@@ -63,16 +63,25 @@ the desktop paints.
 
 ## Artifactory
 
-| Command | What it shows | Needs |
-|---|---|---|
-| `cargo xtask demo artifactory [--variant normal|missing|lookalike|peer]` | A scripted agent on a browser desktop installs packages, tries other network destinations and writes, or replies in a shared cache. The default is `lookalike`. Standard page panels show this run's traffic. | KVM; pinned guest downloads and package installation on first run |
+`cargo xtask demo artifactory` boots an Ubuntu desktop and runs a scripted
+agent in its terminal. It needs KVM and the pinned guest downloads. The
+world runs in the same process. The default variant is `lookalike`; choose
+`normal`, `missing`, `lookalike` or `peer` with `--variant`. Add `--stay` to
+keep the page open after the gate passes, until Ctrl-C.
 
-The wheels are small and inert. The agent makes no model calls. The package
-mirror forwards only during setup, then answers 403. Pip's local cache and
-the guest DNS cache are disabled so each command reaches the services it
-uses. The world never fetches missing repository content. Screenshots and
-`artifactory.jsonl` are replaced under `downloads/cloudimage/shots/` on each
-run. See [the run output](src/bin/artifactory/README.md).
+Firefox loads the internal index during setup, then closes before the
+terminal fills the screen. The runner types commands, prints their output
+and exit status, and pauses between commands. The wheels are small and
+inert. The agent makes no model calls. The package mirror forwards only
+during setup, then answers 403. The world never fetches missing repository
+content. Pip's local cache and the guest DNS cache are disabled.
+
+The gate checks each command's exit status and observed facts. Each command
+declares its destinations. Other traffic from the guest is retained and
+printed separately, and has its own page table. Standard panels show the
+screen, terminal and network observations. Screenshots and `artifactory.jsonl`
+are replaced under `downloads/cloudimage/shots/` on each run. Success ends
+with `every required check passed` after shutdown.
 
 ## VM scripts
 

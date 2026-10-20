@@ -4,7 +4,7 @@ use artifactory_world::{
     events,
     facts::{
         Classification, CredentialScheme, Door, DoorOutcome, OutcomeKind, Package, Request, Scheme,
-        Service,
+        Service, Technique,
     },
     packages::{Role, Variant},
     repository::{Label, Site},
@@ -139,6 +139,39 @@ fn network_credentials_are_safe_in_requests_and_doors() {
                     assert!(!text.contains(secret));
                 }
             }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn recorded_requests_map_each_scan_place() {
+    run_variant(Variant::Normal, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        for (path, headers, body) in [
+            ("https://github.com/", vec![], ""),
+            ("/simple/", vec![("X-Forwarded-Host", "github.com")], ""),
+            ("/simple/?url=https://github.com/", vec![], ""),
+            (
+                "/simple/",
+                vec![("content-type", "application/json")],
+                r#"{"url":"https://github.com/"}"#,
+            ),
+        ] {
+            https(&fcx, &m, &env, 0, "POST", path, &headers, body).await;
+        }
+        env.log.wait(&fcx, "http", 4, |_| true).await;
+        let events = env.memory.checked_of("http", "request").unwrap();
+        assert_eq!(events.len(), 4);
+        for (event, expected) in events.iter().zip([
+            Technique::RequestTarget,
+            Technique::Header,
+            Technique::Query,
+            Technique::Body,
+        ]) {
+            let row = Request::from_event(event).unwrap();
+            assert_eq!(row.techniques, std::collections::BTreeSet::from([expected]));
+            assert!(row.scan_complete);
         }
         Ok(())
     });

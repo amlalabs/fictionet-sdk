@@ -1,3 +1,8 @@
+//! Runs the Artifactory world and a scripted agent on an Ubuntu desktop.
+//! Run `cargo xtask demo artifactory`. The default variant is lookalike.
+//! Select normal, missing, lookalike or peer with `--variant`.
+//! Add `--stay` to keep the page open after the gate until Ctrl-C.
+
 mod facts;
 mod guest;
 mod mirror;
@@ -13,7 +18,7 @@ use fictionet::events::Fanout;
 use fictionet_demo::kit::{self, Kit};
 use fictionet_observe::{
     Aggregate,
-    page::{EventFilter, Page},
+    page::{Column, Format, Page},
 };
 use guest::HOSTNAME;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -26,22 +31,29 @@ use std::time::{Duration, Instant};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-fn args(mut args: impl Iterator<Item = String>) -> Result<(PathBuf, Variant)> {
-    let downloads = args
-        .next()
-        .ok_or("usage: artifactory <downloads> [--variant normal|missing|lookalike|peer]")?;
+fn args(mut args: impl Iterator<Item = String>) -> Result<(PathBuf, Variant, bool)> {
+    let downloads = args.next().ok_or(
+        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--stay]",
+    )?;
+    if downloads.starts_with("--") {
+        return Err("expected the downloads directory before options".into());
+    }
     let mut variant = Variant::Lookalike;
-    if let Some(flag) = args.next() {
-        if flag != "--variant" {
+    let mut selected = false;
+    let mut stay = false;
+    while let Some(flag) = args.next() {
+        if flag == "--stay" && !stay {
+            stay = true;
+            continue;
+        }
+        if flag != "--variant" || selected {
             return Err(format!("unknown argument {flag}").into());
         }
+        selected = true;
         variant = Variant::parse(&args.next().ok_or("--variant needs a value")?)
             .ok_or("variant must be normal, missing, lookalike or peer")?;
     }
-    if args.next().is_some() {
-        return Err("too many arguments".into());
-    }
-    Ok((downloads.into(), variant))
+    Ok((downloads.into(), variant, stay))
 }
 
 #[tokio::main]
@@ -53,7 +65,7 @@ async fn main() {
 }
 
 async fn execute() -> Result {
-    let (downloads, variant) = args(std::env::args().skip(1))?;
+    let (downloads, variant, stay) = args(std::env::args().skip(1))?;
     let start = Instant::now();
     let shots = downloads.join("shots");
     std::fs::create_dir_all(&shots)?;
@@ -69,28 +81,37 @@ async fn execute() -> Result {
     .map_err(io::Error::other)?;
     let facts = Arc::new(facts::Facts::new(contents.inventory()));
     let listener = facts.clone();
-    let contents = Arc::new(
-        contents
-            .on_change(move |_, change, inventory| listener.inventory_changed(change, inventory)),
-    );
+    let contents =
+        Arc::new(contents.on_change(move |at, change, inventory| {
+            listener.inventory_changed(at, change, inventory)
+        }));
     let closed = Arc::new(AtomicBool::new(false));
     let mirror_closed = closed.clone();
     let world_log = log.clone();
+    let other = facts.topics.other.clone();
     let kit = Kit::new("artifactory")
         .guest(guest::definition())
-        .page(|dashboard, hosts| {
-            Page::new("Artifactory", dashboard)
-                .host(hosts.take(HOSTNAME))
-                .standard_panels()
-                .moment(
-                    "Scripted agent. No model calls. Small, inert wheels.",
-                    EventFilter {
-                        source: Some("http".into()),
-                        kind: Some("request".into()),
-                        field: Some(("host".into(), artifactory_world::REPOSITORY_NAME.into())),
-                        ..Default::default()
-                    },
-                )
+        .page(move |dashboard, hosts| {
+            Page::new(
+                format!("Artifactory · {} · Scripted agent", variant.as_str()),
+                dashboard,
+            )
+            .host(hosts.take(HOSTNAME))
+            .table(
+                "Other guest traffic",
+                other,
+                vec![
+                    Column::new("Time", "/at").format(Format::Time),
+                    Column::new("During step", "/step"),
+                    Column::new("Name", "/row/name"),
+                    Column::new("Address", "/row/addr"),
+                    Column::new("Transport", "/row/transport"),
+                    Column::new("Port", "/row/port"),
+                    Column::new("Count", "/row/count").format(Format::Number),
+                    Column::new("Outcome", "/row/outcome"),
+                ],
+            )
+            .standard_panels()
         })
         .observer(Arc::new(Aggregate::new(Arc::new(Fanout::new(vec![
             Arc::new(log.clone()),
@@ -110,6 +131,16 @@ async fn execute() -> Result {
     let boot = run.guest(HOSTNAME).ssh_ready();
     println!("boot to SSH-ready: {} ms", boot.as_millis());
     let result = gate(&run, &facts, &closed, variant, &shots).await;
+    let result = match result {
+        Ok(duration) if stay => {
+            println!("gate passed; the page stays open until Ctrl-C");
+            wait_for_interrupt()
+                .await
+                .map(|()| duration)
+                .map_err(Into::into)
+        }
+        result => result,
+    };
     let run_dir = run.path().to_path_buf();
     let pid = run.guest(HOSTNAME).vm().pid();
     let shutdown = run.shutdown().await;
@@ -155,7 +186,6 @@ async fn gate(
     closed.store(true, Ordering::SeqCst);
     println!("mirror closed");
     guest.wait_desktop(Duration::from_secs(300)).await?;
-    guest::open_terminal(guest).await?;
     wait_setup(run.page_url()).await?;
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -174,6 +204,7 @@ async fn gate(
     })
     .await
     .map_err(|_| "Firefox did not load the internal package index")?;
+    guest::open_terminal(guest).await?;
     let story_time = story::run(guest, facts, variant).await?;
     let screen = shots.join("artifactory-screen.png");
     kit::rfb::capture_page(run.page_url(), HOSTNAME, &screen).await?;
@@ -194,6 +225,11 @@ async fn gate(
     Ok(story_time)
 }
 
+/// Waits for the operator before the caller shuts down its run.
+async fn wait_for_interrupt() -> io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
 async fn wait_setup(url: &str) -> io::Result<()> {
     let client = kit::client::PageClient::from_url(url)?;
     client.bootstrap().await?;
@@ -212,7 +248,7 @@ async fn wait_setup(url: &str) -> io::Result<()> {
             }) {
                 return Ok(());
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
     .await?
@@ -246,8 +282,18 @@ mod tests {
                 variant
             );
         }
+        for input in [
+            vec!["d", "--stay"],
+            vec!["d", "--stay", "--variant", "peer"],
+            vec!["d", "--variant", "normal", "--stay"],
+        ] {
+            assert!(args(input.into_iter().map(str::to_owned)).unwrap().2);
+        }
         for args_in in [
             vec![],
+            vec!["--stay"],
+            vec!["d", "--stay", "--stay"],
+            vec!["d", "--variant", "peer", "--variant", "normal"],
             vec!["d", "--variant"],
             vec!["d", "--variant", "bad"],
             vec!["d", "--bad", "peer"],

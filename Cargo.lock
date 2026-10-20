@@ -922,6 +922,7 @@ dependencies = [
  "httpdate",
  "libc",
  "russh",
+ "serde",
  "serde_json",
  "tokio",
  "tower-service",

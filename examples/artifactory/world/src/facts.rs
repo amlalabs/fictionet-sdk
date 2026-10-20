@@ -14,6 +14,7 @@ use fictionet::events::Event;
 use fictionet::stdlib::{codec::base64, protocols::json::Value as J};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 
 /// Credential JSON bound: 64 user characters, 16 ASCII scheme characters,
@@ -21,9 +22,10 @@ use std::net::IpAddr;
 pub const MAX_CREDENTIAL_JSON_BYTES: usize = 64 * 6 + 16 + 160;
 /// Request JSON bound: sandbox 64, method 32, host 253, project 100, and
 /// path, repo, filename, upstream each 300 characters; one credential;
-/// and 1024 bytes for all fixed fields, enum values, numbers, and punctuation.
+/// 80 bytes for four distinct scan places and their field framing;
+/// and 1024 bytes for all other fixed fields, enum values, numbers, and punctuation.
 pub const MAX_REQUEST_JSON_BYTES: usize =
-    (64 + 32 + 253 + 100 + 4 * 300) * 6 + MAX_CREDENTIAL_JSON_BYTES + 1024;
+    (64 + 32 + 253 + 100 + 4 * 300) * 6 + MAX_CREDENTIAL_JSON_BYTES + 80 + 1024;
 /// Door JSON bound: sandbox 64 and name 253 characters; one credential;
 /// and 512 bytes for address, enum values, numbers, keys, and punctuation.
 pub const MAX_DOOR_JSON_BYTES: usize = (64 + 253) * 6 + MAX_CREDENTIAL_JSON_BYTES + 512;
@@ -273,6 +275,20 @@ impl Package {
     }
 }
 
+/// Where the scan found an off-site target.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Technique {
+    /// Absolute request URI or CONNECT authority.
+    RequestTarget,
+    /// An HTTP header.
+    Header,
+    /// A query parameter.
+    Query,
+    /// Request body content.
+    Body,
+}
+
 /// One HTTP request row, bounded by MAX_REQUEST_JSON_BYTES.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -302,6 +318,8 @@ pub struct Request {
     pub upstream: Option<String>,
     /// Number of off-site targets found by the bounded scan.
     pub ssrf_targets: u64,
+    /// Distinct target locations, with at most four values.
+    pub techniques: BTreeSet<Technique>,
     /// Whether the request scan was complete.
     pub scan_complete: bool,
     /// Credential metadata without the secret.
@@ -368,6 +386,18 @@ impl Request {
             package,
             upstream: e.str("upstream").map(ssrf::truncate),
             ssrf_targets: scan["ssrf"].as_array().map_or(0, |a| a.len() as u64),
+            techniques: scan["ssrf"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|target| match target["where"].as_str()? {
+                    "request_target" => Some(Technique::RequestTarget),
+                    "header" => Some(Technique::Header),
+                    "query" => Some(Technique::Query),
+                    "body" => Some(Technique::Body),
+                    _ => None,
+                })
+                .collect(),
             scan_complete: scan["ssrf_scan"]["state"] == "complete",
             credential: Credential::from_event(e),
             folder_revision: e.u64("folder_revision"),
@@ -749,6 +779,37 @@ mod tests {
             !Request::from_event(&e.field("received", "cut_off"))
                 .unwrap()
                 .scan_complete
+        );
+    }
+
+    #[test]
+    fn scan_places_are_distinct_and_bounded() {
+        let places = [
+            ("request_target", Technique::RequestTarget),
+            ("header", Technique::Header),
+            ("query", Technique::Query),
+            ("body", Technique::Body),
+        ];
+        for (place, expected) in places {
+            let target = J::Object(vec![
+                ("where".into(), place.into()),
+                ("target".into(), "https://github.com/".into()),
+            ]);
+            let event = request()
+                .field("ssrf", J::Array(vec![target.clone(), target]))
+                .field(
+                    "ssrf_scan",
+                    J::Object(vec![("state".into(), "complete".into())]),
+                );
+            let row = Request::from_event(&event).unwrap();
+            assert_eq!(row.ssrf_targets, 2);
+            assert_eq!(row.techniques, BTreeSet::from([expected]));
+        }
+        assert!(
+            Request::from_event(&request())
+                .unwrap()
+                .techniques
+                .is_empty()
         );
     }
 
@@ -1178,6 +1239,12 @@ mod tests {
                 }),
                 upstream: Some(text),
                 ssrf_targets: u64::MAX,
+                techniques: BTreeSet::from([
+                    Technique::RequestTarget,
+                    Technique::Header,
+                    Technique::Query,
+                    Technique::Body,
+                ]),
                 scan_complete: false,
                 credential: Some(largest_credential()),
                 folder_revision: Some(u64::MAX),

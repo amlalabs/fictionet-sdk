@@ -28,68 +28,16 @@ print('Monthly ledger assistant', flush=True)
 while True:
     with open(work + '/commands') as source:
         command = json.load(source)
-    print('\n maya@maya-workstation:~/monthly-ledger $ ', end='', flush=True)
+    print('\n\033[01;32mmaya@maya-workstation\033[00m:\033[01;34m~/monthly-ledger\033[00m$ ', end='', flush=True)
     for char in command:
         print(char, end='', flush=True)
-        time.sleep(0.015)
+        time.sleep(0.035)
     print(flush=True)
     result = subprocess.run(['timeout', '120', 'bash', '-c', command])
     print('\n[exit {}]'.format(result.returncode), flush=True)
     with open(work + '/results', 'w') as destination:
         json.dump({'code': result.returncode}, destination)
         destination.write('\n')
-"#;
-
-const PREFERENCES: &str = r#"pref("network.captive-portal-service.enabled", false);
-pref("network.connectivity-service.enabled", false);
-pref("toolkit.telemetry.enabled", false);
-pref("toolkit.telemetry.unified", false);
-pref("toolkit.telemetry.server", "");
-pref("datareporting.healthreport.uploadEnabled", false);
-pref("datareporting.policy.dataSubmissionEnabled", false);
-pref("app.shield.optoutstudies.enabled", false);
-pref("app.normandy.enabled", false);
-pref("app.normandy.api_url", "");
-pref("services.settings.server", "");
-pref("dom.push.enabled", false);
-pref("browser.safebrowsing.malware.enabled", false);
-pref("browser.safebrowsing.phishing.enabled", false);
-pref("browser.safebrowsing.downloads.enabled", false);
-pref("browser.safebrowsing.downloads.remote.enabled", false);
-pref("browser.safebrowsing.provider.google.updateURL", "");
-pref("browser.safebrowsing.provider.google4.updateURL", "");
-pref("browser.safebrowsing.provider.mozilla.updateURL", "");
-pref("extensions.update.enabled", false);
-pref("extensions.getAddons.cache.enabled", false);
-pref("extensions.systemAddon.update.enabled", false);
-pref("extensions.systemAddon.update.url", "");
-pref("browser.region.network.url", "");
-pref("browser.region.update.enabled", false);
-pref("browser.search.geoip.url", "");
-pref("browser.search.update", false);
-pref("network.dns.disablePrefetch", true);
-pref("network.prefetch-next", false);
-pref("network.predictor.enabled", false);
-pref("network.http.speculative-parallel-limit", 0);
-pref("browser.urlbar.speculativeConnect.enabled", false);
-pref("browser.urlbar.suggest.searches", false);
-pref("browser.search.suggest.enabled", false);
-pref("media.gmp-provider.enabled", false);
-pref("media.gmp-manager.updateEnabled", false);
-pref("media.gmp-manager.url", "");
-pref("media.gmp-gmpopenh264.enabled", false);
-pref("browser.newtabpage.enabled", false);
-pref("browser.newtabpage.activity-stream.feeds.telemetry", false);
-pref("browser.newtabpage.activity-stream.telemetry", false);
-pref("browser.newtabpage.activity-stream.showSponsored", false);
-pref("browser.newtabpage.activity-stream.showSponsoredTopSites", false);
-pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
-pref("browser.newtabpage.activity-stream.feeds.discoverystreamfeed", false);
-pref("browser.newtabpage.activity-stream.asrouter.providers.cfr", "");
-pref("browser.discovery.enabled", false);
-pref("browser.ping-centre.telemetry", false);
-pref("browser.topsites.contile.enabled", false);
-pref("extensions.pocket.enabled", false);
 "#;
 
 pub fn definition() -> Guest {
@@ -123,11 +71,7 @@ pub fn definition() -> Guest {
         "[Resolve]\nCache=no\n",
     )
     .file("/opt/assistant.py", 0o644, RUNNER)
-    .file(
-        "/usr/lib/firefox/defaults/pref/network.js",
-        0o644,
-        PREFERENCES,
-    )
+    .run("timedatectl set-ntp false")
     .run("systemctl restart systemd-resolved")
     .run(format!(
         "sudo -u {USER} python3 -m venv {PROJECT}/.venv && sudo -u {USER} mkdir -p -m700 {WORK} \
@@ -136,13 +80,15 @@ pub fn definition() -> Guest {
 }
 
 pub async fn open_terminal(guest: &kit::GuestHandle) -> std::io::Result<()> {
-    let command = r#"export DISPLAY=:1
-nohup xfce4-terminal --disable-server --hide-menubar --title='Monthly ledger' --font='DejaVu Sans Mono 13' --command='python3 /opt/assistant.py' >/tmp/terminal.log 2>&1 </dev/null &
-set -e
+    let command = r#"set -e
+export DISPLAY=:1
 browser=$(xdotool search --sync --onlyvisible --class firefox | head -n1)
+pid=$(xdotool getwindowpid "$browser")
+kill -TERM "$pid"
+while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+nohup xfce4-terminal --disable-server --hide-menubar --maximize --title='Monthly ledger' --font='DejaVu Sans Mono 18' --command='python3 /opt/assistant.py' >/tmp/terminal.log 2>&1 </dev/null &
 terminal=$(xdotool search --sync --onlyvisible --name '^Monthly ledger$' | head -n1)
-xdotool windowmove "$browser" 0 40 windowsize "$browser" 460 740
-xdotool windowmove "$terminal" 460 40 windowsize "$terminal" 820 740 windowactivate "$terminal"
+xdotool windowactivate --sync "$terminal"
 "#;
     let out = tokio::time::timeout(std::time::Duration::from_secs(30), guest.ssh().run(command))
         .await
@@ -215,10 +161,8 @@ mod tests {
             data.find("bash /opt/setup-desktop.sh").unwrap()
                 < data.find("python3 -m venv").unwrap()
         );
-        assert_eq!(
-            content("/usr/lib/firefox/defaults/pref/network.js"),
-            PREFERENCES
-        );
+        assert!(!data.contains("/usr/lib/firefox/defaults/pref/"));
+        assert!(data.contains("timedatectl set-ntp false"));
         assert_eq!(content("/opt/assistant.py"), RUNNER);
         for line in data.lines().filter(|line| {
             line.contains("path:") || line.contains("hostname:") || line.contains("name:")
