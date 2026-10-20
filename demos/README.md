@@ -88,9 +88,12 @@ login shell and run `bank-check` subcommands. Browser takeover only claims
 browser input; it does not pause the script. After the story, Routing remains
 available and the page stays open until Ctrl-C. With nonterminal stdin, or
 with `border demos/downloads/cloudimage --gate`, it shuts down automatically.
-The gate saves `normal.png`, `hijacked.png`, and `log.jsonl` under the printed
-`downloads/cloudimage/shots/border-<run>/` directory. Screen captures use the
-page's ticketed WebSocket without taking browser input.
+The gate saves `normal.png`, `hijacked.png`, `page-hijacked.png`, and
+`log.jsonl` under the printed `downloads/cloudimage/shots/border-<run>/`
+directory. Screen captures use the page's ticketed WebSocket without taking
+browser input. Each is kept once two captures in a row match, so Firefox has
+finished loading. `page-hijacked.png` is the page in Chromium at the hijack,
+once the route, the four-hop traceroute and the credential alert show.
 
 ## VM scripts
 
