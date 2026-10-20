@@ -66,18 +66,16 @@ External I/O and opt-in axum upgrades have separate timing limits; see
 ## Try it
 
 ```console
-$ cargo xtask demo web
+$ cargo xtask demo desktop
 ```
 
-It boots a small Debian VM under QEMU and KVM, builds Fictionet inside it, and
-shows a sandbox using a world of websites with `dig`, `curl` and `ping`. Nothing
-needs root or Docker on your machine. The first run takes a few minutes; after
-that a demo starts in seconds. [demos/README.md](demos/README.md) lists every
-demo, what each one needs and shows, and how to make a demo of your own.
-
-`cargo xtask demo desktop` runs one executable on your machine, booting Ubuntu's
-unmodified cloud image in Cloud Hypervisor with the world in the same process.
-It needs KVM.
+It runs one executable that boots Ubuntu's unmodified cloud image as a desktop
+in Cloud Hypervisor, with the world in the same process. It prints a page URL
+where you watch the desktop beside its packets and events. It needs Linux with
+KVM, and no root or Docker. The first run downloads about 650 MB of pinned
+files and about 280 MB of Ubuntu packages, which later runs reuse.
+[demos/README.md](demos/README.md) lists every demo, what each one needs and
+shows, and how to make a demo of your own.
 
 ## Install
 
@@ -163,11 +161,9 @@ The integrator installs one observer through `RunOptions` before the run.
 
 The companion crate owns consumption and retention: `Memory` for grading,
 `Aggregate` to combine repeats, `Jsonl` for files, and `DashboardObserver` for
-watching a world. Graders check that retained events are complete. Serve the
-dashboard handle with `fictionet_observe::serve` on a private observation
-socket. Both `fictionet dashboard` and `fictionet observe` connect through
-`--observation unix:PATH`. See [Fictionet Observe](observe/README.md) for setup
-and limits, and [services](docs/services.md) for a small world.
+watching a world. Graders check that retained events are complete. See
+[Fictionet Observe](observe/README.md) for watching a running world, setup and
+limits, and [services](docs/services.md) for a small world.
 
 Protocol codecs also work in unit tests and fuzz targets. The companion's
 `decode` feature supplies presenters that use those codecs for captured traffic.
