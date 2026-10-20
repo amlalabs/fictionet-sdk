@@ -335,6 +335,74 @@ test('a custom workspace panel replaces the console tiles and hides the pins', a
   assert.equal(h.budget.open, 0);
 });
 
+test('a custom workspace can sit beside consoles while pins remain available', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = { ...DESCRIPTION, panels: [
+    { id: 'packets', title: 'Packets', area: 'inspector', kind: 'packets' },
+    { id: 'plant', title: 'Plant', area: 'workspace', kind: 'custom', module: '/panels/plant.mjs', state: '/api/state/rows' },
+    { id: 'alpha-screen', title: 'Screen', area: 'workspace', kind: 'screen', host: 'alpha' },
+  ] };
+  const stop = await mount(h.root, {
+    get: async (path) => path === '/api/page' ? description : { rows: [], next: 0, dropped: 0 },
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'), packetStream: (links) => h.stream('packets', links), close() {},
+  }, { subscribe: () => () => {}, dispose() {} });
+  await settle();
+  const workspace = h.root.querySelector('#workspace');
+  const custom = workspace.querySelector('section.custom-workspace');
+  assert.ok(custom);
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 1);
+  const pins = h.root.querySelectorAll('button.pin');
+  assert.ok(pins.every((pin) => !pin.hidden));
+  pins.forEach((pin) => pin.click());
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 2);
+  assert.equal(workspace.querySelector('section.custom-workspace'), custom);
+  pins[0].click();
+  assert.equal(workspace.querySelector('section.workspace-tile').getAttribute('aria-label'), 'beta');
+  assert.equal(h.root.querySelector('#divider').getAttribute('aria-valuenow'), '68');
+  stop();
+  assert.equal(h.budget.open, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test('a shared custom workspace keeps the console tile and releases both on disposal', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = { ...DESCRIPTION, hosts: DESCRIPTION.hosts.map((host) => ({ ...host, screen: true, terminal: true })), panels: [
+    { id: 'plant', title: 'Plant', area: 'workspace', kind: 'custom', module: '/panels/plant.mjs', state: '/api/state/rows' },
+    { id: 'alpha-screen', title: 'Alpha', area: 'workspace', kind: 'screen', host: 'alpha' },
+  ] };
+  const stop = await mount(h.root, {
+    get: async (path) => path === '/api/page' ? description : { rows: [], next: 0, dropped: 0 },
+    stateStream: (topics) => h.stream('state', topics), watch: () => h.stream('watch'), close() {},
+  }, { subscribe: (listener) => { listener('light'); return () => {}; }, dispose() {} });
+  await settle();
+  const workspace = h.root.querySelector('#workspace');
+  assert.ok(workspace.classList.contains('shared-workspace'));
+  assert.ok(h.root.querySelector('#workbench').classList.contains('shared-workbench'));
+  assert.equal(h.root.querySelector('#workbench').style['--workspace'], '68%');
+  assert.equal(h.root.querySelector('#divider').getAttribute('aria-valuenow'), '68');
+  assert.equal(workspace.querySelectorAll('section.custom-workspace').length, 1);
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 1);
+  assert.equal(workspace.querySelector('section.workspace-tile').style.alignSelf, 'start');
+  const terminal = workspace.querySelectorAll('button').find((button) => button.textContent === 'Terminal');
+  terminal.click();
+  await settle();
+  assert.equal(workspace.querySelector('section.workspace-tile').style.alignSelf, undefined);
+  workspace.querySelectorAll('button').find((button) => button.textContent === 'Screen').click();
+  await settle();
+  assert.equal(workspace.querySelector('section.workspace-tile').style.alignSelf, 'start');
+  assert.ok(h.root.querySelectorAll('button.pin').every((pin) => !pin.hidden));
+  h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
+  h.document.hidden = false; h.document.dispatchEvent(new Event('visibilitychange'));
+  await settle();
+  assert.equal(workspace.querySelectorAll('section.custom-workspace').length, 1);
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 1);
+  stop();
+  assert.equal(h.budget.open, 0);
+  assert.equal(h.timers.size, 0);
+});
 
 test('the stopped page stays stopped without an Events reconnect banner after the stream drops', async (t) => {
   const h = harness(t);
@@ -371,4 +439,27 @@ test('the stopped page stays stopped without an Events reconnect banner after th
   assert.doesNotMatch(h.root.textContent, /Connection dropped|Reconnecting/);
   assert.equal(requests, 1);
   stop();
+});
+
+test('declared pins open both hosts without a click', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = { ...DESCRIPTION, hosts: DESCRIPTION.hosts.map((host) => ({ ...host, pinned: true })) };
+  const transport = {
+    get: async (path) => (path === '/api/page' ? description : path.startsWith('/api/host/') ? { links: [] } : { rows: [], next: 0, dropped: 0 }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  };
+  const stop = await mount(h.root, transport, { subscribe: (listener) => { listener('light'); return () => {}; }, dispose() {} });
+  await settle();
+  assert.equal(h.root.querySelectorAll('section.workspace-tile').length, 2);
+  const pins = h.root.querySelectorAll('button.pin');
+  assert.ok(pins.every((pin) => pin.getAttribute('aria-pressed') === 'true'));
+  pins[1].click();
+  assert.equal(h.root.querySelectorAll('section.workspace-tile').length, 1);
+  assert.equal(h.root.querySelector('section.workspace-tile').getAttribute('aria-label'), 'alpha');
+  stop();
+  assert.equal(h.budget.open, 0);
 });

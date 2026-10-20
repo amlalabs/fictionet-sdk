@@ -8,8 +8,11 @@ mod common;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use border_world::scenario::{BANK_ADDR, FOREIGN, HOME, ROGUE_CA_NAME, STATUS_ADDR, Task, Variant};
+use border_world::scenario::{
+    BANK_ADDR, FOREIGN, HOME, IMPOSTOR_ADDR, ROGUE_CA_NAME, STATUS_ADDR, Task, Variant,
+};
 use common::*;
+use example_common::hyper_io::Io;
 use fictionet::Interface;
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Frames, Stream, Wire};
@@ -796,7 +799,7 @@ async fn answer(
 #[test]
 fn an_address_with_no_host_ends_at_the_last_router_and_every_hop_takes_time() {
     for variant in [Variant::Legitimate, Variant::Hijack] {
-        run_variant(variant, Task::Read, move |fcx, attacher, _env| async move {
+        run_variant(variant, Task::Read, move |fcx, attacher, env| async move {
             let me = Ipv4Addr::new(10, 0, 0, 3);
             let mut raw = attacher.attach("raw").unwrap();
             let ms = |d: Duration| d.as_millis();
@@ -847,6 +850,44 @@ fn an_address_with_no_host_ends_at_the_last_router_and_every_hop_takes_time() {
             )
             .await;
             assert_eq!((from, ttl, kind, code), (GATEWAY, 64, 3, 1));
+
+            // The log keeps the router's answer, and Left the box shows the
+            // world's no-route answer for the sandbox.
+            let lines = env
+                .log
+                .wait(&fcx, "unreachable", 1, |l| l["dst"] == "1.1.1.1")
+                .await;
+            assert_eq!(lines[0]["sandbox"], "raw");
+            assert_eq!(lines[0]["from"], GATEWAY.to_string());
+            assert_eq!(lines[0]["dst_port"], 53);
+            use fictionet::events::Observer;
+            let egress = fictionet_observe::egress::Egress::default();
+            for (seq, event) in env.events.checked_all().unwrap().iter().enumerate() {
+                let interest = fictionet::events::Interest::Event(
+                    fictionet::events::Metadata {
+                        source: event.source,
+                        kind: event.kind,
+                    },
+                    &event.conn,
+                );
+                if egress.enabled(interest) {
+                    egress.observe(
+                        fictionet::events::Stamp {
+                            stream: fictionet::events::Stream::Events,
+                            seq: seq as u64,
+                            at: fictionet::time::Instant::ZERO,
+                        },
+                        fictionet::events::Observation::Event(event),
+                    );
+                }
+            }
+            let snapshot = egress.snapshot();
+            assert!(
+                snapshot.destinations.iter().any(|row| row.sandbox == "raw"
+                    && row.address == "1.1.1.1:53"
+                    && row.outcome == fictionet_observe::egress::Outcome::NoRoute),
+                "{snapshot:#?}"
+            );
             Ok(())
         });
     }
@@ -1141,9 +1182,10 @@ where
         )),
         |fcx| async move {
             let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "Test Root CA")?;
-            let ids = border_world::identities(&fcx, &scenario, &ca)?;
+            let ids = border_world::identities(&fcx, &ca)?;
             let (attacher, attachments) = fictionet::attachments();
-            border_world::start(&fcx, scenario, ids, log, attachments)?;
+            log.attach(&fcx);
+            border_world::start(&fcx, scenario, ids, attachments)?;
             test(fcx.clone(), attacher, buf, recorded).await?;
             fcx.cancel();
             Ok(())
@@ -1229,7 +1271,7 @@ fn password_in_partial_head_before_eof() {
             assert!(fcx.now() < started + Duration::from_secs(30));
             redacted(&log);
             let lines = log.lines();
-            let local = SocketAddr::new(BANK_ADDR.into(), port);
+            let local = SocketAddr::new(IMPOSTOR_ADDR.into(), port);
             let classified = _recorded.checked_all().unwrap().iter().any(|event| {
                 event.source == "http"
                     && event.conn.local == Some(local)
@@ -1283,7 +1325,7 @@ fn password_in_partial_head_before_reset() {
         let lines = log.lines();
         let mut evidence = Vec::new();
         for (port, peer) in [(443, secure_peer), (80, plain_peer)] {
-            let local = SocketAddr::new(BANK_ADDR.into(), port);
+            let local = SocketAddr::new(IMPOSTOR_ADDR.into(), port);
             let classified = _recorded.checked_all().unwrap().iter().any(|event| {
                 event.source == "http"
                     && event.conn.local == Some(local)

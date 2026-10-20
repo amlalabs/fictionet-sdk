@@ -22,8 +22,9 @@
 //! - **Dates** ([`world_start`]): the world's clock starts on the seed's
 //!   date, so every response's `Date` header is in the scenario, and each
 //!   certificate was issued shortly before it.
-//! - **Pages** ([`backend`]): every site forwards to the Python backend
-//!   on 127.0.0.1, which makes, stores and serves the pages. Fixed responses
+//! - **Pages** ([`backend`]): sites use either the Python backend on
+//!   127.0.0.1 or the in-process [`stub`]. Python serves evals and model
+//!   generation; the Rust stub serves demos without host I/O. Fixed responses
 //!   retain their bytes and metadata on first use. Replay needs no fixed
 //!   source files and returns 404 for pages absent from the store. Stores
 //!   check the seed and generator identity; incompatible or legacy stores
@@ -31,9 +32,57 @@
 //! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, the
 //!   ready file, and the store. The log is written from the run's events
 //!   ([`events`]).
+//!
+//! An in-process world can keep its addresses, pages and CA in memory.
+//! This example sends its log to standard output. Give the PEM root and
+//! attacher to the guest runner, then use commands to change generation.
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use adaptive_web_world::{Addresses, Ca, serve, world_start};
+//! use adaptive_web_world::{events::LogObserver, search::Searches};
+//! use adaptive_web_world::stub::{Command, Seed, Stub};
+//! use example_common::log::Log;
+//! use fictionet::events::Fanout;
+//!
+//! # fn main() -> fictionet::Result {
+//! let seed = Seed::builtin("halvard-cve")?;
+//! let start = world_start(&seed.date)?;
+//! let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
+//! let searches = Arc::new(Searches::from_seed(&seed));
+//! let stub = Arc::new(Stub::new(seed));
+//! let log = Arc::new(Log::new(Box::new(std::io::stdout()), &[], |s| s));
+//! let observer = Arc::new(Fanout::new(vec![
+//!     searches.clone(),
+//!     Arc::new(LogObserver { log: log.clone() }),
+//! ]));
+//! let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(7))
+//!     .observer(observer);
+//! let output = log.clone();
+//! fictionet::block_on(fictionet::run(options, |cx| async move {
+//!     let ca = Arc::new(Ca::in_memory(&cx, start)?);
+//!     let root_pem = ca.cert_pem();
+//!     let (attacher, attachments) = fictionet::attachments();
+//!     serve(&cx, addresses, ca, stub.clone(), log.clone(), start, attachments)?;
+//!     // Start a guest with root_pem and attacher here.
+//!     let applied = stub.apply(&cx, Command::SetGeneration {
+//!         generate: false,
+//!         expected_revision: stub.generation().revision,
+//!     }).unwrap();
+//!     assert_eq!(applied.revision, 1);
+//!     cx.cancelled().await;
+//!     Ok(())
+//! }))?;
+//! output.finish()?;
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod backend;
 pub mod events;
+pub mod route;
+pub mod search;
+pub mod stub;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -48,7 +97,9 @@ use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use serde_json::{Value, json};
 
+#[cfg(test)]
 use crate::backend::Backend;
+pub use crate::backend::Pages;
 use example_common::log::Log;
 
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
@@ -303,10 +354,23 @@ pub struct Ca {
 impl Ca {
     /// Makes a seeded CA and writes its public certificate for the agent.
     pub fn new(fcx: &Cx, dir: &Path, start: SystemTime) -> fictionet::Result<Ca> {
-        let issuer = fictionet::stdlib::services::ca::Ca::new(fcx, "Internet Security Root CA")?;
+        let ca = Self::in_memory(fcx, start)?;
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("ca.pem"), issuer.cert_pem())?;
-        Ok(Ca { issuer, start })
+        std::fs::write(dir.join("ca.pem"), ca.cert_pem())?;
+        Ok(ca)
+    }
+
+    /// Makes a seeded CA without writing files, for an in-process world.
+    pub fn in_memory(fcx: &Cx, start: SystemTime) -> fictionet::Result<Ca> {
+        Ok(Ca {
+            issuer: fictionet::stdlib::services::ca::Ca::new(fcx, "Internet Security Root CA")?,
+            start,
+        })
+    }
+
+    /// Returns the public root certificate in PEM format for a guest to trust.
+    pub fn cert_pem(&self) -> String {
+        self.issuer.cert_pem()
     }
 
     /// A certificate for `host`: the host as CN and SAN, for server auth,
@@ -349,22 +413,40 @@ impl Ca {
 
 /// Builds the network: a site for every name [`admit`] lets in, at its
 /// address from `addresses`, with a certificate from `ca` made at its first
-/// handshake, every request answered by `backend` and logged, and every
+/// handshake, every request answered by `pages` and logged, and every
 /// response dated from `start`, the world's date at the start of the run.
 /// Returns at once; the network runs in `fcx`'s region.
 pub fn serve(
     fcx: &Cx,
     addresses: Arc<Addresses>,
     ca: Arc<Ca>,
-    backend: Backend,
+    pages: impl Into<Pages>,
     log: Arc<Log>,
     start: SystemTime,
     attachments: fictionet::Attachments,
 ) -> fictionet::Result {
+    net(fcx, addresses, ca, pages, log, start, |_| None).start(fcx, attachments)
+}
+
+/// Builds an unstarted network, giving the caller first choice of each name.
+/// Claimed names bypass adaptive addresses, certificates and site events.
+pub fn net(
+    fcx: &Cx,
+    addresses: Arc<Addresses>,
+    ca: Arc<Ca>,
+    pages: impl Into<Pages>,
+    log: Arc<Log>,
+    start: SystemTime,
+    forward: impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static,
+) -> fictionet::stdlib::world::net::Net {
+    let handler = pages.into().handler(fcx);
     log.attach(fcx);
     let names = addresses.fixed.clone();
     let world = fcx.clone();
     let site_for = move |host: &str| {
+        if let Some(site) = forward(host) {
+            return Some(site);
+        }
         if let Err(why) = admit(host) {
             world.emit("adaptive", "refused", |event| {
                 event
@@ -403,7 +485,7 @@ pub fn serve(
         let (ca, name) = (ca.clone(), host.to_owned());
         let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
         Some(
-            web::Site::new(backend.clone())
+            web::Site::new(handler.clone())
                 .date(start)
                 .at(addr)
                 .tls_with(move |fcx| {
@@ -433,8 +515,7 @@ pub fn serve(
     for host in hosts {
         net = net.add_host(host);
     }
-    net.start(fcx, attachments)?;
-    Ok(())
+    net
 }
 
 /// The fixed addresses in the backend's first line.

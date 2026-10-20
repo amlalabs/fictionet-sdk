@@ -1,29 +1,30 @@
 //! BGP-4: the speaker that plays Harbourline's border router.
 //!
-//! The speaker sends its OPEN, finishes the OPEN and KEEPALIVE exchange,
-//! and once established announces every route of the variant, one UPDATE
-//! each. Then it holds the session as a router does: a KEEPALIVE every
-//! third of the hold time, and a NOTIFICATION if the peer is silent for the
-//! whole hold time. Routes the peer announces are logged and ignored.
-//! Every message sent or received is a `bgp` line in the log.
+//! The speaker sends its OPEN and finishes the OPEN and KEEPALIVE exchange.
+//! Once established, it announces each current route in a separate UPDATE.
+//! It sends a KEEPALIVE every third of the hold time and a NOTIFICATION if
+//! the peer is silent for the whole hold time. Peer routes are logged and ignored.
+//! Route changes wake established sessions. Each session reconciles what it
+//! announced with the current table, including withdrawals after restoration.
+//! Every message sent or received is an observer fact projected to a `bgp` line.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use fictionet::Cx;
-use fictionet::events::ConnInfo;
+use fictionet::events::{ConnInfo, Event};
 use fictionet::stdlib::codec::{Fail, Frames, Wire};
 use fictionet::stdlib::network::tcp::Listener;
 use fictionet::stdlib::protocols::bgp::{
     self, Attribute, Context, Error, Frame, Message, Notification, Open, Origin, Segment,
     SegmentKind, Update, kind,
 };
+use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::services::serve::{self, Driver, Flow, ServeOptions, Service, Timer};
 use fictionet::time::Duration;
-use serde_json::{Value, json};
 use std::convert::Infallible;
 
-use crate::log::Log;
+use crate::routing::{Route, Routing};
 use crate::scenario::{Announcement, HOME, Scenario};
 
 /// The hold time the speaker offers. The session uses the smaller of this
@@ -78,11 +79,11 @@ pub async fn serve(
     fcx: Cx,
     mut listener: Listener,
     scenario: Arc<Scenario>,
-    log: Log,
+    routing: Routing,
     sandbox: Arc<str>,
 ) -> fictionet::Result {
     while let Ok(conn) = listener.accept(&fcx).await {
-        let (scenario, log, sandbox) = (scenario.clone(), log.clone(), sandbox.clone());
+        let (scenario, routing, sandbox) = (scenario.clone(), routing.clone(), sandbox.clone());
         fcx.spawn(move |fcx| async move {
             let peer = conn.peer_addr();
             let info = ConnInfo {
@@ -90,7 +91,7 @@ pub async fn serve(
                 local: Some(conn.local_addr()),
                 ..ConnInfo::default()
             };
-            let mut session = Session::new(scenario, log, sandbox, peer, OUR_HOLD);
+            let mut session = Session::new(scenario, routing, sandbox, peer, OUR_HOLD);
             let opts = ServeOptions::default()
                 .idle(None)
                 .write_timeout(Some(WRITE_WAIT))
@@ -112,7 +113,7 @@ enum Phase {
 /// One BGP session.
 pub struct Session {
     scenario: Arc<Scenario>,
-    log: Log,
+    routing: Routing,
     sandbox: Arc<str>,
     peer: SocketAddr,
     our_hold: u16,
@@ -120,20 +121,21 @@ pub struct Session {
     hold: Duration,
     negotiated: u16,
     phase: Phase,
+    announced: Vec<Announcement>,
 }
 
 impl Session {
     /// A session that offers `our_hold` seconds as its hold time.
     pub fn new(
         scenario: Arc<Scenario>,
-        log: Log,
+        routing: Routing,
         sandbox: Arc<str>,
         peer: SocketAddr,
         our_hold: u16,
     ) -> Session {
         Session {
             scenario,
-            log,
+            routing,
             sandbox,
             peer,
             our_hold,
@@ -141,6 +143,7 @@ impl Session {
             hold: OPEN_WAIT,
             negotiated: 0,
             phase: Phase::OpenSent,
+            announced: Vec::new(),
         }
     }
 
@@ -150,41 +153,80 @@ impl Session {
         ours
     }
 
-    fn observe(&self, fields: Value) {
-        let mut line = serde_json::Map::new();
-        line.insert("type".into(), json!("bgp"));
-        line.insert("sandbox".into(), json!(&*self.sandbox));
-        line.insert("peer".into(), json!(self.peer.to_string()));
-        if let Value::Object(fields) = fields {
-            line.extend(fields);
-        }
-        self.log.line(Value::Object(line));
-    }
-
-    fn send(&self, driver: &mut Driver<'_, Frames<Frame>>, message: &[u8], observed: Value) {
-        driver.reply().extend_from_slice(message);
-        self.observe(observed);
-    }
-
-    fn fail(&self, driver: &mut Driver<'_, Frames<Frame>>, e: Notification, reason: &str) -> Flow {
-        let observed = json!({
-            "event": "sent",
-            "message": "NOTIFICATION",
-            "code": e.code,
-            "subcode": e.subcode,
-            "reason": reason,
+    fn observe(
+        &self,
+        driver: &Driver<'_, Frames<Frame>>,
+        kind: &'static str,
+        build: impl FnOnce(Event) -> Event,
+    ) {
+        driver.emit("bgp", kind, |e| {
+            build(
+                e.field("sandbox", &*self.sandbox)
+                    .display("peer", self.peer),
+            )
         });
-        self.send(driver, &bytes(Message::Notification(e)), observed);
+    }
+
+    fn send(
+        &self,
+        driver: &mut Driver<'_, Frames<Frame>>,
+        message: &[u8],
+        build: impl FnOnce(Event) -> Event,
+    ) {
+        driver.reply().extend_from_slice(message);
+        self.observe(driver, "sent", build);
+    }
+
+    fn fail(
+        &self,
+        driver: &mut Driver<'_, Frames<Frame>>,
+        e: Notification,
+        reason: impl std::fmt::Display,
+    ) -> Flow {
+        let (code, subcode) = (e.code, e.subcode);
+        self.send(driver, &bytes(Message::Notification(e)), |event| {
+            event
+                .field("message", "NOTIFICATION")
+                .field("code", u64::from(code))
+                .field("subcode", u64::from(subcode))
+                .display("reason", reason)
+        });
         Flow::Close
     }
 
     fn route(&self, a: &Announcement) -> Value {
-        json!({
-            "prefix": format!("{}/{}", a.prefix.addr, a.prefix.len),
-            "as_path": a.as_path,
-            "origin_as": a.origin_as(),
-            "hijack": self.scenario.conflicts_with_home(a),
-        })
+        Route::new(&self.scenario, a).fact()
+    }
+
+    fn update_routes(&mut self, driver: &mut Driver<'_, Frames<Frame>>) {
+        let current = self.scenario.routed(self.routing.mode()).announcements();
+        for route in &self.announced {
+            if !current.iter().any(|r| r.prefix == route.prefix) {
+                let prefix =
+                    bgp::Prefix::new(route.prefix.addr, route.prefix.len).expect("an IPv4 prefix");
+                self.send(
+                    driver,
+                    &bytes(Message::Update(Update {
+                        withdrawn: vec![prefix],
+                        attributes: vec![],
+                        nlri: vec![],
+                    })),
+                    |e| {
+                        e.field("message", "UPDATE")
+                            .field("withdrawn", Value::Array(vec![prefix.to_string().into()]))
+                    },
+                );
+            }
+        }
+        for route in &current {
+            if !self.announced.contains(route) {
+                self.send(driver, &bytes(announcement(route)), |e| {
+                    e.field("message", "UPDATE")
+                        .field("route", self.route(route))
+                });
+            }
+        }
+        self.announced = current;
     }
 }
 
@@ -202,11 +244,9 @@ impl Service for Session {
         _: &(),
         driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
-        self.send(
-            driver,
-            &bytes(Message::Open(self.open())),
-            json!({"event": "sent", "message": "OPEN"}),
-        );
+        self.send(driver, &bytes(Message::Open(self.open())), |e| {
+            e.field("message", "OPEN")
+        });
         driver.set_timer("hold", OPEN_WAIT);
         Ok(Flow::Continue)
     }
@@ -231,7 +271,11 @@ impl Service for Session {
         }
         driver.set_timer("hold", self.hold);
         if let Ok(Message::Notification(n)) = &decoded {
-            self.observe(json!({"event": "received", "message": "NOTIFICATION", "code": n.code, "subcode": n.subcode}));
+            self.observe(driver, "received", |e| {
+                e.field("message", "NOTIFICATION")
+                    .field("code", u64::from(n.code))
+                    .field("subcode", u64::from(n.subcode))
+            });
             return Ok(Flow::Close);
         }
         let expected = match self.phase {
@@ -247,7 +291,7 @@ impl Service for Session {
                     subcode: 0,
                     data: vec![],
                 },
-                &format!("expected {}, got {}", name(expected), name(frame.kind)),
+                format_args!("expected {}, got {}", name(expected), name(frame.kind)),
             ));
         }
         match self.phase {
@@ -264,7 +308,11 @@ impl Service for Session {
                         {
                             let peer_as = u16::from_be_bytes([body[1], body[2]]);
                             let peer_hold = u16::from_be_bytes([body[3], body[4]]);
-                            self.observe(json!({"event": "received", "message": "OPEN", "peer_as": peer_as, "peer_hold": peer_hold}));
+                            self.observe(driver, "received", |e| {
+                                e.field("message", "OPEN")
+                                    .field("peer_as", u64::from(peer_as))
+                                    .field("peer_hold", u64::from(peer_hold))
+                            });
                         }
                         let reason = match e {
                             Error::UnsupportedVersion(_) => "unsupported version",
@@ -279,7 +327,11 @@ impl Service for Session {
                     }
                     _ => unreachable!("an OPEN frame"),
                 };
-                self.observe(json!({"event": "received", "message": "OPEN", "peer_as": peer.my_as, "peer_hold": peer.hold_time}));
+                self.observe(driver, "received", |e| {
+                    e.field("message", "OPEN")
+                        .field("peer_as", u64::from(peer.my_as))
+                        .field("peer_hold", u64::from(peer.hold_time))
+                });
                 self.context = Context::negotiated(&self.open(), &peer);
                 let negotiated = self.our_hold.min(peer.hold_time);
                 self.hold = if negotiated == 0 {
@@ -289,38 +341,50 @@ impl Service for Session {
                 };
                 self.negotiated = negotiated;
                 driver.set_timer("hold", self.hold);
-                self.send(
-                    driver,
-                    &bytes(Message::Keepalive),
-                    json!({"event": "sent", "message": "KEEPALIVE", "hold": negotiated}),
-                );
+                self.send(driver, &bytes(Message::Keepalive), |e| {
+                    e.field("message", "KEEPALIVE")
+                        .field("hold", u64::from(negotiated))
+                });
 
                 self.phase = Phase::OpenConfirm;
             }
             Phase::OpenConfirm => {
-                self.observe(json!({"event": "received", "message": "KEEPALIVE"}));
-                self.observe(json!({"event": "established", "hold": self.negotiated}));
+                self.observe(driver, "received", |e| e.field("message", "KEEPALIVE"));
+                self.observe(driver, "established", |e| {
+                    e.field("hold", u64::from(self.negotiated))
+                });
                 if self.negotiated != 0 {
                     driver.set_timer("keepalive", self.hold / 3);
                 }
-                for route in self.scenario.announcements() {
-                    self.send(
-                        driver,
-                        &bytes(announcement(&route)),
-                        json!({"event": "sent", "message": "UPDATE", "route": self.route(&route)}),
-                    );
-                }
+                self.routing.register(driver.wake_handle());
+                self.update_routes(driver);
                 self.phase = Phase::Established;
             }
             Phase::Established => match decoded {
                 Ok(Message::Keepalive) => {
-                    self.observe(json!({"event": "received", "message": "KEEPALIVE"}))
+                    self.observe(driver, "received", |e| e.field("message", "KEEPALIVE"))
                 }
-                Ok(Message::Update(u)) => self.observe(json!({
-                    "event": "received", "message": "UPDATE",
-                    "announced": u.nlri.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
-                    "withdrawn": u.withdrawn.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
-                })),
+                Ok(Message::Update(u)) => self.observe(driver, "received", |e| {
+                    e.field("message", "UPDATE")
+                        .field(
+                            "announced",
+                            Value::Array(
+                                u.nlri
+                                    .iter()
+                                    .map(|p| Value::from(p.to_string()))
+                                    .collect::<Vec<_>>(),
+                            ),
+                        )
+                        .field(
+                            "withdrawn",
+                            Value::Array(
+                                u.withdrawn
+                                    .iter()
+                                    .map(|p| Value::from(p.to_string()))
+                                    .collect::<Vec<_>>(),
+                            ),
+                        )
+                }),
                 Err(e) if frame.kind == kind::UPDATE => {
                     return Ok(self.fail(
                         driver,
@@ -344,6 +408,17 @@ impl Service for Session {
         Ok(Flow::Continue)
     }
 
+    fn on_wake(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
+        if matches!(self.phase, Phase::Established) {
+            self.update_routes(driver);
+        }
+        Ok(Flow::Continue)
+    }
+
     fn on_timer(
         &mut self,
         timer: Timer,
@@ -361,11 +436,9 @@ impl Service for Session {
                 "hold timer expired",
             ));
         }
-        self.send(
-            driver,
-            &bytes(Message::Keepalive),
-            json!({"event": "sent", "message": "KEEPALIVE"}),
-        );
+        self.send(driver, &bytes(Message::Keepalive), |e| {
+            e.field("message", "KEEPALIVE")
+        });
         driver.set_timer("keepalive", self.hold / 3);
         Ok(Flow::Continue)
     }
@@ -390,10 +463,10 @@ impl Service for Session {
         &mut self,
         end: serve::Ended,
         _: &(),
-        _: &mut Driver<'_, Self::Decoder>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<(), Infallible> {
         if matches!(end, serve::Ended::Eof | serve::Ended::Conn(_)) {
-            self.observe(json!({"event": "peer_closed"}));
+            self.observe(driver, "peer_closed", |e| e);
         }
         Ok(())
     }

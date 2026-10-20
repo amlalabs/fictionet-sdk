@@ -42,7 +42,7 @@ services:
       <<: *build
       target: fictionet
     image: fictionet-scan:dev
-    command: ["scan", "/run/fictionet/sock/world.sock", "/run/fictionet/sock/observation.sock"]
+    command: ["scan-world", "/run/fictionet/sock/world.sock", "/run/fictionet/sock/observation.sock"]
     init: true                      # passes SIGTERM on to the world
     network_mode: none
     volumes:
@@ -55,7 +55,7 @@ services:
 
   container-attach:
     <<: *attach
-    command: [fictionet, attach, --world, unix:/run/fictionet/sock/world.sock, --name, container, --type, tun,
+    command: [fictionet, attach, --world, unix:/run/fictionet/sock/world.sock, --name, server, --type, tun,
               --ip-addr, 10.0.0.50/24, --gateway, 10.0.0.1, --no-dns, --no-ip-addr-v6, --no-gateway-v6,
               --no-dns-v6, --no-resolv-conf, --ready-file, /run/attach-ready]
 

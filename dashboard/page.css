@@ -442,6 +442,7 @@
   min-width: 0;
   min-height: 0;
   background: var(--paper);
+  container-type: inline-size;
 }
 .tab-strip {
   position: relative;
@@ -1116,3 +1117,32 @@ body.licenses {
 .probe-title strong { display: flex; gap: 3px; align-items: start; }
 .probe-title strong svg { flex: none; width: 12px; height: 16px; color: var(--muted); }
 .containment-probe[open] .probe-title strong svg { transform: rotate(90deg); }
+
+/* Shared workspaces keep the custom panel and consoles visible together. */
+#workbench.shared-workbench {
+  grid-template-columns: minmax(0, min(var(--workspace), calc(100% - 408px))) 8px minmax(400px, 1fr);
+}
+.shared-workspace .screen-display { position: relative; }
+.shared-workspace .screen-display > div { height: auto !important; }
+.shared-workspace .screen-display canvas { display: block; width: 100% !important; height: auto !important; margin: 0 !important; }
+.shared-workspace .console-stage:has(.screen-display):not(:has(canvas)) { min-height: 200px; }
+#workspace.shared-workspace {
+  grid-template-columns: minmax(0, 5fr) minmax(0, 4fr);
+}
+.shared-workspace > .custom-workspace { grid-column: 1; grid-row: 1 / span var(--console-count, 1); }
+.shared-workspace > .workspace-tile { grid-column: 2; }
+@media (max-width: 1000px) {
+  #workbench.shared-workbench { grid-template-columns:minmax(0, var(--workspace)) 8px minmax(0, 1fr); }
+  #workspace.shared-workspace { grid-template-columns: minmax(0, 1fr); overflow: auto; }
+  .shared-workspace > .custom-workspace { grid-row: auto; min-height: 640px; }
+  .shared-workspace > .workspace-tile { grid-column: 1; min-height: 320px; }
+}
+
+#inspector .egress-groups td { overflow-wrap: normal; }
+#inspector .egress-groups .egress-name,
+#inspector .egress-groups td:nth-child(3),
+#inspector .egress-groups td:nth-child(4) { white-space: nowrap; }
+@container (width < 600px) {
+  .egress-groups .data-table th, .egress-groups .data-table td { padding: 6px 3px; font-size: 11px; }
+  .egress-groups .mono { font-size: 11px; }
+}

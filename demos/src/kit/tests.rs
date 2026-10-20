@@ -195,6 +195,7 @@ async fn addresses_follow_each_guests_lease() {
             vm: None,
             ssh: None,
             backend: None,
+            boot: std::time::Instant::now(),
             ssh_ready: Duration::ZERO,
         });
     }
@@ -297,13 +298,10 @@ impl PageFixture {
         self.run.connected(0, self.peer.session.clone());
     }
     pub async fn state(&self, topic: &str) -> serde_json::Value {
-        let response = self
-            .client
-            .request("GET", &format!("/api/state/{topic}"), None, true)
+        self.client
+            .get_json(&format!("/api/state/{topic}"))
             .await
-            .unwrap();
-        assert_eq!(response.status, 200);
-        serde_json::from_slice(&response.body).unwrap()
+            .unwrap()
     }
 }
 
@@ -670,20 +668,19 @@ async fn chromium_paints_the_page_through_the_ssh_console() {
         .wait_desktop(Duration::from_secs(5))
         .await
         .unwrap();
-    let url = fixture.run.page_url().to_string();
     let before = fixture.state("leases").await;
-    let path = fixture.run.path().join("console.png");
-    let result = tokio::task::spawn_blocking(move || {
-        shot::capture(
-            &url,
-            &path,
-            &shot::desktop_painted("workstation"),
-            Duration::from_secs(20),
-        )
-    })
-    .await
-    .unwrap();
-    let captured = result.unwrap();
+    let (screen, page) = (
+        fixture.run.path().join("screen.png"),
+        fixture.run.path().join("console.png"),
+    );
+    let shots = fixture
+        .run
+        .screenshots("workstation", &screen, &page)
+        .await
+        .unwrap();
+    assert_eq!((shots.screen.width, shots.screen.colors), (64, 256));
+    assert_eq!(shots.page, page);
+    let captured = shots.page;
     let png = std::fs::read(&captured).unwrap();
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 1440);
@@ -728,6 +725,40 @@ fn desktop_readiness_commands_are_neutral() {
                 .contains("readiness command")
         );
     }
+}
+
+#[tokio::test]
+async fn page_terminal_executes_the_declared_command_on_a_pty() {
+    use fictionet_observe::page::Console;
+    let mut peer = ssh::tests::Peer::new().await;
+    let guest =
+        Guest::ubuntu("workstation", "analyst").terminal("tmux attach -r -t main; exec bash -l");
+    guest.validate().unwrap();
+    let console = page::GuestConsole::new(&guest);
+    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)), |cx| {
+        console.connected(
+            &cx,
+            peer.session.clone(),
+            "10.0.0.2".parse().unwrap(),
+            Instant::now(),
+        );
+        async { Ok(()) }
+    }))
+    .unwrap();
+    let mut terminal = console.terminal(120, 35).unwrap().await.unwrap();
+    assert_eq!(
+        peer.events.recv().await.unwrap(),
+        "pty xterm-256color 120 35"
+    );
+    assert_eq!(
+        peer.events.recv().await.unwrap(),
+        "exec tmux attach -r -t main; exec bash -l"
+    );
+    assert_eq!(
+        terminal.read().await.unwrap().unwrap(),
+        b"window manager is not running"
+    );
+    assert!(terminal.read().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -870,4 +901,275 @@ async fn page_capture_reports_websocket_failure() {
     assert_eq!(error.to_string(), "page WebSocket closed: None");
     peer.await.unwrap();
     assert!(!out.exists());
+}
+
+#[test]
+fn home_files_are_written_after_user_creation() {
+    let guest = Guest::ubuntu("station", "analyst")
+        .file("/home/analyst/.config/account", 0o600, "private")
+        .file("/home/analyst-other/account", 0o644, "other")
+        .file("/etc/account", 0o644, "system");
+    let data = seed::user_data(&seed::Provision {
+        guest: &guest,
+        authorized_key: "key",
+        ca: None,
+    });
+    for entry in data.split("  - path: ").skip(1) {
+        let home = entry.starts_with("\"/home/analyst/");
+        assert_eq!(entry.contains("owner: analyst:analyst"), home);
+        assert_eq!(entry.contains("defer: true"), home);
+        if home {
+            assert!(entry.contains("permissions: '0600'"));
+            assert!(entry.contains(&base64(b"private")));
+        }
+    }
+}
+
+#[tokio::test]
+async fn attachment_names_are_independent_of_guest_identity() {
+    let mut kit = Kit::new("storage")
+        .guest(
+            Guest::ubuntu("laptop", "alex")
+                .attachment("client-link")
+                .resources(3, 1536),
+        )
+        .guest(
+            Guest::ubuntu("storage", "sam")
+                .attachment("storage-link")
+                .resources(2, 768)
+                .card(Family::Serve(fictionet::stdlib::network::ethernet::Lease {
+                    addr: fictionet::stdlib::network::ethernet::Cidr {
+                        addr: Ipv4Addr::new(192, 0, 2, 20),
+                        prefix: 24,
+                    },
+                    gateway: Some(Ipv4Addr::new(192, 0, 2, 1)),
+                    dns: Some(Ipv4Addr::new(192, 0, 2, 53)),
+                })),
+        );
+    let (mut run, mut prepared) = kit.prepare().unwrap();
+    assert_eq!(run.guests[0].name(), "laptop");
+    assert_eq!(run.guests[1].name(), "storage");
+    assert_eq!(run.guests[0].guest.attachment, "client-link");
+    assert_eq!(run.guests[1].guest.attachment, "storage-link");
+    assert_eq!(run.guests[0].resources.mac, [2, 0, 0, 0, 0, 2]);
+    assert_eq!(run.guests[1].resources.mac, [2, 0, 0, 0, 0, 3]);
+    assert_eq!(
+        (run.guests[0].guest.vcpus, run.guests[0].guest.memory_mib),
+        (3, 1536)
+    );
+    assert_eq!(
+        (run.guests[1].guest.vcpus, run.guests[1].guest.memory_mib),
+        (2, 768)
+    );
+    assert!(matches!(prepared.bridges[0].family, Family::FromWorld));
+    assert_eq!(run.guests[1].addr(), Some(Ipv4Addr::new(192, 0, 2, 20)));
+    assert!(matches!(prepared.bridges[1].family, Family::Serve(_)));
+    run.bind_page(
+        "storage",
+        Box::new(|dashboard, hosts| {
+            Page::new("Example", dashboard)
+                .host(hosts.take("laptop").pinned())
+                .host(hosts.take("storage").pinned())
+                .standard_panels()
+        }),
+        &mut prepared,
+    )
+    .await
+    .unwrap();
+    let client = client::PageClient::from_url(run.page_url()).unwrap();
+    client.bootstrap().await.unwrap();
+    let response = client
+        .request("GET", "/api/page", None, true)
+        .await
+        .unwrap();
+    assert_eq!(response.status, 200);
+    let description: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(description["hosts"][0]["sandbox"], "client-link");
+    assert_eq!(description["hosts"][1]["sandbox"], "storage-link");
+    assert_eq!(description["hosts"][0]["pinned"], true);
+    assert_eq!(description["hosts"][1]["pinned"], true);
+    run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn page_client_reads_state_posts_commands_and_waits() {
+    let fixture = PageFixture::new().await;
+    let client = &fixture.client;
+    let page = client.get_json("/api/page").await.unwrap();
+    assert!(page["panels"].as_array().is_some_and(|p| !p.is_empty()));
+    let missing = client.get_json("/api/state/missing").await.unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .starts_with("GET /api/state/missing: HTTP/1.1 404"),
+        "{missing}"
+    );
+    let add = serde_json::json!({"action":"add","target":{"kind":"event","seq":1},"text":"Boot"});
+    let applied = client.command("labels", "add", add).await.unwrap();
+    assert_eq!(applied["status"], "applied");
+    let rejected = client
+        .command(
+            "labels",
+            "remove",
+            serde_json::json!({"action":"remove","id":99}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected["status"], "rejected");
+    let invalid = client
+        .command("labels", "bad", serde_json::json!({"action":"rename"}))
+        .await
+        .unwrap_err();
+    assert!(
+        invalid
+            .to_string()
+            .starts_with("POST /api/command/labels: HTTP/1.1 400"),
+        "{invalid}"
+    );
+    let labels = client
+        .wait_for(
+            "/api/state/labels",
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            |state| Ok(state["value"][0]["text"] == "Boot"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(labels["value"].as_array().unwrap().len(), 1);
+    let never = client
+        .wait_for(
+            "/api/state/labels",
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(never.kind(), io::ErrorKind::TimedOut);
+    let stopped = client
+        .wait_for(
+            "/api/state/labels",
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            |_| Err(io::Error::other("the predicate stops the wait")),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stopped.to_string(), "the predicate stops the wait");
+    let event = client
+        .wait_for_event(
+            0,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            |event| Ok(event["source"] == "page" && event["kind"] == "label"),
+        )
+        .await
+        .unwrap();
+    let seq = event["seq"].as_u64().unwrap();
+    let later = client
+        .wait_for_event(
+            seq,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            |event| Ok(event["source"] == "page" && event["kind"] == "label"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        later.kind(),
+        io::ErrorKind::TimedOut,
+        "events after the cursor only"
+    );
+    let batch = client.events(0).await.unwrap();
+    assert!(batch["last"].as_u64().unwrap() >= seq);
+    fixture.run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_reads_until_the_expected_output() {
+    use client::Capability;
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut fixture = PageFixture::new().await;
+        fixture.connect();
+        let open = || async {
+            let ticket = fixture
+                .client
+                .ticket("workstation", Capability::Terminal)
+                .await
+                .unwrap();
+            fixture
+                .client
+                .open("workstation", Capability::Terminal, Some(&ticket.ticket))
+                .await
+                .unwrap()
+        };
+        let mut socket = open().await;
+        socket.read_until(b"ready", 64 << 10).await.unwrap();
+        socket.write_all(b"name:workstation:end\r").await.unwrap();
+        socket
+            .read_until(b"name:workstation:end", 64 << 10)
+            .await
+            .unwrap();
+        let mut socket = open().await;
+        socket.write_all(b"large-output\r").await.unwrap();
+        let error = socket.read_until(b"absent", 64 << 10).await.unwrap_err();
+        assert!(error.to_string().contains("without \"absent\""), "{error}");
+        fixture.run.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cloud_init_wait_and_diagnostics_use_the_guest_session() {
+    let mut fixture = PageFixture::new().await;
+    let offline = fixture.run.guests[0].diagnostics().await;
+    assert!(offline.contains("No SSH session"), "{offline}");
+    fixture.connect();
+    let guest = &fixture.run.guests[0];
+    let error = guest
+        .wait_cloud_init(Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "workstation: cloud-init exit 7\nwindow manager is not running"
+    );
+    fixture
+        .peer
+        .ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let ready = guest.wait_cloud_init(Duration::from_secs(5)).await.unwrap();
+    assert!(ready <= guest.boot.elapsed());
+    let report = guest.diagnostics().await;
+    for command in gate_commands() {
+        assert!(report.contains(&format!("guest$ {command}\n")), "{report}");
+    }
+    assert_eq!(report.matches("[exit 0]").count(), gate_commands().len());
+    // Readiness and containment probes share the session; keep this test's commands.
+    let wait = "sudo cloud-init status --wait --long";
+    let mut sent = Vec::new();
+    while let Ok(event) = fixture.peer.events.try_recv() {
+        sent.extend(
+            event
+                .strip_prefix("exec ")
+                .filter(|command| *command == wait || gate_commands().contains(command))
+                .map(str::to_owned),
+        );
+    }
+    assert_eq!(sent[..2], [wait; 2]);
+    assert_eq!(sent[2..], gate_commands());
+    fixture.run.shutdown().await.unwrap();
+}
+
+fn gate_commands() -> Vec<&'static str> {
+    vec![
+        "cloud-init status --long",
+        "sudo tail -n 30 /var/log/cloud-init-output.log",
+        "systemctl is-active vnc",
+        "tail -n 15 /tmp/xvnc.log /tmp/xfce.log",
+        "tail -n 40 /tmp/firefox.log",
+        "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'",
+    ]
 }

@@ -23,11 +23,12 @@ COPY tests tests
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-scan-target \
-    CARGO_BUILD_JOBS=4 cargo build --release --locked --bin fictionet --example scan \
-    && cp target/release/fictionet target/release/examples/scan /usr/local/bin/
+    CARGO_BUILD_JOBS=4 cargo build --release --locked -p scan-world --bin scan-world \
+    && CARGO_BUILD_JOBS=4 cargo build --release --locked -p fictionet-cli --bin fictionet \
+    && cp target/release/scan-world target/release/fictionet /usr/local/bin/
 
 FROM debian:bookworm-slim AS fictionet
-COPY --from=build /usr/local/bin/fictionet /usr/local/bin/scan /usr/local/bin/
+COPY --from=build /usr/local/bin/fictionet /usr/local/bin/scan-world /usr/local/bin/
 
 # A real machine for the subnet: nginx on port 80 and OpenSSH on port 22.
 FROM alpine:3.20 AS container

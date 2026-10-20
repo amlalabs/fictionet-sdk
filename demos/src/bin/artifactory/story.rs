@@ -465,7 +465,8 @@ pub async fn run(
             println!("story: {}", step.name);
             let encoded = kit::base64(serde_json::to_string(&step.command)?.as_bytes());
             let command = format!(
-                "printf %s '{encoded}' | base64 -d > {}/commands && head -n1 {}/results",
+                "printf %s {} | base64 -d > {}/commands && head -n1 {}/results",
+                kit::ssh::quote(&encoded),
                 guest::WORK,
                 guest::WORK
             );

@@ -1,7 +1,7 @@
 //! Shared guests, networking, provisioning, and run lifetime.
 //!
 //! ```no_run
-//! use fictionet_demo::kit::{self, Guest, Kit, rfb, shot};
+//! use fictionet_demo::kit::{self, Guest, Kit};
 //! use fictionet_observe::page::Page;
 //! use fictionet::stdlib::web;
 //! use example_common::zscaler::{DEFAULT_CLOUD, zscaler};
@@ -28,14 +28,12 @@
 //!             .start(&fcx, world.into_attachments())
 //!     });
 //! let run = kit.boot("demos/downloads/cloudimage").await?;
-//! let url = run.page_url().to_string();
-//! println!("Office: {url}");
-//! run.guest("workstation").wait_desktop(Duration::from_secs(300)).await?;
-//! rfb::capture_page(&url, "workstation", &run.path().join("desktop.png")).await?;
-//! let out = run.path().join("page.png");
-//! tokio::task::spawn_blocking(move || shot::capture(
-//!     &url, &out, &shot::desktop_painted("workstation"), Duration::from_secs(30),
-//! )).await??;
+//! let workstation = run.guest("workstation");
+//! workstation.wait_cloud_init(Duration::from_secs(300)).await?;
+//! workstation.wait_desktop(Duration::from_secs(300)).await?;
+//! let (screen, page) = (run.path().join("desktop.png"), run.path().join("page.png"));
+//! let shots = run.screenshots("workstation", &screen, &page).await?;
+//! kit::gate::check("the screen is 1280 pixels wide", shots.screen.width == 1280)?;
 //! run.shutdown().await?;
 //! # Ok(())
 //! # }
@@ -51,9 +49,11 @@ mod page;
 pub use page::Hosts;
 pub mod containment;
 pub mod desktop;
+pub mod gate;
 pub mod jump;
 pub mod mirror;
 pub mod net;
+pub mod preview;
 pub mod rfb;
 pub mod seed;
 pub mod shot;
@@ -100,6 +100,7 @@ struct File {
 #[derive(Clone)]
 pub struct Guest {
     hostname: String,
+    attachment: String,
     user: String,
     vcpus: u8,
     memory_mib: u32,
@@ -110,6 +111,7 @@ pub struct Guest {
     files: Vec<File>,
     steps: Vec<String>,
     desktop: Option<(u16, String)>,
+    terminal: Option<String>,
 }
 
 impl Guest {
@@ -119,6 +121,7 @@ impl Guest {
     pub fn ubuntu(hostname: &str, user: &str) -> Self {
         Self {
             hostname: hostname.into(),
+            attachment: hostname.into(),
             user: user.into(),
             vcpus: 2,
             memory_mib: 2048,
@@ -129,7 +132,13 @@ impl Guest {
             files: Vec::new(),
             steps: Vec::new(),
             desktop: None,
+            terminal: None,
         }
+    }
+    /// Sets the host-side attachment name independently of the guest hostname.
+    pub fn attachment(mut self, name: &str) -> Self {
+        self.attachment = name.into();
+        self
     }
     /// Sets the vCPU count and memory in MiB, defaulting to 2 and 2048.
     pub fn resources(mut self, vcpus: u8, memory_mib: u32) -> Self {
@@ -172,6 +181,11 @@ impl Guest {
         self.desktop = Some((port, ready.into()));
         self
     }
+    /// Runs a command on the page terminal's PTY instead of a login shell.
+    pub fn terminal(mut self, command: impl Into<String>) -> Self {
+        self.terminal = Some(command.into());
+        self
+    }
     fn initial_addr(&self) -> Option<Ipv4Addr> {
         match &self.family {
             Family::Serve(lease) => Some(lease.addr.addr),
@@ -186,7 +200,11 @@ impl Guest {
                 )));
             }
         }
-        if self.hostname == JUMP || self.vcpus == 0 || self.memory_mib == 0 {
+        if self.attachment.is_empty()
+            || self.attachment == JUMP
+            || self.vcpus == 0
+            || self.memory_mib == 0
+        {
             return Err(io::Error::other("guest name or resources are invalid"));
         }
         for value in [&self.manufacturer, &self.product] {
@@ -205,6 +223,13 @@ impl Guest {
         {
             return Err(io::Error::other(
                 "desktop needs a nonzero port and a neutral, nonempty readiness command",
+            ));
+        }
+        if self.terminal.as_ref().is_some_and(|command| {
+            command.trim().is_empty() || command.contains('\0') || !neutral(command)
+        }) {
+            return Err(io::Error::other(
+                "terminal needs a neutral, nonempty command",
             ));
         }
         Ok(())
@@ -291,7 +316,7 @@ impl Kit {
 }
 
 impl<W> Kit<W> {
-    /// Adds a guest whose hostname also names its world attachment.
+    /// Adds a guest with its world attachment.
     pub fn guest(mut self, guest: Guest) -> Self {
         self.guests.push(guest);
         self
@@ -366,12 +391,13 @@ pub struct GuestHandle {
     vm: Option<vm::Vm>,
     ssh: Option<Arc<ssh::Session>>,
     backend: Option<net::Backend>,
+    boot: Instant,
     ssh_ready: Duration,
     console: page::GuestConsole,
 }
 
 impl GuestHandle {
-    /// Returns the guest hostname and world attachment name.
+    /// Returns the guest hostname.
     pub fn name(&self) -> &str {
         &self.guest.hostname
     }
@@ -618,10 +644,11 @@ impl<W> Kit<W> {
             return Err(io::Error::other("declare at least one guest"));
         }
         let mut names = std::collections::HashSet::new();
+        let mut attachments = std::collections::HashSet::new();
         for guest in &self.guests {
             guest.validate()?;
-            if !names.insert(&guest.hostname) {
-                return Err(io::Error::other("duplicate guest hostname"));
+            if !names.insert(&guest.hostname) || !attachments.insert(&guest.attachment) {
+                return Err(io::Error::other("duplicate guest hostname or attachment"));
             }
         }
         let mut run = Run {
@@ -648,7 +675,9 @@ impl<W> Kit<W> {
         };
         for (index, guest) in self.guests.drain(..).enumerate() {
             let resources = Resources::new(run.path(), &guest, index)?;
-            let link = attacher.attach(&guest.hostname).map_err(io::Error::other)?;
+            let link = attacher
+                .attach(&guest.attachment)
+                .map_err(io::Error::other)?;
             let (tx, frames) = tokio::sync::mpsc::unbounded_channel();
             let queue = net::RxQueue::new()?;
             prepared.backends.push((tx, queue.clone()));
@@ -660,7 +689,7 @@ impl<W> Kit<W> {
             });
             let (tx, addr) = watch::channel(guest.initial_addr());
             prepared.observers.push(Arc::new(Lease {
-                name: guest.hostname.clone(),
+                name: guest.attachment.clone(),
                 addr: tx,
             }));
             let console = page::GuestConsole::new(&guest);
@@ -672,6 +701,7 @@ impl<W> Kit<W> {
                 vm: None,
                 ssh: None,
                 backend: None,
+                boot: Instant::now(),
                 ssh_ready: Duration::ZERO,
             });
         }
@@ -934,6 +964,7 @@ impl Run {
     fn connected(&mut self, index: usize, session: Arc<ssh::Session>) {
         let guest = &mut self.guests[index];
         guest.ssh = Some(session);
+        guest.boot = self.boot;
         guest.ssh_ready = self.boot.elapsed();
         let cx = self.fcx.lock().unwrap().as_ref().unwrap().clone();
         let session = guest.ssh().clone();
@@ -941,7 +972,7 @@ impl Run {
             .console
             .connected(&cx, session.clone(), guest.addr().unwrap(), self.boot);
         if let Some(dashboard) = self.dashboard.clone() {
-            let name = guest.name().to_string();
+            let name = guest.guest.attachment.clone();
             let topic = self.containment.clone();
             let probes = self.probes.clone();
             cx.spawn(move |cx| async move {

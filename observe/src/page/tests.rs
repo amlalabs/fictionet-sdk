@@ -11,6 +11,76 @@ async fn server() -> Server {
     .unwrap()
 }
 
+#[tokio::test]
+async fn state_names_are_valid_and_unique() {
+    let page = || {
+        Page::new(
+            "State",
+            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        )
+    };
+    let topic = || StateTopic::<serde_json::Value>::new(StateLimits::default());
+    for invalid in [
+        page().state("same", topic()).state("same", topic()),
+        page().state("bad/name", topic()),
+    ] {
+        assert!(invalid.bind_loopback(0).await.is_err());
+    }
+    let server = page()
+        .state("details", topic())
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let state = request(&server, "GET", "/api/state/details", &bearer(&server), "").await;
+    status(&state, 200);
+    assert_eq!(json_body(&state)["value"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn field_presence_includes_null_values_and_excludes_other_events() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(dashboard.observer()),
+        |cx| async move {
+            cx.emit("fixture", "request", |event| event.field("selected", 0u64));
+            cx.emit("fixture", "request", |event| {
+                event.field("selected", fictionet::stdlib::protocols::json::Value::Null)
+            });
+            cx.emit("fixture", "request", |event| event);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let server = Page::new("Presence", dashboard.handle())
+        .event_table(
+            "Reads",
+            EventFilter {
+                source: Some("fixture".into()),
+                kind: Some("request".into()),
+                field_present: Some("selected".into()),
+                ..EventFilter::default()
+            },
+            vec![],
+        )
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let response = request(
+        &server,
+        "GET",
+        "/api/event-table/reads",
+        &bearer(&server),
+        "",
+    )
+    .await;
+    status(&response, 200);
+    let rows = json_body(&response)["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["fields"]["selected"], 0);
+    assert_eq!(rows[1]["fields"]["selected"], serde_json::Value::Null);
+}
+
 fn address(server: &Server) -> &str {
     server
         .url()
@@ -1579,6 +1649,7 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
                 kind: Some("request".into()),
                 field: Some(("route".into(), "bank".into())),
                 host: None,
+                field_present: None,
             },
             vec![Column::new("Route", "/fields/route")],
         )
@@ -1589,6 +1660,7 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
                 kind: Some("request".into()),
                 field: Some(("route".into(), "bank".into())),
                 host: None,
+                field_present: None,
             },
         )
         .custom(
@@ -2048,6 +2120,190 @@ async fn labels_are_world_commands_and_event_exports_keep_scope_labels_and_loss(
             "containment",
             "labels"
         ]
+    );
+}
+
+#[tokio::test]
+async fn state_can_be_registered_without_a_panel() {
+    let topic = StateTopic::new(StateLimits::default());
+    topic
+        .publish(
+            fictionet::time::Instant::from_since_start(std::time::Duration::ZERO),
+            &serde_json::json!({"enabled":true,"revision":0}),
+        )
+        .unwrap();
+    let page = Page::new(
+        "Settings",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .state("settings", topic.clone());
+    let server = page.bind_loopback(0).await.unwrap();
+    let state =
+        json_body(&request(&server, "GET", "/api/state/settings", &bearer(&server), "").await);
+    assert_eq!(state["revision"], 1);
+    assert_eq!(state["value"]["revision"], 0);
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    let panels = description["panels"].as_array().unwrap();
+    assert!(panels.is_empty());
+}
+
+#[tokio::test]
+async fn command_endpoint_works_without_a_control_panel() {
+    let port = CommandPort::<SetRoute, u64>::new(CommandLimits::default());
+    let server = Page::new(
+        "Commands",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .command("settings", port.clone())
+    .bind_loopback(0)
+    .await
+    .unwrap();
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    assert!(description["panels"].as_array().unwrap().is_empty());
+    let auth = format!("{}Origin: http://{}\r\n", bearer(&server), address(&server));
+    let send = request(
+        &server,
+        "POST",
+        "/api/command/settings",
+        &auth,
+        r#"{"request_id":"change","command":{"mode":"direct","expected_revision":7}}"#,
+    );
+    let receive = async {
+        let command = port.recv().await.unwrap();
+        assert_eq!(command.command.expected_revision, 7);
+        fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+            |cx| async move {
+                command.reply(&cx, 8);
+                cx.cancel();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    };
+    let (reply, ()) = tokio::join!(send, receive);
+    assert_eq!(json_body(&reply)["reply"], 8);
+    let invalid = Page::new(
+        "Commands",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .command("same", port.clone())
+    .command("same", port)
+    .bind_loopback(0)
+    .await;
+    assert!(invalid.is_err());
+}
+
+#[tokio::test]
+async fn workspace_consoles_keep_hosts_beside_the_custom_panel() {
+    let server = Page::new(
+        "Tiles",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .host(Host::new("workstation").console(FakeConsole::default()))
+    .standard_panels()
+    .custom(
+        "View",
+        "export function mount() { return () => {}; }",
+        StateTopic::<u64>::new(StateLimits::default()),
+    )
+    .workspace("View")
+    .workspace_consoles()
+    .bind_loopback(0)
+    .await
+    .unwrap();
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    let panels = description["panels"].as_array().unwrap();
+    for kind in ["screen", "terminal", "custom"] {
+        assert!(
+            panels
+                .iter()
+                .any(|p| p["kind"] == kind && p["area"] == "workspace")
+        );
+    }
+    assert!(
+        panels
+            .iter()
+            .any(|p| p["kind"] == "packets" && p["area"] == "inspector")
+    );
+}
+
+#[tokio::test]
+async fn commands_without_panels_validate_names_and_bounds() {
+    let page = || {
+        Page::new(
+            "Commands",
+            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        )
+    };
+    let port =
+        || CommandPort::<serde_json::Value, serde_json::Value>::new(CommandLimits::default());
+    for invalid in [
+        page().command("", port()),
+        page().command("bad/name", port()),
+        page().command("same", port()).command("same", port()),
+        page().command(
+            "zero",
+            CommandPort::<serde_json::Value, serde_json::Value>::new(CommandLimits {
+                requests: 0,
+                ..CommandLimits::default()
+            }),
+        ),
+    ] {
+        assert!(invalid.bind_loopback(0).await.is_err());
+    }
+    let server = page()
+        .command("switch", port())
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let description = request(&server, "GET", "/api/page", &bearer(&server), "").await;
+    assert!(
+        json_body(&description)["panels"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let response = request(
+        &server,
+        "POST",
+        "/api/command/switch",
+        &format!("{}Origin: http://{}\r\n", bearer(&server), address(&server)),
+        "{}",
+    )
+    .await;
+    status(&response, 400);
+}
+
+#[tokio::test]
+async fn a_shared_workspace_keeps_declared_consoles() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let console = FakeConsole::default();
+    let server = Page::new("Shared workspace", dashboard.handle())
+        .host(Host::new("workstation").console(console))
+        .standard_panels()
+        .custom(
+            "Article",
+            "export function mount() { return () => {}; }",
+            StateTopic::<u32>::new(StateLimits::default()),
+        )
+        .workspace("Article")
+        .workspace_consoles()
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let response = request(&server, "GET", "/api/page", &bearer(&server), "").await;
+    let description: PageDescription = serde_json::from_value(json_body(&response)).unwrap();
+    let workspace: Vec<_> = description
+        .panels
+        .iter()
+        .filter(|panel| panel.area == Area::Workspace)
+        .map(|panel| panel.id.as_str())
+        .collect();
+    assert_eq!(
+        workspace,
+        ["article", "workstation-screen", "workstation-terminal"]
     );
 }
 

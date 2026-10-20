@@ -31,7 +31,10 @@ pub fn run(args: &[String]) -> Result {
     {
         microvm::assets()?;
         microvm::build(name)?;
-        return microvm::launch(name, rest);
+        return microvm::launch(
+            name,
+            rest.strip_prefix(&[String::from("--")]).unwrap_or(rest),
+        );
     }
     let usage = format!(
         "usage: cargo xtask demo [assets|libraries|{}]",

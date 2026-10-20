@@ -31,7 +31,7 @@ impl Hosts {
                 panic!("guest {name} was already taken; call Hosts::take only once per guest")
             });
         Host::new(name)
-            .sandbox(name)
+            .sandbox(console.attachment.clone())
             .status(console.status.clone())
             .console(console)
     }
@@ -40,7 +40,9 @@ impl Hosts {
 #[derive(Clone)]
 pub(super) struct GuestConsole {
     name: String,
+    attachment: String,
     desktop: Option<(u16, String)>,
+    terminal: Option<String>,
     session: Arc<Mutex<SessionState>>,
     pub(super) status: StateTopic<HostStatus>,
     ready: watch::Sender<Readiness>,
@@ -64,7 +66,9 @@ impl GuestConsole {
     pub(super) fn new(guest: &Guest) -> Self {
         Self {
             name: guest.hostname.clone(),
+            attachment: guest.attachment.clone(),
             desktop: guest.desktop.clone(),
+            terminal: guest.terminal.clone(),
             session: Arc::new(Mutex::new(SessionState::default())),
             status: StateTopic::new(StateLimits::default()),
             ready: watch::channel(Readiness::Waiting(
@@ -267,7 +271,12 @@ impl Console for GuestConsole {
             let session = this.session()?;
             Ok(Box::new(
                 session
-                    .pty("xterm-256color", cols.into(), rows.into())
+                    .pty(
+                        "xterm-256color",
+                        cols.into(),
+                        rows.into(),
+                        this.terminal.as_deref(),
+                    )
                     .await?,
             ) as Box<dyn Pty>)
         }))

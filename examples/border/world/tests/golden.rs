@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use border_world::scenario::{BANK_ADDR, STATUS_ADDR, Task, Variant};
 use common::*;
+use example_common::hyper_io::Io;
 use fictionet::Interface;
 use fictionet::prelude::*;
 use serde_json::Value;

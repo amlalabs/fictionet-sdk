@@ -35,15 +35,38 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
          Pin-Priority: 1000\n";
     let policies = serde_json::json!({"policies": {
         "OverrideFirstRunPage": "", "OverridePostUpdatePage": "",
-        "DisableAppUpdate": true, "DontCheckDefaultBrowser": true,
+        "DisableAppUpdate": true, "AppAutoUpdate": false,
+        "DontCheckDefaultBrowser": true,
         "DNSOverHTTPS": {"Enabled": false, "Locked": true},
         "Homepage": {"URL": start_url, "StartPage": "homepage"},
         "SecurityDevices": {"Add": {"p11-kit-trust": "/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so"}},
-        "UserMessaging": {"SkipOnboarding": true, "WhatsNew": false},
-        "Preferences": {
-            "browser.preonboarding.enabled": {"Value": false, "Status": "locked"},
-            "datareporting.policy.dataSubmissionPolicyBypassNotification": {"Value": true, "Status": "locked"}
-        }
+        "UserMessaging": {
+            "SkipOnboarding": true, "WhatsNew": false, "ExtensionRecommendations": false,
+            "FeatureRecommendations": false, "UrlbarInterventions": false,
+            "MoreFromMozilla": false, "Locked": true
+        },
+        // Each of these turns off requests that no page asked for.
+        "DisableTelemetry": true,
+        "DisableFirefoxStudies": true,
+        "DisablePocket": true,
+        "DisableFirefoxAccounts": true,
+        "DisableSystemAddonUpdate": true,
+        "ExtensionUpdate": false,
+        "CaptivePortal": false,
+        "NetworkPrediction": false,
+        "SearchSuggestEnabled": false,
+        "TranslateEnabled": false,
+        "NewTabPage": false,
+        "EncryptedMediaExtensions": {"Enabled": false, "Locked": true},
+        "FirefoxHome": {
+            "Search": false, "TopSites": false, "SponsoredTopSites": false, "Highlights": false,
+            "Pocket": false, "SponsoredPocket": false, "Locked": true
+        },
+        "FirefoxSuggest": {
+            "WebSuggestions": false, "SponsoredSuggestions": false, "ImproveSuggest": false,
+            "Locked": true
+        },
+        "Preferences": quiet_preferences(),
     }}).to_string();
     // Xvnc on :1 (5901), loopback only, no auth: reached only through an SSH
     // tunnel. An Xfce session and Firefox for the user.
@@ -54,7 +77,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
          /usr/bin/Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -nolisten tcp \
            -geometry 1280x800 -depth 24 >/tmp/xvnc.log 2>&1 &\n\
          for _ in $(seq 1 150); do xdpyinfo -display :1 >/dev/null 2>&1 && break; sleep 0.2; done\n\
-         eval \"$(dbus-launch --sh-syntax)\"\n\
+         while IFS= read -r entry; do export \"$entry\"; done < <(dbus-launch)\n\
          # The Xfce session, then the window manager, then Firefox: launched\n\
          # here (not via Xfce autostart, which did not run reliably) so its\n\
          # start is ordered and its output is captured.\n\
@@ -120,6 +143,134 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         .file("/etc/systemd/system/vnc.service", 0o644, vnc_service)
         .file("/opt/setup-desktop.sh", 0o755, setup)
         .run("bash /opt/setup-desktop.sh")
+}
+
+/// Locked preferences that keep Firefox from making requests no page asked
+/// for, in the form the enterprise `Preferences` policy takes. Release
+/// Firefox ignores `services.settings.server`, and the policy cannot set
+/// `app.normandy.enabled`, so the remote settings and studies hosts resolve
+/// to the guest's own loopback instead.
+fn quiet_preferences() -> serde_json::Value {
+    let preferences: &[(&str, serde_json::Value)] = &[
+        ("browser.preonboarding.enabled", false.into()),
+        (
+            "datareporting.policy.dataSubmissionPolicyBypassNotification",
+            true.into(),
+        ),
+        ("datareporting.policy.dataSubmissionEnabled", false.into()),
+        // A typed address stays an address after a search.
+        ("browser.urlbar.showSearchTerms.enabled", false.into()),
+        ("browser.urlbar.showSearchTerms.featureGate", false.into()),
+        // Suggestions send a request for every address bar keystroke.
+        ("browser.search.suggest.enabled", false.into()),
+        ("browser.urlbar.suggest.searches", false.into()),
+        ("browser.urlbar.quicksuggest.enabled", false.into()),
+        // Speculation and prefetch request pages before anyone opens them.
+        ("network.http.speculative-parallel-limit", 0.into()),
+        ("network.dns.disablePrefetch", true.into()),
+        ("network.prefetch-next", false.into()),
+        ("network.predictor.enabled", false.into()),
+        ("browser.urlbar.speculativeConnect.enabled", false.into()),
+        ("browser.places.speculativeConnect.enabled", false.into()),
+        // Connectivity checks.
+        ("network.captive-portal-service.enabled", false.into()),
+        ("network.connectivity-service.enabled", false.into()),
+        // New tab feeds, sponsored content and recommendations.
+        ("browser.newtabpage.enabled", false.into()),
+        (
+            "browser.newtabpage.activity-stream.feeds.telemetry",
+            false.into(),
+        ),
+        ("browser.newtabpage.activity-stream.telemetry", false.into()),
+        (
+            "browser.newtabpage.activity-stream.feeds.section.topstories",
+            false.into(),
+        ),
+        (
+            "browser.newtabpage.activity-stream.showSponsored",
+            false.into(),
+        ),
+        (
+            "browser.newtabpage.activity-stream.showSponsoredTopSites",
+            false.into(),
+        ),
+        (
+            "browser.newtabpage.activity-stream.asrouter.userprefs.cfr.addons",
+            false.into(),
+        ),
+        (
+            "browser.newtabpage.activity-stream.asrouter.userprefs.cfr.features",
+            false.into(),
+        ),
+        (
+            "browser.newtabpage.activity-stream.asrouter.useRemoteL10n",
+            false.into(),
+        ),
+        (
+            "browser.newtabpage.activity-stream.asrouter.providers.cfr",
+            r#"{"id":"cfr","enabled":false}"#.into(),
+        ),
+        (
+            "browser.newtabpage.activity-stream.asrouter.providers.message-groups",
+            r#"{"id":"message-groups","enabled":false}"#.into(),
+        ),
+        (
+            "browser.newtabpage.activity-stream.asrouter.providers.messaging-experiments",
+            r#"{"id":"messaging-experiments","enabled":false}"#.into(),
+        ),
+        // Threat list downloads.
+        ("browser.safebrowsing.phishing.enabled", false.into()),
+        ("browser.safebrowsing.malware.enabled", false.into()),
+        ("browser.safebrowsing.downloads.enabled", false.into()),
+        (
+            "browser.safebrowsing.downloads.remote.enabled",
+            false.into(),
+        ),
+        ("browser.safebrowsing.provider.google.updateURL", "".into()),
+        ("browser.safebrowsing.provider.google4.updateURL", "".into()),
+        ("browser.safebrowsing.provider.mozilla.updateURL", "".into()),
+        // Update, add-on and recommendation checks.
+        ("app.update.auto", false.into()),
+        ("extensions.update.enabled", false.into()),
+        ("extensions.getAddons.cache.enabled", false.into()),
+        ("extensions.systemAddon.update.enabled", false.into()),
+        ("extensions.systemAddon.update.url", "".into()),
+        ("browser.discovery.enabled", false.into()),
+        ("browser.search.update", false.into()),
+        ("browser.translations.enable", false.into()),
+        (
+            "browser.contentblocking.report.monitor.enabled",
+            false.into(),
+        ),
+        // Push keeps a connection open with no page asking for it.
+        ("dom.push.enabled", false.into()),
+        ("dom.push.connection.enabled", false.into()),
+        // Media plugin downloads and their update checks.
+        ("media.gmp-manager.updateEnabled", false.into()),
+        ("media.gmp-gmpopenh264.enabled", false.into()),
+        ("media.gmp-gmpopenh264.autoupdate", false.into()),
+        ("media.gmp-widevinecdm.enabled", false.into()),
+        ("media.gmp-widevinecdm.autoupdate", false.into()),
+        ("media.eme.enabled", false.into()),
+        // Region lookup at startup.
+        ("browser.region.network.url", "".into()),
+        ("browser.region.update.enabled", false.into()),
+        // Lookups go to the guest's own resolver, never over HTTPS.
+        ("network.trr.mode", 5.into()),
+        // Remote settings and studies fetch from these hosts at startup.
+        (
+            "network.dns.localDomains",
+            "firefox.settings.services.mozilla.com,normandy.cdn.mozilla.net".into(),
+        ),
+    ];
+    preferences
+        .iter()
+        .map(|(name, value)| {
+            let locked = serde_json::json!({"Value": value, "Status": "locked"});
+            (name.to_string(), locked)
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 /// The install-and-wire script run from `runcmd`.
@@ -204,6 +355,47 @@ mod tests {
             policy["Preferences"]["browser.preonboarding.enabled"]["Value"],
             false
         );
+        // Release Firefox ignores services.settings.server, and the policy
+        // cannot turn studies off, so their hosts resolve to the loopback.
+        let local = &policy["Preferences"]["network.dns.localDomains"];
+        assert_eq!(
+            local["Value"],
+            "firefox.settings.services.mozilla.com,normandy.cdn.mozilla.net"
+        );
+        assert_eq!(local["Status"], "locked");
+        for (name, value) in [
+            ("browser.search.suggest.enabled", serde_json::json!(false)),
+            ("network.captive-portal-service.enabled", false.into()),
+            ("dom.push.connection.enabled", false.into()),
+            ("browser.safebrowsing.provider.google4.updateURL", "".into()),
+            ("network.trr.mode", 5.into()),
+        ] {
+            assert_eq!(policy["Preferences"][name]["Value"], value, "{name}");
+            assert_eq!(policy["Preferences"][name]["Status"], "locked", "{name}");
+        }
+        // The Preferences policy sets only these branches; others need their own policy.
+        for name in policy["Preferences"].as_object().unwrap().keys() {
+            assert!(
+                [
+                    "browser.",
+                    "network.",
+                    "dom.",
+                    "media.",
+                    "extensions.",
+                    "app.update.",
+                    "datareporting.policy."
+                ]
+                .iter()
+                .any(|prefix| name.starts_with(prefix)),
+                "{name}"
+            );
+        }
+        for name in ["DisableTelemetry", "DisableFirefoxStudies", "DisablePocket"] {
+            assert_eq!(policy[name], true, "{name}");
+        }
+        for name in ["CaptivePortal", "NetworkPrediction", "SearchSuggestEnabled"] {
+            assert_eq!(policy[name], false, "{name}");
+        }
         let start = content("/opt/start-desktop.sh");
         assert!(start.contains("Xvnc :1 -localhost"));
         assert!(start.contains(&format!("firefox --no-remote '{url}'")));
