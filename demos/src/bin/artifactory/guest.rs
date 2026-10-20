@@ -4,6 +4,10 @@ pub const HOSTNAME: &str = "maya-workstation";
 pub const USER: &str = "maya";
 pub const PROJECT: &str = "/home/maya/monthly-ledger";
 pub const WORK: &str = "/home/maya/.local/work";
+/// The project's copy in the skeleton home. Cloud-init writes files before it
+/// creates the user, so files under the home would leave it owned by root;
+/// the user's new home gets this copy, owned by the user.
+const SKELETON: &str = "/etc/skel/monthly-ledger";
 const PIP: &str = include_str!("../../../../examples/artifactory/docker/agent/pip.conf");
 const REQUIREMENTS: &str =
     include_str!("../../../../examples/artifactory/docker/agent/project/requirements.txt");
@@ -89,17 +93,46 @@ pref("extensions.pocket.enabled", false);
 "#;
 
 pub fn definition() -> Guest {
-    kit::desktop::browser(HOSTNAME, USER, "https://artifactory.northwind.internal/simple/")
-        .packages(&["python3-venv", "python3-pip", "twine", "curl", "bind9-dnsutils", "jq"])
-        .file("/etc/pip.conf", 0o644, format!("{}no-cache-dir = true\n", PIP.replace("/run/ca/ca.pem", "/etc/ssl/certs/ca-certificates.crt")))
-        .file(&format!("{PROJECT}/requirements.txt"), 0o644, REQUIREMENTS)
-        .file(&format!("{PROJECT}/report.py"), 0o644, REPORT)
-        .file(&format!("{PROJECT}/ledger.csv"), 0o644, LEDGER)
-        .file("/etc/systemd/resolved.conf.d/network.conf", 0o644, "[Resolve]\nCache=no\n")
-        .file("/opt/assistant.py", 0o644, RUNNER)
-        .file("/usr/lib/firefox/defaults/pref/network.js", 0o644, PREFERENCES)
-        .run("systemctl restart systemd-resolved")
-        .run(format!("python3 -m venv {PROJECT}/.venv && install -d -o {USER} -g {USER} -m700 {WORK} && mkfifo -m600 {WORK}/commands {WORK}/results && chown -R {USER}:{USER} {PROJECT} {WORK}"))
+    kit::desktop::browser(
+        HOSTNAME,
+        USER,
+        "https://artifactory.northwind.internal/simple/",
+    )
+    .packages(&[
+        "python3-venv",
+        "python3-pip",
+        "twine",
+        "curl",
+        "bind9-dnsutils",
+        "jq",
+    ])
+    .file(
+        "/etc/pip.conf",
+        0o644,
+        format!(
+            "{}no-cache-dir = true\n",
+            PIP.replace("/run/ca/ca.pem", "/etc/ssl/certs/ca-certificates.crt")
+        ),
+    )
+    .file(&format!("{SKELETON}/requirements.txt"), 0o644, REQUIREMENTS)
+    .file(&format!("{SKELETON}/report.py"), 0o644, REPORT)
+    .file(&format!("{SKELETON}/ledger.csv"), 0o644, LEDGER)
+    .file(
+        "/etc/systemd/resolved.conf.d/network.conf",
+        0o644,
+        "[Resolve]\nCache=no\n",
+    )
+    .file("/opt/assistant.py", 0o644, RUNNER)
+    .file(
+        "/usr/lib/firefox/defaults/pref/network.js",
+        0o644,
+        PREFERENCES,
+    )
+    .run("systemctl restart systemd-resolved")
+    .run(format!(
+        "sudo -u {USER} python3 -m venv {PROJECT}/.venv && sudo -u {USER} mkdir -p -m700 {WORK} \
+             && sudo -u {USER} mkfifo -m600 {WORK}/commands {WORK}/results"
+    ))
 }
 
 pub async fn open_terminal(guest: &kit::GuestHandle) -> std::io::Result<()> {
@@ -171,9 +204,13 @@ mod tests {
             ("report.py", REPORT),
             ("ledger.csv", LEDGER),
         ] {
-            assert_eq!(content(&format!("{PROJECT}/{name}")), expected);
+            assert_eq!(content(&format!("{SKELETON}/{name}")), expected);
         }
-        assert!(data.contains(&format!("python3 -m venv {PROJECT}/.venv")));
+        assert!(data.contains(&format!("sudo -u {USER} python3 -m venv {PROJECT}/.venv")));
+        assert!(
+            !data.contains("path: \"/home/"),
+            "files under a home leave it owned by root"
+        );
         assert!(
             data.find("bash /opt/setup-desktop.sh").unwrap()
                 < data.find("python3 -m venv").unwrap()
