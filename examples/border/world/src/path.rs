@@ -15,7 +15,8 @@
 //!   the count for the sender's physical path on the way back. Each sandbox's
 //!   routers send at most [`TIME_EXCEEDED_PER_SECOND`] of these a second.
 //! - **No host.** A packet for an address where no machine answers
-//!   ([`Scenario::has_host`]) ends at the last router on its way, which
+//!   ([`Scenario::has_host`], or the hijacked bank with the impostor off,
+//!   [`Routing::impostor`]) ends at the last router on its way, which
 //!   answers ICMP "host unreachable", as a router with no route does. The
 //!   path reports it as `path.unreachable`, naming the sandbox in a
 //!   `sandbox` field, and Left the box counts it as no route.
@@ -278,8 +279,11 @@ pub async fn run(
                 let mut p = packet.0;
                 let ttl = p[8];
                 // Where the packet's way ends: at `dst`, or, with no host
-                // there, at the last router, which has no route for it.
-                let ends_at = (!extra && !scenario.has_host(dst)).then(|| hops.len() - 1);
+                // there, at the last router, which has no route for it. With
+                // the impostor off, no host answers at the hijacked bank.
+                let absent = !scenario.has_host(dst)
+                    || (dst == BANK_ADDR && scenario.hijacked() && !shared.routing.impostor());
+                let ends_at = (!extra && absent).then(|| hops.len() - 1);
                 let reach = ends_at.unwrap_or(hops.len());
                 if usize::from(ttl) <= reach {
                     // It runs out at hop `ttl` (a TTL of 0 at the first).
