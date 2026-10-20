@@ -318,12 +318,37 @@ fn forbidden_in<'a>(text: &str, extra: &'a [String]) -> Option<&'a str> {
 pub struct World {
     attachments: Attachments,
     ca: Arc<Mutex<Option<(String, String)>>>,
+    environment: Arc<Mutex<Vec<(String, String)>>>,
     now_unix: i64,
     mirror: Option<mirror::Cache<fictionet::stdlib::web::Proxy>>,
     mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
 }
 
 impl World {
+    /// Installs environment values in each guest before its first login.
+    /// Model sites supply placeholder credentials here.
+    pub fn seed_env(
+        &mut self,
+        values: impl IntoIterator<Item = (&'static str, String)>,
+    ) -> fictionet::Result {
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        if values.iter().any(|(name, value)| {
+            name.is_empty()
+                || !name.bytes().all(|c| c.is_ascii_uppercase() || c == b'_')
+                || !value
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_./:".contains(&c))
+        }) {
+            return Err(fictionet::Error::msg(
+                "invalid guest environment assignment",
+            ));
+        }
+        self.environment.lock().unwrap().extend(values);
+        Ok(())
+    }
     /// Returns the run start time as Unix seconds for certificate issuance.
     pub fn now_unix(&self) -> i64 {
         self.now_unix
@@ -1041,9 +1066,11 @@ impl Run {
         F: Future<Output = fictionet::Result> + Send + 'static,
     {
         let ca = Arc::new(Mutex::new(None));
+        let environment = Arc::new(Mutex::new(Vec::new()));
         let world = World {
             attachments: prepared.attachments,
             ca: ca.clone(),
+            environment: environment.clone(),
             mirror: None,
             mirror_addresses: prepared.mirror_addresses,
             now_unix: SystemTime::now()
@@ -1104,6 +1131,32 @@ impl Run {
             .map_err(io::Error::other)?
             .map_err(io::Error::other)?;
         self.jump = Some(Arc::new(jump));
+        let environment = environment.lock().unwrap();
+        if !environment.is_empty() {
+            let assignments = environment
+                .iter()
+                .map(|(k, v)| format!("{k}={v}\n"))
+                .collect::<String>();
+            let exports = environment
+                .iter()
+                .map(|(k, v)| format!("export {k}={v}\n"))
+                .collect::<String>();
+            for guest in &mut self.guests {
+                guest.guest.files.extend([
+                    File {
+                        path: "/etc/environment".into(),
+                        mode: 0o644,
+                        content: assignments.clone(),
+                    },
+                    File {
+                        path: "/etc/profile.d/model.sh".into(),
+                        mode: 0o644,
+                        content: exports.clone(),
+                    },
+                ]);
+                guest.guest.validate()?;
+            }
+        }
         Ok(ca.lock().unwrap().clone())
     }
 

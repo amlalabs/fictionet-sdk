@@ -331,6 +331,7 @@ fn root_certificate_names_are_neutral() {
     let mut world = World {
         attachments,
         ca: Arc::new(Mutex::new(None)),
+        environment: Default::default(),
         now_unix: 0,
         mirror: None,
         mirror_addresses: Default::default(),
@@ -1738,4 +1739,32 @@ fn kit_rules_precede_world_policy_and_preserve_non_console_flows() {
         },
     ))
     .unwrap();
+}
+
+#[tokio::test]
+async fn model_environment_is_seeded_before_login() {
+    let mut kit = Kit::new("office").guest(Guest::ubuntu("workstation", "analyst"));
+    let (mut run, prepared) = kit.prepare().unwrap();
+    run.start_world(
+        |cx, mut world| async move {
+            assert!(world.seed_env([("BAD", "a\nINJECT=value".into())]).is_err());
+            world.seed_env([("ANTHROPIC_API_KEY", "sk-ant-api03-placeholder".into())])?;
+            hold_world(cx, world).await
+        },
+        prepared,
+    )
+    .await
+    .unwrap();
+    let data = seed::user_data(&seed::Provision {
+        guest: &run.guests[0].guest,
+        authorized_key: "key",
+        ca: None,
+    });
+    assert!(data.contains(&base64::encode(
+        b"ANTHROPIC_API_KEY=sk-ant-api03-placeholder\n"
+    )));
+    assert!(data.contains(&base64::encode(
+        b"export ANTHROPIC_API_KEY=sk-ant-api03-placeholder\n"
+    )));
+    run.shutdown().await.unwrap();
 }

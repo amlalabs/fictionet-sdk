@@ -301,6 +301,8 @@ pub struct Model {
     credential: Credential,
     forward: web::Forward,
     authority: String,
+    upstream_provider: Provider,
+    path_prefix: &'static str,
     ledger: Arc<Mutex<Ledger>>,
     prices: Option<(String, Prices)>,
 }
@@ -323,6 +325,8 @@ impl Model {
             credential,
             forward: web::forward(cx, origin)?,
             authority,
+            upstream_provider: provider,
+            path_prefix: "",
             ledger: Arc::new(Mutex::new(Ledger::default())),
             prices: None,
         })
@@ -450,9 +454,21 @@ impl Model {
             parts.headers.remove(name);
         }
         parts.headers.insert(
-            self.provider.header(),
-            self.credential.wire(self.provider, true).parse()?,
+            self.upstream_provider.header(),
+            self.credential.wire(self.upstream_provider, true).parse()?,
         );
+        if !self.path_prefix.is_empty() {
+            parts.uri = format!(
+                "{}{}",
+                self.path_prefix,
+                parts
+                    .uri
+                    .path_and_query()
+                    .map(|v| v.as_str())
+                    .unwrap_or("/")
+            )
+            .parse()?;
+        }
         parts.headers.insert("host", self.authority.parse()?);
         parts.headers.insert("accept-encoding", "identity".parse()?);
         let request = Request::from_parts(parts, Body::from(bytes));
@@ -522,6 +538,28 @@ pub fn openai(cx: &Cx) -> fictionet::Result<Model> {
 /// OpenRouter using `OPENROUTER_API_KEY`.
 pub fn openrouter(cx: &Cx) -> fictionet::Result<Model> {
     from_env(cx, Provider::OpenRouter)
+}
+/// Anthropic Messages served through OpenRouter's compatible endpoint.
+/// Reads only `OPENROUTER_API_KEY`; the guest uses an Anthropic placeholder.
+pub fn anthropic_via_openrouter(cx: &Cx) -> fictionet::Result<Model> {
+    let real = Secret::from_env("OPENROUTER_API_KEY")?;
+    let mut credential = Credential::api_key(
+        cx,
+        Secret::new(
+            "ANTHROPIC_API_KEY",
+            format!("sk-ant-api03-{}", "a".repeat(96)),
+        )?,
+    );
+    credential.real = real;
+    let mut model = Model::at(
+        cx,
+        Provider::Anthropic,
+        credential,
+        "https://openrouter.ai".parse()?,
+    )?;
+    model.upstream_provider = Provider::OpenRouter;
+    model.path_prefix = "/api";
+    Ok(model)
 }
 /// Gemini using `GEMINI_API_KEY`.
 pub fn gemini(cx: &Cx) -> fictionet::Result<Model> {

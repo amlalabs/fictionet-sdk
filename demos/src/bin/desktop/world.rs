@@ -5,6 +5,9 @@ use fictionet::events::{Event, Observation, Observer, Stamp};
 use fictionet::stdlib::web;
 use fictionet::{Cx, Result};
 use fictionet_demo::kit;
+use fictionet_extras::models;
+use fictionet_observe::page::{CommandPort, Rejected};
+use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -47,7 +50,20 @@ fn user_agent(event: &Event) -> Option<&str> {
     })
 }
 
-pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Command {
+    Pause,
+    Resume,
+    Calls(u64),
+}
+
+pub async fn start(
+    fcx: Cx,
+    mut world: kit::World,
+    site: String,
+    commands: CommandPort<Command, bool>,
+) -> Result {
     let now_unix = world.now_unix();
     let now_sys = SystemTime::UNIX_EPOCH + Duration::from_secs(now_unix as u64);
     let z = zscaler(&fcx, DEFAULT_CLOUD, now_unix)?;
@@ -60,6 +76,35 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
     let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys)?;
     let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys)?;
     world.trust("zscaler", z.root_pem())?;
+    let model_cfg = z.server_config(&fcx, &["api.anthropic.com"], now_sys)?;
+    let model = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        Some(models::anthropic(&fcx)?)
+    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        Some(models::anthropic_via_openrouter(&fcx)?)
+    } else {
+        None
+    }
+    .map(|model| model.budget(models::Budget::new().calls(8)));
+    if let Some(model) = &model {
+        world.seed_env(model.guest_env())?;
+    }
+    let controlled = model.clone();
+    fcx.spawn(move |cx| async move {
+        kit::serve_commands(&cx, &commands, |command| {
+            let Some(model) = &controlled else {
+                return Ok(Err(Rejected::Invalid {
+                    message: "No model credential is configured".into(),
+                }));
+            };
+            match command {
+                Command::Pause => model.pause(true),
+                Command::Resume => model.pause(false),
+                Command::Calls(limit) => model.set_budget(models::Budget::new().calls(*limit)),
+            }
+            Ok(Ok(true))
+        })
+        .await
+    });
     // The mirror: the world forwards these names to the real servers over
     // the host's network, so the guest installs the desktop and the
     // coding agents at boot. apt's signatures verify the packages, and
@@ -70,6 +115,9 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
         "archive.ubuntu.com" | "security.ubuntu.com" | "ports.ubuntu.com" => {
             Some(web::Site::new(mirror.clone()))
         }
+        "api.anthropic.com" => model
+            .clone()
+            .map(|model| web::Site::new(model).tls(model_cfg.clone())),
         "packages.mozilla.org" => Some(web::Site::new(mirror.clone()).tls(mozilla_cfg.clone())),
         "downloads.claude.ai" => Some(web::Site::new(mirror.clone()).tls(claude_cfg.clone())),
         "releases.openai.com" => Some(web::Site::new(mirror.clone()).tls(openai_cfg.clone())),

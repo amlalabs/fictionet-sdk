@@ -8,7 +8,9 @@ use fictionet::stdlib::codec::base64;
 use fictionet_demo::kit::checks::check;
 use fictionet_demo::kit::client::{Capability, PageClient};
 use fictionet_demo::kit::{self, Kit, rfb, ssh};
-use fictionet_observe::page::{Column, Page, StateLimits, StateTopic};
+use fictionet_observe::page::{
+    Action, Column, CommandLimits, CommandPort, Page, StateLimits, StateTopic,
+};
 use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -69,6 +71,8 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
     let loaded = Arc::new(AtomicBool::new(false));
     let agents = StateTopic::<Vec<Value>>::new(StateLimits::default());
     let table = agents.clone();
+    let commands = CommandPort::<world::Command, bool>::new(CommandLimits::default());
+    let controls = commands.clone();
     let (world_clock, clock) = tokio::sync::oneshot::channel();
     let kit = Kit::new("desktop")
         .guest(guest::workstation(HOSTNAME, USER, SITE))
@@ -76,6 +80,28 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
             Page::new("Desktop", dashboard)
                 .host(hosts.take(HOSTNAME))
                 .standard_panels()
+                .control(
+                    "Model",
+                    controls,
+                    vec![
+                        Action {
+                            label: "Pause calls".into(),
+                            command: json!("pause"),
+                        },
+                        Action {
+                            label: "Resume calls".into(),
+                            command: json!("resume"),
+                        },
+                        Action {
+                            label: "Limit to 8 calls".into(),
+                            command: json!({"calls":8}),
+                        },
+                        Action {
+                            label: "Limit to 20 calls".into(),
+                            command: json!({"calls":20}),
+                        },
+                    ],
+                )
                 .table(
                     "Coding agents",
                     table,
@@ -91,7 +117,7 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
         }))
         .world(move |fcx, world| async move {
             let _ = world_clock.send(fcx.clone());
-            world::start(fcx, world, SITE.into()).await
+            world::start(fcx, world, SITE.into(), commands).await
         });
     // Screenshots survive the run (the run dir does not).
     let shots = downloads.join("shots");
@@ -451,19 +477,48 @@ async fn run_checks(
 
     page_checks(page_url, session, &mut failures).await;
 
-    // Required: each agent's own HTTP client trusts the world's CA through
-    // the system store, with no flags. Each asks the site for a path it does
-    // not serve; reporting the site's 404 means the client verified the
-    // Zscaler chain, where a distrusted chain reports a certificate error.
-    let claude_tls = guest_cmd(
+    let model = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        "claude-haiku-4-5-20251001"
+    } else {
+        "anthropic/claude-haiku-4.5"
+    };
+    let task = guest_cmd(
         session,
-        &format!("timeout 60 claude plugin marketplace add https://{SITE}/marketplace.json 2>&1"),
+        &format!(
+            "cd /home/analyst && timeout 120 claude -p \
+         'Create sum.py that prints 19 + 23, run it, and report the result.' \
+         --model {model} --max-turns 4 --allowedTools Bash,Write,Read 2>&1"
+        ),
     )
     .await?;
     failures.extend(
         check(
-            &format!("Claude Code's client gets the {SITE} site's answer over the Zscaler chain"),
-            claude_tls.stdout.contains("HTTP 404") && !claude_tls.stdout.contains("certificate"),
+            "Claude Code completes a task through the model site",
+            task.code == 0,
+        )
+        .err(),
+    );
+    let result = guest_cmd(session, "cd /home/analyst && python3 sum.py").await?;
+    failures.extend(
+        check(
+            "the program Claude Code wrote prints 42",
+            result.code == 0 && result.stdout.trim() == "42",
+        )
+        .err(),
+    );
+    let page = PageClient::from_url(page_url)?;
+    let call = page
+        .find_event(&mut 0, |event| {
+            Ok(event["source"] == "model"
+                && event["kind"] == "call"
+                && event["fields"]["status"] == 200
+                && event["fields"]["credential"] == "placeholder")
+        })
+        .await?;
+    failures.extend(
+        check(
+            "the page reports the completed model call with a placeholder",
+            call.is_some(),
         )
         .err(),
     );
