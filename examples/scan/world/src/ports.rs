@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
+use example_common::names::name;
 use fictionet::events::{Fields, Level, opt};
 use fictionet::stdlib::network::{Direction, ip};
 use fictionet::sync::Mutex;
@@ -77,14 +78,6 @@ pub enum PortState {
     Closed,
     /// A matching ICMP unreachable arrived, with any code for an echo probe.
     Unreachable,
-}
-
-/// The name serde writes for a unit variant, as facts carry it too.
-fn name(value: impl Serialize) -> String {
-    match serde_json::to_value(value) {
-        Ok(serde_json::Value::String(name)) => name,
-        other => unreachable!("a unit variant serializes as its name, not {other:?}"),
-    }
 }
 
 /// One port's probes and latest answered state.
@@ -274,13 +267,13 @@ impl Tap {
                         "{}:{}/{} {}",
                         row.host,
                         row.port,
-                        name(row.protocol),
-                        name(row.state)
+                        name(&row.protocol),
+                        name(&row.state)
                     ))
                     .field("host", row.host.to_string())
-                    .field("protocol", name(row.protocol))
-                    .field("state", name(row.state))
-                    .field("previous", opt(previous.map(name)))
+                    .field("protocol", name(&row.protocol))
+                    .field("state", name(&row.state))
+                    .field("previous", opt(previous.map(|state| name(&state))))
                     .repeat(
                         Fields::new()
                             .with("port", u32::from(row.port))
