@@ -515,6 +515,16 @@ async fn run(
             }
             output.response["usage"] = usage;
             output.response["output"] = json!(output.items);
+            if let (Some(shown), Some(last)) =
+                (output.response["id"].as_str(), turn.response["id"].as_str())
+                && shown != last
+            {
+                model
+                    .continued
+                    .lock()
+                    .unwrap()
+                    .insert(shown.to_owned(), last.to_owned());
+            }
             let kind = match output.response["status"].as_str() {
                 Some("incomplete") => "response.incomplete",
                 Some("failed") => "response.failed",

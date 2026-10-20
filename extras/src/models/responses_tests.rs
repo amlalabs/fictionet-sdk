@@ -13,7 +13,17 @@ pub(super) fn echo(
     stream: bool,
     request: &Value,
 ) {
-    let mut response = json!({"id":"resp_one","object":"response","created_at":1,"model":"small","status":"completed","output":items,"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},"error":null,"incomplete_details":null});
+    reply(socket, "resp_one", items, stream, request);
+}
+/// Answers like `echo`, as the response with this id.
+fn reply(
+    socket: &mut std::net::TcpStream,
+    id: &str,
+    items: Vec<Value>,
+    stream: bool,
+    request: &Value,
+) {
+    let mut response = json!({"id":id,"object":"response","created_at":1,"model":"small","status":"completed","output":items,"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},"error":null,"incomplete_details":null});
     if let Some(tools) = request.get("tools") {
         response["tools"] = tools.clone();
     }
@@ -406,4 +416,88 @@ fn a_budget_stop_during_a_search_fails_the_response_like_openai() {
     ))
     .unwrap();
     server.join().unwrap();
+}
+/// The id of a response passed through as the upstream wrote it, streamed
+/// or not.
+async fn completed_id(response: Response<Body>) -> String {
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+        return body["id"].as_str().unwrap().to_owned();
+    }
+    let mut decoder =
+        fictionet::stdlib::codec::Stream::new(fictionet::stdlib::protocols::sse::Events::new());
+    let mut id = String::new();
+    fictionet::stdlib::codec::try_pump(&mut decoder, &bytes, |event| {
+        if let Ok(event) = serde_json::from_str::<Value>(&event.data)
+            && event["type"] == "response.completed"
+        {
+            id = event["response"]["id"].as_str().unwrap().to_owned();
+        }
+        Ok::<_, fictionet::stdlib::protocols::sse::Error>(())
+    })
+    .unwrap();
+    id
+}
+#[test]
+fn a_searched_response_continues_from_its_final_upstream_turn() {
+    for stream in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let first = receive(&mut socket);
+            let call = json!({"type":"function_call","id":"fc_first","call_id":"call_first","name":"web_search","arguments":"{\"query\":\"page\"}","status":"completed"});
+            reply(&mut socket, "resp_first", vec![call], stream, &first);
+            let (mut socket, _) = listener.accept().unwrap();
+            let second = receive(&mut socket);
+            assert_eq!(second["input"][2]["type"], "function_call_output");
+            let text = json!({"type":"message","id":"msg_final","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Page title","annotations":[]}]});
+            reply(
+                &mut socket,
+                "resp_final",
+                vec![text.clone()],
+                stream,
+                &second,
+            );
+            // The follow-up names the upstream turn that holds the answer.
+            let (mut socket, _) = listener.accept().unwrap();
+            let third = receive(&mut socket);
+            assert!(third.get("tools").is_none());
+            assert_eq!(third["previous_response_id"], "resp_final");
+            reply(&mut socket, "resp_next", vec![text.clone()], stream, &third);
+            // An id with no search behind it passes unchanged.
+            let (mut socket, _) = listener.accept().unwrap();
+            let fourth = receive(&mut socket);
+            assert_eq!(fourth["previous_response_id"], "resp_next");
+            reply(&mut socket, "resp_last", vec![text], stream, &fourth);
+        });
+        let pages = Arc::new(Pages(AtomicUsize::new(0)));
+        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(14)), |cx| async move {
+            let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
+            let key = credential.wire(Provider::OpenAi, false);
+            let model = Model::at(&cx, Provider::OpenAi, credential, format!("http://{address}").parse()?)?.search(pages);
+            let request = |body: &Value| Request::post("/v1/responses").header("authorization", &key).body(Body::from(body.to_string())).unwrap();
+            let searched = model.clone().send(request(&json!({"model":"small","stream":stream,"store":true,"input":"Search","tools":[{"type":"web_search"}]}))).await?;
+            let id = if stream {
+                // Every event shows the one response id the client knows.
+                let events = events(searched).await;
+                let ids: Vec<_> = events.iter().filter_map(|e| e["response"]["id"].as_str()).collect();
+                assert!(ids.len() >= 2, "{events:?}");
+                assert!(ids.iter().all(|id| *id == "resp_first"), "{ids:?}");
+                "resp_first".to_owned()
+            } else {
+                let response = collect(searched, false).await;
+                assert_eq!(response["output"][1]["content"][0]["text"], "Page title");
+                response["id"].as_str().unwrap().to_owned()
+            };
+            assert_eq!(id, "resp_first");
+            let next = model.clone().send(request(&json!({"model":"small","stream":stream,"store":true,"input":"Explain","previous_response_id":id}))).await?;
+            assert_eq!(completed_id(next).await, "resp_next");
+            let last = model.clone().send(request(&json!({"model":"small","stream":stream,"store":true,"input":"More","previous_response_id":"resp_next"}))).await?;
+            assert_eq!(completed_id(last).await, "resp_last");
+            Ok(())
+        })).unwrap();
+        server.join().unwrap();
+    }
 }
