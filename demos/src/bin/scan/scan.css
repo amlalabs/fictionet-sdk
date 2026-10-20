@@ -418,6 +418,9 @@
   position: static;
   padding: 0 8px;
 }
+.ports-matrix th.ports-matrix-port {
+  text-align: center;
+}
 .ports-matrix th[scope='row'] {
   text-align: left;
   white-space: nowrap;

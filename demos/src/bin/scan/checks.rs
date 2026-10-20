@@ -136,7 +136,11 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
     }
     let rows = moment["rows"].as_array().map_or(&[][..], Vec::as_slice);
     let [event] = rows else {
-        return Err(format!("moment: {} events, expected one", rows.len()));
+        return Err(format!(
+            "moment: {} events, expected one ({} events lost or evicted)",
+            rows.len(),
+            moment["dropped"]
+        ));
     };
     let hosts: BTreeSet<Ipv4Addr> = event["fields"]["hosts"]
         .as_array()

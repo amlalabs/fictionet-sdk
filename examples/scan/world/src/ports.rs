@@ -15,7 +15,11 @@
 //! A `scan.port` fact marks a new row or a state change. It includes the
 //! previous state, probe count, first and last probe times, and revision.
 //! The previous state is null for a new row. Times are whole milliseconds
-//! since the run began.
+//! since the run began. A port scan makes thousands of these facts, so each
+//! is a repeatable fact: the host, protocol, state and previous state
+//! identify it, and the port, times, probe count and revision are its
+//! detail. An event store with a separate budget for repeatable facts, such
+//! as `fictionet_observe::Memory`, keeps them from evicting other events.
 //!
 //! [`Ports::snapshot`] copies the five office labels and all rows, sorted
 //! by address, protocol, then port. [`Ports::changes_since`] copies the latest
@@ -37,7 +41,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use fictionet::events::{Level, opt};
+use fictionet::events::{Fields, Level, opt};
 use fictionet::stdlib::network::{Direction, ip};
 use fictionet::sync::Mutex;
 use fictionet::{Cx, Packet};
@@ -278,14 +282,17 @@ impl Ports {
                         row.state.as_str()
                     ))
                     .field("host", row.host.to_string())
-                    .field("port", u32::from(row.port))
                     .field("protocol", row.protocol.as_str())
                     .field("state", row.state.as_str())
                     .field("previous", opt(previous.map(PortState::as_str)))
-                    .field("first_probe_ms", row.first_probe_ms)
-                    .field("last_probe_ms", row.last_probe_ms)
-                    .field("probes", row.probes)
-                    .field("revision", row.revision)
+                    .repeat(
+                        Fields::new()
+                            .with("port", u32::from(row.port))
+                            .with("first_probe_ms", row.first_probe_ms)
+                            .with("last_probe_ms", row.last_probe_ms)
+                            .with("probes", row.probes)
+                            .with("revision", row.revision),
+                    )
             }),
             Signal::Full => fcx.emit("scan", "full", |e| {
                 e.level(Level::Notice).field("max_rows", MAX_ROWS as u64)

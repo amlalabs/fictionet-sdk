@@ -1,4 +1,15 @@
-//! The workstation and office server.
+//! The two guests. Both boot Ubuntu's 24.04 cloud image unmodified and
+//! install their packages at boot through the world's mirror.
+//!
+//! The workstation is the scanner, with nmap. Its screen is Xvnc with
+//! openbox and one full-screen xterm. The xterm runs a small runner that
+//! reads one command at a time from a named pipe, types it out, runs it and
+//! writes back its exit status. The demo sends the story's nmap commands
+//! through that pipe over SSH.
+//!
+//! The office server runs nginx and OpenSSH at 10.0.0.50. Its login shell
+//! follows sshd's journal and nginx's access log, so the page's terminal
+//! shows nmap's probes reaching a real server.
 use fictionet::stdlib::network::ethernet::Family;
 use fictionet_demo::kit::{Guest, desktop::VNC_PORT};
 
@@ -20,13 +31,16 @@ pub fn server() -> Guest {
         .resources(1, 512)
         .card(Family::Serve(scan_world::SERVER_LEASE))
         .packages(&["nginx", "openssh-server"])
+        // The page's terminal can log in before cloud-init has installed
+        // nginx. tail -F waits for the access log to appear; its notes about
+        // the missing file go to /dev/null so the terminal shows only logs.
         .file(
             "/etc/profile.d/office-logs.sh",
             0o644,
             r#"if [ -n "$PS1" ]; then
     sudo journalctl -f -u ssh.service -u ssh.socket --no-pager &
     journal_pid=$!
-    sudo tail -n 20 -F /var/log/nginx/access.log &
+    sudo tail -n 20 -F /var/log/nginx/access.log 2>/dev/null &
     access_pid=$!
     trap 'kill "$journal_pid" "$access_pid" 2>/dev/null' EXIT
 fi
@@ -220,6 +234,14 @@ mod tests {
         );
         let text = data(&office);
         assert!(text.contains("'nginx' 'openssh-server'"));
+        // The login shell follows the access log without printing tail's
+        // notes while nginx is not installed yet.
+        assert!(
+            text.lines()
+                .filter_map(|line| line.strip_prefix("    content: "))
+                .map(|s| String::from_utf8(b64_decode(s).unwrap()).unwrap())
+                .any(|s| s.contains("tail -n 20 -F /var/log/nginx/access.log 2>/dev/null &"))
+        );
         // nginx is enabled; OpenSSH stays socket-activated as the image ships it.
         let runcmd = text
             .lines()

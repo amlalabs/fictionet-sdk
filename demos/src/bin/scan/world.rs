@@ -1,4 +1,7 @@
-//! The office, jump route, and temporary package mirror.
+//! The world: the scan office, the kit's jump route and an apt mirror at
+//! 10.0.20.10, outside both subnets. The mirror forwards to the kit's package
+//! cache while cloud-init installs packages. Once both guests have finished
+//! cloud-init, it answers every request with 403.
 use fictionet::stdlib::{
     web::{self, Body},
     world::net::Net,

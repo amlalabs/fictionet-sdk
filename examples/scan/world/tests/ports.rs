@@ -9,7 +9,7 @@ use fictionet::stdlib::network::ports::{Event, Ports as Links};
 use fictionet::stdlib::network::{ip, tcp, udp};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RunOptions, Seed};
-use fictionet_observe::Memory;
+use fictionet_observe::{Limits, Memory};
 use scan_world::ports::MAX_ROWS;
 use scan_world::{
     Banner, Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Protocol, SCANNER,
@@ -285,15 +285,27 @@ fn scan_snapshot_deltas_and_facts_follow_the_packets() {
                         .collect::<Vec<_>>(),
                     [
                         "host",
-                        "port",
                         "protocol",
                         "state",
                         "previous",
+                        "port",
                         "first_probe_ms",
                         "last_probe_ms",
                         "probes",
                         "revision"
                     ]
+                );
+                assert_eq!(
+                    event.repeat_fields(),
+                    Some(
+                        &[
+                            "port",
+                            "first_probe_ms",
+                            "last_probe_ms",
+                            "probes",
+                            "revision"
+                        ][..]
+                    )
                 );
                 assert_eq!(event.u64("revision"), Some(i as u64 + 1));
                 let first = (i / 2) as u64 * 10;
@@ -422,4 +434,36 @@ fn banners_from_real_connections_are_kept_once_with_facts() {
         },
     ))
     .unwrap();
+}
+
+#[test]
+fn port_facts_do_not_evict_other_events() {
+    // Room for 64 ordinary events and 1,000 repeatable ones.
+    let memory = Arc::new(Memory::with_noise_limits(
+        Limits::new(64, 1 << 20),
+        Limits::new(1000, 1 << 20),
+    ));
+    let history = memory.clone();
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(42)).observer(memory),
+        move |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            let ports = start(&fcx, office(), attachments)?;
+            let mut scanner = attacher.attach(SCANNER)?;
+            fcx.emit("story", "moment", |e| e.level(Level::Notice));
+            for port in 1..=200 {
+                scanner.send(syn(Ipv4Addr::new(10, 0, 0, 10), port));
+                fcx.sleep(ms(1)).await?;
+            }
+            fcx.sleep(ms(50)).await?;
+            assert_eq!(ports.snapshot().rows.len(), 200);
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+    assert_eq!(history.checked_of("story", "moment").unwrap().len(), 1);
+    let facts = history.checked_of("scan", "port").unwrap();
+    assert_eq!(facts.len(), 400);
+    assert!(facts.iter().all(|fact| fact.repeat_fields().is_some()));
 }
