@@ -57,6 +57,7 @@
 //! | [`facts`] | Plant facts for the Fictionet event log |
 //! | [`hmi`] | Supervisory client hmi01: polls the controllers, serves the mimic page and control API |
 //! | [`network`] | Operations and control networks, with the controllers on port 502 |
+//! | [`story`] | The scripted operator story: six steps with automatic protection off |
 //!
 //! Loops are loop A and loop B, in that array order.
 //! Commands use externally tagged serde enums with snake_case wire names. Rod positions use tenths of a
@@ -70,7 +71,8 @@
 //! a stopped pump. Telemetry quiet freezes readings and reported equipment
 //! status together; controller modes remain live.
 //! Fault slots and the schedule are fixed arrays, so overflow cannot be built.
-//! No executable is included in this crate yet.
+//! The viewer example, `examples/viewer.rs`, runs the plant in real time and
+//! serves the control room page with the scripted story.
 //!
 //! ```
 //! use nuclear_world::{Plant, Config, command::{Command, FaultCommand}};
@@ -119,5 +121,6 @@ pub mod registers;
 pub mod sensors;
 pub mod snapshot;
 pub mod steam;
+pub mod story;
 
 pub use plant::{Config, InitialPower, Plant};

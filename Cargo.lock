@@ -1742,6 +1742,7 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

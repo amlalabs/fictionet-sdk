@@ -17,4 +17,10 @@ bytes = "1"
 http = "1"
 
 [dev-dependencies]
-fictionet-observe = { path = "../../../observe", features = ["native"] }
+# The page feature implies native, so one line serves the tests and the viewer.
+fictionet-observe = { path = "../../../observe", features = ["page"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+
+[[example]]
+name = "viewer"
+path = "examples/viewer.rs"
