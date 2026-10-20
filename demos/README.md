@@ -42,9 +42,9 @@ The page screenshots need Chromium on your machine.
 Five demos also run without a VM: `cargo xtask demo <name> preview` serves
 the same page with an in-world client in place of the guests, and needs only
 the browser libraries. A screen on its page says NO VM. Every preview reads its
-standard input the same way. Press Enter to run the in-world client again,
-where the demo has one, or type `drop` to close the screen's connections.
-The end of input or Ctrl-C stops it.
+standard input the same way. In Border and FakeWiki, Enter runs the in-world
+client again. The other previews run their story once. Type `drop` to close
+the screen's connections. The end of input or Ctrl-C stops a preview.
 
 The times below are from one run of each demo on a 24-core machine with other
 work running, the pinned files downloaded, the package cache filled and no
@@ -318,7 +318,8 @@ The checks use the same few calls in every demo, all in
 `kit::desktop::browser` declares an Ubuntu desktop with Mozilla's Firefox,
 quieted through enterprise policies so it makes no requests a page did not ask
 for. `kit::desktop::terminal` declares one full-screen terminal that types and
-runs each command `GuestHandle::type_command` sends.
+runs each command `GuestHandle::type_command` sends, for at most the time the
+call gives.
 `Guest::typed_commands` adds that program to any guest, as Artifactory's
 browser desktop does. `Guest::validate` refuses a guest whose names, files,
 packages or commands contain one of the words in `kit::FORBIDDEN`, such as
@@ -328,6 +329,9 @@ and the desktop's [guest](src/bin/desktop/guest.rs) and
 [world](src/bin/desktop/world.rs).
 
 ## VM scripts
+
+A new demo is a microVM demo on the kit. See
+[Making a demo of your own](#making-a-demo-of-your-own).
 
 The other demos are scripts in [`guest/`](guest) that run in the Fictionet VM.
 The command boots the VM if it is not running ([vm/README.md](../vm/README.md)),
@@ -371,9 +375,6 @@ end with the expected exit status and diagnostic: a timeout, a missing command
 or a signal is a failure, not a refusal. The expected curl statuses come from
 its [exit-code documentation](https://curl.se/docs/manpage.html#exit-codes)
 and the world's DNS, TLS and routing behavior.
-
-A new demo is a microVM demo on the kit; see
-[Making a demo of your own](#making-a-demo-of-your-own).
 
 ## The evals, and the recipes
 

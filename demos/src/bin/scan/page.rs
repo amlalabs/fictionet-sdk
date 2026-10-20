@@ -3,8 +3,9 @@
 //! One world task publishes three topics. `Ports` is the world's port map,
 //! with its banners. `Services` is nmap's report for each finished step, as
 //! its XML gave it. `Office` is the scripted story: each step's command,
-//! state and exit status, and whether the page is a replay without VMs. The task also marks the moment every office
-//! machine has answered a probe, with one `scan.discovered` fact.
+//! state and exit status, and whether the page is a replay without VMs. The
+//! task also marks the moment every office machine has answered a probe,
+//! with one `scan.discovered` fact.
 //!
 //! The panels are ES modules served as assets under `/assets/scan/`. Each
 //! panel reads its own topic and the topics of the other two by path.

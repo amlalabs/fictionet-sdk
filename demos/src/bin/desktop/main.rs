@@ -30,6 +30,10 @@ fn boxed<E: std::fmt::Display>(error: E) -> Error {
 
 fn main() -> ExitCode {
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if args.first().is_some_and(|arg| arg == "preview") {
+        eprintln!("desktop: this demo has no preview. Its page shows the guest's own desktop.");
+        return ExitCode::FAILURE;
+    }
     let [downloads, rest @ ..] = args.as_slice() else {
         eprintln!(
             "usage: desktop <downloads-directory> [observation-socket]\n\

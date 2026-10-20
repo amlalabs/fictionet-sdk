@@ -592,13 +592,10 @@ impl Run {
             world.abort();
             let _ = world.await;
         }
-        if let Some(dir) = self.dir.take() {
-            if let Err(error) = std::fs::remove_dir_all(dir.path()) {
-                failures.push(format!("removing the run directory: {error}"));
-            }
-            if dir.path().exists() {
-                failures.push(format!("{} remains", dir.path().display()));
-            }
+        if let Some(dir) = self.dir.take()
+            && let Err(error) = std::fs::remove_dir_all(dir.path())
+        {
+            failures.push(format!("{} remains: {error}", dir.path().display()));
         }
         for pid in pids {
             if Path::new(&format!("/proc/{pid}")).exists() {

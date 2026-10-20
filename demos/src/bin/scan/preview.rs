@@ -104,7 +104,7 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
         fictionet::block_on(fictionet::run(
             RunOptions::new(Seed::from_u64(7)).observer(dashboard.observer()),
             move |cx| async move {
-                // Enter stops the run, during the story too.
+                // The end of input or Ctrl-C stops the run, during the story too.
                 cx.spawn(move |cx| async move {
                     while !stopping.load(Ordering::SeqCst) {
                         cx.sleep(Duration::from_millis(200)).await?;
@@ -182,7 +182,6 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
             },
         ))
     });
-    // The page has no screen, and the story runs once.
     while input.next().await.is_some() {
         eprintln!("This preview has no screen, and its story runs once.");
     }

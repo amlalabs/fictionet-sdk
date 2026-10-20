@@ -2,9 +2,10 @@
 //! a VM.
 //!
 //! Every demo's `preview` subcommand reads standard input the same way. An
-//! empty line runs the in-world client's story again, where the demo has
-//! one; `drop` closes the screen's open connections, as a lost guest
-//! connection would; the end of input or Ctrl-C stops the preview.
+//! empty line asks for the in-world client's story again. A preview whose
+//! story runs once says so. `drop` closes the screen's open connections, as
+//! a lost guest connection would. The end of input or Ctrl-C stops the
+//! preview.
 
 use fictionet_observe::page::{BoxFuture, Duplex, Pty};
 use std::io;
@@ -15,7 +16,8 @@ use tokio::sync::mpsc;
 /// A command typed on a preview's standard input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// An empty line: run the in-world client's story again.
+    /// An empty line: run the in-world client's story again, where the
+    /// preview can.
     Again,
     /// `drop`: close the screen's open connections.
     Drop,
@@ -49,7 +51,7 @@ impl Input {
                 let Ok(line) = line else { break };
                 let Some(command) = Command::parse(&line) else {
                     eprintln!(
-                        "{line:?}: press Enter to run the client again, type drop to close \
+                        "{line:?}: press Enter to ask for the story again, type drop to close \
                          the screen's connections, or end the input to stop"
                     );
                     continue;

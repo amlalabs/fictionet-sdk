@@ -82,7 +82,7 @@ pub async fn run(spend: bool) -> Result {
                 world.stub.clone(),
                 "In-world client (scripted) · no VM",
             )?;
-            let client = machine(
+            let workstation = machine(
                 &cx,
                 attacher.attach("workstation")?,
                 "10.0.0.2".parse::<std::net::Ipv4Addr>()?,
@@ -104,7 +104,7 @@ pub async fn run(spend: bool) -> Result {
                 let result = async {
                     let client = Client {
                         cx: &cx,
-                        machine: &client,
+                        machine: &workstation,
                         world: &world,
                         searches: &searches,
                         page: &page_client,
@@ -216,7 +216,7 @@ const GOOGLE: &str = "https://www.google.com/search?q=";
 async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     let Client {
         cx,
-        machine: client,
+        machine,
         world,
         searches,
         page,
@@ -225,7 +225,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     let pause = || cx.sleep(Duration::from_secs(3));
     // Give viewers a chance to see the empty world before the first request.
     cx.sleep(Duration::from_secs(8)).await?;
-    fetch(cx, client, &search(GOOGLE, words), world.start).await?;
+    fetch(cx, machine, &search(GOOGLE, words), world.start).await?;
     pause().await?;
     let state = searches.snapshot();
     let first = state
@@ -238,7 +238,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         })
         .ok_or_else(|| fictionet::Error::msg("search returned no generated result"))?;
     let mut url = first.url.clone();
-    let mut html = fetch(cx, client, &url, world.start).await?;
+    let mut html = fetch(cx, machine, &url, world.start).await?;
     for _ in 0..2 {
         pause().await?;
         let state = searches.snapshot();
@@ -253,7 +253,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
             })
             .ok_or_else(|| fictionet::Error::msg("page has no unvisited link"))?;
         url = format!("https://{host}{path}");
-        html = fetch(cx, client, &url, world.start).await?;
+        html = fetch(cx, machine, &url, world.start).await?;
     }
     let opened = [
         search("https://www.bing.com/search?q=", words),
@@ -265,19 +265,19 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     ];
     for url in opened.iter().chain(seed.fixed.iter().map(|f| &f.url)) {
         pause().await?;
-        fetch(cx, client, url, world.start).await?;
+        fetch(cx, machine, url, world.start).await?;
     }
     pause().await?;
-    client
+    machine
         .lookup(cx, "10.0.0.1".parse()?, "wiki.corp", RecordType::A)
         .await?;
     println!("Scripted client asked for wiki.corp");
     pause().await?;
     generation(page, searches, false).await?;
     let new = format!("{words} new question");
-    fetch(cx, client, &search(GOOGLE, &new), world.start).await?;
+    fetch(cx, machine, &search(GOOGLE, &new), world.start).await?;
     pause().await?;
-    fetch(cx, client, &search(GOOGLE, words), world.start).await?;
+    fetch(cx, machine, &search(GOOGLE, words), world.start).await?;
     Ok(())
 }
 
@@ -310,7 +310,7 @@ async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> f
 async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     let Client {
         cx,
-        machine: client,
+        machine,
         world,
         searches,
         page,
@@ -322,7 +322,7 @@ async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     // above the stub's budget, so it only stops a story that cannot fail.
     for n in 1..=1_000 {
         let words = format!("{} question {n}", seed.search);
-        let (status, _) = get(cx, client, &search(GOOGLE, &words), world.start).await?;
+        let (status, _) = get(cx, machine, &search(GOOGLE, &words), world.start).await?;
         let failed = searches.snapshot().queries.iter().any(|q| {
             q.search == words
                 && matches!(
