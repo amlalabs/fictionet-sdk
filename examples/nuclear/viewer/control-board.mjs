@@ -8,10 +8,9 @@ import { look, walk, walkDelta, walkPath, glidePose } from './room-motion.mjs';
 import { createPlantScene, mergeStatic } from './plant-scene.mjs';
 import { createRenderer, createEnvironment, createLighting, createMaterial, applyMaterialPalette, setIndicator } from './look.mjs';
 
-const NEEDLE_SWEEP = 270 * Math.PI / 180;
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif";
 
-export function createControlBoard(container, { knobIds, knobLabels, theme, reducedMotion }) {
+export function createControlBoard(container, { knobIds, knobLabels, knobKinds, onDevice, theme, reducedMotion }) {
   const resources = new Set();
   const track = resource => { resources.add(resource); return resource; };
   const listeners = [];
@@ -116,8 +115,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
       mesh.receiveShadow = false;
       return mesh;
     });
-    const labels = paintedFace(BOARD.width, 0.16, group, [0, 0.88, 0.81], 0, 1600, 80);
-    return { ...face, config, labels, windows };
+    return { ...face, config, windows };
   });
   const meters = createMeters(THREE, scene, theme, { anisotropy: Math.min(4, renderer.capabilities.getMaxAnisotropy()) });
   const screens = [];
@@ -144,6 +142,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
   ];
   const plant = createPlantScene({ theme, reducedMotion, environment: environment.texture });
   const cctvTarget = track(new THREE.WebGLRenderTarget(480, 270, { type: THREE.HalfFloatType }));
+  track(cctvTarget.texture);
   cctvTarget.texture.colorSpace = THREE.LinearSRGBColorSpace;
   const cctvMat = track(new THREE.MeshBasicMaterial({ map: cctvTarget.texture }));
   block(staticRoom, [0.12, CCTV.height + 0.16, CCTV.width + 0.16], [CCTV.x - 0.01, CCTV.y, CCTV.z], material.ink);
@@ -151,23 +150,75 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
   cctvScreen.rotation.y = Math.PI / 2; cctvScreen.position.set(CCTV.x + 0.06, CCTV.y, CCTV.z); staticRoom.add(cctvScreen);
   mergeStatic(staticRoom, { add: track });
 
-  // The ordered operator controls occupy the three sloped desks.
-  const knobPoses = knobIds.map((id, i) => {
-    const b = BOARDS[Math.min(2, Math.floor(i * 3 / knobIds.length))];
+  // Device coordinates follow the sloped desk, with their fronts toward the operator.
+  const devices = knobIds.map((id, i) => {
+    const b = BOARDS[Math.floor(i * 3 / knobIds.length)];
     const first = Math.ceil(BOARDS.indexOf(b) * knobIds.length / 3);
     const count = Math.ceil((BOARDS.indexOf(b) + 1) * knobIds.length / 3) - first;
     const x = ((i - first + 0.5) / count - 0.5) * (BOARD.width - 0.4);
-    const p = boardPoint(b, x, BOARD.deskY + 0.075, 0.5);
-    return { position: [p.x, p.y, p.z], yaw: b.yaw };
+    const p = boardPoint(b, x, BOARD.deskY, BOARD.deskDepth / 2);
+    const frame = new THREE.Group();
+    frame.position.set(p.x, p.y, p.z); frame.rotation.set(BOARD.slope, b.yaw, 0, 'YXZ');
+    frame.translateY(0.065); frame.updateMatrix(); scene.add(frame);
+    const kind = knobKinds[i];
+    const label = paintedFace(0.8, 0.2, frame, [0, 0.117, 0.311], 0, 768, 192);
+    label.mesh.rotation.x = -0.22; label.mesh.userData.device = i;
+    const device = { id, kind, frame, label, index: i };
+    if (kind === 'dial' || kind === 'rotary') {
+      const size = kind === 'dial' ? 0.49 : 0.42;
+      device.skirt = paintedFace(size, size, frame, [0, 0.025, -0.02], 0, 512, 512);
+      device.skirt.mesh.rotation.x = -Math.PI / 2; device.skirt.mesh.userData.device = i;
+    }
+    return device;
   });
-  const knobBase = track(new THREE.CylinderGeometry(0.11, 0.12, 0.025, 16));
-  instance(knobBase, material.ink, knobPoses.map(p => ({ ...p, rotation: [0, p.yaw, 0] })));
-  const knobBodies = instance(track(new THREE.CylinderGeometry(0.075, 0.085, 0.07, 16)), material.metal, knobPoses);
-  const knobMarks = instance(unitBox, material.ink, knobPoses);
-  const knobLevers = instance(unitBox, material.ink, knobPoses);
-  const capGeometry = track(new THREE.CylinderGeometry(0.065, 0.075, 0.05, 16));
-  const knobCaps = instance(capGeometry, material.accent, knobPoses);
-  const litCaps = instance(capGeometry, material.lamp, knobPoses);
+  const cylinder = track(new THREE.CylinderGeometry(1, 1, 1, 32));
+  const statusMaterial = track(new THREE.MeshBasicMaterial({ color: theme.lightKey, toneMapped: false }));
+  const batches = [];
+  function batch(geometry, mat, entries) {
+    const mesh = instance(geometry, mat, entries.map(() => ({ position: [0, 0, 0] })));
+    mesh.castShadow = mat !== statusMaterial;
+    mesh.userData.devices = entries.map(e => e.device.index);
+    batches.push({ mesh, entries });
+    return mesh;
+  }
+  const entries = (filter, parts) => devices.filter(filter).flatMap(device => parts(device).map(part => ({ device, ...part })));
+  const all = () => true;
+  const turning = d => d.kind === 'dial' || d.kind === 'rotary';
+  const switches = d => d.kind === 'switch';
+  const buttons = d => d.kind === 'button';
+  batch(unitBox, material.metal, entries(all, () => [{ position: [0, 0.115, 0.30], rotation: [-0.22, 0, 0], scale: [0.82, 0.22, 0.018] }]));
+  batch(cylinder, material.metal, entries(all, d => [{ position: [0, 0.013, -0.02], scale: [turning(d) ? 0.25 : 0.14, 0.025, turning(d) ? 0.25 : 0.14] }]));
+  batch(cylinder, material.ink, entries(turning, d => [{ position: [0, 0.08, -0.02], scale: [d.kind === 'dial' ? 0.13 : 0.095, 0.11, d.kind === 'dial' ? 0.13 : 0.095] }]));
+  batch(unitBox, material.steel, entries(turning, () => [{ part: 'pointer' }]));
+  batch(cylinder, material.ink, entries(switches, () => [{ position: [0, 0.045, -0.02], scale: [0.08, 0.07, 0.08] }]));
+  batch(unitBox, material.ink, entries(switches, () => [{ part: 'grip' }, { part: 'heel' }]));
+  batch(unitBox, material.metal, entries(buttons, d => d.id === 'manual-trip' ? [] : [{ position: [0, 0.04, -0.02], scale: [0.22, 0.06, 0.22] }]));
+  const lenses = entries(switches, () => [-1, 1].map(side => ({ side, part: 'lamp', position: [side * 0.10, 0.036, -0.205], scale: [0.039, 0.024, 0.039] })));
+  batch(cylinder, material.metal, lenses.map(e => ({ ...e, part: null, scale: [0.05, 0.025, 0.05], position: [e.position[0], 0.015, e.position[2]] })));
+  batch(cylinder, statusMaterial, lenses);
+  batch(unitBox, statusMaterial, entries(buttons, d => d.id === 'manual-trip' ? [] : [{ part: 'button' }]));
+  const tripMaterial = track(createMaterial(THREE, theme, 'rubber', 'hotCoolant'));
+  batch(cylinder, material.metal, entries(d => d.id === 'manual-trip', () => [{ position: [0, 0.08, -0.02], scale: [0.045, 0.12, 0.045] }]));
+  batch(cylinder, tripMaterial, entries(d => d.id === 'manual-trip', () => [{ part: 'mushroom' }]));
+  batch(cylinder, statusMaterial, entries(all, () => [{ part: 'pending', position: [0.35, 0.117, 0.326], rotation: [Math.PI / 2 - 0.22, 0, 0], scale: [0.017, 0.015, 0.017] }]));
+  const trip = devices.find(d => d.id === 'manual-trip');
+  const cover = new THREE.Group();
+  const glass = track(createMaterial(THREE, theme, 'glass', 'steam', { transparent: true, opacity: 0.26, depthWrite: false, side: THREE.DoubleSide }));
+  glass.forceSinglePass = true;
+  block(cover, [0.32, 0.012, 0.35], [0, 0.205, 0.175], glass);
+  for (const x of [-0.16, 0.16]) block(cover, [0.009, 0.20, 0.35], [x, 0.10, 0.175], glass);
+  block(cover, [0.32, 0.20, 0.009], [0, 0.10, 0.35], glass);
+  // Thin rails and a hinge make the clear guard readable against the desk.
+  for (const x of [-0.16, 0.16]) block(cover, [0.012, 0.012, 0.35], [x, 0.212, 0.175], material.metal);
+  block(cover, [0.33, 0.012, 0.012], [0, 0.212, 0.35], material.metal);
+  block(cover, [0.36, 0.035, 0.035], [0, 0.01, 0], material.metal);
+  mergeStatic(cover, { add: track });
+  cover.position.set(0, 0.025, -0.19); trip.frame.add(cover);
+  cover.traverse(mesh => { if (mesh.isMesh) { mesh.userData.device = trip.index; mesh.userData.cover = true; } });
+  const localMatrix = new THREE.Matrix4();
+  const tint = new THREE.Color();
+  const raycaster = new THREE.Raycaster(), pointer = new THREE.Vector2();
+  let hovered = null, grabbed = null;
 
   let palette = theme, view = null, text = null, knobStates = [];
   let pose = { ...STANDING_SPOTS[DEFAULT_VIEW] }, selected = DEFAULT_VIEW, glide = null;
@@ -187,12 +238,13 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     plant.setTheme(next); meters.setTheme(next); themeDirty = true; plantDirty = true;
     boards.forEach(b => { b.signature = ''; }); screens.forEach(s => { s.signature = ''; });
     for (const sign of signs) paintSign(sign.face, sign.text);
-    boards.forEach((b, index) => {
-      const ctx = b.labels.canvas.getContext('2d'); ctx.fillStyle = palette.surface; ctx.fillRect(0, 0, 1600, 80);
-      const first = Math.ceil(index * knobIds.length / 3), end = Math.ceil((index + 1) * knobIds.length / 3);
-      for (let i = first; i < end; i++) paintText(ctx, knobLabels[i], { x: (i - first) * 1600 / (end - first), y: 0, w: 1600 / (end - first), h: 80, font: 24 }, palette.ink);
-      b.labels.texture.needsUpdate = true;
-    });
+    applyMaterialPalette(tripMaterial, palette); applyMaterialPalette(glass, palette);
+    // Instance colors carry the lamp palette without a material per lens.
+    statusMaterial.color.set(palette.lightKey);
+    for (const device of devices) {
+      device.label.signature = '';
+      if (device.skirt) paintSkirt(device);
+    }
   }
   function paintSign(face, label) {
     const ctx = face.canvas.getContext('2d'); ctx.fillStyle = palette.surface; ctx.fillRect(0, 0, face.canvas.width, face.canvas.height);
@@ -240,7 +292,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     camera.position.set(pose.x, ROOM.eye, pose.z); camera.rotation.set(pose.pitch, pose.yaw, 0, 'YXZ');
     const needlesMoving = !isPlant() && easeNeedles(dt);
     if (!isPlant()) { meters.update(view?.pairs ?? [], shown); paintBoards(now); paintScreens(now); }
-    placeKnobs();
+    placeKnobs(now);
     renderer.info.reset();
     if (isPlant() || now - lastCctv >= 200) {
       plantMoving = plant.advance(Math.min(0.25, (now - lastPlant) / 1000)); lastPlant = now;
@@ -256,7 +308,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     frameTimes.push(performance.now() - frameStart); if (frameTimes.length > 30) frameTimes.shift();
     const mean = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
     if (pixelRatio > 1 && frameTimes.length === 30 && mean > 20) { pixelRatio = 1; renderer.setPixelRatio(pixelRatio); resize(); }
-    const flashing = !reducedMotion() && view?.alarms.some(a => a.state === 'active');
+    const flashing = !reducedMotion() && (view?.alarms.some(a => a.state === 'active') || knobStates.some(s => s.pending || s.refusedUntil > now));
     if (glide || walking || needlesMoving || (isPlant() && plantMoving) || (!isPlant() && flashing)) {
       if (!raf) raf = requestAnimationFrame(frame);
     } else if (!isPlant()) {
@@ -330,25 +382,108 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
       screen.texture.needsUpdate = true;
     });
   }
-  function placeKnobs() {
-    const meshes = [knobBodies, knobMarks, knobLevers, knobCaps, litCaps];
-    knobPoses.forEach((p, i) => {
-      const state = knobStates[i] ?? { kind: 'switch', travel: 0 };
-      const dial = state.kind === 'dial' || state.kind === 'rotary';
-      for (let part = 0; part < meshes.length; part++) {
-        const lit = knobIds[i] === 'manual-trip' ? view?.reportedStatus.reactorTripped
-          : knobIds[i] === 'acknowledge' && view?.alarms.some(a => a.state === 'active');
-        const on = part < 2 ? dial : part === 2 ? state.kind === 'switch'
-          : state.kind === 'button' && (part === 4 ? lit : !lit);
-        dummy.position.set(...p.position); dummy.position.y += part === 1 ? 0.075 : 0.045;
-        dummy.rotation.set(0, p.yaw, 0); dummy.scale.setScalar(on ? 1 : 0);
-        if (part === 1 && on) { dummy.scale.set(0.014, 0.008, 0.065); dummy.rotation.y += Math.PI - ((state.fraction ?? 0) - 0.5) * NEEDLE_SWEEP; }
-        if (part === 2 && on) { dummy.scale.set(0.035, 0.12, 0.035); dummy.rotation.x = ((state.travel ?? 0) * 2 - 1) * -0.42; }
-        if (part >= 3) dummy.position.y -= (state.depth ?? 0) * 0.02;
-        dummy.updateMatrix(); meshes[part].setMatrixAt(i, dummy.matrix);
-      }
-    });
-    meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; m.computeBoundingSphere(); });
+  function paintSkirt(device) {
+    const ctx = device.skirt.canvas.getContext('2d');
+    ctx.fillStyle = palette.surface; ctx.fillRect(0, 0, 512, 512);
+    const sweep = device.kind === 'dial' ? 300 : 240;
+    const steps = device.kind === 'dial' ? 10 : 4;
+    ctx.strokeStyle = palette.ink; ctx.lineWidth = 3;
+    for (let i = 0; i <= steps; i++) {
+      const angle = (i / steps - 0.5) * sweep * Math.PI / 180;
+      const x = Math.sin(angle), y = -Math.cos(angle);
+      ctx.beginPath(); ctx.moveTo(256 + x * 178, 256 + y * 178); ctx.lineTo(256 + x * 195, 256 + y * 195); ctx.stroke();
+      paintText(ctx, String(i * 100 / steps), { x: 256 + x * 220 - 30, y: 256 + y * 220 - 16, w: 60, h: 32, font: 26 }, palette.ink);
+    }
+    paintText(ctx, '%', { x: 220, y: 390, w: 72, h: 38, font: 28 }, palette.ink);
+    device.skirt.texture.needsUpdate = true;
+  }
+
+  function placeKnobs(now) {
+    for (const { mesh, entries } of batches) {
+      entries.forEach((entry, i) => {
+        const { device, part } = entry, state = knobStates[device.index];
+        dummy.position.set(...(entry.position ?? [0, 0, 0]));
+        dummy.rotation.set(...(entry.rotation ?? [0, 0, 0])); dummy.scale.set(...(entry.scale ?? [1, 1, 1]));
+        let color = palette.lampOff;
+        if (part === 'pointer') {
+          const angle = ((state?.fraction ?? 0) - 0.5) * (state?.sweep ?? (device.kind === 'dial' ? 300 : 240)) * Math.PI / 180;
+          dummy.position.set(Math.sin(angle) * 0.052, 0.139, -0.02 - Math.cos(angle) * 0.052);
+          dummy.rotation.y = -angle; dummy.scale.set(0.016, 0.01, 0.10);
+        } else if (part === 'grip' || part === 'heel') {
+          const angle = ((state?.travel ?? 0) * 2 - 1) * 0.7;
+          const offset = part === 'heel' ? -0.025 : 0.035;
+          dummy.position.set(-Math.sin(angle) * offset, part === 'heel' ? 0.17 : 0.10, -0.02 + Math.cos(angle) * offset);
+          dummy.rotation.y = -angle;
+          dummy.scale.set(...(part === 'heel' ? [0.065, 0.05, 0.17] : [0.05, 0.13, 0.08]));
+        } else if (part === 'lamp') {
+          const lit = state && typeof state.green === 'boolean' && (entry.side === 1 ? state.green : !state.green);
+          color = lit ? (entry.side === 1 ? palette.controlGreen : palette.accent) : palette.lampOff;
+        } else if (part === 'button' || part === 'mushroom') {
+          dummy.position.set(0, (part === 'mushroom' ? 0.15 : 0.085) - (state?.depth ?? 0) * 0.035, -0.02);
+          dummy.scale.set(...(part === 'mushroom' ? [0.12, 0.065, 0.12] : [0.18, 0.045, 0.18]));
+          const lit = device.id === 'reset-trip' ? view?.reportedStatus.reactorTripped : view?.alarms.some(a => a.state === 'active');
+          color = lit ? palette.lampGlow : palette.lampOff;
+        } else if (part === 'pending') {
+          color = state?.pending && (reducedMotion() || Math.floor(now / 300) % 2 === 0) ? palette.lampGlow : palette.lampOff;
+        }
+        dummy.updateMatrix(); localMatrix.multiplyMatrices(device.frame.matrix, dummy.matrix); mesh.setMatrixAt(i, localMatrix);
+        if (mesh.material === statusMaterial) mesh.setColorAt(i, tint.set(color));
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    }
+    cover.rotation.x = knobStates[trip.index]?.cover?.open ? -1.35 : 0;
+    for (const device of devices) {
+      const state = knobStates[device.index];
+      const focused = state?.focused || hovered?.index === device.index || grabbed?.index === device.index;
+      const refused = state?.refusedUntil > now && (reducedMotion() || Math.floor(now / 250) % 2 === 0);
+      const detail = !state ? 'WAITING FOR SNAPSHOT' : device.kind === 'switch'
+        ? (state.mode ? 'MANUAL / AUTOMATIC' : 'OFF / ON')
+        : device.kind === 'button' ? device.id === 'manual-trip'
+          ? state.cover.open ? state.cover.fired ? 'CLOSE COVER TO REARM' : 'COVER OPEN · PRESS TO TRIP' : 'LIFT COVER TO ARM'
+          : device.id === 'reset-trip' ? 'RESET' : 'ACK'
+        : `${state.value}% SETPOINT`;
+      const signature = JSON.stringify([focused, refused, detail]);
+      if (device.label.signature === signature) continue;
+      device.label.signature = signature;
+      const ctx = device.label.canvas.getContext('2d');
+      const bg = refused ? palette.warning : focused ? palette.ink : palette.surface;
+      const fg = refused || focused ? palette.surface : palette.ink;
+      ctx.fillStyle = bg; ctx.fillRect(0, 0, 768, 192);
+      ctx.strokeStyle = fg; ctx.lineWidth = focused ? 9 : 3; ctx.strokeRect(6, 6, 756, 180);
+      paintText(ctx, knobLabels[device.index], { x: 16, y: 12, w: 690, h: 90, font: 44 }, fg);
+      paintText(ctx, detail, { x: 16, y: 108, w: 690, h: 66, font: 26 }, fg);
+      device.label.texture.needsUpdate = true;
+    }
+  }
+
+  function hitDevice(event) {
+    if (isPlant()) return null;
+    const rect = canvas.getBoundingClientRect();
+    pointer.set((event.clientX - rect.left) / rect.width * 2 - 1, 1 - (event.clientY - rect.top) / rect.height * 2);
+    scene.updateMatrixWorld(true); camera.updateMatrixWorld(true);
+    raycaster.setFromCamera(pointer, camera);
+    const hit = raycaster.intersectObjects(scene.children, true)[0];
+    if (!hit) return null;
+    const index = hit.object.userData.device ?? hit.object.userData.devices?.[hit.instanceId];
+    if (index === undefined) return null;
+    return { index, cover: Boolean(hit.object.userData.cover) };
+  }
+  function deviceSample(index, event) {
+    const rect = canvas.getBoundingClientRect();
+    const center = new THREE.Vector3(0, 0.08, -0.02);
+    devices[index].frame.localToWorld(center); center.project(camera);
+    const x = rect.left + (center.x + 1) * rect.width / 2;
+    const y = rect.top + (1 - center.y) * rect.height / 2;
+    return { angle: Math.atan2(event.clientY - y, event.clientX - x) * 180 / Math.PI, time: event.timeStamp };
+  }
+  function cancelGrab() {
+    if (!grabbed) return;
+    const active = grabbed; grabbed = null;
+    onDevice(knobIds[active.index], 'cancel');
+    if (canvas.hasPointerCapture?.(active.pointerId)) canvas.releasePointerCapture(active.pointerId);
+    canvas.style.cursor = '';
   }
   function paintText(ctx, value, box, color, align = 'center') {
     ctx.textAlign = align;
@@ -361,6 +496,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
 
   function setView(name) {
     if (!(name in STANDING_SPOTS) && name !== 'reactor' && name !== 'turbine') return;
+    cancelGrab(); hovered = null; canvas.style.cursor = '';
     selected = name; keys.clear(); dragging = false;
     if (document.pointerLockElement === canvas) document.exitPointerLock();
     if (isPlant()) { glide = null; plant.setView(name); }
@@ -377,26 +513,55 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
   }
   const walkingKeys = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
   listen(canvas, 'keydown', event => {
-    if (document.activeElement !== canvas || isPlant() || !walkingKeys.has(event.code) || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (document.activeElement !== canvas || grabbed || isPlant() || !walkingKeys.has(event.code) || event.ctrlKey || event.metaKey || event.altKey) return;
     event.preventDefault(); keys.add(event.code); glide = null; requestFrame();
   });
   listen(canvas, 'keyup', event => { if (keys.delete(event.code)) { event.preventDefault(); requestFrame(); } });
-  const stop = () => { keys.clear(); dragging = false; requestFrame(); };
+  const stop = () => { cancelGrab(); keys.clear(); dragging = false; requestFrame(); };
   listen(canvas, 'blur', stop); listen(window, 'blur', stop);
   listen(document, 'pointerlockchange', () => { if (document.pointerLockElement !== canvas) stop(); });
   listen(canvas, 'pointerdown', event => {
-    if (event.button !== 0 || isPlant()) return;
+    if (event.button !== 0 || isPlant() || grabbed) return;
+    const hit = hitDevice(event);
+    if (hit) {
+      if (document.pointerLockElement === canvas) document.exitPointerLock();
+      canvas.focus(); keys.clear(); glide = null; dragging = false;
+      if (hit.cover && knobStates[hit.index]?.cover?.open) {
+        onDevice(knobIds[hit.index], 'close'); requestFrame(); return;
+      }
+      if (onDevice(knobIds[hit.index], 'down', deviceSample(hit.index, event))) {
+        grabbed = { ...hit, pointerId: event.pointerId }; hovered = hit;
+        canvas.setPointerCapture?.(event.pointerId); canvas.style.cursor = 'grabbing';
+      }
+      requestFrame(); return;
+    }
     canvas.focus(); dragging = true; dragDistance = 0; pointerX = event.clientX; pointerY = event.clientY;
     canvas.setPointerCapture?.(event.pointerId); glide = null;
   });
   listen(document, 'pointermove', event => {
+    if (grabbed) {
+      if (event.pointerId === grabbed.pointerId) onDevice(knobIds[grabbed.index], 'move', deviceSample(grabbed.index, event));
+      requestFrame(); return;
+    }
     const locked = document.pointerLockElement === canvas;
+    if (!dragging && !locked && event.target === canvas) {
+      hovered = hitDevice(event);
+      canvas.style.cursor = hovered ? knobStates[hovered.index]?.disabled ? 'not-allowed' : 'grab' : '';
+      requestFrame();
+    }
     if ((!dragging && !locked) || isPlant()) return;
     const dx = locked ? event.movementX : event.clientX - pointerX, dy = locked ? event.movementY : event.clientY - pointerY;
     pointerX = event.clientX; pointerY = event.clientY; dragDistance += Math.abs(dx) + Math.abs(dy);
     pose = look(pose, dx, dy); requestFrame();
   });
   listen(canvas, 'pointerup', event => {
+    if (grabbed) {
+      if (event.pointerId !== grabbed.pointerId) return;
+      const active = grabbed; grabbed = null;
+      onDevice(knobIds[active.index], 'up', deviceSample(active.index, event));
+      if (canvas.hasPointerCapture?.(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      canvas.style.cursor = 'grab'; requestFrame(); return;
+    }
     if (!dragging) return;
     dragging = false;
     if (canvas.hasPointerCapture?.(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
@@ -406,6 +571,9 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     requestFrame();
   });
   listen(canvas, 'pointercancel', stop);
+  listen(canvas, 'lostpointercapture', cancelGrab);
+  listen(canvas, 'pointerleave', () => { if (!grabbed) { hovered = null; canvas.style.cursor = ''; requestFrame(); } });
+  listen(canvas, 'keydown', event => { if (event.key === 'Escape') stop(); });
   applyTheme(theme); resize(); setView(DEFAULT_VIEW);
   return {
     update(nextView, nextText, nextKnobs) { view = nextView; text = nextText; knobStates = nextKnobs; requestFrame(); },

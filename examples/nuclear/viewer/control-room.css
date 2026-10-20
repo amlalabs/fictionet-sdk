@@ -1,6 +1,7 @@
 /* The shared scene comes first. Text controls remain below it. */
 
 .cr-root {
+  --control-green: #268b50;
   container-type: inline-size;
   min-width: 0;
   background: var(--surface);
@@ -162,6 +163,34 @@
   display: grid;
   gap: 18px;
 }
+
+.cr-controls > summary {
+  min-height: 32px;
+  padding: 6px 0;
+  color: var(--ink);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cr-controls[open] > summary { margin-bottom: 12px; }
+
+.cr-cover-close {
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+.cr-knob[data-cover] .cr-push-cap { background: var(--coolant-hot); }
+.cr-knob[data-cover='closed'] .cr-push-cap { border: 5px double var(--ink); }
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .cr-root { --control-green: #69d496; }
+}
+
+:root[data-theme='dark'] .cr-root { --control-green: #69d496; }
 
 .cr-note {
   margin: 0 0 8px;
@@ -328,6 +357,14 @@
 }
 
 @media (forced-colors: active) {
+  :root .cr-root,
+  :root[data-theme] .cr-root,
+  :root:not([data-theme='light']) .cr-root {
+    --control-green: Highlight;
+    --coolant-hot: CanvasText;
+  }
+  .cr-knob[data-cover] .cr-push-cap { background: ButtonFace; }
+  .cr-cover-close { border-color: ButtonText; color: ButtonText; background: ButtonFace; }
   .cr-vantage,
   .cr-scene-status {
     border: 2px solid CanvasText;

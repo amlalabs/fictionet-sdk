@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   DIAL_SWEEP_DEG,
   ROTARY_SWEEP_DEG,
   advanceButton,
   advanceSwitch,
   coastDial,
+  coverState,
   createButton,
   createDial,
   createRotary,
@@ -17,6 +19,7 @@ import {
   plant,
   postCommand,
   pressButton,
+  pressCover,
   releaseButton,
   releaseDial,
   releaseRotary,
@@ -33,6 +36,44 @@ import {
 } from './knobs.mjs';
 
 const TENTHS = [0, 250, 500, 750, 1000];
+
+test('the first covered press opens the guard without a command', () => {
+  const closed = coverState();
+  const opened = pressCover(closed);
+  assert.deepEqual(closed, { open: false, fired: false });
+  assert.deepEqual(opened, { state: { open: true, fired: false }, command: null });
+});
+
+test('an open guard sends one manual trip until it closes', () => {
+  const opened = pressCover(coverState());
+  const pressed = pressCover(opened.state);
+  assert.equal(pressed.command, plant.manualTrip());
+  assert.deepEqual(pressed.state, { open: true, fired: true });
+  assert.equal(pressCover(pressed.state).command, null);
+  const reopened = pressCover(coverState());
+  assert.equal(reopened.command, null);
+  assert.equal(pressCover(reopened.state).command, plant.manualTrip());
+});
+
+test('control lamps contrast with unlit lenses in light and both dark palettes', () => {
+  const controls = readFileSync(new URL('./control-room.css', import.meta.url), 'utf8');
+  const viewer = readFileSync(new URL('./viewer.css', import.meta.url), 'utf8');
+  const green = [...controls.matchAll(/--control-green:\s*(#[\da-f]+);/g)].map(match => match[1]);
+  const red = [...viewer.matchAll(/--accent:\s*(#[\da-f]+);/g)].map(match => match[1]);
+  const off = [...viewer.matchAll(/--lamp-off:\s*(#[\da-f]+);/g)].map(match => match[1]);
+  const luminance = hex => hex.slice(1).match(/../g).map(value => parseInt(value, 16) / 255)
+    .map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
+    .reduce((sum, value, i) => sum + value * [0.2126, 0.7152, 0.0722][i], 0);
+  assert.equal(green.length, 3);
+  assert.equal(red.length, 3);
+  assert.equal(off.length, 3);
+  for (let i = 0; i < 3; i++) {
+    for (const lit of [green[i], red[i]]) {
+      assert.ok((luminance(lit) + 0.05) / (luminance(off[i]) + 0.05) >= 3);
+    }
+  }
+  assert.match(controls, /@media \(forced-colors: active\)[\s\S]*--control-green: Highlight;/);
+});
 
 test('a rotary with detents snaps to the nearest detent', () => {
   // Five detents over 240 degrees sit at 0, 60, 120, 180 and 240 degrees.

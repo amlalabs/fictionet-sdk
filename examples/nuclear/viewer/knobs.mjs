@@ -217,6 +217,18 @@ export function advanceButton(button, dt) {
   return { ...button, depth: clamp(depth, 0, 1) };
 }
 
+/** Closing the guard also rearms the next covered press. */
+export function coverState() {
+  return { open: false, fired: false };
+}
+
+/** Open first, then trip once. Another trip needs a closed guard first. */
+export function pressCover(state) {
+  if (!state.open) return { state: { open: true, fired: false }, command: null };
+  if (state.fired) return { state, command: null };
+  return { state: { open: true, fired: true }, command: plant.manualTrip() };
+}
+
 // Commands. Each builder returns the value a knob posts as `command`.
 
 /** Plant commands in the world's serde forms. */

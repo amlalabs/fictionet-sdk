@@ -15,6 +15,7 @@ import {
   advanceButton,
   advanceSwitch,
   coastDial,
+  coverState,
   createButton,
   createDial,
   createRotary,
@@ -24,6 +25,7 @@ import {
   faultCommand,
   hotLegCount,
   pressButton,
+  pressCover,
   plant,
   postCommand,
   releaseButton,
@@ -35,7 +37,6 @@ import {
   settleDial,
   switchAtRest,
   throwSwitch,
-  toggleSwitch,
   turnDial,
   turnRotary,
 } from './knobs.mjs';
@@ -115,6 +116,7 @@ const KNOBS = Object.freeze([
     label: 'Pressurizer heaters',
     channel: 'plant',
     setting: (value) => value.truth.primary.heaters_on,
+    indication: (value, view) => view.reportedStatus.pressurizerHeatersOn,
     command: (on) => plant.heaters(on),
     readout: (value, knob) => (knob.model.on ? 'On' : 'Off'),
   },
@@ -188,6 +190,7 @@ function pumpSwitch(id, label, loop) {
     label,
     channel: 'plant',
     setting: (value) => value.truth.primary.loops[loop === 'a' ? 0 : 1].pump_running,
+    indication: (value, view) => view.reportedStatus.coolantPumpsRunning[loop === 'a' ? 0 : 1],
     command: (on) => plant.pump({ coolant: loop }, on),
     readout: (value, knob) => (knob.model.on ? 'Running' : 'Stopped'),
   };
@@ -201,6 +204,8 @@ function controllerSwitch(id, label, controller, modeOf) {
     label,
     channel: 'plant',
     setting: (value) => modeOf(value) === 'manual',
+    indication: (value) => modeOf(value) === 'automatic',
+    mode: true,
     command: (manual) => plant.controller(controller, manual ? 'manual' : 'automatic'),
     readout: (value, knob) => (knob.model.on ? 'Manual' : 'Automatic'),
   };
@@ -304,15 +309,16 @@ export function mount(root, services, options = {}) {
   const controlStage = h('div', { class: 'cr-stage' });
   const viewport = h('section', { class: 'cr-view', 'aria-label': 'Views of the plant' }, controlStage,
     h('div', { class: 'cr-vantages', role: 'group', 'aria-label': 'Vantage point' }, ...vantageButtons), overlayStatus);
-  const walkHelp = h('p', { id: 'cr-walk-help', class: 'cr-note', text: 'Focus the scene to walk with WASD or arrow keys. Drag to look. Click to lock the pointer. Press Esc to release it.' });
+  const walkHelp = h('p', { id: 'cr-walk-help', class: 'cr-note', text: 'Focus the scene to walk with WASD or arrow keys. Drag a device to operate it. Drag empty space to look. Click empty space to lock the pointer. Press Esc to release it.' });
 
   const knobGroups = {
     plant: h('div', { class: 'cr-knob-grid' }),
     faults: h('div', { class: 'cr-knob-grid' }),
   };
   const controls = h(
-    'section',
+    'details',
     { class: 'cr-controls', 'aria-label': 'Knobs, switches and pushbuttons' },
+    h('summary', { text: 'Controls (text)' }),
     h(
       'div',
       { class: 'cr-group', role: 'group', 'aria-labelledby': 'cr-plant-title' },
@@ -356,6 +362,9 @@ export function mount(root, services, options = {}) {
     const ids = { name: `cr-knob-${spec.id}-name`, read: `cr-knob-${spec.id}-read`, status: `cr-knob-${spec.id}-status` };
     const knob = {
       spec,
+      cover: spec.id === 'manual-trip' ? coverState() : null,
+      focused: false,
+      refusedUntil: 0,
       model: initialModel(spec),
       pending: false,
       seq: 0,
@@ -411,6 +420,16 @@ export function mount(root, services, options = {}) {
       knob.root = h('div', { class: 'cr-knob', 'data-kind': 'button', 'data-group': spec.group }, knob.control, name, knob.statusEl);
       wireButton(knob);
     }
+    if (knob.cover) {
+      knob.closeCover = h('button', { type: 'button', class: 'cr-cover-close', text: 'Close trip cover', hidden: true });
+      knob.root.append(knob.closeCover);
+      listen(knob.closeCover, 'click', () => { deviceAction(spec.id, 'close'); knob.control.focus(); });
+      knob.statusEl.textContent = 'Cover closed. Press to open.';
+    }
+    listen(knob.root, 'focusin', () => { knob.focused = true; refreshBoard(); });
+    listen(knob.root, 'focusout', event => {
+      if (!knob.root.contains(event.relatedTarget)) { knob.focused = false; refreshBoard(); }
+    });
     return knob;
   }
 
@@ -426,7 +445,7 @@ export function mount(root, services, options = {}) {
     const { spec, model } = knob;
     if (spec.kind === 'dial' || spec.kind === 'rotary') {
       const fraction = model.angle / model.sweep;
-      knob.pointer.style.transform = `rotate(${-135 + 270 * fraction}deg)`;
+      knob.pointer.style.transform = `rotate(${(fraction - 0.5) * model.sweep}deg)`;
       const percent = spec.kind === 'dial' ? dialValue(model) : rotaryValue(model);
       knob.face.setAttribute('aria-valuenow', String(percent / 10));
       knob.face.setAttribute('aria-valuetext', spec.describe(percent));
@@ -440,10 +459,14 @@ export function mount(root, services, options = {}) {
     const blocked = disabledFor(knob) || (knob.pending && spec.kind !== 'dial' && spec.kind !== 'rotary');
     knob.control.setAttribute('aria-disabled', String(blocked));
     knob.root.dataset.pending = String(knob.pending);
+    if (knob.cover) {
+      knob.root.dataset.cover = knob.cover.open ? 'open' : 'closed';
+      knob.closeCover.hidden = !knob.cover.open;
+    }
   }
 
   function disabledFor(knob) {
-    if (knob.spec.channel === 'plant') return !options.command;
+    if (knob.spec.channel === 'plant') return !options.command || !latest;
     return !options.faults || latest === null;
   }
 
@@ -459,6 +482,7 @@ export function mount(root, services, options = {}) {
   function setOutcome(knob, outcome) {
     knob.statusEl.textContent = outcome?.text ?? '';
     knob.root.dataset.outcome = outcome?.state ?? '';
+    knob.refusedUntil = outcome?.state === 'refused' ? performance.now() + 1600 : 0;
   }
 
   // Each knob's model follows the plant when the user is not moving it.
@@ -486,49 +510,18 @@ export function mount(root, services, options = {}) {
       const c = center();
       return (Math.atan2(event.clientY - c.y, event.clientX - c.x) * 180) / Math.PI;
     };
-    listen(face, 'pointerdown', (event) => {
-      if (disabledFor(knob)) return;
+    listen(face, 'pointerdown', event => {
+      if (event.button !== 0 || disabledFor(knob)) return;
       face.setPointerCapture?.(event.pointerId);
-      knob.dragging = true;
-      knob.lastAngle = angleAt(event);
-      knob.trail = [{ t: event.timeStamp, deg: 0 }];
-      knob.releasedPending = false;
       face.focus();
+      deviceAction(knob.spec.id, 'down', { angle: angleAt(event), time: event.timeStamp });
     });
-    listen(face, 'pointermove', (event) => {
-      if (!knob.dragging) return;
-      const now = angleAt(event);
-      let delta = now - knob.lastAngle;
-      if (delta > 180) delta -= 360;
-      if (delta < -180) delta += 360;
-      knob.lastAngle = now;
-      const total = (knob.trail.at(-1)?.deg ?? 0) + delta;
-      knob.trail.push({ t: event.timeStamp, deg: total });
-      if (knob.trail.length > 12) knob.trail.shift();
-      knob.model = knob.spec.kind === 'dial' ? turnDial(knob.model, delta) : turnRotary(knob.model, delta);
-      paintKnob(knob);
-      refreshBoard();
+    listen(face, 'pointermove', event => deviceAction(knob.spec.id, 'move', { angle: angleAt(event), time: event.timeStamp }));
+    listen(face, 'pointerup', event => {
+      if (face.hasPointerCapture?.(event.pointerId)) face.releasePointerCapture(event.pointerId);
+      deviceAction(knob.spec.id, 'up', { time: event.timeStamp });
     });
-    const release = (event) => {
-      if (!knob.dragging) return;
-      knob.dragging = false;
-      face.releasePointerCapture?.(event.pointerId);
-      const velocity = flickVelocity(knob.trail);
-      if (knob.spec.kind === 'dial') {
-        knob.model = releaseDial(knob.model, velocity);
-        if (reducedMotion()) knob.model = settleDial(knob.model);
-        knob.releasedPending = true;
-        if (knob.model.velocity === 0) settleTurn(knob);
-        else requestTick();
-      } else {
-        knob.model = releaseRotary(knob.model);
-        settleTurn(knob);
-      }
-      paintKnob(knob);
-      refreshBoard();
-    };
-    listen(face, 'pointerup', release);
-    listen(face, 'pointercancel', release);
+    listen(face, 'pointercancel', () => deviceAction(knob.spec.id, 'cancel'));
     listen(face, 'keydown', (event) => onDialKey(knob, event));
   }
 
@@ -539,6 +532,7 @@ export function mount(root, services, options = {}) {
   function settleTurn(knob) {
     knob.releasedPending = false;
     const value = knob.spec.kind === 'dial' ? dialValue(knob.model) : rotaryValue(knob.model);
+    if (knob.spec.kind === 'dial') knob.model = setDial(knob.model, value);
     if (latest && value === plantValueOf(knob)) return;
     send(knob, knob.spec.command(value));
   }
@@ -571,6 +565,7 @@ export function mount(root, services, options = {}) {
       event.preventDefault();
       const next = setDial(knob.model, targets[event.key]);
       if (dialValue(next) === value) return;
+      knob.releasedPending = false;
       knob.model = next;
       paintKnob(knob);
       refreshBoard();
@@ -598,7 +593,7 @@ export function mount(root, services, options = {}) {
 
   function onSwitch(knob) {
     if (disabledFor(knob) || knob.pending) return;
-    knob.model = toggleSwitch(knob.model);
+    knob.model = throwSwitch(knob.model, !knob.model.on);
     if (reducedMotion()) knob.model = advanceSwitch(knob.model, Number.POSITIVE_INFINITY);
     paintKnob(knob);
     refreshBoard();
@@ -606,33 +601,91 @@ export function mount(root, services, options = {}) {
     send(knob, knob.spec.command(knob.model.on, latest?.view));
   }
 
+  function activateButton(knob, held = false) {
+    if (disabledFor(knob) || knob.pending) return;
+    let command = knob.spec.command();
+    if (knob.cover) {
+      const next = pressCover(knob.cover);
+      knob.cover = next.state;
+      command = next.command;
+      if (command === null) {
+        setOutcome(knob, { text: knob.cover.fired ? 'Close the cover to rearm.' : 'Cover open. Press again to trip.' });
+        paintKnob(knob); refreshBoard();
+        return;
+      }
+    }
+    knob.model = { ...pressButton(knob.model), depth: 1 };
+    if (!held) knob.model = releaseButton(knob.model);
+    if (reducedMotion()) knob.model = advanceButton(knob.model, Infinity);
+    paintKnob(knob); refreshBoard(); requestTick();
+    send(knob, command);
+  }
+
   function wireButton(knob) {
-    listen(knob.control, 'pointerdown', (event) => {
-      if (disabledFor(knob) || knob.pending) return;
+    listen(knob.control, 'pointerdown', event => {
+      if (event.button !== 0 || disabledFor(knob) || knob.pending || (knob.cover && (!knob.cover.open || knob.cover.fired))) return;
       knob.model = pressButton(knob.model);
-      paintKnob(knob);
-      refreshBoard();
-      requestTick();
+      if (reducedMotion()) knob.model = advanceButton(knob.model, Infinity);
+      paintKnob(knob); refreshBoard(); requestTick();
     });
-    const letGo = () => {
+    const release = () => {
       knob.model = releaseButton(knob.model);
-      if (reducedMotion()) knob.model = { ...knob.model, depth: 0 };
-      paintKnob(knob);
-      refreshBoard();
-      requestTick();
+      if (reducedMotion()) knob.model = advanceButton(knob.model, Infinity);
+      paintKnob(knob); refreshBoard(); requestTick();
     };
-    listen(knob.control, 'pointerup', letGo);
-    listen(knob.control, 'pointerleave', letGo);
-    listen(knob.control, 'click', () => {
-      if (disabledFor(knob) || knob.pending) return;
-      // A keyboard press has no pointer down, so the cap goes down here and springs back.
-      knob.model = releaseButton({ ...pressButton(knob.model), depth: 1 });
-      if (reducedMotion()) knob.model = { ...knob.model, depth: 0 };
-      paintKnob(knob);
-      refreshBoard();
-      requestTick();
-      send(knob, knob.spec.command());
-    });
+    listen(knob.control, 'pointerup', release);
+    listen(knob.control, 'pointerleave', release);
+    listen(knob.control, 'pointercancel', release);
+    listen(knob.control, 'click', () => activateButton(knob));
+  }
+
+  // Both input surfaces operate the same model and send path.
+  function deviceAction(id, action, sample = {}) {
+    const knob = knobs.get(id);
+    if (!knob) return false;
+    const { spec } = knob;
+    const turning = spec.kind === 'dial' || spec.kind === 'rotary';
+    if (action === 'close' && knob.cover) {
+      knob.cover = coverState();
+      setOutcome(knob, { text: 'Cover closed.' });
+    } else if (action === 'down') {
+      if (disabledFor(knob) || knob.pending) return false;
+      if (turning) {
+        knob.dragging = true; knob.lastAngle = sample.angle;
+        knob.trail = [{ t: sample.time, deg: 0 }]; knob.releasedPending = false;
+        if (spec.kind === 'dial') knob.model = releaseDial(knob.model, 0);
+      } else if (spec.kind === 'switch') onSwitch(knob);
+      else activateButton(knob, true);
+    } else if (action === 'move' && knob.dragging) {
+      let delta = sample.angle - knob.lastAngle;
+      if (delta > 180) delta -= 360;
+      if (delta < -180) delta += 360;
+      knob.lastAngle = sample.angle;
+      knob.trail.push({ t: sample.time, deg: (knob.trail.at(-1)?.deg ?? 0) + delta });
+      if (knob.trail.length > 12) knob.trail.shift();
+      knob.model = spec.kind === 'dial' ? turnDial(knob.model, delta) : turnRotary(knob.model, delta);
+    } else if (action === 'up' || action === 'cancel') {
+      if (turning && knob.dragging) {
+        knob.dragging = false;
+        if (action === 'cancel') {
+          knob.releasedPending = false;
+          if (spec.kind === 'dial') knob.model = releaseDial(knob.model, 0);
+          syncKnob(knob);
+        } else if (spec.kind === 'dial') {
+          knob.trail.push({ t: sample.time, deg: knob.trail.at(-1)?.deg ?? 0 });
+          knob.model = releaseDial(knob.model, flickVelocity(knob.trail));
+          if (reducedMotion()) knob.model = settleDial(knob.model);
+          knob.releasedPending = true;
+          if (knob.model.velocity === 0) settleTurn(knob);
+        } else {
+          knob.model = releaseRotary(knob.model);
+          settleTurn(knob);
+        }
+      } else if (spec.kind === 'button') knob.model = releaseButton(knob.model);
+    }
+    if (reducedMotion() && spec.kind === 'button') knob.model = advanceButton(knob.model, Infinity);
+    paintKnob(knob); paintReadout(knob); refreshBoard(); requestTick();
+    return true;
   }
 
   /** Posts one command for a knob and shows its pending state, then its reply. */
@@ -655,13 +708,17 @@ export function mount(root, services, options = {}) {
     knob.pending = true;
     setOutcome(knob, { state: 'pending', text: 'Sending…' });
     paintKnob(knob);
+    refreshBoard();
     const outcome = await postCommand(services.transport, path, body, { signal: controller.signal });
     if (disposed || seq !== knob.seq) return; // a newer turn owns the knob now
     knob.pending = false;
     setOutcome(knob, outcome);
     // An applied turn keeps the knob where the user put it until the next snapshot shows it.
     // A refused turn goes back to the plant's state now.
-    if (outcome.state === 'refused' || outcome.state === 'failed') syncKnob(knob);
+    if (outcome.state === 'refused' || outcome.state === 'failed') {
+      syncKnob(knob);
+      if (knob.spec.kind === 'switch') knob.model = advanceSwitch(knob.model, Infinity);
+    }
     paintKnob(knob);
     paintReadout(knob);
     refreshBoard();
@@ -693,11 +750,11 @@ export function mount(root, services, options = {}) {
     for (const knob of knobList) {
       const { spec } = knob;
       if (spec.kind === 'dial' && knob.model.velocity !== 0) {
-        knob.model = coastDial(knob.model, dt);
+        knob.model = reducedMotion() ? settleDial(knob.model) : coastDial(knob.model, dt);
       } else if (spec.kind === 'switch' && !switchAtRest(knob.model)) {
-        knob.model = advanceSwitch(knob.model, dt);
+        knob.model = advanceSwitch(knob.model, reducedMotion() ? Infinity : dt);
       } else if (spec.kind === 'button' && moving(knob)) {
-        knob.model = advanceButton(knob.model, dt);
+        knob.model = advanceButton(knob.model, reducedMotion() ? Infinity : dt);
       }
       if (moving(knob)) any = true;
       if (spec.kind === 'dial' && knob.releasedPending && knob.model.velocity === 0) settleTurn(knob);
@@ -762,9 +819,11 @@ export function mount(root, services, options = {}) {
     };
     const knobStates = knobList.filter(knob => knob.spec.group === 'plant').map((knob) => {
       const { model, spec } = knob;
-      if (spec.kind === 'dial' || spec.kind === 'rotary') return { kind: spec.kind, fraction: model.angle / model.sweep };
-      if (spec.kind === 'switch') return { kind: 'switch', travel: model.travel };
-      return { kind: 'button', depth: model.depth };
+      return { kind: spec.kind, fraction: model.angle / model.sweep, sweep: model.sweep,
+        travel: model.travel, depth: model.depth, cover: knob.cover, focused: knob.focused,
+        pending: knob.pending || knob.root.dataset.outcome === 'pending', refusedUntil: knob.refusedUntil,
+        disabled: disabledFor(knob), green: spec.indication?.(latest.value, view), mode: spec.mode,
+        value: spec.kind === 'dial' ? dialValue(model) / 10 : spec.kind === 'rotary' ? rotaryValue(model) / 10 : null };
     });
     return { view, text, knobStates };
   }
@@ -780,7 +839,7 @@ export function mount(root, services, options = {}) {
   function onTheme() {
     if (disposed) return;
     const colors = palette();
-    if (!paletteReady(colors)) return;
+    if (!paletteReady(colors) || !colors.controlGreen) return;
     board?.setTheme(colors);
     refreshBoard();
   }
@@ -813,7 +872,8 @@ export function mount(root, services, options = {}) {
     if (disposed || started) return;
     if (paletteRaf) cancelAnimationFrame(paletteRaf);
     paletteRaf = 0;
-    if (!paletteReady(palette())) {
+    const colors = palette();
+    if (!paletteReady(colors) || !colors.controlGreen) {
       if (paletteFrames++ < 300) paletteRaf = requestAnimationFrame(startViews);
       else for (const message of styleMessages) message.textContent = 'View colors could not load. Reload the page to try again.';
       return;
@@ -827,6 +887,8 @@ export function mount(root, services, options = {}) {
         board = createControlBoard(controlStage, {
           knobIds: KNOBS.filter(spec => spec.group === 'plant').map(spec => spec.id),
           knobLabels: KNOBS.filter(spec => spec.group === 'plant').map(spec => spec.label),
+          knobKinds: KNOBS.filter(spec => spec.group === 'plant').map(spec => spec.kind),
+          onDevice: deviceAction,
           theme: palette(),
           reducedMotion,
         });
@@ -899,7 +961,7 @@ function readPalette(root) {
   swatch.hidden = true;
   swatch.style.forcedColorAdjust = 'none';
   root.append(swatch);
-  for (const [name, token] of Object.entries(PALETTE_TOKENS)) {
+  for (const [name, token] of Object.entries({ ...PALETTE_TOKENS, controlGreen: '--control-green' })) {
     const color = style.getPropertyValue(token).trim();
     if (color && !color.startsWith('#')) {
       swatch.style.color = color;
