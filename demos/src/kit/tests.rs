@@ -729,3 +729,145 @@ fn desktop_readiness_commands_are_neutral() {
         );
     }
 }
+
+#[tokio::test]
+async fn rfb_pointer_update_waits_for_every_rectangle() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (client, mut server) = tokio::io::duplex(64);
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut banner = [0; 12];
+            server.read_exact(&mut banner).await.unwrap();
+            assert_eq!(&banner, b"RFB 003.008\n");
+            server.write_all(&[1, 1]).await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), 1);
+            server.write_all(&[0; 4]).await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), 1);
+            let mut init = [0; 24];
+            init[..4].copy_from_slice(&[0, 2, 0, 1]);
+            server.write_all(&init).await.unwrap();
+            let mut format = [0; 28];
+            server.read_exact(&mut format).await.unwrap();
+            assert_eq!(
+                format,
+                [
+                    0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0, 2, 0, 0,
+                    1, 0, 0, 0, 0
+                ]
+            );
+            let mut pointer = [0; 6];
+            server.read_exact(&mut pointer).await.unwrap();
+            assert_eq!(pointer, [5, 0, 0, 1, 0, 0]);
+            let mut request = [0; 10];
+            server.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [3, 0, 0, 0, 0, 0, 0, 2, 0, 1]);
+            // Send the first of two rectangles before allowing the reply to finish.
+            server
+                .write_all(&[0, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 255, 0])
+                .await
+                .unwrap();
+            sent.send(()).unwrap();
+            finishing.await.unwrap();
+            server
+                .write_all(&[0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 255, 0, 0])
+                .await
+                .unwrap();
+        });
+        let mut viewer = rfb::Viewer::handshake(client).await.unwrap();
+        assert_eq!(viewer.size(), (2, 1));
+        viewer.pointer(1, 0, 0).await.unwrap();
+        let update = viewer.update();
+        tokio::pin!(update);
+        tokio::select! {
+            biased;
+            result = &mut update => panic!("update completed before the reply: {result:?}"),
+            result = received => result.unwrap(),
+        }
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                update.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        finish.send(()).unwrap();
+        assert_eq!(update.await.unwrap(), vec![255, 0, 0, 0, 255, 0]);
+        peer.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn page_capture_reports_websocket_failure() {
+    use fictionet::stdlib::protocols::websocket;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let out = std::env::temp_dir().join(format!("{}.png", random_uuid()));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let url = format!(
+        "http://{}/#token={}",
+        listener.local_addr().unwrap(),
+        "a".repeat(64)
+    );
+    let peer = tokio::spawn(async move {
+        for path in [
+            "/api/bootstrap",
+            "/api/ticket",
+            "/ws/screen/workstation?ticket=abcd",
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert_eq!(head.split_whitespace().nth(1), Some(path));
+            let header = |name: &str| {
+                head.lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.trim())
+            };
+            let length = header("Content-Length").unwrap_or("0").parse().unwrap();
+            stream.read_exact(&mut vec![0; length]).await.unwrap();
+            match path {
+                "/api/bootstrap" => stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .unwrap(),
+                "/api/ticket" => {
+                    let body = r#"{"ticket":"abcd","session":"ef01"}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    let accept = websocket::accept_key(header("Sec-WebSocket-Key").unwrap());
+                    stream.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
+                    stream.write_all(b"\x82\x0cRFB 003.008\n").await.unwrap();
+                    let mut banner = [0; 18];
+                    stream.read_exact(&mut banner).await.unwrap();
+                    stream.write_all(b"\x88\x00").await.unwrap();
+                }
+            }
+        }
+    });
+    let error = rfb::capture_page(&url, "workstation", &out)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "page WebSocket closed: None");
+    peer.await.unwrap();
+    assert!(!out.exists());
+}

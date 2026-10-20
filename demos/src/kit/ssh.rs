@@ -145,12 +145,12 @@ impl Session {
             .request_pty(true, term, cols, rows, 0, 0, &[])
             .await
             .map_err(io::Error::other)?;
-        request_accepted(&mut channel).await?;
+        request_accepted(&mut channel, "pty-req").await?;
         channel
             .request_shell(true)
             .await
             .map_err(io::Error::other)?;
-        request_accepted(&mut channel).await?;
+        request_accepted(&mut channel, "shell").await?;
         Ok(Pty { channel })
     }
 
@@ -283,10 +283,25 @@ impl Pty {
     }
 }
 
-async fn request_accepted(channel: &mut russh::Channel<Msg>) -> io::Result<()> {
-    match channel.wait().await {
-        Some(russh::ChannelMsg::Success) => Ok(()),
-        _ => Err(io::Error::other("the guest refused the shell or PTY")),
+async fn request_accepted(channel: &mut russh::Channel<Msg>, request: &str) -> io::Result<()> {
+    while !request_reply(channel.wait().await, request)? {}
+    Ok(())
+}
+
+fn request_reply(message: Option<russh::ChannelMsg>, request: &str) -> io::Result<bool> {
+    match message {
+        Some(russh::ChannelMsg::Success) => Ok(true),
+        Some(russh::ChannelMsg::Failure) => {
+            Err(io::Error::other(format!("the guest refused {request}")))
+        }
+        // russh has already updated the write window. Keep waiting for the reply.
+        Some(russh::ChannelMsg::WindowAdjusted { .. }) => Ok(false),
+        Some(message) => Err(io::Error::other(format!(
+            "waiting for {request} reply: unexpected {message:?}"
+        ))),
+        None => Err(io::Error::other(format!(
+            "waiting for {request} reply: channel ended"
+        ))),
     }
 }
 

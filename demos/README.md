@@ -14,23 +14,52 @@ libraries into `observe/downloads/vendor/` at the repository root.
 
 ## Desktop
 
-`cargo xtask demo desktop` downloads the pinned files, builds the `desktop`
-binary in release mode and runs it on your machine. It needs KVM. It needs no
-QEMU, Docker or root. The world runs in the same process. The guest is
-Ubuntu's official 24.04 cloud image, never modified: each run writes its own
-qcow2 overlay and cloud-init seed. Cloud Hypervisor runs from a copy embedded
-in the binary.
+`cargo xtask demo desktop` downloads about 650 MB of pinned files on its first
+run, builds the `desktop` binary in release mode and runs it on your machine.
+It needs KVM, with no QEMU, Docker or root. The world runs in the same process.
+The guest is Ubuntu's official 24.04 cloud image, never modified: each run
+writes its own qcow2 overlay and cloud-init seed. Cloud Hypervisor runs from
+a copy embedded in the binary.
 
 At boot the guest installs Xfce, Mozilla's Firefox, Xvnc and two pinned coding
-agents, Claude Code and Codex, through the world's mirror. The demo reaches the
-guest over SSH from the world's jump host, and serves a noVNC page of its
-screen while it runs. It prints each check, powers the guest off, checks that
-no Cloud Hypervisor process or run directory is left, and ends with `every
-required check passed`. Screenshots go to `downloads/cloudimage/shots/`.
+agents, Claude Code and Codex, through the world's mirror. The printed page
+URL opens the live desktop and terminal over SSH, alongside packets, events,
+the map, left the box, containment checks, labels and exports. The Coding
+agents table stays empty until the gate runs both version commands, then
+shows the guest's version output and `installed` status. No model API is
+forwarded, and the page does not claim the agents performed a task.
+
+The gate checks the guest, trust store, browser, agent installations and page
+access controls. It tests terminal command output and pointer input with and
+without the screen lease, powers the guest off, and checks that no Cloud
+Hypervisor process or run directory is left. Success ends with `every required
+check passed`. The Chromium page screenshot is reported but is not required;
+the guest and page screen captures are required.
 
 The binary takes the downloads directory and, optionally, a Unix socket path.
 With the path, `fictionet observe --observation unix:PATH watch` follows the
-run from another terminal.
+same dashboard as the page from another terminal.
+
+## The page
+
+`Kit::page` takes a builder over the dashboard and declared hosts:
+`Page::new("Desktop", dashboard).host(hosts.take("workstation")).standard_panels()`.
+The kit installs one dashboard observer with startup packet capture, host
+status, containment probes and labels. The standard panels provide the
+screen, terminal, packets, events, map, left the box, containment, labels and
+export; `Page::table` adds a view over a world-owned `StateTopic`.
+
+The page binds to loopback and requires its per-run bearer token for data and
+commands, with exact Host and Origin checks.
+Consoles use short-lived, single-use WebSocket tickets obtained through the
+authenticated API, and screen input requires the host's input lease.
+Taking control claims browser input only; it does not pause an agent.
+
+Pinned noVNC and xterm.js files are embedded from `observe/downloads/vendor/`.
+Desktop screenshots go to `demos/downloads/cloudimage/shots/`:
+`guest-desktop.png` from the guest, `viewer-desktop.png` through the page's
+screen socket without taking input, and `page-desktop.png` from Chromium after
+the desktop paints.
 
 ## Artifactory
 
@@ -123,12 +152,28 @@ socket served by `fictionet_observe::serve`; attachments use the world socket.
 
 The shared `fictionet_demo::kit` boots one or more Ubuntu cloud guests with
 Cloud Hypervisor and a world in the same process. A binary in
-`src/bin/<name>/main.rs` declares its guests and the world startup function:
+`src/bin/<name>/main.rs` declares its guests, world and page:
 
 ```rust
+use fictionet_demo::kit::{self, Guest, Kit};
+use fictionet_observe::page::Page;
+
 let kit = Kit::new("office")
     .guest(Guest::ubuntu("workstation", "analyst").packages(&["curl"]))
-    .world(start_world);
+    .world(|cx, mut world| async move {
+        let mirror = world.mirror(&cx)?;
+        fictionet::stdlib::web::Sites::new(move |host: &str| match host {
+            "archive.ubuntu.com" | "security.ubuntu.com" =>
+                Some(fictionet::stdlib::web::Site::new(mirror.clone())),
+            _ => None,
+        })
+        .into_net()
+        .route(kit::JUMP, kit::jump_prefix())
+        .start(&cx, world.into_attachments())
+    })
+    .page(|dashboard, hosts| Page::new("Office", dashboard)
+        .host(hosts.take("workstation"))
+        .standard_panels());
 let run = kit.boot(downloads).await?;
 run.shutdown().await?;
 ```

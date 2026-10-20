@@ -64,6 +64,20 @@ assert!(replies[0].end);
 # Ok::<(), fictionet::Error>(())
 ```
 
+## Serve a page
+
+The `page` feature serves a loopback page directly from the run's
+`DashboardHandle`. Compose hosts and standard panels with `Page`, add tables
+over `StateTopic` values, and connect typed controls with `CommandPort`.
+Screen and terminal consoles share the page's bearer and single-use ticket
+boundary; browser screen input also needs a host lease. Browser libraries
+are pinned and embedded by `cargo xtask demo libraries`.
+
+The [builder example in `fictionet_observe::page`](src/page/mod.rs) is compiled
+by `cargo test --doc --all-features`. It shows hosts, state, tables, event
+filters, custom panels and typed controls. The default crate remains sans-I/O;
+only `native` and `page` add native I/O.
+
 ## Serve an external world
 
 With `native` on Unix, serve the handle on its own private socket. Keep the

@@ -281,7 +281,7 @@
 //!     .asset("plant/data.json", "application/json", b"{}".to_vec())
 //!     .workspace("Plant")
 //!     .control("Routing", commands, vec![Action {
-//!         label: "Bank".into(), command: serde_json::json!({"mode":"bank"}),
+//!         label: "Bank".into(), command: serde_json::json!({"mode":"bank","expected_revision":0}),
 //!     }])
 //!     .control_state(routing)
 //!     .bind_loopback(0).await?;
