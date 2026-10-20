@@ -85,22 +85,50 @@ pub async fn start(
     let pages = Arc::new(adaptive_web_world::pages::Pages::new(seed));
     let handler = adaptive_web_world::handler::Handler::new(&fcx, pages.clone());
     let model_cfg = z.server_config(&fcx, &["api.anthropic.com"], now_sys)?;
-    let model = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
-        Some(
-            models::anthropic(&fcx)?
-                .prices("claude-haiku-4-5-20251001", models::Prices::haiku_4_5()),
-        )
-    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
-        Some(
-            models::anthropic_via_openrouter(&fcx)?
-                .prices("anthropic/claude-haiku-4.5", models::Prices::haiku_4_5()),
-        )
+    let store = std::path::Path::new(".ax/credentials.redb");
+    let store = if store.exists() {
+        Some(models::oauth::Store::open(store)?)
     } else {
         None
-    }
-    .map(|model| model.search(pages).budget(models::Budget::new().calls(12)));
+    };
+    let oauth = if let Some(store) = store.as_ref()
+        && store.has_login(models::oauth::Login::Claude)?
+    {
+        Some(models::oauth::OAuth::new(
+            &fcx,
+            models::oauth::Login::Claude,
+            store.clone(),
+        )?)
+    } else {
+        None
+    };
+    let token_cfg = z.server_config(&fcx, &[models::oauth::Login::Claude.host()], now_sys)?;
+    let (model, name) = if let Some(oauth) = &oauth {
+        let model = models::Model::oauth(&fcx, oauth.clone()).await?;
+        world.seed_home_files(oauth.guest_files()?)?;
+        (Some(model), "claude-haiku-4-5-20251001")
+    } else if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        (Some(models::anthropic(&fcx)?), "claude-haiku-4-5-20251001")
+    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        (
+            Some(models::anthropic_via_openrouter(&fcx)?),
+            "anthropic/claude-haiku-4.5",
+        )
+    } else {
+        (None, "claude-haiku-4-5-20251001")
+    };
+    let model = model.map(|model| {
+        model
+            .search(pages)
+            .prices(name, models::Prices::haiku_4_5())
+            .budget(models::Budget::new().calls(12))
+    });
     if let Some(model) = &model {
         world.seed_env(model.guest_env())?;
+        world.seed_home_files([(
+            ".claude/settings.json",
+            serde_json::json!({"model":name}).to_string(),
+        )])?;
     }
     let controlled = model.clone();
     fcx.spawn(move |cx| async move {
@@ -134,6 +162,9 @@ pub async fn start(
         "api.anthropic.com" => model
             .clone()
             .map(|model| web::Site::new(model).tls(model_cfg.clone())),
+        "platform.claude.com" => oauth
+            .clone()
+            .map(|oauth| web::Site::new(oauth).tls(token_cfg.clone())),
         "packages.mozilla.org" => Some(web::Site::new(mirror.clone()).tls(mozilla_cfg.clone())),
         "downloads.claude.ai" => Some(web::Site::new(mirror.clone()).tls(claude_cfg.clone())),
         "releases.openai.com" => Some(web::Site::new(mirror.clone()).tls(openai_cfg.clone())),

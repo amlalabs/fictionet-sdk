@@ -319,12 +319,35 @@ pub struct World {
     attachments: Attachments,
     ca: Arc<Mutex<Option<(String, String)>>>,
     environment: Arc<Mutex<Vec<(String, String)>>>,
+    home_files: Arc<Mutex<Vec<(String, String)>>>,
     now_unix: i64,
     mirror: Option<mirror::Cache<fictionet::stdlib::web::Proxy>>,
     mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
 }
 
 impl World {
+    /// Installs private files relative to each guest user's home before login.
+    pub fn seed_home_files(
+        &mut self,
+        files: impl IntoIterator<Item = (&'static str, String)>,
+    ) -> fictionet::Result {
+        let files: Vec<_> = files
+            .into_iter()
+            .map(|(path, content)| (path.to_owned(), content))
+            .collect();
+        if files.iter().any(|(path, _)| {
+            path.is_empty()
+                || std::path::Path::new(path)
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        }) {
+            return Err(fictionet::Error::msg(
+                "Guest home file needs a relative path",
+            ));
+        }
+        self.home_files.lock().unwrap().extend(files);
+        Ok(())
+    }
     /// Installs environment values in each guest before its first login.
     /// Model sites supply placeholder credentials here.
     pub fn seed_env(
@@ -1067,10 +1090,12 @@ impl Run {
     {
         let ca = Arc::new(Mutex::new(None));
         let environment = Arc::new(Mutex::new(Vec::new()));
+        let home_files = Arc::new(Mutex::new(Vec::new()));
         let world = World {
             attachments: prepared.attachments,
             ca: ca.clone(),
             environment: environment.clone(),
+            home_files: home_files.clone(),
             mirror: None,
             mirror_addresses: prepared.mirror_addresses,
             now_unix: SystemTime::now()
@@ -1131,6 +1156,16 @@ impl Run {
             .map_err(io::Error::other)?
             .map_err(io::Error::other)?;
         self.jump = Some(Arc::new(jump));
+        for guest in &mut self.guests {
+            for (path, content) in home_files.lock().unwrap().iter() {
+                guest.guest.files.push(File {
+                    path: format!("/home/{}/{path}", guest.guest.user),
+                    mode: 0o600,
+                    content: content.clone(),
+                });
+            }
+            guest.guest.validate()?;
+        }
         let environment = environment.lock().unwrap();
         if !environment.is_empty() {
             let assignments = environment

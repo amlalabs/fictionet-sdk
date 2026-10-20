@@ -67,6 +67,11 @@ and search results as the browser. The checks run a real WebSearch for Halvard
 Gateway advisories and require a world search event. The World menu pauses calls
 or changes the default limit of twelve calls.
 
+A dedicated Claude login installed with `models::oauth::Store::put` in
+`.ax/credentials.redb` takes precedence over API keys. The world owns refresh and
+seeds only placeholders in the guest, with private file permissions. The desktop
+does not read the host’s Claude Code or Codex login files.
+
 The checks cover the guest's address and devices, the trust store, Firefox, the
 agents' own TLS clients, and the page's access controls. They type a command
 in the page terminal and move the pointer with and without the screen lease.

@@ -225,6 +225,10 @@ impl Store {
         self.wake[login.index()].notify_one();
         Ok(true)
     }
+    /// Whether the store contains a login, including one that must be renewed.
+    pub fn has_login(&self, login: Login) -> fictionet::Result<bool> {
+        Ok(self.row(login)?.tokens.is_some())
+    }
     /// Replaces a dedicated login and invalidates any refresh already in flight.
     pub fn put(&self, login: Login, tokens: Tokens) -> fictionet::Result<()> {
         self.change(login, None, Some(encoded(&tokens)), false)?;

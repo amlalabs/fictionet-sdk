@@ -485,18 +485,11 @@ async fn run_checks(
 
     page_checks(page_url, session, &mut failures).await;
 
-    let model = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
-        "claude-haiku-4-5-20251001"
-    } else {
-        "anthropic/claude-haiku-4.5"
-    };
     let task = guest_cmd(
         session,
-        &format!(
-            "cd /home/analyst && timeout 120 claude -p \
+        "cd /home/analyst && timeout 120 claude -p \
          'Create sum.py that prints 19 + 23, run it, and report the result.' \
-         --model {model} --max-turns 4 --allowedTools Bash,Write,Read < /dev/null 2>&1"
-        ),
+         --max-turns 4 --allowedTools Bash,Write,Read < /dev/null 2>&1",
     )
     .await?;
     failures.extend(
@@ -530,9 +523,9 @@ async fn run_checks(
         )
         .err(),
     );
-    let search = guest_cmd(session, &format!(
-        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --model {model} --max-turns 3 --allowedTools WebSearch,WebFetch --output-format stream-json --verbose < /dev/null 2>&1"
-    )).await?;
+    let search = guest_cmd(session,
+        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --max-turns 3 --allowedTools WebSearch,WebFetch --output-format stream-json --verbose < /dev/null 2>&1"
+    ).await?;
     if search.code != 0 {
         let mut cursor = 0;
         while let Some(event) = page
