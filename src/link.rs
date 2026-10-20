@@ -16,12 +16,13 @@ use crate::Packet;
 /// A pair counts its packets itself, as plain numbers under the lock it
 /// takes for each packet anyway, and the meter reads them through
 /// `counted`. An attachment counts in `counts`, with atomics.
-/// Registration assigns a run-scoped link id and installs a packet stream.
+/// Registration assigns a run-scoped link id. A tap installs a packet stream.
 /// Without an observer the link does not register. A handle shares this
 /// lightweight state, without retaining a topology graph.
 pub(crate) struct Meter {
     registration: Mutex<Option<Registration>>,
     packets: OnceLock<Arc<PacketStream>>,
+    tap: OnceLock<Arc<Mutex<Arc<str>>>>,
     /// What end `s` sent, for an attachment.
     #[cfg(feature = "std")]
     counts: [Count; 2],
@@ -37,12 +38,21 @@ pub(crate) struct PacketStream {
     observer: Arc<crate::events::Dispatch>,
     link: crate::events::LinkId,
     sequence: Mutex<u64>,
+    tap: Arc<Mutex<Arc<str>>>,
+    sandbox: Option<Arc<str>>,
 }
 
 impl PacketStream {
-    fn reference<'a>(&self, side: usize, packet: &'a Packet) -> crate::events::PacketRef<'a> {
+    fn reference<'a>(
+        &'a self,
+        tap: &'a str,
+        side: usize,
+        packet: &'a Packet,
+    ) -> crate::events::PacketRef<'a> {
         crate::events::PacketRef {
             link: self.link,
+            tap,
+            sandbox: self.sandbox.as_deref(),
             side: if side == 0 {
                 crate::events::Side::A
             } else {
@@ -55,14 +65,16 @@ impl PacketStream {
     }
 
     pub(crate) fn packet(&self, side: usize, packet: &Packet) -> Option<Publication<'_>> {
+        let tap = self.tap.lock().clone();
         self.observer
             .enabled(crate::events::Interest::Packet(
-                self.reference(side, packet),
+                self.reference(&tap, side, packet),
             ))
             .then(|| Publication {
                 stream: self,
                 sequence: self.sequence.lock(),
                 side,
+                tap,
             })
     }
 }
@@ -71,13 +83,15 @@ pub(crate) struct Publication<'a> {
     stream: &'a PacketStream,
     sequence: MutexGuard<'a, u64>,
     side: usize,
+    tap: Arc<str>,
 }
 
 impl Publication<'_> {
     pub(crate) fn publish(&mut self, packet: &Packet) {
-        self.stream
-            .observer
-            .packet(&mut self.sequence, self.stream.reference(self.side, packet));
+        self.stream.observer.packet(
+            &mut self.sequence,
+            self.stream.reference(&self.tap, self.side, packet),
+        );
     }
 }
 
@@ -107,6 +121,7 @@ impl Meter {
         Arc::new(Meter {
             registration: Mutex::new(None),
             packets: OnceLock::new(),
+            tap: OnceLock::new(),
             #[cfg(feature = "std")]
             counts: Default::default(),
             counted: OnceLock::new(),
@@ -129,7 +144,7 @@ impl Meter {
     pub(crate) fn register_current(self: &Arc<Self>) {
         crate::run::with_dispatch(|observer| {
             if let Some(observer) = observer {
-                self.register(observer);
+                self.register_tapped(observer);
             }
         });
     }
@@ -145,15 +160,6 @@ impl Meter {
             return;
         }
         let link = observer.next_link();
-        let packets = Arc::new(PacketStream {
-            observer: observer.clone(),
-            link,
-            sequence: Mutex::new(0),
-        });
-        assert!(self.packets.set(packets.clone()).is_ok());
-        if let Some(counted) = self.counted.get().and_then(Weak::upgrade) {
-            counted.observe_packets(packets);
-        }
         let sandbox = self.sandbox.get();
         let host = sandbox.map(|_| observer.next_host());
         *registration = Some(Registration {
@@ -183,13 +189,47 @@ impl Meter {
         });
     }
 
+    pub(crate) fn register_tapped(self: &Arc<Self>, observer: &Arc<crate::events::Dispatch>) {
+        self.register(observer);
+        if let Some(r) = self.registration.lock().as_ref()
+            && r.observer.run_id == observer.run_id
+            && !r.ended
+            && self.packets.get().is_none()
+            && let Some(tap) = self.tap.get()
+        {
+            self.install_packets(r, tap);
+            let name = tap.lock().clone();
+            r.observer.topology(crate::events::TopologyRef::LinkTap {
+                link: r.link,
+                name: &name,
+            });
+        }
+    }
+
+    fn install_packets(&self, r: &Registration, tap: &Arc<Mutex<Arc<str>>>) {
+        if self.packets.get().is_some() {
+            return;
+        }
+        let packets = Arc::new(PacketStream {
+            observer: r.observer.clone(),
+            link: r.link,
+            sequence: Mutex::new(0),
+            tap: tap.clone(),
+            sandbox: self.sandbox.get().cloned(),
+        });
+        assert!(self.packets.set(packets.clone()).is_ok());
+        if let Some(counted) = self.counted.get().and_then(Weak::upgrade) {
+            counted.observe_packets(packets);
+        }
+    }
+
     #[cold]
     pub(crate) fn owner(self: &Arc<Self>, fcx: &crate::Cx, side: usize, task: u64) {
         use crate::events::{Side, TaskId, TopologyRef};
         let Some(observer) = fcx.run.observer.shared() else {
             return;
         };
-        self.register(observer);
+        self.register_tapped(observer);
         let mut registration = self.registration.lock();
         if let Some(r) = registration.as_mut()
             && r.observer.run_id == fcx.run.observer.run_id
@@ -205,18 +245,24 @@ impl Meter {
         }
     }
 
-    pub(crate) fn label(self: &Arc<Self>, fcx: &crate::Cx, label: &str) {
-        let Some(observer) = fcx.run.observer.shared() else {
-            return;
-        };
-        self.register(observer);
-        if let Some(r) = self.registration.lock().as_ref()
-            && r.observer.run_id == fcx.run.observer.run_id
-            && !r.ended
+    pub(crate) fn tap(self: &Arc<Self>, fcx: &crate::Cx, name: &str) {
+        if let Some(observer) = fcx.run.observer.shared() {
+            self.register(observer);
+        }
+        let registration = self.registration.lock();
+        if let Some(r) = registration.as_ref()
+            && (r.observer.run_id != fcx.run.observer.run_id || r.ended)
         {
-            r.observer.topology(crate::events::TopologyRef::LinkLabel {
+            return;
+        }
+        let name: Arc<str> = name.into();
+        let tap = self.tap.get_or_init(|| Arc::new(Mutex::new(name.clone())));
+        *tap.lock() = name.clone();
+        if let Some(r) = registration.as_ref() {
+            self.install_packets(r, tap);
+            r.observer.topology(crate::events::TopologyRef::LinkTap {
                 link: r.link,
-                label,
+                name: &name,
             });
         }
     }
@@ -250,6 +296,8 @@ impl Meter {
             reason = "callers set the sandbox once, on a meter just made by Meter::new or pair_with_guard"
         )]
         let _ = self.sandbox.set(Arc::from(name));
+        self.tap
+            .get_or_init(|| Arc::new(Mutex::new(Arc::from(name))));
     }
 
     /// Uses `counted` as the source of link counters.
@@ -309,7 +357,7 @@ mod tests {
             crate::RunOptions::new(crate::Seed::from_u64(1)),
             |cx| async move {
                 let (mut a, mut b) = crate::pair();
-                a.link().unwrap().label(&cx, "link".into());
+                a = cx.tap("link", a);
                 a.send(crate::Packet(vec![1]));
                 b.recv(&cx).await?;
                 assert!(a.meter().registration.lock().is_none());
@@ -331,7 +379,7 @@ mod tests {
     struct Link {
         creator: u64,
         owners: [u64; 2],
-        label: Option<String>,
+        tap: Option<String>,
     }
 
     impl crate::events::Observer for Topology {
@@ -377,8 +425,8 @@ mod tests {
                     self.links.lock().get_mut(&link).unwrap().owners
                         [usize::from(side == Side::B)] = task.get();
                 }
-                Observation::Topology(TopologyRef::LinkLabel { link, label }) => {
-                    self.links.lock().get_mut(&link).unwrap().label = Some(label.into());
+                Observation::Topology(TopologyRef::LinkTap { link, name }) => {
+                    self.links.lock().get_mut(&link).unwrap().tap = Some(name.into());
                 }
                 _ => {}
             }
@@ -465,7 +513,7 @@ mod tests {
                         let (mut c, mut d) = crate::pair();
                         c.send(Packet(vec![3]));
                         d.recv(&foreign).await?;
-                        d.link().unwrap().label(&foreign, "foreign".into());
+                        let _d = foreign.tap("foreign", d);
                         Ok(())
                     },
                 )
@@ -478,13 +526,13 @@ mod tests {
         let link = links.values().next().unwrap();
         assert_eq!(link.owners, [0, 1]);
         assert_eq!(link.creator, 1);
-        assert!(link.label.is_none());
+        assert!(link.tap.is_none());
         let links = inner.links.lock();
         assert_eq!(links.len(), 1);
         let link = links.values().next().unwrap();
         assert_eq!(link.owners, [0, 0]);
         assert_eq!(link.creator, 1);
-        assert!(link.label.is_none());
+        assert!(link.tap.is_none());
     }
 
     /// Pairs count their packets in every run.

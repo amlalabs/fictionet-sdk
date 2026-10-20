@@ -105,7 +105,7 @@ struct Direction {
     /// Packets and bytes put into this queue, published to the observer.
     packets: u64,
     bytes: u64,
-    /// The packet stream after the link registers with the run's observer.
+    /// The packet stream after the link is tapped.
     observation: Option<Arc<crate::link::PacketStream>>,
 }
 
@@ -166,7 +166,7 @@ impl Interface for End {
         let waker = {
             let mut dir = self.cable.dirs[1 - self.side].lock();
             if self.packets.is_none() && dir.observation.is_some() {
-                // The link registered with a run after this end was made.
+                // The link was tapped after this end was made.
                 self.packets = dir.observation.clone();
                 drop(dir);
                 return self.send(packet);
@@ -329,6 +329,8 @@ pub(crate) mod tests {
     pub(crate) struct Captured {
         pub(crate) stamp: Stamp,
         pub(crate) side: Side,
+        pub(crate) tap: String,
+        pub(crate) sandbox: Option<String>,
         pub(crate) bytes: Vec<u8>,
     }
 
@@ -338,6 +340,7 @@ pub(crate) mod tests {
         pub(crate) packets: Mutex<Vec<Captured>>,
         events: Mutex<Vec<Stamp>>,
         links: Mutex<Vec<(LinkId, LinkCounters)>>,
+        taps: Mutex<Vec<(LinkId, String)>>,
     }
 
     impl PacketSink {
@@ -348,6 +351,7 @@ pub(crate) mod tests {
                 packets: Mutex::new(Vec::new()),
                 events: Mutex::new(Vec::new()),
                 links: Mutex::new(Vec::new()),
+                taps: Mutex::new(Vec::new()),
             }
         }
     }
@@ -371,12 +375,17 @@ pub(crate) mod tests {
                     self.packets.lock().push(Captured {
                         stamp,
                         side: packet.side,
+                        tap: packet.tap.into(),
+                        sandbox: packet.sandbox.map(str::to_owned),
                         bytes: packet.bytes.to_vec(),
                     });
                 }
                 Observation::Event(_) => self.events.lock().push(stamp),
                 Observation::Topology(TopologyRef::LinkAdded { link, counters, .. }) => {
                     self.links.lock().push((link, counters))
+                }
+                Observation::Topology(TopologyRef::LinkTap { link, name }) => {
+                    self.taps.lock().push((link, name.into()));
                 }
                 Observation::Topology(_) => {}
                 Observation::TlsKey(_) => panic!("unexpected TLS key"),
@@ -394,6 +403,8 @@ pub(crate) mod tests {
                 |cx| async move {
                     let (mut a, mut b) = pair_with_limit(PACKET_COST + 3);
                     let (mut c, d) = pair();
+                    a = cx.tap("first", a);
+                    c = cx.tap("second", c);
                     cx.emit("test", "before", |event| event);
                     a.send(Packet(vec![1, 2, 3]));
                     a.send(Packet(vec![9]));
@@ -450,12 +461,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn registering_one_end_observes_crossings_from_the_other() {
+    fn tapping_one_end_observes_crossings_from_the_other() {
         let (mut a, mut b) = pair();
         let sink = Arc::new(PacketSink::new(true, false));
         block_on(crate::lab(
             crate::RunOptions::new(crate::Seed::from_u64(1)).observer(sink.clone()),
             |cx| async move {
+                b = cx.tap("pair", b);
                 assert!(
                     b.poll_recv(&cx, &mut Context::from_waker(Waker::noop()))
                         .is_pending()
@@ -479,6 +491,7 @@ pub(crate) mod tests {
             crate::RunOptions::new(crate::Seed::from_u64(1)).observer(observer.clone()),
             |cx| async move {
                 let (mut a, _b) = pair();
+                a = cx.tap("pair", a);
                 for (i, enabled) in [false, true, false, true].into_iter().enumerate() {
                     observer.enabled.store(enabled, Ordering::Relaxed);
                     a.send(Packet(vec![u8::try_from(i).unwrap()]));
@@ -524,6 +537,7 @@ pub(crate) mod tests {
             crate::RunOptions::new(crate::Seed::from_u64(1)).observer(sink.clone()),
             |cx| async move {
                 let (mut a, mut b) = pair();
+                a = cx.tap("pair", a);
                 for byte in 1..=6 {
                     let reads = cx.run.environment.clock.reads.load(Ordering::Relaxed);
                     a.send(Packet(vec![byte]));
@@ -562,8 +576,9 @@ pub(crate) mod tests {
         let sink = Arc::new(ClosePeer(Mutex::new(None)));
         block_on(crate::lab(
             crate::RunOptions::new(crate::Seed::from_u64(1)).observer(sink.clone()),
-            |_| async move {
+            |cx| async move {
                 let (mut a, b) = pair();
+                a = cx.tap("pair", a);
                 *sink.0.lock() = Some(b);
                 a.send(Packet(vec![1]));
                 assert_eq!(a.meter().totals(), [1, 1, 0, 0]);
@@ -579,8 +594,9 @@ pub(crate) mod tests {
         let sink = Arc::new(PacketSink::new(true, false));
         block_on(crate::lab(
             crate::RunOptions::new(crate::Seed::from_u64(1)).observer(sink.clone()),
-            |_| async move {
+            |cx| async move {
                 let (mut a, mut b) = pair();
+                a = cx.tap("pair", a);
                 std::thread::scope(|scope| {
                     let a = scope.spawn(|| {
                         for i in 0..100 {
@@ -615,6 +631,129 @@ pub(crate) mod tests {
                     .map(|p| p.bytes[0])
                     .collect::<Vec<_>>(),
                 (0..100).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn an_untapped_pair_never_calls_the_observer() {
+        struct NoPackets;
+        impl Observer for NoPackets {
+            fn enabled(&self, interest: Interest<'_>) -> bool {
+                assert!(!matches!(interest, Interest::Packet(_)));
+                matches!(interest, Interest::Topology(_))
+            }
+            fn observe(&self, _: Stamp, item: Observation<'_>) {
+                assert!(!matches!(item, Observation::Packet(_)));
+            }
+        }
+        block_on(crate::lab(
+            crate::RunOptions::new(crate::Seed::from_u64(1)).observer(Arc::new(NoPackets)),
+            |cx| async move {
+                let (mut a, mut b) = pair();
+                assert!(a.meter().link_id().is_some());
+                let reads = cx.run.environment.clock.reads.load(Ordering::Relaxed);
+                a.send(Packet(vec![1]));
+                b.send(Packet(vec![2]));
+                assert_eq!(
+                    cx.run.environment.clock.reads.load(Ordering::Relaxed),
+                    reads
+                );
+                assert_eq!(a.recv(&cx).await?, Packet(vec![2]));
+                assert_eq!(b.recv(&cx).await?, Packet(vec![1]));
+                assert_eq!(a.meter().totals(), [1, 1, 1, 1]);
+                assert!(a.packets.is_none());
+                assert!(b.packets.is_none());
+                assert!(a.meter().packets().is_none());
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_tap_names_the_stream_and_renames_it() {
+        let sink = Arc::new(PacketSink::new(true, true));
+        block_on(crate::lab(
+            crate::RunOptions::new(crate::Seed::from_u64(1)).observer(sink.clone()),
+            |cx| async move {
+                let (mut a, mut b) = pair();
+                a.send(Packet(vec![0]));
+                a = cx.tap("first", a);
+                a.send(Packet(vec![1]));
+                b = cx.tap("second", b);
+                b.send(Packet(vec![2]));
+                a.send(Packet(vec![3]));
+                assert_eq!(a.meter().totals(), [3, 3, 1, 1]);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let links = sink.links.lock();
+        assert_eq!(links.len(), 1);
+        let link = links[0].0;
+        assert_eq!(
+            *sink.taps.lock(),
+            [(link, "first".into()), (link, "second".into())]
+        );
+        let packets = sink.packets.lock();
+        assert_eq!(
+            packets
+                .iter()
+                .map(|p| (p.stamp.seq, p.tap.as_str(), p.side, p.bytes[0]))
+                .collect::<Vec<_>>(),
+            [
+                (1, "first", Side::A, 1),
+                (2, "second", Side::B, 2),
+                (3, "second", Side::A, 3)
+            ]
+        );
+        assert!(
+            packets
+                .iter()
+                .all(|p| p.stamp.stream == Stream::Packets(link) && p.sandbox.is_none())
+        );
+    }
+
+    #[test]
+    fn an_attachment_is_tapped_by_its_sandbox_name() {
+        for attach_in_run in [false, true] {
+            let sink = Arc::new(PacketSink::new(true, true));
+            let (attacher, mut attachments) = crate::attachments();
+            let sandbox = (!attach_in_run).then(|| attacher.attach("guest").unwrap());
+            block_on(crate::lab(
+                crate::RunOptions::new(crate::Seed::from_u64(1)).observer(sink.clone()),
+                |cx| async move {
+                    let mut sandbox = sandbox.unwrap_or_else(|| attacher.attach("guest").unwrap());
+                    let mut attachment = attachments.next(&cx).await?;
+                    sandbox.send(Packet(vec![1]));
+                    assert_eq!(attachment.recv(&cx).await?, Packet(vec![1]));
+                    attachment.send(Packet(vec![2]));
+                    assert_eq!(sandbox.recv(&cx).await?, Packet(vec![2]));
+                    attachment = cx.tap("uplink", attachment);
+                    sandbox.send(Packet(vec![3]));
+                    assert_eq!(attachment.recv(&cx).await?, Packet(vec![3]));
+                    Ok(())
+                },
+            ))
+            .unwrap();
+            let packets = sink.packets.lock();
+            assert_eq!(
+                packets
+                    .iter()
+                    .map(|p| (p.stamp.seq, p.tap.as_str(), p.sandbox.as_deref(), p.side))
+                    .collect::<Vec<_>>(),
+                [
+                    (1, "guest", Some("guest"), Side::B),
+                    (2, "guest", Some("guest"), Side::A),
+                    (3, "uplink", Some("guest"), Side::B)
+                ]
+            );
+            let links = sink.links.lock();
+            assert_eq!(links.len(), 1);
+            assert_eq!(
+                *sink.taps.lock(),
+                [(links[0].0, "guest".into()), (links[0].0, "uplink".into())]
             );
         }
     }

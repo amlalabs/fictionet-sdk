@@ -31,8 +31,8 @@ where
 async fn links(cx: &Cx, handle: &DashboardHandle, count: usize) -> (Vec<fictionet::End>, Vec<u64>) {
     let mut ends = Vec::new();
     for _ in 0..count {
-        let (a, b) = fictionet::pair();
-        a.link().unwrap().label(cx, "test".into());
+        let (mut a, b) = fictionet::pair();
+        a = cx.tap("test", a);
         ends.extend([a, b]);
     }
     cx.yield_now().await.unwrap();

@@ -140,10 +140,7 @@ fn current(graph: &DashboardHandle) -> View {
                 .str("id", &id.to_string())
                 .str("a", &a.to_string())
                 .str("b", &b)
-                .opt_str(
-                    "label",
-                    (!link.label.is_empty()).then_some(link.label.as_str()),
-                )
+                .opt_str("label", (!link.tap.is_empty()).then_some(link.tap.as_str()))
                 .done(),
         );
         let [a, b] = link.counters.totals();
@@ -713,7 +710,7 @@ mod tests {
                 assert!(data.contains(r#""id":"t1","kind":"world""#), "{data}");
                 assert!(changes(&handle, &mut view, None).is_empty());
                 let (mut a, mut b) = fictionet::pair();
-                a.link().unwrap().label(&cx, "pair".into());
+                a = cx.tap("pair", a);
                 let worker = cx.spawn_as(
                     || "delay",
                     move |cx| async move {
@@ -821,7 +818,7 @@ mod tests {
             fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(graph.0.clone()),
             move |cx| async move {
                 let (mut a, mut b) = fictionet::pair();
-                a.link().unwrap().label(&cx, "pair".into());
+                a = cx.tap("pair", a);
                 let worker = cx.spawn(move |cx| async move {
                     b.send(Packet(vec![0; 32]));
                     cx.cancelled().await;
@@ -842,14 +839,14 @@ mod tests {
                 let (mut view, _) = snapshot(&graph, None, None);
                 topology(
                     &graph,
-                    TopologyRef::LinkLabel {
+                    TopologyRef::LinkTap {
                         link: id,
-                        label: "link label",
+                        name: "link tap",
                     },
                 );
                 let update = changes(&graph, &mut view, None);
                 assert_eq!(names(&update), ["edge", "status"]);
-                assert!(update[0].1.contains("link label"));
+                assert!(update[0].1.contains("link tap"));
                 assert!(changes(&graph, &mut view, None).is_empty());
                 a.send(Packet(vec![0; 32]));
                 assert_eq!(names(&changes(&graph, &mut view, None)), ["counters"]);

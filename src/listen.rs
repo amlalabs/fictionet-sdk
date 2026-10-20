@@ -939,6 +939,11 @@ mod tests {
         .unwrap();
         let packets = sink.packets.lock();
         assert_eq!(packets.len(), 2);
+        assert!(
+            packets
+                .iter()
+                .all(|p| p.tap == "agent" && p.sandbox.as_deref() == Some("agent"))
+        );
         assert_eq!(
             (packets[0].stamp.seq, packets[0].side, &packets[0].bytes),
             (1, Side::B, &vec![1, 2, 3])

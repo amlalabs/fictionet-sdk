@@ -13,7 +13,7 @@ fn with_link(
         RunOptions::new(Seed::from_u64(3)).observer(collector.clone()),
         move |cx| async move {
             let (mut a, _b) = fictionet::pair();
-            a.link().unwrap().label(&cx, "test".into());
+            a = cx.tap("test", a);
             cx.yield_now().await?;
             let id = *reader.topology().links.keys().next().unwrap();
             test(reader, id);
@@ -34,6 +34,8 @@ fn packet(collector: &Collector, link: LinkId, seq: u64, at: Instant, bytes: &[u
         },
         Observation::Packet(PacketRef {
             link,
+            tap: "test",
+            sandbox: None,
             side: Side::A,
             len: bytes.len(),
             link_type: LinkType::Ip,
@@ -181,6 +183,8 @@ fn capture_follows_policy_and_reference_counted_demand() {
             move |collector, link| {
                 let interest = Interest::Packet(PacketRef {
                     link,
+                    tap: "test",
+                    sandbox: None,
                     side: Side::A,
                     len: 1,
                     bytes: &[0],
@@ -219,8 +223,8 @@ fn aggregate_budget_evicts_the_oldest_copy_across_links() {
         move |cx| async move {
             let (a, _b) = fictionet::pair();
             let (c, _d) = fictionet::pair();
-            a.link().unwrap().label(&cx, "a".into());
-            c.link().unwrap().label(&cx, "b".into());
+            let _a = cx.tap("a", a);
+            let _c = cx.tap("b", c);
             cx.yield_now().await?;
             let links: Vec<_> = reader.topology().links.keys().copied().collect();
             packet(&reader, links[0], 1, Instant::ZERO, &[0; 3]);
@@ -360,7 +364,7 @@ fn world_snapshot() -> (String, Vec<PacketCopy>) {
             let group = cx.group("network");
             let host = group.host("machine");
             let (mut a, mut b) = fictionet::pair();
-            a.link().unwrap().label(&cx, "uplink".into());
+            a = cx.tap("uplink", a);
             let observed = reader.clone();
             let task = host.spawn(move |cx| async move {
                 let packet = b.recv(&cx).await?;
@@ -375,7 +379,7 @@ fn world_snapshot() -> (String, Vec<PacketCopy>) {
                 let link = *snapshot
                     .links
                     .iter()
-                    .find(|(_, link)| link.label == "uplink")
+                    .find(|(_, link)| link.tap == "uplink")
                     .unwrap()
                     .0;
                 assert_eq!(
@@ -530,7 +534,7 @@ fn topology_byte_bounds_and_missing_references_are_counted() {
         move |cx| async move {
             let host = cx.host("machine");
             let (a, _b) = fictionet::pair();
-            a.link().unwrap().label(&cx, "label".into());
+            let _a = cx.tap("label", a);
             cx.yield_now().await?;
             let snapshot = reader.topology();
             assert!(snapshot.tasks.is_empty());
@@ -593,6 +597,8 @@ fn packet_interest_does_not_take_the_collector_lock() {
             let _state = collector.state.lock();
             assert!(collector.enabled(Interest::Packet(PacketRef {
                 link,
+                tap: "test",
+                sandbox: None,
                 side: Side::A,
                 len: 1,
                 bytes: &[0],
@@ -737,8 +743,8 @@ fn startup_capture_accepts_packets_before_out_of_order_registration() {
         move |cx| async move {
             let (a, _b) = fictionet::pair();
             let (c, _d) = fictionet::pair();
-            a.link().unwrap().label(&cx, "first".into());
-            c.link().unwrap().label(&cx, "second".into());
+            let _a = cx.tap("first", a);
+            let _c = cx.tap("second", c);
             cx.yield_now().await?;
             let snapshot = reader.topology();
             let links: Vec<_> = snapshot.links.iter().collect();
@@ -786,9 +792,9 @@ fn removed_captures_stay_readable_and_evict_before_active_captures() {
         RunOptions::new(Seed::from_u64(7)).observer(collector),
         move |cx| async move {
             let (a, _b) = fictionet::pair();
-            let (c, d) = fictionet::pair();
-            a.link().unwrap().label(&cx, "active".into());
-            c.link().unwrap().label(&cx, "removed".into());
+            let (mut c, d) = fictionet::pair();
+            let _a = cx.tap("active", a);
+            c = cx.tap("removed", c);
             cx.yield_now().await?;
             let links: Vec<_> = reader.topology().links.keys().copied().collect();
             packet(&reader, links[0], 1, Instant::ZERO, &[1; 3]);
@@ -830,8 +836,8 @@ fn removed_capture_metadata_keeps_the_link_count_bound() {
         move |cx| async move {
             let mut previous = Vec::new();
             for _ in 0..8 {
-                let (a, b) = fictionet::pair();
-                a.link().unwrap().label(&cx, "short link".into());
+                let (mut a, b) = fictionet::pair();
+                a = cx.tap("short link", a);
                 cx.yield_now().await?;
                 let link = *reader.topology().links.keys().next().unwrap();
                 packet(&reader, link, 1, Instant::ZERO, &[0]);
@@ -863,7 +869,7 @@ fn aggregation_preserves_packets_keys_topology_and_loss() {
         RunOptions::new(Seed::from_u64(7)).observer(aggregate),
         move |cx| async move {
             let (mut a, mut b) = fictionet::pair();
-            a.link().unwrap().label(&cx, "collected".into());
+            a = cx.tap("collected", a);
             a.send(Packet(vec![1, 2, 3]));
             assert_eq!(b.recv(&cx).await?.0, [1, 2, 3]);
             cx.yield_now().await?;

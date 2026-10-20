@@ -130,6 +130,7 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
             move |fcx| async move {
                 let mut sandbox = attachments.next(&fcx).await?;
                 let (mut mine, mut theirs) = fictionet::pair();
+                mine = fcx.tap("echo", mine);
                 fcx.spawn(move |fcx| async move {
                     while let Ok(p) = theirs.recv(&fcx).await {
                         fcx.emit("test", "echo", |event| event.field("len", p.0.len() as u64));
@@ -288,8 +289,8 @@ fn watch_capacity_errors_preserve_shared_streams_and_cancel_frees_admission() {
             RunOptions::new(Seed::from_u64(1)).observer(observer),
             move |fcx| async move {
                 let mut links = Vec::new();
-                for (end, mut other) in [fictionet::pair(), fictionet::pair()] {
-                    end.link().unwrap().label(&fcx, "test".into());
+                for (mut end, mut other) in [fictionet::pair(), fictionet::pair()] {
+                    end = fcx.tap("test", end);
                     fcx.spawn(move |fcx| async move {
                         let _ = other.recv(&fcx).await;
                         Ok(())
@@ -508,6 +509,7 @@ fn https_on_a_watched_link_shows_decrypted_http() {
             move |fcx| async move {
                 let (server_cfg, client_cfg) = configs(&fcx);
                 let (a, b) = fictionet::pair();
+                let a = fcx.tap("tls", a);
                 let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
                 let server = tcp::endpoint(&fcx, b, "10.0.0.1".parse()?);
                 let mut listener = server.listen(443)?;

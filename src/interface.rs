@@ -89,8 +89,8 @@ pub trait Interface: Send + 'static {
 
     /// Lightweight identity for this interface's link, when it has one.
     /// [`End`](crate::End) and [`Attachment`](crate::Attachment) provide handles.
-    /// Wrappers may forward them. [`LinkHandle::label`] publishes a topology
-    /// label to the run's observer. Core does not materialize a graph.
+    /// Wrappers may forward them. [`Cx::tap`] names the link for observation.
+    /// Core does not materialize a graph.
     fn link(&self) -> Option<crate::LinkHandle> {
         None
     }
@@ -173,21 +173,13 @@ impl From<Cancelled> for RecvError {
 /// Lightweight identity for the link an [`Interface`] belongs to.
 /// Clones share link state; they do not own a topology graph.
 /// The link gets a run-scoped id when it registers with a run.
-/// Use [`LinkHandle::label`] to publish its name to an interested observer.
+/// Use [`Cx::tap`] to name it for observation.
 #[derive(Clone)]
-pub struct LinkHandle(std::sync::Arc<crate::link::Meter>);
+pub struct LinkHandle(pub(crate) std::sync::Arc<crate::link::Meter>);
 
 impl LinkHandle {
     pub(crate) fn new(meter: std::sync::Arc<crate::link::Meter>) -> Self {
         Self(meter)
-    }
-
-    /// Publishes a label for this link to `fcx`'s observer as topology.
-    /// Consumers can replace the label they keep for this link. Core keeps
-    /// no label history or graph. With an observer, this also registers the
-    /// link if needed. Without an observer it only consumes the supplied string.
-    pub fn label(&self, fcx: &Cx, label: String) {
-        self.0.label(fcx, &label);
     }
 }
 

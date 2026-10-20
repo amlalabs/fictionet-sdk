@@ -126,6 +126,17 @@ pub struct Cx {
 }
 
 impl Cx {
+    /// Names the interface's link for observation and returns the interface.
+    /// Tapped links offer crossings to the run's observer under this name.
+    /// Tapping again renames the stream. Untapped links offer no packets.
+    /// An interface without a link handle is returned without a tap.
+    pub fn tap<I: crate::Interface>(&self, name: &str, interface: I) -> I {
+        if let Some(link) = interface.link() {
+            link.0.tap(self, name);
+        }
+        interface
+    }
+
     /// The current time on the run's clock: how long ago the run started.
     ///
     /// Under [`run`](crate::run) this is real time, read from the system's

@@ -107,7 +107,7 @@ pub(crate) fn stage<'a>(dispatch: &Dispatch, item: TopologyRef<'a>) -> Option<To
                     name.len().saturating_add(sandbox.map_or(0, str::len))
                 }
                 TopologyRef::LinkAdded { sandbox, .. } => sandbox.map_or(0, str::len),
-                TopologyRef::LinkLabel { label, .. } => label.len(),
+                TopologyRef::LinkTap { name, .. } => name.len(),
                 TopologyRef::ConnectionOpened { conn, .. }
                 | TopologyRef::ConnectionClosed { conn } => conn_bytes(conn),
                 _ => 0,
@@ -219,14 +219,9 @@ fn own(item: TopologyRef<'_>) -> Delivery {
                 })
             })
         }
-        TopologyRef::LinkLabel { link, label } => {
-            let label = label.to_owned();
-            Box::new(move |dispatch| {
-                dispatch.topology(TopologyRef::LinkLabel {
-                    link,
-                    label: &label,
-                })
-            })
+        TopologyRef::LinkTap { link, name } => {
+            let name = name.to_owned();
+            Box::new(move |dispatch| dispatch.topology(TopologyRef::LinkTap { link, name: &name }))
         }
         TopologyRef::TaskRemoved { task } => {
             Box::new(move |dispatch| dispatch.topology(TopologyRef::TaskRemoved { task }))

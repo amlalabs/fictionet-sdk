@@ -23,8 +23,8 @@ pub struct TopologyLimits {
     pub connections: usize,
     /// Maximum bytes of each name and connection text field.
     pub name_bytes: usize,
-    /// Maximum bytes of each link label.
-    pub label_bytes: usize,
+    /// Maximum bytes of each link tap.
+    pub tap_bytes: usize,
     /// Maximum total retained entry and text bytes.
     pub bytes: usize,
 }
@@ -38,7 +38,7 @@ impl Default for TopologyLimits {
             links: 4096,
             connections: 20_000,
             name_bytes: 1024,
-            label_bytes: 1024,
+            tap_bytes: 1024,
             bytes: 16 << 20,
         }
     }
@@ -92,8 +92,8 @@ pub struct Link {
     pub sandbox: Option<String>,
     /// Attached host.
     pub host: Option<HostId>,
-    /// Display label.
-    pub label: String,
+    /// Tap name.
+    pub tap: String,
     /// Live absolute counters.
     pub counters: LinkCounters,
 }
@@ -156,7 +156,7 @@ impl Size for Host {
 }
 impl Size for Link {
     fn size(&self) -> usize {
-        size_of::<Self>() + self.label.len() + self.sandbox.as_ref().map_or(0, String::len)
+        size_of::<Self>() + self.tap.len() + self.sandbox.as_ref().map_or(0, String::len)
     }
 }
 impl Size for Connection {
@@ -327,7 +327,7 @@ impl Topology {
                             sandbox: sandbox.map(|s| text(s, limits.name_bytes, &mut cut)),
                             host,
                             counters,
-                            label: String::new(),
+                            tap: String::new(),
                         },
                         limits.links,
                         &mut self.bytes,
@@ -342,14 +342,14 @@ impl Topology {
                 }
                 !missing
             }
-            TopologyRef::LinkLabel { link, label } => {
+            TopologyRef::LinkTap { link, name } => {
                 if let Some(link) = self.links.get_mut(&link) {
-                    let label = text(label, limits.label_bytes, &mut cut);
-                    if label.len() > limits.bytes.saturating_sub(self.bytes - link.label.len()) {
+                    let tap = text(name, limits.tap_bytes, &mut cut);
+                    if tap.len() > limits.bytes.saturating_sub(self.bytes - link.tap.len()) {
                         false
                     } else {
-                        self.bytes = self.bytes - link.label.len() + label.len();
-                        link.label = label;
+                        self.bytes = self.bytes - link.tap.len() + tap.len();
+                        link.tap = tap;
                         true
                     }
                 } else {

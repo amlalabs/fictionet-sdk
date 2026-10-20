@@ -353,6 +353,7 @@ fn ping_pong(n: usize, observation: Observation) -> World {
     }
     World::with_options(options, move |fcx, checkpoint| async move {
         let (mut a, mut b) = pair();
+        a = fcx.tap("ping pong", a);
         let echo = fcx.spawn(move |fcx| async move {
             for _ in 0..n {
                 let p = b.recv(&fcx).await?;

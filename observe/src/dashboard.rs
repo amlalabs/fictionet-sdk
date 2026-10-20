@@ -776,7 +776,7 @@ mod tests {
                 let group = cx.group("network");
                 let host = group.host("machine");
                 let mut attachment = attachments.next(&cx).await?;
-                attachment.link().unwrap().label(&cx, "guest link".into());
+                attachment = cx.tap("guest link", attachment);
                 sandbox.send(Packet(vec![0; 3]));
                 attachment.recv(&cx).await?;
                 host.emit("test", "origin", |e| e);

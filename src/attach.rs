@@ -665,7 +665,7 @@ impl Attachments {
                 drop(state);
                 drop(gone);
                 if let Some(observer) = fcx.run.observer.shared() {
-                    found.meter.register(observer);
+                    found.meter.register_tapped(observer);
                 }
                 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                 let found = {

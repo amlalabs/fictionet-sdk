@@ -62,12 +62,16 @@ pub enum LinkType {
     Ip,
 }
 
-/// Borrowed bytes of an interested successful link crossing.
-/// Core delivers every such crossing without copying, decoding or sampling.
+/// Borrowed bytes offered for a link crossing.
+/// Core delivers interested successful crossings without copying, decoding or sampling.
 #[derive(Clone, Copy, Debug)]
 pub struct PacketRef<'a> {
     /// The link crossed.
     pub link: LinkId,
+    /// The tap's current name.
+    pub tap: &'a str,
+    /// The attached sandbox, when this is an attachment.
+    pub sandbox: Option<&'a str>,
     /// The sending end.
     pub side: Side,
     /// The original byte length.
@@ -266,12 +270,12 @@ pub enum TopologyRef<'a> {
         /// Owning task.
         task: TaskId,
     },
-    /// A link label has changed.
-    LinkLabel {
+    /// A link has been tapped or renamed.
+    LinkTap {
         /// Link identity.
         link: LinkId,
-        /// Label text.
-        label: &'a str,
+        /// Tap name.
+        name: &'a str,
     },
     /// A link has been removed.
     LinkRemoved {
@@ -294,7 +298,7 @@ impl TopologyRef<'_> {
             Self::HostAdded { .. } | Self::HostRemoved { .. } => TopologyKind::Host,
             Self::LinkAdded { .. }
             | Self::LinkOwner { .. }
-            | Self::LinkLabel { .. }
+            | Self::LinkTap { .. }
             | Self::LinkRemoved { .. } => TopologyKind::Link,
         }
     }
@@ -414,7 +418,7 @@ mod tests {
                 let group = cx.group("network");
                 let host = group.host("machine");
                 let (mut a, mut b) = crate::pair();
-                a.link().unwrap().label(&cx, "uplink".into());
+                a = cx.tap("uplink", a);
                 let task = host.spawn(move |cx| async move {
                     let packet = b.recv(&cx).await?;
                     b.send(packet);
@@ -475,7 +479,7 @@ mod tests {
             )
         );
         assert!(text.contains("LinkAdded { link: LinkId(1), creator: Some(TaskId(1))"));
-        assert!(text.contains("LinkLabel { link: LinkId(1), label: \"uplink\" }"));
+        assert!(text.contains("LinkTap { link: LinkId(1), name: \"uplink\" }"));
         assert!(text.contains("LinkOwner { link: LinkId(1), side: A, task: TaskId(1) }"));
         assert!(text.contains("LinkOwner { link: LinkId(1), side: B, task: TaskId(2) }"));
         assert!(text.find("HostRemoved").unwrap() < text.find("GroupRemoved").unwrap());
@@ -572,7 +576,7 @@ mod tests {
                         foreign.spawn(move |cx| async move {
                             assert_eq!(std::thread::current().id(), polling_thread);
                             let (mut a, mut b) = crate::pair();
-                            a.link().unwrap().label(&cx, "foreign".into());
+                            a = cx.tap("foreign", a);
                             b.send(Packet(vec![1]));
                             a.recv(&cx).await?;
                             Ok(())
@@ -636,7 +640,7 @@ mod tests {
             RunOptions::new(Seed::from_u64(2)).observer(topology.clone()),
             move |cx| async move {
                 let mut attachment = attachments.next(&cx).await?;
-                attachment.link().unwrap().label(&cx, "guest uplink".into());
+                attachment = cx.tap("guest uplink", attachment);
                 sandbox.send(Packet(vec![7; 3]));
                 attachment.recv(&cx).await?;
                 drop(attachment);
@@ -653,7 +657,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|(_, item)| item == "LinkLabel { link: LinkId(1), label: \"guest uplink\" }")
+                .any(|(_, item)| item == "LinkTap { link: LinkId(1), name: \"guest uplink\" }")
         );
         assert!(
             items
