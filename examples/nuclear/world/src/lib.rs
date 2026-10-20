@@ -60,7 +60,7 @@
 //! | [`pace`] | Plant pacing and scenario commands |
 //! | [`scenarios`] | Named starting conditions and fault schedules |
 //! | [`protection`] | True-channel trips and reported-channel alarms |
-//! | [`registers`] | Modbus register map and telemetry heartbeats of the three controllers |
+//! | [`registers`] | Modbus register map and telemetry heartbeats of the four controllers |
 //! | [`sensors`] | Instrument ranges, lag, noise and sampling |
 //! | [`faults`] | Fixed fault slots and schedules |
 //! | [`command`] | Integer commands and replies |

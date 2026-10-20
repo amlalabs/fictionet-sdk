@@ -16,7 +16,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 pub const SAMPLE_MS: u64 = 250;
-pub const SENSOR_COUNT: usize = 22;
+pub const SENSOR_COUNT: usize = 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Sensor {
@@ -36,9 +36,19 @@ pub enum Sensor {
     CondenserPressure,
     CoreExitTemperature,
     ShutdownRodPosition,
+    CoreExitWideRange,
+    VesselLevel,
+    ContainmentPressure,
+    ContainmentTemperature,
+    ContainmentHydrogen,
+    ContainmentRadiation,
+    ReliefTailpipeTemperature,
+    ReliefTankPressure,
+    SafetyInjectionFlow,
+    TurbineBuildingTemperature,
 }
 impl Sensor {
-    pub const MAX_JSON_BYTES: usize = 29;
+    pub const MAX_JSON_BYTES: usize = "\"turbine_building_temperature\"".len();
     pub const ALL: [Self; SENSOR_COUNT] = [
         Self::NeutronPower,
         Self::RodPosition,
@@ -62,6 +72,16 @@ impl Sensor {
         Self::CondenserPressure,
         Self::CoreExitTemperature,
         Self::ShutdownRodPosition,
+        Self::CoreExitWideRange,
+        Self::VesselLevel,
+        Self::ContainmentPressure,
+        Self::ContainmentTemperature,
+        Self::ContainmentHydrogen,
+        Self::ContainmentRadiation,
+        Self::ReliefTailpipeTemperature,
+        Self::ReliefTankPressure,
+        Self::SafetyInjectionFlow,
+        Self::TurbineBuildingTemperature,
     ];
     pub fn index(self) -> usize {
         match self {
@@ -81,11 +101,31 @@ impl Sensor {
             Self::CondenserPressure => 19,
             Self::CoreExitTemperature => 20,
             Self::ShutdownRodPosition => 21,
+            Self::CoreExitWideRange => 22,
+            Self::VesselLevel => 23,
+            Self::ContainmentPressure => 24,
+            Self::ContainmentTemperature => 25,
+            Self::ContainmentHydrogen => 26,
+            Self::ContainmentRadiation => 27,
+            Self::ReliefTailpipeTemperature => 28,
+            Self::ReliefTankPressure => 29,
+            Self::SafetyInjectionFlow => 30,
+            Self::TurbineBuildingTemperature => 31,
         }
     }
     /// Unit, minimum, maximum and resolution. Flow is per loop in kg/s.
     pub fn spec(self) -> Instrument {
         let (unit, min, max, resolution) = match self {
+            Self::CoreExitWideRange => (Unit::Celsius, 0.0, 1300.0, 0.1),
+            Self::ContainmentTemperature => (Unit::Celsius, 0.0, 300.0, 0.1),
+            Self::ReliefTailpipeTemperature => (Unit::Celsius, 0.0, 400.0, 0.1),
+            Self::TurbineBuildingTemperature => (Unit::Celsius, 0.0, 200.0, 0.1),
+            Self::ContainmentPressure | Self::ReliefTankPressure => {
+                (Unit::Kilopascal, 0.0, 1000.0, 0.1)
+            }
+            Self::ContainmentHydrogen => (Unit::Percent, 0.0, 30.0, 0.01),
+            Self::ContainmentRadiation => (Unit::SievertsPerHour, 0.0, 655.0, 0.01),
+            Self::SafetyInjectionFlow => (Unit::KilogramsPerSecond, 0.0, 100.0, 0.1),
             Self::HotLeg(_) | Self::ColdLeg(_) | Self::CoreExitTemperature => {
                 (Unit::Celsius, 0.0, 600.0, 0.1)
             }
@@ -107,7 +147,13 @@ impl Sensor {
     fn temperature(self) -> bool {
         matches!(
             self,
-            Self::HotLeg(_) | Self::ColdLeg(_) | Self::CoreExitTemperature
+            Self::HotLeg(_)
+                | Self::ColdLeg(_)
+                | Self::CoreExitTemperature
+                | Self::CoreExitWideRange
+                | Self::ContainmentTemperature
+                | Self::ReliefTailpipeTemperature
+                | Self::TurbineBuildingTemperature
         )
     }
 }
@@ -120,6 +166,7 @@ pub enum Unit {
     KilogramsPerSecond,
     Megawatt,
     Percent,
+    SievertsPerHour,
 }
 impl Unit {
     pub const MAX_JSON_BYTES: usize = 22;
@@ -146,7 +193,7 @@ pub struct Channel {
     pub fault: Option<SensorFault>,
 }
 impl Channel {
-    pub const MAX_JSON_BYTES: usize = 158;
+    pub const MAX_JSON_BYTES: usize = 129 + Sensor::MAX_JSON_BYTES;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Telemetry {
@@ -249,6 +296,72 @@ impl Instruments {
 mod tests {
     use super::*;
     use crate::{Config, Plant};
+
+    #[test]
+    fn post_accident_channels_have_their_ranges_lag_noise_and_faults() {
+        let specs = [
+            ("core_exit_wide_range", 1300.0, 0.1, true),
+            ("vessel_level", 100.0, 0.1, false),
+            ("containment_pressure", 1000.0, 0.1, false),
+            ("containment_temperature", 300.0, 0.1, true),
+            ("containment_hydrogen", 30.0, 0.01, false),
+            ("containment_radiation", 655.0, 0.01, false),
+            ("relief_tailpipe_temperature", 400.0, 0.1, true),
+            ("relief_tank_pressure", 1000.0, 0.1, false),
+            ("safety_injection_flow", 100.0, 0.1, false),
+            ("turbine_building_temperature", 200.0, 0.1, true),
+        ];
+        assert_eq!(SENSOR_COUNT, 32);
+        let status = Plant::new(Config::default()).snapshot().reported_status;
+        for (offset, (name, max, resolution, temperature)) in specs.into_iter().enumerate() {
+            let sensor: Sensor = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert_eq!(sensor.index(), 22 + offset);
+            assert_eq!(sensor.spec().min, 0.0);
+            assert_eq!(sensor.spec().max, max);
+            assert_eq!(sensor.spec().resolution, resolution);
+            assert_eq!(sensor.temperature(), temperature);
+            let mut instruments = Instruments::new(1, [0.0; SENSOR_COUNT], status);
+            let mut faults = Faults::default();
+            let mut values = [0.0; SENSOR_COUNT];
+            let i = sensor.index();
+            values[i] = 12.0;
+            for at in (50..=250).step_by(50) {
+                instruments.step(at, 0.05, values, status, &faults);
+            }
+            if temperature {
+                assert!((0.8..1.2).contains(&instruments.readings[i].value));
+            } else {
+                assert!((instruments.readings[i].value - 12.0).abs() <= resolution);
+            }
+            assert_eq!(instruments.readings[i].sampled_at_ms, 250);
+            faults.sensors[i] = Some(SensorFault::Stuck { value: 1000 });
+            instruments.step(500, 0.05, values, status, &faults);
+            assert_eq!(
+                instruments.readings[i].value,
+                (1000.0 * resolution).min(max)
+            );
+            faults.sensors[i] = Some(SensorFault::Quiet);
+            let held = instruments.readings[i];
+            instruments.step(750, 0.05, values, status, &faults);
+            assert_eq!(instruments.readings[i], held);
+            faults.sensors[i] = None;
+            faults.telemetry_quiet = true;
+            instruments.step(1000, 0.05, values, status, &faults);
+            assert_eq!(instruments.readings[i], held);
+            faults.telemetry_quiet = false;
+            faults.sensors[i] = Some(SensorFault::Bias { delta: 10 });
+            let mut unbiased = instruments.clone();
+            let mut clear = faults.clone();
+            clear.sensors[i] = None;
+            unbiased.step(1250, 0.05, values, status, &clear);
+            instruments.step(1250, 0.05, values, status, &faults);
+            assert!(
+                (instruments.readings[i].value - unbiased.readings[i].value - 10.0 * resolution)
+                    .abs()
+                    < resolution * 0.01
+            );
+        }
+    }
 
     #[test]
     fn shutdown_rods_sample_without_lag_and_obey_faults() {

@@ -40,7 +40,7 @@ use crate::faults::{Fault, FaultChange, FaultTarget, ProcessFault};
 use crate::protection::TripCause;
 use crate::scenarios::Scenario;
 use crate::sensors::{Sensor, Unit};
-use crate::snapshot::{PlantSnapshot, Truth};
+use crate::snapshot::PlantSnapshot;
 use crate::stages::{FailureCause, Stage};
 
 /// The source name of every plant fact.
@@ -421,6 +421,7 @@ pub fn divergence(
             Unit::KilogramsPerSecond => "kg/s",
             Unit::Megawatt => "MW",
             Unit::Percent => "%",
+            Unit::SievertsPerHour => "Sv/h",
         };
         event
             .summary(format!(
@@ -619,6 +620,16 @@ fn point_name(sensor: Sensor) -> String {
         Sensor::GeneratorOutput => "generator_output".into(),
         Sensor::CondenserPressure => "condenser_pressure".into(),
         Sensor::CoreExitTemperature => "core_exit_temperature".into(),
+        Sensor::CoreExitWideRange => "core_exit_wide_range".into(),
+        Sensor::VesselLevel => "vessel_level".into(),
+        Sensor::ContainmentPressure => "containment_pressure".into(),
+        Sensor::ContainmentTemperature => "containment_temperature".into(),
+        Sensor::ContainmentHydrogen => "containment_hydrogen".into(),
+        Sensor::ContainmentRadiation => "containment_radiation".into(),
+        Sensor::ReliefTailpipeTemperature => "relief_tailpipe_temperature".into(),
+        Sensor::ReliefTankPressure => "relief_tank_pressure".into(),
+        Sensor::SafetyInjectionFlow => "safety_injection_flow".into(),
+        Sensor::TurbineBuildingTemperature => "turbine_building_temperature".into(),
     }
 }
 
@@ -629,9 +640,10 @@ fn loop_name(l: Loop) -> &'static str {
     }
 }
 
-/// The true value of a sensor's point, read from the snapshot's truth. This
-/// matches the plant's own sensor source.
-pub(crate) fn true_value_of(truth: &Truth, sensor: Sensor) -> f64 {
+/// The true value of a sensor's point, read from the snapshot. This matches
+/// the plant's own sensor source.
+pub(crate) fn true_value_of(snapshot: &PlantSnapshot, sensor: Sensor) -> f64 {
+    let truth = &snapshot.truth;
     let reactor = &truth.reactor;
     let primary = &truth.primary;
     let secondary = &truth.secondary;
@@ -651,7 +663,17 @@ pub(crate) fn true_value_of(truth: &Truth, sensor: Sensor) -> f64 {
         Sensor::TurbineValve => secondary.turbine_valve_percent,
         Sensor::GeneratorOutput => secondary.generator_mw,
         Sensor::CondenserPressure => secondary.condenser_pressure_kpa,
-        Sensor::CoreExitTemperature => reactor.core_exit_c,
+        Sensor::CoreExitTemperature => snapshot.severe.core_exit_steam_c,
+        Sensor::CoreExitWideRange => snapshot.severe.core_exit_steam_c,
+        Sensor::VesselLevel => snapshot.severe.vessel_level_percent,
+        Sensor::ContainmentPressure => snapshot.severe.containment.pressure_kpa,
+        Sensor::ContainmentTemperature => snapshot.severe.containment.temperature_c,
+        Sensor::ContainmentHydrogen => snapshot.severe.containment.hydrogen_percent,
+        Sensor::ContainmentRadiation => snapshot.stylized.containment_dose_sv_h,
+        Sensor::ReliefTailpipeTemperature => snapshot.severe.relief.tailpipe_c,
+        Sensor::ReliefTankPressure => snapshot.severe.relief_tank.pressure_kpa,
+        Sensor::SafetyInjectionFlow => snapshot.severe.safety_injection.flow_kg_s,
+        Sensor::TurbineBuildingTemperature => snapshot.severe.turbine_hall.temperature_c,
     }
 }
 
@@ -688,6 +710,14 @@ mod tests {
 
     fn snapshot() -> PlantSnapshot {
         Plant::new(Config::default()).snapshot()
+    }
+
+    #[test]
+    fn core_exit_truth_is_the_steam_the_thermocouples_sit_in() {
+        let mut snap = snapshot();
+        snap.severe.core_exit_steam_c = 1_200.0;
+        assert_ne!(snap.truth.reactor.core_exit_c, 1_200.0);
+        assert_eq!(true_value_of(&snap, Sensor::CoreExitTemperature), 1_200.0);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! hmi01 on the operations network. It polls the three controllers, serves the
+//! hmi01 on the operations network. It polls the four controllers, serves the
 //! mimic page and the plant's values, and carries control POSTs to the
 //! controllers. The operator console is a trusted sandbox here too. An
 //! ordinary sandbox on the operations subnet cannot reach hmi01 at all.
@@ -332,11 +332,12 @@ fn poll_holds_each_controller_block_and_plant_json_matches_the_snapshot() {
             // The blocks the HMI holds are the controllers' own blocks.
             {
                 let held = world.held.lock();
-                for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1] {
+                for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1, Plc::Pam1] {
                     let block = &held.blocks[match plc {
                         Plc::Rps1 => 0,
                         Plc::Rcs1 => 1,
                         Plc::Bop1 => 2,
+                        Plc::Pam1 => 3,
                     }];
                     assert!(block.online, "{plc:?} is online");
                     assert_eq!(
@@ -678,7 +679,7 @@ fn telemetry_heartbeats_hold_across_polls_and_resume_after_clearing() {
             let held_counts = counts(&before);
             assert_eq!(
                 held_counts,
-                vec![u64::from(driver.snapshot().telemetry.heartbeat); 3]
+                vec![u64::from(driver.snapshot().telemetry.heartbeat); 4]
             );
             driver
                 .apply_fault(
@@ -898,4 +899,135 @@ fn configured_site_clock_reaches_http_and_json() {
         },
     ))
     .unwrap();
+}
+
+#[test]
+fn emergency_posts_write_the_controller_coils() {
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(32)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            let world = start_world(&fcx, &driver)?;
+            for (path, body, plc, address) in [
+                ("relief", json!({"open": true}), Plc::Rcs1, 4),
+                ("relief-block", json!({"closed": true}), Plc::Rcs1, 5),
+                (
+                    "pump",
+                    json!({"name": "safety-injection", "running": true}),
+                    Plc::Rcs1,
+                    6,
+                ),
+                ("steam-isolation", json!({"closed": true}), Plc::Bop1, 7),
+            ] {
+                let response = send(
+                    &fcx,
+                    &world.operator,
+                    &post(&format!("/api/control/{path}"), &body),
+                )
+                .await;
+                assert_eq!(
+                    response.head.status,
+                    200,
+                    "{path}: {}",
+                    String::from_utf8_lossy(&response.body)
+                );
+                driver.advance_to(&(), driver.snapshot().at_ms + 250);
+                assert!(registers::coils(plc, &driver.snapshot())[address]);
+            }
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn failed_safety_injection_post_returns_the_controller_exception() {
+    use nuclear_world::{
+        command::FaultCommand,
+        faults::{Fault, FaultChange, ProcessFault},
+    };
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(33)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver
+                .apply_fault(
+                    &(),
+                    FaultCommand {
+                        change: FaultChange::Inject(Fault::Process(
+                            ProcessFault::SafetyInjectionFailure,
+                        )),
+                        expected_revision: 0,
+                    },
+                )
+                .unwrap();
+            let world = start_world(&fcx, &driver)?;
+            let response = send(
+                &fcx,
+                &world.operator,
+                &post(
+                    "/api/control/pump",
+                    &json!({"name": "safety-injection", "running": true}),
+                ),
+            )
+            .await;
+            assert_eq!(response.head.status, 409);
+            let body = json_body(&response);
+            assert_eq!(body["exception"], 4);
+            assert_eq!(body["reason"], "server device failure");
+            assert_eq!(driver.snapshot().operator_actions, 0);
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn post_accident_api_scales_freezes_and_reports_sensor_faults() {
+    use nuclear_world::{
+        command::FaultCommand,
+        faults::{Fault, FaultChange, SensorFault},
+    };
+    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(35)), |fcx| async move {
+        let driver = Driver::new(Config::default());
+        let world = start_world(&fcx, &driver)?;
+        let first = next_poll(&fcx, &world.operator, "").await;
+        assert_close(value(&first, "containment_pressure"), 101.3, 0.1, "containment pressure");
+        let specs = [
+            ("core_exit_wide_range", "TE-413W", "C"), ("vessel_level", "LT-480", "%"),
+            ("containment_pressure", "PT-934", "kPa"), ("containment_temperature", "TE-935", "C"),
+            ("containment_hydrogen", "AT-936", "%"), ("containment_radiation", "RE-937", "Sv/h"),
+            ("relief_tailpipe_temperature", "TE-463", "C"), ("relief_tank_pressure", "PT-472", "kPa"),
+            ("safety_injection_flow", "FT-940", "kg/s"), ("turbine_building_temperature", "TE-951", "C"),
+        ];
+        for (name, tag, unit) in specs {
+            let sensor: Sensor = serde_json::from_value(json!(name)).unwrap();
+            assert_close(value(&first, name), driver.snapshot().readings[sensor.index()].reading.value, 0.001, name);
+            assert_eq!(first["readings"][name]["tag"], tag);
+            assert_eq!(first["readings"][name]["unit"], unit);
+        }
+        assert_eq!(first["links"].as_array().unwrap().len(), 4);
+        assert_eq!(first["links"][3]["id"], "pam1");
+        assert_eq!(first["links"][3]["online"], true);
+        for (name, expected) in [("safety_injection", false), ("relief_block_closed", false), ("steam_isolation_closed", false), ("fan_coolers", true)] {
+            assert_eq!(first["status"][name], expected);
+        }
+        for (name, counts) in [("containment_pressure", 2345), ("containment_hydrogen", 234), ("containment_radiation", 123)] {
+            driver.apply_fault(&(), FaultCommand { change: FaultChange::Inject(Fault::Sensor { sensor: serde_json::from_value(json!(name)).unwrap(), kind: SensorFault::Stuck { value: counts } }), expected_revision: driver.snapshot().revision }).unwrap();
+        }
+        driver.advance_to(&(), 1000);
+        let changed = next_poll(&fcx, &world.operator, first["plant_time"].as_str().unwrap()).await;
+        assert_eq!(value(&changed, "containment_pressure"), 234.5);
+        assert_eq!(value(&changed, "containment_hydrogen"), 2.34);
+        assert_eq!(value(&changed, "containment_radiation"), 1.23);
+        driver.apply_fault(&(), FaultCommand { change: FaultChange::Inject(Fault::TelemetryQuiet), expected_revision: driver.snapshot().revision }).unwrap();
+        driver.advance_to(&(), 2000);
+        let frozen = next_poll(&fcx, &world.operator, changed["plant_time"].as_str().unwrap()).await;
+        for (name, _, _) in specs { assert_eq!(value(&frozen, name), value(&changed, name)); }
+        println!("HMI containment pressure: 101.3 kPa initially; fault 234.5 kPa, hydrogen 2.34%, radiation 1.23 Sv/h; all ten channels held during telemetry quiet");
+        fcx.cancel();
+        Ok(())
+    })).unwrap();
 }

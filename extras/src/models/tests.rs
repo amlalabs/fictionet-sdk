@@ -265,3 +265,81 @@ fn bearer_and_google_keys_and_usage() {
         thread.join().unwrap();
     }
 }
+
+#[test]
+fn cached_input_counts_once_toward_budget() {
+    use std::io::Write;
+    for (provider, path, usage, total) in [
+        (
+            Provider::Anthropic,
+            "/v1/messages",
+            json!({"input_tokens":1,"cache_read_input_tokens":1000,"cache_creation_input_tokens":1000,"output_tokens":1}),
+            2001,
+        ),
+        (
+            Provider::OpenAi,
+            "/v1/responses",
+            json!({"input_tokens":1000,"input_tokens_details":{"cached_tokens":900},"output_tokens":1}),
+            1000,
+        ),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            super::splice_tests::receive(&mut socket);
+            let body = json!({"type":"message","content":[],"usage":usage}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let memory = Arc::new(fictionet_observe::Memory::default());
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(12))
+                .observer(Arc::new(fictionet_observe::Aggregate::new(memory.clone()))),
+            |cx| async move {
+                let credential =
+                    Credential::api_key(&cx, Secret::new("key", "private-key".into())?);
+                let key = credential.wire(provider, false);
+                let model = Model::at(
+                    &cx,
+                    provider,
+                    credential,
+                    format!("http://{address}").parse()?,
+                )?
+                .budget(Budget::new().input_tokens(100));
+                let request = || {
+                    Request::post(path)
+                        .header(provider.header(), &key)
+                        .body(Body::from(r#"{"model":"small"}"#))
+                        .unwrap()
+                };
+                let response = model.clone().send(request()).await?;
+                assert_eq!(response.status(), 200);
+                response.into_body().collect().await?;
+                assert_eq!(model.ledger.lock().unwrap().input, total);
+                let refused = model.clone().send(request()).await?;
+                assert_eq!(refused.status(), provider.stop().status());
+                assert_eq!(
+                    refused.into_body().collect().await?.to_bytes(),
+                    provider.stop().into_body().collect().await?.to_bytes()
+                );
+                assert_eq!(model.ledger.lock().unwrap().calls, 1);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let listener = server.join().unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let calls = memory.checked_of("model", "call").unwrap();
+        assert_eq!(calls.len(), 1);
+        if provider == Provider::Anthropic {
+            assert_eq!(calls[0].u64("input_tokens"), Some(1));
+            assert_eq!(calls[0].u64("cache_read_input_tokens"), Some(1000));
+            assert_eq!(calls[0].u64("cache_creation_input_tokens"), Some(1000));
+        }
+    }
+}

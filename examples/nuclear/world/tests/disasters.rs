@@ -2,7 +2,9 @@ use nuclear_world::{
     Config, Plant,
     command::*,
     faults::*,
+    registers::{self, Plc},
     scenarios::Scenario,
+    sensors::Sensor,
     snapshot::{PlantSnapshot, Regime},
     stages::{FailureCause, Stage},
 };
@@ -403,6 +405,35 @@ fn accepted_commands_alone_update_last_command() {
         FaultChange::Inject(Fault::Process(ProcessFault::ReliefStuckOpen)),
     );
     assert_eq!(plant.snapshot().last_command, Some(last));
+}
+
+#[test]
+fn narrow_core_exit_reads_the_hot_steam_and_pegs_at_its_top() {
+    let narrow = Sensor::CoreExitTemperature;
+    let mut plant = Plant::new(Scenario::LoopBUnattended.config());
+    let mut superheated = 0;
+    for at in (1_000..=139 * 60_000).step_by(1_000) {
+        plant.advance(at);
+        let snap = plant.snapshot();
+        let reading = snap.readings[narrow.index()].reading.value;
+        let register = registers::input_registers(Plc::Rps1, &snap)[2];
+        assert_eq!(f64::from(register), (reading * 10.0).round(), "at {at} ms");
+        let saturation = snap.truth.reactor.core_exit_c;
+        let steam = snap.severe.core_exit_steam_c;
+        // The thermocouple follows the steam, not the saturation temperature.
+        if steam > saturation + 100.0 && steam < 590.0 {
+            superheated += 1;
+            assert!(
+                reading > saturation + 50.0,
+                "core exit reads {reading} C at {at} ms, steam {steam} C, saturation {saturation} C"
+            );
+        }
+        if at >= 107 * 60_000 {
+            assert_eq!(reading, 600.0, "narrow range at {at} ms");
+            assert_eq!(register, 6000, "rps1 input register 2 at {at} ms");
+        }
+    }
+    assert!(superheated > 0);
 }
 
 fn core_to_breach(scenario: Scenario, targets_minutes: [f64; 6]) {
@@ -964,4 +995,99 @@ fn blackout_relief_changes_the_end_to_a_hydrogen_burn() {
         Some(FailureCause::HydrogenBurn)
     );
     stage_time("Containment failure", end.at_ms, 10_509_000, 1_050_900);
+}
+
+fn instrument(name: &str) -> Sensor {
+    serde_json::from_value(serde_json::json!(name)).unwrap()
+}
+
+#[test]
+fn post_accident_ranges_follow_the_unattended_core() {
+    let wide = instrument("core_exit_wide_range");
+    let mut plant = Plant::new(Scenario::LoopBUnattended.config());
+    for minute in 107..=139 {
+        plant.advance(minute * 60_000);
+        let snap = plant.snapshot();
+        assert_eq!(
+            snap.readings[Sensor::CoreExitTemperature.index()]
+                .reading
+                .value,
+            600.0
+        );
+        let value = snap.readings[wide.index()].reading.value;
+        if minute == 117 {
+            println!("Wide range at 117 min: {value} C; target above 1000 C");
+            assert!(value > 1000.0);
+        }
+        if minute >= 121 {
+            assert_eq!(value, 1300.0);
+        }
+    }
+}
+
+#[test]
+fn post_accident_normal_running_raises_no_new_alarm() {
+    assert_eq!(nuclear_world::protection::ALARM_COUNT, 30);
+    let mut plant = Plant::new(Scenario::Normal.config());
+    for at in (250..=600_000).step_by(250) {
+        plant.advance(at);
+        assert!(plant.snapshot().alarms[22..].iter().all(Option::is_none));
+    }
+}
+
+#[test]
+fn post_accident_relief_indications_and_alarms_follow_the_discharge() {
+    use nuclear_world::protection::{Alarm, AlarmState};
+    let tail: Alarm =
+        serde_json::from_value(serde_json::json!("relief_tailpipe_temperature_high")).unwrap();
+    let tank: Alarm =
+        serde_json::from_value(serde_json::json!("relief_tank_pressure_high")).unwrap();
+    let mut plant = Plant::new(Scenario::StuckOpenRelief.config());
+    let mut tail_at = None;
+    let mut tank_at = None;
+    let mut disk_at = None;
+    let mut cleared = false;
+    for at in (250..=150 * 60_000).step_by(250) {
+        plant.advance(at);
+        let snap = plant.snapshot();
+        assert!(!registers::discrete_inputs(Plc::Rcs1, &snap)[2]);
+        assert_eq!(snap.severe.relief.flow_kg_s > 0.0, at >= 10_000);
+        if snap.alarms[tail.index()].is_some_and(|a| a.state == AlarmState::Active) {
+            tail_at.get_or_insert(at);
+        }
+        if snap.alarms[tank.index()].is_some() {
+            tank_at.get_or_insert(at);
+        }
+        if snap.severe.relief_tank.disk_ruptured {
+            disk_at.get_or_insert(at);
+            cleared |= snap.alarms[tank.index()].is_none();
+        }
+    }
+    println!(
+        "Tailpipe alarm: {tail_at:?} ms; target within 120000 ms. Tank alarm: {tank_at:?} ms; disk: {disk_at:?} ms; target alarm before disk, cleared after: {cleared}"
+    );
+    assert!(tail_at.unwrap() <= 120_000);
+    assert!(tank_at.unwrap() < disk_at.unwrap());
+    assert!(cleared);
+}
+
+#[test]
+fn post_accident_stuck_vessel_level_holds_while_inventory_falls() {
+    let level = instrument("vessel_level");
+    let mut plant = Plant::new(Scenario::StuckOpenRelief.config());
+    fault(
+        &mut plant,
+        FaultChange::Inject(Fault::Sensor {
+            sensor: level,
+            kind: SensorFault::Stuck { value: 1000 },
+        }),
+    );
+    plant.advance(100 * 60_000);
+    let snap = plant.snapshot();
+    assert_eq!(snap.readings[level.index()].reading.value, 100.0);
+    assert!(snap.severe.vessel_level_percent < 70.0);
+    println!(
+        "Stuck vessel level: 100%; true {}%; target true below 70%",
+        snap.severe.vessel_level_percent
+    );
 }

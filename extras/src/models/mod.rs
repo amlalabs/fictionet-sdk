@@ -368,6 +368,27 @@ pub struct Model {
     prices: Option<(String, Prices)>,
     engine: Option<Arc<dyn Engine>>,
     seal: Arc<splice::Seal>,
+    continued: Arc<Mutex<Continued>>,
+}
+/// Searched Responses ids: the id a client saw, and the final upstream turn
+/// that holds the whole response. The oldest go first past the bound.
+#[derive(Default)]
+struct Continued {
+    finals: std::collections::HashMap<String, String>,
+    order: std::collections::VecDeque<String>,
+}
+impl Continued {
+    const LIMIT: usize = 4096;
+    fn insert(&mut self, shown: String, last: String) {
+        if self.finals.insert(shown.clone(), last).is_none() {
+            self.order.push_back(shown);
+        }
+        while self.order.len() > Self::LIMIT {
+            if let Some(old) = self.order.pop_front() {
+                self.finals.remove(&old);
+            }
+        }
+    }
 }
 impl Model {
     /// Builds the model site for a dedicated OAuth authority.
@@ -432,6 +453,7 @@ impl Model {
             prices: None,
             engine: None,
             seal: Arc::new(splice::Seal::new(cx)),
+            continued: Arc::default(),
         }
     }
     /// Installs a budget shared by all clones.
@@ -619,7 +641,7 @@ impl Model {
         };
         parts.headers.remove("content-encoding");
         parts.headers.remove("content-length");
-        let body: Value = match serde_json::from_slice(&bytes) {
+        let mut body: Value = match serde_json::from_slice(&bytes) {
             Ok(Value::Object(body)) => Value::Object(body),
             _ if listing && bytes.is_empty() => json!({}),
             _ => {
@@ -630,7 +652,22 @@ impl Model {
                 ));
             }
         };
+        // A searched response continues from the upstream turn that holds it.
+        let last = body["previous_response_id"].as_str().and_then(|id| {
+            let continued = self.continued.lock().unwrap();
+            continued.finals.get(id).cloned()
+        });
+        let bytes = match last {
+            Some(last) if path.ends_with("/responses") => {
+                body["previous_response_id"] = json!(last);
+                Bytes::from(body.to_string())
+            }
+            _ => bytes,
+        };
         if self.provider == Provider::Anthropic && self.engine.is_some() && splice::needed(&body) {
+            if path.ends_with("/count_tokens") {
+                return Box::pin(splice::count(self, parts, body)).await;
+            }
             return Box::pin(splice::serve(self, parts, body)).await;
         }
         if matches!(self.provider, Provider::OpenAi | Provider::ChatGpt)

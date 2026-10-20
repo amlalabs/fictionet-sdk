@@ -444,6 +444,10 @@ impl Plant {
 
     fn reported_status(&self) -> ReportedStatus {
         ReportedStatus {
+            safety_injection_running: self.severe.values.safety_injection.running,
+            relief_block_closed: self.severe.values.relief.block_closed,
+            steam_isolation_closed: self.severe.values.steam_isolation_closed,
+            fan_coolers_running: self.severe.values.containment.fan_coolers_running,
             pressurizer_relief_open: self.severe.values.relief.demanded_open
                 || self.severe.values.relief.safety_valve_flow_kg_s > 0.0,
             ..ReportedStatus::from(&self.state)
@@ -693,7 +697,19 @@ impl Plant {
             Sensor::TurbineValve => t.secondary.turbine_valve_percent,
             Sensor::GeneratorOutput => t.secondary.generator_mw,
             Sensor::CondenserPressure => t.secondary.condenser_pressure_kpa,
-            Sensor::CoreExitTemperature => t.reactor.core_exit_c,
+            Sensor::CoreExitWideRange => self.severe.values.core_exit_steam_c,
+            Sensor::VesselLevel => self.severe.values.vessel_level_percent,
+            Sensor::ContainmentPressure => self.severe.values.containment.pressure_kpa,
+            Sensor::ContainmentTemperature => self.severe.values.containment.temperature_c,
+            Sensor::ContainmentHydrogen => self.severe.values.containment.hydrogen_percent,
+            Sensor::ContainmentRadiation => self.stylized.values.containment_dose_sv_h,
+            Sensor::ReliefTailpipeTemperature => self.severe.values.relief.tailpipe_c,
+            Sensor::ReliefTankPressure => self.severe.values.relief_tank.pressure_kpa,
+            Sensor::SafetyInjectionFlow => self.severe.values.safety_injection.flow_kg_s,
+            Sensor::TurbineBuildingTemperature => self.severe.values.turbine_hall.temperature_c,
+
+            // The thermocouples sit in the steam leaving the core.
+            Sensor::CoreExitTemperature => self.severe.values.core_exit_steam_c,
         })
     }
 

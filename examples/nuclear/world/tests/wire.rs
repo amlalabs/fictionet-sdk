@@ -16,7 +16,7 @@ fn bounded<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: T, bound:
 
 #[test]
 fn shutdown_rod_channel_is_appended_and_serializes() {
-    assert_eq!(SENSOR_COUNT, 22);
+    assert_eq!(SENSOR_COUNT, 32);
     assert_eq!(Sensor::ShutdownRodPosition.index(), 21);
     assert_eq!(Sensor::ALL[21], Sensor::ShutdownRodPosition);
     for (index, sensor) in Sensor::ALL.into_iter().enumerate() {
@@ -296,6 +296,10 @@ fn snapshot_bound_with_every_alarm_fault_and_maximum_numeric_width() {
         steam_relief_open: false,
         reactor_tripped: false,
         turbine_tripped: false,
+        safety_injection_running: false,
+        relief_block_closed: false,
+        steam_isolation_closed: false,
+        fan_coolers_running: false,
     };
     s.telemetry = Telemetry {
         quiet: false,

@@ -1,4 +1,4 @@
-//! Modbus register map for the three controllers. Each controller answers
+//! Modbus register map for the four controllers. Each controller answers
 //! Modbus/TCP on port 502 with unit id 1. Read functions take their values from
 //! a plant snapshot. Write functions decode to one plant command each.
 //!
@@ -19,6 +19,11 @@
 //! no state. Holding registers read back the rod demand. The snapshot holds no
 //! valve demands, so valve registers read back the valve position.
 //!
+//! rcs1 coils 4, 5 and 6 set the relief demand, block closure and injection
+//! pump state. Its discrete inputs 4 and 5 report injection and block closure.
+//! bop1 coil 7 sets steam isolation; discrete input 6 reports closure.
+//! pam1 discrete input 0 reports fan coolers. It has no writable banks.
+//!
 //! Each input block ends with an unscaled Telemetry heartbeat count. It wraps
 //! at 16 bits and holds while telemetry is quiet.
 //!
@@ -29,14 +34,25 @@
 //! | rps1 | 2 (30003) | Core exit temperature | 0.1 C |
 //! | rps1 | 3 (30004) | Shutdown rod position | 0.1 % |
 //! | rps1 | 4 (30005) | Telemetry heartbeat | 1 |
-//! | rcs1 | 8 (30009) | Telemetry heartbeat | 1 |
-//! | bop1 | 10 (30011) | Telemetry heartbeat | 1 |
+//! | rcs1 | 8 (30009) | Relief tailpipe temperature | 0.1 C |
+//! | rcs1 | 9 (30010) | Relief tank pressure | 0.1 kPa |
+//! | rcs1 | 10 (30011) | Safety injection flow | 0.1 kg/s |
+//! | rcs1 | 11 (30012) | Telemetry heartbeat | 1 |
+//! | bop1 | 10 (30011) | Turbine building temperature | 0.1 C |
+//! | bop1 | 11 (30012) | Telemetry heartbeat | 1 |
+//! | pam1 | 0 (30001) | Core exit temperature wide range | 0.1 C |
+//! | pam1 | 1 (30002) | Reactor vessel level | 0.1 % |
+//! | pam1 | 2 (30003) | Containment pressure | 0.1 kPa |
+//! | pam1 | 3 (30004) | Containment temperature | 0.1 C |
+//! | pam1 | 4 (30005) | Containment hydrogen | 0.01 % |
+//! | pam1 | 5 (30006) | Containment radiation | 0.01 Sv/h |
+//! | pam1 | 6 (30007) | Telemetry heartbeat | 1 |
 
 use crate::command::{Command, Controller, Loop, Mode, Pump, Valve};
 use crate::sensors::Sensor;
 use crate::snapshot::PlantSnapshot;
 
-/// One of the three Modbus controllers.
+/// One of the four Modbus controllers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plc {
     /// Reactor protection and rod control.
@@ -45,6 +61,8 @@ pub enum Plc {
     Rcs1,
     /// Balance of plant.
     Bop1,
+    /// Post-accident monitoring.
+    Pam1,
 }
 
 /// Source of one input register.
@@ -66,7 +84,7 @@ const RPS1_INPUTS: [Input; 5] = [
     Input::Heartbeat,
 ];
 
-const RCS1_INPUTS: [Input; 9] = [
+const RCS1_INPUTS: [Input; 12] = [
     Input::Sensor(Sensor::HotLeg(Loop::A)),
     Input::Sensor(Sensor::HotLeg(Loop::B)),
     Input::Sensor(Sensor::ColdLeg(Loop::A)),
@@ -75,10 +93,13 @@ const RCS1_INPUTS: [Input; 9] = [
     Input::Sensor(Sensor::PressurizerLevel),
     Input::Sensor(Sensor::CoolantFlow(Loop::A)),
     Input::Sensor(Sensor::CoolantFlow(Loop::B)),
+    Input::Sensor(Sensor::ReliefTailpipeTemperature),
+    Input::Sensor(Sensor::ReliefTankPressure),
+    Input::Sensor(Sensor::SafetyInjectionFlow),
     Input::Heartbeat,
 ];
 
-const BOP1_INPUTS: [Input; 11] = [
+const BOP1_INPUTS: [Input; 12] = [
     Input::Sensor(Sensor::SteamGeneratorLevel(Loop::A)),
     Input::Sensor(Sensor::SteamGeneratorLevel(Loop::B)),
     Input::Sensor(Sensor::SteamPressure),
@@ -89,6 +110,17 @@ const BOP1_INPUTS: [Input; 11] = [
     Input::Sensor(Sensor::TurbineValve),
     Input::Sensor(Sensor::GeneratorOutput),
     Input::Sensor(Sensor::CondenserPressure),
+    Input::Sensor(Sensor::TurbineBuildingTemperature),
+    Input::Heartbeat,
+];
+
+const PAM1_INPUTS: [Input; 7] = [
+    Input::Sensor(Sensor::CoreExitWideRange),
+    Input::Sensor(Sensor::VesselLevel),
+    Input::Sensor(Sensor::ContainmentPressure),
+    Input::Sensor(Sensor::ContainmentTemperature),
+    Input::Sensor(Sensor::ContainmentHydrogen),
+    Input::Sensor(Sensor::ContainmentRadiation),
     Input::Heartbeat,
 ];
 
@@ -97,6 +129,7 @@ fn inputs(plc: Plc) -> &'static [Input] {
         Plc::Rps1 => &RPS1_INPUTS,
         Plc::Rcs1 => &RCS1_INPUTS,
         Plc::Bop1 => &BOP1_INPUTS,
+        Plc::Pam1 => &PAM1_INPUTS,
     }
 }
 
@@ -128,11 +161,14 @@ pub fn discrete_inputs(plc: Plc, s: &PlantSnapshot) -> Vec<bool> {
     let r = &s.reported_status;
     match plc {
         Plc::Rps1 => vec![r.reactor_tripped, r.turbine_tripped],
+        Plc::Pam1 => vec![r.fan_coolers_running],
         Plc::Rcs1 => vec![
             r.coolant_pumps_running[0],
             r.coolant_pumps_running[1],
             r.pressurizer_relief_open,
             r.pressurizer_heaters_on,
+            r.safety_injection_running,
+            r.relief_block_closed,
         ],
         Plc::Bop1 => vec![
             r.feed_pumps_running[0],
@@ -141,6 +177,7 @@ pub fn discrete_inputs(plc: Plc, s: &PlantSnapshot) -> Vec<bool> {
             r.circulating_water_running,
             r.steam_relief_open,
             r.turbine_tripped,
+            r.steam_isolation_closed,
         ],
     }
 }
@@ -152,11 +189,15 @@ pub fn coils(plc: Plc, s: &PlantSnapshot) -> Vec<bool> {
     let c = &s.truth.controllers;
     match plc {
         Plc::Rps1 => vec![false, false, false],
+        Plc::Pam1 => Vec::new(),
         Plc::Rcs1 => vec![
             r.coolant_pumps_running[0],
             r.coolant_pumps_running[1],
             r.pressurizer_heaters_on,
             c.pressurizer_pressure == Mode::Automatic,
+            s.severe.relief.demanded_open,
+            r.relief_block_closed,
+            r.safety_injection_running,
         ],
         Plc::Bop1 => vec![
             r.feed_pumps_running[0],
@@ -166,6 +207,7 @@ pub fn coils(plc: Plc, s: &PlantSnapshot) -> Vec<bool> {
             c.feed_level[0] == Mode::Automatic,
             c.feed_level[1] == Mode::Automatic,
             c.steam_dump == Mode::Automatic,
+            r.steam_isolation_closed,
         ],
     }
 }
@@ -180,6 +222,7 @@ pub fn holding_registers(plc: Plc, s: &PlantSnapshot) -> Vec<u16> {
             ROD_RESOLUTION_PERCENT,
         )],
         Plc::Rcs1 => vec![count(s.truth.primary.spray_percent, 0.1)],
+        Plc::Pam1 => Vec::new(),
         Plc::Bop1 => vec![
             count(s.truth.secondary.loops[0].feed_valve_percent, 0.1),
             count(s.truth.secondary.loops[1].feed_valve_percent, 0.1),
@@ -229,6 +272,9 @@ pub fn decode_coil_write(plc: Plc, addr: u16, on: bool) -> Option<Command> {
         (Plc::Rcs1, 1) => Some(pump(Pump::Coolant(Loop::B), on)),
         (Plc::Rcs1, 2) => Some(Command::Heaters { on }),
         (Plc::Rcs1, 3) => Some(controller(Controller::PressurizerPressure, on)),
+        (Plc::Rcs1, 4) => Some(Command::Relief { open: on }),
+        (Plc::Rcs1, 5) => Some(Command::ReliefBlock { closed: on }),
+        (Plc::Rcs1, 6) => Some(pump(Pump::SafetyInjection, on)),
         (Plc::Bop1, 0) => Some(pump(Pump::MainFeed(Loop::A), on)),
         (Plc::Bop1, 1) => Some(pump(Pump::MainFeed(Loop::B), on)),
         (Plc::Bop1, 2) => Some(pump(Pump::AuxiliaryFeed, on)),
@@ -236,6 +282,7 @@ pub fn decode_coil_write(plc: Plc, addr: u16, on: bool) -> Option<Command> {
         (Plc::Bop1, 4) => Some(controller(Controller::FeedLevel(Loop::A), on)),
         (Plc::Bop1, 5) => Some(controller(Controller::FeedLevel(Loop::B), on)),
         (Plc::Bop1, 6) => Some(controller(Controller::SteamDump, on)),
+        (Plc::Bop1, 7) => Some(Command::SteamIsolation { closed: on }),
         _ => None,
     }
 }
@@ -250,9 +297,59 @@ mod tests {
     }
 
     fn assert_heartbeats(snapshot: &PlantSnapshot, expected: u16) {
-        for (plc, address) in [(Plc::Rps1, 4), (Plc::Rcs1, 8), (Plc::Bop1, 10)] {
+        for (plc, address) in [
+            (Plc::Rps1, 4),
+            (Plc::Rcs1, 11),
+            (Plc::Bop1, 11),
+            (Plc::Pam1, 6),
+        ] {
             assert_eq!(input_registers(plc, snapshot)[address], expected);
             assert_eq!(expected, snapshot.telemetry.heartbeat);
+        }
+    }
+
+    #[test]
+    fn post_accident_controller_blocks_have_the_required_lengths() {
+        let s = full_power();
+        let blocks: Vec<_> = crate::network::CONTROLLERS
+            .iter()
+            .map(|(_, plc, _)| {
+                (
+                    input_registers(*plc, &s).len(),
+                    discrete_inputs(*plc, &s).len(),
+                    coils(*plc, &s).len(),
+                    holding_registers(*plc, &s).len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            [(5, 2, 3, 1), (12, 6, 7, 1), (12, 7, 8, 4), (7, 1, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn emergency_controls_are_exposed_over_modbus() {
+        for on in [false, true] {
+            assert_eq!(
+                decode_coil_write(Plc::Rcs1, 4, on),
+                Some(Command::Relief { open: on })
+            );
+            assert_eq!(
+                decode_coil_write(Plc::Rcs1, 5, on),
+                Some(Command::ReliefBlock { closed: on })
+            );
+            assert_eq!(
+                decode_coil_write(Plc::Rcs1, 6, on),
+                Some(Command::Pump {
+                    pump: Pump::SafetyInjection,
+                    running: on
+                })
+            );
+            assert_eq!(
+                decode_coil_write(Plc::Bop1, 7, on),
+                Some(Command::SteamIsolation { closed: on })
+            );
         }
     }
 
@@ -302,7 +399,7 @@ mod tests {
             before.truth.reactor.neutron_power_percent
         );
         assert_heartbeats(&after, before.telemetry.heartbeat);
-        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1] {
+        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1, Plc::Pam1] {
             assert_eq!(input_registers(plc, &before), input_registers(plc, &after));
             assert_eq!(discrete_inputs(plc, &before), discrete_inputs(plc, &after));
         }
@@ -364,6 +461,9 @@ mod tests {
                 600,
                 990,
                 980,
+                400,
+                1000,
+                0,
                 s.telemetry.heartbeat
             ],
         );
@@ -400,6 +500,7 @@ mod tests {
                 800,
                 9000,
                 50,
+                300,
                 s.telemetry.heartbeat
             ],
         );
@@ -437,11 +538,11 @@ mod tests {
         assert_eq!(discrete_inputs(Plc::Rps1, &s), vec![true, false]);
         assert_eq!(
             discrete_inputs(Plc::Rcs1, &s),
-            vec![true, true, false, false],
+            vec![true, true, false, false, false, false],
         );
         assert_eq!(
             discrete_inputs(Plc::Bop1, &s),
-            vec![true, true, false, true, false, false],
+            vec![true, true, false, true, false, false, false],
         );
     }
 
@@ -450,11 +551,14 @@ mod tests {
         let mut s = full_power();
         assert_eq!(coils(Plc::Rps1, &s), vec![false, false, false]);
         // Full power starts with both coolant pumps, the heaters and every controller automatic.
-        assert_eq!(coils(Plc::Rcs1, &s), vec![true, true, true, true]);
+        assert_eq!(
+            coils(Plc::Rcs1, &s),
+            vec![true, true, true, true, false, false, false]
+        );
         // Auxiliary feed starts off; both feed pumps, circulating water and every controller run.
         assert_eq!(
             coils(Plc::Bop1, &s),
-            vec![true, true, false, true, true, true, true],
+            vec![true, true, false, true, true, true, true, false],
         );
         s.truth.controllers.pressurizer_pressure = Mode::Manual;
         s.truth.controllers.feed_level[1] = Mode::Manual;
@@ -579,8 +683,8 @@ mod tests {
     #[test]
     fn coil_addresses_outside_each_block_decode_to_none() {
         assert_eq!(decode_coil_write(Plc::Rps1, 3, true), None);
-        assert_eq!(decode_coil_write(Plc::Rcs1, 4, true), None);
-        assert_eq!(decode_coil_write(Plc::Bop1, 7, true), None);
+        assert_eq!(decode_coil_write(Plc::Rcs1, 7, true), None);
+        assert_eq!(decode_coil_write(Plc::Bop1, 8, true), None);
     }
 
     #[test]
