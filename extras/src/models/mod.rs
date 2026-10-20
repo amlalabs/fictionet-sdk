@@ -26,6 +26,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower_service::Service;
 
+pub mod oauth;
 mod response;
 #[cfg(test)]
 mod tests;
@@ -37,6 +38,8 @@ pub enum Provider {
     Anthropic,
     /// OpenAI Responses and Chat Completions.
     OpenAi,
+    /// Codex inference with a ChatGPT subscription.
+    ChatGpt,
     /// OpenRouter Messages, Responses and Chat Completions.
     OpenRouter,
     /// Gemini content generation.
@@ -48,6 +51,7 @@ impl Provider {
         match self {
             Self::Anthropic => "api.anthropic.com",
             Self::OpenAi => "api.openai.com",
+            Self::ChatGpt => "chatgpt.com",
             Self::OpenRouter => "openrouter.ai",
             Self::Gemini => "generativelanguage.googleapis.com",
         }
@@ -56,7 +60,7 @@ impl Provider {
     pub fn key_variable(self) -> &'static str {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::OpenAi => "OPENAI_API_KEY",
+            Self::OpenAi | Self::ChatGpt => "OPENAI_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
             Self::Gemini => "GEMINI_API_KEY",
         }
@@ -72,6 +76,7 @@ impl Provider {
         match self {
             Self::Anthropic => matches!(path, "/v1/messages" | "/v1/messages/count_tokens"),
             Self::OpenAi => matches!(path, "/v1/responses" | "/v1/chat/completions"),
+            Self::ChatGpt => path == "/backend-api/codex/responses",
             Self::OpenRouter => matches!(
                 path,
                 "/api/v1/messages" | "/api/v1/responses" | "/api/v1/chat/completions"
@@ -90,7 +95,7 @@ impl Provider {
     fn error(self, status: u16, kind: &str, message: &str) -> Response<Body> {
         let body = match self {
             Self::Anthropic => json!({"type":"error", "error":{"type":kind,"message":message}}),
-            Self::OpenAi => {
+            Self::OpenAi | Self::ChatGpt => {
                 json!({"error":{"type":kind,"code":kind,"message":message,"param":null}})
             }
             Self::OpenRouter => json!({"error":{"code":status,"message":message}}),
@@ -105,7 +110,7 @@ impl Provider {
     fn stop(self) -> Response<Body> {
         match self {
             Self::Anthropic => self.error(400, "invalid_request_error", "You have reached your specified workspace API usage limits. Please contact your workspace administrator to raise your usage limit."),
-            Self::OpenAi => self.error(429, "organization_spend_limit_exceeded", "You have reached your organization spend limit."),
+            Self::OpenAi | Self::ChatGpt => self.error(429, "organization_spend_limit_exceeded", "You have reached your organization spend limit."),
             Self::OpenRouter => self.error(402, "", "Insufficient credits. Add more credits and retry the request."),
             Self::Gemini => self.error(429, "RESOURCE_EXHAUSTED", "Quota exceeded for quota metric: Generate Content requests."),
         }
@@ -152,18 +157,27 @@ impl fmt::Debug for Secret {
 }
 
 /// An API key paired with the credential installed in the guest.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Credential {
     real: Secret,
     placeholder: String,
+    oauth: Option<oauth::OAuth>,
 }
 impl Credential {
     /// Mints a placeholder preserving the provider prefix and key length.
     pub fn api_key(cx: &Cx, real: Secret) -> Self {
-        let prefix = ["sk-ant-api03-", "sk-or-v1-", "sk-proj-", "sk-", "AIza"]
-            .into_iter()
-            .find(|p| real.value.starts_with(p) && real.value.len() > p.len())
-            .unwrap_or("");
+        let prefix = [
+            "sk-ant-api03-",
+            "sk-ant-oat01-",
+            "sk-ant-ort01-",
+            "sk-or-v1-",
+            "sk-proj-",
+            "sk-",
+            "AIza",
+        ]
+        .into_iter()
+        .find(|p| real.value.starts_with(p) && real.value.len() > p.len())
+        .unwrap_or("");
         let mut bytes = vec![0; real.value.len() - prefix.len()];
         cx.fill_random(&mut bytes);
         let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -178,7 +192,18 @@ impl Credential {
             let last = placeholder.pop().expect("nonempty credential");
             placeholder.push(if last == 'a' { 'b' } else { 'a' });
         }
-        Self { real, placeholder }
+        Self {
+            real,
+            placeholder,
+            oauth: None,
+        }
+    }
+    fn header(&self, provider: Provider) -> &'static str {
+        if self.oauth.is_some() {
+            "authorization"
+        } else {
+            provider.header()
+        }
     }
     /// The only credential value suitable for guest provisioning.
     pub fn placeholder(&self) -> &str {
@@ -190,7 +215,7 @@ impl Credential {
         } else {
             &self.placeholder
         };
-        if provider.header() == "authorization" {
+        if self.oauth.is_some() || provider.header() == "authorization" {
             format!("Bearer {value}")
         } else {
             value.clone()
@@ -307,6 +332,25 @@ pub struct Model {
     prices: Option<(String, Prices)>,
 }
 impl Model {
+    /// Builds the model site for a dedicated OAuth authority.
+    /// Mount the authority itself at its token hostname as well.
+    pub async fn oauth(cx: &Cx, oauth: oauth::OAuth) -> fictionet::Result<Self> {
+        let provider = match oauth.login() {
+            oauth::Login::Claude => Provider::Anthropic,
+            oauth::Login::Codex => Provider::ChatGpt,
+        };
+        let credential = Credential {
+            real: oauth.secret().await?,
+            placeholder: oauth.placeholder(),
+            oauth: Some(oauth),
+        };
+        Self::at(
+            cx,
+            provider,
+            credential,
+            format!("https://{}", provider.host()).parse()?,
+        )
+    }
     /// Builds a provider using a supplied credential and origin.
     /// Custom origins let a world use its own gateway or a local upstream.
     pub fn at(
@@ -351,6 +395,9 @@ impl Model {
     }
     /// Placeholder environment for a guest.
     pub fn guest_env(&self) -> Vec<(&'static str, String)> {
+        if self.credential.oauth.is_some() {
+            return Vec::new();
+        }
         vec![(
             self.provider.key_variable(),
             self.credential.placeholder.clone(),
@@ -363,7 +410,7 @@ impl Model {
                 .field("reason", reason)
         });
     }
-    async fn send(self, request: Request<Body>) -> fictionet::Result<Response<Body>> {
+    async fn send(mut self, request: Request<Body>) -> fictionet::Result<Response<Body>> {
         let path = request.uri().path().to_owned();
         if self.provider == Provider::Anthropic
             && request.method() == http::Method::HEAD
@@ -376,12 +423,20 @@ impl Model {
             return Ok(self.provider.error(404, "not_found_error", "Not found"));
         }
         let expected = self.credential.wire(self.provider, false);
-        let values = request.headers().get_all(self.provider.header());
+        let values = request
+            .headers()
+            .get_all(self.credential.header(self.provider));
         if values.iter().count() != 1
-            || values
-                .iter()
-                .next()
-                .is_none_or(|v| v.as_bytes() != expected.as_bytes())
+            || values.iter().next().is_none_or(|v| {
+                if let Some(oauth) = &self.credential.oauth {
+                    v.to_str()
+                        .ok()
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .is_none_or(|v| !oauth.accepts(v))
+                } else {
+                    v.as_bytes() != expected.as_bytes()
+                }
+            })
         {
             self.refused(&path, "credential");
             return Ok(self.provider.error(
@@ -439,9 +494,21 @@ impl Model {
                         .field("kind", kind)
                 });
                 self.refused(&path, "budget");
-                return Ok(self.provider.stop());
+                return Ok(self
+                    .credential
+                    .oauth
+                    .as_ref()
+                    .map_or_else(|| self.provider.stop(), oauth::OAuth::stop));
             }
             ledger.calls += 1;
+        }
+        if let Some(oauth) = &self.credential.oauth {
+            self.credential.real = oauth.secret().await?;
+            if self.provider == Provider::ChatGpt {
+                parts
+                    .headers
+                    .insert("chatgpt-account-id", oauth.account()?.parse()?);
+            }
         }
         let mut call = response::Call::new(&self, path, &body, bytes.len(), free);
         for name in [
@@ -454,7 +521,7 @@ impl Model {
             parts.headers.remove(name);
         }
         parts.headers.insert(
-            self.upstream_provider.header(),
+            self.credential.header(self.upstream_provider),
             self.credential.wire(self.upstream_provider, true).parse()?,
         );
         if !self.path_prefix.is_empty() {
