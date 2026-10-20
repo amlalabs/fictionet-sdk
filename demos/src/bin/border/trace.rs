@@ -161,20 +161,8 @@ impl Tracker {
 
 #[cfg(test)]
 mod tests {
+    use super::super::client::probe;
     use super::*;
-    fn packet(ttl: u8, port: u16) -> Vec<u8> {
-        let mut p = vec![0u8; 28];
-        p[0] = 0x45;
-        p[3] = 28;
-        p[8] = ttl;
-        p[9] = 17;
-        p[12..16].copy_from_slice(&[192, 168, 1, 2]);
-        p[16..20].copy_from_slice(&BANK_ADDR.octets());
-        p[20..22].copy_from_slice(&port.to_be_bytes());
-        p[22..24].copy_from_slice(&(33433 + u16::from(ttl)).to_be_bytes());
-        p[25] = 8;
-        p
-    }
     fn reply(probe: &[u8], from: Ipv4Addr, destination: bool) -> Vec<u8> {
         border_world::path::icmp_error(
             probe,
@@ -190,13 +178,13 @@ mod tests {
     #[test]
     fn replies_complete_and_replace_the_trace_without_late_hops() {
         let mut tracker = Tracker::default();
-        let old = packet(2, 40000);
+        let old = probe(2, 40000);
         for (ttl, from) in [
             (1, Ipv4Addr::new(192, 168, 1, 1)),
             (2, Ipv4Addr::new(84, 21, 44, 1)),
             (3, BANK_ADDR),
         ] {
-            let p = packet(ttl, 40000);
+            let p = probe(ttl, 40000);
             tracker.packet(10, true, &p);
             tracker.packet(34, false, &reply(&p, from, ttl == 3));
         }
@@ -204,7 +192,7 @@ mod tests {
         assert!(trace.complete);
         assert_eq!(trace.hops.len(), 3);
         assert_eq!(trace.hops[2].round_trip_ms, 24);
-        let first = packet(1, 41000);
+        let first = probe(1, 41000);
         tracker.packet(50, true, &first);
         tracker.packet(51, false, &reply(&old, BANK_ADDR, false));
         assert!(tracker.trace.as_ref().unwrap().hops.is_empty());
@@ -229,7 +217,7 @@ mod tests {
             BANK_ADDR,
         ];
         let probes: Vec<_> = (1..=6u8)
-            .map(|ttl| packet(ttl, 51000 + 731 * u16::from(ttl)))
+            .map(|ttl| probe(ttl, 51000 + 731 * u16::from(ttl)))
             .collect();
         for p in &probes {
             tracker.packet(10, true, p);
@@ -253,19 +241,19 @@ mod tests {
     fn probes_and_hops_stay_bounded_and_report_loss() {
         let mut tracker = Tracker::default();
         for ttl in 1..=100 {
-            let p = packet(ttl, 40000);
+            let p = probe(ttl, 40000);
             tracker.packet(10, true, &p);
         }
         assert_eq!(tracker.probes.len(), MAX_PROBES);
         assert_eq!(tracker.trace.as_ref().unwrap().dropped, 36);
         for ttl in 37..=100 {
-            let p = packet(ttl, 40000);
+            let p = probe(ttl, 40000);
             tracker.packet(20, false, &reply(&p, BANK_ADDR, false));
         }
         assert_eq!(tracker.trace.as_ref().unwrap().hops.len(), MAX_HOPS);
         assert_eq!(tracker.trace.as_ref().unwrap().dropped, 68);
         for n in 0..28 {
-            tracker.packet(30, true, &packet(1, 2)[..n]);
+            tracker.packet(30, true, &probe(1, 2)[..n]);
         }
     }
 }

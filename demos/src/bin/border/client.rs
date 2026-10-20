@@ -199,7 +199,8 @@ impl Client {
         ))
     }
 }
-fn probe(ttl: u8, port: u16) -> Vec<u8> {
+/// A traceroute probe: a UDP datagram to the bank at port 33433 + `ttl`.
+pub(super) fn probe(ttl: u8, port: u16) -> Vec<u8> {
     let mut p = vec![0u8; 28];
     p[0] = 0x45;
     p[3] = 28;

@@ -1330,6 +1330,6 @@ fn diagnostic_commands() -> Vec<&'static str> {
         "systemctl is-active vnc",
         "tail -n 15 /tmp/xvnc.log /tmp/xfce.log",
         "tail -n 40 /tmp/firefox.log",
-        "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'",
+        desktop::FIREFOX_TITLE,
     ]
 }

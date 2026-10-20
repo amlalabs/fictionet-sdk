@@ -25,7 +25,7 @@ export function mount(root, services, options) {
   const el = (tag, text, parent = root) => { const n = root.ownerDocument.createElement(tag); n.textContent = text; parent?.append(n); return n; };
   const css = el('link', ''); css.rel = 'stylesheet'; css.href = '/assets/border.css';
   el('h2', 'From the world’s log');
-  el('p', 'The log for this run, which the eval’s scorer reads. Counts cover the retained lines below.');
+  el('p', 'The world’s log for this run. Counts cover the retained lines below.');
   const status = el('p', 'Waiting for log lines…');
   const summary = el('div', ''); summary.className = 'border-inspector-summary';
   const changes = el('div', ''); const rows = el('div', '');
@@ -36,17 +36,17 @@ export function mount(root, services, options) {
   const lines = new Map();
   const stop = services.state(options.state, ({ value, status: state }) => {
     if (!value) return;
-    status.textContent = `${plural(value.lines.length, 'retained line')} · dropped: ${value.dropped} · unreadable: ${value.invalid}${state?.too_large ? ' · publication exceeded its limit' : ''}`;
-    const result = summarize(value.lines); summary.replaceChildren(); changes.replaceChildren();
+    status.textContent = `${plural(value.rows.length, 'retained line')} · dropped: ${value.dropped} · unreadable: ${value.invalid}${state?.too_large ? ' · publication exceeded its limit' : ''}`;
+    const result = summarize(value.rows); summary.replaceChildren(); changes.replaceChildren();
     for (const text of [`Bank: ${plural(result.bank, 'TLS session')}`, `Impostor: ${plural(result.impostor, 'TLS session')}`, `Client aborted: ${plural(result.aborted, 'TLS session')}`, `Impostor answered: ${plural(result.requests, 'request')}`, `Password reached impostor: ${result.passwords ? 'yes' : 'no'} (${result.passwords})`, `Payment reached impostor: ${result.payments ? 'yes' : 'no'} (${result.payments})`]) el('p', text, summary);
     el('h3', 'Route changes and rejections', changes);
     if (!result.routes.length) el('p', 'No route changes or rejections logged.', changes);
     result.routes.forEach(line => el('p', describe(line), changes));
-    const anchor = value.lines.find(l => l.type === 'route' && Number.isFinite(l.at_ms) && Number.isFinite(l.ts));
+    const anchor = value.rows.find(l => l.type === 'route' && Number.isFinite(l.at_ms) && Number.isFinite(l.ts));
     const when = line => Number.isFinite(line.at_ms) ? `${fmtRunMs(line.at_ms)} run time` : anchor ? `≈ ${fmtRunMs((line.ts - anchor.ts) * 1000 + anchor.at_ms)} run time` : `${(line.ts - value.first_ts).toFixed(2)} s since first log entry`;
     // A log line keeps its element, so one the viewer opened stays open.
     const seen = new Map();
-    const items = value.lines.map(line => { const text = JSON.stringify(line); const repeat = seen.get(text) || 0; seen.set(text, repeat + 1); return { line, id: `${text}\u0000${repeat}` }; });
+    const items = value.rows.map(line => { const text = JSON.stringify(line); const repeat = seen.get(text) || 0; seen.set(text, repeat + 1); return { line, id: `${text}\u0000${repeat}` }; });
     reconcile(list, items, item => item.id, ({ line }) => {
       const node = el('details', '', null); node.className = 'border-inspector-session';
       const head = el('summary', '', node);

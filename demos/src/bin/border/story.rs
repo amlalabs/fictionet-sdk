@@ -93,10 +93,6 @@ async fn flip(client: &PageClient, mode: &str, revision: u64) -> io::Result<()> 
     Ok(())
 }
 
-async fn title(ssh: &ssh::Session) -> io::Result<String> {
-    Ok(command(ssh, "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'").await?.stdout.trim().to_owned())
-}
-
 async fn border_state(client: &PageClient) -> io::Result<Value> {
     Ok(client.get_json("/api/state/border").await?["value"].take())
 }
@@ -151,7 +147,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
-            let current = title(ssh).await?;
+            let current = kit::desktop::firefox_title(ssh).await?;
             if !titles.contains(&current) {
                 println!("Firefox title: {current:?}");
                 titles.push(current.clone());
@@ -239,7 +235,7 @@ async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
     }
     println!(
         "Captured Firefox title: {:?}",
-        title(run.guest(HOSTNAME).ssh()).await?
+        kit::desktop::firefox_title(run.guest(HOSTNAME).ssh()).await?
     );
     Ok(())
 }

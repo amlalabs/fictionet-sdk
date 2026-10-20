@@ -20,7 +20,8 @@ use fictionet_observe::page::{StateLimits, StateTopic};
 use serde::Serialize;
 use std::{collections::VecDeque, net::Ipv4Addr, sync::Arc};
 
-const ROWS: usize = 32;
+/// How many rows a [`Rows`] keeps.
+pub(super) const ROWS: usize = 32;
 const SANDBOXES: usize = 8;
 const TEXT: usize = 256;
 
@@ -38,7 +39,8 @@ impl<T> Default for Rows<T> {
     }
 }
 impl<T> Rows<T> {
-    fn push(&mut self, row: T) {
+    /// Keeps `row`, dropping the oldest row once [`ROWS`] are kept.
+    pub(super) fn push(&mut self, row: T) {
         if self.rows.len() == ROWS {
             self.rows.pop_front();
             self.dropped += 1;

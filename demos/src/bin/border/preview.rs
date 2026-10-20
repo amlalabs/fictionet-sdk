@@ -229,7 +229,7 @@ mod tests {
         let results: serde_json::Value = serde_json::from_slice(&results.body).unwrap();
         assert_eq!(results["value"]["invalid"], 0);
         assert_eq!(results["value"]["dropped"], 0);
-        let lines = results["value"]["lines"].as_array().unwrap();
+        let lines = results["value"]["rows"].as_array().unwrap();
         assert!(lines.iter().any(|l| l["type"] == "http"
             && l["served_by"] == "impostor"
             && l["carries_password"] == true));

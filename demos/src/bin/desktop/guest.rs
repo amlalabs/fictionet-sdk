@@ -18,7 +18,6 @@ const CODEX_SHA256: &str = "df22dac1f24b7927e817e8b113067fbe1caa586aba7554247fab
 pub fn workstation(hostname: &str, user: &str, site: &str) -> Guest {
     desktop::browser(hostname, user, &format!("https://{site}/"))
         .resources(4, 4096)
-        .dmi("LENOVO", "20UES000-WS")
         .file(
             "/etc/claude-code/managed-settings.json",
             0o644,

@@ -78,7 +78,6 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
                     vec![
                         Column::new("Agent", "/name"),
                         Column::new("Version", "/version"),
-                        Column::new("Status", "/status"),
                     ],
                 )
         })
@@ -375,11 +374,6 @@ async fn run_checks(
         )
         .err(),
     );
-    // A moment for Firefox to finish painting the page and its padlock. A
-    // failed load fails the run, which then prints the guest's Firefox log.
-    if loaded.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_secs(6)).await;
-    }
 
     // Required: the coding agents are on the desktop user's PATH over SSH,
     // each at its pinned release.
@@ -407,28 +401,17 @@ async fn run_checks(
         .into_iter()
         .filter(|(_, output)| output.code == 0)
         .filter_map(|(name, output)| {
-            agent_version(&output.stdout)
-                .map(|version| json!({"name":name, "version":version, "status":"installed"}))
+            agent_version(&output.stdout).map(|version| json!({"name": name, "version": version}))
         })
         .collect();
     agents.publish(cx.now(), &rows).map_err(boxed)?;
 
-    // A screenshot of the guest's own screen, over ssh, decoded on the host.
-    let mut screenshots = Vec::new();
-    let shot = session
-        .run(
-            "sudo -u analyst env DISPLAY=:1 scrot -o /tmp/guest.png 2>/dev/null && base64 -w0 \
-            /tmp/guest.png",
-        )
-        .await?;
-    let guest_png = save_png(&shot.stdout, &shots.join("guest-desktop.png"));
-    failures.extend(check("the guest's own screen was captured", guest_png.is_some()).err());
-    screenshots.extend(guest_png);
-
     // Required: the desktop as the viewer delivers it, proved without a
     // browser -- connect to the page's own WebSocket and speak RFB through the
     // bridge (page -> WebSocket -> SSH tunnel across the world -> Xvnc) --
+    // once two captures in a row match, so Firefox has finished painting,
     // and then as the host's headless Chromium renders the page.
+    let mut screenshots = Vec::new();
     let captured = run
         .screenshots(
             HOSTNAME,
@@ -450,6 +433,17 @@ async fn run_checks(
         )
         .err(),
     );
+
+    // A screenshot of the guest's own screen, over ssh, decoded on the host.
+    let shot = session
+        .run(
+            "sudo -u analyst env DISPLAY=:1 scrot -o /tmp/guest.png 2>/dev/null && base64 -w0 \
+            /tmp/guest.png",
+        )
+        .await?;
+    let guest_png = save_png(&shot.stdout, &shots.join("guest-desktop.png"));
+    failures.extend(check("the guest's own screen was captured", guest_png.is_some()).err());
+    screenshots.extend(guest_png);
 
     page_checks(page_url, session, &mut failures).await;
 
@@ -521,18 +515,14 @@ async fn probe(
     name: &str,
     test: impl std::future::Future<Output = std::io::Result<bool>>,
 ) {
-    let result = tokio::time::timeout(Duration::from_secs(45), test).await;
-    let ok = match result {
-        Ok(Ok(ok)) => ok,
-        Ok(Err(error)) => {
-            println!("{name}: {error}");
-            false
-        }
-        Err(error) => {
-            println!("{name}: {error}");
-            false
-        }
-    };
+    let result = tokio::time::timeout(Duration::from_secs(45), test)
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result);
+    let ok = result.unwrap_or_else(|error| {
+        println!("{name}: {error}");
+        false
+    });
     failures.extend(check(name, ok).err());
 }
 

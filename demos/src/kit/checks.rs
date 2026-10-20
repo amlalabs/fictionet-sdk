@@ -239,16 +239,16 @@ impl Run {
         Ok(page)
     }
 
-    /// Saves `host`'s screen to `screen` as [`Run::screen`] does, then the
-    /// page to `page` from Chromium once the page shows that screen painted,
-    /// within 30 s.
+    /// Saves `host`'s screen to `screen` as [`Run::settled_screen`] does,
+    /// then the page to `page` from Chromium once the page shows that screen
+    /// painted, within 30 s.
     pub async fn screenshots(
         &self,
         host: &str,
         screen: &Path,
         page: &Path,
     ) -> io::Result<Screenshots> {
-        let capture = self.screen(host, screen).await?;
+        let (capture, _) = self.settled_screen(host, screen).await?;
         let page = self
             .page_shot(page, &shot::desktop_painted(host), PAGE_TIMEOUT)
             .await?;
@@ -308,7 +308,7 @@ const DESKTOP_DIAGNOSTICS: &[&str] = &[
     "systemctl is-active vnc",
     "tail -n 15 /tmp/xvnc.log /tmp/xfce.log",
     "tail -n 40 /tmp/firefox.log",
-    "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'",
+    super::desktop::FIREFOX_TITLE,
 ];
 /// Each diagnostic command's time and output bounds.
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(3);

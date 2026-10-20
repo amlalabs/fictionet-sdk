@@ -39,6 +39,26 @@ while IFS= read -r command < "$work/commands"; do
     printf '%s\n' "$status" > "$work/results"
 done
 "#;
+/// Prints the title of the first visible Firefox window on the guest's
+/// display, or nothing when none shows.
+pub(crate) const FIREFOX_TITLE: &str = "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible \
+    --class firefox | head -n1 | xargs -r xdotool getwindowname'";
+
+/// Returns the title of the first visible Firefox window on the guest's
+/// screen, or an empty string when none shows. It takes at most 10 s.
+pub async fn firefox_title(ssh: &ssh::Session) -> io::Result<String> {
+    let out = tokio::time::timeout(Duration::from_secs(10), ssh.run(FIREFOX_TITLE))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the Firefox title query hung"))??;
+    if out.code != 0 {
+        return Err(io::Error::other(format!(
+            "the Firefox title query exited {}: {}",
+            out.code, out.stderr
+        )));
+    }
+    Ok(out.stdout.trim().to_owned())
+}
+
 /// How long [`GuestHandle::type_command`] waits: the program's own 300 s
 /// limit and time to type.
 const TYPED_TIMEOUT: Duration = Duration::from_secs(330);
