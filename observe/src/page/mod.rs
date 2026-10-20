@@ -229,9 +229,10 @@
 //! combined with AND. `field` names a member of the event's `fields` object;
 //! `host` maps the page host to the event's `sandbox.name`. Missing fields
 //! do not match, including when the expected value is null. Omitted filters
-//! match everything. Each call reads at most the session's default 1,000
-//! events before filtering; `next` advances over all examined events, even
-//! when rows is empty. `dropped` has the session's loss semantics. Pass next
+//! match everything. Each call reads the retained events after the cursor in
+//! batches of 1,000, until they run out or 1,000 rows match; `next` advances
+//! over exactly the examined events, even when rows is empty, so it never
+//! skips an event. `dropped` has the session's loss semantics. Pass next
 //! as after on the next request. Only after is accepted as a query field.
 //!
 //! `moment(title, EventFilter)` names a story moment. `/api/page` includes

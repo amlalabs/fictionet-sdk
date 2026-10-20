@@ -392,34 +392,54 @@ pub(super) async fn projection(
         },
         _ => return http::error(conn, 400, "event tables accept only after").await,
     };
-    let values = shared.page.dashboard.session().request(
-        1,
-        &serde_json::json!({"op":"events", "after":after}).to_string(),
-        std::time::Instant::now(),
-        None,
-    );
-    let mut value: serde_json::Value = serde_json::from_slice(&values[0].bytes)?;
-    let Some(events) = value["events"].as_array_mut() else {
-        return http::respond(conn, 404, "application/json", &values[0].bytes).await;
-    };
     let sandbox = filter
         .host
         .as_ref()
         .and_then(|name| shared.page.hosts.iter().find(|host| &host.name == name))
         .map(|h| &h.sandbox);
-    events.retain(|event| {
-        filter.source.as_ref().is_none_or(|s| event["source"] == *s)
-            && filter.kind.as_ref().is_none_or(|s| event["kind"] == *s)
-            && filter
-                .field
-                .as_ref()
-                .is_none_or(|(name, v)| event["fields"].get(name) == Some(v))
-            && sandbox.is_none_or(|s| event["sandbox"]["name"] == *s)
-    });
+    // The session returns at most BATCH events after a cursor. Read batches
+    // until the retained events run out or a page of rows matches, so a
+    // filter's next cursor never skips events it has not seen.
+    const BATCH: usize = 1000;
+    let (mut cursor, mut rows) = (after, Vec::new());
+    let dropped = loop {
+        let values = shared.page.dashboard.session().request(
+            1,
+            &serde_json::json!({"op":"events", "after":cursor, "max":BATCH}).to_string(),
+            std::time::Instant::now(),
+            None,
+        );
+        let mut value: serde_json::Value = serde_json::from_slice(&values[0].bytes)?;
+        let Some(events) = value["events"].as_array_mut() else {
+            return http::respond(conn, 404, "application/json", &values[0].bytes).await;
+        };
+        let full = events.len() == BATCH;
+        let read = events.last().and_then(|event| event["seq"].as_u64());
+        rows.extend(events.drain(..).filter(|event| {
+            filter.source.as_ref().is_none_or(|s| event["source"] == *s)
+                && filter.kind.as_ref().is_none_or(|s| event["kind"] == *s)
+                && filter
+                    .field
+                    .as_ref()
+                    .is_none_or(|(name, v)| event["fields"].get(name) == Some(v))
+                && sandbox.is_none_or(|s| event["sandbox"]["name"] == *s)
+        }));
+        let dropped = value["dropped"].take();
+        match read {
+            Some(seq) if full => cursor = seq,
+            _ => {
+                cursor = value["last"].as_u64().unwrap_or(cursor);
+                break dropped;
+            }
+        }
+        if rows.len() >= BATCH {
+            break dropped;
+        }
+    };
     let reply = serde_json::json!({
-        "rows": value["events"],
-        "next": value["last"],
-        "dropped": value["dropped"],
+        "rows": rows,
+        "next": cursor,
+        "dropped": dropped,
     });
     http::json(conn, 200, &reply).await
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use fictionet::events::Level;
+use fictionet::prelude::*;
 use fictionet::stdlib::network::ports::{Event, Ports as Links};
 use fictionet::stdlib::network::{ip, tcp, udp};
 use fictionet::time::ms;
@@ -11,8 +12,8 @@ use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RunOptions, Seed};
 use fictionet_observe::Memory;
 use scan_world::ports::MAX_ROWS;
 use scan_world::{
-    Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Protocol, SCANNER, SERVER,
-    SERVER_ADDR, office, start,
+    Banner, Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Protocol, SCANNER,
+    SERVER, SERVER_ADDR, office, start,
 };
 
 const SCANNER_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 9, 2);
@@ -179,6 +180,8 @@ fn scan_snapshot_deltas_and_facts_follow_the_packets() {
                 at_ms: 90,
                 max_rows: MAX_ROWS,
                 untracked: 0,
+                untracked_banners: 0,
+                banners: vec![],
                 machines: [
                     ("www", 10),
                     ("mail", 11),
@@ -236,7 +239,9 @@ fn scan_snapshot_deltas_and_facts_follow_the_packets() {
                     revision: 14,
                     at_ms: 90,
                     untracked: 0,
+                    untracked_banners: 0,
                     rows: [1, 2, 4, 6].map(|i| expected.rows[i].clone()).into(),
+                    banners: vec![],
                 }
             );
             let facts = history.checked_of("scan", "port").unwrap();
@@ -308,6 +313,110 @@ fn scan_snapshot_deltas_and_facts_follow_the_packets() {
             assert_eq!(ports.snapshot(), expected);
             assert_eq!(history.checked_of("scan", "port").unwrap(), facts);
             assert!(history.checked_of("scan", "full").unwrap().is_empty());
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+/// Reads the first data a connection sends after `request`, then closes it.
+async fn first_data(fcx: &Cx, tcp: &tcp::Endpoint, host: Ipv4Addr, port: u16, request: &[u8]) {
+    let mut conn = tcp.connect(fcx, (host, port).into()).await.unwrap();
+    if !request.is_empty() {
+        conn.write_all(fcx, request).await.unwrap();
+    }
+    let mut bytes = [0; 512];
+    assert_ne!(conn.read(fcx, &mut bytes).await.unwrap(), 0);
+    conn.shutdown(fcx).await.unwrap();
+}
+
+#[test]
+fn banners_from_real_connections_are_kept_once_with_facts() {
+    let memory = Arc::new(Memory::default());
+    let history = memory.clone();
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(42)).observer(memory),
+        move |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            let ports = start(&fcx, office(), attachments)?;
+            let (server, mut web, _inject) = server(&fcx, attacher.attach(SERVER)?);
+            fcx.spawn(move |fcx| async move {
+                while let Ok(mut conn) = web.accept(&fcx).await {
+                    let mut request = [0; 512];
+                    let _ = conn.read(&fcx, &mut request).await;
+                    conn.write_all(
+                        &fcx,
+                        b"HTTP/1.1 200 OK\r\nServer: nginx/1.24.0 (Ubuntu)\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await?;
+                    conn.shutdown(&fcx).await?;
+                }
+                Ok(())
+            });
+            let mut ssh = server.listen(22).unwrap();
+            fcx.spawn(move |fcx| async move {
+                while let Ok(mut conn) = ssh.accept(&fcx).await {
+                    conn.write_all(&fcx, b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20\r\n\xff")
+                        .await?;
+                    conn.shutdown(&fcx).await?;
+                }
+                Ok(())
+            });
+            let scanner = tcp::endpoint(&fcx, attacher.attach(SCANNER)?, SCANNER_ADDR.into());
+            let www = Ipv4Addr::new(10, 0, 0, 10);
+            let mail = Ipv4Addr::new(10, 0, 0, 11);
+            first_data(&fcx, &scanner, www, 22, b"").await;
+            first_data(&fcx, &scanner, mail, 25, b"").await;
+            first_data(&fcx, &scanner, SERVER_ADDR, 22, b"").await;
+            let request = b"GET / HTTP/1.0\r\n\r\n";
+            first_data(&fcx, &scanner, SERVER_ADDR, 80, request).await;
+            let before = ports.snapshot();
+            // Later connections leave every kept banner as it was.
+            first_data(&fcx, &scanner, www, 22, b"").await;
+            first_data(&fcx, &scanner, SERVER_ADDR, 80, request).await;
+            fcx.sleep(ms(10)).await?;
+            let map = ports.snapshot();
+            assert_eq!(map.banners, before.banners);
+            assert_eq!(
+                map.banners
+                    .iter()
+                    .map(|b| (b.host, b.port, b.text.as_str(), b.server.as_deref()))
+                    .collect::<Vec<_>>(),
+                [
+                    (www, 22, "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3", None),
+                    (mail, 25, "220 mail.corp.test ESMTP Postfix (Debian/GNU)", None),
+                    (SERVER_ADDR, 22, "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20", None),
+                    (SERVER_ADDR, 80, "HTTP/1.1 200 OK", Some("nginx/1.24.0 (Ubuntu)")),
+                ]
+            );
+            assert_eq!(map.untracked_banners, 0);
+            for banner in &map.banners {
+                let row = map
+                    .rows
+                    .iter()
+                    .find(|r| (r.host, r.port, r.protocol) == (banner.host, banner.port, Protocol::Tcp))
+                    .unwrap();
+                assert_eq!(row.state, PortState::Open);
+            }
+            let facts = history.checked_of("scan", "banner").unwrap();
+            assert_eq!(facts.len(), 4);
+            for (event, banner) in facts.iter().zip(&map.banners) {
+                assert_eq!(event.str("host"), Some(banner.host.to_string().as_str()));
+                assert_eq!(event.u64("port"), Some(u64::from(banner.port)));
+                assert_eq!(event.str("text"), Some(banner.text.as_str()));
+                assert_eq!(event.str("server"), banner.server.as_deref());
+                assert_eq!(event.u64("at_ms"), Some(banner.at_ms));
+                assert_eq!(event.u64("revision"), Some(banner.revision));
+                assert_eq!(event.level, Level::Info);
+            }
+            let first: &Banner = &map.banners[0];
+            let changes = ports.changes_since(first.revision - 1);
+            assert!(changes.banners.contains(first));
+            let (snapshot, delta) = ports.snapshot_with_changes(first.revision - 1);
+            assert_eq!(snapshot, map);
+            assert_eq!(delta, changes);
+            assert_eq!(delta.revision, snapshot.revision);
             fcx.cancel();
             Ok(())
         },

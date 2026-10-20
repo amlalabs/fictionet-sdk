@@ -1852,6 +1852,81 @@ async fn moments_validate_titles_ids_and_host_filters_before_binding() {
 }
 
 #[tokio::test]
+async fn a_late_event_table_read_finds_a_moment_past_the_first_thousand_events() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let observer = dashboard.observer();
+    let server = Page::new("Late reader", dashboard.handle())
+        .moment(
+            "Found",
+            EventFilter {
+                source: Some("fixture".into()),
+                kind: Some("found".into()),
+                ..EventFilter::default()
+            },
+        )
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    std::thread::spawn(move || {
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(3)).observer(observer),
+            |cx| async move {
+                for n in 0..2500u64 {
+                    cx.emit("fixture", "noise", |e| e.field("n", n));
+                }
+                cx.emit("fixture", "found", |e| e.field("n", 2500u64));
+                for n in 0..1500u64 {
+                    cx.emit("fixture", "noise", |e| e.field("n", n));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap()
+    })
+    .join()
+    .unwrap();
+    let all = json_body(&request(&server, "GET", "/api/events?max=1", &bearer(&server), "").await);
+    let last = all["last"].as_u64().unwrap();
+    let rows = json_body(
+        &request(
+            &server,
+            "GET",
+            "/api/event-table/found",
+            &bearer(&server),
+            "",
+        )
+        .await,
+    );
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(rows["rows"][0]["fields"]["n"], 2500);
+    assert_eq!(rows["next"], last);
+    let seq = rows["rows"][0]["seq"].as_u64().unwrap();
+    let before = json_body(
+        &request(
+            &server,
+            "GET",
+            &format!("/api/event-table/found?after={}", seq - 1),
+            &bearer(&server),
+            "",
+        )
+        .await,
+    );
+    assert_eq!(before["rows"], rows["rows"]);
+    let after = json_body(
+        &request(
+            &server,
+            "GET",
+            &format!("/api/event-table/found?after={seq}"),
+            &bearer(&server),
+            "",
+        )
+        .await,
+    );
+    assert_eq!(after["rows"], serde_json::json!([]));
+    assert_eq!(after["next"], last);
+}
+
+#[tokio::test]
 async fn left_the_box_is_declared_and_requires_a_bearer() {
     for standard in [false, true] {
         let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());

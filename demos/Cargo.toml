@@ -53,3 +53,7 @@ path = "src/bin/desktop/main.rs"
 [[bin]]
 name = "scan"
 path = "src/bin/scan/main.rs"
+
+[[example]]
+name = "scan_page"
+path = "src/bin/scan/example.rs"

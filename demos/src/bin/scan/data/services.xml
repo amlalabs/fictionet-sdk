@@ -1,35 +1,97 @@
-<?xml version="1.0"?>
-<!-- Representative nmap XML for parser and story tests. -->
-<nmaprun scanner="nmap" version="7.94SVN">
-<host><status state="up" reason="echo-reply"/><address addr="10.0.0.10" addrtype="ipv4"/>
-<ports><extraports state="closed" count="1022"><extrareasons reason="resets" count="1022"/></extraports>
-<port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.2p1"/></port>
-<port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Apache httpd" version="2.4.62"/></port>
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.94SVN scan initiated Tue Oct 20 02:17:02 2026 as: nmap -sS -sV -&#45;version-light -n -p 1-1024 -&#45;max-rate 300 -oX notes/office-2.xml 10.0.0.0/24 -->
+<nmaprun scanner="nmap" args="nmap -sS -sV -&#45;version-light -n -p 1-1024 -&#45;max-rate 300 -oX notes/office-2.xml 10.0.0.0/24" start="1792462622" startstr="Tue Oct 20 02:17:02 2026" version="7.94SVN" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="1024" services="1-1024"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<hosthint><status state="up" reason="unknown-response" reason_ttl="0"/>
+<address addr="10.0.0.12" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+</hosthint>
+<hosthint><status state="up" reason="unknown-response" reason_ttl="0"/>
+<address addr="10.0.0.11" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+</hosthint>
+<hosthint><status state="up" reason="unknown-response" reason_ttl="0"/>
+<address addr="10.0.0.50" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+</hosthint>
+<hosthint><status state="up" reason="unknown-response" reason_ttl="0"/>
+<address addr="10.0.0.10" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+</hosthint>
+<hosthint><status state="up" reason="unknown-response" reason_ttl="0"/>
+<address addr="10.0.0.13" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+</hosthint>
+<host starttime="1792462630" endtime="1792462649"><status state="up" reason="echo-reply" reason_ttl="64"/>
+<address addr="10.0.0.10" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports><extraports state="closed" count="1022">
+<extrareasons reason="reset" count="1022" proto="tcp" ports="1-21,23-79,81-1024"/>
+</extraports>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ssh" product="OpenSSH" version="9.2p1 Debian 2+deb12u3" extrainfo="protocol 2.0" ostype="Linux" method="probed" conf="10"><cpe>cpe:/a:openbsd:openssh:9.2p1</cpe><cpe>cpe:/o:linux:linux_kernel</cpe></service></port>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="http" product="Apache httpd" version="2.4.62" extrainfo="(Debian)" method="probed" conf="10"><cpe>cpe:/a:apache:http_server:2.4.62</cpe></service></port>
 </ports>
+<times srtt="4225" rttvar="32" to="100000"/>
 </host>
-<host><status state="up" reason="echo-reply"/><address addr="10.0.0.11" addrtype="ipv4"/>
-<ports><extraports state="closed" count="1021"><extrareasons reason="resets" count="1021"/></extraports>
-<port protocol="tcp" portid="25"><state state="open" reason="syn-ack"/><service name="smtp" product="Postfix smtpd" version=""/></port>
-<port protocol="tcp" portid="110"><state state="open" reason="syn-ack"/><service name="pop3" product="Dovecot pop3d" version=""/></port>
-<port protocol="tcp" portid="143"><state state="open" reason="syn-ack"/><service name="imap" product="Dovecot imapd" version=""/></port>
+<host starttime="1792462630" endtime="1792462649"><status state="up" reason="echo-reply" reason_ttl="64"/>
+<address addr="10.0.0.11" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports><extraports state="closed" count="1021">
+<extrareasons reason="reset" count="1021" proto="tcp" ports="1-24,26-109,111-142,144-1024"/>
+</extraports>
+<port protocol="tcp" portid="25"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="smtp" product="Postfix smtpd" hostname=" mail.corp.test" method="probed" conf="10"><cpe>cpe:/a:postfix:postfix</cpe></service></port>
+<port protocol="tcp" portid="110"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="pop3" product="Dovecot pop3d" method="probed" conf="10"><cpe>cpe:/a:dovecot:dovecot</cpe></service></port>
+<port protocol="tcp" portid="143"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="imap" product="Dovecot imapd" method="probed" conf="10"><cpe>cpe:/a:dovecot:dovecot</cpe></service></port>
 </ports>
+<times srtt="4236" rttvar="15" to="100000"/>
 </host>
-<host><status state="up" reason="echo-reply"/><address addr="10.0.0.12" addrtype="ipv4"/>
-<ports><extraports state="closed" count="1022"><extrareasons reason="resets" count="1022"/></extraports>
-<port protocol="tcp" portid="21"><state state="open" reason="syn-ack"/><service name="ftp" product="vsftpd" version="3.0.3"/></port>
-<port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.2p1"/></port>
+<host starttime="1792462630" endtime="1792462649"><status state="up" reason="echo-reply" reason_ttl="64"/>
+<address addr="10.0.0.12" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports><extraports state="closed" count="1022">
+<extrareasons reason="reset" count="1022" proto="tcp" ports="1-20,23-1024"/>
+</extraports>
+<port protocol="tcp" portid="21"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ftp" product="vsftpd" version="3.0.3" ostype="Unix" method="probed" conf="10"><cpe>cpe:/a:vsftpd:vsftpd:3.0.3</cpe></service></port>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ssh" product="OpenSSH" version="9.2p1 Debian 2+deb12u3" extrainfo="protocol 2.0" ostype="Linux" method="probed" conf="10"><cpe>cpe:/a:openbsd:openssh:9.2p1</cpe><cpe>cpe:/o:linux:linux_kernel</cpe></service></port>
 </ports>
+<times srtt="4236" rttvar="27" to="100000"/>
 </host>
-<host><status state="up" reason="echo-reply"/><address addr="10.0.0.13" addrtype="ipv4"/>
-<ports><extraports state="closed" count="1022"><extrareasons reason="resets" count="1022"/></extraports>
-<port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="lighttpd" version="1.4.69"/></port>
-<port protocol="tcp" portid="631"><state state="open" reason="syn-ack"/><service name="ipp" product="CUPS" version="2.4"/></port>
+<host starttime="1792462630" endtime="1792462649"><status state="up" reason="echo-reply" reason_ttl="64"/>
+<address addr="10.0.0.13" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports><extraports state="closed" count="1022">
+<extrareasons reason="reset" count="1022" proto="tcp" ports="1-79,81-630,632-1024"/>
+</extraports>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="http" product="lighttpd" version="1.4.69" extrainfo="Linux" method="probed" conf="10"><cpe>cpe:/a:lighttpd:lighttpd:1.4.69</cpe></service></port>
+<port protocol="tcp" portid="631"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ipp" product="CUPS" version="2.4" method="probed" conf="10"><cpe>cpe:/a:apple:cups:2.4</cpe></service></port>
 </ports>
+<times srtt="4221" rttvar="38" to="100000"/>
 </host>
-<host><status state="up" reason="echo-reply"/><address addr="10.0.0.50" addrtype="ipv4"/>
-<ports><extraports state="closed" count="1022"><extrareasons reason="resets" count="1022"/></extraports>
-<port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.6p1" extrainfo="Ubuntu Linux; protocol 2.0"/></port>
-<port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="nginx" version="1.24.0"/></port>
+<host starttime="1792462649" endtime="1792462659"><status state="up" reason="echo-reply" reason_ttl="64"/>
+<address addr="10.0.0.50" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports><extraports state="closed" count="1022">
+<extrareasons reason="reset" count="1022" proto="tcp" ports="1-21,23-79,81-1024"/>
+</extraports>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ssh" product="OpenSSH" version="9.6p1 Ubuntu 3ubuntu13.20" extrainfo="Ubuntu Linux; protocol 2.0" ostype="Linux" method="probed" conf="10"><cpe>cpe:/a:openbsd:openssh:9.6p1</cpe><cpe>cpe:/o:linux:linux_kernel</cpe></service></port>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="http" product="nginx" version="1.24.0" extrainfo="Ubuntu" ostype="Linux" method="probed" conf="10"><cpe>cpe:/a:igor_sysoev:nginx:1.24.0</cpe><cpe>cpe:/o:linux:linux_kernel</cpe></service></port>
 </ports>
+<times srtt="6412" rttvar="40" to="100000"/>
 </host>
-<runstats><finished exit="success"/><hosts up="5" down="251" total="256"/></runstats></nmaprun>
+<runstats><finished time="1792462659" timestr="Tue Oct 20 02:17:39 2026" summary="Nmap done at Tue Oct 20 02:17:39 2026; 256 IP addresses (5 hosts up) scanned in 36.36 seconds" elapsed="36.36" exit="success"/><hosts up="5" down="251" total="256"/>
+</runstats>
+</nmaprun>

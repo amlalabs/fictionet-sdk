@@ -32,7 +32,10 @@ pub fn server() -> Guest {
 fi
 "#,
         )
-        .run("systemctl enable --now nginx.service ssh.service")
+        // The cloud image socket-activates OpenSSH already, and the kit reaches
+        // the guest through it. Restarting ssh.service here would put systemd's
+        // left-over process warnings in the journal the terminal follows.
+        .run("systemctl enable --now nginx.service")
 }
 
 fn terminal_desktop(hostname: &str, user: &str) -> Guest {
@@ -63,7 +66,7 @@ mkdir -p "$HOME/notes"
 for fifo in "$HOME/notes/requests" "$HOME/notes/results"; do
     if [ ! -p "$fifo" ]; then mkfifo "$fifo"; fi
 done
-Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -nolisten tcp -geometry 640x480 -depth 24 &
+Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -nolisten tcp -geometry {GEOMETRY} -depth 24 &
 xpid=$!
 trap 'kill "$xpid"' EXIT
 # Wait for the X server before opening the terminal.
@@ -73,11 +76,21 @@ for ((attempt=0; attempt<150; attempt++)); do
 done
 xdpyinfo >/dev/null
 openbox &
-exec xterm -fa 'DejaVu Sans Mono' -fs 14 -fullscreen -bg '#101820' -fg '#e7edf4' \
+exec xterm -fa 'DejaVu Sans Mono' -fs {FONT_SIZE} -fullscreen -bg '#101820' -fg '#e7edf4' \
     -title 'Office work' -e /opt/assistant
 "#
     )
 }
+
+// The screen is wide and short because its tile is: with two hosts stacked
+// in the workspace, a tile's console measures 817x344 at 1440x900 and
+// 724x294 at 1280x800, about 2.4 times as wide as tall, so a screen of that
+// shape fills it. At 15 px, DejaVu Sans Mono's characters are 9 px wide, so
+// 960 px holds 106 columns and nmap's widest service line (82 characters)
+// fits on one line. The page scales the screen by 0.85 at 1440x900 and 0.74
+// at 1280x800, so the text shows at 11 to 13 px.
+const GEOMETRY: &str = "960x400";
+const FONT_SIZE: u8 = 15;
 
 fn service(user: &str) -> String {
     format!(
@@ -200,9 +213,20 @@ mod tests {
                 .any(|s| s.contains("timeout 300 bash") && s.contains("PIPESTATUS[0]"))
         );
         assert!(text.contains("enable --now vnc.service"));
+        assert!(
+            files
+                .iter()
+                .any(|s| s.contains("-geometry 960x400 ") && s.contains("-fs 15 "))
+        );
         let text = data(&office);
         assert!(text.contains("'nginx' 'openssh-server'"));
-        assert!(text.contains("enable --now nginx.service ssh.service"));
+        // nginx is enabled; OpenSSH stays socket-activated as the image ships it.
+        let runcmd = text
+            .lines()
+            .find(|line| line.starts_with("  - [bash, -euc, "))
+            .unwrap();
+        assert!(runcmd.contains("systemctl enable --now nginx.service"));
+        assert!(!runcmd.contains("ssh.service") && !runcmd.contains("ssh.socket"));
         assert!(!text.contains("vnc"));
     }
 }
