@@ -72,8 +72,8 @@ $ cargo xtask demo desktop
 It runs one executable that boots Ubuntu's unmodified cloud image as a desktop
 in Cloud Hypervisor, with the world in the same process. It prints a page URL
 where you watch the desktop beside its packets and events. It needs Linux with
-KVM, and no root or Docker. The first run downloads about 650 MB of pinned
-files and about 280 MB of Ubuntu packages, which later runs reuse.
+KVM, and no root or Docker. The first run downloads pinned files and Ubuntu
+packages, which later runs reuse.
 [demos/README.md](demos/README.md) lists every demo, what each one needs and
 shows, and how to make a demo of your own.
 
