@@ -1,0 +1,28 @@
+@media (min-width: 768px) {
+.custom-bodytext-alignment .bodytext>p,
+.custom-bodytext-alignment .bodytext>h2, 
+.custom-bodytext-alignment .bodytext>h3, 
+.custom-bodytext-alignment .bodytext>h4, 
+.custom-bodytext-alignment .bodytext>ul, 
+.custom-bodytext-alignment .bodytext>ol {
+    padding-left: 220px;
+    padding-right: 320px;
+}
+}
+@media (min-width: 768px) {
+.custom-bodytext-alignment .bodytext .google-ad.floatRight {
+    position: sticky;
+    top: 125px;
+}
+}
+
+@media (min-width: 768px) {
+.custom-bodytext-alignment .column.google-ad.widthFull,
+.custom-bodytext-alignment .placement-top > .column.google-ad,
+body.article section.related .large-12.google-ad,
+body.front .placement-top > .column.google-ad,
+body.front .large-12.google-ad {
+padding-left: 0;
+padding-right: 0;
+}
+}

@@ -29,6 +29,7 @@
 //! not hold is a 404, and a query it does not hold has no results. The
 //! same holds while generation is turned off.
 
+mod clones;
 pub mod make;
 pub mod meta;
 pub mod model;
@@ -503,6 +504,13 @@ impl Pages {
     }
 
     async fn answer(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, route: Route) -> Response {
+        let path = target.split('?').next().unwrap_or(target);
+        if path.starts_with("/_assets/") {
+            return match clones::asset(host, path) {
+                Some((mime, bytes)) => Response::new(200, mime, bytes, vec![], Meta::Asset),
+                None => Response::new(404, "text/plain", "Not found", vec![], Meta::Asset),
+            };
+        }
         match route {
             Route::Redirect { location, status } => {
                 let body = format!(
@@ -1016,7 +1024,9 @@ impl Pages {
                 },
                 |text| {
                     let page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
-                    if ask.profile.is_none() && page.site.as_ref().is_none_or(|p| p.css.is_empty())
+                    if ask.profile.is_none()
+                        && clones::prompt(host, target).is_none()
+                        && page.site.as_ref().is_none_or(|p| p.css.is_empty())
                     {
                         return Err(prompts::Unreadable("the first page needs SITE_CSS".into()));
                     }
@@ -1052,7 +1062,7 @@ impl Pages {
         } else if page.status == 404 && ask.mentions.is_empty() {
             render::not_found(host, Some(&profile), target, year)
         } else {
-            render::page(host, &profile, &page, year)
+            render::page_at(host, target, &profile, &page, year)
         };
         let tells = text::tells(&if html {
             text::text_of(&page.body)

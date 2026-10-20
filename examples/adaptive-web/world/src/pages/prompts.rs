@@ -524,7 +524,9 @@ pub fn page(
         .about(host)
         .map(|about| format!("What this site is: {about}"))
         .unwrap_or_default();
+    let captured = super::clones::prompt(host, &super::text::target_of(url).1);
     let (site, site_line) = match profile {
+        _ if captured.is_some() => ("", "The site's layout is already supplied.".to_owned()),
         Some(profile) => {
             let tagline = if profile.tagline.is_empty() {
                 ".".to_owned()
@@ -548,7 +550,9 @@ pub fn page(
             )
         })
         .unwrap_or_default();
-    let layout = if profile.is_none() { SITE_LAYOUT } else { "" };
+    let layout = captured
+        .as_deref()
+        .unwrap_or(if profile.is_none() { SITE_LAYOUT } else { "" });
     let user = format!(
         "Write the page at: {url}
 {expected}
@@ -562,8 +566,14 @@ What the world has already said:
 {said}
 
 {PAGE_FORMAT_HEAD}{site}{layout}
-{PAGE_FORMAT_TAIL}",
+{PAGE_FORMAT_TAIL}
+{captured_note}",
         said = said_before(host_pages, claims),
+        captured_note = if captured.is_some() {
+            "For this captured site, use the supplied container and class names instead of the generic main layout. Do not write a stylesheet."
+        } else {
+            ""
+        },
     );
     (system(seed, cast), user)
 }

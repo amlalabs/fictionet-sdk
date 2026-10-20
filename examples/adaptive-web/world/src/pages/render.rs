@@ -2,11 +2,12 @@
 
 use super::{
     make::{Page, Profile, Search},
-    text::{escape as e, normalize_space, quote, quote_plus, split_url, unescape},
+    text::{escape as e, normalize_space, quote, quote_plus, split_url},
 };
 use crate::route::Engine;
 
 pub(super) const SEARCH_CSS: &str = r#"
+@scope (html:has(> body.google, > body.bing, > body.body--html), .uEierd, .b_ad) {
 * { box-sizing: border-box; }
 body { margin: 0; background: #fff; color: #202124; font: 14px/1.55 Arial, sans-serif; }
 a { color: #1a0dab; text-decoration: none; }
@@ -98,6 +99,7 @@ footer a { color: inherit; }
   #hdtb, #b_header nav { grid-column: 1 / -1; overflow-x: auto; gap: 24px; }
   .body--html .header { flex-wrap: wrap; padding: 20px 24px; gap: 12px; }
 }
+}
 "#;
 
 /// Formats a URL as a host and up to three decoded path segments.
@@ -147,6 +149,11 @@ pub fn server_of(profile: Option<&Profile>) -> &'static str {
 }
 /// Renders results in the selected engine's layout.
 pub fn search(engine: Engine, query: &str, record: &Search, start: u64) -> String {
+    if let Some(page) =
+        super::clones::available(super::clones::search(engine, query, record, start))
+    {
+        return page;
+    }
     match engine {
         Engine::Google => google(query, record, start),
         Engine::DuckDuckGo => duckduckgo(query, record),
@@ -227,12 +234,15 @@ pub fn google(query: &str, record: &Search, start: u64) -> String {
 }
 /// The links and titles of the results a [`google`] page lists, unescaped.
 pub fn google_results(page: &str) -> Vec<(String, String)> {
-    page.split(r#"<div class="yuRUbf"><a href=""#)
-        .skip(1)
-        .filter_map(|chunk| {
-            let (url, rest) = chunk.split_once('"')?;
-            let title = rest.split_once("<h3>")?.1.split_once("</h3>")?.0;
-            Some((unescape(url), unescape(title)))
+    use kuchiki::traits::TendrilSink;
+    kuchiki::parse_html()
+        .one(page)
+        .select(".yuRUbf a")
+        .unwrap()
+        .filter_map(|link| {
+            let heading = link.as_node().select_first("h3").ok()?;
+            let url = link.attributes.borrow().get("href")?.to_owned();
+            Some((url, heading.text_contents()))
         })
         .collect()
 }
@@ -382,6 +392,19 @@ fn nav(items: &[String], class: &str) -> String {
 }
 /// Wraps HTML content in the site's layout.
 pub fn page(host: &str, profile: &Profile, record: &Page, year: &str) -> String {
+    page_at(host, "/", profile, record, year)
+}
+
+/// Renders a page using the captured section layout when available.
+pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, year: &str) -> String {
+    if let Some(page) = super::clones::available(super::clones::page(
+        host,
+        target,
+        &record.title,
+        &record.body,
+    )) {
+        return page;
+    }
     let name = if profile.name.is_empty() {
         host
     } else {
@@ -555,7 +578,7 @@ pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str
         ),
         ..Page::default()
     };
-    page(host, profile.unwrap_or(&fallback), &record, year)
+    page_at(host, target, profile.unwrap_or(&fallback), &record, year)
 }
 
 #[cfg(test)]

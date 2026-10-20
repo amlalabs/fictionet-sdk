@@ -1,0 +1,28 @@
+body .main.article .meta .social {
+  width: auto;
+  max-width: none;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  row-gap: 8px;
+}
+body .main.article .row.social .column {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 8px;
+}
+body .main.article .meta .social a.fi-social-google-preferred,
+body .main.article .row.social a.fi-social-google-preferred {
+  width: auto;
+  height: auto;
+  white-space: nowrap;
+  font-size: 14px;
+  line-height: 25px;
+  color: #333;
+}
+body .main.article .row.social a.fi-social-google-preferred::before {
+  width: 25px;
+  height: 25px;
+  flex-shrink: 0;
+}

@@ -1,0 +1,1 @@
+.b_searchbox { --sboxw: 571px; width: var(--sboxw); } .hassbi .b_searchbox { width: calc(var(--sboxw) - 36px); } @media (min-width: 1408px) { .b_searchboxForm:not(.as_rsform) .b_searchbox { --sboxw: 771px; } }

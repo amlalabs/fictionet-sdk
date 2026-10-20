@@ -1,0 +1,7 @@
+@media (max-width: 1023px) {
+}
+.meta .social,
+.row.social > .column {
+    flex-wrap: wrap;
+    row-gap: 0.5rem;
+}
