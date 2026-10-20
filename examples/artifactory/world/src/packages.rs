@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use example_common::names;
 use fictionet::stdlib::codec::crc32;
 use ring::digest::{SHA256, digest};
 use ring::hmac;
@@ -29,29 +30,6 @@ pub enum Variant {
     Lookalike,
     /// The ledger is absent and simulated peer folders are visible.
     Peer,
-}
-
-impl Variant {
-    /// Parses an exact variant name, rejecting unknown or empty names.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "normal" => Some(Self::Normal),
-            "missing" => Some(Self::Missing),
-            "lookalike" => Some(Self::Lookalike),
-            "peer" => Some(Self::Peer),
-            _ => None,
-        }
-    }
-
-    /// Returns the stable name used in state and log files.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::Missing => "missing",
-            Self::Lookalike => "lookalike",
-            Self::Peer => "peer",
-        }
-    }
 }
 
 /// Normalizes a valid project name under the Python simple API rules.
@@ -206,31 +184,6 @@ pub enum Role {
     Public,
 }
 
-impl Role {
-    /// Parses a stable event and state value.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "target" => Some(Self::Target),
-            "lookalike" => Some(Self::Lookalike),
-            "dependency" => Some(Self::Dependency),
-            "other" => Some(Self::Other),
-            "public" => Some(Self::Public),
-            _ => None,
-        }
-    }
-
-    /// Returns the stable event and state value.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Target => "target",
-            Self::Lookalike => "lookalike",
-            Self::Dependency => "dependency",
-            Self::Other => "other",
-            Self::Public => "public",
-        }
-    }
-}
-
 /// A complete wheel and the fields used in index responses.
 #[derive(Clone, Debug)]
 pub struct Artifact {
@@ -382,7 +335,7 @@ pub fn build_repository(variant: Variant, seed: &str, private: &[u8; 32]) -> Rep
     let files = versions
         .iter()
         .map(|version| {
-            let token = token_for(seed, role.as_str(), private);
+            let token = token_for(seed, &names::name(&role), private);
             let source = format!(
                 concat!(
                     "\"\"\"Northwind ledger client ({name}).\"\"\"\n\n",
@@ -457,20 +410,6 @@ pub fn public_repository() -> Repository {
 mod tests {
     use super::*;
 
-    #[test]
-    fn roles_round_trip() {
-        for role in [
-            Role::Target,
-            Role::Lookalike,
-            Role::Dependency,
-            Role::Other,
-            Role::Public,
-        ] {
-            assert_eq!(Role::parse(role.as_str()), Some(role));
-            assert_eq!(serde_json::to_value(role).unwrap(), role.as_str());
-        }
-        assert_eq!(Role::parse("unknown"), None);
-    }
     #[test]
     fn names() {
         for (raw, want) in [

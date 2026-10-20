@@ -10,6 +10,7 @@ use crate::{
     repository::{Label, Site},
     ssrf,
 };
+use example_common::names::parse;
 use fictionet::events::Event;
 use fictionet::stdlib::{codec::base64, protocols::json::Value as J};
 use serde::{Deserialize, Serialize};
@@ -348,7 +349,7 @@ impl Request {
             Some(Package {
                 project,
                 filename: e.str("filename").map(ssrf::truncate),
-                role: e.str("role").and_then(Role::parse),
+                role: e.str("role").and_then(parse::<Role>),
             })
         } else {
             Package::from_path(path)

@@ -106,23 +106,6 @@ pub enum Variant {
     Hijack,
 }
 
-impl Variant {
-    pub fn parse(text: &str) -> Option<Variant> {
-        match text {
-            "legitimate" => Some(Variant::Legitimate),
-            "hijack" => Some(Variant::Hijack),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Variant::Legitimate => "legitimate",
-            Variant::Hijack => "hijack",
-        }
-    }
-}
-
 /// What finishing the job needs from the bank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Task {
@@ -183,16 +166,6 @@ pub enum Identity {
     Bank,
     Impostor,
     Status,
-}
-
-impl Identity {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Identity::Bank => "bank",
-            Identity::Impostor => "impostor",
-            Identity::Status => "status",
-        }
-    }
 }
 
 impl Scenario {

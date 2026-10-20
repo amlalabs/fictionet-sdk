@@ -11,12 +11,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use example_common::events::field;
+use example_common::names::name;
 use fictionet::Cx;
-use fictionet::events::Fields;
-use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::services::serve::WakeHandle;
 use fictionet::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::scenario::{Announcement, BANK_ADDR, Identity, Scenario, Variant};
 
@@ -51,15 +52,6 @@ pub enum Rejection {
     AlreadyInMode,
 }
 
-impl Rejection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::StaleRevision => "stale_revision",
-            Self::AlreadyInMode => "already_in_mode",
-        }
-    }
-}
-
 /// A rejected command, with the state the caller should use next.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejected {
@@ -89,18 +81,6 @@ impl Route {
             origin_as: route.origin_as(),
             hijack: scenario.conflicts_with_home(route),
         }
-    }
-
-    pub(crate) fn fact(&self) -> Value {
-        Fields::new()
-            .with("prefix", self.prefix.clone())
-            .with(
-                "as_path",
-                Value::Array(self.as_path.iter().map(|&n| u64::from(n).into()).collect()),
-            )
-            .with("origin_as", u64::from(self.origin_as))
-            .with("hijack", self.hijack)
-            .to_json()
     }
 }
 
@@ -204,10 +184,10 @@ impl Routing {
         };
         if let Some(reason) = reason {
             fcx.emit("border", "route_rejected", |e| {
-                e.field("reason", reason.as_str())
+                e.field("reason", name(&reason))
                     .field("expected_revision", command.expected_revision)
                     .field("revision", revision.number)
-                    .field("mode", previous.as_str())
+                    .field("mode", name(&previous))
             });
             return Err(Rejected {
                 reason,
@@ -223,22 +203,13 @@ impl Routing {
         fcx.emit("border", "route", |e| {
             let scenario = self.0.scenario.routed(command.mode);
             e.field("revision", revision.number)
-                .field("mode", command.mode.as_str())
-                .field("previous_mode", previous.as_str())
+                .field("mode", name(&command.mode))
+                .field("previous_mode", name(&previous))
                 .field(
                     "bank_route",
-                    Route::new(&scenario, &scenario.bank_route()).fact(),
+                    field(&json!(Route::new(&scenario, &scenario.bank_route()))),
                 )
-                .field(
-                    "bank_hops",
-                    Value::Array(
-                        scenario
-                            .hops(BANK_ADDR)
-                            .iter()
-                            .map(|a| a.to_string().into())
-                            .collect(),
-                    ),
-                )
+                .field("bank_hops", field(&json!(scenario.hops(BANK_ADDR))))
                 .field("at_ms", revision.since_ms)
         });
         revision.peers.retain(|p| !p.is_closed());

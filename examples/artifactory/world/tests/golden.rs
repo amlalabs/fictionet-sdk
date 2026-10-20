@@ -4,6 +4,7 @@
 mod common;
 use artifactory_world::packages::Variant;
 use common::{run_variant, script};
+use example_common::names::name;
 
 fn golden(variant: Variant) {
     run_variant(variant, move |fcx, attacher, env| async move {
@@ -40,7 +41,7 @@ fn golden(variant: Variant) {
             .collect();
         lines.sort();
         let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("tests/golden/{}.jsonl", variant.as_str()));
+            .join(format!("tests/golden/{}.jsonl", name(&variant)));
         let got = lines.join("\n") + "\n";
         if std::env::var("ARTIFACTORY_GOLDEN_WRITE").as_deref() == Ok("1") {
             std::fs::write(file, got)?;

@@ -93,10 +93,7 @@ fn tls(scenario: &Scenario, e: &Event) -> Value {
         .str("addr")
         .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok());
     let sni = e.str("sni");
-    let identity = sni
-        .zip(addr)
-        .and_then(|(n, a)| scenario.identity(n, a))
-        .map(|i| i.as_str());
+    let identity = sni.zip(addr).and_then(|(n, a)| scenario.identity(n, a));
     let mut line = json!({
         "type": "tls",
         "sandbox": sandbox(e),

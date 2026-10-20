@@ -1,6 +1,6 @@
 //! Shared network event projection.
 
-use fictionet::events::Event;
+use fictionet::events::{Event, float};
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
@@ -18,6 +18,24 @@ pub fn js(v: Option<&J>) -> Value {
         Some(J::Array(a)) => Value::Array(a.iter().map(|v| js(Some(v))).collect()),
         Some(J::Object(o)) => {
             Value::Object(o.iter().map(|(k, v)| (k.clone(), js(Some(v)))).collect())
+        }
+    }
+}
+
+/// A JSON value as an event field's value, the reverse of [`js`].
+pub fn field(v: &Value) -> J {
+    match v {
+        Value::Null => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::Number(n) => match (n.as_u64(), n.as_i64()) {
+            (Some(u), _) => u.into(),
+            (None, Some(i)) => i.into(),
+            _ => float(n.as_f64().unwrap_or(0.0)),
+        },
+        Value::String(s) => s.as_str().into(),
+        Value::Array(items) => J::Array(items.iter().map(field).collect()),
+        Value::Object(members) => {
+            J::Object(members.iter().map(|(k, v)| (k.clone(), field(v))).collect())
         }
     }
 }

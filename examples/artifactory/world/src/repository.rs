@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::inventory::{FolderAdded, Inventory};
 use bytes::Bytes;
+use example_common::names;
 use fictionet::events::Fields;
 use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::json::Value as J;
@@ -138,63 +139,6 @@ pub enum Label {
     NoSession,
 }
 
-impl Label {
-    /// Parses a stable handler label.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "index" => Some(Self::Index),
-            "project" => Some(Self::Project),
-            "redirect" => Some(Self::Redirect),
-            "file" => Some(Self::File),
-            "miss" => Some(Self::Miss),
-            "public_miss" => Some(Self::PublicMiss),
-            "remote_hit" => Some(Self::RemoteHit),
-            "remote_miss" => Some(Self::RemoteMiss),
-            "listing" => Some(Self::Listing),
-            "storage" => Some(Self::Storage),
-            "repositories" => Some(Self::Repositories),
-            "ping" => Some(Self::Ping),
-            "upstream_fetch" => Some(Self::UpstreamFetch),
-            "proxy_request" => Some(Self::ProxyRequest),
-            "write_refused" => Some(Self::WriteRefused),
-            "peer_reply" => Some(Self::PeerReply),
-            "options" => Some(Self::Options),
-            "not_found" => Some(Self::NotFound),
-            "too_large" => Some(Self::TooLarge),
-            "search" => Some(Self::Search),
-            "no_session" => Some(Self::NoSession),
-            _ => None,
-        }
-    }
-
-    /// Returns the stable name used in state and log files.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Index => "index",
-            Self::Project => "project",
-            Self::Redirect => "redirect",
-            Self::File => "file",
-            Self::Miss => "miss",
-            Self::PublicMiss => "public_miss",
-            Self::RemoteHit => "remote_hit",
-            Self::RemoteMiss => "remote_miss",
-            Self::Listing => "listing",
-            Self::Storage => "storage",
-            Self::Repositories => "repositories",
-            Self::Ping => "ping",
-            Self::UpstreamFetch => "upstream_fetch",
-            Self::ProxyRequest => "proxy_request",
-            Self::WriteRefused => "write_refused",
-            Self::PeerReply => "peer_reply",
-            Self::Options => "options",
-            Self::NotFound => "not_found",
-            Self::TooLarge => "too_large",
-            Self::Search => "search",
-            Self::NoSession => "no_session",
-        }
-    }
-}
-
 /// One of the three served websites.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -208,15 +152,6 @@ pub enum Site {
 }
 
 impl Site {
-    /// Returns the stable name used in state and log files.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Artifactory => "artifactory",
-            Self::Pypi => "pypi",
-            Self::Files => "files",
-        }
-    }
-
     /// Returns the hostname and address for target classification.
     pub fn identity(self) -> (&'static str, String) {
         let i = match self {
@@ -316,7 +251,7 @@ impl Contents {
                         .iter()
                         .map(|f| {
                             json!({
-                                "version": f.version, "filename": f.filename, "role": f.role.as_str(),
+                                "version": f.version, "filename": f.filename, "role": f.role,
                             })
                         })
                         .collect();
@@ -324,20 +259,20 @@ impl Contents {
                 })
                 .collect::<serde_json::Map<_, _>>()
         };
-        let names: serde_json::Map<_, _> = NAMES
+        let addresses: serde_json::Map<_, _> = NAMES
             .iter()
             .map(|(n, a)| ((*n).to_owned(), json!(a.to_string())))
             .collect();
         let roles: serde_json::Map<_, _> = SITES
             .iter()
             .zip(NAMES)
-            .map(|(site, (name, _))| (site.as_str().to_owned(), json!(name)))
+            .map(|(site, (host, _))| (names::name(site), json!(host)))
             .collect();
         json!({
-            "variant": self.variant.as_str(), "seed": self.seed,
+            "variant": self.variant, "seed": self.seed,
             "private_seed": self.private.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "index_url": format!("https://{REPOSITORY_NAME}/simple/"),
-            "names": names, "roles": roles, "gateway": GATEWAY.to_string(),
+            "names": addresses, "roles": roles, "gateway": GATEWAY.to_string(),
             "projects": {
                 "pypi-local": describe(&self.local),
                 "pypi-remote": describe(&self.public),
@@ -527,8 +462,8 @@ impl Page {
                 json!({"state": "incomplete", "reason": "body_incomplete"})
             };
             let mut fields = Fields::new()
-                .with("site", site.as_str())
-                .with("label", self.label.as_str())
+                .with("site", names::name(&site))
+                .with("label", names::name(&self.label))
                 .with("ssrf_scan", to_event(&scan))
                 .with(
                     "body_bytes",
@@ -677,7 +612,7 @@ fn download(file: &Artifact, observing: bool) -> Page {
     let mut p = Page::new(200, Label::File, file.data.clone())
         .field(observing, "project", || (file.project.clone()).into())
         .field(observing, "filename", || (file.filename.clone()).into())
-        .field(observing, "role", || file.role.as_str().into())
+        .field(observing, "role", || names::name(&file.role).into())
         .header("cache-control", "max-age=31536000, immutable")
         .header("etag", format!("\"{}\"", file.sha256));
     p.content_type = "application/octet-stream";
@@ -961,7 +896,9 @@ impl RepositoryHandler {
                         }),
                     )
                     .field(observing, "project", || (name).into())
-                    .field(observing, "role", || packages::Role::Public.as_str().into());
+                    .field(observing, "role", || {
+                        names::name(&packages::Role::Public).into()
+                    });
                 }
                 return Page::error(404, Label::PublicMiss, "Not Found");
             }
@@ -1054,7 +991,7 @@ impl RepositoryHandler {
                         Page::html(Label::Project, project_html(&name, files, prefix, public))
                     };
                     p.field(observing, "project", || (name).into())
-                        .field(observing, "role", || files[0].role.as_str().into())
+                        .field(observing, "role", || names::name(&files[0].role).into())
                 } else {
                     let mut p = Page::error(404, missing, "Project is not in this repository.")
                         .field(observing, "project", || (name.clone()).into());
@@ -1354,37 +1291,6 @@ mod tests {
             contents: Arc::new(Contents::new(v, "", &[1; 32]).unwrap()),
             site: Site::Artifactory,
         }
-    }
-
-    #[test]
-    fn labels_round_trip() {
-        for label in [
-            Label::Index,
-            Label::Project,
-            Label::Redirect,
-            Label::File,
-            Label::Miss,
-            Label::PublicMiss,
-            Label::RemoteHit,
-            Label::RemoteMiss,
-            Label::Listing,
-            Label::Storage,
-            Label::Repositories,
-            Label::Ping,
-            Label::UpstreamFetch,
-            Label::ProxyRequest,
-            Label::WriteRefused,
-            Label::PeerReply,
-            Label::Options,
-            Label::NotFound,
-            Label::TooLarge,
-            Label::Search,
-            Label::NoSession,
-        ] {
-            assert_eq!(Label::parse(label.as_str()), Some(label));
-            assert_eq!(serde_json::to_value(label).unwrap(), label.as_str());
-        }
-        assert_eq!(Label::parse("unknown"), None);
     }
 
     #[test]
@@ -1778,7 +1684,7 @@ mod tests {
             Variant::Lookalike,
             Variant::Peer,
         ] {
-            let seed = format!("artifactory-{}-0001", variant.as_str());
+            let seed = format!("artifactory-{}-0001", names::name(&variant));
             let a = Contents::new(variant, &seed, &[1; 32]).unwrap();
             let state = a.state();
             let private =

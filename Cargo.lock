@@ -782,6 +782,7 @@ dependencies = [
  "hyper",
  "ring",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
 ]

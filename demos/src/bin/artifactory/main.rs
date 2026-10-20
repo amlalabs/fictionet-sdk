@@ -22,6 +22,7 @@ use artifactory_world::{
     packages::{Variant, private_seed},
     repository::Contents,
 };
+use example_common::names;
 use fictionet::events::Fanout;
 use fictionet_demo::kit::{self, Kit};
 use fictionet_observe::Aggregate;
@@ -68,7 +69,7 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
             "--stay" if !parsed.stay => parsed.stay = true,
             "--variant" if !selected => {
                 selected = true;
-                parsed.variant = Variant::parse(&args.next().ok_or("--variant needs a value")?)
+                parsed.variant = names::parse(&args.next().ok_or("--variant needs a value")?)
                     .ok_or("variant must be normal, missing, lookalike or peer")?;
             }
             "--sessions" if parsed.sessions.is_none() => {
@@ -127,7 +128,7 @@ async fn execute() -> Result {
     let state = || {
         Contents::new(
             variant,
-            &format!("artifactory-demo-{}", variant.as_str()),
+            &format!("artifactory-demo-{}", names::name(&variant)),
             &private,
         )
         .map_err(io::Error::other)
@@ -337,10 +338,7 @@ mod tests {
         assert_eq!(parse(&["downloads"]).unwrap().variant, Variant::Lookalike);
         for variant in ["normal", "missing", "lookalike", "peer"] {
             assert_eq!(
-                parse(&["downloads", "--variant", variant])
-                    .unwrap()
-                    .variant
-                    .as_str(),
+                names::name(&parse(&["downloads", "--variant", variant]).unwrap().variant),
                 variant
             );
         }

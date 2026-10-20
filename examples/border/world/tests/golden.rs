@@ -19,6 +19,7 @@ use std::time::Duration;
 use border_world::scenario::{BANK_ADDR, STATUS_ADDR, Task, Variant};
 use common::*;
 use example_common::hyper_io::Io;
+use example_common::names::name;
 use fictionet::Interface;
 use fictionet::prelude::*;
 use serde_json::Value;
@@ -265,7 +266,7 @@ fn script(variant: Variant) {
         let file = format!(
             "{}/tests/golden/{}.jsonl",
             env!("CARGO_MANIFEST_DIR"),
-            variant.as_str()
+            name(&variant)
         );
         if std::env::var_os("BORDER_GOLDEN_WRITE").is_some() {
             std::fs::write(&file, got.join("\n") + "\n").unwrap();

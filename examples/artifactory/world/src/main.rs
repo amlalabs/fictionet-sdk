@@ -24,6 +24,7 @@ use artifactory_world::packages::{Variant, private_seed};
 use artifactory_world::repository::Contents;
 use artifactory_world::repository::Sessions;
 use artifactory_world::{Identity, Result};
+use example_common::names::{name, parse};
 
 struct Args {
     socket: String,
@@ -79,7 +80,7 @@ fn serve() -> Result {
         Err(e) => return Err(e.into()),
     }
     let variant = std::env::var("ARTIFACTORY_VARIANT").unwrap_or_default();
-    let variant = Variant::parse(&variant).ok_or_else(|| {
+    let variant = parse::<Variant>(&variant).ok_or_else(|| {
         fictionet::Error::msg(format!(
             "ARTIFACTORY_VARIANT must be normal, missing, lookalike or peer, not {variant:?}"
         ))
@@ -132,10 +133,10 @@ fn serve() -> Result {
             attacher,
         )?;
         parent(&args.ready)?;
-        std::fs::write(&args.ready, variant.as_str())?;
+        let variant = name(&variant);
+        std::fs::write(&args.ready, &variant)?;
         println!(
-            "artifactory world up: variant={} seed={}",
-            variant.as_str(),
+            "artifactory world up: variant={variant} seed={}",
             contents.seed
         );
         shutdown.wait(&fcx).await

@@ -1,7 +1,7 @@
-use adaptive_web_world::handler::to_field;
 use adaptive_web_world::pages::{Pages, Seed, store::Store};
 use adaptive_web_world::route::Engine;
 use adaptive_web_world::search::*;
+use example_common::events::field;
 use fictionet::events::{
     ConnInfo, Event, Interest, Metadata, Observation, Observer, Stamp, Stream, TopologyKind,
 };
@@ -89,7 +89,7 @@ fn answer(id: u64, complete: bool) -> Event {
         .field("gen_ms", 15u64)
         .field(
             "listed",
-            to_field(&json!([{"rank":1,"url":"https://a.com/","title":"A"}])),
+            field(&json!([{"rank":1,"url":"https://a.com/","title":"A"}])),
         )
 }
 fn page(path: &str, cache: &str, model: &str, reason: serde_json::Value) -> Event {
@@ -101,7 +101,7 @@ fn page(path: &str, cache: &str, model: &str, reason: serde_json::Value) -> Even
         .field("status", 200u64)
         .field("cache", cache)
         .field("model", model)
-        .field("reason", to_field(&reason))
+        .field("reason", field(&reason))
         .field("serve_ms", 20u64)
         .field("gen_ms", 15u64)
         .field("title", "Title")
@@ -162,7 +162,7 @@ fn a_list_made_later_replaces_the_empty_one() {
     let empty = answer(1, true)
         .field("cache", "missing")
         .field("results", 0u64)
-        .field("listed", to_field(&json!([])));
+        .field("listed", field(&json!([])));
     feed(&s, 2, empty);
     let off = s.snapshot();
     assert_eq!(off.queries[0].results, Some(0));
@@ -432,7 +432,7 @@ fn strings_and_lists_are_bounded() {
     feed(
         &s,
         2,
-        answer(1, true).field("listed", to_field(&json!(listed))),
+        answer(1, true).field("listed", field(&json!(listed))),
     );
     let snap = s.snapshot();
     assert_eq!(snap.seed.name.len(), STRING_BYTES);

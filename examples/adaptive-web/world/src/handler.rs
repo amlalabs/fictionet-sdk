@@ -13,13 +13,12 @@ use std::task::{Context, Poll};
 use crate::pages::{MAX_FORM_BYTES, Pages};
 use crate::route::{Route, query_key, route};
 use bytes::Bytes;
-use fictionet::events::{ConnInfo, Fields, float};
-use fictionet::stdlib::protocols::json::Value as J;
+use example_common::events::field;
+use fictionet::events::{ConnInfo, Fields};
 use fictionet::stdlib::web::{self, Body};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use serde_json::Value;
 
 /// Page fields kept in HTTP log lines. None is a name `http.request` uses
 /// itself. There, `query` is the URL query, so search text is `search`.
@@ -102,27 +101,6 @@ impl Drop for QueryGuard {
         if !self.finished {
             self.fail("abandoned", None, None);
         }
-    }
-}
-
-/// A JSON value as an event field's value.
-pub fn to_field(v: &Value) -> J {
-    match v {
-        Value::Null => J::Null,
-        Value::Bool(b) => J::Bool(*b),
-        Value::Number(n) => match (n.as_u64(), n.as_i64()) {
-            (Some(u), _) => u.into(),
-            (None, Some(i)) => i.into(),
-            _ => float(n.as_f64().unwrap_or(0.0)),
-        },
-        Value::String(s) => s.as_str().into(),
-        Value::Array(items) => J::Array(items.iter().map(to_field).collect()),
-        Value::Object(members) => J::Object(
-            members
-                .iter()
-                .map(|(k, v)| (k.clone(), to_field(v)))
-                .collect(),
-        ),
     }
 }
 
@@ -214,7 +192,7 @@ impl Handler {
             let mut fields = Fields::new();
             for name in PAGE_FIELDS.into_iter().chain(EVENT_FIELDS) {
                 if let Some(v) = meta.get(name) {
-                    fields.set(name, to_field(v));
+                    fields.set(name, field(v));
                 }
             }
             if let Some(q) = &query {

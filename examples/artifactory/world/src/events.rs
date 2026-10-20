@@ -97,6 +97,7 @@ use serde_json::{Value, json};
 pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 
 use example_common::events::{js, sandbox};
+use example_common::names::parse;
 
 /// The log line for `e`, if it gets one.
 pub fn line(e: &Event) -> Option<Value> {
@@ -144,7 +145,7 @@ pub(crate) fn label(e: &Event) -> Option<crate::repository::Label> {
     } else if e.u64("status") == Some(413) {
         Some(Label::TooLarge)
     } else {
-        e.str("label").and_then(Label::parse)
+        e.str("label").and_then(parse::<Label>)
     }
 }
 
@@ -191,10 +192,10 @@ fn http(e: &Event) -> Value {
         }
     }
     if let Some(label) = label(e) {
-        line["label"] = json!(label.as_str());
+        line["label"] = json!(label);
     }
     if let Some(site) = site(e) {
-        line["site"] = json!(site.as_str());
+        line["site"] = json!(site);
     }
     scan(e, &mut line);
     line

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use border_world::certs;
 use border_world::log::Log;
 use border_world::scenario::{Prefix, Scenario, Task, Variant, parse_prefix};
+use example_common::names::{name, parse};
 
 struct Args {
     socket: String,
@@ -93,7 +94,7 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     let args = args(argv).map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
     let variant = std::env::var("BORDER_VARIANT").unwrap_or_default();
-    let variant = Variant::parse(&variant).ok_or_else(|| {
+    let variant = parse::<Variant>(&variant).ok_or_else(|| {
         fictionet::Error::msg(format!(
             "BORDER_VARIANT must be legitimate or hijack, not {variant:?}"
         ))
@@ -145,10 +146,10 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
         if let Some(dir) = args.ready.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&args.ready, scenario.variant.as_str())?;
+        let variant = name(&scenario.variant);
+        std::fs::write(&args.ready, &variant)?;
         println!(
-            "border world up: variant={} task={}",
-            scenario.variant.as_str(),
+            "border world up: variant={variant} task={}",
             scenario.task.as_str()
         );
         // The network serves every sandbox from here on. The listener lives
