@@ -1,0 +1,484 @@
+/* Colors are tokens on :root. The control room palette is dark by default. */
+:root {
+  --bg: #202020;
+  --panel: #292929;
+  --ink: #eeeeee;
+  --muted: #bbbbbb;
+  --line: #555555;
+  --line-strong: #777777;
+  --equip: #333333;
+  --pipe: #999999;
+  --ok: #cccccc;
+  --stale: #d4a72c;
+  --trend: #cccccc;
+  --focus: #eeeeee;
+  --alarm-bg: #4a1d1d;
+  --alarm-ink: #ffd8d4;
+  --alarm-line: #ff7b72;
+  --ack-bg: #3a2f10;
+  --ack-ink: #f2e2b0;
+  --ack-line: #d4a72c;
+  --button-bg: #404040;
+  --button-ink: #eeeeee;
+  --danger-bg: #8b1e1e;
+  --danger-ink: #dedede;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #c6c6c6;
+    --panel: #dedede;
+    --ink: #202020;
+    --muted: #444444;
+    --line: #999999;
+    --line-strong: #777777;
+    --equip: #d2d2d2;
+    --pipe: #666666;
+    --ok: #555555;
+    --stale: #7a4d00;
+    --trend: #333333;
+    --focus: #202020;
+    --alarm-bg: #fde7e4;
+    --alarm-ink: #7a1b13;
+    --alarm-line: #b3261e;
+    --ack-bg: #fff4cf;
+    --ack-ink: #5a4300;
+    --ack-line: #9a6700;
+    --button-bg: #d2d2d2;
+    --button-ink: #202020;
+    --danger-bg: #b3261e;
+    --danger-ink: #dedede;
+    color-scheme: light;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #c6c6c6;
+  --panel: #dedede;
+  --ink: #202020;
+  --muted: #444444;
+  --line: #999999;
+  --line-strong: #777777;
+  --equip: #d2d2d2;
+  --pipe: #666666;
+  --ok: #555555;
+  --stale: #7a4d00;
+  --trend: #333333;
+  --focus: #202020;
+  --alarm-bg: #fde7e4;
+  --alarm-ink: #7a1b13;
+  --alarm-line: #b3261e;
+  --ack-bg: #fff4cf;
+  --ack-ink: #5a4300;
+  --ack-line: #9a6700;
+  --button-bg: #d2d2d2;
+  --button-ink: #202020;
+  --danger-bg: #b3261e;
+  --danger-ink: #dedede;
+  color-scheme: light;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.top {
+  grid-area: header;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 32px;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.top h1 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+
+.subtitle,
+.noscript {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.hmi {
+  display: grid;
+  gap: 12px;
+  padding: 12px 16px 24px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "header"
+    "alarms"
+    "mimic"
+    "controls"
+    "trends"
+    "status";
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 12px;
+  min-width: 0;
+}
+
+.panel-title {
+  margin: 0 0 8px;
+  font-size: 1rem;
+}
+
+.group-title {
+  margin: 12px 0 6px;
+  font-size: 0.9rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.annunciators {
+  grid-area: alarms;
+}
+
+.mimic {
+  grid-area: mimic;
+}
+
+.controls {
+  grid-area: controls;
+}
+
+.trends {
+  grid-area: trends;
+  align-self: start;
+}
+
+.statusbar {
+  grid-area: status;
+}
+
+@media (min-width: 1000px) {
+  .hmi {
+    grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
+    grid-template-areas:
+      "header header"
+      "alarms alarms"
+      "mimic mimic"
+      "controls trends"
+      "status status";
+  }
+  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .controls > .panel-title, .controls > .message { grid-column: 1 / -1; }
+}
+
+/* Annunciators */
+.annunciators .panel-title {
+  display: inline-block;
+  margin-right: 12px;
+}
+
+.alarm-summary {
+  color: var(--muted);
+}
+
+.tiles {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 2px;
+  border: 1px solid var(--line);
+  border-left: 6px solid var(--line-strong);
+  background: var(--equip);
+}
+
+.tile.active {
+  background: var(--alarm-bg);
+  color: var(--alarm-ink);
+  border-left-color: var(--alarm-line);
+  font-weight: 600;
+}
+
+.tile.acknowledged {
+  background: var(--ack-bg);
+  color: var(--ack-ink);
+  border-left-color: var(--ack-line);
+}
+
+.tile-state {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.tile.active .tile-state,
+.tile.acknowledged .tile-state {
+  color: inherit;
+}
+
+/* Mimic */
+.mimic {
+  align-self: start;
+  overflow-x: auto;
+}
+
+/* The drawing keeps a readable size and scrolls inside its panel on phones. */
+.mimic svg {
+  display: block;
+  width: 100%;
+  min-width: 1050px;
+  height: auto;
+}
+
+.pipe {
+  stroke: var(--pipe);
+  stroke-width: 4;
+  stroke-linecap: round;
+}
+
+.equipment {
+  fill: var(--equip);
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+}
+
+.equipment-title {
+  fill: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* Controls */
+.control-group {
+  border-top: 1px solid var(--line);
+  padding-top: 4px;
+}
+
+.control-group:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.control-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+  margin: 6px 0;
+}
+
+.row-label {
+  min-width: 0;
+}
+
+.row-state {
+  color: var(--muted);
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.control-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  background: var(--button-bg);
+  color: var(--button-ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.control-input {
+  width: 6.5rem;
+  min-height: 32px;
+  padding: 4px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+}
+
+.control-button:focus-visible,
+.control-input:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.message {
+  min-height: 1.5em;
+  margin: 12px 0 0;
+  color: var(--muted);
+}
+
+/* Trends */
+.trend {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  margin-bottom: 10px;
+}
+
+.trend-label {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.trend-value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.sparkline {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 40px;
+  background: var(--equip);
+  border-radius: 4px;
+}
+
+.trend-line {
+  fill: none;
+  stroke: var(--trend);
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+
+/* Status bar */
+.statusbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  align-items: center;
+  font-size: 0.9rem;
+}
+
+.status-item {
+  font-variant-numeric: tabular-nums;
+}
+
+.status-item.offline,
+.status-item.notice {
+  color: var(--alarm-ink);
+}
+
+.status-item.notice:empty {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .hmi {
+    padding: 12px 16px 24px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .panel,
+  .tile,
+  .equipment,
+  .control-button,
+  .control-input {
+    border: 1px solid var(--ink);
+  }
+
+  .tile.active {
+    border-left-width: 6px;
+    border-left-color: var(--focus);
+  }
+
+  .pipe,
+  .trend-line {
+    stroke: var(--ink);
+  }
+}
+
+.mimic text { font-family: ui-monospace, monospace; font-size: 13px; }
+.site-clock { font-variant-numeric: tabular-nums; }
+.alarm-entries { margin: 12px 0 0; padding-left: 20px; }
+
+/* Line patterns identify the medium without color. */
+.pipe.primary-hot { stroke-width: 5; }
+.pipe.primary-cold { stroke-width: 3; }
+.pipe.steam { stroke-width: 3; stroke-dasharray: 10 4; }
+.pipe.feedwater { stroke-width: 2; }
+.pipe.circulating-water { stroke-width: 2; stroke-dasharray: 8 3 2 3; }
+.tube, .shaft { fill: none; stroke: var(--pipe); stroke-width: 2; }
+.level-fill { fill: var(--pipe); stroke: none; }
+.core { fill: none; stroke: var(--ink); stroke-dasharray: 2 3; }
+.data-box { fill: var(--panel); stroke: var(--line-strong); }
+.mimic .instrument-tag { fill: var(--muted); font-size: 13px; }
+.mimic .instrument-value { fill: var(--ink); font-size: 15px; }
+.symbol-letter { fill: var(--ink); stroke: none; }
+.instrument.stale text, .instrument-value.stale { fill: var(--stale); }
+.equipment.abnormal { stroke: var(--alarm-line); }
+.instrument-value.abnormal { fill: var(--alarm-ink); }
+.equipment.stale { stroke: var(--stale); stroke-dasharray: 3 3; }
+.equipment.open { fill: var(--panel); stroke-width: 3; }
+.equipment.stopped { stroke-dasharray: 3 2; }
+.confirmation { grid-column: 1 / -1; padding: 8px; background: var(--panel); border: 2px solid var(--line-strong); display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
+.confirmation[hidden] { display: none; }
+.trend-min, .trend-max { grid-column: 1 / -1; color: var(--muted); font-size: .8rem; }
+.time-axis { grid-column: 1 / -1; display: flex; justify-content: space-between; font-size: .8rem; color: var(--muted); }
+@media (forced-colors: active) {
+  .equipment, .data-box, .tube, .shaft { stroke: var(--ink); }
+  .instrument text, .symbol-letter { fill: var(--ink); }
+  .equipment.abnormal, .equipment.stale { stroke: var(--focus); }
+  .level-fill { fill: var(--ok); }
+}
+
+.rod-bank { fill: var(--ink); stroke: none; }
+.level-fill.stale, .rod-bank.stale { fill: var(--stale); }
+
+.process-key { fill: var(--muted); }
+
+.state-label { fill: var(--muted); }
+.state-value { fill: var(--ink); }
+.state-value.abnormal { fill: var(--alarm-ink); }
+.state-value.stale { fill: var(--stale); }
+.control-button[aria-pressed="true"] {
+  background: var(--ink);
+  color: var(--panel);
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  font-weight: 700;
+}
+@media (forced-colors: active) {
+  :root[data-theme], :root:not([data-theme]) {
+    --ink: CanvasText;
+    --panel: Canvas;
+    --muted: CanvasText;
+    --focus: Highlight;
+    --ok: GrayText;
+  }
+  .state-value.abnormal, .state-value.stale { fill: var(--ink); text-decoration: underline; }
+  .control-button[aria-pressed="true"] { border: 3px double var(--focus); }
+}
+
+.confirmation > [role="status"] { flex: 1; min-width: 0; }
+.confirmation > button { flex: none; white-space: nowrap; }

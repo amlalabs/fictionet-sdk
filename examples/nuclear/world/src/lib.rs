@@ -47,10 +47,17 @@
 //! | [`plant`] | Time, energy balances, controls and command application |
 //! | [`steam`] | Coarse saturation table |
 //! | [`protection`] | True-channel trips and reported-channel alarms |
+//! | [`registers`] | Modbus register map and telemetry heartbeats of the three controllers |
 //! | [`sensors`] | Instrument ranges, lag, noise and sampling |
 //! | [`faults`] | Fixed fault slots and schedules |
 //! | [`command`] | Integer commands and replies |
 //! | [`snapshot`] | Bounded projection for a future state topic |
+//! | [`driver`] | Shared handle that owns the plant behind a mutex |
+//! | [`plc`] | Modbus/TCP service of one controller over the shared plant |
+//! | [`facts`] | Plant facts for the Fictionet event log |
+//! | [`hmi`] | Supervisory client hmi01: polls the controllers, serves the mimic page and control API |
+//! | [`network`] | Operations and control networks, with the controllers on port 502 |
+//! | [`story`] | The scripted operator story: six steps with automatic protection off |
 //!
 //! Loops are loop A and loop B, in that array order.
 //! Commands use externally tagged serde enums with snake_case wire names. Rod positions use tenths of a
@@ -64,8 +71,10 @@
 //! a stopped pump. Telemetry quiet freezes readings and reported equipment
 //! status together; controller modes remain live.
 //! Fault slots and the schedule are fixed arrays, so overflow cannot be built.
-//! No networking,
-//! world start function or executable is included in this crate yet.
+//! The viewer example, `examples/viewer.rs`, runs the plant in real time and
+//! serves the control room page with scripted steps and plant moments. The operator
+//! reads and commands through hmi01. The checks read plant truth. Each HMI link
+//! shows a telemetry heartbeat that stops when the feed freezes; the update time keeps advancing.
 //!
 //! ```
 //! use nuclear_world::{Plant, Config, command::{Command, FaultCommand}};
@@ -101,12 +110,19 @@
 //!   The long-irradiation comparison used here is 0.066 t^-0.2 for t in seconds.
 
 pub mod command;
+pub mod driver;
+pub mod facts;
 pub mod faults;
+pub mod hmi;
 pub mod kinetics;
+pub mod network;
 pub mod plant;
+pub mod plc;
 pub mod protection;
+pub mod registers;
 pub mod sensors;
 pub mod snapshot;
 pub mod steam;
+pub mod story;
 
 pub use plant::{Config, InitialPower, Plant};

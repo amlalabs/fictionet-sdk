@@ -1,0 +1,419 @@
+/* The shared scene comes first. Text controls remain below it. */
+
+.cr-root {
+  --control-green: #268b50;
+  container-type: inline-size;
+  min-width: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.cr-root [hidden] {
+  display: none !important;
+}
+
+.cr-root *,
+.cr-root *::before,
+.cr-root *::after {
+  box-sizing: border-box;
+}
+
+.cr-panel {
+  display: grid;
+  gap: 16px;
+  padding: 0;
+  min-width: 0;
+}
+
+.cr-panel > * { min-width: 0; }
+
+.cr-view {
+  position: relative;
+  width: 100%;
+  height: auto;
+  min-width: 0;
+}
+
+.cr-fallback {
+  display: grid;
+  gap: 16px;
+  padding: 16px;
+  min-width: 0;
+}
+
+.cr-scene-status {
+  position: static;
+  width: fit-content;
+  max-width: calc(100% - 20px);
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.cr-root h2 {
+  margin: 0 0 8px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.cr-headline {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.cr-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px 12px;
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.cr-fact {
+  font-size: 0.8125rem;
+}
+
+.cr-fact dt {
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.cr-fact dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+/* Viewport. */
+.cr-vantages {
+  margin-top: 6px;
+  padding: 4px;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.cr-vantage {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  pointer-events: auto;
+  min-height: 24px;
+  padding: 2px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.cr-vantage[aria-pressed='true'] {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
+}
+
+.cr-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface-sunken);
+}
+
+.cr-stage canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+.cr-stage canvas:focus-visible {
+  outline-offset: -4px;
+}
+
+.cr-error {
+  margin: 0;
+  padding: 16px;
+  font-weight: 600;
+}
+
+/* Knobs. */
+.cr-controls {
+  display: grid;
+  gap: 18px;
+}
+
+.cr-controls > summary {
+  min-height: 32px;
+  padding: 6px 0;
+  color: var(--ink);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cr-controls[open] > summary { margin-bottom: 12px; }
+
+.cr-cover-close {
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+.cr-knob[data-cover] .cr-push-cap { background: var(--coolant-hot); }
+.cr-knob[data-cover='closed'] .cr-push-cap { border: 5px double var(--ink); }
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .cr-root { --control-green: #69d496; }
+}
+
+:root[data-theme='dark'] .cr-root { --control-green: #69d496; }
+
+.cr-note {
+  margin: 0 0 8px;
+  color: var(--text);
+  font-size: 0.875rem;
+}
+
+.cr-knob-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 12px;
+}
+
+.cr-knob {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  text-align: center;
+}
+
+.cr-knob-name {
+  margin: 0;
+  font-weight: 600;
+  font-size: 0.9375rem;
+}
+
+.cr-knob-read {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.cr-knob-status {
+  margin: 0;
+  min-height: 1.5em;
+  font-size: 0.8125rem;
+}
+
+.cr-knob[data-outcome='refused'] .cr-knob-status,
+.cr-knob[data-outcome='failed'] .cr-knob-status {
+  font-weight: 600;
+}
+
+.cr-knob[data-pending='true'] {
+  border-style: dashed;
+}
+
+/* A dial or rotary: a round face with a pointer that turns on it. */
+.cr-knob-face {
+  position: relative;
+  width: 92px;
+  height: 92px;
+  border: 2px solid var(--line-strong);
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, var(--steel), var(--metal));
+  box-shadow: inset 0 2px 4px var(--shadow-inset), 0 2px 6px var(--shadow-soft);
+  cursor: grab;
+  touch-action: none;
+}
+
+.cr-knob-face.cr-rotary {
+  width: 84px;
+  height: 84px;
+}
+
+.cr-pointer {
+  position: absolute;
+  left: 50%;
+  top: 12%;
+  width: 4px;
+  height: 38%;
+  margin-left: -2px;
+  border-radius: 2px;
+  background: var(--ink);
+  transform-origin: 50% 100%;
+}
+
+/* A switch: a track with a lever that throws between two firm stops. */
+.cr-switch {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.cr-switch-track {
+  position: relative;
+  display: block;
+  width: 48px;
+  height: 84px;
+  border: 2px solid var(--line-strong);
+  border-radius: 24px;
+  background: var(--surface-sunken);
+}
+
+.cr-switch[aria-checked='true'] .cr-switch-track {
+  background: var(--metal);
+}
+
+.cr-switch-lever {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--ink);
+  box-shadow: 0 2px 4px var(--shadow-deep);
+}
+
+/* A pushbutton: a cap that goes down and comes back up. */
+.cr-push {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.cr-push-cap {
+  display: block;
+  width: 72px;
+  height: 56px;
+  border: 2px solid var(--line-strong);
+  border-radius: 10px;
+  background: radial-gradient(circle at 35% 30%, var(--steel), var(--metal));
+  box-shadow: 0 4px 0 var(--line-strong);
+}
+
+.cr-knob[data-kind='button'] .cr-push-cap {
+  box-shadow: 0 3px 0 var(--line-strong);
+}
+
+/* Focus is always visible: a thick outline outside the control. */
+.cr-root :focus {
+  outline: none;
+}
+
+.cr-root :focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.cr-readings {
+  overflow: auto;
+  margin-top: 4px;
+}
+
+@container (max-width: 540px) {
+  .cr-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cr-knob-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cr-root *,
+  .cr-root *::before,
+  .cr-root *::after {
+    animation: none;
+    transition: none;
+    scroll-behavior: auto;
+  }
+}
+
+@media (forced-colors: active) {
+  :root .cr-root,
+  :root[data-theme] .cr-root,
+  :root:not([data-theme='light']) .cr-root {
+    --control-green: Highlight;
+    --coolant-hot: CanvasText;
+  }
+  .cr-knob[data-cover] .cr-push-cap { background: ButtonFace; }
+  .cr-cover-close { border-color: ButtonText; color: ButtonText; background: ButtonFace; }
+  .cr-vantage,
+  .cr-scene-status {
+    border: 2px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+  .cr-vantage[aria-pressed='true'] {
+    border-color: Highlight;
+    color: HighlightText;
+    background: Highlight;
+  }
+  .cr-root :focus-visible { outline-color: Highlight; }
+  .cr-knob-face,
+  .cr-push-cap,
+  .cr-switch-track {
+    border: 2px solid CanvasText;
+  }
+}
+
+.cr-readings .plant-readings { max-height: none; }
+.cr-group-faults { padding-top: 16px; border-top: 2px solid var(--line-strong); }
+
+.cr-instructor-builder { display: flex; flex-wrap: wrap; align-items: end; gap: 16px; margin-block: 16px; }
+.cr-instructor-field { display: grid; gap: 6px; max-width: 100%; }
+.cr-instructor-field[hidden] { display: none; }
+.cr-instructor-field select,
+.cr-instructor-field input,
+.cr-instructor-button { min-height: 36px; min-width: 36px; max-width: 100%; padding: 6px 10px; font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: 4px; }
+.cr-instructor-field input { width: 12ch; }
+.cr-instructor-button { cursor: pointer; }
+.cr-instructor-button[aria-disabled='true'] { cursor: default; border-style: dashed; }
+.cr-instructor-status { margin: 6px 0; color: var(--ink); }
+.cr-instructor-active { list-style: none; padding: 0; }
+.cr-instructor-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding-block: 10px; border-bottom: 1px solid var(--line); }
+.cr-instructor-field :focus-visible,
+.cr-instructor-button:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+@media (forced-colors: active) {
+  .cr-instructor-field select,
+  .cr-instructor-field input,
+  .cr-instructor-button { border-color: ButtonText; color: ButtonText; background: ButtonFace; }
+  .cr-instructor-field :focus-visible,
+  .cr-instructor-button:focus-visible { outline-color: Highlight; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cr-group-faults *, .cr-group-faults *::before, .cr-group-faults *::after { animation: none; transition: none; }
+}

@@ -16,7 +16,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 pub const SAMPLE_MS: u64 = 250;
-pub const SENSOR_COUNT: usize = 21;
+pub const SENSOR_COUNT: usize = 22;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Sensor {
@@ -35,6 +35,7 @@ pub enum Sensor {
     GeneratorOutput,
     CondenserPressure,
     CoreExitTemperature,
+    ShutdownRodPosition,
 }
 impl Sensor {
     pub const MAX_JSON_BYTES: usize = 29;
@@ -60,6 +61,7 @@ impl Sensor {
         Self::GeneratorOutput,
         Self::CondenserPressure,
         Self::CoreExitTemperature,
+        Self::ShutdownRodPosition,
     ];
     pub fn index(self) -> usize {
         match self {
@@ -78,6 +80,7 @@ impl Sensor {
             Self::GeneratorOutput => 18,
             Self::CondenserPressure => 19,
             Self::CoreExitTemperature => 20,
+            Self::ShutdownRodPosition => 21,
         }
     }
     /// Unit, minimum, maximum and resolution. Flow is per loop in kg/s.
@@ -186,7 +189,7 @@ impl Instruments {
             random: seed,
             telemetry: Telemetry {
                 quiet: false,
-                heartbeat: 0,
+                heartbeat: (seed ^ seed.rotate_right(17) ^ 0xa7c5) as u16,
                 last_sample_ms: 0,
             },
         }
@@ -239,5 +242,41 @@ impl Instruments {
                 sampled_at_ms: at_ms,
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Config, Plant};
+
+    #[test]
+    fn shutdown_rods_sample_without_lag_and_obey_faults() {
+        let status = Plant::new(Config::default()).snapshot().reported_status;
+        let mut values = [0.0; SENSOR_COUNT];
+        let i = Sensor::ShutdownRodPosition.index();
+        let mut instruments = Instruments::new(0, values, status);
+        let mut faults = Faults::default();
+        values[i] = 75.0;
+        instruments.step(200, 0.05, values, status, &faults);
+        assert_eq!(instruments.readings[i].value, 0.0);
+        instruments.step(250, 0.05, values, status, &faults);
+        assert!((instruments.readings[i].value - 75.0).abs() <= 0.1);
+        assert_eq!(instruments.readings[i].sampled_at_ms, 250);
+        faults.sensors[i] = Some(SensorFault::Stuck { value: 321 });
+        instruments.step(500, 0.05, values, status, &faults);
+        assert_eq!(instruments.readings[i].value, 32.1);
+        faults.sensors[i] = Some(SensorFault::Quiet);
+        let held = instruments.readings[i];
+        instruments.step(750, 0.05, values, status, &faults);
+        assert_eq!(instruments.readings[i], held);
+        faults.sensors[i] = None;
+        faults.telemetry_quiet = true;
+        instruments.step(1000, 0.05, values, status, &faults);
+        assert_eq!(instruments.readings[i], held);
+        faults.telemetry_quiet = false;
+        instruments.step(1250, 0.05, values, status, &faults);
+        assert!((instruments.readings[i].value - 75.0).abs() <= 0.1);
+        assert_eq!(instruments.readings[i].sampled_at_ms, 1250);
     }
 }

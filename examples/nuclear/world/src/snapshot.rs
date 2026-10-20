@@ -150,5 +150,5 @@ pub struct PlantSnapshot {
     pub faults: Faults,
 }
 impl PlantSnapshot {
-    pub const MAX_JSON_BYTES: usize = 8609;
+    pub const MAX_JSON_BYTES: usize = 8795;
 }

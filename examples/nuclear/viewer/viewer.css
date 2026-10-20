@@ -1,0 +1,243 @@
+/* HTML text meets AA. Painted scene faces take the room light.
+ * The warning clears three to one against board steel.
+ */
+/*
+ * Nuclear plant viewer: the 3D scene beside a text panel of the same readings.
+ *
+ * Colors follow the site palette: paper, ink and the accent. The warning
+ * amber, the steel and metal greys, and the cold and hot coolant colors are
+ * added here. Each token has a light and a dark value, and each text or
+ * graphic color is checked against the surface it sits on.
+ */
+
+:root {
+  color-scheme: light;
+  --light-key: #ffffff;
+  --light-ground: #8a8a80;
+  --shadow-inset: rgba(0, 0, 0, 0.18);
+  --shadow-soft: rgba(0, 0, 0, 0.12);
+  --shadow-deep: rgba(0, 0, 0, 0.25);
+  --surface: #f7f6f0;
+  --plant-key: #c4d9ef;
+  --rubber: #252d29;
+  --lamp-glow: #ffbe50;
+  --lamp-off: #222b27;
+  --lamp-ink: #281b0b;
+  --lamp-legend: #f7f6f0;
+  --surface-raised: #fbfaf6;
+  --surface-sunken: #e9eddf;
+  --ink: #263e35;
+  --text: #5f6c59;
+  --muted: #66715f;
+  --line: #dedfd4;
+  --line-strong: #d2d8c8;
+  --steel: #acb5a8;
+  --metal: #8a9482;
+  --steam: #fbfaf6;
+  --accent: #df5835;
+  --accent-text: #b4441f;
+  --warning: #805000;
+  --coolant-cold: #2f6fa3;
+  --coolant-hot: #a8322a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface: #141915;
+    --plant-key: #c4d9ef;
+    --rubber: #252d29;
+    --lamp-glow: #ffbe50;
+    --lamp-off: #222b27;
+    --lamp-ink: #281b0b;
+    --lamp-legend: #f7f6f0;
+    --surface-raised: #1b211c;
+    --surface-sunken: #1d241e;
+    --ink: #e2e4d6;
+    --text: #aeb6a3;
+    --muted: #9ba391;
+    --line: #2a312b;
+    --line-strong: #363f37;
+    --steel: #4d564a;
+    --metal: #5d6759;
+    --steam: #aeb6a3;
+    --accent: #f0704c;
+    --accent-text: #f0704c;
+    --warning: #f2b441;
+    --coolant-cold: #6aa6e0;
+    --coolant-hot: #e4604f;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #141915;
+  --plant-key: #c4d9ef;
+  --rubber: #252d29;
+  --lamp-glow: #ffbe50;
+  --lamp-off: #222b27;
+  --lamp-ink: #281b0b;
+  --lamp-legend: #f7f6f0;
+  --surface-raised: #1b211c;
+  --surface-sunken: #1d241e;
+  --ink: #e2e4d6;
+  --text: #aeb6a3;
+  --muted: #9ba391;
+  --line: #2a312b;
+  --line-strong: #363f37;
+  --steel: #4d564a;
+  --metal: #5d6759;
+  --steam: #aeb6a3;
+  --accent: #f0704c;
+  --accent-text: #f0704c;
+  --warning: #f2b441;
+  --coolant-cold: #6aa6e0;
+  --coolant-hot: #e4604f;
+}
+
+/* Layout: the scene and the text panel side by side, stacked on a phone. */
+.plant-viewer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(24rem, 27rem);
+  gap: 16px;
+  align-items: start;
+  padding: 16px;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.plant-scene {
+  position: relative;
+  width: 100%;
+  min-height: 16rem;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-sunken);
+}
+
+.plant-scene canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.plant-scene:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.plant-readings {
+  min-width: 0;
+  max-height: 80vh;
+  overflow: auto;
+}
+
+.plant-readings h2 {
+  margin: 0 0 4px;
+  font-size: 1.125rem;
+  line-height: 1.3;
+}
+
+.plant-readings h3 {
+  margin: 16px 0 4px;
+  font-size: 1rem;
+  line-height: 1.3;
+}
+
+.plant-readings p {
+  margin: 4px 0;
+  color: var(--text);
+}
+
+.plant-readings table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.875rem;
+}
+
+.plant-readings th,
+.plant-readings td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.plant-readings th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.plant-readings td.num,
+.plant-readings th.num {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* A diverged or frozen point is named in words; the color only adds weight. */
+.plant-readings .state-diverged {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.plant-readings .state-frozen {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.plant-readings ul {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.plant-readings li {
+  margin: 2px 0;
+}
+
+@media (max-width: 760px) {
+  .plant-viewer {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .plant-readings {
+    max-height: none;
+  }
+}
+
+@media (forced-colors: active) {
+  :root, :root[data-theme] {
+    --surface: Canvas;
+    --surface-raised: Canvas;
+    --surface-sunken: Canvas;
+    --ink: CanvasText;
+    --text: CanvasText;
+    --steel: Canvas;
+    --metal: CanvasText;
+    --rubber: CanvasText;
+    --line: CanvasText;
+    --line-strong: CanvasText;
+    --warning: CanvasText;
+    --lamp-legend: Canvas;
+  }
+
+  .plant-scene {
+    border: 1px solid CanvasText;
+  }
+
+  .plant-readings .state-diverged,
+  .plant-readings .state-frozen {
+    color: CanvasText;
+    text-decoration: underline;
+  }
+}
