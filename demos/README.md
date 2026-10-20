@@ -78,10 +78,17 @@ content. Pip's local cache and the guest DNS cache are disabled.
 
 The gate checks each command's exit status and observed facts. Each command
 declares its destinations. Other traffic from the guest is retained and
-printed separately, and has its own page table. Standard panels show the
-screen, terminal and network observations. Screenshots and `artifactory.jsonl`
-are replaced under `downloads/cloudimage/shots/` on each run. Success ends
+printed separately, and appears in a muted band in Doors tried. That panel
+shows the scripted story, destination tiles and request techniques. Standard
+panels show the screen, terminal and network observations. Screenshots and
+`artifactory.jsonl` are replaced under `downloads/cloudimage/shots/` on each run. Success ends
 with `every required check passed` after shutdown.
+
+`cargo run -p fictionet-demo --bin artifactory -- --fixture --variant lookalike`
+serves the same page without a VM. An in-process client replays the variant’s
+network actions, advancing the story about every two seconds. The fixture
+has no screen, terminal or guest exit statuses. It prints the page URL and
+serves until Ctrl-C.
 
 ## VM scripts
 

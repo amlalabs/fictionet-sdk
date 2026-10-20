@@ -2,8 +2,10 @@
 //! Run `cargo xtask demo artifactory`. The default variant is lookalike.
 //! Select normal, missing, lookalike or peer with `--variant`.
 //! Add `--stay` to keep the page open after the gate until Ctrl-C.
+//! Run `cargo run -p fictionet-demo --bin artifactory -- --fixture` without a VM.
 
 mod facts;
+mod fixture;
 mod guest;
 mod mirror;
 mod story;
@@ -16,10 +18,7 @@ use artifactory_world::{
 };
 use fictionet::events::Fanout;
 use fictionet_demo::kit::{self, Kit};
-use fictionet_observe::{
-    Aggregate,
-    page::{Column, Format, Page},
-};
+use fictionet_observe::{Aggregate, page::Page};
 use guest::HOSTNAME;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -31,17 +30,22 @@ use std::time::{Duration, Instant};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-fn args(mut args: impl Iterator<Item = String>) -> Result<(PathBuf, Variant, bool)> {
+fn args(mut args: impl Iterator<Item = String>) -> Result<(PathBuf, Variant, bool, bool)> {
     let downloads = args.next().ok_or(
-        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--stay]",
+        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--stay], or artifactory --fixture [--variant V]",
     )?;
-    if downloads.starts_with("--") {
+    let mut fixture = downloads == "--fixture";
+    if downloads.starts_with("--") && !fixture {
         return Err("expected the downloads directory before options".into());
     }
     let mut variant = Variant::Lookalike;
     let mut selected = false;
     let mut stay = false;
     while let Some(flag) = args.next() {
+        if flag == "--fixture" && !fixture {
+            fixture = true;
+            continue;
+        }
         if flag == "--stay" && !stay {
             stay = true;
             continue;
@@ -53,7 +57,7 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<(PathBuf, Variant, boo
         variant = Variant::parse(&args.next().ok_or("--variant needs a value")?)
             .ok_or("variant must be normal, missing, lookalike or peer")?;
     }
-    Ok((downloads.into(), variant, stay))
+    Ok((downloads.into(), variant, stay, fixture))
 }
 
 #[tokio::main]
@@ -65,7 +69,10 @@ async fn main() {
 }
 
 async fn execute() -> Result {
-    let (downloads, variant, stay) = args(std::env::args().skip(1))?;
+    let (downloads, variant, stay, fixture) = args(std::env::args().skip(1))?;
+    if fixture {
+        return fixture::serve(variant).await;
+    }
     let start = Instant::now();
     let shots = downloads.join("shots");
     std::fs::create_dir_all(&shots)?;
@@ -89,31 +96,10 @@ async fn execute() -> Result {
     let closed = Arc::new(AtomicBool::new(false));
     let mirror_closed = closed.clone();
     let world_log = log.clone();
-    let other = facts.topics.other.clone();
+    let topics = facts.topics.clone();
     let kit = Kit::new("artifactory")
         .guest(guest::definition())
-        .page(move |dashboard, hosts| {
-            Page::new(
-                format!("Artifactory · {} · Scripted agent", variant.as_str()),
-                dashboard,
-            )
-            .host(hosts.take(HOSTNAME))
-            .table(
-                "Other guest traffic",
-                other,
-                vec![
-                    Column::new("Time", "/at").format(Format::Time),
-                    Column::new("During step", "/step"),
-                    Column::new("Name", "/row/name"),
-                    Column::new("Address", "/row/addr"),
-                    Column::new("Transport", "/row/transport"),
-                    Column::new("Port", "/row/port"),
-                    Column::new("Count", "/row/count").format(Format::Number),
-                    Column::new("Outcome", "/row/outcome"),
-                ],
-            )
-            .standard_panels()
-        })
+        .page(move |dashboard, hosts| page(variant, dashboard, hosts.take(HOSTNAME), topics, false))
         .observer(Arc::new(Aggregate::new(Arc::new(Fanout::new(vec![
             Arc::new(log.clone()),
             facts.clone(),
@@ -170,6 +156,28 @@ async fn execute() -> Result {
     );
     println!("every required check passed");
     Ok(())
+}
+
+fn page(
+    variant: Variant,
+    dashboard: fictionet_observe::DashboardHandle,
+    host: fictionet_observe::page::Host,
+    topics: facts::Topics,
+    fixture: bool,
+) -> Page {
+    let mode = if fixture {
+        "Scripted agent fixture · network replay only"
+    } else {
+        "Scripted agent"
+    };
+    Page::new(
+        format!("Artifactory · {} · {mode}", variant.as_str()),
+        dashboard,
+    )
+    .host(host)
+    .custom("Doors tried", include_str!("doors.mjs"), topics.doors)
+    .asset("doors.css", "text/css", include_str!("doors.css"))
+    .standard_panels()
 }
 
 async fn gate(
@@ -296,9 +304,17 @@ mod tests {
         ] {
             assert!(args(input.into_iter().map(str::to_owned)).unwrap().2);
         }
+        for input in [
+            vec!["--fixture"],
+            vec!["d", "--fixture"],
+            vec!["--fixture", "--variant", "peer"],
+        ] {
+            assert!(args(input.into_iter().map(str::to_owned)).unwrap().3);
+        }
         for args_in in [
             vec![],
             vec!["--stay"],
+            vec!["--fixture", "--fixture"],
             vec!["d", "--stay", "--stay"],
             vec!["d", "--variant", "peer", "--variant", "normal"],
             vec!["d", "--variant"],

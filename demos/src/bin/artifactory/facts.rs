@@ -1,6 +1,6 @@
 use artifactory_world::{
     facts::{Door, MAX_DOOR_JSON_BYTES, MAX_REQUEST_JSON_BYTES, Request},
-    inventory::{Entry, EntryKind, FolderAdded, Inventory, MAX_INVENTORY_JSON_BYTES, Origin},
+    inventory::{FolderAdded, Inventory, MAX_INVENTORY_JSON_BYTES},
 };
 use fictionet::{
     events::{Interest, Loss, Observation, Observer, Stamp, Stream},
@@ -15,6 +15,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 const ROWS: usize = 4096;
 const PAGE_ROWS: usize = 512;
+const INVENTORY_DELTAS: usize = 64;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -76,13 +77,22 @@ pub struct Snapshot {
     pub lost: u64,
     pub publication_error: Option<String>,
     dirty: bool,
+    pending_changes: Vec<FolderAdded>,
+}
+
+#[derive(Serialize)]
+pub struct Doors {
+    #[serde(flatten)]
+    pub rows: Rows<Door>,
+    pub story: Vec<StoryStep>,
+    pub requests: Rows<Request>,
 }
 
 #[derive(Clone)]
 pub struct Topics {
     pub inventory: StateTopic<Inventory>,
     pub requests: StateTopic<Rows<Request>>,
-    pub doors: StateTopic<Rows<Door>>,
+    pub doors: StateTopic<Doors>,
     pub story: StateTopic<Vec<StoryStep>>,
     pub other: StateTopic<Vec<Tagged<Door>>>,
 }
@@ -103,10 +113,13 @@ impl Facts {
         let topics = Topics {
             inventory: StateTopic::new(StateLimits {
                 max_bytes: MAX_INVENTORY_JSON_BYTES,
-                deltas: 64,
+                deltas: INVENTORY_DELTAS,
             }),
             requests: StateTopic::new(limits(PAGE_ROWS * (MAX_REQUEST_JSON_BYTES + 512))),
-            doors: StateTopic::new(limits(PAGE_ROWS * (MAX_DOOR_JSON_BYTES + 512))),
+            doors: StateTopic::new(limits(
+                PAGE_ROWS * (MAX_DOOR_JSON_BYTES + MAX_REQUEST_JSON_BYTES + 1024)
+                    + StateLimits::default().max_bytes,
+            )),
             // Retained row references use at most 2 * ROWS * 21 bytes. Commands
             // and titles come from the fixed story and fit in the remainder.
             story: StateTopic::new(StateLimits::default()),
@@ -138,6 +151,7 @@ impl Facts {
             lost: 0,
             publication_error: None,
             dirty: true,
+            pending_changes: Vec::new(),
         };
         let result = topics.inventory.publish(state.at, &state.inventory);
         state.record(result);
@@ -183,6 +197,11 @@ impl Facts {
         let mut state = self.state.lock().unwrap();
         state.at = at;
         state.inventory = inventory.clone();
+        if state.pending_changes.len() == INVENTORY_DELTAS {
+            state.publication_error = Some("inventory changes exceed the delta count bound".into());
+        } else {
+            state.pending_changes.push(change.clone());
+        }
         let step = state.step;
         state.dropped += keep(
             &mut state.changes,
@@ -221,7 +240,8 @@ struct Batch {
     requests: Rows<Request>,
     doors: Rows<Door>,
     story: Vec<StoryStep>,
-    changes: Vec<Tagged<FolderAdded>>,
+    inventory: Inventory,
+    changes: Vec<FolderAdded>,
 }
 
 impl Batch {
@@ -251,7 +271,8 @@ impl Batch {
             requests,
             doors,
             story,
-            changes: state.changes.iter().cloned().collect(),
+            inventory: state.inventory.clone(),
+            changes: std::mem::take(&mut state.pending_changes),
         })
     }
 }
@@ -276,8 +297,15 @@ impl Topics {
             .cloned()
             .collect();
         self.other.publish(batch.at, &other)?;
-        self.doors.publish(batch.at, &batch.doors)?;
-        self.story.publish(batch.at, &batch.story)
+        self.story.publish(batch.at, &batch.story)?;
+        self.doors.publish(
+            batch.at,
+            &Doors {
+                rows: batch.doors,
+                story: batch.story,
+                requests: batch.requests,
+            },
+        )
     }
 }
 
@@ -290,7 +318,6 @@ pub struct Publisher {
 impl Publisher {
     pub fn start(facts: Arc<Facts>) -> Self {
         let (flush, mut receiver) = mpsc::channel::<oneshot::Sender<()>>(1);
-        let mut inventory = facts.state.lock().unwrap().inventory.clone();
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -302,7 +329,7 @@ impl Publisher {
                         None => break,
                     },
                 };
-                publish_changed(&facts, &mut inventory);
+                publish_changed(&facts);
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
@@ -324,30 +351,23 @@ impl Drop for Publisher {
     }
 }
 
-fn publish_changed(facts: &Facts, inventory: &mut Inventory) {
-    let Some(batch) = Batch::take(&mut facts.state.lock().unwrap()) else {
+fn publish_changed(facts: &Facts) {
+    let mut state = facts.state.lock().unwrap();
+    if state.publication_error.is_some() {
+        return;
+    }
+    let Some(batch) = Batch::take(&mut state) else {
         return;
     };
+    drop(state);
     // Copy rows under the facts lock, then serialize without holding it.
     let result = (|| {
-        for change in &batch.changes {
-            if change.row.revision <= inventory.revision {
-                continue;
-            }
-            let entries = &mut inventory.repositories[2].entries;
-            entries.push(Entry {
-                path: change.row.path.clone(),
-                kind: EntryKind::Folder,
-                origin: Origin::Reply,
-            });
-            let replies = entries.partition_point(|e| e.origin != Origin::Reply);
-            entries[replies..].sort_by(|a, b| a.path.cmp(&b.path));
-            inventory.revision = change.row.revision;
-            let at = Instant::from_since_start(Duration::from_secs_f64(change.at));
-            facts
-                .topics
-                .inventory
-                .publish_with_delta(at, inventory, &change.row)?;
+        if !batch.changes.is_empty() {
+            facts.topics.inventory.publish_with_delta(
+                batch.at,
+                &batch.inventory,
+                &batch.changes,
+            )?;
         }
         facts.topics.publish(batch)
     })();
@@ -451,7 +471,7 @@ impl Observer for Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use artifactory_world::{packages::Variant, repository::Contents};
+    use artifactory_world::{inventory::Origin, packages::Variant, repository::Contents};
     use fictionet::events::Event;
     #[test]
     fn phases_and_overflow_stay_visible() {
@@ -592,39 +612,79 @@ mod tests {
         state.check_complete().unwrap();
     }
 
+    fn folder(contents: Arc<Contents>, path: &str, seconds: u64) {
+        use artifactory_world::repository::{RepositoryHandler, Site};
+        let handler = RepositoryHandler {
+            contents,
+            site: Site::Artifactory,
+        };
+        let response = handler.respond(
+            &http::Request::builder()
+                .method("MKCOL")
+                .uri(format!("/artifactory/github-remote-cache/{path}/"))
+                .body(bytes::Bytes::new())
+                .unwrap(),
+            false,
+            Instant::from_since_start(Duration::from_secs(seconds)),
+            None,
+        );
+        assert_eq!(response.status(), 201);
+    }
+
     #[test]
     fn inventory_bursts_keep_each_revision_and_sorted_replies() {
         let contents = Contents::new(Variant::Peer, "", &[1; 32]).unwrap();
-        let mut published = contents.inventory();
-        let facts = Arc::new(Facts::new(published.clone()));
-        let mut next = published.clone();
-        let replies = next.repositories[2].entries.len();
-        for (index, path) in ["reply-z", "reply-a", "reply-m"].iter().enumerate() {
-            next.revision = index as u64 + 1;
-            next.repositories[2].entries.push(Entry {
-                path: (*path).into(),
-                kind: EntryKind::Folder,
-                origin: Origin::Reply,
-            });
-            next.repositories[2].entries[replies..].sort_by(|a, b| a.path.cmp(&b.path));
-            facts.inventory_changed(
-                Instant::from_since_start(Duration::from_secs(index as u64 + 1)),
-                &FolderAdded {
-                    revision: next.revision,
-                    path: (*path).into(),
-                    sandbox: None,
-                },
-                &next,
-            );
+        let facts = Arc::new(Facts::new(contents.inventory()));
+        let listener = facts.clone();
+        let contents = Arc::new(contents.on_change(move |at, change, inventory| {
+            listener.inventory_changed(at, change, inventory);
+        }));
+        for (index, path) in ["reply-z/nested", "reply-a", "reply-m"].iter().enumerate() {
+            folder(contents.clone(), path, index as u64 + 1);
             assert_eq!(facts.topics.inventory.revision(), 1);
         }
-        publish_changed(&facts, &mut published);
-        assert_eq!(published, next);
-        assert_eq!(facts.topics.inventory.revision(), 4);
+        let state = facts.state.lock().unwrap();
+        assert_eq!(state.inventory, contents.inventory());
+        assert_eq!(
+            state
+                .pending_changes
+                .iter()
+                .map(|c| c.revision)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            state.inventory.repositories[2]
+                .entries
+                .iter()
+                .filter(|e| e.origin == Origin::Reply)
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            ["reply-a", "reply-m", "reply-z/nested"]
+        );
+        drop(state);
+        publish_changed(&facts);
+        assert_eq!(facts.topics.inventory.revision(), 2);
         assert_eq!(facts.state.lock().unwrap().changes.len(), 3);
-        publish_changed(&facts, &mut published);
-        assert_eq!(facts.topics.inventory.revision(), 4);
+        publish_changed(&facts);
+        assert_eq!(facts.topics.inventory.revision(), 2);
         facts.state.lock().unwrap().check_complete().unwrap();
+    }
+
+    #[test]
+    fn pending_inventory_changes_have_a_visible_bound() {
+        let contents = Contents::new(Variant::Peer, "", &[1; 32]).unwrap();
+        let facts = Arc::new(Facts::new(contents.inventory()));
+        let listener = facts.clone();
+        let contents = Arc::new(contents.on_change(move |at, change, inventory| {
+            listener.inventory_changed(at, change, inventory);
+        }));
+        for index in 0..=INVENTORY_DELTAS {
+            folder(contents.clone(), &format!("reply-{index}"), index as u64);
+        }
+        let state = facts.state.lock().unwrap();
+        assert_eq!(state.pending_changes.len(), INVENTORY_DELTAS);
+        assert!(state.check_complete().is_err());
     }
 
     async fn topic(
@@ -641,14 +701,16 @@ mod tests {
 
     #[tokio::test]
     async fn topics_publish_inventory_rows_and_story() {
-        use artifactory_world::inventory::{Entry, EntryKind, Origin};
         use fictionet_demo::kit::client::PageClient;
         use fictionet_observe::{DashboardObserver, DashboardOptions, page::Page};
 
-        let initial = Contents::new(Variant::Peer, "", &[1; 32])
-            .unwrap()
-            .inventory();
+        let contents = Contents::new(Variant::Peer, "", &[1; 32]).unwrap();
+        let initial = contents.inventory();
         let facts = Arc::new(Facts::new(initial.clone()));
+        let listener = facts.clone();
+        let contents = Arc::new(contents.on_change(move |at, change, inventory| {
+            listener.inventory_changed(at, change, inventory);
+        }));
         let publisher = Publisher::start(facts.clone());
         let dashboard = DashboardObserver::new(DashboardOptions::demo());
         let page = Page::new("Topic publishing", dashboard.handle())
@@ -679,19 +741,14 @@ mod tests {
         );
 
         let at = Instant::from_since_start(std::time::Duration::from_secs(3));
-        let mut next = initial;
-        next.revision = 1;
-        next.repositories[2].entries.push(Entry {
-            path: "reply".into(),
-            kind: EntryKind::Folder,
-            origin: Origin::Reply,
-        });
-        let change = FolderAdded {
-            revision: 1,
-            path: "reply".into(),
-            sandbox: None,
-        };
-        facts.inventory_changed(at, &change, &next);
+        folder(contents.clone(), "reply-z/nested", 2);
+        folder(contents.clone(), "reply-a", 3);
+        let next = contents.inventory();
+        let changes = facts.state.lock().unwrap().pending_changes.clone();
+        assert_eq!(
+            changes.iter().map(|c| c.revision).collect::<Vec<_>>(),
+            [1, 2]
+        );
         publisher.flush().await.unwrap();
         let inventory = topic(&client, "packages").await;
         assert_eq!(inventory["revision"], 2);
@@ -721,7 +778,10 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("\"delta\""), "{response}");
         assert!(
-            response.contains(&serde_json::to_string(&change).unwrap()),
+            response.contains(&format!(
+                "\"delta\":{}",
+                serde_json::to_string(&changes).unwrap()
+            )),
             "{response}"
         );
 
