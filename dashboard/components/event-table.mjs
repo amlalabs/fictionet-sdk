@@ -15,7 +15,7 @@ export function mount(root, services, options) {
   const cancel = services.clearTimeout || clearTimeout;
   let timer, after = 0, rows = [], pending = 0, paused = false, dropped = 0;
   function draw() {
-    render(body, rows, options.columns);
+    render(body, rows, options.columns, { key: (row) => row.seq });
     pending = 0;
     jump.hidden = true;
   }

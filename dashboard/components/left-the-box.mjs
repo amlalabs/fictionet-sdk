@@ -1,12 +1,12 @@
 // Guest destinations projected by the observer, including startup traffic.
 import { scoped, icon } from '../dom.mjs';
 import { render } from './table.mjs';
+import { plural } from '../format.mjs';
 
 const groups = [
   ['forwarded', 'Forwarded to the real internet'], ['served', 'Served by the world'],
   ['refused', 'Refused'], ['no_route', 'No route'],
 ];
-const plural = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 const attempts = (row) => (row.requests || 0) + (row.packets || 0) || row.connections || 0;
 
 export function mount(root, services) {

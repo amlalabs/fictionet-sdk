@@ -1,20 +1,7 @@
-import { engine, ms, time, made, siteReason, cache, outcome, counts, resultView, tree } from './model.mjs';
-
-// Keep keyed elements in place unless their order or parent actually changes.
-export function reconcile(parent, items, key, create, update, retained) {
-  const wanted = new Set(items.map(key));
-  for (const [id, entry] of retained) if (!wanted.has(id)) { entry.node.remove(); retained.delete(id); }
-  items.forEach((item, index) => {
-    const id = key(item);
-    let entry = retained.get(id);
-    const fresh = !entry;
-    if (!entry) { entry = create(item); retained.set(id, entry); }
-    update(entry, item, fresh);
-    if (parent.children[index] !== entry.node) parent.insertBefore(entry.node, parent.children[index] || null);
-  });
-}
+import { engine, ms, made, siteReason, cache, outcome, counts, resultView, tree } from './model.mjs';
 
 export function mount(root, services, options) {
+  const { reconcile } = services.dom, { fmtRunMs: time } = services.format;
   const doc = root.ownerDocument;
   root.classList.add('search-content');
   const el = (tag, text, parent, cls) => {

@@ -7,6 +7,7 @@ import { createTheme } from './theme.mjs';
 import { createStateHub, createWatchHub } from './streams.mjs';
 import { watchState } from './state.mjs';
 import * as format from './format.mjs';
+import * as dom from './dom.mjs';
 import { scoped, listen } from './dom.mjs';
 import { mount as screen } from './components/screen.mjs';
 import { mount as terminal } from './components/terminal.mjs';
@@ -41,7 +42,7 @@ export function createServices(transport, theme) {
   const momentListeners = new Set();
   const clock = { t: 0, at: performance.now(), ended: true };
   return {
-    transport, selection, theme, format, clock,
+    transport, selection, theme, format, dom, clock,
     packetPair: store(null),
     watch: () => watches.subscribe(),
     connect: (graph) => watchState(watches.subscribe(), graph),

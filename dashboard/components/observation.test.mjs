@@ -112,6 +112,7 @@ test('events filters text, preserves loss and selects only explicit flow identit
   const dispose = events(h.root, h.services);
   const event = { seq: 1, at: 2, node: 's1', sandbox: { name: 'guest' }, source: 'http', kind: 'request', summary: '<script>hello</script>', fields: {}, conn: 12 };
   h.watches[0].emit('snapshot', { ...h.snapshot, events: [event], status: { losses: [{ stream: 'events', count: 4, reason: 'eviction' }] } });
+  h.frame();
   assert.match(h.root.textContent, /4 lost/);
   assert.match(h.root.textContent, /<script>hello<\/script>/);
   assert.equal(h.root.querySelector('script'), null);
@@ -127,12 +128,48 @@ test('events filters text, preserves loss and selects only explicit flow identit
   h.clean();
 });
 
+test('a burst of events renders once per frame and keeps each row by key', (t) => {
+  const h = fixture(t);
+  const dispose = events(h.root, h.services);
+  const event = (seq) => seq === 1999
+    ? { seq, at: seq / 100, source: 'events', kind: 'dropped', fields: { count: 12, reason: 'eviction' } }
+    : { seq, at: seq / 100, sandbox: { name: 'guest' }, source: 'scan', kind: 'port', summary: `port ${seq}`, fields: {} };
+  h.watches[0].emit('snapshot', { ...h.snapshot, events: [] });
+  h.frame();
+  const document = h.root.ownerDocument, createElement = document.createElement;
+  let built = 0;
+  document.createElement = (tag) => { if (tag === 'div') built++; return createElement.call(document, tag); };
+  // A port scan reports hundreds of ports at once.
+  for (let seq = 1; seq <= 2000; seq++) h.watches[0].emit('event', event(seq));
+  assert.equal(h.frames.size, 1, 'the whole burst waits for one frame');
+  assert.equal(h.root.querySelectorAll('.event-item').length, 0);
+  h.frame();
+  const items = h.root.querySelectorAll('.event-item');
+  assert.equal(items.length, 500);
+  assert.match(items[0].textContent, /port 2000/);
+  assert.match(items[1].textContent, /12 events were lost here \(eviction\)/);
+  assert.match(items.at(-1).textContent, /port 1501/);
+  assert.equal(built, 500, 'each kept row is built once');
+  // One more event adds one row; every other row keeps its node.
+  h.watches[0].emit('event', event(2001));
+  h.frame();
+  const next = h.root.querySelectorAll('.event-item');
+  assert.equal(next.length, 500);
+  assert.match(next[0].textContent, /port 2001/);
+  assert.deepEqual(next.slice(1), items.slice(0, -1));
+  assert.equal(built, 501);
+  assert.equal(h.frames.size, 0);
+  dispose();
+  h.clean();
+});
+
 test('incoming events preserve a label being typed', (t) => {
   const h = fixture(t);
   h.services.labelCommand = '/api/command/labels';
   const dispose = events(h.root, h.services);
   const event = { seq: 1, at: 2, source: 'http', kind: 'request', summary: 'first', fields: {} };
   h.watches[0].emit('snapshot', { ...h.snapshot, events: [event] });
+  h.frame();
   h.root.querySelector('.event-line').click();
   h.root.querySelector('.label-action').querySelector('button').click();
   const input = h.root.querySelector('.label-action').querySelector('input');
@@ -200,6 +237,7 @@ test('a selected event shows its fields and offers only an approximate packet ma
   const dispose = events(h.root, h.services);
   const event = { seq: 2, at: 3, sandbox: { name: 'guest' }, source: 'dns', kind: 'query', summary: 'example.test', fields: { name: 'example.test' }, local: '10.0.0.1:53', peer: '10.0.0.2:5000', transport: 'udp', tls: false, conn: null };
   h.watches[0].emit('snapshot', { ...h.snapshot, events: [event] });
+  h.frame();
   assert.equal(h.root.querySelector('.event-detail'), null);
   h.root.querySelector('button.event-line').click();
   assert.equal(h.selection.get().host, 'alpha');
@@ -296,6 +334,7 @@ test('event and connection labels come from state and stay after the summary', (
   const event = { seq: 7, at: 1.2, source: 'dns', kind: 'query', summary: 'example.test', conn: 4, fields: {} };
   h.watches[0].emit('snapshot', { ...h.snapshot, events: [event, { ...event, seq: 8, conn: 5 }] });
   update({ value: [{ text: 'download', target: { kind: 'event', seq: 7 } }, { text: 'lookup', target: { kind: 'connection', id: 4 } }] });
+  h.frame();
   const lines = h.root.querySelectorAll('.event-line');
   assert.equal(lines[0].querySelector('.label-chip'), null);
   assert.equal(lines[1].querySelector('.text').textContent, 'example.testdownloadlookup');

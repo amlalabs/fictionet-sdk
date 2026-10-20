@@ -17,10 +17,13 @@ snapshot and the changes since, then live events. Close it when done.
 `services.state(path, onSnapshot, onError)` subscribes to a state topic and
 returns an unsubscribe function; snapshots have `{revision, at, value, status}`.
 It fetches a replacement snapshot when a delta arrives, since deltas are the
-author's. `services.selection` holds explicit host, node, link, event,
+author's. A topic stays on the stream after its panel closes, so switching
+panels never reopens the stream. `services.selection` holds explicit host, node, link, event,
 connection and request identities. `services.theme` has `current()` and
 `subscribe(listener) -> unsubscribe`. `services.format` contains text formatters
-for bytes, counts and run time. `services.moment(element)` applies the shared
+for bytes, counts and run time. `services.dom` has the DOM helpers `scoped`,
+`listen`, `icon` and `reconcile`, which updates a keyed list in place so live
+rows keep their place and focus. `services.moment(element)` applies the shared
 story moment style. `services.runTime()` is the run's clock in seconds.
 
 Options are the panel description from `/api/page`, with any explicit composition

@@ -2,7 +2,6 @@
 export const engine = (name) => ({ google: 'Google', bing: 'Bing', duckduckgo: 'DuckDuckGo' }[name] || name);
 export const queryKey = (text) => text.toLowerCase().split(/[\p{White_Space}\u001c-\u001f]+/u).filter(Boolean).join(' ');
 export const ms = (value) => value == null ? 'not reported' : `${value} ms`;
-export const time = (value) => `${(value / 1000).toFixed(2)} s`;
 export const made = (value) => ({ stubbed: 'Made by the stub generator', stored: 'Served from memory', fixed: 'Written into the seed', missing: 'Not made, so 404', not_made: 'Not made: over the budget', written_live: 'Written by a model' }[value] || 'How it was made was not reported');
 export const siteReason = (value) => ({ search_engine: 'Search engine address', seed: 'Address from the seed', pool: 'Address from the world’s pool', recorded: 'Address from storage' }[value] || 'Address reason not reported');
 export const cache = (value) => ({ generated: 'Made for this search', cached: 'From memory', prefetched: 'Made ahead of this search', fixed: 'Written into the seed', missing: 'Generation was off', budget: 'Generation budget spent' }[value] || '');

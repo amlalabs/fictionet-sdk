@@ -1,5 +1,6 @@
 // Article text and delivery facts come from separate world projections.
 export function mount(root, services, options = {}) {
+  const { reconcile } = services.dom;
   const el = (tag, text, parent, cls) => {
     const node = root.ownerDocument.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -8,11 +9,19 @@ export function mount(root, services, options = {}) {
     return node;
   };
   root.classList.add('article-container');
-  const cleanup = [], dynamic = [];
-  const listen = (target, type, fn, list = cleanup) => {
+  const cleanup = [];
+  const listen = (target, type, fn) => {
     target.addEventListener(type, fn);
-    list.push(() => target.removeEventListener(type, fn));
+    cleanup.push(() => target.removeEventListener(type, fn));
   };
+  // Buttons in kept lists hold their own listener, released on dispose.
+  const button = (cls, onClick) => {
+    const node = el('button', undefined, undefined, cls);
+    node.type = 'button';
+    node.addEventListener('click', onClick);
+    return { node, off: () => node.removeEventListener('click', onClick) };
+  };
+  const topicButtons = new Map(), chipButtons = new Map(), ticks = new Map();
   const controller = new AbortController();
   const sheet = el('link', undefined, root);
   sheet.setAttribute('rel', 'stylesheet'); sheet.setAttribute('href', '/assets/article.css');
@@ -38,6 +47,10 @@ export function mount(root, services, options = {}) {
   const follow = el('button', 'Following reads', topicRow, 'text-button'); follow.type = 'button';
   const body = el('div', undefined, panel, 'article-body');
   const history = el('div', undefined, panel, 'article-history');
+  history.hidden = true;
+  const counts = el('p', '', el('div', undefined, history, 'article-history-summary'), 'article-counts');
+  const axis = el('div', undefined, history, 'article-axis');
+  const span = el('div', '', history, 'article-meta');
   const loss = el('p', '', panel, 'article-meta'); loss.setAttribute('role', 'status');
   const readMarker = el('p', '', undefined, 'article-read');
   let markedRead = -1;
@@ -60,7 +73,6 @@ export function mount(root, services, options = {}) {
   }
   function render() {
     if (disposed || !diff) return;
-    dynamic.splice(0).forEach((off) => off());
     const latest = events.filter(knownRead).at(-1);
     if (!pinned && latest) { topicName = latest.fields.topic; sourceName = latest.fields.source; }
     let topic = diff.topics.find((item) => item.topic === topicName)
@@ -79,27 +91,26 @@ export function mount(root, services, options = {}) {
     address.setAttribute('title', `${url.textContent} · ${identity.textContent}${last ? '' : ' · Not read yet'}`);
     panel.dataset.on = String(diff.on);
     follow.textContent = pinned ? 'Follow latest read' : 'Following reads';
-    topics.replaceChildren();
-    for (const item of diff.topics) {
+    // Topic and source buttons keep their elements, so focus stays put.
+    reconcile(topics, diff.topics, (item) => item.topic, (item) => button(undefined, () => { pinned = true; topicName = item.topic; sourceName = undefined; render(); }), (entry, item) => {
       const title = item.sources.find((source) => new URL(source.url).hostname === 'en.wikipedia.org')?.real.title || item.topic;
-      const button = el('button', title, topics);
-      button.setAttribute('title', title);
-      button.type = 'button'; button.setAttribute('aria-pressed', String(item.topic === topicName));
-      listen(button, 'click', () => { pinned = true; topicName = item.topic; sourceName = undefined; render(); }, dynamic);
-    }
-    chips.replaceChildren();
-    for (const item of topic.sources) {
+      if (entry.node.textContent !== title) { entry.node.textContent = title; entry.node.setAttribute('title', title); }
+      entry.node.setAttribute('aria-pressed', String(item.topic === topicName));
+    }, topicButtons);
+    reconcile(chips, topic.sources, (item) => item.source, (item) => button(undefined, () => { pinned = true; sourceName = item.source; render(); }), (entry, item) => {
       const read = readsFor(topicName, item.source).length > 0;
       const host = new URL(item.url).hostname;
       const caption = `${host} · ${item.served} · ${read ? 'read' : 'unread'}`;
-      const chip = el('button', undefined, chips);
-      el('span', host, chip, 'article-source-host');
-      el('span', item.served === 'real' ? 'Real' : 'Tampered', chip, `article-source-state ${item.served}`);
-      if (read) el('span', '✓ read', chip, 'article-source-read');
-      chip.setAttribute('aria-label', caption); chip.setAttribute('title', caption);
-      chip.type = 'button'; chip.setAttribute('aria-pressed', String(item.source === sourceName));
-      listen(chip, 'click', () => { pinned = true; sourceName = item.source; render(); }, dynamic);
-    }
+      if (entry.caption !== caption) {
+        entry.caption = caption;
+        entry.node.replaceChildren();
+        el('span', host, entry.node, 'article-source-host');
+        el('span', item.served === 'real' ? 'Real' : 'Tampered', entry.node, `article-source-state ${item.served}`);
+        if (read) el('span', '✓ read', entry.node, 'article-source-read');
+        entry.node.setAttribute('aria-label', caption); entry.node.setAttribute('title', caption);
+      }
+      entry.node.setAttribute('aria-pressed', String(item.source === sourceName));
+    }, chipButtons);
     const scroll = body.querySelector('.article-text')?.scrollTop || 0;
     body.replaceChildren();
     const claims = el('div', undefined, body, 'article-claims');
@@ -136,23 +147,23 @@ export function mount(root, services, options = {}) {
       }
     }
     text.scrollTop = scroll;
-    history.replaceChildren();
+    history.hidden = false;
     const real = reads.filter((event) => event.fields.served === 'real').length;
-    const summary = el('div', undefined, history, 'article-history-summary');
-    el('p', `${reads.length} ${incomplete ? 'retained ' : ''}${reads.length === 1 ? 'read' : 'reads'}: ${real} real, ${reads.length - real} tampered`, summary, 'article-counts');
+    counts.textContent = `${reads.length} ${incomplete ? 'retained ' : ''}${reads.length === 1 ? 'read' : 'reads'}: ${real} real, ${reads.length - real} tampered`;
     const changes = events.filter((event) => event.source === 'fakewiki' && event.kind === 'tampering');
     const end = Math.max(services.runTime(), ...reads.map((event) => event.at), ...changes.map((event) => event.at), 0.001);
-    const axis = el('div', undefined, history, 'article-axis');
-    for (const event of [...reads, ...changes].sort((a, b) => a.seq - b.seq)) {
+    reconcile(axis, [...reads, ...changes].sort((a, b) => a.seq - b.seq), (event) => event.seq, (event) => {
       const read = isRead(event), kind = read ? event.fields.served : 'switch';
       const caption = read ? `${kind} · r${event.fields.tamper_revision} · ${time(event.at)}` : `${event.fields.on ? 'On' : 'Off'} r${event.fields.revision}${event.fields.changed ? '' : ' unchanged'}`;
-      const mark = el('button', undefined, axis, `article-tick ${kind}`);
-      if (!read) { el('span', caption, mark); mark.dataset.end = String(event.at / end > 0.5); }
-      mark.type = 'button'; mark.setAttribute('title', caption); mark.setAttribute('aria-label', caption);
-      mark.style.setProperty('left', `calc(${event.at / end * 100}% + ${12 - event.at / end * 24}px)`);
-      listen(mark, 'click', () => services.selection.set({ host: event.sandbox?.name || null, node: event.node || null, event, connection: event.conn ?? null, request: event.fields?.request_id ?? null, links: [] }), dynamic);
-    }
-    el('div', `${time(0)} – ${time(end)} · ○ real  ● tampered`, history, 'article-meta');
+      const mark = button(`article-tick ${kind}`, () => services.selection.set({ host: event.sandbox?.name || null, node: event.node || null, event, connection: event.conn ?? null, request: event.fields?.request_id ?? null, links: [] }));
+      if (!read) el('span', caption, mark.node);
+      mark.node.setAttribute('title', caption); mark.node.setAttribute('aria-label', caption);
+      return { ...mark, read };
+    }, (mark, event) => {
+      if (!mark.read) mark.node.dataset.end = String(event.at / end > 0.5);
+      mark.node.style.setProperty('left', `calc(${event.at / end * 100}% + ${12 - event.at / end * 24}px)`);
+    }, ticks);
+    span.textContent = `${time(0)} – ${time(end)} · ○ real  ● tampered`;
     loss.textContent = incomplete ? 'History is incomplete; counts and marks cover retained observations only.' : '';
   }
   listen(follow, 'click', () => { pinned = false; render(); });
@@ -215,5 +226,9 @@ export function mount(root, services, options = {}) {
   listen(watch, 'event', (event) => ingest([JSON.parse(event.data)]));
   listen(watch, 'status', (event) => ingest([], JSON.parse(event.data).status));
   listen(watch, 'error', () => { loss.textContent = 'Read stream disconnected. Last observed read is shown.'; });
-  return () => { disposed = true; controller.abort(); cleanup.splice(0).forEach((off) => off()); dynamic.splice(0).forEach((off) => off()); watch.close(); root.classList.remove('article-container'); root.replaceChildren(); };
+  return () => {
+    disposed = true; controller.abort(); cleanup.splice(0).forEach((off) => off());
+    for (const kept of [topicButtons, chipButtons, ticks]) kept.forEach((entry) => entry.off());
+    watch.close(); root.classList.remove('article-container'); root.replaceChildren();
+  };
 }

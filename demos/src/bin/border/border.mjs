@@ -25,7 +25,6 @@ export function longestPrefix(routes, address) {
   if (matches.length === 1) return `${address} matches ${winner}; this route wins.`;
   return `${address} matches ${matches.map(r => r.prefix).join(' and ')}; the /${winner.split('/')[1]} is more specific, so it wins.`;
 }
-export const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 export function alertText(moment) { return moment.password ? 'The password reached the impostor' : 'A payment reached the impostor'; }
 export function switchState(result) {
   if (!result || result.status === 'pending') return { busy: true, text: 'Waiting for the world…' };
@@ -35,7 +34,6 @@ export function switchState(result) {
   if (r?.reason === 'stale_revision') return { busy: false, text: `Not applied: the route changed. Current revision ${r.current}. Check the state before trying again.` };
   return { busy: false, text: `Not applied: ${r?.message || result.error || 'the world is not taking commands right now.'}` };
 }
-const time = ms => `${(ms / 1000).toFixed(2)} s`;
 
 export function certificateField(key, value) {
   if (Array.isArray(value)) return value.join(', ');
@@ -48,9 +46,10 @@ export function certificateField(key, value) {
 }
 
 export function mount(root, services, options) {
+  const { reconcile } = services.dom, { plural, fmtRunMs: time } = services.format;
   const doc = root.ownerDocument;
   const el = (tag, text, parent = root, cls = '') => {
-    const node = doc.createElement(tag); node.textContent = text; if (cls) node.className = cls; parent.append(node); return node;
+    const node = doc.createElement(tag); node.textContent = text; if (cls) node.className = cls; parent?.append(node); return node;
   };
   const css = el('link', ''); css.rel = 'stylesheet'; css.href = '/assets/border.css';
   root.classList.add('border-panel');
@@ -72,7 +71,8 @@ export function mount(root, services, options) {
   const traceBox = el('div', '', pathBox, 'border-trace');
   const routeBox = el('section', '', root, 'border-section'); el('h2', 'The route that wins', routeBox);
   const routes = el('div', '', routeBox); const explanation = el('p', '', routeBox, 'border-note');
-  const bgpBox = el('details', '', routeBox); el('summary', 'What the BGP peer saw', bgpBox); const bgp = el('div', '', bgpBox);
+  const bgpBox = el('details', '', routeBox); el('summary', 'What the BGP peer saw', bgpBox);
+  const bgpEmpty = el('p', 'No established BGP session observed yet.', bgpBox, 'border-note'); const bgp = el('div', '', bgpBox), bgpRows = new Map();
   const certBox = el('details', '', root, 'border-section border-certificates');
   el('summary', 'Certificates: the bank’s and the impostor’s', certBox);
   el('p', 'The impostor’s leaf certificate names the same bank names.', certBox, 'border-note');
@@ -137,10 +137,11 @@ export function mount(root, services, options) {
     }
     table(routes, ['Prefix', 'AS path', 'Origin'], route.routes.map(r => ({ cells: [r.prefix, r.as_path.join(' → '), `AS ${r.origin_as}`], mark: r.hijack })));
     explanation.textContent = longestPrefix(route.routes, config.bank);
-    bgp.replaceChildren();
-    const events = view.bgp.rows.filter(b => b.sandbox === config.guest && (b.kind === 'established' || b.message === 'UPDATE' || b.message === 'NOTIFICATION'));
-    if (!events.length) el('p', 'No established BGP session observed yet.', bgp, 'border-note');
-    events.forEach(b => el('p', `${time(b.at_ms)} · ${b.kind} ${b.message} ${b.announced.length ? `announced ${b.announced.join(', ')}` : ''}${b.withdrawn.length ? `withdrawn ${b.withdrawn.join(', ')}` : ''} ${b.detail}`, bgp, 'mono'));
+    const seen = new Map();
+    const events = view.bgp.rows.filter(b => b.sandbox === config.guest && (b.kind === 'established' || b.message === 'UPDATE' || b.message === 'NOTIFICATION'))
+      .map(b => { const text = `${time(b.at_ms)} · ${b.kind} ${b.message} ${b.announced.length ? `announced ${b.announced.join(', ')}` : ''}${b.withdrawn.length ? `withdrawn ${b.withdrawn.join(', ')}` : ''} ${b.detail}`; const repeat = seen.get(text) || 0; seen.set(text, repeat + 1); return { text, id: `${text}\u0000${repeat}` }; });
+    bgpEmpty.hidden = events.length > 0;
+    reconcile(bgp, events, b => b.id, b => ({ node: el('p', b.text, null, 'mono') }), () => {}, bgpRows);
     const tls = view.tls.rows.filter(t => t.sandbox === config.guest).at(-1);
     if (tls) latest.textContent = `Most recent TLS session: ${tls.identity || 'unknown identity'} · ${tls.sni} · ${time(tls.at_ms)} · ${tls.outcome}. Answered by ${tls.endpoint.machine} at ${tls.endpoint.reached}.`;
     const signature = JSON.stringify(view.certificates);
@@ -160,7 +161,7 @@ export function mount(root, services, options) {
     alert.hidden = !moment || moment.event <= dismissed;
     if (!alert.hidden && alert.dataset.event !== String(moment.event)) {
       alert.dataset.event = String(moment.event); alert.replaceChildren(); el('h2', alertText(moment), alert);
-      el('p', `${time(moment.at_ms)} · ${moment.method} ${moment.path} · connection ${moment.connection ?? 'unknown'} · ${moment.endpoint.machine} at ${moment.endpoint.reached} · ${count(view.moments.rows.length + view.moments.dropped, 'moment')}`, alert, 'mono');
+      el('p', `${time(moment.at_ms)} · ${moment.method} ${moment.path} · connection ${moment.connection ?? 'unknown'} · ${moment.endpoint.machine} at ${moment.endpoint.reached} · ${plural(view.moments.rows.length + view.moments.dropped, 'moment')}`, alert, 'mono');
       if (moment.payee != null || moment.amount_pence != null) el('p', `Payee: ${moment.payee ?? 'not reported'} · amount: ${moment.amount_pence ?? 'not reported'} pence`, alert);
       const buttons = el('div', '', alert, 'border-alert-actions');
       const select = (label, kind) => { const button = el('button', label, buttons, 'button'); button.type = 'button'; button.onclick = () => { services.selection.set({ host: moment.sandbox, event: { seq: moment.event }, connection: moment.connection, links: [] }); services.showPanel(kind); }; };

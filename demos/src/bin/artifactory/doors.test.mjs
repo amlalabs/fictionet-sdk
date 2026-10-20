@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createDocument } from '../../../../dashboard/test-dom.mjs';
 import { createSelection } from '../../../../dashboard/selection.mjs';
+import * as dom from '../../../../dashboard/dom.mjs';
 import { mount } from './doors.mjs';
 
 function fixture() {
@@ -12,7 +13,7 @@ function fixture() {
   const selection = createSelection();
   let callback, failure;
   const dispose = mount(root, {
-    selection,
+    dom, selection,
     showPanel(name) { panels.push(name); },
     state(path, update, error) {
       assert.equal(path, '/api/state/doors-tried');
@@ -120,10 +121,12 @@ test('the strip shows every state and links finished steps to their observed eve
   assert.equal(f.selection.get().connection, 17);
   links[1].click();
   assert.deepEqual(f.panels, ['events', 'events']);
+  // The world publishes the whole story each time; a step that changes keeps its line.
   const line = lines[1];
-  f.update({ story: [story('done', { title: '<running>', exit: 0 })] });
-  assert.equal(f.root.querySelectorAll('.doors-step')[1], line);
+  f.update({ story: ['waiting', 'done', 'done', 'failed'].map((state, i) => story(state, { title: `<${['waiting', 'running', 'done', 'failed'][i]}>`, exit: i === 1 ? 0 : state === 'waiting' ? null : 1 })) });
+  assert.deepEqual(f.root.querySelectorAll('.doors-step'), lines);
   assert.equal(line.dataset.state, 'done');
+  assert.equal(line.querySelector('.doors-exit').textContent, 'exit 0');
   f.dispose();
 });
 
