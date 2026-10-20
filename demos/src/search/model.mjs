@@ -8,11 +8,11 @@ export const cache = (value) => ({ generated: 'Made for this search', cached: 'F
 export function outcome(q) {
   switch (q.outcome.status) {
     case 'pending': return '◌ Pending';
-    case 'served': return q.results === 0 ? `Served with no results${q.cache === 'missing' ? ' — generation was off' : ''}` : `Served · ${q.results ?? 'unreported'} results`;
+    case 'served': return q.results === 0 ? 'Served with no results' : `Served · ${q.results ?? 'unreported'} results`;
     case 'undelivered': return 'Not fully delivered';
     case 'failed': {
       const why = q.outcome.why;
-      if (why === 'budget') return 'Failed: the run’s 200 generation calls are spent';
+      if (why === 'budget') return 'Failed: the run’s generation budget is spent';
       if (why === 'abandoned') return 'Failed: the browser left before the answer';
       return `Failed: ${['backend_error', 'meta_error', 'error'].includes(why) ? 'the page maker failed' : 'reason not reported'}${q.outcome.error ? ` — ${q.outcome.error}` : ''}`;
     }
@@ -32,6 +32,7 @@ export function counts(s) {
 }
 export function resultView(s, q) {
   if (q.outcome.status === 'pending') return { origin: 'Waiting for the result list.', rows: [] };
+  if (q.outcome.status === 'failed') return { origin: `${outcome(q)}. The world made no result list for it.`, rows: [] };
   if (q.results === 0) return { origin: q.cache === 'missing' ? 'No results: generation was off for this search.' : 'This search returned no results.', rows: [] };
   const list = s.results.find((r) => r.key === q.key);
   if (list && list.query_id > q.id) return { origin: 'The retained list was made after this search; its earlier results are no longer held.', rows: [] };
@@ -45,15 +46,15 @@ export function resultView(s, q) {
 export function tree(s) {
   const roots = new Map();
   const pages = new Map(s.pages.map((p) => [p.url, { id: `page:${p.url}`, page: p, children: [] }]));
-  const root = (id, label) => {
-    if (!roots.has(id)) roots.set(id, { id, label, children: [] });
+  const root = (id, label, key) => {
+    if (!roots.has(id)) roots.set(id, { id, label, key, children: [] });
     return roots.get(id);
   };
-  for (const q of s.queries) root(`query:${q.key}`, q.search);
+  for (const q of s.queries) root(`query:${q.key}`, q.search, q.key);
   for (const node of pages.values()) {
     const r = node.page.reason;
     let parent;
-    if (r.via === 'search') parent = root(`query:${queryKey(r.query)}`, r.query);
+    if (r.via === 'search') parent = root(`query:${queryKey(r.query)}`, r.query, queryKey(r.query));
     else if (r.via === 'link') {
       parent = pages.get(r.from);
       const seen = new Set([node.page.url]);
@@ -75,4 +76,28 @@ export function tree(s) {
   };
   roots.forEach((node) => visit(node, 0));
   return flat;
+}
+// The muted line under a search in the tree: the engines that asked, what the
+// list held and how many of its results were opened.
+export function rootNote(s, node) {
+  if (node.key == null) return '';
+  const asked = s.queries.filter((q) => q.key === node.key);
+  const engines = [...new Set(asked.map((q) => engine(q.engine)))].join(', ');
+  // The retained list, or else the count the latest served search reported.
+  const list = s.results.find((r) => r.key === node.key);
+  const served = asked.findLast((q) => q.outcome.status === 'served' && q.results != null);
+  const n = list?.listed.length ?? served?.results;
+  // Opened means fetched by any route, as the result view marks it. Each page
+  // sits in the tree under its own reason, which can be another search, a
+  // link, a typed address or the seed, so the note says how many are there.
+  const pages = list ? list.listed.map((r) => s.pages.find((p) => p.url === r.url)).filter(Boolean) : [];
+  const opened = list ? pages.length : node.children.length;
+  const elsewhere = pages.filter((p) => !node.children.some((child) => child.page === p)).length;
+  const openedNote = opened ? `${opened} opened${elsewhere ? ` · ${elsewhere} shown under another reason` : ''}` : 'none opened yet';
+  let listed;
+  if (n) listed = `${n} result${n === 1 ? '' : 's'} listed · ${openedNote}`;
+  else if (n === 0) listed = 'No results listed';
+  else if (asked.length) listed = outcome(asked[asked.length - 1]);
+  else listed = `Search no longer held · ${opened} opened`;
+  return engines ? `${engines} · ${listed}` : listed;
 }

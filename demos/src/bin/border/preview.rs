@@ -72,7 +72,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
                     Host::new(HOSTNAME)
                         .sandbox(HOSTNAME)
                         .status(status)
-                        .console(kit::preview::Console),
+                        .console(kit::preview::Console::new()),
                 )
                 .standard_panels(),
         )

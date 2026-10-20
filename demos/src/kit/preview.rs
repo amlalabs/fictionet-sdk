@@ -5,17 +5,42 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 /// A screen-only page console that draws the words NO VM, so a preview page
-/// is never mistaken for a guest's desktop. Input reaches nothing.
-pub struct Console;
+/// is never mistaken for a guest's desktop. Input reaches nothing. Clones share
+/// one set of open connections.
+#[derive(Clone)]
+pub struct Console {
+    drops: tokio::sync::watch::Sender<u64>,
+}
+impl Console {
+    pub fn new() -> Self {
+        Self {
+            drops: tokio::sync::watch::channel(0).0,
+        }
+    }
+    /// Closes every open screen connection, as a lost guest connection would.
+    /// Later connections open normally.
+    pub fn drop_connections(&self) {
+        self.drops.send_modify(|count| *count += 1);
+    }
+}
+impl Default for Console {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl fictionet_observe::page::Console for Console {
     fn terminal(&self, _: u16, _: u16) -> Option<BoxFuture<'static, io::Result<Box<dyn Pty>>>> {
         None
     }
     fn screen(&self) -> Option<BoxFuture<'static, io::Result<Box<dyn Duplex>>>> {
-        Some(Box::pin(async {
+        let mut drops = self.drops.subscribe();
+        Some(Box::pin(async move {
             let (client, server) = tokio::io::duplex(64 << 10);
             tokio::spawn(async move {
-                let _ = screen(server).await;
+                tokio::select! {
+                    _ = screen(server) => {}
+                    _ = drops.changed() => {}
+                }
             });
             Ok(Box::new(client) as Box<dyn Duplex>)
         }))
@@ -133,6 +158,7 @@ async fn screen(mut stream: DuplexStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet_observe::page::Console as _;
     #[tokio::test]
     async fn screen_delivers_labeled_pixels_and_closes_on_disconnect() {
         let (mut client, server) = tokio::io::duplex(64 << 10);
@@ -162,5 +188,19 @@ mod tests {
         assert_eq!(&frame[offset..offset + 4], &[214, 228, 226, 0]);
         drop(client);
         assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_connections_closes_open_screens_only() {
+        let console = Console::new();
+        let mut open = console.screen().unwrap().await.unwrap();
+        let mut version = [0; 12];
+        open.read_exact(&mut version).await.unwrap();
+        console.drop_connections();
+        let mut rest = Vec::new();
+        assert_eq!(open.read_to_end(&mut rest).await.unwrap(), 0);
+        let mut next = console.screen().unwrap().await.unwrap();
+        next.read_exact(&mut version).await.unwrap();
+        assert_eq!(&version, b"RFB 003.008\n");
     }
 }

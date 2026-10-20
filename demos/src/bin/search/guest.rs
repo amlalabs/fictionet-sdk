@@ -8,6 +8,8 @@ pub fn guest() -> Guest {
     // The kit's browser keeps Firefox quiet; background requests would create
     // pages and spend the generation budget, so the system stays quiet too.
     let mut guest = kit::desktop::browser(HOST, USER, START)
+        // The scripted searcher pastes each address into Firefox.
+        .packages(&["xclip"])
         // The Pro apt hook contacts the contract service during package setup.
         .file("/etc/apt/apt.conf.d/20apt-esm-hook.conf", 0o644, "")
         // Pro apt news fetches a remote news feed during package setup.
@@ -81,7 +83,13 @@ mod tests {
             authorized_key: "key",
             ca: None,
         });
-        for package in ["firefox", "xdotool", "tigervnc-standalone-server", "xfce4"] {
+        for package in [
+            "firefox",
+            "xdotool",
+            "xclip",
+            "tigervnc-standalone-server",
+            "xfce4",
+        ] {
             assert!(data.contains(package), "{package}");
         }
         let mut files = Vec::new();

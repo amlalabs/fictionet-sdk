@@ -1,4 +1,7 @@
-import { engine, ms, made, siteReason, cache, outcome, counts, resultView, tree } from './model.mjs';
+import { engine, ms, made, siteReason, cache, outcome, counts, resultView, tree, rootNote } from './model.mjs';
+
+// Names for the snapshot's omitted counts.
+const OMITTED = { queries: 'searches', results: 'result lists', listed: 'results cut from long lists', pages: 'pages', sites: 'sites', refused: 'refused names', seed_facts: 'seed facts', seed_sites: 'seed sites' };
 
 export function mount(root, services, options) {
   const { reconcile } = services.dom, { fmtRunMs: time } = services.format;
@@ -39,23 +42,30 @@ export function mount(root, services, options) {
   const omitted = el('small', '', box, 'search-omitted');
   const columns = el('div', null, box, 'search-columns');
   const streamSection = el('section', null, columns, 'search-stream-section');
-  el('h3', 'Search stream', streamSection);
-  const source = el('p', 'Waiting for searcher…', streamSection, 'eyebrow');
+  const streamHead = el('header', null, streamSection, 'search-section-head');
+  el('h3', 'Search stream', streamHead);
+  const source = el('p', 'Waiting for searcher…', streamHead, 'eyebrow');
   const stream = el('div', null, streamSection, 'search-stream');
   const empty = el('p', 'No searches yet. The web starts with a question.', streamSection, 'note search-empty');
   const detail = el('section', null, columns, 'search-results');
-  const detailTitle = el('h3', 'Results the world made', detail);
-  const origin = el('p', 'Select a search to inspect its result list.', detail);
+  const detailHead = el('header', null, detail, 'search-section-head');
+  const detailTitle = el('h3', 'Results the world made', detailHead);
+  const origin = el('p', 'Select a search to inspect its result list.', detailHead);
   const resultList = el('ol', null, detail);
   const treeSection = el('section', null, columns, 'search-tree-section');
-  el('h3', 'The made-up web', treeSection);
-  el('p', 'Searches → results → links', treeSection, 'eyebrow');
+  const treeHead = el('header', null, treeSection, 'search-section-head');
+  el('h3', 'The made-up web', treeHead);
+  el('p', 'Searches → results → links', treeHead, 'eyebrow');
   const treeList = el('div', null, treeSection, 'search-tree');
-  const treeEmpty = el('p', 'Sites and pages appear here when the world is asked for them.', treeSection, 'note search-empty');
+  const treeEmpty = el('p', 'No pages yet. Pages appear here when the world is asked for them.', treeSection, 'note search-empty');
+  const sitesHead = el('h4', 'Sites with no page in the tree', treeSection, 'search-list-head');
   const otherSites = el('div', null, treeSection, 'search-sites');
+  const refusedHead = el('h4', 'Names the world refused', treeSection, 'search-list-head');
   const refused = el('div', null, treeSection, 'search-refused');
+  sitesHead.hidden = refusedHead.hidden = true;
   const rows = new Map(), nodes = new Map(), results = new Map(), sites = new Map(), refusals = new Map();
-  const seenSites = new Set();
+  // Hosts on screen when the panel opened, and hosts that had their moment.
+  const firstSites = new Set(), marked = new Set();
   const controller = new AbortController();
   let snapshot, chosen, selectedPage, busy = false, waitingRevision, disposed = false, initialized = false;
   const cleanup = [];
@@ -64,9 +74,12 @@ export function mount(root, services, options) {
   const line = (parent, cls) => el('span', '', parent, cls);
   const stateButton = () => {
     const g = snapshot?.generator;
+    // A reply describes one revision; once the switch moves past it, it is history.
+    if (!busy && g && waitingRevision != null && g.generation_revision > waitingRevision) { waitingRevision = null; set(commandStatus, ''); }
     toggle.disabled = !g || busy || (waitingRevision != null && g.generation_revision < waitingRevision);
     toggle.setAttribute('aria-busy', String(busy));
     toggle.setAttribute('aria-checked', String(!!g?.generate));
+    toggle.dataset.known = String(!!g);
     set(toggleLabel, busy ? 'Waiting for the world…' : g ? (g.generate ? 'Making new pages' : 'Serving only what exists') : 'Waiting for generation state…');
     if (g) set(revision, `Revision ${g.generation_revision} · changed at ${time(g.generation_at_ms)}`);
   };
@@ -128,7 +141,7 @@ export function mount(root, services, options) {
   const card = (cls, parentTag = 'button') => {
     const node = el(parentTag, null, null, cls);
     if (parentTag === 'button') node.type = 'button';
-    return { node, top: line(node, 'search-row-top'), title: line(node, 'search-row-title'), note: line(node, 'search-row-note') };
+    return { node, top: line(node, 'search-row-top'), title: line(node, 'search-row-title'), path: line(node, 'search-row-path'), note: line(node, 'search-row-note') };
   };
   function render() {
     const s = snapshot;
@@ -145,7 +158,7 @@ export function mount(root, services, options) {
       set(countNodes.get(label), value);
     }
     const lost = Object.values(s.omitted).reduce((a, b) => a + b, 0);
-    set(omitted, lost ? `${lost} rows are no longer held here. Counts describe retained rows. ${Object.entries(s.omitted).filter(([, n]) => n).map(([k, n]) => `${k.replaceAll('_', ' ')}: ${n}`).join(' · ')}` : '');
+    set(omitted, lost ? `No longer held here: ${Object.entries(s.omitted).filter(([, n]) => n).map(([k, n]) => `${n} ${OMITTED[k] || k.replaceAll('_', ' ')}`).join(', ')}. The counts describe what is held.` : '');
     empty.hidden = s.queries.length > 0;
     reconcile(stream, [...s.queries].reverse(), (q) => q.id, () => { const entry = card('search-row'); entry.badge = el('span', '', entry.top, 'pill outline'); entry.meta = el('span', '', entry.top); return entry; }, (entry, q, fresh) => {
       entry.node.dataset.identity = String(q.id);
@@ -153,7 +166,9 @@ export function mount(root, services, options) {
       set(entry.badge, engine(q.engine));
       set(entry.meta, ` ${time(q.at_ms)} · ${q.sandbox || 'Host not reported'}${q.peer ? ` · ${q.peer}` : ''}`);
       set(entry.title, q.search);
-      set(entry.note, `${outcome(q)}${q.cache ? ` · ${cache(q.cache)}` : ''}${q.serve_ms != null ? ` · ${ms(q.serve_ms)}` : ''}`);
+      // A failure already names its cause, so its cache state would repeat it.
+      const label = q.outcome.status === 'failed' ? '' : cache(q.cache);
+      set(entry.note, `${outcome(q)}${label ? ` · ${label}` : ''}${q.serve_ms != null ? ` · ${ms(q.serve_ms)}` : ''}`);
       if (fresh) entry.node.classList.add('search-arrival');
     }, rows);
     const q = s.queries.find((q) => q.id === chosen);
@@ -168,12 +183,17 @@ export function mount(root, services, options) {
         set(entry.note, r.site ? `${r.site.address} · ${siteReason(r.site.reason)}` : 'No address assignment observed yet');
         entry.open.hidden = !r.page;
         entry.open.dataset.identity = r.url;
-        set(entry.open, r.page ? `↳ Opened · ${made(r.page.made)} · ${ms(r.page.serve_ms)} · show page` : '');
+        set(entry.open, r.page ? `Opened · ${made(r.page.made)} · ${ms(r.page.serve_ms)} · show page` : '');
       }, results);
     } else if (chosen != null) { set(origin, 'This search is no longer retained.'); reconcile(resultList, [], (r) => r.url, () => {}, () => {}, results); }
-    const freshSites = new Set(s.sites.filter((site) => initialized && site.reason === 'pool' && !seenSites.has(site.host)).map((site) => site.host));
-    const moments = new Set();
-    const mark = (entry, host) => { if (freshSites.has(host) && !moments.has(host)) { services.moment(entry.node); moments.add(host); } };
+    if (!initialized) s.sites.forEach((site) => firstSites.add(site.host));
+    // The story moment is the first page on a made-up site that is new to this
+    // viewer; a lookup with no page is background traffic, not the story.
+    const pool = new Set(s.sites.filter((site) => site.reason === 'pool').map((site) => site.host));
+    const mark = (entry, host) => {
+      if (!initialized || !pool.has(host) || firstSites.has(host) || marked.has(host)) return;
+      services.moment(entry.node); marked.add(host);
+    };
     const branches = tree(s);
     treeEmpty.hidden = branches.length > 0;
     reconcile(treeList, branches, (n) => n.id, (n) => card(n.page ? 'search-node' : 'search-root', n.page ? 'button' : 'div'), (entry, n, fresh) => {
@@ -184,21 +204,23 @@ export function mount(root, services, options) {
         entry.node.dataset.identity = p.url;
         entry.node.setAttribute('aria-pressed', String(selectedPage === p.url));
         set(entry.top, p.host); set(entry.title, p.title || p.url);
-        const path = p.url.replace(/^https?:\/\/[^/]+/, '') || '/';
-        set(entry.note, `${path}\n${made(p.made)} · first ${ms(p.first_serve_ms)} · latest ${ms(p.latest_serve_ms)}${p.fetches > 1 ? ` · ${p.fetches} fetches · ${made(p.latest)}` : ''}`);
+        set(entry.path, p.url.replace(/^https?:\/\/[^/]+/, '') || '/');
+        set(entry.note, `${made(p.made)} · first ${ms(p.first_serve_ms)} · latest ${ms(p.latest_serve_ms)}${p.fetches > 1 ? ` · ${p.fetches} fetches · ${made(p.latest)}` : ''}`);
         if (fresh) entry.node.classList.add('search-arrival');
         mark(entry, p.host);
-      } else { set(entry.top, n.label); set(entry.title, ''); set(entry.note, ''); }
+      } else { set(entry.top, n.label); set(entry.title, ''); set(entry.note, rootNote(s, n)); }
     }, nodes);
-    reconcile(otherSites, s.sites.filter((site) => !s.pages.some((p) => p.host === site.host)), (site) => site.host, () => card('search-site', 'div'), (entry, site) => {
-      set(entry.top, site.host); set(entry.title, `${site.address} · ${siteReason(site.reason)}`); set(entry.note, 'no page fetched'); mark(entry, site.host);
+    const unfetched = s.sites.filter((site) => !s.pages.some((p) => p.host === site.host));
+    sitesHead.hidden = !unfetched.length;
+    reconcile(otherSites, unfetched, (site) => site.host, () => card('search-site', 'div'), (entry, site) => {
+      set(entry.top, site.host); set(entry.title, `${site.address} · ${siteReason(site.reason)}`);
     }, sites);
     const occurrences = new Map();
     const refusedRows = s.refused.map((r) => { const key = `${r.name}:${r.at_ms}`; const count = occurrences.get(key) || 0; occurrences.set(key, count + 1); return { ...r, identity: `${key}:${count}` }; });
     reconcile(refused, refusedRows, (r) => r.identity, () => card('search-refusal', 'div'), (entry, r) => {
-      set(entry.top, `× Refused · ${r.name}`); set(entry.title, r.reason); set(entry.note, time(r.at_ms));
+      set(entry.top, r.name); set(entry.title, r.reason); set(entry.note, `at ${time(r.at_ms)}`);
     }, refusals);
-    s.sites.forEach((site) => seenSites.add(site.host));
+    refusedHead.hidden = !refusedRows.length;
     initialized = true;
   }
   stateButton();

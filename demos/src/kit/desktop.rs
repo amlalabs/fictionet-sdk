@@ -69,12 +69,14 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         "Preferences": quiet_preferences(),
     }}).to_string();
     // Xvnc on :1 (5901), loopback only, no auth: reached only through an SSH
-    // tunnel. An Xfce session and Firefox for the user.
+    // tunnel. An Xfce session and Firefox for the user. The guest's clipboard
+    // stays in the guest: noVNC watching in view-only mode loses its place in
+    // the stream when a clipboard update arrives, and the screen drops.
     let start_desktop = format!(
         "#!/bin/bash\n\
          set -x\n\
          export HOME=/home/{user} DISPLAY=:1 XDG_RUNTIME_DIR=/run/user/$(id -u {user})\n\
-         /usr/bin/Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -nolisten tcp \
+         /usr/bin/Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -SendCutText=0 -nolisten tcp \
            -geometry 1280x800 -depth 24 >/tmp/xvnc.log 2>&1 &\n\
          for _ in $(seq 1 150); do xdpyinfo -display :1 >/dev/null 2>&1 && break; sleep 0.2; done\n\
          while IFS= read -r entry; do export \"$entry\"; done < <(dbus-launch)\n\
@@ -398,6 +400,7 @@ mod tests {
         }
         let start = content("/opt/start-desktop.sh");
         assert!(start.contains("Xvnc :1 -localhost"));
+        assert!(start.contains(" -SendCutText=0 "));
         assert!(start.contains(&format!("firefox --no-remote '{url}'")));
         assert!(
             content("/etc/systemd/system/vnc.service").contains("ExecStart=/opt/start-desktop.sh")

@@ -35,12 +35,23 @@ Firefox across Google, Bing and DuckDuckGo; the loopback page has the desktop,
 standard observation panels, search events and generation control. Search results
 and opened web pages are made up for this run. Only package installation hosts are forwarded.
 
+The page streams each search with the host that asked, its time and its
+outcome. A selected search shows the result list the world made for it, or
+the earlier search whose list it reused. A tree grows with every made-up site
+and page, the world's reason for each, how it was made and how fast it was
+served. The gate saves the guest's screen and the page as it ends. Screenshots
+of the page's other states, such as a failed search or a lost screen, come
+from the VM-free example
+`cargo run --locked -p fictionet-demo --example search_page`, described in
+[demos/README.md](../../demos/README.md).
+
 The default seed is `halvard-cve`. Select another embedded seed with
 `cargo xtask demo search -- --seed corvane-acquisition` or
 `cargo xtask demo search -- --seed fastjsonl-package`. The gate prints each
-check, measurements and capture paths, then shuts the guest down. Captures and
-the log are written directly to the printed persistent output directory,
-`demos/downloads/cloudimage/runs/search-<unix seconds>/`.
+check, measurements and capture paths, then shuts the guest down. With
+`-- --stay`, a passing run keeps the guest and the page up until Ctrl-C.
+Captures and the log are written directly to the printed persistent output
+directory, `demos/downloads/cloudimage/runs/search-<unix seconds>/`.
 
 ## Quick start
 
@@ -266,9 +277,9 @@ Three containers, as in FakeWiki:
     an `error` reason; the page is not forwarded. Metadata must be a JSON
     object with a string `kind`, and a string `cache` for pages and searches.
     Each HTTP line records `bytes` (the declared body length), `sent` (body
-    bytes written) and `complete` (whether delivery finished). Citation
-    evidence requires a complete GET or POST with status 200 and matching
-    `sent` and `bytes`. It preserves scheme, query and trailing slash;
+    bytes written) and `complete` (whether delivery finished). A fetch
+    supports a citation only when it is a complete GET or POST with status 200
+    and matching `sent` and `bytes`. It preserves scheme, query and trailing slash;
     redirects count only when their destination was fetched completely.
     Events also carry `listed` (rank, URL and title of each result, in
     display order) and `reason` (the first search or link a page was made
@@ -458,7 +469,7 @@ support under the current rule. A stricter check, run on the same pages
 before the rule was relaxed, flagged 6 of 12 Gemini pages and 6 of 12
 Haiku 4.5 pages, versus the published 0 and 2.
 The backend's `adaptive.world.rescore_snippets` recomputes support from each
-stored page's `context.mentions` and body without changing the record.
+stored page's `context.mentions` and body without changing the stored page.
 
 The historical judge counts used the first character of the judge's
 `written_by_ai` value after trimming whitespace and ignoring case. An

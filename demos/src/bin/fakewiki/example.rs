@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .page(
             Page::new("FakeWiki · no VM · placeholder screen", dashboard.handle()).host(
                 Host::new(HOST)
-                    .console(kit::preview::Console)
+                    .console(kit::preview::Console::new())
                     .status(status.clone()),
             ),
         )

@@ -225,7 +225,7 @@ mod tests {
             .host(
                 Host::new("preview")
                     .status(status)
-                    .console(super::super::preview::Console),
+                    .console(super::super::preview::Console::new()),
             )
             .bind_loopback(0)
             .await

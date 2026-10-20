@@ -42,7 +42,7 @@ pub async fn serve(variant: Variant) -> Result {
         dashboard.handle(),
         Host::new("fixture")
             .status(status)
-            .console(fictionet_demo::kit::preview::Console),
+            .console(fictionet_demo::kit::preview::Console::new()),
         facts.topics.clone(),
         true,
     )

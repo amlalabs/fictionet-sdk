@@ -428,6 +428,9 @@ test('a custom workspace can sit beside consoles while pins remain available', a
   const custom = workspace.querySelector('section.custom-workspace');
   assert.ok(custom);
   assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 1);
+  assert.ok(workspace.classList.contains('shared-workspace'));
+  assert.ok(h.root.querySelector('#workbench').classList.contains('shared-workbench'));
+  assert.equal(workspace.querySelector('section.workspace-tile').style.alignSelf, 'start');
   const pins = h.root.querySelectorAll('button.pin');
   assert.ok(pins.every((pin) => !pin.hidden));
   pins.forEach((pin) => pin.click());

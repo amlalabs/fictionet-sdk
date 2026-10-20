@@ -324,7 +324,8 @@ export async function mount(root, transport, theme) {
     }
     if (customWorkspace && !sharedWorkspace) return;
     const names = pinned.size ? [...pinned] : [services.selection.get().host || page.hosts[0]?.name].filter(Boolean);
-    workspace.style.setProperty('--console-count', String(Math.max(names.length, 1)));
+    // The shared layout gives each console its own row above the inspector.
+    $('workbench').style.setProperty('--console-count', String(Math.max(names.length, 1)));
     for (const [name, tile] of tiles) {
       if (!names.includes(name) || tile.mode !== modes.get(name)) { tile.dispose(); tile.root.remove(); tiles.delete(name); }
     }
