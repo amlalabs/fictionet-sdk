@@ -257,13 +257,36 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_registers_start_from_the_seed() {
+        let first = Plant::new(Config {
+            seed: 29,
+            ..Config::default()
+        })
+        .snapshot();
+        let repeat = Plant::new(Config {
+            seed: 29,
+            ..Config::default()
+        })
+        .snapshot();
+        let other = Plant::new(Config {
+            seed: 30,
+            ..Config::default()
+        })
+        .snapshot();
+        assert_ne!(first.telemetry.heartbeat, 0);
+        assert_ne!(first.telemetry.heartbeat, other.telemetry.heartbeat);
+        assert_heartbeats(&first, repeat.telemetry.heartbeat);
+    }
+
+    #[test]
     fn telemetry_registers_hold_while_the_plant_advances() {
         use crate::command::FaultCommand;
         use crate::faults::{Fault, FaultChange};
         let mut plant = Plant::new(Config::default());
+        let initial = plant.snapshot().telemetry.heartbeat;
         plant.advance(1_000);
         let before = plant.snapshot();
-        assert_heartbeats(&before, 4);
+        assert_heartbeats(&before, initial.wrapping_add(4));
         plant
             .apply_fault(FaultCommand {
                 change: FaultChange::Inject(Fault::TelemetryQuiet),
@@ -288,9 +311,10 @@ mod tests {
     #[test]
     fn telemetry_registers_wrap_at_sixteen_bits() {
         let mut plant = Plant::new(Config::default());
-        plant.advance(u64::from(u16::MAX) * 250);
+        let remaining = u64::from(u16::MAX - plant.snapshot().telemetry.heartbeat);
+        plant.advance(remaining * 250);
         assert_heartbeats(&plant.snapshot(), u16::MAX);
-        plant.advance((u64::from(u16::MAX) + 1) * 250);
+        plant.advance((remaining + 1) * 250);
         assert_heartbeats(&plant.snapshot(), 0);
     }
 

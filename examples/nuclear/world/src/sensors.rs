@@ -189,7 +189,7 @@ impl Instruments {
             random: seed,
             telemetry: Telemetry {
                 quiet: false,
-                heartbeat: 0,
+                heartbeat: (seed ^ seed.rotate_right(17) ^ 0xa7c5) as u16,
                 last_sample_ms: 0,
             },
         }

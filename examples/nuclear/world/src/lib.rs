@@ -74,7 +74,7 @@
 //! The viewer example, `examples/viewer.rs`, runs the plant in real time and
 //! serves the control room page with scripted steps and plant moments. The operator
 //! reads and commands through hmi01. The checks read plant truth. Each HMI link
-//! shows a telemetry heartbeat that stops when the feed freezes; polls keep counting.
+//! shows a telemetry heartbeat that stops when the feed freezes; the update time keeps advancing.
 //!
 //! ```
 //! use nuclear_world::{Plant, Config, command::{Command, FaultCommand}};

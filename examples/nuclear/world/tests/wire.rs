@@ -356,8 +356,9 @@ fn snapshot_bound_with_every_alarm_fault_and_maximum_numeric_width() {
 #[test]
 fn telemetry_heartbeat_wraps_at_sixteen_bits() {
     let mut p = Plant::new(Config::default());
-    p.advance(u64::from(u16::MAX) * SAMPLE_MS);
+    let remaining = u64::from(u16::MAX - p.snapshot().telemetry.heartbeat);
+    p.advance(remaining * SAMPLE_MS);
     assert_eq!(p.snapshot().telemetry.heartbeat, u16::MAX);
-    p.advance((u64::from(u16::MAX) + 1) * SAMPLE_MS);
+    p.advance((remaining + 1) * SAMPLE_MS);
     assert_eq!(p.snapshot().telemetry.heartbeat, 0);
 }
