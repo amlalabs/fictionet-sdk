@@ -8,6 +8,17 @@ use std::time::Duration;
 
 const KEY: &str = "sk-or-test-key-must-not-be-stored";
 
+/// The event fields of an answer, as JSON: what the log and the search
+/// projection read.
+trait Logged {
+    fn logged(&self) -> Value;
+}
+impl Logged for Response {
+    fn logged(&self) -> Value {
+        example_common::events::js(Some(&self.fields().to_json()))
+    }
+}
+
 fn lab<F, Fut>(work: F)
 where
     F: FnOnce(Cx) -> Fut + Send,
@@ -280,7 +291,7 @@ fn routed_hosts_share_the_lowercase_page() {
             .handle(&cx, "GET", "upper.io", "/page.json", None)
             .await;
         assert_eq!(first.body, second.body);
-        assert_eq!(second.meta["cache"], "cached");
+        assert_eq!(second.logged()["cache"], "cached");
         assert_eq!(
             serde_json::from_slice::<Value>(&first.body).unwrap()["url"],
             "https://upper.io/page.json"
@@ -317,7 +328,7 @@ fn pages_have_their_results_titles_and_snippets() {
                 html.contains(&format!("<title>{}</title>", text::escape(&title))),
                 "{url}"
             );
-            if let Some(unsupported) = page.meta.get("unsupported_snippets") {
+            if let Some(unsupported) = page.logged().get("unsupported_snippets") {
                 assert_eq!(unsupported, &json!([]), "{url}");
             }
             assert_eq!(get(&pages, &cx, &url).await.body, page.body, "{url}");
@@ -353,7 +364,7 @@ fn engines_share_one_result_list() {
         let ddg = pages
             .handle(&cx, "POST", "html.duckduckgo.com", "/html/", Some(form))
             .await;
-        assert_eq!(ddg.meta["cache"], "cached");
+        assert_eq!(ddg.logged()["cache"], "cached");
         let html = String::from_utf8(ddg.body).unwrap();
         let links: Vec<_> = html
             .split("<div class=\"result ")
@@ -535,7 +546,7 @@ fn engines_redirects_and_assets() {
             .handle(&cx, "GET", "a.com", "/static/css/main.css", None)
             .await;
         assert_eq!(
-            (css.content_type.as_str(), &css.meta["kind"]),
+            (css.content_type.as_str(), &css.logged()["kind"]),
             ("text/css", &json!("asset"))
         );
         assert!(
@@ -555,7 +566,7 @@ fn fixed_pages_are_served_as_written() {
         let fixed = pages.seed().fixed[0].clone();
         let page = get(&pages, &cx, &fixed.url).await;
         assert_eq!(page.body, fixed.body);
-        assert_eq!(page.meta["cache"], "fixed");
+        assert_eq!(page.logged()["cache"], "fixed");
         // Its links are written down for the pages behind them.
         assert!(
             !pages
@@ -592,7 +603,7 @@ fn concurrent_requests_make_one_page() {
         }
         let generated = replies
             .iter()
-            .filter(|r| r.meta["cache"] == "generated")
+            .filter(|r| r.logged()["cache"] == "generated")
             .count();
         assert_eq!(generated, 1);
         assert!(replies.iter().all(|r| r.body == replies[0].body));
@@ -613,14 +624,19 @@ fn the_budget_refuses_new_work_but_keeps_stored_pages() {
         pages.store().made = GENERATION_BUDGET;
         let second = get(&pages, &cx, "https://example.com/second").await;
         assert_eq!(
-            (second.status, &second.meta["cache"]),
+            (second.status, &second.logged()["cache"]),
             (503, &json!("budget"))
         );
         let search = google(&pages, &cx, "new query").await;
         assert_eq!(
-            (search.status, &search.meta["cache"]),
+            (search.status, &search.logged()["cache"]),
             (503, &json!("budget"))
         );
+        // The agent sees a busy server's page; the log says what it was for.
+        for (answer, kind) in [(&second, "page"), (&search, "search")] {
+            assert_eq!(answer.body, UNAVAILABLE);
+            assert_eq!(answer.logged()["kind"], kind);
+        }
         assert_eq!(
             get(&pages, &cx, "https://example.com/first").await.body,
             first.body
@@ -641,7 +657,7 @@ fn listed_results_and_the_reason_each_page_was_made() {
             .enumerate()
             .map(|(i, (url, title))| json!({"rank": i + 1, "url": url, "title": title}))
             .collect();
-        assert_eq!(response.meta["listed"], json!(listed));
+        assert_eq!(response.logged()["listed"], json!(listed));
         for (rank, (url, _)) in found.iter().enumerate() {
             let first = get(&pages, &cx, url).await;
             let (host, target) = text::target_of(url);
@@ -650,14 +666,14 @@ fn listed_results_and_the_reason_each_page_was_made() {
             } else {
                 json!({"via": "search", "query": "halvard gateway vulnerability", "rank": rank + 1})
             };
-            assert_eq!(first.meta["reason"], expected, "{url}");
-            assert_eq!(get(&pages, &cx, url).await.meta["reason"], expected);
+            assert_eq!(first.logged()["reason"], expected, "{url}");
+            assert_eq!(get(&pages, &cx, url).await.logged()["reason"], expected);
         }
         let source = get(&pages, &cx, "https://direct-site.com/story").await;
-        assert_eq!(source.meta["reason"], json!({"via": "direct"}));
+        assert_eq!(source.logged()["reason"], json!({"via": "direct"}));
         let linked = get(&pages, &cx, "https://direct-site.com/archive/2026/").await;
         assert_eq!(
-            linked.meta["reason"],
+            linked.logged()["reason"],
             json!({"via": "link", "from": "https://direct-site.com/story"})
         );
         // Nothing made, no reason.
@@ -672,10 +688,10 @@ fn listed_results_and_the_reason_each_page_was_made() {
             .unwrap();
         let missing = get(&pages, &cx, "https://new-site.com/missing").await;
         assert_eq!(
-            (missing.status, &missing.meta["cache"]),
+            (missing.status, &missing.logged()["cache"]),
             (404, &json!("missing"))
         );
-        assert!(missing.meta.get("reason").is_none());
+        assert!(missing.logged().get("reason").is_none());
         pages
             .apply(
                 &cx,
@@ -689,7 +705,7 @@ fn listed_results_and_the_reason_each_page_was_made() {
         assert!(
             get(&pages, &cx, "https://new-site.com/budget")
                 .await
-                .meta
+                .logged()
                 .get("reason")
                 .is_none()
         );
@@ -764,23 +780,26 @@ fn replay_serves_the_store_and_nothing_new() {
             .handle(&cx, "GET", "html.duckduckgo.com", "/html/?q=halvard", None)
             .await;
         assert_eq!(s.body, search);
-        assert_eq!(s.meta["cache"], "cached");
+        assert_eq!(s.logged()["cache"], "cached");
         let p = replay
             .handle(&cx, "GET", "www.halvardsystems.com", "/support/", None)
             .await;
-        assert_eq!((p.body, &p.meta["cache"]), (page, &json!("cached")));
+        assert_eq!((&p.logged()["cache"], p.body), (&json!("cached"), page));
         let missing = replay
             .handle(&cx, "GET", "www.halvardsystems.com", "/never-asked", None)
             .await;
         assert_eq!(
-            (missing.status, &missing.meta["cache"]),
+            (missing.status, &missing.logged()["cache"]),
             (404, &json!("missing"))
         );
         let none = replay
             .handle(&cx, "GET", "html.duckduckgo.com", "/html/?q=never", None)
             .await;
         assert_eq!(
-            (none.meta["cache"].clone(), none.meta["results"].clone()),
+            (
+                none.logged()["cache"].clone(),
+                none.logged()["results"].clone()
+            ),
             (json!("missing"), json!(0))
         );
         Ok(())
@@ -837,9 +856,10 @@ fn worlds_sharing_a_store_make_each_list_and_page_once() {
                 .iter()
                 .all(|r| r.status == 200 && r.body == pages[0].body)
         );
-        assert_eq!(pages[0].meta["title"], json!(title));
-        let made =
-            |cache: &str, rs: &[Response]| rs.iter().filter(|r| r.meta["cache"] == cache).count();
+        assert_eq!(pages[0].logged()["title"], json!(title));
+        let made = |cache: &str, rs: &[Response]| {
+            rs.iter().filter(|r| r.logged()["cache"] == cache).count()
+        };
         assert_eq!((made("generated", &lists), made("cached", &lists)), (1, 2));
         assert_eq!((made("generated", &pages), made("cached", &pages)), (1, 2));
         let asked: Vec<String> = fakes.iter().flat_map(|fake| fake.users()).collect();
@@ -882,13 +902,9 @@ fn fixed_snapshots_survive_changed_and_deleted_sources() {
         let (tx, rx) = std::sync::mpsc::channel();
         lab(|cx| async move {
             let page = get(&pages, &cx, &url).await;
-            tx.send((
-                page.status,
-                page.content_type,
-                page.body,
-                page.meta["cache"].clone(),
-            ))
-            .unwrap();
+            let cache = page.logged()["cache"].clone();
+            tx.send((page.status, page.content_type, page.body, cache))
+                .unwrap();
             Ok(())
         });
         rx.recv().unwrap()
@@ -1084,19 +1100,19 @@ fn model_pages_keep_titles_count_cost_and_never_store_the_key() {
     lab(|cx| async move {
         let search = google(&world, &cx, "halvard flaw").await;
         assert_eq!(
-            (&search.meta["cache"], &search.meta["cost"]),
+            (&search.logged()["cache"], &search.logged()["cost"]),
             (&json!("generated"), &json!(0.0021))
         );
         let (url, title) = results(&search.body)[0].clone();
         // The prefetched page is ready in the background.
         cx.sleep(ms(1000)).await?;
         let page = get(&world, &cx, &url).await;
-        assert_eq!(page.meta["cache"], "prefetched");
+        assert_eq!(page.logged()["cache"], "prefetched");
         assert_eq!(page.status, 200, "a page a result points at is never a 404");
         let html = String::from_utf8_lossy(&page.body);
         assert!(html.contains(&format!("<title>{title}</title>")));
-        assert_eq!(page.meta["unsupported_snippets"], json!([]));
-        assert_eq!(get(&world, &cx, &url).await.meta["cache"], "cached");
+        assert_eq!(page.logged()["unsupported_snippets"], json!([]));
+        assert_eq!(get(&world, &cx, &url).await.logged()["cache"], "cached");
         // The cast was made once, and every later prompt names it.
         assert_eq!(
             world.cast(&cx).await.ok().unwrap()[0].name,
@@ -1188,12 +1204,12 @@ fn a_page_is_checked_against_the_mentions_its_model_was_shown() {
             } else {
                 json!([])
             };
-            assert_eq!(page.meta["unsupported_snippets"], expected);
-            assert_eq!(page.meta["unchecked_snippets"], json!([]));
+            assert_eq!(page.logged()["unsupported_snippets"], expected);
+            assert_eq!(page.logged()["unchecked_snippets"], json!([]));
             // A stored page keeps the result of its check.
             let cached = get(&pages, &cx, "https://news.example-site.com/story").await;
-            assert_eq!(cached.meta["cache"], "cached");
-            assert_eq!(cached.meta["unsupported_snippets"], expected);
+            assert_eq!(cached.logged()["cache"], "cached");
+            assert_eq!(cached.logged()["unsupported_snippets"], expected);
             Ok(())
         });
     }
@@ -1209,8 +1225,8 @@ fn an_unreadable_answer_is_asked_again_and_counted() {
     let world = pages.clone();
     lab(|cx| async move {
         let search = google(&world, &cx, "halvard").await;
-        assert_eq!(search.meta["results"], 10);
-        assert_eq!(search.meta["cost"], json!(0.0042));
+        assert_eq!(search.logged()["results"], 10);
+        assert_eq!(search.logged()["cost"], json!(0.0042));
         Ok(())
     });
     let users = fake.users();
@@ -1238,10 +1254,10 @@ fn two_unreadable_answers_keep_their_attempts_and_serve_503() {
             .await;
         assert_eq!(page.status, 503);
         assert_eq!(page.body, UNAVAILABLE);
-        assert_eq!(page.meta["kind"], "error");
-        assert_eq!(page.meta["cost"], json!(0.0042));
-        assert!(page.meta["error"].as_str().unwrap().contains("no BODY"));
-        assert!(page.meta["serve_ms"].is_u64());
+        assert_eq!(page.logged()["kind"], "error");
+        assert_eq!(page.logged()["cost"], json!(0.0042));
+        assert!(page.logged()["error"].as_str().unwrap().contains("no BODY"));
+        assert!(page.logged()["serve_ms"].is_u64());
         assert!(world.store().page("example.com", "/story").is_none());
         Ok(())
     });
@@ -1307,7 +1323,12 @@ fn an_echoed_key_is_never_stored_or_shown() {
         lab(|cx| async move {
             let search = google(&world, &cx, "halvard flaw").await;
             assert_eq!(search.status, 503);
-            assert!(!search.meta["error"].as_str().unwrap().contains(&KEY[..12]));
+            assert!(
+                !search.logged()["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&KEY[..12])
+            );
             Ok(())
         });
         let rows = dir.rows();
@@ -1340,7 +1361,7 @@ fn a_failed_prefetch_is_recorded_and_made_again_on_request() {
         cx.sleep(ms(1000)).await?;
         let page = get(&world, &cx, &url).await;
         assert_eq!(
-            (page.status, &page.meta["cache"]),
+            (page.status, &page.logged()["cache"]),
             (200, &json!("generated"))
         );
         Ok(())
@@ -1372,7 +1393,7 @@ fn model_pages_keep_their_status_type_and_body() {
         push(&[&format!("STATUS: 404\nTITLE: Missing\nBODY:\n{body}")]);
         for cache in ["generated", "cached"] {
             let page = get(&world, &cx, "https://example.com/missing.json").await;
-            assert_eq!((page.status, &page.meta["cache"]), (404, &json!(cache)));
+            assert_eq!((page.status, &page.logged()["cache"]), (404, &json!(cache)));
             assert_eq!(page.content_type, "application/json; charset=utf-8");
             assert_eq!(page.body, body.as_bytes());
         }
@@ -1380,7 +1401,7 @@ fn model_pages_keep_their_status_type_and_body() {
         push(&["STATUS: 404\nTITLE: Missing\nBODY:\nPage not found"]);
         for cache in ["generated", "cached"] {
             let page = get(&world, &cx, "https://example.com/missing").await;
-            assert_eq!((page.status, &page.meta["cache"]), (404, &json!(cache)));
+            assert_eq!((page.status, &page.logged()["cache"]), (404, &json!(cache)));
             assert!(String::from_utf8_lossy(&page.body).contains("<h1>Page not found</h1>"));
         }
         // Another status, or JSON that is not JSON, is never stored.
@@ -1438,7 +1459,7 @@ fn a_referenced_page_is_never_a_404() {
             let refused = world.handle(&cx, "GET", &host, &path, None).await;
             assert_eq!(refused.status, 503);
             assert!(
-                refused.meta["error"]
+                refused.logged()["error"]
                     .as_str()
                     .unwrap()
                     .contains("referenced")
@@ -1447,14 +1468,14 @@ fn a_referenced_page_is_never_a_404() {
             task.pages.lock().unwrap().extend([bad, good]);
             let page = world.handle(&cx, "GET", &host, &path, None).await;
             assert_eq!(
-                (page.status, &page.meta["cache"]),
+                (page.status, &page.logged()["cache"]),
                 (200, &json!("generated"))
             );
-            assert_eq!(page.meta["cost"], json!(0.0042));
+            assert_eq!(page.logged()["cost"], json!(0.0042));
             assert!(String::from_utf8_lossy(&page.body).contains("Details"));
             let cached = world.handle(&cx, "GET", &host, &path, None).await;
             assert_eq!(
-                (cached.status, &cached.meta["cache"], cached.body),
+                (cached.status, &cached.logged()["cache"], cached.body),
                 (200, &json!("cached"), page.body)
             );
         }
@@ -1477,7 +1498,7 @@ fn listed_ranks_follow_display_order_after_duplicates() {
     no_cast(&pages);
     lab(|cx| async move {
         let search = google(&pages, &cx, "stories").await;
-        let ranks: Vec<_> = search.meta["listed"]
+        let ranks: Vec<_> = search.logged()["listed"]
             .as_array()
             .unwrap()
             .iter()
@@ -1486,7 +1507,7 @@ fn listed_ranks_follow_display_order_after_duplicates() {
         assert_eq!(ranks, [json!(1), json!(2)]);
         let page = get(&pages, &cx, "https://second-site.com/story").await;
         assert_eq!(
-            page.meta["reason"],
+            page.logged()["reason"],
             json!({"via": "search", "query": "stories", "rank": 2})
         );
         Ok(())
@@ -1541,7 +1562,7 @@ fn a_search_and_a_page_publish_one_title() {
             let (listed, direct) = (search_rx.await.unwrap(), page_rx.await.unwrap());
             let title = if page_first { "Story" } else { "first" };
             assert_eq!(results(&listed.body), [(URL.to_owned(), title.to_owned())]);
-            assert_eq!(direct.meta["title"], title);
+            assert_eq!(direct.logged()["title"], title);
             assert!(
                 String::from_utf8_lossy(&direct.body).contains(&format!("<title>{title}</title>"))
             );
@@ -1601,7 +1622,7 @@ fn competing_searches_publish_one_title() {
             );
         }
         let page = get(&pages, &cx, URL).await;
-        assert_eq!(page.meta["title"], "first");
+        assert_eq!(page.logged()["title"], "first");
         let store = pages.store();
         let mentions = store.mentions("race.example-site.com", "/story");
         let queries: Vec<_> = mentions.iter().map(|m| m["query"].clone()).collect();
@@ -1656,7 +1677,7 @@ fn a_retried_failure_counts_in_the_generation() {
         (usage.attempts, usage.asks, usage.gen_ms, usage.call_ms),
         (2, 1, 1850, Some(250))
     );
-    assert_eq!(page.meta["gen_ms"], 1850);
+    assert_eq!(page.logged()["gen_ms"], 1850);
     assert_eq!((usage.cost_known, usage.cost_unknown), (0.0021, 1));
     assert_eq!(
         (usage.cost, usage.input_tokens, usage.output_tokens),
@@ -1687,7 +1708,12 @@ fn exhausted_attempts_fail_with_their_totals() {
     );
     assert!(record.is_none());
     assert_eq!(page.status, 503);
-    assert!(page.meta["error"].as_str().unwrap().contains("HTTP 529"));
+    assert!(
+        page.logged()["error"]
+            .as_str()
+            .unwrap()
+            .contains("HTTP 529")
+    );
     assert_eq!(column(&rows, "attempt"), [json!(1), json!(2), json!(3)]);
     assert_eq!(
         column(&rows, "cost"),
@@ -1707,7 +1733,7 @@ fn exhausted_attempts_fail_with_their_totals() {
         (&json!(3), &json!(0.0), &json!(3))
     );
     assert!(usage["call_ms"].is_null() && usage["cost"].is_null());
-    assert_eq!(page.meta["gen_ms"], 5100);
+    assert_eq!(page.logged()["gen_ms"], 5100);
 }
 
 #[test]
@@ -1787,8 +1813,8 @@ fn an_unreadable_answer_then_transport_failures_count_every_attempt() {
         (&usage["cost_known"], &usage["cost_unknown"]),
         (&json!(0.0021), &json!(3))
     );
-    assert!(usage["cost"].is_null() && page.meta["cost"].is_null());
-    assert_eq!(page.meta["gen_ms"], 5200);
+    assert!(usage["cost"].is_null() && page.logged()["cost"].is_null());
+    assert_eq!(page.logged()["gen_ms"], 5200);
 }
 
 #[test]

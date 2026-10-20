@@ -101,8 +101,11 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
             )
             .await;
             if exhaust {
+                // A busy server's plain page; the log says why.
                 assert_eq!(status, 503);
-                assert_eq!(body, b"Generation budget exhausted");
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                assert!(body.contains("<h1>503 Service Temporarily Unavailable</h1>"));
+                assert!(!body.to_lowercase().contains("generat"));
             } else {
                 assert_eq!(status, 200);
                 let results = google_results(std::str::from_utf8(&body).unwrap());

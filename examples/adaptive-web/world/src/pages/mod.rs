@@ -29,6 +29,7 @@
 //! hold has no results. The same holds while generation is turned off.
 
 pub mod make;
+pub mod meta;
 pub mod model;
 pub mod prompts;
 pub mod render;
@@ -36,11 +37,14 @@ pub mod seed;
 pub mod store;
 pub mod text;
 
+pub use meta::Meta;
 pub use seed::Seed;
 
 use crate::route::{Engine, Route, query_key, route};
-use crate::search::GeneratorKind;
+use crate::search::{Cache, GeneratorKind, Reason};
 use fictionet::Cx;
+use fictionet::events::Fields;
+use meta::{Asked, Listing, Shown};
 use model::{Failure, Ledger, Model, Usage};
 use prompts::{Claim, HostPage, Person};
 use regex::Regex;
@@ -114,18 +118,43 @@ pub struct Response {
     pub body: Vec<u8>,
     /// Extra headers, excluding content type and content length.
     pub headers: Vec<(String, String)>,
-    /// Facts for the request's event.
-    pub meta: Value,
+    /// What the log records about the answer.
+    pub meta: Meta,
+    /// How long a routed request took on the run's clock, in milliseconds.
+    pub serve_ms: Option<u64>,
 }
 impl Response {
-    fn html(body: impl Into<String>, meta: Value, status: u16, server: &str) -> Self {
+    fn new(
+        status: u16,
+        content_type: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+        headers: Vec<(String, String)>,
+        meta: Meta,
+    ) -> Self {
         Self {
             status,
-            content_type: "text/html; charset=utf-8".into(),
-            body: body.into().into_bytes(),
-            headers: vec![("Server".into(), server.into())],
+            content_type: content_type.into(),
+            body: body.into(),
+            headers,
             meta,
+            serve_ms: None,
         }
+    }
+
+    fn html(body: impl Into<String>, meta: Meta, status: u16, server: &str) -> Self {
+        let headers = vec![("Server".into(), server.into())];
+        let body = body.into().into_bytes();
+        Self::new(status, "text/html; charset=utf-8", body, headers, meta)
+    }
+
+    /// The answer as fields of its request's event: [`Meta::fields`] and
+    /// `serve_ms`.
+    pub fn fields(&self) -> Fields {
+        let mut fields = self.meta.fields();
+        if let Some(ms) = self.serve_ms {
+            fields.set("serve_ms", ms);
+        }
+        fields
     }
 }
 
@@ -171,32 +200,18 @@ impl Stop {
             usage: None,
         }
     }
-    /// The answer for a stopped search or page.
-    fn response(self, kind: &str) -> Response {
-        match self {
-            Self::Budget => Response::html(
-                "Generation budget exhausted",
-                json!({"kind": kind, "cache": "budget"}),
-                503,
-                "nginx",
-            ),
-            Self::Failed { error, usage } => {
-                let mut meta =
-                    json!({"kind": "error", "error": error.chars().take(400).collect::<String>()});
-                if let Some(usage) = usage {
-                    meta["model"] = json!(usage.model);
-                    meta["gen_ms"] = json!(usage.gen_ms);
-                    meta["cost"] = json!(usage.cost);
-                }
-                Response {
-                    status: 503,
-                    content_type: "text/html".into(),
-                    body: UNAVAILABLE.into(),
-                    headers: vec![("Server".into(), "nginx".into())],
-                    meta,
-                }
-            }
-        }
+    /// The answer for a stopped search or page: the plain 503 page a busy
+    /// server shows. The log keeps why.
+    fn response(self, asked: Asked) -> Response {
+        let meta = match self {
+            Self::Budget => Meta::Budget(asked),
+            Self::Failed { error, usage } => Meta::Error {
+                error: error.chars().take(400).collect(),
+                usage,
+            },
+        };
+        let headers = vec![("Server".into(), "nginx".into())];
+        Response::new(503, "text/html", UNAVAILABLE, headers, meta)
     }
 }
 
@@ -475,30 +490,28 @@ impl Pages {
     ) -> Response {
         let started = cx.now().since_start();
         let mut response = self.answer(cx, &host.to_lowercase(), target, route).await;
-        response.meta["serve_ms"] = json!((cx.now().since_start() - started).as_millis() as u64);
+        response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
         response
     }
 
     async fn answer(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, route: Route) -> Response {
         match route {
-            Route::Redirect { location, status } => Response {
-                status,
-                content_type: "text/html; charset=utf-8".into(),
-                body: format!(
+            Route::Redirect { location, status } => {
+                let body = format!(
                     "<html><head><title>{status} Moved</title></head><body>\
                     <a href=\"{}\">here</a></body></html>",
                     text::escape(&location)
-                )
-                .into_bytes(),
-                headers: vec![("Location".into(), location.clone())],
-                meta: json!({"kind": "redirect", "location": location}),
-            },
+                );
+                let headers = vec![("Location".into(), location.clone())];
+                let meta = Meta::Redirect { location };
+                Response::new(status, "text/html; charset=utf-8", body, headers, meta)
+            }
             Route::SearchHome { engine } => Response::html(
                 match engine {
                     Engine::Google => render::google_home(),
                     _ => render::duckduckgo_home(),
                 },
-                json!({"kind": "search_home"}),
+                Meta::SearchHome,
                 200,
                 render::engine_server(engine),
             ),
@@ -632,42 +645,33 @@ impl Pages {
         let key = query_key(query, start);
         let _lock = match self.locks.lock(cx, format!("search {key}")).await {
             Ok(lock) => lock,
-            Err(error) => return Stop::store(error).response("search"),
+            Err(error) => return Stop::store(error).response(Asked::Search),
         };
         let stored = self.store().search(&key).cloned();
         let (record, cache) = match stored {
-            Some(record) => (Some(record), "cached"),
-            None if !self.generating() => (None, "missing"),
+            Some(record) => (Some(record), Cache::Cached),
+            None if !self.generating() => (None, Cache::Missing),
             None => match self.make_search(cx, &key, query).await {
                 Ok(record) => {
                     self.start_prefetch(cx, &record);
-                    (Some(record), "generated")
+                    (Some(record), Cache::Generated)
                 }
-                Err(stop) => return stop.response("search"),
+                Err(stop) => return stop.response(Asked::Search),
             },
         };
         let empty = make::Search::default();
         let search = record.as_ref().map_or(&empty, |r| &r.search);
         let body = render::search(engine, query, search, start);
-        let listed: Vec<_> = search
-            .results
-            .iter()
-            .enumerate()
-            .map(|(i, r)| json!({"rank": i + 1, "url": r.url, "title": r.title}))
-            .collect();
-        let mut meta = json!({
-            "kind": "search",
-            "engine": engine,
-            "search": query,
-            "cache": cache,
-            "model": record.as_ref().map(|r| r.usage.model.clone()),
-            "results": search.results.len(),
-            "listed": listed,
-        });
-        if let (Some(record), "generated") = (&record, cache) {
-            meta["gen_ms"] = json!(record.usage.gen_ms);
-            meta["cost"] = json!(record.usage.cost);
-        }
+        let listing = Listing {
+            engine,
+            search: query.into(),
+            cache,
+            listed: (search.results.iter())
+                .map(|r| (r.url.clone(), r.title.clone()))
+                .collect(),
+            usage: record.map(|r| r.usage),
+        };
+        let meta = Meta::Search(Box::new(listing));
         Response::html(body, meta, 200, render::engine_server(engine))
     }
 
@@ -740,18 +744,18 @@ impl Pages {
             cx.spawn(move |cx| async move {
                 let started = cx.now().since_start();
                 let response = pages.page(&cx, &host, &target, true).await;
-                if response.meta["kind"] == "error" {
+                if let Meta::Error { error, usage } = &response.meta {
                     let mut row = json!({
                         "kind": "prefetch_error",
                         "record": "diagnostic",
                         "url": format!("https://{host}{target}"),
-                        "error": response.meta["error"],
+                        "error": error,
                         "serve_ms": (cx.now().since_start() - started).as_millis() as u64,
                     });
-                    for key in ["model", "gen_ms", "cost"] {
-                        if let Some(value) = response.meta.get(key) {
-                            row[key] = value.clone();
-                        }
+                    if let Some(usage) = usage {
+                        row["model"] = json!(usage.model);
+                        row["gen_ms"] = json!(usage.gen_ms);
+                        row["cost"] = json!(usage.cost);
                     }
                     // A world that cannot write the row says so on the next request.
                     let _ = pages.log(&[row]);
@@ -765,14 +769,14 @@ impl Pages {
         let (host, target) = (fixed.host.as_str(), fixed.target.as_str());
         let lock = match self.locks.lock(cx, page_key(host, target)).await {
             Ok(lock) => lock,
-            Err(error) => return Stop::store(error).response("page"),
+            Err(error) => return Stop::store(error).response(Asked::Page),
         };
         let stored = self.store().page(host, target).cloned();
         let (record, made) = match stored {
             Some(record) => (record, false),
             None if !self.generating() => {
                 drop(lock);
-                return self.not_found(host, target, "missing");
+                return self.missing(host, target);
             }
             None => {
                 let record = PageRecord {
@@ -796,7 +800,7 @@ impl Pages {
                     usage: None,
                 };
                 if let Err(error) = self.store().insert_page(record.clone()) {
-                    return Stop::store(error).response("page");
+                    return Stop::store(error).response(Asked::Page);
                 }
                 (record, true)
             }
@@ -805,26 +809,25 @@ impl Pages {
         if made && record.content_type.starts_with("text/html") {
             self.note_links(&record.url, &String::from_utf8_lossy(&record.body));
         }
-        Response {
-            status: record.status,
-            content_type: record.content_type,
-            body: record.body,
-            headers: record.headers,
-            meta: json!({
-                "kind": "page",
-                "cache": "fixed",
-                "title": record.title,
-                "reason": {"via": "fixed"},
-            }),
-        }
+        let meta = Meta::Fixed {
+            title: record.title,
+        };
+        Response::new(
+            record.status,
+            record.content_type,
+            record.body,
+            record.headers,
+            meta,
+        )
     }
 
-    fn not_found(&self, host: &str, target: &str, cache: &str) -> Response {
+    /// The 404 for a page the store does not hold while nothing new is made.
+    fn missing(&self, host: &str, target: &str) -> Response {
         let store = self.store();
         let profile = store.site(host);
         Response::html(
             render::not_found(host, profile, target, &self.seed.date[..4]),
-            json!({"kind": "page", "cache": cache}),
+            Meta::Missing,
             404,
             render::server_of(profile),
         )
@@ -833,64 +836,54 @@ impl Pages {
     async fn page(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, prefetch: bool) -> Response {
         let lock = match self.locks.lock(cx, page_key(host, target)).await {
             Ok(lock) => lock,
-            Err(error) => return Stop::store(error).response("page"),
+            Err(error) => return Stop::store(error).response(Asked::Page),
         };
         let stored = self.store().page(host, target).cloned();
         let (record, mut cache) = match stored {
-            Some(record) => (record, "cached"),
+            Some(record) => (record, Cache::Cached),
             None if !self.generating() => {
                 drop(lock);
-                return self.not_found(host, target, "missing");
+                return self.missing(host, target);
             }
             None => match self.make_page(cx, host, target, prefetch).await {
-                Ok(record) => (record, "generated"),
-                Err(stop) => return stop.response("page"),
+                Ok(record) => (record, Cache::Generated),
+                Err(stop) => return stop.response(Asked::Page),
             },
         };
         drop(lock);
-        if cache == "generated" && record.content_type.starts_with("text/html") {
+        if cache == Cache::Generated && record.content_type.starts_with("text/html") {
             self.note_links(&record.url, &String::from_utf8_lossy(&record.body));
         }
         if !prefetch
             && record.prefetched
             && self.store().unserved.remove(&(host.into(), target.into()))
         {
-            cache = "prefetched";
+            cache = Cache::Prefetched;
         }
-        let first = record
-            .mentions
-            .first()
-            .cloned()
-            .unwrap_or(json!({"via": "direct"}));
-        let reason: serde_json::Map<_, _> = ["via", "query", "rank", "from"]
-            .into_iter()
-            .filter_map(|k| first.get(k).map(|v| (k.to_owned(), v.clone())))
-            .collect();
-        let usage = record.usage.as_ref();
-        let mut meta = json!({
-            "kind": "page",
-            "cache": cache,
-            "title": record.title,
-            "model": usage.map(|u| u.model.clone()),
-            "prefetched": record.prefetched,
-            "claims": record.claims,
-            "mentions": record.mentions.len(),
-            "unsupported_snippets": record.unsupported_snippets,
-            "unchecked_snippets": record.unchecked_snippets,
-            "tells": record.tells,
-            "reason": reason,
+        // A page asked for before anything mentioned it came direct.
+        let reason = (record.mentions.first()).map_or(Reason::Direct, |m| {
+            Reason::deserialize(m).unwrap_or_default()
         });
-        if cache != "cached" {
-            meta["gen_ms"] = json!(usage.map(|u| u.gen_ms));
-            meta["cost"] = json!(usage.and_then(|u| u.cost));
-        }
-        Response {
-            status: record.status,
-            content_type: record.content_type,
-            body: record.body,
-            headers: record.headers,
+        let shown = Shown {
+            cache,
+            title: record.title,
+            prefetched: record.prefetched,
+            claims: record.claims,
+            mentions: record.mentions.len(),
+            unsupported_snippets: record.unsupported_snippets,
+            unchecked_snippets: record.unchecked_snippets,
+            tells: record.tells,
+            reason,
+            usage: record.usage,
+        };
+        let meta = Meta::Page(Box::new(shown));
+        Response::new(
+            record.status,
+            record.content_type,
+            record.body,
+            record.headers,
             meta,
-        }
+        )
     }
 
     async fn make_page(
@@ -1040,13 +1033,7 @@ fn static_asset(path: &str) -> Option<Response> {
             _ => return None,
         }
     };
-    Some(Response {
-        status: 200,
-        content_type: ctype.into(),
-        body: body.into(),
-        headers: vec![],
-        meta: json!({"kind": "asset"}),
-    })
+    Some(Response::new(200, ctype, body, vec![], Meta::Asset))
 }
 
 #[cfg(test)]

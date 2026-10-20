@@ -16,7 +16,6 @@ use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
-use crate::handler::PAGE_FIELDS;
 use example_common::events::js;
 use example_common::log::Log;
 
@@ -58,6 +57,32 @@ impl fictionet::events::Observer for LogObserver {
         }
     }
 }
+
+/// Page fields an `http` line keeps, in this order. None is a name
+/// `http.request` uses itself. There, `query` is the URL query, so search
+/// text is `search`. The search projection also reads `listed` and
+/// `reason`, which the line leaves out.
+const PAGE_FIELDS: [&str; 19] = [
+    "kind",
+    "cache",
+    "engine",
+    "search",
+    "results",
+    "title",
+    "model",
+    "gen_ms",
+    "cost",
+    "serve_ms",
+    "prefetched",
+    "claims",
+    "mentions",
+    "unsupported_snippets",
+    "unchecked_snippets",
+    "tells",
+    "location",
+    "error",
+    "bytes",
+];
 
 fn get(e: &Event, name: &str) -> Value {
     js(e.get(name))

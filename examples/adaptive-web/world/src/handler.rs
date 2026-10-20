@@ -10,44 +10,15 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 
-use crate::pages::{MAX_FORM_BYTES, Pages};
+use crate::pages::{MAX_FORM_BYTES, Meta, Pages};
 use crate::route::{Route, query_key, route};
 use bytes::Bytes;
-use example_common::events::field;
 use example_common::names::name;
-use fictionet::events::{ConnInfo, Fields};
+use fictionet::events::ConnInfo;
 use fictionet::stdlib::web::{self, Body};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-
-/// Page fields kept in HTTP log lines. None is a name `http.request` uses
-/// itself. There, `query` is the URL query, so search text is `search`.
-pub const PAGE_FIELDS: [&str; 19] = [
-    "kind",
-    "cache",
-    "engine",
-    "search",
-    "results",
-    "title",
-    "model",
-    "gen_ms",
-    "cost",
-    "serve_ms",
-    "prefetched",
-    "claims",
-    "mentions",
-    "unsupported_snippets",
-    "unchecked_snippets",
-    "tells",
-    "location",
-    "error",
-    "bytes",
-];
-
-/// Page fields for the projection, kept out of HTTP log lines.
-/// These names and the handler's `query_id` are not used by `http.request` itself.
-pub const EVENT_FIELDS: [&str; 2] = ["listed", "reason"];
 
 /// Shared routing, query facts and response event fields. Clones share one
 /// query counter.
@@ -159,7 +130,14 @@ impl Handler {
             .pages
             .handle_route(&self.fcx, &target.host, path, action)
             .await;
-        let meta = answer.meta;
+        if let Some(q) = &mut query {
+            match &answer.meta {
+                Meta::Error { error, .. } => q.fail("error", Some(error), answer.serve_ms),
+                Meta::Budget(_) => q.fail("budget", None, answer.serve_ms),
+                _ => q.finished = true,
+            }
+        }
+        let fields = observing.then(|| answer.fields());
         let mut response = Response::builder()
             .status(StatusCode::from_u16(answer.status)?)
             .header(CONTENT_TYPE, answer.content_type)
@@ -175,27 +153,7 @@ impl Handler {
             Bytes::from(answer.body)
         };
         let mut response = response.body(Full::new(body))?;
-        if let Some(q) = &mut query {
-            let why = if meta["kind"] == "error" {
-                Some("error")
-            } else if meta["cache"] == "budget" {
-                Some("budget")
-            } else {
-                None
-            };
-            if let Some(why) = why {
-                q.fail(why, meta["error"].as_str(), meta["serve_ms"].as_u64());
-            } else {
-                q.finished = true;
-            }
-        }
-        if observing {
-            let mut fields = Fields::new();
-            for name in PAGE_FIELDS.into_iter().chain(EVENT_FIELDS) {
-                if let Some(v) = meta.get(name) {
-                    fields.set(name, field(v));
-                }
-            }
+        if let Some(mut fields) = fields {
             if let Some(q) = &query {
                 fields.set("query_id", q.id);
             }
