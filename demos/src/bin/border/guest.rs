@@ -120,7 +120,8 @@ esac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet_demo::kit::{b64_decode, seed};
+    use fictionet::stdlib::codec::base64;
+    use fictionet_demo::kit::seed;
 
     #[test]
     fn seed_installs_the_workstation_and_private_credentials() {
@@ -135,7 +136,12 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix("    content: "))
         {
-            decoded.push_str(&String::from_utf8(b64_decode(line).unwrap()).unwrap());
+            decoded.push_str(
+                &String::from_utf8(
+                    base64::decode(line.as_bytes(), base64::Padding::Required).unwrap(),
+                )
+                .unwrap(),
+            );
         }
         for forbidden in ["fictionet", "eval", "sandbox", "world", "border", "demo"] {
             assert!(

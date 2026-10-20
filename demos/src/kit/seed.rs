@@ -1,7 +1,16 @@
 //! NoCloud provisioning for an unmodified Ubuntu cloud image.
-use super::{Guest, base64};
+use super::Guest;
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
+use fictionet::stdlib::codec::base64;
 use std::io::{Cursor, Write};
+
+/// The variables that point TLS clients at the system trust store: Node,
+/// Python's requests, and OpenSSL's users.
+const TRUST_ENV: &[(&str, &str)] = &[
+    ("NODE_USE_SYSTEM_CA", "1"),
+    ("REQUESTS_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt"),
+    ("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt"),
+];
 
 /// The guest configuration and credentials for one seed.
 pub struct Provision<'a> {
@@ -76,23 +85,19 @@ pub fn user_data(p: &Provision) -> String {
         quote(&g.user),
         quote(p.authorized_key)
     );
+    let assignments: Vec<_> = TRUST_ENV.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let systemd = format!("[Manager]\nDefaultEnvironment={}\n", assignments.join(" "));
+    let profile: String = assignments
+        .iter()
+        .map(|a| format!("export {a}\n"))
+        .collect();
     let shared = [
         (
             "/etc/systemd/network/05-eth0.network",
             "[Match]\nName=eth0\n[Network]\nDHCP=ipv4\n",
         ),
-        (
-            "/etc/systemd/system.conf.d/trust.conf",
-            "[Manager]\nDefaultEnvironment=NODE_USE_SYSTEM_CA=1 \
-                REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
-                SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n",
-        ),
-        (
-            "/etc/profile.d/trust.sh",
-            "export NODE_USE_SYSTEM_CA=1\n\
-             export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
-             export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n",
-        ),
+        ("/etc/systemd/system.conf.d/trust.conf", systemd.as_str()),
+        ("/etc/profile.d/trust.sh", profile.as_str()),
     ];
     let root =
         p.ca.map(|(name, pem)| (format!("/usr/local/share/ca-certificates/{name}.crt"), pem));
@@ -109,7 +114,7 @@ pub fn user_data(p: &Provision) -> String {
         out.push_str(&format!(
             "  - path: {}\n    permissions: '{mode:04o}'\n    encoding: b64\n    content: {}\n",
             quote(path),
-            base64(content.as_bytes())
+            base64::encode(content.as_bytes())
         ));
         if path.starts_with(&format!("/home/{}/", g.user)) {
             out.push_str(&format!(
@@ -125,10 +130,10 @@ pub fn user_data(p: &Provision) -> String {
             ca-certificates"
             .into(),
         "update-ca-certificates".into(),
-        "printf '%s\\n' NODE_USE_SYSTEM_CA=1 \
-            REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
-            SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt >> /etc/environment"
-            .into(),
+        format!(
+            "printf '%s\\n' {} >> /etc/environment",
+            assignments.join(" ")
+        ),
         "systemctl daemon-reexec".into(),
     ];
     if !g.packages.is_empty() {

@@ -74,15 +74,11 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
     // the stream when a clipboard update arrives, and the screen drops.
     let start_desktop = format!(
         "#!/bin/bash\n\
-         set -x\n\
          export HOME=/home/{user} DISPLAY=:1 XDG_RUNTIME_DIR=/run/user/$(id -u {user})\n\
          /usr/bin/Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -SendCutText=0 -nolisten tcp \
            -geometry 1280x800 -depth 24 >/tmp/xvnc.log 2>&1 &\n\
          for _ in $(seq 1 150); do xdpyinfo -display :1 >/dev/null 2>&1 && break; sleep 0.2; done\n\
          while IFS= read -r entry; do export \"$entry\"; done < <(dbus-launch)\n\
-         # The Xfce session, then the window manager, then Firefox: launched\n\
-         # here (not via Xfce autostart, which did not run reliably) so its\n\
-         # start is ordered and its output is captured.\n\
          startxfce4 >/tmp/xfce.log 2>&1 &\n\
          for _ in $(seq 1 150); do pgrep -x xfwm4 >/dev/null 2>&1 && break; sleep 0.2; done\n\
          sleep 2\n\
@@ -303,7 +299,8 @@ fn setup_script(user: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kit::{b64_decode, seed};
+    use crate::kit::seed;
+    use fictionet::stdlib::codec::base64;
 
     #[test]
     fn browser_seed_has_the_desktop_and_firefox_policy() {
@@ -327,7 +324,10 @@ mod tests {
                 .unwrap()
                 .strip_prefix("    content: ")
                 .unwrap();
-            String::from_utf8(b64_decode(encoded).unwrap()).unwrap()
+            String::from_utf8(
+                base64::decode(encoded.as_bytes(), base64::Padding::Required).unwrap(),
+            )
+            .unwrap()
         };
         assert_eq!(
             content("/etc/apt/keyrings/packages.mozilla.org.asc"),

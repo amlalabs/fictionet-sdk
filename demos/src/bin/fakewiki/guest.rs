@@ -6,7 +6,8 @@ pub fn workstation() -> Guest {
 
 #[cfg(test)]
 mod tests {
-    use fictionet_demo::kit::{b64_decode, seed};
+    use fictionet::stdlib::codec::base64;
+    use fictionet_demo::kit::seed;
 
     #[test]
     fn desktop_starts_the_article_with_neutral_files_and_packages() {
@@ -29,7 +30,10 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix("    content: "))
         {
-            let content = String::from_utf8(b64_decode(line).unwrap()).unwrap();
+            let content = String::from_utf8(
+                base64::decode(line.as_bytes(), base64::Padding::Required).unwrap(),
+            )
+            .unwrap();
             for line in content.lines().map(str::trim) {
                 if line.starts_with("systemctl ")
                     || line.starts_with("After=")

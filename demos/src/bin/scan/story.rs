@@ -3,7 +3,8 @@
 //! progress and nmap's reports for the page.
 use crate::script::{self, STEPS};
 use crate::{Error, guests, nmap, page};
-use fictionet_demo::kit::{self, base64, ssh::quote};
+use fictionet::stdlib::codec::base64;
+use fictionet_demo::kit::{self, ssh::quote};
 use scan_world::{PortMap, PortState, Protocol};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -182,7 +183,7 @@ pub async fn run(
         progress.start(index);
         let send = format!(
             "printf '%s' {} | base64 -d > ~/notes/requests; cat ~/notes/results",
-            quote(&base64(format!("{command}\n").as_bytes()))
+            quote(&base64::encode(format!("{command}\n").as_bytes()))
         );
         // The step's exit status and nmap's report, as far as the step got.
         let mut exit = None;

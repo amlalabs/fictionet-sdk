@@ -319,7 +319,7 @@ impl PageClient {
         ticket: Option<&str>,
     ) -> io::Result<Socket> {
         let mut nonce = [0; 16];
-        super::getrandom(&mut nonce);
+        fictionet::random_bytes(&mut nonce)?;
         let headers =
             websocket::request_headers(&self.authority, nonce, &[]).map_err(io::Error::other)?;
         let key = headers
@@ -598,7 +598,7 @@ impl AsyncWrite for Socket {
 }
 async fn send_message(stream: &mut TcpStream, message: Message) -> io::Result<()> {
     let mut mask = [0; 4];
-    super::getrandom(&mut mask);
+    fictionet::random_bytes(&mut mask)?;
     let wire = message
         .to_frame(Some(mask))
         .map_err(io::Error::other)?

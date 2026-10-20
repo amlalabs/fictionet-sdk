@@ -73,7 +73,8 @@ pub fn guest() -> Guest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet_demo::kit::{b64_decode, seed};
+    use fictionet::stdlib::codec::base64;
+    use fictionet_demo::kit::seed;
 
     #[test]
     fn desktop_is_quiet_and_uses_neutral_names() {
@@ -95,7 +96,12 @@ mod tests {
         let mut files = Vec::new();
         for line in data.lines() {
             if let Some(encoded) = line.strip_prefix("    content: ") {
-                files.push(String::from_utf8(b64_decode(encoded).unwrap()).unwrap());
+                files.push(
+                    String::from_utf8(
+                        base64::decode(encoded.as_bytes(), base64::Padding::Required).unwrap(),
+                    )
+                    .unwrap(),
+                );
             }
         }
         assert!(

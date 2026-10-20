@@ -121,6 +121,7 @@ xdotool windowactivate --sync "$terminal"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::base64;
     #[test]
     fn the_colleague_has_curl_and_a_neutral_name() {
         let guest = colleague();
@@ -151,7 +152,10 @@ mod tests {
                 .unwrap()
                 .strip_prefix("    content: ")
                 .unwrap();
-            String::from_utf8(kit::b64_decode(encoded).unwrap()).unwrap()
+            String::from_utf8(
+                base64::decode(encoded.as_bytes(), base64::Padding::Required).unwrap(),
+            )
+            .unwrap()
         };
         for package in [
             "python3-venv",

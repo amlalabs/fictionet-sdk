@@ -74,7 +74,6 @@ impl RxQueue {
 
 struct NetBackend {
     mem: Option<Mem>,
-    event_idx: bool,
     mac: [u8; 6],
     to_world: UnboundedSender<Vec<u8>>,
     rx: RxQueue,
@@ -105,9 +104,8 @@ impl VhostUserBackendMut for NetBackend {
         VhostUserProtocolFeatures::empty()
     }
 
-    fn set_event_idx(&mut self, enabled: bool) {
-        self.event_idx = enabled;
-    }
+    // The features above leave out VIRTIO_RING_F_EVENT_IDX, so it stays off.
+    fn set_event_idx(&mut self, _: bool) {}
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
         // The virtio-net config starts with the 6-byte MAC.
@@ -254,7 +252,6 @@ pub fn start(
     let stop = exit.try_clone()?;
     let backend = Arc::new(RwLock::new(NetBackend {
         mem: None,
-        event_idx: false,
         mac,
         to_world,
         rx: rx.clone(),

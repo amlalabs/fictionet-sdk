@@ -75,6 +75,8 @@ mod tests {
                 < data.find("bash /opt/install-agents.sh").unwrap()
         );
         assert!(data.contains("/etc/claude-code/managed-settings.json"));
-        assert!(data.contains(&fictionet_demo::kit::base64(install_agents().as_bytes())));
+        assert!(data.contains(&fictionet::stdlib::codec::base64::encode(
+            install_agents().as_bytes()
+        )));
     }
 }

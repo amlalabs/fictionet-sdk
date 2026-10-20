@@ -61,7 +61,7 @@ pub mod ssh;
 mod util;
 pub mod vm;
 
-pub use util::{b64_decode, base64, getrandom, random_uuid};
+pub use util::random_uuid;
 
 use std::future::Future;
 use std::io;
@@ -409,15 +409,6 @@ impl GuestHandle {
     pub fn addr(&self) -> Option<Ipv4Addr> {
         *self.addr.borrow()
     }
-    /// Waits until the fixed or observed DHCP address is known.
-    pub async fn wait_addr(&self) -> io::Result<Ipv4Addr> {
-        let mut addr = self.addr.clone();
-        let value = addr
-            .wait_for(Option::is_some)
-            .await
-            .map_err(io::Error::other)?;
-        Ok(value.unwrap())
-    }
     /// Returns the SSH session connected through the jump host.
     pub fn ssh(&self) -> &Arc<ssh::Session> {
         self.ssh.as_ref().expect("boot completed")
@@ -475,10 +466,6 @@ impl Run {
             .iter()
             .find(|g| g.name() == name)
             .unwrap_or_else(|| panic!("guest {name} is not declared; add it with Kit::guest"))
-    }
-    /// Returns the admin jump host for connections across the world network.
-    pub fn jump(&self) -> &jump::Jump {
-        self.jump.as_ref().expect("boot completed")
     }
     /// Returns all guests in declaration order.
     pub fn guests(&self) -> &[GuestHandle] {

@@ -794,7 +794,7 @@ async fn persist(
     received_at: SystemTime,
 ) -> Result<(), Error> {
     let mut random = [0; 8];
-    crate::kit::getrandom(&mut random);
+    fictionet::random_bytes(&mut random)?;
     let path = reservation
         .path
         .parent()

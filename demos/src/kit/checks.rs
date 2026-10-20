@@ -142,17 +142,7 @@ impl Run {
         let (capture, settled) = loop {
             tick.tick().await;
             captures += 1;
-            let capture = tokio::time::timeout(
-                SCREEN_TIMEOUT,
-                rfb::capture_page(self.page_url(), host, out),
-            )
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("{host}: the screen capture took over {SCREEN_TIMEOUT:?}"),
-                )
-            })??;
+            let capture = capture(self.page_url(), host, out).await?;
             let pixels = std::fs::read(&capture.png)?;
             if previous.as_ref() == Some(&pixels) {
                 break (capture, Some(captures));
@@ -162,12 +152,7 @@ impl Run {
             }
             previous = Some(pixels);
         };
-        if capture.colors < MIN_COLORS {
-            return Err(io::Error::other(format!(
-                "{host}: the captured screen has {} colors; a desktop shows at least {MIN_COLORS}",
-                capture.colors
-            )));
-        }
+        colorful(host, &capture)?;
         match settled {
             Some(n) => println!(
                 "{host} screen through the page: {} (settled after {n} captures)",
@@ -223,22 +208,33 @@ impl Run {
     }
 }
 
-/// [`Run::screen`] for any signed page URL.
-async fn screen(url: &str, host: &str, out: &Path) -> io::Result<rfb::Capture> {
-    let capture = tokio::time::timeout(SCREEN_TIMEOUT, rfb::capture_page(url, host, out))
+/// Saves `host`'s screen to `out` through the page at `url`, within 30 s.
+async fn capture(url: &str, host: &str, out: &Path) -> io::Result<rfb::Capture> {
+    tokio::time::timeout(SCREEN_TIMEOUT, rfb::capture_page(url, host, out))
         .await
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("{host}: the screen capture took over {SCREEN_TIMEOUT:?}"),
             )
-        })??;
+        })?
+}
+
+/// Fails unless the capture shows a desktop: at least 16 colors.
+fn colorful(host: &str, capture: &rfb::Capture) -> io::Result<()> {
     if capture.colors < MIN_COLORS {
         return Err(io::Error::other(format!(
             "{host}: the captured screen has {} colors; a desktop shows at least {MIN_COLORS}",
             capture.colors
         )));
     }
+    Ok(())
+}
+
+/// [`Run::screen`] for any signed page URL.
+async fn screen(url: &str, host: &str, out: &Path) -> io::Result<rfb::Capture> {
+    let capture = capture(url, host, out).await?;
+    colorful(host, &capture)?;
     println!(
         "{host} screen through the page: {} ({}x{}, {}{} colors, {})",
         capture.png.display(),

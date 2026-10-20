@@ -4,9 +4,10 @@
 mod guest;
 mod world;
 
+use fictionet::stdlib::codec::base64;
 use fictionet_demo::kit::checks::check;
 use fictionet_demo::kit::client::{Capability, PageClient};
-use fictionet_demo::kit::{self, Kit, b64_decode, rfb, ssh};
+use fictionet_demo::kit::{self, Kit, rfb, ssh};
 use fictionet_observe::page::{Column, Page, StateLimits, StateTopic};
 use serde_json::{Value, json};
 use std::net::IpAddr;
@@ -673,7 +674,7 @@ async fn guest_cmd(session: &ssh::Session, command: &str) -> Result<ssh::Output,
 
 /// Decodes a base64 PNG from the guest and writes it; returns the path.
 fn save_png(b64: &str, path: &Path) -> Option<String> {
-    let bytes = b64_decode(b64.trim())?;
+    let bytes = base64::decode(b64.trim().as_bytes(), base64::Padding::Required)?;
     if bytes.len() < 8 || &bytes[1..4] != b"PNG" {
         return None;
     }

@@ -12,6 +12,7 @@ use artifactory_world::{
     packages::{Role, Variant},
     repository::Label,
 };
+use fictionet::stdlib::codec::base64;
 use fictionet_demo::kit;
 use std::time::{Duration, Instant};
 
@@ -546,7 +547,7 @@ pub fn steps(variant: Variant, sessions: Option<Mode>) -> Vec<Step> {
 
 /// Types the step's command in Maya's terminal window and returns its exit.
 async fn type_command(guest: &kit::GuestHandle, step: &Step) -> std::io::Result<i32> {
-    let encoded = kit::base64(serde_json::to_string(&step.command)?.as_bytes());
+    let encoded = base64::encode(serde_json::to_string(&step.command)?.as_bytes());
     let command = format!(
         "printf %s {} | base64 -d > {}/commands && head -n1 {}/results",
         kit::ssh::quote(&encoded),

@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::stdlib::codec::base64;
 use std::io::Read;
 
 fn seed_file(path: &Path, name: &str) -> String {
@@ -46,7 +47,7 @@ async fn two_guests_have_separate_resources_and_shared_trust() {
         let data = seed_file(&r.seed, "user-data");
         assert!(data.contains(&format!("hostname: {:?}", guest.name())));
         assert!(data.contains("/usr/local/share/ca-certificates/office.crt"));
-        assert!(data.contains(&base64(ca.as_bytes())));
+        assert!(data.contains(&base64::encode(ca.as_bytes())));
         assert!(data.contains(&key.authorized_key));
         assert!(seed_file(&r.seed, "network-config").contains("dhcp4: true"));
     }
@@ -89,11 +90,22 @@ fn user_data_installs_packages_files_and_steps() {
     });
     assert!(data.contains("'curl' 'openssh-server'"));
     assert!(data.contains("path: \"/opt/start.sh\"\n    permissions: '0755'"));
-    assert!(data.contains(&base64(b"echo ready\n")));
+    assert!(data.contains(&base64::encode(b"echo ready\n")));
     assert!(data.contains("bash /opt/start.sh"));
     assert!(data.find("update-ca-certificates").unwrap() < data.find("'curl'").unwrap());
     assert!(data.contains("/etc/profile.d/trust.sh"));
     assert!(data.contains("/etc/systemd/system.conf.d/trust.conf"));
+    let trust = "NODE_USE_SYSTEM_CA=1 REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+        SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt";
+    assert!(data.contains(&base64::encode(
+        format!("[Manager]\nDefaultEnvironment={trust}\n").as_bytes()
+    )));
+    let exports = trust
+        .split(' ')
+        .map(|a| format!("export {a}\n"))
+        .collect::<String>();
+    assert!(data.contains(&base64::encode(exports.as_bytes())));
+    assert!(data.contains(&format!("printf '%s\\\\n' {trust} >> /etc/environment")));
     assert!(!data.contains("firefox"));
     assert!(data.contains("/usr/local/share/ca-certificates/office.crt"));
     let data = seed::user_data(&seed::Provision {
@@ -200,7 +212,11 @@ async fn addresses_follow_each_guests_lease() {
         });
     }
     assert_eq!(handles[0].addr(), None);
-    assert_eq!(handles[1].wait_addr().await.unwrap(), fixed);
+    let address = |handle: &GuestHandle| {
+        let mut addr = handle.addr.clone();
+        async move { addr.wait_for(Option::is_some).await.unwrap().unwrap() }
+    };
+    assert_eq!(address(&handles[1]).await, fixed);
     let fanout = Fanout::new(observers);
     let leased = Ipv4Addr::new(10, 0, 0, 5);
     for (name, addr) in [("unrelated", fixed), ("station", leased)] {
@@ -224,7 +240,7 @@ async fn addresses_follow_each_guests_lease() {
             Observation::Event(&event),
         );
     }
-    assert_eq!(handles[0].wait_addr().await.unwrap(), leased);
+    assert_eq!(address(&handles[0]).await, leased);
     assert_eq!(handles[1].addr(), Some(fixed));
 }
 
@@ -259,7 +275,6 @@ fn root_certificate_names_are_neutral() {
 }
 
 /// A real kit page and world clock over an in-process SSH guest.
-/// Keep this helper available for browser tests of the shared screen condition.
 pub(crate) struct PageFixture {
     pub run: Run,
     pub peer: ssh::tests::Peer,
@@ -920,7 +935,7 @@ fn home_files_are_written_after_user_creation() {
         assert_eq!(entry.contains("defer: true"), home);
         if home {
             assert!(entry.contains("permissions: '0600'"));
-            assert!(entry.contains(&base64(b"private")));
+            assert!(entry.contains(&base64::encode(b"private")));
         }
     }
 }
@@ -1221,7 +1236,6 @@ async fn cloud_init_wait_and_diagnostics_use_the_guest_session() {
         report.matches("[exit 0]").count(),
         diagnostic_commands().len()
     );
-    // Readiness and containment probes share the session; keep this test's commands.
     let wait = "sudo cloud-init status --wait --long";
     let mut sent = Vec::new();
     while let Ok(event) = fixture.peer.events.try_recv() {

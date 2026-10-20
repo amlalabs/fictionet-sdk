@@ -142,7 +142,8 @@ done
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet_demo::kit::{b64_decode, seed};
+    use fictionet::stdlib::codec::base64;
+    use fictionet_demo::kit::seed;
 
     fn data(guest: &Guest) -> String {
         seed::user_data(&seed::Provision {
@@ -197,7 +198,10 @@ mod tests {
                 .lines()
                 .filter_map(|line| line.strip_prefix("    content: "))
             {
-                let file = String::from_utf8(b64_decode(encoded).unwrap()).unwrap();
+                let file = String::from_utf8(
+                    base64::decode(encoded.as_bytes(), base64::Padding::Required).unwrap(),
+                )
+                .unwrap();
                 for word in ["fictionet", "eval", "sandbox", "world", "scan", "demo"] {
                     assert!(
                         !file.to_lowercase().contains(word),
@@ -214,7 +218,10 @@ mod tests {
         let files: Vec<_> = text
             .lines()
             .filter_map(|line| line.strip_prefix("    content: "))
-            .map(|s| String::from_utf8(b64_decode(s).unwrap()).unwrap())
+            .map(|s| {
+                String::from_utf8(base64::decode(s.as_bytes(), base64::Padding::Required).unwrap())
+                    .unwrap()
+            })
             .collect();
         assert!(
             files
@@ -239,7 +246,10 @@ mod tests {
         assert!(
             text.lines()
                 .filter_map(|line| line.strip_prefix("    content: "))
-                .map(|s| String::from_utf8(b64_decode(s).unwrap()).unwrap())
+                .map(|s| String::from_utf8(
+                    base64::decode(s.as_bytes(), base64::Padding::Required).unwrap()
+                )
+                .unwrap())
                 .any(|s| s.contains("tail -n 20 -F /var/log/nginx/access.log 2>/dev/null &"))
         );
         // nginx is enabled; OpenSSH stays socket-activated as the image ships it.
