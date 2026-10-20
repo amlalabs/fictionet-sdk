@@ -73,8 +73,9 @@ route) traceroute -n -q 1 -w 2 84.21.44.10 ;;
 bgp)
     expected=${2:?supply the expected route count}
     sudo install -d /run/bird
-    sudo bird -c /etc/bird/bird.conf -s /run/bird/bird.ctl
-    trap 'sudo birdc -s /run/bird/bird.ctl down >/dev/null' EXIT
+    if ! sudo birdc -s /run/bird/bird.ctl show status >/dev/null 2>&1; then
+        sudo bird -c /etc/bird/bird.conf -s /run/bird/bird.ctl
+    fi
     deadline=$((SECONDS + 30))
     until sudo birdc -s /run/bird/bird.ctl show route count | grep -q "^$expected of $expected routes .* table master4"; do
         if (( SECONDS >= deadline )); then echo 'BIRD did not import the expected routes' >&2; exit 1; fi

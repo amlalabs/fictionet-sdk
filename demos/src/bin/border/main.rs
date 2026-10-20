@@ -1,11 +1,18 @@
 //! Border's scripted workstation on the shared page and microVM kit.
 
+mod certificates;
 mod checks;
+mod client;
 mod control;
 mod guest;
+mod preview;
+mod results;
 mod story;
 #[cfg(test)]
 mod tests;
+mod tls;
+mod trace;
+mod view;
 mod world;
 
 use border_world::log::Log;
@@ -21,10 +28,14 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let mut args = std::env::args().skip(1);
-    let downloads = PathBuf::from(
-        args.next()
-            .unwrap_or_else(|| "demos/downloads/cloudimage".into()),
-    );
+    let first = args.next();
+    if first.as_deref() == Some("page") {
+        if args.next().is_some() {
+            return Err("usage: border page".into());
+        }
+        return preview::run().await;
+    }
+    let downloads = PathBuf::from(first.unwrap_or_else(|| "demos/downloads/cloudimage".into()));
     let option = args.next();
     if option.as_deref().is_some_and(|s| s != "--gate") || args.next().is_some() {
         return Err("usage: border [downloads] [--gate]".into());
@@ -37,12 +48,15 @@ async fn main() -> Result<(), Error> {
     std::fs::create_dir_all(&out)?;
     println!("Output: {}", out.display());
     let scenario = control::scenario();
+    let control = control::Control::new(&scenario)?;
     let log = Log::start(
-        Box::new(std::fs::File::create(out.join("log.jsonl"))?),
+        Box::new(results::Writer::new(
+            std::fs::File::create(out.join("log.jsonl"))?,
+            control.results.clone(),
+        )),
         scenario.clone(),
     );
     let world_log = log.clone();
-    let control = control::Control::new(&scenario)?;
     let page_control = control.clone();
     println!("Border: booting one Ubuntu workstation with a scripted agent.");
     println!(
@@ -52,6 +66,7 @@ async fn main() -> Result<(), Error> {
     let boot = Kit::new("Border")
         .guest(guest::guest())
         .observer(Arc::new(log.clone()))
+        .observer(Arc::new(control.view.clone()))
         .page(move |dashboard, hosts| {
             page_control.page(
                 Page::new("Border", dashboard)
@@ -86,6 +101,9 @@ async fn main() -> Result<(), Error> {
         }
         Ok(())
     }.await;
+    if result.is_err() {
+        story::diagnostics(&run).await;
+    }
     let run_path = run.path().to_owned();
     let shutdown = run.shutdown().await;
     let finished = log.finish();

@@ -111,6 +111,12 @@ pub fn user_data(p: &Provision) -> String {
             quote(path),
             base64(content.as_bytes())
         ));
+        if path.starts_with(&format!("/home/{}/", g.user)) {
+            out.push_str(&format!(
+                "    owner: {}:{}\n    defer: true\n",
+                g.user, g.user
+            ));
+        }
     }
     out.push_str("runcmd:\n");
     let mut commands = vec![

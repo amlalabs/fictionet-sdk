@@ -905,3 +905,25 @@ async fn page_capture_reports_websocket_failure() {
     peer.await.unwrap();
     assert!(!out.exists());
 }
+
+#[test]
+fn home_files_are_written_after_user_creation() {
+    let guest = Guest::ubuntu("station", "analyst")
+        .file("/home/analyst/.config/account", 0o600, "private")
+        .file("/home/analyst-other/account", 0o644, "other")
+        .file("/etc/account", 0o644, "system");
+    let data = seed::user_data(&seed::Provision {
+        guest: &guest,
+        authorized_key: "key",
+        ca: None,
+    });
+    for entry in data.split("  - path: ").skip(1) {
+        let home = entry.starts_with("\"/home/analyst/");
+        assert_eq!(entry.contains("owner: analyst:analyst"), home);
+        assert_eq!(entry.contains("defer: true"), home);
+        if home {
+            assert!(entry.contains("permissions: '0600'"));
+            assert!(entry.contains(&base64(b"private")));
+        }
+    }
+}

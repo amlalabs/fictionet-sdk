@@ -22,6 +22,9 @@ pub async fn start(
     let ca = Ca::new(&cx, certs::LAB_CA_NAME)?;
     world.trust("internet-security", &ca.cert_pem())?;
     let ids = border_world::identities(&cx, &ca)?;
+    control
+        .view
+        .certificates(cx.now(), super::certificates::Certificates::new(&ids)?);
     let mirror = world.mirror(&cx)?;
     let mut extra = Extra::default().route(kit::JUMP, kit::jump_prefix());
     for (index, name) in ["archive.ubuntu.com", "security.ubuntu.com"]

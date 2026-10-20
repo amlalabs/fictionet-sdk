@@ -1,14 +1,16 @@
 //! The scripted terminal story and the page's own command client.
 
-use super::{
-    checks,
-    guest::{HOSTNAME, USER},
+use super::{checks, guest::HOSTNAME};
+use fictionet_demo::kit::{
+    self, Run,
+    client::{Capability, PageClient},
+    ssh,
 };
-use fictionet_demo::kit::{self, Run, client::PageClient, ssh};
 use serde_json::{Value, json};
 use std::io;
 use std::path::Path;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Quotes one literal argument for a POSIX shell, including embedded quotes.
 pub fn quote(text: &str) -> String {
@@ -104,22 +106,128 @@ async fn flip(client: &PageClient, mode: &str, revision: u64) -> io::Result<()> 
     Ok(())
 }
 
+async fn title(ssh: &ssh::Session) -> io::Result<String> {
+    Ok(command(ssh, "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'").await?.stdout.trim().to_owned())
+}
+
+async fn border_state(client: &PageClient) -> io::Result<Value> {
+    let response = client
+        .request("GET", "/api/state/border", None, true)
+        .await?;
+    if response.status != 200 {
+        return Err(io::Error::other(format!(
+            "Border state HTTP {}",
+            response.status
+        )));
+    }
+    Ok(serde_json::from_slice::<Value>(&response.body)?["value"].clone())
+}
+
+fn aborted_after(view: &Value, after: u64) -> bool {
+    view["tls"]["rows"].as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row["event"].as_u64().is_some_and(|seq| seq > after)
+                && row["sandbox"] == HOSTNAME
+                && row["identity"] == "impostor"
+                && row["outcome"] == "alert"
+                && row["endpoint"]["machine"] == "45.144.30.10"
+                && row["endpoint"]["reached"] == "84.21.44.10"
+        })
+    })
+}
+
 async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
-    let expected = if hijacked {
-        "Warning: Potential Security Risk Ahead"
-    } else {
-        "Kestrelmoor"
-    };
-    let browser = format!(
-        "export DISPLAY=:1; window=$(xdotool search --sync --onlyvisible --class firefox | head -n1); xdotool key --window \"$window\" ctrl+r; until xdotool getwindowname \"$window\" | grep -F {}; do sleep 0.2; done",
-        quote(expected)
-    );
-    command(
-        run.guest(HOSTNAME).ssh(),
-        &format!("timeout 60 sudo -u {USER} bash -c {}", quote(&browser)),
-    )
-    .await?;
-    Ok(())
+    let ssh = run.guest(HOSTNAME).ssh();
+    let client = PageClient::from_url(run.page_url())?;
+    let mut titles = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let before = border_state(&client).await?;
+        let after = before["tls"]["rows"].as_array().into_iter().flatten()
+            .filter_map(|row| row["event"].as_u64()).max().unwrap_or(0);
+        command(ssh, "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r -I{} xdotool key --window {} ctrl+r'").await?;
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let current = title(ssh).await?;
+            if !titles.contains(&current) {
+                println!("Firefox title: {current:?}");
+                titles.push(current.clone());
+            }
+            let bank = current.contains("Kestrelmoor");
+            if !current.is_empty() && bank != hijacked
+                && (!hijacked || aborted_after(&border_state(&client).await?, after)) {
+                println!("Firefox final title: {current:?}");
+                if hijacked {
+                    println!("Browser TLS: the impostor answered and the guest aborted with an alert.");
+                }
+                return Ok(());
+            }
+        }
+    }).await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other(format!(
+            "browser reload did not finish; titles seen: {titles:?}"
+        ))),
+    }
+}
+
+pub async fn diagnostics(run: &Run) {
+    let ssh = run.guest(HOSTNAME).ssh();
+    for cmd in [
+        "cloud-init status --long",
+        "sudo tail -30 /var/log/cloud-init-output.log",
+        "systemctl is-active vnc",
+        "tail -15 /tmp/xvnc.log /tmp/xfce.log",
+        "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'",
+    ] {
+        match tokio::time::timeout(Duration::from_secs(3), ssh.run_bounded(cmd, 8192)).await {
+            Ok(Ok(out)) => eprintln!(
+                "Diagnostic: {cmd}\n{}{}[exit {}]",
+                out.stdout, out.stderr, out.code
+            ),
+            Ok(Err(error)) => eprintln!("Diagnostic unavailable: {cmd}: {error}"),
+            Err(error) => eprintln!("Diagnostic timed out: {cmd}: {error}"),
+        }
+    }
+}
+
+async fn terminal(client: &PageClient, ssh: &ssh::Session) -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let expected = command(ssh, "tail -1 ~/.cache/bank-check/output").await?.stdout;
+        let expected = expected.trim();
+        if expected.is_empty() {
+            return Err(io::Error::other("the agent's last output line is empty"));
+        }
+        let ticket = client.ticket(HOSTNAME, Capability::Terminal).await?;
+        let mut socket = client.open(HOSTNAME, Capability::Terminal, Some(&ticket.ticket)).await?;
+        let mut output = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let n = socket.read(&mut chunk).await?;
+            if n == 0 { return Err(io::Error::other("page terminal closed before agent output")); }
+            output.extend_from_slice(&chunk[..n]);
+            if output.windows(expected.len()).any(|bytes| bytes == expected.as_bytes()) { break; }
+            if output.len() > 65536 { return Err(io::Error::other("page terminal did not show the agent output")); }
+        }
+        // The tmux client flag proves input is disabled before sending a command.
+        let clients = command(ssh, "tmux list-clients -t main -F '#{client_readonly}'").await?;
+        if !clients.stdout.lines().any(|line| line == "1") {
+            return Err(io::Error::other("page terminal is not a read-only tmux client"));
+        }
+        let marker = format!("/tmp/terminal-{}", kit::random_uuid());
+        socket.write_all(format!("touch {}\r", quote(&marker)).as_bytes()).await?;
+        socket.flush().await?;
+        // A fresh agent command supplies output after the viewer's input.
+        step(ssh, "bgp 2", false).await?;
+        command(ssh, &format!("test ! -e {}", quote(&marker))).await?;
+        let pane = command(ssh, "tmux capture-pane -p -t main").await?;
+        if pane.stdout.contains(&marker) {
+            return Err(io::Error::other("viewer input reached the agent's pane"));
+        }
+        println!("Page terminal: agent output visible; viewer typing did not reach the read-only session.");
+        Ok(())
+    }).await?
 }
 
 async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
@@ -141,6 +249,10 @@ async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
     }
     std::fs::copy(&capture.png, out.join(file))?;
     println!("Screen: {}", out.join(file).display());
+    println!(
+        "Captured Firefox title: {:?}",
+        title(run.guest(HOSTNAME).ssh()).await?
+    );
     Ok(())
 }
 
@@ -158,6 +270,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     for name in ["signin", "balance", "cert", "route", "bgp 2"] {
         step(ssh, name, false).await?;
     }
+    terminal(&client, ssh).await?;
     screen(run, out, false).await?;
     println!("Opening a persistent HTTPS connection before the flip.");
     begin(ssh, "hold").await?;
@@ -197,16 +310,119 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     step(ssh, "signin-insecure", true).await?;
     password_received(&client, cursor).await?;
     println!("Page events: impostor received credentials; the event contains no password.");
+    observed(&client, true).await?;
+    println!(
+        "Border observations: four hops, the more specific announcement, an impostor TLS session, and credentials without the password."
+    );
     screen(run, out, true).await?;
     flip(&client, "legitimate", 1).await?;
-    for name in ["route", "balance"] {
+    for name in ["route", "balance", "bgp 2"] {
         step(ssh, name, false).await?;
     }
     reload(run, false).await?;
+    observed(&client, false).await?;
+    println!(
+        "Border observations: the more specific route was withdrawn and the new traceroute has three hops."
+    );
     println!(
         "Restored: three hops, a fresh trusted balance request, and the bank browser title succeeded."
     );
     Ok(())
+}
+
+pub async fn observed(client: &PageClient, hijacked: bool) -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client
+                .request("GET", "/api/state/border", None, true)
+                .await?;
+            if response.status != 200 {
+                return Err(io::Error::other(format!(
+                    "Border state HTTP {}",
+                    response.status
+                )));
+            }
+            let text = String::from_utf8(response.body).map_err(io::Error::other)?;
+            if text
+                .to_lowercase()
+                .contains(&border_world::bank::ACCOUNT.password.to_lowercase())
+            {
+                return Err(io::Error::other("Border state exposed the password"));
+            }
+            let snapshot: Value = serde_json::from_str(&text)?;
+            if snapshot["status"]["too_large"] == true {
+                return Err(io::Error::other("Border state exceeded its byte bound"));
+            }
+            if observed_complete(&snapshot["value"], hijacked) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::other("Border observations did not contain the complete traffic story")
+    })?
+}
+
+fn observed_complete(view: &Value, hijacked: bool) -> bool {
+    let rows = |key: &str| {
+        view[key]["rows"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
+    let mut hops = vec![
+        super::control::scenario().gateway().to_string(),
+        "84.21.44.1".into(),
+    ];
+    if hijacked {
+        hops.push("45.144.30.1".into());
+    }
+    hops.push("84.21.44.10".into());
+    let trace = view["traces"].as_array().is_some_and(|traces| {
+        traces.iter().any(|t| {
+            t["sandbox"] == HOSTNAME
+                && t["trace"]["complete"] == true
+                && t["trace"]["dropped"] == 0
+                && t["trace"]["hops"].as_array().is_some_and(|actual| {
+                    actual.len() == hops.len()
+                        && actual
+                            .iter()
+                            .zip(&hops)
+                            .enumerate()
+                            .all(|(i, (a, b))| a["address"] == b.as_str() && a["ttl"] == i + 1)
+                })
+        })
+    });
+    let bgp = rows("bgp").iter().any(|e| {
+        e["sandbox"] == HOSTNAME
+            && e["kind"] == "sent"
+            && e["message"] == "UPDATE"
+            && e[if hijacked { "announced" } else { "withdrawn" }]
+                .as_array()
+                .is_some_and(|routes| routes.iter().any(|p| p == "84.21.44.0/25"))
+    });
+    let moments: Vec<_> = rows("moments")
+        .iter()
+        .filter(|m| {
+            m["sandbox"] == HOSTNAME
+                && m["password"] == true
+                && m["endpoint"]["machine"] == "45.144.30.10"
+                && m["endpoint"]["reached"] == "84.21.44.10"
+        })
+        .collect();
+    let tls = moments.iter().any(|m| {
+        m["connection"].as_u64().is_some()
+            && rows("tls").iter().any(|t| {
+                t["sandbox"] == HOSTNAME
+                    && t["identity"] == "impostor"
+                    && t["outcome"] == "accepted"
+                    && t["connection"] == m["connection"]
+                    && t["endpoint"] == m["endpoint"]
+            })
+    });
+    trace && bgp && tls && moments.len() == 1 && view["lost"] == 0 && view["truncated"] == 0
 }
 
 async fn events(client: &PageClient, after: u64) -> io::Result<Value> {
@@ -246,7 +462,7 @@ async fn password_received(client: &PageClient, mut cursor: u64) -> io::Result<(
                     .as_u64()
                     .ok_or_else(|| io::Error::other("event has no sequence"))?;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
@@ -270,6 +486,27 @@ fn has_password_event(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_alert_requires_a_new_guest_handshake_at_the_impostor() {
+        let row = json!({"event": 12, "sandbox": HOSTNAME, "identity": "impostor",
+            "outcome": "alert", "endpoint": {"machine": "45.144.30.10", "reached": "84.21.44.10"}});
+        let view = |row| json!({"tls": {"rows": [row]}});
+        assert!(aborted_after(&view(row.clone()), 11));
+        assert!(!aborted_after(&view(row.clone()), 12));
+        for (key, value) in [
+            ("outcome", "accepted"),
+            ("sandbox", "other"),
+            ("identity", "bank"),
+        ] {
+            let mut changed = row.clone();
+            changed[key] = value.into();
+            assert!(!aborted_after(&view(changed), 11));
+        }
+        let mut changed = row;
+        changed["endpoint"]["machine"] = "84.21.44.10".into();
+        assert!(!aborted_after(&view(changed), 11));
+    }
+
     #[test]
     fn shell_arguments_round_trip_without_expansion() {
         for text in ["", "hello world", "a'b", "$(exit 7); `exit 8`\n$HOME"] {
