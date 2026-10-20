@@ -65,7 +65,7 @@ fn main() -> fictionet::Result {
     let after: u64 = args.next().map(|s| s.parse()).transpose()?.unwrap_or(20);
     let (options, _observation) = fictionet_observe::serve_observation(
         fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.next(),
+        args.next().map(Into::into),
         None,
     )?;
     let (_listening, mut attachments) =

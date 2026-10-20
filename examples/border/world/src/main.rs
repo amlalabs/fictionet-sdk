@@ -131,7 +131,7 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     let (attacher, attachments) = fictionet::attachments();
     let (options, _observation) = fictionet_observe::serve_observation(
         fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.observation.as_ref(),
+        args.observation.clone(),
         Some(Arc::new(log.clone())),
     )?;
     let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {

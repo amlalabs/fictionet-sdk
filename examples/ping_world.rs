@@ -36,7 +36,7 @@ fn main() -> Result {
         .unwrap_or_else(|| "/run/fictionet/world.sock".into());
     let (options, _observation) = fictionet_observe::serve_observation(
         fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.next(),
+        args.next().map(Into::into),
         None,
     )?;
     let (_listening, mut attachments) =

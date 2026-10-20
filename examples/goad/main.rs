@@ -82,7 +82,7 @@ fn main() -> Result {
 
     let (options, _observation) = fictionet_observe::serve_observation(
         fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.get(2),
+        args.get(2).map(Into::into),
         None,
     )?;
     let (_listening, mut attachments) =

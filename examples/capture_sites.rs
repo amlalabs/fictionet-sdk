@@ -38,7 +38,7 @@ fn main() -> fictionet::Result {
         .unwrap_or_else(|| "/run/fictionet/agent.pcap".into());
     let (options, _observation) = fictionet_observe::serve_observation(
         fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.next(),
+        args.next().map(Into::into),
         None,
     )?;
     let (_listening, attachments) =

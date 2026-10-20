@@ -54,7 +54,7 @@ pub fn run(
 
     let (options, _observation) = fictionet_observe::serve_observation(
         fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.get(3),
+        args.get(3).map(Into::into),
         None,
     )?;
     let (_listening, attachments) =

@@ -77,7 +77,7 @@ fn real_main() -> fictionet::Result {
 
     let (options, _observation) = fictionet_observe::serve_observation(
         fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.observation.as_ref(),
+        args.observation.clone(),
         Some(Arc::new(fakewiki_world::events::LogObserver {
             log: log.clone(),
             hosts: hosts.clone(),
