@@ -215,53 +215,6 @@ pub(crate) fn update_alarms(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn normal() -> ProtectionInputs {
-        ProtectionInputs {
-            power: 100.0,
-            pressure: 15.5,
-            flow: [100.0; 2],
-            level: [50.0; 2],
-            hot: [325.0; 2],
-            turbine_trip: false,
-        }
-    }
-
-    #[test]
-    fn trip_channels_and_low_power_interlocks() {
-        assert_eq!(normal().cause(), None);
-        let mut p = normal();
-        p.power = 110.0;
-        assert_eq!(p.cause(), Some(TripCause::NeutronPowerHigh));
-        let mut p = normal();
-        p.pressure = 17.1;
-        assert_eq!(p.cause(), Some(TripCause::PressurizerPressureHigh));
-        p.pressure = 12.9;
-        assert_eq!(p.cause(), Some(TripCause::PressurizerPressureLow));
-        for l in Loop::ALL {
-            let mut p = normal();
-            p.flow[l.index()] = 69.0;
-            assert_eq!(p.cause(), Some(TripCause::CoolantFlowLow(l)));
-            p.power = 19.0;
-            assert_eq!(p.cause(), None);
-            let mut p = normal();
-            p.level[l.index()] = 19.0;
-            assert_eq!(p.cause(), Some(TripCause::SteamGeneratorLevelLow(l)));
-            let mut p = normal();
-            p.hot[l.index()] = 344.0;
-            assert_eq!(p.cause(), Some(TripCause::HotLegTemperatureHigh(l)));
-        }
-        let mut p = normal();
-        p.turbine_trip = true;
-        assert_eq!(p.cause(), Some(TripCause::TurbineTrip));
-        p.power = 19.0;
-        assert_eq!(p.cause(), None);
-    }
-}
-
 /// Tracks threshold crossings so an operator can undo an automatic action.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct AutomaticState {
@@ -311,6 +264,53 @@ pub(crate) fn automatic_actions(state: AutomaticState, input: AutomaticInputs) -
             && !input.blackout,
         isolation_closed: input.isolation_closed
             || (input.enabled && isolation_low && !state.isolation_low),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn normal() -> ProtectionInputs {
+        ProtectionInputs {
+            power: 100.0,
+            pressure: 15.5,
+            flow: [100.0; 2],
+            level: [50.0; 2],
+            hot: [325.0; 2],
+            turbine_trip: false,
+        }
+    }
+
+    #[test]
+    fn trip_channels_and_low_power_interlocks() {
+        assert_eq!(normal().cause(), None);
+        let mut p = normal();
+        p.power = 110.0;
+        assert_eq!(p.cause(), Some(TripCause::NeutronPowerHigh));
+        let mut p = normal();
+        p.pressure = 17.1;
+        assert_eq!(p.cause(), Some(TripCause::PressurizerPressureHigh));
+        p.pressure = 12.9;
+        assert_eq!(p.cause(), Some(TripCause::PressurizerPressureLow));
+        for l in Loop::ALL {
+            let mut p = normal();
+            p.flow[l.index()] = 69.0;
+            assert_eq!(p.cause(), Some(TripCause::CoolantFlowLow(l)));
+            p.power = 19.0;
+            assert_eq!(p.cause(), None);
+            let mut p = normal();
+            p.level[l.index()] = 19.0;
+            assert_eq!(p.cause(), Some(TripCause::SteamGeneratorLevelLow(l)));
+            let mut p = normal();
+            p.hot[l.index()] = 344.0;
+            assert_eq!(p.cause(), Some(TripCause::HotLegTemperatureHigh(l)));
+        }
+        let mut p = normal();
+        p.turbine_trip = true;
+        assert_eq!(p.cause(), Some(TripCause::TurbineTrip));
+        p.power = 19.0;
+        assert_eq!(p.cause(), None);
     }
 }
 
