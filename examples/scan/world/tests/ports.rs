@@ -425,10 +425,6 @@ fn banners_from_real_connections_are_kept_once_with_facts() {
             let first: &Banner = &map.banners[0];
             let changes = ports.changes_since(first.revision - 1);
             assert!(changes.banners.contains(first));
-            let (snapshot, delta) = ports.snapshot_with_changes(first.revision - 1);
-            assert_eq!(snapshot, map);
-            assert_eq!(delta, changes);
-            assert_eq!(delta.revision, snapshot.revision);
             fcx.cancel();
             Ok(())
         },

@@ -211,7 +211,7 @@ impl PortMap {
 }
 
 /// Latest versions of rows changed after a revision, sorted as a snapshot.
-/// This is a delta of rows, not a history of every probe or answer.
+/// Each changed row appears once, not once per probe or answer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortChanges {
     /// The requested revision, excluded from these changes.
@@ -231,7 +231,7 @@ pub struct PortChanges {
 }
 
 impl PortChanges {
-    /// Compact JSON bound for deltas produced by [`Ports`].
+    /// Compact JSON bound for changes produced by [`Ports::changes_since`].
     pub const MAX_JSON_BYTES: usize =
         r#"{"from_revision":18446744073709551615,"revision":18446744073709551615,"at_ms":18446744073709551615,"untracked":18446744073709551615,"untracked_banners":18446744073709551615,"rows":[],"banners":[]}"#.len()
         + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
@@ -256,13 +256,6 @@ impl Ports {
     /// At or past the current revision, the rows are empty.
     pub fn changes_since(&self, revision: u64) -> PortChanges {
         self.0.lock().changes_since(revision)
-    }
-
-    /// Copies the complete map and the changes since `revision` under one
-    /// lock, so the changes lead exactly to that snapshot.
-    pub fn snapshot_with_changes(&self, revision: u64) -> (PortMap, PortChanges) {
-        let tracker = self.0.lock();
-        (tracker.snapshot(), tracker.changes_since(revision))
     }
 
     pub(crate) fn tap(&self, fcx: &Cx, direction: Direction, packet: &Packet) -> bool {
