@@ -1,5 +1,6 @@
 //! Bounded search and page state for a run observer.
 
+use crate::pages::GeneratorKind;
 use crate::route::Engine;
 use example_common::events::js;
 use fictionet::events::{Event, Interest, Observation, Observer, Stamp};
@@ -60,23 +61,6 @@ impl SeedCard {
             sites: seed.sites.iter().map(|s| s.host.clone()).collect(),
         }
     }
-}
-/// What makes the world's content.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GeneratorKind {
-    /// Deterministic placeholder content.
-    Stub,
-    /// Models served by OpenRouter.
-    Openrouter,
-    /// Models served by Anthropic.
-    Anthropic,
-    /// Previously stored content.
-    Replay,
-    /// An absent or unrecognized generator.
-    #[default]
-    #[serde(other)]
-    Unknown,
 }
 /// The generator settings for a run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,7 +406,7 @@ impl Searches {
             SeedCard::of(pages.seed()),
             Generator {
                 kind: pages.generator_kind(),
-                model: pages.model().into(),
+                model: pages.model(),
                 prefetch: pages.prefetch() as u64,
                 generate: pages.generation().generate,
                 ..Generator::default()

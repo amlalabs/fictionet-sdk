@@ -82,12 +82,12 @@ impl Drop for Dir {
 fn on_disk(
     dir: &Path,
     seed: Seed,
-    generator: Option<Generator>,
+    maker: Option<Maker>,
     prefetch: usize,
 ) -> Result<Arc<Pages>, String> {
-    let identity = generator.as_ref().map(Generator::identity);
+    let identity = maker.as_ref().map(Maker::identity);
     let (store, _) = Store::open(&dir.join(&seed.name), &seed, identity.as_ref())?;
-    Ok(Arc::new(Pages::open(seed, store, generator, prefetch)))
+    Ok(Arc::new(Pages::open(seed, store, maker, prefetch)))
 }
 
 /// The result links and titles of a Google results page.
@@ -760,7 +760,7 @@ fn mentions_reserve_titles_and_keep_creation_order() {
 fn replay_serves_the_store_and_nothing_new() {
     let dir = Dir::new("replay");
     let (search, page) = {
-        let pages = on_disk(&dir.0, seed(), Some(Generator::Stub), 0).unwrap();
+        let pages = on_disk(&dir.0, seed(), Some(Maker::Stub), 0).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         lab(|cx| async move {
             let s = pages
@@ -839,7 +839,7 @@ fn worlds_sharing_a_store_make_each_list_and_page_once() {
         .iter()
         .map(|fake| {
             let model = openrouter(fake.clone());
-            on_disk(&dir.0, seed(), Some(Generator::Model(model)), 0).unwrap()
+            on_disk(&dir.0, seed(), Some(Maker::Model(model)), 0).unwrap()
         })
         .collect();
     lab(move |cx| async move {
@@ -909,12 +909,12 @@ fn fixed_snapshots_survive_changed_and_deleted_sources() {
         });
         rx.recv().unwrap()
     };
-    let first = fetch(on_disk(&dir.0, load(), Some(Generator::Stub), 0).unwrap());
+    let first = fetch(on_disk(&dir.0, load(), Some(Maker::Stub), 0).unwrap());
     assert_eq!(first.3, "fixed");
     // A restarted world serves the captured bytes, whatever the source says now.
     std::fs::write(&file, "a changed advisory").unwrap();
     assert_eq!(
-        fetch(on_disk(&dir.0, load(), Some(Generator::Stub), 0).unwrap()),
+        fetch(on_disk(&dir.0, load(), Some(Maker::Stub), 0).unwrap()),
         first
     );
     std::fs::remove_file(&file).unwrap();
@@ -930,7 +930,7 @@ fn fixed_snapshots_survive_changed_and_deleted_sources() {
     // Replay never captures a fixed page it has not seen.
     let fresh = Dir::new("fixed-unseen");
     {
-        on_disk(&fresh.0, load_with(&source), Some(Generator::Stub), 0).unwrap();
+        on_disk(&fresh.0, load_with(&source), Some(Maker::Stub), 0).unwrap();
     }
     let unseen = fetch(on_disk(&fresh.0, replay_seed(), None, 0).unwrap());
     assert_eq!((unseen.0, unseen.3), (404, json!("missing")));
@@ -959,8 +959,8 @@ fn binary_and_empty_fixed_bodies_round_trip() {
         seed.fixed[0].content_type = "application/octet-stream".into();
         let url = seed.fixed[0].url.clone();
         let host = seed.fixed[0].host.clone();
-        for generator in [Some(Generator::Stub), None] {
-            let pages = on_disk(&dir.0, seed.clone(), generator, 0).unwrap();
+        for maker in [Some(Maker::Stub), None] {
+            let pages = on_disk(&dir.0, seed.clone(), maker, 0).unwrap();
             let (url, body, host) = (url.clone(), body.clone(), host.clone());
             lab(|cx| async move {
                 let page = get(&pages, &cx, &url).await;
@@ -974,6 +974,18 @@ fn binary_and_empty_fixed_bodies_round_trip() {
                 Ok(())
             });
         }
+    }
+}
+
+#[test]
+fn each_generator_kind_has_one_name() {
+    let all: Vec<_> = GeneratorKind::ALL.iter().map(names::name).collect();
+    assert_eq!(all, ["stub", "openrouter", "anthropic", "replay"]);
+    for kind in GeneratorKind::ALL {
+        assert_eq!(names::parse(&names::name(&kind)), Some(kind));
+    }
+    for text in ["", "Stub", "OpenRouter", "model", "other"] {
+        assert_eq!(names::parse::<GeneratorKind>(text), None, "{text:?}");
     }
 }
 
@@ -994,7 +1006,7 @@ fn a_store_answers_only_for_its_seed_and_generator() {
         json!({"provider": "anthropic", "model": "some/model", "reasoning": "low"}),
         model("other/model", "low"),
         model("some/model", "high"),
-        Generator::Stub.identity(),
+        Maker::Stub.identity(),
     ] {
         let error = Store::open(&dir.0, &seed, Some(&other)).err().unwrap();
         assert!(
@@ -1047,7 +1059,7 @@ fn stores_of_another_format_and_empty_replays_are_refused() {
     let legacy = dir.0.join("legacy");
     std::fs::create_dir_all(legacy.join("pages")).unwrap();
     std::fs::write(legacy.join("@store.json"), "{}").unwrap();
-    let error = Store::open(&legacy, &seed, Some(&Generator::Stub.identity()))
+    let error = Store::open(&legacy, &seed, Some(&Maker::Stub.identity()))
         .err()
         .unwrap();
     assert!(
@@ -1055,7 +1067,7 @@ fn stores_of_another_format_and_empty_replays_are_refused() {
         "{error}"
     );
     let fresh = dir.0.join("fresh");
-    Store::open(&fresh, &seed, Some(&Generator::Stub.identity())).unwrap();
+    Store::open(&fresh, &seed, Some(&Maker::Stub.identity())).unwrap();
     let path = fresh.join("store.json");
     let mut identity: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     identity["version"] = json!(999);
@@ -1084,7 +1096,7 @@ fn model_world(dir: &Dir, script: &Arc<Script>, prefetch: usize) -> (Arc<Pages>,
     let pages = on_disk(
         &dir.0,
         seed(),
-        Some(Generator::Model(openrouter(fake.clone()))),
+        Some(Maker::Model(openrouter(fake.clone()))),
         prefetch,
     )
     .unwrap();
@@ -1494,7 +1506,7 @@ fn listed_ranks_follow_display_order_after_duplicates() {
         completion(10, answer, Some(0.001)),
         completion(10, PAGE, Some(0.001)),
     ]);
-    let pages = on_disk(&dir.0, seed(), Some(Generator::Model(openrouter(fake))), 0).unwrap();
+    let pages = on_disk(&dir.0, seed(), Some(Maker::Model(openrouter(fake))), 0).unwrap();
     no_cast(&pages);
     lab(|cx| async move {
         let search = google(&pages, &cx, "stories").await;
@@ -1535,7 +1547,7 @@ fn a_search_and_a_page_publish_one_title() {
                 completion(50, page, Some(0.001))
             }
         });
-        let pages = on_disk(&dir.0, seed(), Some(Generator::Model(openrouter(fake))), 0).unwrap();
+        let pages = on_disk(&dir.0, seed(), Some(Maker::Model(openrouter(fake))), 0).unwrap();
         no_cast(&pages);
         lab(|cx| async move {
             let (search_tx, search_rx) = tokio::sync::oneshot::channel();
@@ -1603,7 +1615,7 @@ fn competing_searches_publish_one_title() {
             completion(10, PAGE, Some(0.001))
         }
     });
-    let pages = on_disk(&dir.0, seed(), Some(Generator::Model(openrouter(fake))), 0).unwrap();
+    let pages = on_disk(&dir.0, seed(), Some(Maker::Model(openrouter(fake))), 0).unwrap();
     no_cast(&pages);
     lab(|cx| async move {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1642,7 +1654,7 @@ fn competing_searches_publish_one_title() {
 /// A page made by `fake` alone, without a cast, and its generation rows.
 fn ledger_page(name: &str, fake: Arc<Fake>) -> (Response, Vec<Value>, Option<PageRecord>) {
     let dir = Dir::new(name);
-    let pages = on_disk(&dir.0, seed(), Some(Generator::Model(openrouter(fake))), 0).unwrap();
+    let pages = on_disk(&dir.0, seed(), Some(Maker::Model(openrouter(fake))), 0).unwrap();
     no_cast(&pages);
     let world = pages.clone();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1821,7 +1833,7 @@ fn an_unreadable_answer_then_transport_failures_count_every_attempt() {
 fn a_permanent_error_is_not_retried() {
     let dir = Dir::new("ledger-cast");
     let fake = Fake::script(vec![http_error(100, 401)]);
-    let pages = on_disk(&dir.0, seed(), Some(Generator::Model(openrouter(fake))), 0).unwrap();
+    let pages = on_disk(&dir.0, seed(), Some(Maker::Model(openrouter(fake))), 0).unwrap();
     lab(|cx| async move {
         assert!(pages.cast(&cx).await.is_err());
         Ok(())

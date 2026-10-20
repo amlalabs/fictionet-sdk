@@ -1,4 +1,5 @@
-use adaptive_web_world::pages::{Pages, Seed, store::Store};
+use adaptive_web_world::pages::model::Provider;
+use adaptive_web_world::pages::{GeneratorKind, Pages, Seed, store::Store};
 use adaptive_web_world::route::Engine;
 use adaptive_web_world::search::*;
 use example_common::events::field;
@@ -527,7 +528,7 @@ fn worst_case_snapshot_fits() {
         at_ms: n,
         seed,
         generator: Generator {
-            kind: GeneratorKind::Openrouter,
+            kind: GeneratorKind::Model(Provider::OpenRouter),
             model: t,
             prefetch: n,
             generate: false,

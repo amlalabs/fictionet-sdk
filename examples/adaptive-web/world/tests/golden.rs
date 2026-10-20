@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use adaptive_web_world::pages::render::google_results;
 use adaptive_web_world::pages::text::{escape, target_of};
-use adaptive_web_world::pages::{Generator, Pages, Seed, store::Store};
+use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed, store::Store};
 use adaptive_web_world::{Addresses, Ca, serve, world_start};
 use bytes::Bytes;
 use example_common::log::Log;
@@ -108,11 +108,11 @@ fn the_log_is_the_recorded_one() {
     seed.date = "2026-09-30".into();
     let fixed_pages: Vec<String> = seed.fixed.iter().map(|f| f.url.clone()).collect();
     let root = base.join("store").join(&seed.name);
-    let (store, _) = Store::open(&root, &seed, Some(&Generator::Stub.identity())).unwrap();
+    let (store, _) = Store::open(&root, &seed, Some(&Maker::Stub.identity())).unwrap();
     let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), Some(&root)).unwrap());
     let start = world_start(&seed.date).unwrap();
     let ca_dir = base.join("ca");
-    let pages = Arc::new(Pages::open(seed, store, Some(Generator::Stub), 0));
+    let pages = Arc::new(Pages::open(seed, store, Some(Maker::Stub), 0));
     let searches = Arc::new(adaptive_web_world::search::Searches::of(&pages));
     let log_path = base.join("log.jsonl");
     let log = Arc::new(Log::new(
@@ -133,10 +133,7 @@ fn the_log_is_the_recorded_one() {
             .iter()
             .any(|h| h == "www.halvardsystems.com")
     );
-    assert_eq!(
-        initial.generator.kind,
-        adaptive_web_world::search::GeneratorKind::Stub
-    );
+    assert_eq!(initial.generator.kind, GeneratorKind::Stub);
     assert_eq!(initial.generator.model, "stub");
     assert_eq!(initial.generator.prefetch, 0);
     let projection = searches.clone();

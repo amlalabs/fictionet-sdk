@@ -23,10 +23,11 @@
 //! lock per URL, so a search and a request for the page publish one title.
 //! Worlds sharing a store share these locks too (see [`store`]).
 //!
-//! [`Generator::Stub`] makes everything offline and deterministically;
-//! [`Generator::Model`] asks a model. Without a generator nothing new is
-//! made: a URL the store does not hold is a 404, and a query it does not
-//! hold has no results. The same holds while generation is turned off.
+//! [`Maker::Stub`] makes everything offline and deterministically;
+//! [`Maker::Model`] asks a model. Without a maker
+//! ([`GeneratorKind::Replay`]) nothing new is made: a URL the store does
+//! not hold is a 404, and a query it does not hold has no results. The
+//! same holds while generation is turned off.
 
 pub mod make;
 pub mod meta;
@@ -42,11 +43,12 @@ pub use seed::Seed;
 
 use crate::files::FileLock;
 use crate::route::{Engine, Route, query_key, route};
-use crate::search::{Cache, GeneratorKind, Reason};
+use crate::search::{Cache, Reason};
+use example_common::names;
 use fictionet::Cx;
 use fictionet::events::Fields;
 use meta::{Asked, Listing, Shown};
-use model::{Failure, Ledger, Model, Usage};
+use model::{Failure, Ledger, Model, Provider, Usage};
 use prompts::{Claim, HostPage, Person};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -159,15 +161,39 @@ impl Response {
     }
 }
 
+/// What makes new pages, as `ADAPTIVE_WEB_GENERATOR` names it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratorKind {
+    /// The offline generator ([`make`]).
+    #[default]
+    Stub,
+    /// Nothing new: the world serves what its store holds.
+    Replay,
+    /// A model, named by its provider.
+    #[serde(untagged)]
+    Model(Provider),
+}
+
+impl GeneratorKind {
+    /// Every kind.
+    pub const ALL: [Self; 4] = [
+        Self::Stub,
+        Self::Model(Provider::OpenRouter),
+        Self::Model(Provider::Anthropic),
+        Self::Replay,
+    ];
+}
+
 /// What makes new result lists and pages.
-pub enum Generator {
+pub enum Maker {
     /// The offline generator ([`make`]).
     Stub,
     /// A model ([`model`]).
     Model(Model),
 }
 
-impl Generator {
+impl Maker {
     /// What a store made with this generator records.
     pub fn identity(&self) -> Value {
         match self {
@@ -334,7 +360,7 @@ struct PageAsk {
 /// The world's pages: its seed, its store and what makes new pages.
 pub struct Pages {
     seed: Seed,
-    generator: Option<Generator>,
+    maker: Option<Maker>,
     prefetch: usize,
     store: Mutex<Store>,
     locks: Locks,
@@ -343,26 +369,21 @@ pub struct Pages {
 impl Pages {
     /// An in-memory world with the offline generator.
     pub fn new(seed: Seed) -> Self {
-        Self::open(seed, Store::memory(), Some(Generator::Stub), 0)
+        Self::open(seed, Store::memory(), Some(Maker::Stub), 0)
     }
 
-    /// A world on `store` that makes new pages with `generator`, or serves
+    /// A world on `store` that makes new pages with `maker`, or serves
     /// only the store's with none. Each new result list starts making the
     /// pages behind its first `prefetch` results ahead of time.
-    pub fn open(
-        seed: Seed,
-        mut store: Store,
-        generator: Option<Generator>,
-        prefetch: usize,
-    ) -> Self {
-        store.generation.generate = generator.is_some();
+    pub fn open(seed: Seed, mut store: Store, maker: Option<Maker>, prefetch: usize) -> Self {
+        store.generation.generate = maker.is_some();
         let locks = Locks {
             local: Mutex::default(),
             dir: store.root().map(|root| root.join("locks")),
         };
         Self {
             seed,
-            generator,
+            maker,
             prefetch,
             store: Mutex::new(store),
             locks,
@@ -374,24 +395,20 @@ impl Pages {
         &self.seed
     }
 
-    /// The model that makes new pages: `stub`, a model's name, or `replay`
-    /// when nothing new is made.
-    pub fn model(&self) -> &str {
-        match &self.generator {
-            Some(Generator::Stub) => "stub",
-            Some(Generator::Model(model)) => &model.model,
-            None => "replay",
+    /// The model that makes new pages, or the kind's name (`stub`,
+    /// `replay`) when no model does.
+    pub fn model(&self) -> String {
+        match &self.maker {
+            Some(Maker::Model(model)) => model.model.clone(),
+            _ => names::name(&self.generator_kind()),
         }
     }
 
-    /// What makes new pages, or `Replay` when nothing new is made.
+    /// What makes new pages.
     pub fn generator_kind(&self) -> GeneratorKind {
-        match &self.generator {
-            Some(Generator::Stub) => GeneratorKind::Stub,
-            Some(Generator::Model(model)) => match model.provider {
-                model::Provider::Anthropic => GeneratorKind::Anthropic,
-                model::Provider::OpenRouter => GeneratorKind::Openrouter,
-            },
+        match &self.maker {
+            Some(Maker::Stub) => GeneratorKind::Stub,
+            Some(Maker::Model(model)) => GeneratorKind::Model(model.provider),
             None => GeneratorKind::Replay,
         }
     }
@@ -410,7 +427,7 @@ impl Pages {
     }
 
     fn generating(&self) -> bool {
-        self.generator.is_some() && self.store().generation.generate
+        self.maker.is_some() && self.store().generation.generate
     }
 
     /// Applies a command against the current revision, without clearing pages.
@@ -542,11 +559,11 @@ impl Pages {
         Ok(())
     }
 
-    fn generator(&self) -> &Generator {
-        self.generator.as_ref().expect("a world that is generating")
+    fn maker(&self) -> &Maker {
+        self.maker.as_ref().expect("a world that is generating")
     }
 
-    /// Runs one generation with `generator`'s offline or model path and
+    /// Runs one generation with the maker's offline or model path and
     /// writes its rows. `context` names it in `generations.jsonl`.
     async fn generate<T>(
         &self,
@@ -556,8 +573,8 @@ impl Pages {
         prompt: impl FnOnce() -> (String, String, u32),
         read: impl Fn(&str) -> Result<T, prompts::Unreadable>,
     ) -> Result<Made<T>, Stop> {
-        match self.generator() {
-            Generator::Stub => {
+        match self.maker() {
+            Maker::Stub => {
                 let started = cx.now().since_start();
                 let fields = stub();
                 let ms = (cx.now().since_start() - started).as_millis() as u64;
@@ -571,7 +588,7 @@ impl Pages {
                 self.log(&[row])?;
                 Ok(Made { fields, usage })
             }
-            Generator::Model(model) => {
+            Maker::Model(model) => {
                 let (system, user, max_tokens) = prompt();
                 let (answer, ledger): (_, Ledger) =
                     model.ask(cx, &system, &user, max_tokens, read).await;

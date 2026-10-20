@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use adaptive_web_world::pages::model::{self, Https, Key, Model, Provider};
+use adaptive_web_world::pages::model::{self, Https, Key, Model};
 use adaptive_web_world::pages::store::Store;
-use adaptive_web_world::pages::{Generator, Pages, Seed};
+use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed};
 use adaptive_web_world::{Addresses, Ca, GATEWAY, serve, world_start};
 use example_common::args::{args, secs};
 use example_common::log::Log;
@@ -45,13 +45,6 @@ fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_default()
 }
 
-/// What makes new pages, as the environment names it.
-enum Kind {
-    Stub,
-    Model(Provider, Key),
-    Replay,
-}
-
 fn real_main() -> fictionet::Result {
     let args = args().map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
@@ -63,19 +56,20 @@ fn real_main() -> fictionet::Result {
         return Err(fictionet::Error::msg("ADAPTIVE_WEB_SEED is not set"));
     }
     let kind = match var("ADAPTIVE_WEB_GENERATOR").as_str() {
-        "" | "stub" => Kind::Stub,
-        "replay" => Kind::Replay,
-        other => {
-            let provider = names::parse::<Provider>(other).ok_or_else(|| {
-                fictionet::Error::msg(format!(
-                    "ADAPTIVE_WEB_GENERATOR must be stub, openrouter, anthropic or replay, not {other:?}"
-                ))
-            })?;
-            Kind::Model(
-                provider,
-                Key::from_env(provider).map_err(fictionet::Error::msg)?,
-            )
+        "" => GeneratorKind::default(),
+        text => names::parse(text).ok_or_else(|| {
+            let kinds: Vec<_> = GeneratorKind::ALL.iter().map(names::name).collect();
+            fictionet::Error::msg(format!(
+                "ADAPTIVE_WEB_GENERATOR must be one of {}, not {text:?}",
+                kinds.join(", ")
+            ))
+        })?,
+    };
+    let key = match kind {
+        GeneratorKind::Model(provider) => {
+            Some(Key::from_env(provider).map_err(fictionet::Error::msg)?)
         }
+        GeneratorKind::Stub | GeneratorKind::Replay => None,
     };
     let path = if Path::new(&name).is_file() {
         PathBuf::from(&name)
@@ -85,7 +79,7 @@ fn real_main() -> fictionet::Result {
     };
     // Replay serves the bytes the store captured, never the seed's files.
     let seed = match kind {
-        Kind::Replay => {
+        GeneratorKind::Replay => {
             let text = std::fs::read_to_string(&path)?;
             let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&name);
             Seed::parse(name, &text, |_| Ok(Vec::new()))?
@@ -94,14 +88,14 @@ fn real_main() -> fictionet::Result {
             .map_err(|e| fictionet::Error::msg(format!("{}: {e}", path.display())))?,
     };
     let (model, reasoning) = (var("ADAPTIVE_WEB_MODEL"), var("ADAPTIVE_WEB_REASONING"));
-    let identity = match &kind {
-        Kind::Stub => Some(Generator::Stub.identity()),
-        Kind::Model(provider, _) => Some(model::identity(*provider, &model, &reasoning)),
-        Kind::Replay => None,
+    let identity = match kind {
+        GeneratorKind::Stub => Some(Maker::Stub.identity()),
+        GeneratorKind::Model(provider) => Some(model::identity(provider, &model, &reasoning)),
+        GeneratorKind::Replay => None,
     };
-    let prefetch = match (&kind, var("ADAPTIVE_WEB_PREFETCH").as_str()) {
-        (Kind::Replay, _) => 0,
-        (Kind::Model(..), "") => 3,
+    let prefetch = match (kind, var("ADAPTIVE_WEB_PREFETCH").as_str()) {
+        (GeneratorKind::Replay, _) => 0,
+        (GeneratorKind::Model(_), "") => 3,
         (_, "") => 0,
         (_, n) => n.parse().map_err(|e| {
             fictionet::Error::msg(format!("ADAPTIVE_WEB_PREFETCH must be a count: {e}"))
@@ -145,17 +139,18 @@ fn real_main() -> fictionet::Result {
         })),
     )?;
     let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
-        let generator = match kind {
-            Kind::Stub => Some(Generator::Stub),
-            Kind::Model(provider, key) => {
+        let maker = match (kind, key) {
+            (GeneratorKind::Stub, _) => Some(Maker::Stub),
+            (GeneratorKind::Model(provider), Some(key)) => {
                 let https = Arc::new(Https::new(&fcx, provider)?);
-                Some(Generator::Model(Model::new(
+                Some(Maker::Model(Model::new(
                     provider, &model, &reasoning, key, https,
                 )))
             }
-            Kind::Replay => None,
+            (GeneratorKind::Model(_), None) => unreachable!("a model's key is read above"),
+            (GeneratorKind::Replay, _) => None,
         };
-        let pages = Arc::new(Pages::open(seed, store, generator, prefetch));
+        let pages = Arc::new(Pages::open(seed, store, maker, prefetch));
         let seed = pages.seed();
         let fixed: std::collections::BTreeMap<_, _> = seed
             .fixed_addresses()
