@@ -1,6 +1,6 @@
 // Interaction with the Fictionet dashboard's graph: selection and search,
 // opening and closing groups, dragging, pan and zoom, tooltips, and the
-// places and open groups the viewer keeps per world. app.mjs passes in the
+// places and open groups the viewer keeps per world. components/map.mjs passes in the
 // state and view and the layout's steps, and moves the view's glide on
 // once a frame with `stepTween`.
 

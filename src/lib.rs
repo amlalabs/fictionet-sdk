@@ -251,11 +251,12 @@
 //!
 //! Install `fictionet_observe::DashboardObserver` in [`RunOptions`] before
 //! execution. It consumes all four streams and owns their bounded retention.
-//! Serve its handle on a private observation socket for `fictionet dashboard`
-//! and `fictionet observe`, using `--observation unix:PATH`. The attachment
-//! socket carries sandbox traffic. Late clients see retained history.
+//! A world shows its own page with `fictionet_observe::page::Page`, and serves
+//! the handle on a private observation socket for `fictionet observe`, using
+//! `--observation unix:PATH`. The attachment socket carries sandbox traffic.
+//! Late clients see retained history.
 //!
-//! The dashboard draws tasks and groups with host context from topology and
+//! The page draws tasks and groups with host context from topology and
 //! decodes captured packets. It can decrypt TLS 1.3 when instrumented endpoints
 //! emit the needed keys. `fictionet observe` prints JSON replies and streams,
 //! or exports packets and keys. The [companion crate](../fictionet_observe/index.html)

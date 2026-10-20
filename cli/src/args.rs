@@ -1,6 +1,6 @@
 //! The flags of `fictionet attach`, parsed by hand, and the `--observation` flag
-//! that `observe` and `dashboard` take. It names the Unix socket a world
-//! serves with `fictionet_observe::serve`.
+//! that `observe` takes. It names the Unix socket a world serves with
+//! `fictionet_observe::serve`.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;

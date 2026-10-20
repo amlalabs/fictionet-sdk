@@ -1,7 +1,7 @@
 import { renderEvents } from './components/events.mjs';
 // The Fictionet dashboard's tables: tooltip contents, the header's counts,
 // the breadcrumb, and the side panel's sections, lists and event rows.
-// app.mjs passes in the state and view, formatting, the graph's rates and
+// components/map.mjs passes in the state and view, formatting, the graph's rates and
 // helpers, and the selection, focus and packet steps the rows link to,
 // and calls `refresh` once a frame.
 

@@ -216,14 +216,6 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
       return;
     }
     if (req.url === '/result') { recordResult(req, res); return; }
-    if (req.url === '/legacy') {
-      res.writeHead(302, {
-        'Set-Cookie': 'fictionet_token=browser-test-token; Path=/; HttpOnly; SameSite=Strict',
-        Location: '/#token=browser-test-token',
-      }).end();
-      return;
-    }
-    if (req.url === '/') res.setHeader('Set-Cookie', 'fictionet_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict');
     if (req.url.endsWith('.mjs') || req.url.endsWith('.css')) {
       res.setHeader('Content-Type', req.url.endsWith('.css') ? 'text/css' : 'text/javascript');
       res.end(await readFile(new URL('.' + req.url, import.meta.url)));
@@ -320,7 +312,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
     '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
     // The throwaway profile must not wait on the desktop keyring, which can be locked.
-    '--password-store=basic', '--use-mock-keychain', `${origin}/legacy`,
+    '--password-store=basic', '--use-mock-keychain', `${origin}/#token=browser-test-token`,
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   browser.stderr.setEncoding('utf8');
@@ -357,8 +349,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
   assert.equal(streams, 2);
   assert.ok(received.some((r) => r.url.startsWith('/api/pcap?')));
   assert.ok(received.some((r) => r.url === '/reload'));
-  assert.equal(received.find((r) => r.url === '/').cookie, 'fictionet_token=browser-test-token');
-  assert.ok(received.every((r) => (r.url === '/' || !r.cookie) && !r.url.includes('browser-test-token')));
+  assert.ok(received.every((r) => !r.cookie && !r.url.includes('browser-test-token')));
   assert.ok(foreign.some((r) => r.url === '/probe'));
   assert.ok(foreign.some((r) => r.url === '/done'));
   assert.ok(foreign.every((r) => !r.cookie && !r.authorization));

@@ -1,6 +1,6 @@
 name: VM demo
 
-# Runs cargo xtask demo web and cargo xtask demo dashboard in the Fictionet VM
+# Runs cargo xtask demo web in the Fictionet VM
 # (cargo xtask vm), the way a newcomer would: Rust, QEMU and KVM on the runner,
 # and nothing else. Started by hand from the Actions tab.
 on:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   web:
-    name: cargo xtask demo web and cargo xtask demo dashboard
+    name: cargo xtask demo web
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -37,8 +37,6 @@ jobs:
           key: vm-debian-${{ hashFiles('xtask/src/vm.rs') }}
       - name: cargo xtask demo web
         run: cargo xtask demo web
-      - name: cargo xtask demo dashboard
-        run: DASHBOARD_SECONDS=5 cargo xtask demo dashboard
       - name: The VM's console, if it failed
         if: failure()
         run: tail -50 .vm/run/console.log .vm/prepare.log || true

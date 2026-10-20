@@ -1,8 +1,8 @@
 # Attach recipes
 
 These small recipes connect ordinary tools to the `web_world` example. Start
-with [`cargo xtask demo dashboard`](../../demos/README.md) for a scripted run and the
-world's retained events, or choose a deployment recipe below.
+with [`cargo xtask demo web`](../../demos/README.md) for a scripted run, or
+choose a deployment recipe below.
 
 `web_world` takes an optional third path after the attachment socket and CA
 output. It installs a collector and serves its handle on that observation socket:

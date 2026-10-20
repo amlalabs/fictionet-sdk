@@ -1,7 +1,7 @@
 // The Fictionet dashboard's graph view: what is drawn for the state
 // (`derive`), the SVG of each drawn item, edge and open group's frame, the
 // rings that mark events, and the packets that move along the edges.
-// app.mjs passes in the state and view, the layout's edge paths and
+// components/map.mjs passes in the state and view, the layout's edge paths and
 // frames, and the selection, drag, tooltip and packet steps the drawing
 // hooks up, and calls `draw` once a frame.
 
@@ -382,7 +382,7 @@ export function createGraph({ $, el, hostOverview = false, state, view, reducedM
   }
 
   // ---------------------------------------------------------------------------
-  // The frame loop (app.mjs runs it): items glide to their places, edges
+  // The frame loop (components/map.mjs runs it): items glide to their places, edges
   // follow, packets move.
 
   let dotCount = 0;

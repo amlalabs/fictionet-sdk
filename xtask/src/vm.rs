@@ -235,9 +235,7 @@ impl Vm {
             .into());
         }
         let ssh_port = port(2222)?;
-        let dashboard_port = port(7878)?;
         fs::write(self.path("run/ssh-port"), ssh_port.to_string())?;
-        fs::write(self.path("run/dashboard-port"), dashboard_port.to_string())?;
         let mem = std::env::var("VM_MEM").unwrap_or_else(|_| "5G".into());
         let mut command = cmd("qemu-system-x86_64", &[]);
         if std::env::var("VM_SCOPE").as_deref() != Ok("0") {
@@ -280,12 +278,49 @@ impl Vm {
                 );
             }
         }
-        command.args(["-name", "fictionet-vm", "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", &std::env::var("VM_CPUS").unwrap_or_else(|_| "4".into()), "-m", &mem,
-            "-nodefaults", "-display", "none", "-vga", "std", "-serial", &format!("file:{}", self.path("run/console.log").display()),
-            "-drive", &format!("if=none,id=root,file={},format=qcow2,cache={mode},discard=unmap", disk.display()), "-device", "virtio-blk-pci,drive=root,bootindex=0",
-            "-drive", &format!("if=none,id=cache,file={},format=qcow2,cache=writeback,discard=unmap", cache.display()), "-device", "virtio-blk-pci,drive=cache,serial=fncache",
-            "-netdev", &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22,hostfwd=tcp:127.0.0.1:{dashboard_port}-:7878"), "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:f1:c7:01", "-device", "virtio-rng-pci", "-pidfile"])
-            .arg(self.path("run/qemu.pid")).arg("-daemonize");
+        command
+            .args([
+                "-name",
+                "fictionet-vm",
+                "-machine",
+                "q35,accel=kvm",
+                "-cpu",
+                "host",
+                "-smp",
+                &std::env::var("VM_CPUS").unwrap_or_else(|_| "4".into()),
+                "-m",
+                &mem,
+                "-nodefaults",
+                "-display",
+                "none",
+                "-vga",
+                "std",
+                "-serial",
+                &format!("file:{}", self.path("run/console.log").display()),
+                "-drive",
+                &format!(
+                    "if=none,id=root,file={},format=qcow2,cache={mode},discard=unmap",
+                    disk.display()
+                ),
+                "-device",
+                "virtio-blk-pci,drive=root,bootindex=0",
+                "-drive",
+                &format!(
+                    "if=none,id=cache,file={},format=qcow2,cache=writeback,discard=unmap",
+                    cache.display()
+                ),
+                "-device",
+                "virtio-blk-pci,drive=cache,serial=fncache",
+                "-netdev",
+                &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
+                "-device",
+                "virtio-net-pci,netdev=net0,mac=52:54:00:f1:c7:01",
+                "-device",
+                "virtio-rng-pci",
+                "-pidfile",
+            ])
+            .arg(self.path("run/qemu.pid"))
+            .arg("-daemonize");
         if let Some(seed) = seed {
             command.args([
                 "-drive",
@@ -523,10 +558,9 @@ impl Vm {
             format!("{:.1}", start.elapsed().as_secs_f64()),
         )?;
         eprintln!(
-            "The VM is up in {:.1} s: SSH on 127.0.0.1:{}, dashboard on 127.0.0.1:{}",
+            "The VM is up in {:.1} s: SSH on 127.0.0.1:{}",
             start.elapsed().as_secs_f64(),
-            self.read("run/ssh-port")?,
-            self.read("run/dashboard-port")?
+            self.read("run/ssh-port")?
         );
         Ok(())
     }
@@ -691,9 +725,8 @@ pub fn run(args: &[String]) -> Result {
         "status" => {
             if let Some(pid) = vm.pid() {
                 println!(
-                    "running: pid {pid}, SSH on 127.0.0.1:{}, dashboard on 127.0.0.1:{}",
-                    vm.read("run/ssh-port")?,
-                    vm.read("run/dashboard-port")?
+                    "running: pid {pid}, SSH on 127.0.0.1:{}",
+                    vm.read("run/ssh-port")?
                 );
             } else {
                 println!("not running");

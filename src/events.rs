@@ -76,8 +76,9 @@
 //! [Fictionet Observe](../../fictionet_observe/index.html) owns those consumers:
 //! `Memory` and `Aggregate` for grading, `Jsonl` for files, `Collector` for
 //! bounded collection, and `DashboardObserver` for dashboard requests.
-//! Serve its handle on an observation socket for `fictionet dashboard` and
-//! `fictionet observe`. Late clients see what the installed consumer kept.
+//! A world's page reads its handle in process; serve the handle on an
+//! observation socket for `fictionet observe`. Late clients see what the
+//! installed consumer kept.
 //!
 //! ```
 //! use std::sync::Arc;

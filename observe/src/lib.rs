@@ -4,57 +4,12 @@
 //!
 //! The integrator installs a [`DashboardObserver`] before starting the run.
 //! It owns a [`Collector`] and gives callers a [`DashboardHandle`]. The handle
-//! works before, during and after the run. For external clients, [`serve`]
-//! exposes it on an observation socket. The world socket serves attachments.
-//!
-//! With the observation socket at `/run/fictionet/observe.sock`, start the
-//! browser server with a private token file:
-//!
-//! ```sh
-//! (umask 077; openssl rand -hex 32 > /run/fictionet/dashboard-token)
-//! fictionet dashboard --observation unix:/run/fictionet/observe.sock --token-file /run/fictionet/dashboard-token
-//! ```
-//!
-//! Open `http://127.0.0.1:7878/#token=<token>` with the file's token.
-//! Percent-encode URL punctuation. The page removes the fragment immediately.
-//! It calls `/api/bootstrap` with `Authorization: Bearer <token>`.
-//! Bootstrap succeeds once per dashboard process and sets no cookie.
-//! The browser stores the token in `sessionStorage`, scoped to this origin
-//! and tab. Reloading keeps it. Opening the bootstrap URL in the same tab
-//! also keeps the session if the stored token matches.
-//!
-//! Log out or close the tab to clear the stored token. Restart the dashboard
-//! to reuse a consumed bootstrap URL. Logout cancels requests and streams.
-//! It does not revoke the file token for scripts or other signed-in tabs.
-//! An authorization failure stops requests, clears the stored token and
-//! closes the packet drawer. After signing in again, reopen the drawer.
-//!
-//! The static app shell is public and contains no world data. It expires
-//! the `fictionet_token` cookie. Every API call, stream and download requires
-//! the bearer header, including `/api/keylog` from loopback. Cookies and query
-//! tokens do not authenticate. The browser uses fetch, omits cookies and
-//! refuses redirects. It sends credentials only to fixed API paths at its
-//! own origin. A service on another port receives no dashboard credential.
-//! Scripts can send the same bearer header directly.
-//!
-//! The dashboard serves one HTTP/1.0 or HTTP/1.1 GET request per connection.
-//! The target must start with `/`. The head is limited to 16 KiB, including
-//! the first `\r\n\r\n`. Bytes after it cannot supply headers or another
-//! request. Invalid request lines and headers close the connection.
-//! Repeated `Host`, `Authorization`, `Cookie`, `Origin` or `Sec-Fetch-Site`
-//! fields are rejected. `Transfer-Encoding` is rejected. `Content-Length`
-//! may occur only once and must be zero.
-//!
-//! `Host` must name `localhost`, a loopback IP or the bound IP. A wildcard
-//! bind accepts any IP literal. Other hostnames are rejected. If supplied,
-//! `Sec-Fetch-Site` must be `same-origin` or `none`. An `Origin` must have the
-//! same authority as `Host`. Scripts may omit both origin headers.
-//! Responses disable caching and MIME sniffing, set `Referrer-Policy: no-referrer`,
-//! and use a content security policy that restricts assets to the app's origin
-//! and prevents framing.
-//!
-//! The dashboard embeds its web assets in the CLI binary. It forwards requests
-//! to the observation socket and streams results to the browser:
+//! works before, during and after the run. A world shows it in a browser with
+//! its own page: [`page::Page`] serves the handle from the same process on a
+//! loopback port, and its module docs cover sign-in and access rules. For
+//! external clients, [`serve`] exposes the handle on an observation socket,
+//! which `fictionet observe` reads from a shell. The world socket serves
+//! attachments.
 //!
 //! <style>.fn-observe > svg {display:block;width:100%;max-width:840px;min-width:560px;height:auto}</style>
 //! <div class="fn-observe" style="overflow-x:auto;margin:1.25em 0">
@@ -169,12 +124,11 @@
 //! counts. Click a task for its spawn location, links and events.
 //! Click a link for packets, with source, destination, protocol and summary.
 //! Select a packet for its layers and bytes. Selecting a field marks its bytes.
-//! **Capture for Wireshark** downloads the kept packets as pcapng.
+//! **pcapng** downloads the kept packets for Wireshark.
 //!
 //! Drag a box, or an open group's name, to move it. The lines follow and
-//! other boxes keep out of its way. The browser remembers positions and open
-//! groups for each world. Double-click the background or press the round arrow
-//! to lay out the drawing again.
+//! other boxes keep out of its way. Double-click the background or press the
+//! round arrow to lay out the drawing again.
 //!
 //! # Groups
 //!
@@ -208,7 +162,7 @@
 //!
 //! A closed group is one box with a stack of cards behind it. Internal links
 //! are hidden. Links to the same outer box become one line with summed counts.
-//! Clicking it opens packets from its links in time order. The drawer chooses
+//! Clicking it opens packets from its links in time order. The list chooses
 //! at most the 32 busiest links and labels that choice. Its capture download
 //! contains one pcapng section per selected link.
 //!
@@ -345,13 +299,13 @@
 //! A separate copy cursor distinguishes eviction from sampling gaps.
 //!
 //! A watch decodes kept copies in order. All subscribers to a link share its
-//! decoder and rows. The drawer shows sampling, capture eviction and subscriber
+//! decoder and rows. The packet list shows sampling, capture eviction and subscriber
 //! overruns separately. Its totals count reports in the loaded history;
 //! evicted rows may have carried other reports. Pausing and browser queue
 //! trimming do not clear those totals.
 //!
 //! Selecting a packet clears the preceding layers and bytes while it loads.
-//! Only that selection can fill them. Closing or reopening the drawer, or
+//! Only that selection can fill them. Closing or reopening the packet list, or
 //! reconnecting its stream, cancels pending detail requests. If a detail request
 //! fails, both views clear. Select the packet again to retry.
 //! A reconnect clears rows, queued packets, loss totals and selected detail,
@@ -422,8 +376,8 @@
 //! The integrator chooses whether to expose a [`DashboardHandle`]. On Unix,
 //! [`serve`] creates the socket in a temporary directory with mode `0700`,
 //! sets the socket to `0600`, then publishes it at the requested path.
-//! File permissions control access. Keep the observation socket and dashboard
-//! token outside the sandbox. The sandbox's simulated network does not reach
+//! File permissions control access. Keep the observation socket and the
+//! page's address outside the sandbox. The sandbox's simulated network does not reach
 //! this Unix socket, but sharing its filesystem can expose it.
 //!
 //! The world socket carries attachments only. An attach-protocol hello with
@@ -433,10 +387,9 @@
 //! to people and programs trusted with those contents. Requests can change
 //! capture demand, but do not command the world.
 //!
-//! The dashboard binds to `127.0.0.1:7878` by default. `--listen <ip:port>`
-//! chooses another address. HTTP carries the token in plaintext; use loopback
-//! or a trusted TLS tunnel. Containers in a Kubernetes pod share loopback,
-//! so a loopback bind does not isolate the dashboard from an agent in that pod.
+//! A world's page binds IPv4 loopback only; [`page`] lists its access rules.
+//! Containers in a Kubernetes pod share loopback, so a loopback bind does not
+//! isolate the page from an agent in that pod.
 //!
 //! # What it costs
 //!
@@ -500,7 +453,7 @@
 //! `too many observation sessions`. Admission reserves a slot before acceptance;
 //! disconnect or failed thread creation frees it. [`Endpoint::set_session_limit`]
 //! changes admission for that endpoint and preserves connected sessions.
-//! Zero refuses further sessions. The dashboard has its own 64-connection cap.
+//! Zero refuses further sessions. A world's page has its own 64-connection cap.
 //! Attached sandboxes use separate resources.
 //!
 //! Each [`Session`] may hold 64 subscriptions and capture downloads combined.
@@ -732,8 +685,8 @@
 //! Here rows 8 through 11 are missing. `next` is the first retained row, or
 //! the next row number to be assigned if none remain. The cursor advances
 //! past the gap so it is reported once. This applies to `after:0` too.
-//! It counts decoded rows, not copies or sampling omissions. Merged dashboard
-//! streams add `link` to packet and gap data. Pcapng contains retained packet
+//! It counts decoded rows, not copies or sampling omissions. A page's merged
+//! packet streams add `link` to packet and gap data. Pcapng contains retained packet
 //! bytes and keys; these JSON loss counts are not written into that file.
 //!
 //! Packet detail has `seq`, `t`, `side`, `len`, `layers` and `buffers`.
@@ -756,19 +709,18 @@
 //! element-count or nesting-depth limit. Invalid JSON, duplicate envelope
 //! fields, mixed event/error objects, and missing or wrongly typed fields
 //! are not recognized. Binary values are not inspected.
-//! The CLI preserves original bytes. The dashboard forwards original JSON
-//! data as server-sent events, with one `data:` line per JSON line. Event
-//! names with line breaks or the reserved browser name `error` become errors.
+//! `fictionet observe` preserves original bytes. A boundary close differs
+//! from a partial value: the command accepts a boundary close after `ended`,
+//! and a partial value exits with status 1 even after `ended`. Other request
+//! failures also exit with status 1; bad arguments use 2.
 //!
-//! A boundary close differs from a partial value. The CLI accepts a boundary
-//! close after `ended`; a partial value exits with status 1 even after `ended`.
-//! Other request failures also exit with status 1; bad CLI arguments use 2.
-//! The dashboard emits `end` with `the world closed` for a boundary close.
-//! Framing errors and single-stream refusals emit `world_error` with `error`.
-//! Merged refusals emit `link_error` with `link` and `error`; other links
-//! continue until the merged stream ends. The browser displays terminal
-//! reasons without retrying. Transient connection drops reconnect.
-//! Non-stream framing errors return HTTP 502 with JSON.
+//! A world's page forwards original JSON data as server-sent events, with
+//! one `data:` line per JSON line. Event names with line breaks or the
+//! reserved browser name `error` become errors. Single-stream refusals emit
+//! `world_error` with `error`. Merged refusals emit `link_error` with `link`
+//! and `error`; other links continue until the merged stream ends. The
+//! browser displays terminal reasons without retrying. Transient connection
+//! drops reconnect.
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 

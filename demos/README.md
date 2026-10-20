@@ -55,7 +55,7 @@ the page terminal and moves the pointer with and without the screen lease.
 
 - Options: a Unix socket path after `--`. With it,
   `fictionet observe --observation unix:PATH watch` follows the same
-  dashboard from another terminal.
+  collector from another terminal.
 - Screenshots: `downloads/cloudimage/shots/`, with `guest-desktop.png` from
   the guest, `viewer-desktop.png` through the page's screen socket, and
   `page-desktop.png` from Chromium.
@@ -326,7 +326,6 @@ VM that a demo booted.
 |---|---|---|---|
 | [`cargo xtask demo web`](guest/web.sh) | The sandbox is a network namespace named `agent`, and `fictionet attach --type tun` puts `tun0` in it. From inside: `dig` answers the world's names and NXDOMAIN for the rest, `curl` reaches `https://example.test/` with the world's CA and fails without it, `ping` reaches the gateway, an address with no machine fails at once, and `example.com` and `1.1.1.1` are not there. | | 3.5 min; then 10 s |
 | [`cargo xtask demo proxy`](guest/proxy.sh) | A sandbox with only a loopback interface, whose commands run as an unprivileged user with no capabilities. Two attaches inside its namespace serve `--type http_proxy` and `--type socks5`. `curl` and Python reach the world through `http_proxy`, and `curl` through SOCKS5. A wrong token gets 407, an unknown name gets 502 with the reason, and around the proxy there is no network. | | 10 s |
-| [`cargo xtask demo dashboard`](guest/dashboard.sh) | The world and sandbox of `cargo xtask demo web`, with the world's third argument opening an observation socket. `fictionet dashboard --observation unix:PATH` reads that collector and serves the live view on the VM's port 7878, which `cargo xtask vm` forwards to `127.0.0.1` on your machine. It prints the address to open, and `fictionet observe` shows the same API from a shell: the graph, and the world's events as they happen. A loop in the sandbox makes requests until you press Enter (or for `DASHBOARD_SECONDS`). | a browser | 25 s |
 | [`cargo xtask demo k8s`](guest/k8s.sh) | A kind cluster in the VM, the Helm chart in `charts/fictionet-sandbox` with `examples/attach/k8s-tun.yaml`, and the agent's pod. Its `eth0` is down, `tun0` is its only route, it reaches `https://example.test/`, and the internet, the cluster's DNS and the API server are out of reach. | pulls kind's node image | 1.5 min; then 1 min |
 
 The times are from a 24-core machine with other work running, with the VM's
@@ -389,7 +388,7 @@ by hand with `docker compose`. The evals and the VM are also test suites:
 [`examples/attach`](../examples/attach) has the Compose and Kubernetes recipes
 for `fictionet attach` on your own machine or cluster, and
 [`examples/hosted`](../examples/hosted) runs the Compose setup inside a Daytona
-or E2B sandbox. `cargo xtask scan` records the scan example's dashboard as a video.
-[Fictionet Observe](../observe/README.md) covers the collector, browser sign-in
-and capture limits. The dashboard and `fictionet observe` use the observation
-socket served by `fictionet_observe::serve`. Attachments use the world socket.
+or E2B sandbox.
+[Fictionet Observe](../observe/README.md) covers the collector, the page and
+capture limits. `fictionet observe` uses the observation socket served by
+`fictionet_observe::serve`. Attachments use the world socket.

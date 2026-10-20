@@ -70,10 +70,7 @@ pub fn run(args: &[String]) -> Result {
             command.arg("-t");
         }
         command.arg("root@127.0.0.1").arg(format!(
-            "FICTIONET_DASHBOARD_PORT={} DASHBOARD_SECONDS={} \
-             KIND_NODE_IMAGE={} bash /src/demos/guest/{name}.sh",
-            quote(&vm.read("run/dashboard-port")?),
-            quote(&std::env::var("DASHBOARD_SECONDS").unwrap_or_default()),
+            "KIND_NODE_IMAGE={} bash /src/demos/guest/{name}.sh",
             quote(vm::KIND_NODE),
         ));
         let result = execute(&mut command);

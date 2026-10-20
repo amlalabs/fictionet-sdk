@@ -3,8 +3,8 @@
 `fictionet-observe` consumes the four streams produced by
 [`fictionet::events`](../src/events.rs):
 events, packets, TLS keys and topology. Core delivers borrowed observations.
-This crate owns retention, decoding and the request service that the dashboard
-and `fictionet observe` use. Install one collector per run, before it starts.
+This crate owns retention, decoding and the request service that a world's
+page and `fictionet observe` use. Install one collector per run, before it starts.
 
 There are no default features.
 
@@ -108,11 +108,9 @@ fictionet::block_on(fictionet::run(options, move |fcx| async move {
 # Ok::<(), fictionet::Error>(())
 ```
 
-Create a private dashboard token, then connect either command:
+Then read it from a shell:
 
 ```sh
-(umask 077; openssl rand -hex 32 > /run/fictionet/dashboard-token)
-fictionet dashboard --observation unix:/run/fictionet/observe.sock --token-file /run/fictionet/dashboard-token
 fictionet observe --observation unix:/run/fictionet/observe.sock
 ```
 

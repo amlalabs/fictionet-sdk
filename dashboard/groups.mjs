@@ -1,7 +1,7 @@
 // Groups in the Fictionet dashboard: which tasks a closed group stands for,
 // and which drawn edges stand for which links. Plain functions over the
 // graph as the observe API sends it, with no drawing, so they can be
-// tested on their own (groups.test.mjs). app.mjs draws what they work out.
+// tested on their own (groups.test.mjs). components/map.mjs draws what they work out.
 'use strict';
 
 const FictionetGroups = (() => {

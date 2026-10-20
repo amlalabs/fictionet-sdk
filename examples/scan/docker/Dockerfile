@@ -2,7 +2,7 @@
 # The nmap demo. Build context: the fictionet-sdk root (see ../compose.yaml).
 #
 #   build     - the fictionet binary and the scan example world
-#   fictionet - compose services "world", "*-attach" and "dashboard"
+#   fictionet - compose services "world" and "*-attach"
 #   container - compose service "container": a real nginx and OpenSSH
 #   scanner   - compose service "scanner": the agent, with nmap
 

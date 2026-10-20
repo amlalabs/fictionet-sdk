@@ -864,11 +864,11 @@ describe retention, event JSON, loss reports and grading.
 
 ## 6. The dashboard
 
-The dashboard draws a run's tasks and groups and lists its events and
+A world's page draws a run's tasks and groups and lists its events and
 captured packets through an installed `DashboardObserver`. See the
 [companion README](../observe/README.md) for setup and the
 [crate walkthrough](../observe/src/lib.rs)
-for sign-in, the drawing, capture and observation requests.
+for the drawing, capture and observation requests.
 
 ## Changing framing between items
 

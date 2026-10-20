@@ -1,6 +1,6 @@
 // Layout of the Fictionet dashboard's graph: the size and place of each
 // drawn item, the frames of open groups, and the path of each drawn edge.
-// No drawing: app.mjs passes in the state and view, text measurement, and
+// No drawing: components/map.mjs passes in the state and view, text measurement, and
 // the `derive` and `fit` steps that `layout` runs before and after placing,
 // and draws what this works out. layout.test.mjs runs it on its own.
 

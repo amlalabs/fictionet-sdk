@@ -1,5 +1,5 @@
-/* The parts the CLI dashboard and the demo pages share: base type and
-   controls, the map, the packet list, the layer tree and the hex view. */
+/* The page's shared parts: base type and controls, the map, the packet
+   list, the layer tree and the hex view. */
 @import url("./tokens.css");
 
 * {
