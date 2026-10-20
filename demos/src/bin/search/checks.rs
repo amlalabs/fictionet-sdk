@@ -295,6 +295,26 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         },
     )
     .await?;
+    for (host, url, name) in [
+        (
+            "docs.python.org",
+            "https://docs.python.org/3/library/itertools.html",
+            "python.png",
+        ),
+        (
+            "en.wikipedia.org",
+            "https://en.wikipedia.org/wiki/Iterator",
+            "wikipedia.png",
+        ),
+    ] {
+        visited.insert(host.into());
+        navigate(run, url).await?;
+        wait(&client, "opened page on a bundled host", |s| {
+            s.pages.iter().any(|p| p.url == url && p.status == 200)
+        })
+        .await?;
+        run.settled_screen(HOST, &output.join(name)).await?;
+    }
     navigate(run, "http://wiki.corp/").await?;
     wait(&client, "reserved name is refused", |s| {
         s.refused
