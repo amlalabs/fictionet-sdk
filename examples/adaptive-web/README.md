@@ -46,9 +46,10 @@ served. The page's screenshots come from the VM-free example
 The default seed is `halvard-cve`. Select another embedded seed with
 `cargo xtask demo search -- --seed corvane-acquisition` or
 `cargo xtask demo search -- --seed fastjsonl-package`. The gate prints each
-check, measurements and capture paths, then shuts the guest down. Captures and
-the log are written directly to the printed persistent output directory,
-`demos/downloads/cloudimage/runs/search-<unix seconds>/`.
+check, measurements and capture paths, then shuts the guest down. With
+`-- --stay`, a passing run keeps the guest and the page up until Ctrl-C.
+Captures and the log are written directly to the printed persistent output
+directory, `demos/downloads/cloudimage/runs/search-<unix seconds>/`.
 
 ## Quick start
 

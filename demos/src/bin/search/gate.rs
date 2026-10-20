@@ -49,9 +49,15 @@ async fn wait(
     Ok(snapshot(&value)?.expect("the accepted state has a value"))
 }
 
+/// How long the story holds each step before the next one, so a person
+/// watching the page and the screen can follow it. No check depends on it:
+/// every check waits for the world's state.
+const STEP_PAUSE: Duration = Duration::from_millis(1500);
+
 /// Enters a URL in Firefox's address bar and presses Return only once the bar
 /// holds the whole URL.
 async fn navigate(run: &Run, url: &str) -> Result {
+    tokio::time::sleep(STEP_PAUSE).await;
     let quoted = quote(url);
     // Typed keys can lose the start of a URL when the bar selects its text
     // late, and a paste can land after a Return sent with it. So the URL is
@@ -133,6 +139,7 @@ pub async fn command(
     revision: u64,
     id: &str,
 ) -> Result<Value> {
+    tokio::time::sleep(STEP_PAUSE).await;
     let command =
         json!({"command":"set_generation","generate":generate,"expected_revision":revision});
     let reply = client.command("generation", id, command).await;
