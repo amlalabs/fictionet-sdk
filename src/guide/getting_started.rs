@@ -2,9 +2,9 @@
 //!
 //! This page runs the crate's `web_world` example, a small world of websites,
 //! and attaches one sandbox to it. Everything runs on one Linux machine.
-//! Every command below was run as shown, and every output except the
-//! observer's is copied from that run. This is the manual namespace tutorial;
-//! the [attachment guide](crate::guide::attaching) covers deployment and the
+//! Commands show the manual namespace setup. Outputs illustrate a run;
+//! timings, task ids and generated addresses can differ. The
+//! [attachment guide](crate::guide::attaching) covers deployment and a
 //! scripted namespace recipe.
 //!
 //! You need:
@@ -12,7 +12,7 @@
 //! - Linux, with Rust 1.99 or later.
 //! - Root through `sudo`. Attach makes a network device, which needs
 //!   `CAP_NET_ADMIN`.
-//! - `ip` (iproute2) and `curl`. `dig` (in Debian's `dnsutils`) is
+//! - `ip` (iproute2), `curl` and `openssl`. `dig` (in Debian's `dnsutils`) is
 //!   optional.
 //!
 //! The sandbox here is a Linux network namespace named `agent`. It isolates
@@ -36,12 +36,11 @@
 //! From the top directory of the repository:
 //!
 //! ```text
-//! $ cargo build --release --bin fictionet --example web_world
-//! ...
-//!     Finished `release` profile [optimized] target(s) in 6.72s
+//! $ cargo build --locked --release -p fictionet --example web_world -p fictionet-cli --bin fictionet
 //! ```
 //!
-//! This builds two programs:
+//! This builds two programs. These paths assume the default target directory;
+//! if `CARGO_TARGET_DIR` is set, use that directory in place of `target`:
 //!
 //! - `target/release/examples/web_world`, the world. It runs its local
 //!   sites on a tokio runtime and makes no upstream requests.
@@ -59,16 +58,18 @@
 //! $ sudo chown "$USER" /run/fictionet
 //! ```
 //!
-//! Now the world can run as you, without root. `/run` is emptied at every
+//! The world can run as you, without root. `/run` is emptied at every
 //! boot, so do this again after a reboot.
 //!
 //! # 3. Start the world
 //!
-//! In a first terminal, start the world. Its two arguments are the socket
-//! to listen on and the file to write its certificate authority to:
+//! In a first terminal, start the world. Its arguments are the attachment
+//! socket, the certificate authority file, and the optional observation socket.
+//! The third argument installs `DashboardObserver` wrapped in `Aggregate` and
+//! serves its handle. Without it, this program installs no observer:
 //!
 //! ```text
-//! $ target/release/examples/web_world /run/fictionet/world.sock /run/fictionet/ca.pem
+//! $ target/release/examples/web_world /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observe.sock
 //! listening on /run/fictionet/world.sock, CA in /run/fictionet/ca.pem
 //! ```
 //!
@@ -290,7 +291,7 @@
 //! In another terminal, start watching the world's HTTP requests:
 //!
 //! ```text
-//! $ target/release/fictionet observe --world unix:/run/fictionet/world.sock watch | grep '"kind":"request"'
+//! $ target/release/fictionet observe --observation unix:/run/fictionet/observe.sock watch | grep '"kind":"request"'
 //! ```
 //!
 //! Back in the third terminal, repeat these two requests:
@@ -305,9 +306,10 @@
 //! Location: https://example.test/
 //! ```
 //!
-//! The observer shows the world's side. `web_world` explicitly installs bounded
-//! retention and repeat aggregation. Its sites emit each DNS query, TLS handshake
-//! and HTTP request; worlds without observers construct and retain no events.
+//! The observer shows the world's side. With the third argument, `web_world`
+//! installs bounded retention and repeat aggregation in the companion. Its
+//! sites emit DNS queries, TLS handshakes and HTTP requests to that observer.
+//! Core retains no history.
 //! `fictionet observe` prints each event as a line of JSON while it watches.
 //! These lines come from a separate run of the same two requests (cut short
 //! here):
@@ -317,15 +319,32 @@
 //! {"event":"event","data":{...,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 301","sandbox":{"id":1,"name":"agent",...},"conn":4,...,"fields":{"scheme":"http","host":"example.test","method":"GET","path":"/","status":301,...},"node":"t33",...}}
 //! ```
 //!
-//! `fictionet dashboard` shows the same world in a browser
-//! ([`observe`](crate::observe)). An eval writes such events to a log file of its own,
-//! as the [Border](https://github.com/amlalabs/fictionet-sdk/tree/main/examples/border)
-//! and [FakeWiki](https://github.com/amlalabs/fictionet-sdk/tree/main/examples/fakewiki) worlds do.
+//! ## Open the dashboard
+//!
+//! Create a private token file and start the dashboard in another terminal:
+//!
+//! ```sh
+//! (umask 077; openssl rand -hex 32 > /run/fictionet/dashboard-token)
+//! target/release/fictionet dashboard --observation unix:/run/fictionet/observe.sock --token-file /run/fictionet/dashboard-token
+//! ```
+//!
+//! Read the token from the file. Open `http://127.0.0.1:7878/#token=<token>`
+//! with that value to sign in. The page removes the fragment and keeps the
+//! token in this tab's session storage. The bootstrap URL works once per
+//! dashboard process. Reloading the signed-in tab keeps its session; logout
+//! or closing the tab clears it.
+//!
+//! The dashboard consumes the same `DashboardObserver` handle as the shell
+//! command. It draws collected topology and shows retained events. Select a
+//! link before sending traffic to capture its packets: this world's default
+//! options capture on demand. TLS decryption needs emitted keys and captured
+//! traffic. See [Fictionet Observe](../../../fictionet_observe/index.html) for
+//! the walkthrough, resource limits and the observation protocol.
 //!
 //! # 7. Stop
 //!
-//! Press Ctrl-C in the observe terminal, then in the attach terminal. Attach
-//! exits, and removes `tun0` as it goes:
+//! Press Ctrl-C in the dashboard and observe terminals, then in the attach
+//! terminal. Attach exits and removes `tun0` as it goes:
 //!
 //! ```text
 //! $ sudo ip netns exec agent ip link show tun0

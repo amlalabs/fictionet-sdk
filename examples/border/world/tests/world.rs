@@ -1118,7 +1118,7 @@ where
             fictionet::Cx,
             fictionet::Attacher,
             Buf,
-            std::sync::Arc<fictionet::events::Memory>,
+            std::sync::Arc<fictionet_observe::Memory>,
         ) -> Fut
         + Send
         + 'static,
@@ -1134,7 +1134,7 @@ where
     let buf = Buf::default();
     let log = border_world::log::Log::start(Box::new(buf.clone()), scenario.clone());
     let drain = log.clone();
-    let recorded = Arc::new(fictionet::events::Memory::default());
+    let recorded = Arc::new(fictionet_observe::Memory::default());
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(9)).observer(Arc::new(
             fictionet::events::Fanout::new(vec![Arc::new(log.clone()), recorded.clone()]),

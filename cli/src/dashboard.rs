@@ -1,10 +1,11 @@
-//! `fictionet dashboard`: serves the dashboard app, and carries its API
-//! calls to the world as an observer.
+//! `fictionet dashboard` serves the app and forwards its API calls to the
+//! socket a world serves with `fictionet_observe::serve`. The world's
+//! `DashboardObserver` owns collection and retention.
 //!
 //! The app is the static files in the repository's `dashboard/` folder,
 //! built into this binary. Every `GET /api/<op>?<key>=<value>...` becomes
-//! one observe request, `{"op":"<op>","<key>":<value>,...}`, on a new
-//! observer session. Streams (`watch`, `packets`) come back as server-sent
+//! one observation request, `{"op":"<op>","<key>":<value>,...}`, on a
+//! client session. Streams (`watch`, `packets`) come back as server-sent
 //! events, binary values as downloads, and the rest as JSON. So the app
 //! uses the observe API and nothing else.
 //!
@@ -23,11 +24,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use fictionet::relay::observer::Client;
 use fictionet_cli::attach_proxy::auth::Token;
 
-use crate::args::take_world;
-use crate::config::world_path;
+use crate::args::take_observation;
+use crate::config::{connect_observation, observation_path};
 
 mod api;
 mod assets;
@@ -40,17 +40,16 @@ use auth::Auth;
 use http::{host_allowed, parse_request, read_head, same_site};
 
 pub(crate) const USAGE: &str = "\
-usage: fictionet dashboard --world unix:<path> --token-file <path> [--listen <address:port>]
+usage: fictionet dashboard --observation unix:<path> --token-file <path> [--listen <address:port>]
 
-Serves the dashboard, a live view of the world on <path>, at
-http://127.0.0.1:7878/ (or --listen). It connects to the world socket as an
-observer, so the world needs no flag of its own.
-
-The dashboard shows everything the world carries, decrypted TLS included.
+Serves the dashboard at http://127.0.0.1:7878/ (or --listen).
+--observation names the Unix socket a world serves with fictionet_observe::serve.
+The world's DashboardObserver supplies topology, events and captured packets.
+TLS 1.3 decryption needs keys from instrumented endpoints and a usable capture.
 The token file is required. Open /#token=<URL-encoded-token> once to sign in.
 The page removes the fragment and stores the token for this origin and tab.
 API calls, streams and downloads send Authorization: Bearer <token>.
-Cookies do not authenticate; the app shell expires the old login cookie.
+Cookies do not authenticate.
 Log out or close the tab to clear the stored token.
 Restart the dashboard to use the bootstrap URL again. Keep the token outside
 the sandbox. Use loopback or a trusted TLS tunnel; HTTP carries the token
@@ -65,8 +64,8 @@ pub(crate) fn main(args: &[String]) -> i32 {
         println!("{USAGE}");
         return 0;
     }
-    let parsed = take_world(args).and_then(|(world, rest)| {
-        let path = world_path(&world)?;
+    let parsed = take_observation(args).and_then(|(world, rest)| {
+        let path = observation_path(&world)?;
         let mut listen = "127.0.0.1:7878".to_owned();
         let mut token_file = None;
         let mut args = rest.iter();
@@ -98,7 +97,7 @@ pub(crate) fn main(args: &[String]) -> i32 {
         }
     };
     // Check the world is there, so a wrong path fails now, not in a browser.
-    match Client::connect(&path, "fictionet dashboard") {
+    match connect_observation(&path) {
         Ok(_) => {}
         Err(msg) => {
             eprintln!("fictionet dashboard: {msg}");
@@ -179,13 +178,23 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
     if !host_allowed(req.host.as_deref(), bound) {
         return respond(&mut conn, "403 Forbidden", text, b"bad Host header\n", "");
     }
-    if req.method != "GET" {
+    if req.method
+        != if req.path == "/api/bootstrap" {
+            "POST"
+        } else {
+            "GET"
+        }
+    {
         return respond(
             &mut conn,
             "405 Method Not Allowed",
             text,
-            b"GET only\n",
-            "Allow: GET\r\n",
+            b"method not allowed\n",
+            if req.path == "/api/bootstrap" {
+                "Allow: POST\r\n"
+            } else {
+                "Allow: GET\r\n"
+            },
         );
     }
     if !same_site(&req) {
@@ -198,7 +207,7 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
         );
     }
     if let Some((kind, body)) = assets::lookup(req.path.as_str()) {
-        // Remove the old port-wide credential when an existing browser upgrades.
+        // Clear the credential cookie so other ports do not receive it.
         let extra = if matches!(req.path.as_str(), "/" | "/index.html") {
             "Set-Cookie: fictionet_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n"
         } else {
@@ -288,7 +297,7 @@ mod tests {
     #[test]
     fn stream_values_split_into_events() {
         let inspect = |bytes: &[u8]| {
-            event(&fictionet::relay::observer::Value {
+            event(&fictionet_observe::Value {
                 id: 1,
                 bytes: bytes.to_vec(),
                 binary: false,

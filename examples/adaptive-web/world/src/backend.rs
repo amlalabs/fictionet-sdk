@@ -408,7 +408,7 @@ mod tests {
         Abandoned,
     }
 
-    fn query_outcome(answer: Answer) -> (Arc<fictionet::events::Memory>, Option<Fields>) {
+    fn query_outcome(answer: Answer) -> (Arc<fictionet_observe::Memory>, Option<Fields>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let abandoned = matches!(answer, Answer::Abandoned);
@@ -444,7 +444,7 @@ mod tests {
             };
             write!(conn, "HTTP/1.1 {status} OK\r\nContent-Length: 4\r\nConnection: close\r\nX-Adaptive-Meta: {meta}\r\n\r\npage").unwrap();
         });
-        let events = Arc::new(fictionet::events::Memory::default());
+        let events = Arc::new(fictionet_observe::Memory::default());
         let observed = events.clone();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

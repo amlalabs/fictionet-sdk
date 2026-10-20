@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The world's command line.
 pub struct Args {
     pub socket: String,
+    pub observation: Option<PathBuf>,
     pub ca_dir: PathBuf,
     pub backend: PathBuf,
     pub backend_port: u16,
@@ -19,6 +20,7 @@ pub struct Args {
 /// Reads the command line.
 pub fn args() -> Result<Args, String> {
     let mut a = Args {
+        observation: None,
         socket: "/run/fictionet/sock/world.sock".into(),
         ca_dir: "/app/ca".into(),
         backend: "/app/backend".into(),
@@ -31,6 +33,7 @@ pub fn args() -> Result<Args, String> {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--socket" => a.socket = value,
+            "--observation" => a.observation = Some(value.into()),
             "--ca-dir" => a.ca_dir = value.into(),
             "--backend" => a.backend = value.into(),
             "--backend-port" => {

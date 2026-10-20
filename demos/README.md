@@ -6,7 +6,36 @@ Every demo is one command:
 $ cargo xtask demo <name>
 ```
 
-It boots the Fictionet VM if it is not running ([vm/README.md](../vm/README.md)),
+`cargo xtask demo` lists in-process binaries and the scripts in `demos/guest/`.
+`cargo xtask demo assets` downloads the pinned Ubuntu image, kernel, initrd,
+and Cloud Hypervisor into `downloads/cloudimage/`, plus the browser libraries,
+without booting. `cargo xtask demo libraries` downloads only the pinned browser
+libraries into `observe/downloads/vendor/` at the repository root.
+
+## Desktop
+
+`cargo xtask demo desktop` downloads the pinned files, builds the `desktop`
+binary in release mode and runs it on your machine. It needs KVM. It needs no
+QEMU, Docker or root. The world runs in the same process. The guest is
+Ubuntu's official 24.04 cloud image, never modified: each run writes its own
+qcow2 overlay and cloud-init seed. Cloud Hypervisor runs from a copy embedded
+in the binary.
+
+At boot the guest installs Xfce, Mozilla's Firefox, Xvnc and two pinned coding
+agents, Claude Code and Codex, through the world's mirror. The demo reaches the
+guest over SSH from the world's jump host, and serves a noVNC page of its
+screen while it runs. It prints each check, powers the guest off, checks that
+no Cloud Hypervisor process or run directory is left, and ends with `every
+required check passed`. Screenshots go to `downloads/cloudimage/shots/`.
+
+The binary takes the downloads directory and, optionally, a Unix socket path.
+With the path, `fictionet observe --observation unix:PATH watch` follows the
+run from another terminal.
+
+## VM scripts
+
+The other demos are scripts in `demos/guest/` that run in the Fictionet VM.
+The command boots the VM if it is not running ([vm/README.md](../vm/README.md)),
 builds Fictionet inside it, runs the demo, and cleans up. Each step says in plain
 words what happens next, then shows the commands and their real output. Nothing
 needs root or Docker on your machine: QEMU, KVM and
@@ -25,12 +54,12 @@ VM that a demo booted.
 |---|---|---|---|
 | [`cargo xtask demo web`](guest/web.sh) | The sandbox is a network namespace named `agent`, and `fictionet attach --type tun` puts `tun0` in it. From inside: `dig` answers the world's names and NXDOMAIN for the rest, `curl` reaches `https://example.test/` with the world's CA and fails without it, `ping` reaches the gateway, an address with no machine fails at once, and `example.com` and `1.1.1.1` are not there. | | 3.5 min; then 10 s |
 | [`cargo xtask demo proxy`](guest/proxy.sh) | A sandbox with only a loopback interface, whose commands run as an unprivileged user with no capabilities. Two attaches inside its namespace serve `--type http_proxy` and `--type socks5`. `curl` and Python reach the world through `http_proxy`, and `curl` through SOCKS5. A wrong token gets 407, an unknown name gets 502 with the reason, and around the proxy there is no network. | | 10 s |
-| [`cargo xtask demo dashboard`](guest/dashboard.sh) | The world and sandbox of `cargo xtask demo web`, with `fictionet dashboard` serving the live view on the VM's port 7878, which `cargo xtask vm` forwards to `127.0.0.1` on your machine. It prints the address to open, and `fictionet observe` shows the same API from a shell: the graph, and the world's events as they happen. A loop in the sandbox makes requests until you press Enter (or for `DASHBOARD_SECONDS`). | a browser | 25 s |
+| [`cargo xtask demo dashboard`](guest/dashboard.sh) | The world and sandbox of `cargo xtask demo web`, with the world's third argument opening an observation socket. `fictionet dashboard --observation unix:PATH` reads that collector and serves the live view on the VM's port 7878, which `cargo xtask vm` forwards to `127.0.0.1` on your machine. It prints the address to open, and `fictionet observe` shows the same API from a shell: the graph, and the world's events as they happen. A loop in the sandbox makes requests until you press Enter (or for `DASHBOARD_SECONDS`). | a browser | 25 s |
 | [`cargo xtask demo k8s`](guest/k8s.sh) | A kind cluster in the VM, the Helm chart in `charts/fictionet-sandbox` with `examples/attach/k8s-tun.yaml`, and the agent's pod. Its `eth0` is down, `tun0` is its only route, it reaches `https://example.test/`, and the internet, the cluster's DNS and the API server are out of reach. | pulls kind's node image | 1.5 min; then 1 min |
 | [`cargo xtask demo border`](guest/border.sh) | [Border](../examples/border)'s world under Docker Compose in the VM, with a scripted agent. First the real bank: sign-in, balance, three hops, one BGP route. Then the hijack: a fourth hop and a more specific route from AS 65002, an impostor certificate that `curl` refuses, and with `curl -k`, the password sent to the impostor, as the world's log shows. | pulls Debian and Python images | 2 min; then 20 s |
 | [`cargo xtask demo fakewiki`](guest/fakewiki.sh) | [FakeWiki](../examples/fakewiki)'s world under Docker Compose in the VM. The agent reads a Wikipedia article at its real name over TLS it trusts, first as it is, then tampered; the world's log labels each request with the topic, the source and its stance. | pulls Debian and Python images | 1.5 min; then 20 s |
 | [`cargo xtask demo adaptive-web`](guest/adaptive-web.sh) | [The adaptive web](../examples/adaptive-web) under Docker Compose in the VM, with its stub generator. A search on `google.com` answers with ten results made for the query; the page behind the first result is made when it is asked for and kept; the world's log says why each site exists. | pulls Debian and Python images | 30 s; then 15 s |
-| [`cargo xtask demo scan`](guest/scan.sh) | [The scan example](../examples/scan) under Docker Compose in the VM: four simulated hosts and a real container with nginx and OpenSSH on one office subnet. `nmap` in the agent's sandbox finds all five, and a SYN scan with service detection names what runs on each. The dashboard, forwarded to your machine like the dashboard demo's, shows the scan as it happens. | a browser; pulls Debian and Alpine images | 1.5 min; then 1 min |
+| [`cargo xtask demo scan`](guest/scan.sh) | [The scan example](../examples/scan) under Docker Compose in the VM: four simulated hosts and a real container with nginx and OpenSSH on one office subnet. `nmap` in the agent's sandbox finds all five, and a SYN scan with service detection names what runs on each. The world's second argument opens its observation socket. The dashboard connects to that socket and shows the scan, with its HTTP port forwarded to your machine. | a browser; pulls Debian and Alpine images | 1.5 min; then 1 min |
 
 The times are from a 24-core machine with other work running, with the VM's
 default 4 vCPUs and 5 GB. "First run" is the whole command on a machine that
@@ -73,8 +102,29 @@ by hand with `docker compose`. The evals and the VM are also test suites:
 for `fictionet attach` on your own machine or cluster, and
 [`examples/hosted`](../examples/hosted) runs the Compose setup inside a Daytona
 or E2B sandbox. `cargo xtask scan` records the scan demo's dashboard as a video.
+[Fictionet Observe](../observe/README.md) covers the collector, browser sign-in
+and capture limits. The dashboard and `fictionet observe` use the observation
+socket served by `fictionet_observe::serve`; attachments use the world socket.
 
 ## Making a demo of your own
+
+The shared `fictionet_demo::kit` boots one or more Ubuntu cloud guests with
+Cloud Hypervisor and a world in the same process. A binary in
+`src/bin/<name>/main.rs` declares its guests and the world startup function:
+
+```rust
+let kit = Kit::new("office")
+    .guest(Guest::ubuntu("workstation", "analyst").packages(&["curl"]))
+    .world(start_world);
+let run = kit.boot(downloads).await?;
+run.shutdown().await?;
+```
+
+The guest image is never modified; each run gets its own overlay and seed.
+See the [kit API](src/kit/mod.rs) and the desktop's
+[guest](src/bin/desktop/guest.rs) and [world](src/bin/desktop/world.rs) definitions.
+
+### Adding a VM script
 
 Start from [`examples/scan`](../examples/scan), the smallest Docker example with
 an agent container: the world in one file, a Dockerfile with one stage per

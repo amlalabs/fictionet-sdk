@@ -524,7 +524,7 @@ fn real_io_is_refused_before_opening_resources() {
 }
 
 fn recorded_world() -> Vec<u8> {
-    let evidence = Arc::new(fictionet::events::Memory::default());
+    let evidence = Arc::new(fictionet_observe::Memory::default());
     let out = evidence.clone();
     block_on(lab(
         RunOptions::new(Seed::from_u64(7)).observer(out.clone()),
@@ -574,7 +574,7 @@ fn seeded_service_faults_repeat_at_the_same_points() {
     }
 
     let episode = |seed| {
-        let evidence = Arc::new(fictionet::events::Memory::default());
+        let evidence = Arc::new(fictionet_observe::Memory::default());
         let output = evidence.clone();
         let points = Arc::new(Mutex::new(Vec::new()));
         let replies = points.clone();

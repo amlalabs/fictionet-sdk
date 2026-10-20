@@ -187,7 +187,8 @@ mod tests {
     fn generation_commands_emit_only_changes() {
         use crate::search::Searches;
         use crate::stub::{Applied, Command, Generation, Rejected, Seed, Stub};
-        use fictionet::events::{Fanout, Memory};
+        use fictionet::events::Fanout;
+        use fictionet_observe::Memory;
 
         let seed = Seed::builtin("halvard-cve").unwrap();
         let searches = Arc::new(Searches::from_seed(&seed));
@@ -291,7 +292,8 @@ mod tests {
 
     #[test]
     fn query_lines_and_http_context() {
-        use fictionet::events::{Fanout, Memory, Observation, Observer, Stamp, Stream};
+        use fictionet::events::{Fanout, Observation, Observer, Stamp, Stream};
+        use fictionet_observe::Memory;
         let query = Event::new("adaptive", "query")
             .field("query_id", 3u64)
             .field("engine", "google")

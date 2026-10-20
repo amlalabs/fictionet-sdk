@@ -18,21 +18,6 @@ fn mutex_guard_excludes_another_lock() {
     assert_eq!(*mutex.try_lock().unwrap(), 9);
 }
 
-#[cfg(all(feature = "std", not(feature = "observe"), not(target_arch = "wasm32")))]
-#[test]
-fn world_socket_refuses_disabled_observer_sessions() {
-    let path = std::env::temp_dir().join(format!("fictionet-features-{}.sock", std::process::id()));
-    let (attacher, _attachments) = fictionet::attachments();
-    let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone()), attacher)
-        .expect("listen on the test socket");
-    let error = match fictionet::relay::observer::Client::connect(path.to_str().unwrap(), "test") {
-        Ok(_) => panic!("observer sessions must be refused without observe"),
-        Err(error) => error,
-    };
-    assert!(error.contains("observer sessions are disabled"), "{error}");
-    drop(listening);
-}
-
 #[cfg(feature = "std")]
 mod http {
     use fictionet::stdlib::{
@@ -218,7 +203,7 @@ mod http {
     #[cfg(feature = "tokio")]
     #[test]
     fn tower_upgrade_with_a_cut_off_body_is_answered() {
-        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence = std::sync::Arc::new(fictionet_observe::Memory::default());
         fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()), |fcx| async move {
             let app = axum::Router::new().route("/", axum::routing::post(|| async { "reached" }));
             let mut conn = client(&fcx, httpd::tower(app)).await;

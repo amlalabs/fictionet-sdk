@@ -11,6 +11,80 @@ import { join } from 'node:path';
 
 const exec = promisify(execFile);
 
+async function checkPacketLayout() {
+  const { mount } = await import('./components/packets.mjs');
+  const { createSelection } = await import('./selection.mjs');
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  const css = document.createElement('link');
+  css.rel = 'stylesheet'; css.href = '/page.css';
+  const loaded = new Promise((resolve, reject) => { css.onload = resolve; css.onerror = reject; });
+  document.head.append(css);
+  await loaded;
+  const root = document.createElement('section');
+  root.style.cssText = 'width:530px;height:500px;display:flex';
+  document.body.append(root);
+  class Source extends EventTarget {
+    emit(type, data) { this.dispatchEvent(new MessageEvent(type, { data: JSON.stringify(data) })); }
+    close() {}
+  }
+  const source = new Source(), watch = new Source();
+  let view;
+  const dispose = mount(root, {
+    selection: createSelection(), watch: () => watch,
+    transport: { packetStream: () => source },
+  }, { onReady(value) { view = value; } });
+  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'b' }, host: 'beta' }]);
+  const send = (seq, src, dst, t = seq / 1000) => source.emit('packet', {
+    link: 'a', seq, src, dst, proto: 'ICMP', info: 'Echo (ping) reply id=0x1234',
+    t, side: 0, len: 28, tags: [],
+  });
+  send(1, '10.0.0.2', '10.0.0.3', 11.0039);
+  send(2, '255.255.255.255', '192.168.100.200', 1000.0039);
+  const frame = () => new Promise(requestAnimationFrame);
+  while (root.querySelectorAll('#prows tr').length < 2) await frame();
+  const $ = (selector) => root.querySelector(selector);
+  check($('td.c-src').textContent === '10.0.0.2' && $('td.c-dst').textContent === '10.0.0.3', 'IPv4 address changed');
+  const whole = (cell) => {
+    const range = document.createRange(); range.selectNodeContents(cell);
+    const text = range.getBoundingClientRect(), bounds = cell.getBoundingClientRect();
+    check(text.left >= bounds.left && text.right <= bounds.right - 7, 'text exceeds its column: ' + cell.textContent);
+    check(getComputedStyle(cell).textOverflow !== 'ellipsis', 'text can ellipsize: ' + cell.textContent);
+  };
+  for (const width of [530, 559, 559.5, 560, 599, 599.5, 600, 800, 530]) {
+    root.style.width = width + 'px';
+    await frame();
+    for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
+    check($('td.c-time').textContent === '11.0039' && $('#prows tr:nth-child(2) .c-time').textContent === '1000.0039', 'Time changed');
+    check((getComputedStyle($('td.c-proto')).display === 'none') === (width < 560), 'Protocol breakpoint');
+    for (const column of ['c-no', 'c-len']) check((getComputedStyle($('td.' + column)).display === 'none') === (width < 600), column + ' breakpoint');
+    check(getComputedStyle($('td.c-time')).display !== 'none', 'Time hidden');
+    const prefix = $('.packet-info-protocol');
+    check((getComputedStyle(prefix).display !== 'none') === (width < 560), 'protocol prefix visibility');
+    if (width < 560) {
+      check($('td.c-info').innerText.startsWith('ICMP Echo (ping) reply'), 'protocol missing from Info');
+      check(getComputedStyle(prefix).fontWeight === '600', 'protocol weight');
+    }
+    check($('#pfilter').getBoundingClientRect().width >= 160, 'filter too narrow');
+    check($('#plist').scrollWidth <= $('#plist').clientWidth, 'IPv4 table overflows');
+  }
+  const title = $('#drawer-title');
+  check(title.title === title.textContent && title.getAttribute('aria-label') === title.textContent, 'incomplete title accessibility');
+  $('#jump-packets').hidden = false;
+  $('#jump-packets').textContent = '↓ 9 new';
+  await frame();
+  check(title.scrollWidth > title.clientWidth && getComputedStyle(title).textOverflow === 'ellipsis', 'title did not yield space');
+  check($('#pfilter').getBoundingClientRect().width >= 160, 'new packets button squeezed filter');
+  check($('#pcap').getBoundingClientRect().right <= root.getBoundingClientRect().right, 'toolbar overflows');
+  const src = '[2001:db8:1234:5678:90ab:cdef:1234:5678]:65535';
+  const dst = '192.168.100.200:65535';
+  send(3, src, dst, 1001.0039);
+  while (root.querySelectorAll('#prows tr').length < 3) await frame();
+  const last = $('#prows').lastElementChild;
+  check(last.querySelector('.c-src').textContent === src && last.querySelector('.c-dst').textContent === dst, 'long address changed');
+  for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
+  dispose(); root.remove(); css.remove();
+}
+
 test('browser bootstrap, reconnect and downloads keep credentials away from another port', async (t) => {
   const chromium = process.env.CHROMIUM || 'chromium';
   try { await exec(chromium, ['--version'], { timeout: 10000 }); } catch (error) {
@@ -19,6 +93,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
   const profile = await mkdtemp(join(tmpdir(), 'fictionet-browser-'));
   t.after(() => rm(profile, { recursive: true, force: true }));
   const received = [], foreign = [];
+  let layoutReport;
   let streams = 0, bootstraps = 0;
   let recordResult;
   const reported = new Promise((resolve, reject) => {
@@ -50,9 +125,15 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
       fetch('/result', { method: 'POST', credentials: 'omit', body: document.body.textContent });
     </script>`);
   });
-  const transport = await readFile(new URL('./transport.mjs', import.meta.url));
-  const origin = await serve((req, res) => {
+  const origin = await serve(async (req, res) => {
     received.push({ url: req.url, ...req.headers });
+    if (req.url === '/layout-result') {
+      layoutReport = '';
+      req.setEncoding('utf8');
+      for await (const chunk of req) layoutReport += chunk;
+      res.writeHead(204).end();
+      return;
+    }
     if (req.url === '/result') { recordResult(req, res); return; }
     if (req.url === '/legacy') {
       res.writeHead(302, {
@@ -62,9 +143,9 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
       return;
     }
     if (req.url === '/') res.setHeader('Set-Cookie', 'fictionet_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict');
-    if (req.url === '/transport.mjs') {
-      res.setHeader('Content-Type', 'text/javascript');
-      res.end(transport);
+    if (req.url.endsWith('.mjs') || req.url.endsWith('.css')) {
+      res.setHeader('Content-Type', req.url.endsWith('.css') ? 'text/css' : 'text/javascript');
+      res.end(await readFile(new URL('.' + req.url, import.meta.url)));
       return;
     }
     if (req.url.startsWith('/api/')) {
@@ -95,6 +176,13 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
         check(sessionStorage.getItem('fictionet_token') === 'browser-test-token', 'missing session');
         check(!document.cookie.includes('fictionet_token'), 'cookie created');
         if (location.pathname === '/') {
+          try {
+            await (${checkPacketLayout.toString()})();
+            await fetch('/layout-result', { method: 'POST', body: 'PASS' });
+          } catch (error) {
+            await fetch('/layout-result', { method: 'POST', body: error.message });
+            throw error;
+          }
           await new Promise((resolve) => {
             addEventListener('hashchange', resolve, { once: true });
             location.hash = '#token=browser-test-token';
@@ -150,7 +238,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
     '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
     // The throwaway profile must not wait on the desktop keyring, which can be locked.
-    '--password-store=basic', `${origin}/legacy`,
+    '--password-store=basic', '--use-mock-keychain', `${origin}/legacy`,
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   browser.stderr.setEncoding('utf8');
@@ -179,6 +267,9 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     assert.fail(`Chromium exited before reporting a result (code ${outcome.code}, signal ${outcome.signal})\n${diagnostics}`);
   }
   if (outcome.timeout) assert.fail(`Chromium did not report a result within 30 s\n${diagnostics}`);
+  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width', () => {
+    assert.equal(layoutReport, 'PASS');
+  });
   assert.match(outcome.report, /^PASS: isolated$/);
   assert.equal(bootstraps, 3);
   assert.equal(streams, 2);

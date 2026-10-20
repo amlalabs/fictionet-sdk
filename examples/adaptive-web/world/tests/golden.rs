@@ -237,13 +237,12 @@ fn golden(use_stub: bool) {
             .unwrap();
         let drain = log.clone();
         let result = rt.block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random())
-                .aggregate_events()
-                .event_history(Arc::new(fictionet::events::Memory::default()))
-                .observer(Arc::new(fictionet::events::Fanout::new(vec![
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
+                fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
                     Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() }),
                     searches.clone(),
                 ]))),
+            )),
             move |fcx| async move {
                 let ca = Arc::new(Ca::new(&fcx, &ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();

@@ -1,4 +1,5 @@
-# Shared setup for the web and dashboard demos.
+# Shared setup for the web and dashboard demos. start_web passes its optional
+# argument as web_world's third path, which opens the observation socket.
 # shellcheck shell=bash
 
 cleanup_web() {
@@ -11,7 +12,7 @@ cleanup_web() {
 start_web() {
     mkdir -p /run/fictionet
     chmod 700 /run/fictionet
-    web_world /run/fictionet/world.sock /run/fictionet/ca.pem >/run/world.log 2>&1 &
+    web_world /run/fictionet/world.sock /run/fictionet/ca.pem "$@" >/run/world.log 2>&1 &
     world_pid=$!
     local i
     for ((i = 0; i < 100; i++)); do

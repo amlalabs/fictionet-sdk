@@ -22,6 +22,6 @@ fictionet::cfg_std! {
     pub mod harness;
 }
 
-fictionet::cfg_observe! {
+fictionet::cfg_std! {
     pub mod bench;
 }

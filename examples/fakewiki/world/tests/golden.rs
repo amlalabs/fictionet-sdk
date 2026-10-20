@@ -94,6 +94,7 @@ fn the_log_is_the_recorded_one() {
         std::env::set_var("FAKEWIKI_VARIANT", "altered_one");
     }
     let args = Args {
+        observation: None,
         socket: String::new(),
         ca_dir: state_dir.join("ca"),
         backend: here.join("backend"),
@@ -131,13 +132,12 @@ fn the_log_is_the_recorded_one() {
             .unwrap();
         let drain = log.clone();
         let result = rt.block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random())
-                .aggregate_events()
-                .event_history(Arc::new(fictionet::events::Memory::default()))
-                .observer(Arc::new(fakewiki_world::events::LogObserver {
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
+                fictionet_observe::Aggregate::new(Arc::new(fakewiki_world::events::LogObserver {
                     log: log.clone(),
                     hosts: hosts.clone(),
                 })),
+            )),
             move |fcx| async move {
                 let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys()).unwrap();
                 let (attacher, attachments) = fictionet::attachments();

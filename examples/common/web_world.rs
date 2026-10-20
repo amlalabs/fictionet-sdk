@@ -1,6 +1,18 @@
 //! The sites and startup of the quick-start world, `examples/web_world.rs`.
 //! The web test's fixture, `tests/web_fixture`, serves the same world with
 //! routes of its own added.
+//!
+//! `run` takes the attachment socket, CA output and optional observation
+//! socket after the executable name. The third path installs a collector
+//! and serves its handle with `fictionet_observe::serve`:
+//!
+//! ```sh
+//! cargo run --example web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! Run the watch command in another terminal. See `fictionet_observe` for
+//! browser access and capture limits.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -23,6 +35,7 @@ const SHARED6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x113, 0, 0, 0, 0, 0x10);
 
 /// Starts a world on the socket and writes its CA certificate.
 pub fn run(
+    args: &[String],
     start: fn(
         &fictionet::Cx,
         Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -30,7 +43,6 @@ pub fn run(
         fictionet::Attachments,
     ) -> Result,
 ) -> Result {
-    let args: Vec<String> = std::env::args().collect();
     let path = args
         .get(1)
         .cloned()
@@ -40,6 +52,16 @@ pub fn run(
         .cloned()
         .unwrap_or_else(|| "/run/fictionet/ca.pem".into());
 
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
+    let _observation = if let Some(path) = args.get(3) {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        options = options.observer(std::sync::Arc::new(
+            fictionet_observe::Aggregate::new(dashboard.observer()),
+        ));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}, CA in {ca_path}");
@@ -48,9 +70,7 @@ pub fn run(
         .enable_all()
         .build()?;
     runtime.block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
+        options,
         move |fcx| async move {
             let (ca, leaf) = certificates(&fcx)?;
             std::fs::write(&ca_path, ca.cert_pem())?;

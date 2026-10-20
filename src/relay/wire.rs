@@ -9,26 +9,6 @@ pub const HELLO: u8 = 1;
 pub const ACCEPT: u8 = 2;
 pub const REFUSE: u8 = 3;
 pub const PACKET: u8 = 4;
-pub const REQUEST: u8 = 5;
-pub const REPLY: u8 = 6;
-
-/// The `hello` type of an observer session, which is not a sandbox.
-pub const OBSERVE: &str = "observe";
-/// The version of the observe API that a world speaks, as its `world`
-/// request reports.
-pub const OBSERVE_VERSION: u32 = 1;
-
-/// `reply` flags. `MORE`: the value goes on in the next reply with the
-/// same id. `END`: no more replies come for this id. `BINARY`: the value
-/// is raw bytes, not JSON.
-pub const MORE: u8 = 1;
-pub const END: u8 = 2;
-pub const BINARY: u8 = 4;
-
-/// The most payload one `reply` carries: the message limit, less the kind
-/// byte, the id and the flags.
-pub const MAX_REPLY_CHUNK: usize = MAX_MESSAGE - 6;
-
 /// Steps 1 and 2 of a connection must finish within this.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -79,17 +59,6 @@ pub enum Message<'a> {
     Accept,
     Refuse(String),
     Packet(&'a [u8]),
-    /// An observer's request: its id, and a JSON object with an `op`.
-    Request {
-        id: u32,
-        body: &'a [u8],
-    },
-    /// The world's reply to request `id`: flags, then a piece of a value.
-    Reply {
-        id: u32,
-        flags: u8,
-        body: &'a [u8],
-    },
 }
 
 impl Message<'_> {
@@ -115,10 +84,6 @@ impl Message<'_> {
             Message::Accept => vec![ACCEPT],
             Message::Refuse(reason) => [&[REFUSE][..], reason.as_bytes()].concat(),
             Message::Packet(packet) => [&[PACKET][..], packet].concat(),
-            Message::Request { id, body } => [&[REQUEST][..], &id.to_be_bytes(), body].concat(),
-            Message::Reply { id, flags, body } => {
-                [&[REPLY][..], &id.to_be_bytes(), &[*flags], body].concat()
-            }
         }
     }
 }
@@ -138,16 +103,6 @@ pub fn decode(message: &[u8]) -> Result<Message<'_>, DecodeError> {
             .map(Message::Refuse)
             .map_err(|_| DecodeError::BadBody),
         PACKET => Ok(Message::Packet(body)),
-        REQUEST if body.len() >= 4 => Ok(Message::Request {
-            id: u32::from_be_bytes(body[..4].try_into().unwrap()),
-            body: &body[4..],
-        }),
-        REPLY if body.len() >= 5 => Ok(Message::Reply {
-            id: u32::from_be_bytes(body[..4].try_into().unwrap()),
-            flags: body[4],
-            body: &body[5..],
-        }),
-        REQUEST | REPLY => Err(DecodeError::BadBody),
         other => Err(DecodeError::UnknownKind(other)),
     }
 }
@@ -191,34 +146,13 @@ mod tests {
 
     #[test]
     fn decode_enforces_the_message_limit() {
-        for kind in [AUTH, REFUSE, PACKET, REQUEST, REPLY] {
+        for kind in [AUTH, REFUSE, PACKET] {
             let mut frame = vec![b'x'; MAX_MESSAGE];
             frame[0] = kind;
             assert!(decode(&frame).is_ok());
             frame.push(b'x');
             assert_eq!(decode(&frame), Err(DecodeError::BadBody));
         }
-    }
-
-    #[test]
-    fn observer_messages_round_trip() {
-        let req = Message::Request {
-            id: 7,
-            body: br#"{"op":"graph"}"#,
-        };
-        let bytes = req.encode();
-        assert_eq!(&bytes[..5], &[5, 0, 0, 0, 7]);
-        assert_eq!(decode(&bytes), Ok(req));
-        let reply = Message::Reply {
-            id: 7,
-            flags: MORE | BINARY,
-            body: &[1, 2],
-        };
-        let bytes = reply.encode();
-        assert_eq!(bytes, [6, 0, 0, 0, 7, 5, 1, 2]);
-        assert_eq!(decode(&bytes), Ok(reply));
-        assert_eq!(decode(&[5, 0, 0]), Err(DecodeError::BadBody));
-        assert_eq!(decode(&[6, 0, 0, 0, 1]), Err(DecodeError::BadBody));
     }
 
     #[test]
@@ -248,7 +182,9 @@ mod tests {
             decode(&Message::Packet(&[1, 2, 3]).encode()),
             Ok(Message::Packet(&[1, 2, 3]))
         );
-        assert_eq!(decode(&[9]), Err(DecodeError::UnknownKind(9)));
+        for kind in [5, 6, 9] {
+            assert_eq!(decode(&[kind]), Err(DecodeError::UnknownKind(kind)));
+        }
         assert_eq!(decode(&[7]), Err(DecodeError::UnknownKind(7)));
         assert_eq!(decode(&[]), Err(DecodeError::Empty));
         assert_eq!(decode(&[1, 0, 1]), Err(DecodeError::BadBody));

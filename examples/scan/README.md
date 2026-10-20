@@ -47,10 +47,20 @@ group too.
 
 ## Running it
 
-`compose.yaml` runs the world, the two sandboxes and the dashboard:
+The world's optional second argument opens the observation socket with
+`fictionet_observe::serve`. For a local run, use separate terminals:
 
-- `world` runs `main.rs`, with no network at all. Its only door is the
-  world socket on a shared volume.
+```sh
+cargo run --example scan -- /run/fictionet/world.sock /run/fictionet/observation.sock
+fictionet observe --observation unix:/run/fictionet/observation.sock watch
+```
+
+`compose.yaml` passes both socket paths and runs the world, two sandboxes
+and dashboard. See [Fictionet Observe](../../observe/README.md) for capture
+limits and browser access.
+
+- `world` runs `main.rs`, with no network at all. Its world and observation
+  sockets are on a shared volume.
 - `container-attach` runs `fictionet attach --type tun` for the real
   container, at 10.0.0.50. The `container` service (nginx and OpenSSH on
   Alpine) joins its network namespace, so its only interface is `tun0`.
@@ -58,14 +68,14 @@ group too.
   `scanner` service, with nmap, joins it. nmap needs `NET_RAW` to send SYN
   scans and pings, and the compose file grants it. The scanner does not
   see the world socket.
-- `dashboard` runs `fictionet dashboard` on the socket, published on
+- `dashboard` connects with `--observation unix:/run/fictionet/sock/observation.sock`, published on
   `127.0.0.1:7880` only (`SCAN_DASHBOARD_PORT` picks another port). Its
   token file is mounted only in the dashboard container.
 
 Open `http://127.0.0.1:7880/#token=<token>` once, using the token
 from the file below. The page removes the fragment and stores the token for
 this origin and tab. Log out or close the tab to clear it. Restart the
-dashboard to sign in again. Keep the token outside the sandboxes.
+dashboard to reuse a consumed bootstrap URL. Keep the token outside the sandboxes.
 
 From this folder:
 

@@ -135,7 +135,7 @@ fn naming_callback_can_cancel() {
             fcx.spawn_as(
                 || {
                     fcx.cancel();
-                    "cancelled task".into()
+                    "cancelled task"
                 },
                 |fcx| async move {
                     assert!(fcx.is_cancelled());
@@ -973,7 +973,7 @@ fn region_completion_and_concurrent_admission_have_one_boundary() {
                         entered_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                     }
-                    "boundary task".into()
+                    "boundary task"
                 },
                 |_fcx| {
                     if !admitted_first {

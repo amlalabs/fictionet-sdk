@@ -1,4 +1,4 @@
-use fictionet::relay::observer::{Client, Envelope, Value};
+use fictionet_observe::{Client, Envelope, Value};
 use std::io::{self, ErrorKind};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};

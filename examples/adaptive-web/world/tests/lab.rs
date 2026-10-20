@@ -7,7 +7,7 @@ use adaptive_web_world::{
 };
 use fictionet::{
     Cx,
-    events::{Fanout, Memory},
+    events::Fanout,
     stdlib::{
         codec::Wire,
         protocols::{
@@ -17,6 +17,7 @@ use fictionet::{
         world::sandbox::{self, Machine, machine},
     },
 };
+use fictionet_observe::Memory;
 use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddr},

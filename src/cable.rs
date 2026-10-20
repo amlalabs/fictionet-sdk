@@ -3,8 +3,8 @@ use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 
 use crate::cx::CancelWait;
+use crate::link::{Counted, Meter};
 use crate::packet_queue::PacketQueue;
-use crate::watch::{Counted, Meter};
 use crate::{Cx, Interface, Packet, RecvError};
 
 /// Makes two connected [`Interface`]s and returns them.
@@ -88,7 +88,7 @@ struct Cable {
     dirs: [Mutex<Direction>; 2],
     /// Dropped when the first end is dropped.
     guard: Mutex<Option<Box<dyn Send>>>,
-    /// Counts for the dashboard.
+    /// Counters published to the observer.
     meter: Arc<Meter>,
     /// The most bytes each queue may hold, if limited.
     limit: Option<usize>,
@@ -102,11 +102,11 @@ struct Direction {
     waker: Option<Waker>,
     /// One end was dropped.
     closed: bool,
-    /// Packets and bytes put into this queue, for the dashboard.
+    /// Packets and bytes put into this queue, published to the observer.
     packets: u64,
     bytes: u64,
-    /// The link's packet stream, once it registers with an observed run.
-    observation: Option<Arc<crate::watch::PacketStream>>,
+    /// The packet stream after the link registers with the run's observer.
+    observation: Option<Arc<crate::link::PacketStream>>,
 }
 
 /// One of the two connected [`Interface`]s made by [`pair`].
@@ -115,14 +115,14 @@ struct Direction {
 /// lost. The other end receives what was already sent to it, and then
 /// [`RecvError::Closed`].
 pub struct End {
-    packets: Option<Arc<crate::watch::PacketStream>>,
+    packets: Option<Arc<crate::link::PacketStream>>,
     cable: Arc<Cable>,
     /// Which end this is: 0 or 1. It receives from `dirs[side]` and sends
     /// into `dirs[1 - side]`.
     side: usize,
     /// Where a receiver outside the run waits for a cancel.
     wait: CancelWait,
-    /// The last task seen polling this end, for the dashboard.
+    /// The last task polling this end, published as link ownership.
     seen: Option<crate::run::RunTask>,
 }
 
@@ -131,12 +131,11 @@ impl Interface for End {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
-        let current = crate::run::RunTask::current_in(fcx.graph());
+        let current = crate::run::RunTask::current_in(fcx.run.id);
         if current != self.seen
             && let Some(task) = current
         {
             self.seen = current;
-            fcx.graph().owns(&self.cable.meter, self.side, task.id);
             self.cable.meter.owner(fcx, self.side, task.id);
         }
         {
@@ -176,10 +175,9 @@ impl Interface for End {
                 return;
             }
             let bytes = packet.0.len() as u64;
-            let Ok(packet) = dir.queue.try_push(packet, self.cable.limit) else {
+            if dir.queue.try_push(packet, self.cable.limit).is_err() {
                 return;
-            };
-            self.cable.meter.copy(self.side, packet);
+            }
             dir.packets += 1;
             dir.bytes += bytes;
             dir.waker.take()
@@ -204,7 +202,7 @@ impl Interface for End {
 fn send_observed(
     cable: &Cable,
     side: usize,
-    mut publication: crate::watch::Publication<'_>,
+    mut publication: crate::link::Publication<'_>,
     packet: Packet,
 ) {
     {
@@ -218,7 +216,6 @@ fn send_observed(
         }
         dir.packets += 1;
         dir.bytes += packet.0.len() as u64;
-        cable.meter.copy(side, &packet);
     }
     publication.publish(&packet);
     let waker = {
@@ -282,7 +279,7 @@ impl End {
         move || cable.upgrade().is_none_or(|c| c.dirs[side].lock().closed)
     }
 
-    /// The counts and tap of this end's pair.
+    /// The counters and packet stream of this end's pair.
     pub(crate) fn meter(&self) -> &Arc<Meter> {
         &self.cable.meter
     }
@@ -295,7 +292,7 @@ impl Drop for Cable {
 }
 
 impl Counted for Cable {
-    fn observe_packets(&self, packets: Arc<crate::watch::PacketStream>) {
+    fn observe_packets(&self, packets: Arc<crate::link::PacketStream>) {
         for direction in &self.dirs {
             direction.lock().observation = Some(packets.clone());
         }
