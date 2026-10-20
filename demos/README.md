@@ -47,7 +47,7 @@ where the demo has one, or type `drop` to close the screen's connections.
 The end of input or Ctrl-C stops it.
 
 The times below are from one run of each demo on a 24-core machine with other
-work running, the pinned files downloaded, the package cache filled and one
+work running, the pinned files downloaded, the package cache filled and no
 page tab open. All six ran one after another on the same build.
 
 ### Desktop
@@ -69,8 +69,8 @@ in the page terminal and move the pointer with and without the screen lease.
 - Screenshots: `downloads/cloudimage/shots/`, with `guest-desktop.png` from
   the guest, `viewer-desktop.png` through the page's screen socket, and
   `page-desktop.png` from Chromium.
-- Times: SSH up after 7.1 s, desktop after 44.7 s, cloud-init done after
-  47.7 s, whole run 58.2 s. One 88 MB file was not in the package cache.
+- Times: SSH up after 7.2 s, desktop after 44.8 s, cloud-init done after
+  47.5 s, whole run 52.8 s. One 88 MB file was not in the package cache.
 
 ### Artifactory
 
@@ -107,8 +107,8 @@ apart, and shown in a muted band in Doors tried.
   guest exit statuses. It takes `--variant` and `--sessions` too, and
   `--extra-reads N` adds N index reads after the story, enough to fill the
   page's row bound.
-- Times: for `lookalike`, SSH up after 7.0 s, story 64.4 s, whole run
-  114.2 s. Earlier runs of the other variants, before the demos were merged,
+- Times: for `lookalike`, SSH up after 7.8 s, story 59.8 s, whole run
+  118.3 s. Earlier runs of the other variants, before the demos were merged,
   took 4.9 s and 63.4 s for the story and the whole run of `normal`, 70.6 s
   and 128.0 s for `missing`, 23.4 s and 74.1 s for `peer`, and 29.2 s and
   79.8 s for `peer` with `--sessions shared`.
@@ -140,8 +140,8 @@ open until Ctrl-C.
 - Without a VM: `cargo xtask demo border preview` serves the page with an
   in-process scripted client and real world traffic. Change the route on the
   page, then press Enter to run sign-in, balance and traceroute on it.
-- Times: SSH up after 6.8 s, desktop after 49.1 s, story done after 61.0 s,
-  whole run 61.8 s.
+- Times: SSH up after 6.4 s, desktop after 48.8 s, story done after 60.8 s,
+  whole run 61.5 s.
 
 ### Search
 
@@ -173,8 +173,8 @@ it on the page.
   Type `drop` to show the lost screen. The preview holds the package cache
   while it runs, so a VM run started beside it fetches its packages without
   the cache.
-- Times: SSH up after 7.5 s, Google loaded in Firefox after 45.3 s, story done
-  after 65.3 s, whole run 66.0 s.
+- Times: SSH up after 6.7 s, Google loaded in Firefox after 44.9 s, story done
+  after 67.3 s, whole run 68.1 s.
 
 ### FakeWiki
 
@@ -196,7 +196,7 @@ and that the panels have data.
   world. The first line it prints is the page URL. Press Enter to have the
   in-world scripted client read the article, use the page's tamper switch, and
   press Enter again.
-- Times: SSH up after 7.2 s, article read after 47.6 s, whole run 52.2 s.
+- Times: SSH up after 7.3 s, article read after 48.5 s, whole run 53.2 s.
 
 ### Scan
 
@@ -220,8 +220,8 @@ page's access controls and terminal.
   reports are the ones recorded in a KVM run, so no step has an exit status.
   `--bound` keeps probing new ports until the port map is full, and
   `--no-os-match ADDR` removes nmap's OS matches for one host.
-- Times: both guests SSH up after 7.5 s, boot 31.2 s, story 51.1 s, whole run
-  84.1 s.
+- Times: both guests SSH up after 7.1 s, boot 29.7 s, story 53.4 s, whole run
+  85.4 s.
 
 ## The page
 
