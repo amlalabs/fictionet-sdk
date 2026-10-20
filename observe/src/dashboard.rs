@@ -583,7 +583,7 @@ impl Subscription {
 mod tests {
     use super::*;
     use crate::Limits;
-    use fictionet::events::{Event, LossReason, Stream};
+    use fictionet::events::{Event, Stream};
     use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::protocols::json::Value as Json;
     use fictionet::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
@@ -748,13 +748,7 @@ mod tests {
         let events = value.get("events").and_then(Json::as_array).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].get("seq").and_then(Json::as_u64), Some(1001));
-        dashboard.observer().lost(Loss {
-            stream: Stream::Events,
-            reason: LossReason::Staging,
-            count: 3,
-            bytes: None,
-            seqs: None,
-        });
+        dashboard.observer().lost(Loss::staged(Stream::Events, 3));
         let changes = session.poll(now + Duration::from_millis(250), None);
         assert!(
             changes

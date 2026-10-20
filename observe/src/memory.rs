@@ -368,7 +368,7 @@ impl Observer for Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::events::{Loss, LossReason, Stream};
+    use fictionet::events::{Loss, Stream};
     use fictionet::stdlib::network::bottleneck;
     use fictionet::time::{Instant, ms};
     use fictionet::{Interface, Packet, pair};
@@ -564,13 +564,10 @@ mod tests {
                         .poll(&mut Context::from_waker(&waker))
                         .is_pending()
                 );
-                memory.lost(fictionet::events::Loss {
-                    stream: fictionet::events::Stream::Events,
-                    reason: fictionet::events::LossReason::Staging,
-                    count: 1,
-                    bytes: None,
-                    seqs: None,
-                });
+                memory.lost(fictionet::events::Loss::staged(
+                    fictionet::events::Stream::Events,
+                    1,
+                ));
                 assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 2);
                 assert!(
                     wait.as_mut()
@@ -656,13 +653,7 @@ mod tests {
     #[test]
     fn only_event_losses_affect_memory() {
         let memory = Memory::default();
-        let mut loss = Loss {
-            stream: Stream::Keys,
-            reason: LossReason::Staging,
-            count: 3,
-            bytes: None,
-            seqs: None,
-        };
+        let mut loss = Loss::staged(Stream::Keys, 3);
         memory.lost(loss.clone());
         assert!(memory.checked_all().is_ok());
         loss.stream = Stream::Events;

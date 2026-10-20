@@ -716,13 +716,7 @@ fn waking_an_event_reader_can_inspect_the_collector() {
                     .poll(&mut Context::from_waker(&waker))
                     .is_pending()
             );
-            collector.lost(Loss {
-                stream: Stream::Events,
-                reason: LossReason::Staging,
-                count: 1,
-                bytes: None,
-                seqs: None,
-            });
+            collector.lost(Loss::staged(Stream::Events, 1));
             assert!(
                 wait.as_mut()
                     .poll(&mut Context::from_waker(&waker))

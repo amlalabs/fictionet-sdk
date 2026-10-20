@@ -260,13 +260,7 @@ mod tests {
                 log.attach(&cx);
                 fictionet::events::Observer::lost(
                     &observer,
-                    fictionet::events::Loss {
-                        stream: fictionet::events::Stream::Events,
-                        reason: fictionet::events::LossReason::Staging,
-                        count: 3,
-                        bytes: None,
-                        seqs: None,
-                    },
+                    fictionet::events::Loss::staged(fictionet::events::Stream::Events, 3),
                 );
                 async { Ok(()) }
             },

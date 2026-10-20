@@ -328,13 +328,10 @@ mod tests {
         assert_eq!(memory.after(3, 10)[0].seq, 4);
         aggregate.end(Instant::ZERO);
         assert_eq!(memory.checked_all().unwrap().len(), 4);
-        aggregate.lost(fictionet::events::Loss {
-            stream: fictionet::events::Stream::Events,
-            reason: fictionet::events::LossReason::Staging,
-            count: 7,
-            bytes: None,
-            seqs: None,
-        });
+        aggregate.lost(fictionet::events::Loss::staged(
+            fictionet::events::Stream::Events,
+            7,
+        ));
         assert_eq!(memory.checked_all().unwrap_err().dropped, 7);
     }
 
