@@ -5,6 +5,7 @@
 //! new searches until the world refuses one for its generation budget.
 
 use adaptive_web_world::{
+    route::Engine,
     search::{Failure, Outcome, Searches},
     stub::{self, Seed},
 };
@@ -34,7 +35,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use super::Result;
+use super::{Result, checks::search_url};
 
 pub async fn run(spend: bool) -> Result {
     let mut input = kit::preview::Input::stdin()?;
@@ -206,12 +207,6 @@ struct Client<'a> {
     page: &'a PageClient,
 }
 
-/// A search engine address for `words`.
-fn search(engine: &str, words: &str) -> String {
-    format!("{engine}{}", words.replace(' ', "+"))
-}
-const GOOGLE: &str = "https://www.google.com/search?q=";
-
 /// The seed's searches and pages, in the order a reader would make them.
 async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     let Client {
@@ -225,7 +220,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     let pause = || cx.sleep(Duration::from_secs(3));
     // Give viewers a chance to see the empty world before the first request.
     cx.sleep(Duration::from_secs(8)).await?;
-    fetch(cx, machine, &search(GOOGLE, words), world.start).await?;
+    fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
     pause().await?;
     let state = searches.snapshot();
     let first = state
@@ -256,11 +251,8 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         html = fetch(cx, machine, &url, world.start).await?;
     }
     let opened = [
-        search("https://www.bing.com/search?q=", words),
-        search(
-            "https://html.duckduckgo.com/html/?q=",
-            &format!("{words} details"),
-        ),
+        search_url(Engine::Bing, words),
+        search_url(Engine::DuckDuckGo, &format!("{words} details")),
         seed.visit.clone(),
     ];
     for url in opened.iter().chain(seed.fixed.iter().map(|f| &f.url)) {
@@ -275,9 +267,9 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     pause().await?;
     generation(page, searches, false).await?;
     let new = format!("{words} new question");
-    fetch(cx, machine, &search(GOOGLE, &new), world.start).await?;
+    fetch(cx, machine, &search_url(Engine::Google, &new), world.start).await?;
     pause().await?;
-    fetch(cx, machine, &search(GOOGLE, words), world.start).await?;
+    fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
     Ok(())
 }
 
@@ -322,7 +314,13 @@ async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     // above the stub's budget, so it only stops a story that cannot fail.
     for n in 1..=1_000 {
         let words = format!("{} question {n}", seed.search);
-        let (status, _) = get(cx, machine, &search(GOOGLE, &words), world.start).await?;
+        let (status, _) = get(
+            cx,
+            machine,
+            &search_url(Engine::Google, &words),
+            world.start,
+        )
+        .await?;
         let failed = searches.snapshot().queries.iter().any(|q| {
             q.search == words
                 && matches!(

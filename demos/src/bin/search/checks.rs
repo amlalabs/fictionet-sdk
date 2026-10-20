@@ -76,6 +76,17 @@ exit 1"#
     Ok(())
 }
 
+/// The address that searches `engine` for `words`, with the words
+/// percent-encoded. The preview searches the same addresses.
+pub(super) fn search_url(engine: Engine, words: &str) -> String {
+    let base = match engine {
+        Engine::Google => "https://www.google.com/search?q=",
+        Engine::Bing => "https://www.bing.com/search?q=",
+        Engine::DuckDuckGo => "https://html.duckduckgo.com/html/?q=",
+    };
+    format!("{base}{}", encoded(words))
+}
+
 fn encoded(text: &str) -> String {
     text.bytes()
         .map(|b| {
@@ -96,12 +107,7 @@ async fn search(
     after: u64,
     count: u64,
 ) -> Result<(Snapshot, Query)> {
-    let base = match engine {
-        Engine::Google => "https://www.google.com/search?q=",
-        Engine::Bing => "https://www.bing.com/search?q=",
-        Engine::DuckDuckGo => "https://html.duckduckgo.com/html/?q=",
-    };
-    navigate(run, &format!("{base}{}", encoded(words))).await?;
+    navigate(run, &search_url(engine, words)).await?;
     let matches = |q: &&Query| {
         q.id > after
             && q.engine == engine
