@@ -662,6 +662,16 @@ pub(crate) mod tests {
                 assert_eq!(a.recv(&cx).await?, Packet(vec![2]));
                 assert_eq!(b.recv(&cx).await?, Packet(vec![1]));
                 assert_eq!(a.meter().totals(), [1, 1, 1, 1]);
+                let reads = cx.run.environment.clock.reads.load(Ordering::Relaxed);
+                a.send(Packet(vec![3]));
+                b.send(Packet(vec![4]));
+                assert_eq!(
+                    cx.run.environment.clock.reads.load(Ordering::Relaxed),
+                    reads
+                );
+                assert_eq!(a.recv(&cx).await?, Packet(vec![4]));
+                assert_eq!(b.recv(&cx).await?, Packet(vec![3]));
+                assert_eq!(a.meter().totals(), [2, 2, 2, 2]);
                 assert!(a.packets.is_none());
                 assert!(b.packets.is_none());
                 assert!(a.meter().packets().is_none());

@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use crate::time::Instant;
 use crate::{Cx, sync::Mutex};
 
-use super::{ConnInfo, Event, Interest, KeyRef, Loss, LossReason, PacketRef, Stream, TopologyRef};
+use super::{ConnInfo, Event, Interest, KeyRef, Loss, PacketRef, Stream, TopologyRef};
 
 /// Metadata available before constructing an event.
 #[derive(Clone, Copy, Debug)]

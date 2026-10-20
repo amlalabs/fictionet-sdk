@@ -238,14 +238,15 @@ pub fn start(fcx: &Cx, net: Net, attachments: Attachments) -> Result<Tap> {
             SCANNER => {
                 let group = fcx.group("scanner");
                 let tap = scanner_tap.clone();
-                Box::new(fictionet::stdlib::network::delay(
+                let link = fictionet::stdlib::network::filter(
                     &group,
-                    ms(2),
-                    fictionet::stdlib::network::filter(
-                        &group,
-                        sandbox,
-                        move |fcx, direction, packet| tap.tap(fcx, direction, packet),
-                    ),
+                    sandbox,
+                    move |fcx, direction, packet| tap.tap(fcx, direction, packet),
+                );
+                let link = group.tap("probes", link);
+                Box::new(group.tap(
+                    "delayed",
+                    fictionet::stdlib::network::delay(&group, ms(2), link),
                 ))
             }
             _ => Box::new(sandbox),

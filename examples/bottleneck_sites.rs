@@ -77,9 +77,9 @@ fn main() -> fictionet::Result {
             let name = sandbox.name().to_owned();
             let near: Counts = Arc::default();
             let far: Counts = Arc::default();
-            let link = count(fcx, sandbox, near.clone());
-            let link = stdlib::network::bottleneck(fcx, RATE, QUEUE, link);
-            let link = count(fcx, link, far.clone());
+            let link = fcx.tap("near", count(fcx, sandbox, near.clone()));
+            let link = fcx.tap("queued", stdlib::network::bottleneck(fcx, RATE, QUEUE, link));
+            let link = fcx.tap("far", count(fcx, link, far.clone()));
 
             // Each time the packets stop for a second, report. The queues
             // are empty by then, so the counts are exact. When the sandbox

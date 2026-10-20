@@ -140,7 +140,11 @@ fn current(graph: &DashboardHandle) -> View {
                 .str("id", &id.to_string())
                 .str("a", &a.to_string())
                 .str("b", &b)
-                .opt_str("label", (!link.tap.is_empty()).then_some(link.tap.as_str()))
+                .opt_str(
+                    "label",
+                    (!link.tap.is_empty() && link.sandbox.as_deref() != Some(link.tap.as_str()))
+                        .then_some(link.tap.as_str()),
+                )
                 .done(),
         );
         let [a, b] = link.counters.totals();
@@ -866,6 +870,39 @@ mod tests {
                 assert_eq!(view.nodes.len(), 2);
                 drop(worker);
                 cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn sandbox_taps_leave_edge_labels_empty_until_renamed() {
+        use fictionet::{Interface, InterfaceExt, Packet};
+        let graph = history_graph();
+        let (attacher, mut attachments) = fictionet::attachments();
+        let mut sandbox = attacher.attach("guest").unwrap();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(graph.0.clone()),
+            |cx| async move {
+                let mut attachment = attachments.next(&cx).await?;
+                sandbox.send(Packet(vec![1]));
+                attachment.recv(&cx).await?;
+                cx.idle().await?;
+                let (mut view, _) = snapshot(&graph, None, None);
+                assert_eq!(view.edges.len(), 1);
+                let edge = view.edges.values().next().unwrap();
+                assert!(edge.contains(r#""label":null"#), "{edge}");
+                for (name, label) in [
+                    ("uplink", r#""label":"uplink""#),
+                    ("guest", r#""label":null"#),
+                ] {
+                    attachment = cx.tap(name, attachment);
+                    cx.idle().await?;
+                    let update = changes(&graph, &mut view, None);
+                    assert_eq!(names(&update), ["edge", "status"]);
+                    assert!(update[0].1.contains(label), "{}", update[0].1);
+                }
                 Ok(())
             },
         ))

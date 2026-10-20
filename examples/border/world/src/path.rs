@@ -177,9 +177,11 @@ pub async fn run(
     name: Arc<str>,
 ) -> fictionet::Result {
     let scenario = shared.scenario.clone();
-    let (mut home, home_side) = pair();
+    let (home, home_side) = pair();
+    let mut home = fcx.tap("home", home);
     router(&fcx, home_side, HOME.router, Some((&shared, name.clone())));
-    let (mut foreign, foreign_side) = pair();
+    let (foreign, foreign_side) = pair();
+    let mut foreign = fcx.tap("foreign", foreign);
     router(&fcx, foreign_side, FOREIGN.router, None);
 
     let mut on_the_way = OnTheWay::default();

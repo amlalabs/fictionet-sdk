@@ -23,7 +23,7 @@ pub struct TopologyLimits {
     pub connections: usize,
     /// Maximum bytes of each name and connection text field.
     pub name_bytes: usize,
-    /// Maximum bytes of each link tap.
+    /// Maximum bytes of each tap name.
     pub tap_bytes: usize,
     /// Maximum total retained entry and text bytes.
     pub bytes: usize,

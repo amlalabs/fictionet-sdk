@@ -36,7 +36,7 @@ use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 pub struct Attachment {
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     packets: Option<Arc<crate::link::PacketStream>>,
-    name: String,
+    name: Arc<str>,
     mtu: u16,
     link: Link,
     /// Counters published to the observer. Side 0 is the world, side 1 the sandbox.
@@ -106,8 +106,9 @@ impl Attachment {
 
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     pub(crate) fn from_socket(name: String, mtu: u16, link: SocketLink) -> Attachment {
+        let name: Arc<str> = name.into();
         let meter = Meter::new();
-        meter.set_sandbox(&name);
+        meter.set_sandbox(name.clone());
         meter.register_current();
         Attachment {
             name,
@@ -351,10 +352,11 @@ impl Attacher {
         let guard = self.reserve(name)?;
         let (world, sandbox) = pair_with_guard(Some(Box::new(guard)));
         let meter = world.meter().clone();
-        meter.set_sandbox(name);
+        let name: Arc<str> = name.into();
+        meter.set_sandbox(name.clone());
         meter.register_current();
         self.deliver(Attachment {
-            name: name.to_owned(),
+            name,
             mtu: 1500,
             link: Link::Cable(world),
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -503,7 +505,7 @@ impl Attachments {
     /// cancelled.
     pub async fn get(&mut self, fcx: &Cx, name: &str) -> Result<Attachment, Cancelled> {
         let mut wait = CancelWait::default();
-        let found = poll_fn(|cx| self.poll_take(fcx, cx, &mut wait, |a| a.name == name)).await;
+        let found = poll_fn(|cx| self.poll_take(fcx, cx, &mut wait, |a| a.name() == name)).await;
         found.map(Attachment::unwrap_pending)
     }
 
@@ -728,7 +730,7 @@ mod tests {
             .lock()
             .pending
             .iter()
-            .map(|a| a.name.clone())
+            .map(|a| a.name().to_owned())
             .collect();
         assert_eq!(names, ["first", "last"]);
         drop((first, last));

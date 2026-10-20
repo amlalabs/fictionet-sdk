@@ -3,7 +3,8 @@
 
 use fictionet::sync::{Mutex, MutexGuard};
 #[cfg(feature = "std")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use crate::Packet;
@@ -22,7 +23,6 @@ use crate::Packet;
 pub(crate) struct Meter {
     registration: Mutex<Option<Registration>>,
     packets: OnceLock<Arc<PacketStream>>,
-    tap: OnceLock<Arc<Mutex<Arc<str>>>>,
     /// What end `s` sent, for an attachment.
     #[cfg(feature = "std")]
     counts: [Count; 2],
@@ -38,11 +38,27 @@ pub(crate) struct PacketStream {
     observer: Arc<crate::events::Dispatch>,
     link: crate::events::LinkId,
     sequence: Mutex<u64>,
-    tap: Arc<Mutex<Arc<str>>>,
+    tap: AtomicPtr<Arc<str>>,
+    // Names stay at stable addresses until the stream is dropped.
+    #[expect(clippy::vec_box, reason = "packet readers borrow names across renames")]
+    names: Mutex<Vec<Box<Arc<str>>>>,
     sandbox: Option<Arc<str>>,
 }
 
 impl PacketStream {
+    fn name(&self) -> &str {
+        // SAFETY: The pointer names an immutable box owned by names. Renaming
+        // only appends boxes, so this borrow stays valid for the stream's life.
+        unsafe { &*self.tap.load(Ordering::Acquire) }
+    }
+
+    fn rename(&self, name: Arc<str>) {
+        let mut name = Box::new(name);
+        let pointer = &mut *name as *mut Arc<str>;
+        self.names.lock().push(name);
+        self.tap.store(pointer, Ordering::Release);
+    }
+
     fn reference<'a>(
         &'a self,
         tap: &'a str,
@@ -65,10 +81,10 @@ impl PacketStream {
     }
 
     pub(crate) fn packet(&self, side: usize, packet: &Packet) -> Option<Publication<'_>> {
-        let tap = self.tap.lock().clone();
+        let tap = self.name();
         self.observer
             .enabled(crate::events::Interest::Packet(
-                self.reference(&tap, side, packet),
+                self.reference(tap, side, packet),
             ))
             .then(|| Publication {
                 stream: self,
@@ -83,14 +99,14 @@ pub(crate) struct Publication<'a> {
     stream: &'a PacketStream,
     sequence: MutexGuard<'a, u64>,
     side: usize,
-    tap: Arc<str>,
+    tap: &'a str,
 }
 
 impl Publication<'_> {
     pub(crate) fn publish(&mut self, packet: &Packet) {
         self.stream.observer.packet(
             &mut self.sequence,
-            self.stream.reference(&self.tap, self.side, packet),
+            self.stream.reference(self.tap, self.side, packet),
         );
     }
 }
@@ -121,7 +137,6 @@ impl Meter {
         Arc::new(Meter {
             registration: Mutex::new(None),
             packets: OnceLock::new(),
-            tap: OnceLock::new(),
             #[cfg(feature = "std")]
             counts: Default::default(),
             counted: OnceLock::new(),
@@ -195,26 +210,26 @@ impl Meter {
             && r.observer.run_id == observer.run_id
             && !r.ended
             && self.packets.get().is_none()
-            && let Some(tap) = self.tap.get()
+            && let Some(name) = self.sandbox.get()
         {
-            self.install_packets(r, tap);
-            let name = tap.lock().clone();
-            r.observer.topology(crate::events::TopologyRef::LinkTap {
-                link: r.link,
-                name: &name,
-            });
+            self.install_packets(r, name);
+            r.observer
+                .topology(crate::events::TopologyRef::LinkTap { link: r.link, name });
         }
     }
 
-    fn install_packets(&self, r: &Registration, tap: &Arc<Mutex<Arc<str>>>) {
-        if self.packets.get().is_some() {
+    fn install_packets(&self, r: &Registration, name: &Arc<str>) {
+        if let Some(packets) = self.packets.get() {
+            packets.rename(name.clone());
             return;
         }
+        let mut name = Box::new(name.clone());
         let packets = Arc::new(PacketStream {
             observer: r.observer.clone(),
             link: r.link,
             sequence: Mutex::new(0),
-            tap: tap.clone(),
+            tap: AtomicPtr::new(&mut *name),
+            names: Mutex::new(vec![name]),
             sandbox: self.sandbox.get().cloned(),
         });
         assert!(self.packets.set(packets.clone()).is_ok());
@@ -246,9 +261,10 @@ impl Meter {
     }
 
     pub(crate) fn tap(self: &Arc<Self>, fcx: &crate::Cx, name: &str) {
-        if let Some(observer) = fcx.run.observer.shared() {
-            self.register(observer);
-        }
+        let Some(observer) = fcx.run.observer.shared() else {
+            return;
+        };
+        self.register(observer);
         let registration = self.registration.lock();
         if let Some(r) = registration.as_ref()
             && (r.observer.run_id != fcx.run.observer.run_id || r.ended)
@@ -256,10 +272,8 @@ impl Meter {
             return;
         }
         let name: Arc<str> = name.into();
-        let tap = self.tap.get_or_init(|| Arc::new(Mutex::new(name.clone())));
-        *tap.lock() = name.clone();
         if let Some(r) = registration.as_ref() {
-            self.install_packets(r, tap);
+            self.install_packets(r, &name);
             r.observer.topology(crate::events::TopologyRef::LinkTap {
                 link: r.link,
                 name: &name,
@@ -290,14 +304,12 @@ impl Meter {
     }
 
     /// Marks side 1 as the sandbox called `name`.
-    pub(crate) fn set_sandbox(&self, name: &str) {
+    pub(crate) fn set_sandbox(&self, name: Arc<str>) {
         #[expect(
             clippy::let_underscore_must_use,
             reason = "callers set the sandbox once, on a meter just made by Meter::new or pair_with_guard"
         )]
-        let _ = self.sandbox.set(Arc::from(name));
-        self.tap
-            .get_or_init(|| Arc::new(Mutex::new(Arc::from(name))));
+        let _ = self.sandbox.set(name);
     }
 
     /// Uses `counted` as the source of link counters.
@@ -361,6 +373,56 @@ mod tests {
                 a.send(crate::Packet(vec![1]));
                 b.recv(&cx).await?;
                 assert!(a.meter().registration.lock().is_none());
+                assert!(a.meter().packets.get().is_none());
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn attachment_names_share_storage_with_default_taps() {
+        use crate::Interface;
+        for observed in [false, true] {
+            let (attacher, mut attachments) = crate::attachments();
+            let sandbox = attacher.attach("guest").unwrap();
+            let mut options = crate::RunOptions::new(crate::Seed::from_u64(1));
+            if observed {
+                options = options.observer(Arc::new(Topology::default()));
+            }
+            crate::block_on(crate::lab(options, |cx| async move {
+                let attachment = attachments.next(&cx).await?;
+                let meter = sandbox.meter();
+                let name = meter.sandbox.get().unwrap();
+                assert_eq!(attachment.name().as_ptr(), name.as_ptr());
+                assert_eq!(meter.registration.lock().is_some(), observed);
+                assert_eq!(meter.packets.get().is_some(), observed);
+                if let Some(packets) = meter.packets.get() {
+                    assert_eq!(packets.name().as_ptr(), name.as_ptr());
+                }
+                assert_eq!(attachment.link().unwrap().0.sandbox.get(), Some(name));
+                Ok(())
+            }))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn borrowed_tap_names_survive_renames() {
+        crate::block_on(crate::lab(
+            crate::RunOptions::new(crate::Seed::from_u64(1))
+                .observer(Arc::new(Topology::default())),
+            |cx| async move {
+                let (a, _b) = crate::pair();
+                let mut a = cx.tap("first", a);
+                let stream = a.meter().packets().unwrap();
+                let first = stream.name();
+                for i in 0..32 {
+                    let name = format!("tap {i}");
+                    a = cx.tap(&name, a);
+                    assert_eq!(stream.name(), name);
+                    assert_eq!(first, "first");
+                }
                 Ok(())
             },
         ))

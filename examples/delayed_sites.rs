@@ -39,7 +39,7 @@ fn main() -> fictionet::Result {
 
         // Every sandbox, as it attaches, gets a 200 ms delay each way.
         let far = attachments.map(&fcx, |fcx, sandbox| {
-            stdlib::network::delay(fcx, ms(200), sandbox)
+            fcx.tap("delayed", stdlib::network::delay(fcx, ms(200), sandbox))
         });
 
         web::Sites::new(move |host: &str| match host {

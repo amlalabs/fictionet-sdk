@@ -13,9 +13,10 @@
 //!
 //! Packet bytes are borrowed, without copying, decoding or sampling in core.
 //! [`LinkType::Ip`] means IP bytes without a link-layer header. The packet
-//! includes its link, sending side and original length. TLS key debug output
-//! omits secret bytes. Topology includes link owners, labels and absolute
-//! directional counters. Hosts have their own identity, separate from groups.
+//! includes its link, tap name, sandbox, sending side and original length.
+//! TLS key debug output omits secret bytes. Topology includes link owners, taps
+//! and absolute directional counters. Hosts have their own identity, separate
+//! from groups.
 //!
 //! # Interest, identity and order
 //!

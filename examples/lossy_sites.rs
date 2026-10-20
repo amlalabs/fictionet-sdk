@@ -41,9 +41,10 @@ fn main() -> fictionet::Result {
 
         // `fcx.random_f64()` is below 0.05 one time in twenty: drop those.
         let lossy = attachments.map(&fcx, |fcx, sandbox| {
-            stdlib::network::filter(fcx, sandbox, |fcx, _direction, _packet| {
+            let link = stdlib::network::filter(fcx, sandbox, |fcx, _direction, _packet| {
                 fcx.random_f64() >= LOSS
-            })
+            });
+            fcx.tap("lossy", link)
         });
 
         web::Sites::new(move |host: &str| match host {

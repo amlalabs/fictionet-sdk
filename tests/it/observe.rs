@@ -12,6 +12,22 @@ use fictionet::{Cx, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
+#[test]
+fn tapping_without_an_observer_allocates_nothing() {
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+        |fcx| async move {
+            let (a, _b) = fictionet::pair();
+            let (a, count) = crate::common::alloc::allocations(|| fcx.tap("first", a));
+            assert_eq!(count, 0);
+            let (_a, count) = crate::common::alloc::allocations(|| fcx.tap("second", a));
+            assert_eq!(count, 0);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
 /// A CA, and a server and client config for `secret.test`.
 fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let ca = fictionet::stdlib::services::ca::Ca::new(fcx, "Test CA").unwrap();

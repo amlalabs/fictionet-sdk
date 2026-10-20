@@ -434,9 +434,9 @@
 //!
 //! [`TopologyLimits`] defaults to 16,384 tasks, 4,096 groups, 4,096 hosts,
 //! 4,096 links including capture state, and 20,000 active connections.
-//! Names and connection text fields allow 1,024 bytes each; link labels allow
-//! 1,024 bytes. The aggregate topology budget is 16 MiB for entries and owned
-//! text. Bounds can refuse entries or shorten text at UTF-8 boundaries.
+//! Names and connection text fields allow 1,024 bytes each; `tap_bytes` allows
+//! 1,024 bytes per tap name. The aggregate topology budget is 16 MiB for entries
+//! and owned text. Bounds can refuse entries or shorten text at UTF-8 boundaries.
 //! Missing references and loss mark topology incomplete.
 //!
 //! Loss totals persist by stream and cause. After `loss_streams` fills,

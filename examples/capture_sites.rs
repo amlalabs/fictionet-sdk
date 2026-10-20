@@ -71,13 +71,14 @@ fn main() -> fictionet::Result {
 
         let watched = attachments.map(&fcx, move |fcx, sandbox| {
             let (tx, lost) = (tx.clone(), lost.clone());
-            stdlib::network::filter(fcx, sandbox, move |fcx, _direction, packet| {
+            let link = stdlib::network::filter(fcx, sandbox, move |fcx, _direction, packet| {
                 let at = start + fcx.now().since_start();
                 if tx.try_send((at, packet.0.clone())).is_err() {
                     lost.fetch_add(1, Ordering::Relaxed);
                 }
                 true // pass every packet on
-            })
+            });
+            fcx.tap("captured", link)
         });
 
         web::Sites::new(move |host: &str| match host {
