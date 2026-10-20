@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::fmt::{self, Write};
+use std::fmt;
 
 use fictionet::events::{ConnInfo, KeyRef, LossReason, Stamp};
 
@@ -114,9 +114,7 @@ pub(crate) fn push_keylog_line(
     output.push_str(label);
     for bytes in [client_random, secret] {
         output.push(' ');
-        for byte in bytes {
-            write!(output, "{byte:02x}").expect("string write");
-        }
+        crate::json::push_hex(output, bytes);
     }
     output.push('\n');
 }

@@ -187,13 +187,13 @@ impl Drop for Endpoint {
 /// the run; it is `None` without a path.
 ///
 /// ```no_run
-/// use std::sync::Arc;
+/// use std::{path::PathBuf, sync::Arc};
 /// use fictionet::{RunOptions, Seed};
 /// use fictionet_observe::{Memory, serve_observation};
 ///
 /// // The optional observation socket from the command line, such as
 /// // /run/fictionet/observe.sock.
-/// let path = std::env::args().nth(1);
+/// let path = std::env::args_os().nth(1).map(PathBuf::from);
 /// let grader = Arc::new(Memory::default());
 /// let (options, _endpoint) =
 ///     serve_observation(RunOptions::new(Seed::random()), path, Some(grader.clone()))?;
@@ -201,7 +201,7 @@ impl Drop for Endpoint {
 /// ```
 pub fn serve_observation(
     options: fictionet::RunOptions,
-    path: Option<impl AsRef<Path>>,
+    path: Option<PathBuf>,
     observer: Option<Arc<dyn fictionet::events::Observer>>,
 ) -> io::Result<(fictionet::RunOptions, Option<Endpoint>)> {
     let Some(path) = path else {
@@ -635,7 +635,7 @@ mod tests {
         let grader = Arc::new(crate::Memory::default());
         let (options, endpoint) = serve_observation(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
-            None::<&Path>,
+            None,
             Some(grader.clone()),
         )
         .unwrap();

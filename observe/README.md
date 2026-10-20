@@ -94,7 +94,7 @@ use fictionet_observe::serve_observation;
 
 let (options, _endpoint) = serve_observation(
     RunOptions::new(Seed::random()),
-    Some("/run/fictionet/observe.sock"),
+    Some("/run/fictionet/observe.sock".into()),
     None,
 )?;
 let (_listener, mut attachments) = fictionet::Listening::bind(
