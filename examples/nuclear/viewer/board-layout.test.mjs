@@ -1,9 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { ROOM, FLOOR, CEILING_LIGHTS, DEFAULT_VIEW, BOARD, BOARDS, BOARD_PX, DESKS, CHAIRS, CCTV, DOOR,
-  STANDING_SPOTS, COLLISIONS, ANNUNCIATOR_WINDOWS, HORSESHOE_CENTER, windowState, cellLayout, gapLayout,
-  boardLayout, boardPoint, fitSpot, devicePlacements, meterCenter, deskOutline, mimicLines } from './board-layout.mjs';
+import {
+  ROOM,
+  FLOOR,
+  CEILING_LIGHTS,
+  DEFAULT_VIEW,
+  BOARD,
+  BOARDS,
+  BOARD_PX,
+  DESKS,
+  CHAIRS,
+  CCTV,
+  DOOR,
+  STANDING_SPOTS,
+  COLLISIONS,
+  ANNUNCIATOR_WINDOWS,
+  HORSESHOE_CENTER,
+  windowState,
+  cellLayout,
+  gapLayout,
+  boardLayout,
+  boardPoint,
+  fitSpot,
+  devicePlacements,
+  meterCenter,
+  deskOutline,
+  mimicLines,
+} from './board-layout.mjs';
 import { KNOBS } from './control-room.mjs';
 import { POINTS } from './instruments.mjs';
 import { circleHits } from './room-motion.mjs';
@@ -16,7 +40,8 @@ const inside = (box, width, height) => {
 };
 const strings = {
   label: ['Pressurizer pressure', 'Core exit temperature', 'Steam gen. level A'],
-  hmi: ['HMI'], plant: ['Plant'],
+  hmi: ['HMI'],
+  plant: ['Plant'],
   reported: ['15.57 MPa', '599.6 MW', '563.9 kg/s', 'no reading'],
   truth: ['15.57 MPa', '599.6 MW', '563.9 kg/s', 'no reading'],
   gap: ['Gap -10.9 °C', 'Lagging +1.9 °C', 'No instrument'],
@@ -40,7 +65,8 @@ for (const count of [6, 9]) {
       }
       for (const [name, values] of Object.entries(strings)) {
         const box = layout.text[name];
-        for (const value of values) assert.ok(value.length * 0.6 * box.font * box.stretch <= box.w, `${value} fits ${name}`);
+        for (const value of values)
+          assert.ok(value.length * 0.6 * box.font * box.stretch <= box.w, `${value} fits ${name}`);
         assert.ok(box.font <= box.h);
         assert.ok(box.stretch >= 0.85);
       }
@@ -50,26 +76,36 @@ for (const count of [6, 9]) {
       inside(box, board.header.w, board.header.h);
       headerTexts.slice(i + 1).forEach((other) => assert.ok(!overlaps(box, other)));
     });
-    for (const [name, value] of Object.entries({ title: 'Reactor controls', time: 'Plant time 3:21.3', telemetry: 'Telemetry live, heartbeat 1234567890' })) {
+    for (const [name, value] of Object.entries({
+      title: 'Reactor controls',
+      time: 'Plant time 3:21.3',
+      telemetry: 'Telemetry live, heartbeat 1234567890',
+    })) {
       assert.ok(value.length * 0.6 * board.text[name].font <= board.text[name].w);
     }
   });
 }
 
 test('canvas texels have equal physical width and height within pixel rounding', () => {
-  assert.ok(Math.abs(BOARD_PX.height - BOARD_PX.width * (BOARD.top - BOARD.bottom) / BOARD.width) <= 0.5);
+  assert.ok(Math.abs(BOARD_PX.height - (BOARD_PX.width * (BOARD.top - BOARD.bottom)) / BOARD.width) <= 0.5);
 });
 
 test('boards form a horseshoe at human scale with clear standing spots', () => {
-  assert.deepEqual(BOARDS.map(b => b.id), ['rps', 'rcs', 'loops', 'feed', 'turbine']);
+  assert.deepEqual(
+    BOARDS.map((b) => b.id),
+    ['rps', 'rcs', 'loops', 'feed', 'turbine'],
+  );
   assert.equal(BOARDS.length, 5);
-  assert.equal(BOARDS.reduce((sum, board) => sum + board.width, 0), 14);
+  assert.equal(
+    BOARDS.reduce((sum, board) => sum + board.width, 0),
+    14,
+  );
   assert.equal(ROOM.eye, 1.65);
   assert.equal(BOARD.top - BOARD.bottom, 2.2);
   assert.equal(BOARD.deskY, 0.9);
   for (const [index, board] of BOARDS.entries()) {
     const towardCenter = Math.atan2(HORSESHOE_CENTER.x - board.x, HORSESHOE_CENTER.z - board.z);
-    assert.ok(Math.abs(towardCenter - board.yaw) < 10 * Math.PI / 180, board.id);
+    assert.ok(Math.abs(towardCenter - board.yaw) < (10 * Math.PI) / 180, board.id);
     const next = BOARDS[index + 1];
     if (next) {
       assert.ok(board.yaw > next.yaw);
@@ -88,10 +124,11 @@ test('boards form a horseshoe at human scale with clear standing spots', () => {
       assert.ok(ROOM.depth / 2 - 0.12 - Math.abs(rear.z) >= 0.9, `${board.id} rear service aisle`);
     }
   }
-  assert.deepEqual(BOARDS.flatMap(b => b.points).sort(), POINTS.map(p => p.key).sort());
-  for (const spot of Object.values(STANDING_SPOTS)) for (const box of COLLISIONS) {
-    assert.equal(circleHits(spot, ROOM.radius, box), false, spot.name);
-  }
+  assert.deepEqual(BOARDS.flatMap((b) => b.points).sort(), POINTS.map((p) => p.key).sort());
+  for (const spot of Object.values(STANDING_SPOTS))
+    for (const box of COLLISIONS) {
+      assert.equal(circleHits(spot, ROOM.radius, box), false, spot.name);
+    }
 });
 
 test('the control room is the first standing spot and every spot clears the room and furniture', () => {
@@ -103,8 +140,10 @@ test('the control room is the first standing spot and every spot clears the room
     assert.ok(Math.abs(spot.z) + ROOM.radius < ROOM.depth / 2, spot.name);
     for (const box of COLLISIONS) assert.equal(circleHits(spot, ROOM.radius, box), false, spot.name);
   }
-  const supervisor = DESKS.find(d => d.supervisor);
-  assert.ok(Math.hypot(STANDING_SPOTS[DEFAULT_VIEW].x - supervisor.x, STANDING_SPOTS[DEFAULT_VIEW].z - supervisor.z) < 3);
+  const supervisor = DESKS.find((d) => d.supervisor);
+  assert.ok(
+    Math.hypot(STANDING_SPOTS[DEFAULT_VIEW].x - supervisor.x, STANDING_SPOTS[DEFAULT_VIEW].z - supervisor.z) < 3,
+  );
 });
 
 test('board faces and furniture reserve separate footprints', () => {
@@ -116,8 +155,10 @@ test('board faces and furniture reserve separate footprints', () => {
       for (const other of boxes.slice(i + 1)) assert.ok(!overlaps(box, other), board.title);
     });
   }
-  const furniture = [...DESKS.map(d => ({ x: d.x - d.w / 2, y: d.z - d.d / 2, w: d.w, h: d.d })),
-    ...CHAIRS.map(c => ({ x: c.x - 0.3, y: c.z - 0.3, w: 0.6, h: 0.6 }))];
+  const furniture = [
+    ...DESKS.map((d) => ({ x: d.x - d.w / 2, y: d.z - d.d / 2, w: d.w, h: d.d })),
+    ...CHAIRS.map((c) => ({ x: c.x - 0.3, y: c.z - 0.3, w: 0.6, h: 0.6 })),
+  ];
   const bench = COLLISIONS.slice(4, 4 + BOARDS.length * 14);
   for (const [index, piece] of furniture.entries()) {
     assert.ok(Math.abs(piece.x) < ROOM.width / 2 && Math.abs(piece.x + piece.w) < ROOM.width / 2);
@@ -130,42 +171,58 @@ test('board faces and furniture reserve separate footprints', () => {
 });
 
 function project(point, spot, width, height) {
-  const dx = point.x - spot.x, dy = point.y - ROOM.eye, dz = point.z - spot.z;
+  const dx = point.x - spot.x,
+    dy = point.y - ROOM.eye,
+    dz = point.z - spot.z;
   const across = Math.cos(spot.yaw) * dx - Math.sin(spot.yaw) * dz;
   const forward = -Math.sin(spot.yaw) * dx - Math.cos(spot.yaw) * dz;
   const depth = Math.cos(spot.pitch) * forward + Math.sin(spot.pitch) * dy;
   const up = Math.cos(spot.pitch) * dy - Math.sin(spot.pitch) * forward;
-  const scale = height / (2 * Math.tan(spot.fov * Math.PI / 360) * depth);
+  const scale = height / (2 * Math.tan((spot.fov * Math.PI) / 360) * depth);
   return { x: width / 2 + across * scale, y: height / 2 - up * scale, depth };
 }
 
 // Measured hero columns at page sizes 1440 by 900 and 1280 by 800, with the stage at sixteen by ten.
-const CANVASES = [[785, 491], [692, 433]];
+const CANVASES = [
+  [785, 491],
+  [692, 433],
+];
 for (const [width, height] of CANVASES) {
-  const inFrame = (p, margin = 0.04) => p.depth > 0 && p.x >= width * margin && p.x <= width * (1 - margin)
-    && p.y >= height * margin && p.y <= height * (1 - margin);
-  test(`the establishing view shows the U and desks below a limited ceiling at ${width} by ${height}`, t => {
+  const inFrame = (p, margin = 0.04) =>
+    p.depth > 0 &&
+    p.x >= width * margin &&
+    p.x <= width * (1 - margin) &&
+    p.y >= height * margin &&
+    p.y <= height * (1 - margin);
+  test(`the establishing view shows the U and desks below a limited ceiling at ${width} by ${height}`, (t) => {
     const spot = STANDING_SPOTS[DEFAULT_VIEW];
     const edges = [];
     for (const board of BOARDS.slice(1, 4)) {
-      for (const x of [-BOARD.width / 2, BOARD.width / 2]) for (const y of [BOARD.bottom, BOARD.top]) {
-        const corner = project(boardPoint(board, x, y, 0), spot, width, height);
-        edges.push(corner.x);
-        assert.ok(inFrame(corner), board.title);
-      }
+      for (const x of [-BOARD.width / 2, BOARD.width / 2])
+        for (const y of [BOARD.bottom, BOARD.top]) {
+          const corner = project(boardPoint(board, x, y, 0), spot, width, height);
+          edges.push(corner.x);
+          assert.ok(inFrame(corner), board.title);
+        }
     }
     for (const board of [BOARDS[0], BOARDS.at(-1)]) {
       let left = 0;
       let right = 1;
       for (const y of [BOARD.bottom, BOARD.top]) {
-        const ends = [-BOARD.width / 2, BOARD.width / 2].map(x =>
-          project(boardPoint(board, x, y, 0), spot, width, height));
-        edges.push(...ends.map(p => p.x));
-        assert.ok(ends.every(p => p.depth > 0), board.title);
+        const ends = [-BOARD.width / 2, BOARD.width / 2].map((x) =>
+          project(boardPoint(board, x, y, 0), spot, width, height),
+        );
+        edges.push(...ends.map((p) => p.x));
+        assert.ok(
+          ends.every((p) => p.depth > 0),
+          board.title,
+        );
         // Clip in homogeneous coordinates to measure physical panel width.
         for (const distance of [
-          p => p.x * p.depth, p => (width - p.x) * p.depth,
-          p => p.y * p.depth, p => (height - p.y) * p.depth,
+          (p) => p.x * p.depth,
+          (p) => (width - p.x) * p.depth,
+          (p) => p.y * p.depth,
+          (p) => (height - p.y) * p.depth,
         ]) {
           const [a, b] = ends.map(distance);
           assert.ok(a >= 0 || b >= 0, `${board.title} intersects the frame`);
@@ -182,75 +239,110 @@ for (const [width, height] of CANVASES) {
     assert.ok(span >= 0.85);
     t.diagnostic(`U width ${(span * 100).toFixed(2)}% of the frame.`);
     for (const box of COLLISIONS) assert.equal(circleHits(spot, ROOM.radius, box), false, spot.name);
-    for (const desk of DESKS.filter(d => !d.supervisor)) {
+    for (const desk of DESKS.filter((d) => !d.supervisor)) {
       assert.ok(desk.z < spot.z);
       const end = deskOutline(BOARDS[0])[3];
       const opening = boardPoint(BOARDS[0], end.x, 0, end.z);
       assert.ok(desk.z + desk.d / 2 < opening.z, 'operator desks stay inside the U');
-      for (const x of [-desk.w / 2, desk.w / 2]) for (const z of [-desk.d / 2, desk.d / 2]) {
-        for (const y of [0, 0.823]) {
-          assert.ok(inFrame(project({ x: desk.x + x, y, z: desk.z + z }, spot, width, height)));
+      for (const x of [-desk.w / 2, desk.w / 2])
+        for (const z of [-desk.d / 2, desk.d / 2]) {
+          for (const y of [0, 0.823]) {
+            assert.ok(inFrame(project({ x: desk.x + x, y, z: desk.z + z }, spot, width, height)));
+          }
         }
-      }
-      for (const offset of [-0.51, 0.51]) for (const x of [-0.455, 0.455])
-        for (const y of [-0.295, 0.295]) for (const z of [-0.18, -0.08]) {
-          assert.ok(inFrame(project({ x: desk.x + offset + x, y: 1.18 + y, z: desk.z + z }, spot, width, height)));
-        }
-      for (const offset of [-0.51, 0.51]) for (const x of [-0.425, 0.425]) for (const y of [-0.26, 0.26]) {
-        const p = { x: desk.x + offset + x, y: 1.18 + y, z: desk.z - 0.073 };
-        assert.ok(inFrame(project(p, spot, width, height)));
-      }
+      for (const offset of [-0.51, 0.51])
+        for (const x of [-0.455, 0.455])
+          for (const y of [-0.295, 0.295])
+            for (const z of [-0.18, -0.08]) {
+              assert.ok(inFrame(project({ x: desk.x + offset + x, y: 1.18 + y, z: desk.z + z }, spot, width, height)));
+            }
+      for (const offset of [-0.51, 0.51])
+        for (const x of [-0.425, 0.425])
+          for (const y of [-0.26, 0.26]) {
+            const p = { x: desk.x + offset + x, y: 1.18 + y, z: desk.z - 0.073 };
+            assert.ok(inFrame(project(p, spot, width, height)));
+          }
     }
-    assert.ok(DESKS.find(d => d.supervisor).z > spot.z);
+    assert.ok(DESKS.find((d) => d.supervisor).z > spot.z);
     for (const chair of CHAIRS) assert.ok(chair.z - 0.3 > spot.z, 'chairs stay behind the eye');
     for (const x of [-BOARD.width / 2, BOARD.width / 2]) {
       assert.ok(boardPoint(BOARDS[2], x, BOARD.bottom, 0).z < spot.z, 'the center segment stays ahead of the eye');
     }
-    const lights = CEILING_LIGHTS.xs.flatMap(x => CEILING_LIGHTS.zs.map(z =>
-      project({ x, y: ROOM.height - 0.04, z }, spot, width, height)));
-    assert.ok(lights.some(p => inFrame(p, 0) && p.y < height * 0.2));
+    const lights = CEILING_LIGHTS.xs.flatMap((x) =>
+      CEILING_LIGHTS.zs.map((z) => project({ x, y: ROOM.height - 0.04, z }, spot, width, height)),
+    );
+    assert.ok(lights.some((p) => inFrame(p, 0) && p.y < height * 0.2));
   });
 
   test(`each fitted section includes edges, headers, desks and every nameplate at ${width} by ${height}`, () => {
     const placements = devicePlacements(KNOBS);
     for (const board of BOARDS) {
       const spot = { ...STANDING_SPOTS[board.view], ...fitSpot(board, width / height, STANDING_SPOTS[board.view].fov) };
-      assert.ok(!COLLISIONS.some(box => circleHits(spot, ROOM.radius, box)), board.id);
-      for (const x of [-BOARD.width / 2, BOARD.width / 2]) for (const y of [BOARD.bottom, BOARD.top]) {
-        assert.ok(inFrame(project(boardPoint(board, x, y, 0), spot, width, height)), board.title);
-      }
+      assert.ok(!COLLISIONS.some((box) => circleHits(spot, ROOM.radius, box)), board.id);
+      for (const x of [-BOARD.width / 2, BOARD.width / 2])
+        for (const y of [BOARD.bottom, BOARD.top]) {
+          assert.ok(inFrame(project(boardPoint(board, x, y, 0), spot, width, height)), board.title);
+        }
       for (const x of [-BOARD.width / 2, BOARD.width / 2]) {
-        const edge = boardPoint(board, x, BOARD.deskY - Math.sin(BOARD.slope) * BOARD.deskDepth - 0.06, BOARD.deskDepth);
+        const edge = boardPoint(
+          board,
+          x,
+          BOARD.deskY - Math.sin(BOARD.slope) * BOARD.deskDepth - 0.06,
+          BOARD.deskDepth,
+        );
         assert.ok(inFrame(project(edge, spot, width, height)), `${board.id} desk`);
       }
       const layout = boardLayout(board.points.length, board.view);
-      const boxes = [...Object.values(layout.text), ...layout.cells.flatMap(cell => {
-        return Object.values(cellLayout(cell.w, cell.h).text).map(box => ({ ...box, x: box.x + cell.x, y: box.y + cell.y }));
-      })];
-      for (const box of boxes) for (const x of [box.x, box.x + box.w]) for (const y of [box.y, box.y + box.h]) {
-        const point = boardPoint(board, x / BOARD_PX.width * BOARD.width - BOARD.width / 2,
-          BOARD.top - y / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.06);
-        assert.ok(inFrame(project(point, spot, width, height)), `${board.id} printed text`);
-      }
-      for (const device of placements.filter(p => p.segment === board.id)) {
-        for (const x of [-0.075, 0.075]) for (const y of [-0.02, 0.02]) {
-          const point = boardPoint(board, device.x + x, BOARD.deskY + 0.09 + y, BOARD.deskDepth / 4 + 0.08);
-          assert.ok(inFrame(project(point, spot, width, height)), device.id);
-        }
+      const boxes = [
+        ...Object.values(layout.text),
+        ...layout.cells.flatMap((cell) => {
+          return Object.values(cellLayout(cell.w, cell.h).text).map((box) => ({
+            ...box,
+            x: box.x + cell.x,
+            y: box.y + cell.y,
+          }));
+        }),
+      ];
+      for (const box of boxes)
+        for (const x of [box.x, box.x + box.w])
+          for (const y of [box.y, box.y + box.h]) {
+            const point = boardPoint(
+              board,
+              (x / BOARD_PX.width) * BOARD.width - BOARD.width / 2,
+              BOARD.top - (y / BOARD_PX.height) * (BOARD.top - BOARD.bottom),
+              0.06,
+            );
+            assert.ok(inFrame(project(point, spot, width, height)), `${board.id} printed text`);
+          }
+      for (const device of placements.filter((p) => p.segment === board.id)) {
+        for (const x of [-0.075, 0.075])
+          for (const y of [-0.02, 0.02]) {
+            const point = boardPoint(board, device.x + x, BOARD.deskY + 0.09 + y, BOARD.deskDepth / 4 + 0.08);
+            assert.ok(inFrame(project(point, spot, width, height)), device.id);
+          }
       }
     }
   });
 
-  test(`every fitted segment has readable meter lettering and dials at ${width} by ${height}`, t => {
+  test(`every fitted segment has readable meter lettering and dials at ${width} by ${height}`, (t) => {
     let smallestLetter = Infinity;
     let smallestReadout = Infinity;
     let smallestRadius = Infinity;
     for (const board of BOARDS) {
       const spot = { ...STANDING_SPOTS[board.view], ...fitSpot(board, width / height, STANDING_SPOTS[board.view].fov) };
       const layout = boardLayout(board.points.length, board.view);
-      const projected = (x, y, z) => project(boardPoint(board,
-        x / BOARD_PX.width * BOARD.width - BOARD.width / 2,
-        BOARD.top - y / BOARD_PX.height * (BOARD.top - BOARD.bottom), z), spot, width, height);
+      const projected = (x, y, z) =>
+        project(
+          boardPoint(
+            board,
+            (x / BOARD_PX.width) * BOARD.width - BOARD.width / 2,
+            BOARD.top - (y / BOARD_PX.height) * (BOARD.top - BOARD.bottom),
+            z,
+          ),
+          spot,
+          width,
+          height,
+        );
       const lettering = (box, minimum, z) => {
         const top = projected(box.x, box.y + (box.h - box.font) / 2, z);
         const bottom = projected(box.x, box.y + (box.h + box.font) / 2, z);
@@ -259,7 +351,7 @@ for (const [width, height] of CANVASES) {
         smallestLetter = Math.min(smallestLetter, pixels);
         if (minimum === 11) smallestReadout = Math.min(smallestReadout, pixels);
       };
-      Object.values(layout.text).forEach(box => lettering(box, 10, 0.031));
+      Object.values(layout.text).forEach((box) => lettering(box, 10, 0.031));
       for (const cell of layout.cells) {
         const meter = cellLayout(cell.w, cell.h);
         for (const [name, box] of Object.entries(meter.text)) {
@@ -275,7 +367,9 @@ for (const [width, height] of CANVASES) {
         }
       }
     }
-    t.diagnostic(`Smallest lettering ${smallestLetter.toFixed(3)} px; readout ${smallestReadout.toFixed(3)} px; dial radius ${smallestRadius.toFixed(3)} px.`);
+    t.diagnostic(
+      `Smallest lettering ${smallestLetter.toFixed(3)} px; readout ${smallestReadout.toFixed(3)} px; dial radius ${smallestRadius.toFixed(3)} px.`,
+    );
   });
 
   test(`CCTV and door views include floor and ceiling at ${width} by ${height}`, () => {
@@ -297,14 +391,20 @@ for (const [width, height] of CANVASES) {
 test('every alarm in the plant has exactly one permanent window on its board', () => {
   const rust = readFileSync(new URL('../world/src/protection.rs', import.meta.url), 'utf8');
   const all = rust.match(/pub const ALL: \[Self; ALARM_COUNT\] = \[([\s\S]*?)\];/)[1];
-  const expected = [...all.matchAll(/Self::(\w+)(?:\(Loop::([AB])\))?/g)].map(([, name, loop]) =>
-    name.replace(/[A-Z]/g, (c, i) => `${i ? '_' : ''}${c.toLowerCase()}`) + (loop ? `:${loop.toLowerCase()}` : ''));
-  const keys = ANNUNCIATOR_WINDOWS.map(w => w.key);
-  assert.equal(keys.length, 22); assert.equal(new Set(keys).size, 22);
+  const expected = [...all.matchAll(/Self::(\w+)(?:\(Loop::([AB])\))?/g)].map(
+    ([, name, loop]) =>
+      name.replace(/[A-Z]/g, (c, i) => `${i ? '_' : ''}${c.toLowerCase()}`) + (loop ? `:${loop.toLowerCase()}` : ''),
+  );
+  const keys = ANNUNCIATOR_WINDOWS.map((w) => w.key);
+  assert.equal(keys.length, 22);
+  assert.equal(new Set(keys).size, 22);
   assert.deepEqual([...keys].sort(), expected.sort());
-  assert.deepEqual(ANNUNCIATOR_WINDOWS.filter(w => w.board === 'turbine-board').map(w => w.key), ['turbine_tripped', 'condenser_vacuum_low']);
-  assert.equal(ANNUNCIATOR_WINDOWS.find(w => w.key === 'coolant_flow_low:b').board, 'rcs-board');
-  assert.equal(ANNUNCIATOR_WINDOWS.find(w => w.key === 'reactor_tripped').board, 'rps-board');
+  assert.deepEqual(
+    ANNUNCIATOR_WINDOWS.filter((w) => w.board === 'turbine-board').map((w) => w.key),
+    ['turbine_tripped', 'condenser_vacuum_low'],
+  );
+  assert.equal(ANNUNCIATOR_WINDOWS.find((w) => w.key === 'coolant_flow_low:b').board, 'rcs-board');
+  assert.equal(ANNUNCIATOR_WINDOWS.find((w) => w.key === 'reactor_tripped').board, 'rps-board');
   for (const board of BOARDS) {
     const layout = boardLayout(board.points.length, board.view);
     for (const [i, window] of layout.windows.entries()) {
@@ -346,12 +446,12 @@ test('alarm windows flash twice a second only while unacknowledged', () => {
 });
 
 test('every control sits under its own meter without overlapping another device', () => {
-  const knobs = KNOBS.filter(k => k.group === 'plant');
+  const knobs = KNOBS.filter((k) => k.group === 'plant');
   const placements = devicePlacements(KNOBS);
   assert.equal(placements.length, knobs.length);
   for (const knob of knobs) {
-    const p = placements.find(p => p.id === knob.id);
-    const board = BOARDS.find(b => b.id === knob.board);
+    const p = placements.find((p) => p.id === knob.id);
+    const board = BOARDS.find((b) => b.id === knob.board);
     assert.equal(p.segment, knob.board);
     assert.equal(p.yaw, board.yaw);
     if (knob.point === null) {
@@ -362,17 +462,22 @@ test('every control sits under its own meter without overlapping another device'
       assert.ok(board.points.includes(knob.point), knob.id);
       assert.ok(Math.abs(p.x - meterCenter(board, knob.point)) < 0.3, knob.id);
     }
-    const y = BOARD.deskY - Math.sin(BOARD.slope) * BOARD.deskDepth / 4;
+    const y = BOARD.deskY - (Math.sin(BOARD.slope) * BOARD.deskDepth) / 4;
     assert.deepEqual(p.position, boardPoint(board, p.x, y, BOARD.deskDepth / 4));
     const depth = Math.sin(board.yaw) * (p.position.x - board.x) + Math.cos(board.yaw) * (p.position.z - board.z);
     assert.ok(depth > 0 && depth <= BOARD.deskDepth / 3);
     assert.ok(p.footprint.y >= 0 && p.footprint.y + p.footprint.h <= BOARD.deskDepth);
     assert.ok(p.footprint.x >= -BOARD.width / 2 && p.footprint.x + p.footprint.w <= BOARD.width / 2);
-    for (const other of placements.filter(q => q.segment === p.segment && q.id !== p.id)) {
+    for (const other of placements.filter((q) => q.segment === p.segment && q.id !== p.id)) {
       assert.ok(!overlaps(p.footprint, other.footprint), `${p.id} and ${other.id}`);
     }
   }
-  assert.deepEqual(devicePlacements([...KNOBS].reverse()).map(p => p.segment).sort(), placements.map(p => p.segment).sort());
+  assert.deepEqual(
+    devicePlacements([...KNOBS].reverse())
+      .map((p) => p.segment)
+      .sort(),
+    placements.map((p) => p.segment).sort(),
+  );
 });
 
 test('fit distance follows canvas aspect and camera field of view', () => {
@@ -388,7 +493,7 @@ for (const count of [6, 9]) {
   test(`${count} point board centers the warning and longest gap text without overlap`, () => {
     const cell = boardLayout(count).cells[0];
     const { gapLine } = cellLayout(cell.w, cell.h);
-    const longest = strings.gap.reduce((a, b) => a.length > b.length ? a : b);
+    const longest = strings.gap.reduce((a, b) => (a.length > b.length ? a : b));
     const gap = gapLayout(gapLine, longest.length * 0.6 * gapLine.font);
     assert.ok(!overlaps(gap.warning, gap.text));
     assert.equal(gap.text.x - (gap.warning.x + gap.warning.w), 6);
@@ -402,7 +507,6 @@ for (const count of [6, 9]) {
   });
 }
 
-
 test('hot and cold mimic paths stay in the meter rows and meet across segment joins', () => {
   assert.deepEqual(mimicLines(BOARDS[0]), []);
   assert.deepEqual(mimicLines(BOARDS[4]), []);
@@ -410,11 +514,11 @@ test('hot and cold mimic paths stay in the meter rows and meet across segment jo
     const lines = mimicLines(board);
     assert.equal(lines.length, 4);
     for (const line of lines) {
-      const y = BOARD.top - line.y * BOARD.width / BOARD_PX.width;
+      const y = BOARD.top - (line.y * BOARD.width) / BOARD_PX.width;
       assert.ok(y >= 1.15 && y <= 2.35);
       assert.ok(line.start >= 0 && line.end <= BOARD_PX.width && line.start < line.end);
       assert.equal(line.direction, line.color === 'hotCoolant' ? 1 : -1);
-      const point = board.points.findIndex(key => key.endsWith(`:${line.loop}`));
+      const point = board.points.findIndex((key) => key.endsWith(`:${line.loop}`));
       const cell = boardLayout(board.points.length, board.view).cells[point];
       const dial = cellLayout(cell.w, cell.h).dials[0];
       assert.ok(line.y > cell.y + dial.y && line.y < cell.y + dial.y + dial.h);
@@ -428,8 +532,8 @@ test('hot and cold mimic paths stay in the meter rows and meet across segment jo
       assert.equal(left.y, right.y);
       assert.equal(left.end, BOARD_PX.width);
       assert.equal(right.start, 0);
-      const p = boardPoint(a, BOARD.width / 2, BOARD.top - left.y * BOARD.width / BOARD_PX.width, 0);
-      const q = boardPoint(b, -BOARD.width / 2, BOARD.top - right.y * BOARD.width / BOARD_PX.width, 0);
+      const p = boardPoint(a, BOARD.width / 2, BOARD.top - (left.y * BOARD.width) / BOARD_PX.width, 0);
+      const q = boardPoint(b, -BOARD.width / 2, BOARD.top - (right.y * BOARD.width) / BOARD_PX.width, 0);
       assert.ok(Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z) < 0.001);
     }
   }
@@ -447,20 +551,25 @@ test('standing spots own their field of view and keep section optics unchanged',
 test('the plant door opens through the rear wall while both jambs still block walking', () => {
   const start = STANDING_SPOTS.door;
   for (const z of [6.8, 7, 7.2]) {
-    assert.equal(COLLISIONS.some(box => circleHits({ x: start.x, z }, ROOM.radius, box)), false);
+    assert.equal(
+      COLLISIONS.some((box) => circleHits({ x: start.x, z }, ROOM.radius, box)),
+      false,
+    );
   }
   for (const x of [3.7, 5.3]) {
-    assert.equal(COLLISIONS.some(box => circleHits({ x, z: 7 }, ROOM.radius, box)), true);
+    assert.equal(
+      COLLISIONS.some((box) => circleHits({ x, z: 7 }, ROOM.radius, box)),
+      true,
+    );
   }
 });
-
 
 test('the wall monitor bank has a collision footprint and fits below the ceiling', () => {
   assert.ok(CCTV.y + (CCTV.bankHeight + 0.08) / 2 < ROOM.height);
   assert.ok(CCTV.y - (CCTV.bankHeight + 0.08) / 2 > 0);
   for (const z of [-CCTV.bankWidth / 2, 0, CCTV.bankWidth / 2]) {
     const point = { x: CCTV.x + 0.04, z: CCTV.z - 0.35 + z };
-    assert.ok(COLLISIONS.some(box => circleHits(point, ROOM.radius, box)));
+    assert.ok(COLLISIONS.some((box) => circleHits(point, ROOM.radius, box)));
   }
   for (const [width, height] of CANVASES) {
     const corners = [];
@@ -469,8 +578,8 @@ test('the wall monitor bank has a collision footprint and fits below the ceiling
         corners.push(project({ x: CCTV.x + 0.06, y: CCTV.y + y, z: CCTV.z + z }, STANDING_SPOTS.cctv, width, height));
       }
     }
-    const share = (Math.max(...corners.map(p => p.x)) - Math.min(...corners.map(p => p.x))) / width;
+    const share = (Math.max(...corners.map((p) => p.x)) - Math.min(...corners.map((p) => p.x))) / width;
     assert.ok(share >= 0.68 && share <= 0.72);
-    assert.ok(corners.every(p => p.depth > 0 && p.x > 0 && p.x < width && p.y > 0 && p.y < height));
+    assert.ok(corners.every((p) => p.depth > 0 && p.x > 0 && p.x < width && p.y > 0 && p.y < height));
   }
 });

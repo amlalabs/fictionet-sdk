@@ -69,8 +69,9 @@ export const PALETTE_TOKENS = Object.freeze({
   hotCoolant: '--coolant-hot',
 });
 export function paletteReady(values) {
-  return Object.keys(PALETTE_TOKENS).every((name) =>
-    typeof values[name] === 'string' && values[name].trim().length > 0);
+  return Object.keys(PALETTE_TOKENS).every(
+    (name) => typeof values[name] === 'string' && values[name].trim().length > 0,
+  );
 }
 
 const LOAD_FAILURE = 'Run `cargo xtask demo libraries`, then rebuild.';
@@ -104,24 +105,54 @@ export const KNOBS = Object.freeze([
     label: 'Turbine valve',
     channel: 'plant',
     values: TURBINE_VALVE_VALUES,
-    setting: (value) => nearestIndex(TURBINE_VALVE_VALUES, Math.round(value.truth.secondary.turbine_valve_percent * 10)),
+    setting: (value) =>
+      nearestIndex(TURBINE_VALVE_VALUES, Math.round(value.truth.secondary.turbine_valve_percent * 10)),
     command: (permille) => plant.valveDemand('turbine', permille),
     readout: (value) => `Valve ${formatValue(value.truth.secondary.turbine_valve_percent, '%')}`,
     describe: (permille) => `${formatValue(permille / 10, '%')} demanded`,
   },
-  { ...pumpSwitch('coolant-pump-a', 'Coolant pump A', 'a'),
-    board: 'rcs', point: 'coolant_flow:a' },
-  { ...pumpSwitch('coolant-pump-b', 'Coolant pump B', 'b'),
-    board: 'rcs', point: 'coolant_flow:b' },
-  { ...controllerSwitch('feed-level-a', 'Feed level A control', { feed_level: 'a' }, (v) => v.truth.controllers.feed_level[0]),
-    board: 'feed', point: 'feed_flow:a' },
-  { ...controllerSwitch('feed-level-b', 'Feed level B control', { feed_level: 'b' }, (v) => v.truth.controllers.feed_level[1]),
-    board: 'feed', point: 'feed_flow:b' },
-  { ...controllerSwitch('pressurizer-control', 'Pressurizer pressure control', 'pressurizer_pressure',
-    (v) => v.truth.controllers.pressurizer_pressure),
-    board: 'rcs', point: 'pressurizer_pressure' },
-  { ...controllerSwitch('steam-dump-control', 'Steam dump control', 'steam_dump', (v) => v.truth.controllers.steam_dump),
-    board: 'turbine', point: 'steam_pressure' },
+  { ...pumpSwitch('coolant-pump-a', 'Coolant pump A', 'a'), board: 'rcs', point: 'coolant_flow:a' },
+  { ...pumpSwitch('coolant-pump-b', 'Coolant pump B', 'b'), board: 'rcs', point: 'coolant_flow:b' },
+  {
+    ...controllerSwitch(
+      'feed-level-a',
+      'Feed level A control',
+      { feed_level: 'a' },
+      (v) => v.truth.controllers.feed_level[0],
+    ),
+    board: 'feed',
+    point: 'feed_flow:a',
+  },
+  {
+    ...controllerSwitch(
+      'feed-level-b',
+      'Feed level B control',
+      { feed_level: 'b' },
+      (v) => v.truth.controllers.feed_level[1],
+    ),
+    board: 'feed',
+    point: 'feed_flow:b',
+  },
+  {
+    ...controllerSwitch(
+      'pressurizer-control',
+      'Pressurizer pressure control',
+      'pressurizer_pressure',
+      (v) => v.truth.controllers.pressurizer_pressure,
+    ),
+    board: 'rcs',
+    point: 'pressurizer_pressure',
+  },
+  {
+    ...controllerSwitch(
+      'steam-dump-control',
+      'Steam dump control',
+      'steam_dump',
+      (v) => v.truth.controllers.steam_dump,
+    ),
+    board: 'turbine',
+    point: 'steam_pressure',
+  },
   {
     id: 'heaters',
     board: 'rcs',
@@ -166,18 +197,31 @@ export const KNOBS = Object.freeze([
     command: () => plant.acknowledgeAlarms(),
   },
   // Fault injection. These post a FaultCommand carrying the snapshot's revision.
-  faultSwitch('telemetry-quiet', 'Telemetry quiet', (value) => value.faults.telemetry_quiet, (on) => fault.telemetryQuiet(on)),
+  faultSwitch(
+    'telemetry-quiet',
+    'Telemetry quiet',
+    (value) => value.faults.telemetry_quiet,
+    (on) => fault.telemetryQuiet(on),
+  ),
   faultSwitch(
     'condenser-loss',
     'Condenser cooling loss',
     (value) => hasProcess(value, 'condenser_cooling_loss'),
     (on) => fault.condenserCoolingLoss(on),
   ),
-  ...['a', 'b'].flatMap(loop => [
-    faultSwitch(`coolant-trip-${loop}`, `Coolant pump ${loop.toUpperCase()} trip`,
-      value => hasProcess(value, `coolant_pump_trip:${loop}`), on => fault.coolantPumpTrip(loop, on)),
-    faultSwitch(`feed-trip-${loop}`, `Feed pump ${loop.toUpperCase()} trip`,
-      value => hasProcess(value, `feed_pump_trip:${loop}`), on => fault.feedPumpTrip(loop, on)),
+  ...['a', 'b'].flatMap((loop) => [
+    faultSwitch(
+      `coolant-trip-${loop}`,
+      `Coolant pump ${loop.toUpperCase()} trip`,
+      (value) => hasProcess(value, `coolant_pump_trip:${loop}`),
+      (on) => fault.coolantPumpTrip(loop, on),
+    ),
+    faultSwitch(
+      `feed-trip-${loop}`,
+      `Feed pump ${loop.toUpperCase()} trip`,
+      (value) => hasProcess(value, `feed_pump_trip:${loop}`),
+      (on) => fault.feedPumpTrip(loop, on),
+    ),
   ]),
   {
     id: 'clear-faults',
@@ -308,7 +352,12 @@ export function mount(root, services, options = {}) {
 
   const alarmList = h('ul', { class: 'cr-alarm-list' }, h('li', { text: 'Waiting for the plant.' }));
   const processList = h('ul', { class: 'cr-instructor-active' }, h('li', { text: 'Waiting for the plant.' }));
-  const overlayStatus = h('p', { class: 'cr-scene-status', role: 'status', 'aria-live': 'off', text: 'Waiting for the first plant snapshot.' });
+  const overlayStatus = h('p', {
+    class: 'cr-scene-status',
+    role: 'status',
+    'aria-live': 'off',
+    text: 'Waiting for the first plant snapshot.',
+  });
   const vantageButtons = [
     ['control-room', 'Room', STANDING_SPOTS['control-room'].name],
     ['rps-board', 'RPS', STANDING_SPOTS['rps-board'].name],
@@ -320,14 +369,29 @@ export function mount(root, services, options = {}) {
     ['door', 'Door', STANDING_SPOTS.door.name],
     ['reactor', 'Containment', 'Reactor building'],
     ['turbine', 'Turbine hall', 'Turbine hall'],
-  ].map(([name, label, accessible]) => h('button', {
-    type: 'button', class: 'cr-vantage', 'data-view': name, 'aria-label': accessible,
-    'aria-pressed': name === viewName ? 'true' : 'false', text: label,
-  }));
+  ].map(([name, label, accessible]) =>
+    h('button', {
+      type: 'button',
+      class: 'cr-vantage',
+      'data-view': name,
+      'aria-label': accessible,
+      'aria-pressed': name === viewName ? 'true' : 'false',
+      text: label,
+    }),
+  );
   const controlStage = h('div', { class: 'cr-stage' });
-  const viewport = h('section', { class: 'cr-view', 'aria-label': 'Views of the plant' }, controlStage,
-    h('div', { class: 'cr-vantages', role: 'group', 'aria-label': 'Vantage point' }, ...vantageButtons), overlayStatus);
-  const walkHelp = h('p', { id: 'cr-walk-help', class: 'cr-note', text: 'Focus the scene to walk with WASD or arrow keys. Drag a device to operate it. Drag empty space to look. Click empty space to lock the pointer. Press Esc to release it.' });
+  const viewport = h(
+    'section',
+    { class: 'cr-view', 'aria-label': 'Views of the plant' },
+    controlStage,
+    h('div', { class: 'cr-vantages', role: 'group', 'aria-label': 'Vantage point' }, ...vantageButtons),
+    overlayStatus,
+  );
+  const walkHelp = h('p', {
+    id: 'cr-walk-help',
+    class: 'cr-note',
+    text: 'Focus the scene to walk with WASD or arrow keys. Drag a device to operate it. Drag empty space to look. Click empty space to lock the pointer. Press Esc to release it.',
+  });
 
   const knobGroups = {
     plant: h('div', { class: 'cr-knob-grid' }),
@@ -344,39 +408,92 @@ export function mount(root, services, options = {}) {
       knobGroups.plant,
     ),
   );
-  const sensorPicker = h('select', { id: 'cr-instructor-sensor' },
-    ...FAULT_SENSORS.map(point => h('option', { value: point.key, text: `${point.label} (${point.tag})` })));
-  const kindPicker = h('select', { id: 'cr-instructor-kind', 'aria-describedby': 'cr-instructor-help' },
+  const sensorPicker = h(
+    'select',
+    { id: 'cr-instructor-sensor' },
+    ...FAULT_SENSORS.map((point) => h('option', { value: point.key, text: `${point.label} (${point.tag})` })),
+  );
+  const kindPicker = h(
+    'select',
+    { id: 'cr-instructor-kind', 'aria-describedby': 'cr-instructor-help' },
     h('option', { value: 'stuck', text: 'Stuck at the current count' }),
     h('option', { value: 'bias', text: 'Bias' }),
-    h('option', { value: 'quiet', text: 'Quiet' }));
+    h('option', { value: 'quiet', text: 'Quiet' }),
+  );
   const biasInput = h('input', { id: 'cr-instructor-bias', type: 'number', value: '0', step: '0.1' });
   const biasUnit = h('span', { text: '%' });
-  const biasField = h('div', { class: 'cr-instructor-field', hidden: true },
-    h('label', { for: 'cr-instructor-bias' }, 'Signed bias (', biasUnit, ')'), biasInput);
+  const biasField = h(
+    'div',
+    { class: 'cr-instructor-field', hidden: true },
+    h('label', { for: 'cr-instructor-bias' }, 'Signed bias (', biasUnit, ')'),
+    biasInput,
+  );
   const instructorStatus = h('p', { class: 'cr-instructor-status', role: 'status', text: 'Waiting for the plant.' });
   const clearActions = new Map();
   const injectAction = instructorAction('Inject', () => {
-    const point = FAULT_SENSORS.find(entry => entry.key === sensorPicker.value);
+    const point = FAULT_SENSORS.find((entry) => entry.key === sensorPicker.value);
     if (kindPicker.value === 'bias' && biasInput.value.trim() === '') throw new RangeError('Enter a signed bias.');
     return sensorFault(latest.value, point, kindPicker.value, Number(biasInput.value));
   });
-  const sensorBuilder = h('div', { class: 'cr-instructor-builder' },
-    h('div', { class: 'cr-instructor-field' }, h('label', { for: 'cr-instructor-sensor', text: 'Sensor' }), sensorPicker),
-    h('div', { class: 'cr-instructor-field' }, h('label', { for: 'cr-instructor-kind', text: 'Fault kind' }), kindPicker),
-    biasField, injectAction.root);
+  const sensorBuilder = h(
+    'div',
+    { class: 'cr-instructor-builder' },
+    h(
+      'div',
+      { class: 'cr-instructor-field' },
+      h('label', { for: 'cr-instructor-sensor', text: 'Sensor' }),
+      sensorPicker,
+    ),
+    h(
+      'div',
+      { class: 'cr-instructor-field' },
+      h('label', { for: 'cr-instructor-kind', text: 'Fault kind' }),
+      kindPicker,
+    ),
+    biasField,
+    injectAction.root,
+  );
   listen(sensorPicker, 'change', syncInstructorBuilder);
   listen(kindPicker, 'change', syncInstructorBuilder);
-  const instructor = h('section', { class: 'cr-group cr-group-faults', 'aria-labelledby': 'cr-faults-title' },
+  const instructor = h(
+    'section',
+    { class: 'cr-group cr-group-faults', 'aria-labelledby': 'cr-faults-title' },
     h('h2', { id: 'cr-faults-title', text: 'Instructor station' }),
-    h('p', { class: 'cr-note', text: "Instructor faults for the scenario. The operator's console does not include these." }),
-    h('p', { id: 'cr-instructor-help', class: 'cr-note', text: 'Clear an active sensor fault before changing its kind.' }),
-    sensorBuilder, instructorStatus, knobGroups.faults,
-    h('h3', { text: 'Active faults' }), processList);
+    h('p', {
+      class: 'cr-note',
+      text: "Instructor faults for the scenario. The operator's console does not include these.",
+    }),
+    h('p', {
+      id: 'cr-instructor-help',
+      class: 'cr-note',
+      text: 'Clear an active sensor fault before changing its kind.',
+    }),
+    sensorBuilder,
+    instructorStatus,
+    knobGroups.faults,
+    h('h3', { text: 'Active faults' }),
+    processList,
+  );
   const readingsHost = h('div', { class: 'cr-readings' });
-  root.append(h('section', { class: 'cr-panel' }, viewport,
-    h('section', { class: 'cr-fallback', 'aria-label': 'Plant status and text controls' }, walkHelp, status, facts,
-      h('h2', { text: 'Alarms' }), alarmList, controls, readingsHost, instructor)));
+  root.append(
+    h(
+      'section',
+      { class: 'cr-panel' },
+      viewport,
+      h(
+        'section',
+        { class: 'cr-fallback', 'aria-label': 'Plant status and text controls' },
+        walkHelp,
+        status,
+        facts,
+        h('h2', { text: 'Alarms' }),
+        alarmList,
+        controls,
+        readingsHost,
+        instructor,
+      ),
+    ),
+  );
 
   // Knobs are built once. Their DOM follows the model every tick.
   for (const spec of KNOBS) {
@@ -391,9 +508,17 @@ export function mount(root, services, options = {}) {
     const control = h('button', { type: 'button', class: 'cr-instructor-button' }, cap);
     const statusEl = h('p', { class: 'cr-instructor-status', role: 'status' });
     const readEl = h('span');
-    const action = { spec: { channel: 'faults', kind: 'button' }, model: createButton(),
-      pending: false, seq: 0, cap, control, statusEl, readEl,
-      root: h('div', { class: 'cr-instructor-action' }, control, statusEl, readEl) };
+    const action = {
+      spec: { channel: 'faults', kind: 'button' },
+      model: createButton(),
+      pending: false,
+      seq: 0,
+      cap,
+      control,
+      statusEl,
+      readEl,
+      root: h('div', { class: 'cr-instructor-action' }, control, statusEl, readEl),
+    };
     listen(control, 'click', async () => {
       if (disabledFor(action) || action.pending) return;
       try {
@@ -414,7 +539,7 @@ export function mount(root, services, options = {}) {
   }
 
   function syncInstructorBuilder() {
-    const point = FAULT_SENSORS.find(entry => entry.key === sensorPicker.value);
+    const point = FAULT_SENSORS.find((entry) => entry.key === sensorPicker.value);
     biasField.hidden = kindPicker.value !== 'bias';
     biasUnit.textContent = point.unit;
     biasInput.step = String(point.resolution);
@@ -425,7 +550,7 @@ export function mount(root, services, options = {}) {
     syncInstructorBuilder();
     if (instructorStatus.textContent === 'Waiting for the plant.') instructorStatus.textContent = 'Ready.';
     const entries = activeFaults(latest.value);
-    const present = new Set(entries.map(entry => entry.key));
+    const present = new Set(entries.map((entry) => entry.key));
     for (const [key, row] of clearActions) {
       if (present.has(key)) continue;
       if (row.root.contains(document.activeElement)) injectAction.control.focus();
@@ -466,7 +591,11 @@ export function mount(root, services, options = {}) {
   // ---- Knob models and DOM ------------------------------------------------
 
   function buildKnob(spec) {
-    const ids = { name: `cr-knob-${spec.id}-name`, read: `cr-knob-${spec.id}-read`, status: `cr-knob-${spec.id}-status` };
+    const ids = {
+      name: `cr-knob-${spec.id}-name`,
+      read: `cr-knob-${spec.id}-read`,
+      status: `cr-knob-${spec.id}-status`,
+    };
     const knob = {
       spec,
       cover: spec.id === 'manual-trip' ? coverState() : null,
@@ -490,52 +619,98 @@ export function mount(root, services, options = {}) {
 
     if (spec.kind === 'dial' || spec.kind === 'rotary') {
       const pointer = h('span', { class: 'cr-pointer', 'aria-hidden': 'true' });
-      knob.face = h('div', {
-        class: `cr-knob-face cr-${spec.kind}`,
-        role: 'slider',
-        tabindex: '0',
-        'aria-labelledby': ids.name,
-        'aria-describedby': `${ids.read} ${ids.status}`,
-        'aria-valuemin': spec.kind === 'dial' ? '0' : String(spec.values[0] / 10),
-        'aria-valuemax': spec.kind === 'dial' ? '100' : String(spec.values[spec.values.length - 1] / 10),
-      }, pointer);
+      knob.face = h(
+        'div',
+        {
+          class: `cr-knob-face cr-${spec.kind}`,
+          role: 'slider',
+          tabindex: '0',
+          'aria-labelledby': ids.name,
+          'aria-describedby': `${ids.read} ${ids.status}`,
+          'aria-valuemin': spec.kind === 'dial' ? '0' : String(spec.values[0] / 10),
+          'aria-valuemax': spec.kind === 'dial' ? '100' : String(spec.values[spec.values.length - 1] / 10),
+        },
+        pointer,
+      );
       knob.pointer = pointer;
       knob.control = knob.face;
-      knob.root = h('div', { class: 'cr-knob', 'data-kind': spec.kind, 'data-group': spec.group }, knob.face, name, knob.readEl, knob.statusEl);
+      knob.root = h(
+        'div',
+        { class: 'cr-knob', 'data-kind': spec.kind, 'data-group': spec.group },
+        knob.face,
+        name,
+        knob.readEl,
+        knob.statusEl,
+      );
       wireDial(knob);
     } else if (spec.kind === 'switch') {
       const lever = h('span', { class: 'cr-switch-lever', 'aria-hidden': 'true' });
       knob.lever = lever;
-      knob.control = h('button', {
-        type: 'button',
-        class: 'cr-switch',
-        role: 'switch',
-        'aria-checked': 'false',
-        'aria-labelledby': ids.name,
-        'aria-describedby': `${ids.read} ${ids.status}`,
-      }, h('span', { class: 'cr-switch-track', 'aria-hidden': 'true' }, lever));
-      knob.root = h('div', { class: 'cr-knob', 'data-kind': 'switch', 'data-group': spec.group }, knob.control, name, knob.readEl, knob.statusEl);
+      knob.control = h(
+        'button',
+        {
+          type: 'button',
+          class: 'cr-switch',
+          role: 'switch',
+          'aria-checked': 'false',
+          'aria-labelledby': ids.name,
+          'aria-describedby': `${ids.read} ${ids.status}`,
+        },
+        h('span', { class: 'cr-switch-track', 'aria-hidden': 'true' }, lever),
+      );
+      knob.root = h(
+        'div',
+        { class: 'cr-knob', 'data-kind': 'switch', 'data-group': spec.group },
+        knob.control,
+        name,
+        knob.readEl,
+        knob.statusEl,
+      );
       listen(knob.control, 'click', () => onSwitch(knob));
     } else {
       knob.cap = h('span', { class: 'cr-push-cap', 'aria-hidden': 'true' });
-      knob.control = h('button', {
-        type: 'button',
-        class: 'cr-push',
-        'aria-labelledby': ids.name,
-        'aria-describedby': ids.status,
-      }, knob.cap);
-      knob.root = h('div', { class: 'cr-knob', 'data-kind': 'button', 'data-group': spec.group }, knob.control, name, knob.statusEl);
+      knob.control = h(
+        'button',
+        {
+          type: 'button',
+          class: 'cr-push',
+          'aria-labelledby': ids.name,
+          'aria-describedby': ids.status,
+        },
+        knob.cap,
+      );
+      knob.root = h(
+        'div',
+        { class: 'cr-knob', 'data-kind': 'button', 'data-group': spec.group },
+        knob.control,
+        name,
+        knob.statusEl,
+      );
       wireButton(knob);
     }
     if (knob.cover) {
-      knob.closeCover = h('button', { type: 'button', class: 'cr-cover-close', text: 'Close trip cover', hidden: true });
+      knob.closeCover = h('button', {
+        type: 'button',
+        class: 'cr-cover-close',
+        text: 'Close trip cover',
+        hidden: true,
+      });
       knob.root.append(knob.closeCover);
-      listen(knob.closeCover, 'click', () => { deviceAction(spec.id, 'close'); knob.control.focus(); });
+      listen(knob.closeCover, 'click', () => {
+        deviceAction(spec.id, 'close');
+        knob.control.focus();
+      });
       knob.statusEl.textContent = 'Cover closed. Press to open.';
     }
-    listen(knob.root, 'focusin', () => { knob.focused = true; refreshBoard(); });
-    listen(knob.root, 'focusout', event => {
-      if (!knob.root.contains(event.relatedTarget)) { knob.focused = false; refreshBoard(); }
+    listen(knob.root, 'focusin', () => {
+      knob.focused = true;
+      refreshBoard();
+    });
+    listen(knob.root, 'focusout', (event) => {
+      if (!knob.root.contains(event.relatedTarget)) {
+        knob.focused = false;
+        refreshBoard();
+      }
     });
     return knob;
   }
@@ -617,14 +792,16 @@ export function mount(root, services, options = {}) {
       const c = center();
       return (Math.atan2(event.clientY - c.y, event.clientX - c.x) * 180) / Math.PI;
     };
-    listen(face, 'pointerdown', event => {
+    listen(face, 'pointerdown', (event) => {
       if (event.button !== 0 || disabledFor(knob)) return;
       face.setPointerCapture?.(event.pointerId);
       face.focus();
       deviceAction(knob.spec.id, 'down', { angle: angleAt(event), time: event.timeStamp });
     });
-    listen(face, 'pointermove', event => deviceAction(knob.spec.id, 'move', { angle: angleAt(event), time: event.timeStamp }));
-    listen(face, 'pointerup', event => {
+    listen(face, 'pointermove', (event) =>
+      deviceAction(knob.spec.id, 'move', { angle: angleAt(event), time: event.timeStamp }),
+    );
+    listen(face, 'pointerup', (event) => {
       if (face.hasPointerCapture?.(event.pointerId)) face.releasePointerCapture(event.pointerId);
       deviceAction(knob.spec.id, 'up', { time: event.timeStamp });
     });
@@ -717,28 +894,41 @@ export function mount(root, services, options = {}) {
       command = next.command;
       if (command === null) {
         setOutcome(knob, { text: knob.cover.fired ? 'Close the cover to rearm.' : 'Cover open. Press again to trip.' });
-        paintKnob(knob); refreshBoard();
+        paintKnob(knob);
+        refreshBoard();
         return;
       }
     }
     knob.model = { ...pressButton(knob.model), depth: 1 };
     if (!held) knob.model = releaseButton(knob.model);
     if (reducedMotion()) knob.model = advanceButton(knob.model, Infinity);
-    paintKnob(knob); refreshBoard(); requestTick();
+    paintKnob(knob);
+    refreshBoard();
+    requestTick();
     send(knob, command);
   }
 
   function wireButton(knob) {
-    listen(knob.control, 'pointerdown', event => {
-      if (event.button !== 0 || disabledFor(knob) || knob.pending || (knob.cover && (!knob.cover.open || knob.cover.fired))) return;
+    listen(knob.control, 'pointerdown', (event) => {
+      if (
+        event.button !== 0 ||
+        disabledFor(knob) ||
+        knob.pending ||
+        (knob.cover && (!knob.cover.open || knob.cover.fired))
+      )
+        return;
       knob.model = pressButton(knob.model);
       if (reducedMotion()) knob.model = advanceButton(knob.model, Infinity);
-      paintKnob(knob); refreshBoard(); requestTick();
+      paintKnob(knob);
+      refreshBoard();
+      requestTick();
     });
     const release = () => {
       knob.model = releaseButton(knob.model);
       if (reducedMotion()) knob.model = advanceButton(knob.model, Infinity);
-      paintKnob(knob); refreshBoard(); requestTick();
+      paintKnob(knob);
+      refreshBoard();
+      requestTick();
     };
     listen(knob.control, 'pointerup', release);
     listen(knob.control, 'pointerleave', release);
@@ -758,8 +948,10 @@ export function mount(root, services, options = {}) {
     } else if (action === 'down') {
       if (disabledFor(knob) || knob.pending) return false;
       if (turning) {
-        knob.dragging = true; knob.lastAngle = sample.angle;
-        knob.trail = [{ t: sample.time, deg: 0 }]; knob.releasedPending = false;
+        knob.dragging = true;
+        knob.lastAngle = sample.angle;
+        knob.trail = [{ t: sample.time, deg: 0 }];
+        knob.releasedPending = false;
         if (spec.kind === 'dial') knob.model = releaseDial(knob.model, 0);
       } else if (spec.kind === 'switch') onSwitch(knob);
       else activateButton(knob, true);
@@ -791,7 +983,10 @@ export function mount(root, services, options = {}) {
       } else if (spec.kind === 'button') knob.model = releaseButton(knob.model);
     }
     if (reducedMotion() && spec.kind === 'button') knob.model = advanceButton(knob.model, Infinity);
-    paintKnob(knob); paintReadout(knob); refreshBoard(); requestTick();
+    paintKnob(knob);
+    paintReadout(knob);
+    refreshBoard();
+    requestTick();
     return true;
   }
 
@@ -884,8 +1079,14 @@ export function mount(root, services, options = {}) {
     latest = { revision: value.revision, value, view };
     showStatus(view);
     showFacts(value, view);
-    const alarms = view.alarms.filter(a => a.state === 'active' || a.state === 'acknowledged');
-    alarmList.replaceChildren(...(alarms.length ? alarms.map(a => h('li', { text: `${a.label}. ${a.state === 'active' ? 'Active, unacknowledged' : 'Acknowledged'}.` })) : [h('li', { text: 'No alarms.' })]));
+    const alarms = view.alarms.filter((a) => a.state === 'active' || a.state === 'acknowledged');
+    alarmList.replaceChildren(
+      ...(alarms.length
+        ? alarms.map((a) =>
+            h('li', { text: `${a.label}. ${a.state === 'active' ? 'Active, unacknowledged' : 'Acknowledged'}.` }),
+          )
+        : [h('li', { text: 'No alarms.' })]),
+    );
     syncInstructor();
     for (const knob of knobList) {
       syncKnob(knob);
@@ -921,17 +1122,31 @@ export function mount(root, services, options = {}) {
     }
     const text = {
       plantTime: formatClock(view.atMs),
-      telemetry: view.telemetry.quiet ? 'Telemetry quiet: readings held' : `Telemetry live, heartbeat ${view.telemetry.heartbeat}`,
+      telemetry: view.telemetry.quiet
+        ? 'Telemetry quiet: readings held'
+        : `Telemetry live, heartbeat ${view.telemetry.heartbeat}`,
       held,
     };
-    const knobStates = knobList.filter(knob => knob.spec.group === 'plant').map((knob) => {
-      const { model, spec } = knob;
-      return { kind: spec.kind, fraction: model.angle / model.sweep, sweep: model.sweep,
-        travel: model.travel, depth: model.depth, cover: knob.cover, focused: knob.focused,
-        pending: knob.pending || knob.root.dataset.outcome === 'pending', refusedUntil: knob.refusedUntil,
-        disabled: disabledFor(knob), green: spec.indication?.(latest.value, view), mode: spec.mode,
-        value: spec.kind === 'dial' ? dialValue(model) / 10 : spec.kind === 'rotary' ? rotaryValue(model) / 10 : null };
-    });
+    const knobStates = knobList
+      .filter((knob) => knob.spec.group === 'plant')
+      .map((knob) => {
+        const { model, spec } = knob;
+        return {
+          kind: spec.kind,
+          fraction: model.angle / model.sweep,
+          sweep: model.sweep,
+          travel: model.travel,
+          depth: model.depth,
+          cover: knob.cover,
+          focused: knob.focused,
+          pending: knob.pending || knob.root.dataset.outcome === 'pending',
+          refusedUntil: knob.refusedUntil,
+          disabled: disabledFor(knob),
+          green: spec.indication?.(latest.value, view),
+          mode: spec.mode,
+          value: spec.kind === 'dial' ? dialValue(model) / 10 : spec.kind === 'rotary' ? rotaryValue(model) / 10 : null,
+        };
+      });
     return { view, text, knobStates };
   }
 
@@ -963,7 +1178,11 @@ export function mount(root, services, options = {}) {
 
   const failure = (where, error) => {
     const detail = error?.message ? ` (${error.message})` : '';
-    return h('p', { class: 'cr-error', role: 'status', text: `Could not load three.js for the ${where}${detail}. ${LOAD_FAILURE}` });
+    return h('p', {
+      class: 'cr-error',
+      role: 'status',
+      text: `Could not load three.js for the ${where}${detail}. ${LOAD_FAILURE}`,
+    });
   };
 
   let paletteRaf = 0;
@@ -982,19 +1201,21 @@ export function mount(root, services, options = {}) {
     const colors = palette();
     if (!paletteReady(colors) || !colors.controlGreen) {
       if (paletteFrames++ < 300) paletteRaf = requestAnimationFrame(startViews);
-      else for (const message of styleMessages) message.textContent = 'View colors could not load. Reload the page to try again.';
+      else
+        for (const message of styleMessages)
+          message.textContent = 'View colors could not load. Reload the page to try again.';
       return;
     }
     started = true;
     for (const message of styleMessages) message.remove();
 
-    import('./control-board.mjs').then(
-      ({ createControlBoard }) => {
+    import('./control-board.mjs')
+      .then(({ createControlBoard }) => {
         if (disposed) return;
         board = createControlBoard(controlStage, {
-          knobIds: KNOBS.filter(spec => spec.group === 'plant').map(spec => spec.id),
-          knobLabels: KNOBS.filter(spec => spec.group === 'plant').map(spec => spec.label),
-          knobKinds: KNOBS.filter(spec => spec.group === 'plant').map(spec => spec.kind),
+          knobIds: KNOBS.filter((spec) => spec.group === 'plant').map((spec) => spec.id),
+          knobLabels: KNOBS.filter((spec) => spec.group === 'plant').map((spec) => spec.label),
+          knobKinds: KNOBS.filter((spec) => spec.group === 'plant').map((spec) => spec.kind),
           onDevice: deviceAction,
           theme: palette(),
           reducedMotion,
@@ -1002,18 +1223,20 @@ export function mount(root, services, options = {}) {
         board.setView(viewName);
         if (latest) board.updatePlant(latest.value);
         refreshBoard();
-      }).catch((error) => {
+      })
+      .catch((error) => {
         if (!disposed) controlStage.append(failure('control room', error));
       });
 
-    import('./plant-scene.mjs').then(
-      ({ createReadingsPanel }) => {
+    import('./plant-scene.mjs')
+      .then(({ createReadingsPanel }) => {
         if (disposed) return;
         readings = createReadingsPanel(readingsHost);
         if (latest) {
           readings.update(latest.value);
         }
-      }).catch((error) => {
+      })
+      .catch((error) => {
         if (disposed) return;
         readingsHost.append(failure('readings', error));
       });
@@ -1027,7 +1250,8 @@ export function mount(root, services, options = {}) {
   // ---- Subscription and disposal ------------------------------------------
 
   if (!options.state) {
-    status.textContent = overlayStatus.textContent = 'This panel has no plant state topic, so it cannot show the plant.';
+    status.textContent = overlayStatus.textContent =
+      'This panel has no plant state topic, so it cannot show the plant.';
   } else {
     unsubscribe = services.state(options.state, onSnapshot, (error) => {
       if (disposed) return;

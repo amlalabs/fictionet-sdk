@@ -28,6 +28,7 @@ pub enum Pump {
     MainFeed(Loop),
     AuxiliaryFeed,
     CirculatingWater,
+    SafetyInjection,
 }
 impl Pump {
     pub const MAX_JSON_BYTES: usize = 19;
@@ -72,6 +73,9 @@ pub enum Command {
     ValveDemand { valve: Valve, permille: u16 },
     Controller { controller: Controller, mode: Mode },
     Heaters { on: bool },
+    Relief { open: bool },
+    ReliefBlock { closed: bool },
+    SteamIsolation { closed: bool },
     AcknowledgeAlarms,
 }
 impl Command {
