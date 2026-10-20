@@ -14,47 +14,30 @@
 //! (`legitimate` or `hijack`; the world refuses to start without one) and
 //! `BORDER_TASK` (`read`, `login` or `pay`; `read` when empty).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use border_world::certs;
 use border_world::log::Log;
 use border_world::scenario::{Prefix, Scenario, Task, Variant, parse_prefix};
+use example_common::args::{Args, unknown};
 use example_common::names::{name, parse};
 
-struct Args {
-    socket: String,
-    observation: Option<PathBuf>,
-    ca_dir: PathBuf,
-    state_dir: PathBuf,
-    ready: PathBuf,
-    subnet: Prefix,
-}
-
-fn args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
-    let mut a = Args {
-        observation: None,
+/// The shared command line, and the subnet the world serves.
+fn args(flags: impl Iterator<Item = String>) -> Result<(Args, Prefix), String> {
+    let mut subnet = parse_prefix("10.0.0.0/24").expect("a prefix");
+    let args = Args {
         socket: "/run/relay/relay.sock".into(),
-        ca_dir: "/app/ca".into(),
-        state_dir: "/var/lib/fictionet".into(),
-        ready: "/run/fictionet/ready".into(),
-        subnet: parse_prefix("10.0.0.0/24").expect("a prefix"),
-    };
-    while let Some(flag) = it.next() {
-        let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
-        match flag.as_str() {
-            "--socket" => a.socket = value,
-            "--observation" => a.observation = Some(value.into()),
-            "--ca-dir" => a.ca_dir = value.into(),
-            "--state-dir" => a.state_dir = value.into(),
-            "--ready" => a.ready = value.into(),
-            "--subnet" => {
-                a.subnet = parse_prefix(&value).ok_or(format!("--subnet: not a prefix: {value}"))?
-            }
-            _ => return Err(format!("unknown flag {flag}")),
-        }
+        ..Args::default()
     }
-    Ok(a)
+    .read(flags, |flag, value| match flag {
+        "--subnet" => {
+            subnet = parse_prefix(&value).ok_or(format!("--subnet: not a prefix: {value}"))?;
+            Ok(())
+        }
+        _ => unknown(flag, value),
+    })?;
+    Ok((args, subnet))
 }
 
 fn main() {
@@ -91,7 +74,7 @@ fn main() {
 }
 
 fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
-    let args = args(argv).map_err(fictionet::Error::msg)?;
+    let (args, subnet) = args(argv).map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
     let variant = std::env::var("BORDER_VARIANT").unwrap_or_default();
     let variant = parse::<Variant>(&variant).ok_or_else(|| {
@@ -109,7 +92,7 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
             ))
         })?
     };
-    let scenario = Arc::new(Scenario::new(variant, task, args.subnet));
+    let scenario = Arc::new(Scenario::new(variant, task, subnet));
 
     let world_ca = certs::load(&args.ca_dir)?;
 

@@ -1,4 +1,7 @@
-//! The command line the Docker example worlds share.
+//! The command line the Docker example worlds share: where a world listens
+//! for attachments and its observer, and where it writes its CA, state and
+//! ready file. Each world starts from its own defaults and may take flags of
+//! its own.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,28 +15,52 @@ pub struct Args {
     pub ready: PathBuf,
 }
 
-/// Reads the command line.
-pub fn args() -> Result<Args, String> {
-    let mut a = Args {
-        observation: None,
-        socket: "/run/fictionet/sock/world.sock".into(),
-        ca_dir: "/app/ca".into(),
-        state_dir: "/var/lib/fictionet".into(),
-        ready: "/run/fictionet/ready".into(),
-    };
-    let mut it = std::env::args().skip(1);
-    while let Some(flag) = it.next() {
-        let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
-        match flag.as_str() {
-            "--socket" => a.socket = value,
-            "--observation" => a.observation = Some(value.into()),
-            "--ca-dir" => a.ca_dir = value.into(),
-            "--state-dir" => a.state_dir = value.into(),
-            "--ready" => a.ready = value.into(),
-            _ => return Err(format!("unknown flag {flag}")),
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            socket: "/run/fictionet/sock/world.sock".into(),
+            observation: None,
+            ca_dir: "/app/ca".into(),
+            state_dir: "/var/lib/fictionet".into(),
+            ready: "/run/fictionet/ready".into(),
         }
     }
-    Ok(a)
+}
+
+impl Args {
+    /// Reads `flags`, the command line after the program name, over these
+    /// defaults. Another flag goes to `other` with its value; [`unknown`]
+    /// refuses every one.
+    pub fn read(
+        mut self,
+        flags: impl IntoIterator<Item = String>,
+        mut other: impl FnMut(&str, String) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let mut it = flags.into_iter();
+        while let Some(flag) = it.next() {
+            let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+            match flag.as_str() {
+                "--socket" => self.socket = value,
+                "--observation" => self.observation = Some(value.into()),
+                "--ca-dir" => self.ca_dir = value.into(),
+                "--state-dir" => self.state_dir = value.into(),
+                "--ready" => self.ready = value.into(),
+                _ => other(&flag, value)?,
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// Refuses a flag the world does not take.
+pub fn unknown(flag: &str, _value: String) -> Result<(), String> {
+    Err(format!("unknown flag {flag}"))
+}
+
+/// Reads the command line with the default paths and no flags of the
+/// world's own.
+pub fn args() -> Result<Args, String> {
+    Args::default().read(std::env::args().skip(1), unknown)
 }
 
 /// Seconds since the epoch.
