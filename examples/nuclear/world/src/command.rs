@@ -88,7 +88,7 @@ pub struct FaultCommand {
     pub expected_revision: u64,
 }
 impl FaultCommand {
-    pub const MAX_JSON_BYTES: usize = 148;
+    pub const MAX_JSON_BYTES: usize = 52 + FaultChange::MAX_JSON_BYTES;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Applied {

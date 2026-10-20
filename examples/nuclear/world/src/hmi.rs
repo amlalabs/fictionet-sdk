@@ -34,8 +34,9 @@
 //! | Controller | Heartbeat address |
 //! | --- | --- |
 //! | rps1 | 4 (30005) |
-//! | rcs1 | 8 (30009) |
-//! | bop1 | 10 (30011) |
+//! | rcs1 | 11 (30012) |
+//! | bop1 | 11 (30012) |
+//! | pam1 | 6 (30007) |
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -166,17 +167,18 @@ pub struct Sample {
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const UNIT: u8 = 1;
-const PLCS: [Plc; 3] = [Plc::Rps1, Plc::Rcs1, Plc::Bop1];
+const PLCS: [Plc; 4] = [Plc::Rps1, Plc::Rcs1, Plc::Bop1, Plc::Pam1];
 const INDEX_HTML: &str = include_str!("../../viewer/hmi/index.html");
 const STYLE_CSS: &str = include_str!("../../viewer/hmi/hmi.css");
 const SCRIPT_JS: &str = include_str!("../../viewer/hmi/hmi.mjs");
 
-/// The three controllers' addresses. Each is a Modbus/TCP endpoint on port 502.
+/// The four controllers' addresses. Each is a Modbus/TCP endpoint on port 502.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Controllers {
     pub rps1: SocketAddr,
     pub rcs1: SocketAddr,
     pub bop1: SocketAddr,
+    pub pam1: SocketAddr,
 }
 
 impl Controllers {
@@ -186,15 +188,21 @@ impl Controllers {
             Plc::Rps1 => self.rps1,
             Plc::Rcs1 => self.rcs1,
             Plc::Bop1 => self.bop1,
+            Plc::Pam1 => self.pam1,
         }
     }
 }
 
 /// The controllers at their addresses on the control network.
 pub fn controllers() -> Controllers {
-    let [rps1, rcs1, bop1] =
+    let [rps1, rcs1, bop1, pam1] =
         network::CONTROLLERS.map(|(_, _, ip)| SocketAddr::new(IpAddr::V4(ip), modbus::PORT));
-    Controllers { rps1, rcs1, bop1 }
+    Controllers {
+        rps1,
+        rcs1,
+        bop1,
+        pam1,
+    }
 }
 
 /// The network with hmi01 attached as a trusted sandbox at its fixed address.
@@ -229,16 +237,22 @@ pub fn layout(plc: Plc) -> Layout {
             holding: 1,
         },
         Plc::Rcs1 => Layout {
-            input: 9,
-            discrete: 4,
-            coils: 4,
+            input: 12,
+            discrete: 6,
+            coils: 7,
             holding: 1,
         },
         Plc::Bop1 => Layout {
-            input: 11,
-            discrete: 6,
-            coils: 7,
+            input: 12,
+            discrete: 7,
+            coils: 8,
             holding: 4,
+        },
+        Plc::Pam1 => Layout {
+            input: 7,
+            discrete: 1,
+            coils: 0,
+            holding: 0,
         },
     }
 }
@@ -248,6 +262,7 @@ fn slot(plc: Plc) -> usize {
         Plc::Rps1 => 0,
         Plc::Rcs1 => 1,
         Plc::Bop1 => 2,
+        Plc::Pam1 => 3,
     }
 }
 
@@ -256,6 +271,7 @@ fn link_id(plc: Plc) -> &'static str {
         Plc::Rps1 => "rps1",
         Plc::Rcs1 => "rcs1",
         Plc::Bop1 => "bop1",
+        Plc::Pam1 => "pam1",
     }
 }
 
@@ -291,12 +307,12 @@ impl Latch {
     }
 }
 
-/// Everything the poll task holds: the three blocks, the update time, and
+/// Everything the poll task holds: the four blocks, the update time, and
 /// the alarm latches.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Held {
-    /// One block per controller: rps1, rcs1, bop1.
-    pub blocks: [Block; 3],
+    /// One block per controller: rps1, rcs1, bop1, pam1.
+    pub blocks: [Block; 4],
     /// Run clock of the last poll cycle, in ms.
     pub clock_ms: Option<i64>,
     site: Site,
@@ -538,11 +554,92 @@ const POINTS: &[Point] = &[
     holding("feed_valve_b", "ZT-433B", Plc::Bop1, 1, "%"),
     holding("turbine_valve_position", "ZIC-441", Plc::Bop1, 2, "%"),
     holding("steam_dump_valve", "ZT-434", Plc::Bop1, 3, "%"),
+    input(
+        "core_exit_wide_range",
+        "TE-413W",
+        Plc::Pam1,
+        0,
+        Scale::Tenth,
+        "C",
+    ),
+    input("vessel_level", "LT-480", Plc::Pam1, 1, Scale::Tenth, "%"),
+    input(
+        "containment_pressure",
+        "PT-934",
+        Plc::Pam1,
+        2,
+        Scale::Tenth,
+        "kPa",
+    ),
+    input(
+        "containment_temperature",
+        "TE-935",
+        Plc::Pam1,
+        3,
+        Scale::Tenth,
+        "C",
+    ),
+    input(
+        "containment_hydrogen",
+        "AT-936",
+        Plc::Pam1,
+        4,
+        Scale::Hundredth,
+        "%",
+    ),
+    input(
+        "containment_radiation",
+        "RE-937",
+        Plc::Pam1,
+        5,
+        Scale::Hundredth,
+        "Sv/h",
+    ),
+    input(
+        "relief_tailpipe_temperature",
+        "TE-463",
+        Plc::Rcs1,
+        8,
+        Scale::Tenth,
+        "C",
+    ),
+    input(
+        "relief_tank_pressure",
+        "PT-472",
+        Plc::Rcs1,
+        9,
+        Scale::Tenth,
+        "kPa",
+    ),
+    input(
+        "safety_injection_flow",
+        "FT-940",
+        Plc::Rcs1,
+        10,
+        Scale::Tenth,
+        "kg/s",
+    ),
+    input(
+        "turbine_building_temperature",
+        "TE-951",
+        Plc::Bop1,
+        10,
+        Scale::Tenth,
+        "C",
+    ),
 ];
 
-/// A discrete input, read as a yes or no.
+/// The bank holding an equipment indication.
+#[derive(Clone, Copy, Debug)]
+enum BitBank {
+    Discrete,
+    Coil,
+}
+
+/// One equipment indication.
 #[derive(Clone, Copy, Debug)]
 struct Flag {
+    bank: BitBank,
     id: &'static str,
     plc: Plc,
     index: usize,
@@ -550,59 +647,94 @@ struct Flag {
 
 const FLAGS: &[Flag] = &[
     Flag {
+        bank: BitBank::Discrete,
         id: "reactor_tripped",
         plc: Plc::Rps1,
         index: 0,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "coolant_pump_a",
         plc: Plc::Rcs1,
         index: 0,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "coolant_pump_b",
         plc: Plc::Rcs1,
         index: 1,
     },
     Flag {
+        bank: BitBank::Coil,
         id: "pressurizer_relief",
         plc: Plc::Rcs1,
-        index: 2,
+        index: 4,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "heaters",
         plc: Plc::Rcs1,
         index: 3,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "feed_pump_a",
         plc: Plc::Bop1,
         index: 0,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "feed_pump_b",
         plc: Plc::Bop1,
         index: 1,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "auxiliary_feed",
         plc: Plc::Bop1,
         index: 2,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "circulating_water",
         plc: Plc::Bop1,
         index: 3,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "steam_relief",
         plc: Plc::Bop1,
         index: 4,
     },
     Flag {
+        bank: BitBank::Discrete,
         id: "turbine_tripped",
         plc: Plc::Bop1,
         index: 5,
+    },
+    Flag {
+        bank: BitBank::Discrete,
+        id: "safety_injection",
+        plc: Plc::Rcs1,
+        index: 4,
+    },
+    Flag {
+        bank: BitBank::Discrete,
+        id: "relief_block_closed",
+        plc: Plc::Rcs1,
+        index: 5,
+    },
+    Flag {
+        bank: BitBank::Discrete,
+        id: "steam_isolation_closed",
+        plc: Plc::Bop1,
+        index: 6,
+    },
+    Flag {
+        bank: BitBank::Discrete,
+        id: "fan_coolers",
+        plc: Plc::Pam1,
+        index: 0,
     },
 ];
 
@@ -795,6 +927,78 @@ const ALARMS: &[Alarm] = &[
             set: true,
         },
     },
+    Alarm {
+        id: "core_exit_temperature_high",
+        label: "Core exit temperature high",
+        rule: Rule::Above {
+            points: &["core_exit_wide_range"],
+            limit: 650.0,
+            clear: 649.0,
+        },
+    },
+    Alarm {
+        id: "vessel_level_low",
+        label: "Reactor vessel level low",
+        rule: Rule::Below {
+            points: &["vessel_level"],
+            limit: 70.0,
+            clear: 72.0,
+        },
+    },
+    Alarm {
+        id: "containment_pressure_high",
+        label: "Containment pressure high",
+        rule: Rule::Above {
+            points: &["containment_pressure"],
+            limit: 130.0,
+            clear: 129.0,
+        },
+    },
+    Alarm {
+        id: "containment_hydrogen_high",
+        label: "Containment hydrogen high",
+        rule: Rule::Above {
+            points: &["containment_hydrogen"],
+            limit: 2.0,
+            clear: 1.8,
+        },
+    },
+    Alarm {
+        id: "containment_radiation_high",
+        label: "Containment radiation high",
+        rule: Rule::Above {
+            points: &["containment_radiation"],
+            limit: 1.0,
+            clear: 0.9,
+        },
+    },
+    Alarm {
+        id: "relief_tank_pressure_high",
+        label: "Relief tank pressure high",
+        rule: Rule::Above {
+            points: &["relief_tank_pressure"],
+            limit: 300.0,
+            clear: 299.0,
+        },
+    },
+    Alarm {
+        id: "relief_tailpipe_temperature_high",
+        label: "Relief tailpipe temperature high",
+        rule: Rule::Above {
+            points: &["relief_tailpipe_temperature"],
+            limit: 100.0,
+            clear: 99.0,
+        },
+    },
+    Alarm {
+        id: "turbine_building_temperature_high",
+        label: "Turbine building temperature high",
+        rule: Rule::Above {
+            points: &["turbine_building_temperature"],
+            limit: 60.0,
+            clear: 59.0,
+        },
+    },
 ];
 
 /// The number of alarm tiles.
@@ -926,7 +1130,10 @@ fn point_value(held: &Held, point: &Point) -> Option<f64> {
 fn flag_value(held: &Held, flag: &Flag) -> Option<bool> {
     let block = block(held, flag.plc);
     block.read_ms?;
-    block.discrete.get(flag.index).copied()
+    match flag.bank {
+        BitBank::Discrete => block.discrete.get(flag.index).copied(),
+        BitBank::Coil => block.coils.get(flag.index).copied(),
+    }
 }
 
 fn mode_value(held: &Held, plc: Plc, index: usize) -> Option<&'static str> {
@@ -1203,26 +1410,34 @@ async fn read_controller(fcx: &Cx, session: &mut Session, plc: Plc) -> Result<Bl
         l.discrete,
     )
     .await?;
-    let coils = bits(
-        fcx,
-        session,
-        modbus::Request::ReadCoils {
-            address: 0,
-            quantity: l.coils,
-        },
-        l.coils,
-    )
-    .await?;
-    let holding = registers(
-        fcx,
-        session,
-        modbus::Request::ReadHoldingRegisters {
-            address: 0,
-            quantity: l.holding,
-        },
-        l.holding,
-    )
-    .await?;
+    let coils = if l.coils == 0 {
+        Vec::new()
+    } else {
+        bits(
+            fcx,
+            session,
+            modbus::Request::ReadCoils {
+                address: 0,
+                quantity: l.coils,
+            },
+            l.coils,
+        )
+        .await?
+    };
+    let holding = if l.holding == 0 {
+        Vec::new()
+    } else {
+        registers(
+            fcx,
+            session,
+            modbus::Request::ReadHoldingRegisters {
+                address: 0,
+                quantity: l.holding,
+            },
+            l.holding,
+        )
+        .await?
+    };
     Ok(Block {
         input,
         discrete,
@@ -1254,7 +1469,7 @@ async fn poll(
     held: Arc<Mutex<Held>>,
 ) -> fictionet::Result {
     let tcp = machine.tcp.clone();
-    let mut sessions: [Option<Session>; 3] = [None, None, None];
+    let mut sessions: [Option<Session>; PLCS.len()] = std::array::from_fn(|_| None);
     while !fcx.is_cancelled() {
         for plc in PLCS {
             let at = slot(plc);
@@ -1461,6 +1676,8 @@ struct Body {
     running: Option<bool>,
     auto: Option<bool>,
     on: Option<bool>,
+    open: Option<bool>,
+    closed: Option<bool>,
 }
 
 fn need<T>(value: Option<T>, field: &str) -> Result<T, String> {
@@ -1479,6 +1696,7 @@ fn tenths(body: &Body) -> Result<u16, String> {
 
 fn pump_coil(name: &str) -> Option<(Plc, u16)> {
     match name {
+        "safety-injection" => Some((Plc::Rcs1, 6)),
         "coolant-a" => Some((Plc::Rcs1, 0)),
         "coolant-b" => Some((Plc::Rcs1, 1)),
         "feed-a" => Some((Plc::Bop1, 0)),
@@ -1518,6 +1736,9 @@ fn order(kind: &str, body: &Body) -> Result<Order, String> {
         acknowledge: false,
     };
     match kind {
+        "relief" => Ok(coil(Plc::Rcs1, 4, need(body.open, "open")?)),
+        "relief-block" => Ok(coil(Plc::Rcs1, 5, need(body.closed, "closed")?)),
+        "steam-isolation" => Ok(coil(Plc::Bop1, 7, need(body.closed, "closed")?)),
         "rod-demand" => Ok(Order {
             plc: Plc::Rps1,
             write: Write::Register {
@@ -1671,6 +1892,80 @@ mod tests {
             assert_eq!(held.blocks[slot(plc)].input.len(), usize::from(l.input));
         }
         held
+    }
+
+    #[test]
+    fn post_accident_alarm_rules_apply_limits_and_clear_deadbands() {
+        for (id, point, limit, clear, below) in [
+            (
+                "core_exit_temperature_high",
+                "core_exit_wide_range",
+                650.0,
+                649.0,
+                false,
+            ),
+            ("vessel_level_low", "vessel_level", 70.0, 72.0, true),
+            (
+                "containment_pressure_high",
+                "containment_pressure",
+                130.0,
+                129.0,
+                false,
+            ),
+            (
+                "containment_hydrogen_high",
+                "containment_hydrogen",
+                2.0,
+                1.8,
+                false,
+            ),
+            (
+                "containment_radiation_high",
+                "containment_radiation",
+                1.0,
+                0.9,
+                false,
+            ),
+            (
+                "relief_tank_pressure_high",
+                "relief_tank_pressure",
+                300.0,
+                299.0,
+                false,
+            ),
+            (
+                "relief_tailpipe_temperature_high",
+                "relief_tailpipe_temperature",
+                100.0,
+                99.0,
+                false,
+            ),
+            (
+                "turbine_building_temperature_high",
+                "turbine_building_temperature",
+                60.0,
+                59.0,
+                false,
+            ),
+        ] {
+            let alarm = ALARMS.iter().find(|a| a.id == id).expect(id);
+            for (value, latched, expected) in [
+                (limit, false, false),
+                (if below { limit - 0.01 } else { limit + 0.01 }, false, true),
+                ((limit + clear) / 2.0, true, true),
+                (clear, true, false),
+            ] {
+                let known = Known {
+                    points: BTreeMap::from([(point, value)]),
+                    flags: BTreeMap::new(),
+                };
+                assert_eq!(
+                    alarm.rule.decide(&known, latched),
+                    Some(expected),
+                    "{id}: {value}"
+                );
+            }
+        }
     }
 
     #[test]

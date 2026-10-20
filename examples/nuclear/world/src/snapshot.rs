@@ -116,9 +116,14 @@ pub struct ReportedStatus {
     pub steam_relief_open: bool,
     pub reactor_tripped: bool,
     pub turbine_tripped: bool,
+    pub safety_injection_running: bool,
+    pub relief_block_closed: bool,
+    pub steam_isolation_closed: bool,
+    pub fan_coolers_running: bool,
 }
 impl ReportedStatus {
-    pub const MAX_JSON_BYTES: usize = 276;
+    pub const MAX_JSON_BYTES: usize = 276
+        + ",\"safety_injection_running\":false,\"relief_block_closed\":false,\"steam_isolation_closed\":false,\"fan_coolers_running\":false".len();
 }
 impl From<&Truth> for ReportedStatus {
     fn from(t: &Truth) -> Self {
@@ -132,6 +137,10 @@ impl From<&Truth> for ReportedStatus {
             steam_relief_open: t.secondary.steam_relief_open,
             reactor_tripped: t.reactor.trip.is_some(),
             turbine_tripped: t.secondary.turbine_tripped,
+            safety_injection_running: false,
+            relief_block_closed: false,
+            steam_isolation_closed: false,
+            fan_coolers_running: true,
         }
     }
 }
@@ -156,7 +165,13 @@ pub struct PlantSnapshot {
     pub last_command: Option<LastCommand>,
 }
 impl PlantSnapshot {
-    pub const MAX_JSON_BYTES: usize = 11348;
+    pub const MAX_JSON_BYTES: usize = 11348
+        + (SENSOR_COUNT - 22)
+            * (Channel::MAX_JSON_BYTES + crate::faults::SensorFault::MAX_JSON_BYTES + 2)
+        + 22 * (Channel::MAX_JSON_BYTES - 158)
+        + (ALARM_COUNT - 22) * (AlarmEntry::MAX_JSON_BYTES + 1)
+        + 22 * (AlarmEntry::MAX_JSON_BYTES - 67)
+        + (ReportedStatus::MAX_JSON_BYTES - 276);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

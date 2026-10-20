@@ -17,6 +17,7 @@ const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 40, 0, 50);
 const RPS1: Ipv4Addr = Ipv4Addr::new(192, 168, 95, 11);
 const RCS1: Ipv4Addr = Ipv4Addr::new(192, 168, 95, 12);
 const BOP1: Ipv4Addr = Ipv4Addr::new(192, 168, 95, 13);
+const PAM1: Ipv4Addr = Ipv4Addr::new(192, 168, 95, 14);
 const MODBUS: u16 = 502;
 
 /// Sends one request on `conn` and returns the response to it.
@@ -103,7 +104,12 @@ fn each_controller_serves_its_own_map_and_a_write_reaches_the_shared_plant() {
             network::start(&fcx, &driver, attachments)?;
             let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
 
-            for (addr, plc) in [(RPS1, Plc::Rps1), (RCS1, Plc::Rcs1), (BOP1, Plc::Bop1)] {
+            for (addr, plc) in [
+                (RPS1, Plc::Rps1),
+                (RCS1, Plc::Rcs1),
+                (BOP1, Plc::Bop1),
+                (PAM1, Plc::Pam1),
+            ] {
                 let mut conn = client
                     .tcp
                     .connect(&fcx, SocketAddr::new(addr.into(), MODBUS))
@@ -155,4 +161,153 @@ fn each_controller_serves_its_own_map_and_a_write_reaches_the_shared_plant() {
         },
     ));
     result.unwrap();
+}
+
+#[test]
+fn emergency_writes_recover_the_plant_over_modbus() {
+    use nuclear_world::{scenarios::Scenario, stages::Stage};
+    for (scenario, minute, plc, addr, coils, boiling) in [
+        (
+            Scenario::StuckOpenRelief,
+            20,
+            Plc::Rcs1,
+            RCS1,
+            vec![5],
+            426_000,
+        ),
+        (
+            Scenario::LoopBUnattended,
+            30,
+            Plc::Rcs1,
+            RCS1,
+            vec![6, 4],
+            52_750,
+        ),
+        (Scenario::SteamLineBreak, 1, Plc::Bop1, BOP1, vec![7], 0),
+    ] {
+        fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(31)), |fcx| async move {
+            let driver = Driver::new(scenario.config());
+            driver.advance_to(&(), minute * 60_000);
+            let (attacher, attachments) = fictionet::attachments();
+            network::start(&fcx, &driver, attachments)?;
+            let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
+            let mut conn = client.tcp.connect(&fcx, SocketAddr::new(addr.into(), MODBUS)).await.unwrap();
+            for address in coils {
+                assert_eq!(exchange(&fcx, &mut conn, &Request::WriteSingleCoil { address, value: true }).await,
+                    Response::WriteSingleCoil { address, value: true });
+                if scenario == Scenario::SteamLineBreak {
+                    driver.advance_to(&(), driver.snapshot().at_ms + 50);
+                    assert_eq!(driver.snapshot().severe.steam_break_kg_s, 0.0);
+                }
+                driver.advance_to(&(), driver.snapshot().at_ms + 250);
+                assert_eq!(exchange(&fcx, &mut conn, &Request::ReadCoils { address, quantity: 1 }).await, Response::Bits(vec![true, false, false, false, false, false, false, false]));
+                assert!(registers::coils(plc, &driver.snapshot())[address as usize]);
+            }
+            if scenario == Scenario::SteamLineBreak {
+                assert_eq!(driver.snapshot().severe.steam_break_kg_s, 0.0);
+                println!("Steam isolation break flow: 0 kg/s; target 0 kg/s");
+            } else {
+                driver.advance_to(&(), 12 * 3_600_000);
+                let snap = driver.snapshot();
+                assert_eq!(snap.at_ms, 12 * 3_600_000);
+                assert!(snap.end.is_none());
+                assert_eq!(snap.severe.uncovered_percent, 0.0);
+                for stage in Stage::ALL {
+                    assert_eq!(snap.stages[stage.index()], if stage == Stage::Boiling { Some(boiling) } else { None });
+                }
+                println!("{scenario:?}: twelve hours, uncovered {}%, no end, boiling at {boiling} ms", snap.severe.uncovered_percent);
+            }
+            fcx.cancel();
+            Ok(())
+        })).unwrap();
+    }
+}
+
+#[test]
+fn post_accident_monitor_serves_pressure_and_refuses_coils() {
+    use fictionet::stdlib::protocols::modbus::Exception;
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(34)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            let (attacher, attachments) = fictionet::attachments();
+            network::start(&fcx, &driver, attachments)?;
+            let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
+            let mut conn = client
+                .tcp
+                .connect(&fcx, SocketAddr::new(PAM1.into(), MODBUS))
+                .await
+                .expect("pam1 accepts Modbus");
+            let sensor: nuclear_world::sensors::Sensor =
+                serde_json::from_value(serde_json::json!("containment_pressure")).unwrap();
+            let expected =
+                (driver.snapshot().readings[sensor.index()].reading.value * 10.0).round() as u16;
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::ReadInputRegisters {
+                        address: 2,
+                        quantity: 1
+                    }
+                )
+                .await,
+                Response::Registers(vec![expected])
+            );
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::ReadCoils {
+                        address: 0,
+                        quantity: 1
+                    }
+                )
+                .await,
+                Response::Exception(Exception::IllegalDataAddress)
+            );
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::ReadHoldingRegisters {
+                        address: 0,
+                        quantity: 1
+                    }
+                )
+                .await,
+                Response::Exception(Exception::IllegalDataAddress)
+            );
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::WriteSingleCoil {
+                        address: 0,
+                        value: true
+                    }
+                )
+                .await,
+                Response::Exception(Exception::IllegalDataAddress)
+            );
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::WriteSingleRegister {
+                        address: 0,
+                        value: 1
+                    }
+                )
+                .await,
+                Response::Exception(Exception::IllegalDataAddress)
+            );
+            println!(
+                "pam1 containment pressure count: {expected}; target snapshot count {expected}"
+            );
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
 }

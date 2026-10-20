@@ -5,10 +5,11 @@
 //! `10.40.0.1`.
 //!
 //! The control network is `192.168.95.0/24`. Each controller is a host at its
-//! own address there: rps1 at `.11`, rcs1 at `.12` and bop1 at `.13`. [`Net`]
+//! own address there: rps1 at `.11`, rcs1 at `.12`, bop1 at `.13` and pam1
+//! at `.14`. [`Net`]
 //! gives its router one route per machine, so a sandbox on the operations
 //! network reaches a controller through the router. Each controller listens
-//! for Modbus/TCP on port 502. All three serve the same plant, through one
+//! for Modbus/TCP on port 502. All four serve the same plant, through one
 //! [`Driver`].
 //!
 //! A trusted sandbox, such as the HMI, joins the network with
@@ -41,10 +42,11 @@ const OPERATIONS: Prefix = Prefix {
 
 /// The controllers: each host's label, its Modbus register map, and its
 /// address on the control network.
-pub const CONTROLLERS: [(&str, Plc, Ipv4Addr); 3] = [
+pub const CONTROLLERS: [(&str, Plc, Ipv4Addr); 4] = [
     ("rps1", Plc::Rps1, Ipv4Addr::new(192, 168, 95, 11)),
     ("rcs1", Plc::Rcs1, Ipv4Addr::new(192, 168, 95, 12)),
     ("bop1", Plc::Bop1, Ipv4Addr::new(192, 168, 95, 13)),
+    ("pam1", Plc::Pam1, Ipv4Addr::new(192, 168, 95, 14)),
 ];
 
 /// The network before it starts: the operations subnet, IPv4 only, with each

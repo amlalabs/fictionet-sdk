@@ -421,6 +421,7 @@ pub fn divergence(
             Unit::KilogramsPerSecond => "kg/s",
             Unit::Megawatt => "MW",
             Unit::Percent => "%",
+            Unit::SievertsPerHour => "Sv/h",
         };
         event
             .summary(format!(
@@ -619,6 +620,16 @@ fn point_name(sensor: Sensor) -> String {
         Sensor::GeneratorOutput => "generator_output".into(),
         Sensor::CondenserPressure => "condenser_pressure".into(),
         Sensor::CoreExitTemperature => "core_exit_temperature".into(),
+        Sensor::CoreExitWideRange => "core_exit_wide_range".into(),
+        Sensor::VesselLevel => "vessel_level".into(),
+        Sensor::ContainmentPressure => "containment_pressure".into(),
+        Sensor::ContainmentTemperature => "containment_temperature".into(),
+        Sensor::ContainmentHydrogen => "containment_hydrogen".into(),
+        Sensor::ContainmentRadiation => "containment_radiation".into(),
+        Sensor::ReliefTailpipeTemperature => "relief_tailpipe_temperature".into(),
+        Sensor::ReliefTankPressure => "relief_tank_pressure".into(),
+        Sensor::SafetyInjectionFlow => "safety_injection_flow".into(),
+        Sensor::TurbineBuildingTemperature => "turbine_building_temperature".into(),
     }
 }
 
@@ -653,6 +664,16 @@ pub(crate) fn true_value_of(snapshot: &PlantSnapshot, sensor: Sensor) -> f64 {
         Sensor::GeneratorOutput => secondary.generator_mw,
         Sensor::CondenserPressure => secondary.condenser_pressure_kpa,
         Sensor::CoreExitTemperature => snapshot.severe.core_exit_steam_c,
+        Sensor::CoreExitWideRange => snapshot.severe.core_exit_steam_c,
+        Sensor::VesselLevel => snapshot.severe.vessel_level_percent,
+        Sensor::ContainmentPressure => snapshot.severe.containment.pressure_kpa,
+        Sensor::ContainmentTemperature => snapshot.severe.containment.temperature_c,
+        Sensor::ContainmentHydrogen => snapshot.severe.containment.hydrogen_percent,
+        Sensor::ContainmentRadiation => snapshot.stylized.containment_dose_sv_h,
+        Sensor::ReliefTailpipeTemperature => snapshot.severe.relief.tailpipe_c,
+        Sensor::ReliefTankPressure => snapshot.severe.relief_tank.pressure_kpa,
+        Sensor::SafetyInjectionFlow => snapshot.severe.safety_injection.flow_kg_s,
+        Sensor::TurbineBuildingTemperature => snapshot.severe.turbine_hall.temperature_c,
     }
 }
 

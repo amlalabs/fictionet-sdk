@@ -67,7 +67,7 @@ pub enum Fault {
     TelemetryQuiet,
 }
 impl Fault {
-    pub const MAX_JSON_BYTES: usize = 85;
+    pub const MAX_JSON_BYTES: usize = 56 + Sensor::MAX_JSON_BYTES;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,7 +77,7 @@ pub enum FaultTarget {
     TelemetryQuiet,
 }
 impl FaultTarget {
-    pub const MAX_JSON_BYTES: usize = 46;
+    pub const MAX_JSON_BYTES: usize = 17 + Sensor::MAX_JSON_BYTES;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,7 +87,7 @@ pub enum FaultChange {
     ClearAll,
 }
 impl FaultChange {
-    pub const MAX_JSON_BYTES: usize = 96;
+    pub const MAX_JSON_BYTES: usize = 11 + Fault::MAX_JSON_BYTES;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledFault {
@@ -95,7 +95,7 @@ pub struct ScheduledFault {
     pub change: FaultChange,
 }
 impl ScheduledFault {
-    pub const MAX_JSON_BYTES: usize = 136;
+    pub const MAX_JSON_BYTES: usize = 40 + FaultChange::MAX_JSON_BYTES;
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Faults {

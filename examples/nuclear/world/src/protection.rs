@@ -17,6 +17,8 @@
 //! Subcooling margin uses reported pressure and core exit temperature. It alarms
 //! below 15 C and clears at 16 C. Equipment alarms use sampled reported status
 //! for stopped pumps, open relief and latched trips.
+//! Post-accident alarms cover core cooling, vessel level, containment,
+//! relief discharge and turbine building temperature.
 use crate::{
     command::Loop,
     sensors::{Reading, SENSOR_COUNT, Sensor},
@@ -71,10 +73,18 @@ pub enum Alarm {
     TurbineTripped,
     NeutronPowerHigh,
     SubcoolingMarginLow,
+    CoreExitTemperatureHigh,
+    VesselLevelLow,
+    ContainmentPressureHigh,
+    ContainmentHydrogenHigh,
+    ContainmentRadiationHigh,
+    ReliefTankPressureHigh,
+    ReliefTailpipeTemperatureHigh,
+    TurbineBuildingTemperatureHigh,
 }
-pub const ALARM_COUNT: usize = 22;
+pub const ALARM_COUNT: usize = 30;
 impl Alarm {
-    pub const MAX_JSON_BYTES: usize = 34;
+    pub const MAX_JSON_BYTES: usize = "\"turbine_building_temperature_high\"".len();
     pub const ALL: [Self; ALARM_COUNT] = [
         Self::PressurizerPressureHigh,
         Self::PressurizerPressureLow,
@@ -98,6 +108,14 @@ impl Alarm {
         Self::TurbineTripped,
         Self::NeutronPowerHigh,
         Self::SubcoolingMarginLow,
+        Self::CoreExitTemperatureHigh,
+        Self::VesselLevelLow,
+        Self::ContainmentPressureHigh,
+        Self::ContainmentHydrogenHigh,
+        Self::ContainmentRadiationHigh,
+        Self::ReliefTankPressureHigh,
+        Self::ReliefTailpipeTemperatureHigh,
+        Self::TurbineBuildingTemperatureHigh,
     ];
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|a| *a == self).unwrap()
@@ -119,7 +137,7 @@ pub struct AlarmEntry {
     pub state: AlarmState,
 }
 impl AlarmEntry {
-    pub const MAX_JSON_BYTES: usize = 67;
+    pub const MAX_JSON_BYTES: usize = 33 + Alarm::MAX_JSON_BYTES;
 }
 
 pub(crate) struct ProtectionInputs {
@@ -206,6 +224,18 @@ pub(crate) fn update_alarms(
                 1.0,
             ),
             Alarm::NeutronPowerHigh => high(read(Sensor::NeutronPower), 105.0, 2.0),
+            Alarm::CoreExitTemperatureHigh => high(read(Sensor::CoreExitWideRange), 650.0, 1.0),
+            Alarm::VesselLevelLow => low(read(Sensor::VesselLevel), 70.0, 2.0),
+            Alarm::ContainmentPressureHigh => high(read(Sensor::ContainmentPressure), 130.0, 1.0),
+            Alarm::ContainmentHydrogenHigh => high(read(Sensor::ContainmentHydrogen), 2.0, 0.2),
+            Alarm::ContainmentRadiationHigh => high(read(Sensor::ContainmentRadiation), 1.0, 0.1),
+            Alarm::ReliefTankPressureHigh => high(read(Sensor::ReliefTankPressure), 300.0, 1.0),
+            Alarm::ReliefTailpipeTemperatureHigh => {
+                high(read(Sensor::ReliefTailpipeTemperature), 100.0, 1.0)
+            }
+            Alarm::TurbineBuildingTemperatureHigh => {
+                high(read(Sensor::TurbineBuildingTemperature), 60.0, 1.0)
+            }
         };
         if !active {
             *state = AlarmState::Normal;
@@ -279,6 +309,81 @@ mod tests {
             level: [50.0; 2],
             hot: [325.0; 2],
             turbine_trip: false,
+        }
+    }
+
+    #[test]
+    fn post_accident_alarms_use_reported_values_and_deadbands() {
+        for (name, sensor, limit, clear, below) in [
+            (
+                "core_exit_temperature_high",
+                "core_exit_wide_range",
+                650.0,
+                649.0,
+                false,
+            ),
+            ("vessel_level_low", "vessel_level", 70.0, 72.0, true),
+            (
+                "containment_pressure_high",
+                "containment_pressure",
+                130.0,
+                129.0,
+                false,
+            ),
+            (
+                "containment_hydrogen_high",
+                "containment_hydrogen",
+                2.0,
+                1.8,
+                false,
+            ),
+            (
+                "containment_radiation_high",
+                "containment_radiation",
+                1.0,
+                0.9,
+                false,
+            ),
+            (
+                "relief_tank_pressure_high",
+                "relief_tank_pressure",
+                300.0,
+                299.0,
+                false,
+            ),
+            (
+                "relief_tailpipe_temperature_high",
+                "relief_tailpipe_temperature",
+                100.0,
+                99.0,
+                false,
+            ),
+            (
+                "turbine_building_temperature_high",
+                "turbine_building_temperature",
+                60.0,
+                59.0,
+                false,
+            ),
+        ] {
+            let alarm: Alarm = serde_json::from_value(serde_json::json!(name)).unwrap();
+            let sensor: Sensor = serde_json::from_value(serde_json::json!(sensor)).unwrap();
+            let snapshot = crate::Plant::new(crate::Config::default()).snapshot();
+            let mut readings = snapshot.readings.map(|channel| channel.reading);
+            let mut states = [AlarmState::Normal; ALARM_COUNT];
+            for (value, expected) in [
+                (limit, AlarmState::Normal),
+                (
+                    if below { limit - 0.01 } else { limit + 0.01 },
+                    AlarmState::Active,
+                ),
+                ((limit + clear) / 2.0, AlarmState::Active),
+                (clear, AlarmState::Normal),
+            ] {
+                readings[sensor.index()].value = value;
+                update_alarms(&mut states, &readings, snapshot.reported_status);
+                assert_eq!(states[alarm.index()], expected, "{name}: {value}");
+            }
         }
     }
 

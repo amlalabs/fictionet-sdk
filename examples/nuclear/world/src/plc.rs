@@ -506,7 +506,7 @@ mod tests {
         let past = exchange(
             &mut rcs,
             &Request::ReadCoils {
-                address: 2,
+                address: 5,
                 quantity: 3,
             },
         )?;
@@ -755,7 +755,7 @@ mod tests {
             (4, "VC-2600 Process Controller"),
             (5, "VC-2640"),
         ];
-        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1] {
+        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1, Plc::Pam1] {
             let mut h = harness(plc, &plant());
             for (code, start, indices) in [
                 (1, 0, vec![0, 1, 2]),
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn device_identity_rejects_invalid_requests() -> Result<(), Box<dyn Error>> {
-        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1] {
+        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1, Plc::Pam1] {
             let mut h = harness(plc, &plant());
             for (data, exception) in [
                 (vec![0x0E, 4, 3], 2),
