@@ -373,8 +373,8 @@ pub struct Model {
 }
 #[derive(Clone)]
 enum Catalog {
-    Forward,
-    Answer(Bytes),
+    Forward(String),
+    Answer { origin: String, body: Bytes },
 }
 
 /// Searched Responses ids: the id a client saw, and the final upstream turn
@@ -468,18 +468,26 @@ impl Model {
     pub fn codex_catalog(
         &self,
         origin: http::Uri,
-        answer: Option<Bytes>,
+        answer: Option<(String, Bytes)>,
     ) -> fictionet::Result<Self> {
         if self.provider != Provider::OpenAi || self.credential.oauth.is_some() {
             return Err(Error::msg(
                 "Codex API-key catalogs require an OpenAI model site",
             ));
         }
-        let mut site = Self::at(&self.cx, Provider::ChatGpt, self.credential.clone(), origin)?;
+        let mut site = Self::at(
+            &self.cx,
+            Provider::ChatGpt,
+            self.credential.clone(),
+            origin.clone(),
+        )?;
         site.ledger = self.ledger.clone();
         site.catalog = Some(match answer {
-            Some(body) => Catalog::Answer(body),
-            None => Catalog::Forward,
+            Some((origin, body)) => Catalog::Answer { origin, body },
+            None => Catalog::Forward(format!(
+                "{}/backend-api/codex/models",
+                origin.to_string().trim_end_matches('/'),
+            )),
         });
         Ok(site)
     }
@@ -627,8 +635,9 @@ impl Model {
             self.refused(&path, "credential");
             return Ok(self.unauthorized());
         }
-        if let Some(Catalog::Answer(body)) = &self.catalog {
+        if let Some(Catalog::Answer { origin, body }) = &self.catalog {
             return Ok(Response::builder()
+                .extension(fictionet::events::Fields::new().with("served_by", origin.clone()))
                 .header("content-type", "application/json")
                 .body(Body::from(body.clone()))?);
         }
@@ -792,6 +801,13 @@ impl Model {
         let result = self.forward.clone().call(request).await;
         match result {
             Ok(mut response) => {
+                if let Some(Catalog::Forward(origin)) = &self.catalog {
+                    response
+                        .extensions_mut()
+                        .get_mut::<fictionet::events::Fields>()
+                        .expect("forwarded response fields")
+                        .set("forwarded", origin.clone());
+                }
                 call.status = response.status().as_u16();
                 let sse = response
                     .headers()

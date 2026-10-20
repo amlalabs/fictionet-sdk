@@ -200,6 +200,9 @@ impl Audit {
                     "https://packages.mozilla.org",
                     "https://downloads.claude.ai",
                     "https://releases.openai.com",
+                    // OpenAI's Codex model catalog.
+                    "https://raw.githubusercontent.com",
+                    "https://chatgpt.com/backend-api/codex/models",
                 ]
                 .contains(&origin)
         });

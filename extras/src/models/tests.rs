@@ -406,7 +406,10 @@ fn codex_catalog_answer_checks_credentials_and_passes_a_pause() {
             .budget(Budget::new().calls(0));
             model.pause(true);
             let catalog = Bytes::from_static(br#"{"models":[]}"#);
-            let site = model.codex_catalog("http://127.0.0.1:1".parse()?, Some(catalog.clone()))?;
+            let site = model.codex_catalog(
+                "http://127.0.0.1:1".parse()?,
+                Some(("https://raw.githubusercontent.com".into(), catalog.clone())),
+            )?;
             let request = |method, path, bearer: &str| {
                 Request::builder()
                     .method(method)
@@ -543,4 +546,61 @@ fn codex_catalog_forward_swaps_key_and_preserves_response() {
     ))
     .unwrap();
     upstream.join().unwrap();
+}
+
+#[test]
+fn codex_catalog_forward_origin_is_separate_from_model_calls() {
+    struct Transport;
+    impl web::Upstream for Transport {
+        fn request(self: Arc<Self>, _: Request<Body>) -> web::UpstreamFuture {
+            Box::pin(async { Ok(Response::new(Body::from(r#"{"models":[]}"#))) })
+        }
+    }
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(33)),
+        |cx| async move {
+            let origin: http::Uri = "https://chatgpt.com".parse()?;
+            let credential =
+                Credential::api_key(&cx, Secret::new("OPENAI_API_KEY", "sk-private".into())?);
+            let mut model = Model::with_forward(
+                &cx,
+                Provider::OpenAi,
+                credential,
+                web::forward(&cx, origin.clone(), Arc::new(Transport))?,
+                "chatgpt.com".into(),
+            );
+            let mut catalog_site = model.codex_catalog(origin, None)?;
+            catalog_site.forward = model.forward.clone();
+            model.provider = Provider::ChatGpt;
+            let bearer = model.credential.wire(Provider::ChatGpt, false);
+            for catalog in [false, true] {
+                let site = if catalog { &catalog_site } else { &model };
+                let request = if catalog {
+                    Request::get("/backend-api/codex/models?client_version=0.163.0")
+                        .header("authorization", &bearer)
+                        .body(Body::empty())?
+                } else {
+                    Request::post("/backend-api/codex/responses")
+                        .header("authorization", &bearer)
+                        .body(Body::from(r#"{"model":"gpt-5","input":"Hello"}"#))?
+                };
+                let response = site.clone().send(request).await?;
+                let fields = response
+                    .extensions()
+                    .get::<fictionet::events::Fields>()
+                    .unwrap();
+                assert_eq!(
+                    fields.get("forwarded").and_then(|value| value.as_str()),
+                    Some(if catalog {
+                        "https://chatgpt.com/backend-api/codex/models"
+                    } else {
+                        "https://chatgpt.com"
+                    })
+                );
+                response.into_body().collect().await?;
+            }
+            Ok(())
+        },
+    ))
+    .unwrap();
 }

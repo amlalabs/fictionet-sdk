@@ -152,7 +152,7 @@ impl Logins {
 fn chatgpt_model(
     codex: &models::Model,
     subscription: bool,
-    catalog: Option<bytes::Bytes>,
+    catalog: Option<(String, bytes::Bytes)>,
 ) -> Result<models::Model> {
     if subscription {
         Ok(codex.clone())
@@ -161,15 +161,12 @@ fn chatgpt_model(
     }
 }
 
-async fn bundled_catalog(cx: &Cx) -> Result<bytes::Bytes> {
+async fn bundled_catalog(cx: &Cx) -> Result<(String, bytes::Bytes)> {
     use http_body_util::BodyExt;
     use tower_service::Service;
     let version = super::guest::CODEX_VERSION;
-    let mut forward = web::forward(
-        cx,
-        "https://raw.githubusercontent.com".parse()?,
-        Arc::new(fictionet_host::Client::new()),
-    )?;
+    let origin = "https://raw.githubusercontent.com";
+    let mut forward = web::forward(cx, origin.parse()?, Arc::new(fictionet_host::Client::new()))?;
     let request = http::Request::get(format!(
         "/openai/codex/rust-v{version}/codex-rs/models-manager/models.json"
     ))
@@ -188,7 +185,7 @@ async fn bundled_catalog(cx: &Cx) -> Result<bytes::Bytes> {
         if !decoded["models"].is_array() {
             return Err(fictionet::Error::msg("catalog has no models array"));
         }
-        Ok(body)
+        Ok((origin.to_owned(), body))
     };
     fetch.await.map_err(|error: fictionet::Error| {
         fictionet::Error::msg(format!(
@@ -521,8 +518,12 @@ mod tests {
                     "http://127.0.0.1:1".parse()?,
                 )?;
                 let catalog = bytes::Bytes::from_static(br#"{"models":[]}"#);
-                let site = chatgpt_model(&model, false, Some(catalog))
-                    .expect("chatgpt.com must resolve for API-key catalog reads");
+                let site = chatgpt_model(
+                    &model,
+                    false,
+                    Some(("https://raw.githubusercontent.com".into(), catalog)),
+                )
+                .expect("chatgpt.com must resolve for API-key catalog reads");
                 let conn = fictionet::events::ConnInfo::default();
                 let mut exchange = web::httpd::Exchange::new(cx.now(), &cx, &conn);
                 let reply = site.call(
@@ -548,6 +549,105 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn chatgpt_catalog_audit_preserves_first_party_checks() {
+        use example_common::guest_content::Audit;
+        use fictionet::stdlib::network::ConnectionExt;
+        use fictionet::stdlib::protocols::dns::rr::RecordType;
+        use fictionet::stdlib::world::sandbox;
+        use std::net::{Ipv4Addr, SocketAddr};
+        for path in [
+            "/backend-api/codex/responses",
+            "/backend-api/wham/usage",
+            "/backend-api/codex/models?client_version=0.163.0",
+        ] {
+            let audit = Arc::new(Audit::default());
+            fictionet::block_on(fictionet::run(
+                fictionet::RunOptions::new(fictionet::Seed::from_u64(5))
+                    .observer(audit.clone()),
+                |cx| async move {
+                    let credential = models::Credential::api_key(
+                        &cx,
+                        models::Secret::new("OPENAI_API_KEY", "sk-host-key".into())?,
+                    );
+                    let bearer = format!("Bearer {}", credential.placeholder());
+                    let model = models::Model::at(
+                        &cx,
+                        models::Provider::OpenAi,
+                        credential,
+                        "http://127.0.0.1:1".parse()?,
+                    )?;
+                    let catalog = bytes::Bytes::from_static(
+                        br#"{"models":[{"instructions":"test and evaluation"}]}"#,
+                    );
+                    let site = chatgpt_model(&model, false, Some(("https://raw.githubusercontent.com".into(), catalog.clone())))?;
+                    let first_party = web::httpd::Router::new()
+                        .post("/backend-api/codex/responses", |_, _| {
+                            http::Response::new(bytes::Bytes::from_static(b"test and evaluation"))
+                        })
+                        .get("/backend-api/wham/usage", |_, _| {
+                            http::Response::builder()
+                                .extension(Fields::new().with("forwarded", "https://chatgpt.com"))
+                                .body(bytes::Bytes::from_static(b"test and evaluation"))
+                                .unwrap()
+                        });
+                    let is_catalog = path.starts_with("/backend-api/codex/models");
+                    let (attacher, attachments) = fictionet::attachments();
+                    web::Sites::new(move |host: &str| {
+                        (host == "chatgpt.com").then(|| {
+                            if is_catalog {
+                                web::Site::handler(site.clone()).at(SHARED)
+                            } else {
+                                web::Site::handler(first_party.clone()).at(SHARED)
+                            }
+                        })
+                    })
+                    .into_net()
+                    .start(&cx, attachments)?;
+                    let end = attacher.attach("client")?;
+                    let machine = sandbox::machine(&cx, end, Ipv4Addr::new(10, 0, 0, 2));
+                    let answer = machine.lookup(
+                        &cx, Ipv4Addr::new(10, 0, 0, 1).into(), "chatgpt.com", RecordType::A,
+                    ).await?;
+                    assert!(!answer.answers.is_empty());
+                    let mut conn = machine.tcp
+                        .connect(&cx, SocketAddr::new(SHARED.into(), 80))
+                        .await?;
+                    let method = if path.ends_with("/responses") { "POST" } else { "GET" };
+                    conn.write_all(&cx, format!(
+                        "{method} {path} HTTP/1.1\r\nHost: chatgpt.com\r\nAuthorization: {bearer}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ).as_bytes()).await?;
+                    let mut response = Vec::new();
+                    loop {
+                        let mut buf = [0; 4096];
+                        let n = conn.read(&cx, &mut buf).await?;
+                        if n == 0 { break; }
+                        response.extend_from_slice(&buf[..n]);
+                    }
+                    assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+                    if is_catalog {
+                        assert!(response.ends_with(&catalog), "{response:?}");
+                    } else {
+                        assert!(response.ends_with(b"test and evaluation"), "{response:?}");
+                    }
+                    cx.cancel();
+                    Ok(())
+                },
+            )).unwrap();
+            let result = audit.check();
+            if path.starts_with("/backend-api/codex/models") {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("guest content contains \"test\""), "{error}");
+                assert!(
+                    error.contains("guest content contains \"evaluation\""),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]
