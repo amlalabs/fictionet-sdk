@@ -251,6 +251,7 @@ test('a normal snapshot has no diverged pair and no frozen reading', () => {
   for (const p of result.pairs) {
     assert.equal(p.diverged, false, `${p.key} should agree with its true value`);
     assert.equal(p.frozen, false, `${p.key} should not be frozen`);
+    assert.equal(p.marked, false, `${p.key} should not be marked at full power`);
     assert.ok(Math.abs(p.gap) < 0.1, `${p.key} gap ${p.gap} should be noise`);
   }
   assert.deepEqual(result.alarms, []);
@@ -279,6 +280,7 @@ test('a stuck hot leg B shows its gap from the true value and is diverged', () =
   assert.equal(hotB.marked, true, 'a faulted gap is marked for the viewer');
   assert.equal(hotB.fault, 'stuck');
   assert.equal(hotB.frozen, false, 'a stuck instrument still samples');
+  for (const p of result.pairs) assert.equal(p.marked, p.key === 'hot_leg:b', `${p.key} mark`);
 
   assert.equal(pair(result, 'hot_leg:a').diverged, false);
   assert.deepEqual(result.alarms, [

@@ -263,6 +263,7 @@ export function mount(root, services, options = {}) {
   const reduceQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
   const reducedMotion = () => reduceQuery.matches;
   const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+  const forcedQuery = window.matchMedia('(forced-colors: active)');
 
   let disposed = false;
   let unsubscribe = null;
@@ -786,6 +787,7 @@ export function mount(root, services, options = {}) {
   const themeObserver = new MutationObserver(onTheme);
   themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   listen(darkQuery, 'change', onTheme);
+  listen(forcedQuery, 'change', onTheme);
   listen(reduceQuery, 'change', () => {
     // Snap the views to where they are now.
     refreshBoard();
@@ -892,9 +894,19 @@ export function mount(root, services, options = {}) {
 function readPalette(root) {
   const style = getComputedStyle(root);
   const out = {};
+  // Resolve system colors before passing them to Three's color parser.
+  const swatch = document.createElement('span');
+  swatch.hidden = true;
+  swatch.style.forcedColorAdjust = 'none';
+  root.append(swatch);
   for (const [name, token] of Object.entries(PALETTE_TOKENS)) {
-    out[name] = style.getPropertyValue(token).trim();
+    const color = style.getPropertyValue(token).trim();
+    if (color && !color.startsWith('#')) {
+      swatch.style.color = color;
+      out[name] = getComputedStyle(swatch).color;
+    } else out[name] = color;
   }
+  swatch.remove();
   return out;
 }
 

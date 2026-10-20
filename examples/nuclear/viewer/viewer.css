@@ -1,7 +1,5 @@
-/* Painted board contrast, light / dark:
- * ink on raised: 11.03 / 12.73; text on raised: 5.33 / 7.82;
- * text on surface: 5.14 / 8.49; warning on raised: 5.54 / 8.88;
- * surface on warning: 5.34 / 9.65. Unlit canvas faces preserve these ratios.
+/* Printed faces preserve palette contrast without tone mapping.
+ * Text meets AA and the warning clears three to one against board steel.
  */
 /*
  * Nuclear plant viewer: the 3D scene beside a text panel of the same readings.
@@ -38,7 +36,7 @@
   --steam: #fbfaf6;
   --accent: #df5835;
   --accent-text: #b4441f;
-  --warning: #8f5a00;
+  --warning: #805000;
   --coolant-cold: #2f6fa3;
   --coolant-hot: #a8322a;
 }
@@ -218,6 +216,21 @@
 }
 
 @media (forced-colors: active) {
+  :root, :root[data-theme] {
+    --surface: Canvas;
+    --surface-raised: Canvas;
+    --surface-sunken: Canvas;
+    --ink: CanvasText;
+    --text: CanvasText;
+    --steel: Canvas;
+    --metal: CanvasText;
+    --rubber: CanvasText;
+    --line: CanvasText;
+    --line-strong: CanvasText;
+    --warning: CanvasText;
+    --lamp-legend: Canvas;
+  }
+
   .plant-scene {
     border: 1px solid CanvasText;
   }

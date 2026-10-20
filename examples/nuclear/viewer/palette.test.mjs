@@ -45,7 +45,7 @@ test('lamp states and window borders have graphic contrast in every theme', () =
     const colors = Object.fromEntries(
       [...block.matchAll(/--([\w-]+):\s*#([\da-f]+);/g)].map(([, name, hex]) => [name, luminance(hex)]),
     );
-    for (const [a, b] of [['lamp-glow', 'lamp-off'], ['ink', 'steel']]) {
+    for (const [a, b] of [['lamp-glow', 'lamp-off'], ['ink', 'steel'], ['warning', 'steel']]) {
       const contrast = (Math.max(colors[a], colors[b]) + 0.05) / (Math.min(colors[a], colors[b]) + 0.05);
       assert.ok(contrast >= 3, `${a} against ${b}: ${contrast}`);
     }
@@ -71,4 +71,12 @@ test('view colors are ready only when every required token has a value', () => {
       assert.equal(paletteReady(partial), false, name);
     }
   }
+});
+
+test('forced colors preserve meter text and warning contrast with system colors', () => {
+  const block = css.match(/@media \(forced-colors: active\)\s*\{\s*:root, :root\[data-theme\]\s*\{([^}]+)\}/)[1];
+  const colors = Object.fromEntries([...block.matchAll(/--([\w-]+):\s*(\w+);/g)].map(([, name, color]) => [name, color]));
+  for (const name of ['surface', 'surface-raised', 'surface-sunken', 'steel']) assert.equal(colors[name], 'Canvas');
+  for (const name of ['ink', 'text', 'warning', 'line', 'line-strong']) assert.equal(colors[name], 'CanvasText');
+  assert.notEqual(colors.rubber, colors['lamp-legend']);
 });

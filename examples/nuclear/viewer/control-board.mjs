@@ -1,41 +1,15 @@
 // One stage owns the renderer, the room camera, and the live containment feed.
 import * as THREE from '/vendor/three/build/three.module.js';
-import { formatGap, formatValue } from './instruments.mjs';
+import { formatValue } from './instruments.mjs';
+import { createMeters } from './meters.mjs';
 import { ROOM, FLOOR, CEILING_LIGHTS, DEFAULT_VIEW, BOARD, BOARDS, BOARD_PX, DESKS, CHAIRS, CCTV, DOOR, COLLISIONS, STANDING_SPOTS,
-  boardPoint, boardLayout, cellLayout, gapLayout, windowState } from './board-layout.mjs';
+  boardPoint, boardLayout, windowState } from './board-layout.mjs';
 import { look, walk, walkDelta, walkPath, glidePose } from './room-motion.mjs';
 import { createPlantScene, mergeStatic } from './plant-scene.mjs';
 import { createRenderer, createEnvironment, createLighting, createMaterial, applyMaterialPalette, setIndicator } from './look.mjs';
 
-const TAU = Math.PI * 2;
-const NEEDLE_START = 135 * Math.PI / 180;
 const NEEDLE_SWEEP = 270 * Math.PI / 180;
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif";
-const clamp01 = v => Math.max(0, Math.min(1, v));
-const fractionOf = (v, [low, high]) => clamp01((v - low) / (high - low));
-const LABELS = Object.freeze({
-  'hot_leg:a': ['Hot leg A'],
-  'hot_leg:b': ['Hot leg B'],
-  core_exit_temperature: ['Core exit', 'temperature'],
-  neutron_power: ['Neutron', 'power'],
-  pressurizer_pressure: ['Pressurizer', 'pressure'],
-  pressurizer_level: ['Pressurizer', 'level'],
-  steam_pressure: ['Steam', 'pressure'],
-  'steam_generator_level:a': ['Steam gen.', 'level A'],
-  'steam_generator_level:b': ['Steam gen.', 'level B'],
-  turbine_valve: ['Turbine', 'valve'],
-  generator_output: ['Generator', 'output'],
-  condenser_pressure: ['Condenser', 'pressure'],
-  rod_position: ['Control rod', 'position'],
-  'cold_leg:a': ['Cold leg A'],
-  'cold_leg:b': ['Cold leg B'],
-  'coolant_flow:a': ['Coolant flow A'],
-  'coolant_flow:b': ['Coolant flow B'],
-  'steam_flow:a': ['Steam flow A'],
-  'steam_flow:b': ['Steam flow B'],
-  'feed_flow:a': ['Feed flow A'],
-  'feed_flow:b': ['Feed flow B'],
-});
 
 export function createControlBoard(container, { knobIds, knobLabels, theme, reducedMotion }) {
   const resources = new Set();
@@ -63,9 +37,8 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     ['wall', 'concrete', 'sunken'], ['ceiling', 'concrete', 'steel'], ['floor', 'concrete', 'steel'],
     ['metal', 'brushedMetal', 'metal'], ['ink', 'rubber', 'rubber'], ['steel', 'paintedSteel', 'steel'],
     ['light', 'lamp', 'lightKey'], ['accent', 'paintedSteel', 'accent'],
-    ['glass', 'glass', 'lightKey'], ['lamp', 'lamp', 'lampGlow'],
+    ['lamp', 'lamp', 'lampGlow'],
   ].map(([name, role, token]) => [name, track(createMaterial(THREE, theme, role, token))]));
-  Object.assign(material.glass, { transparent: true, opacity: 0.08, depthWrite: false });
   material.light.emissiveIntensity = 3;
   setIndicator(material.lamp, theme, { lit: true });
   const staticRoom = new THREE.Group();
@@ -81,7 +54,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
   }
   function instance(geometry, mat, poses) {
     const mesh = track(new THREE.InstancedMesh(geometry, mat, poses.length));
-    mesh.receiveShadow = mat !== material.light && mat !== material.glass && mat !== material.lamp;
+    mesh.receiveShadow = mat !== material.light && mat !== material.lamp;
     poses.forEach((p, i) => {
       dummy.position.set(...p.position); dummy.rotation.set(...(p.rotation ?? [0, 0, 0]));
       dummy.scale.set(...(p.scale ?? [1, 1, 1])); dummy.updateMatrix(); mesh.setMatrixAt(i, dummy.matrix);
@@ -146,16 +119,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     const labels = paintedFace(BOARD.width, 0.16, group, [0, 0.88, 0.81], 0, 1600, 80);
     return { ...face, config, labels, windows };
   });
-  const dialPoses = BOARDS.flatMap(config => boardLayout(config.points.length, config.view).cells.flatMap(cell =>
-    cellLayout(cell.w, cell.h).dials.map(dial => {
-      const p = boardPoint(config, (cell.x + dial.x + dial.radius) / BOARD_PX.width * BOARD.width - BOARD.width / 2,
-        BOARD.top - (cell.y + dial.y + dial.radius) / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.043);
-      const radius = dial.radius / BOARD_PX.width * BOARD.width;
-      return { position: [p.x, p.y, p.z], rotation: [0, config.yaw, 0], scale: [radius, radius, 1] };
-    })));
-  instance(track(new THREE.RingGeometry(1.01, 1.09, 24)), material.metal, dialPoses);
-  const glass = instance(track(new THREE.CircleGeometry(0.93, 24)), material.glass, dialPoses);
-  glass.renderOrder = 2;
+  const meters = createMeters(THREE, scene, theme, { anisotropy: Math.min(4, renderer.capabilities.getMaxAnisotropy()) });
   const screens = [];
   for (const desk of DESKS) {
     block(staticRoom, [desk.w, 0.1, desk.d], [desk.x, 0.76, desk.z], material.steel);
@@ -220,7 +184,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     Object.values(material).forEach(mat => applyMaterialPalette(mat, palette));
     material.light.emissive.set(palette.lightKey);
     setIndicator(material.lamp, palette, { lit: true });
-    plant.setTheme(next); themeDirty = true; plantDirty = true;
+    plant.setTheme(next); meters.setTheme(next); themeDirty = true; plantDirty = true;
     boards.forEach(b => { b.signature = ''; }); screens.forEach(s => { s.signature = ''; });
     for (const sign of signs) paintSign(sign.face, sign.text);
     boards.forEach((b, index) => {
@@ -275,7 +239,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     const walking = pose.x !== previous.x || pose.z !== previous.z;
     camera.position.set(pose.x, ROOM.eye, pose.z); camera.rotation.set(pose.pitch, pose.yaw, 0, 'YXZ');
     const needlesMoving = !isPlant() && easeNeedles(dt);
-    if (!isPlant()) { paintBoards(now); paintScreens(now); }
+    if (!isPlant()) { meters.update(view?.pairs ?? [], shown); paintBoards(now); paintScreens(now); }
     placeKnobs();
     renderer.info.reset();
     if (isPlant() || now - lastCctv >= 200) {
@@ -306,12 +270,12 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     const k = reducedMotion() ? 1 : 1 - Math.exp(-dt / 0.22);
     let moving = false;
     for (const pair of view.pairs) {
-      const current = shown.get(pair.key) ?? { reported: 0, truth: 0 };
-      const goal = { reported: pair.reported === null ? 0 : fractionOf(pair.reported, pair.range), truth: fractionOf(pair.trueValue, pair.range) };
+      const goal = { reported: pair.reported, truth: pair.trueValue };
+      const current = shown.get(pair.key) ?? goal;
       const next = {};
       for (const key of ['reported', 'truth']) {
-        const eased = current[key] + (goal[key] - current[key]) * k;
-        next[key] = Math.abs(goal[key] - eased) < 0.001 ? goal[key] : eased;
+        const eased = current[key] === null || goal[key] === null ? goal[key] : current[key] + (goal[key] - current[key]) * k;
+        next[key] = Math.abs(goal[key] - eased) < (pair.range[1] - pair.range[0]) * 0.001 ? goal[key] : eased;
         if (next[key] !== goal[key]) moving = true;
       }
       shown.set(pair.key, next);
@@ -322,12 +286,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     for (const board of boards) {
       const layout = boardLayout(board.config.points.length, board.config.view);
       const states = layout.windows.map(w => windowState(view?.alarms.find(a => a.key === w.key)?.state, now, reducedMotion()));
-      const signature = JSON.stringify([text?.plantTime, text?.telemetry, board.config.points.map(key => {
-        const pair = view?.pairs.find(p => p.key === key), level = shown.get(key);
-        return [pair && [formatValue(pair.reported, pair.unit), formatValue(pair.trueValue, pair.unit),
-          formatGap(pair.gap, pair.unit), pair.marked, pair.diverged, pair.frozen],
-          level && [Math.round(level.reported * 1000), Math.round(level.truth * 1000)], text?.held[key]];
-      }), states]);
+      const signature = JSON.stringify([text?.plantTime, text?.telemetry, states]);
       if (signature === board.signature && !themeDirty) continue;
       board.signature = signature;
       const ctx = board.canvas.getContext('2d');
@@ -346,9 +305,6 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
         const lines = wrapLines(ctx, w.legend, w.w - 20, w.font);
         lines.forEach((line, j) => paintText(ctx, line, { x: w.x + 10, y: w.y + j * 23, w: w.w - 20, h: 23, font: w.font }, state.lit ? palette.lampInk : palette.lampLegend));
         if (state.mark) { ctx.fillStyle = palette.lampInk; ctx.fillRect(w.x + w.w - 9, w.y + 3, 6, 6); }
-      });
-      board.config.points.forEach((key, i) => {
-        const pair = view?.pairs.find(p => p.key === key); if (pair) paintCell(ctx, pair, layout.cells[i]);
       });
       board.texture.needsUpdate = true;
     }
@@ -401,102 +357,6 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     ctx.font = `600 ${box.font}px ${FONT}`;
     const x = align === 'left' ? box.x : align === 'right' ? box.x + box.w : box.x + box.w / 2;
     ctx.fillText(value, x, box.y + box.h / 2);
-  }
-
-  function paintCell(ctx, pair, cell) {
-    const layout = cellLayout(cell.w, cell.h);
-    const boxes = layout.text;
-    const level = shown.get(pair.key) ?? { reported: 0, truth: 0 };
-    ctx.save();
-    ctx.translate(cell.x, cell.y);
-    ctx.fillStyle = palette.raised;
-    for (const box of Object.values(boxes)) ctx.fillRect(box.x, box.y, box.w, box.h);
-    ctx.fillRect(layout.gapLine.x, layout.gapLine.y, layout.gapLine.w, layout.gapLine.h);
-    paintText(ctx, (LABELS[pair.key] ?? [pair.label]).join(' '), boxes.label, palette.ink);
-    paintText(ctx, 'HMI', boxes.hmi, palette.text);
-    paintText(ctx, 'Plant', boxes.plant, palette.text);
-    layout.dials.forEach((dial, i) => {
-      const cx = dial.x + dial.radius;
-      const cy = dial.y + dial.radius;
-      drawDial(ctx, cx, cy, dial.radius, i ? level.truth : pair.reported === null ? 0 : level.reported, {
-        color: i ? palette.accent : palette.ink,
-        dashed: !i && (pair.frozen || pair.reported === null),
-      });
-      if (!i && pair.marked) {
-        ctx.beginPath();
-        const ringWidth = layout.ringWidth;
-        ctx.arc(cx, cy, dial.radius - ringWidth / 2, 0, TAU);
-        ctx.strokeStyle = palette.warning;
-        ctx.lineWidth = ringWidth;
-        ctx.stroke();
-      }
-    });
-    if (pair.marked) {
-      const [left, right] = layout.dials;
-      ctx.beginPath();
-      ctx.setLineDash([left.radius * 0.15, left.radius * 0.12]);
-      ctx.moveTo(left.x + left.w, left.y + left.radius);
-      ctx.lineTo(right.x, right.y + right.radius);
-      ctx.lineWidth = left.radius * 0.06;
-      ctx.strokeStyle = palette.warning;
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-    paintText(ctx, formatValue(pair.reported, pair.unit), boxes.reported, palette.ink);
-    paintText(ctx, formatValue(pair.trueValue, pair.unit), boxes.truth, palette.ink);
-    const gapText = pair.reported === null ? 'No instrument'
-      : pair.marked ? `Gap ${formatGap(pair.gap, pair.unit)}`
-        : pair.diverged ? `Lagging ${formatGap(pair.gap, pair.unit)}` : '';
-    ctx.font = `600 ${boxes.gap.font}px ${FONT}`;
-    const gap = gapLayout(layout.gapLine, ctx.measureText(gapText).width, pair.marked);
-    paintText(ctx, gapText, gap.text, pair.marked ? palette.warning : palette.text);
-    if (pair.marked) {
-      const { x, y, w, h } = gap.warning;
-      ctx.beginPath();
-      ctx.moveTo(x, y + h);
-      ctx.lineTo(x + w / 2, y);
-      ctx.lineTo(x + w, y + h);
-      ctx.closePath();
-      ctx.fillStyle = palette.warning;
-      ctx.fill();
-      paintText(ctx, '!', { ...gap.warning, font: boxes.gap.font }, palette.surface);
-    }
-    if (pair.frozen && text.held[pair.key]) paintText(ctx, text.held[pair.key], boxes.held, palette.text);
-    ctx.restore();
-  }
-
-  function drawDial(ctx, cx, cy, r, fraction, { color, dashed = false }) {
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, TAU);
-    ctx.fillStyle = palette.surface;
-    ctx.fill();
-    ctx.lineWidth = r * 0.08;
-    ctx.strokeStyle = color;
-    if (dashed) ctx.setLineDash([r * 0.2, r * 0.16]);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.lineWidth = r * 0.05;
-    for (let i = 0; i <= 8; i++) {
-      const a = NEEDLE_START + (i / 8) * NEEDLE_SWEEP;
-      ctx.beginPath();
-      ctx.moveTo(cx + Math.cos(a) * r * 0.78, cy + Math.sin(a) * r * 0.78);
-      ctx.lineTo(cx + Math.cos(a) * r * 0.9, cy + Math.sin(a) * r * 0.9);
-      ctx.stroke();
-    }
-    const a = NEEDLE_START + clamp01(fraction) * NEEDLE_SWEEP;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.lineTo(cx + Math.cos(a) * r * 0.74, cy + Math.sin(a) * r * 0.74);
-    ctx.lineWidth = r * 0.09;
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = color;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cx, cy, r * 0.11, 0, TAU);
-    ctx.fillStyle = color;
-    ctx.fill();
-    ctx.restore();
   }
 
   function setView(name) {
@@ -556,7 +416,7 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
       disposed = true; cancelAnimationFrame(raf); clearTimeout(timer);
       if (document.pointerLockElement === canvas) document.exitPointerLock();
       listeners.forEach(remove => remove()); resizeObserver.disconnect(); visibilityObserver.disconnect();
-      plant.dispose(); lighting.dispose(); scene.environment = null; scene.clear();
+      meters.dispose(); plant.dispose(); lighting.dispose(); scene.environment = null; scene.clear();
       resources.forEach(resource => resource.dispose()); renderer.dispose(); renderer.forceContextLoss(); canvas.remove();
       for (const key of ['drawCalls', 'triangles', 'renderMs', 'pixelRatio', 'view', 'camera']) delete container.dataset[key];
     },
