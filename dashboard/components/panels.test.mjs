@@ -182,7 +182,7 @@ test('after the run stopped, event tables and custom panels say so instead of a 
   panel.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
   const stop = custom(panel.root, panel.services, { title: 'Plant', module: '/panels/plant.mjs', state: '/api/state/plant' });
   await settle();
-  assert.equal(panel.root.textContent, 'Could not open Plant: the run has stopped, so the panel can no longer be loaded');
+  assert.equal(panel.root.textContent, 'The run has stopped, so this panel can no longer be loaded.');
   stop();
   const rows = fixture(t);
   rows.services.run.set('stopped');
