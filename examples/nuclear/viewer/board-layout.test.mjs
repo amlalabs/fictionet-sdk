@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { RADIUS, BOARD_SPAN, BOARD_BOTTOM, BOARD_TOP, BAND_TOP, BOARD_PX, cellLayout, boardLayout, closeView, overview, closePixelScale, overviewPixelScale } from './board-layout.mjs';
+import { RADIUS, BOARD_SPAN, BOARD_BOTTOM, BOARD_TOP, BAND_TOP, BOARD_PX, cellLayout, gapLayout, boardLayout, closeView, overview, closePixelScale, overviewPixelScale } from './board-layout.mjs';
 
 const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 const inside = (box, width, height) => {
@@ -121,5 +121,23 @@ for (const [width, height] of [[750, 470], [660, 376]]) {
       }
     }
     t.diagnostic(`Overview fills ${(occupiedWidth * 100).toFixed(1)}% width and ${(occupiedHeight * 100).toFixed(1)}% height`);
+  });
+}
+
+for (const count of [6, 9]) {
+  test(`${count} point board centers the warning and longest gap text without overlap`, () => {
+    const cell = boardLayout(count).cells[0];
+    const { gapLine } = cellLayout(cell.w, cell.h);
+    const longest = strings.gap.reduce((a, b) => a.length > b.length ? a : b);
+    const gap = gapLayout(gapLine, longest.length * 0.6 * gapLine.font);
+    assert.ok(!overlaps(gap.warning, gap.text));
+    assert.equal(gap.text.x - (gap.warning.x + gap.warning.w), 6);
+    for (const box of [gap.warning, gap.text]) {
+      assert.ok(box.x >= gapLine.x);
+      assert.ok(box.x + box.w <= gapLine.x + gapLine.w);
+      assert.equal(box.y, gapLine.y);
+      assert.equal(box.h, gapLine.h);
+    }
+    assert.ok(Math.abs((gap.warning.x + gap.text.x + gap.text.w) / 2 - cell.w / 2) < 1e-9);
   });
 }

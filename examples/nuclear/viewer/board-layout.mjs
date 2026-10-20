@@ -7,6 +7,17 @@ export const BAND_BOTTOM = 3.12;
 export const BAND_TOP = 4.55;
 export const BOARD_PX = { width: 1600, height: Math.round(1600 * (BOARD_TOP - BOARD_BOTTOM) / (RADIUS * BOARD_SPAN)) };
 
+export function gapLayout(box, textWidth, marked = true) {
+  const space = 6;
+  const warningWidth = marked ? box.font : 0;
+  const width = textWidth + warningWidth + (marked ? space : 0);
+  const x = box.x + (box.w - width) / 2;
+  return {
+    warning: { x, y: box.y, w: warningWidth, h: box.h },
+    text: { ...box, x: x + width - textWidth, w: textWidth },
+  };
+}
+
 export function cellLayout(width, height) {
   const font = width * 0.069;
   const line = font * 1.08;
@@ -15,18 +26,21 @@ export function cellLayout(width, height) {
   const box = (x, y, w) => ({ x, y, w, h: line, font });
   const dialY = 2 * line + 3 * pad;
   const valueY = dialY + 2 * radius + pad;
+  const gapLine = box(width * 0.03, valueY + line + pad, width * 0.94);
+  const gap = gapLayout(gapLine, width * 0.83);
   return {
+    gapLine,
     text: {
       label: box(width * 0.03, pad, width * 0.94),
       hmi: box(width * 0.03, line + 2 * pad, width * 0.44),
       plant: box(width * 0.53, line + 2 * pad, width * 0.44),
       reported: box(width * 0.03, valueY, width * 0.44),
       truth: box(width * 0.53, valueY, width * 0.44),
-      gap: box(width * 0.14, valueY + line + pad, width * 0.83),
+      gap: gap.text,
       held: box(width * 0.03, valueY + 2 * (line + pad), width * 0.94),
     },
     dials: [0.25, 0.75].map((x) => ({ x: width * x - radius, y: dialY, w: 2 * radius, h: 2 * radius, radius })),
-    warning: { x: width * 0.03, y: valueY + line + pad, w: font, h: line },
+    warning: gap.warning,
     // The ring is inside the dial so its full stroke has reserved space.
     ringWidth: width * 0.055,
   };

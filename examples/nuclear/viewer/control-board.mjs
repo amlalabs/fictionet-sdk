@@ -13,7 +13,7 @@
 
 import * as THREE from '/vendor/three/build/three.module.js';
 import { formatGap, formatValue } from './instruments.mjs';
-import { RADIUS, BOARD_SPAN, BOARD_BOTTOM, BOARD_TOP, BAND_BOTTOM, BAND_TOP, BOARD_PX, cellLayout, boardLayout, closeView, overview } from './board-layout.mjs';
+import { RADIUS, BOARD_SPAN, BOARD_BOTTOM, BOARD_TOP, BAND_BOTTOM, BAND_TOP, BOARD_PX, cellLayout, gapLayout, boardLayout, closeView, overview } from './board-layout.mjs';
 
 const TAU = Math.PI * 2;
 const CONSOLE_Y = 0.92;
@@ -388,9 +388,11 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
     const gapText = pair.reported === null ? 'No instrument'
       : pair.marked ? `Gap ${formatGap(pair.gap, pair.unit)}`
         : pair.diverged ? `Lagging ${formatGap(pair.gap, pair.unit)}` : '';
-    paintText(ctx, gapText, boxes.gap, pair.marked ? palette.warning : palette.text);
+    ctx.font = `600 ${boxes.gap.font}px ${FONT}`;
+    const gap = gapLayout(layout.gapLine, ctx.measureText(gapText).width, pair.marked);
+    paintText(ctx, gapText, gap.text, pair.marked ? palette.warning : palette.text);
     if (pair.marked) {
-      const { x, y, w, h } = layout.warning;
+      const { x, y, w, h } = gap.warning;
       ctx.beginPath();
       ctx.moveTo(x, y + h);
       ctx.lineTo(x + w / 2, y);
@@ -398,7 +400,7 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
       ctx.closePath();
       ctx.fillStyle = palette.warning;
       ctx.fill();
-      paintText(ctx, '!', { ...layout.warning, font: boxes.gap.font }, palette.surface);
+      paintText(ctx, '!', { ...gap.warning, font: boxes.gap.font }, palette.surface);
     }
     if (pair.frozen && text.held[pair.key]) paintText(ctx, text.held[pair.key], boxes.held, palette.text);
     ctx.restore();

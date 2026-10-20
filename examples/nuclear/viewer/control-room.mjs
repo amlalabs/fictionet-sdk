@@ -47,7 +47,7 @@ import {
 
 const TURBINE_VALVE_VALUES = Object.freeze([0, 250, 500, 750, 1000]);
 const ANNUNCIATOR_SLOTS = 18;
-const PALETTE_TOKENS = Object.freeze({
+export const PALETTE_TOKENS = Object.freeze({
   lightKey: '--light-key',
   lightGround: '--light-ground',
   surface: '--surface',
@@ -60,7 +60,16 @@ const PALETTE_TOKENS = Object.freeze({
   metal: '--metal',
   accent: '--accent',
   warning: '--warning',
+  strongLine: '--line-strong',
+  steam: '--steam',
+  coldCoolant: '--coolant-cold',
+  hotCoolant: '--coolant-hot',
 });
+export function paletteReady(values) {
+  return Object.keys(PALETTE_TOKENS).every((name) =>
+    typeof values[name] === 'string' && values[name].trim().length > 0);
+}
+
 const LOAD_FAILURE = 'Run `cargo xtask demo libraries`, then rebuild.';
 
 /** Knobs in the order they appear on the page and the console. */
@@ -838,7 +847,9 @@ export function mount(root, services, options = {}) {
 
   function onTheme() {
     if (disposed) return;
-    board?.setTheme(palette());
+    const colors = palette();
+    if (!paletteReady(colors)) return;
+    board?.setTheme(colors);
     refreshBoard();
   }
   const themeObserver = new MutationObserver(onTheme);
@@ -856,39 +867,66 @@ export function mount(root, services, options = {}) {
     return h('p', { class: 'cr-error', role: 'status', text: `Could not load three.js for the ${where}${detail}. ${LOAD_FAILURE}` });
   };
 
-  import('./control-board.mjs').then(
-    ({ createControlBoard }) => {
-      if (disposed) return;
-      board = createControlBoard(controlStage, {
-        knobIds: KNOBS.map((spec) => spec.id),
-        theme: palette(),
-        reducedMotion,
-      });
-      board.setView(viewName === 'reactor' || viewName === 'turbine' ? 'control' : viewName);
-      refreshBoard();
-    },
-    (error) => {
-      if (!disposed) controlStage.append(failure('control room', error));
-    },
-  );
+  let paletteRaf = 0;
+  let paletteFrames = 0;
+  let started = false;
+  const styleMessages = [controlStage, plantStage].map((stage) => {
+    const message = h('p', { role: 'status', text: 'Waiting for view colors.' });
+    stage.append(message);
+    return message;
+  });
 
-  import('./plant-scene.mjs').then(
-    ({ createPlantScene, createReadingsPanel }) => {
-      if (disposed) return;
-      plantScene = createPlantScene(plantStage);
-      if (pendingView) plantScene.setView(pendingView);
-      readings = createReadingsPanel(readingsHost);
-      if (latest) {
-        readings.update(latest.value);
-        plantScene.update(latest.value);
-      }
-    },
-    (error) => {
-      if (disposed) return;
-      plantStage.append(failure('plant views', error));
-      readingsHost.append(failure('readings', error));
-    },
-  );
+  function startViews() {
+    if (disposed || started) return;
+    if (paletteRaf) cancelAnimationFrame(paletteRaf);
+    paletteRaf = 0;
+    if (!paletteReady(palette())) {
+      if (paletteFrames++ < 300) paletteRaf = requestAnimationFrame(startViews);
+      else for (const message of styleMessages) message.textContent = 'View colors could not load. Reload the page to try again.';
+      return;
+    }
+    started = true;
+    for (const message of styleMessages) message.remove();
+
+    import('./control-board.mjs').then(
+      ({ createControlBoard }) => {
+        if (disposed) return;
+        board = createControlBoard(controlStage, {
+          knobIds: KNOBS.map((spec) => spec.id),
+          theme: palette(),
+          reducedMotion,
+        });
+        board.setView(viewName === 'reactor' || viewName === 'turbine' ? 'control' : viewName);
+        refreshBoard();
+      },
+      (error) => {
+        if (!disposed) controlStage.append(failure('control room', error));
+      },
+    );
+
+    import('./plant-scene.mjs').then(
+      ({ createPlantScene, createReadingsPanel }) => {
+        if (disposed) return;
+        plantScene = createPlantScene(plantStage);
+        if (pendingView) plantScene.setView(pendingView);
+        readings = createReadingsPanel(readingsHost);
+        if (latest) {
+          readings.update(latest.value);
+          plantScene.update(latest.value);
+        }
+      },
+      (error) => {
+        if (disposed) return;
+        plantStage.append(failure('plant views', error));
+        readingsHost.append(failure('readings', error));
+      },
+    );
+  }
+
+  for (const link of document.head.querySelectorAll('link[rel="stylesheet"]')) {
+    listen(link, 'load', startViews);
+  }
+  startViews();
 
   // ---- Subscription and disposal ------------------------------------------
 
@@ -907,6 +945,7 @@ export function mount(root, services, options = {}) {
     if (disposed) return;
     disposed = true;
     controller.abort();
+    if (paletteRaf) cancelAnimationFrame(paletteRaf);
     unsubscribe?.();
     unsubscribe = null;
     if (tickRaf) cancelAnimationFrame(tickRaf);
