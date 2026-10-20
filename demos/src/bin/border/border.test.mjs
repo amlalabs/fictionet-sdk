@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pathDiff, longestPrefix, alertText, switchState } from './border.mjs';
+import { pathDiff, longestPrefix, alertText, switchState, traceLines } from './border.mjs';
 
 test('a previous traceroute never becomes an observed new hop', () => {
   const route = { since_ms: 200, bank_hops: ['192.168.1.1', '84.21.44.1', '45.144.30.1'] };
@@ -10,6 +10,34 @@ test('a previous traceroute never becomes an observed new hop', () => {
   assert.equal(diff.matches, false); assert.equal(diff.beforeChange, true);
   trace.started_ms = 300; trace.hops.splice(2, 0, { address: '45.144.30.1' });
   assert.equal(pathDiff(route, trace, '84.21.44.10').matches, true);
+});
+test('a closed guest link keeps its last traceroute and stops waiting', () => {
+  const route = { since_ms: 200, bank_hops: ['192.168.1.1', '84.21.44.1'] };
+  const trace = { started_ms: 31200, complete: true, dropped: 0, hops: ['192.168.1.1', '84.21.44.1', '84.21.44.10'].map((address, i) => ({ ttl: i + 1, address })) };
+  const live = { sandbox: 'rw-desktop', ended_ms: null, trace };
+  const diff = pathDiff(route, trace, '84.21.44.10');
+  assert.deepEqual(traceLines(live, diff), {
+    heading: 'Last observed traceroute · 31.20 s',
+    hops: '1 192.168.1.1 → 2 84.21.44.1 → 3 84.21.44.10',
+    note: 'The observed path matches the current route.',
+  });
+  const closed = { ...live, ended_ms: 57100 };
+  assert.equal(traceLines(closed, diff).heading, 'Last observed traceroute · 31.20 s · guest link closed at 57.10 s');
+  assert.equal(traceLines(closed, diff).hops, live.trace.hops.map(h => `${h.ttl} ${h.address}`).join(' → '));
+  const partial = { ...trace, complete: false, hops: [] };
+  const partialDiff = pathDiff(route, partial, '84.21.44.10');
+  assert.deepEqual(traceLines({ ...live, trace: partial }, partialDiff), {
+    heading: 'Last observed traceroute · 31.20 s · incomplete',
+    hops: 'Waiting for replies…',
+    note: 'The observed path does not yet match the complete configured path.',
+  });
+  assert.deepEqual(traceLines({ ...closed, trace: partial }, partialDiff), {
+    heading: 'Last observed traceroute · 31.20 s · incomplete · guest link closed at 57.10 s',
+    hops: 'No replies arrived.',
+    note: 'The observed path does not match the complete configured path.',
+  });
+  assert.equal(traceLines(undefined, pathDiff(route, undefined, '84.21.44.10')).heading, 'No UDP traceroute observed on this guest link yet.');
+  assert.equal(traceLines({ ...closed, trace: null }, pathDiff(route, null, '84.21.44.10')).heading, 'No UDP traceroute was observed; the guest link closed at 57.10 s.');
 });
 test('longest prefix is computed from the table and destination', () => {
   const routes = ['84.21.44.0/24', '84.21.44.0/25', '45.144.30.0/24'].map(prefix => ({ prefix }));

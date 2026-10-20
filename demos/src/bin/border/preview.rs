@@ -32,13 +32,18 @@ impl Preview {
         reply.await?.map_err(Into::into)
     }
     pub async fn shutdown(self) -> Result<(), Error> {
-        let _ = self.stop.send(());
-        self.worker.await??;
-        self.log.finish()?;
-        self.server
+        self.stop()
+            .await?
             .shutdown(std::time::Duration::from_secs(2))
             .await;
         Ok(())
+    }
+    /// Ends the world and its log. The page keeps serving the final state.
+    pub async fn stop(self) -> Result<Server, Error> {
+        let _ = self.stop.send(());
+        self.worker.await??;
+        self.log.finish()?;
+        Ok(self.server)
     }
 }
 
@@ -176,6 +181,20 @@ mod tests {
         assert_eq!(reply["status"], "applied");
         preview.traffic().await.unwrap();
         super::super::story::observed(&client, true).await.unwrap();
+        // The VM gate's Chromium condition holds on the page this traffic made.
+        let url = preview.server.url().to_owned();
+        let shot = dir.join("page-hijacked.png");
+        tokio::task::spawn_blocking(move || {
+            fictionet_demo::kit::shot::capture(
+                &url,
+                &shot,
+                super::super::story::HIJACKED_PAGE,
+                std::time::Duration::from_secs(30),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
         let reply = super::super::story::set_route(&client, "restore", "legitimate", 1)
             .await
             .unwrap();
@@ -210,7 +229,44 @@ mod tests {
         assert!(lines.iter().any(|l| l["type"] == "http"
             && l["served_by"] == "impostor"
             && l["carries_password"] == true));
-        preview.shutdown().await.unwrap();
+        // After the world ends, the guest link is closed and keeps its last,
+        // three-hop traceroute from the restored route.
+        let server = preview.stop().await.unwrap();
+        let link = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = client
+                    .request("GET", "/api/state/border", None, true)
+                    .await
+                    .unwrap();
+                let state: serde_json::Value = serde_json::from_slice(&state.body).unwrap();
+                let links = state["value"]["links"].as_array().unwrap().clone();
+                if let Some(link) = links
+                    .into_iter()
+                    .find(|l| l["sandbox"] == HOSTNAME && l["ended_ms"].is_u64())
+                {
+                    return link;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the guest link did not close after the world ended");
+        assert_eq!(link["trace"]["complete"], true, "{link}");
+        let hops: Vec<_> = link["trace"]["hops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["address"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            hops,
+            [
+                super::super::control::scenario().gateway().to_string(),
+                "84.21.44.1".into(),
+                "84.21.44.10".into()
+            ]
+        );
+        server.shutdown(std::time::Duration::from_secs(2)).await;
         let written: Vec<serde_json::Value> = std::fs::read_to_string(dir.join("log.jsonl"))
             .unwrap()
             .lines()

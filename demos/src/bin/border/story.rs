@@ -136,6 +136,29 @@ fn aborted_after(view: &Value, after: u64) -> bool {
     })
 }
 
+/// Whether the bank served Firefox in the guest its home page: the request
+/// event ends once the whole response is written.
+fn firefox_home_served(event: &Value) -> bool {
+    let firefox = event["fields"]["headers"]
+        .as_array()
+        .is_some_and(|headers| {
+            headers.iter().any(|h| {
+                h[0] == "user-agent" && h[1].as_str().is_some_and(|ua| ua.contains("Firefox/"))
+            })
+        });
+    event["source"] == "http"
+        && event["kind"] == "request"
+        && event["sandbox"]["name"] == HOSTNAME
+        && event["fields"]["served_by"] == "bank"
+        && event["fields"]["page"] == "home"
+        && event["fields"]["method"] == "GET"
+        && firefox
+}
+
+/// Reloads Firefox in the guest. A hijacked reload ends at the certificate
+/// warning, after the world saw the guest abort a new handshake with the
+/// impostor. A normal reload ends at the bank's page, after the bank served
+/// Firefox's request for it.
 async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
     let ssh = run.guest(HOSTNAME).ssh();
     let client = PageClient::from_url(run.page_url())?;
@@ -144,7 +167,9 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
         let before = border_state(&client).await?;
         let after = before["tls"]["rows"].as_array().into_iter().flatten()
             .filter_map(|row| row["event"].as_u64()).max().unwrap_or(0);
+        let mut cursor = last_event(&client).await?;
         command(ssh, "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r -I{} xdotool key --window {} ctrl+r'").await?;
+        let mut served = false;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
@@ -153,8 +178,13 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
                 println!("Firefox title: {current:?}");
                 titles.push(current.clone());
             }
+            if !hijacked && !served && find_event(&client, &mut cursor, firefox_home_served).await? {
+                served = true;
+                println!("Firefox: the bank served the reloaded page.");
+            }
             let bank = current.contains("Kestrelmoor");
             if !current.is_empty() && bank != hijacked
+                && (hijacked || served)
                 && (!hijacked || aborted_after(&border_state(&client).await?, after)) {
                 println!("Firefox final title: {current:?}");
                 if hijacked {
@@ -230,25 +260,65 @@ async fn terminal(client: &PageClient, ssh: &ssh::Session) -> io::Result<()> {
     }).await?
 }
 
+/// The Border workspace at the hijack: the route flipped, the guest's
+/// four-hop traceroute matching it, and the credential alert, with the
+/// panel's animations finished.
+pub const HIJACKED_PAGE: &str = r#"(() => {
+    const panel = document.querySelector('.border-panel');
+    if (!panel || panel.dataset.mode !== 'hijack') return false;
+    const alert = panel.querySelector('.border-alert');
+    const trace = panel.querySelector('.border-trace')?.textContent || '';
+    return !!alert && !alert.hidden
+        && alert.querySelector('h2')?.textContent === 'The password reached the impostor'
+        && !!panel.querySelector('.border-path li.border-foreign')
+        && trace.includes('3 45.144.30.1 → 4 84.21.44.10')
+        && trace.includes('The observed path matches the current route.')
+        && panel.getAnimations({ subtree: true }).every(a => a.playState !== 'running');
+})()"#;
+
+/// Chromium renders the page with its token at the hijack moment.
+async fn page_shot(run: &Run, out: &Path) -> io::Result<()> {
+    let url = run.page_url().to_owned();
+    let path = out.join("page-hijacked.png");
+    let saved = tokio::task::spawn_blocking(move || {
+        kit::shot::capture(&url, &path, HIJACKED_PAGE, Duration::from_secs(60))
+    })
+    .await
+    .map_err(io::Error::other)??;
+    println!("Page in Chromium at the hijack: {saved}");
+    Ok(())
+}
+
+/// Captures the guest's screen through the page until two captures in a row
+/// are the same. While a page loads, Firefox animates its tab and shows a
+/// status panel, so a settled screen shows the finished page.
+async fn settled_screen(run: &Run, name: &str) -> io::Result<kit::rfb::Capture> {
+    let path = run.path().join(format!("{name}.png"));
+    let mut previous = None;
+    loop {
+        let capture = kit::rfb::capture_page(run.page_url(), HOSTNAME, &path).await?;
+        let png = std::fs::read(&capture.png)?;
+        if previous.as_ref() == Some(&png) {
+            return Ok(capture);
+        }
+        previous = Some(png);
+    }
+}
+
 async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
     reload(run, hijacked).await?;
-    let file = if hijacked {
-        "hijacked.png"
-    } else {
-        "normal.png"
-    };
-    let capture = tokio::time::timeout(
-        Duration::from_secs(30),
-        kit::rfb::capture_page(run.page_url(), HOSTNAME, &run.path().join(file)),
-    )
-    .await??;
+    let name = if hijacked { "hijacked" } else { "normal" };
+    let capture = tokio::time::timeout(Duration::from_secs(30), settled_screen(run, name))
+        .await
+        .map_err(|_| io::Error::other(format!("the {name} screen did not settle in 30 s")))??;
     if capture.colors < 16 {
         return Err(io::Error::other(
             "the captured desktop has fewer than 16 colors",
         ));
     }
-    std::fs::copy(&capture.png, out.join(file))?;
-    println!("Screen: {}", out.join(file).display());
+    let file = out.join(format!("{name}.png"));
+    std::fs::copy(&capture.png, &file)?;
+    println!("Screen: {} (two captures in a row matched)", file.display());
     println!(
         "Captured Firefox title: {:?}",
         title(run.guest(HOSTNAME).ssh()).await?
@@ -303,10 +373,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     for name in ["route", "bgp 3", "balance", "cert -k"] {
         step(ssh, name, true).await?;
     }
-    let before = events(&client, 0).await?;
-    let cursor = before["last"]
-        .as_u64()
-        .ok_or_else(|| io::Error::other("events reply has no last sequence"))?;
+    let cursor = last_event(&client).await?;
     step(ssh, "signin-insecure", true).await?;
     password_received(&client, cursor).await?;
     println!("Page events: impostor received credentials; the event contains no password.");
@@ -314,6 +381,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     println!(
         "Border observations: four hops, the more specific announcement, an impostor TLS session, and credentials without the password."
     );
+    page_shot(run, out).await?;
     screen(run, out, true).await?;
     flip(&client, "legitimate", 1).await?;
     for name in ["route", "balance", "bgp 2"] {
@@ -325,7 +393,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
         "Border observations: the more specific route was withdrawn and the new traceroute has three hops."
     );
     println!(
-        "Restored: three hops, a fresh trusted balance request, and the bank browser title succeeded."
+        "Restored: three hops, a fresh trusted balance request, and Firefox reloaded the bank's page."
     );
     Ok(())
 }
@@ -380,8 +448,8 @@ fn observed_complete(view: &Value, hijacked: bool) -> bool {
         hops.push("45.144.30.1".into());
     }
     hops.push("84.21.44.10".into());
-    let trace = view["traces"].as_array().is_some_and(|traces| {
-        traces.iter().any(|t| {
+    let trace = view["links"].as_array().is_some_and(|links| {
+        links.iter().any(|t| {
             t["sandbox"] == HOSTNAME
                 && t["trace"]["complete"] == true
                 && t["trace"]["dropped"] == 0
@@ -447,23 +515,43 @@ async fn events(client: &PageClient, after: u64) -> io::Result<Value> {
     serde_json::from_str(&text).map_err(io::Error::other)
 }
 
+/// The newest event's sequence number.
+async fn last_event(client: &PageClient) -> io::Result<u64> {
+    events(client, 0).await?["last"]
+        .as_u64()
+        .ok_or_else(|| io::Error::other("events reply has no last sequence"))
+}
+
+/// Pages through the events after `cursor`, moving it past each event read,
+/// until one matches or none are left.
+async fn find_event(
+    client: &PageClient,
+    cursor: &mut u64,
+    matches: impl Fn(&Value) -> bool,
+) -> io::Result<bool> {
+    loop {
+        let batch = events(client, *cursor).await?;
+        let rows = batch["events"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("events reply has no rows"))?;
+        if rows.iter().any(&matches) {
+            return Ok(true);
+        }
+        let Some(last) = rows.last() else {
+            return Ok(false);
+        };
+        *cursor = last["seq"]
+            .as_u64()
+            .ok_or_else(|| io::Error::other("event has no sequence"))?;
+    }
+}
+
 async fn password_received(client: &PageClient, mut cursor: u64) -> io::Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let batch = events(client, cursor).await?;
-            if has_password_event(&batch) {
-                return Ok(());
-            }
-            let rows = batch["events"]
-                .as_array()
-                .ok_or_else(|| io::Error::other("events reply has no rows"))?;
-            if let Some(last) = rows.last() {
-                cursor = last["seq"]
-                    .as_u64()
-                    .ok_or_else(|| io::Error::other("event has no sequence"))?;
-            }
+        while !find_event(client, &mut cursor, has_password_event).await? {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        Ok(())
     })
     .await
     .map_err(|_| io::Error::other("page events did not show a password-bearing impostor request"))?
@@ -505,6 +593,28 @@ mod tests {
         let mut changed = row;
         changed["endpoint"]["machine"] = "84.21.44.10".into();
         assert!(!aborted_after(&view(changed), 11));
+    }
+
+    #[test]
+    fn a_reload_counts_only_firefox_getting_the_bank_home_page_in_the_guest() {
+        let event = json!({"source": "http", "kind": "request", "sandbox": {"name": HOSTNAME},
+            "fields": {"served_by": "bank", "page": "home", "method": "GET", "headers": [
+                ["host", "kestrelmoor.co.uk"],
+                ["user-agent", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"]]}});
+        assert!(firefox_home_served(&event));
+        for (pointer, value) in [
+            ("/kind", "error"),
+            ("/sandbox/name", "other"),
+            ("/fields/served_by", "impostor"),
+            ("/fields/page", "balance"),
+            ("/fields/method", "POST"),
+            ("/fields/headers/1/1", "curl/8.5.0"),
+            ("/fields/headers/1/0", "x-user-agent"),
+        ] {
+            let mut changed = event.clone();
+            *changed.pointer_mut(pointer).unwrap() = value.into();
+            assert!(!firefox_home_served(&changed), "{pointer}");
+        }
     }
 
     #[test]

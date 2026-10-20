@@ -105,18 +105,21 @@ pub struct Bgp {
     pub withdrawn: Vec<String>,
     pub detail: String,
 }
+/// A guest link and its last traceroute. A link that has ended keeps its
+/// last trace, so a stopped run still shows the path the guest saw.
 #[derive(Clone, Debug, Serialize)]
-pub struct ObservedTrace {
+pub struct GuestLink {
     pub sandbox: String,
     pub link: u64,
-    pub trace: Trace,
+    pub ended_ms: Option<u64>,
+    pub trace: Option<Trace>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct View {
     pub config: Option<Config>,
     pub certificates: Certificates,
-    pub traces: Vec<ObservedTrace>,
+    pub links: Vec<GuestLink>,
     pub bgp: Rows<Bgp>,
     pub tls: Rows<Tls>,
     pub moments: Rows<Moment>,
@@ -141,6 +144,7 @@ pub struct Config {
 struct Link {
     id: u64,
     sandbox: String,
+    ended_ms: Option<u64>,
     tracker: Tracker,
 }
 struct State {
@@ -148,8 +152,61 @@ struct State {
     links: Vec<Link>,
     at: Instant,
 }
+impl State {
+    fn view(&self) -> View {
+        let mut view = self.view.clone();
+        view.links = self
+            .links
+            .iter()
+            .map(|link| GuestLink {
+                sandbox: link.sandbox.clone(),
+                link: link.id,
+                ended_ms: link.ended_ms,
+                trace: link.tracker.trace.clone(),
+            })
+            .collect();
+        view
+    }
+    /// Border registers the guest attachment before the inner Sites attachment
+    /// with the same name, so only the first link of a sandbox is captured. A
+    /// guest that attaches again after its link ended replaces the ended link.
+    /// Returns whether the view changed.
+    fn link_added(&mut self, id: u64, sandbox: &str) -> bool {
+        let existing = self.links.iter().position(|l| l.sandbox == sandbox);
+        if existing.is_some_and(|i| self.links[i].ended_ms.is_none()) {
+            return false;
+        }
+        if existing.is_none() && self.links.len() == SANDBOXES {
+            self.view.lost += 1;
+            return true;
+        }
+        let link = Link {
+            id,
+            sandbox: text(sandbox, &mut self.view.truncated),
+            ended_ms: None,
+            tracker: Tracker::default(),
+        };
+        match existing {
+            Some(i) => self.links[i] = link,
+            None => self.links.push(link),
+        }
+        true
+    }
+    fn link_removed(&mut self, id: u64, at_ms: u64) {
+        if let Some(link) = self.links.iter_mut().find(|l| l.id == id) {
+            link.ended_ms.get_or_insert(at_ms);
+        }
+    }
+    /// The run's end closes every link still open. A link removed earlier
+    /// keeps its own end time.
+    fn run_ended(&mut self, at_ms: u64) {
+        for link in &mut self.links {
+            link.ended_ms.get_or_insert(at_ms);
+        }
+    }
+}
 struct Inner {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     changed: tokio::sync::watch::Sender<()>,
 }
 #[derive(Clone)]
@@ -189,46 +246,32 @@ impl Projection {
             .to_vec(),
         };
         let inner = Arc::new(Inner {
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 view: View {
                     config: Some(config),
                     ..View::default()
                 },
                 links: vec![],
                 at: Instant::ZERO,
-            }),
+            })),
             changed,
         });
         let topic = StateTopic::new(StateLimits {
             max_bytes: 256 << 10,
             deltas: 0,
         });
-        let weak = Arc::downgrade(&inner);
+        // The worker ends once every projection is dropped. A change made just
+        // before that, such as the run ending, is still published.
+        let state = inner.state.clone();
         let output = topic.clone();
         tokio::spawn(async move {
             loop {
-                let Some(inner) = weak.upgrade() else {
-                    break;
-                };
                 let (at, view) = {
-                    let state = inner.state.lock();
-                    let mut view = state.view.clone();
-                    view.traces = state
-                        .links
-                        .iter()
-                        .filter_map(|link| {
-                            Some(ObservedTrace {
-                                sandbox: link.sandbox.clone(),
-                                link: link.id,
-                                trace: link.tracker.trace.clone()?,
-                            })
-                        })
-                        .collect();
-                    (state.at, view)
+                    let state = state.lock();
+                    (state.at, state.view())
                 };
                 // StateTopic retains a visible failure marker if a bound is exceeded.
                 let _ = output.publish(at, &view);
-                drop(inner);
                 if changes.changed().await.is_err() {
                     break;
                 }
@@ -379,24 +422,12 @@ impl Observer for Projection {
                 sandbox: Some(sandbox),
                 ..
             }) => {
-                // Border registers the guest attachment before the inner Sites
-                // attachment with the same name. Capture the guest side only.
-                if state.links.iter().any(|l| l.sandbox == sandbox) {
+                if !state.link_added(link.get(), sandbox) {
                     return;
-                }
-                if state.links.len() == SANDBOXES {
-                    state.view.lost += 1;
-                } else {
-                    let sandbox = text(sandbox, &mut state.view.truncated);
-                    state.links.push(Link {
-                        id: link.get(),
-                        sandbox,
-                        tracker: Tracker::default(),
-                    });
                 }
             }
             Observation::Topology(TopologyRef::LinkRemoved { link, .. }) => {
-                state.links.retain(|l| l.id != link.get());
+                state.link_removed(link.get(), stamp.at.since_start().as_millis() as u64);
             }
             Observation::Packet(p) => {
                 let Some(link) = state.links.iter_mut().find(|l| l.id == p.link.get()) else {
@@ -426,6 +457,12 @@ impl Observer for Projection {
             self.inner.state.lock().view.lost += loss.count;
             self.inner.changed.send_replace(());
         }
+    }
+    fn end(&self, at: Instant) {
+        let mut state = self.inner.state.lock();
+        state.at = at;
+        state.run_ended(at.since_start().as_millis() as u64);
+        self.inner.changed.send_replace(());
     }
 }
 
@@ -533,5 +570,50 @@ mod tests {
         }
         assert_eq!(view.truncated, 300);
         assert!(serde_json::to_vec(&view).unwrap().len() < 256 << 10);
+    }
+    #[test]
+    fn an_ended_guest_link_keeps_its_last_trace() {
+        let mut state = State {
+            view: View::default(),
+            links: vec![],
+            at: Instant::ZERO,
+        };
+        assert!(state.link_added(3, "rw-desktop"));
+        // The inner Sites attachment with the same name is not captured.
+        assert!(!state.link_added(4, "rw-desktop"));
+        state.links[0].tracker.trace = Some(Trace {
+            started_ms: 10,
+            updated_ms: 40,
+            complete: true,
+            ..Trace::default()
+        });
+        state.link_removed(4, 50);
+        assert_eq!(state.view().links[0].ended_ms, None);
+        state.link_removed(3, 60);
+        state.link_removed(3, 70);
+        let view = state.view();
+        assert_eq!(view.links.len(), 1);
+        assert_eq!(view.links[0].ended_ms, Some(60));
+        let trace = view.links[0].trace.as_ref().unwrap();
+        assert!(trace.complete);
+        assert_eq!(trace.started_ms, 10);
+        // A guest attached again replaces its ended link and starts without a trace.
+        assert!(state.link_added(5, "rw-desktop"));
+        let view = state.view();
+        assert_eq!(view.links.len(), 1);
+        assert_eq!((view.links[0].link, view.links[0].ended_ms), (5, None));
+        assert!(view.links[0].trace.is_none());
+        // Links stay bounded, ended or not, and an extra sandbox counts as lost.
+        for n in 0..SANDBOXES {
+            state.link_added(10 + n as u64, &format!("guest-{n}"));
+        }
+        assert_eq!(state.links.len(), SANDBOXES);
+        assert_eq!(state.view.lost, 1);
+        // The run's end closes the open links; an earlier removal keeps its time.
+        state.link_removed(10, 90);
+        state.run_ended(100);
+        let ended: Vec<_> = state.view().links.iter().map(|l| l.ended_ms).collect();
+        assert_eq!(ended[..2], [Some(100), Some(90)]);
+        assert!(ended.iter().all(Option::is_some));
     }
 }
