@@ -4,7 +4,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn server() -> Server {
     Page::new(
         "Test page",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .bind_loopback(0)
     .await
@@ -16,7 +20,11 @@ async fn state_names_are_valid_and_unique() {
     let page = || {
         Page::new(
             "State",
-            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+            crate::DashboardObserver::new(crate::DashboardOptions {
+                collector: crate::Options::default(),
+                ..Default::default()
+            })
+            .handle(),
         )
     };
     let topic = || StateTopic::<serde_json::Value>::new(StateLimits::default());
@@ -38,7 +46,10 @@ async fn state_names_are_valid_and_unique() {
 
 #[tokio::test]
 async fn field_presence_includes_null_values_and_excludes_other_events() {
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(dashboard.observer()),
         |cx| async move {
@@ -397,7 +408,10 @@ fn request_parsing_uses_only_the_first_head() {
 
 #[tokio::test]
 async fn observation_routes_preserve_session_replies() {
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(5)).observer(dashboard.observer()),
         |cx| async move {
@@ -477,7 +491,11 @@ async fn state_routes_serve_snapshots_and_persistent_status() {
     topic.publish(at, &vec![1, 2]).unwrap();
     let server = Page::new(
         "State",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .table("Numbers", topic.clone(), vec![Column::new("Number", "")])
     .bind_loopback(0)
@@ -544,7 +562,11 @@ async fn one_state_stream_carries_several_topics_and_rejects_bad_lists() {
     second.publish(at, &vec![2, 3]).unwrap();
     let server = Page::new(
         "State",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .table("First", first.clone(), vec![Column::new("Number", "")])
     .table("Second", second.clone(), vec![Column::new("Number", "")])
@@ -643,7 +665,10 @@ async fn commands_decode_bound_deduplicate_timeout_and_record_world_inputs() {
         requests: 2,
         timeout: std::time::Duration::ZERO,
     });
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     let server = Page::new("Controls", dashboard.handle())
         .control(
             "Routing",
@@ -714,7 +739,11 @@ async fn the_command_cache_retains_pending_ids_and_evicts_completed_ids() {
     });
     let server = Page::new(
         "Cache",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .control("Count", port.clone(), vec![])
     .bind_loopback(0)
@@ -755,7 +784,11 @@ async fn a_world_reply_reaches_the_waiting_http_caller() {
     let port = CommandPort::<u32, u32>::new(CommandLimits::default());
     let server = Page::new(
         "Reply",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .control("Count", port.clone(), vec![])
     .bind_loopback(0)
@@ -792,7 +825,11 @@ async fn invalid_declarations_fail_before_binding() {
     let page = || {
         Page::new(
             "Validation",
-            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+            crate::DashboardObserver::new(crate::DashboardOptions {
+                collector: crate::Options::default(),
+                ..Default::default()
+            })
+            .handle(),
         )
     };
     let topic = || StateTopic::<Vec<u32>>::new(StateLimits::default());
@@ -923,7 +960,10 @@ async fn split_heads_preserve_bodies_and_the_deadline_is_bounded() {
 #[tokio::test]
 async fn packet_streams_merge_links_and_downloads_join_sections() {
     use fictionet::{Interface, InterfaceExt};
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(5)).observer(dashboard.observer()),
         |cx| async move {
@@ -1061,7 +1101,11 @@ async fn linked_controls_insert_a_revision_for_action_validation() {
     });
     let server = Page::new(
         "Routing",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .control(
         "Route",
@@ -1092,7 +1136,11 @@ async fn linked_controls_insert_a_revision_for_action_validation() {
     assert_eq!(command.command.expected_revision, 7);
     let invalid = Page::new(
         "Routing",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .control(
         "Route",
@@ -1370,7 +1418,11 @@ async fn tickets_are_bound_single_use_expiring_and_bounded_before_console_open()
     let b = FakeConsole::default();
     let server = Page::new(
         "Hosts",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .host(Host::new("alpha").console(a.clone()))
     .host(Host::new("beta").console(b.clone()))
@@ -1420,7 +1472,11 @@ async fn screen_input_follows_the_live_lease_and_disconnect_releases_it() {
     let fake = FakeConsole::default();
     let server = Page::new(
         "Screen",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .host(Host::new("host").console(fake.clone()))
     .bind_loopback(0)
@@ -1535,7 +1591,11 @@ async fn terminals_resize_echo_backpressure_and_close_with_session_bounds() {
     let fake = FakeConsole::default();
     let server = Page::new(
         "Terminal",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .host(Host::new("host").console(fake.clone()))
     .bind_loopback(0)
@@ -1590,7 +1650,10 @@ async fn terminals_resize_echo_backpressure_and_close_with_session_bounds() {
 #[tokio::test]
 async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
     use fictionet::{Interface, InterfaceExt};
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     let observer = dashboard.observer();
     let (ready, started) = tokio::sync::oneshot::channel();
     let world = std::thread::spawn(move || {
@@ -1785,7 +1848,11 @@ async fn all_panel_kinds_and_assets_are_validated_at_bind() {
     let page = || {
         Page::new(
             "Builder",
-            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+            crate::DashboardObserver::new(crate::DashboardOptions {
+                collector: crate::Options::default(),
+                ..Default::default()
+            })
+            .handle(),
         )
     };
     let topic = || StateTopic::<Vec<u32>>::new(StateLimits::default());
@@ -1851,7 +1918,11 @@ async fn console_open_errors_and_oversized_messages_close_the_socket() {
     let fake = FakeConsole::default();
     let server = Page::new(
         "Limits",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .host(Host::new("booting").console(Unready))
     .host(Host::new("ready").console(fake.clone()))
@@ -1893,7 +1964,11 @@ async fn moments_validate_titles_ids_and_host_filters_before_binding() {
     let page = || {
         Page::new(
             "Moments",
-            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+            crate::DashboardObserver::new(crate::DashboardOptions {
+                collector: crate::Options::default(),
+                ..Default::default()
+            })
+            .handle(),
         )
     };
     for invalid in [
@@ -1928,7 +2003,10 @@ async fn moments_validate_titles_ids_and_host_filters_before_binding() {
 
 #[tokio::test]
 async fn a_late_event_table_read_finds_a_moment_past_the_first_thousand_events() {
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     let observer = dashboard.observer();
     let server = Page::new("Late reader", dashboard.handle())
         .moment(
@@ -2003,7 +2081,10 @@ async fn a_late_event_table_read_finds_a_moment_past_the_first_thousand_events()
 
 #[tokio::test]
 async fn left_the_box_is_declared_and_requires_a_bearer() {
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     let server = Page::new("Destinations", dashboard.handle())
         .standard_panels()
         .bind_loopback(0)
@@ -2043,7 +2124,10 @@ async fn left_the_box_is_declared_and_requires_a_bearer() {
 
 #[tokio::test]
 async fn labels_are_world_commands_and_event_exports_keep_scope_labels_and_loss() {
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     let labels = Labels::default();
     let worker_labels = labels.clone();
     let observer = dashboard.observer();
@@ -2205,7 +2289,11 @@ async fn state_can_be_registered_without_a_panel() {
         .unwrap();
     let page = Page::new(
         "Settings",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .state("settings", topic.clone());
     let server = page.bind_loopback(0).await.unwrap();
@@ -2223,7 +2311,11 @@ async fn command_endpoint_works_without_a_control_panel() {
     let port = CommandPort::<SetRoute, u64>::new(CommandLimits::default());
     let server = Page::new(
         "Commands",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .command("settings", port.clone())
     .bind_loopback(0)
@@ -2257,7 +2349,11 @@ async fn command_endpoint_works_without_a_control_panel() {
     assert_eq!(json_body(&reply)["reply"], 8);
     let invalid = Page::new(
         "Commands",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .command("same", port.clone())
     .command("same", port)
@@ -2270,7 +2366,11 @@ async fn command_endpoint_works_without_a_control_panel() {
 async fn workspace_consoles_keep_hosts_beside_the_custom_panel() {
     let server = Page::new(
         "Tiles",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .host(Host::new("workstation").console(FakeConsole::default()))
     .standard_panels()
@@ -2305,7 +2405,11 @@ async fn commands_without_panels_validate_names_and_bounds() {
     let page = || {
         Page::new(
             "Commands",
-            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+            crate::DashboardObserver::new(crate::DashboardOptions {
+                collector: crate::Options::default(),
+                ..Default::default()
+            })
+            .handle(),
         )
     };
     let port =
@@ -2349,7 +2453,10 @@ async fn commands_without_panels_validate_names_and_bounds() {
 
 #[tokio::test]
 async fn a_shared_workspace_keeps_declared_consoles() {
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     let console = FakeConsole::default();
     let server = Page::new("Shared workspace", dashboard.handle())
         .host(Host::new("workstation").console(console))
@@ -2421,7 +2528,11 @@ async fn inspector_first_opens_the_inspector_on_a_named_panel() {
     let page = || {
         Page::new(
             "First",
-            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+            crate::DashboardObserver::new(crate::DashboardOptions {
+                collector: crate::Options::default(),
+                ..Default::default()
+            })
+            .handle(),
         )
         .standard_panels()
         .custom(
@@ -2482,7 +2593,11 @@ async fn a_closed_stream_frees_its_place_without_waiting_for_a_heartbeat() {
         .unwrap();
     let server = Page::new(
         "Streams",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     )
     .table("Numbers", topic, vec![])
     .bind_loopback(0)
@@ -2529,7 +2644,10 @@ async fn a_closed_stream_frees_its_place_without_waiting_for_a_heartbeat() {
 
 #[tokio::test]
 async fn shutdown_drains_run_and_state_events_and_closes_consoles() {
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     let topic = StateTopic::new(StateLimits::default());
     let server = Page::new("Shutdown", dashboard.handle())
         .table("Numbers", topic.clone(), vec![])
@@ -2597,7 +2715,11 @@ async fn shutdown_bounds_a_stream_whose_client_stops_reading() {
         .unwrap();
     let mut page = Page::new(
         "Stalled reader",
-        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
     );
     let topics: Vec<_> = (0..64).map(|n| format!("data-{n}")).collect();
     for name in &topics {
@@ -2637,7 +2759,10 @@ async fn shutdown_bounds_a_stream_whose_client_stops_reading() {
 #[tokio::test]
 async fn shutdown_drains_packets_while_the_world_is_running() {
     use fictionet::{Interface, InterfaceExt};
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options::default(),
+        ..Default::default()
+    });
     let server = Page::new("Packets", dashboard.handle())
         .bind_loopback(0)
         .await

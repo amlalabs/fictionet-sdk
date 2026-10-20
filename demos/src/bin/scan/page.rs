@@ -557,7 +557,10 @@ pub mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let dashboard = DashboardObserver::new(DashboardOptions::demo());
+            let dashboard = DashboardObserver::new(DashboardOptions {
+                collector: fictionet_observe::Options::default(),
+                ..Default::default()
+            });
             let topics = Topics::new();
             let progress = Progress::new(false);
             let server = topics

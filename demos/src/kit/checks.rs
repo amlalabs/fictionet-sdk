@@ -403,7 +403,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_blank_screen_fails_the_capture() {
-        let dashboard = DashboardObserver::new(DashboardOptions::demo());
+        let dashboard = DashboardObserver::new(DashboardOptions {
+            collector: fictionet_observe::Options::default(),
+            ..Default::default()
+        });
         let status = StateTopic::new(StateLimits::default());
         status
             .publish(

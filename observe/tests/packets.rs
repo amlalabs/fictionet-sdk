@@ -363,7 +363,10 @@ fn watch_capacity_errors_preserve_shared_streams_and_cancel_frees_admission() {
 
 #[test]
 fn the_handle_and_the_endpoint_give_the_same_packet_bytes() {
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     fictionet::block_on(fictionet::lab(
         RunOptions::new(Seed::from_u64(5)).observer(dashboard.observer()),
         |cx| async move {

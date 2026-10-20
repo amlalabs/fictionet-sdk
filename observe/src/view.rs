@@ -16,9 +16,9 @@ pub(crate) struct View {
     hosts: BTreeMap<String, String>,
     counters: BTreeMap<String, [u64; 4]>,
     event_seq: u64,
-    event_position: [u64; 2],
+    event_position: Vec<u64>,
     dropped: u64,
-    evicted: [u64; 2],
+    evicted: Vec<u64>,
     ended: bool,
     revision: u64,
     status: String,
@@ -435,9 +435,9 @@ pub(crate) fn changes(
     drop(state);
     let mut new = current(graph);
     new.event_seq = old.event_seq;
-    new.event_position = old.event_position;
+    new.event_position.clone_from(&old.event_position);
     new.dropped = old.dropped;
-    new.evicted = old.evicted;
+    new.evicted.clone_from(&old.evicted);
     let mut out = Vec::new();
     // Edges go first, then nodes, so a browser never holds an edge to a
     // node it was told is gone, nor a new edge to a node it has not met.
@@ -530,7 +530,12 @@ pub(crate) fn event_changes(graph: &DashboardHandle, view: &mut View) -> (Vec<Me
     let missed = rejected
         + evicted
             .iter()
-            .zip(view.event_position)
+            .zip(
+                view.event_position
+                    .iter()
+                    .copied()
+                    .chain(std::iter::repeat(0)),
+            )
             .map(|(evicted, position)| evicted.saturating_sub(position))
             .sum::<u64>();
     if missed != 0 {
@@ -551,7 +556,7 @@ pub(crate) fn event_changes(graph: &DashboardHandle, view: &mut View) -> (Vec<Me
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DashboardObserver, DashboardOptions, Limits, Options, Topology};
+    use crate::{DashboardObserver, DashboardOptions, Options, Topology};
     use fictionet::events::{Interest, Observation, Observer, Stamp, Stream, TopologyRef};
 
     fn identities(count: usize) -> Topology {
@@ -603,8 +608,10 @@ mod tests {
     fn limited() -> DashboardHandle {
         DashboardObserver::new(DashboardOptions {
             collector: Options {
-                events: Some(Limits::new(2, 4096)),
-                noise: Limits::new(2, 4096),
+                policy: crate::tests::policy([
+                    crate::Class::new("events").count(2).bytes(4096),
+                    crate::Class::new("noise").count(2).bytes(4096),
+                ]),
                 ..Options::default()
             },
             ..DashboardOptions::default()
@@ -679,9 +686,25 @@ mod tests {
 
     #[test]
     fn events_can_be_declined_by_the_dashboard() {
+        struct NoEvents(std::sync::Arc<dyn crate::Policy>);
+        impl crate::Policy for NoEvents {
+            fn classes(&self) -> &[crate::Class] {
+                self.0.classes()
+            }
+            fn admit(&self, interest: fictionet::events::Interest<'_>) -> crate::Admit {
+                if matches!(interest, fictionet::events::Interest::Event(..)) {
+                    crate::Admit::Skip
+                } else {
+                    self.0.admit(interest)
+                }
+            }
+            fn sort(&self, observation: &Observation<'_>) -> Option<usize> {
+                self.0.sort(observation)
+            }
+        }
         let dashboard = DashboardObserver::new(DashboardOptions {
             collector: Options {
-                events: None,
+                policy: std::sync::Arc::new(NoEvents(<dyn crate::Policy>::default())),
                 ..Options::default()
             },
             ..DashboardOptions::default()
@@ -1100,7 +1123,7 @@ mod tests {
         retain(graph, Event::new("test", "large").summary("x".repeat(4096)));
         let mut view = View {
             event_seq: 1,
-            event_position: [1, 0],
+            event_position: vec![1, 0],
             dropped: 1,
             ..View::default()
         };

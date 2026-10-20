@@ -69,9 +69,11 @@ struct Inner {
     /// The last capture copy decoded.
     cursor: u64,
     /// Copies evicted before the next decoded row.
-    evicted: u64,
+    evicted: BTreeMap<usize, u64>,
+    positions: BTreeMap<usize, u64>,
     next_row: u64,
-    dissector: Dissector,
+    dissectors: BTreeMap<usize, Dissector>,
+    registry: Registry,
     rows: VecDeque<Row>,
     row_bytes: usize,
     max_rows: usize,
@@ -122,9 +124,11 @@ impl LinkWatch {
             inner: Mutex::new(Inner {
                 demand: None,
                 cursor: 0,
-                evicted: 0,
+                evicted: BTreeMap::new(),
+                positions: BTreeMap::new(),
                 next_row: 1,
-                dissector: Dissector::with_registry(registry),
+                dissectors: BTreeMap::new(),
+                registry,
                 rows: VecDeque::new(),
                 row_bytes: 0,
                 max_rows: ROWS,
@@ -222,9 +226,16 @@ impl LinkWatch {
         let mut drained = inner.gone;
         while !inner.gone && done < PUMP_BATCH {
             let batch = collector.packets(self.id, inner.cursor, 512);
-            if batch.missed > 0 {
-                inner.evicted += batch.missed;
-                inner.dissector.lost();
+            for (class, total) in batch.evicted {
+                let position = inner.positions.entry(class).or_default();
+                let missed = total.saturating_sub(*position);
+                *position = (*position).max(total);
+                if missed > 0 {
+                    *inner.evicted.entry(class).or_default() += missed;
+                    if let Some(dissector) = inner.dissectors.get_mut(&class) {
+                        dissector.lost();
+                    }
+                }
             }
             inner.cursor = batch.cursor;
             if batch.packets.is_empty() {
@@ -232,12 +243,11 @@ impl LinkWatch {
                 break;
             }
             done += batch.packets.len();
-            inner.take_keys(collector, watches.keys);
+            inner.take_keys(collector, collector.key_bounds());
             let inner = &mut *inner;
             for copy in batch.packets {
-                if copy.skipped > 0 {
-                    inner.dissector.lost();
-                }
+                let position = inner.positions.entry(copy.class).or_default();
+                *position = position.saturating_add(1);
                 let seq = inner.next_row;
                 inner.next_row += 1;
                 let at = copy.stamp.at.since_start();
@@ -246,7 +256,14 @@ impl LinkWatch {
                     Side::B => 1,
                 };
                 let keys = inner.keys.make_contiguous();
-                let mut decoded = inner.dissector.decode(&copy.bytes, keys);
+                let dissector = inner
+                    .dissectors
+                    .entry(copy.class)
+                    .or_insert_with(|| Dissector::with_registry(inner.registry.clone()));
+                if copy.skipped > 0 {
+                    dissector.lost();
+                }
+                let mut decoded = dissector.decode(&copy.bytes, keys);
                 decoded.tags.sort_unstable();
                 decoded.tags.dedup();
                 let summary = Object::new()
@@ -255,7 +272,9 @@ impl LinkWatch {
                     .num("side", side)
                     .num("len", copy.original_len)
                     .num("skipped", copy.skipped)
-                    .num("evicted", std::mem::take(&mut inner.evicted))
+                    .num("evicted", inner.evicted.remove(&copy.class).unwrap_or(0))
+                    .str("class", collector.options.policy.classes()[copy.class].name)
+                    .str("source", &copy.tap)
                     .str("src", &decoded.src)
                     .str("dst", &decoded.dst)
                     .str("proto", &decoded.proto)
@@ -435,8 +454,6 @@ pub(crate) struct Watches {
     registry: Registry,
     limit: usize,
     budget: usize,
-    /// Bounds of each watch's key cache.
-    keys: Bounds,
     /// Decoded row bytes across all watches.
     total: AtomicUsize,
     /// Orders rows and releases across all watches.
@@ -444,13 +461,12 @@ pub(crate) struct Watches {
 }
 
 impl Watches {
-    pub(crate) fn new(registry: Registry, limit: usize, budget: usize, keys: Bounds) -> Self {
+    pub(crate) fn new(registry: Registry, limit: usize, budget: usize) -> Self {
         Self {
             state: Mutex::new(BTreeMap::new()),
             registry,
             limit,
             budget,
-            keys,
             total: AtomicUsize::new(0),
             order: Arc::new(AtomicU64::new(1)),
         }

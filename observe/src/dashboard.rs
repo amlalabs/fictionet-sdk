@@ -8,7 +8,7 @@ use fictionet::time::Instant as RunTime;
 use crate::egress::{Egress, EgressLimits, EgressSnapshot};
 use crate::json::{self, Object, Scalar};
 use crate::watch::{Export, Subscription as Hold, Watches};
-use crate::{Bounds, CapturePolicy, Collector, Options, Registry, Value, view};
+use crate::{Collector, Options, Registry, Value, view};
 
 /// How often a graph subscription sends what changed.
 const GRAPH_TICK: Duration = Duration::from_millis(250);
@@ -45,23 +45,13 @@ impl Default for DashboardOptions {
     fn default() -> Self {
         Self {
             collector: Options {
-                sandbox_capture: CapturePolicy::Demand,
+                policy: crate::policy::watched(),
                 ..Options::default()
             },
             protocols: Registry::default(),
             watches: 64,
             watch_bytes: 256 << 20,
             egress: EgressLimits::default(),
-        }
-    }
-}
-
-impl DashboardOptions {
-    /// Captures sandbox links from startup and other links on demand.
-    pub fn demo() -> Self {
-        Self {
-            collector: Options::default(),
-            ..Self::default()
         }
     }
 }
@@ -131,18 +121,9 @@ impl Observer for Shared {
 impl DashboardObserver {
     /// Builds the collector before a run or any clients exist.
     pub fn new(options: DashboardOptions) -> Self {
-        let keys = options
-            .collector
-            .keys
-            .unwrap_or(Bounds { count: 0, bytes: 0 });
         Self(Arc::new(Shared {
-            watches: Watches::new(
-                options.protocols,
-                options.watches,
-                options.watch_bytes,
-                keys,
-            ),
-            collector: Collector::new(options.collector),
+            watches: Watches::new(options.protocols, options.watches, options.watch_bytes),
+            collector: Collector::with_options(options.collector),
             egress: Egress::new(options.egress),
             clock: Mutex::new(Clock::default()),
         }))
@@ -582,7 +563,7 @@ impl Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Limits;
+
     use fictionet::events::{Event, Stream};
     use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::protocols::json::Value as Json;
@@ -717,7 +698,9 @@ mod tests {
     fn events_replay_with_limits_loss_and_immediate_catch_up() {
         let dashboard = DashboardObserver::new(DashboardOptions {
             collector: Options {
-                events: Some(Limits::new(2200, 4 << 20)),
+                policy: crate::tests::policy([crate::Class::new("events")
+                    .count(2200)
+                    .bytes(4 << 20)]),
                 ..Options::default()
             },
             ..DashboardOptions::default()
@@ -764,7 +747,10 @@ mod tests {
 
     #[test]
     fn lab_graph_has_groups_hosts_labels_counters_and_event_origins() {
-        let dashboard = DashboardObserver::new(DashboardOptions::demo());
+        let dashboard = DashboardObserver::new(DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        });
         let handle = dashboard.handle();
         let (attacher, mut attachments) = fictionet::attachments();
         let mut sandbox = attacher.attach("guest").unwrap();

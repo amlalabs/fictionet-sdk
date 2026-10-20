@@ -276,22 +276,19 @@
 //! The collector exists before clients connect. A late client can read retained
 //! events, current topology, kept packet copies and TLS keys. Capture policy
 //! decides which links have copies. [`DashboardOptions::default()`] captures
-//! all links on demand. [`DashboardOptions::demo()`] captures sandbox links
+//! all links on demand. `Options::default()` captures sandbox links
 //! from startup and other links on demand. Both retain TLS keys from startup.
-//! The base [`Options::default()`] uses the demo capture policy.
+//! [`Policy`] defines selection and independent class budgets.
 //!
 //! A `packets` subscriber holds capture demand for its link. Dropping the last
 //! demand handle stops demand capture. Startup capture continues without
-//! subscribers. [`CapturePolicy::Off`] declines capture. Packets that were
+//! subscribers. `Admit::Skip` declines capture. Packets that were
 //! not captured cannot be recovered later. Watching the graph alone does not
 //! start demand capture.
 //!
-//! Topology can arrive after packets produced during a task poll. If either
-//! startup policy is enabled, the collector provisionally captures unknown
-//! links within its limits. Link registration applies the policy and discards
-//! provisional copies for links that should not retain them. Removed links
-//! keep copies within the same budgets. Under pressure those captures are
-//! evicted first, in removal order.
+//! Packet interest carries the tap and sandbox, so policy applies before
+//! topology arrives. Removed links keep copies within the same budgets.
+//! Under aggregate pressure removed captures go first, then the largest ring.
 //!
 //! Sampling uses run time. Each link keeps the first 64 packets in each
 //! 100 ms window, then one in two, one in four, and so on. Each [`PacketCopy`]
@@ -420,16 +417,16 @@
 //! # Resource limits
 //!
 //! Set [`DashboardOptions::collector`] before constructing the observer.
-//! [`Options`] supplies these retention defaults:
+//! `<dyn Policy>::default()` supplies these class budgets:
 //!
 //! | Budget | Default | What it charges |
 //! |---|---|---|
-//! | `events` | 50,000 events, 16 MiB | Ordinary events, sized by [`Event::size`](fictionet::events::Event::size). `None` declines event retention. |
+//! | `events` | 50,000 events, 16 MiB | Ordinary events, sized by [`Event::size`](fictionet::events::Event::size). |
 //! | `noise` | 5,000 events, 2 MiB | Separate storage for facts marked with [`Event::repeat`](fictionet::events::Event::repeat). |
 //! | `packets` | 4,096 copies, 8 MiB per link | Packet payload bytes. |
-//! | `packet_bytes` | 64 MiB | Packet payload bytes across all links. |
-//! | `snap_len` | 65,535 bytes | Maximum copied bytes per packet; excess bytes count as truncation. |
-//! | `keys` | 20,000 keys, 8 MiB | Key entries, labels, randoms, secrets and owned connection text. `None` declines keys. |
+//! | `Options::bytes` | 64 MiB | Bytes across every event, packet and key ring. |
+//! | Packet class `snap` | 65,535 bytes | Maximum copied bytes per packet; excess bytes count as truncation. |
+//! | `keys` | 20,000 keys, 8 MiB | Key entries, labels, randoms, secrets and owned connection text. |
 //! | `loss_streams` | 4,099 streams | Detailed loss totals by stream and reason. |
 //!
 //! [`TopologyLimits`] defaults to 16,384 tasks, 4,096 groups, 4,096 hosts,
@@ -733,7 +730,9 @@ pub mod egress;
 mod keys;
 mod loss;
 mod memory;
+mod policy;
 mod ring;
+pub use policy::{Admit, Class, Policy, When};
 mod topology;
 
 #[cfg(feature = "page")]
@@ -783,7 +782,7 @@ pub const MAX_EVENTS: usize = 50_000;
 /// Default ordinary event bytes, as counted by [`fictionet::events::Event::size`], separate from noise.
 pub const MAX_EVENT_BYTES: usize = 16 << 20;
 
-pub use capture::{CaptureDemand, CapturePolicy, PacketBatch, PacketCopy};
+pub use capture::{CaptureDemand, PacketBatch, PacketCopy};
 pub use keys::{Key, keylog};
 pub use loss::{LossStatus, LossTotal};
 pub use topology::{Connection, Group, Host, Link, Task, Topology, TopologyLimits};
@@ -798,8 +797,9 @@ use fictionet::events::{
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 
-use capture::{CaptureFlag, Captures};
+use capture::{Captures, Demand};
 use keys::Keys;
+use ring::Kept;
 
 /// Count and byte bounds. Zero refuses retention.
 #[derive(Clone, Copy, Debug)]
@@ -810,50 +810,35 @@ pub struct Bounds {
     pub bytes: usize,
 }
 
-/// All collector limits and capture policies.
-#[derive(Clone, Debug)]
+/// Collector policy and shared resource limits.
+#[derive(Clone)]
 pub struct Options {
-    /// Ordinary event retention; none declines events.
-    pub events: Option<Limits>,
-    /// Separate retention for repeating network events.
-    pub noise: Limits,
+    /// Selection and per-class retention, fixed for the run.
+    pub policy: Arc<dyn Policy>,
     /// Topology count and text limits.
     pub topology: TopologyLimits,
-    /// Capture policy for sandbox links.
-    pub sandbox_capture: CapturePolicy,
-    /// Capture policy for other links.
-    pub capture: CapturePolicy,
-    /// Maximum bytes copied from each packet.
-    pub snap_len: usize,
-    /// Per-link packet count and payload byte limits.
-    pub packets: Bounds,
-    /// Aggregate packet payload byte budget across links.
-    pub packet_bytes: usize,
-    /// TLS key retention; none declines keys.
-    pub keys: Option<Bounds>,
-    /// Maximum streams with detailed loss totals. Further loss remains in
-    /// `LossStatus::untracked`, grouped by cause without stream identity.
+    /// Byte budget across every event, packet and key ring.
+    pub bytes: usize,
+    /// Maximum streams with detailed loss totals.
     pub loss_streams: usize,
 }
 
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("classes", &self.policy.classes())
+            .field("topology", &self.topology)
+            .field("bytes", &self.bytes)
+            .field("loss_streams", &self.loss_streams)
+            .finish()
+    }
+}
 impl Default for Options {
     fn default() -> Self {
         Self {
-            events: Some(Limits::default()),
-            noise: Limits::new(5000, 2 << 20),
+            policy: <dyn Policy>::default(),
             topology: TopologyLimits::default(),
-            sandbox_capture: CapturePolicy::Startup,
-            capture: CapturePolicy::Demand,
-            snap_len: 65_535,
-            packets: Bounds {
-                count: 4096,
-                bytes: 8 << 20,
-            },
-            packet_bytes: 64 << 20,
-            keys: Some(Bounds {
-                count: 20_000,
-                bytes: 8 << 20,
-            }),
+            bytes: 64 << 20,
             loss_streams: 4099,
         }
     }
@@ -864,7 +849,7 @@ impl Default for Options {
 pub struct Collector {
     options: Options,
     events: Memory,
-    flags: ArcSwap<BTreeMap<LinkId, Arc<CaptureFlag>>>,
+    demand: ArcSwap<BTreeMap<LinkId, Arc<Demand>>>,
     state: Mutex<State>,
 }
 
@@ -879,20 +864,25 @@ struct State {
 
 impl Default for Collector {
     fn default() -> Self {
-        Self::new(Options::default())
+        Self::new(<dyn Policy>::default())
     }
 }
 
 impl Collector {
     /// Creates a collector before installing it on a run.
-    pub fn new(options: Options) -> Self {
+    pub fn new(policy: Arc<dyn Policy>) -> Self {
+        Self::with_options(Options {
+            policy,
+            ..Options::default()
+        })
+    }
+
+    /// Creates a collector with shared byte and topology limits.
+    pub fn with_options(options: Options) -> Self {
         Self {
-            events: Memory::with_noise_limits(
-                options.events.unwrap_or(Limits::new(0, 0)),
-                options.noise,
-            ),
+            events: Memory::with_policy(options.policy.clone(), options.bytes),
             options,
-            flags: ArcSwap::from_pointee(BTreeMap::new()),
+            demand: ArcSwap::from_pointee(BTreeMap::new()),
             state: Mutex::new(State::default()),
         }
     }
@@ -905,7 +895,7 @@ impl Collector {
     pub fn topology(&self) -> Topology {
         self.state.lock().topology.clone()
     }
-    /// Retained copies after a copy cursor and the number evicted before them.
+    /// Retained copies after a stream sequence and eviction totals per class.
     pub fn packets(&self, link: LinkId, after: u64, max: usize) -> PacketBatch {
         self.state
             .lock()
@@ -916,7 +906,7 @@ impl Collector {
     }
     /// Retained TLS keys, ordered by stream sequence.
     pub fn keys(&self) -> Vec<Key> {
-        self.state.lock().keys.ring.events.iter().cloned().collect()
+        self.keys_after(0)
     }
     /// Retained TLS keys in SSLKEYLOGFILE format.
     pub fn keylog(&self) -> String {
@@ -930,17 +920,33 @@ impl Collector {
     pub fn ended(&self) -> Option<Instant> {
         self.state.lock().ended
     }
-    /// Starts or joins demand capture. Off and unknown links return none.
+    /// Starts or joins demand on a known link. Policy still decides each crossing.
     pub fn capture_demand(&self, link: LinkId) -> Option<CaptureDemand> {
-        self.flags.load().get(&link)?.demand()
+        self.demand.load().get(&link)?.take()
     }
     /// Retained TLS keys after stream sequence `after`.
-    #[cfg(feature = "decode")]
     pub(crate) fn keys_after(&self, after: u64) -> Vec<Key> {
-        let state = self.state.lock();
-        let items = &state.keys.ring.events;
-        let start = items.partition_point(|k| k.stamp.seq <= after);
-        items.range(start..).cloned().collect()
+        crate::ring::after(self.state.lock().keys.rings.values(), after)
+            .cloned()
+            .collect()
+    }
+    #[cfg(feature = "decode")]
+    pub(crate) fn key_bounds(&self) -> Bounds {
+        self.state
+            .lock()
+            .keys
+            .rings
+            .keys()
+            .fold(Bounds { count: 0, bytes: 0 }, |total, index| {
+                let class = &self.options.policy.classes()[*index];
+                Bounds {
+                    count: total.count.saturating_add(class.count),
+                    bytes: total
+                        .bytes
+                        .saturating_add(class.bytes)
+                        .min(self.options.bytes),
+                }
+            })
     }
     /// Guest links, including retained captures after the topology removed them.
     #[cfg(feature = "page")]
@@ -993,47 +999,64 @@ impl Collector {
 
 impl Observer for Collector {
     fn enabled(&self, interest: Interest<'_>) -> bool {
-        match interest {
-            Interest::Event(..) => self.options.events.is_some(),
-            Interest::Topology(_) => true,
-            Interest::TlsKey(_) => self.options.keys.is_some(),
-            Interest::Packet(packet) => {
-                let flags = self.flags.load();
-                flags.get(&packet.link).map_or(
-                    self.options.capture == CapturePolicy::Startup
-                        || self.options.sandbox_capture == CapturePolicy::Startup,
-                    |flag| flag.enabled(),
-                )
-            }
+        if let Interest::Topology(kind) = interest {
+            return self.options.policy.topology(kind);
+        }
+        match self.options.policy.admit(interest) {
+            Admit::Skip => false,
+            Admit::Build => matches!(interest, Interest::Event(..)),
+            Admit::Class(index) => self
+                .options
+                .policy
+                .classes()
+                .get(index)
+                .is_some_and(|class| match (class.when, interest) {
+                    (When::Always, _) => true,
+                    (When::Watched, Interest::Packet(packet)) => self
+                        .demand
+                        .load()
+                        .get(&packet.link)
+                        .is_some_and(|demand| demand.enabled()),
+                    _ => false,
+                }),
         }
     }
 
     fn observe(&self, stamp: Stamp, item: Observation<'_>) {
+        if !self.enabled(item.interest()) {
+            return;
+        }
+        let index = if matches!(item, Observation::Topology(_)) {
+            None
+        } else {
+            match self.options.policy.admit(item.interest()) {
+                Admit::Class(index) => Some(index),
+                Admit::Build if matches!(item, Observation::Event(_)) => {
+                    self.options.policy.sort(&item)
+                }
+                _ => None,
+            }
+        };
         if let Observation::Event(event) = item {
-            if self.options.events.is_none() || self.state.lock().ended.is_some() {
+            let Some(index) = index else {
+                return;
+            };
+            let mut state = self.state.lock();
+            if state.ended.is_some() {
                 return;
             }
-            let before = self.events.dropped();
-            self.events.observe(stamp, Observation::Event(event));
-            let dropped = self.events.dropped().saturating_sub(before);
-            let mut state = self.state.lock();
-            let losses = &mut state.losses;
-            if dropped > 0 {
-                let retained = self
-                    .events
-                    .after(stamp.seq.saturating_sub(1), 1)
-                    .first()
-                    .is_some_and(|e| e.seq == stamp.seq);
-                let reason = if retained {
-                    LossReason::Eviction
-                } else {
-                    LossReason::Overflow
-                };
-                losses.event_loss(self.options.loss_streams, reason, dropped);
+            let losses = self.events.push(stamp, event, index);
+            for loss in losses.streams {
+                state.losses.add(self.options.loss_streams, loss);
             }
             if event.is_truncated() {
-                losses.record(self.options.loss_streams, stamp, LossReason::Truncation, 0);
+                state
+                    .losses
+                    .record(self.options.loss_streams, stamp, LossReason::Truncation, 0);
             }
+            self.enforce(&mut state);
+            drop(state);
+            self.events.wake();
             return;
         }
         let mut state = self.state.lock();
@@ -1049,37 +1072,23 @@ impl Observer for Collector {
         } = &mut *state;
         match item {
             Observation::TlsKey(key) => {
-                if let Some(bounds) = self.options.keys {
-                    keys.push(stamp, key, bounds, losses, self.options.loss_streams);
+                if let Some(index) = index {
+                    let mut class = self.options.policy.classes()[index];
+                    class.bytes = class.bytes.min(self.options.bytes);
+                    keys.push(stamp, key, index, &class, losses, self.options.loss_streams);
                 }
             }
             Observation::Packet(packet) => {
-                if self.enabled(Interest::Packet(packet)) {
-                    let link = packet.link;
-                    captures.push(stamp, packet, &self.options, losses);
-                    if let Some(capture) = captures.links.get_mut(&link)
-                        && capture.sandbox.is_none()
-                    {
-                        capture.sandbox = topology
-                            .links
-                            .get(&link)
-                            .and_then(|link| link.sandbox.clone());
-                    }
+                if let Some(index) = index {
+                    captures.push(stamp, packet, index, &self.options, losses);
                 }
             }
             Observation::Topology(item) => {
                 let link = match &item {
-                    TopologyRef::LinkAdded { link, sandbox, .. } => Some((
-                        *link,
-                        Some(if sandbox.is_some() {
-                            self.options.sandbox_capture
-                        } else {
-                            self.options.capture
-                        }),
-                    )),
+                    TopologyRef::LinkAdded { link, .. } => Some((*link, true)),
                     TopologyRef::LinkRemoved { link, .. } => {
                         captures.retired(*link);
-                        Some((*link, None))
+                        Some((*link, false))
                     }
                     _ => None,
                 };
@@ -1090,28 +1099,27 @@ impl Observer for Collector {
                     losses,
                     self.options.loss_streams,
                 );
-                if let Some((id, policy)) = link {
+                if let Some((id, added)) = link {
                     if let Some(capture) = captures.links.get_mut(&id)
                         && let Some(link) = topology.links.get(&id)
                     {
                         capture.sandbox.clone_from(&link.sandbox);
                     }
-                    let mut flags = (**self.flags.load()).clone();
-                    if let Some(policy) = policy.filter(|_| topology.links.contains_key(&id)) {
-                        flags.insert(id, Arc::new(CaptureFlag::new(policy)));
-                        if policy != CapturePolicy::Startup {
-                            captures.remove(id, losses, self.options.loss_streams);
-                        }
+                    let mut demand = (**self.demand.load()).clone();
+                    if added && topology.links.contains_key(&id) {
+                        demand.entry(id).or_default();
                     } else {
-                        flags.remove(&id);
-                        if policy.is_some() {
-                            captures.remove(id, losses, self.options.loss_streams);
-                        }
+                        demand.remove(&id);
                     }
-                    self.flags.store(Arc::new(flags));
+                    self.demand.store(Arc::new(demand));
                 }
             }
             _ => {}
+        }
+        let evicted_events = self.enforce(&mut state);
+        drop(state);
+        if evicted_events {
+            self.events.wake();
         }
     }
 
@@ -1138,6 +1146,72 @@ impl Observer for Collector {
             drop(state);
             self.events.end(at);
         }
+    }
+}
+
+impl Collector {
+    fn enforce(&self, state: &mut State) -> bool {
+        let mut evicted_events = false;
+        loop {
+            let keys_bytes: usize = state.keys.rings.values().map(|ring| ring.bytes).sum();
+            if self
+                .events
+                .retained()
+                .1
+                .saturating_add(keys_bytes)
+                .saturating_add(state.captures.bytes)
+                <= self.options.bytes
+            {
+                break;
+            }
+            let events = self.events.largest();
+            let keys = state
+                .keys
+                .rings
+                .iter()
+                .filter(|(_, ring)| !ring.events.is_empty())
+                .max_by_key(|(_, ring)| ring.bytes)
+                .map(|(index, ring)| (*index, ring.bytes));
+            let packets = state.captures.largest();
+            let largest = events
+                .map_or(0, |(_, bytes)| bytes)
+                .max(keys.map_or(0, |(_, bytes)| bytes));
+            if let Some((link, class, bytes, removed)) = packets
+                && (removed || bytes >= largest)
+            {
+                state
+                    .captures
+                    .evict(link, class, &mut state.losses, self.options.loss_streams);
+            } else if let Some((index, bytes)) = events
+                && bytes >= keys.map_or(0, |(_, bytes)| bytes)
+            {
+                let event = self.events.evict(index).expect("event budget");
+                evicted_events = true;
+                state.losses.record(
+                    self.options.loss_streams,
+                    event.stamp(),
+                    LossReason::Eviction,
+                    event.size(),
+                );
+            } else if let Some((index, _)) = keys {
+                let key = state
+                    .keys
+                    .rings
+                    .get_mut(&index)
+                    .expect("key class")
+                    .evict()
+                    .expect("key budget");
+                state.losses.record(
+                    self.options.loss_streams,
+                    key.stamp,
+                    LossReason::Eviction,
+                    key.size(),
+                );
+            } else {
+                break;
+            }
+        }
+        evicted_events
     }
 }
 

@@ -310,7 +310,10 @@ struct DropConsoles {}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let containment = StateTopic::new(StateLimits::default());
     let labels = fictionet_observe::page::Labels::default();
     let exchanges = StateTopic::new(StateLimits::default());

@@ -104,16 +104,11 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
     let out = Arc::new(fictionet::sync::Mutex::new(None));
     let o = out.clone();
     let log = Arc::new(fictionet_observe::Memory::default());
-    let collector = Arc::new(fictionet_observe::Collector::new(
-        fictionet_observe::Options {
-            keys: if observe {
-                fictionet_observe::Options::default().keys
-            } else {
-                None
-            },
-            ..fictionet_observe::Options::default()
-        },
-    ));
+    let collector = Arc::new(fictionet_observe::Collector::new(if observe {
+        <dyn fictionet_observe::Policy>::default()
+    } else {
+        <dyn fictionet_observe::Policy>::events()
+    }));
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(Arc::new(
             fictionet::events::Fanout::new(vec![log.clone(), collector.clone()]),

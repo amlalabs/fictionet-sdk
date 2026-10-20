@@ -73,7 +73,10 @@ impl Replay {
 pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> Result {
     let replay = Replay::new(variant, mode).map_err(std::io::Error::other)?;
     let facts = replay.facts.clone();
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let screen = Console::new();
     let page = bind(&dashboard, &facts, screen.clone()).await?;
     println!(
@@ -588,7 +591,10 @@ mod tests {
         for (variant, mode) in RUNS {
             let replay = Replay::new(variant, mode).unwrap();
             let facts = replay.facts.clone();
-            let dashboard = DashboardObserver::new(DashboardOptions::demo());
+            let dashboard = DashboardObserver::new(DashboardOptions {
+                collector: fictionet_observe::Options::default(),
+                ..Default::default()
+            });
             let page = bind(&dashboard, &facts, Console::new()).await.unwrap();
             let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
                 dashboard.observer(),
@@ -821,7 +827,10 @@ mod tests {
     async fn extra_reads_fill_the_page_bound() {
         let replay = Replay::new(Variant::Normal, None).unwrap();
         let facts = replay.facts.clone();
-        let dashboard = DashboardObserver::new(DashboardOptions::demo());
+        let dashboard = DashboardObserver::new(DashboardOptions {
+            collector: fictionet_observe::Options::default(),
+            ..Default::default()
+        });
         let page = bind(&dashboard, &facts, Console::new()).await.unwrap();
         let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
         let reads = super::super::facts::PAGE_ROWS + 20;

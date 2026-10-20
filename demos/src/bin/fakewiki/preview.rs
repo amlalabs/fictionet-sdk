@@ -19,7 +19,10 @@ use super::{HOST, page, world};
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let controls = page::Controls::new("in-world client (scripted)");
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let status = StateTopic::<HostStatus>::new(StateLimits::default());
     let screen = Console::new();
     let labels = Labels::default();

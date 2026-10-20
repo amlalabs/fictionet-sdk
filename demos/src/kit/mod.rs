@@ -820,7 +820,10 @@ impl Run {
         build: PageBuilder,
         prepared: &mut Prepared,
     ) -> io::Result<()> {
-        let observer = DashboardObserver::new(DashboardOptions::demo());
+        let observer = DashboardObserver::new(DashboardOptions {
+            collector: fictionet_observe::Options::default(),
+            ..Default::default()
+        });
         let dashboard = observer.handle();
         prepared.observers.push(observer.observer());
         let mut hosts = Hosts(

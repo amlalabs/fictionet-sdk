@@ -47,7 +47,10 @@ pub async fn run(spend: bool) -> Result {
     let script = seed.clone();
     let searches = Arc::new(Searches::from_seed(&seed));
     let topics = Topics::new();
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let status = StateTopic::new(StateLimits::default());
     let labels = Labels::default();
     let containment = StateTopic::new(StateLimits::default());

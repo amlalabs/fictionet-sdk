@@ -50,7 +50,10 @@ use fictionet::{RunOptions, Seed, block_on, lab};
 use fictionet::events::Fanout;
 use fictionet_observe::{DashboardObserver, DashboardOptions, Memory};
 
-let dashboard = DashboardObserver::new(DashboardOptions::demo());
+let dashboard = DashboardObserver::new(DashboardOptions {
+    collector: fictionet_observe::Options::default(),
+    ..Default::default()
+});
 let grader = Arc::new(Memory::default());
 let options = RunOptions::new(Seed::from_u64(7)).observer(Arc::new(
     Fanout::new(vec![dashboard.observer(), grader.clone()]),

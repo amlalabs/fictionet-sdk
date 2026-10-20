@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use fictionet::events::{ConnInfo, KeyRef, LossReason, Stamp};
 
 use crate::ring::{Kept, Ring};
-use crate::{Bounds, LossStatus};
+use crate::{Class, LossStatus};
 
 impl Kept for Key {
     fn stamp(&self) -> Stamp {
@@ -19,6 +20,8 @@ impl Kept for Key {
 pub struct Key {
     /// Run sequence and time.
     pub stamp: Stamp,
+    /// Policy class index.
+    pub class: usize,
     /// TLS key log label.
     pub label: String,
     /// ClientHello random.
@@ -65,7 +68,7 @@ pub(crate) fn connection_bytes(conn: &ConnInfo) -> usize {
 
 #[derive(Default)]
 pub(crate) struct Keys {
-    pub(crate) ring: Ring<Key>,
+    pub(crate) rings: BTreeMap<usize, Ring<Key>>,
 }
 
 impl Keys {
@@ -73,7 +76,8 @@ impl Keys {
         &mut self,
         stamp: Stamp,
         key: KeyRef<'_>,
-        bounds: Bounds,
+        index: usize,
+        class: &Class,
         losses: &mut LossStatus,
         loss_streams: usize,
     ) {
@@ -82,16 +86,21 @@ impl Keys {
             .saturating_add(key.client_random.len())
             .saturating_add(key.secret().len())
             .saturating_add(key.connection.map_or(0, connection_bytes));
-        if bounds.count == 0 || size > bounds.bytes {
+        let ring = self.rings.entry(index).or_default();
+        if !ring.admit(stamp, class.burst) {
+            losses.record(loss_streams, stamp, LossReason::Sampling, size);
+            return;
+        }
+        if class.count == 0 || size > class.bytes {
             losses.record(loss_streams, stamp, LossReason::Overflow, size);
             return;
         }
-        self.ring
-            .make_room(size, bounds.count, bounds.bytes, |old| {
-                losses.record(loss_streams, old.stamp, LossReason::Eviction, old.size());
-            });
-        self.ring.push(Key {
+        ring.make_room(size, class.count, class.bytes, |old| {
+            losses.record(loss_streams, old.stamp, LossReason::Eviction, old.size());
+        });
+        ring.push(Key {
             stamp,
+            class: index,
             label: key.label.into(),
             client_random: key.client_random.into(),
             secret: key.secret().into(),

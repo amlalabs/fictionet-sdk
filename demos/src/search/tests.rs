@@ -47,7 +47,10 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
     let seed = Seed::builtin("halvard-cve").unwrap();
     let searches = Arc::new(Searches::from_seed(&seed));
     let topics = page::Topics::new();
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     // Port zero asks the OS for a free loopback port.
     let server = topics
         .page(dashboard.handle(), Host::new("workstation"))
@@ -204,7 +207,10 @@ fn first_generated<'a>(seed: &Seed, list: &'a search::Results) -> Option<&'a sea
 
 #[tokio::test]
 async fn page_declares_the_workspace_and_serves_its_modules() {
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let server = Topics::new()
         .page(dashboard.handle(), Host::new("workstation"))
         .bind_loopback(0)

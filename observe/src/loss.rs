@@ -1,4 +1,4 @@
-use fictionet::events::{Loss, LossReason, Stamp, Stream};
+use fictionet::events::{Loss, LossReason, Stamp};
 
 /// Persistent loss totals. Sequence ranges are omitted because gaps may be disjoint.
 #[derive(Clone, Debug, Default)]
@@ -67,19 +67,6 @@ impl LossStatus {
                 reason,
                 count: 1,
                 bytes: Some(bytes as u64),
-                seqs: None,
-            },
-        );
-    }
-
-    pub(crate) fn event_loss(&mut self, limit: usize, reason: LossReason, count: u64) {
-        self.add(
-            limit,
-            Loss {
-                stream: Stream::Events,
-                reason,
-                count,
-                bytes: None,
                 seqs: None,
             },
         );

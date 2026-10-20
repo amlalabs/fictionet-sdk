@@ -45,7 +45,10 @@ fn article_javascript() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_commands_change_articles_and_publish_bounded_state() {
     let controls = Controls::new("Firefox (scripted)");
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let memory = Arc::new(Memory::default());
     let server = controls
         .page(Page::new("FakeWiki", dashboard.handle()).host(Host::new(HOST)))

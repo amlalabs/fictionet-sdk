@@ -272,7 +272,10 @@
 //! struct Applied { revision: u64, at: f64 }
 //!
 //! # async fn build() -> std::io::Result<()> {
-//! let dashboard = DashboardObserver::new(DashboardOptions::demo());
+//! let dashboard = DashboardObserver::new(DashboardOptions {
+//!     collector: fictionet_observe::Options::default(),
+//!     ..Default::default()
+//! });
 //! let status = StateTopic::<HostStatus>::new(StateLimits::default());
 //! let inventory = StateTopic::<Vec<Package>>::new(StateLimits::default());
 //! let routing = StateTopic::<String>::new(StateLimits::default());

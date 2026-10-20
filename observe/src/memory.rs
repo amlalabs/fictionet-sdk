@@ -3,7 +3,8 @@ use std::task::{Poll, Waker};
 
 use fictionet::sync::Mutex;
 
-use fictionet::events::{Event, Observation, Observer, Stamp, Stream};
+use crate::{Admit, Class, LossStatus, Policy, When};
+use fictionet::events::{Event, Interest, LossReason, Observation, Observer, Stamp, Stream};
 
 use crate::ring::{Kept, Ring};
 
@@ -67,21 +68,21 @@ impl std::error::Error for Incomplete {}
 /// select a different kind of event. Graders use [`Self::checked_of`]. Reading
 /// does not mutate retention or flush pending work.
 pub struct Memory {
-    limits: Limits,
-    noise_limits: Option<Limits>,
+    policy: Arc<dyn Policy>,
+    bytes: usize,
     state: Mutex<State>,
 }
 
 #[derive(Default)]
 struct State {
-    history: [Ring<Arc<Event>>; 2],
+    history: Vec<Ring<Arc<Event>>>,
     last: u64,
     dropped: u64,
     waiters: Vec<Weak<Mutex<Option<Waker>>>>,
 }
 
 /// A consistent history batch and cursors for displaying loss without counting
-/// gaps caused by event filtering. Array entries are ordinary events and noise.
+/// gaps caused by event filtering. Entries follow the policy class indices.
 #[derive(Default)]
 pub struct DisplayBatch {
     /// Retained events in sequence order.
@@ -91,29 +92,14 @@ pub struct DisplayBatch {
     /// Total events lost, including rejected events and evictions.
     pub dropped: u64,
     /// Evictions from each retention budget.
-    pub evicted: [u64; 2],
+    pub evicted: Vec<u64>,
     /// Positions through this batch, including earlier evictions, per budget.
-    pub position: [u64; 2],
+    pub position: Vec<u64>,
 }
 
 impl State {
     fn after(&self, after: u64) -> impl Iterator<Item = &Arc<Event>> {
-        let mut parts = self.history.each_ref().map(|history| {
-            let start = history.events.partition_point(|event| event.seq <= after);
-            history.events.range(start..).peekable()
-        });
-        std::iter::from_fn(move || {
-            let index = match (
-                parts[0].peek().map(|e| e.seq),
-                parts[1].peek().map(|e| e.seq),
-            ) {
-                (Some(a), Some(b)) => usize::from(b < a),
-                (Some(_), None) => 0,
-                (None, Some(_)) => 1,
-                (None, None) => return None,
-            };
-            parts[index].next()
-        })
+        crate::ring::after(&self.history, after)
     }
 }
 
@@ -128,19 +114,42 @@ impl Memory {
     /// Use [`Self::with_noise_limits`] to keep network floods from evicting
     /// ordinary events, as the default does.
     pub fn new(limits: Limits) -> Self {
-        Self {
-            limits,
-            noise_limits: None,
-            state: Mutex::new(State::default()),
-        }
+        Self::with_policy(
+            Arc::new(crate::policy::Standard {
+                classes: vec![
+                    Class::new("events")
+                        .count(limits.events)
+                        .bytes(limits.bytes),
+                ],
+            }),
+            usize::MAX,
+        )
     }
 
-    /// Reserves independent count and byte bounds for ordinary events and
-    /// facts marked with [`Event::repeat`], including aggregate summaries.
+    /// Reserves separate budgets for ordinary and repeating events.
     pub fn with_noise_limits(limits: Limits, noise: Limits) -> Self {
+        Self::with_policy(
+            Arc::new(crate::policy::Standard {
+                classes: vec![
+                    Class::new("events")
+                        .count(limits.events)
+                        .bytes(limits.bytes),
+                    Class::new("noise").count(noise.events).bytes(noise.bytes),
+                ],
+            }),
+            usize::MAX,
+        )
+    }
+
+    pub(crate) fn with_policy(policy: Arc<dyn Policy>, bytes: usize) -> Self {
+        let history = policy.classes().iter().map(|_| Ring::default()).collect();
         Self {
-            noise_limits: Some(noise),
-            ..Self::new(limits)
+            policy,
+            bytes,
+            state: Mutex::new(State {
+                history,
+                ..State::default()
+            }),
         }
     }
 
@@ -275,11 +284,15 @@ impl Memory {
             events,
             last: state.last,
             dropped: state.dropped,
-            evicted: state.history.each_ref().map(|h| h.evicted),
-            position: state.history.each_ref().map(|h| {
-                h.evicted
-                    .saturating_add(h.events.partition_point(|e| e.seq <= through) as u64)
-            }),
+            evicted: state.history.iter().map(|h| h.evicted).collect(),
+            position: state
+                .history
+                .iter()
+                .map(|h| {
+                    h.evicted
+                        .saturating_add(h.events.partition_point(|e| e.seq <= through) as u64)
+                })
+                .collect(),
         }
     }
 
@@ -321,40 +334,96 @@ impl Observer for Memory {
         }
     }
 
-    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        let fictionet::events::Interest::Event(_, _) = interest else {
+    fn enabled(&self, interest: Interest<'_>) -> bool {
+        if !matches!(interest, Interest::Event(..)) {
             return false;
-        };
-        true
+        }
+        match self.policy.admit(interest) {
+            Admit::Skip => false,
+            Admit::Build => true,
+            Admit::Class(index) => self
+                .policy
+                .classes()
+                .get(index)
+                .is_some_and(|class| class.when == When::Always),
+        }
     }
 
     fn observe(&self, stamp: Stamp, observation: Observation<'_>) {
-        let Observation::Event(event) = observation else {
+        let Observation::Event(event) = &observation else {
             return;
+        };
+        let index = match self.policy.admit(observation.interest()) {
+            Admit::Skip => return,
+            Admit::Class(index) => Some(index),
+            Admit::Build => self.policy.sort(&observation),
+        };
+        if let Some(index) = index {
+            self.push(stamp, event, index);
+            self.wake();
+        }
+    }
+}
+
+impl Memory {
+    pub(crate) fn push(&self, stamp: Stamp, event: &Event, index: usize) -> LossStatus {
+        let mut losses = LossStatus::default();
+        let Some(class) = self
+            .policy
+            .classes()
+            .get(index)
+            .filter(|class| class.when == When::Always)
+        else {
+            return losses;
         };
         let size = event.size();
         let mut state = self.state.lock();
         state.last = stamp.seq;
-        let (index, limits) = match (event.repeat_fields().is_some(), self.noise_limits) {
-            (true, Some(limits)) => (1, limits),
-            _ => (0, self.limits),
-        };
-        if limits.events == 0 || size > limits.bytes {
-            state.dropped = state.dropped.saturating_add(1);
+        let history = &mut state.history[index];
+        if !history.admit(stamp, class.burst) {
+            losses.record(1, stamp, LossReason::Sampling, size);
+        } else if class.count == 0 || size > class.bytes.min(self.bytes) {
+            losses.record(1, stamp, LossReason::Overflow, size);
         } else {
-            let history = &mut state.history[index];
-            let before = history.evicted;
-            history.make_room(size, limits.events, limits.bytes, |_| {});
+            history.make_room(size, class.count, class.bytes, |old| {
+                losses.record(1, old.stamp(), LossReason::Eviction, old.size());
+            });
             let mut event = event.clone();
             event.seq = stamp.seq;
             event.at = stamp.at;
-            // Cloning strings can shrink their capacity; charge the retained copy.
             history.push(Arc::new(event));
-            let evicted = history.evicted - before;
-            state.dropped = state.dropped.saturating_add(evicted);
         }
-        let waiters: Vec<_> = state.waiters.iter().filter_map(Weak::upgrade).collect();
-        drop(state);
+        let dropped: u64 = losses.streams.iter().map(|loss| loss.count).sum();
+        state.dropped = state.dropped.saturating_add(dropped);
+        losses
+    }
+
+    pub(crate) fn largest(&self) -> Option<(usize, usize)> {
+        self.state
+            .lock()
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, ring)| !ring.events.is_empty())
+            .max_by_key(|(_, ring)| ring.bytes)
+            .map(|(index, ring)| (index, ring.bytes))
+    }
+
+    pub(crate) fn evict(&self, index: usize) -> Option<Arc<Event>> {
+        let mut state = self.state.lock();
+        let event = state.history[index].evict()?;
+        state.dropped = state.dropped.saturating_add(1);
+        Some(event)
+    }
+
+    pub(crate) fn wake(&self) {
+        let waiters: Vec<_> = self
+            .state
+            .lock()
+            .waiters
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
         for wait in waiters {
             let waker = wait.lock().take();
             if let Some(waker) = waker {

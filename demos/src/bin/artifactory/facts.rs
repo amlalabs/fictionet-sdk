@@ -1207,7 +1207,10 @@ pub(super) mod tests {
         let (facts, contents) = listening(Variant::Peer);
         let initial = facts.state.lock().unwrap().inventory.clone();
         let publisher = Publisher::start(facts.clone());
-        let dashboard = DashboardObserver::new(DashboardOptions::demo());
+        let dashboard = DashboardObserver::new(DashboardOptions {
+            collector: fictionet_observe::Options::default(),
+            ..Default::default()
+        });
         let page = super::super::page::compose(
             &initial,
             dashboard.handle(),

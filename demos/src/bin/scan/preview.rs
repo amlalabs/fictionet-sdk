@@ -68,7 +68,10 @@ fn recorded(index: usize, no_match: Option<Ipv4Addr>) -> fictionet::Result<page:
 
 pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
     let options = options(args)?;
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let topics = page::Topics::new();
     let progress = page::Progress::new(true);
     let statuses = [(); 2].map(|()| StateTopic::<HostStatus>::new(StateLimits::default()));

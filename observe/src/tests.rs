@@ -3,11 +3,27 @@ use fictionet::events::{ConnInfo, GroupId, KeyMeta, LinkType, PacketRef, Side, T
 use fictionet::time::ms;
 use fictionet::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
 
+pub(crate) fn policy(classes: impl IntoIterator<Item = Class>) -> Arc<dyn Policy> {
+    let mut policy = crate::policy::Standard::default();
+    for class in classes {
+        for existing in &mut policy.classes {
+            if existing.name == class.name {
+                *existing = class;
+            }
+        }
+    }
+    Arc::new(policy)
+}
+
+fn evictions(batch: &PacketBatch) -> u64 {
+    batch.evicted.iter().map(|(_, count)| count).sum()
+}
+
 fn with_link(
     options: Options,
     test: impl FnOnce(Arc<Collector>, LinkId) + Send + 'static,
 ) -> Arc<Collector> {
-    let collector = Arc::new(Collector::new(options));
+    let collector = Arc::new(Collector::with_options(options));
     let reader = collector.clone();
     block_on(lab(
         RunOptions::new(Seed::from_u64(3)).observer(collector.clone()),
@@ -58,7 +74,11 @@ fn count(collector: &Collector, stream: Stream, reason: LossReason) -> u64 {
 fn sampling_uses_run_time_and_keeps_stream_sequences() {
     with_link(
         Options {
-            capture: CapturePolicy::Startup,
+            policy: policy([Class::new("packets")
+                .count(4096)
+                .bytes(8 << 20)
+                .snap(65_535)
+                .burst(64)]),
             ..Options::default()
         },
         |collector, link| {
@@ -66,7 +86,7 @@ fn sampling_uses_run_time_and_keeps_stream_sequences() {
                 packet(&collector, link, seq, Instant::ZERO, &[1]);
             }
             let copies = collector.packets(link, 0, usize::MAX);
-            assert_eq!(copies.missed, 0);
+            assert_eq!(evictions(&copies), 0);
             assert_eq!(copies.packets.len(), 128);
             assert_eq!(
                 copies.packets[..64]
@@ -112,9 +132,11 @@ fn packet_bounds_and_snap_length_report_separate_losses() {
     ] {
         with_link(
             Options {
-                capture: CapturePolicy::Startup,
-                packets: bounds,
-                snap_len: 4,
+                policy: policy([Class::new("packets")
+                    .count(bounds.count)
+                    .bytes(bounds.bytes)
+                    .snap(4)
+                    .burst(64)]),
                 ..Options::default()
             },
             |collector, link| {
@@ -122,7 +144,7 @@ fn packet_bounds_and_snap_length_report_separate_losses() {
                     packet(&collector, link, seq, Instant::ZERO, &[7; 10]);
                 }
                 let batch = collector.packets(link, 0, 10);
-                assert_eq!(batch.missed, 3);
+                assert_eq!(evictions(&batch), 3);
                 assert_eq!(batch.cursor, 5);
                 assert_eq!(
                     batch
@@ -147,20 +169,20 @@ fn packet_bounds_and_snap_length_report_separate_losses() {
                     3
                 );
                 let first = collector.packets(link, 0, 1);
-                assert_eq!(first.missed, 3);
+                assert_eq!(evictions(&first), 3);
                 assert_eq!(first.packets.len(), 1);
                 assert_eq!(first.packets[0].stamp.seq, 4);
                 assert_eq!(first.packets[0].skipped, 0);
-                for (after, missed) in [(1, 2), (2, 1), (3, 0)] {
-                    assert_eq!(collector.packets(link, after, 10).missed, missed);
+                for after in [1, 2, 3] {
+                    assert_eq!(evictions(&collector.packets(link, after, 10)), 3);
                 }
                 let last = collector.packets(link, 4, 10);
-                assert_eq!(last.missed, 0);
+                assert_eq!(evictions(&last), 3);
                 assert_eq!(last.packets.len(), 1);
                 assert_eq!(last.packets[0].stamp.seq, 5);
                 for after in [5, u64::MAX] {
                     let batch = collector.packets(link, after, 10);
-                    assert_eq!(batch.missed, 0);
+                    assert_eq!(evictions(&batch), 3);
                     assert!(batch.packets.is_empty());
                 }
             },
@@ -169,15 +191,13 @@ fn packet_bounds_and_snap_length_report_separate_losses() {
 }
 
 #[test]
-fn capture_follows_policy_and_reference_counted_demand() {
-    for policy in [
-        CapturePolicy::Off,
-        CapturePolicy::Startup,
-        CapturePolicy::Demand,
-    ] {
+fn demand_opens_watched_classes_and_is_counted_per_link() {
+    for when in [When::Always, When::Watched] {
+        let mut class = Class::new("packets").count(4096).bytes(8 << 20);
+        class.when = when;
         with_link(
             Options {
-                capture: policy,
+                policy: policy([class]),
                 ..Options::default()
             },
             move |collector, link| {
@@ -190,31 +210,39 @@ fn capture_follows_policy_and_reference_counted_demand() {
                     bytes: &[0],
                     link_type: LinkType::Ip,
                 });
-                assert_eq!(
-                    collector.enabled(interest),
-                    policy == CapturePolicy::Startup
-                );
-                let first = collector.capture_demand(link);
-                let second = collector.capture_demand(link);
-                assert_eq!(first.is_some(), policy != CapturePolicy::Off);
-                assert_eq!(collector.enabled(interest), policy != CapturePolicy::Off);
+                assert_eq!(collector.enabled(interest), when == When::Always);
+                let first = collector.capture_demand(link).unwrap();
+                let second = collector.capture_demand(link).unwrap();
+                assert!(collector.enabled(interest));
                 drop(first);
-                assert_eq!(collector.enabled(interest), policy != CapturePolicy::Off);
+                assert!(collector.enabled(interest));
                 drop(second);
-                assert_eq!(
-                    collector.enabled(interest),
-                    policy == CapturePolicy::Startup
-                );
+                assert_eq!(collector.enabled(interest), when == When::Always);
             },
         );
     }
+    with_link(
+        Options {
+            policy: <dyn Policy>::events(),
+            ..Options::default()
+        },
+        |collector, link| {
+            let _demand = collector.capture_demand(link);
+            packet(&collector, link, 1, Instant::ZERO, &[0]);
+            assert!(collector.packets(link, 0, 10).packets.is_empty());
+        },
+    );
 }
 
 #[test]
-fn aggregate_budget_evicts_the_oldest_copy_across_links() {
-    let collector = Arc::new(Collector::new(Options {
-        capture: CapturePolicy::Startup,
-        packet_bytes: 6,
+fn aggregate_pressure_evicts_the_largest_ring_first() {
+    let collector = Arc::new(Collector::with_options(Options {
+        policy: policy([Class::new("packets")
+            .count(4096)
+            .bytes(8 << 20)
+            .snap(65_535)
+            .burst(64)]),
+        bytes: 6,
         ..Options::default()
     }));
     let reader = collector.clone();
@@ -227,17 +255,23 @@ fn aggregate_budget_evicts_the_oldest_copy_across_links() {
             let _c = cx.tap("b", c);
             cx.yield_now().await?;
             let links: Vec<_> = reader.topology().links.keys().copied().collect();
-            packet(&reader, links[0], 1, Instant::ZERO, &[0; 3]);
-            packet(&reader, links[1], 1, Instant::ZERO, &[1; 3]);
-            packet(&reader, links[0], 2, Instant::ZERO, &[2; 3]);
-            assert_eq!(reader.packets(links[0], 0, 10).missed, 1);
-            assert_eq!(reader.packets(links[1], 0, 10).missed, 0);
+            packet(&reader, links[0], 1, Instant::ZERO, &[0; 1]);
+            packet(&reader, links[1], 1, Instant::ZERO, &[1; 4]);
+            packet(&reader, links[0], 2, Instant::ZERO, &[2; 2]);
+            assert_eq!(evictions(&reader.packets(links[0], 0, 10)), 0);
+            assert_eq!(evictions(&reader.packets(links[1], 0, 10)), 1);
             assert_eq!(
-                reader.packets(links[0], 0, 10).packets[0].bytes.as_ref(),
-                &[2; 3]
+                reader
+                    .packets(links[0], 0, 10)
+                    .packets
+                    .iter()
+                    .map(|copy| copy.bytes.to_vec())
+                    .collect::<Vec<_>>(),
+                [vec![0; 1], vec![2; 2]]
             );
+            assert!(reader.packets(links[1], 0, 10).packets.is_empty());
             assert_eq!(
-                count(&reader, Stream::Packets(links[0]), LossReason::Eviction),
+                count(&reader, Stream::Packets(links[1]), LossReason::Eviction),
                 1
             );
             Ok(())
@@ -258,8 +292,8 @@ fn key_count_and_byte_bounds_preserve_redaction_and_keylog() {
             bytes: 2 * (size_of::<Key>() + 13 + 2 + 3),
         },
     ] {
-        let collector = Arc::new(Collector::new(Options {
-            keys: Some(bounds),
+        let collector = Arc::new(Collector::with_options(Options {
+            policy: policy([Class::new("keys").count(bounds.count).bytes(bounds.bytes)]),
             ..Options::default()
         }));
         let reader = collector.clone();
@@ -281,11 +315,8 @@ fn key_count_and_byte_bounds_preserve_redaction_and_keylog() {
         .unwrap();
         assert_eq!(count(&collector, Stream::Keys, LossReason::Eviction), 2);
     }
-    let collector = Arc::new(Collector::new(Options {
-        keys: Some(Bounds {
-            count: 10,
-            bytes: 1,
-        }),
+    let collector = Arc::new(Collector::with_options(Options {
+        policy: policy([Class::new("keys").count(10).bytes(1)]),
         ..Options::default()
     }));
     block_on(lab(
@@ -301,8 +332,8 @@ fn key_count_and_byte_bounds_preserve_redaction_and_keylog() {
     assert!(collector.keys().is_empty());
     assert_eq!(count(&collector, Stream::Keys, LossReason::Overflow), 1);
     assert!(
-        !Collector::new(Options {
-            keys: None,
+        !Collector::with_options(Options {
+            policy: <dyn Policy>::events(),
             ..Options::default()
         })
         .enabled(Interest::TlsKey(KeyMeta {
@@ -314,7 +345,7 @@ fn key_count_and_byte_bounds_preserve_redaction_and_keylog() {
 
 #[test]
 fn topology_bounds_and_unicode_truncation_remain_visible() {
-    let collector = Arc::new(Collector::new(Options {
+    let collector = Arc::new(Collector::with_options(Options {
         topology: TopologyLimits {
             groups: 2,
             name_bytes: 5,
@@ -348,8 +379,12 @@ fn topology_bounds_and_unicode_truncation_remain_visible() {
 }
 
 fn world_snapshot() -> (String, Vec<PacketCopy>) {
-    let collector = Arc::new(Collector::new(Options {
-        capture: CapturePolicy::Startup,
+    let collector = Arc::new(Collector::with_options(Options {
+        policy: policy([Class::new("packets")
+            .count(4096)
+            .bytes(8 << 20)
+            .snap(65_535)
+            .burst(64)]),
         ..Options::default()
     }));
     let reader = collector.clone();
@@ -425,7 +460,7 @@ fn lab_topology_and_capture_repeat_and_removal_is_visible() {
 
 #[test]
 fn spawned_tasks_remain_visible_after_their_parent_ends() {
-    let collector = Arc::new(Collector::new(Options::default()));
+    let collector = Arc::new(Collector::with_options(Options::default()));
     let reader = collector.clone();
     block_on(lab(
         RunOptions::new(Seed::from_u64(7)).observer(collector.clone()),
@@ -468,7 +503,7 @@ fn spawned_tasks_remain_visible_after_their_parent_ends() {
 
 #[test]
 fn connection_bindings_follow_hosts_and_release_their_budget() {
-    let collector = Arc::new(Collector::new(Options {
+    let collector = Arc::new(Collector::with_options(Options {
         topology: TopologyLimits {
             connections: 1,
             name_bytes: 8,
@@ -521,7 +556,7 @@ fn connection_bindings_follow_hosts_and_release_their_budget() {
 
 #[test]
 fn topology_byte_bounds_and_missing_references_are_counted() {
-    let collector = Arc::new(Collector::new(Options {
+    let collector = Arc::new(Collector::with_options(Options {
         topology: TopologyLimits {
             bytes: 0,
             ..TopologyLimits::default()
@@ -553,7 +588,7 @@ fn topology_byte_bounds_and_missing_references_are_counted() {
 
 #[test]
 fn producer_losses_and_exhausted_loss_detail_remain_queryable() {
-    let collector = Collector::new(Options {
+    let collector = Collector::with_options(Options {
         loss_streams: 1,
         ..Options::default()
     });
@@ -590,7 +625,11 @@ fn producer_losses_and_exhausted_loss_detail_remain_queryable() {
 fn packet_interest_does_not_take_the_collector_lock() {
     with_link(
         Options {
-            capture: CapturePolicy::Startup,
+            policy: policy([Class::new("packets")
+                .count(4096)
+                .bytes(8 << 20)
+                .snap(65_535)
+                .burst(64)]),
             ..Options::default()
         },
         |collector, link| {
@@ -611,9 +650,11 @@ fn packet_interest_does_not_take_the_collector_lock() {
 #[test]
 fn event_retention_separates_noise_and_reports_each_loss_cause() {
     use fictionet::events::{Event, Fields};
-    let collector = Collector::new(Options {
-        events: Some(Limits::new(2, 8192)),
-        noise: Limits::new(1, 8192),
+    let collector = Collector::with_options(Options {
+        policy: policy([
+            Class::new("events").count(2).bytes(8192),
+            Class::new("noise").count(1).bytes(8192),
+        ]),
         ..Options::default()
     });
     for (index, event) in [
@@ -662,23 +703,22 @@ fn event_retention_separates_noise_and_reports_each_loss_cause() {
 fn an_oversized_copy_evicts_old_copies_and_advances_empty_cursors() {
     with_link(
         Options {
-            capture: CapturePolicy::Startup,
-            packets: Bounds { count: 2, bytes: 4 },
+            policy: policy([Class::new("packets").count(2).bytes(4)]),
             ..Options::default()
         },
         |collector, link| {
             packet(&collector, link, 1, Instant::ZERO, &[0; 4]);
             packet(&collector, link, 2, Instant::ZERO, &[0; 8]);
             let batch = collector.packets(link, 0, 10);
-            assert_eq!(batch.missed, 2);
+            assert_eq!(evictions(&batch), 2);
             assert_eq!(batch.cursor, 2);
             assert!(batch.packets.is_empty());
-            assert_eq!(collector.packets(link, 1, 10).missed, 1);
-            assert_eq!(collector.packets(link, 2, 10).missed, 0);
+            assert_eq!(evictions(&collector.packets(link, 1, 10)), 2);
+            assert_eq!(evictions(&collector.packets(link, 2, 10)), 2);
             packet(&collector, link, 3, Instant::ZERO, &[1; 4]);
             let batch = collector.packets(link, 2, 10);
-            assert_eq!(batch.missed, 0);
-            assert_eq!(batch.packets[0].cursor, 3);
+            assert_eq!(evictions(&batch), 2);
+            assert_eq!(batch.packets[0].stamp.seq, 3);
             assert_eq!(
                 count(&collector, Stream::Packets(link), LossReason::Eviction),
                 2
@@ -735,7 +775,7 @@ fn waking_an_event_reader_can_inspect_the_collector() {
 }
 
 #[test]
-fn startup_capture_accepts_packets_before_out_of_order_registration() {
+fn a_first_packet_is_classified_before_topology_arrives() {
     let source = Arc::new(Collector::default());
     let reader = source.clone();
     block_on(lab(
@@ -748,8 +788,12 @@ fn startup_capture_accepts_packets_before_out_of_order_registration() {
             cx.yield_now().await?;
             let snapshot = reader.topology();
             let links: Vec<_> = snapshot.links.iter().collect();
-            let collector = Collector::new(Options {
-                capture: CapturePolicy::Startup,
+            let collector = Collector::with_options(Options {
+                policy: policy([Class::new("packets")
+                    .count(4096)
+                    .bytes(8 << 20)
+                    .snap(65_535)
+                    .burst(64)]),
                 ..Options::default()
             });
             for (index, (id, link)) in links.iter().rev().enumerate() {
@@ -782,9 +826,13 @@ fn startup_capture_accepts_packets_before_out_of_order_registration() {
 
 #[test]
 fn removed_captures_stay_readable_and_evict_before_active_captures() {
-    let collector = Arc::new(Collector::new(Options {
-        capture: CapturePolicy::Startup,
-        packet_bytes: 6,
+    let collector = Arc::new(Collector::with_options(Options {
+        policy: policy([Class::new("packets")
+            .count(4096)
+            .bytes(8 << 20)
+            .snap(65_535)
+            .burst(64)]),
+        bytes: 6,
         ..Options::default()
     }));
     let reader = collector.clone();
@@ -808,7 +856,7 @@ fn removed_captures_stay_readable_and_evict_before_active_captures() {
             );
             packet(&reader, links[0], 2, Instant::ZERO, &[3; 3]);
             assert_eq!(reader.packets(links[0], 0, 10).packets.len(), 2);
-            assert_eq!(reader.packets(links[1], 0, 10).missed, 1);
+            assert_eq!(evictions(&reader.packets(links[1], 0, 10)), 1);
             assert!(reader.packets(links[1], 0, 10).packets.is_empty());
             assert_eq!(
                 count(&reader, Stream::Packets(links[1]), LossReason::Eviction),
@@ -822,8 +870,12 @@ fn removed_captures_stay_readable_and_evict_before_active_captures() {
 
 #[test]
 fn removed_capture_metadata_keeps_the_link_count_bound() {
-    let collector = Arc::new(Collector::new(Options {
-        capture: CapturePolicy::Startup,
+    let collector = Arc::new(Collector::with_options(Options {
+        policy: policy([Class::new("packets")
+            .count(4096)
+            .bytes(8 << 20)
+            .snap(65_535)
+            .burst(64)]),
         topology: TopologyLimits {
             links: 2,
             ..TopologyLimits::default()
@@ -858,8 +910,12 @@ fn removed_capture_metadata_keeps_the_link_count_bound() {
 
 #[test]
 fn aggregation_preserves_packets_keys_topology_and_loss() {
-    let collector = Arc::new(Collector::new(Options {
-        capture: CapturePolicy::Startup,
+    let collector = Arc::new(Collector::with_options(Options {
+        policy: policy([Class::new("packets")
+            .count(4096)
+            .bytes(8 << 20)
+            .snap(65_535)
+            .burst(64)]),
         ..Options::default()
     }));
     let aggregate = Arc::new(crate::Aggregate::new(collector.clone()));
@@ -923,11 +979,11 @@ fn one_ring_evicts_the_same_way_for_events_packets_and_keys() {
             bytes: size * 2,
         },
     ] {
-        let collector = Arc::new(Collector::new(Options {
-            events: Some(Limits::new(bounds.count, bounds.bytes)),
-            capture: CapturePolicy::Startup,
-            packets: bounds,
-            keys: Some(bounds),
+        let collector = Arc::new(Collector::with_options(Options {
+            policy: policy(
+                ["events", "packets", "keys"]
+                    .map(|name| Class::new(name).count(bounds.count).bytes(bounds.bytes)),
+            ),
             ..Options::default()
         }));
         let reader = collector.clone();
@@ -966,16 +1022,507 @@ fn one_ring_evicts_the_same_way_for_events_packets_and_keys() {
                     assert_eq!(rows.len(), 1);
                     assert_eq!(rows[0].reason, LossReason::Eviction);
                     assert_eq!(rows[0].count, 3);
-                    if stream != Stream::Events {
-                        assert_eq!(rows[0].bytes, Some((3 * size) as u64));
-                    }
+                    assert_eq!(rows[0].bytes, Some((3 * size) as u64));
                 }
-                assert_eq!(reader.events().display_batch(None, 10).evicted, [3, 0]);
-                assert_eq!(reader.packets(link, 0, 10).missed, 3);
-                assert_eq!(reader.state.lock().keys.ring.evicted, 3);
+                assert_eq!(
+                    reader.events().display_batch(None, 10).evicted,
+                    [3, 0, 0, 0, 0]
+                );
+                assert_eq!(evictions(&reader.packets(link, 0, 10)), 3);
+                assert_eq!(reader.state.lock().keys.rings[&2].evicted, 3);
                 Ok(())
             },
         ))
         .unwrap();
     }
+}
+
+const WORK_CLASSES: [Class; 5] = [
+    Class::new("events").count(50_000).bytes(16 << 20),
+    Class::new("noise").count(5_000).bytes(2 << 20).burst(64),
+    Class::new("keys").count(20_000).bytes(8 << 20),
+    Class::new("agent").count(8_192).bytes(32 << 20),
+    Class::new("bulk")
+        .watched()
+        .count(4_096)
+        .bytes(1 << 20)
+        .snap(96)
+        .burst(64),
+];
+struct WorkPolicy;
+impl Policy for WorkPolicy {
+    fn classes(&self) -> &[Class] {
+        &WORK_CLASSES
+    }
+    fn admit(&self, interest: Interest<'_>) -> Admit {
+        use fictionet::stdlib::network::ip;
+        let jump = "10.10.5.20".parse::<std::net::IpAddr>().unwrap();
+        let mirror = "10.10.5.30".parse::<std::net::IpAddr>().unwrap();
+        match interest {
+            Interest::Event(_, conn)
+                if conn
+                    .sandbox
+                    .as_ref()
+                    .is_some_and(|sandbox| &*sandbox.name == "jump") =>
+            {
+                Admit::Skip
+            }
+            Interest::Event(meta, _) if meta.source == "console" => Admit::Skip,
+            Interest::Event(meta, _) if meta.source == "net" && meta.kind == "blocked" => {
+                Admit::Class(1)
+            }
+            Interest::Event(..) => Admit::Build,
+            Interest::TlsKey(_) => Admit::Class(2),
+            Interest::Packet(p) if p.sandbox == Some("jump") => Admit::Skip,
+            Interest::Packet(p) if p.sandbox.is_some() => {
+                match ip::Header::parse_truncated(p.bytes) {
+                    Some(h) if h.src == jump || h.dst == jump => Admit::Skip,
+                    Some(h) if h.src == mirror || h.dst == mirror => Admit::Class(4),
+                    _ => Admit::Class(3),
+                }
+            }
+            Interest::Packet(_) => Admit::Class(4),
+            Interest::Topology(_) => Admit::Build,
+        }
+    }
+    fn sort(&self, observation: &Observation<'_>) -> Option<usize> {
+        match observation {
+            Observation::Event(event) => Some(usize::from(event.repeat_fields().is_some())),
+            _ => None,
+        }
+    }
+}
+
+#[test]
+fn a_policy_skips_an_event_before_its_builder_runs() {
+    let collector = Arc::new(Collector::new(Arc::new(WorkPolicy)));
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)).observer(collector.clone()),
+        |cx| async move {
+            cx.emit("console", "traffic", |_| panic!("declined builder ran"));
+            cx.emit("http", "request", |event| event);
+            Ok(())
+        },
+    ))
+    .unwrap();
+    assert!(
+        collector
+            .events()
+            .after(0, usize::MAX)
+            .iter()
+            .all(|event| event.source != "console")
+    );
+    assert_eq!(
+        collector
+            .events()
+            .checked_of("http", "request")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_policy_sorts_a_built_event_by_its_repeat_mark() {
+    use fictionet::events::{Event, Fields};
+    let collector = Collector::with_options(Options {
+        policy: policy([
+            Class::new("events").count(1).bytes(8192),
+            Class::new("noise").count(1).bytes(8192),
+        ]),
+        ..Options::default()
+    });
+    for (index, event) in [
+        Event::new("test", "item"),
+        Event::new("test", "item").repeat(Fields::new()),
+        Event::new("test", "item").repeat(Fields::new()),
+    ]
+    .iter()
+    .enumerate()
+    {
+        collector.observe(
+            Stamp {
+                stream: Stream::Events,
+                seq: index as u64 + 1,
+                at: Instant::ZERO,
+            },
+            Observation::Event(event),
+        );
+    }
+    assert_eq!(
+        collector
+            .events()
+            .after(0, 10)
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        [1, 3]
+    );
+    assert_eq!(
+        collector.events().display_batch(None, 10).evicted,
+        [0, 1, 0, 0, 0]
+    );
+}
+
+#[test]
+fn noise_and_events_classes_evict_independently() {
+    use fictionet::events::{Event, Fields};
+    let collector = Collector::new(policy([
+        Class::new("events").count(2).bytes(8192),
+        Class::new("noise").count(3).bytes(8192),
+    ]));
+    for seq in 1..=100 {
+        let event = if seq <= 2 {
+            Event::new("http", "request")
+        } else {
+            Event::new("net", "blocked")
+                .field("destination", seq)
+                .repeat(Fields::new())
+        };
+        collector.observe(
+            Stamp {
+                stream: Stream::Events,
+                seq,
+                at: Instant::ZERO,
+            },
+            Observation::Event(&event),
+        );
+    }
+    assert_eq!(
+        collector
+            .events()
+            .after(0, 100)
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        [1, 2, 98, 99, 100]
+    );
+    assert_eq!(
+        collector.events().display_batch(None, 100).evicted,
+        [0, 95, 0, 0, 0]
+    );
+    assert_eq!(count(&collector, Stream::Events, LossReason::Eviction), 95);
+}
+
+#[test]
+fn a_burst_bound_thins_noise_and_counts_sampling() {
+    use fictionet::events::{Event, Fields};
+    let burst = 4;
+    let collector = Collector::new(policy([Class::new("noise")
+        .count(100)
+        .bytes(1 << 20)
+        .burst(burst)]));
+    for seq in 1..=16 {
+        let at = Instant::ZERO + ms(if seq <= 8 { 0 } else { 100 });
+        collector.observe(
+            Stamp {
+                stream: Stream::Events,
+                seq,
+                at,
+            },
+            Observation::Event(&Event::new("net", "blocked").repeat(Fields::new())),
+        );
+    }
+    assert_eq!(
+        collector
+            .events()
+            .after(0, 100)
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 15]
+    );
+    assert_eq!(count(&collector, Stream::Events, LossReason::Sampling), 4);
+    assert_eq!(collector.events().dropped(), 4);
+}
+
+fn work_packet(destination: [u8; 4], seq: u32, payload: &[u8]) -> Packet {
+    let mut bytes = vec![0; 40];
+    bytes[0] = 0x45;
+    bytes[2..4].copy_from_slice(&((40 + payload.len()) as u16).to_be_bytes());
+    bytes[8] = 64;
+    bytes[9] = 6;
+    bytes[12..16].copy_from_slice(&[10, 10, 5, 40]);
+    bytes[16..20].copy_from_slice(&destination);
+    bytes[20..22].copy_from_slice(&40_000u16.to_be_bytes());
+    bytes[22..24].copy_from_slice(&80u16.to_be_bytes());
+    bytes[24..28].copy_from_slice(&seq.to_be_bytes());
+    bytes[32] = 0x50;
+    bytes[33] = 0x18;
+    bytes.extend_from_slice(payload);
+    Packet(bytes)
+}
+
+#[test]
+fn console_traffic_costs_nothing_when_excluded() {
+    use fictionet::events::Fanout;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Probe {
+        collector: Arc<Collector>,
+        packets: AtomicUsize,
+    }
+    impl Observer for Probe {
+        fn enabled(&self, interest: Interest<'_>) -> bool {
+            matches!(interest, Interest::Packet(_)) && self.collector.enabled(interest)
+        }
+        fn observe(&self, _: Stamp, item: Observation<'_>) {
+            if matches!(item, Observation::Packet(_)) {
+                self.packets.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let collector = Arc::new(Collector::new(Arc::new(WorkPolicy)));
+    let probe = Arc::new(Probe {
+        collector: collector.clone(),
+        packets: AtomicUsize::new(0),
+    });
+    let reader = collector.clone();
+    let observed = probe.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![collector, probe]))),
+        move |cx| async move {
+            let (attacher, mut attachments) = fictionet::attachments();
+            let mut jump = attacher.attach("jump").unwrap();
+            let mut guest = attacher.attach("guest").unwrap();
+            let mut jump_link = attachments.get(&cx, "jump").await?;
+            let mut guest_link = attachments.get(&cx, "guest").await?;
+            cx.yield_now().await?;
+            let topology = reader.topology();
+            let guest_id = *topology
+                .links
+                .iter()
+                .find(|(_, link)| link.sandbox.as_deref() == Some("guest"))
+                .unwrap()
+                .0;
+            let jump_id = *topology
+                .links
+                .iter()
+                .find(|(_, link)| link.sandbox.as_deref() == Some("jump"))
+                .unwrap()
+                .0;
+            let console = work_packet([10, 10, 5, 20], 1, &[7; 120]);
+            let mut reply = console.clone();
+            reply.0[12..16].copy_from_slice(&[10, 10, 5, 20]);
+            reply.0[16..20].copy_from_slice(&[10, 10, 5, 40]);
+            let mut agent = Vec::new();
+            for index in 0..2000 {
+                if index % 2 == 0 {
+                    guest.send(console.clone());
+                    guest_link.recv(&cx).await?;
+                } else {
+                    guest_link.send(reply.clone());
+                    guest.recv(&cx).await?;
+                }
+                jump.send(reply.clone());
+                jump_link.recv(&cx).await?;
+                jump_link.send(console.clone());
+                jump.recv(&cx).await?;
+                if index % 10 == 0 {
+                    let packet = work_packet([10, 10, 5, 50], index, &[index as u8; 120]);
+                    agent.push(packet.0.clone());
+                    guest.send(packet);
+                    guest_link.recv(&cx).await?;
+                }
+            }
+            assert_eq!(cx.now(), Instant::ZERO);
+            assert_eq!(observed.packets.load(Ordering::Relaxed), 200);
+            let batch = reader.packets(guest_id, 0, usize::MAX);
+            assert_eq!(batch.cursor, 200);
+            assert_eq!(
+                batch
+                    .packets
+                    .iter()
+                    .map(|p| p.bytes.as_ref())
+                    .collect::<Vec<_>>(),
+                agent.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            );
+            assert!(
+                batch
+                    .packets
+                    .iter()
+                    .all(|p| p.class == 3 && p.skipped == 0 && p.original_len == p.bytes.len())
+            );
+            assert_eq!(evictions(&batch), 0);
+            assert!(!reader.state.lock().captures.links.contains_key(&jump_id));
+            for reason in [
+                LossReason::Sampling,
+                LossReason::Truncation,
+                LossReason::Eviction,
+            ] {
+                assert_eq!(count(&reader, Stream::Packets(guest_id), reason), 0);
+            }
+            let crossings = |id| {
+                reader.topology().counters()[&id]
+                    .iter()
+                    .map(|count| count.packets)
+                    .sum::<u64>()
+            };
+            assert_eq!(crossings(guest_id) - batch.cursor, 2000);
+            assert_eq!(
+                crossings(jump_id) - reader.packets(jump_id, 0, 1).cursor,
+                4000
+            );
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[cfg(feature = "decode")]
+#[test]
+fn agent_traffic_keeps_full_fidelity_under_load() {
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: Options {
+            policy: Arc::new(WorkPolicy),
+            ..Options::default()
+        },
+        ..DashboardOptions::default()
+    });
+    let handle = dashboard.handle();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)).observer(dashboard.observer()),
+        move |cx| async move {
+            let (attacher, mut attachments) = fictionet::attachments();
+            let _jump = attacher.attach("jump").unwrap();
+            let mut guest = attacher.attach("guest").unwrap();
+            let _jump_link = attachments.get(&cx, "jump").await?;
+            let mut guest_link = attachments.get(&cx, "guest").await?;
+            cx.yield_now().await?;
+            let collector = &handle.0.collector;
+            let link = *collector
+                .topology()
+                .links
+                .iter()
+                .find(|(_, link)| link.sandbox.as_deref() == Some("guest"))
+                .unwrap()
+                .0;
+            let _demand = collector.capture_demand(link).unwrap();
+            let request = format!(
+                "GET /load HTTP/1.1\r\nHost: site.test\r\nX-Padding: {}\r\n\r\n",
+                "x".repeat(1000)
+            );
+            let mut agent = Vec::new();
+            let windows = 50;
+            let per_window = 1000;
+            let bulk = WORK_CLASSES[4];
+            let burst = bulk.burst.unwrap();
+            let kept_per_window = (0..per_window)
+                .filter(|index: &u64| {
+                    *index < burst || index.is_multiple_of(1u64 << (*index / burst).min(30))
+                })
+                .count();
+            let retained = bulk.count.min(bulk.bytes / bulk.snap.unwrap());
+            let expected_evicted = kept_per_window * windows - retained;
+            let expected_sampled = windows * (per_window as usize - kept_per_window);
+            assert!(expected_evicted > 0 && expected_sampled > 0);
+            for window in 0..windows {
+                for index in 0..per_window {
+                    guest.send(work_packet([10, 10, 5, 30], index as u32, &[7; 200]));
+                    guest_link.recv(&cx).await?;
+                    if window % 5 == 0 && index == 500 {
+                        let part = window / 5;
+                        let start = request.len() * part / 10;
+                        let end = request.len() * (part + 1) / 10;
+                        let packet = work_packet(
+                            [10, 10, 5, 50],
+                            start as u32 + 1,
+                            &request.as_bytes()[start..end],
+                        );
+                        agent.push(packet.0.clone());
+                        guest.send(packet);
+                        guest_link.recv(&cx).await?;
+                    }
+                }
+                cx.sleep(ms(100)).await?;
+            }
+            let batch = collector.packets(link, 0, usize::MAX);
+            let copies: Vec<_> = batch
+                .packets
+                .iter()
+                .filter(|copy| copy.class == 3)
+                .collect();
+            assert_eq!(copies.len(), 10);
+            assert_eq!(
+                copies
+                    .iter()
+                    .map(|copy| copy.bytes.as_ref())
+                    .collect::<Vec<_>>(),
+                agent.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            );
+            assert!(
+                copies
+                    .iter()
+                    .all(|copy| copy.skipped == 0 && copy.original_len == copy.bytes.len())
+            );
+            assert!(
+                copies
+                    .windows(2)
+                    .all(|pair| pair[0].stamp.seq < pair[1].stamp.seq)
+            );
+            assert_eq!(batch.evicted, [(3, 0), (4, expected_evicted as u64)]);
+            assert_eq!(
+                batch.packets.iter().filter(|copy| copy.class == 4).count(),
+                retained
+            );
+            assert_eq!(
+                count(collector, Stream::Packets(link), LossReason::Sampling),
+                expected_sampled as u64
+            );
+            assert_eq!(
+                count(collector, Stream::Packets(link), LossReason::Eviction),
+                expected_evicted as u64
+            );
+            let subscription = handle
+                .0
+                .watches
+                .acquire(collector, link.get(), std::time::Instant::now(), || {
+                    Some((link, "{}".into()))
+                })
+                .unwrap();
+            let watch = subscription.watch();
+            let mut cursor = 0;
+            let mut agent_rows = 0;
+            let mut http = 0;
+            let mut http_rows = 0;
+            let mut sampled = 0;
+            let mut evicted = 0;
+            loop {
+                let drained = watch.pump(&handle.0);
+                let (missed, rows) = watch.rows_after(cursor, usize::MAX);
+                assert_eq!(missed, 0);
+                for (seq, row) in rows {
+                    cursor = seq;
+                    if row.contains("\"class\":\"agent\"") {
+                        agent_rows += 1;
+                        assert!(row.contains("\"skipped\":0,\"evicted\":0"), "{row}");
+                        let detail = watch.detail(seq).unwrap();
+                        http += detail
+                            .matches("\"name\":\"Hypertext Transfer Protocol\"")
+                            .count();
+                        if row.contains("\"proto\":\"HTTP\"") {
+                            http_rows += 1;
+                            assert!(row.contains("GET /load HTTP/1.1"), "{row}");
+                        }
+                    } else {
+                        assert!(row.contains("\"class\":\"bulk\""), "{row}");
+                        if !row.contains("\"skipped\":0,") {
+                            sampled += 1;
+                        }
+                        if !row.contains("\"evicted\":0,") {
+                            evicted += 1;
+                        }
+                    }
+                }
+                if drained {
+                    break;
+                }
+            }
+            assert_eq!(agent_rows, 10);
+            assert_eq!(http, 1);
+            assert_eq!(http_rows, 1);
+            assert!(sampled > 0 && evicted > 0);
+            Ok(())
+        },
+    ))
+    .unwrap();
 }

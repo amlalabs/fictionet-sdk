@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_commands_change_the_route_and_record_inputs() {
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let control = control::Control::new(&control::scenario()).unwrap();
     let server = control
         .page(Page::new("Border", dashboard.handle()))
@@ -111,7 +114,10 @@ async fn http_commands_change_the_route_and_record_inputs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn browser_buttons_use_the_world_revision() {
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let control = control::Control::new(&control::scenario()).unwrap();
     let server = control
         .page(

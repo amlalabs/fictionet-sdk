@@ -1,8 +1,8 @@
 use super::*;
 use crate::dashboard::PACKET_TICK;
 use crate::{
-    CapturePolicy, DashboardHandle, DashboardObserver, DashboardOptions, Envelope, Match, Options,
-    Session, Value,
+    Class, DashboardHandle, DashboardObserver, DashboardOptions, Envelope, Match, Options, Session,
+    Value,
 };
 use fictionet::stdlib::codec::le32;
 use fictionet::{Cx, Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
@@ -126,12 +126,16 @@ fn download(session: &mut Session, id: u32, link: u64, now: Instant) -> Vec<u8> 
     file
 }
 
-fn startup(collector: Options) -> DashboardOptions {
+fn startup(mut collector: Options) -> DashboardOptions {
+    let mut classes = collector.policy.classes().to_vec();
+    for class in &mut classes {
+        if class.name == "packets" {
+            class.when = crate::When::Always;
+        }
+    }
+    collector.policy = Arc::new(crate::policy::Standard { classes });
     DashboardOptions {
-        collector: Options {
-            capture: CapturePolicy::Startup,
-            ..collector
-        },
+        collector,
         ..DashboardOptions::default()
     }
 }
@@ -139,10 +143,7 @@ fn startup(collector: Options) -> DashboardOptions {
 #[test]
 fn capture_reports_eviction_separately_from_sampling_without_renumbering() {
     let options = startup(Options {
-        packets: crate::Bounds {
-            count: 2,
-            bytes: 1024,
-        },
+        policy: crate::tests::policy([Class::new("packets").count(2).bytes(1024).burst(64)]),
         ..Options::default()
     });
     with_dashboard(options, |cx, handle| async move {
@@ -178,10 +179,7 @@ fn capture_reports_eviction_separately_from_sampling_without_renumbering() {
 #[test]
 fn capture_carries_eviction_from_an_empty_capture_once() {
     let options = startup(Options {
-        packets: crate::Bounds {
-            count: 2,
-            bytes: 20,
-        },
+        policy: crate::tests::policy([Class::new("packets").count(2).bytes(20).burst(64)]),
         ..Options::default()
     });
     with_dashboard(options, |cx, handle| async move {
@@ -215,7 +213,10 @@ fn quiet_capture_keeps_keys_after_the_collector_ring_rotates() {
         bytes: 1 << 20,
     };
     let options = startup(Options {
-        keys: Some(bounds),
+        policy: crate::tests::policy([
+            Class::new("keys").count(bounds.count).bytes(bounds.bytes),
+            Class::new("packets").count(4096).bytes(8 << 20).burst(64),
+        ]),
         ..Options::default()
     });
     with_dashboard(options, move |cx, handle| async move {
@@ -744,49 +745,61 @@ fn the_aggregate_budget_forgets_idle_watches_first_then_the_oldest_rows() {
 
 #[test]
 fn a_late_watch_of_a_startup_link_sees_packets_from_before_it() {
-    with_dashboard(DashboardOptions::demo(), |cx, handle| async move {
-        let (attacher, mut attachments) = fictionet::attachments();
-        let mut sandbox = attacher.attach("guest").unwrap();
-        let mut attachment = attachments.next(&cx).await?;
-        for _ in 0..3 {
-            sandbox.send(ip());
-            attachment.recv(&cx).await?;
-        }
-        cx.yield_now().await?;
-        let link = handle
-            .0
-            .collector
-            .topology()
-            .links
-            .keys()
-            .next()
-            .unwrap()
-            .get();
-        let now = Instant::now();
-        let mut session = handle.session();
-        let start = call(&mut session, 1, &packets(link, 0), now);
-        assert!(text(&start).contains(r#""b":"s"#), "{}", text(&start));
-        let values = session.poll(now, None);
-        assert_eq!(names(&values), ["packet", "packet", "packet"]);
-        assert!(text(&values[0]).contains(r#""side":1,"#));
-        Ok(())
-    });
+    with_dashboard(
+        DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        },
+        |cx, handle| async move {
+            let (attacher, mut attachments) = fictionet::attachments();
+            let mut sandbox = attacher.attach("guest").unwrap();
+            let mut attachment = attachments.next(&cx).await?;
+            for _ in 0..3 {
+                sandbox.send(ip());
+                attachment.recv(&cx).await?;
+            }
+            cx.yield_now().await?;
+            let link = handle
+                .0
+                .collector
+                .topology()
+                .links
+                .keys()
+                .next()
+                .unwrap()
+                .get();
+            let now = Instant::now();
+            let mut session = handle.session();
+            let start = call(&mut session, 1, &packets(link, 0), now);
+            assert!(text(&start).contains(r#""b":"s"#), "{}", text(&start));
+            let values = session.poll(now, None);
+            assert_eq!(names(&values), ["packet", "packet", "packet"]);
+            assert!(text(&values[0]).contains(r#""side":1,"#));
+            Ok(())
+        },
+    );
 }
 
 #[test]
 fn a_capture_of_a_detached_sandbox_stays_readable() {
-    let dashboard = with_dashboard(DashboardOptions::demo(), |cx, _| async move {
-        let (attacher, mut attachments) = fictionet::attachments();
-        let mut sandbox = attacher.attach("guest").unwrap();
-        let mut attachment = attachments.next(&cx).await?;
-        for _ in 0..3 {
-            sandbox.send(ip());
-            attachment.recv(&cx).await?;
-        }
-        drop((sandbox, attachment));
-        cx.yield_now().await?;
-        Ok(())
-    });
+    let dashboard = with_dashboard(
+        DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        },
+        |cx, _| async move {
+            let (attacher, mut attachments) = fictionet::attachments();
+            let mut sandbox = attacher.attach("guest").unwrap();
+            let mut attachment = attachments.next(&cx).await?;
+            for _ in 0..3 {
+                sandbox.send(ip());
+                attachment.recv(&cx).await?;
+            }
+            drop((sandbox, attachment));
+            cx.yield_now().await?;
+            Ok(())
+        },
+    );
     let handle = dashboard.handle();
     assert!(handle.0.collector.topology().links.is_empty());
     let link = handle.0.collector.find_link(1).unwrap().get();

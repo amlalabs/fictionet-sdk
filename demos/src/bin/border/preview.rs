@@ -60,7 +60,10 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         )),
         scenario.clone(),
     );
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions {
+        collector: fictionet_observe::Options::default(),
+        ..Default::default()
+    });
     let screen = kit::preview::Console::new();
     let status = StateTopic::new(StateLimits::default());
     status.publish(

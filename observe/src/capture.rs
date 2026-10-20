@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fictionet::events::{LinkId, LinkType, LossReason, PacketRef, Side, Stamp};
-use fictionet::time::{Duration, Instant};
 
 use crate::ring::{Kept, Ring};
 use crate::{LossStatus, Options};
@@ -17,38 +16,15 @@ impl Kept for PacketCopy {
     }
 }
 
-/// When a link's packets are retained.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CapturePolicy {
-    /// Never capture this link.
-    Off,
-    /// Capture from registration onward.
-    Startup,
-    /// Capture while at least one demand handle exists.
-    #[default]
-    Demand,
-}
-
-pub(crate) struct CaptureFlag {
-    policy: CapturePolicy,
+#[derive(Default)]
+pub(crate) struct Demand {
     readers: AtomicUsize,
 }
-
-impl CaptureFlag {
-    pub(crate) fn new(policy: CapturePolicy) -> Self {
-        Self {
-            policy,
-            readers: AtomicUsize::new(0),
-        }
-    }
+impl Demand {
     pub(crate) fn enabled(&self) -> bool {
-        self.policy == CapturePolicy::Startup
-            || (self.policy == CapturePolicy::Demand && self.readers.load(Ordering::Relaxed) != 0)
+        self.readers.load(Ordering::Relaxed) != 0
     }
-    pub(crate) fn demand(self: &Arc<Self>) -> Option<CaptureDemand> {
-        if self.policy == CapturePolicy::Off {
-            return None;
-        }
+    pub(crate) fn take(self: &Arc<Self>) -> Option<CaptureDemand> {
         self.readers
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .ok()?;
@@ -56,9 +32,8 @@ impl CaptureFlag {
     }
 }
 
-/// A reader's capture demand. Dropping the last handle stops demand capture.
-/// It does not keep a world link alive.
-pub struct CaptureDemand(Arc<CaptureFlag>);
+/// A reader's demand on one link. Dropping the last handle stops watched classes.
+pub struct CaptureDemand(Arc<Demand>);
 impl Drop for CaptureDemand {
     fn drop(&mut self) {
         self.0.readers.fetch_sub(1, Ordering::Relaxed);
@@ -68,10 +43,12 @@ impl Drop for CaptureDemand {
 /// A bounded copy of a packet crossing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PacketCopy {
-    /// Cursor counting copies, independent of the stream sequence.
-    pub cursor: u64,
     /// Original stream sequence and run time.
     pub stamp: Stamp,
+    /// Policy class index.
+    pub class: usize,
+    /// Tap name at the crossing.
+    pub tap: Arc<str>,
     /// Sending end.
     pub side: Side,
     /// Original packet length before snap truncation.
@@ -80,66 +57,55 @@ pub struct PacketCopy {
     pub link_type: LinkType,
     /// Retained bytes.
     pub bytes: Arc<[u8]>,
-    /// Packets sampled out since the preceding copy.
+    /// Packets sampled out in this class since its preceding copy.
     pub skipped: u64,
-    pub(crate) order: u64,
 }
 
-/// Captures after a copy cursor. Sampling gaps remain in the packet stamps.
+/// Captures merged by the core's per-link sequence.
 #[derive(Clone, Debug, Default)]
 pub struct PacketBatch {
-    /// Copies evicted between the supplied cursor and the first retained copy.
-    pub missed: u64,
-    /// Cursor for the next read, including evictions when no copies remain.
+    /// Total evictions per class. Readers compare these with their previous totals.
+    pub evicted: Vec<(usize, u64)>,
+    /// Sequence for the next read, including gaps when no copies remain.
     pub cursor: u64,
-    /// Retained copies, bounded by the read limit and capture limits.
+    /// Retained copies, bounded by the read limit and class limits.
     pub packets: Vec<PacketCopy>,
 }
 
 #[derive(Default)]
 pub(crate) struct Capture {
     pub(crate) sandbox: Option<String>,
-    ring: Ring<PacketCopy>,
-    next: u64,
-    window: Option<Instant>,
-    in_window: u64,
-    skipped: u64,
+    pub(crate) rings: BTreeMap<usize, Ring<PacketCopy>>,
     removed: Option<u64>,
 }
 
 impl Capture {
     pub(crate) fn since(&self, after: u64, max: usize) -> PacketBatch {
-        let first = self
-            .ring
-            .events
-            .front()
-            .map_or(self.next.saturating_add(1), |p| p.cursor);
-        let packets: Vec<_> = self
-            .ring
-            .events
-            .iter()
-            .filter(|p| p.cursor > after)
+        let packets: Vec<_> = crate::ring::after(self.rings.values(), after)
             .take(max)
             .cloned()
             .collect();
+        let last = self.rings.values().map(|ring| ring.last).max().unwrap_or(0);
         PacketBatch {
-            missed: first.saturating_sub(after.saturating_add(1)),
+            evicted: self
+                .rings
+                .iter()
+                .map(|(class, ring)| (*class, ring.evicted))
+                .collect(),
             cursor: packets
                 .last()
-                .map_or(after.max(first.saturating_sub(1)), |p| p.cursor),
+                .map_or(if max == 0 { after } else { after.max(last) }, |p| {
+                    p.stamp.seq
+                }),
             packets,
         }
     }
 }
 
-fn keep(k: u64) -> bool {
-    k < 64 || k.is_multiple_of(1u64 << (k / 64).min(30))
-}
-
 #[derive(Default)]
 pub(crate) struct Captures {
     pub(crate) links: BTreeMap<LinkId, Capture>,
-    bytes: usize,
+    pub(crate) bytes: usize,
     order: u64,
 }
 
@@ -159,42 +125,50 @@ impl Captures {
             .map(|(id, _)| id)
     }
 
-    fn oldest(&self) -> Option<LinkId> {
+    pub(crate) fn largest(&self) -> Option<(LinkId, usize, usize, bool)> {
         self.links
             .iter()
-            .filter_map(|(id, c)| {
-                c.ring
-                    .events
-                    .front()
-                    .map(|p| (*id, (c.removed.is_none(), c.removed.unwrap_or(p.order))))
+            .flat_map(|(link, capture)| {
+                capture
+                    .rings
+                    .iter()
+                    .filter(|(_, ring)| !ring.events.is_empty())
+                    .map(move |(class, ring)| {
+                        (*link, *class, ring.bytes, capture.removed.is_some())
+                    })
             })
-            .min_by_key(|(_, order)| *order)
-            .map(|(id, _)| id)
+            .max_by_key(|(link, class, bytes, removed)| {
+                (*removed, *bytes, std::cmp::Reverse((*link, *class)))
+            })
     }
 
-    fn evict(&mut self, id: LinkId, losses: &mut LossStatus, loss_streams: usize) {
-        let capture = self.links.get_mut(&id).expect("capture link");
-        if let Some(old) = capture.ring.evict() {
+    pub(crate) fn evict(
+        &mut self,
+        id: LinkId,
+        class: usize,
+        losses: &mut LossStatus,
+        limit: usize,
+    ) {
+        let ring = self
+            .links
+            .get_mut(&id)
+            .expect("capture link")
+            .rings
+            .get_mut(&class)
+            .expect("capture class");
+        if let Some(old) = ring.evict() {
             self.bytes -= old.bytes.len();
-            losses.record(
-                loss_streams,
-                old.stamp,
-                LossReason::Eviction,
-                old.bytes.len(),
-            );
+            losses.record(limit, old.stamp, LossReason::Eviction, old.bytes.len());
         }
     }
 
-    pub(crate) fn remove(&mut self, id: LinkId, losses: &mut LossStatus, loss_streams: usize) {
+    fn remove(&mut self, id: LinkId, losses: &mut LossStatus, limit: usize) {
         if let Some(capture) = self.links.remove(&id) {
-            self.bytes -= capture.ring.bytes;
-            for old in capture.ring.events {
-                losses.record(
-                    loss_streams,
-                    old.stamp,
-                    LossReason::Eviction,
-                    old.bytes.len(),
-                );
+            for ring in capture.rings.into_values() {
+                self.bytes -= ring.bytes;
+                for old in ring.events {
+                    losses.record(limit, old.stamp, LossReason::Eviction, old.bytes.len());
+                }
             }
         }
     }
@@ -203,6 +177,7 @@ impl Captures {
         &mut self,
         stamp: Stamp,
         packet: PacketRef<'_>,
+        index: usize,
         options: &Options,
         losses: &mut LossStatus,
     ) {
@@ -221,17 +196,13 @@ impl Captures {
             );
             return;
         }
+        let class = &options.policy.classes()[index];
         let capture = self.links.entry(packet.link).or_default();
-        let start = capture.window.unwrap_or(Instant::ZERO);
-        if stamp.at.since_start().saturating_sub(start.since_start()) >= Duration::from_millis(100)
-        {
-            capture.window = Some(stamp.at);
-            capture.in_window = 0;
+        if capture.sandbox.is_none() {
+            capture.sandbox = packet.sandbox.map(str::to_owned);
         }
-        let index = capture.in_window;
-        capture.in_window = capture.in_window.saturating_add(1);
-        if !keep(index) {
-            capture.skipped = capture.skipped.saturating_add(1);
+        let ring = capture.rings.entry(index).or_default();
+        if !ring.admit(stamp, class.burst) {
             losses.record(
                 options.loss_streams,
                 stamp,
@@ -240,8 +211,7 @@ impl Captures {
             );
             return;
         }
-        let len = packet.bytes.len().min(options.snap_len);
-        capture.next = capture.next.saturating_add(1);
+        let len = packet.bytes.len().min(class.snap.unwrap_or(usize::MAX));
         if len < packet.len {
             losses.record(
                 options.loss_streams,
@@ -250,33 +220,9 @@ impl Captures {
                 packet.len - len,
             );
         }
-        if options.packets.count == 0 || len > options.packets.bytes || len > options.packet_bytes {
-            capture.skipped = 0;
-            while !self.links[&packet.link].ring.events.is_empty() {
-                self.evict(packet.link, losses, options.loss_streams);
-            }
-            if len > options.packet_bytes {
-                while let Some(id) = self.oldest() {
-                    self.evict(id, losses, options.loss_streams);
-                }
-            }
-            losses.record(options.loss_streams, stamp, LossReason::Eviction, len);
-            return;
-        }
-        self.order = self.order.saturating_add(1);
-        let copy = PacketCopy {
-            cursor: capture.next,
-            stamp,
-            side: packet.side,
-            original_len: packet.len,
-            link_type: packet.link_type,
-            bytes: packet.bytes[..len].into(),
-            skipped: std::mem::take(&mut capture.skipped),
-            order: self.order,
-        };
-        capture
-            .ring
-            .make_room(len, options.packets.count, options.packets.bytes, |old| {
+        if class.count == 0 || len > class.bytes || len > options.bytes {
+            ring.skipped = 0;
+            while let Some(old) = ring.evict() {
                 self.bytes -= old.bytes.len();
                 losses.record(
                     options.loss_streams,
@@ -284,13 +230,31 @@ impl Captures {
                     LossReason::Eviction,
                     old.bytes.len(),
                 );
-            });
-        while self.bytes > options.packet_bytes - len {
-            let oldest = self.oldest().expect("aggregate capture budget");
-            self.evict(oldest, losses, options.loss_streams);
+            }
+            ring.evicted = ring.evicted.saturating_add(1);
+            losses.record(options.loss_streams, stamp, LossReason::Eviction, len);
+            return;
         }
-        let capture = self.links.get_mut(&packet.link).expect("capture link");
+        ring.make_room(len, class.count, class.bytes, |old| {
+            self.bytes -= old.bytes.len();
+            losses.record(
+                options.loss_streams,
+                old.stamp,
+                LossReason::Eviction,
+                old.bytes.len(),
+            );
+        });
+        let copy = PacketCopy {
+            stamp,
+            class: index,
+            tap: packet.tap.into(),
+            side: packet.side,
+            original_len: packet.len,
+            link_type: packet.link_type,
+            bytes: packet.bytes[..len].into(),
+            skipped: std::mem::take(&mut ring.skipped),
+        };
+        ring.push(copy);
         self.bytes += len;
-        capture.ring.push(copy);
     }
 }
