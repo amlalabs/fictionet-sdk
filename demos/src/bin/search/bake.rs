@@ -14,6 +14,7 @@ use std::sync::Arc;
 use adaptive_web_world::pages::{
     Maker, Meta, Pages, Seed,
     model::{Model, Provider},
+    render,
     store::{self, Store},
     text::target_of,
 };
@@ -142,12 +143,42 @@ pub async fn run() -> Result {
     .await;
     result?;
     let root = store::canned_root(super::SEED);
-    let dropped = keep_made(&root, &Seed::builtin(super::SEED)?)?;
+    let seed = Seed::builtin(super::SEED)?;
+    let dropped = keep_made(&root, &seed)?;
     println!("{dropped} results without a page dropped from their lists");
+    let laid_out = lay_out_again(&root, &seed)?;
+    println!("{laid_out} pages on captured layouts laid out again");
     // The lock files only coordinate worlds writing one store.
     let _ = std::fs::remove_file(root.join("store.lock"));
     let _ = std::fs::remove_dir_all(root.join("locks"));
     Ok(())
+}
+
+/// Records each page on a host with a captured layout again in the layout as
+/// it is now; its text stays as the model wrote it. Returns how many changed.
+fn lay_out_again(root: &Path, seed: &Seed) -> Result<usize> {
+    let (mut store, _) = Store::open(root, seed, None)?;
+    let pages: Vec<_> = store.pages().cloned().collect();
+    let mut changed = 0;
+    for mut page in pages {
+        let html = String::from_utf8_lossy(&page.body).into_owned();
+        if !page.content_type.starts_with("text/html") {
+            continue;
+        }
+        if let Some(again) = render::again(
+            &page.host,
+            &page.target,
+            &page.title,
+            &html,
+            &page.date,
+            &seed.date,
+        ) {
+            page.body = again.into_bytes();
+            store.insert_page(page)?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
 }
 
 /// Records each list again without the results whose page the model could

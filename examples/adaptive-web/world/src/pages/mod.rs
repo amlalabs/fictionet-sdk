@@ -1132,8 +1132,9 @@ impl Pages {
             let about = self.seed.about(&host);
             if host.is_empty()
                 || results.iter().any(|x| x.url == r.url)
-                || known_match
-                    .is_some_and(|k| !make::shares_words(&format!("{} {}", k.title, k.url), query))
+                || known_match.is_some_and(|k| {
+                    !make::shares_words(&format!("{} {} {}", k.title, k.url, k.snippet), query)
+                })
                 || about.is_some_and(|about| !make::shares_words(&format!("{host} {about}"), query))
             {
                 continue;

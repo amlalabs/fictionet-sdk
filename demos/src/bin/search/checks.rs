@@ -523,11 +523,32 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     for (outcome, count) in counts {
         println!("Left the box: {outcome}: {count} destinations");
     }
+    // A mirrored name either left the box or was answered from the host's
+    // package cache, as a file fetched by an earlier run is.
+    let mirrored = |host: &str| {
+        observed(host, "forwarded")
+            || destinations.iter().any(|row| {
+                row["sandbox"] == HOST
+                    && row["name"] == host
+                    && row["outcome"] == "served"
+                    && row["by"] == "host package cache"
+            })
+    };
+    for (host, _) in super::page::FORWARDED {
+        if !mirrored(host) {
+            println!("Left the box: {host} was neither forwarded nor answered from the cache");
+        }
+    }
+    for host in visited.iter() {
+        if !observed(host, "served") {
+            println!("Left the box: {host} was not served by the world");
+        }
+    }
     check(
         "Left the box names all forwarded mirrors and visited sites",
         super::page::FORWARDED
             .iter()
-            .all(|(host, _)| observed(host, "forwarded"))
+            .all(|(host, _)| mirrored(host))
             && visited.iter().all(|host| observed(host, "served"))
             && destinations
                 .iter()

@@ -193,6 +193,12 @@ impl Guest {
         self.steps.push(command.into());
         self
     }
+    /// Puts a shell command before every other step, still after package
+    /// installation: before the desktop starts, for one.
+    pub fn run_first(mut self, command: impl Into<String>) -> Self {
+        self.steps.insert(0, command.into());
+        self
+    }
     /// Declares a loopback VNC port and a command that exits zero when the desktop is ready.
     pub fn desktop(mut self, port: u16, ready: impl Into<String>) -> Self {
         self.desktop = Some((port, ready.into()));

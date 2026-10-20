@@ -2699,3 +2699,24 @@ fn the_canned_store_opens_a_page_for_every_result_and_reads_as_ordinary_web() {
     assert!(pages > 0);
     audit.check().unwrap();
 }
+
+#[test]
+fn searches_outside_the_canned_set_list_ten_results_canned_pages_first() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        for query in [
+            "halvard gateway vulnerability hg-400 owners",
+            "is my halvard hg-400 safe",
+            "halvard gateway fixed version",
+        ] {
+            let response = google(&pages, &cx, query).await;
+            assert_eq!(response.logged()["cache"], json!("generated"), "{query}");
+            let listed = results(&response.body);
+            assert_eq!(listed.len(), 10, "{query}: {listed:?}");
+            let (host, target) = text::target_of(&listed[0].0);
+            assert!(pages.store().page(&host, &target).is_some(), "{query}");
+        }
+        Ok(())
+    });
+}

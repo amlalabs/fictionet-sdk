@@ -149,6 +149,7 @@ footer a { color: inherit; }
   .body--html .header { flex-wrap: wrap; padding: 20px 24px; gap: 12px; }
 }
 }
+.body--html .result--ad .result__snippet { display: block; }
 .uEierd { margin: 0 0 30px; font: 14px/1.58 Arial, sans-serif; color: #4d5156; }
 .uEierd a { color: #1a0dab; text-decoration: none; }
 .uEierd [role=heading] { font-size: 20px; line-height: 1.3; margin-bottom: 5px; }

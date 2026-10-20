@@ -77,13 +77,9 @@ pub fn guest(date: &str) -> Guest {
         .then_some(date)
         .expect("a YYYY-MM-DD date");
     kit::desktop::claude_code(guest)
-        // Claude Code keeps its state in the user's own ~/.claude.
-        .run(format!(
-            "install -d -o {USER} -g {USER} /home/{USER}/.claude && chown -R {USER}:{USER} /home/{USER}/.claude"
-        ))
-        // After the packages are in, the clock moves to the web's day, at
-        // the same time of day.
-        .run(format!("date -u -s {date}T$(date -u +%T)"))
+        // Once the packages are in, and before the desktop starts, the clock
+        // moves to the web's day, at the same time of day.
+        .run_first(format!("date -u -s {date}T$(date -u +%T)"))
 }
 
 #[cfg(test)]
@@ -128,7 +124,7 @@ mod tests {
         assert!(data.contains("then systemctl stop apt-daily.timer; fi"));
         assert!(files.contains_key("/etc/claude-code/managed-settings.json"));
         assert!(
-            data.find("bash /opt/install-claude.sh").unwrap() < data.find("date -u -s").unwrap()
+            data.find("date -u -s").unwrap() < data.find("bash /opt/setup-desktop.sh").unwrap()
         );
         assert!(data.contains("date -u -s 2026-10-07T$(date -u +%T)"));
     }

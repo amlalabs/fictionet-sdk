@@ -70,6 +70,18 @@ fn container(host: &str, target: &str) -> Option<&'static str> {
     })
 }
 
+/// A page's heading: its title without the site name the title ends with,
+/// as "Iterator - Wikipedia" heads its page "Iterator".
+fn heading(title: &str) -> &str {
+    [" - ", " — ", " | ", " • "]
+        .iter()
+        .filter_map(|separator| title.rsplit_once(separator))
+        .filter(|(page, site)| !page.trim().is_empty() && site.chars().count() <= 40)
+        .map(|(page, _)| page.trim())
+        .max_by_key(|page| page.len())
+        .unwrap_or(title)
+}
+
 /// A bundled stylesheet, assets, and page skeleton. Obtain one with [`lookup`].
 #[derive(Clone, Copy, Debug)]
 pub struct Skin {
@@ -113,6 +125,13 @@ impl Skin {
         )
     }
 
+    /// The body a page rendered with this skin wraps, for rendering it again.
+    pub fn content(&self, page: &str) -> Option<String> {
+        let dom = document(page);
+        let main = one(&dom, self.container).ok()?;
+        Some(main.children().map(|node| node.to_string()).collect())
+    }
+
     /// Wraps a title and trusted HTML body in the skin. The publication date is
     /// capped at `today`; navigation and contents come from this body's headings.
     /// A mismatched skeleton returns `None` so the caller can use its own layout.
@@ -147,13 +166,14 @@ impl Skin {
             heading.attributes.borrow_mut().insert("id", id.clone());
             contents.push_str(&format!("<li class=\"vector-toc-list-item\"><a class=\"vector-toc-link\" href=\"#{id}\">{}</a></li>", escape(&heading.text_contents())));
         }
+        let heading = heading(title);
         for node in dom.select(".page-title").ok()? {
-            replace(node.as_node(), &escape(title));
+            replace(node.as_node(), &escape(heading));
         }
         for node in dom.select(".page-contents").ok()? {
             replace(node.as_node(), &contents);
         }
-        let breadcrumb = format!("<a href=\"/\">Home</a> › {}", escape(title));
+        let breadcrumb = format!("<a href=\"/\">Home</a> › {}", escape(heading));
         for node in dom.select(".page-breadcrumb").ok()? {
             replace(node.as_node(), &breadcrumb);
         }
@@ -342,6 +362,36 @@ mod tests {
         let html = skin.render("Paths", "Text", today(), earlier).unwrap();
         assert!(html.contains("2024-02-29"));
         assert!(!html.contains("2026"));
+    }
+
+    #[test]
+    fn a_rendered_page_gives_back_its_body() {
+        let skin = lookup("www.theregister.com", "/2026/10/01/a/").unwrap();
+        let page = skin
+            .render(
+                "A - The Register",
+                "<p>Text one.</p><h2>Two</h2>",
+                today(),
+                today(),
+            )
+            .unwrap();
+        let body = skin.content(&page).unwrap();
+        assert!(body.contains("<p>Text one.</p>") && body.contains("Two</h2>"));
+        let again = skin
+            .render("A - The Register", &body, today(), today())
+            .unwrap();
+        assert_eq!(again, page);
+    }
+
+    #[test]
+    fn headings_leave_out_the_site_name() {
+        assert_eq!(heading("Iterator - Wikipedia"), "Iterator");
+        assert_eq!(
+            heading("itertools — Functions creating iterators — Python 3.12.1 documentation"),
+            "itertools — Functions creating iterators"
+        );
+        assert_eq!(heading("Patch now • The Register"), "Patch now");
+        assert_eq!(heading("A plain title"), "A plain title");
     }
 
     #[test]

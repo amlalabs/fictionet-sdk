@@ -352,11 +352,14 @@ impl Store {
         match entry {
             Entry::Page(page) => {
                 let at = key(&page.host, &page.target);
-                self.claims.extend(page.claims.iter().map(|claim| Claim {
-                    url: page.url.clone(),
-                    claim: claim.clone(),
-                }));
-                self.order.push(at.clone());
+                // A page recorded again, laid out anew, keeps its place.
+                if !self.pages.contains_key(&at) {
+                    self.claims.extend(page.claims.iter().map(|claim| Claim {
+                        url: page.url.clone(),
+                        claim: claim.clone(),
+                    }));
+                    self.order.push(at.clone());
+                }
                 self.pages.insert(at, page);
             }
             Entry::Search(search) => {
@@ -549,6 +552,11 @@ impl Store {
 
     pub fn search(&self, key: &str) -> Option<&SearchRecord> {
         self.searches.get(key)
+    }
+
+    /// Every page, in the order they were made.
+    pub fn pages(&self) -> impl Iterator<Item = &PageRecord> {
+        self.order.iter().map(|at| &self.pages[at])
     }
 
     /// Every result list, in no particular order.
