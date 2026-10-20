@@ -119,12 +119,12 @@ impl GuestHandle {
             },
         };
         let read = format!("tail -c {OUTPUT_LIMIT} ~/{WORK}/output");
-        let output =
-            match tokio::time::timeout(TYPING, self.ssh().run_bounded(&read, OUTPUT_LIMIT)).await {
-                Ok(Ok(out)) => out.stdout,
-                Ok(Err(error)) => format!("(unreadable: {error})"),
-                Err(_) => "(reading it timed out)".into(),
-            };
+        let reading = self.ssh().run_bounded(&read, OUTPUT_LIMIT);
+        let output = match tokio::time::timeout(Duration::from_secs(10), reading).await {
+            Ok(Ok(out)) => out.stdout,
+            Ok(Err(error)) => format!("(unreadable: {error})"),
+            Err(_) => "(reading it timed out)".into(),
+        };
         Err(io::Error::other(format!(
             "{}: the terminal did not run {command:?}: {error}\nits output so far:\n{output}",
             self.name()

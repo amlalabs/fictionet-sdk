@@ -3,7 +3,7 @@
 //! and the discovery moment.
 use crate::Error;
 use crate::page::{self, Reports, StepState, Story};
-use crate::story::{SERVER_PORTS, addr, hosts};
+use crate::story::{SERVER_PORTS, hosts};
 use fictionet_demo::kit::client::PageClient;
 use scan_world::{PortMap, PortState, Protocol, SERVER_ADDR};
 use std::collections::BTreeSet;
@@ -150,6 +150,7 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
 mod tests {
     use super::*;
     use crate::page::tests::{recorded_discovery, recorded_reports};
+    use crate::story::addr;
     use scan_world::{Banner, PortRow};
 
     fn topics() -> (Topics, serde_json::Value) {
