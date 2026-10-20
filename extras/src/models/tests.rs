@@ -89,7 +89,7 @@ fn swap_stream_and_budget_against_upstream() {
             let placeholder = credential.placeholder().to_owned();
             assert_eq!(placeholder.len(), "sk-ant-api03-private".len());
             assert_ne!(placeholder, "sk-ant-api03-private");
-            let mut site = Model::at(
+            let site = Model::at(
                 &cx,
                 Provider::Anthropic,
                 credential,
@@ -105,24 +105,32 @@ fn swap_stream_and_budget_against_upstream() {
                     .unwrap()
             };
             assert_eq!(
-                site.call(request("/v1/messages", "wrong")).await?.status(),
+                site.clone()
+                    .send(request("/v1/messages", "wrong"))
+                    .await?
+                    .status(),
                 401
             );
             assert_eq!(
-                site.call(request("/v1/messages/batches", &placeholder))
+                site.clone()
+                    .send(request("/v1/messages/batches", &placeholder))
                     .await?
                     .status(),
                 404
             );
             let response = site
-                .call(request("/v1/messages?beta=true", &placeholder))
+                .clone()
+                .send(request("/v1/messages?beta=true", &placeholder))
                 .await?;
             assert_eq!(response.status(), 200);
             let body = response.into_body().collect().await?.to_bytes();
             let text = std::str::from_utf8(&body).unwrap();
             assert!(!text.contains("sk-ant-api03-private"));
             assert!(text.contains("<ANTHROPIC_API_KEY>"));
-            let response = site.call(request("/v1/messages", &placeholder)).await?;
+            let response = site
+                .clone()
+                .send(request("/v1/messages", &placeholder))
+                .await?;
             assert_eq!(response.status(), 400);
             assert_eq!(site.ledger.lock().unwrap().input, 7);
             assert_eq!(site.ledger.lock().unwrap().output, 3);
@@ -217,7 +225,7 @@ fn bearer_and_google_keys_and_usage() {
                     Secret::new(provider.key_variable(), "private-key".into())?,
                 );
                 let key = credential.wire(provider, false);
-                let mut site = Model::at(
+                let site = Model::at(
                     &cx,
                     provider,
                     credential,
@@ -231,14 +239,15 @@ fn bearer_and_google_keys_and_usage() {
                         .unwrap()
                 };
                 let body = site
-                    .call(request())
+                    .clone()
+                    .send(request())
                     .await?
                     .into_body()
                     .collect()
                     .await?
                     .to_bytes();
                 assert_eq!(body, response);
-                let stopped = site.call(request()).await?;
+                let stopped = site.clone().send(request()).await?;
                 assert_eq!(
                     stopped.status().as_u16(),
                     if provider == Provider::OpenRouter {

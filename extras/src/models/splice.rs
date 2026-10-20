@@ -309,7 +309,7 @@ pub(super) async fn upstream(
     *request.extensions_mut() = parts.extensions.clone();
     *request.version_mut() = parts.version;
     request.headers_mut().remove("content-length");
-    Service::call(&mut model.clone(), request).await
+    model.clone().boxed(request).await
 }
 
 struct Turn {

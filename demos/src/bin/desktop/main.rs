@@ -623,8 +623,8 @@ async fn agent_tls_checks(
     Ok(agents_install)
 }
 
-/// Codex reaches the model through the world as well: the world refuses its
-/// WebSocket, Codex falls back to HTTP, and the world answers its search.
+/// Codex reaches the model through the world as well: it keeps the
+/// Responses WebSocket it opens, and the world answers its search.
 async fn codex_checks(
     session: &ssh::Session,
     page: &PageClient,
@@ -656,14 +656,33 @@ async fn codex_checks(
         .find_event(&mut start.clone(), |event| {
             Ok(openai(event)
                 && event["kind"] == "transport"
-                && event["fields"]["status"] == 426
-                && event["fields"]["fallback"] == "sse")
+                && event["fields"]["transport"] == "websocket"
+                && event["fields"]["status"] == 101)
         })
         .await?;
+    let refused = page
+        .find_event(&mut start.clone(), |event| {
+            Ok(openai(event)
+                && ((event["kind"] == "transport"
+                    && event["fields"]["status"]
+                        .as_u64()
+                        .is_some_and(|status| status != 101))
+                    || (event["kind"] == "refused"
+                        && matches!(
+                            event["fields"]["reason"].as_str(),
+                            Some("credential" | "handshake")
+                        ))))
+        })
+        .await?;
+    let output = codex.stdout.to_lowercase();
     failures.extend(
         check(
-            "Codex tries a WebSocket, is refused with 426, and falls back",
-            websocket.is_some(),
+            "Codex keeps its WebSocket, with no refusal or fallback",
+            websocket.is_some()
+                && refused.is_none()
+                && !output.contains("websocket")
+                && !output.contains("426")
+                && !output.contains("falling back to http"),
         )
         .err(),
     );
@@ -674,7 +693,7 @@ async fn codex_checks(
                 && event["fields"]["path"]
                     .as_str()
                     .is_some_and(|p| p.ends_with("/responses"))
-                && event["fields"]["stream"] == true
+                && event["fields"]["transport"] == "websocket"
                 && event["fields"]["status"] == 200
                 && event["fields"]["output_tokens"]
                     .as_u64()
@@ -683,7 +702,7 @@ async fn codex_checks(
         .await?;
     failures.extend(
         check(
-            "Codex completes a streamed Responses call over HTTP",
+            "Codex completes a Responses call over its WebSocket",
             response.is_some(),
         )
         .err(),

@@ -386,7 +386,7 @@ fn chatgpt_login_swaps_the_bearer_adds_the_account_and_stops_like_codex_limits()
                 oauth: Some(authority.clone()),
             };
             let guest = format!("Bearer {}", authority.placeholder());
-            let mut model = Model::at(&cx, Provider::ChatGpt, credential, origin)?
+            let model = Model::at(&cx, Provider::ChatGpt, credential, origin)?
                 .budget(Budget::new().calls(1));
             let get = |path: &str, bearer: &str| {
                 Request::get(path)
@@ -404,28 +404,31 @@ fn chatgpt_login_swaps_the_bearer_adds_the_account_and_stops_like_codex_limits()
             };
             assert_eq!(
                 model
-                    .call(get("/backend-api/wham/accounts/check", "Bearer wrong"))
+                    .clone()
+                    .send(get("/backend-api/wham/accounts/check", "Bearer wrong"))
                     .await?
                     .status(),
                 401
             );
             assert_eq!(
                 model
-                    .call(get("/backend-api/ps/plugins/installed", &guest))
+                    .clone()
+                    .send(get("/backend-api/ps/plugins/installed", &guest))
                     .await?
                     .status(),
                 404
             );
             let account = model
-                .call(get("/backend-api/wham/accounts/check", &guest))
+                .clone()
+                .send(get("/backend-api/wham/accounts/check", &guest))
                 .await?;
             assert_eq!(account.status(), 200);
             account.into_body().collect().await?;
-            let call = model.call(post()).await?;
+            let call = model.clone().send(post()).await?;
             assert_eq!(call.status(), 200);
             call.into_body().collect().await?;
             // The listing was free; the one model call used the budget.
-            let stop = model.call(post()).await?;
+            let stop = model.clone().send(post()).await?;
             assert_eq!(stop.status(), 429);
             assert_eq!(stop.headers()["x-codex-primary-used-percent"], "100.0");
             let reset: u64 = stop.headers()["x-codex-primary-reset-at"]

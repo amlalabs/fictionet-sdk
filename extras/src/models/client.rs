@@ -154,16 +154,14 @@ impl Transport for Https {
                     .parse()
                     .map_err(|_| "Invalid placeholder".to_owned())?,
             );
-            let mut site = Model::with_forward(
+            let site = Model::with_forward(
                 cx,
                 self.provider,
                 credential,
                 self.forward.clone(),
                 self.authority.clone(),
             );
-            let response = tower_service::Service::call(&mut site, request)
-                .await
-                .map_err(|e| e.to_string())?;
+            let response = site.send(request).await.map_err(|e| e.to_string())?;
             let status = response.status().as_u16();
             let body = response
                 .into_body()
