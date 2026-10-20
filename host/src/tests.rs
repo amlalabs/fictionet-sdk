@@ -281,6 +281,78 @@ fn close_delimited_responses_and_redirects_are_passed_through() {
 }
 
 #[test]
+fn close_delimited_events_arrive_before_the_server_closes() {
+    for tls in [false, true] {
+        run(async move |fcx, _log| {
+            let (received, receipt) = mpsc::channel();
+            let (mut forward, server, _origin) = upstream(&fcx, tls, move |socket| {
+                read_head(socket);
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: first\n\n").unwrap();
+                socket.flush().unwrap();
+                receipt
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the client buffered the first event until the server closed");
+                socket.write_all(b"data: second\n\n").unwrap();
+                socket.flush().unwrap();
+            });
+            let response = forward.call(request()).await?;
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let mut body = response.into_body();
+            let mut first = Vec::new();
+            while first.len() < b"data: first\n\n".len() {
+                let frame = body.frame().await.expect("the first event is missing")?;
+                first.extend_from_slice(&frame.into_data().unwrap());
+            }
+            assert_eq!(first, b"data: first\n\n");
+            received.send(()).unwrap();
+            let mut second = Vec::new();
+            while let Some(frame) = body.frame().await {
+                second.extend_from_slice(&frame?.into_data().unwrap());
+            }
+            assert_eq!(second, b"data: second\n\n");
+            assert!(body.is_end_stream());
+            server.join().unwrap();
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn tls_without_close_notify_uses_the_response_framing() {
+    run(async move |fcx, _log| {
+        for (response, complete) in [
+            (b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello".as_slice(), true),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", true),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello", false),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", true),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let (trust, config) = certificates(&fcx, "127.0.0.1");
+            let server = thread::spawn(move || {
+                let mut socket = serve_tls(config, accept(&listener));
+                read_head(&mut socket);
+                socket.write_all(response).unwrap();
+                socket.flush().unwrap();
+            });
+            let mut client = Client::new();
+            client.tls = trust;
+            let mut forward = forward(&fcx, Arc::new(client), true, address);
+            let body = forward.call(request()).await?.into_body().collect().await;
+            if complete {
+                assert_eq!(body?.to_bytes(), "hello");
+            } else {
+                assert!(body.is_err(), "a truncated body was accepted");
+            }
+            server.join().unwrap();
+        }
+        Ok(())
+    });
+}
+
+#[test]
 fn head_204_304_and_interim_responses_have_no_body() {
     for tls in [false, true] {
         run(async move |fcx, _log| {
