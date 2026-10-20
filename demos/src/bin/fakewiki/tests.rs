@@ -101,8 +101,8 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
             let answer = machine.lookup(&cx, fakewiki_world::GATEWAY.into(), name, RecordType::A).await?;
             assert_eq!(answer.metadata.response_code, ResponseCode::NXDomain, "{name}");
         }
-        let mut stream = gate::StateStream::open(&url).await?;
-        let initial = stream.state("tamper", 0).await?;
+        let mut stream = client.state_stream(&["tamper", "diff"]).await?;
+        let initial = stream.next("tamper", |s| s["value"]["revision"] == 0).await?;
         assert_eq!(initial["value"]["on"], false);
         for revision in 0..=2 {
             let mut tls = machine.tls(&cx, (pages::host_ips()[WIKI], 443).into(), WIKI, None, SystemTime::now()).await?;
@@ -134,7 +134,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
             if revision < 2 {
                 assert!(matches!(gate::command(&client, &format!("change-{revision}"), revision == 0, revision).await?,
                     Reply::Applied { revision: next, changed: true, .. } if next == revision + 1));
-                let changed = stream.state("tamper", revision + 1).await?;
+                let changed = stream.next("tamper", |s| s["value"]["revision"] == revision + 1).await?;
                 assert_eq!(changed["value"]["on"], revision == 0);
             }
         }

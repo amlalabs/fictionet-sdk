@@ -217,6 +217,10 @@ impl server::Handler for Server {
             if data == b"large-output\r" {
                 let output: Vec<u8> = (0..512 * 1024).map(|n| (n % 251) as u8).collect();
                 session.data(id, CryptoVec::from_slice(&output))?;
+            } else if data == crate::kit::gate::HOSTNAME_LINE {
+                // The shell runs the gate's hostname line on the workstation.
+                session.data(id, CryptoVec::from_slice(data))?;
+                session.data(id, CryptoVec::from_slice(b"name:workstation:end\r\n"))?;
             } else {
                 session.data(id, CryptoVec::from_slice(data))?;
             }

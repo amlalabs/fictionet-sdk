@@ -643,7 +643,7 @@ pub async fn run(
             })??;
             facts.finish(Some(code), true);
             publisher.flush().await?;
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tokio::time::sleep(fictionet_demo::kit::gate::STEP_PAUSE).await;
             let state = facts.state.lock().unwrap();
             state.check_complete()?;
             let requests = state

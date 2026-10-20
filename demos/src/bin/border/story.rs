@@ -145,7 +145,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
         let before = border_state(&client).await?;
         let after = before["tls"]["rows"].as_array().into_iter().flatten()
             .filter_map(|row| row["event"].as_u64()).max().unwrap_or(0);
-        let mut cursor = last_event(&client).await?;
+        let mut cursor = client.last_event().await?;
         command(ssh, "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r -I{} xdotool key --window {} ctrl+r'").await?;
         let mut served = false;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
@@ -156,7 +156,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
                 println!("Firefox title: {current:?}");
                 titles.push(current.clone());
             }
-            if !hijacked && !served && find_event(&client, &mut cursor, firefox_home_served).await? {
+            if !hijacked && !served && client.find_event(&mut cursor, |e| Ok(password_hidden(e)? && firefox_home_served(e))).await?.is_some() {
                 served = true;
                 println!("Firefox: the bank served the reloaded page.");
             }
@@ -226,49 +226,17 @@ pub const HIJACKED_PAGE: &str = r#"(() => {
         && panel.getAnimations({ subtree: true }).every(a => a.playState !== 'running');
 })()"#;
 
-/// Chromium renders the page with its token at the hijack moment.
-async fn page_shot(run: &Run, out: &Path) -> io::Result<()> {
-    let url = run.page_url().to_owned();
-    let path = out.join("page-hijacked.png");
-    let saved = tokio::task::spawn_blocking(move || {
-        kit::shot::capture(&url, &path, HIJACKED_PAGE, Duration::from_secs(60))
-    })
-    .await
-    .map_err(io::Error::other)??;
-    println!("Page in Chromium at the hijack: {saved}");
-    Ok(())
-}
-
-/// Captures the guest's screen through the page until two captures in a row
-/// are the same. While a page loads, Firefox animates its tab and shows a
-/// status panel, so a settled screen shows the finished page.
-async fn settled_screen(run: &Run, name: &str) -> io::Result<kit::rfb::Capture> {
-    let path = run.path().join(format!("{name}.png"));
-    let mut previous = None;
-    loop {
-        let capture = kit::rfb::capture_page(run.page_url(), HOSTNAME, &path).await?;
-        let png = std::fs::read(&capture.png)?;
-        if previous.as_ref() == Some(&png) {
-            return Ok(capture);
-        }
-        previous = Some(png);
-    }
-}
-
 async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
     reload(run, hijacked).await?;
     let name = if hijacked { "hijacked" } else { "normal" };
-    let capture = tokio::time::timeout(Duration::from_secs(30), settled_screen(run, name))
-        .await
-        .map_err(|_| io::Error::other(format!("the {name} screen did not settle in 30 s")))??;
-    if capture.colors < 16 {
-        return Err(io::Error::other(
-            "the captured desktop has fewer than 16 colors",
-        ));
+    let (_, settled) = run
+        .settled_screen(HOSTNAME, &out.join(format!("{name}.png")))
+        .await?;
+    if settled.is_none() {
+        return Err(io::Error::other(format!(
+            "the {name} screen was still changing"
+        )));
     }
-    let file = out.join(format!("{name}.png"));
-    std::fs::copy(&capture.png, &file)?;
-    println!("Screen: {} (two captures in a row matched)", file.display());
     println!(
         "Captured Firefox title: {:?}",
         title(run.guest(HOSTNAME).ssh()).await?
@@ -322,7 +290,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     for name in ["route", "bgp 3", "balance", "cert -k"] {
         step(ssh, name, true).await?;
     }
-    let cursor = last_event(&client).await?;
+    let cursor = client.last_event().await?;
     step(ssh, "signin-insecure", true).await?;
     password_received(&client, cursor).await?;
     println!("Page events: impostor received credentials; the event contains no password.");
@@ -330,7 +298,12 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     println!(
         "Border observations: four hops, the more specific announcement, an impostor TLS session, and credentials without the password."
     );
-    page_shot(run, out).await?;
+    run.page_shot(
+        &out.join("page-hijacked.png"),
+        HIJACKED_PAGE,
+        Duration::from_secs(60),
+    )
+    .await?;
     screen(run, out, true).await?;
     flip(&client, "legitimate", 1).await?;
     for name in ["route", "balance", "bgp 2"] {
@@ -440,44 +413,13 @@ fn observed_complete(view: &Value, hijacked: bool) -> bool {
     trace && bgp && tls && moments.len() == 1 && view["lost"] == 0 && view["truncated"] == 0
 }
 
-/// At most 1000 events after `after`. Any trace of the password is an error.
-async fn events(client: &PageClient, after: u64) -> io::Result<Value> {
-    let batch = client.events(after).await?;
-    if exposes_password(&batch) {
+/// Whether a page event leaves the password out. An event that carries it
+/// is an error.
+fn password_hidden(event: &Value) -> io::Result<bool> {
+    if exposes_password(event) {
         return Err(io::Error::other("page events exposed the password"));
     }
-    Ok(batch)
-}
-
-/// The newest event's sequence number.
-async fn last_event(client: &PageClient) -> io::Result<u64> {
-    events(client, 0).await?["last"]
-        .as_u64()
-        .ok_or_else(|| io::Error::other("events reply has no last sequence"))
-}
-
-/// Pages through the events after `cursor`, moving it past each event read,
-/// until one matches or none are left.
-async fn find_event(
-    client: &PageClient,
-    cursor: &mut u64,
-    matches: impl Fn(&Value) -> bool,
-) -> io::Result<bool> {
-    loop {
-        let batch = events(client, *cursor).await?;
-        let rows = batch["events"]
-            .as_array()
-            .ok_or_else(|| io::Error::other("events reply has no rows"))?;
-        if rows.iter().any(&matches) {
-            return Ok(true);
-        }
-        let Some(last) = rows.last() else {
-            return Ok(false);
-        };
-        *cursor = last["seq"]
-            .as_u64()
-            .ok_or_else(|| io::Error::other("event has no sequence"))?;
-    }
+    Ok(true)
 }
 
 async fn password_received(client: &PageClient, cursor: u64) -> io::Result<()> {
@@ -486,12 +428,7 @@ async fn password_received(client: &PageClient, cursor: u64) -> io::Result<()> {
             cursor,
             Duration::from_secs(10),
             Duration::from_millis(100),
-            |event| {
-                if exposes_password(event) {
-                    return Err(io::Error::other("page events exposed the password"));
-                }
-                Ok(has_password_event(event))
-            },
+            |event| Ok(password_hidden(event)? && has_password_event(event)),
         )
         .await
         .map_err(|error| match error.kind() {
@@ -500,11 +437,11 @@ async fn password_received(client: &PageClient, cursor: u64) -> io::Result<()> {
             }
             _ => error,
         })?;
-    // Every event the page now shows after the cursor, not only those read
-    // up to the match, must still leave the password out.
-    if exposes_password(&client.events(cursor).await?) {
-        return Err(io::Error::other("page events exposed the password"));
-    }
+    // Every event the page now holds, not only those read up to the match,
+    // must still leave the password out.
+    client
+        .find_event(&mut 0, |event| Ok(!password_hidden(event)?))
+        .await?;
     Ok(())
 }
 

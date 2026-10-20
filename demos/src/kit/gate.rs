@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::client::{Capability, PageClient};
 use super::{GuestHandle, Run, rfb, shot};
 
 /// How long the screen capture through the page may take.
@@ -13,6 +14,14 @@ const SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
 const PAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A captured screen with fewer colors than this is blank.
 const MIN_COLORS: usize = 16;
+/// How often [`Run::settled_screen`] captures, and for how long at most.
+const SETTLE_INTERVAL: Duration = Duration::from_millis(500);
+const SETTLE_LIMIT: Duration = Duration::from_secs(20);
+
+/// How long a scripted story holds each step before the next one, so a
+/// person watching the page and the screen can follow it. No check may
+/// depend on it: every check waits for the world's state.
+pub const STEP_PAUSE: Duration = Duration::from_millis(1500);
 
 /// Prints a required check as `[pass] name` or `[FAIL] name`. A failed check
 /// is an error that names it.
@@ -23,6 +32,77 @@ pub fn check(name: &str, ok: bool) -> io::Result<()> {
     } else {
         Err(io::Error::other(format!("required check failed: {name}")))
     }
+}
+
+/// Checks that the page API refuses a request without the run's bearer and
+/// answers one with it, after signing in as a browser tab does.
+pub async fn bearer_required(client: &PageClient) -> io::Result<()> {
+    let refused = client.request("GET", "/api/page", None, false).await?;
+    check(
+        "the page API refuses a request without the bearer",
+        refused.status == 401,
+    )?;
+    client.bootstrap().await?;
+    let allowed = client.request("GET", "/api/page", None, true).await?;
+    check(
+        "the page API answers a request with the bearer",
+        allowed.status == 200,
+    )
+}
+
+/// Checks that `host`'s console refuses an upgrade without a ticket, opens
+/// with one, and refuses that ticket a second time.
+pub async fn single_use_ticket(
+    client: &PageClient,
+    host: &str,
+    capability: Capability,
+) -> io::Result<()> {
+    let refused = |result: io::Result<super::client::Socket>| {
+        result
+            .err()
+            .is_some_and(|e| e.to_string().starts_with("HTTP/1.1 401 "))
+    };
+    let name = capability.name();
+    check(
+        &format!("the {host} {name} refuses an upgrade without a ticket"),
+        refused(client.open(host, capability, None).await),
+    )?;
+    let ticket = client.ticket(host, capability).await?;
+    let open = client.open(host, capability, Some(&ticket.ticket)).await?;
+    check(
+        &format!("the {host} {name} refuses a ticket used once"),
+        refused(client.open(host, capability, Some(&ticket.ticket)).await),
+    )?;
+    drop(open);
+    Ok(())
+}
+
+/// The line [`terminal_runs_on`] types: it prints `name:<hostname>:end`.
+/// The line itself holds no hostname, so its echo cannot match.
+pub(crate) const HOSTNAME_LINE: &[u8] = b"printf 'name:%s:end\\n' \"$(hostname)\"\r";
+
+/// Checks that the page's terminal on `host` runs a command there: it types
+/// one that prints the guest's own hostname and waits up to 30 s for it.
+pub async fn terminal_runs_on(client: &PageClient, host: &str) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let run = async {
+        let ticket = client.ticket(host, Capability::Terminal).await?;
+        let mut socket = client
+            .open(host, Capability::Terminal, Some(&ticket.ticket))
+            .await?;
+        socket.write_all(HOSTNAME_LINE).await?;
+        socket
+            .read_until(format!("name:{host}:end").as_bytes(), 64 << 10)
+            .await
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(30), run).await;
+    if let Ok(Err(error)) = &ran {
+        println!("{host} terminal: {error}");
+    }
+    check(
+        &format!("the page terminal runs a command on {host}"),
+        matches!(ran, Ok(Ok(()))),
+    )
 }
 
 /// Prints that the page stays open, then waits for Ctrl-C.
@@ -47,6 +127,82 @@ impl Run {
         screen(self.page_url(), host, out).await
     }
 
+    /// Saves `host`'s screen to `out` once two captures in a row match, so
+    /// a page the guest is loading has finished. It captures every 500 ms
+    /// for at most 20 s, and returns the number of captures it took, or None
+    /// when the screen was still changing and the last capture was kept.
+    pub async fn settled_screen(
+        &self,
+        host: &str,
+        out: &Path,
+    ) -> io::Result<(rfb::Capture, Option<usize>)> {
+        let started = tokio::time::Instant::now();
+        let mut tick = tokio::time::interval(SETTLE_INTERVAL);
+        let (mut previous, mut captures) = (None, 0);
+        let (capture, settled) = loop {
+            tick.tick().await;
+            captures += 1;
+            let capture = tokio::time::timeout(
+                SCREEN_TIMEOUT,
+                rfb::capture_page(self.page_url(), host, out),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{host}: the screen capture took over {SCREEN_TIMEOUT:?}"),
+                )
+            })??;
+            let pixels = std::fs::read(&capture.png)?;
+            if previous.as_ref() == Some(&pixels) {
+                break (capture, Some(captures));
+            }
+            if started.elapsed() >= SETTLE_LIMIT {
+                break (capture, None);
+            }
+            previous = Some(pixels);
+        };
+        if capture.colors < MIN_COLORS {
+            return Err(io::Error::other(format!(
+                "{host}: the captured screen has {} colors; a desktop shows at least {MIN_COLORS}",
+                capture.colors
+            )));
+        }
+        match settled {
+            Some(n) => println!(
+                "{host} screen through the page: {} (settled after {n} captures)",
+                capture.png.display()
+            ),
+            None => println!(
+                "{host} screen through the page: {} (still changing after {SETTLE_LIMIT:?})",
+                capture.png.display()
+            ),
+        }
+        Ok((capture, settled))
+    }
+
+    /// Saves the page from Chromium to `out` once the JavaScript expression
+    /// `ready` is true in it, within `timeout`.
+    pub async fn page_shot(
+        &self,
+        out: &Path,
+        ready: &str,
+        timeout: Duration,
+    ) -> io::Result<PathBuf> {
+        let (url, path, ready) = (
+            self.page_url().to_string(),
+            out.to_path_buf(),
+            ready.to_string(),
+        );
+        let page = tokio::task::spawn_blocking(move || {
+            shot::capture(&url, &path, &ready, timeout).map(|_| path)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        println!("page in Chromium: {}", page.display());
+        Ok(page)
+    }
+
     /// Saves `host`'s screen to `screen` as [`Run::screen`] does, then the
     /// page to `page` from Chromium once the page shows that screen painted,
     /// within 30 s.
@@ -57,17 +213,9 @@ impl Run {
         page: &Path,
     ) -> io::Result<Screenshots> {
         let capture = self.screen(host, screen).await?;
-        let (url, out, condition) = (
-            self.page_url().to_string(),
-            page.to_path_buf(),
-            shot::desktop_painted(host),
-        );
-        let page = tokio::task::spawn_blocking(move || {
-            shot::capture(&url, &out, &condition, PAGE_TIMEOUT).map(|_| out)
-        })
-        .await
-        .map_err(io::Error::other)??;
-        println!("{host} page in Chromium: {}", page.display());
+        let page = self
+            .page_shot(page, &shot::desktop_painted(host), PAGE_TIMEOUT)
+            .await?;
         Ok(Screenshots {
             screen: capture,
             page,

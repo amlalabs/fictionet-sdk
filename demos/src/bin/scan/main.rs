@@ -16,6 +16,7 @@ mod world;
 use fictionet_demo::kit::{
     Kit,
     client::{Capability, PageClient},
+    gate,
 };
 use fictionet_observe::page::Page;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -153,45 +153,16 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
 
 async fn page_checks(url: &str) -> Result<(), Error> {
     let client = PageClient::from_url(url)?;
-    if client
-        .request("GET", "/api/page", None, false)
-        .await?
-        .status
-        != 401
-    {
-        return Err("page accepted an API call without the bearer".into());
-    }
-    client.bootstrap().await?;
+    gate::bearer_required(&client).await?;
     let description = client.get_json("/api/page").await?;
     let hosts = description["hosts"].as_array().ok_or("page has no hosts")?;
-    if hosts.len() != 2 || hosts.iter().any(|h| h["pinned"] != true) {
-        return Err("page must pin both guests".into());
-    }
-    for (host, capability) in [
-        (guests::WORKSTATION, Capability::Screen),
-        (guests::SERVER, Capability::Terminal),
-    ] {
-        let refused = client
-            .open(host, capability, None)
-            .await
-            .err()
-            .ok_or("page accepted an upgrade without a ticket")?;
-        if !refused.to_string().starts_with("HTTP/1.1 401 ") {
-            return Err(format!("upgrade was not refused for authentication: {refused}").into());
-        }
-    }
-    println!("[pass] page bearer and console ticket checks");
-    let ticket = client.ticket(guests::SERVER, Capability::Terminal).await?;
-    let mut socket = client
-        .open(guests::SERVER, Capability::Terminal, Some(&ticket.ticket))
-        .await?;
-    socket
-        .write_all(b"printf 'name:%s:end\\n' \"$(hostname)\"\r")
-        .await?;
-    socket
-        .read_until(format!("name:{}:end", guests::SERVER).as_bytes(), 64 << 10)
-        .await?;
-    println!("[pass] page terminal hostname: {}", guests::SERVER);
+    gate::check(
+        "the page pins both guests",
+        hosts.len() == 2 && hosts.iter().all(|h| h["pinned"] == true),
+    )?;
+    gate::single_use_ticket(&client, guests::WORKSTATION, Capability::Screen).await?;
+    gate::single_use_ticket(&client, guests::SERVER, Capability::Terminal).await?;
+    gate::terminal_runs_on(&client, guests::SERVER).await?;
     // The world task publishes at most every 250 ms, so the last story step
     // can reach the page a moment after the story ends.
     let deadline = Instant::now() + Duration::from_secs(5);

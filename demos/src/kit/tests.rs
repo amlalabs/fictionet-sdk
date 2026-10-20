@@ -1082,7 +1082,76 @@ async fn page_client_reads_state_posts_commands_and_waits() {
     );
     let batch = client.events(0).await.unwrap();
     assert!(batch["last"].as_u64().unwrap() >= seq);
+    assert_eq!(
+        client.last_event().await.unwrap(),
+        batch["last"].as_u64().unwrap()
+    );
+    let label =
+        |event: &serde_json::Value| Ok(event["source"] == "page" && event["kind"] == "label");
+    let mut cursor = 0;
+    let found = client.find_event(&mut cursor, label).await.unwrap();
+    assert_eq!(found.unwrap()["seq"], seq);
+    assert_eq!(cursor, seq, "the cursor stops at the match");
+    assert!(
+        client
+            .find_event(&mut cursor, label)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(cursor >= seq, "the cursor moves past every event read");
+    let stopped = client
+        .find_event(&mut 0, |_| {
+            Err(io::Error::other("the predicate stops the read"))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stopped.to_string(), "the predicate stops the read");
+    let mut stream = client.state_stream(&["labels"]).await.unwrap();
+    let streamed = stream
+        .next("labels", |snapshot| snapshot["value"][0]["text"] == "Boot")
+        .await
+        .unwrap();
+    assert_eq!(streamed["value"], labels["value"]);
+    assert!(client.state_stream(&["labels,leases"]).await.is_err());
+    assert!(client.state_stream(&[]).await.is_err());
     fixture.run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn gate_checks_cover_access_the_terminal_and_a_settled_screen() {
+    use client::Capability;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut fixture = PageFixture::new().await;
+        fixture
+            .peer
+            .ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fixture.network();
+        fixture.connect();
+        let client = &fixture.client;
+        gate::bearer_required(client).await.unwrap();
+        gate::single_use_ticket(client, "workstation", Capability::Screen)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(gate::HOSTNAME_LINE).contains("name:workstation:end"),
+            "an echo of the typed line must not pass the terminal check"
+        );
+        gate::terminal_runs_on(client, "workstation").await.unwrap();
+        let out = fixture.run.path().join("settled.png");
+        let (capture, settled) = fixture
+            .run
+            .settled_screen("workstation", &out)
+            .await
+            .unwrap();
+        assert_eq!((capture.width, capture.colors), (64, 256));
+        assert_eq!(settled, Some(2), "an unchanging screen settles at once");
+        assert_eq!(capture.png, out);
+        fixture.run.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

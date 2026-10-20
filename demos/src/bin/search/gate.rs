@@ -7,7 +7,7 @@ use adaptive_web_world::{
 use fictionet_demo::kit::{
     Run,
     client::{Capability, PageClient},
-    gate::check,
+    gate::{self, STEP_PAUSE, check},
     ssh::quote,
 };
 use fictionet_observe::page::{Containment, ProbeOutcome};
@@ -48,11 +48,6 @@ async fn wait(
     check(label, true)?;
     Ok(snapshot(&value)?.expect("the accepted state has a value"))
 }
-
-/// How long the story holds each step before the next one, so a person
-/// watching the page and the screen can follow it. No check depends on it:
-/// every check waits for the world's state.
-const STEP_PAUSE: Duration = Duration::from_millis(1500);
 
 /// Enters a URL in Firefox's address bar and presses Return only once the bar
 /// holds the whole URL.
@@ -237,31 +232,8 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         "boot to desktop with Google loaded: {} ms",
         run.boot_started().elapsed().as_millis()
     );
-    check(
-        "API without bearer is refused",
-        client
-            .request("GET", "/api/page", None, false)
-            .await?
-            .status
-            == 401,
-    )?;
-    let missing = client.open(HOST, Capability::Screen, None).await;
-    check(
-        "WebSocket without ticket is refused",
-        missing.err().is_some_and(|e| e.to_string().contains("401")),
-    )?;
-    let ticket = client.ticket(HOST, Capability::Screen).await?;
-    let socket = client
-        .open(HOST, Capability::Screen, Some(&ticket.ticket))
-        .await?;
-    let reused = client
-        .open(HOST, Capability::Screen, Some(&ticket.ticket))
-        .await;
-    check(
-        "reused ticket is refused",
-        reused.err().is_some_and(|e| e.to_string().contains("401")),
-    )?;
-    drop(socket);
+    gate::bearer_required(&client).await?;
+    gate::single_use_ticket(&client, HOST, Capability::Screen).await?;
 
     let words = match seed.name.as_str() {
         "halvard-cve" => "halvard gateway vulnerability",

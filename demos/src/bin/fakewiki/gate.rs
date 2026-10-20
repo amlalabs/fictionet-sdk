@@ -6,12 +6,10 @@ use fakewiki_world::tamper::Reply;
 use fictionet_demo::kit::{
     GuestHandle, Run,
     client::{Capability, PageClient},
-    gate::check,
-    rfb, shot,
+    gate::{self, check},
+    shot,
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 use super::{ARTICLE, HOST, WIKI};
 
@@ -61,66 +59,6 @@ pub async fn stale_command(
         },
     )
     .await
-}
-
-pub struct StateStream(BufReader<TcpStream>);
-
-impl StateStream {
-    pub async fn open(url: &str) -> io::Result<Self> {
-        let (authority, token) = url
-            .strip_prefix("http://")
-            .and_then(|s| s.split_once("/#token="))
-            .ok_or_else(|| io::Error::other("invalid page URL"))?;
-        let mut socket = TcpStream::connect(authority).await?;
-        socket.write_all(format!(
-            "GET /api/states/stream?topics=tamper,diff HTTP/1.1\r\nHost: {authority}\r\nOrigin: http://{authority}\r\nAuthorization: Bearer {token}\r\n\r\n"
-        ).as_bytes()).await?;
-        let mut stream = Self(BufReader::new(socket));
-        let mut line = String::new();
-        stream.0.read_line(&mut line).await?;
-        if !line.starts_with("HTTP/1.1 200 ") {
-            return Err(io::Error::other(format!("state stream refused: {line}")));
-        }
-        loop {
-            line.clear();
-            if stream.0.read_line(&mut line).await? == 0 {
-                return Err(io::Error::other("state stream closed in headers"));
-            }
-            if line == "\r\n" {
-                break;
-            }
-        }
-        Ok(stream)
-    }
-
-    pub async fn state(&mut self, topic: &str, revision: u64) -> io::Result<Value> {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let mut line = String::new();
-                if self.0.read_line(&mut line).await? == 0 {
-                    return Err(io::Error::other("state stream closed"));
-                }
-                if line.len() > 128 << 10 {
-                    return Err(io::Error::other("state stream line exceeds bound"));
-                }
-                if let Some(data) = line.strip_prefix("data: ") {
-                    let value: Value = serde_json::from_str(data.trim())?;
-                    if value["topic"] == topic && value["value"]["revision"] == revision {
-                        if value["status"]["too_large"] != false {
-                            return Err(io::Error::other("state stream exceeded its bound"));
-                        }
-                        return Ok(value);
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| {
-            io::Error::other(format!(
-                "state stream did not show {topic} revision {revision}"
-            ))
-        })?
-    }
 }
 
 async fn event(
@@ -301,35 +239,6 @@ async fn second_read(
     }
 }
 
-/// Captures the guest's screen until two captures in a row match, for at
-/// most 15 s. Firefox animates its tab while it loads, so a settled screen
-/// shows the page it received rather than the one it is replacing. Returns
-/// the last capture and how many captures it took, or None if the screen
-/// was still changing.
-async fn settled_screen(run: &Run, out: &Path) -> io::Result<(rfb::Capture, Option<usize>)> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let (mut previous, mut captures) = (None, 0);
-    let mut poll = tokio::time::interval(Duration::from_millis(500));
-    loop {
-        poll.tick().await;
-        captures += 1;
-        let capture = tokio::time::timeout(
-            Duration::from_secs(30),
-            rfb::capture_page(run.page_url(), HOST, out),
-        )
-        .await
-        .map_err(|_| io::Error::other("guest screen capture timed out"))??;
-        let pixels = std::fs::read(&capture.png)?;
-        if previous.as_ref() == Some(&pixels) {
-            return Ok((capture, Some(captures)));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok((capture, None));
-        }
-        previous = Some(pixels);
-    }
-}
-
 /// Runs the checks. On a failure it prints the article's requests and saves
 /// the guest's screen before it returns the error.
 pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
@@ -346,12 +255,10 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
         let path = output.join("failure-desktop.png");
         let capture = async {
             std::fs::create_dir_all(output)?;
-            rfb::capture_page(run.page_url(), HOST, &path).await
+            run.screen(HOST, &path).await
         };
-        match tokio::time::timeout(Duration::from_secs(30), capture).await {
-            Ok(Ok(_)) => eprintln!("Guest screen at the failure: {}", path.display()),
-            Ok(Err(error)) => eprintln!("Guest screen unavailable: {error}"),
-            Err(_) => eprintln!("Guest screen unavailable: timed out"),
+        if let Err(error) = capture.await {
+            eprintln!("Guest screen unavailable: {error}");
         }
     }
     result
@@ -368,29 +275,25 @@ async fn article_requests(run: &Run, switch: Option<u64>) -> io::Result<()> {
     };
     eprintln!("Article requests since {since}:");
     let (mut after, mut count) = (switch.unwrap_or(0), 0);
-    let dropped = loop {
-        let value = client.events(after).await?;
-        let events = value["events"]
-            .as_array()
-            .ok_or_else(|| io::Error::other("the events reply has no events"))?;
-        for event in events.iter().filter(|event| article(event)) {
-            count += 1;
-            let fields = &event["fields"];
-            eprintln!(
-                "  at {} s: {} served {} at revision {}, status {}, complete {}",
-                event["at"],
-                fields["method"],
-                fields["served"],
-                fields["tamper_revision"],
-                fields["status"],
-                fields["complete"],
-            );
-        }
-        match events.last().and_then(|event| event["seq"].as_u64()) {
-            Some(next) => after = next,
-            None => break value["dropped"].clone(),
-        }
-    };
+    client
+        .find_event(&mut after, |event| {
+            if article(event) {
+                count += 1;
+                let fields = &event["fields"];
+                eprintln!(
+                    "  at {} s: {} served {} at revision {}, status {}, complete {}",
+                    event["at"],
+                    fields["method"],
+                    fields["served"],
+                    fields["tamper_revision"],
+                    fields["status"],
+                    fields["complete"],
+                );
+            }
+            Ok(false)
+        })
+        .await?;
+    let dropped = client.events(0).await?["dropped"].clone();
     eprintln!("{count} article requests; events lost from the history: {dropped}");
     Ok(())
 }
@@ -406,46 +309,19 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
         run.boot_started().elapsed().as_millis()
     );
 
-    check(
-        "the page API refuses a request without the token",
-        client
-            .request("GET", "/api/page", None, false)
-            .await?
-            .status
-            == 401,
-    )?;
-    let missing = client.open(HOST, Capability::Screen, None).await;
-    check(
-        "the screen refuses a missing ticket with 401",
-        missing
-            .err()
-            .is_some_and(|e| e.to_string().contains("HTTP/1.1 401 ")),
-    )?;
-    let ticket = client.ticket(HOST, Capability::Screen).await?;
-    let socket = client
-        .open(HOST, Capability::Screen, Some(&ticket.ticket))
-        .await?;
-    let reused = client
-        .open(HOST, Capability::Screen, Some(&ticket.ticket))
-        .await;
-    check(
-        "the screen refuses a reused ticket with 401",
-        reused
-            .err()
-            .is_some_and(|e| e.to_string().contains("HTTP/1.1 401 ")),
-    )?;
-    drop(socket);
-    println!("[pass] page security: token required, missing and reused tickets refused");
+    gate::bearer_required(&client).await?;
+    gate::single_use_ticket(&client, HOST, Capability::Screen).await?;
     println!("[pass] first read: real, revision 0");
 
     let window = article_window(guest).await?;
     println!("Scripted reader: the article's title is in Firefox window {window}");
 
-    let mut stream = StateStream::open(run.page_url()).await?;
-    let initial = stream.state("tamper", 0).await?;
+    let mut stream = client.state_stream(&["tamper", "diff"]).await?;
+    let initial = stream
+        .next("tamper", |s| s["value"]["revision"] == 0)
+        .await?;
     check("tampering starts off", initial["value"]["on"] == false)?;
-    let before = client.events(0).await?["last"].as_u64();
-    *switch = Some(before.ok_or_else(|| io::Error::other("events API has no cursor"))?);
+    *switch = Some(client.last_event().await?);
     check(
         "the switch is applied at revision 1",
         matches!(
@@ -459,7 +335,9 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
     )?;
     stale_command(&client, "stale-switch", true, 0, 1).await?;
     let state = client.get_json("/api/state/tamper").await?;
-    let streamed = stream.state("tamper", 1).await?;
+    let streamed = stream
+        .next("tamper", |s| s["value"]["revision"] == 1)
+        .await?;
     check(
         "GET and the stream agree that tampering is on",
         state["value"] == streamed["value"] && state["value"]["on"] == true,
@@ -502,34 +380,16 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
     println!("[pass] panels: Reads, Left the box, containment and map have data");
     std::fs::create_dir_all(output)?;
     let screen = output.join("desktop.png");
-    let (capture, settled) = settled_screen(run, &screen).await?;
+    let (capture, _) = run.settled_screen(HOST, &screen).await?;
     check(
-        "the guest screen is 1280x800 and not blank",
-        capture.width == 1280 && capture.height == 800 && capture.colors >= 16,
+        "the guest screen is 1280x800",
+        capture.width == 1280 && capture.height == 800,
     )?;
-    match settled {
-        Some(captures) => println!(
-            "guest screenshot: {} (the screen settled after {captures} captures)",
-            screen.display()
-        ),
-        None => println!(
-            "guest screenshot: {} (the screen was still changing after 15 s)",
-            screen.display()
-        ),
-    }
-    let page = output.join("page.png");
-    let url = run.page_url().to_owned();
-    let screenshot = page.clone();
-    tokio::task::spawn_blocking(move || {
-        shot::capture(
-            &url,
-            &screenshot,
-            &shot::desktop_painted(HOST),
-            Duration::from_secs(30),
-        )
-    })
-    .await
-    .map_err(io::Error::other)??;
-    println!("page screenshot: {}", page.display());
+    run.page_shot(
+        &output.join("page.png"),
+        &shot::desktop_painted(HOST),
+        Duration::from_secs(30),
+    )
+    .await?;
     Ok(())
 }

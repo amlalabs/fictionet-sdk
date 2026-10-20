@@ -12,7 +12,7 @@ use fictionet::stdlib::protocols::{
     websocket::{self, Message, Messages},
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 /// A page console capability.
@@ -24,7 +24,7 @@ pub enum Capability {
     Terminal,
 }
 impl Capability {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Screen => "screen",
             Self::Terminal => "terminal",
@@ -186,6 +186,41 @@ impl PageClient {
         })?
     }
 
+    /// The sequence number of the run's newest event.
+    pub async fn last_event(&self) -> io::Result<u64> {
+        self.events(0).await?["last"]
+            .as_u64()
+            .ok_or_else(|| io::Error::other("the events reply has no last sequence number"))
+    }
+
+    /// Reads every event after `*cursor`, a page at a time, until `matches`
+    /// accepts one, and returns it. The cursor moves past each event read, so
+    /// the next call starts after the match. Returns None once no events are
+    /// left. `matches` can end the read with its own error.
+    pub async fn find_event(
+        &self,
+        cursor: &mut u64,
+        mut matches: impl FnMut(&Value) -> io::Result<bool>,
+    ) -> io::Result<Option<Value>> {
+        loop {
+            let mut batch = self.events(*cursor).await?;
+            let Some(events) = batch["events"].as_array_mut() else {
+                return Err(io::Error::other("the events reply has no events"));
+            };
+            if events.is_empty() {
+                return Ok(None);
+            }
+            for event in events.iter_mut() {
+                *cursor = event["seq"]
+                    .as_u64()
+                    .ok_or_else(|| io::Error::other("an event has no sequence number"))?;
+                if matches(event)? {
+                    return Ok(Some(event.take()));
+                }
+            }
+        }
+    }
+
     /// Reads the events after sequence number `after` every `interval` until
     /// `matches` accepts one, and returns that event. Each read starts after
     /// the last event already read. `matches` can end the wait with its own
@@ -203,17 +238,8 @@ impl PageClient {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let mut batch = self.events(cursor).await?;
-                let Some(events) = batch["events"].as_array_mut() else {
-                    return Err(io::Error::other("the events reply has no events"));
-                };
-                for event in events.iter_mut() {
-                    if matches(event)? {
-                        return Ok(event.take());
-                    }
-                    cursor = event["seq"]
-                        .as_u64()
-                        .ok_or_else(|| io::Error::other("an event has no sequence number"))?;
+                if let Some(event) = self.find_event(&mut cursor, &mut matches).await? {
+                    return Ok(event);
                 }
             }
         };
@@ -223,6 +249,40 @@ impl PageClient {
                 format!("no matching event arrived within {timeout:?}"),
             )
         })?
+    }
+
+    /// Opens the page's state stream for `topics`, as a browser tab does.
+    pub async fn state_stream(&self, topics: &[&str]) -> io::Result<StateStream> {
+        if topics.is_empty()
+            || topics.iter().any(|topic| {
+                topic.is_empty()
+                    || !topic
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+            })
+        {
+            return Err(io::Error::other("invalid state topic names"));
+        }
+        let path = format!("/api/states/stream?topics={}", topics.join(","));
+        let stream = self.send("GET", &path, self.headers(true), vec![]).await?;
+        let mut stream = StateStream(tokio::io::BufReader::new(stream));
+        let mut line = String::new();
+        stream.0.read_line(&mut line).await?;
+        if !line.starts_with("HTTP/1.1 200 ") {
+            return Err(io::Error::other(format!(
+                "state stream refused: {}",
+                line.trim_end()
+            )));
+        }
+        loop {
+            line.clear();
+            if stream.0.read_line(&mut line).await? == 0 {
+                return Err(io::Error::other("state stream closed in its headers"));
+            }
+            if line == "\r\n" {
+                return Ok(stream);
+            }
+        }
     }
 
     /// Requests a single-use credential for a declared host console.
@@ -382,6 +442,57 @@ fn require(reply: &Response, status: u16) -> io::Result<()> {
             reply.status_line,
             String::from_utf8_lossy(&reply.body)
         )))
+    }
+}
+
+/// A page's state stream: each topic's snapshots as the page publishes them.
+pub struct StateStream(tokio::io::BufReader<TcpStream>);
+impl StateStream {
+    /// The longest line the stream may send.
+    const MAX_LINE: usize = 128 << 10;
+
+    /// Waits up to 10 s for a snapshot of `topic` that `matches` accepts,
+    /// and returns it. A snapshot over the topic's bound, or a line over
+    /// 128 KiB, is an error.
+    pub async fn next(
+        &mut self,
+        topic: &str,
+        matches: impl Fn(&Value) -> bool,
+    ) -> io::Result<Value> {
+        let read = async {
+            loop {
+                let mut line = String::new();
+                if self.0.read_line(&mut line).await? == 0 {
+                    return Err(io::Error::other("state stream closed"));
+                }
+                if line.len() > Self::MAX_LINE {
+                    return Err(io::Error::other("state stream line exceeds its bound"));
+                }
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                let snapshot: Value = serde_json::from_str(data.trim())?;
+                if snapshot["topic"] != topic {
+                    continue;
+                }
+                if snapshot["status"]["too_large"] != false {
+                    return Err(io::Error::other(format!(
+                        "state stream: {topic} exceeded its bound"
+                    )));
+                }
+                if matches(&snapshot) {
+                    return Ok(snapshot);
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), read)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the state stream showed no matching {topic} snapshot within 10 s"),
+                )
+            })?
     }
 }
 

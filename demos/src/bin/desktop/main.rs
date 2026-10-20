@@ -15,7 +15,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
 
 const HOSTNAME: &str = "workstation";
 const USER: &str = "analyst";
@@ -552,53 +551,12 @@ async fn probe(
 
 async fn page_checks(url: &str, session: &ssh::Session, failures: &mut Vec<std::io::Error>) {
     let page = PageClient::from_url(url).expect("the kit's signed page URL");
-    probe(
-        failures,
-        "the page requires the bearer for API calls",
-        async {
-            let refused = page.request("GET", "/api/page", None, false).await?;
-            page.bootstrap().await?;
-            let allowed = page.request("GET", "/api/page", None, true).await?;
-            Ok(refused.status == 401 && allowed.status == 200)
-        },
-    )
-    .await;
-    probe(
-        failures,
-        "the page requires a single-use screen ticket",
-        async {
-            let missing = page.open(HOSTNAME, Capability::Screen, None).await;
-            let ticket = page.ticket(HOSTNAME, Capability::Screen).await?;
-            let socket = page
-                .open(HOSTNAME, Capability::Screen, Some(&ticket.ticket))
-                .await?;
-            let viewer = rfb::Viewer::handshake(socket).await?;
-            drop(viewer);
-            let reused = page
-                .open(HOSTNAME, Capability::Screen, Some(&ticket.ticket))
-                .await;
-            let unauthorized = |result: std::io::Result<kit::client::Socket>| {
-                result
-                    .err()
-                    .is_some_and(|error| error.to_string().starts_with("HTTP/1.1 401 "))
-            };
-            Ok(unauthorized(missing) && unauthorized(reused))
-        },
-    )
-    .await;
-    probe(
-        failures,
-        "the page terminal runs hostname on workstation",
-        async {
-            let ticket = page.ticket(HOSTNAME, Capability::Terminal).await?;
-            let mut socket = page
-                .open(HOSTNAME, Capability::Terminal, Some(&ticket.ticket))
-                .await?;
-            socket.write_all(b"echo \"name:$(hostname):end\"\r").await?;
-            socket.read_until(b"name:workstation:end", 64 << 10).await?;
-            Ok(true)
-        },
-    )
+    probe(failures, "the page's access checks", async {
+        kit::gate::bearer_required(&page).await?;
+        kit::gate::single_use_ticket(&page, HOSTNAME, Capability::Screen).await?;
+        kit::gate::terminal_runs_on(&page, HOSTNAME).await?;
+        Ok(true)
+    })
     .await;
     probe(
         failures,
