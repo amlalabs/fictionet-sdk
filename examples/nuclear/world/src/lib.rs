@@ -53,6 +53,7 @@
 //! | [`command`] | Integer commands and replies |
 //! | [`snapshot`] | Bounded projection for a future state topic |
 //! | [`driver`] | Shared handle that owns the plant behind a mutex |
+//! | [`plc`] | Modbus/TCP service of one controller over the shared plant |
 //!
 //! Loops are loop A and loop B, in that array order.
 //! Commands use externally tagged serde enums with snake_case wire names. Rod positions use tenths of a
@@ -66,7 +67,7 @@
 //! a stopped pump. Telemetry quiet freezes readings and reported equipment
 //! status together; controller modes remain live.
 //! Fault slots and the schedule are fixed arrays, so overflow cannot be built.
-//! No networking,
+//! No listener,
 //! world start function or executable is included in this crate yet.
 //!
 //! ```
@@ -107,6 +108,7 @@ pub mod driver;
 pub mod faults;
 pub mod kinetics;
 pub mod plant;
+pub mod plc;
 pub mod protection;
 pub mod registers;
 pub mod sensors;
