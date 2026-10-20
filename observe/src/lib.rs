@@ -822,8 +822,8 @@ pub struct Options {
     pub policy: Arc<dyn Policy>,
     /// Topology count and text limits.
     pub topology: TopologyLimits,
-    /// Byte budget across every event, packet and key ring. The default covers
-    /// all default class budgets, including packet classes on every allowed link.
+    /// Byte budget across every event, packet and key ring. The default holds
+    /// the event, noise and key class budgets plus 64 MiB shared by packets.
     pub bytes: usize,
     /// Maximum streams with detailed loss totals.
     pub loss_streams: usize,
@@ -844,7 +844,7 @@ impl Default for Options {
         Self {
             policy: <dyn Policy>::default(),
             topology: TopologyLimits::default(),
-            bytes: policy::default_bytes(TopologyLimits::default().links),
+            bytes: policy::default_bytes(),
             loss_streams: 4099,
         }
     }

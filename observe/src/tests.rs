@@ -2122,10 +2122,10 @@ fn events_survive_packet_load_under_the_default_policy() {
             let event_count = classes[0].count.min(classes[0].bytes / event.size());
             let packet_size = classes[3].snap.unwrap();
             let packet_count = classes[3].count.min(classes[3].bytes / packet_size);
-            let expected_budget = classes[..3].iter().map(|class| class.bytes).sum::<usize>()
-                + classes[3..].iter().map(|class| class.bytes).sum::<usize>()
-                    * collector.options.topology.links;
-            assert!(collector.options.bytes >= expected_budget);
+            // Ten full packet rings need more than the packets' share of the
+            // default budget, so the shared budget must evict.
+            let links = reader.topology().links.len();
+            assert!(links * classes[3].bytes > policy::PACKET_BYTES);
             for seq in 1..=event_count {
                 collector.observe(
                     Stamp {
@@ -2156,12 +2156,27 @@ fn events_survive_packet_load_under_the_default_policy() {
                         }),
                     );
                 }
-                assert_eq!(
-                    collector.packets(*link, 0, usize::MAX).packets.len(),
-                    packet_count
-                );
-                assert_eq!(evictions(&collector.packets(*link, 0, 0)), 2);
             }
+            let sent = links * (packet_count + 2);
+            let kept: usize = reader
+                .topology()
+                .links
+                .keys()
+                .map(|link| collector.packets(*link, 0, usize::MAX).packets.len())
+                .sum();
+            let evicted: usize = reader
+                .topology()
+                .links
+                .keys()
+                .map(|link| evictions(&collector.packets(*link, 0, 0)) as usize)
+                .sum();
+            assert!(kept < links * packet_count);
+            assert_eq!(kept + evicted, sent);
+            let state = collector.state.lock();
+            let keys: usize = state.keys.rings.values().map(|ring| ring.bytes).sum();
+            let retained = collector.events.retained_bytes() + keys + state.captures.bytes;
+            drop(state);
+            assert!(retained <= collector.options.bytes);
             assert_eq!(
                 collector
                     .events()

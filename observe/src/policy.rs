@@ -122,17 +122,19 @@ impl dyn Policy {
 
 pub(crate) const NOISE: crate::Limits = crate::Limits::new(5_000, 2 << 20);
 
-pub(crate) fn default_bytes(links: usize) -> usize {
+/// Bytes all packet rings share under the default budget.
+pub(crate) const PACKET_BYTES: usize = 64 << 20;
+
+/// The default shared budget: the event, noise and key class budgets, plus
+/// `PACKET_BYTES` for packets. Packet rings rank lowest, so packet load
+/// evicts packets and leaves events and keys alone.
+pub(crate) fn default_bytes() -> usize {
     default_classes()
         .iter()
-        .enumerate()
-        .fold(0usize, |total, (index, class)| {
-            total.saturating_add(
-                class
-                    .bytes
-                    .saturating_mul(if index >= 3 { links } else { 1 }),
-            )
-        })
+        .take(3)
+        .map(|class| class.bytes)
+        .sum::<usize>()
+        + PACKET_BYTES
 }
 
 pub(crate) fn default_classes() -> Vec<Class> {
