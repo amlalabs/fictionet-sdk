@@ -4,9 +4,7 @@ use std::sync::{Arc, RwLock};
 use crate::time::Instant;
 use crate::{Cx, sync::Mutex};
 
-use super::{
-    ConnInfo, Event, Interest, KeyRef, Loss, LossReason, PacketMeta, PacketRef, Stream, TopologyRef,
-};
+use super::{ConnInfo, Event, Interest, KeyRef, Loss, PacketMeta, PacketRef, Stream, TopologyRef};
 
 /// Metadata available before constructing an event.
 #[derive(Clone, Copy, Debug)]
@@ -353,18 +351,9 @@ impl Dispatch {
         observer.observe(stamp, Observation::Event(&event));
     }
 
-    /// Reports facts omitted by a producer before delivery.
-    pub fn lost(&self, count: u64) {
-        self.report_loss(Loss {
-            stream: Stream::Events,
-            reason: LossReason::Staging,
-            count,
-            bytes: None,
-            seqs: None,
-        });
-    }
-
-    pub(crate) fn report_loss(&self, loss: Loss) {
+    /// Reports observations a producer omitted before delivery. A zero
+    /// count, or a loss after the run ends, reports nothing.
+    pub fn report_loss(&self, loss: Loss) {
         if loss.count != 0
             && let Some(observer) = &self.observer
         {
