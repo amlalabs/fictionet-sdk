@@ -1,0 +1,133 @@
+/* The Artifactory panels. Colors come only from the page's tokens. Red
+   (danger) marks denied egress and names the world does not serve. */
+.art-panel { color: var(--ink); font-size: 13px; }
+.art-panel h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.art-panel h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.art-panel h4 { margin: 0; font-size: 12px; font-weight: 600; }
+.art-panel p { margin: 0; }
+.art-panel .section:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.art-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 8px; }
+.art-panel code { padding: 0 4px; border-radius: 4px; background: var(--sunken); font-size: 12px; white-space: nowrap; }
+
+/* The variant. */
+.art-variant { display: grid; gap: 4px; }
+.art-variant .eyebrow { text-transform: uppercase; }
+.art-variant-text { font-weight: 500; }
+
+/* The scripted story: one line per step, in two columns when they fit. */
+.art-panel { container-type: inline-size; }
+.doors-steps { margin: 0; padding: 0; list-style: none; columns: 1; column-gap: 16px; }
+@container (min-width: 560px) { .doors-steps { columns: 2; } }
+.doors-step { display: grid; grid-template-columns: 20px 56px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 24px; padding: 0 8px 0 6px; border-left: 2px solid transparent; break-inside: avoid; font-size: 12px; }
+.doors-step[data-state='running'] { border-left-color: var(--accent); background: var(--sunken); }
+.doors-number { color: var(--muted); text-align: right; }
+.doors-state { color: var(--muted); font-size: 11px; }
+.doors-step[data-state='running'] .doors-state { color: var(--accent-text); font-weight: 600; }
+.doors-step[data-state='done'] .doors-state { color: var(--success); }
+.doors-step[data-state='failed'] .doors-state { color: var(--warning); font-weight: 600; }
+.doors-step-title { overflow: hidden; min-height: 24px; padding: 0; border: 0; background: none; color: var(--ink); font-size: 12px; text-align: left; text-decoration: underline; text-decoration-color: var(--edge); text-underline-offset: 3px; text-overflow: ellipsis; white-space: nowrap; }
+.doors-step-title:hover:not(:disabled) { color: var(--accent-text); text-decoration-color: currentColor; }
+.doors-step-title:disabled { color: var(--ink); text-decoration: none; cursor: default; }
+.doors-exit { color: var(--muted); font-size: 11px; }
+
+/* The summary and the board. */
+.doors-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; font-variant-numeric: tabular-nums; }
+.doors-totals { font-size: 14px; }
+.doors-panel > .loss-note { margin: 8px 0 0; }
+.doors-panel > .empty-note { margin: 16px 0 0; }
+.doors-board { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; }
+.doors-board:empty { display: none; }
+/* A destination is as wide as its tiles, so small groups share a row. */
+.doors-destination { flex: 1 1 calc(var(--tiles, 1) * 176px + (var(--tiles, 1) - 1) * 8px); min-width: 0; max-width: 100%; }
+.doors-destination-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 8px; }
+.doors-destination-head h3 { font-size: 12px; overflow-wrap: anywhere; }
+.doors-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 8px; }
+.door-tile { display: flex; flex-direction: column; gap: 4px; min-height: 64px; padding: 8px 12px; border: 1px solid var(--line-strong); border-radius: 6px; font-size: 12px; }
+.door-served { background: var(--raised); }
+.door-other { border-style: dashed; background: none; }
+.door-denied { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+.door-head { display: flex; justify-content: space-between; gap: 8px; }
+.doors-count { min-width: 6ch; text-align: right; font-variant-numeric: tabular-nums; }
+.door-service { color: var(--muted); }
+.door-denied .door-service { color: inherit; }
+.door-verdict { font-weight: 600; }
+.door-credential { align-self: start; max-width: 100%; height: auto; min-height: 18px; white-space: normal; overflow-wrap: anywhere; }
+.door-tile.new-row { animation: door-arrives 600ms ease-out; }
+@keyframes door-arrives { from { opacity: 0; } to { opacity: 1; } }
+
+/* Techniques, the incident and other traffic. */
+.doors-technique-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 0; }
+.doors-technique { display: flex; justify-content: space-between; gap: 8px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
+.doors-technique dt { color: var(--muted); }
+.doors-technique dd { margin: 0; color: var(--muted); }
+.doors-technique.seen { border-color: var(--line-strong); background: var(--raised); }
+.doors-technique.seen dt, .doors-technique.seen dd { color: var(--ink); font-weight: 600; }
+.art-incident { display: grid; gap: 8px; }
+.art-incident a { color: var(--accent-text); }
+.art-incident-list { margin: 0; padding-left: 20px; }
+.art-incident-list li + li { margin-top: 4px; }
+.doors-other { color: var(--muted); }
+.doors-other h2 { color: var(--ink); }
+.doors-other-rows { margin: 0; padding-left: 20px; font-size: 12px; }
+.doors-other-rows li { overflow-wrap: anywhere; }
+
+/* Packages. */
+.packages-lookalike { display: grid; gap: 8px; margin-bottom: 8px; padding: 12px 16px; border: 1px solid var(--line-strong); border-left: 3px solid var(--accent); border-radius: 6px; background: var(--raised); }
+.packages-names { display: grid; gap: 4px; margin: 0; }
+.packages-names > div { display: grid; grid-template-columns: 80px minmax(0, 1fr); align-items: baseline; }
+.packages-names dt { color: var(--muted); font-size: 12px; }
+.packages-names dd { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.name-diff, .name-gap { padding: 0 2px; border-radius: 3px; background: var(--hex-mark); color: var(--on-selection); font-weight: 600; }
+.name-gap { color: var(--accent-text); }
+.packages-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+.packages-badges:empty { display: none; }
+.badge-installed { background: var(--ink); color: var(--on-ink); }
+.packages-repo-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.packages-upstream { margin-top: 4px; }
+.packages-scroll { margin-top: 8px; overflow-x: auto; }
+.packages-table th { position: static; }
+.packages-table th, .packages-table td { padding: 4px 8px; vertical-align: top; }
+.packages-table td { white-space: pre-line; }
+.packages-table td.packages-release { white-space: pre; }
+.packages-name { display: grid; gap: 4px; justify-items: start; }
+.packages-lookalike-row td:first-child { box-shadow: inset 3px 0 0 var(--accent); font-weight: 600; }
+.packages-cache { margin-top: 12px; }
+.packages-cache .art-head { margin-bottom: 4px; }
+.packages-entries { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+.packages-entry { display: grid; gap: 2px; padding: 4px 8px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.packages-path { overflow-wrap: anywhere; }
+.packages-message { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; color: var(--ink); }
+.packages-reply .packages-entry { background: var(--raised); }
+.packages-reply-meta { color: var(--muted); font-size: 11px; }
+.packages-refused { margin-top: 8px; overflow-wrap: anywhere; }
+
+/* Requests. */
+.requests-panel { display: flex; flex-direction: column; min-height: 100%; }
+.requests-legend { display: flex; flex-wrap: wrap; gap: 4px 8px; margin: 0 0 8px; padding: 0; list-style: none; }
+.requests-panel > .loss-note { margin: 0 0 8px; }
+.requests-scroll { overflow-x: auto; border-top: 1px solid var(--line); }
+.requests-table th, .requests-table td { padding: 4px 8px; white-space: nowrap; }
+.requests-host, .requests-path { overflow: hidden; max-width: 24ch; text-overflow: ellipsis; }
+.requests-path { max-width: 32ch; }
+.requests-row { cursor: pointer; }
+.requests-row.on td { background: var(--highlight); }
+.requests-row:focus-visible { outline-offset: -2px; }
+.requests-step.traffic-setup, .requests-step.traffic-other, .requests-step.traffic-after { color: var(--muted); }
+.outcome-served { color: var(--ink); }
+.outcome-not_found, .outcome-refused, .outcome-failed, .outcome-unanswered, .outcome-redirected { color: var(--text); }
+.family-read { background: var(--sunken); color: var(--text); }
+.family-lookalike { background: var(--hex-mark); color: var(--on-selection); }
+.family-upstream { border: 1px solid var(--warning); background: none; color: var(--warning); }
+.family-write { border: 1px solid var(--ink); background: none; color: var(--ink); }
+.family-left { background: var(--danger-soft); color: var(--danger); }
+.requests-detail h3 { margin-bottom: 8px; overflow-wrap: anywhere; }
+.requests-kv { font-size: 12px; }
+.requests-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .door-tile.new-row { animation: none; }
+}
+@media (forced-colors: active) {
+  .door-denied, .family-left, .family-upstream, .family-write, .family-lookalike, .name-diff, .name-gap { border: 1px solid CanvasText; }
+  .doors-step[data-state='running'] { border-left-color: Highlight; }
+}

@@ -296,8 +296,9 @@ export async function mount(root, transport, theme) {
       tabs[index].button.focus();
     }));
   }
-  const tabOf = (kind) => tabs.find((tab) => tab.options.kind === kind);
-  services.showPanel = (kind) => { const item = tabOf(kind); if (item) activate(item); };
+  // A panel kind, or a panel id for the panels that share a kind, such as custom ones.
+  const tabOf = (name) => tabs.find((tab) => tab.options.kind === name) || tabs.find((tab) => tab.options.id === name);
+  services.showPanel = (name) => { const item = tabOf(name); if (item) activate(item); };
   services.openPackets = (id) => {
     services.selection.set({ links: [id] });
     const item = tabOf('packets'); if (item) activate(item);

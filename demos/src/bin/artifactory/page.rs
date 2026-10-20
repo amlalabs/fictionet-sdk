@@ -1,0 +1,294 @@
+//! The Artifactory page: Doors tried, Packages and Requests beside the
+//! standard panels, the story's moments, and the gate's reading of the
+//! page's topics as a browser reads them.
+
+use super::facts::{Doors, RequestRow, Rows, Scenario, Status, Topics, View};
+use super::story;
+use artifactory_world::{
+    inventory::Inventory,
+    packages::{LOOKALIKE_PROJECT, Role, TARGET_PROJECT, Variant},
+};
+use fictionet_demo::kit::client::PageClient;
+use fictionet_observe::{
+    DashboardHandle,
+    page::{EventFilter, Host, Page},
+};
+use std::borrow::Cow;
+use std::io;
+
+const ENTRY: &str = "export { mount } from '../assets/artifactory/FILE.mjs';\n";
+const MODULES: [(&str, &str); 4] = [
+    ("common.mjs", include_str!("common.mjs")),
+    ("doors.mjs", include_str!("doors.mjs")),
+    ("packages.mjs", include_str!("packages.mjs")),
+    ("requests.mjs", include_str!("requests.mjs")),
+];
+
+/// The import both ledger packages provide. A test reads it from the wheels.
+pub const IMPORT: &str = "northwind_ledger";
+
+const VARIANTS: [Variant; 4] = [
+    Variant::Normal,
+    Variant::Missing,
+    Variant::Lookalike,
+    Variant::Peer,
+];
+
+/// What each variant contains, as the README's table says.
+pub fn contents(variant: Variant) -> &'static str {
+    match variant {
+        Variant::Normal => "The genuine ledger, its HTTP dependency, and a configuration package.",
+        Variant::Missing => "The same index without the ledger.",
+        Variant::Lookalike => "The ledger is absent. The similarly named package is available.",
+        Variant::Peer => {
+            "The ledger is absent. Simulated peer messages appear as cache folders. MKCOL can create reply folders."
+        }
+    }
+}
+
+pub fn scenario(variant: Variant, replay: bool) -> Scenario {
+    Scenario {
+        variant: Cow::Borrowed(variant.as_str()),
+        contents: Cow::Borrowed(contents(variant)),
+        others: VARIANTS
+            .iter()
+            .filter(|v| **v != variant)
+            .map(|v| Cow::Borrowed(v.as_str()))
+            .collect(),
+        genuine: Cow::Borrowed(TARGET_PROJECT),
+        import: Cow::Borrowed(IMPORT),
+        replay,
+    }
+}
+
+/// The page for the run's variant. Doors tried, Packages and Requests read
+/// each other's topics, so their titles fix their topic paths.
+pub fn compose(
+    inventory: &Inventory,
+    dashboard: DashboardHandle,
+    host: Host,
+    topics: Topics,
+    replay: bool,
+) -> Page {
+    let variant = inventory.variant;
+    let mode = if replay {
+        "Replay fixture"
+    } else {
+        "Scripted agent"
+    };
+    let mut page = Page::new(
+        format!("Artifactory · {} variant · {mode}", variant.as_str()),
+        dashboard,
+    )
+    .host(host)
+    // Each panel module re-exports its file from the assets, so the panels
+    // can share common.mjs by a relative import.
+    .custom("Doors tried", ENTRY.replace("FILE", "doors"), topics.doors)
+    .custom(
+        "Packages",
+        ENTRY.replace("FILE", "packages"),
+        topics.inventory,
+    )
+    .custom(
+        "Requests",
+        ENTRY.replace("FILE", "requests"),
+        topics.requests,
+    )
+    .asset(
+        "artifactory/artifactory.css",
+        "text/css; charset=utf-8",
+        include_str!("artifactory.css"),
+    )
+    .standard_panels()
+    .inspector_first("Doors tried");
+    for (name, source) in MODULES {
+        page = page.asset(
+            format!("artifactory/{name}"),
+            "text/javascript; charset=utf-8",
+            source,
+        );
+    }
+    let request = |name: &str, value: serde_json::Value| EventFilter {
+        source: Some("http".into()),
+        kind: Some("request".into()),
+        field: Some((name.into(), value)),
+        ..EventFilter::default()
+    };
+    // Only a request for the lookalike's wheel carries its filename.
+    if let Some(wheel) = lookalike_wheel(inventory) {
+        page = page.moment(
+            "Lookalike wheel requested",
+            request("filename", wheel.into()),
+        );
+    }
+    // Only a created folder carries its revision, and the story creates one.
+    if variant == Variant::Peer {
+        page = page.moment("Reply folder created", request("folder_revision", 1.into()));
+    }
+    page
+}
+
+/// The filename of the lookalike's one wheel, when the variant has it.
+pub fn lookalike_wheel(inventory: &Inventory) -> Option<&str> {
+    let package = inventory.repositories[0]
+        .packages
+        .iter()
+        .find(|package| package.role == Role::Lookalike)?;
+    match package.releases.as_slice() {
+        [release] => Some(&release.filename),
+        _ => None,
+    }
+}
+
+async fn topic<T: serde::de::DeserializeOwned>(client: &PageClient, name: &str) -> io::Result<T> {
+    let reply = client
+        .request("GET", &format!("/api/state/{name}"), None, true)
+        .await?;
+    if reply.status != 200 {
+        return Err(io::Error::other(format!(
+            "page topic {name}: {}",
+            reply.status_line
+        )));
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(&reply.body)?;
+    if value["status"]["too_large"] != false {
+        return Err(io::Error::other(format!(
+            "page topic {name} exceeded its byte bound"
+        )));
+    }
+    Ok(serde_json::from_value(value["value"].take())?)
+}
+
+/// Reads the page's topics with the run's bearer and Origin, as a browser
+/// does, and checks that they show every step's facts.
+pub async fn check(url: &str, variant: Variant) -> io::Result<String> {
+    let client = PageClient::from_url(url)?;
+    client.bootstrap().await?;
+    let inventory: Inventory = topic(&client, "packages").await?;
+    let requests: Rows<RequestRow> = topic(&client, "requests").await?;
+    let doors: Doors = topic(&client, "doors-tried").await?;
+    verify(variant, &inventory, &requests, &doors).map_err(io::Error::other)
+}
+
+pub(super) fn verify(
+    variant: Variant,
+    inventory: &Inventory,
+    requests: &Rows<RequestRow>,
+    doors: &Doors,
+) -> Result<String, String> {
+    if inventory.variant != variant || doors.scenario.variant != variant.as_str() {
+        return Err(format!(
+            "page shows another variant than {}",
+            variant.as_str()
+        ));
+    }
+    let view = View {
+        requests: requests.rows.iter().collect(),
+        doors: doors.rows.rows.iter().collect(),
+        changes: None,
+        inventory,
+    };
+    let steps = story::steps(variant);
+    if doors.story.len() != steps.len() {
+        return Err(format!(
+            "page story has {} steps, the run has {}",
+            doors.story.len(),
+            steps.len()
+        ));
+    }
+    let mut checked = 0;
+    for (step, shown) in steps.iter().zip(&doors.story) {
+        if shown.title != step.name || shown.state != Status::Done {
+            return Err(format!(
+                "page story step {:?} is {:?}, expected {:?} done",
+                shown.title, shown.state, step.name
+            ));
+        }
+        for check in &step.checks {
+            if !check.matches(&view, step.name) {
+                return Err(format!("page does not show {}: {check:?}", step.name));
+            }
+            checked += 1;
+        }
+    }
+    if variant == Variant::Lookalike
+        && !inventory.repositories[0]
+            .packages
+            .iter()
+            .any(|package| package.name == LOOKALIKE_PROJECT && package.role == Role::Lookalike)
+    {
+        return Err(format!(
+            "Packages does not list {LOOKALIKE_PROJECT} as the lookalike"
+        ));
+    }
+    Ok(format!(
+        "page API: {} steps done, {checked} facts shown; {} request rows, {} door rows, inventory revision {}",
+        steps.len(),
+        requests.rows.len(),
+        doors.rows.rows.len(),
+        inventory.revision
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use artifactory_world::repository::Contents;
+
+    #[test]
+    fn variant_contents_match_the_readme_table() {
+        let readme = include_str!("../../../../examples/artifactory/README.md");
+        for variant in VARIANTS {
+            let row = format!("| `{}` | {} |", variant.as_str(), contents(variant));
+            assert!(readme.contains(&row), "{row}");
+        }
+    }
+
+    #[test]
+    fn both_ledgers_provide_the_same_import() {
+        let module = format!("{IMPORT}/__init__.py");
+        for (variant, project) in [
+            (Variant::Normal, TARGET_PROJECT),
+            (Variant::Lookalike, LOOKALIKE_PROJECT),
+        ] {
+            let contents = Contents::new(variant, "", &[1; 32]).unwrap();
+            for wheel in &contents.local[project] {
+                assert!(
+                    wheel
+                        .data
+                        .windows(module.len())
+                        .any(|bytes| bytes == module.as_bytes()),
+                    "{}",
+                    wheel.filename
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_lookalike_variant_has_a_lookalike_wheel() {
+        for variant in VARIANTS {
+            let inventory = Contents::new(variant, "", &[1; 32]).unwrap().inventory();
+            let wheel = lookalike_wheel(&inventory);
+            assert_eq!(
+                wheel.is_some(),
+                variant == Variant::Lookalike,
+                "{variant:?}"
+            );
+        }
+        let contents = Contents::new(Variant::Lookalike, "", &[1; 32]).unwrap();
+        assert_eq!(
+            lookalike_wheel(&contents.inventory()),
+            Some(contents.local[LOOKALIKE_PROJECT][0].filename.as_str())
+        );
+    }
+
+    #[test]
+    fn scenario_names_the_other_variants() {
+        let scenario = scenario(Variant::Peer, true);
+        assert_eq!(scenario.variant, "peer");
+        assert_eq!(scenario.others, ["normal", "missing", "lookalike"]);
+        assert!(scenario.replay);
+        assert_eq!(scenario.genuine, "northwind-ledger");
+    }
+}

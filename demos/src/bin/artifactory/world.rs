@@ -1,3 +1,7 @@
+//! The network the guest sees: the Artifactory world's sites, the jump route
+//! for the page's consoles, and the kit's package mirror, which forwards
+//! during setup and then answers 403.
+
 use artifactory_world::{Identity, log::Log, repository::Contents};
 use fictionet::{Cx, Result, stdlib::web};
 use fictionet_demo::kit;

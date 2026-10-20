@@ -1,3 +1,8 @@
+//! The `--fixture` mode: the page without a VM. An in-process client replays
+//! each step's requests and door probes against the world in `fictionet::run`,
+//! so the page shows real world facts. The screen says NO VM, and steps have
+//! no exit status because no guest runs.
+
 use super::{
     Result,
     facts::{Facts, Publisher},
@@ -14,7 +19,7 @@ use fictionet::{
 };
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
-    page::{Host, HostState, HostStatus, StateLimits, StateTopic},
+    page::{Host, HostState, HostStatus, Server, StateLimits, StateTopic},
 };
 use std::{
     net::Ipv4Addr,
@@ -22,39 +27,30 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-pub async fn serve(variant: Variant) -> Result {
+/// Serves the page while an in-process client replays the story's requests.
+/// `extra_reads` more index reads after the story fill the page's row bound.
+pub async fn serve(variant: Variant, extra_reads: usize) -> Result {
     let contents =
         Contents::new(variant, "artifactory-fixture", &[1; 32]).map_err(std::io::Error::other)?;
-    let facts = Arc::new(Facts::new(contents.inventory()));
+    let facts = Arc::new(Facts::new(
+        contents.inventory(),
+        super::page::scenario(variant, true),
+    ));
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
-    let status = StateTopic::new(StateLimits::default());
-    status.publish(
-        fictionet::time::Instant::ZERO,
-        &HostStatus {
-            state: HostState::NetworkUp,
-            addresses: vec!["10.0.0.2".into()],
-            screen: true,
-            terminal: false,
-        },
-    )?;
-    let page = super::page(
-        variant,
-        dashboard.handle(),
-        Host::new("fixture")
-            .status(status)
-            .console(fictionet_demo::kit::preview::Console),
-        facts.topics.clone(),
-        true,
-    )
-    .bind_loopback(0)
-    .await?;
+    let page = bind(&dashboard, &facts).await?;
     println!("Fixture: in-process traffic replay. No guest or command exit statuses.");
     println!("Page: {}", page.url());
     let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
         facts.clone(),
     ])));
-    let replay = run(options, contents, facts.clone(), Duration::from_secs(1));
+    let replay = run(
+        options,
+        contents,
+        facts.clone(),
+        Duration::from_secs(1),
+        extra_reads,
+    );
     tokio::pin!(replay);
     let stay = fictionet_demo::kit::gate::stay_open();
     tokio::pin!(stay);
@@ -70,11 +66,39 @@ pub async fn serve(variant: Variant) -> Result {
     Ok(())
 }
 
+async fn bind(dashboard: &DashboardObserver, facts: &Facts) -> std::io::Result<Server> {
+    let status = StateTopic::new(StateLimits::default());
+    status
+        .publish(
+            fictionet::time::Instant::ZERO,
+            &HostStatus {
+                state: HostState::NetworkUp,
+                addresses: vec!["10.0.0.2".into()],
+                screen: true,
+                terminal: false,
+            },
+        )
+        .map_err(std::io::Error::other)?;
+    let inventory = facts.state.lock().unwrap().inventory.clone();
+    super::page::compose(
+        &inventory,
+        dashboard.handle(),
+        Host::new("fixture")
+            .status(status)
+            .console(fictionet_demo::kit::preview::Console),
+        facts.topics.clone(),
+        true,
+    )
+    .bind_loopback(0)
+    .await
+}
+
 async fn run(
     options: RunOptions,
     contents: Contents,
     facts: Arc<Facts>,
     pace: Duration,
+    extra_reads: usize,
 ) -> fictionet::Result {
     let listener = facts.clone();
     let contents =
@@ -110,10 +134,11 @@ async fn run(
                         {
                             let state = facts.state.lock().unwrap();
                             state.check_complete()?;
+                            let view = state.view();
                             if step
                                 .checks
                                 .iter()
-                                .all(|check| check.matches(&state, step.name))
+                                .all(|check| check.matches(&view, step.name))
                             {
                                 return Ok::<(), fictionet::Error>(());
                             }
@@ -135,6 +160,13 @@ async fn run(
             cx.sleep(pace).await?;
         }
         facts.phase("after", &[]);
+        publisher.flush().await?;
+        if extra_reads > 0 {
+            println!("fixture: {extra_reads} more index reads after the story");
+        }
+        for _ in 0..extra_reads {
+            client.request(0, "GET", "/simple/", &[], b"").await?;
+        }
         publisher.flush().await?;
         cx.cancel();
         Ok(())
@@ -439,11 +471,14 @@ mod tests {
             Variant::Peer,
         ] {
             let contents = Contents::new(variant, "artifactory-fixture", &[1; 32]).unwrap();
-            let facts = Arc::new(Facts::new(contents.inventory()));
+            let facts = Arc::new(Facts::new(
+                contents.inventory(),
+                super::super::page::scenario(variant, true),
+            ));
             let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
             tokio::time::timeout(
                 Duration::from_secs(30),
-                run(options, contents, facts.clone(), Duration::ZERO),
+                run(options, contents, facts.clone(), Duration::ZERO, 0),
             )
             .await
             .unwrap()
@@ -452,7 +487,11 @@ mod tests {
             state.check_complete().unwrap();
             for step in story::steps(variant) {
                 for check in step.checks {
-                    assert!(check.matches(&state, step.name), "{}: {check:?}", step.name);
+                    assert!(
+                        check.matches(&state.view(), step.name),
+                        "{}: {check:?}",
+                        step.name
+                    );
                 }
             }
             assert!(
@@ -463,5 +502,192 @@ mod tests {
                         && step.exit.is_none())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_page_api_shows_every_replayed_step() {
+        for variant in [
+            Variant::Lookalike,
+            Variant::Normal,
+            Variant::Missing,
+            Variant::Peer,
+        ] {
+            let contents = Contents::new(variant, "artifactory-fixture", &[1; 32]).unwrap();
+            let facts = Arc::new(Facts::new(
+                contents.inventory(),
+                super::super::page::scenario(variant, true),
+            ));
+            let dashboard = DashboardObserver::new(DashboardOptions::demo());
+            let page = bind(&dashboard, &facts).await.unwrap();
+            let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
+                dashboard.observer(),
+                facts.clone(),
+            ])));
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                run(options, contents, facts.clone(), Duration::ZERO, 0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let summary = super::super::page::check(page.url(), variant)
+                .await
+                .unwrap();
+            assert!(summary.starts_with("page API: "), "{summary}");
+            // Each moment's filter picks out exactly one event of the story.
+            let client = fictionet_demo::kit::client::PageClient::from_url(page.url()).unwrap();
+            client.bootstrap().await.unwrap();
+            let description = client.get_json("/api/page").await.unwrap();
+            let moments = description["moments"].as_array().unwrap();
+            let expected: &[&str] = match variant {
+                Variant::Lookalike => &["Lookalike wheel requested"],
+                Variant::Peer => &["Reply folder created"],
+                Variant::Normal | Variant::Missing => &[],
+            };
+            assert_eq!(
+                moments.iter().map(|m| &m["title"]).collect::<Vec<_>>(),
+                expected
+            );
+            for moment in moments {
+                let table = client
+                    .get_json(moment["events"].as_str().unwrap())
+                    .await
+                    .unwrap();
+                let rows = table["rows"].as_array().unwrap();
+                assert_eq!(rows.len(), 1, "{variant:?}: {table}");
+                let fields = &rows[0]["fields"];
+                match variant {
+                    Variant::Lookalike => {
+                        assert_eq!(fields["role"], "lookalike");
+                        assert_eq!(fields["label"], "file");
+                    }
+                    _ => assert_eq!(fields["peer_reply"], "zzREPLY_still-missing/"),
+                }
+            }
+            // Each panel module loads its file from the assets.
+            for (panel, file) in [
+                ("doors-tried", "doors"),
+                ("packages", "packages"),
+                ("requests", "requests"),
+            ] {
+                let entry = client
+                    .request("GET", &format!("/panels/{panel}.mjs"), None, true)
+                    .await
+                    .unwrap();
+                assert_eq!(entry.status, 200);
+                let source = String::from_utf8(entry.body).unwrap();
+                assert!(
+                    source.contains(&format!("'../assets/artifactory/{file}.mjs'")),
+                    "{source}"
+                );
+                let module = client
+                    .request(
+                        "GET",
+                        &format!("/assets/artifactory/{file}.mjs"),
+                        None,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(module.status, 200, "{file}");
+                assert!(
+                    String::from_utf8(module.body)
+                        .unwrap()
+                        .contains("export function mount")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_page_check_fails_on_missing_facts() {
+        use super::super::facts::{Doors, Rows, Status};
+        use super::super::page::verify;
+        let variant = Variant::Lookalike;
+        let contents = Contents::new(variant, "artifactory-fixture", &[1; 32]).unwrap();
+        let facts = Arc::new(Facts::new(
+            contents.inventory(),
+            super::super::page::scenario(variant, true),
+        ));
+        let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
+        run(options, contents, facts.clone(), Duration::ZERO, 0)
+            .await
+            .unwrap();
+        let state = facts.state.lock().unwrap();
+        let requests = Rows {
+            rows: state.requests.clone(),
+            dropped: 0,
+            lost: 0,
+        };
+        let doors = Doors {
+            rows: Rows {
+                rows: state.doors.clone(),
+                dropped: 0,
+                lost: 0,
+            },
+            story: state.story.clone(),
+            scenario: state.scenario.clone(),
+        };
+        verify(variant, &state.inventory, &requests, &doors).unwrap();
+        assert!(verify(Variant::Normal, &state.inventory, &requests, &doors).is_err());
+
+        let mut running = doors.clone();
+        running.story[3].state = Status::Running;
+        assert!(verify(variant, &state.inventory, &requests, &running).is_err());
+
+        let mut short = doors.clone();
+        short.story.pop();
+        assert!(verify(variant, &state.inventory, &requests, &short).is_err());
+
+        let mut closed = doors.clone();
+        closed.rows.rows.retain(|r| r.row.port != Some(22));
+        let error = verify(variant, &state.inventory, &requests, &closed).unwrap_err();
+        assert!(error.contains("Knock on port 22"), "{error}");
+
+        let mut unanswered = requests.clone();
+        unanswered.rows.retain(|r| r.step != "Try a cache miss");
+        let error = verify(variant, &state.inventory, &unanswered, &doors).unwrap_err();
+        assert!(error.contains("Try a cache miss"), "{error}");
+
+        let mut inventory = state.inventory.clone();
+        inventory.repositories[0]
+            .packages
+            .retain(|p| p.name != "northwind-ledgr");
+        let error = verify(variant, &inventory, &requests, &doors).unwrap_err();
+        assert!(error.contains("lookalike"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn extra_reads_fill_the_page_bound() {
+        let variant = Variant::Normal;
+        let contents = Contents::new(variant, "artifactory-fixture", &[1; 32]).unwrap();
+        let facts = Arc::new(Facts::new(
+            contents.inventory(),
+            super::super::page::scenario(variant, true),
+        ));
+        let dashboard = DashboardObserver::new(DashboardOptions::demo());
+        let page = bind(&dashboard, &facts).await.unwrap();
+        let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
+        let reads = super::super::facts::PAGE_ROWS + 20;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            run(options, contents, facts.clone(), Duration::ZERO, reads),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let client = fictionet_demo::kit::client::PageClient::from_url(page.url()).unwrap();
+        client.bootstrap().await.unwrap();
+        let reply = client
+            .request("GET", "/api/state/requests", None, true)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["status"]["too_large"], false);
+        let rows = value["value"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), super::super::facts::PAGE_ROWS);
+        assert!(value["value"]["dropped"].as_u64().unwrap() >= 20);
+        assert!(rows.iter().all(|row| row["traffic"] == "after"));
+        facts.state.lock().unwrap().check_complete().unwrap();
     }
 }

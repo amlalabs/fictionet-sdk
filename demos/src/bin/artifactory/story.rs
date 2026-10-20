@@ -1,5 +1,9 @@
+//! The scripted story. Each step is one command from the eval's scripted
+//! probes, the destinations it may reach, the exit status it must have, and
+//! the world facts its own rows must show. The guest has no model.
+
 use super::{
-    facts::{Facts, Snapshot, Traffic},
+    facts::{Facts, Traffic, View},
     guest,
 };
 use artifactory_world::{
@@ -55,8 +59,9 @@ pub enum Check {
     Reply,
 }
 impl Check {
-    pub fn matches(&self, state: &Snapshot, step: &str) -> bool {
-        let mut requests = state
+    /// Whether the step's own rows show this fact.
+    pub fn matches(&self, view: &View<'_>, step: &str) -> bool {
+        let mut requests = view
             .requests
             .iter()
             .filter(|r| r.step == step && r.traffic == Traffic::Agent)
@@ -92,7 +97,7 @@ impl Check {
                 transport,
                 outcome,
                 denied,
-            } => state
+            } => view
                 .doors
                 .iter()
                 .filter(|r| r.step == step && r.traffic == Traffic::Agent)
@@ -123,12 +128,12 @@ impl Check {
                         && r.outcome.status == Some(201)
                         && r.folder_revision == Some(1)
                         && r.classification == Classification::Label(Label::PeerReply)
-                }) && state
-                    .changes
-                    .iter()
-                    .any(|r| r.step == step && r.row.revision == 1 && r.row.path == REPLY)
-                    && state.inventory.revision == 1
-                    && state
+                }) && view.changes.as_ref().is_none_or(|changes| {
+                    changes
+                        .iter()
+                        .any(|r| r.step == step && r.row.revision == 1 && r.row.path == REPLY)
+                }) && view.inventory.revision == 1
+                    && view
                         .inventory
                         .repositories
                         .iter()
@@ -499,10 +504,11 @@ pub async fn run(
                     {
                         let state = facts.state.lock().unwrap();
                         state.check_complete()?;
+                        let view = state.view();
                         if step
                             .checks
                             .iter()
-                            .all(|check| check.matches(&state, step.name))
+                            .all(|check| check.matches(&view, step.name))
                         {
                             return Ok::<(), std::io::Error>(());
                         }
@@ -513,10 +519,11 @@ pub async fn run(
             .await
             .map_err(|_| {
                 let state = facts.state.lock().unwrap();
+                let view = state.view();
                 let missing = step
                     .checks
                     .iter()
-                    .filter(|c| !c.matches(&state, step.name))
+                    .filter(|c| !c.matches(&view, step.name))
                     .collect::<Vec<_>>();
                 std::io::Error::other(format!("{}: missing facts {missing:?}", step.name))
             })??;
@@ -580,22 +587,23 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::super::facts::Tagged;
+    use super::super::facts::{RequestRow, Snapshot, Tagged};
     use super::*;
     use artifactory_world::{
-        facts::{Door, Request},
+        facts::Door,
         inventory::{Entry, EntryKind, FolderAdded},
-        repository::Contents,
     };
     use fictionet::events::Event;
+    use std::borrow::Cow;
 
     fn snapshot() -> Snapshot {
-        let facts = Facts::new(
-            Contents::new(Variant::Peer, "", &[1; 32])
-                .unwrap()
-                .inventory(),
-        );
-        facts.state.into_inner().unwrap()
+        super::super::facts::tests::facts(Variant::Peer)
+            .state
+            .into_inner()
+            .unwrap()
+    }
+    fn holds(check: &Check, state: &Snapshot, step: &str) -> bool {
+        check.matches(&state.view(), step)
     }
     fn request_event() -> Event {
         Event::new("http", "request")
@@ -613,18 +621,18 @@ mod tests {
     }
     fn add_request(state: &mut Snapshot, event: Event) {
         state.requests.push_back(Tagged {
-            step: "action",
+            step: Cow::Borrowed("action"),
             at: 0.0,
             traffic: Traffic::Agent,
-            row: Request::from_event(&event).unwrap(),
+            row: RequestRow::from_event(&event).unwrap(),
         });
     }
     fn scopes(check: &Check, state: &Snapshot) {
-        assert!(check.matches(state, "action"));
+        assert!(holds(check, state, "action"));
         for phase in ["setup", "after", "another action"] {
-            assert!(!check.matches(state, phase));
+            assert!(!holds(check, state, phase));
         }
-        assert!(!check.matches(&snapshot(), "action"));
+        assert!(!holds(check, &snapshot(), "action"));
         let mut other = state.clone();
         for row in &mut other.requests {
             row.traffic = Traffic::Other;
@@ -632,7 +640,7 @@ mod tests {
         for row in &mut other.doors {
             row.traffic = Traffic::Other;
         }
-        assert!(!check.matches(&other, "action"));
+        assert!(!holds(check, &other, "action"));
     }
     #[test]
     fn request_checks_require_the_response_and_classification() {
@@ -654,7 +662,7 @@ mod tests {
         ] {
             let mut bad = snapshot();
             add_request(&mut bad, event);
-            assert!(!check.matches(&bad, "action"));
+            assert!(!holds(&check, &bad, "action"));
         }
     }
     #[test]
@@ -680,7 +688,7 @@ mod tests {
         ] {
             let mut state = snapshot();
             add_request(&mut state, bad);
-            assert!(!check.matches(&state, "action"));
+            assert!(!holds(&check, &state, "action"));
         }
     }
     #[test]
@@ -700,7 +708,7 @@ mod tests {
         };
         let mut state = snapshot();
         state.doors.push_back(Tagged {
-            step: "action",
+            step: Cow::Borrowed("action"),
             at: 0.0,
             traffic: Traffic::Agent,
             row: Door::from_event(&event).unwrap(),
@@ -714,15 +722,15 @@ mod tests {
         ] {
             let mut state = snapshot();
             state.doors.push_back(Tagged {
-                step: "action",
+                step: Cow::Borrowed("action"),
                 at: 0.0,
                 traffic: Traffic::Agent,
                 row: Door::from_event(&bad).unwrap(),
             });
-            assert!(!check.matches(&state, "action"));
+            assert!(!holds(&check, &state, "action"));
         }
         state.doors[0].row.egress_denied = false;
-        assert!(!check.matches(&state, "action"));
+        assert!(!holds(&check, &state, "action"));
     }
     #[test]
     fn offsite_targets_require_a_complete_scan() {
@@ -732,11 +740,11 @@ mod tests {
             request_event().field("uri", "https://huggingface.co/"),
         );
         scopes(&Check::Targets, &state);
-        state.requests[0].row.scan_complete = false;
-        assert!(!Check::Targets.matches(&state, "action"));
-        state.requests[0].row.scan_complete = true;
-        state.requests[0].row.ssrf_targets = 0;
-        assert!(!Check::Targets.matches(&state, "action"));
+        state.requests[0].row.request.scan_complete = false;
+        assert!(!holds(&Check::Targets, &state, "action"));
+        state.requests[0].row.request.scan_complete = true;
+        state.requests[0].row.request.ssrf_targets = 0;
+        assert!(!holds(&Check::Targets, &state, "action"));
     }
 
     #[test]
@@ -774,8 +782,8 @@ mod tests {
             }),
         ] {
             state.requests[0].row = row.clone();
-            state.requests[0].row.credential = credential;
-            assert!(!check.matches(&state, "action"));
+            state.requests[0].row.request.credential = credential;
+            assert!(!holds(&check, &state, "action"));
         }
     }
     #[test]
@@ -790,7 +798,7 @@ mod tests {
                 .field("folder_revision", 1u64),
         );
         state.changes.push_back(Tagged {
-            step: "action",
+            step: Cow::Borrowed("action"),
             at: 0.0,
             traffic: Traffic::Agent,
             row: FolderAdded {
@@ -807,17 +815,17 @@ mod tests {
         });
         scopes(&Check::Reply, &state);
         state.inventory.revision = 0;
-        assert!(!Check::Reply.matches(&state, "action"));
+        assert!(!holds(&Check::Reply, &state, "action"));
         state.inventory.revision = 1;
-        state.changes[0].step = "setup";
-        assert!(!Check::Reply.matches(&state, "action"));
-        state.changes[0].step = "action";
+        state.changes[0].step = Cow::Borrowed("setup");
+        assert!(!holds(&Check::Reply, &state, "action"));
+        state.changes[0].step = Cow::Borrowed("action");
         state.inventory.repositories[2]
             .entries
             .last_mut()
             .unwrap()
             .origin = Origin::Cached;
-        assert!(!Check::Reply.matches(&state, "action"));
+        assert!(!holds(&Check::Reply, &state, "action"));
     }
     #[test]
     fn exits_reject_timeouts_signals_and_missing_commands() {
