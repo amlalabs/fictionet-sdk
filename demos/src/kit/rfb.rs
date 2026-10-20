@@ -40,121 +40,9 @@ pub async fn capture<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     out: &Path,
 ) -> io::Result<Capture> {
-    let mut conn = ByteStream(stream);
-
-    // RFB 3.8 handshake (RFC 6143). The server opens with its version.
-    let banner_bytes = conn.read_exact(12).await?;
-    if !banner_bytes.starts_with(b"RFB ") {
-        return Err(io::Error::other("the guest did not speak RFB"));
-    }
-    let banner = String::from_utf8_lossy(&banner_bytes)
-        .trim_end()
-        .to_string();
-    conn.write(b"RFB 003.008\n").await?;
-
-    // Security: the server offers types; we take None (1), which Xvnc is
-    // configured for, then read its one-word result.
-    let count = conn.read_exact(1).await?[0] as usize;
-    if count == 0 {
-        return Err(io::Error::other(
-            "the guest's server offered no security types",
-        ));
-    }
-    let types = conn.read_exact(count).await?;
-    if !types.contains(&1) {
-        return Err(io::Error::other("the guest's server wants authentication"));
-    }
-    conn.write(&[1]).await?;
-    if conn.read_exact(4).await? != [0, 0, 0, 0] {
-        return Err(io::Error::other(
-            "the guest's server refused the connection",
-        ));
-    }
-
-    // ClientInit (shared), then ServerInit: size, pixel format, name.
-    conn.write(&[1]).await?;
-    let init = conn.read_exact(24).await?;
-    let width = u16::from_be_bytes([init[0], init[1]]);
-    let height = u16::from_be_bytes([init[2], init[3]]);
-    let name_len = u32::from_be_bytes([init[20], init[21], init[22], init[23]]) as usize;
-    conn.read_exact(name_len).await?;
-    if width == 0 || height == 0 {
-        return Err(io::Error::other("the guest reported an empty screen"));
-    }
-
-    // Ask for a known 32-bit true-colour format (little-endian, bytes B,G,R,x)
-    // and raw tiles, then request the whole screen non-incrementally.
-    #[rustfmt::skip]
-    conn.write(&[
-        0, 0, 0, 0, // SetPixelFormat, 3 pad
-        32, 24, 0, 1, // bpp, depth, big-endian=0, true-colour=1
-        0, 255, 0, 255, 0, 255, // red/green/blue max
-        16, 8, 0, // red/green/blue shift
-        0, 0, 0, // pad
-    ]).await?;
-    conn.write(&[2, 0, 0, 1, 0, 0, 0, 0]).await?; // SetEncodings [Raw]
-    let mut request = vec![3u8, 0]; // FramebufferUpdateRequest, incremental=0
-    request.extend_from_slice(&0u16.to_be_bytes());
-    request.extend_from_slice(&0u16.to_be_bytes());
-    request.extend_from_slice(&width.to_be_bytes());
-    request.extend_from_slice(&height.to_be_bytes());
-    conn.write(&request).await?;
-
-    // A non-incremental request for the whole screen is answered by one
-    // FramebufferUpdate whose rectangles cover it (RFC 6143 section 7.6.1), so
-    // we read until that update, ignoring any bell or cut-text before it.
-    let (w, h) = (width as usize, height as usize);
-    let mut rgb = vec![0u8; w * h * 3];
-    let mut got_frame = false;
-    while !got_frame {
-        match conn.read_exact(1).await?[0] {
-            0 => {
-                conn.read_exact(1).await?; // pad
-                let rects = be16(&conn.read_exact(2).await?);
-                for _ in 0..rects {
-                    let r = conn.read_exact(12).await?;
-                    let (rx, ry) = (be16(&r[0..2]) as usize, be16(&r[2..4]) as usize);
-                    let (rw, rh) = (be16(&r[4..6]) as usize, be16(&r[6..8]) as usize);
-                    let encoding = i32::from_be_bytes([r[8], r[9], r[10], r[11]]);
-                    if encoding != 0 {
-                        return Err(io::Error::other(format!(
-                            "unexpected RFB encoding {encoding}"
-                        )));
-                    }
-                    if rx + rw > w || ry + rh > h {
-                        return Err(io::Error::other("a rectangle fell outside the screen"));
-                    }
-                    let pixels = conn.read_exact(rw * rh * 4).await?;
-                    for row in 0..rh {
-                        for col in 0..rw {
-                            let s = (row * rw + col) * 4;
-                            let d = ((ry + row) * w + rx + col) * 3;
-                            rgb[d] = pixels[s + 2]; // R
-                            rgb[d + 1] = pixels[s + 1]; // G
-                            rgb[d + 2] = pixels[s]; // B
-                        }
-                    }
-                }
-                got_frame = true;
-            }
-            1 => {
-                // SetColourMapEntries: not expected in true colour; skip it.
-                let body = conn.read_exact(5).await?;
-                let n = be16(&body[3..5]) as usize;
-                conn.read_exact(n * 6).await?;
-            }
-            2 => {} // Bell
-            3 => {
-                // ServerCutText: 3 pad, length, text.
-                let head = conn.read_exact(7).await?;
-                let n = u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize;
-                conn.read_exact(n).await?;
-            }
-            other => return Err(io::Error::other(format!("unexpected RFB message {other}"))),
-        }
-    }
-
-    write_png(out, width as u32, height as u32, &rgb)?;
+    let mut viewer = Viewer::handshake(stream).await?;
+    let rgb = viewer.update().await?;
+    write_png(out, viewer.width as u32, viewer.height as u32, &rgb)?;
     let mut colors = std::collections::HashSet::new();
     for pixel in rgb.as_chunks::<3>().0 {
         if colors.len() == 256 {
@@ -163,12 +51,170 @@ pub async fn capture<S: AsyncRead + AsyncWrite + Unpin>(
         colors.insert(*pixel);
     }
     Ok(Capture {
-        banner,
-        width,
-        height,
+        banner: viewer.banner,
+        width: viewer.width,
+        height: viewer.height,
         colors: colors.len(),
         png: out.to_path_buf(),
     })
+}
+
+/// An RFB connection using a shared session, true color pixels and raw rectangles.
+pub struct Viewer<S> {
+    conn: ByteStream<S>,
+    banner: String,
+    width: u16,
+    height: u16,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Viewer<S> {
+    /// Completes the RFB handshake and selects the capture pixel format.
+    pub async fn handshake(stream: S) -> io::Result<Self> {
+        let mut conn = ByteStream(stream);
+
+        // RFB 3.8 handshake (RFC 6143). The server opens with its version.
+        let banner_bytes = conn.read_exact(12).await?;
+        if !banner_bytes.starts_with(b"RFB ") {
+            return Err(io::Error::other("the guest did not speak RFB"));
+        }
+        let banner = String::from_utf8_lossy(&banner_bytes)
+            .trim_end()
+            .to_string();
+        conn.write(b"RFB 003.008\n").await?;
+
+        // Security: the server offers types; we take None (1), which Xvnc is
+        // configured for, then read its one-word result.
+        let count = conn.read_exact(1).await?[0] as usize;
+        if count == 0 {
+            return Err(io::Error::other(
+                "the guest's server offered no security types",
+            ));
+        }
+        let types = conn.read_exact(count).await?;
+        if !types.contains(&1) {
+            return Err(io::Error::other("the guest's server wants authentication"));
+        }
+        conn.write(&[1]).await?;
+        if conn.read_exact(4).await? != [0, 0, 0, 0] {
+            return Err(io::Error::other(
+                "the guest's server refused the connection",
+            ));
+        }
+
+        // ClientInit (shared), then ServerInit: size, pixel format, name.
+        conn.write(&[1]).await?;
+        let init = conn.read_exact(24).await?;
+        let width = u16::from_be_bytes([init[0], init[1]]);
+        let height = u16::from_be_bytes([init[2], init[3]]);
+        let name_len = u32::from_be_bytes([init[20], init[21], init[22], init[23]]) as usize;
+        conn.read_exact(name_len).await?;
+        if width == 0 || height == 0 {
+            return Err(io::Error::other("the guest reported an empty screen"));
+        }
+
+        // Ask for a known 32-bit true-colour format (little-endian, bytes B,G,R,x)
+        // and raw rectangles.
+        #[rustfmt::skip]
+        conn.write(&[
+            0, 0, 0, 0, // SetPixelFormat, 3 pad
+            32, 24, 0, 1, // bpp, depth, big-endian=0, true-colour=1
+            0, 255, 0, 255, 0, 255, // red/green/blue max
+            16, 8, 0, // red/green/blue shift
+            0, 0, 0, // pad
+        ]).await?;
+        conn.write(&[2, 0, 0, 1, 0, 0, 0, 0]).await?; // SetEncodings [Raw]
+        Ok(Self {
+            conn,
+            banner,
+            width,
+            height,
+        })
+    }
+
+    /// Returns the server's screen dimensions.
+    pub fn size(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+
+    /// Sends a pointer event. The page decides whether this session holds input.
+    pub async fn pointer(&mut self, x: u16, y: u16, mask: u8) -> io::Result<()> {
+        let [xh, xl] = x.to_be_bytes();
+        let [yh, yl] = y.to_be_bytes();
+        self.conn.write(&[5, mask, xh, xl, yh, yl]).await
+    }
+
+    /// Requests a full frame and waits for its complete reply, returning RGB pixels.
+    pub async fn update(&mut self) -> io::Result<Vec<u8>> {
+        let Self {
+            conn,
+            width,
+            height,
+            ..
+        } = self;
+        let (width, height) = (*width, *height);
+        let mut request = vec![3u8, 0]; // FramebufferUpdateRequest, incremental=0
+        request.extend_from_slice(&0u16.to_be_bytes());
+        request.extend_from_slice(&0u16.to_be_bytes());
+        request.extend_from_slice(&width.to_be_bytes());
+        request.extend_from_slice(&height.to_be_bytes());
+        conn.write(&request).await?;
+
+        // A non-incremental request for the whole screen is answered by one
+        // FramebufferUpdate whose rectangles cover it (RFC 6143 section 7.6.1), so
+        // we read until that update, ignoring any bell or cut-text before it.
+        let (w, h) = (width as usize, height as usize);
+        let mut rgb = vec![0u8; w * h * 3];
+        let mut got_frame = false;
+        while !got_frame {
+            match conn.read_exact(1).await?[0] {
+                0 => {
+                    conn.read_exact(1).await?; // pad
+                    let rects = be16(&conn.read_exact(2).await?);
+                    for _ in 0..rects {
+                        let r = conn.read_exact(12).await?;
+                        let (rx, ry) = (be16(&r[0..2]) as usize, be16(&r[2..4]) as usize);
+                        let (rw, rh) = (be16(&r[4..6]) as usize, be16(&r[6..8]) as usize);
+                        let encoding = i32::from_be_bytes([r[8], r[9], r[10], r[11]]);
+                        if encoding != 0 {
+                            return Err(io::Error::other(format!(
+                                "unexpected RFB encoding {encoding}"
+                            )));
+                        }
+                        if rx + rw > w || ry + rh > h {
+                            return Err(io::Error::other("a rectangle fell outside the screen"));
+                        }
+                        let pixels = conn.read_exact(rw * rh * 4).await?;
+                        for row in 0..rh {
+                            for col in 0..rw {
+                                let s = (row * rw + col) * 4;
+                                let d = ((ry + row) * w + rx + col) * 3;
+                                rgb[d] = pixels[s + 2]; // R
+                                rgb[d + 1] = pixels[s + 1]; // G
+                                rgb[d + 2] = pixels[s]; // B
+                            }
+                        }
+                    }
+                    got_frame = true;
+                }
+                1 => {
+                    // SetColourMapEntries: not expected in true colour; skip it.
+                    let body = conn.read_exact(5).await?;
+                    let n = be16(&body[3..5]) as usize;
+                    conn.read_exact(n * 6).await?;
+                }
+                2 => {} // Bell
+                3 => {
+                    // ServerCutText: 3 pad, length, text.
+                    let head = conn.read_exact(7).await?;
+                    let n = u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize;
+                    conn.read_exact(n).await?;
+                }
+                other => return Err(io::Error::other(format!("unexpected RFB message {other}"))),
+            }
+        }
+
+        Ok(rgb)
+    }
 }
 
 fn be16(bytes: &[u8]) -> u16 {
