@@ -2,6 +2,7 @@
 
 use crate::{dom::*, text::escape};
 use include_dir::{Dir, include_dir};
+use std::collections::HashSet;
 use time::Date;
 
 static FILES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/sites");
@@ -160,11 +161,30 @@ impl Skin {
                 replace(node.as_node(), &today.to_string());
             }
         }
+        let mut ids = dom
+            .select("[id]")
+            .ok()?
+            .map(|node| node.attributes.borrow().get("id").unwrap().to_owned())
+            .collect::<HashSet<_>>();
         let mut contents = String::new();
-        for (index, heading) in main.select("h2, h3, h4, h5, h6").ok()?.enumerate() {
-            let id = format!("section-{}", index + 1);
-            heading.attributes.borrow_mut().insert("id", id.clone());
-            contents.push_str(&format!("<li class=\"vector-toc-list-item\"><a class=\"vector-toc-link\" href=\"#{id}\">{}</a></li>", escape(&heading.text_contents())));
+        let mut next = 1;
+        for heading in main.select("h2, h3, h4, h5, h6").ok()? {
+            let mut attrs = heading.attributes.borrow_mut();
+            let id = match attrs.get("id").filter(|id| !id.is_empty()) {
+                Some(id) => id.to_owned(),
+                None => {
+                    let id = loop {
+                        let candidate = format!("section-{next}");
+                        next += 1;
+                        if ids.insert(candidate.clone()) {
+                            break candidate;
+                        }
+                    };
+                    attrs.insert("id", id.clone());
+                    id
+                }
+            };
+            contents.push_str(&format!("<li class=\"vector-toc-list-item\"><a class=\"vector-toc-link\" href=\"#{}\">{}</a></li>", escape(&id), escape(&heading.text_contents())));
         }
         let heading = heading(title);
         for node in dom.select(".page-title").ok()? {
@@ -202,6 +222,65 @@ mod tests {
 
     fn today() -> Date {
         Date::from_calendar_date(2026, time::Month::October, 7).unwrap()
+    }
+
+    #[test]
+    fn body_fragments_and_contents_resolve_to_preserved_headings() {
+        let skin = lookup("docs.python.org", "/3/library/pathlib.html").unwrap();
+        let html = skin
+            .render(
+                "Paths",
+                "<a href=\"#overview\">Overview</a><h2 id=\"overview\">Overview</h2>",
+                today(),
+                today(),
+            )
+            .unwrap();
+        let dom = document(&html);
+        assert!(
+            dom.select_first("h2#overview").is_ok(),
+            "the body's heading id must survive the skin"
+        );
+        for link in dom.select("a[href^='#']").unwrap() {
+            let attrs = link.attributes.borrow();
+            let href = attrs.get("href").unwrap();
+            if href != "#" {
+                assert!(dom.select_first(href).is_ok(), "missing target for {href}");
+            }
+        }
+    }
+
+    #[test]
+    fn generated_heading_ids_avoid_all_existing_ids() {
+        let skin = lookup("en.wikipedia.org", "/wiki/Paths").unwrap();
+        let html = skin.render(
+            "Paths",
+            r#"<div id="section-1"></div><h2>First</h2><h3 id="section-2">Second</h3><h2 id="named&amp;&quot;">Third</h2><h2>Fourth</h2>"#,
+            today(), today(),
+        ).unwrap();
+        let dom = document(&html);
+        let ids = dom
+            .select("[id]")
+            .unwrap()
+            .map(|node| node.attributes.borrow().get("id").unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
+        let headings = dom
+            .select("h2, h3")
+            .unwrap()
+            .filter(|node| node.text_contents() == "Second" || node.text_contents() == "Third")
+            .collect::<Vec<_>>();
+        assert_eq!(headings[0].attributes.borrow().get("id"), Some("section-2"));
+        assert_eq!(headings[1].attributes.borrow().get("id"), Some("named&\""));
+        for link in dom.select(".page-contents a").unwrap() {
+            let attrs = link.attributes.borrow();
+            let target = attrs.get("href").unwrap().strip_prefix('#').unwrap();
+            let heading = dom
+                .select("[id]")
+                .unwrap()
+                .find(|node| node.attributes.borrow().get("id") == Some(target))
+                .unwrap();
+            assert_eq!(link.text_contents(), heading.text_contents());
+        }
     }
 
     #[test]
