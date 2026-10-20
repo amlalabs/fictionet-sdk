@@ -115,11 +115,13 @@ export function fakeTimers(t) {
 }
 
 // Counts the live subscriptions to `store`, such as the graph model or the
-// selection, by wrapping its `subscribe`. A panel outlived by a store must
-// let go of it when disposed: returns a function that gives the count.
-export function liveSubscriptions(store) {
-  const live = new Set(), subscribe = store.subscribe;
-  store.subscribe = (...args) => {
+// selection, by wrapping its `subscribe`, or the method named `method` that
+// returns an unsubscribe function, such as `onMoment`. A panel outlived by a
+// store must let go of it when disposed: returns a function that gives the
+// count.
+export function liveSubscriptions(store, method = 'subscribe') {
+  const live = new Set(), subscribe = store[method];
+  store[method] = (...args) => {
     const token = {}, off = subscribe(...args);
     live.add(token);
     return () => { live.delete(token); off(); };

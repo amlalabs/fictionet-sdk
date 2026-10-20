@@ -2,9 +2,7 @@
 // port maps from a KVM run of the demo. Not served.
 import { readFileSync } from 'node:fs';
 import { createDocument } from '../../../../dashboard/test-dom.mjs';
-import { createSelection } from '../../../../dashboard/selection.mjs';
-import * as dom from '../../../../dashboard/dom.mjs';
-import * as format from '../../../../dashboard/format.mjs';
+import { createServices } from '../../../../dashboard/page.mjs';
 
 // The world's port map after host discovery in the KVM run. That run
 // predates banners, so the two banner fields are added here.
@@ -73,32 +71,29 @@ export const HOSTS = [
   { name: 'office', sandbox: 'server', status: '/api/state/host-office', pinned: true, screen: null, terminal: 'office-terminal' },
 ];
 
-// Mounts a panel with fake services. `publish(path, value, status)` delivers
-// a snapshot to that topic's subscribers.
+// Mounts a panel with the page's services, whose state topics the test
+// publishes: `publish(path, value, status)` delivers a snapshot to that
+// topic's subscribers.
 export function harness(mount, state) {
   const document = createDocument();
   const root = document.createElement('section');
   document.body.append(root);
   const subscribers = new Map();
   const moments = [];
-  const selection = createSelection();
   let revision = 0;
-  const services = {
-    dom,
-    format,
-    hosts: HOSTS,
-    selection,
-    moment(element) { moments.push(element); element.classList.add('moment'); },
-    state(path, onSnapshot, onError) {
-      if (!subscribers.has(path)) subscribers.set(path, new Set());
-      const entry = { onSnapshot, onError };
-      subscribers.get(path).add(entry);
-      return () => subscribers.get(path).delete(entry);
-    },
+  const services = createServices({});
+  services.hosts = HOSTS;
+  const moment = services.moment;
+  services.moment = (element) => { moments.push(element); moment(element); };
+  services.state = (path, onSnapshot, onError) => {
+    if (!subscribers.has(path)) subscribers.set(path, new Set());
+    const entry = { onSnapshot, onError };
+    subscribers.get(path).add(entry);
+    return () => subscribers.get(path).delete(entry);
   };
   const dispose = mount(root, services, { state, title: 'Panel', module: '/panels/x.mjs' });
   return {
-    document, root, services, moments, selection, dispose, subscribers,
+    document, root, services, moments, selection: services.selection, dispose, subscribers,
     publish(path, value, status = { too_large: false }) {
       for (const entry of subscribers.get(path) || []) entry.onSnapshot({ revision: ++revision, at: revision, value, status });
     },

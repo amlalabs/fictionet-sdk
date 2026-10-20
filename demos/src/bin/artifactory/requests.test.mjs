@@ -80,7 +80,7 @@ test('selecting a row selects its request and connection and opens its flow', ()
   const [events, packets] = detail.querySelectorAll('button');
   events.click();
   packets.click();
-  assert.deepEqual(f.panels, ['events']);
+  assert.deepEqual(f.panels, ['events', 'packets']);
   assert.deepEqual(f.pairs, [{ local: '10.20.0.15:443', peer: '10.0.0.2:40100' }]);
   second.click();
   assert.equal(f.selection.get().connection, null);
@@ -124,12 +124,12 @@ test('dispose releases subscriptions, listeners and moments', () => {
   const before = f.listeners();
   assert.ok(before >= 4);
   assert.equal(f.subscriptions.size, 2);
-  assert.equal(f.momentListeners.size, 1);
+  assert.equal(f.momentListeners(), 1);
   const tr = rows(f)[0], buttons = f.root.querySelectorAll('button');
   const update = f.subscriptions.get(REQUESTS);
   f.dispose();
   assert.equal(f.subscriptions.size, 0);
-  assert.equal(f.momentListeners.size, 0);
+  assert.equal(f.momentListeners(), 0);
   assert.equal(tr.listenerCount + buttons.reduce((n, node) => n + node.listenerCount, 0), 0);
   tr.click();
   assert.equal(f.selection.get().request, null);

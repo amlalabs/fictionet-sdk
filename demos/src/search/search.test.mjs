@@ -1,9 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDocument } from '../../../dashboard/test-dom.mjs';
-import * as dom from '../../../dashboard/dom.mjs';
-import * as format from '../../../dashboard/format.mjs';
-import { createSelection } from '../../../dashboard/selection.mjs';
+import { createServices } from '../../../dashboard/page.mjs';
 import { counts, tree, queryKey, resultView, made, rootNote } from './model.mjs';
 import { mount } from './view.mjs';
 
@@ -24,19 +22,18 @@ function fixture() {
 }
 function harness(t) {
   const document = createDocument(), root = document.createElement('div');
-  const subscriptions = new Map(), pending = [], selected = createSelection(), moments = [];
+  const subscriptions = new Map(), pending = [], moments = [];
   const timers = [], pairs = [];
   t.mock.method(globalThis, 'setTimeout', () => { timers.push('timeout'); });
   t.mock.method(globalThis, 'setInterval', () => { timers.push('interval'); });
-  const services = {
-    dom, format, selection: selected, packetPair: { set: (pair) => pairs.push(pair) },
-    moment: (node) => moments.push(node),
-    state(path, publish, error) { subscriptions.set(path, { publish, error }); return () => subscriptions.delete(path); },
-    transport: {
-      post(path, body, signal) { return new Promise((resolve, reject) => pending.push({ path, body, signal, resolve, reject })); },
-      async get(path, args) { return { events: [{ seq: args.after + 1, sandbox: { name: 'workstation' }, fields: { request_id: 99 }, conn: 4, local: '23.1.2.3:443', peer: '10.0.0.2:52970' }] }; },
-    },
-  };
+  const services = createServices({
+    post(path, body, signal) { return new Promise((resolve, reject) => pending.push({ path, body, signal, resolve, reject })); },
+    async get(path, args) { return { events: [{ seq: args.after + 1, sandbox: { name: 'workstation' }, fields: { request_id: 99 }, conn: 4, local: '23.1.2.3:443', peer: '10.0.0.2:52970' }] }; },
+  });
+  const selected = services.selection;
+  services.packetPair.subscribe((pair) => pairs.push(pair));
+  services.moment = (node) => moments.push(node);
+  services.state = (path, publish, error) => { subscriptions.set(path, { publish, error }); return () => subscriptions.delete(path); };
   const dispose = mount(root, services, { state: '/api/state/search' });
   subscriptions.get('/api/state/policy').publish({ value: { searcher: 'Firefox (scripted)', made_up: 'Every internet name', refused: 'Private names', forwarded: [] } });
   const publish = (value) => subscriptions.get('/api/state/search').publish({ revision: 500, value });

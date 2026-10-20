@@ -1,34 +1,28 @@
-// Page services for the panels' Node tests, on the framework's test DOM.
-// Not served.
-import { createDocument } from '../../../../dashboard/test-dom.mjs';
-import { createSelection } from '../../../../dashboard/selection.mjs';
-import * as dom from '../../../../dashboard/dom.mjs';
-import * as format from '../../../../dashboard/format.mjs';
+// Page services for the panels' Node tests, on the framework's test DOM:
+// the page's own services, with state topics the test publishes. Not served.
+import { createDocument, liveSubscriptions } from '../../../../dashboard/test-dom.mjs';
+import { createServices } from '../../../../dashboard/page.mjs';
 
 export function harness(mount, state) {
   const document = createDocument(), root = document.createElement('section');
   document.body.append(root);
-  const subscriptions = new Map(), failures = new Map(), panels = [], pairs = [], moments = new Set(), momentListeners = new Set();
-  const selection = createSelection();
-  const services = {
-    dom, format, selection,
-    showPanel(name) { panels.push(name); },
-    showPackets(pair) { pairs.push(pair); },
-    moment(element) { element.classList.add('moment'); },
-    isMoment: (event) => moments.has(event.seq),
-    onMoment(callback) { momentListeners.add(callback); return () => momentListeners.delete(callback); },
-    state(path, update, error) {
-      subscriptions.set(path, update);
-      failures.set(path, error);
-      return () => { subscriptions.delete(path); failures.delete(path); };
-    },
+  const subscriptions = new Map(), failures = new Map(), panels = [], pairs = [];
+  const services = createServices({});
+  // The inspector sets showPanel on a page; here it records the panels asked for.
+  services.showPanel = (name) => { panels.push(name); };
+  services.packetPair.subscribe((pair) => { if (pair) pairs.push(pair); });
+  const momentListeners = liveSubscriptions(services, 'onMoment');
+  services.state = (path, update, error) => {
+    subscriptions.set(path, update);
+    failures.set(path, error);
+    return () => { subscriptions.delete(path); failures.delete(path); };
   };
   const dispose = mount(root, services, { state });
   return {
-    root, panels, pairs, selection, dispose, subscriptions, momentListeners,
+    root, panels, pairs, selection: services.selection, dispose, subscriptions, momentListeners,
     publish(path, value, status = {}) { subscriptions.get(path)?.({ revision: 1, at: 0, value, status }); },
     fail(path, error) { failures.get(path)?.(error); },
-    mark(seq) { moments.add(seq); momentListeners.forEach((callback) => callback()); },
+    mark(seq) { services.markMoment({ seq }); },
     listeners: () => root.querySelectorAll('button').concat(root.querySelectorAll('tr')).reduce((n, node) => n + node.listenerCount, 0),
   };
 }

@@ -76,7 +76,7 @@ export function mount(root, services, options) {
   };
   // Resolve real event identities; sequence numbers are never treated as request IDs.
   async function select(seq, host) {
-    services.packetPair?.set(null);
+    services.packetPair.set(null);
     services.selection.set({ host: host || null, event: { seq }, request: null, connection: null, node: null, links: [] });
     try {
       const events = await services.transport.get('/api/events', { after: Math.max(0, seq - 1), max: 1 }, controller.signal);
@@ -84,7 +84,7 @@ export function mount(root, services, options) {
       const event = events.events?.find((e) => e.seq === seq);
       if (event) {
         services.selection.set({ event, host: event.sandbox?.name || host || null, request: event.fields?.request_id ?? null, connection: event.conn ?? null });
-        services.packetPair?.set(event.local && event.peer ? { local: event.local, peer: event.peer } : null);
+        services.packetPair.set(event.local && event.peer ? { local: event.local, peer: event.peer } : null);
       }
     } catch (e) { if (!disposed) set(error, `Selection details unavailable: ${e.message}`); }
   }

@@ -42,7 +42,7 @@ export function mount(root, services, options) {
   const events = button(actions, 'button', 'Events on this connection', () => services.showPanel('events'));
   const packets = button(actions, 'button', 'Packets for this address pair', () => {
     const row = selectedRow();
-    if (row?.local && row?.peer) services.showPackets?.({ local: row.local, peer: row.peer });
+    if (row?.local && row?.peer) services.showPackets({ local: row.local, peer: row.peer });
   });
   el('span', { class: 'note', text: 'The address pair can match other connections between the same ports.' }, actions);
 
@@ -90,7 +90,7 @@ export function mount(root, services, options) {
     add('World address', row.local);
     add('Guest address', row.peer);
     events.disabled = row.conn == null;
-    packets.disabled = !(row.local && row.peer && services.showPackets);
+    packets.disabled = !(row.local && row.peer);
   }
 
   function render() {
@@ -121,7 +121,7 @@ export function mount(root, services, options) {
       set(entry.cells.step, stepLabel(tag, story, hosts));
       entry.cells.step.setAttribute('title', tag.traffic === 'agent' ? tag.step : `${words(tag.traffic)} traffic`);
       if (fresh) entry.node.classList.add('new-row');
-      if (services.isMoment?.({ seq: tag.row.seq })) services.moment(entry.node);
+      if (services.isMoment({ seq: tag.row.seq })) services.moment(entry.node);
       const chosen = tag.row.seq === selected;
       entry.node.classList.toggle('on', chosen);
       entry.node.setAttribute('aria-selected', String(chosen));
@@ -150,12 +150,12 @@ export function mount(root, services, options) {
     selected = value.request ?? null;
     render();
   });
-  const stopMoments = services.onMoment?.(() => { if (!disposed) render(); });
+  const stopMoments = services.onMoment(() => { if (!disposed) render(); });
   return () => {
     disposed = true;
     stopTopics();
     stopSelection();
-    stopMoments?.();
+    stopMoments();
     b.release();
     rows.clear(); latest = {};
     root.replaceChildren();

@@ -50,7 +50,7 @@ export function mount(root, services, options) {
   const left = el('section', { class: 'office-found', 'aria-label': 'Scanner and hosts' }, map);
   const found = el('h3', { class: 'office-found-title', text: 'No host has answered yet' }, left);
   const scanner = el('div', { class: 'office-card office-scanner' }, left);
-  const scannerHost = services.hosts?.find((host) => host.sandbox === 'scanner');
+  const scannerHost = services.hosts.find((host) => host.sandbox === 'scanner');
   const scannerTitle = el('div', { class: 'office-card-title' }, scanner);
   el('b', { class: 'office-name', text: scannerHost?.name || 'scanner' }, scannerTitle);
   const scannerAddr = el('span', { class: 'scan-muted', text: 'waiting for its lease' }, scannerTitle);
@@ -101,11 +101,11 @@ export function mount(root, services, options) {
     el('span', { class: 'office-addr', text: machine.addr }, title);
     if (machine.kind === 'real') {
       realBadges.push(el('span', { class: 'scan-badge', text: server(replay) }, title));
-      const host = services.hosts?.find((entry) => entry.sandbox === machine.name);
+      const host = services.hosts.find((entry) => entry.sandbox === machine.name);
       if (host) {
         const show = el('button', { class: 'text-button', text: `Show ${host.name} in the workspace` }, item);
         show.setAttribute('type', 'button');
-        cleanups.push(listen(show, 'click', () => services.selection?.set({ host: host.name, node: null, links: [], event: null, connection: null, request: null })));
+        cleanups.push(listen(show, 'click', () => services.selection.set({ host: host.name, node: null, links: [], event: null, connection: null, request: null })));
       }
     } else if (machine.kind === 'simulated') {
       el('span', { class: 'scan-muted', text: 'Simulated by the world' }, title);
@@ -152,9 +152,9 @@ export function mount(root, services, options) {
     if (!complete && total && named === total) {
       complete = true;
       found.textContent = `All ${total === 5 ? 'five' : total} hosts answered`;
-      services.moment?.(found);
+      services.moment(found);
       // Seen live, the card that completed the set carries the moment too.
-      if (added && !first) services.moment?.(added);
+      if (added && !first) services.moment(added);
     } else if (!complete) {
       found.textContent = machines.length ? `${plural(machines.length, 'host')} answered` : 'No host has answered yet';
     }
