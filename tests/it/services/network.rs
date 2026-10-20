@@ -961,6 +961,25 @@ fn trusted_routes_attribute_requests_and_refusals() {
                     sandbox.name.as_ref() == "server" && sandbox.addr == Some(address)
                 })
         }));
+        let guest = machine(&fcx, attacher.attach("agent")?, ME);
+        assert_eq!(
+            lookup(&fcx, &guest, "office.internal").await,
+            Some(PLC_ADDR)
+        );
+        let mut listener = guest.tcp.listen(390)?;
+        fcx.spawn(move |cx| async move {
+            let mut connection = listener.accept(&cx).await?;
+            connection.write_all(&cx, b"hello\n").await?;
+            Ok(())
+        });
+        let mut connection = server.tcp.connect(&fcx, (ME, 390).into()).await?;
+        assert_eq!(read_some(&fcx, &mut connection, 6).await, b"hello\n");
+        assert!(
+            kept.checked_of("net", "blocked")
+                .unwrap()
+                .iter()
+                .all(|event| { event.str("dst") != Some(ME.to_string().as_str()) })
+        );
         let mut socket = server.udp.bind(40001)?;
         socket.send_to(b"query", "8.8.8.8:53".parse()?);
         let refused = kept

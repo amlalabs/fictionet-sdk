@@ -191,7 +191,14 @@ impl Interface for Routed {
                 .by_addr
                 .lock()
                 .insert(header.src, me.clone());
-            if let Some(why) = self.context.destinations.refused(&packet.0) {
+            let attached = self
+                .context
+                .hooks
+                .by_addr
+                .lock()
+                .get(&header.dst)
+                .is_some_and(|sandbox| self.context.hooks.is_attached(sandbox.id));
+            if !attached && let Some(why) = self.context.destinations.refused(&packet.0) {
                 fcx.emitter(&sandbox_only(me))
                     .emit("net", "blocked", |_| blocked(why, &packet.0));
             }
