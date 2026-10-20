@@ -2345,6 +2345,49 @@ async fn stream_status(server: &Server, path: &str) -> (TcpStream, String) {
 }
 
 #[tokio::test]
+async fn inspector_first_opens_the_inspector_on_a_named_panel() {
+    let topic = StateTopic::<Vec<u8>>::new(StateLimits::default());
+    let page = || {
+        Page::new(
+            "First",
+            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        )
+        .standard_panels()
+        .custom(
+            "Doors tried",
+            "export function mount() { return () => {}; }",
+            topic.clone(),
+        )
+    };
+    let server = page()
+        .inspector_first("Doors tried")
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let description = request(&server, "GET", "/api/page", &bearer(&server), "").await;
+    status(&description, 200);
+    assert_eq!(json_body(&description)["inspector_first"], "doors-tried");
+    let plain = page().bind_loopback(0).await.unwrap();
+    let description = request(&plain, "GET", "/api/page", &bearer(&plain), "").await;
+    assert_eq!(
+        json_body(&description)["inspector_first"],
+        serde_json::Value::Null
+    );
+    for invalid in [
+        page().inspector_first("Missing"),
+        page()
+            .workspace("Doors tried")
+            .inspector_first("Doors tried"),
+        page()
+            .inspector_first("Doors tried")
+            .inspector_first("Events"),
+    ] {
+        let error = invalid.bind_loopback(0).await.err().unwrap();
+        assert!(error.to_string().contains("inspector_first"), "{error}");
+    }
+}
+
+#[tokio::test]
 async fn a_closed_stream_frees_its_place_without_waiting_for_a_heartbeat() {
     let topic = StateTopic::new(StateLimits::default());
     topic

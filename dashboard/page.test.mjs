@@ -511,6 +511,24 @@ test('a tab opened late shows the run time as soon as the snapshot comes', async
   stop();
 });
 
+test('a page can open its inspector on its own panel', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const transport = {
+    get: async (path) => (path === '/api/page' ? { ...DESCRIPTION, moments: [], inspector_first: 'plant' } : path.startsWith('/api/host/') ? { links: [] } : { rows: [], next: 0, dropped: 0 }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  };
+  const stop = await mount(h.root, transport, { subscribe: () => () => {}, dispose() {} });
+  const tabs = h.root.querySelector('#tabs').children;
+  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Plant', 'Packets', 'Events', 'Map', 'Rows', 'Log', 'Traffic']);
+  assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
+  assert.equal(h.root.querySelector('#inspector-content').dataset.kind, 'custom');
+  stop();
+});
+
 test('declared pins open both hosts without a click', async (t) => {
   const h = harness(t);
   const { mount } = await import('./page.mjs');
