@@ -3,9 +3,9 @@
 //!
 //! Every demo's `preview` subcommand reads standard input the same way. An
 //! empty line asks for the in-world client's story again. A preview whose
-//! story runs once says so. `drop` closes the screen's open connections, as
-//! a lost guest connection would. The end of input or Ctrl-C stops the
-//! preview.
+//! story runs once says so. On a page with a screen, `drop` closes the
+//! screen's open connections, as a lost guest connection would. The end of
+//! input or Ctrl-C stops the preview.
 
 use fictionet_observe::page::{BoxFuture, Duplex, Pty};
 use std::io;

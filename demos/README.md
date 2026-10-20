@@ -41,10 +41,12 @@ The page screenshots need Chromium on your machine.
 
 Five demos also run without a VM: `cargo xtask demo <name> preview` serves
 the same page with an in-world client in place of the guests, and needs only
-the browser libraries. A screen on its page says NO VM. Every preview reads its
-standard input the same way. In Border and FakeWiki, Enter runs the in-world
-client again. The other previews run their story once. Type `drop` to close
-the screen's connections. The end of input or Ctrl-C stops a preview.
+the browser libraries. In Artifactory, Border, FakeWiki and Search, a screen
+that says NO VM takes the guest's place. Scan's preview has no screen and
+shows its two hosts with status only. Every preview reads its standard input
+the same way. In Border and FakeWiki, Enter runs the in-world client again.
+The other previews run their story once. Where the page has a screen, type
+`drop` to close its connections. The end of input or Ctrl-C stops a preview.
 
 The times below are from one run of each demo on a 24-core machine with other
 work running, the pinned files downloaded, the package cache filled and no
@@ -102,7 +104,7 @@ apart, and shown in a muted band in Doors tried.
   `artifactory-page.png`, with the world's log in `artifactory.jsonl`, each
   replaced on every run.
 - Without a VM: `cargo xtask demo artifactory preview` serves the same page,
-  labeled a replay fixture. An in-process client replays the variant's
+  labeled "Replay without VMs". An in-process client replays the variant's
   requests and door probes, about one step every two seconds, so there are no
   guest exit statuses. It takes `--variant` and `--sessions` too, and
   `--extra-reads N` adds N index reads after the story, enough to fill the
@@ -215,9 +217,10 @@ page's access controls and terminal.
 - Screenshots: `downloads/cloudimage/shots/`, with `viewer-scan.png`,
   `page-scan.png`, and each step's nmap report and the world's ports beside it.
 - Without a VM: `cargo xtask demo scan preview` serves the same page,
-  labeled a replay. An in-world scanner sends the story's probes, a stand-in
-  answers at 10.0.0.50 with the banners the real server sent, and nmap's
-  reports are the ones recorded in a KVM run, so no step has an exit status.
+  labeled "replay without VMs". An in-world scanner sends the story's
+  probes, a stand-in answers at 10.0.0.50 with the banners the real server
+  sent, and nmap's reports are the ones recorded in a KVM run, so no step has
+  an exit status.
   `--bound` keeps probing new ports until the port map is full, and
   `--no-os-match ADDR` removes nmap's OS matches for one host.
 - Times: both guests SSH up after 7.1 s, boot 29.7 s, story 53.4 s, whole run
