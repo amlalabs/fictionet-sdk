@@ -1,7 +1,7 @@
 // The Office panel: the scripted story, then the scanner and the office
 // subnet. A cell lights as the world's port map shows a probe to its
 // address; a card rises for each machine once its address answers.
-import { stylesheet, addresses, summary, hosts, count, limits, server, PORTS } from './model.mjs';
+import { stylesheet, addresses, summary, hosts, limits, server, PORTS } from './model.mjs';
 
 const STEP = { waiting: 'Waiting', running: 'Running', done: 'Done', failed: 'Failed' };
 const CELL = {
@@ -16,6 +16,7 @@ export function mount(root, services, options) {
   const { el } = services.dom.scoped(root);
   const cleanups = [];
   const { listen } = services.dom;
+  const { plural } = services.format;
   const reduced = () => Boolean(globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
   stylesheet(el, root);
   const panel = el('div', { class: 'scan-panel office-panel' }, root);
@@ -143,8 +144,8 @@ export function mount(root, services, options) {
     answering.name.textContent = figures.answering === 1 ? ' host answering' : ' hosts answering';
     open.value.textContent = String(figures.open);
     open.name.textContent = figures.open === 1 ? ' open port' : ' open ports';
-    grid.setAttribute('aria-label', `${count(figures.probed, 'address', 'addresses')} of 256 probed, ${count(figures.answering, 'host')} answering`);
-    notes.textContent = limits(snapshot).join(' ');
+    grid.setAttribute('aria-label', `${plural(figures.probed, 'address', 'addresses')} of 256 probed, ${plural(figures.answering, 'host')} answering`);
+    notes.textContent = limits(snapshot, plural).join(' ');
     const machines = hosts(map);
     let added;
     for (const machine of machines) {
@@ -162,7 +163,7 @@ export function mount(root, services, options) {
       // Seen live, the card that completed the set carries the moment too.
       if (added && !first) services.moment?.(added);
     } else if (!complete) {
-      found.textContent = machines.length ? `${count(machines.length, 'host')} answered` : 'No host has answered yet';
+      found.textContent = machines.length ? `${plural(machines.length, 'host')} answered` : 'No host has answered yet';
     }
     first = false;
   }

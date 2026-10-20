@@ -1,7 +1,7 @@
 // The Ports panel: for each host that answered, its 1,024 scanned TCP ports
 // as a grid that fills in as the world's tap sees nmap's probes and their
 // answers. A second view compares only the ports open on any host.
-import { stylesheet, hosts, ports, counts, openPorts, portState, services as nmapNames, count, limits, server, OFFICE, SERVICES } from './model.mjs';
+import { stylesheet, hosts, ports, counts, openPorts, portState, services as nmapNames, limits, server, OFFICE, SERVICES } from './model.mjs';
 
 const LEGEND = [
   ['open', 'open'],
@@ -15,6 +15,7 @@ export function mount(root, services, options) {
   const { el } = services.dom.scoped(root);
   const cleanups = [];
   const { listen } = services.dom;
+  const { plural } = services.format;
   stylesheet(el, root);
   const panel = el('div', { class: 'scan-panel ports-panel' }, root);
   const bar = el('div', { class: 'ports-bar' }, panel);
@@ -94,7 +95,7 @@ export function mount(root, services, options) {
       figure.name.textContent = ` ${words[state]}`;
       figure.item.hidden = !tally[state] && state !== 'open' && state !== 'closed';
     }
-    entry.grid.setAttribute('aria-label', `${entry.machine.addr}: ${count(tally.open, 'open port')}, ${tally.closed.toLocaleString('en-US')} closed, ${tally.idle.toLocaleString('en-US')} not probed`);
+    entry.grid.setAttribute('aria-label', `${entry.machine.addr}: ${plural(tally.open, 'open port')}, ${tally.closed.toLocaleString('en-US')} closed, ${tally.idle.toLocaleString('en-US')} not probed`);
     const open = [];
     for (let port = 1; port <= 1024; port++) if (states[port] === 'open') open.push(port);
     entry.openList.replaceChildren();
@@ -118,7 +119,7 @@ export function mount(root, services, options) {
       el('p', { class: 'empty-note', text: 'No port is open on any host yet.' }, compare);
       return;
     }
-    el('p', { class: 'scan-muted ports-compare-note', text: `The ${count(columns.length, 'TCP port')} open on any host. Under each open port, the service name nmap says.` }, compare);
+    el('p', { class: 'scan-muted ports-compare-note', text: `The ${plural(columns.length, 'TCP port')} open on any host. Under each open port, the service name nmap says.` }, compare);
     const table = el('table', { class: 'data-table ports-matrix' }, compare);
     const head = el('tr', {}, el('thead', {}, table));
     el('th', { text: 'Host' }, head).setAttribute('scope', 'col');
@@ -150,7 +151,7 @@ export function mount(root, services, options) {
     const map = latest?.value;
     const machines = hosts(map);
     empty.hidden = machines.length > 0;
-    notes.textContent = limits(latest).join(' ');
+    notes.textContent = limits(latest, plural).join(' ');
     if (view === 'open') {
       drawCompare(map);
       return;

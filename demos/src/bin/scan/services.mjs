@@ -1,10 +1,11 @@
 // The Services panel: one row per open port, with the banner the world's
 // tap saw on the wire beside nmap's name, product and version, and nmap's
 // OS guess for each host. Everything from nmap is labeled "nmap says".
-import { stylesheet, hosts, services as nmapNames, osGuess, version, banners as wireBanners, count, server, OFFICE, PORTS } from './model.mjs';
+import { stylesheet, hosts, services as nmapNames, osGuess, version, banners as wireBanners, server, OFFICE, PORTS } from './model.mjs';
 
 export function mount(root, services, options) {
   const { el } = services.dom.scoped(root);
+  const { plural } = services.format;
   stylesheet(el, root);
   const panel = el('div', { class: 'scan-panel services-panel' }, root);
   el('p', { class: 'scan-muted services-intro', text: 'A banner is the first data an open port sent to the scanner, as the world saw it on the wire. Service names, versions and OS guesses are what nmap says.' }, panel);
@@ -33,7 +34,7 @@ export function mount(root, services, options) {
     el('span', { class: 'nmap-says', text: guess.none ? 'nmap made no match' : 'nmap says' }, line);
     if (guess.none) return;
     el('b', { class: 'services-os-name', text: ` ${guess.name}` }, line);
-    el('span', { class: 'scan-muted', text: ` · ${guess.accuracy}%${guess.more ? ` · ${count(guess.more, 'other guess', 'other guesses')}` : ''}` }, line);
+    el('span', { class: 'scan-muted', text: ` · ${guess.accuracy}%${guess.more ? ` · ${plural(guess.more, 'other guess', 'other guesses')}` : ''}` }, line);
   }
 
   function draw() {
@@ -43,7 +44,7 @@ export function mount(root, services, options) {
     const notesText = [];
     if (mapStatus?.too_large) notesText.push('The port map passed its size limit. The last complete map is shown.');
     if (reportStatus?.too_large) notesText.push('nmap\'s reports passed their size limit. The last complete reports are shown.');
-    if (map?.untracked_banners) notesText.push(`${count(map.untracked_banners, 'banner')} did not fit; the map keeps ${count(1024, 'banner')}.`);
+    if (map?.untracked_banners) notesText.push(`${plural(map.untracked_banners, 'banner')} did not fit; the map keeps ${plural(1024, 'banner')}.`);
     notes.textContent = notesText.join(' ');
     empty.hidden = machines.length > 0;
     table.hidden = machines.length === 0;

@@ -6,6 +6,9 @@ test('counts agree with singular and plural nouns', () => {
   assert.equal(plural(1, 'moment'), '1 moment');
   assert.equal(plural(0, 'moment'), '0 moments');
   assert.equal(plural(2, 'moment'), '2 moments');
+  assert.equal(plural(1, 'address', 'addresses'), '1 address');
+  assert.equal(plural(2, 'address', 'addresses'), '2 addresses');
+  assert.equal(plural(1024, 'banner'), '1,024 banners');
 });
 
 test('run times in milliseconds read as seconds', () => {

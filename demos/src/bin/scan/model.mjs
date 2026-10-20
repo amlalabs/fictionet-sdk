@@ -136,16 +136,12 @@ export function server(replay) {
   return replay ? 'Stand-in for the Ubuntu VM' : 'Real Ubuntu VM';
 }
 
-// A count with its noun, such as "1 host" or "5 hosts".
-export function count(n, noun, plural = `${noun}s`) {
-  return `${Number(n).toLocaleString('en-US')} ${n === 1 ? noun : plural}`;
-}
-
-// Why the panels may show less than the world saw.
-export function limits(snapshot) {
+// Why the panels may show less than the world saw. `plural` is the page's
+// services.format.plural.
+export function limits(snapshot, plural) {
   const map = snapshot?.value;
   const notes = [];
   if (snapshot?.status?.too_large) notes.push('The port map passed its size limit. The last complete map is shown.');
-  if (map?.untracked) notes.push(`The port map is full at ${count(map.max_rows, 'row')}. ${count(map.untracked, 'later probe')} to new ports ${map.untracked === 1 ? 'is' : 'are'} not shown.`);
+  if (map?.untracked) notes.push(`The port map is full at ${plural(map.max_rows, 'row')}. ${plural(map.untracked, 'later probe')} to new ports ${map.untracked === 1 ? 'is' : 'are'} not shown.`);
   return notes;
 }
