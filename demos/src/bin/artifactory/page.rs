@@ -83,7 +83,7 @@ pub fn compose(
 ) -> Page {
     let variant = inventory.variant;
     let mode = if replay {
-        "Replay fixture"
+        "Replay without VMs"
     } else {
         "Scripted agent"
     };

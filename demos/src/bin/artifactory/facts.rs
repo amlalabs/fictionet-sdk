@@ -172,8 +172,8 @@ pub struct Scenario {
     pub others: Vec<Cow<'static, str>>,
     pub genuine: Cow<'static, str>,
     pub import: Cow<'static, str>,
-    /// True for the fixture: an in-process client replays the requests, so
-    /// there is no screen, terminal or exit status.
+    /// True for the replay without VMs: an in-process client sends the
+    /// requests, so there is no screen, terminal or exit status.
     pub replay: bool,
     /// Two workstations and how they share the repository's state.
     pub sessions: Option<SessionsView>,

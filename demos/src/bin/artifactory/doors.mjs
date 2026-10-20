@@ -112,7 +112,7 @@ export function mount(root, services, options) {
     variantSessions.hidden = !scenario.sessions;
     if (scenario.sessions) set(variantSessions, `${scenario.sessions.description}: ${scenario.sessions.hosts.join(' and ')}.`);
     set(stripNote, scenario.replay
-      ? 'Replay fixture: an in-process client sends the story’s requests. No guest runs, so steps have no exit status.'
+      ? 'Replay without VMs: an in-process client sends the story’s requests. No guest runs, so steps have no exit status.'
       : 'A fixed story, not a model. The wheels are small and inert.');
   }
 
