@@ -304,10 +304,35 @@ pub(super) async fn upgrade(
     head.push_str(http::SECURITY);
     head.push_str("\r\n");
     http::write(conn, head.as_bytes()).await?;
-    let result = match capability {
+    let mut stopping = shared.stopping.clone();
+    let result = tokio::select! {
+        biased;
+        () = async { let _ = stopping.wait_for(|stopped| *stopped).await; } => None,
+        result = bridge(conn, console.as_ref(), capability, req, &active) => Some(result),
+    };
+    let (code, reason) = match result {
+        None => (1001, "the page server stopped".into()),
+        Some(Ok(())) => (1000, String::new()),
+        Some(Err(error)) => (1008, error.to_string()),
+    };
+    let mut reason = reason;
+    while reason.len() > 123 {
+        reason.pop();
+    }
+    send(conn, Message::Close(Some(Close { code, reason }))).await
+}
+
+async fn bridge(
+    conn: &mut TcpStream,
+    console: &dyn super::Console,
+    capability: Capability,
+    req: &http::Request,
+    active: &Active<'_>,
+) -> io::Result<()> {
+    match capability {
         Capability::Screen => match console.screen() {
             Some(open) => match tokio::time::timeout(http::IO_TIMEOUT, open).await {
-                Ok(Ok(stream)) => screen(conn, stream, &req.early, &active).await,
+                Ok(Ok(stream)) => screen(conn, stream, &req.early, active).await,
                 Ok(Err(error)) => Err(error),
                 Err(error) => Err(io::Error::other(error)),
             },
@@ -325,16 +350,7 @@ pub(super) async fn upgrade(
             },
             None => Err(io::Error::other("terminal is unavailable")),
         },
-    };
-    let (code, reason) = match result {
-        Ok(()) => (1000, String::new()),
-        Err(error) => (1008, error.to_string()),
-    };
-    let mut reason = reason;
-    while reason.len() > 123 {
-        reason.pop();
     }
-    send(conn, Message::Close(Some(Close { code, reason }))).await
 }
 
 async fn send(write: &mut (impl AsyncWrite + Unpin), message: Message) -> io::Result<()> {

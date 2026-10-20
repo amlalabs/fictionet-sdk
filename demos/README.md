@@ -26,8 +26,15 @@ agents, Claude Code and Codex, through the world's mirror. The printed page
 URL opens the live desktop and terminal over SSH, alongside packets, events,
 the map, left the box, containment checks, labels and exports. The Coding
 agents table stays empty until the gate runs both version commands, then
-shows the guest's version output and `installed` status. No model API is
+shows the version each command printed and `installed`. No model API is
 forwarded, and the page does not claim the agents performed a task.
+
+The first run also fetches about 280 MB of Ubuntu packages through the
+world's mirror, which keeps them in `downloads/cloudimage/apt-cache/` for
+later runs. On a 24-core machine, with the pinned files downloaded and the
+binary built, a run with an empty package cache took 88 s from start to power
+off, with the desktop up after 73 s. A later run took 74 s, with the desktop up
+after 59 s.
 
 The gate checks the guest, trust store, browser, agent installations and page
 access controls. It tests terminal command output and pointer input with and

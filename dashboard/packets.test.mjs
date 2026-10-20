@@ -522,3 +522,19 @@ test('merged host rows keep display numbers and link identities in detail and la
   h.view.openLinks('alpha', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'c' }, host: 'alpha' }]);
   assert.equal($('drawer').classList.contains('merged-hosts'), false);
 });
+
+
+test('host columns fit the declared names and stay fixed as packets arrive', (t) => {
+  const h = setup(t);
+  h.view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'workstation' }, { e: { id: 'b' }, host: 'jump' }]);
+  const width = () => $('drawer').style['--packet-host'];
+  assert.equal(width(), 'calc(11ch + 16px)');
+  for (const [link, seq] of [['b', 1], ['a', 2]]) {
+    h.sources.at(-1).emit('packet', { link, seq, side: 0, t: seq, tags: [], src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', len: 28, info: 'Echo request' });
+    h.flush();
+    assert.equal(width(), 'calc(11ch + 16px)');
+  }
+  assert.deepEqual(h.rows().map((row) => row.querySelector('.c-host').textContent), ['jump', 'workstation']);
+  h.view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'a-very-long-host-name' }, { e: { id: 'b' }, host: 'jump' }]);
+  assert.equal(width(), 'calc(16ch + 16px)');
+});
