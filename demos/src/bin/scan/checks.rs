@@ -3,7 +3,7 @@
 //! and the discovery moment.
 use crate::Error;
 use crate::page::{self, Reports, StepState, Story};
-use crate::story::{HOSTS, addr};
+use crate::story::{SERVER_PORTS, addr, hosts};
 use fictionet_demo::kit::client::PageClient;
 use scan_world::{PortMap, PortState, Protocol, SERVER_ADDR};
 use std::collections::BTreeSet;
@@ -32,20 +32,20 @@ pub async fn read(client: &PageClient) -> Result<(Topics, serde_json::Value), Er
 /// Checks what the page shows after the story. Returns a one-line summary.
 pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, String> {
     let map = &topics.ports;
-    let five: BTreeSet<Ipv4Addr> = HOSTS.map(addr).into();
+    let office = hosts();
     let answered = |host: Ipv4Addr| {
         map.rows
             .iter()
             .any(|r| r.host == host && matches!(r.state, PortState::Open | PortState::Closed))
     };
-    if let Some(host) = five.iter().find(|h| !answered(**h)) {
+    if let Some(host) = office.iter().find(|h| !answered(**h)) {
         return Err(format!("port map: {host} has no answered row"));
     }
     let others: BTreeSet<Ipv4Addr> = map
         .rows
         .iter()
         .map(|r| r.host)
-        .filter(|h| !five.contains(h))
+        .filter(|h| !office.contains(h))
         .collect();
     if others.is_empty() {
         return Err("port map: no probes to other addresses".into());
@@ -56,7 +56,7 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
             return Err(format!("port map: {host} is not only unreachable"));
         }
     }
-    for port in [22, 80] {
+    for port in SERVER_PORTS {
         if !map.rows.iter().any(|r| {
             (r.host, r.protocol, r.port, r.state)
                 == (SERVER_ADDR, Protocol::Tcp, port, PortState::Open)
@@ -93,7 +93,7 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
             .filter(|h| h.state == "up")
             .map(|h| h.addr)
             .collect();
-        if up != five || step.up != 5 {
+        if up != office || step.up != office.len() {
             return Err(format!("nmap reports: {} found {up:?} up", step.title));
         }
     }
@@ -119,14 +119,14 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
             moment["dropped"]
         ));
     };
-    let hosts: BTreeSet<Ipv4Addr> = event["fields"]["hosts"]
+    let moment_hosts: BTreeSet<Ipv4Addr> = event["fields"]["hosts"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|h| h.as_str()?.parse().ok())
         .collect();
-    if hosts != five {
-        return Err(format!("moment: hosts {hosts:?}"));
+    if moment_hosts != office {
+        return Err(format!("moment: hosts {moment_hosts:?}"));
     }
     let no_match = steps[2]
         .hosts
@@ -220,7 +220,7 @@ mod tests {
             "port map: 10.0.0.12 has no answered row"
         );
         assert!(
-            fails(&|t, _| t.ports.rows.retain(|r| HOSTS.map(addr).contains(&r.host)))
+            fails(&|t, _| t.ports.rows.retain(|r| hosts().contains(&r.host)))
                 .contains("no probes to other addresses")
         );
         assert!(

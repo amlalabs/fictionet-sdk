@@ -10,10 +10,25 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// The last octets of the five office machines.
-pub const HOSTS: [u8; 5] = [10, 11, 12, 13, 50];
-/// Each machine's open TCP ports, in the order of `HOSTS`.
-const OPEN: [&[u16]; 5] = [&[22, 80], &[25, 110, 143], &[21, 22], &[80, 631], &[22, 80]];
+/// The office server VM's open TCP ports: OpenSSH and nginx.
+pub const SERVER_PORTS: [u16; 2] = [22, 80];
+
+/// Each office machine's address and open TCP ports: the ports the world
+/// answers on, and the server VM's own.
+fn open_ports() -> Vec<(Ipv4Addr, Vec<u16>)> {
+    let mut office = scan_world::open_ports();
+    for (addr, ports) in &mut office {
+        if *addr == scan_world::SERVER_ADDR {
+            ports.extend(SERVER_PORTS);
+        }
+    }
+    office
+}
+
+/// The office machines' addresses.
+pub fn hosts() -> BTreeSet<Ipv4Addr> {
+    open_ports().into_iter().map(|(addr, _)| addr).collect()
+}
 
 /// How long one nmap step may run in the analyst's terminal.
 const STEP_LIMIT: Duration = Duration::from_secs(300);
@@ -38,9 +53,10 @@ pub fn check(index: usize, exit: i32, report: &nmap::Report, map: &PortMap) -> R
         .filter(|h| h.status.state == "up")
         .collect();
     let addresses: BTreeSet<_> = up.iter().filter_map(|h| h.ipv4()).collect();
-    if up.len() != 5 || report.runstats.hosts.up != 5 || addresses != HOSTS.map(addr).into() {
+    let office = hosts();
+    if up.len() != office.len() || report.runstats.hosts.up != office.len() || addresses != office {
         return Err(format!(
-            "expected exactly five office hosts up, got {addresses:?}"
+            "expected exactly the office hosts {office:?} up, got {addresses:?}"
         ));
     }
     if map.untracked != 0 {
@@ -62,8 +78,7 @@ pub fn check(index: usize, exit: i32, report: &nmap::Report, map: &PortMap) -> R
             .iter()
             .map(|r| ((r.host, r.protocol, r.port), r.state))
             .collect();
-        for (last, open) in HOSTS.into_iter().zip(OPEN) {
-            let ip = addr(last);
+        for (ip, open) in open_ports() {
             for port in 1..=1024 {
                 let expected = if open.contains(&port) {
                     PortState::Open
@@ -320,16 +335,16 @@ mod tests {
         let report = nmap::parse(DISCOVERY).unwrap();
         let map = recorded_discovery();
         check(0, 0, &report, &map).unwrap();
-        for last in HOSTS {
+        for host in hosts() {
             let mut missing = map.clone();
-            missing.rows.retain(|r| r.host != addr(last));
+            missing.rows.retain(|r| r.host != host);
             assert_eq!(
                 check(0, 0, &report, &missing),
-                Err(format!("{} has no answered port probe", addr(last)))
+                Err(format!("{host} has no answered port probe"))
             );
             for state in [PortState::Unanswered, PortState::Unreachable] {
                 let mut unanswered = map.clone();
-                for row in unanswered.rows.iter_mut().filter(|r| r.host == addr(last)) {
+                for row in unanswered.rows.iter_mut().filter(|r| r.host == host) {
                     row.state = state;
                 }
                 assert!(check(0, 0, &report, &unanswered).is_err());

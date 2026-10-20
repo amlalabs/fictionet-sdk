@@ -13,14 +13,20 @@ export function discoveryMap() {
   return { ...map, untracked_banners: 0, banners: [] };
 }
 
-// The open TCP ports nmap found in the KVM run's SYN scan, by host.
-export const OPEN = {
-  '10.0.0.10': [22, 80],
-  '10.0.0.11': [25, 110, 143],
-  '10.0.0.12': [21, 22],
-  '10.0.0.13': [80, 631],
-  '10.0.0.50': [22, 80],
+// One open port as nmap's report gives it.
+const port = (port, service, product = '', version = '', extra_info = '') => ({ port, protocol: 'tcp', state: 'open', reason: 'syn-ack', service, product, version, extra_info });
+
+// The open TCP ports nmap found and named in the KVM run's SYN scan, by host.
+const SCAN = {
+  '10.0.0.10': [port(22, 'ssh', 'OpenSSH', '9.2p1 Debian 2+deb12u3', 'protocol 2.0'), port(80, 'http', 'Apache httpd', '2.4.62', '(Debian)')],
+  '10.0.0.11': [port(25, 'smtp', 'Postfix smtpd'), port(110, 'pop3', 'Dovecot pop3d'), port(143, 'imap', 'Dovecot imapd')],
+  '10.0.0.12': [port(21, 'ftp', 'vsftpd', '3.0.3'), port(22, 'ssh', 'OpenSSH', '9.2p1 Debian 2+deb12u3', 'protocol 2.0')],
+  '10.0.0.13': [port(80, 'http', 'lighttpd', '1.4.69', 'Linux'), port(631, 'ipp', 'CUPS', '2.4')],
+  '10.0.0.50': [port(22, 'ssh', 'OpenSSH', '9.6p1 Ubuntu 3ubuntu13.20', 'Ubuntu Linux; protocol 2.0'), port(80, 'http', 'nginx', '1.24.0', 'Ubuntu')],
 };
+
+// The open port numbers of SCAN, by host.
+export const OPEN = Object.fromEntries(Object.entries(SCAN).map(([addr, ports]) => [addr, ports.map((entry) => entry.port)]));
 
 // The discovery map plus a row for ports 1 to `last` on every host, open
 // where the SYN scan found them open and closed elsewhere.
@@ -38,18 +44,10 @@ export function scannedMap(last = 1024) {
 
 // nmap's reports in the topic's shape, with values from the KVM run.
 export function reports({ os = true, noMatch = null } = {}) {
-  const port = (port, service, product = '', version = '', extra_info = '') => ({ port, protocol: 'tcp', state: 'open', reason: 'syn-ack', service, product, version, extra_info });
   const hosts = (ports) => Object.keys(OPEN).map((addr) => ({ addr, state: 'up', reason: 'echo-reply', ports: ports(addr), summarized: [], os: null }));
-  const scan = {
-    '10.0.0.10': [port(22, 'ssh', 'OpenSSH', '9.2p1 Debian 2+deb12u3', 'protocol 2.0'), port(80, 'http', 'Apache httpd', '2.4.62', '(Debian)')],
-    '10.0.0.11': [port(25, 'smtp', 'Postfix smtpd'), port(110, 'pop3', 'Dovecot pop3d'), port(143, 'imap', 'Dovecot imapd')],
-    '10.0.0.12': [port(21, 'ftp', 'vsftpd', '3.0.3'), port(22, 'ssh', 'OpenSSH', '9.2p1 Debian 2+deb12u3', 'protocol 2.0')],
-    '10.0.0.13': [port(80, 'http', 'lighttpd', '1.4.69', 'Linux'), port(631, 'ipp', 'CUPS', '2.4')],
-    '10.0.0.50': [port(22, 'ssh', 'OpenSSH', '9.6p1 Ubuntu 3ubuntu13.20', 'Ubuntu Linux; protocol 2.0'), port(80, 'http', 'nginx', '1.24.0', 'Ubuntu')],
-  };
   const steps = [
     { title: 'Host discovery', args: 'nmap -sn -n -oX notes/office-1.xml 10.0.0.0/24', start: 1792462616, end: 1792462620, elapsed: 3.54, exit: 'success', up: 5, hosts: hosts(() => []) },
-    { title: 'SYN scan with service detection', args: 'nmap -sS -sV', start: 1792462622, end: 1792462659, elapsed: 36.36, exit: 'success', up: 5, hosts: hosts((addr) => scan[addr]) },
+    { title: 'SYN scan with service detection', args: 'nmap -sS -sV', start: 1792462622, end: 1792462659, elapsed: 36.36, exit: 'success', up: 5, hosts: hosts((addr) => SCAN[addr]) },
   ];
   if (os) {
     const guesses = {
@@ -59,7 +57,7 @@ export function reports({ os = true, noMatch = null } = {}) {
       '10.0.0.13': ['OpenWrt Kamikaze 7.09 (Linux 2.6.22)', 92],
     };
     // OS detection lists open ports by the name nmap's table gives them, with no product.
-    const third = hosts((addr) => scan[addr].map((entry) => port(entry.port, entry.service)));
+    const third = hosts((addr) => SCAN[addr].map((entry) => port(entry.port, entry.service)));
     for (const host of third) {
       if (host.addr === noMatch) host.os = [];
       else if (host.addr === '10.0.0.50') host.os = [{ name: 'Linux 5.0 - 5.5', accuracy: 100 }];
