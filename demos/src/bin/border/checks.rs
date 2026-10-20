@@ -80,16 +80,19 @@ pub fn check(step: &str, output: &Output, scenario: &Scenario) -> bool {
                 && line.contains(if hijacked { ROGUE_CA_NAME } else { LAB_CA_NAME })
         }),
         "hold" => {
-            text.contains("Persistent HTTPS request: 200")
-                && [
-                    "ConnectionResetError",
-                    "BrokenPipeError",
-                    "RemoteDisconnected",
-                ]
-                .iter()
-                .any(|error| {
-                    text.contains(&format!("Persistent HTTPS connection failed: {error}:"))
-                })
+            text.lines()
+                .any(|line| line == "Persistent HTTPS request: 200")
+                && text.lines().any(|line| line == "Connection: open")
+                && (!hijacked
+                    || [
+                        "ConnectionResetError",
+                        "BrokenPipeError",
+                        "RemoteDisconnected",
+                    ]
+                    .iter()
+                    .any(|error| {
+                        text.contains(&format!("Persistent HTTPS connection failed: {error}:"))
+                    }))
         }
         _ => false,
     }
@@ -111,6 +114,54 @@ mod tests {
             stderr: String::new(),
         }
     }
+
+    #[test]
+    fn hold_rejects_a_closed_initial_socket() {
+        for variant in [Variant::Legitimate, Variant::Hijack] {
+            let scenario = crate::control::scenario().routed(variant);
+            assert!(!check(
+                "hold",
+                &output(
+                    0,
+                    "Persistent HTTPS request: 200\nConnection: closed\nPersistent HTTPS connection failed: ConnectionResetError: Connection reset by peer\n",
+                ),
+                &scenario,
+            ));
+        }
+    }
+
+    #[test]
+    fn hold_rejects_a_missing_initial_socket_state() {
+        for variant in [Variant::Legitimate, Variant::Hijack] {
+            let scenario = crate::control::scenario().routed(variant);
+            assert!(!check(
+                "hold",
+                &output(
+                    0,
+                    "Persistent HTTPS request: 200\nPersistent HTTPS connection failed: ConnectionResetError: Connection reset by peer\n",
+                ),
+                &scenario,
+            ));
+        }
+    }
+
+    #[test]
+    fn hold_requires_a_successful_open_socket_then_a_failure_after_the_flip() {
+        let scenario = crate::control::scenario();
+        let initial = "Persistent HTTPS request: 200\nConnection: open\n";
+        assert!(check("hold", &output(0, initial), &scenario));
+        assert!(!check(
+            "hold",
+            &output(0, &initial.replace("200", "500")),
+            &scenario,
+        ));
+        assert!(!check(
+            "hold",
+            &output(0, initial),
+            &scenario.routed(Variant::Hijack),
+        ));
+    }
+
     #[test]
     fn checks_accept_complete_outputs_and_reject_incomplete_or_failed_steps() {
         let scenario = crate::control::scenario();
@@ -145,7 +196,7 @@ mod tests {
             ("cert -k", "* issuer: CN=Anchorpoint Root CA R1", true, 0),
             (
                 "hold",
-                "Persistent HTTPS request: 200\nPersistent HTTPS connection failed: ConnectionResetError: [Errno 104] Connection reset by peer",
+                "Persistent HTTPS request: 200\nConnection: open\nPersistent HTTPS connection failed: ConnectionResetError: [Errno 104] Connection reset by peer",
                 true,
                 0,
             ),
@@ -189,7 +240,10 @@ mod tests {
         assert!(!unreachable(&output(7, "")));
         assert!(!check(
             "hold",
-            &output(0, "Persistent HTTPS request: 200\nTimeoutError: timed out"),
+            &output(
+                0,
+                "Persistent HTTPS request: 200\nConnection: open\nTimeoutError: timed out"
+            ),
             &mode(true)
         ));
     }
