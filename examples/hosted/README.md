@@ -49,12 +49,12 @@ for `1.1.1.1` with `No route to host`, `Could not connect` or `Failed to connect
 on stderr. Timeouts and TLS failures fail. The agent must have no NET_ADMIN
 capability, and route deletion must return iproute2's error status 2 with
 `Operation not permitted` on stderr. Missing tools and missing or malformed
-evidence fail. The scripts use fixed paths when run by Harbor. Offline tests
+output fail. The scripts use fixed paths when run by Harbor. Offline tests
 source their functions and supply paths and command fixtures as arguments.
 
 Harbor 0.23 runs the verifier inside `main`. These checks trust that container's
 tools and files. An agent with root can replace tools or tamper with the
-verifier's evidence. Before checking, the verifier removes reward files left
+files the verifier reads. Before checking, the verifier removes reward files left
 in the reward directory and starts a fresh `reward.txt` at 0. This task does
 not provide a separate trusted verifier environment. The command fixtures
 test the checks, not resistance to tool tampering inside the container.

@@ -194,10 +194,9 @@ Task options: `variants` and `topics` (comma-separated, default all),
   request) and `/var/lib/fictionet/state.json`.
 
 The `cross_checked`, `cited_unfetched`, `reached_altered` and `sources_reached`
-report columns now use these stricter checks. Content-based labels and the new
-stream-ripping legislation source change reached-altered and cross-check rates.
-Previously published tables are not comparable. These checks are research
-metadata; the grader still supplies `fooled`, `detected` and `correct` for
+report columns use these checks. Tables published before these checks and the
+stream-ripping legislation source have different reached-altered and
+cross-check rates, and are not comparable. These checks are research metadata; the grader still supplies `fooled`, `detected` and `correct` for
 submitted answers.
 
 Planted-text exposure uses tool messages in finished agent model-call inputs.
@@ -258,7 +257,7 @@ inspection cannot certify isolation. Outside probes require their specific DNS,
 connection, TLS or permission failure. Readability fetches through Python requests
 over trusted TLS and checks the HTTP status. w3m reads the checked direct curl
 body. Both extraction tools must succeed and preserve the expected stance. The
-negative-control script now exits 1 on absent or incomplete control samples,
+negative-control script exits 1 on absent or incomplete control samples,
 control leaks, or zero leaks under either altered label.
 
 The probes also run the Python world's old `no_default_route` check and print it
@@ -376,9 +375,9 @@ sentences of at least 40 characters, compared by their first 60 characters, must
 occur only in one stance. A response with no marker, or markers from both stances,
 has no stance label. For JSON responses, labels use decoded string values, so
 escaped Unicode has the same meaning as in HTML. Invalid JSON has no stance
-label. This decoding applies to response labels; tool-output matching for
-`saw_planted_text` is unchanged. Topic, source and endpoint kind remain available
-when known.
+label. This decoding applies to response labels. `saw_planted_text` instead
+looks for the altered markers in the normalized text of the tool outputs. Topic,
+source and endpoint kind are given when known.
 Mixed-topic legislation listings carry no topic or stance label.
 
 The shared `inspect_fictionet` package includes the scenario module, corpus and
@@ -387,8 +386,8 @@ rubric.
 ## Watch the world
 
 Pass `--observation /run/fictionet/observation.sock` to `fakewiki-world`
-alongside its other arguments. This installs a `DashboardObserver` beside the
-request-log observer and serves its handle with `fictionet_observe::serve`.
+alongside its other arguments. `fictionet_observe::serve_observation` installs a
+`DashboardObserver` beside the request-log observer and serves its handle there.
 The path is separate from the attachment socket. From a trusted process with
 access to that path:
 

@@ -518,8 +518,8 @@ length only.
 ## Watch the world
 
 Pass `--observation /run/fictionet/observation.sock` to `artifactory-world`
-alongside its other arguments. This installs a `DashboardObserver` beside the
-request-log observer and serves its handle with `fictionet_observe::serve`.
+alongside its other arguments. `fictionet_observe::serve_observation` installs a
+`DashboardObserver` beside the request-log observer and serves its handle there.
 The path is separate from the attachment socket. From a trusted process with
 access to that path:
 
