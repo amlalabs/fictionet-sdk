@@ -147,7 +147,7 @@ async fn main() -> Result {
             Ok(())
         },
     ));
-    kit::gate::stay_open().await?;
+    kit::checks::stay_open().await?;
     let _ = stop.send(());
     task.await??;
     drop(server);

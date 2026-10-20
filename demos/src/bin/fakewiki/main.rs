@@ -1,4 +1,4 @@
-mod gate;
+mod checks;
 mod guest;
 mod page;
 mod world;
@@ -9,7 +9,7 @@ mod tests;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use fictionet_demo::kit::{Kit, gate::check};
+use fictionet_demo::kit::{Kit, checks::check};
 use fictionet_observe::page::Page;
 
 const HOST: &str = "workstation";
@@ -46,8 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = run.path().to_path_buf();
     let pid = run.guest(HOST).vm().pid();
     let output = downloads.join("shots").join(path.file_name().unwrap());
-    let checks = gate::run(&run, &output).await;
-    if checks.is_err() {
+    let result = checks::run(&run, &output).await;
+    if result.is_err() {
         eprint!("{}", run.guest(HOST).diagnostics().await);
     }
     let shutdown = run.shutdown().await;
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pid.is_none_or(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
     )?;
     println!("[pass] shutdown: no guest process or run directory remains");
-    checks?;
+    result?;
     println!("whole run: {} ms", total.elapsed().as_millis());
     println!("every required check passed");
     Ok(())

@@ -155,7 +155,7 @@ pub async fn run() -> Result<(), Error> {
             }
         }
     });
-    let stay = kit::gate::stay_open();
+    let stay = kit::checks::stay_open();
     tokio::pin!(stay);
     loop {
         tokio::select! {
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(reply["status"], "applied");
         preview.traffic().await.unwrap();
         super::super::story::observed(&client, true).await.unwrap();
-        // The VM gate's Chromium condition holds on the page this traffic made.
+        // The VM run's Chromium condition holds on the page this traffic made.
         let url = preview.server.url().to_owned();
         let shot = dir.join("page-hijacked.png");
         tokio::task::spawn_blocking(move || {

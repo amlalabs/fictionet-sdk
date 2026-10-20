@@ -1,4 +1,4 @@
-//! What every demo gate does: required checks, waiting for cloud-init,
+//! The checks every demo runs: required checks, waiting for cloud-init,
 //! screenshots, the guest's side of a failure, and keeping the page open.
 
 use std::io;
@@ -301,7 +301,7 @@ impl GuestHandle {
         Ok(self.boot.elapsed())
     }
 
-    /// The guest's side of a failed run, for a gate to print: cloud-init's
+    /// The guest's side of a failed run, for a demo to print: cloud-init's
     /// report and log tail, the desktop's state and logs when the guest has
     /// one, and the serial console tail. Each command has 3 s and 16 KiB.
     pub async fn diagnostics(&self) -> String {

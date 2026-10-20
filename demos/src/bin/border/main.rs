@@ -37,10 +37,10 @@ async fn main() -> Result<(), Error> {
     }
     let downloads = PathBuf::from(first.unwrap_or_else(|| "demos/downloads/cloudimage".into()));
     let option = args.next();
-    if option.as_deref().is_some_and(|s| s != "--gate") || args.next().is_some() {
-        return Err("usage: border [downloads] [--gate]".into());
+    if option.as_deref().is_some_and(|s| s != "--checks") || args.next().is_some() {
+        return Err("usage: border [downloads] [--checks]".into());
     }
-    let gate = option.is_some() || !std::io::stdin().is_terminal();
+    let checks_only = option.is_some() || !std::io::stdin().is_terminal();
     let started = Instant::now();
     let out = downloads
         .join("shots")
@@ -100,9 +100,9 @@ async fn main() -> Result<(), Error> {
             "Story completed in {:.2} s",
             started.elapsed().as_secs_f64()
         );
-        if !gate {
+        if !checks_only {
             println!("Use Routing to flip the route, or Ctrl-b d in the terminal for bank-check.");
-            kit::gate::stay_open().await?;
+            kit::checks::stay_open().await?;
         }
         Ok(())
     }

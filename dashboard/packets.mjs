@@ -57,7 +57,7 @@ export function createPackets({
     $('console-text').textContent = showConsole
       ? `Showing console packets · ${where}`
       : `${fmtCount(packets.console)} console ${packets.console === 1 ? 'packet' : 'packets'} hidden · ${where}`;
-    consoleNote.title = `The page's own screen and terminal sessions, and the gate's commands, reach the hosts from ${where}.`;
+    consoleNote.title = `The page's own screen and terminal sessions, and the demo's checks, reach the hosts from ${where}.`;
     $('console-toggle').textContent = showConsole ? 'Hide' : 'Show';
     consoleNote.hidden = !showConsole && !packets.console;
   }

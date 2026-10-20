@@ -2,7 +2,7 @@
 //! serves its page: Doors tried, Packages and Requests beside the standard
 //! panels. Run `cargo xtask demo artifactory`. The default variant is
 //! lookalike. Select normal, missing, lookalike or peer with `--variant`.
-//! Add `--stay` to keep the page open after the gate until Ctrl-C.
+//! Add `--stay` to keep the page open after the checks until Ctrl-C.
 //! Run `cargo run -p fictionet-demo --bin artifactory -- --fixture` to serve
 //! the page without a VM. `--extra-reads N` adds N index reads after the
 //! fixture's story, enough to fill the page's row bound. With `--variant
@@ -189,11 +189,11 @@ async fn execute() -> Result {
     };
     let boot = run.guest(HOSTNAME).ssh_ready();
     println!("boot to SSH-ready: {} ms", boot.as_millis());
-    let result = gate(&run, &facts, &publisher, &closed, variant, sessions, &shots).await;
+    let result = checks(&run, &facts, &publisher, &closed, variant, sessions, &shots).await;
     let result = match result {
         Ok(duration) if stay => {
-            println!("gate passed");
-            kit::gate::stay_open()
+            println!("checks passed");
+            kit::checks::stay_open()
                 .await
                 .map(|()| duration)
                 .map_err(Into::into)
@@ -244,7 +244,7 @@ async fn execute() -> Result {
     Ok(())
 }
 
-async fn gate(
+async fn checks(
     run: &kit::Run,
     facts: &facts::Facts,
     publisher: &facts::Publisher,

@@ -5,8 +5,8 @@ use std::time::Duration;
 use fakewiki_world::tamper::Reply;
 use fictionet_demo::kit::{
     GuestHandle, Run,
+    checks::{self, check},
     client::{Capability, PageClient},
-    gate::{self, check},
     shot,
 };
 use serde_json::{Value, json};
@@ -245,7 +245,7 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
     let mut switch = None;
     let result = checks(run, output, &mut switch).await;
     if let Err(error) = &result {
-        eprintln!("Gate failed: {error}");
+        eprintln!("Checks failed: {error}");
         let requests = article_requests(run, switch);
         match tokio::time::timeout(Duration::from_secs(10), requests).await {
             Ok(Ok(())) => {}
@@ -265,7 +265,7 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
 }
 
 /// Prints the article's requests since the switch, or since the start
-/// when the gate failed before it.
+/// when the checks failed before it.
 async fn article_requests(run: &Run, switch: Option<u64>) -> io::Result<()> {
     let client = PageClient::from_url(run.page_url())?;
     let since = if switch.is_some() {
@@ -309,8 +309,8 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
         run.boot_started().elapsed().as_millis()
     );
 
-    gate::bearer_required(&client).await?;
-    gate::single_use_ticket(&client, HOST, Capability::Screen).await?;
+    checks::bearer_required(&client).await?;
+    checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
     println!("[pass] first read: real, revision 0");
 
     let window = article_window(guest).await?;

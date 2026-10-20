@@ -81,7 +81,7 @@ pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> 
     ])));
     let replay = run(options, fixture, Duration::from_secs(1), extra_reads);
     tokio::pin!(replay);
-    let stay = fictionet_demo::kit::gate::stay_open();
+    let stay = fictionet_demo::kit::checks::stay_open();
     tokio::pin!(stay);
     tokio::select! {
         result = &mut replay => {

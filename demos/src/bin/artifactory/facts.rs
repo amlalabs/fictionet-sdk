@@ -1,4 +1,4 @@
-//! The world's facts for the gate and the page. An observer tags each request
+//! The world's facts for the checks and the page. An observer tags each request
 //! row and door fact with the story step that was running, and a publisher
 //! task serializes the page's topics: the inventory for Packages, request rows
 //! for Requests, and door facts with the story for Doors tried.
@@ -1035,7 +1035,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn page_retention_does_not_discard_gate_rows() {
+    fn page_retention_does_not_discard_checked_rows() {
         let facts = facts(Variant::Normal);
         // The page publishes the story's rows; setup rows are only counted.
         facts.phase("Look up GitHub", &["github.com"], Who::Maya);

@@ -33,7 +33,7 @@
 //! workstation.wait_desktop(Duration::from_secs(300)).await?;
 //! let (screen, page) = (run.path().join("desktop.png"), run.path().join("page.png"));
 //! let shots = run.screenshots("workstation", &screen, &page).await?;
-//! kit::gate::check("the screen is 1280 pixels wide", shots.screen.width == 1280)?;
+//! kit::checks::check("the screen is 1280 pixels wide", shots.screen.width == 1280)?;
 //! run.shutdown().await?;
 //! # Ok(())
 //! # }
@@ -44,12 +44,12 @@
 //! serve `kit::desktop::HOSTS` through `World::mirror`.
 
 pub mod bridge;
+pub mod checks;
 pub mod client;
 mod page;
 pub use page::Hosts;
 pub mod containment;
 pub mod desktop;
-pub mod gate;
 pub mod jump;
 pub mod mirror;
 pub mod net;

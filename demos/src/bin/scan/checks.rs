@@ -1,4 +1,4 @@
-//! The gate's checks of the page's own API, read with the bearer as a
+//! The checks of the page's own API, read with the bearer as a
 //! browser reads it: the port map and banners, nmap's reports, the story
 //! and the discovery moment.
 use crate::Error;

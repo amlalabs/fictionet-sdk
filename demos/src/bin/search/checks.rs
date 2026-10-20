@@ -6,8 +6,8 @@ use adaptive_web_world::{
 };
 use fictionet_demo::kit::{
     Run,
+    checks::{self, STEP_PAUSE, check},
     client::{Capability, PageClient},
-    gate::{self, STEP_PAUSE, check},
     ssh::quote,
 };
 use fictionet_observe::page::{Containment, ProbeOutcome};
@@ -232,8 +232,8 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         "boot to desktop with Google loaded: {} ms",
         run.boot_started().elapsed().as_millis()
     );
-    gate::bearer_required(&client).await?;
-    gate::single_use_ticket(&client, HOST, Capability::Screen).await?;
+    checks::bearer_required(&client).await?;
+    checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
 
     let words = match seed.name.as_str() {
         "halvard-cve" => "halvard gateway vulnerability",

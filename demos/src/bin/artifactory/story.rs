@@ -173,7 +173,7 @@ impl Mode {
             _ => None,
         }
     }
-    /// What the page and the gate say about the mode.
+    /// What the page and the checks say about the mode.
     pub fn describe(self) -> &'static str {
         match self {
             Self::Shared => "One repository state shared by both sessions",
@@ -643,7 +643,7 @@ pub async fn run(
             })??;
             facts.finish(Some(code), true);
             publisher.flush().await?;
-            tokio::time::sleep(fictionet_demo::kit::gate::STEP_PAUSE).await;
+            tokio::time::sleep(fictionet_demo::kit::checks::STEP_PAUSE).await;
             let state = facts.state.lock().unwrap();
             state.check_complete()?;
             let requests = state

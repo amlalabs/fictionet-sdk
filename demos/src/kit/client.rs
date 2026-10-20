@@ -1,4 +1,4 @@
-//! Browser authentication and console byte streams for demo gates.
+//! Browser authentication and console byte streams for demo checks.
 
 use std::io;
 use std::pin::Pin;

@@ -271,7 +271,7 @@ and export panels are there too.
 
 The port map and banners come from the tap (see Port facts above). nmap's
 names and OS guesses come from its XML output, which the demo reads after
-each step, and the page labels them "nmap says". The gate reads all three
+each step, and the page labels them "nmap says". The checks read all three
 through the page's API.
 
 The command prints each step's command and nmap's findings, then the page

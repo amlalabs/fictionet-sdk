@@ -1,7 +1,7 @@
 //! Two Ubuntu guests inventory an office through the shared kit. A scripted
 //! agent runs three nmap steps in the workstation's terminal; the office
 //! server is a second VM among four simulated machines. The page shows both
-//! VMs and the Office, Ports and Services panels; the gate checks nmap's
+//! VMs and the Office, Ports and Services panels; the checks compare nmap's
 //! reports, the world's port map and the page's own API.
 mod checks;
 #[cfg(test)]
@@ -14,9 +14,8 @@ mod story;
 mod world;
 
 use fictionet_demo::kit::{
-    Kit,
+    self, Kit,
     client::{Capability, PageClient},
-    gate,
 };
 use fictionet_observe::page::Page;
 use std::path::{Path, PathBuf};
@@ -39,7 +38,7 @@ fn main() -> ExitCode {
         .enable_all()
         .build()
         .map_err(|e| -> Error { e.into() })
-        .and_then(|rt| rt.block_on(gate(downloads)));
+        .and_then(|rt| rt.block_on(run(downloads)));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -49,7 +48,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn gate(downloads: &Path) -> Result<(), Error> {
+async fn run(downloads: &Path) -> Result<(), Error> {
     let total = Instant::now();
     let closed = Arc::new(AtomicBool::new(false));
     let cutoff = closed.clone();
@@ -123,7 +122,7 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
     }
     .await;
     if let Err(error) = &result {
-        eprintln!("gate failed: {error}");
+        eprintln!("checks failed: {error}");
         for guest in run.guests() {
             eprint!("{}", guest.diagnostics().await);
         }
@@ -134,11 +133,11 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
             .iter()
             .all(|pid| !Path::new(&format!("/proc/{pid}")).exists());
     if let Err(error) = stop {
-        return Err(format!("shutdown failed: {error}; gate result: {result:?}").into());
+        return Err(format!("shutdown failed: {error}; checks result: {result:?}").into());
     }
     if !clean {
         return Err(format!(
-            "shutdown left a VM process or run directory; gate result: {result:?}"
+            "shutdown left a VM process or run directory; checks result: {result:?}"
         )
         .into());
     }
@@ -153,16 +152,16 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
 
 async fn page_checks(url: &str) -> Result<(), Error> {
     let client = PageClient::from_url(url)?;
-    gate::bearer_required(&client).await?;
+    kit::checks::bearer_required(&client).await?;
     let description = client.get_json("/api/page").await?;
     let hosts = description["hosts"].as_array().ok_or("page has no hosts")?;
-    gate::check(
+    kit::checks::check(
         "the page pins both guests",
         hosts.len() == 2 && hosts.iter().all(|h| h["pinned"] == true),
     )?;
-    gate::single_use_ticket(&client, guests::WORKSTATION, Capability::Screen).await?;
-    gate::single_use_ticket(&client, guests::SERVER, Capability::Terminal).await?;
-    gate::terminal_runs_on(&client, guests::SERVER).await?;
+    kit::checks::single_use_ticket(&client, guests::WORKSTATION, Capability::Screen).await?;
+    kit::checks::single_use_ticket(&client, guests::SERVER, Capability::Terminal).await?;
+    kit::checks::terminal_runs_on(&client, guests::SERVER).await?;
     // The world task publishes at most every 250 ms, so the last story step
     // can reach the page a moment after the story ends.
     let deadline = Instant::now() + Duration::from_secs(5);

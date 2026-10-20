@@ -1,11 +1,11 @@
-//! The desktop gate on the shared microVM kit.
+//! The desktop demo and its checks on the shared microVM kit.
 //! Run with `cargo xtask demo desktop`.
 
 mod guest;
 mod world;
 
+use fictionet_demo::kit::checks::check;
 use fictionet_demo::kit::client::{Capability, PageClient};
-use fictionet_demo::kit::gate::check;
 use fictionet_demo::kit::{self, Kit, b64_decode, rfb, ssh};
 use fictionet_observe::page::{Column, Page, StateLimits, StateTopic};
 use serde_json::{Value, json};
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(gate(downloads, rest.first().cloned())) {
+    match runtime.block_on(run(downloads, rest.first().cloned())) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("desktop: {error}");
@@ -59,7 +59,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
+async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
     let total = Instant::now();
     let loaded = Arc::new(AtomicBool::new(false));
     let agents = StateTopic::<Vec<Value>>::new(StateLimits::default());
@@ -160,7 +160,7 @@ async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Erro
         println!("screenshot:         {shot}");
     }
     if !failures.is_empty() {
-        return Err(format!("the gate's shutdown checks failed: {}", joined(&failures)).into());
+        return Err(format!("the shutdown checks failed: {}", joined(&failures)).into());
     }
     println!("\nevery required check passed");
     Ok(())
@@ -196,11 +196,11 @@ async fn run_checks(
     let page_url = run.page_url();
     let vm = workstation.vm();
     let session = workstation.ssh();
-    // Every required check that failed; the gate fails at the end if any did.
+    // Every required check that failed; the run fails at the end if any did.
     let mut failures = Vec::new();
 
     // Block until cloud-init finishes, but not forever: a stalled install must
-    // fail the gate, not hang it.
+    // fail the run, not hang it.
     let cloud_init = workstation.wait_cloud_init(Duration::from_secs(300)).await;
     let cloud_init_ready_ms = match &cloud_init {
         Ok(ready) => {
@@ -390,7 +390,7 @@ async fn run_checks(
         .err(),
     );
     // A moment for Firefox to finish painting the page and its padlock. A
-    // failed load fails the gate, which then prints the guest's Firefox log.
+    // failed load fails the run, which then prints the guest's Firefox log.
     if loaded.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_secs(6)).await;
     }
@@ -518,7 +518,7 @@ async fn run_checks(
 
     let peak_rss_mib = vm.peak_rss_mib().unwrap_or(0);
     if !failures.is_empty() {
-        return Err(format!("the gate's required checks failed: {}", joined(&failures)).into());
+        return Err(format!("the required checks failed: {}", joined(&failures)).into());
     }
     Ok(Checks {
         desktop_ready_ms,
@@ -552,9 +552,9 @@ async fn probe(
 async fn page_checks(url: &str, session: &ssh::Session, failures: &mut Vec<std::io::Error>) {
     let page = PageClient::from_url(url).expect("the kit's signed page URL");
     probe(failures, "the page's access checks", async {
-        kit::gate::bearer_required(&page).await?;
-        kit::gate::single_use_ticket(&page, HOSTNAME, Capability::Screen).await?;
-        kit::gate::terminal_runs_on(&page, HOSTNAME).await?;
+        kit::checks::bearer_required(&page).await?;
+        kit::checks::single_use_ticket(&page, HOSTNAME, Capability::Screen).await?;
+        kit::checks::terminal_runs_on(&page, HOSTNAME).await?;
         Ok(true)
     })
     .await;

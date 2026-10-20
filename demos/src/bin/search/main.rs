@@ -1,4 +1,4 @@
-mod gate;
+mod checks;
 mod guest;
 use fictionet_demo::search as page;
 
@@ -16,7 +16,7 @@ use std::{
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// The downloads folder, the seed's name and whether the page stays open
-/// after the gate.
+/// after the checks.
 fn arguments(args: impl Iterator<Item = String>) -> Result<(PathBuf, String, bool)> {
     const USAGE: &str = "usage: search [downloads] [--seed <name>] [--stay]";
     let mut args = args.peekable();
@@ -84,14 +84,14 @@ async fn main() -> Result {
         run.guest(guest::HOST).ssh_ready().as_millis()
     );
     let mut visited = BTreeSet::new();
-    let mut result = gate::run(&run, &scenario, &output, &mut visited).await;
+    let mut result = checks::run(&run, &scenario, &output, &mut visited).await;
     if result.is_ok() {
         println!(
             "story done: {} ms",
             run.boot_started().elapsed().as_millis()
         );
         if stay {
-            result = kit::gate::stay_open().await.map_err(Into::into);
+            result = kit::checks::stay_open().await.map_err(Into::into);
         }
     }
     if result.is_err() {
@@ -99,7 +99,7 @@ async fn main() -> Result {
     }
     let shutdown = run.shutdown().await;
     let finish = log.finish();
-    let clean = kit::gate::check(
+    let clean = kit::checks::check(
         "shutdown removes the VMM and run directory",
         shutdown.is_ok()
             && !path.exists()
@@ -110,7 +110,7 @@ async fn main() -> Result {
     let result = result
         .and(clean.map_err(Into::into))
         .and(shutdown.map_err(Into::into));
-    gate::finish(result, &output.join("log.jsonl"), &visited)?;
+    checks::finish(result, &output.join("log.jsonl"), &visited)?;
     println!("every required check passed");
     Ok(())
 }

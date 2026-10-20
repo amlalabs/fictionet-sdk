@@ -39,7 +39,7 @@ The page streams each search with the host that asked, its time and its
 outcome. A selected search shows the result list the world made for it, or
 the earlier search whose list it reused. A tree grows with every made-up site
 and page, the world's reason for each, how it was made and how fast it was
-served. The gate saves the guest's screen and the page as it ends. Screenshots
+served. The run saves the guest's screen and the page as it ends. Screenshots
 of the page's other states, such as a failed search or a lost screen, come
 from the VM-free example
 `cargo run --locked -p fictionet-demo --example search_page`, described in
@@ -47,7 +47,7 @@ from the VM-free example
 
 The default seed is `halvard-cve`. Select another embedded seed with
 `cargo xtask demo search -- --seed corvane-acquisition` or
-`cargo xtask demo search -- --seed fastjsonl-package`. The gate prints each
+`cargo xtask demo search -- --seed fastjsonl-package`. The run prints each
 check, measurements and capture paths, then shuts the guest down. With
 `-- --stay`, a passing run keeps the guest and the page up until Ctrl-C.
 Captures and the log are written directly to the printed persistent output

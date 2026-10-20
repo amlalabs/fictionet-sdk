@@ -29,14 +29,14 @@ world's mirror. The mirror keeps them in `downloads/cloudimage/apt-cache/`, so
 the first run on a machine also fetches about 280 MB of Ubuntu packages and
 later runs reuse them.
 
-Each run prints its page URL before the guests boot. A gate then runs the
+Each run prints its page URL before the guests boot. It then runs the
 demo's story and its checks, saves screenshots, powers the guests off, and
 checks that no Cloud Hypervisor process or run directory is left. A passing
 run ends with `every required check passed`. A failing run prints the guests'
 cloud-init report, log tails and console tail. The page screenshots need
 Chromium on your machine.
 
-The times below are from one run of each gate on a 24-core machine with other
+The times below are from one run of each demo on a 24-core machine with other
 work running, the pinned files downloaded, the package cache filled and one
 page tab open. All six ran one after another on the same build.
 
@@ -46,10 +46,10 @@ page tab open. All six ran one after another on the same build.
 Firefox and two pinned coding agents, Claude Code and Codex. The page shows
 the live desktop and terminal over SSH, beside packets, events, the map, Left
 the box, containment, labels and export. Its Coding agents table fills in once
-the gate has run both version commands. No model API is forwarded, so the
+the checks have run both version commands. No model API is forwarded, so the
 agents run no task.
 
-The gate checks the guest's address and devices, the trust store, Firefox, the
+The checks cover the guest's address and devices, the trust store, Firefox, the
 agents' own TLS clients, and the page's access controls. It types a command in
 the page terminal and moves the pointer with and without the screen lease.
 
@@ -76,13 +76,13 @@ the July 2026 incident beside the rows of this run that match it. Packages
 shows the simulated server's inventory with the lookalike flagged, and
 Requests lists every request with its classification.
 
-The gate checks each command's exit status and the facts the world observed,
+The checks cover each command's exit status and the facts the world observed,
 then reads the same facts from the page's API as a browser does. Each command
 declares its destinations. Other traffic from the guest is kept, printed
 apart, and shown in a muted band in Doors tried.
 
 - Options: `--variant normal|missing|lookalike|peer`, `lookalike` by default.
-  `--stay` keeps the page open after the gate until Ctrl-C. With `--variant
+  `--stay` keeps the page open after the checks until Ctrl-C. With `--variant
   peer`, `--sessions shared|separate` boots a colleague's laptop beside
   Maya's. The colleague leaves a note in the cache first, and then Maya lists
   it. With `shared`, both sessions use one repository state and Maya's
@@ -118,7 +118,7 @@ login shell and run `bank-check` subcommands. Taking browser input does not
 pause the script. After the story, Routing stays available and the page stays
 open until Ctrl-C.
 
-- Options: `--gate` shuts down after the story. A run without a terminal on
+- Options: `--checks` shuts down after the story. A run without a terminal on
   stdin does the same.
 - Screenshots: `normal.png`, `hijacked.png`, `page-hijacked.png` and the
   world's `log.jsonl` in the `downloads/cloudimage/shots/border-<run>/`
@@ -144,7 +144,7 @@ a tree of every made-up site and page, with the world's reason for each, how
 it was made and how fast it was served. A switch turns page generation off and
 on. The desktop sits above the inspector.
 
-The gate searches on Google, Bing and DuckDuckGo, opens results and a typed
+The checks search on Google, Bing and DuckDuckGo, opens results and a typed
 address, and checks each page's reason and how it was made. It checks that a
 stored search comes from memory once generation is off. It also checks that
 Left the box names every forwarded mirror, and that the guest's background
@@ -152,7 +152,7 @@ requests made no pages. The story holds each step for 1.5 s, so you can follow
 it on the page.
 
 - Options: `--seed halvard-cve|corvane-acquisition|fastjsonl-package`,
-  `halvard-cve` by default. `--stay` keeps the page open after the gate until
+  `halvard-cve` by default. `--stay` keeps the page open after the checks until
   Ctrl-C.
 - Screenshots: `downloads/cloudimage/runs/search-<time>/`, with `desktop.png`,
   `page.png` and the world's `log.jsonl`.
@@ -162,7 +162,7 @@ it on the page.
   refuses one for its generation budget. The page's `preview-screen` command,
   `{"command":"drop"}`, closes the screen's connection to show the lost state.
   Press Ctrl-C to close the page. The preview holds the package cache while it
-  runs, so a gate started beside it fetches its packages without the cache.
+  runs, so a VM run started beside it fetches its packages without the cache.
 - Times: SSH up after 7.5 s, Google loaded in Firefox after 45.3 s, story done
   after 65.3 s, whole run 66.0 s.
 
@@ -177,7 +177,7 @@ changed sentences marked. It marks the version the world serves now and the
 version Firefox last received, from the world's facts about each request, and
 keeps a strip of this run's reads. The inspector adds a Reads table.
 
-The gate checks both reads, the switch's revisions, a stale switch command,
+The checks cover both reads, the switch's revisions, a stale switch command,
 and that the panels have data.
 
 - Screenshots: `desktop.png` and `page.png` in a new directory under
@@ -200,7 +200,7 @@ office subnet lighting up as hosts answer, each host's 1,024 ports, and the
 banners seen on the wire beside what nmap says, with the shared panels. See
 [the scan example](../examples/scan/README.md#the-in-process-demo).
 
-The gate checks each nmap report against the ports the world served, and the
+The checks compare each nmap report with the ports the world served, and the
 page's access controls and terminal.
 
 - Screenshots: `downloads/cloudimage/shots/`, with `viewer-scan.png`,
@@ -227,11 +227,11 @@ with exact Host and Origin checks. Consoles use short-lived, single-use
 WebSocket tickets from the authenticated API, and screen input needs the
 host's input lease. Taking control claims browser input only. It does not
 pause an agent. A host takes four screen sessions and four terminal sessions
-at once. A gate's own captures use one or two, so with several page tabs open
-a gate's page shot can be refused a session and fail. The pinned noVNC and
+at once. The checks' own captures use one or two, so with several page tabs
+open a page shot can be refused a session and fail. The pinned noVNC and
 xterm.js files are embedded from `observe/downloads/vendor/`.
 
-The page's consoles and the gate reach each guest over SSH from the kit's
+The page's consoles and the checks reach each guest over SSH from the kit's
 jump host, so that traffic crosses the guest's link too. The packet list hides
 packets to and from the jump host's address, counts them, and shows them on
 request. The list for all hosts covers the declared hosts' links. A packet
@@ -277,8 +277,8 @@ run.guest("workstation").wait_cloud_init(Duration::from_secs(300)).await?;
 run.shutdown().await?;
 ```
 
-A gate uses the same few calls in every demo, all in
-[`kit::gate`](src/kit/gate.rs) and [`kit::client`](src/kit/client.rs):
+The checks use the same few calls in every demo, all in
+[`kit::checks`](src/kit/checks.rs) and [`kit::client`](src/kit/client.rs):
 
 - `GuestHandle::wait_cloud_init` waits for the guest's setup and fails with
   cloud-init's report.
@@ -286,16 +286,16 @@ A gate uses the same few calls in every demo, all in
   Chromium. `Run::screen` saves only the screen, and `Run::settled_screen`
   keeps a capture once two in a row match, so a page the guest is loading has
   finished. `Run::page_shot` saves the page once a condition holds in it.
-- `kit::gate::check` prints `[pass]` or `[FAIL]` with the check's name.
-- `kit::gate::bearer_required`, `single_use_ticket` and `terminal_runs_on`
+- `kit::checks::check` prints `[pass]` or `[FAIL]` with the check's name.
+- `kit::checks::bearer_required`, `single_use_ticket` and `terminal_runs_on`
   check the page's access controls and its terminal.
 - `GuestHandle::diagnostics` collects the guest's side of a failed run.
 - `PageClient` reads the page's API as a signed-in browser does, posts
   commands, waits for a state or an event, pages through events with
   `find_event`, and reads the state stream with `state_stream`.
-- `kit::gate::STEP_PAUSE` holds each story step for 1.5 s, so a person
+- `kit::checks::STEP_PAUSE` holds each story step for 1.5 s, so a person
   watching can follow it. No check may depend on it.
-- `kit::gate::stay_open` keeps the page open until Ctrl-C.
+- `kit::checks::stay_open` keeps the page open until Ctrl-C.
 - `kit::preview::Console` is a screen that says NO VM, for a page without a
   guest.
 

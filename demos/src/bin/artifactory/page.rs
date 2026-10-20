@@ -1,5 +1,5 @@
 //! The Artifactory page: Doors tried, Packages and Requests beside the
-//! standard panels, the story's moments, and the gate's reading of the
+//! standard panels, the story's moments, and the checks' reading of the
 //! page's topics as a browser reads them.
 
 use super::facts::{

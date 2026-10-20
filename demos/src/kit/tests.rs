@@ -1119,7 +1119,7 @@ async fn page_client_reads_state_posts_commands_and_waits() {
 }
 
 #[tokio::test]
-async fn gate_checks_cover_access_the_terminal_and_a_settled_screen() {
+async fn checks_cover_access_the_terminal_and_a_settled_screen() {
     use client::Capability;
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut fixture = PageFixture::new().await;
@@ -1130,15 +1130,17 @@ async fn gate_checks_cover_access_the_terminal_and_a_settled_screen() {
         fixture.network();
         fixture.connect();
         let client = &fixture.client;
-        gate::bearer_required(client).await.unwrap();
-        gate::single_use_ticket(client, "workstation", Capability::Screen)
+        checks::bearer_required(client).await.unwrap();
+        checks::single_use_ticket(client, "workstation", Capability::Screen)
             .await
             .unwrap();
         assert!(
-            !String::from_utf8_lossy(gate::HOSTNAME_LINE).contains("name:workstation:end"),
+            !String::from_utf8_lossy(checks::HOSTNAME_LINE).contains("name:workstation:end"),
             "an echo of the typed line must not pass the terminal check"
         );
-        gate::terminal_runs_on(client, "workstation").await.unwrap();
+        checks::terminal_runs_on(client, "workstation")
+            .await
+            .unwrap();
         let out = fixture.run.path().join("settled.png");
         let (capture, settled) = fixture
             .run
@@ -1212,10 +1214,13 @@ async fn cloud_init_wait_and_diagnostics_use_the_guest_session() {
     let ready = guest.wait_cloud_init(Duration::from_secs(5)).await.unwrap();
     assert!(ready <= guest.boot.elapsed());
     let report = guest.diagnostics().await;
-    for command in gate_commands() {
+    for command in diagnostic_commands() {
         assert!(report.contains(&format!("guest$ {command}\n")), "{report}");
     }
-    assert_eq!(report.matches("[exit 0]").count(), gate_commands().len());
+    assert_eq!(
+        report.matches("[exit 0]").count(),
+        diagnostic_commands().len()
+    );
     // Readiness and containment probes share the session; keep this test's commands.
     let wait = "sudo cloud-init status --wait --long";
     let mut sent = Vec::new();
@@ -1223,16 +1228,16 @@ async fn cloud_init_wait_and_diagnostics_use_the_guest_session() {
         sent.extend(
             event
                 .strip_prefix("exec ")
-                .filter(|command| *command == wait || gate_commands().contains(command))
+                .filter(|command| *command == wait || diagnostic_commands().contains(command))
                 .map(str::to_owned),
         );
     }
     assert_eq!(sent[..2], [wait; 2]);
-    assert_eq!(sent[2..], gate_commands());
+    assert_eq!(sent[2..], diagnostic_commands());
     fixture.run.shutdown().await.unwrap();
 }
 
-fn gate_commands() -> Vec<&'static str> {
+fn diagnostic_commands() -> Vec<&'static str> {
     vec![
         "cloud-init status --long",
         "sudo tail -n 30 /var/log/cloud-init-output.log",
