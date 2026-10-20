@@ -54,33 +54,33 @@ export function mount(root, services, options) {
   const css = el('link', ''); css.rel = 'stylesheet'; css.href = '/assets/border.css';
   root.classList.add('border-panel');
   const header = el('header', '', root, 'border-heading');
-  el('p', 'KESTRELMOOR BANK · LIVE ROUTING', header, 'border-eyebrow');
+  el('p', 'KESTRELMOOR BANK · LIVE ROUTING', header, 'eyebrow accent');
   el('h1', 'Kestrelmoor Bank, live routing', header);
   el('p', 'Hijacked makes Transpeak announce a more specific route to the bank’s network, so the guest’s packets for 84.21.44.10 reach an impostor.', header, 'border-deck');
   const switchBox = el('section', '', root, 'border-switch');
   const actions = el('div', '', switchBox, 'border-toggle'); actions.setAttribute('aria-label', 'Route mode');
   const stateLine = el('p', 'Waiting for routing state…', switchBox, 'mono');
   const reply = el('p', '', switchBox, 'border-reply'); reply.setAttribute('role', 'status');
-  el('p', 'Routing commands do not claim browser input or pause the scripted agent.', switchBox, 'border-note');
+  el('p', 'Routing commands do not claim browser input or pause the scripted agent.', switchBox, 'note');
   const error = el('p', '', root, 'loss-note'); error.setAttribute('role', 'status');
   const alert = el('section', '', root, 'border-alert'); alert.setAttribute('aria-live', 'polite'); alert.hidden = true;
-  const pathBox = el('section', '', root, 'border-section');
+  const pathBox = el('section', '', root, 'section');
   el('h2', 'Where the packets go', pathBox);
-  const pathNote = el('p', '', pathBox, 'border-note');
+  const pathNote = el('p', '', pathBox, 'note');
   const chain = el('ol', '', pathBox, 'border-path');
   const traceBox = el('div', '', pathBox, 'border-trace');
-  const routeBox = el('section', '', root, 'border-section'); el('h2', 'The route that wins', routeBox);
-  const routes = el('div', '', routeBox); const explanation = el('p', '', routeBox, 'border-note');
+  const routeBox = el('section', '', root, 'section'); el('h2', 'The route that wins', routeBox);
+  const routes = el('div', '', routeBox); const explanation = el('p', '', routeBox, 'note');
   const bgpBox = el('details', '', routeBox); el('summary', 'What the BGP peer saw', bgpBox);
-  const bgpEmpty = el('p', 'No established BGP session observed yet.', bgpBox, 'border-note'); const bgp = el('div', '', bgpBox), bgpRows = new Map();
-  const certBox = el('details', '', root, 'border-section border-certificates');
+  const bgpEmpty = el('p', 'No established BGP session observed yet.', bgpBox, 'note'); const bgp = el('div', '', bgpBox), bgpRows = new Map();
+  const certBox = el('details', '', root, 'section border-certificates');
   el('summary', 'Certificates: the bank’s and the impostor’s', certBox);
-  el('p', 'The impostor’s leaf certificate names the same bank names.', certBox, 'border-note');
-  const latest = el('p', 'No observed TLS session yet.', certBox, 'border-note');
+  el('p', 'The impostor’s leaf certificate names the same bank names.', certBox, 'note');
+  const latest = el('p', 'No observed TLS session yet.', certBox, 'note');
   const certs = el('div', '', certBox, 'border-chains');
-  const agent = el('section', '', root, 'border-section'); el('h2', 'A scripted agent', agent);
+  const agent = el('section', '', root, 'section'); el('h2', 'A scripted agent', agent);
   el('p', 'Sign in → read balance → inspect certificate, traceroute and BGP → hold HTTPS open → flip route → inspect the failure → sign in with verification disabled → restore.', agent);
-  el('p', 'In the VM, the Terminal tab watches tmux session main. Ctrl-b d opens your login shell. Taking input does not pause the script.', agent, 'border-note');
+  el('p', 'In the VM, the Terminal tab watches tmux session main. Ctrl-b d opens your login shell. Taking input does not pause the script.', agent, 'note');
   let route, view, pending = false, disposed = false, dismissed = 0, certValue, pathValue;
   const controller = new AbortController();
   const buttons = ['Normal', 'Hijacked'].map((label, index) => {
@@ -128,11 +128,11 @@ export function mount(root, services, options) {
     });
     }
     traceBox.replaceChildren();
-    if (!traced) el('p', 'No UDP traceroute observed on this guest link yet.', traceBox, 'border-note');
+    if (!traced) el('p', 'No UDP traceroute observed on this guest link yet.', traceBox, 'note');
     else {
       el('p', `Last observed traceroute · ${time(traced.trace.started_ms)}${traced.trace.complete ? '' : ' · incomplete'}`, traceBox);
       el('p', traced.trace.hops.map(h => `${h.ttl} ${h.address}`).join(' → ') || 'Waiting for replies…', traceBox, 'mono');
-      el('p', diff.beforeChange ? 'The last traceroute ran before the change.' : diff.matches ? 'The observed path matches the current route.' : 'The observed path does not yet match the complete configured path.', traceBox, 'border-note');
+      el('p', diff.beforeChange ? 'The last traceroute ran before the change.' : diff.matches ? 'The observed path matches the current route.' : 'The observed path does not yet match the complete configured path.', traceBox, 'note');
       if (traced.trace.dropped) el('p', `Probes or hops dropped: ${traced.trace.dropped}.`, traceBox, 'loss-note');
     }
     table(routes, ['Prefix', 'AS path', 'Origin'], route.routes.map(r => ({ cells: [r.prefix, r.as_path.join(' → '), `AS ${r.origin_as}`], mark: r.hijack })));
@@ -170,7 +170,7 @@ export function mount(root, services, options) {
         const flow = el('button', 'Show matching flow (approximate)', buttons, 'button'); flow.type = 'button';
         flow.onclick = () => { services.selection.set({ host: moment.sandbox, event: { seq: moment.event }, connection: moment.connection, links: [] }); services.showPackets({ local: `${moment.endpoint.reached}:${moment.port}`, peer: moment.peer }); };
       }
-      el('p', 'The event uses its exact connection identity. Packet matching uses the guest-visible addresses and ports and is approximate.', alert, 'border-note');
+      el('p', 'The event uses its exact connection identity. Packet matching uses the guest-visible addresses and ports and is approximate.', alert, 'note');
       const dismiss = el('button', 'Dismiss alert', buttons, 'button'); dismiss.type = 'button'; dismiss.onclick = () => { dismissed = moment.event; alert.hidden = true; };
     }
     const dropped = view.lost + view.truncated + view.bgp.dropped + view.tls.dropped + view.moments.dropped;

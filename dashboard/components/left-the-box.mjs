@@ -117,11 +117,12 @@ export function mount(root, services) {
     } catch (error) {
       if (!controller.signal.aborted) {
         failed = true;
+        // After the run stopped, the page server is gone: stop asking.
+        if (services.stopped?.()) { status.textContent = `The run has stopped, so destinations can no longer be loaded.${snapshot ? ' The list shows the last ones read.' : ''}`; return; }
         status.textContent = `Could not load destinations: ${error.message}. The table may be incomplete.`;
       }
-    } finally {
-      if (!controller.signal.aborted) queue();
     }
+    if (!controller.signal.aborted) queue();
   }
   const stopContainment = services.containmentState ? services.state(services.containmentState, (value) => { containment = value; containmentFailed = false; draw(); }, () => { containmentFailed = true; draw(); }) : () => {};
   document.addEventListener('visibilitychange', queue);

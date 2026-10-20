@@ -89,7 +89,7 @@ export function createWatchHub(transport, { limit = 5000 } = {}) {
 /// the stream, kept current, until nothing listens or the stream would carry
 /// more than the server allows. Reopening drops what the old stream had not
 /// delivered yet, and the new one can only resend it if it connects.
-export function createStateHub(transport, { most = 64 } = {}) {
+export function createStateHub(transport, { most = 64, stopped = () => false } = {}) {
   const topics = new Map();
   let stream, carried = '', unbind = () => {}, scheduled = false;
 
@@ -155,6 +155,18 @@ export function createStateHub(transport, { most = 64 } = {}) {
       // starts a stream without them.
       on('world_error', ({ error }) => {
         for (const [id, topic] of topics) { fail(topic, new Error(error)); drop(id); }
+        stream = null;
+        carried = '';
+      }),
+      // After the run stopped a failed connection will not come back: topics
+      // with nothing to show say so and leave, so a panel opened later asks
+      // again and hears the same, and the stream stops trying.
+      on('error', () => {
+        if (!stopped()) return;
+        for (const [id, topic] of topics) if (!topic.latest) { fail(topic, new Error('The run has stopped, so its state can no longer be loaded')); drop(id); }
+        unbind();
+        unbind = () => {};
+        source.close();
         stream = null;
         carried = '';
       }),

@@ -548,6 +548,14 @@ test('merged host rows keep display numbers and link identities in detail and la
 });
 
 
+test('address cells carry their full address, for a narrow list that cuts them', (t) => {
+  const h = setup(t);
+  h.send(1, { src: '185.15.59.224:443', dst: '10.0.0.2:60483' });
+  h.flush();
+  const cells = h.rows()[0].children;
+  assert.deepEqual([cells[3], cells[4]].map((cell) => cell.getAttribute('title')), ['185.15.59.224:443', '10.0.0.2:60483']);
+});
+
 test('host columns fit the declared names and stay fixed as packets arrive', (t) => {
   const h = setup(t);
   h.view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'workstation' }, { e: { id: 'b' }, host: 'jump' }]);

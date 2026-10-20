@@ -6,7 +6,10 @@ import { listen } from './dom.mjs';
 export function createPackets({
   $, el, packetStream, packet, download, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000,
   placeholder = (many) => (many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.'),
-  pcapLabel = 'Capture for Wireshark', onDetail = () => {},
+  pcapLabel = 'Capture for Wireshark', onDetail = () => {}, stopped = () => null,
+  // A table with a Host column gives every row that cell, so gap rows span
+  // all nine columns whichever are hidden.
+  hostColumn = false,
 }) {
   // ---------------------------------------------------------------------------
   // The packet drawer
@@ -142,8 +145,11 @@ export function createPackets({
     });
     onStream('error', (ev) => {
       if (packets?.source !== source) return;
-      addGap(JSON.parse(ev.data).error);
+      // After the run stopped, the connection will not come back.
+      const reason = stopped();
+      addGap(reason || JSON.parse(ev.data).error);
       trimRows();
+      if (reason) source.close();
     });
     onStream('end', (ev) => {
       if (packets?.source !== source) return;
@@ -217,7 +223,7 @@ export function createPackets({
 
   function addGap(text, parent = prows) {
     const tr = el('tr', { class: 'gap' }, parent);
-    el('td', { colspan: 8, text }, tr);
+    el('td', { colspan: hostColumn ? 9 : 8, text }, tr);
   }
 
   function showCounts() {
@@ -295,14 +301,14 @@ export function createPackets({
     p.no = no;
     const cells = [no, time, '', p.src, p.dst, p.proto, p.len, p.info];
     cells.forEach((c, i) => {
-      const td = el('td', i === 7 ? {} : { text: String(c) }, tr);
+      const td = el('td', i === 7 ? {} : i === 3 || i === 4 ? { text: String(c), title: String(c) } : { text: String(c) }, tr);
       if (i === 2) {
         td.className = 'dir';
         el('i', {}, td);
       }
       if (i === 5) td.className = 'proto';
       td.classList.add(['c-no', 'c-time', 'c-dir', 'c-src', 'c-dst', 'c-proto', 'c-len', 'c-info'][i]);
-      if (i === 2 && packets.showHost) el('td', { class: 'c-host mono', text: packets.hosts.get(p.link) || '—' }, tr);
+      if (i === 2 && (hostColumn || packets.showHost)) el('td', { class: 'c-host mono', text: packets.showHost ? packets.hosts.get(p.link) || '—' : '' }, tr);
       if (i === 7) {
         const info = el('div', { class: 'packet-info' }, td);
         const text = el('span', { class: 'packet-info-text' }, info);

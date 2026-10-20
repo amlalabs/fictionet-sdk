@@ -168,6 +168,26 @@ test('event table advances the server cursor and cancels pending reads and timer
   assert.equal(h.root.children.length, 0);
 });
 
+test('after the run stopped, event tables and custom panels say so instead of a fetch error', async () => {
+  const h = fixture();
+  h.services.stopped = () => true;
+  const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
+  await settle();
+  h.requests[0].reject(new TypeError('Failed to fetch'));
+  await settle();
+  assert.match(h.root.textContent, /The run has stopped, so these events can no longer be loaded\./);
+  assert.doesNotMatch(h.root.textContent, /Failed to fetch/);
+  assert.equal(h.timers.size, 0, 'no further reads');
+  dispose();
+  const panel = fixture();
+  panel.services.stopped = () => true;
+  panel.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
+  const stop = custom(panel.root, panel.services, { title: 'Plant', module: '/panels/plant.mjs', state: '/api/state/plant' });
+  await settle();
+  assert.equal(panel.root.textContent, 'Could not open Plant: the run has stopped, so the panel can no longer be loaded');
+  stop();
+});
+
 test('custom panels dispose a late mount and reject foreign module paths', async () => {
   const h = fixture();
   let finish, stopped = 0, imports = 0;

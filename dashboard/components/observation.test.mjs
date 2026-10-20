@@ -291,6 +291,35 @@ test('a late tab opens one packet stream once the graph is known and shows its l
   h.clean();
 });
 
+test('after the run stopped, packets say so instead of a fetch error and stop trying', async (t) => {
+  const stoppedText = 'The run has stopped, so its packets can no longer be loaded.';
+  // The page server is gone, so the host's links cannot be read.
+  const h = fixture(t);
+  h.services.stopped = () => true;
+  h.services.transport.get = async () => { throw new TypeError('Failed to fetch'); };
+  const dispose = packets(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
+  await settle();
+  assert.equal(h.root.querySelector('#prows').textContent, stoppedText);
+  assert.doesNotMatch(h.root.textContent, /Failed to fetch/);
+  dispose();
+  h.clean();
+  // A packet stream that drops after the run stopped says so once and closes.
+  const live = fixture(t);
+  let stopped = false;
+  live.services.stopped = () => stopped;
+  const stop = packets(live.root, live.services);
+  live.watches[0].emit('snapshot', { ...live.snapshot, edges: [{ id: 'e2', a: 's1', b: 't1' }], counters: { e2: [1, 0, 0, 0] } });
+  await settle();
+  stopped = true;
+  live.streams[0].emit('error', { error: 'Connection dropped. Reconnecting.' });
+  live.frame();
+  assert.equal(live.root.querySelector('#prows').textContent, stoppedText);
+  assert.equal(live.streams[0].closed, true);
+  stop();
+  live.clean();
+});
+
 test('the map keeps its own selection instead of applying it back to itself', (t) => {
   // Drawn links move packets along their paths; the fake DOM has no geometry.
   for (const [name, value] of [['getTotalLength', () => 100], ['getPointAtLength', () => ({ x: 0, y: 0 })]]) {

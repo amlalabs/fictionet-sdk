@@ -131,8 +131,8 @@ test('switch track and checked state follow published state while commands are p
   const button = h.root.querySelector('.article-switch');
   assert.equal(button.getAttribute('role'), 'switch');
   assert.equal(button.getAttribute('aria-checked'), 'false');
-  assert.equal(button.querySelector('.article-switch-track').getAttribute('aria-hidden'), 'true');
-  assert.ok(button.querySelector('.article-switch-knob'));
+  assert.equal(button.querySelector('.switch-track').getAttribute('aria-hidden'), 'true');
+  assert.ok(button.querySelector('.switch-knob'));
   assert.match(button.textContent, /Serving the real article/);
   button.click();
   assert.equal(button.getAttribute('aria-busy'), 'true');

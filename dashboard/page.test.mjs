@@ -113,6 +113,31 @@ test('a stream carries at most the server limit, dropping topics no panel shows 
   hub.dispose();
 });
 
+test('after the run stopped, a state stream that cannot connect fails only topics with nothing to show', async () => {
+  const streams = [];
+  let stopped = false;
+  const hub = createStateHub({ stateStream(topics) { const source = new Source('state', { ...topics }); streams.push(source); return source; } }, { stopped: () => stopped });
+  const held = [], fresh = [];
+  hub.subscribe('routing', (value) => held.push(value), (error) => held.push(error));
+  await settle();
+  streams[0].emit('snapshot', { topic: 'routing', revision: 2, value: { mode: 'legitimate' } });
+  // The run ends; a panel opened now needs a topic the stream does not carry.
+  stopped = true;
+  hub.subscribe('results', (value) => fresh.push(value), (error) => fresh.push(error));
+  await settle();
+  streams[1].emit('error', { error: 'Connection dropped. Reconnecting.' });
+  assert.deepEqual(fresh.map((item) => item.message), ['The run has stopped, so its state can no longer be loaded']);
+  assert.deepEqual(held.map((item) => (item instanceof Error ? item.message : item.value.mode)), ['legitimate'], 'a topic with state keeps it and gets no error');
+  assert.equal(streams[1].closed, true);
+  // Another panel showing the same topic later asks again and hears the same.
+  const later = [];
+  hub.subscribe('results', (value) => later.push(value), (error) => later.push(error));
+  await settle();
+  streams[2].emit('error', { error: 'Connection dropped. Reconnecting.' });
+  assert.deepEqual(later.map((item) => item.message), ['The run has stopped, so its state can no longer be loaded']);
+  hub.dispose();
+});
+
 test('the watch hub replays the latest snapshot and changes to a late subscriber', async () => {
   const upstreams = [];
   const hub = createWatchHub({ watch() { const source = new Source('watch'); upstreams.push(source); return source; } }, { limit: 3 });

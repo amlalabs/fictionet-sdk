@@ -32,11 +32,12 @@ export function mount(root, services, options) {
       else if (!paused) { draw(); body.scrollTop = body.scrollHeight; }
     } catch (error) {
       if (controller.signal.aborted) return;
-      status.textContent = `Could not load events: ${error.message}`;
       status.hidden = false;
-    } finally {
-      if (!controller.signal.aborted) timer = schedule(read, 1000);
+      // After the run stopped, the page server is gone: stop asking.
+      if (services.stopped?.()) { status.textContent = 'The run has stopped, so these events can no longer be loaded.'; return; }
+      status.textContent = `Could not load events: ${error.message}`;
     }
+    if (!controller.signal.aborted) timer = schedule(read, 1000);
   }
   const scroll = listen(body, 'scroll', () => { paused = body.scrollHeight - body.scrollTop - body.clientHeight > 24; });
   const click = listen(jump, 'click', () => { paused = false; draw(); body.scrollTop = body.scrollHeight; });

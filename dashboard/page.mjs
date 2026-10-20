@@ -35,14 +35,20 @@ function store(value) {
 }
 
 export function createServices(transport, theme) {
-  const states = createStateHub(transport);
+  // The run status the header shows: connecting, running or stopped.
+  const run = store('connecting');
+  const stopped = () => run.get() === 'stopped';
+  const states = createStateHub(transport, { stopped });
   const watches = createWatchHub(transport);
   const selection = createSelection();
   const moments = new Set();
   const momentListeners = new Set();
   const clock = { t: 0, at: performance.now(), ended: true };
   return {
-    transport, selection, theme, format, dom, clock,
+    transport, selection, theme, format, dom, clock, run,
+    // Whether the header says Stopped. A load that fails then says the run
+    // stopped, not why the request failed.
+    stopped,
     packetPair: store(null),
     watch: () => watches.subscribe(),
     connect: (graph) => watchState(watches.subscribe(), graph),
@@ -262,7 +268,6 @@ export async function mount(root, transport, theme) {
       entry.button.setAttribute('aria-selected', String(entry === item));
       entry.button.tabIndex = entry === item ? 0 : -1;
     }
-    item.button.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
     if (focus) item.button.focus();
     const content = $('inspector-content');
     content.replaceChildren();
@@ -289,20 +294,7 @@ export async function mount(root, transport, theme) {
       event.preventDefault();
       tabs.forEach((entry, i) => { entry.button.tabIndex = i === index ? 0 : -1; });
       tabs[index].button.focus();
-      tabs[index].button.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
     }));
-  }
-  // The tab strip fades at an edge that has more tabs past it.
-  const strip = tabList.parentElement;
-  const edges = () => {
-    strip.dataset.left = String(tabList.scrollLeft > 1);
-    strip.dataset.right = String(tabList.scrollLeft + tabList.clientWidth < tabList.scrollWidth - 1);
-  };
-  cleanup.push(listen(tabList, 'scroll', edges));
-  if (globalThis.ResizeObserver) {
-    const observer = new ResizeObserver(edges);
-    observer.observe(tabList);
-    cleanup.push(() => observer.disconnect());
   }
   const tabOf = (kind) => tabs.find((tab) => tab.options.kind === kind);
   services.showPanel = (kind) => { const item = tabOf(kind); if (item) activate(item); };
@@ -404,7 +396,7 @@ export async function mount(root, transport, theme) {
   // the run time as soon as the snapshot comes, not at the next tick.
   const clock = services.clock;
   const tick = () => { $('run-clock').textContent = format.fmtDuration(services.runTime()); };
-  const status = (state, text) => { $('run-status').dataset.state = state; $('page-status').textContent = text; tick(); };
+  const status = (state, text) => { $('run-status').dataset.state = state; $('page-status').textContent = text; services.run.set(state); tick(); };
   watch = services.watch();
   const on = (name, callback) => cleanup.push(listen(watch, name, (event) => callback(event.data ? JSON.parse(event.data) : null)));
   on('waiting', () => status('connecting', 'Waiting for the world'));

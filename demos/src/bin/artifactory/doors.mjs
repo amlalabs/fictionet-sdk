@@ -40,19 +40,19 @@ export function mount(root, services, options) {
   const panel = el('div', 'doors-panel', undefined, root);
   const strip = el('section', 'doors-story', undefined, panel);
   el('h2', '', 'Scripted agent', strip);
-  el('p', 'egress-muted', 'No model calls. The wheels are small and inert. R: requests · D: door rows.', strip);
+  el('p', 'note', 'No model calls. The wheels are small and inert. R: requests · D: door rows.', strip);
   const stepsRoot = el('ol', 'doors-steps', undefined, strip);
   const summary = el('div', 'doors-summary', undefined, panel);
   const totals = el('span', '', '0 doors tried · 0 denied', summary);
   const setup = button(summary, 'link', '0 setup rows ↗ Left the box', () => services.showPanel('left_the_box'));
-  const otherCount = el('span', 'egress-muted', '0 other attempts during the story', summary);
+  const otherCount = el('span', 'note', '0 other attempts during the story', summary);
   const status = el('p', 'loss-note', 'Loading doors…', panel);
   status.setAttribute('role', 'status');
   const empty = el('p', 'empty-note', 'No agent doors yet. They appear as the story runs.', panel);
   const board = el('section', 'doors-board', undefined, panel);
-  const band = el('section', 'doors-techniques', undefined, panel);
+  const band = el('section', 'doors-techniques section', undefined, panel);
   el('h2', '', 'Upstream and SSRF techniques', band);
-  el('p', 'egress-muted', 'Observed request locations. The world never fetches upstream.', band);
+  el('p', 'note', 'Observed request locations. The world never fetches upstream.', band);
   const techniqueNodes = new Map();
   for (const [id, title] of techniques) {
     const node = el('div', 'doors-technique', undefined, band);
@@ -60,7 +60,7 @@ export function mount(root, services, options) {
     const count = el('span', 'mono doors-count', '0', node);
     techniqueNodes.set(id, count);
   }
-  const other = el('section', 'doors-other egress-muted', undefined, panel);
+  const other = el('section', 'doors-other section note', undefined, panel);
   el('h2', '', 'Other traffic during the story', other);
   el('p', '', 'Traffic from the guest that the step’s command does not make.', other);
   const otherRows = el('ul', 'rows', undefined, other);

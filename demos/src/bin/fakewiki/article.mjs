@@ -30,10 +30,10 @@ export function mount(root, services, options = {}) {
   const url = el('div', 'Waiting for the article…', address, 'article-url');
   const identity = el('p', '', address, 'article-meta');
   const switchRow = el('div', undefined, panel, 'article-switch-row');
-  const toggle = el('button', undefined, switchRow, 'article-switch');
-  const track = el('span', undefined, toggle, 'article-switch-track');
+  const toggle = el('button', undefined, switchRow, 'switch article-switch');
+  const track = el('span', undefined, toggle, 'switch-track');
   track.setAttribute('aria-hidden', 'true');
-  el('span', undefined, track, 'article-switch-knob');
+  el('span', undefined, track, 'switch-knob');
   const switchLabel = el('span', 'Waiting for state…', toggle, 'article-switch-label');
   toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-label', 'Tamper');
   const revision = el('p', '', switchRow, 'article-meta');
@@ -105,7 +105,7 @@ export function mount(root, services, options = {}) {
         entry.caption = caption;
         entry.node.replaceChildren();
         el('span', host, entry.node, 'article-source-host');
-        el('span', item.served === 'real' ? 'Real' : 'Tampered', entry.node, `article-source-state ${item.served}`);
+        el('span', item.served === 'real' ? 'Real' : 'Tampered', entry.node, `pill article-source-state ${item.served}${item.served === 'real' ? '' : ' marked'}`);
         if (read) el('span', '✓ read', entry.node, 'article-source-read');
         entry.node.setAttribute('aria-label', caption); entry.node.setAttribute('title', caption);
       }
@@ -123,7 +123,7 @@ export function mount(root, services, options = {}) {
     for (const kind of ['real', 'tampered']) {
       const head = el('div', undefined, heads, `article-head ${kind}`);
       el('h2', kind === 'real' ? 'Real' : 'Tampered', head);
-      if (source.served === kind) el('span', 'Served now', head, 'article-served');
+      if (source.served === kind) el('span', 'Served now', head, 'pill outline article-served');
       if (last?.fields.served === kind) {
         readMarker.textContent = `✓ Read by ${reader} · r${last.fields.tamper_revision} · ${time(last.at)}`;
         head.appendChild(readMarker);

@@ -95,7 +95,7 @@ test('setup and other traffic are separate from the agent board', () => {
   assert.equal(f.root.querySelectorAll('.door-tile').length, 1);
   assert.match(f.root.querySelector('.doors-summary').textContent, /1 doors tried.*1 setup rows.*2 other attempts/);
   const band = f.root.querySelector('.doors-other');
-  assert.equal(band.classList.contains('egress-muted'), true);
+  assert.equal(band.classList.contains('note'), true);
   assert.match(band.textContent, /the step’s command does not make.*3.25 s · <step> · ntp.ubuntu.com/);
   assert.equal(band.querySelector('step'), null);
   f.root.querySelector('.doors-summary').querySelector('button').click();

@@ -9,6 +9,7 @@ import { fmtCount } from '../format.mjs';
 // What the pair filter tells the viewer: an event names addresses and ports,
 // and packets are matched by them, never by time.
 export const APPROXIMATE = 'Approximate: matched by address and port, not by connection.';
+const STOPPED = 'The run has stopped, so its packets can no longer be loaded.';
 
 export function mount(root, services, options = {}) {
   const { $, el } = scoped(root);
@@ -17,7 +18,7 @@ export function mount(root, services, options = {}) {
     onDetail(packet, header) {
       labelAction(header, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
     },
-    $, el, ...services.transport, fmtCount, fit() {}, ...options,
+    $, el, ...services.transport, fmtCount, fit() {}, stopped: () => (services.stopped?.() ? STOPPED : null), hostColumn: true, ...options,
     placeholder: options.placeholder || (() => 'Select a packet to see its layers.'),
     ...(options.drawer ? {} : { pcapLabel: 'pcapng' }),
   });
@@ -50,7 +51,7 @@ export function mount(root, services, options = {}) {
     $('drawer-title').title = 'Packets';
     $('drawer-title').setAttribute('aria-label', 'Packets');
     $('prows').replaceChildren();
-    el('td', { colspan: 8, text }, el('tr', { class: 'gap' }, $('prows')));
+    el('td', { colspan: 9, text }, el('tr', { class: 'gap' }, $('prows')));
   }
   function show(links, label) {
     const members = links.map((id) => edges.get(id) || { id, c: [0, 0, 0, 0] })
@@ -92,7 +93,7 @@ export function mount(root, services, options = {}) {
     } catch (error) {
       if (attempt !== generation || request.signal.aborted) return;
       current = '';
-      empty(`Packets are unavailable: ${error.message}`);
+      empty(services.stopped?.() ? STOPPED : `Packets are unavailable: ${error.message}`);
     }
   }
 
