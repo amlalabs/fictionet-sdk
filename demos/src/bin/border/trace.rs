@@ -1,8 +1,11 @@
 //! Bounded UDP traceroute reconstruction from a guest link's IPv4 packets.
 //!
 //! Outgoing probe tuples retain their original TTL. ICMP quotes correlate replies
-//! to those probes, including the destination's port-unreachable answer. Starting
-//! at TTL one replaces the preceding run; late replies cannot enter the new run.
+//! to those probes, including the destination's port-unreachable answer. Linux
+//! traceroute sends its probes at once, each from its own socket and source
+//! port, so a run is the probes since the last TTL-one probe, whatever their
+//! ports. Starting at TTL one replaces a finished run, or one that already has
+//! later hops; late replies cannot enter the new run.
 //! This recognizes UDP traceroute, not arbitrary ICMP or TCP probes.
 
 use super::tls::ipv4;
@@ -49,7 +52,6 @@ struct Probe {
 pub struct Tracker {
     pub trace: Option<Trace>,
     probes: Vec<Probe>,
-    source_port: Option<u16>,
 }
 
 fn addr(bytes: &[u8]) -> Ipv4Addr {
@@ -80,11 +82,10 @@ impl Tracker {
                 return;
             };
             if h[8] == 1
-                && (self.source_port != Some(key.source_port)
-                    || self
-                        .trace
-                        .as_ref()
-                        .is_none_or(|t| t.complete || t.hops.iter().any(|h| h.ttl > 1)))
+                && self
+                    .trace
+                    .as_ref()
+                    .is_none_or(|t| t.complete || t.hops.iter().any(|h| h.ttl > 1))
             {
                 self.trace = Some(Trace {
                     started_ms: at_ms,
@@ -92,13 +93,11 @@ impl Tracker {
                     ..Trace::default()
                 });
                 self.probes.clear();
-                self.source_port = Some(key.source_port);
             }
             let Some(trace) = &mut self.trace else {
                 return;
             };
-            if self.source_port != Some(key.source_port) || self.probes.iter().any(|p| p.key == key)
-            {
+            if self.probes.iter().any(|p| p.key == key) {
                 return;
             }
             if self.probes.len() == MAX_PROBES {
@@ -130,6 +129,15 @@ impl Tracker {
             let trace = self.trace.as_mut().expect("a pending probe has a trace");
             let address = addr(&h[12..16]);
             let destination = p[0] == 3 && address == BANK_ADDR;
+            // Probes sent past the destination also reach it. As traceroute
+            // prints, the path ends at the first TTL the destination answered.
+            let first = trace.hops.iter().find(|h| h.destination).map(|h| h.ttl);
+            if first.is_some_and(|ttl| probe.ttl > ttl) {
+                return;
+            }
+            if destination {
+                trace.hops.retain(|h| h.ttl < probe.ttl);
+            }
             let hop = Hop {
                 ttl: probe.ttl,
                 address,
@@ -208,6 +216,38 @@ mod tests {
         assert_eq!(tracker.trace.as_ref().unwrap().hops.len(), 1);
         assert_eq!(tracker.trace.as_ref().unwrap().started_ms, 50);
         assert!(!tracker.trace.as_ref().unwrap().complete);
+    }
+    #[test]
+    fn parallel_probes_from_separate_ports_make_one_trace() {
+        // Linux traceroute: every probe from its own source port, all sent
+        // before the first reply, and replies in any order.
+        let mut tracker = Tracker::default();
+        let hops = [
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(84, 21, 44, 1),
+            Ipv4Addr::new(45, 144, 30, 1),
+            BANK_ADDR,
+        ];
+        let probes: Vec<_> = (1..=6u8)
+            .map(|ttl| packet(ttl, 51000 + 731 * u16::from(ttl)))
+            .collect();
+        for p in &probes {
+            tracker.packet(10, true, p);
+        }
+        for (i, p) in probes.iter().enumerate().rev() {
+            let from = hops[i.min(3)];
+            tracker.packet(20 + i as u64, false, &reply(p, from, from == BANK_ADDR));
+        }
+        let trace = tracker.trace.as_ref().unwrap();
+        assert!(trace.complete);
+        assert_eq!(trace.started_ms, 10);
+        let found: Vec<_> = trace.hops.iter().map(|h| (h.ttl, h.address)).collect();
+        assert_eq!(
+            found,
+            [(1, hops[0]), (2, hops[1]), (3, hops[2]), (4, BANK_ADDR)]
+        );
+        assert!(trace.hops[3].destination);
+        assert!(trace.hops[..3].iter().all(|h| !h.destination));
     }
     #[test]
     fn probes_and_hops_stay_bounded_and_report_loss() {

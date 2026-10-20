@@ -178,7 +178,7 @@ pub async fn diagnostics(run: &Run) {
         "cloud-init status --long",
         "sudo tail -30 /var/log/cloud-init-output.log",
         "systemctl is-active vnc",
-        "tail -15 /tmp/xvnc.log /tmp/xfce.log",
+        "tail -n 15 /tmp/xvnc.log /tmp/xfce.log",
         "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'",
     ] {
         match tokio::time::timeout(Duration::from_secs(3), ssh.run_bounded(cmd, 8192)).await {
