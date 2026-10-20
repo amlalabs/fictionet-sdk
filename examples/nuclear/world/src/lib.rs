@@ -57,6 +57,7 @@
 //! | [`stages`] | First stage times, end selection and scores |
 //! | [`severe`] | Primary, core, vessel, containment, cavity and occupied spaces |
 //! | [`stylized`] | Control room steam and radiation consequences |
+//! | [`pace`] | Plant pacing and scenario commands |
 //! | [`scenarios`] | Named starting conditions and fault schedules |
 //! | [`protection`] | True-channel trips and reported-channel alarms |
 //! | [`registers`] | Modbus register map and telemetry heartbeats of the three controllers |
@@ -84,7 +85,7 @@
 //! status together; controller modes remain live.
 //! Fault slots and the schedule are fixed arrays, so overflow cannot be built.
 //! The viewer example, `examples/viewer.rs`, runs the plant in real time and
-//! serves the control room page with scripted steps and plant moments. The operator
+//! serves the control room page with scripted steps, plant moments, and a scenario command port. The operator
 //! reads and commands through hmi01. The checks read plant truth. Each HMI link
 //! shows a telemetry heartbeat that stops when the feed freezes; the update time keeps advancing.
 //!
@@ -128,6 +129,7 @@ pub mod faults;
 pub mod hmi;
 pub mod kinetics;
 pub mod network;
+pub mod pace;
 pub mod plant;
 pub mod plc;
 pub mod protection;

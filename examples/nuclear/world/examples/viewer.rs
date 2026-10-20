@@ -2,17 +2,23 @@
 //! the scripted story, and a control room page on the loopback interface.
 //!
 //! Run `cargo run --example viewer` and open the printed address. Plant time is
-//! run time, so one plant second is one second. The scripted story starts at
+//! initially run time, so one plant second is one second. The scripted story starts at
 //! once. It reads hmi01 and publishes its steps in the first inspector panel.
 //! Page moments mark the plant actions and faults. Ctrl-C stops the viewer.
 //!
 //! `--gate` ends the run when the story completes. The exit status is nonzero
-//! when the story fails, so CI and the screenshot runs can wait for it.
+//! when the story fails or stops, so CI and the screenshot runs can wait for it.
+//!
+//! Post a start command to `/api/command/scenario` to start a scenario, or use
+//! the page's Scenarios group once available. A start stops the scripted story.
 //!
 //! The page loads Three.js from the browser libraries. Run
 //! `cargo xtask demo libraries` before building, or the 3D boards report it.
 
+use fictionet::sync::Mutex;
+use nuclear_world::pace::{Pace, Reply as ScenarioReply, ScenarioCommand};
 use std::error::Error as StdError;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::{Cx, RunOptions, Seed};
@@ -79,6 +85,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let state = StateTopic::<PlantSnapshot>::new(StateLimits::default());
     let lines_topic = StateTopic::<Vec<story::Line>>::new(StateLimits::default());
     let plant = CommandPort::<Command, Reply>::new(CommandLimits::default());
+    let pace = Arc::new(Mutex::new(Pace::default()));
+    let scenario = CommandPort::<ScenarioCommand, ScenarioReply>::new(CommandLimits::default());
     let faults = CommandPort::<FaultCommand, Reply>::new(CommandLimits::default());
     let log = EventFilter {
         source: Some("plant".into()),
@@ -89,6 +97,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .workspace("Control room")
         .command("plant", plant.clone())
         .command("faults", faults.clone())
+        .command("scenario", scenario.clone())
         .table(
             "Scripted operator",
             lines_topic.clone(),
@@ -135,13 +144,15 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let mut run = tokio::spawn(fictionet::run(
         RunOptions::new(Seed::from_u64(1)).observer(dashboard.observer()),
         move |cx| async move {
+            let story_generation = driver.generation();
             let operator = story::start_network(&cx, &driver)?;
 
+            let clock_pace = pace.clone();
             let clock_driver = driver.clone();
             let publisher = state.clone();
             let publish_cx = cx.clone();
             cx.spawn(move |cx| async move {
-                story::clock(&cx, &clock_driver, move |snapshot| {
+                story::clock(&cx, &clock_driver, &clock_pace, move |snapshot| {
                     publisher
                         .publish(publish_cx.now(), snapshot)
                         .map(|_| ())
@@ -172,8 +183,35 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 Ok(())
             });
 
+            let scenario_driver = driver.clone();
+            cx.spawn(move |cx| async move {
+                while let Some(command) = cx.race(None, scenario.recv()).await? {
+                    let reply = {
+                        let mut pace = pace.lock();
+                        let reply = pace.apply(
+                            command.command,
+                            story::run_ms(&cx),
+                            scenario_driver.snapshot().at_ms,
+                        );
+                        if let Ok(applied) = reply
+                            && let Some(scenario) = applied.scenario
+                        {
+                            scenario_driver.reset(scenario.config());
+                            facts::reset(&cx, scenario, applied.speed);
+                        }
+                        reply
+                    };
+                    command.reply(&cx, reply);
+                }
+                Ok(())
+            });
+
             let story_driver = driver.clone();
             cx.spawn(move |cx| async move {
+                if story_driver.generation() != story_generation {
+                    let _ = story_done.send(Ok(None));
+                    return Ok(());
+                }
                 let mut lines = Vec::new();
                 let mut publish_error = None;
                 let report = story::run(&cx, &story_driver, &operator, |line| {
@@ -206,7 +244,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         ended = &mut run => return Err(run_ended(ended)),
     };
     match &finished {
-        Ok(report) => println!(
+        Ok(Some(report)) => println!(
             "scripted story complete: fault at {:.1} s, trip at {:.1} s, first action {:.1} s after the fault, telemetry quiet from {:.1} s to {:.1} s",
             report.fault_at_ms as f64 / 1000.0,
             report.trip_at_ms as f64 / 1000.0,
@@ -214,13 +252,19 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             report.quiet_from_ms as f64 / 1000.0,
             report.quiet_to_ms as f64 / 1000.0,
         ),
+        Ok(None) => println!("scripted story stopped: a scenario started"),
         Err(error) => eprintln!("scripted story failed: {error}"),
     }
 
     if gate {
         server.shutdown(Duration::from_secs(2)).await;
         run.abort();
-        return finished.map(|_| ()).map_err(Into::into);
+        return finished
+            .and_then(|report| {
+                report.ok_or_else(|| "scripted story stopped: a scenario started".into())
+            })
+            .map(|_| ())
+            .map_err(Into::into);
     }
     println!("Serving the control room until Ctrl-C.");
     tokio::select! {

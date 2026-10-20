@@ -11,7 +11,10 @@
 //! itself. The caller knows the command's source, so it logs the action with
 //! [`facts::action`].
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use fictionet::sync::Mutex;
 
@@ -25,6 +28,7 @@ use crate::{Config, Plant};
 #[derive(Clone)]
 pub struct Driver {
     plant: Arc<Mutex<Plant>>,
+    generation: Arc<AtomicU64>,
     divergence: Arc<Mutex<[Option<Peak>; SENSOR_COUNT]>>,
 }
 
@@ -94,8 +98,22 @@ impl Driver {
     pub fn new(config: Config) -> Driver {
         Driver {
             plant: Arc::new(Mutex::new(Plant::new(config))),
+            generation: Arc::new(AtomicU64::new(0)),
             divergence: Arc::new(Mutex::new([None; SENSOR_COUNT])),
         }
+    }
+
+    /// Replace the plant without replacing any shared handles.
+    pub fn reset(&self, config: Config) {
+        let mut plant = self.plant.lock();
+        *plant = Plant::new(config);
+        *self.divergence.lock() = [None; SENSOR_COUNT];
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The number of resets seen by every clone.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Returns a clone of the shared plant, so other services can use it.
@@ -117,6 +135,9 @@ impl Driver {
                 plant.advance(after.at_ms + crate::plant::STEP_MS);
                 after = plant.snapshot();
                 track(&held, &mut peaks, &after);
+                if before.end.is_none() && after.end.is_some() {
+                    break;
+                }
             }
             (before, after)
         };
@@ -202,6 +223,108 @@ mod tests {
             sensor: Sensor::HotLeg(Loop::A),
             kind: SensorFault::Stuck { value },
         })
+    }
+
+    #[test]
+    fn stages_and_end_follow_the_log_with_operator_context() -> fictionet::Result {
+        use crate::scenarios::Scenario;
+        use crate::stages::Stage;
+        let memory = Arc::new(Memory::default());
+        let driver = Driver::new(Scenario::LoopBUnattended.config());
+        let observed = driver.clone();
+        fictionet::block_on(fictionet::lab(options(&memory), move |cx| async move {
+            driver.advance_to(&cx, 1_800_000);
+            driver.apply(&cx, Command::AcknowledgeAlarms).unwrap();
+            driver.advance_to(&cx, 24 * 3_600_000);
+            let ended = driver.snapshot();
+            assert_eq!(ended.at_ms, ended.end.unwrap().at_ms);
+            driver.advance_to(&cx, ended.at_ms + 50);
+            assert_eq!(driver.snapshot().at_ms, ended.at_ms + 50);
+            Ok(())
+        }))?;
+        let snapshot = observed.snapshot();
+        let mut expected = Stage::ALL
+            .into_iter()
+            .filter_map(|stage| snapshot.stages[stage.index()].map(|at| (stage, at)))
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|(stage, at)| (*at, stage.index()));
+        let stages = memory.checked_of("plant", "stage")?;
+        assert_eq!(stages.len(), expected.len());
+        for (fact, (stage, at)) in stages.iter().zip(expected) {
+            let name = serde_json::to_value(stage).unwrap();
+            assert_eq!(fact.str("stage"), name.as_str());
+            assert_eq!(fact.u64("at_ms"), Some(at));
+            assert_eq!(fact.str("time"), Some(facts::time(at).as_str()));
+            assert!(!fact.summary.contains('_'));
+        }
+        let boiling = stages
+            .iter()
+            .find(|fact| fact.str("stage") == Some("boiling"))
+            .unwrap();
+        assert_eq!(boiling.str("last_command"), Some("none"));
+        assert!(boiling.get("last_command_ms").is_none());
+        assert_eq!(boiling.u64("operator_actions"), Some(0));
+        let uncovered = stages
+            .iter()
+            .find(|fact| fact.str("stage") == Some("core_uncovered"))
+            .unwrap();
+        assert_eq!(uncovered.u64("operator_actions"), Some(1));
+        assert_eq!(uncovered.str("last_command"), Some("acknowledge_alarms"));
+        assert_eq!(uncovered.u64("last_command_ms"), Some(1_800_000));
+        let ends = memory.checked_of("plant", "end")?;
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].str("stage"), Some("containment_failure"));
+        assert_eq!(ends[0].str("cause"), Some("hydrogen_burn"));
+        assert_eq!(ends[0].u64("at_ms"), Some(snapshot.end.unwrap().at_ms));
+        assert_eq!(ends[0].u64("operator_actions"), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn reset_keeps_handles_and_clears_divergence() {
+        let driver = Driver::new(Config::default());
+        let shared = driver.plant();
+        let clone = driver.clone();
+        driver
+            .apply_fault(&(), fault(stuck_hot_leg(3000), 0))
+            .unwrap();
+        driver.advance_to(&(), 1_000);
+        assert!(driver.divergence.lock().iter().any(Option::is_some));
+        driver.reset(crate::scenarios::Scenario::SteamLineBreak.config());
+        assert_eq!(clone.generation(), 1);
+        assert!(Arc::ptr_eq(&shared, &driver.plant()));
+        assert_eq!(
+            clone.snapshot(),
+            Plant::new(crate::scenarios::Scenario::SteamLineBreak.config()).snapshot()
+        );
+        assert!(driver.divergence.lock().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn each_tick_reaches_its_target_or_stops_at_the_end() {
+        for scenario in crate::scenarios::Scenario::ALL {
+            let driver = Driver::new(scenario.config());
+            let mut total = std::time::Duration::ZERO;
+            let mut maximum = std::time::Duration::ZERO;
+            for _ in 0..120 {
+                let target = driver.snapshot().at_ms + 30_000;
+                let started = std::time::Instant::now();
+                driver.advance_to(&(), target);
+                let elapsed = started.elapsed();
+                total += elapsed;
+                maximum = maximum.max(elapsed);
+                let snapshot = driver.snapshot();
+                assert!(
+                    snapshot.at_ms == target
+                        || snapshot.end.is_some_and(|end| end.at_ms == snapshot.at_ms)
+                );
+            }
+            println!(
+                "{scenario:?}: 120 ticks, mean {:.3} ms, max {:.3} ms",
+                total.as_secs_f64() * 1_000.0 / 120.0,
+                maximum.as_secs_f64() * 1_000.0
+            );
+        }
     }
 
     #[test]
