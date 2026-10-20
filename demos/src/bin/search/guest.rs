@@ -9,7 +9,7 @@ pub fn guest() -> Guest {
     // pages and spend the generation budget, so the system stays quiet too.
     let mut guest = kit::desktop::browser(HOST, USER, START)
         .forbid(&["adaptive", "stub"])
-        // The scripted searcher pastes each address into Firefox.
+        // The searcher reads the address back before submitting it.
         .packages(&["xclip"])
         // The Pro apt hook contacts the contract service during package setup.
         .file("/etc/apt/apt.conf.d/20apt-esm-hook.conf", 0o644, "")
