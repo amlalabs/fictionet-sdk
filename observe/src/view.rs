@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::DashboardHandle;
-use crate::DisplayBatch;
 use crate::json::{self, Object};
+use crate::ring::Batch;
 use fictionet::events::Event;
+use fictionet::events::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::json::Value;
 
@@ -17,8 +18,6 @@ pub(crate) struct View {
     counters: BTreeMap<String, [u64; 4]>,
     event_seq: u64,
     event_position: Vec<u64>,
-    dropped: u64,
-    evicted: Vec<u64>,
     ended: bool,
     revision: u64,
     status: String,
@@ -162,7 +161,7 @@ pub(crate) fn counters(graph: &DashboardHandle, wall: Option<Duration>) -> Strin
         .done()
 }
 
-fn status(graph: &DashboardHandle) -> String {
+pub(crate) fn status(graph: &DashboardHandle) -> String {
     use fictionet::events::Stream;
     let topology = graph.0.collector.topology();
     let losses = graph.0.collector.losses();
@@ -171,10 +170,14 @@ fn status(graph: &DashboardHandle) -> String {
             Stream::Events => "events".into(),
             Stream::Keys => "keys".into(),
             Stream::Topology => "topology".into(),
-            Stream::Packets(id) => id.to_string(),
+            Stream::Packets(id) => crate::loss::stream_name(Stream::Packets(id)),
         };
         Object::new()
             .str("stream", &stream)
+            .raw(
+                "class",
+                &loss.class.map_or_else(|| "null".into(), |n| n.to_string()),
+            )
             .str("reason", &format!("{:?}", loss.reason).to_lowercase())
             .num("count", loss.count)
             .raw(
@@ -185,6 +188,10 @@ fn status(graph: &DashboardHandle) -> String {
     });
     let untracked = losses.untracked.iter().map(|loss| {
         Object::new()
+            .raw(
+                "class",
+                &loss.class.map_or_else(|| "null".into(), |n| n.to_string()),
+            )
             .str("reason", &format!("{:?}", loss.reason).to_lowercase())
             .num("count", loss.count)
             .num("bytes", loss.bytes)
@@ -264,31 +271,18 @@ fn last_event(graph: &DashboardHandle) -> u64 {
     graph.0.collector.events().last()
 }
 
-fn history_batch(graph: &DashboardHandle, after: Option<u64>, max: usize) -> DisplayBatch {
-    graph.0.collector.events().display_batch(after, max)
-}
-
-fn loss_line(dropped: u64, seq: u64) -> String {
-    let mut event = Event::new("events", "dropped")
-        .summary(format!("{dropped} events lost from retained history"))
-        .field("count", dropped);
-    event.seq = seq;
-    event_line(&event)
+fn history_batch(graph: &DashboardHandle, after: Option<u64>, max: usize) -> Batch<Event> {
+    graph.0.collector.events().batch(after, max)
 }
 
 /// The `events` reply: at most `max` events after number `after`.
 pub(crate) fn events(graph: &DashboardHandle, after: u64, max: usize) -> String {
-    let DisplayBatch {
-        events,
-        last,
-        dropped,
-        ..
-    } = history_batch(graph, Some(after), max);
+    let Batch { events, last, .. } = history_batch(graph, Some(after), max);
     let lines: Vec<String> = events.iter().map(event_line).collect();
     Object::new()
         .raw("events", &json::array(lines))
         .num("last", last)
-        .num("dropped", dropped)
+        .num("lost", graph.0.collector.losses().events())
         .done()
 }
 
@@ -347,10 +341,9 @@ pub(crate) fn snapshot(
     wall: Option<Duration>,
 ) -> (View, Message) {
     let mut view = current(graph);
-    let DisplayBatch {
+    let Batch {
         events,
         last,
-        dropped,
         evicted,
         position,
     } = history_batch(
@@ -359,13 +352,18 @@ pub(crate) fn snapshot(
         if after.is_some() { 0 } else { SNAPSHOT_EVENTS },
     );
     view.event_seq = after.unwrap_or(last);
-    view.event_position = position;
-    view.dropped = dropped;
-    view.evicted = evicted;
-    let mut events: Vec<String> = events.iter().map(event_line).collect();
-    if view.dropped != 0 {
-        events.insert(0, loss_line(view.dropped, 0));
-    }
+    view.event_position = if after == Some(0) {
+        vec![0; position.len()]
+    } else {
+        position
+    };
+    let events: Vec<String> = events.iter().map(event_line).collect();
+    let missed = evicted.iter().sum();
+    let gaps = if after.is_none() && missed != 0 {
+        vec![crate::loss::gap(Stream::Events, None, 0, last, missed)]
+    } else {
+        Vec::new()
+    };
     view.status = status(graph);
     let data = Object::new()
         .secs("t", graph.elapsed(wall))
@@ -373,6 +371,7 @@ pub(crate) fn snapshot(
         .num("revision", view.revision)
         .raw("hosts", &json::array(view.hosts.values()))
         .raw("status", &view.status)
+        .raw("gaps", &json::array(gaps))
         .bool("ended", view.ended)
         .raw("groups", &json::array(view.groups.values()))
         .raw("nodes", &json::array(view.nodes.values()))
@@ -436,8 +435,6 @@ pub(crate) fn changes(
     let mut new = current(graph);
     new.event_seq = old.event_seq;
     new.event_position.clone_from(&old.event_position);
-    new.dropped = old.dropped;
-    new.evicted.clone_from(&old.evicted);
     let mut out = Vec::new();
     // Edges go first, then nodes, so a browser never holds an edge to a
     // node it was told is gone, nor a new edge to a node it has not met.
@@ -516,33 +513,36 @@ fn counter_changes(
 
 /// A bounded event batch and whether another batch may be waiting.
 pub(crate) fn event_changes(graph: &DashboardHandle, view: &mut View) -> (Vec<Message>, bool) {
-    let DisplayBatch {
+    let Batch {
         events,
         last,
-        dropped,
         evicted,
         position,
     } = history_batch(graph, Some(view.event_seq), EVENTS_PER_CHANGE);
     let full = events.len() == EVENTS_PER_CHANGE;
     let mut messages = Vec::new();
-    let rejected = (dropped - evicted.iter().sum::<u64>())
-        .saturating_sub(view.dropped - view.evicted.iter().sum::<u64>());
-    let missed = rejected
-        + evicted
-            .iter()
-            .zip(
-                view.event_position
-                    .iter()
-                    .copied()
-                    .chain(std::iter::repeat(0)),
-            )
-            .map(|(evicted, position)| evicted.saturating_sub(position))
-            .sum::<u64>();
+    let missed = evicted
+        .iter()
+        .zip(
+            view.event_position
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(0)),
+        )
+        .map(|(evicted, position)| evicted.saturating_sub(position))
+        .sum::<u64>();
     if missed != 0 {
-        messages.push(("event", loss_line(missed, view.event_seq)));
+        messages.push((
+            "gap",
+            crate::loss::gap(
+                Stream::Events,
+                None,
+                view.event_seq,
+                events.first().map_or(last, |event| event.seq),
+                missed,
+            ),
+        ));
     }
-    view.dropped = dropped;
-    view.evicted = evicted;
     view.event_position = position;
     view.event_seq = if full {
         events.last().unwrap().seq
@@ -659,13 +659,10 @@ mod tests {
         let (mut view, (_, data)) = snapshot(&graph, None, None);
         let data = Value::parse(data.as_bytes()).unwrap();
         let events = data.get("events").unwrap().as_array().unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(
-            events[0].get("kind").and_then(Value::as_str),
-            Some("dropped")
-        );
-        assert_eq!(events[1].get("seq").and_then(Value::as_u64), Some(3));
-        assert_eq!(events[2].get("seq").and_then(Value::as_u64), Some(4));
+        assert_eq!(events.len(), 2);
+        assert_eq!(data.get("gaps").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(events[0].get("seq").and_then(Value::as_u64), Some(3));
+        assert_eq!(events[1].get("seq").and_then(Value::as_u64), Some(4));
         assert!(event_changes(&graph, &mut view).0.is_empty());
 
         // A rejected final event must not leave a viewer waiting forever.
@@ -1034,13 +1031,7 @@ mod tests {
         let (messages, _) = event_changes(graph, &mut slow);
         assert_eq!(messages.len(), 3);
         let loss = Value::parse(messages[0].1.as_bytes()).unwrap();
-        assert_eq!(
-            loss.get("fields")
-                .unwrap()
-                .get("count")
-                .and_then(Value::as_u64),
-            Some(4)
-        );
+        assert_eq!(loss.get("missed").and_then(Value::as_u64), Some(4));
         assert!(event_changes(graph, &mut slow).0.is_empty());
     }
 
@@ -1059,13 +1050,7 @@ mod tests {
         assert!(!full);
         assert_eq!(messages.len(), 3);
         let loss = Value::parse(messages[0].1.as_bytes()).unwrap();
-        assert_eq!(
-            loss.get("fields")
-                .unwrap()
-                .get("count")
-                .and_then(Value::as_u64),
-            Some(1)
-        );
+        assert_eq!(loss.get("missed").and_then(Value::as_u64), Some(1));
         assert!(event_changes(graph, &mut view).0.is_empty());
     }
 
@@ -1090,13 +1075,7 @@ mod tests {
         let (messages, _) = event_changes(graph, &mut slow);
         assert_eq!(messages.len(), 3);
         let loss = Value::parse(messages[0].1.as_bytes()).unwrap();
-        assert_eq!(
-            loss.get("fields")
-                .unwrap()
-                .get("count")
-                .and_then(Value::as_u64),
-            Some(8)
-        );
+        assert_eq!(loss.get("missed").and_then(Value::as_u64), Some(8));
         assert!(event_changes(graph, &mut slow).0.is_empty());
     }
 
@@ -1124,7 +1103,6 @@ mod tests {
         let mut view = View {
             event_seq: 1,
             event_position: vec![1, 0],
-            dropped: 1,
             ..View::default()
         };
         retain(graph, Event::new("test", "fourth"));

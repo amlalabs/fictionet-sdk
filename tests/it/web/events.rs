@@ -1574,7 +1574,7 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
             "{want} is gone: {graders:?}"
         );
     }
-    assert_eq!(events.dropped(), 0);
+    assert_eq!(events.losses().events(), 0);
     let blocked: Vec<_> = all
         .iter()
         .filter(|e| e.is("net", "blocked") && from(e, "b"))

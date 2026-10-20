@@ -75,7 +75,7 @@ fn installed_observers_keep_events_and_write_json_lines() {
                 .collect::<Vec<_>>(),
             [1, 2, 3, 4]
         );
-        assert_eq!(log.dropped(), 0);
+        assert_eq!(log.losses().events(), 0);
         let layer = Layer::from_event(&log.checked_all().unwrap()[2]);
         assert_eq!(layer.name, "test.n");
         assert_eq!(layer.summary, "n=1");

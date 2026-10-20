@@ -461,12 +461,12 @@ impl Topology {
             } else {
                 self.refused = self.refused.saturating_add(1);
             }
-            losses.record(loss_streams, stamp, LossReason::Overflow, 0);
+            losses.record(loss_streams, stamp, None, LossReason::Overflow, 0);
         }
         if cut > 0 {
             self.incomplete = true;
             self.truncated_bytes = self.truncated_bytes.saturating_add(cut as u64);
-            losses.record(loss_streams, stamp, LossReason::Truncation, cut);
+            losses.record(loss_streams, stamp, None, LossReason::Truncation, cut);
         }
     }
 }

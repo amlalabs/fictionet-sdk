@@ -177,7 +177,7 @@ fn capture_reports_eviction_separately_from_sampling_without_renumbering() {
 }
 
 #[test]
-fn capture_carries_eviction_from_an_empty_capture_once() {
+fn capture_reports_overflow_from_an_empty_capture() {
     let options = startup(Options {
         policy: crate::tests::policy([Class::new("packets").count(2).bytes(20).burst(64)]),
         ..Options::default()
@@ -200,7 +200,15 @@ fn capture_carries_eviction_from_an_empty_capture_once() {
         }
         let (_, rows) = watch.rows_after(0, 10);
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].1.contains(r#""skipped":0,"evicted":3"#));
+        assert!(rows[0].1.contains(r#""skipped":0,"evicted":0"#));
+        let losses = handle.0.collector.losses();
+        let overflow = losses
+            .streams
+            .iter()
+            .find(|loss| loss.reason == fictionet::events::LossReason::Overflow)
+            .unwrap();
+        assert_eq!(overflow.count, 3);
+        assert_eq!(overflow.class, Some(4));
         assert!(rows[1].1.contains(r#""skipped":0,"evicted":0"#));
         Ok(())
     });
@@ -589,7 +597,8 @@ fn packet_subscribers_report_overruns_once_before_retained_rows() {
                 assert_eq!(
                     text(&gap),
                     format!(
-                        r#"{{"event":"packet_gap","data":{{"after":{after},"next":{next},"missed":{missed}}}}}"#
+                        r#"{{"event":"gap","data":{{"stream":"packets:{}","class":null,"after":{after},"next":{next},"missed":{missed}}}}}"#,
+                        links[0]
                     )
                 );
                 for seq in next..=4 {
@@ -733,11 +742,14 @@ fn the_aggregate_budget_forgets_idle_watches_first_then_the_oldest_rows() {
         let values = lagging.poll(now, None);
         assert_eq!(
             names(&values),
-            ["packet_gap", "packet", "packet", "packet", "packet"]
+            ["gap", "packet", "packet", "packet", "packet"]
         );
         assert_eq!(
             text(&values[0]),
-            r#"{"event":"packet_gap","data":{"after":0,"next":2,"missed":1}}"#
+            format!(
+                r#"{{"event":"gap","data":{{"stream":"packets:{}","class":null,"after":0,"next":2,"missed":1}}}}"#,
+                active
+            )
         );
         Ok(())
     });

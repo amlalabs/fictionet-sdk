@@ -75,10 +75,10 @@ fn real_run_writes_events_to_memory() {
 
     let sink = Sink::default();
     let out = sink.clone();
-    let evidence = Arc::new(Memory::default());
+    let memory = Arc::new(Memory::default());
     fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(42)).observer(Arc::new(Fanout::new(
-            vec![evidence.clone(), Arc::new(sink.clone())],
+            vec![memory.clone(), Arc::new(sink.clone())],
         ))),
         |fcx| async move {
             assert_eq!(fcx.mode(), fictionet::RunMode::Real);
@@ -98,7 +98,7 @@ fn real_run_writes_events_to_memory() {
         },
     ))
     .unwrap();
-    let events = evidence.checked_all().unwrap();
+    let events = memory.checked_all().unwrap();
     assert_eq!(events.len(), 3);
     assert!(events[0].is("run", "start"));
     assert!(events[1].is("test", "before_writer"));
@@ -108,20 +108,20 @@ fn real_run_writes_events_to_memory() {
         .map(|event| format!("{}\n", event.to_line().unwrap()))
         .collect();
     assert_eq!(*sink.0.lock().unwrap(), expected.as_bytes());
-    assert_eq!(evidence.dropped(), 0);
+    assert_eq!(memory.losses().events(), 0);
 }
 
 /// A real run records its wall date on the host and in a JavaScript engine.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn real_run_records_wall_time() {
-    let evidence = Arc::new(Memory::default());
+    let memory = Arc::new(Memory::default());
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(42)).observer(evidence.clone()),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(42)).observer(memory.clone()),
         |_fcx| async move { Ok(()) },
     ))
     .unwrap();
-    let events = evidence.checked_of("run", "start").unwrap();
+    let events = memory.checked_of("run", "start").unwrap();
     assert_eq!(events.len(), 1);
     assert!(
         events[0]

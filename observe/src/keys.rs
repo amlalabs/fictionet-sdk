@@ -88,15 +88,21 @@ impl Keys {
             .saturating_add(key.connection.map_or(0, connection_bytes));
         let ring = self.rings.entry(index).or_default();
         if !ring.admit(stamp, class.burst) {
-            losses.record(loss_streams, stamp, LossReason::Sampling, size);
+            losses.record(loss_streams, stamp, Some(index), LossReason::Sampling, size);
             return;
         }
         if class.count == 0 || size > class.bytes {
-            losses.record(loss_streams, stamp, LossReason::Overflow, size);
+            losses.record(loss_streams, stamp, Some(index), LossReason::Overflow, size);
             return;
         }
         ring.make_room(size, class.count, class.bytes, |old| {
-            losses.record(loss_streams, old.stamp, LossReason::Eviction, old.size());
+            losses.record(
+                loss_streams,
+                old.stamp,
+                Some(old.class),
+                LossReason::Eviction,
+                old.size(),
+            );
         });
         ring.push(Key {
             stamp,

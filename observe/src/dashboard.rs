@@ -531,12 +531,14 @@ impl Subscription {
                 let drained = watch.pump(shared);
                 let (missed, rows) = watch.rows_after(*cursor, ROWS_PER_POLL);
                 if missed > 0 {
-                    let gap = Object::new()
-                        .num("after", *cursor)
-                        .num("next", *cursor + missed + 1)
-                        .num("missed", missed)
-                        .done();
-                    out.push(event(id, "packet_gap", &gap));
+                    let gap = crate::loss::gap(
+                        fictionet::events::Stream::Packets(watch.id()),
+                        None,
+                        *cursor,
+                        *cursor + missed + 1,
+                        missed,
+                    );
+                    out.push(event(id, "gap", &gap));
                     *cursor += missed;
                 }
                 if !drained || rows.len() == ROWS_PER_POLL {
@@ -736,7 +738,7 @@ mod tests {
         assert!(
             changes
                 .iter()
-                .any(|v| String::from_utf8_lossy(&v.bytes).contains("events lost"))
+                .all(|v| !String::from_utf8_lossy(&v.bytes).contains("\"event\":\"gap\""))
         );
         assert!(
             changes

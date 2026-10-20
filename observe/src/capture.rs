@@ -81,23 +81,18 @@ pub(crate) struct Capture {
 
 impl Capture {
     pub(crate) fn since(&self, after: u64, max: usize) -> PacketBatch {
-        let packets: Vec<_> = crate::ring::after(self.rings.values(), after)
-            .take(max)
-            .cloned()
-            .collect();
-        let last = self.rings.values().map(|ring| ring.last).max().unwrap_or(0);
+        let batch = crate::ring::batch(self.rings.values(), Some(after), max);
         PacketBatch {
-            evicted: self
-                .rings
-                .iter()
-                .map(|(class, ring)| (*class, ring.evicted))
-                .collect(),
-            cursor: packets
-                .last()
-                .map_or(if max == 0 { after } else { after.max(last) }, |p| {
-                    p.stamp.seq
-                }),
-            packets,
+            evicted: self.rings.keys().copied().zip(batch.evicted).collect(),
+            cursor: batch.events.last().map_or(
+                if max == 0 {
+                    after
+                } else {
+                    after.max(batch.last)
+                },
+                |p| p.stamp.seq,
+            ),
+            packets: batch.events,
         }
     }
 }
@@ -158,7 +153,13 @@ impl Captures {
             .expect("capture class");
         if let Some(old) = ring.evict() {
             self.bytes -= old.bytes.len();
-            losses.record(limit, old.stamp, LossReason::Eviction, old.bytes.len());
+            losses.record(
+                limit,
+                old.stamp,
+                Some(old.class),
+                LossReason::Eviction,
+                old.bytes.len(),
+            );
         }
     }
 
@@ -167,7 +168,13 @@ impl Captures {
             for ring in capture.rings.into_values() {
                 self.bytes -= ring.bytes;
                 for old in ring.events {
-                    losses.record(limit, old.stamp, LossReason::Eviction, old.bytes.len());
+                    losses.record(
+                        limit,
+                        old.stamp,
+                        Some(old.class),
+                        LossReason::Eviction,
+                        old.bytes.len(),
+                    );
                 }
             }
         }
@@ -191,6 +198,7 @@ impl Captures {
             losses.record(
                 options.loss_streams,
                 stamp,
+                Some(index),
                 LossReason::Overflow,
                 packet.len,
             );
@@ -206,6 +214,7 @@ impl Captures {
             losses.record(
                 options.loss_streams,
                 stamp,
+                Some(index),
                 LossReason::Sampling,
                 packet.len,
             );
@@ -216,23 +225,20 @@ impl Captures {
             losses.record(
                 options.loss_streams,
                 stamp,
+                Some(index),
                 LossReason::Truncation,
                 packet.len - len,
             );
         }
         if class.count == 0 || len > class.bytes || len > options.bytes {
             ring.skipped = 0;
-            while let Some(old) = ring.evict() {
-                self.bytes -= old.bytes.len();
-                losses.record(
-                    options.loss_streams,
-                    old.stamp,
-                    LossReason::Eviction,
-                    old.bytes.len(),
-                );
-            }
-            ring.evicted = ring.evicted.saturating_add(1);
-            losses.record(options.loss_streams, stamp, LossReason::Eviction, len);
+            losses.record(
+                options.loss_streams,
+                stamp,
+                Some(index),
+                LossReason::Overflow,
+                len,
+            );
             return;
         }
         ring.make_room(len, class.count, class.bytes, |old| {
@@ -240,6 +246,7 @@ impl Captures {
             losses.record(
                 options.loss_streams,
                 old.stamp,
+                Some(old.class),
                 LossReason::Eviction,
                 old.bytes.len(),
             );

@@ -55,7 +55,7 @@ pub(super) async fn route(
         let batch: Value =
             serde_json::from_str(&crate::view::events(&shared.page.dashboard, after, 128))
                 .map_err(io::Error::other)?;
-        let dropped = batch["dropped"].as_u64().unwrap_or(0);
+        let dropped = batch["lost"].as_u64().unwrap_or(0);
         if dropped > lost {
             line(conn, &json!({"type":"loss", "stream":"events", "count":dropped - lost, "scope":"run", "through":end})).await?;
             lost = dropped;

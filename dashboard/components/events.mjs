@@ -3,7 +3,7 @@
 import { labelAction } from './labels.mjs';
 import { labelChips } from '../packets.mjs';
 import { eventText } from '../tables.mjs';
-import { scoped, listen, reconcile } from '../dom.mjs';
+import { scoped, listen, reconcile, lossLine } from '../dom.mjs';
 import { fmtRunTime } from '../format.mjs';
 import { APPROXIMATE } from './packets.mjs';
 
@@ -25,7 +25,7 @@ export function mount(root, services, options = {}) {
   const { state } = services.graph;
   let host = services.selection.get().host, chosen = services.selection.get().event?.seq ?? null;
   let pending = 0, paused = false, labels = [], connection = services.selection.get().event ? null : services.selection.get().connection;
-  let frame = null, reported;
+  let frame = null, reported, missed = 0;
   const editing = () => [...list.querySelectorAll('form')].some((form) => !form.hidden);
   const newRows = new Set();
   const cleanup = [];
@@ -70,11 +70,6 @@ export function mount(root, services, options = {}) {
   }
   function create(event) {
     const node = el('div', { class: 'event-item', role: 'listitem' });
-    if (event.source === 'events' && event.kind === 'dropped') {
-      node.classList.add('loss-row');
-      el('p', { text: `${event.fields?.count ?? 'Some'} events were lost here (${event.fields?.reason || 'dropped'}).` }, node);
-      return { node };
-    }
     const line = el('button', { class: 'event-line', type: 'button' }, node);
     el('time', { text: fmtRunTime(event.at) }, line);
     el('span', { class: 'kind', text: `${event.source}.${event.kind}` }, line);
@@ -124,12 +119,13 @@ export function mount(root, services, options = {}) {
   function status(value) {
     reported = value;
     const losses = (value?.losses || []).filter((item) => item.stream === 'events' || item.stream === 'topology');
-    loss.textContent = losses.map((item) => `${item.stream === 'events' ? 'Events' : 'Topology'}: ${item.count} lost (${item.reason}).`).join(' ');
+    lossLine(loss, [...losses, { stream: 'events', reason: 'subscriber', count: missed }]);
     if (!loss.textContent && value?.incomplete) loss.textContent = 'The observation is incomplete.';
     loss.hidden = !loss.textContent;
   }
   cleanup.push(services.graph.subscribe((name, data) => {
-    if (name === 'snapshot') { status(state.status); schedule(); }
+    if (name === 'snapshot') { missed = (data.gaps || []).reduce((n, gap) => n + gap.missed, 0); status(state.status); schedule(); }
+    if (name === 'gap') { missed += data.missed; status(reported); }
     if (name === 'status') status(state.status);
     if (name === 'event') {
       newRows.add(data.seq);

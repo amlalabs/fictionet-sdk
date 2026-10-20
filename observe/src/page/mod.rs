@@ -53,7 +53,7 @@
 //! `edge_end`, `node_end`, `group_end`, `host`, `host_end`, `status`,
 //! `counters`, `event`, `ended` and `end`. Their data is the unchanged
 //! [watch data documented by the crate](crate#watch).
-//! Packet events are `link`, `packet`, `packet_gap` and `end`, with the
+//! Packet events are `link`, `packet`, `gap` and `end`, with the
 //! [crate's packet data](crate#packet-values). `world_error` carries `{error}`
 //! and terminates a refused stream. `end` carries `{reason}` and is terminal.
 //! There are at most 32 active SSE streams, shared with state streams;

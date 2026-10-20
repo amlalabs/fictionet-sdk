@@ -1,7 +1,7 @@
 // The packet list: its stream, queue, selection, detail and hex view.
 // components/packets.mjs passes in DOM helpers, the transport's packet calls,
 // labels and orientation.
-import { listen, scoped } from './dom.mjs';
+import { listen, scoped, lossLine } from './dom.mjs';
 
 // What the detail pane says until a packet is selected.
 const PICK = 'Select a packet to see its layers.';
@@ -123,7 +123,7 @@ export function createPackets({
       }
       queueEntry(p);
     });
-    onStream('packet_gap', (ev) => {
+    onStream('gap', (ev) => {
       if (packets?.source !== source) return;
       const gap = JSON.parse(ev.data);
       packets.missed += gap.missed;
@@ -233,12 +233,11 @@ export function createPackets({
   }
 
   function showCounts() {
-    const counts = [];
-    if (packets.skipped) counts.push(`Sampled: ${fmtCount(packets.skipped)} packets not copied`);
-    if (packets.evicted) counts.push(`Capture: ${fmtCount(packets.evicted)} copies evicted`);
-    if (packets.missed) counts.push(`Subscriber: ${fmtCount(packets.missed)} rows missed`);
-    $('sampled').hidden = !counts.length;
-    $('sampled').textContent = counts.join(' · ');
+    lossLine($('sampled'), [
+      { stream: 'packets', reason: 'sampling', count: packets.skipped },
+      { stream: 'packets', reason: 'eviction', count: packets.evicted },
+      { stream: 'packets', reason: 'subscriber', count: packets.missed },
+    ]);
     $('sampled').title = 'Sampling leaves packets uncopied. Capture eviction drops copies before decoding. Subscriber overruns lose decoded rows before delivery. Counts cover the loss reported by this history; expired rows may have carried more sampling or capture loss.';
   }
 

@@ -123,7 +123,7 @@ test('transient packet retries are visible', (t) => {
 
 test('capture eviction and subscriber overruns stay distinct from sampling and row identity', async (t) => {
   const h = setup(t);
-  h.source.emit('packet_gap', { after: 1, next: 5, missed: 3 });
+  h.source.emit('gap', { after: 1, next: 5, missed: 3 });
   h.send(5, { skipped: 2, evicted: 7 });
   h.send(6, { skipped: 0, evicted: 0 });
   h.flush();
@@ -144,7 +144,7 @@ test('capture eviction and subscriber overruns stay distinct from sampling and r
 
 test('merged loss names its link and leaves display and detail numbering intact', (t) => {
   const h = setup(t, ['a', 'b']);
-  h.source.emit('packet_gap', { link: 'b', after: 0, next: 9, missed: 8 });
+  h.source.emit('gap', { link: 'b', after: 0, next: 9, missed: 8 });
   h.send(9, { link: 'b', t: 2, evicted: 3, skipped: 0 });
   h.send(4, { link: 'a', t: 1, evicted: 2, skipped: 0 });
   h.flush();
@@ -161,7 +161,7 @@ for (const paused of [false, true]) {
     if (paused) $('pause').click();
     h.send(2, { skipped: 0 });
     h.send(3, { skipped: 0 });
-    h.source.emit('packet_gap', { after: 3, next: 10, missed: 6 });
+    h.source.emit('gap', { after: 3, next: 10, missed: 6 });
     assert.equal($('sampled').textContent, 'Subscriber: 6 rows missed');
     h.send(10, { skipped: 0 });
     if (paused) $('pause').click();
@@ -178,7 +178,7 @@ test('merged subscriber gaps follow earlier packets still held for ordering', (t
   // Link b has passed link a's row, so it goes in; link b's row waits for link a.
   h.view.flush();
   assert.deepEqual(h.rows().map((r) => `${r.dataset.link}:${r.dataset.seq}`), ['a:1']);
-  h.source.emit('packet_gap', { link: 'b', after: 1, next: 5, missed: 3 });
+  h.source.emit('gap', { link: 'b', after: 1, next: 5, missed: 3 });
   assert.equal($('sampled').textContent, 'Subscriber: 3 rows missed');
   h.send(5, { link: 'b', t: 3, skipped: 0 });
   h.send(2, { link: 'a', t: 2, skipped: 0 });
@@ -192,7 +192,7 @@ for (const paused of [false, true]) {
   test(`loss survives small browser limits while ${paused ? 'paused' : 'waiting to render'}`, (t) => {
     const h = setup(t, ['a'], 2);
     if (paused) $('pause').click();
-    h.source.emit('packet_gap', { after: 0, next: 2, missed: 1 });
+    h.source.emit('gap', { after: 0, next: 2, missed: 1 });
     h.send(2, { evicted: 3, skipped: 0 });
     for (let seq = 3; seq <= 8; seq++) h.send(seq, { skipped: 0 });
     if (paused) $('pause').click();
@@ -202,7 +202,7 @@ for (const paused of [false, true]) {
     assert.equal($('sampled').textContent, 'Capture: 3 copies evicted · Subscriber: 1 rows missed');
     // Gap notices are bounded even if no rows survive server retention.
     for (let seq = 9; seq <= 12; seq++) {
-      h.source.emit('packet_gap', { after: seq - 1, next: seq + 1, missed: 1 });
+      h.source.emit('gap', { after: seq - 1, next: seq + 1, missed: 1 });
     }
     h.flush();
     assert.equal($('prows').children.length, 2);
@@ -214,7 +214,7 @@ for (const paused of [false, true]) {
 test('reconnect and reopen reset loss totals and ignore an old stream', (t) => {
   const h = setup(t);
   for (let reconnect = 0; reconnect < 3; reconnect++) {
-    h.source.emit('packet_gap', { after: 0, next: 3, missed: 2 });
+    h.source.emit('gap', { after: 0, next: 3, missed: 2 });
     h.send(3, { evicted: 4, skipped: 0 });
     assert.equal($('sampled').textContent, 'Capture: 4 copies evicted · Subscriber: 2 rows missed');
     h.source.emit('open');
@@ -225,7 +225,7 @@ test('reconnect and reopen reset loss totals and ignore an old stream', (t) => {
   }
   h.send(3, { evicted: 4 });
   h.open();
-  h.source.emit('packet_gap', { after: 0, next: 3, missed: 2 });
+  h.source.emit('gap', { after: 0, next: 3, missed: 2 });
   h.send(4, { evicted: 8 });
   assert.equal($('sampled').hidden, true);
   assert.equal($('sampled').textContent, '');

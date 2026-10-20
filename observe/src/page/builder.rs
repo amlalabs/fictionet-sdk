@@ -486,7 +486,7 @@ pub(super) async fn projection(
                     .is_none_or(|name| event["fields"].get(name).is_some())
                 && sandbox.is_none_or(|s| event["sandbox"]["name"] == *s)
         }));
-        let dropped = value["dropped"].take();
+        let dropped = value["lost"].take();
         match read {
             Some(seq) if full => cursor = seq,
             _ => {

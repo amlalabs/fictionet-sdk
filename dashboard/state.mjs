@@ -194,6 +194,7 @@ const WATCH = {
   edge: (graph, data) => graph.upsertEdge(data),
   edge_end: (graph, data) => graph.removeEdge(data.id),
   counters: (graph, data) => graph.counters(data),
+  gap: () => {},
   event: (graph, data) => graph.addEvent(data),
   ended: (graph, data) => {
     graph.tick(data.t);

@@ -2822,3 +2822,93 @@ async fn shutdown_drains_packets_while_the_world_is_running() {
     assert!(watch.ends_with(end), "{watch}");
     assert!(!watch.contains("event: ended\n"));
 }
+
+#[tokio::test]
+async fn a_subscriber_gets_one_gap_per_stream_since_its_cursor() {
+    use fictionet::events::{Event, Observation, Observer, Stamp, Stream};
+    use fictionet::{Interface, Packet};
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions {
+        collector: crate::Options {
+            policy: crate::tests::policy([crate::Class::new("events").count(2)]),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let handle = dashboard.handle();
+    fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(dashboard.observer()),
+        |cx| async move {
+            let (a, _b) = fictionet::pair();
+            let mut a = cx.tap("test", a);
+            cx.yield_now().await?;
+            let link = *handle.0.collector.topology().links.keys().next().unwrap();
+            let now = std::time::Instant::now();
+            let mut session = handle.session();
+            session.request(1, r#"{"op":"watch","after":0}"#, now, None);
+            session.request(
+                2,
+                &format!(r#"{{"op":"packets","link":"{link}"}}"#),
+                now,
+                None,
+            );
+            handle
+                .0
+                .watches
+                .existing(link.get(), now)
+                .unwrap()
+                .set_limits(2, 1 << 20);
+            session.poll(now, None);
+            for seq in 2..=7 {
+                handle.0.collector.observe(
+                    Stamp {
+                        stream: Stream::Events,
+                        seq,
+                        at: fictionet::time::Instant::ZERO,
+                    },
+                    Observation::Event(&Event::new("http", "request")),
+                );
+                a.send(Packet(vec![0x45; 20]));
+            }
+            session.drain_pending(now);
+            let values = session.poll(now, None);
+            let gaps: Vec<serde_json::Value> = values
+                .iter()
+                .filter_map(|value| {
+                    let json: serde_json::Value = serde_json::from_slice(&value.bytes).unwrap();
+                    (json["event"] == "gap").then_some(json["data"].clone())
+                })
+                .collect();
+            assert_eq!(gaps.len(), 2);
+            for (gap, stream) in gaps
+                .iter()
+                .zip(["events".to_owned(), format!("packets:{}", link.get())])
+            {
+                assert_eq!(
+                    gap.as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    std::collections::BTreeSet::from([
+                        "after", "class", "missed", "next", "stream"
+                    ])
+                );
+                assert_eq!(gap["stream"], stream);
+                assert_eq!(gap["class"], serde_json::Value::Null);
+                assert!(gap["missed"].as_u64().unwrap() >= 4);
+                assert_eq!(gap["after"], 0);
+                assert!(gap["next"].as_u64().unwrap() > 0);
+            }
+            assert!(
+                session
+                    .poll(now + std::time::Duration::from_secs(1), None)
+                    .iter()
+                    .all(|value| !String::from_utf8_lossy(&value.bytes)
+                        .contains("\"event\":\"gap\""))
+            );
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+}

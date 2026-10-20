@@ -106,3 +106,53 @@ pub(crate) fn after<'a, T: Kept + 'a>(
         parts[index].next()
     })
 }
+
+/// Items and positions through the rings of one stream.
+#[derive(Default)]
+pub(crate) struct Batch<T> {
+    pub(crate) events: Vec<T>,
+    pub(crate) last: u64,
+    pub(crate) evicted: Vec<u64>,
+    pub(crate) position: Vec<u64>,
+}
+
+pub(crate) fn batch<'a, T: Kept + Clone + 'a>(
+    rings: impl IntoIterator<Item = &'a Ring<T>>,
+    cursor: Option<u64>,
+    max: usize,
+) -> Batch<T> {
+    let rings: Vec<_> = rings.into_iter().collect();
+    let last = rings.iter().map(|ring| ring.last).max().unwrap_or(0);
+    let skip = if cursor.is_none() {
+        rings
+            .iter()
+            .map(|ring| ring.events.len())
+            .sum::<usize>()
+            .saturating_sub(max)
+    } else {
+        0
+    };
+    let events: Vec<_> = after(rings.iter().copied(), cursor.unwrap_or(0))
+        .skip(skip)
+        .take(max)
+        .cloned()
+        .collect();
+    let through = events
+        .last()
+        .map_or(cursor.unwrap_or(last), |item| item.stamp().seq);
+    Batch {
+        events,
+        last,
+        evicted: rings.iter().map(|ring| ring.evicted).collect(),
+        position: rings
+            .iter()
+            .map(|ring| {
+                ring.evicted.saturating_add(
+                    ring.events
+                        .partition_point(|item| item.stamp().seq <= through)
+                        as u64,
+                )
+            })
+            .collect(),
+    }
+}

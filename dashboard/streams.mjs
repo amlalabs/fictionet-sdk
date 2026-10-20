@@ -6,7 +6,7 @@ const queue = globalThis.queueMicrotask || ((callback) => Promise.resolve().then
 
 // Watch events that change what a late subscriber must be told. Counters
 // are absolute, so only the latest is kept for a late subscriber.
-const RECORDED = ['waiting', 'snapshot', 'host', 'host_end', 'group', 'group_end', 'node', 'node_end', 'edge', 'edge_end', 'status', 'event', 'ended', 'end', 'world_error'];
+const RECORDED = ['waiting', 'snapshot', 'host', 'host_end', 'group', 'group_end', 'node', 'node_end', 'edge', 'edge_end', 'status', 'event', 'gap', 'ended', 'end', 'world_error'];
 const FORWARDED = [...RECORDED, 'counters', 'open', 'error'];
 
 /// One watch stream for the page. `subscribe()` returns a source with the

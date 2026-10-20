@@ -615,7 +615,7 @@ fn producer_losses_and_exhausted_loss_detail_remain_queryable() {
         9
     );
     assert!(collector.topology().incomplete);
-    assert_eq!(collector.events().checked_all().unwrap_err().dropped, 3);
+    assert_eq!(collector.events().checked_all().unwrap_err().lost, 3);
     collector.end(Instant::ZERO + ms(10));
     collector.end(Instant::ZERO + ms(20));
     assert_eq!(collector.ended(), Some(Instant::ZERO + ms(10)));
@@ -700,7 +700,7 @@ fn event_retention_separates_noise_and_reports_each_loss_cause() {
 }
 
 #[test]
-fn an_oversized_copy_evicts_old_copies_and_advances_empty_cursors() {
+fn an_oversized_copy_reports_overflow_and_preserves_retained_copies() {
     with_link(
         Options {
             policy: policy([Class::new("packets").count(2).bytes(4)]),
@@ -710,18 +710,20 @@ fn an_oversized_copy_evicts_old_copies_and_advances_empty_cursors() {
             packet(&collector, link, 1, Instant::ZERO, &[0; 4]);
             packet(&collector, link, 2, Instant::ZERO, &[0; 8]);
             let batch = collector.packets(link, 0, 10);
-            assert_eq!(evictions(&batch), 2);
-            assert_eq!(batch.cursor, 2);
-            assert!(batch.packets.is_empty());
-            assert_eq!(evictions(&collector.packets(link, 1, 10)), 2);
-            assert_eq!(evictions(&collector.packets(link, 2, 10)), 2);
+            assert_eq!(evictions(&batch), 0);
+            assert_eq!(batch.cursor, 1);
+            assert_eq!(batch.packets.len(), 1);
+            assert_eq!(batch.packets[0].stamp.seq, 1);
+            assert_eq!(collector.packets(link, 1, 10).cursor, 2);
+            assert_eq!(evictions(&collector.packets(link, 1, 10)), 0);
+            assert_eq!(evictions(&collector.packets(link, 2, 10)), 0);
             packet(&collector, link, 3, Instant::ZERO, &[1; 4]);
             let batch = collector.packets(link, 2, 10);
-            assert_eq!(evictions(&batch), 2);
+            assert_eq!(evictions(&batch), 1);
             assert_eq!(batch.packets[0].stamp.seq, 3);
             assert_eq!(
-                count(&collector, Stream::Packets(link), LossReason::Eviction),
-                2
+                count(&collector, Stream::Packets(link), LossReason::Overflow),
+                1
             );
         },
     );
@@ -1024,10 +1026,7 @@ fn one_ring_evicts_the_same_way_for_events_packets_and_keys() {
                     assert_eq!(rows[0].count, 3);
                     assert_eq!(rows[0].bytes, Some((3 * size) as u64));
                 }
-                assert_eq!(
-                    reader.events().display_batch(None, 10).evicted,
-                    [3, 0, 0, 0, 0]
-                );
+                assert_eq!(reader.events().batch(None, 10).evicted, [3, 0, 0, 0, 0]);
                 assert_eq!(evictions(&reader.packets(link, 0, 10)), 3);
                 assert_eq!(reader.state.lock().keys.rings[&2].evicted, 3);
                 Ok(())
@@ -1158,10 +1157,7 @@ fn a_policy_sorts_a_built_event_by_its_repeat_mark() {
             .collect::<Vec<_>>(),
         [1, 3]
     );
-    assert_eq!(
-        collector.events().display_batch(None, 10).evicted,
-        [0, 1, 0, 0, 0]
-    );
+    assert_eq!(collector.events().batch(None, 10).evicted, [0, 1, 0, 0, 0]);
 }
 
 #[test]
@@ -1198,7 +1194,7 @@ fn noise_and_events_classes_evict_independently() {
         [1, 2, 98, 99, 100]
     );
     assert_eq!(
-        collector.events().display_batch(None, 100).evicted,
+        collector.events().batch(None, 100).evicted,
         [0, 95, 0, 0, 0]
     );
     assert_eq!(count(&collector, Stream::Events, LossReason::Eviction), 95);
@@ -1233,7 +1229,7 @@ fn a_burst_bound_thins_noise_and_counts_sampling() {
         [1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 15]
     );
     assert_eq!(count(&collector, Stream::Events, LossReason::Sampling), 4);
-    assert_eq!(collector.events().dropped(), 4);
+    assert_eq!(collector.events().losses().events(), 4);
 }
 
 fn work_packet(destination: [u8; 4], seq: u32, payload: &[u8]) -> Packet {
@@ -1525,4 +1521,133 @@ fn agent_traffic_keeps_full_fidelity_under_load() {
         },
     ))
     .unwrap();
+}
+
+#[test]
+fn checked_of_ignores_losses_of_other_kinds() {
+    use fictionet::events::{Event, Fields};
+    let collector = Collector::new(policy([
+        Class::new("events").count(2),
+        Class::new("noise").count(1),
+    ]));
+    for seq in 1..=10 {
+        let event = if seq == 1 {
+            Event::new("http", "request")
+        } else {
+            Event::new("net", "noise").repeat(Fields::new())
+        };
+        collector.observe(
+            Stamp {
+                stream: Stream::Events,
+                seq,
+                at: Instant::ZERO,
+            },
+            Observation::Event(&event),
+        );
+    }
+    assert_eq!(
+        collector
+            .events()
+            .checked_of("http", "request")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(collector.events().checked_of("net", "noise").is_err());
+    assert!(collector.events().checked_all().is_err());
+}
+
+#[test]
+fn checked_of_refuses_after_a_loss_of_its_kind() {
+    struct Split([Class; 2]);
+    impl Policy for Split {
+        fn classes(&self) -> &[Class] {
+            &self.0
+        }
+        fn admit(&self, interest: Interest<'_>) -> Admit {
+            match interest {
+                Interest::Event(_, conn) => Admit::Class(usize::from(conn.id == Some(2))),
+                _ => Admit::Skip,
+            }
+        }
+        fn sort(&self, _: &Observation<'_>) -> Option<usize> {
+            panic!("already classified")
+        }
+    }
+    let collector = Collector::new(Arc::new(Split([
+        Class::new("first").count(1),
+        Class::new("second").count(1),
+    ])));
+    for (seq, id) in [(1, 1), (2, 2), (3, 2)] {
+        let mut event = fictionet::events::Event::new("http", "request");
+        event.conn.id = Some(id);
+        collector.observe(
+            Stamp {
+                stream: Stream::Events,
+                seq,
+                at: Instant::ZERO,
+            },
+            Observation::Event(&event),
+        );
+    }
+    assert_eq!(collector.events().after(0, 10).len(), 2);
+    assert!(collector.events().checked_of("http", "request").is_err());
+    let losses = collector.losses();
+    assert_eq!(losses.streams.len(), 1);
+    assert_eq!(losses.streams[0].class, Some(1));
+    assert_eq!(losses.streams[0].event, Some(("http", "request")));
+}
+
+#[test]
+fn checked_of_refuses_after_a_core_loss() {
+    let collector = Collector::default();
+    collector.lost(Loss::staged(Stream::Events, 3));
+    for (source, kind) in [("http", "request"), ("net", "noise"), ("other", "kind")] {
+        assert_eq!(
+            collector
+                .events()
+                .checked_of(source, kind)
+                .unwrap_err()
+                .lost,
+            3
+        );
+    }
+    assert_eq!(collector.losses().streams[0].class, None);
+    assert_eq!(collector.losses().streams[0].event, None);
+    assert_eq!(collector.losses().events(), 3);
+}
+
+#[test]
+fn every_loss_has_a_stream_a_class_and_a_reason() {
+    use fictionet::events::Event;
+    let collector = Collector::new(policy([Class::new("events").count(1)]));
+    for seq in 1..=2 {
+        collector.observe(
+            Stamp {
+                stream: Stream::Events,
+                seq,
+                at: Instant::ZERO,
+            },
+            Observation::Event(&Event::new("http", "request")),
+        );
+    }
+    collector.lost(Loss::staged(Stream::Events, 2));
+    let losses = collector.losses();
+    assert_eq!(losses.streams.len(), 2);
+    let eviction = &losses.streams[0];
+    assert_eq!(eviction.stream, Stream::Events);
+    assert_eq!(eviction.class, Some(0));
+    assert_eq!(eviction.reason, LossReason::Eviction);
+    assert_eq!(eviction.count, 1);
+    assert_eq!(
+        eviction.bytes,
+        Some(Event::new("http", "request").size() as u64)
+    );
+    assert_eq!(eviction.event, Some(("http", "request")));
+    let staged = &losses.streams[1];
+    assert_eq!(staged.stream, Stream::Events);
+    assert_eq!(staged.class, None);
+    assert_eq!(staged.reason, LossReason::Staging);
+    assert_eq!(staged.count, 2);
+    assert_eq!(staged.event, None);
 }

@@ -209,9 +209,7 @@ test('events filters text, preserves loss and selects only explicit flow identit
 test('a burst of events renders once per frame and keeps each row by key', async (t) => {
   const h = await fixture(t);
   const dispose = events(h.root, h.services);
-  const event = (seq) => seq === 1999
-    ? { seq, at: seq / 100, source: 'events', kind: 'dropped', fields: { count: 12, reason: 'eviction' } }
-    : { seq, at: seq / 100, sandbox: { name: 'guest' }, source: 'scan', kind: 'port', summary: `port ${seq}`, fields: {} };
+  const event = (seq) => ({ seq, at: seq / 100, sandbox: { name: 'guest' }, source: 'scan', kind: 'port', summary: `port ${seq}`, fields: {} });
   h.watches[0].emit('snapshot', { ...h.snapshot, events: [] });
   h.frame();
   const document = h.root.ownerDocument, createElement = document.createElement;
@@ -225,7 +223,7 @@ test('a burst of events renders once per frame and keeps each row by key', async
   const items = h.root.querySelectorAll('.event-item');
   assert.equal(items.length, 500);
   assert.match(items[0].textContent, /port 2000/);
-  assert.match(items[1].textContent, /12 events were lost here \(eviction\)/);
+  assert.match(items[1].textContent, /port 1999/);
   assert.match(items.at(-1).textContent, /port 1501/);
   assert.equal(built, 500, 'each kept row is built once');
   // One more event adds one row; every other row keeps its node.
@@ -506,5 +504,21 @@ test('the map rings the item an event came from and draws the graph again when r
   h.frame();
   assert.equal(h.root.querySelector('#nodes').children.length, drawn);
   dispose();
+  h.clean();
+});
+
+test('both lists use one loss line for subscriber gaps', async (t) => {
+  const h = await fixture(t);
+  const dispose = events(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, events: [] });
+  h.watches[0].emit('gap', { stream: 'events', class: null, after: 1, next: 5, missed: 3 });
+  assert.equal(h.root.querySelector('.loss-note').textContent, 'Subscriber: 3 rows missed');
+  dispose();
+  const close = packets(h.root, h.services);
+  h.selection.set({ links: ['e1'] });
+  await settle();
+  h.streams.at(-1).emit('gap', { stream: 'packets:1', class: null, after: 1, next: 5, missed: 3 });
+  assert.equal(h.root.querySelector('#sampled').textContent, 'Subscriber: 3 rows missed');
+  close();
   h.clean();
 });

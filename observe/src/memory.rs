@@ -47,12 +47,12 @@ impl Default for Limits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Incomplete {
     /// Number of evicted or rejected events.
-    pub dropped: u64,
+    pub lost: u64,
 }
 
 impl std::fmt::Display for Incomplete {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "incomplete history: {} events lost", self.dropped)
+        write!(f, "incomplete history: {} events lost", self.lost)
     }
 }
 
@@ -71,30 +71,15 @@ pub struct Memory {
     policy: Arc<dyn Policy>,
     bytes: usize,
     state: Mutex<State>,
+    pub(crate) losses: Arc<Mutex<LossStatus>>,
+    pub(crate) loss_streams: usize,
 }
 
 #[derive(Default)]
 struct State {
     history: Vec<Ring<Arc<Event>>>,
     last: u64,
-    dropped: u64,
     waiters: Vec<Weak<Mutex<Option<Waker>>>>,
-}
-
-/// A consistent history batch and cursors for displaying loss without counting
-/// gaps caused by event filtering. Entries follow the policy class indices.
-#[derive(Default)]
-pub struct DisplayBatch {
-    /// Retained events in sequence order.
-    pub events: Vec<Event>,
-    /// Last delivered event sequence.
-    pub last: u64,
-    /// Total events lost, including rejected events and evictions.
-    pub dropped: u64,
-    /// Evictions from each retention budget.
-    pub evicted: Vec<u64>,
-    /// Positions through this batch, including earlier evictions, per budget.
-    pub position: Vec<u64>,
 }
 
 impl State {
@@ -146,6 +131,8 @@ impl Memory {
         Self {
             policy,
             bytes,
+            losses: Arc::new(Mutex::new(LossStatus::default())),
+            loss_streams: 1,
             state: Mutex::new(State {
                 history,
                 ..State::default()
@@ -153,21 +140,28 @@ impl Memory {
         }
     }
 
-    /// Reads matching retained events only if no event has been lost.
+    /// Reads matching retained events unless that kind or an unknown kind was lost.
     pub fn checked_of(&self, source: &str, kind: &str) -> Result<Vec<Event>, Incomplete> {
-        self.checked(|event| event.is(source, kind))
+        self.checked(Some((source, kind)), |event| event.is(source, kind))
     }
 
     /// Reads all retained events only if no event has been lost.
     pub fn checked_all(&self) -> Result<Vec<Event>, Incomplete> {
-        self.checked(|_| true)
+        self.checked(None, |_| true)
     }
 
-    fn checked(&self, pick: impl Fn(&Event) -> bool) -> Result<Vec<Event>, Incomplete> {
+    fn checked(
+        &self,
+        kind: Option<(&str, &str)>,
+        pick: impl Fn(&Event) -> bool,
+    ) -> Result<Vec<Event>, Incomplete> {
         let state = self.state.lock();
-        if state.dropped != 0 {
+        let losses = self.losses.lock();
+        if kind.map_or(losses.events() != 0, |(source, kind)| {
+            losses.incomplete(source, kind)
+        }) {
             return Err(Incomplete {
-                dropped: state.dropped,
+                lost: losses.events(),
             });
         }
         Ok(state
@@ -215,11 +209,9 @@ impl Memory {
             drop(previous);
             let events = {
                 let state = self.state.lock();
-                if state.dropped != 0 {
-                    return Poll::Ready(Err(Incomplete {
-                        dropped: state.dropped,
-                    }
-                    .into()));
+                let lost = self.losses.lock().events();
+                if lost != 0 {
+                    return Poll::Ready(Err(Incomplete { lost }.into()));
                 }
                 state.after(after).cloned().collect::<Vec<_>>()
             };
@@ -232,9 +224,9 @@ impl Memory {
             if cx.is_cancelled() {
                 return Poll::Ready(Err(fictionet::Cancelled.into()));
             }
-            let dropped = self.dropped();
-            if dropped != 0 {
-                return Poll::Ready(Err(Incomplete { dropped }.into()));
+            let lost = self.losses.lock().events();
+            if lost != 0 {
+                return Poll::Ready(Err(Incomplete { lost }.into()));
             }
             if matches.len() >= count || cx.now() >= deadline {
                 return Poll::Ready(Ok(matches.iter().map(|event| (**event).clone()).collect()));
@@ -261,44 +253,24 @@ impl Memory {
 
     /// Reads events and loss cursors together. `None` selects the newest `max`
     /// events; `Some(after)` selects events following that sequence.
-    pub fn display_batch(&self, after: Option<u64>, max: usize) -> DisplayBatch {
+    pub(crate) fn batch(&self, after: Option<u64>, max: usize) -> crate::ring::Batch<Event> {
         let state = self.state.lock();
-        let skip = if after.is_none() {
-            state
-                .history
-                .iter()
-                .map(|h| h.events.len())
-                .sum::<usize>()
-                .saturating_sub(max)
-        } else {
-            0
-        };
-        let events: Vec<_> = state
-            .after(after.unwrap_or(0))
-            .skip(skip)
-            .take(max)
-            .map(|e| (**e).clone())
-            .collect();
-        let through = events.last().map_or(after.unwrap_or(state.last), |e| e.seq);
-        DisplayBatch {
-            events,
-            last: state.last,
-            dropped: state.dropped,
-            evicted: state.history.iter().map(|h| h.evicted).collect(),
-            position: state
-                .history
-                .iter()
-                .map(|h| {
-                    h.evicted
-                        .saturating_add(h.events.partition_point(|e| e.seq <= through) as u64)
-                })
+        let batch = crate::ring::batch(&state.history, after, max);
+        crate::ring::Batch {
+            events: batch
+                .events
+                .into_iter()
+                .map(|event| (*event).clone())
                 .collect(),
+            last: state.last,
+            evicted: batch.evicted,
+            position: batch.position,
         }
     }
 
-    /// Persistent loss count, independent of sequence gaps from filtering.
-    pub fn dropped(&self) -> u64 {
-        self.state.lock().dropped
+    /// Persistent loss totals for this observer.
+    pub fn losses(&self) -> LossStatus {
+        self.losses.lock().clone()
     }
 
     /// Last delivered sequence number.
@@ -321,9 +293,8 @@ impl Observer for Memory {
         if loss.stream != fictionet::events::Stream::Events {
             return;
         }
-        let count = loss.count;
-        let mut state = self.state.lock();
-        state.dropped = state.dropped.saturating_add(count);
+        self.losses.lock().add(self.loss_streams, loss);
+        let state = self.state.lock();
         let waiters: Vec<_> = state.waiters.iter().filter_map(Weak::upgrade).collect();
         drop(state);
         for wait in waiters {
@@ -366,36 +337,48 @@ impl Observer for Memory {
 }
 
 impl Memory {
-    pub(crate) fn push(&self, stamp: Stamp, event: &Event, index: usize) -> LossStatus {
-        let mut losses = LossStatus::default();
+    pub(crate) fn push(&self, stamp: Stamp, event: &Event, index: usize) {
         let Some(class) = self
             .policy
             .classes()
             .get(index)
             .filter(|class| class.when == When::Always)
         else {
-            return losses;
+            return;
         };
         let size = event.size();
         let mut state = self.state.lock();
         state.last = stamp.seq;
+        let mut losses = self.losses.lock();
         let history = &mut state.history[index];
         if !history.admit(stamp, class.burst) {
-            losses.record(1, stamp, LossReason::Sampling, size);
+            losses.record_event(self.loss_streams, stamp, index, LossReason::Sampling, event);
         } else if class.count == 0 || size > class.bytes.min(self.bytes) {
-            losses.record(1, stamp, LossReason::Overflow, size);
+            losses.record_event(self.loss_streams, stamp, index, LossReason::Overflow, event);
         } else {
             history.make_room(size, class.count, class.bytes, |old| {
-                losses.record(1, old.stamp(), LossReason::Eviction, old.size());
+                losses.record_event(
+                    self.loss_streams,
+                    old.stamp(),
+                    index,
+                    LossReason::Eviction,
+                    &old,
+                );
             });
             let mut event = event.clone();
             event.seq = stamp.seq;
             event.at = stamp.at;
             history.push(Arc::new(event));
         }
-        let dropped: u64 = losses.streams.iter().map(|loss| loss.count).sum();
-        state.dropped = state.dropped.saturating_add(dropped);
-        losses
+        if event.is_truncated() {
+            losses.record_event(
+                self.loss_streams,
+                stamp,
+                index,
+                LossReason::Truncation,
+                event,
+            );
+        }
     }
 
     pub(crate) fn largest(&self) -> Option<(usize, usize)> {
@@ -412,7 +395,13 @@ impl Memory {
     pub(crate) fn evict(&self, index: usize) -> Option<Arc<Event>> {
         let mut state = self.state.lock();
         let event = state.history[index].evict()?;
-        state.dropped = state.dropped.saturating_add(1);
+        self.losses.lock().record_event(
+            self.loss_streams,
+            event.stamp(),
+            index,
+            LossReason::Eviction,
+            &event,
+        );
         Some(event)
     }
 
@@ -480,11 +469,8 @@ mod tests {
         let noise = events.iter().filter(|e| e.is("net", "blocked")).count();
         assert!(noise > 0 && noise <= 5_000);
         assert!(memory.state.lock().history[1].bytes <= 2 << 20);
-        assert_eq!(memory.dropped() + noise as u64, flood);
-        assert_eq!(
-            memory.checked_of("http", "request").unwrap_err().dropped,
-            flood - noise as u64
-        );
+        assert_eq!(memory.losses().events() + noise as u64, flood);
+        assert_eq!(memory.checked_of("http", "request").unwrap().len(), 10);
     }
 
     #[test]
@@ -519,7 +505,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [1, 4, 5]
             );
-            assert_eq!(memory.dropped(), 2);
+            assert_eq!(memory.losses().events(), 2);
             let state = memory.state.lock();
             assert!(state.history[1].bytes <= limits.bytes);
             assert!(state.history[1].events.len() <= limits.events);
@@ -663,7 +649,7 @@ mod tests {
                     .unwrap_err();
                 assert_eq!(
                     error.downcast_ref::<Incomplete>(),
-                    Some(&Incomplete { dropped: 1 })
+                    Some(&Incomplete { lost: 1 })
                 );
                 Ok(())
             },
@@ -686,10 +672,10 @@ mod tests {
         .unwrap();
         assert_eq!(memory.retained().0, 3);
         assert!(memory.retained().1 <= 4096);
-        assert_eq!(memory.dropped(), 998);
-        assert_eq!(memory.checked_of("shop", "order").unwrap_err().dropped, 998);
-        assert!(memory.checked_of("unrelated", "kind").is_err());
-        assert_eq!(memory.checked_all().unwrap_err().dropped, 998);
+        assert_eq!(memory.losses().events(), 998);
+        assert_eq!(memory.checked_of("shop", "order").unwrap_err().lost, 998);
+        assert!(memory.checked_of("unrelated", "kind").unwrap().is_empty());
+        assert_eq!(memory.checked_all().unwrap_err().lost, 998);
         assert_eq!(memory.after(0, usize::MAX).len(), 3);
     }
 
@@ -713,7 +699,7 @@ mod tests {
             Observation::Event(&Event::new("shop", "order").summary("x".repeat(4096))),
         );
         assert_eq!(memory.retained().0, 1);
-        assert_eq!(memory.dropped(), 1);
+        assert_eq!(memory.losses().events(), 1);
         assert_eq!(memory.last(), 2);
         assert_eq!(memory.after(0, 4)[0].seq, 1);
     }
@@ -726,7 +712,7 @@ mod tests {
         assert!(memory.checked_all().is_ok());
         loss.stream = Stream::Events;
         memory.lost(loss);
-        assert_eq!(memory.checked_of("shop", "order").unwrap_err().dropped, 3);
+        assert_eq!(memory.checked_of("shop", "order").unwrap_err().lost, 3);
     }
 
     /// A bounded observer reports an incomplete history when a flood exceeds
@@ -779,11 +765,11 @@ mod tests {
             assert_eq!(event.str("why"), Some("the queue was full"));
         }
         assert_eq!(
-            bounded.dropped() + raw_drops.len() as u64,
+            bounded.losses().events() + raw_drops.len() as u64,
             flood as u64 - 10
         );
         assert!(bounded.checked_all().is_err());
-        assert!(bounded.dropped() > 0);
+        assert!(bounded.losses().events() > 0);
         let (count, bytes) = bounded.retained();
         assert!(count <= 32 && bytes <= 32 << 10);
         assert_eq!(aggregated.checked_of("http", "request").unwrap().len(), 2);

@@ -332,7 +332,7 @@ mod tests {
             fictionet::events::Stream::Events,
             7,
         ));
-        assert_eq!(memory.checked_all().unwrap_err().dropped, 7);
+        assert_eq!(memory.checked_all().unwrap_err().lost, 7);
     }
 
     #[test]

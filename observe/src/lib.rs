@@ -244,17 +244,17 @@
 //! when that task has ended. Outside a task of the same run, task metadata
 //! is absent.
 //!
-//! An `events` reply contains `events`, `last` and `dropped`. `last` is the
+//! An `events` reply contains `events`, `last` and `lost`. `last` is the
 //! last delivered event sequence, not necessarily the last event in this
-//! batch. Page with the last returned event's `seq`. `dropped` is the total
-//! lost from retention. A watch emits `events.dropped` with a `count` field
-//! when it reports loss. Sequence gaps alone do not establish loss.
+//! batch. Page with the last returned event's `seq`. `lost` is the total
+//! lost from the events stream. A watch emits `gap` with stream, class,
+//! after, next and missed fields when a subscriber falls behind. Sequence gaps alone do not establish loss.
 //! [`Memory::checked_of`] and [`Memory::checked_all`] reject incomplete
-//! histories for grading, even if loss affected another event kind.
+//! histories for grading when the requested kind or an unknown kind was lost.
 //!
 //! ```text
 //! $ "$bin/fictionet" observe --observation "unix:$work/observe.sock" events
-//! {"events":[{"seq":1,"at":0,"source":"run","kind":"start","level":"info","summary":"the run started","sandbox":null,"conn":null,"local":null,"peer":null,"transport":"tcp","tls":false,"sni":null,"alpn":null,"fields":{"wall":1792421987.400384,"seed":"0cac0fb52a890a0edb4c72345fd587a5c096814e73c73e35eb68ffc2ea2ae0ac","rng":"chacha20-v1"},"node":"t1","task":"world","file":"src/run.rs","line":236,"parent":null},...],"last":8,"dropped":0}
+//! {"events":[{"seq":1,"at":0,"source":"run","kind":"start","level":"info","summary":"the run started","sandbox":null,"conn":null,"local":null,"peer":null,"transport":"tcp","tls":false,"sni":null,"alpn":null,"fields":{"wall":1792421987.400384,"seed":"0cac0fb52a890a0edb4c72345fd587a5c096814e73c73e35eb68ffc2ea2ae0ac","rng":"chacha20-v1"},"node":"t1","task":"world","file":"src/run.rs","line":236,"parent":null},...],"last":8,"lost":0}
 //! ```
 //!
 //! If JSON exceeds the writer's size, depth or value-count limit, the request
@@ -538,9 +538,9 @@
 //! | `graph` | None | The graph snapshot described below. |
 //! | `watch` | Optional `after`, an event sequence | Snapshot, then changes and events. |
 //! | `counters` | None | `t` and `edges`, with four absolute counters per edge. |
-//! | `events` | `after`, default 0; `max`, default and ceiling 1,000 | `events`, `last`, `dropped`. |
+//! | `events` | `after`, default 0; `max`, default and ceiling 1,000 | `events`, `last`, `lost`. |
 //! | `link` | `link`, such as `"e13"` | One edge with `counters`. |
-//! | `packets` | `link`; `after`, a decoded row number, default 0 | `link`, then `packet` and `packet_gap` events. |
+//! | `packets` | `link`; `after`, a decoded row number, default 0 | `link`, then `packet` and `gap` events. |
 //! | `packet` | `link`, `seq` | One kept row's layers and buffers. |
 //! | `pcap` | `link` | Binary pcapng of that watch's kept rows and keys. |
 //! | `keylog` | None | Binary SSLKEYLOGFILE text from the collector. |
@@ -605,7 +605,7 @@
 //! ignored because a referenced entity was missing. `truncated_bytes` counts
 //! text bytes cut at UTF-8 boundaries.
 //!
-//! Each `losses` entry has `stream`, `reason`, `count` and `bytes`. Stream is
+//! Each `losses` entry has `stream`, `class`, `reason`, `count` and `bytes`. Stream is
 //! `events`, `keys`, `topology` or a link ID such as `e13`. Reasons include
 //! `staging`, `sampling`, `truncation`, `eviction` and `overflow`. `count`
 //! counts affected observations; `bytes` is their byte total or `null` when
@@ -676,7 +676,7 @@
 //! A subscriber whose cursor predates retained rows receives a gap first:
 //!
 //! ```json
-//! {"event":"packet_gap","data":{"after":7,"next":12,"missed":4}}
+//! {"event":"gap","data":{"after":7,"next":12,"missed":4}}
 //! ```
 //!
 //! Here rows 8 through 11 are missing. `next` is the first retained row, or
@@ -775,7 +775,7 @@ pub use tracing_bridge::Tracing;
 
 pub use aggregate::Aggregate;
 pub use egress::Egress;
-pub use memory::{DisplayBatch, Incomplete, Limits, Memory};
+pub use memory::{Incomplete, Limits, Memory};
 
 /// Default number of ordinary events retained by [`Memory`], separate from noise.
 pub const MAX_EVENTS: usize = 50_000;
@@ -784,7 +784,7 @@ pub const MAX_EVENT_BYTES: usize = 16 << 20;
 
 pub use capture::{CaptureDemand, PacketBatch, PacketCopy};
 pub use keys::{Key, keylog};
-pub use loss::{LossStatus, LossTotal};
+pub use loss::{LossEntry, LossStatus, LossTotal};
 pub use topology::{Connection, Group, Host, Link, Task, Topology, TopologyLimits};
 
 use std::collections::BTreeMap;
@@ -858,7 +858,6 @@ struct State {
     topology: Topology,
     captures: Captures,
     keys: Keys,
-    losses: LossStatus,
     ended: Option<Instant>,
 }
 
@@ -879,8 +878,10 @@ impl Collector {
 
     /// Creates a collector with shared byte and topology limits.
     pub fn with_options(options: Options) -> Self {
+        let mut events = Memory::with_policy(options.policy.clone(), options.bytes);
+        events.loss_streams = options.loss_streams;
         Self {
-            events: Memory::with_policy(options.policy.clone(), options.bytes),
+            events,
             options,
             demand: ArcSwap::from_pointee(BTreeMap::new()),
             state: Mutex::new(State::default()),
@@ -914,7 +915,7 @@ impl Collector {
     }
     /// Persistent loss totals, including producer loss.
     pub fn losses(&self) -> LossStatus {
-        self.state.lock().losses.clone()
+        self.events.losses()
     }
     /// Run end time, when delivery has ended.
     pub fn ended(&self) -> Option<Instant> {
@@ -1045,15 +1046,7 @@ impl Observer for Collector {
             if state.ended.is_some() {
                 return;
             }
-            let losses = self.events.push(stamp, event, index);
-            for loss in losses.streams {
-                state.losses.add(self.options.loss_streams, loss);
-            }
-            if event.is_truncated() {
-                state
-                    .losses
-                    .record(self.options.loss_streams, stamp, LossReason::Truncation, 0);
-            }
+            self.events.push(stamp, event, index);
             self.enforce(&mut state);
             drop(state);
             self.events.wake();
@@ -1067,9 +1060,10 @@ impl Observer for Collector {
             topology,
             captures,
             keys,
-            losses,
             ..
         } = &mut *state;
+        let mut ledger = self.events.losses.lock();
+        let losses = &mut *ledger;
         match item {
             Observation::TlsKey(key) => {
                 if let Some(index) = index {
@@ -1116,6 +1110,7 @@ impl Observer for Collector {
             }
             _ => {}
         }
+        drop(ledger);
         let evicted_events = self.enforce(&mut state);
         drop(state);
         if evicted_events {
@@ -1132,10 +1127,13 @@ impl Observer for Collector {
             state.topology.incomplete = true;
             state.topology.revision = state.topology.revision.saturating_add(1);
         }
-        state.losses.add(self.options.loss_streams, loss.clone());
+        self.events
+            .losses
+            .lock()
+            .add(self.options.loss_streams, loss.clone());
         drop(state);
         if loss.stream == Stream::Events {
-            self.events.lost(loss);
+            self.events.wake();
         }
     }
 
@@ -1179,20 +1177,17 @@ impl Collector {
             if let Some((link, class, bytes, removed)) = packets
                 && (removed || bytes >= largest)
             {
-                state
-                    .captures
-                    .evict(link, class, &mut state.losses, self.options.loss_streams);
+                state.captures.evict(
+                    link,
+                    class,
+                    &mut self.events.losses.lock(),
+                    self.options.loss_streams,
+                );
             } else if let Some((index, bytes)) = events
                 && bytes >= keys.map_or(0, |(_, bytes)| bytes)
             {
-                let event = self.events.evict(index).expect("event budget");
+                self.events.evict(index).expect("event budget");
                 evicted_events = true;
-                state.losses.record(
-                    self.options.loss_streams,
-                    event.stamp(),
-                    LossReason::Eviction,
-                    event.size(),
-                );
             } else if let Some((index, _)) = keys {
                 let key = state
                     .keys
@@ -1201,9 +1196,10 @@ impl Collector {
                     .expect("key class")
                     .evict()
                     .expect("key budget");
-                state.losses.record(
+                self.events.losses.lock().record(
                     self.options.loss_streams,
                     key.stamp,
+                    Some(index),
                     LossReason::Eviction,
                     key.size(),
                 );

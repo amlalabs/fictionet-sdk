@@ -58,3 +58,17 @@ export function icon(parent, kind) {
   el('svg:path', { d: paths[kind], fill: 'none', stroke: 'currentColor', 'stroke-width': 1.5, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, svg);
   return svg;
 }
+
+// Both observation lists render their loss totals here.
+export function lossLine(node, losses) {
+  node.textContent = losses.filter((loss) => loss.count > 0).map((loss) => {
+    if (loss.stream === 'packets') {
+      if (loss.reason === 'sampling') return `Sampled: ${loss.count} packets not copied`;
+      if (loss.reason === 'eviction') return `Capture: ${loss.count} copies evicted`;
+    }
+    if (loss.reason === 'subscriber') return `Subscriber: ${loss.count} rows missed`;
+    const stream = loss.stream[0].toUpperCase() + loss.stream.slice(1);
+    return `${stream}: ${loss.count} lost (${loss.reason}).`;
+  }).join(' · ');
+  node.hidden = !node.textContent;
+}
