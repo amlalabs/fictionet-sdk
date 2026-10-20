@@ -42,10 +42,9 @@ where
     let log = Log::start(Box::new(buf.clone())).unwrap();
     let output = log.clone();
     fictionet_test_support::harness::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
-            .aggregate_events()
-            .event_history(Arc::new(fictionet::events::Memory::default()))
-            .observer(Arc::new(log.clone())),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
+            fictionet_observe::Aggregate::new(Arc::new(log.clone())),
+        )),
         move |fcx| async move {
             let contents = Arc::new(Contents::new(variant, "", &[1; 32]).unwrap());
             let identity = Identity::new(&fcx)?;

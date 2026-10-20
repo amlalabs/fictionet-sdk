@@ -3,11 +3,12 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::task::Poll;
 
-use fictionet::events::{Level, Memory};
+use fictionet::events::Level;
 use fictionet::stdlib::network::ports::{Event, Ports as Links};
 use fictionet::stdlib::network::{ip, tcp, udp};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, Packet, RunOptions, Seed};
+use fictionet_observe::Memory;
 use scan_world::ports::MAX_ROWS;
 use scan_world::{
     Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Protocol, SCANNER, SERVER,

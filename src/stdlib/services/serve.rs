@@ -7,7 +7,10 @@
 //! clock and touches no socket, so it unit-tests with the [`Harness`]
 //! here, fuzzes with the codec's contract tools, and a world copies its
 //! file to change it. It has the shape of a FIX session: items in, bytes
-//! and events and timers out.
+//! and events and timers out. The observer installed in `RunOptions` receives
+//! interested events. [Fictionet Observe](../../../../fictionet_observe/index.html)
+//! supplies retention, aggregation and export. A standalone `Harness` accepts
+//! its own observer, as in the example below.
 //!
 //! [`connection`] is the one driver that joins a service to a
 //! [`Connection`]: it reads, decodes, calls the
@@ -49,12 +52,12 @@
 //!     }
 //! }
 //!
-//! let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
-//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(evidence.clone());
+//! let grader = std::sync::Arc::new(fictionet_observe::Memory::default());
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(grader.clone());
 //! assert_eq!(h.push(b"hello\nwor")?, b"hello\n");
 //! assert_eq!(h.push(b"ld\nquit\n")?, b"world\n");
 //! assert!(h.closed());
-//! assert_eq!(evidence.checked_all().unwrap().len(), 2);
+//! assert_eq!(grader.checked_all()?.len(), 2);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -3923,7 +3926,7 @@ impl<S: Service> Drop for Harness<S> {
 mod observation_tests {
     use super::*;
     use crate::stdlib::codec::{Ending, LineError, Lines};
-    use fictionet::events::Memory;
+    use fictionet::events::recorder::Recorder;
 
     struct Echo {
         builds: Arc<AtomicUsize>,
@@ -4064,7 +4067,7 @@ mod observation_tests {
     fn observation_does_not_change_service_output_and_absence_skips_building() {
         for observed in [false, true] {
             let builds = Arc::new(AtomicUsize::new(0));
-            let memory = Arc::new(Memory::default());
+            let memory = Arc::new(Recorder::default());
             let mut harness = Harness::new(
                 Seed::from_u64(1),
                 Echo {
@@ -4079,16 +4082,13 @@ mod observation_tests {
             assert_eq!(harness.push(b"hello\n").unwrap(), b"hello");
             assert!(harness.closed());
             assert_eq!(builds.load(Ordering::Relaxed), usize::from(observed));
-            assert_eq!(
-                memory.checked_of("echo", "line").unwrap().len(),
-                usize::from(observed)
-            );
+            assert_eq!(memory.of("echo", "line").len(), usize::from(observed));
         }
     }
 
     #[test]
     fn staged_builders_can_emit_nested_events() {
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         let mut staged = Staged {
             observer: Some(Arc::new(fictionet::events::Dispatch::new(Some(
                 memory.clone(),
@@ -4101,7 +4101,7 @@ mod observation_tests {
             event.field("value", 9u64)
         });
         staged.drain(|| Instant::ZERO);
-        let events = memory.checked_all().unwrap();
+        let events = memory.all();
         assert_eq!(
             events
                 .iter()
@@ -4114,7 +4114,7 @@ mod observation_tests {
     #[test]
     fn staging_stops_building_when_full_and_reports_loss() {
         let builds = Arc::new(AtomicUsize::new(0));
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         let mut harness = Harness::new(
             Seed::from_u64(1),
             Echo {
@@ -4126,6 +4126,6 @@ mod observation_tests {
         .observer(memory.clone());
         assert_eq!(harness.push(b"hello\n").unwrap(), b"hello");
         assert_eq!(builds.load(Ordering::Relaxed), 256);
-        assert_eq!(memory.checked_all().unwrap_err().dropped, 744);
+        assert_eq!(memory.dropped(), 744);
     }
 }

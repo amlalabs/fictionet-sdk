@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 fictionet = { path = "../../.." }
+fictionet-observe = { path = "../../../observe", features = ["native"] }
 http = "1"
 serde = { version = "1", features = ["derive"] }
 

@@ -4,10 +4,14 @@
 // state and view and the layout's steps, and moves the view's glide on
 // once a frame with `stepTween`.
 
-import { $ } from './dom.mjs';
+import { listen } from './dom.mjs';
 import { HEAD } from './layout.mjs';
 
-export function createInteraction({ state, view, reducedMotion, isGroup, layout, itemsInFrame, frameRects, isOpen }) {
+export function createInteraction({ $, onSelect = () => {}, persist = false, state, view, reducedMotion, isGroup, layout, itemsInFrame, frameRects, isOpen }) {
+  const cleanup = [];
+  let clickTimer;
+  const on = (...args) => cleanup.push(listen(...args));
+
   /// Click, keyboard, tooltip and drag for a drawn item.
   function hookItem(g, n, onSelect, tipFill) {
     g.addEventListener('click', (ev) => {
@@ -179,7 +183,7 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
     applyView();
   }
 
-  stage.addEventListener(
+  on(stage,
     'wheel',
     (ev) => {
       ev.preventDefault();
@@ -211,13 +215,13 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
   }
 
   let pan = null;
-  stage.addEventListener('pointerdown', (ev) => {
+  on(stage, 'pointerdown', (ev) => {
     if (drag || ev.target.closest('.node, .edge .hit, .fhead, button, .crumbs')) return;
     viewTween = null;
     pan = { x: ev.clientX, y: ev.clientY, vx: state.view.x, vy: state.view.y, moved: false };
     stage.setPointerCapture(ev.pointerId);
   });
-  stage.addEventListener('pointermove', (ev) => {
+  on(stage, 'pointermove', (ev) => {
     if (drag) {
       const dx = (ev.clientX - drag.px) / state.view.k;
       const dy = (ev.clientY - drag.py) / state.view.k;
@@ -246,7 +250,7 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
     if (pan.moved) state.userMoved = true;
     applyView();
   });
-  stage.addEventListener('pointerup', () => {
+  on(stage, 'pointerup', () => {
     if (drag) {
       if (drag.moved) {
         // The dragged items stay where they were dropped.
@@ -255,7 +259,8 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
           n.pinned = true;
         }
         suppressClick = true;
-        setTimeout(() => (suppressClick = false), 0);
+        clearTimeout(clickTimer);
+        clickTimer = setTimeout(() => (suppressClick = false), 0);
         state.userMoved = true;
         saveLayout();
       }
@@ -267,15 +272,15 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
     pan = null;
     stage.classList.remove('panning');
   });
-  stage.addEventListener('dblclick', (ev) => {
+  on(stage, 'dblclick', (ev) => {
     if (ev.target.closest('.node, .edge .hit, .fhead, button, .crumbs, .legend')) return;
     resetLayout();
   });
-  $('fit').addEventListener('click', () => {
+  on($('fit'), 'click', () => {
     state.userMoved = false;
     fit();
   });
-  $('reset').addEventListener('click', resetLayout);
+  on($('reset'), 'click', resetLayout);
 
   /// Forgets every dragged place, lays the graph out again, and fits it.
   function resetLayout() {
@@ -286,9 +291,10 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
     fit();
   }
 
-  new ResizeObserver(() => {
+  const resize = new ResizeObserver(() => {
     if (!state.userMoved) fit();
-  }).observe(stage);
+  });
+  resize.observe(stage);
 
   // The viewer's places and open groups, kept per world in this browser.
   // A world is known by its own source files, which stay the same from run
@@ -298,6 +304,7 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
     state.worldKey = `fictionet-layout:${files.join(',') || 'world'}`;
     state.pins.clear();
     state.expanded.clear();
+    if (!persist) return;
     try {
       const saved = JSON.parse(localStorage.getItem(state.worldKey) || 'null');
       if (saved) {
@@ -310,7 +317,7 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
   }
 
   function saveLayout() {
-    if (!state.worldKey) return;
+    if (!persist || !state.worldKey) return;
     try {
       localStorage.setItem(state.worldKey, JSON.stringify({ pins: Object.fromEntries(state.pins), open: Object.fromEntries(state.expanded) }));
     } catch {
@@ -352,6 +359,7 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
 
   function select(sel) {
     state.selected = sel;
+    onSelect(sel);
     for (const n of view.items.values()) {
       const on = !!sel && ((sel.kind === 'node' && sel.id === n.id) || (sel.kind === 'group' && isGroup(n) && sel.id === n.gid));
       n.g?.classList.toggle('selected', on);
@@ -360,11 +368,11 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
     state.sideDirty = true;
   }
 
-  $('search').addEventListener('input', (ev) => {
+  on($('search'), 'input', (ev) => {
     state.search = ev.target.value.trim().toLowerCase();
     applySearch();
   });
-  $('search').addEventListener('keydown', (ev) => {
+  on($('search'), 'keydown', (ev) => {
     if (ev.key === 'Enter') {
       const hit = [...view.items.values()].find((n) => matches(n));
       if (hit) {
@@ -452,6 +460,13 @@ export function createInteraction({ state, view, reducedMotion, isGroup, layout,
   }
 
   return {
+    dispose() {
+      cleanup.splice(0).forEach((remove) => remove());
+      resize.disconnect();
+      clearTimeout(clickTimer);
+      hideTip();
+      drag = pan = viewTween = null;
+    },
     hookItem, toggleGroup, stepTween, fit, startDrag, loadLayout, showTip, moveTip, hideTip, select, applySearch, focusNode, focusGroup,
     // The drag in progress, if any, and whether the click that ends one is being ignored.
     currentDrag: () => drag,

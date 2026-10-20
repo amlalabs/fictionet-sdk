@@ -2,7 +2,7 @@ use std::io;
 use std::net::TcpStream;
 use std::time::Duration;
 
-use fictionet::relay::observer::{Client, Envelope};
+use fictionet_observe::{Client, Envelope};
 
 use super::respond;
 use super::sse::{stream, stream_merged};
@@ -49,7 +49,7 @@ pub(super) fn api(
     op: &str,
     query: &[(String, String)],
 ) -> io::Result<()> {
-    let mut client = match Client::connect(world, "fictionet dashboard") {
+    let mut client = match crate::config::connect_observation(world) {
         Ok(c) => c,
         Err(msg) => {
             let body = format!("{{\"error\":{}}}", quote(&msg));
@@ -84,7 +84,14 @@ pub(super) fn api(
         return stream(client, conn);
     }
     client.set_timeout(Some(Duration::from_secs(30)))?;
-    let value = match client.next_value() {
+    let value = match client.next_value().and_then(|mut value| {
+        if let Some(value) = &mut value
+            && value.binary
+        {
+            complete_download(&mut client, value)?;
+        }
+        Ok(value)
+    }) {
         Ok(Some(value)) => value,
         result => {
             let error = match result {
@@ -167,11 +174,12 @@ pub(super) fn with_link(query: &[(String, String)], link: &str) -> Vec<(String, 
 
 /// One link's capture, or the reason it could not be captured.
 fn capture(client: &mut Client, link: &str) -> io::Result<Result<Vec<u8>, String>> {
-    let value = client.call(&observe_request(
+    let mut value = client.call(&observe_request(
         "pcap",
         &[("link".to_owned(), link.to_owned())],
     ))?;
     if value.binary {
+        complete_download(client, &mut value)?;
         return Ok(Ok(value.bytes));
     }
     let error = match value.envelope() {
@@ -179,6 +187,27 @@ fn capture(client: &mut Client, link: &str) -> io::Result<Result<Vec<u8>, String
         _ => String::from_utf8_lossy(&value.bytes).into_owned(),
     };
     Ok(Err(error))
+}
+
+/// Joins the bounded values of one binary download.
+fn complete_download(client: &mut Client, value: &mut fictionet_observe::Value) -> io::Result<()> {
+    while !value.end {
+        let next = client.next_value()?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the world closed during a reply value",
+            )
+        })?;
+        if next.id != value.id || !next.binary {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid download continuation",
+            ));
+        }
+        value.bytes.extend_from_slice(&next.bytes);
+        value.end = next.end;
+    }
+    Ok(())
 }
 
 /// The captures of several links, one pcapng section after another.

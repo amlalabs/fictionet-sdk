@@ -2,7 +2,7 @@
 //! sandbox, at any address, and drops every other packet.
 //!
 //! ```text
-//! cargo run --example ping_world -- /run/fictionet/world.sock
+//! cargo run --example ping_world -- /run/fictionet/world.sock /run/fictionet/observation.sock
 //! ```
 //!
 //! Each sandbox's interface is split by protocol with
@@ -13,6 +13,15 @@
 //!
 //! It prints `attached <name>` and `detached <name>` lines, which the
 //! Docker test in `tests/docker/ping` reads.
+//!
+//! The optional second argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -21,25 +30,31 @@ use fictionet::stdlib::network::{icmp, ip};
 use fictionet::{Attachment, Cx, Interface, Packet, RecvError, Result};
 
 fn main() -> Result {
-    let path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
         .unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
+    let _observation = if let Some(path) = args.next() {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        options = options.observer(std::sync::Arc::new(fictionet_observe::Aggregate::new(
+            dashboard.observer(),
+        )));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let (_listening, mut attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");
-    fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
-        move |fcx| async move {
-            // `next` returns `Cancelled` when the world stops, and `?` ends
-            // the loop with it.
-            loop {
-                let sandbox = attachments.next(&fcx).await?;
-                fcx.spawn(move |fcx| serve(fcx, sandbox));
-            }
-        },
-    ))
+    fictionet::block_on(fictionet::run(options, move |fcx| async move {
+        // `next` returns `Cancelled` when the world stops, and `?` ends
+        // the loop with it.
+        loop {
+            let sandbox = attachments.next(&fcx).await?;
+            fcx.spawn(move |fcx| serve(fcx, sandbox));
+        }
+    }))
 }
 
 async fn serve(fcx: Cx, sandbox: Attachment) -> Result {

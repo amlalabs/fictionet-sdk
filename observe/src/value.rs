@@ -1,6 +1,10 @@
 use crate::json::Parser;
 
 /// One whole value of a reply: its chunks joined.
+///
+/// A `pcap` download is written as it is read, so it arrives as several
+/// binary values for one request. Every value but the last has `end`
+/// false. Join their bytes in order to get the file.
 #[derive(Debug)]
 pub struct Value {
     /// The request this value answers.

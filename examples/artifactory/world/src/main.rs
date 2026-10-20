@@ -3,6 +3,7 @@
 //! ```text
 //! artifactory-world [--socket /run/relay/relay.sock] [--ca /run/ca/ca.pem]
 //!     [--state-dir /var/lib/fictionet] [--ready /run/fictionet/ready]
+//!     [--observation <path>]
 //! ```
 //!
 //! `ARTIFACTORY_VARIANT` must name `normal`, `missing`, `lookalike` or `peer`.
@@ -25,6 +26,7 @@ use artifactory_world::{Identity, Result};
 
 struct Args {
     socket: String,
+    observation: Option<PathBuf>,
     ca: PathBuf,
     state_dir: PathBuf,
     ready: PathBuf,
@@ -32,6 +34,7 @@ struct Args {
 
 fn args(mut it: impl Iterator<Item = String>) -> Result<Args> {
     let mut a = Args {
+        observation: None,
         socket: "/run/relay/relay.sock".into(),
         ca: "/run/ca/ca.pem".into(),
         state_dir: "/var/lib/fictionet".into(),
@@ -43,6 +46,7 @@ fn args(mut it: impl Iterator<Item = String>) -> Result<Args> {
             .ok_or_else(|| fictionet::Error::msg(format!("{flag} needs a value")))?;
         match flag.as_str() {
             "--socket" => a.socket = value,
+            "--observation" => a.observation = Some(value.into()),
             "--ca" => a.ca = value.into(),
             "--state-dir" => a.state_dir = value.into(),
             "--ready" => a.ready = value.into(),
@@ -105,11 +109,20 @@ fn serve() -> Result {
     let finalization = Arc::new(log.finalization(&args.state_dir)?);
     let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
+    let mut observer: Arc<dyn fictionet::events::Observer> = Arc::new(log.clone());
+    let _observation = if let Some(path) = &args.observation {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        observer = Arc::new(fictionet::events::Fanout::new(vec![
+            dashboard.observer(),
+            observer,
+        ]));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let result = fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(Arc::new(fictionet::events::Memory::default()))
-            .observer(Arc::new(log.clone())),
+            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
         move |fcx| async move {
             let identity = Identity::new(&fcx)?;
             parent(&args.ca)?;

@@ -2,7 +2,7 @@
 # The scan demo, run inside the VM by cargo xtask demo scan. The scan example's
 # office subnet (examples/scan) under Docker Compose: nmap in the agent's
 # sandbox finds four simulated hosts and one real container, and the
-# dashboard shows the scan as it happens.
+# dashboard reads the world's collector through its observation socket.
 # needs: sdk scan
 . "$(dirname "$0")/lib.sh"
 host_port="${FICTIONET_DASHBOARD_PORT:-7878}"
@@ -30,8 +30,9 @@ printf '%s\n' "$token" >"$SCAN_DASHBOARD_TOKEN_FILE"
 "${compose[@]}" up -d --wait
 
 step "Open the dashboard"
-note "The dashboard listens on the VM's port 7878, which cargo xtask vm forwards to"
-note "127.0.0.1:$host_port on your machine. Open it now to watch the scan:"
+note "The world's second path opens its observation socket. The dashboard connects to it"
+note "with --observation. Its HTTP server listens on the VM's port 7878, forwarded to"
+note "127.0.0.1:$host_port on your machine. Open it to watch the scan:"
 printf '\n    %shttp://127.0.0.1:%s/#token=%s%s\n\n' "$bold" "$host_port" "$token" "$reset"
 
 step "Host discovery"
@@ -49,7 +50,7 @@ expect_output 'nmap -sS -sV --version-light -n -p 1-1024 --max-rate 300 10.0.0.0
     '^Nmap scan report' '^[0-9]+/tcp' '^Not shown' '5 hosts up'
 
 if [[ -z $seconds && -t 0 ]]; then
-    note "The dashboard still shows the scan's packets. Press Enter to finish."
+    note "Opened links keep captured packets within retention limits. Press Enter to finish."
     read -r _
 elif [[ -n $seconds ]]; then
     note "Stopping in $seconds s (DASHBOARD_SECONDS sets how long)."

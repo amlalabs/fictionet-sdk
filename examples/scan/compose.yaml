@@ -2,7 +2,7 @@
 # container. See README.md.
 #
 #   world             - the scan example: four simulated hosts and a router.
-#                       No network at all; its only door is the world socket
+#                       No network at all; world and observation sockets
 #                       on the `sock` volume.
 #   container-attach  - fictionet attach --type tun for the real container,
 #                       at 10.0.0.50.
@@ -42,7 +42,7 @@ services:
       <<: *build
       target: fictionet
     image: fictionet-scan:dev
-    command: ["scan-world", "/run/fictionet/sock/world.sock"]
+    command: ["scan-world", "/run/fictionet/sock/world.sock", "/run/fictionet/sock/observation.sock"]
     init: true                      # passes SIGTERM on to the world
     network_mode: none
     volumes:
@@ -90,7 +90,7 @@ services:
   dashboard:
     secrets: [dashboard-token]
     image: fictionet-scan:dev
-    command: [fictionet, dashboard, --world, unix:/run/fictionet/sock/world.sock, --listen, "0.0.0.0:7878", --token-file, /run/secrets/dashboard-token]
+    command: [fictionet, dashboard, --observation, unix:/run/fictionet/sock/observation.sock, --listen, "0.0.0.0:7878", --token-file, /run/secrets/dashboard-token]
     init: true
     ports:
       - "127.0.0.1:${SCAN_DASHBOARD_PORT:-7880}:7878"

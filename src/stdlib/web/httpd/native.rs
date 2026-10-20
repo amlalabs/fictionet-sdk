@@ -132,9 +132,9 @@ impl Http1 {
             tracker.received(received);
             if driver.event_enabled("http", "request")
                 && let Some(head) = &self.head
-                && let Some(request) = to_request(head, version_of(head), Body::empty())
+                && let Some(mut request) = to_request(head, version_of(head), Body::empty())
             {
-                tracker.start(&request, driver.conn(), self.started);
+                tracker.start(&mut request, driver.conn(), self.started);
             }
             if let Some(event) = tracker.finish(
                 || Some(Fields::new().with("answer", received.as_str())),
@@ -191,7 +191,7 @@ impl Http1 {
         }
         let head_only = request.method() == Method::HEAD;
         let mut tracker = self.tracker.take().expect("a parsed request has a tracker");
-        tracker.start(&request, driver.conn(), self.started);
+        tracker.start(&mut request, driver.conn(), self.started);
         let held = held + request_held(&request);
         let now = driver.now();
         let conn = driver.conn().clone();

@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Event, Fields, Level};
-use fictionet::observe::{Dissector, Registry};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{
     ByteFault, Ending, ItemFault, LineError, Lines, RecordKind, Rewrite, Rule, Side, Trigger, Wire,
@@ -52,6 +51,7 @@ use fictionet::stdlib::services::serve::{
 use fictionet::stdlib::web::httpd::{self, Http1, Router};
 use fictionet::stdlib::world::net::{Arrival, Host, Net, PortServer, PreparedShare, Sni};
 use fictionet::{Cx, block_on, lab, pair};
+use fictionet_observe::{Dissector, Registry};
 
 // ---------------------------------------------------------------------------
 // Running a world in a test

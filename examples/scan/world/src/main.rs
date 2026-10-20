@@ -1,26 +1,37 @@
 //! Runs the world on a world socket for `fictionet attach` in the Compose demo.
 //! The first argument is the socket path, defaulting to `/run/fictionet/world.sock`.
-//! Keeps events for the dashboard and prints `attached <name>` for each sandbox.
+//! The optional second argument opens a Unix observation socket for the
+//! dashboard. Prints `attached <name>` for each sandbox.
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
 
 use fictionet::Result;
 
 fn main() -> Result {
-    let path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
         .unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
+    let _observation = if let Some(path) = args.next() {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        options = options.observer(std::sync::Arc::new(fictionet_observe::Aggregate::new(
+            dashboard.observer(),
+        )));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");
-    fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
-        move |fcx| {
-            let attachments = attachments.map(&fcx, |_, sandbox| {
-                println!("attached {}", sandbox.name());
-                sandbox
-            });
-            scan_world::world(fcx, attachments)
-        },
-    ))
+    fictionet::block_on(fictionet::run(options, move |fcx| {
+        let attachments = attachments.map(&fcx, |_, sandbox| {
+            println!("attached {}", sandbox.name());
+            sandbox
+        });
+        scan_world::world(fcx, attachments)
+    }))
 }

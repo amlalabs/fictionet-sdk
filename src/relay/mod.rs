@@ -17,8 +17,3 @@ pub use wire::*;
 
 /// Unix `SOCK_SEQPACKET` sockets: the local transport.
 pub mod unix;
-
-/// A blocking observer: connects to a world socket with an `observe`
-/// hello, sends requests, and reads replies. Used by `fictionet observe`,
-/// `fictionet dashboard`, and tests.
-pub mod observer;

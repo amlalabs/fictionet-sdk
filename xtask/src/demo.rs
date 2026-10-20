@@ -1,3 +1,6 @@
+mod libraries;
+mod microvm;
+
 use crate::process::{Result, run as execute};
 use crate::vm::{self, quote};
 use std::fs;
@@ -8,7 +11,37 @@ use std::time::Instant;
 pub fn run(args: &[String]) -> Result {
     let dir = crate::root().join("demos/guest");
     let demos = demos(&dir)?;
-    let usage = format!("usage: cargo xtask demo <{}>", demos.join("|"));
+    let binaries = binaries(&crate::root().join("demos/src/bin"))?;
+    if args.is_empty() {
+        println!("in-process demos: {}", binaries.join(", "));
+        println!("VM scripts: {}", demos.join(", "));
+        println!(
+            "cargo xtask demo <name>; cargo xtask demo assets downloads everything; cargo xtask demo libraries downloads browser libraries only"
+        );
+        return Ok(());
+    }
+    if args == ["assets"] {
+        return microvm::assets();
+    }
+    if args == ["libraries"] {
+        return libraries::assets();
+    }
+    if let [name] = args
+        && binaries.contains(name)
+    {
+        microvm::assets()?;
+        microvm::build(name)?;
+        return microvm::launch(name);
+    }
+    let usage = format!(
+        "usage: cargo xtask demo [assets|libraries|{}]",
+        binaries
+            .iter()
+            .chain(demos.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|")
+    );
     let [name] = args else {
         return Err(usage.into());
     };
@@ -34,7 +67,8 @@ pub fn run(args: &[String]) -> Result {
             command.arg("-t");
         }
         command.arg("root@127.0.0.1").arg(format!(
-            "FICTIONET_DASHBOARD_PORT={} DASHBOARD_SECONDS={} KIND_NODE_IMAGE={} bash /src/demos/guest/{name}.sh",
+            "FICTIONET_DASHBOARD_PORT={} DASHBOARD_SECONDS={} \
+             KIND_NODE_IMAGE={} bash /src/demos/guest/{name}.sh",
             quote(&vm.read("run/dashboard-port")?),
             quote(&std::env::var("DASHBOARD_SECONDS").unwrap_or_default()),
             quote(vm::KIND_NODE),
@@ -63,6 +97,31 @@ fn demos(dir: &Path) -> Result<Vec<String>> {
             names.push(
                 path.file_stem()
                     .ok_or("a script without a name")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// In-process demos use ordinary binary module directories.
+fn binaries(dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.join("main.rs").is_file() {
+            names.push(
+                path.file_name()
+                    .ok_or("a binary without a name")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            names.push(
+                path.file_stem()
+                    .ok_or("a binary without a name")?
                     .to_string_lossy()
                     .into_owned(),
             );

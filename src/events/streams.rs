@@ -9,6 +9,8 @@ use super::{ConnInfo, Metadata};
 macro_rules! identity {
     ($name:ident, $prefix:literal, $doc:literal) => {
         #[doc = $doc]
+        /// Assigned when the entity registers with a run. Numbers start at 1
+        /// and are never reused within that run.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub(crate) u64);
         impl $name {
@@ -29,7 +31,8 @@ identity!(GroupId, "g", "A group identity within a run.");
 identity!(HostId, "h", "A host identity within a run.");
 identity!(LinkId, "e", "A link identity within a run.");
 
-/// A separately numbered stream.
+/// A separately numbered stream. Each starts at 1 after interest filtering.
+/// Packet interest does not affect event numbering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stream {
     /// Service and network facts.
@@ -72,7 +75,8 @@ pub struct PacketMeta {
     pub link_type: LinkType,
 }
 
-/// Borrowed bytes of a successful link crossing.
+/// Borrowed bytes of an interested successful link crossing.
+/// Core delivers every such crossing without copying, decoding or sampling.
 #[derive(Clone, Copy, Debug)]
 pub struct PacketRef<'a> {
     /// The link crossed.
@@ -96,7 +100,9 @@ pub struct KeyMeta<'a> {
     pub connection: Option<&'a ConnInfo>,
 }
 
-/// A borrowed TLS secret. Debug formatting includes only its length.
+/// A borrowed TLS secret. Debug formatting shows the label, client random,
+/// connection and secret length, but never the secret bytes.
+/// Core does not retain keys.
 #[derive(Clone, Copy)]
 pub struct KeyRef<'a> {
     /// The TLS key log label.
@@ -137,7 +143,7 @@ pub struct Counts {
 
 /// A weak handle to a link's live counters, readable from any thread.
 #[derive(Clone)]
-pub struct LinkCounters(pub(crate) Weak<crate::watch::Meter>);
+pub struct LinkCounters(pub(crate) Weak<crate::link::Meter>);
 
 impl LinkCounters {
     /// Absolute totals for A and B, or zero after the link is gone.
@@ -182,6 +188,8 @@ pub enum TopologyKind {
 }
 
 /// A borrowed change to the run's topology.
+/// Consumers materialize topology. Core keeps identity and producer state.
+/// Link creation lends live absolute counters; removal carries final totals.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum TopologyRef<'a> {
@@ -275,7 +283,7 @@ pub enum TopologyRef<'a> {
     LinkLabel {
         /// Link identity.
         link: LinkId,
-        /// New label.
+        /// Label text.
         label: &'a str,
     },
     /// A link has been removed.
@@ -334,7 +342,9 @@ pub enum LossReason {
     Overflow,
 }
 
-/// Explicit loss within one stream.
+/// Explicit loss within one stream, reported by a producer or consumer.
+/// Missing sequence numbers alone do not imply loss: filters can leave gaps.
+/// Loss before numbering can have no sequence range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loss {
     /// Affected stream.
@@ -352,15 +362,17 @@ pub struct Loss {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{Fanout, Memory, Observation, Observer, Stamp};
+    use crate::events::{Fanout, Observation, Observer, Stamp};
     use crate::sync::Mutex;
     use crate::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
+    use fictionet::events::recorder::Recorder;
     use std::sync::Arc;
     use std::time::Duration;
 
     #[derive(Default)]
     struct Topology {
         items: Mutex<Vec<(Stamp, String)>>,
+        threads: Mutex<Vec<std::thread::ThreadId>>,
         counters: Mutex<Option<LinkCounters>>,
         removed: Mutex<Vec<[Counts; 2]>>,
     }
@@ -381,13 +393,14 @@ mod tests {
                 self.removed.lock().push(*totals);
             }
             self.items.lock().push((stamp, format!("{topology:?}")));
+            self.threads.lock().push(std::thread::current().id());
         }
     }
 
     fn topology_run() -> Vec<(Stamp, String)> {
         let first = Arc::new(Topology::default());
         let second = Arc::new(Topology::default());
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         let observer = Arc::new(Fanout::new(vec![
             first.clone(),
             memory.clone(),
@@ -438,7 +451,7 @@ mod tests {
                 bytes: 12
             }; 2]]
         );
-        assert_eq!(memory.checked_all().unwrap().len(), 1);
+        assert_eq!(memory.all().len(), 1);
         let items = first.items.lock().clone();
         for (index, (stamp, _)) in items.iter().enumerate() {
             assert_eq!(stamp.stream, Stream::Topology);
@@ -461,6 +474,7 @@ mod tests {
             )
         );
         assert!(text.contains("LinkAdded { link: LinkId(1), creator: Some(TaskId(1))"));
+        assert!(text.contains("LinkLabel { link: LinkId(1), label: \"uplink\" }"));
         assert!(text.contains("LinkOwner { link: LinkId(1), side: A, task: TaskId(1) }"));
         assert!(text.contains("LinkOwner { link: LinkId(1), side: B, task: TaskId(2) }"));
         assert!(text.find("HostRemoved").unwrap() < text.find("GroupRemoved").unwrap());
@@ -470,6 +484,146 @@ mod tests {
     #[test]
     fn topology_lifecycles_and_stamps_repeat() {
         assert_eq!(topology_run(), topology_run());
+    }
+
+    #[test]
+    fn spawned_tasks_are_announced_before_their_parent_ends() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        for complete in [true, false] {
+            let topology = Arc::new(Topology::default());
+            let reader = topology.clone();
+            let mut world = Box::pin(lab(
+                RunOptions::new(Seed::from_u64(7)).observer(topology.clone()),
+                move |cx| async move {
+                    cx.spawn(|_| async { Ok(()) });
+                    cx.group("children").spawn(|_| async { Ok(()) });
+                    assert_eq!(reader.items.lock().len(), 1);
+                    Ok(())
+                },
+            ));
+            assert!(
+                world
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            {
+                let items = topology.items.lock();
+                let root_removed = items
+                    .iter()
+                    .position(|(_, item)| item == "TaskRemoved { task: TaskId(1) }")
+                    .unwrap();
+                for (id, group) in [(2, "group: None"), (3, "group: Some(GroupId(1))")] {
+                    let child_added = items
+                        .iter()
+                        .position(|(_, item)| {
+                            item.starts_with(&format!(
+                                "TaskAdded {{ task: TaskId({id}), parent: Some(TaskId(1)),"
+                            )) && item.contains(group)
+                        })
+                        .unwrap();
+                    assert!(child_added < root_removed);
+                }
+            }
+            if complete {
+                block_on(world).unwrap();
+            } else {
+                drop(world);
+            }
+            let items = topology.items.lock();
+            for id in 1..=3 {
+                assert_eq!(
+                    items
+                        .iter()
+                        .filter(|(_, item)| item
+                            .starts_with(&format!("TaskAdded {{ task: TaskId({id}),")))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    items
+                        .iter()
+                        .filter(|(_, item)| item == &format!("TaskRemoved {{ task: TaskId({id}) }}"))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_spawns_are_announced_on_the_polling_thread() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        for complete in [true, false] {
+            let topology = Arc::new(Topology::default());
+            let polling_thread = std::thread::current().id();
+            let mut world = Box::pin(lab(
+                RunOptions::new(Seed::from_u64(7)).observer(topology.clone()),
+                move |cx| async move {
+                    assert_eq!(std::thread::current().id(), polling_thread);
+                    let foreign = cx.clone();
+                    std::thread::spawn(move || {
+                        assert_ne!(std::thread::current().id(), polling_thread);
+                        foreign.spawn(move |cx| async move {
+                            assert_eq!(std::thread::current().id(), polling_thread);
+                            let (mut a, mut b) = crate::pair();
+                            a.link().unwrap().label(&cx, "foreign".into());
+                            b.send(Packet(vec![1]));
+                            a.recv(&cx).await?;
+                            Ok(())
+                        });
+                    })
+                    .join()
+                    .unwrap();
+                    Ok(())
+                },
+            ));
+            assert!(
+                world
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            if complete {
+                block_on(world).unwrap();
+            } else {
+                drop(world);
+            }
+            let items = topology.items.lock();
+            let mentions = items
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, item))| item.contains("TaskId(2)"))
+                .collect::<Vec<_>>();
+            let (added, (_, first)) = mentions[0];
+            assert!(first.starts_with("TaskAdded { task: TaskId(2), parent: None,"));
+            assert_eq!(topology.threads.lock()[added], polling_thread);
+            assert_eq!(
+                mentions
+                    .iter()
+                    .filter(|(_, (_, item))| item.starts_with("TaskAdded"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                mentions
+                    .iter()
+                    .filter(|(_, (_, item))| item.starts_with("TaskRemoved"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                mentions
+                    .iter()
+                    .filter(|(_, (_, item))| item.starts_with("LinkOwner"))
+                    .count(),
+                usize::from(complete)
+            );
+        }
     }
 
     #[test]
@@ -495,6 +649,16 @@ mod tests {
             "HostAdded { host: HostId(1), name: \"guest\", group: None, sandbox: Some(\"guest\")"
         ));
         assert!(items[2].1.starts_with("LinkAdded { link: LinkId(1), creator: None, sandbox: Some(\"guest\"), host: Some(HostId(1))"));
+        assert!(
+            items
+                .iter()
+                .any(|(_, item)| item == "LinkLabel { link: LinkId(1), label: \"guest uplink\" }")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|(_, item)| item == "LinkOwner { link: LinkId(1), side: A, task: TaskId(1) }")
+        );
         assert_eq!(
             *topology.removed.lock(),
             [[
@@ -520,22 +684,5 @@ mod tests {
         assert!(!debug.contains("private secret"));
         assert!(!debug.contains("112, 114, 105"));
         assert!(debug.contains("secret_len: 14"));
-    }
-
-    #[test]
-    fn only_event_losses_affect_memory() {
-        let memory = Memory::default();
-        let mut loss = Loss {
-            stream: Stream::Keys,
-            reason: LossReason::Staging,
-            count: 3,
-            bytes: None,
-            seqs: None,
-        };
-        memory.lost(loss.clone());
-        assert!(memory.checked_all().is_ok());
-        loss.stream = Stream::Events;
-        memory.lost(loss);
-        assert_eq!(memory.checked_of("shop", "order").unwrap_err().dropped, 3);
     }
 }
