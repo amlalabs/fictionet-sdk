@@ -275,6 +275,7 @@ test('a stuck hot leg B shows its gap from the true value and is diverged', () =
   assert.equal(hotB.reported, 325.0);
   assert.ok(Math.abs(hotB.gap - -5.4) < 1e-9, `gap ${hotB.gap}`);
   assert.equal(hotB.diverged, true);
+  assert.equal(hotB.marked, true, 'a faulted gap is marked for the viewer');
   assert.equal(hotB.fault, 'stuck');
   assert.equal(hotB.frozen, false, 'a stuck instrument still samples');
 
@@ -317,6 +318,23 @@ test('a quiet sensor freezes only its own pair', () => {
   assert.equal(pair(result, 'cold_leg:b').frozen, false);
   assert.equal(isFrozen(snap, 'cold_leg:a'), true);
   assert.equal(isFrozen(snap, 'cold_leg:b'), false);
+});
+
+test('a temperature that trails a fast change diverges but is not marked', () => {
+  // No fault: the hot leg reading trails the true value during a fast rise.
+  const snap = snapshot({
+    edit: (t) => {
+      t.primary.loops[0].hot_leg_c = 329.0;
+    },
+    readings: { 'hot_leg:a': { value: 327.3 } },
+  });
+  const hotA = pair(instruments(snap), 'hot_leg:a');
+
+  assert.ok(Math.abs(hotA.gap - -1.7) < 1e-9, `gap ${hotA.gap}`);
+  assert.equal(hotA.diverged, true);
+  assert.equal(hotA.marked, false, 'lag alone is not a fault');
+  assert.equal(hotA.fault, null);
+  assert.equal(hotA.frozen, false);
 });
 
 test('a small negative gap prints without a minus sign', () => {

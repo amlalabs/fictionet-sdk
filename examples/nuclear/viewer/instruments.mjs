@@ -191,9 +191,10 @@ export function formatGap(gap, unit) {
  *
  * `pairs` has one entry per displayed point, in POINTS order. Each pair holds
  * the true value, the reported value (null when no instrument feeds the point),
- * the gap, the diverged and frozen flags, and the fault kind. `equipment` holds
- * the true values the 3D scene moves things with, and `alarms` lists every
- * lit alarm with its state.
+ * the gap, the diverged, frozen and marked flags, and the fault kind. `marked`
+ * is a diverged pair whose gap comes from a fault or a freeze. The other
+ * sections hold the true values the 3D scene moves things with, and the alarms
+ * with their states.
  */
 export function instruments(snapshot) {
   const quiet = snapshot.telemetry.quiet === true;
@@ -203,6 +204,8 @@ export function instruments(snapshot) {
     const reported = channel ? channel.reading.value : null;
     const gap = reported === null ? null : reported - trueValue;
     const fault = channel ? faultKind(channel.fault) : null;
+    const diverged = gap !== null && Math.abs(gap) > DIVERGENCE[p.unit];
+    const frozen = quiet || fault === 'quiet';
     return {
       key: p.key,
       label: p.label,
@@ -211,9 +214,12 @@ export function instruments(snapshot) {
       trueValue,
       reported,
       gap,
-      diverged: gap !== null && Math.abs(gap) > DIVERGENCE[p.unit],
-      frozen: quiet || fault === 'quiet',
+      diverged,
+      frozen,
       fault,
+      // A gap from an instrument fault or a freeze is marked for the viewer.
+      // A gap with no fault is lag: temperature readings trail fast changes.
+      marked: diverged && (fault !== null || frozen),
       sampledAtMs: channel ? channel.reading.sampled_at_ms : null,
     };
   });

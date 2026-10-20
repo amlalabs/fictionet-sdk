@@ -800,16 +800,16 @@ export function createPlantScene(container) {
       place(reportedNeedles, idx, { x: s.reportedX, y: s.y, z: RACK_Z + 0.2, rz: needleAngle(f.reported) });
       place(trueNeedles, idx, { x: s.trueX, y: s.y, z: RACK_Z + 0.2, rz: needleAngle(f.true) });
       const frozen = pair ? pair.frozen : false;
-      const diverged = pair ? pair.diverged : false;
+      const marked = pair ? pair.marked : false;
       const on = (flag) => (flag ? 1 : 0);
       place(frozenRings, idx, { x: s.reportedX, y: s.y, z: RACK_Z + 0.18, sx: on(frozen), sy: on(frozen) });
-      place(divergedRings, idx, { x: s.reportedX, y: s.y, z: RACK_Z + 0.18, sx: on(diverged), sy: on(diverged) });
+      place(divergedRings, idx, { x: s.reportedX, y: s.y, z: RACK_Z + 0.18, sx: on(marked), sy: on(marked) });
       place(divergedLinks, idx, {
         x: (s.reportedX + s.trueX) / 2,
         y: s.y,
         z: RACK_Z + 0.16,
-        sx: diverged ? s.trueX - s.reportedX : 0,
-        sy: on(diverged),
+        sx: marked ? s.trueX - s.reportedX : 0,
+        sy: on(marked),
       });
     });
     for (const m of [reportedNeedles, trueNeedles, frozenRings, divergedRings, divergedLinks]) {
@@ -898,7 +898,7 @@ export function createReadingsPanel(container) {
   status.textContent = 'Waiting for the first plant snapshot.';
   const legend = document.createElement('p');
   legend.textContent =
-    'Reported is what the instruments show. True is the plant itself. The gap is reported minus true. A point is diverged when its gap is larger than the limit for its unit.';
+    'Reported is what the instruments show. True is the plant itself. The gap is reported minus true. Diverged means a gap above the limit for its unit, with a fault. Lagging means the same gap with no fault: temperature readings trail fast changes by about three seconds.';
 
   const table = document.createElement('table');
   const headRow = table.createTHead().insertRow();
@@ -987,7 +987,11 @@ function textItem(text) {
 function stateOf(p) {
   if (p.frozen && p.diverged) return { text: 'Frozen, diverged', className: 'state-frozen' };
   if (p.frozen) return { text: 'Frozen', className: 'state-frozen' };
-  if (p.diverged) return { text: 'Diverged', className: 'state-diverged' };
-  if (p.fault) return { text: `Fault: ${p.fault}`, className: '' };
+  if (p.fault) {
+    return p.diverged
+      ? { text: 'Diverged', className: 'state-diverged' }
+      : { text: `Fault: ${p.fault}, agrees`, className: '' };
+  }
+  if (p.diverged) return { text: 'Lagging', className: '' };
   return { text: 'Agrees', className: '' };
 }
