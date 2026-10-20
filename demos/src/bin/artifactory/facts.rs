@@ -3,7 +3,7 @@
 //! task serializes the page's topics: the inventory for Packages, request rows
 //! for Requests, and door facts with the story for Doors tried.
 
-use super::story::{Mode, Who};
+use super::story::{Mode, Step, Who};
 use artifactory_world::{
     facts::{Classification, Door, MAX_DOOR_JSON_BYTES, MAX_REQUEST_JSON_BYTES, Request},
     inventory::{FolderAdded, Inventory, MAX_INVENTORY_JSON_BYTES},
@@ -350,6 +350,52 @@ impl Facts {
         Arc::new(contents.on_change(move |at, change, inventory| {
             facts.inventory_changed(store, at, change, inventory);
         }))
+    }
+    /// Waits up to `timeout` until `done` holds for the facts, and returns
+    /// whether it did. Incomplete facts end the wait with an error.
+    pub async fn wait_until(
+        &self,
+        timeout: Duration,
+        mut done: impl FnMut(&Snapshot) -> bool,
+    ) -> std::io::Result<bool> {
+        let wait = async {
+            loop {
+                let changed = self.changed.notified();
+                {
+                    let state = self.state.lock().unwrap();
+                    state.check_complete()?;
+                    if done(&state) {
+                        return Ok(true);
+                    }
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .unwrap_or(Ok(false))
+    }
+    /// Waits up to 5 s for every check of `step` to hold. A timeout names
+    /// the checks that do not.
+    pub async fn wait_for(&self, step: &Step) -> std::io::Result<()> {
+        let holds = |view: &View| step.checks.iter().all(|c| c.matches(view, step.name));
+        if self
+            .wait_until(Duration::from_secs(5), |state| holds(&state.view()))
+            .await?
+        {
+            return Ok(());
+        }
+        let state = self.state.lock().unwrap();
+        let view = state.view();
+        let missing = step
+            .checks
+            .iter()
+            .filter(|c| !c.matches(&view, step.name))
+            .collect::<Vec<_>>();
+        Err(std::io::Error::other(format!(
+            "{}: missing facts {missing:?}",
+            step.name
+        )))
     }
     pub fn name(&self, who: Who) -> &str {
         &self.names[who as usize]
@@ -737,6 +783,36 @@ pub(super) mod tests {
             super::super::page::scenario(variant, false, None),
             NAMES,
         )
+    }
+
+    #[tokio::test]
+    async fn waits_end_when_facts_hold_time_out_or_are_lost() {
+        let facts = Arc::new(facts(Variant::Normal));
+        let short = Duration::from_millis(50);
+        assert!(!facts.wait_until(short, |_| false).await.unwrap());
+        let waiting = facts.clone();
+        let wait = tokio::spawn(async move {
+            waiting
+                .wait_until(Duration::from_secs(5), |state| state.step == "now")
+                .await
+        });
+        tokio::task::yield_now().await;
+        facts.phase("now", &[], Who::Maya);
+        facts.changed.notify_one();
+        assert!(wait.await.unwrap().unwrap());
+        let steps = super::super::story::steps(Variant::Normal, None);
+        let step = steps.iter().find(|s| !s.checks.is_empty()).unwrap();
+        let error = facts.wait_for(step).await.unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("{}: missing facts", step.name)),
+            "{error}"
+        );
+        facts.state.lock().unwrap().lost = 1;
+        let error = facts.wait_until(short, |_| true).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "facts incomplete: 0 rows dropped, 1 events lost"
+        );
     }
 
     fn base(method: &str) -> Event {

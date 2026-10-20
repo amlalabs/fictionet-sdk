@@ -1193,6 +1193,17 @@ async fn second_owner_bypasses_and_restart_removes_crash_debris() {
         assert_eq!(second.state.stats.bypassed.lock().unwrap()["disabled"], 1);
         drop(second);
         drop(owner);
+        // The owner's download task keeps the cache locked until it has
+        // committed the file, which can be after the body was read.
+        let lock = std::fs::File::open(dir.path().join(".lock")).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lock.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        lock.unlock().unwrap();
         let debris = dir.path().join(".download-interrupted");
         std::fs::write(&debris, b"partial").unwrap();
         let restarted = Cache::new(source.clone(), dir.path().to_owned());

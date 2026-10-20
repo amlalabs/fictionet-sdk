@@ -76,8 +76,6 @@ async fn run(downloads: &Path) -> Result<(), Error> {
     let shots = downloads.join("shots");
     std::fs::create_dir_all(&shots)?;
     let run = kit.boot(downloads).await?;
-    let pids: Vec<_> = run.guests().iter().filter_map(|g| g.vm().pid()).collect();
-    let dir = run.path().to_owned();
     for guest in run.guests() {
         println!(
             "{} boot to SSH-ready: {} ms",
@@ -111,6 +109,7 @@ async fn run(downloads: &Path) -> Result<(), Error> {
             .await?;
         let boot = run.boot_started().elapsed();
         let story = story::run(&run, &ports, &shots, &progress).await?;
+        run.containment().await?;
         tokio::time::timeout(Duration::from_secs(45), page_checks(run.page_url())).await??;
         run.screenshots(
             guests::WORKSTATION,
@@ -127,21 +126,9 @@ async fn run(downloads: &Path) -> Result<(), Error> {
             eprint!("{}", guest.diagnostics().await);
         }
     }
-    let stop = run.shutdown().await;
-    let clean = !dir.exists()
-        && pids
-            .iter()
-            .all(|pid| !Path::new(&format!("/proc/{pid}")).exists());
-    if let Err(error) = stop {
-        return Err(format!("shutdown failed: {error}; checks result: {result:?}").into());
+    if let Err(error) = run.shutdown().await {
+        return Err(format!("{error}; checks result: {result:?}").into());
     }
-    if !clean {
-        return Err(format!(
-            "shutdown left a VM process or run directory; checks result: {result:?}"
-        )
-        .into());
-    }
-    println!("[pass] both VMs stopped; no VM processes or run directory remain");
     let (boot, story) = result?;
     println!("boot time: {} ms", boot.as_millis());
     println!("story time: {} ms", story.as_millis());

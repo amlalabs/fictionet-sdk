@@ -613,35 +613,7 @@ pub async fn run(
                     step.name, step.exit
                 )));
             }
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let changed = facts.changed.notified();
-                    {
-                        let state = facts.state.lock().unwrap();
-                        state.check_complete()?;
-                        let view = state.view();
-                        if step
-                            .checks
-                            .iter()
-                            .all(|check| check.matches(&view, step.name))
-                        {
-                            return Ok::<(), std::io::Error>(());
-                        }
-                    }
-                    changed.await;
-                }
-            })
-            .await
-            .map_err(|_| {
-                let state = facts.state.lock().unwrap();
-                let view = state.view();
-                let missing = step
-                    .checks
-                    .iter()
-                    .filter(|c| !c.matches(&view, step.name))
-                    .collect::<Vec<_>>();
-                std::io::Error::other(format!("{}: missing facts {missing:?}", step.name))
-            })??;
+            facts.wait_for(&step).await?;
             facts.finish(Some(code), true);
             publisher.flush().await?;
             tokio::time::sleep(fictionet_demo::kit::checks::STEP_PAUSE).await;

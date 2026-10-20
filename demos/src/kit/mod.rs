@@ -538,9 +538,17 @@ impl Run {
     pub fn path(&self) -> &Path {
         self.dir.as_ref().expect("running").path()
     }
-    /// Powers guests off, reaps every VMM, cancels the world, and removes files.
+    /// Powers guests off, reaps every VMM, cancels the world, and removes
+    /// files. Fails unless every guest powered off, no Cloud Hypervisor
+    /// process is left, and the run directory is gone.
     pub async fn shutdown(mut self) -> io::Result<()> {
         self.stop_status();
+        let pids: Vec<u32> = self
+            .guests
+            .iter()
+            .filter_map(|guest| guest.vm.as_ref()?.pid())
+            .collect();
+        let mut failures = Vec::new();
         let mut stops = JoinSet::new();
         for guest in &mut self.guests {
             let ssh = guest.ssh.take();
@@ -560,10 +568,9 @@ impl Run {
                 });
             }
         }
-        let mut failure = None;
         while let Some(result) = stops.join_next().await {
             if let Err(error) = result.map_err(io::Error::other).and_then(|r| r) {
-                failure = Some(error);
+                failures.push(error.to_string());
             }
         }
         self.jump.take();
@@ -585,15 +592,30 @@ impl Run {
             world.abort();
             let _ = world.await;
         }
-        if let Some(dir) = self.dir.take()
-            && let Err(error) = std::fs::remove_dir_all(dir.path())
-        {
-            failure = Some(error);
+        if let Some(dir) = self.dir.take() {
+            if let Err(error) = std::fs::remove_dir_all(dir.path()) {
+                failures.push(format!("removing the run directory: {error}"));
+            }
+            if dir.path().exists() {
+                failures.push(format!("{} remains", dir.path().display()));
+            }
+        }
+        for pid in pids {
+            if Path::new(&format!("/proc/{pid}")).exists() {
+                failures.push(format!("Cloud Hypervisor process {pid} remains"));
+            }
         }
         if let Some(page) = self.page.take() {
             page.shutdown(Duration::from_secs(2)).await;
         }
-        failure.map_or(Ok(()), Err)
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "shutdown: {}",
+                failures.join("; ")
+            )))
+        }
     }
 }
 

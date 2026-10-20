@@ -5,8 +5,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use fictionet_observe::page::{Containment, ProbeOutcome};
+
 use super::client::{Capability, PageClient};
-use super::{GuestHandle, Run, rfb, shot};
+use super::{GuestHandle, Run, containment, rfb, shot};
 
 /// How long the screen capture through the page may take.
 const SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -164,6 +166,55 @@ impl Run {
             ),
         }
         Ok((capture, settled))
+    }
+
+    /// Waits up to 90 s until the page shows every guest's containment
+    /// probes, prints them, and checks that none was forwarded or answered
+    /// from outside the world.
+    pub async fn containment(&self) -> io::Result<()> {
+        let client = PageClient::from_url(self.page_url())?;
+        client.bootstrap().await?;
+        let guests: Vec<&str> = self
+            .guests
+            .iter()
+            .map(|guest| guest.guest.attachment.as_str())
+            .collect();
+        let complete = |value: &serde_json::Value| {
+            let rows = value["value"]["probes"].as_array();
+            guests.iter().all(|guest| {
+                rows.into_iter()
+                    .flatten()
+                    .filter(|r| r["guest"] == *guest)
+                    .count()
+                    == containment::PROBES.len()
+            })
+        };
+        client
+            .wait_for(
+                "/api/state/containment",
+                Duration::from_secs(90),
+                Duration::from_millis(250),
+                "the page did not show every guest's containment probes",
+                |value| Ok(complete(value)),
+            )
+            .await?;
+        let probes: Containment = client.state("containment").await?;
+        for probe in &probes.probes {
+            println!(
+                "containment: {}: {}: {:?}; world: {}",
+                probe.guest, probe.name, probe.outcome, probe.world_answer
+            );
+        }
+        check(
+            "no containment probe was forwarded or answered from outside the world",
+            !probes.probes.is_empty()
+                && probes.probes.iter().all(|probe| {
+                    !matches!(
+                        probe.outcome,
+                        ProbeOutcome::Forwarded | ProbeOutcome::NotContained
+                    )
+                }),
+        )
     }
 
     /// Saves the page from Chromium to `out` once the JavaScript expression

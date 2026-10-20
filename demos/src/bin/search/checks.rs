@@ -10,7 +10,6 @@ use fictionet_demo::kit::{
     client::{Capability, PageClient},
     ssh::quote,
 };
-use fictionet_observe::page::{Containment, ProbeOutcome};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -34,18 +33,11 @@ async fn wait(
             "/api/state/search",
             Duration::from_secs(45),
             Duration::from_millis(100),
+            &format!("the page did not show: {label}"),
             |value| Ok(snapshot(value)?.is_some_and(|s| predicate(&s))),
         )
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                println!("[FAIL] {label}: timed out");
-                format!("timed out waiting for {label}").into()
-            } else {
-                Box::<dyn std::error::Error + Send + Sync>::from(error)
-            }
-        })?;
-    check(label, true)?;
+        .await?;
+    println!("[pass] {label}");
     Ok(snapshot(&value)?.expect("the accepted state has a value"))
 }
 
@@ -211,6 +203,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
             0,
             Duration::from_secs(45),
             Duration::from_millis(100),
+            "Firefox did not load the Google home page",
             |e| {
                 Ok(e["source"] == "http"
                     && e["kind"] == "request"
@@ -221,13 +214,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
                     && e["fields"]["headers"].to_string().contains("Firefox/"))
             },
         )
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::TimedOut => {
-                std::io::Error::other("Firefox did not load the Google home page")
-            }
-            _ => error,
-        })?;
+        .await?;
     println!(
         "boot to desktop with Google loaded: {} ms",
         run.boot_started().elapsed().as_millis()
@@ -407,24 +394,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         "map has nodes",
         graph["nodes"].as_array().is_some_and(|v| !v.is_empty()),
     )?;
-    let probes = client.get_json("/api/state/containment").await?;
-    let probes: Containment = serde_json::from_value(probes["value"].clone())?;
-    check("containment probes have data", !probes.probes.is_empty())?;
-    for probe in &probes.probes {
-        println!(
-            "containment: {}: {:?}; world: {}",
-            probe.name, probe.outcome, probe.world_answer
-        );
-    }
-    check(
-        "containment probes are neither forwarded nor unaccounted",
-        probes.probes.iter().all(|p| {
-            !matches!(
-                p.outcome,
-                ProbeOutcome::Forwarded | ProbeOutcome::NotContained
-            )
-        }),
-    )?;
+    run.containment().await?;
     run.screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
         .await?;
     Ok(())

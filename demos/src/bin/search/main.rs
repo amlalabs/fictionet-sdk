@@ -77,8 +77,6 @@ async fn main() -> Result {
                 .start(&cx, world.into_attachments())
         });
     let run = kit.boot(downloads).await?;
-    let path = run.path().to_path_buf();
-    let pid = run.guest(guest::HOST).vm().pid();
     println!(
         "boot to SSH-ready: {} ms",
         run.guest(guest::HOST).ssh_ready().as_millis()
@@ -99,17 +97,9 @@ async fn main() -> Result {
     }
     let shutdown = run.shutdown().await;
     let finish = log.finish();
-    let clean = kit::checks::check(
-        "shutdown removes the VMM and run directory",
-        shutdown.is_ok()
-            && !path.exists()
-            && pid.is_none_or(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
-    );
     println!("whole run: {} ms", total.elapsed().as_millis());
     finish?;
-    let result = result
-        .and(clean.map_err(Into::into))
-        .and(shutdown.map_err(Into::into));
+    let result = result.and(shutdown.map_err(Into::into));
     checks::finish(result, &output.join("log.jsonl"), &visited)?;
     println!("every required check passed");
     Ok(())

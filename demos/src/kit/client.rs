@@ -157,14 +157,33 @@ impl PageClient {
             .await
     }
 
+    /// Reads the state topic `name` as a browser does and returns its value.
+    /// A status but 200, a publication over the topic's bound or a topic with
+    /// nothing published yet is an error.
+    pub async fn state<T: serde::de::DeserializeOwned>(&self, name: &str) -> io::Result<T> {
+        let path = format!("/api/state/{name}");
+        let reply = self.request("GET", &path, None, true).await?;
+        require(&reply, 200).map_err(|error| io::Error::other(format!("GET {path}: {error}")))?;
+        let snapshot: fictionet_observe::page::Snapshot<T> = serde_json::from_slice(&reply.body)?;
+        if snapshot.status.too_large {
+            return Err(io::Error::other(format!(
+                "{path}: a publication exceeded the topic's bound"
+            )));
+        }
+        snapshot
+            .value
+            .ok_or_else(|| io::Error::other(format!("{path}: nothing is published yet")))
+    }
+
     /// Reads GET `path` every `interval` until `done` accepts its JSON, and
     /// returns that JSON. `done` can end the wait with its own error. A wait
-    /// longer than `timeout` is a `TimedOut` error.
+    /// longer than `timeout` is a `TimedOut` error that says `missing`.
     pub async fn wait_for(
         &self,
         path: &str,
         timeout: Duration,
         interval: Duration,
+        missing: &str,
         mut done: impl FnMut(&Value) -> io::Result<bool>,
     ) -> io::Result<Value> {
         let wait = async {
@@ -178,12 +197,9 @@ impl PageClient {
                 }
             }
         };
-        tokio::time::timeout(timeout, wait).await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("GET {path} did not reach the expected state within {timeout:?}"),
-            )
-        })?
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| timed_out(missing, timeout))?
     }
 
     /// The sequence number of the run's newest event.
@@ -224,12 +240,14 @@ impl PageClient {
     /// Reads the events after sequence number `after` every `interval` until
     /// `matches` accepts one, and returns that event. Each read starts after
     /// the last event already read. `matches` can end the wait with its own
-    /// error. A wait longer than `timeout` is a `TimedOut` error.
+    /// error. A wait longer than `timeout` is a `TimedOut` error that says
+    /// `missing`.
     pub async fn wait_for_event(
         &self,
         after: u64,
         timeout: Duration,
         interval: Duration,
+        missing: &str,
         mut matches: impl FnMut(&Value) -> io::Result<bool>,
     ) -> io::Result<Value> {
         let wait = async {
@@ -243,12 +261,9 @@ impl PageClient {
                 }
             }
         };
-        tokio::time::timeout(timeout, wait).await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("no matching event arrived within {timeout:?}"),
-            )
-        })?
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| timed_out(missing, timeout))?
     }
 
     /// Opens the page's state stream for `topics`, as a browser tab does.
@@ -425,6 +440,13 @@ impl PageClient {
         stream.write_all(&wire).await?;
         Ok(stream)
     }
+}
+/// A wait that ended at its deadline: what was missing, and for how long.
+fn timed_out(missing: &str, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{missing} within {timeout:?}"),
+    )
 }
 fn status_line(head: &http1::ResponseHead) -> String {
     format!(

@@ -326,6 +326,7 @@ pub async fn observed(client: &PageClient, hijacked: bool) -> io::Result<()> {
             "/api/state/border",
             Duration::from_secs(10),
             Duration::from_millis(100),
+            "Border observations did not contain the complete traffic story",
             |snapshot| {
                 if exposes_password(snapshot) {
                     return Err(io::Error::other("Border state exposed the password"));
@@ -336,13 +337,7 @@ pub async fn observed(client: &PageClient, hijacked: bool) -> io::Result<()> {
                 Ok(observed_complete(&snapshot["value"], hijacked))
             },
         )
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => {
-                io::Error::other("Border observations did not contain the complete traffic story")
-            }
-            _ => error,
-        })?;
+        .await?;
     Ok(())
 }
 
@@ -428,15 +423,10 @@ async fn password_received(client: &PageClient, cursor: u64) -> io::Result<()> {
             cursor,
             Duration::from_secs(10),
             Duration::from_millis(100),
+            "page events did not show a password-bearing impostor request",
             |event| Ok(password_hidden(event)? && has_password_event(event)),
         )
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => {
-                io::Error::other("page events did not show a password-bearing impostor request")
-            }
-            _ => error,
-        })?;
+        .await?;
     // Every event the page now holds, not only those read up to the match,
     // must still leave the password out.
     client

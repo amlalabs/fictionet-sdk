@@ -645,6 +645,25 @@ async fn page_wires_containment_and_labels() {
             containment::PROBES.len()
         );
     }
+    fixture.run.containment().await.unwrap();
+    for outcome in [
+        fictionet_observe::page::ProbeOutcome::Forwarded,
+        fictionet_observe::page::ProbeOutcome::NotContained,
+    ] {
+        let mut all = fixture.run.probes.lock().unwrap().clone();
+        all.probes[3].outcome = outcome;
+        fixture
+            .run
+            .containment
+            .publish(fictionet::time::Instant::ZERO, &all)
+            .unwrap();
+        let error = fixture.run.containment().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "required check failed: no containment probe was forwarded or answered from \
+             outside the world"
+        );
+    }
     fixture.run.shutdown().await.unwrap();
 }
 
@@ -1084,26 +1103,39 @@ async fn page_client_reads_state_posts_commands_and_waits() {
             "/api/state/labels",
             Duration::from_secs(5),
             Duration::from_millis(10),
+            "the label did not arrive",
             |state| Ok(state["value"][0]["text"] == "Boot"),
         )
         .await
         .unwrap();
     assert_eq!(labels["value"].as_array().unwrap().len(), 1);
+    let state: serde_json::Value = client.state("labels").await.unwrap();
+    assert_eq!(state, labels["value"]);
+    let missing = client.state::<serde_json::Value>("missing").await;
+    assert!(
+        missing
+            .unwrap_err()
+            .to_string()
+            .starts_with("GET /api/state/missing: HTTP/1.1 404")
+    );
     let never = client
         .wait_for(
             "/api/state/labels",
             Duration::from_millis(50),
             Duration::from_millis(10),
+            "the labels never change",
             |_| Ok(false),
         )
         .await
         .unwrap_err();
     assert_eq!(never.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(never.to_string(), "the labels never change within 50ms");
     let stopped = client
         .wait_for(
             "/api/state/labels",
             Duration::from_secs(5),
             Duration::from_millis(10),
+            "the labels did not arrive",
             |_| Err(io::Error::other("the predicate stops the wait")),
         )
         .await
@@ -1114,6 +1146,7 @@ async fn page_client_reads_state_posts_commands_and_waits() {
             0,
             Duration::from_secs(5),
             Duration::from_millis(10),
+            "no label event arrived",
             |event| Ok(event["source"] == "page" && event["kind"] == "label"),
         )
         .await
@@ -1124,6 +1157,7 @@ async fn page_client_reads_state_posts_commands_and_waits() {
             seq,
             Duration::from_millis(50),
             Duration::from_millis(10),
+            "no later label event arrived",
             |event| Ok(event["source"] == "page" && event["kind"] == "label"),
         )
         .await

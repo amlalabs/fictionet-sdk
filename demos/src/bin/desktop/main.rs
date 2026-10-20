@@ -125,28 +125,15 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
     if result.is_err() {
         eprint!("{}", workstation.diagnostics().await);
     }
-    let run_dir = run.path().to_path_buf();
     let stop = run.shutdown().await;
 
     println!("\n=== shutdown ===");
-    let mut failures = Vec::new();
     if let Err(error) = &stop {
-        println!("shutdown: {error}");
+        println!("{error}");
     }
-    failures.extend(
-        check(
-            "the guest powered off over ACPI and Cloud Hypervisor exited",
-            stop.is_ok(),
-        )
-        .err(),
-    );
-    let ch_gone = ch_pid.is_none_or(|pid| !Path::new(&format!("/proc/{pid}")).exists());
-    failures.extend(
-        check(
-            "nothing is left behind: no Cloud Hypervisor process, no run directory",
-            ch_gone && !run_dir.exists(),
-        )
-        .err(),
+    let shutdown = check(
+        "the guest powered off over ACPI, and no Cloud Hypervisor process or run directory is left",
+        stop.is_ok(),
     );
 
     let (ssh_ready_ms, checks) = result?;
@@ -160,9 +147,7 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
     for shot in &checks.screenshots {
         println!("screenshot:         {shot}");
     }
-    if !failures.is_empty() {
-        return Err(format!("the shutdown checks failed: {}", joined(&failures)).into());
-    }
+    shutdown?;
     println!("\nevery required check passed");
     Ok(())
 }
@@ -517,6 +502,7 @@ async fn run_checks(
         .trim()
         .to_string();
 
+    failures.extend(run.containment().await.err());
     let peak_rss_mib = vm.peak_rss_mib().unwrap_or(0);
     if !failures.is_empty() {
         return Err(format!("the required checks failed: {}", joined(&failures)).into());

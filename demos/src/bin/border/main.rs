@@ -96,6 +96,7 @@ async fn main() -> Result<(), Error> {
             .await?;
         println!("Boot to desktop-ready: {:.2} s", ready.as_secs_f64());
         story::run(&run, &out).await?;
+        run.containment().await?;
         println!(
             "Story completed in {:.2} s",
             started.elapsed().as_secs_f64()
@@ -110,15 +111,11 @@ async fn main() -> Result<(), Error> {
     if result.is_err() {
         eprint!("{}", run.guest(guest::HOSTNAME).diagnostics().await);
     }
-    let run_path = run.path().to_owned();
     let shutdown = run.shutdown().await;
     let finished = log.finish();
     result?;
     shutdown?;
     finished?;
-    if run_path.exists() {
-        return Err("the temporary run directory remains after shutdown".into());
-    }
     println!("Output: {}", out.display());
     println!(
         "Shutdown complete; whole run: {:.2} s",

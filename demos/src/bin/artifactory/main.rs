@@ -206,11 +206,6 @@ async fn execute() -> Result {
             eprint!("{}", run.guest(guest::COLLEAGUE).diagnostics().await);
         }
     }
-    let run_dir = run.path().to_path_buf();
-    let mut pids = vec![run.guest(HOSTNAME).vm().pid()];
-    if two {
-        pids.push(run.guest(guest::COLLEAGUE).vm().pid());
-    }
     let shutdown = run.shutdown().await;
     let published = publisher
         .flush()
@@ -225,15 +220,6 @@ async fn execute() -> Result {
     shutdown?;
     published?;
     finished?;
-    if run_dir.exists()
-        || pids
-            .iter()
-            .flatten()
-            .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
-    {
-        return Err("shutdown left a VM process or run directory".into());
-    }
-    println!("shutdown: no VM process or run directory remains");
     println!(
         "totals: boot {} ms; story {} ms; whole run {} ms",
         boot.as_millis(),
@@ -255,35 +241,27 @@ async fn checks(
 ) -> Result<Duration> {
     let guest = run.guest(HOSTNAME);
     let colleague = sessions.map(|_| run.guest(guest::COLLEAGUE));
-    let mut names = vec![HOSTNAME];
     for handle in std::iter::once(guest).chain(colleague) {
         handle.wait_cloud_init(Duration::from_secs(300)).await?;
         println!("cloud-init done: {}", handle.name());
     }
-    if colleague.is_some() {
-        names.push(guest::COLLEAGUE);
-    }
     closed.store(true, Ordering::SeqCst);
     println!("mirror closed");
     guest.wait_desktop(Duration::from_secs(300)).await?;
-    wait_setup(run.page_url(), &names).await?;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let changed = facts.changed.notified();
-            if facts.state.lock().unwrap().requests.iter().any(|r| {
-                r.step == "setup"
-                    && r.row.host.as_deref() == Some(artifactory_world::REPOSITORY_NAME)
-                    && r.row.path == "/simple/"
-                    && r.row.outcome.status == Some(200)
-                    && r.row.outcome.complete
-            }) {
-                break;
-            }
-            changed.await;
-        }
-    })
-    .await
-    .map_err(|_| "Firefox did not load the internal package index")?;
+    // The probes' traffic is setup traffic, so it ends before the story.
+    run.containment().await?;
+    let index = facts.wait_until(Duration::from_secs(30), |state| {
+        state.requests.iter().any(|r| {
+            r.step == "setup"
+                && r.row.host.as_deref() == Some(artifactory_world::REPOSITORY_NAME)
+                && r.row.path == "/simple/"
+                && r.row.outcome.status == Some(200)
+                && r.row.outcome.complete
+        })
+    });
+    if !index.await? {
+        return Err("Firefox did not load the internal package index".into());
+    }
     guest::open_terminal(guest).await?;
     let story_time = story::run(guest, colleague, facts, publisher, variant, sessions).await?;
     println!("{}", page::check(run.page_url(), variant, sessions).await?);
@@ -294,28 +272,6 @@ async fn checks(
     )
     .await?;
     Ok(story_time)
-}
-
-/// Waits until the containment probes of every named guest are on the page.
-async fn wait_setup(url: &str, names: &[&str]) -> io::Result<()> {
-    let client = kit::client::PageClient::from_url(url)?;
-    client.bootstrap().await?;
-    client
-        .wait_for(
-            "/api/state/containment",
-            Duration::from_secs(90),
-            Duration::from_millis(250),
-            |value| {
-                Ok(value["value"]["probes"].as_array().is_some_and(|rows| {
-                    names.iter().all(|name| {
-                        rows.iter().filter(|r| r["guest"] == *name).count()
-                            == kit::containment::PROBES.len()
-                    })
-                }))
-            },
-        )
-        .await?;
-    Ok(())
 }
 
 fn tail(path: &Path) -> io::Result<()> {

@@ -71,13 +71,10 @@ async fn event(
             0,
             Duration::from_secs(60),
             Duration::from_millis(100),
+            missing,
             |event| Ok(matches(event)),
         )
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => io::Error::other(missing),
-            _ => error,
-        })?;
+        .await?;
     Ok(())
 }
 
@@ -205,9 +202,13 @@ async fn second_read(
     let mut retried = false;
     reload(guest, window).await?;
     let mut wait = client
-        .wait_for_event(after, Duration::from_secs(15), POLL, |event| {
-            observed.observe(std::slice::from_ref(event))
-        })
+        .wait_for_event(
+            after,
+            Duration::from_secs(15),
+            POLL,
+            "no tampered article read arrived",
+            |event| observed.observe(std::slice::from_ref(event)),
+        )
         .await;
     if wait
         .as_ref()
@@ -225,6 +226,7 @@ async fn second_read(
                 observed.last.max(after),
                 Duration::from_secs(45),
                 POLL,
+                "no tampered article read arrived",
                 |event| observed.observe(std::slice::from_ref(event)),
             )
             .await;
@@ -362,10 +364,10 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
     )?;
     println!("[pass] second read: tampered, revision 1; diff agrees");
 
+    run.containment().await?;
     for (path, pointer) in [
         ("/api/event-table/reads-scripted-reader", "/rows"),
         ("/api/egress", "/destinations"),
-        ("/api/state/containment", "/value/probes"),
         ("/api/graph", "/nodes"),
     ] {
         let value = client.get_json(path).await?;
@@ -377,7 +379,7 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
                 .is_some_and(|a| !a.is_empty()),
         )?;
     }
-    println!("[pass] panels: Reads, Left the box, containment and map have data");
+    println!("[pass] panels: Reads, Left the box and map have data");
     std::fs::create_dir_all(output)?;
     let screen = output.join("desktop.png");
     let (capture, _) = run.settled_screen(HOST, &screen).await?;

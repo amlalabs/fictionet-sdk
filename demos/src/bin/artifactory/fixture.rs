@@ -186,28 +186,7 @@ async fn run(
                             .await?
                     }
                 }
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let changed = facts.changed.notified();
-                        {
-                            let state = facts.state.lock().unwrap();
-                            state.check_complete()?;
-                            let view = state.view();
-                            if step
-                                .checks
-                                .iter()
-                                .all(|check| check.matches(&view, step.name))
-                            {
-                                return Ok::<(), fictionet::Error>(());
-                            }
-                        }
-                        changed.await;
-                    }
-                })
-                .await
-                .map_err(|_| {
-                    fictionet::Error::msg(format!("{}: fixture facts did not arrive", step.name))
-                })??;
+                facts.wait_for(&step).await?;
                 Ok::<(), fictionet::Error>(())
             }
             .await;
