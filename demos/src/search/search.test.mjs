@@ -41,6 +41,16 @@ function harness(t) {
   return { root, subscriptions, pending, selected, moments, timers, pairs, publish, dispose, click };
 }
 
+test('generation controls have no hard-coded maker label in model mode', (t) => {
+  const h = harness(t), s = fixture();
+  s.generator.kind = 'openrouter';
+  h.publish(s);
+  const controls = h.root.querySelector('.search-generator');
+  assert.equal(controls.querySelector('.eyebrow'), null);
+  assert.doesNotMatch(controls.textContent, /stub generator|no model/);
+  h.dispose();
+});
+
 test('stream renders every outcome, failure, host, cache and timing', (t) => {
   const h = harness(t), s = fixture();
   s.queries = [query(1, 'pending'), query(2), query(3, 'served', { results: 0, cache: 'missing' }), query(4, 'undelivered'), ...['budget', 'abandoned', 'error'].map((why, i) => query(i + 5, 'failed', { outcome: { status: 'failed', why, error: why === 'budget' || why === 'abandoned' ? null : `detail ${why}` } }))];

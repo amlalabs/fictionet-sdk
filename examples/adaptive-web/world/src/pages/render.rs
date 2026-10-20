@@ -1,10 +1,104 @@
-//! HTML layouts shared by the offline search engines and pages.
+//! HTML layouts shared by the search engines and pages.
 
 use super::{
     make::{Page, Profile, Search},
     text::{escape as e, normalize_space, quote, quote_plus, split_url, unescape},
 };
 use crate::route::Engine;
+
+pub(super) const SEARCH_CSS: &str = r#"
+* { box-sizing: border-box; }
+body { margin: 0; background: #fff; color: #202124; font: 14px/1.55 Arial, sans-serif; }
+a { color: #1a0dab; text-decoration: none; }
+a:hover { text-decoration: underline; }
+input, button, select { font: inherit; }
+input[type=text], input[type=search] { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #202124; font-size: 16px; padding: 12px 20px; }
+form[role=search], #sb_form, #search_form { display: flex; width: min(692px, calc(100vw - 220px)); min-height: 48px; border: 1px solid #dfe1e5; border-radius: 28px; box-shadow: 0 2px 6px #20212414; background: white; }
+form:focus-within { outline: 2px solid #8ab4f8; outline-offset: 2px; }
+input[type=submit], button { border: 0; background: transparent; padding: 0 20px; color: #1a73e8; cursor: pointer; }
+h2 { font-size: 22px; font-weight: 400; }
+footer { padding: 20px 36px; background: #f2f2f2; color: #70757a; }
+footer a { color: inherit; }
+.google header { padding: 28px 36px 0; border-bottom: 1px solid #ebebeb; display: grid; grid-template-columns: 114px 1fr; gap: 0 28px; align-items: center; }
+#logo { font-size: 30px; letter-spacing: -2px; font-weight: 600; text-decoration: none; }
+#logo span:nth-child(1), #logo span:nth-child(4) { color: #4285f4; }
+#logo span:nth-child(2), #logo span:nth-child(6) { color: #ea4335; }
+#logo span:nth-child(3) { color: #fbbc05; }
+#logo span:nth-child(5) { color: #34a853; }
+#gb { float: right; padding: 14px 28px; display: flex; gap: 20px; align-items: center; }
+#gb a { color: #3c4043; font-size: 13px; }
+#gb a:last-child { background: #0b57d0; color: #fff; border-radius: 24px; padding: 8px 22px; }
+#hdtb { grid-column: 2; display: flex; gap: 28px; padding-top: 16px; align-items: center; color: #5f6368; }
+#hdtb a, #hdtb span { color: inherit; padding: 12px 0; }
+#hdtb a:first-child { color: #1a73e8; border-bottom: 3px solid #1a73e8; }
+#result-stats { margin: 16px 0 22px 178px; color: #70757a; }
+#res, #bres, #foot { margin-left: 178px; max-width: 652px; }
+.g, .uEierd { margin: 0 0 30px; }
+.yuRUbf a { display: flex; flex-direction: column; align-items: flex-start; }
+.yuRUbf br { display: none; }
+.yuRUbf cite { order: -1; color: #202124; font-style: normal; font-size: 14px; margin-bottom: 4px; }
+.g h3, .uEierd [role=heading] { font-size: 20px; font-weight: 400; line-height: 1.3; margin: 0 0 5px; }
+.VwiC3b, .MUxGbd { color: #4d5156; line-height: 1.58; }
+.LEwnzc { color: #70757a; }
+.U3A9Ac { display: block; font-weight: 600; margin-bottom: 8px; }
+.related-question-pair { margin: 34px 0; }
+.wQiwMc { padding: 12px 0; border-top: 1px solid #dadce0; }
+.wQiwMc a { color: #202124; font-size: 16px; }
+#bres a { display: inline-block; padding: 8px 0; }
+#foot { padding: 24px 0; }
+.google footer { padding-left: 178px; margin-top: 24px; }
+.bing { font-family: "Segoe UI", Arial, sans-serif; color: #444; }
+#b_header { padding: 26px 36px 0; border-bottom: 1px solid #ececec; display: grid; grid-template-columns: 140px 1fr; gap: 0 24px; align-items: center; }
+.bing-brand { color: #444; font-size: 17px; letter-spacing: -.5px; white-space: nowrap; }
+.bing-brand b { color: #008c9d; font-size: 26px; vertical-align: middle; margin-right: 7px; }
+#sb_form { border-radius: 24px; }
+#b_header nav { grid-column: 2; }
+#b_header ul { display: flex; gap: 32px; padding: 0; margin: 16px 0 0; list-style: none; }
+#b_header li { padding: 12px 0; }
+#b_header li:first-child { border-bottom: 3px solid #00809d; }
+#b_header nav a { color: #666; }
+.bing main { margin: 18px 36px 50px 200px; max-width: 1120px; }
+.sb_count { color: #767676; font-size: 13px; }
+#b_results { list-style: none; padding: 0; margin: 20px 0; max-width: 648px; }
+#b_results li { margin-bottom: 30px; }
+#b_results h2 { font-size: 20px; line-height: 1.3; margin: 0 0 5px; }
+#b_results a { color: #001ba0; }
+.b_caption cite { font-style: normal; color: #006d21; }
+.b_caption p, .b_ad p { margin: 4px 0; }
+.news_dt { color: #767676; }
+#b_context { border-top: 1px solid #eee; max-width: 648px; }
+#b_context ul { list-style: none; padding: 0; columns: 2; }
+#b_context li { margin: 10px 0; }
+.body--html { color: #333; }
+.body--html .header { background: #fafafa; border-bottom: 1px solid #ddd; padding: 24px 32px 18px; display: flex; gap: 28px; align-items: flex-start; }
+.ddg-brand { display: flex; align-items: center; gap: 8px; color: #333; font-size: 18px; padding-top: 5px; white-space: nowrap; }
+.ddg-brand b { display: inline-grid; place-items: center; border-radius: 50%; background: #de5833; color: #fff; width: 38px; height: 38px; font: bold 27px Georgia, serif; }
+#search_form { border-radius: 5px; position: relative; margin-bottom: 42px; box-shadow: 0 2px 3px #0000000d; }
+#search_form .search__button { background: #f3f3f3; border-left: 1px solid #ddd; color: #555; border-radius: 0 5px 5px 0; }
+.frm__select { position: absolute; top: 62px; left: 0; border: 0; color: #666; background: transparent; }
+.serp__results { margin: 28px 0 40px 232px; max-width: 650px; }
+.result { margin-bottom: 30px; }
+.result__title { font-size: 20px; line-height: 1.3; margin: 0 0 5px; }
+.result__a { color: #1a0dab; }
+.result__extras { margin: 4px 0; }
+.result__url { color: #20692b; font-size: 14px; }
+.result__icon { display: none; }
+.result__timestamp { color: #777; padding-left: 12px; }
+.result__snippet { display: block; color: #333; line-height: 1.6; }
+.badge--ad { color: #777; font-size: 12px; }
+.nav-link .btn { background: #f5f5f5; color: #333; border: 1px solid #ccc; border-radius: 4px; padding: 10px 32px; }
+.feedback-btn { padding: 20px 32px; border-top: 1px solid #eee; }
+.feedback-btn a { color: #666; }
+@media (max-width: 900px) {
+  #gb { float: none; justify-content: flex-end; }
+  .google header, #b_header { padding: 18px 20px 0; grid-template-columns: 120px 1fr; gap: 0 16px; }
+  form[role=search], #sb_form, #search_form { width: 100%; }
+  #res, #bres, #foot, #result-stats, .serp__results, .bing main { margin-left: 24px; margin-right: 24px; }
+  .google footer { padding-left: 24px; }
+  #hdtb, #b_header nav { grid-column: 1 / -1; overflow-x: auto; gap: 24px; }
+  .body--html .header { flex-wrap: wrap; padding: 20px 24px; gap: 12px; }
+}
+"#;
 
 /// Formats a URL as a host and up to three decoded path segments.
 pub fn display_url(url: &str) -> String {
@@ -67,9 +161,9 @@ pub fn google(query: &str, record: &Search, start: u64) -> String {
     let seconds = 31 + query.chars().count() % 60;
     let mut out = vec![format!(
         r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{q} - Google Search</title><style>body{{font-family:arial,sans-serif;margin:0}}#res{{margin-left:150px;max-width:652px}}.g{{margin:0 0 30px}}h3{{font-size:20px;font-weight:normal;margin:0}}cite{{color:#202124;font-style:normal;font-size:14px}}.VwiC3b{{color:#4d5156;font-size:14px}}.LEwnzc{{color:#70757a}}</style></head>
-<body><div id="gb"><a href="https://mail.google.com/mail/">Gmail</a> <a href="https://www.google.com/imghp">Images</a> <a href="https://accounts.google.com/ServiceLogin">Sign in</a></div>
-<header><a href="/" id="logo">Google</a><form action="/search" method="GET" role="search"><input name="q" value="{q}" aria-label="Search" type="text"><input type="submit" value="Search"></form>
+<title>{q} - Google Search</title><link rel="stylesheet" href="/search.css"></head>
+<body class="google"><div id="gb"><a href="https://mail.google.com/mail/">Gmail</a> <a href="https://www.google.com/imghp">Images</a> <a href="https://accounts.google.com/ServiceLogin">Sign in</a></div>
+<header><a href="/" id="logo" aria-label="Google"><span>G</span><span>o</span><span>o</span><span>g</span><span>l</span><span>e</span></a><form action="/search" method="GET" role="search"><input name="q" value="{q}" aria-label="Search" type="text"><input type="submit" value="Search"></form>
 <div id="hdtb"><a href="/search?q={qp}">All</a> <a href="/search?q={qp}&amp;tbm=nws">News</a> <a href="/search?q={qp}&amp;tbm=isch">Images</a> <a href="/search?q={qp}&amp;tbm=vid">Videos</a> <a href="https://maps.google.com/maps?q={qp}">Maps</a> <span>More</span> <span>Tools</span></div></header>
 <div id="main"><div id="result-stats">About {count} results <nobr>(0.{seconds} seconds)</nobr></div><div id="res"><div id="search">"#
     )];
@@ -159,8 +253,8 @@ pub fn duckduckgo(query: &str, record: &Search) -> String {
     let mut out = vec![format!(
         r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="content-type" content="text/html; charset=UTF-8" /><meta name="referrer" content="origin" />
-<title>{q} at DuckDuckGo</title><link rel="stylesheet" href="/dist/h.css" type="text/css" /></head>
-<body class="body--html"><div class="header"><form id="search_form" name="x" action="/html/" method="post"><input type="text" name="q" class="search__input" value="{q}" /><input type="submit" class="search__button" value="S" /><select class="frm__select" name="kl"><option value="">All Regions</option><option value="uk-en">United Kingdom</option><option value="us-en">US (English)</option></select></form></div>
+<meta name="viewport" content="width=device-width, initial-scale=1" /><title>{q} at DuckDuckGo</title><link rel="stylesheet" href="/search.css" type="text/css" /></head>
+<body class="body--html"><div class="header"><a class="ddg-brand" href="/"><b>D</b>DuckDuckGo</a><form id="search_form" name="x" action="/html/" method="post" role="search"><input type="text" name="q" class="search__input" value="{q}" aria-label="Search" /><input type="submit" class="search__button" value="Search" /><select class="frm__select" name="kl" aria-label="Region"><option value="">All Regions</option><option value="uk-en">United Kingdom</option><option value="us-en">US (English)</option></select></form></div>
 <div class="serp__results"><div id="links" class="results">"#
     )];
     for ad in record.ads.iter().take(1) {
@@ -224,8 +318,8 @@ pub fn bing(query: &str, record: &Search) -> String {
     let qp = quote_plus(query);
     let count = result_count(query);
     let mut out = vec![format!(
-        r#"<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><title>{q} - Search</title></head>
-<body><header id="b_header"><form action="/search" id="sb_form"><input id="sb_form_q" name="q" type="search" value="{q}"></form>
+        r#"<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{q} - Search</title><link rel="stylesheet" href="/search.css"></head>
+<body class="bing"><header id="b_header"><a class="bing-brand" href="/"><b>◇</b>Microsoft Bing</a><form action="/search" id="sb_form" role="search"><input id="sb_form_q" name="q" type="search" value="{q}" aria-label="Search"><button type="submit">Search</button></form>
 <nav><ul><li><a href="/search?q={qp}">All</a></li><li><a href="/images/search?q={qp}">Images</a></li><li><a href="/videos/search?q={qp}">Videos</a></li><li><a href="/news/search?q={qp}">News</a></li><li><a href="/maps?q={qp}">Maps</a></li></ul></nav></header>
 <main><span class="sb_count">About {count} results</span><ol id="b_results">"#
     )];
@@ -451,6 +545,7 @@ pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str
         nav: vec!["Home|/".into()],
         footer: vec![],
         style: 2,
+        css: String::new(),
     };
     let record = Page {
         title: "Page not found".into(),

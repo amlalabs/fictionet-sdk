@@ -118,6 +118,9 @@ pub struct Profile {
     pub nav: Vec<String>,
     /// Footer links in `label|target` form.
     pub footer: Vec<String>,
+    /// Stylesheet shared by every page on the host.
+    #[serde(default)]
+    pub css: String,
     /// Creation-order index used to choose layouts and server headers.
     pub style: usize,
 }
@@ -155,7 +158,7 @@ pub fn words(s: &str) -> Vec<String> {
         .map(|w| w.as_str().into())
         .collect()
 }
-fn shares_words(a: &str, b: &str) -> bool {
+pub(super) fn shares_words(a: &str, b: &str) -> bool {
     let a = words(a);
     words(b).iter().any(|w| a.contains(w))
 }
@@ -312,7 +315,32 @@ pub fn site_profile(host: &str) -> Profile {
         .collect::<Vec<_>>()
         .join(" ");
     let name = if name.is_empty() { host.into() } else { name };
+    let hash = host
+        .bytes()
+        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize));
+    let kind = if host.contains("wiki") {
+        "wiki"
+    } else if host.starts_with("docs.") || host.contains("github") {
+        "docs"
+    } else if host.contains("forum")
+        || host.contains("community")
+        || host.contains("reddit")
+        || host.contains("stackoverflow")
+    {
+        "forum"
+    } else if host.starts_with("shop.") || host.starts_with("store.") {
+        "shop"
+    } else if host.contains("systems") || host.ends_with(".gov") {
+        "company"
+    } else if host.contains("blog") || host.contains("medium") {
+        "blog"
+    } else if host.starts_with("news.") || host.contains("bbc") || host.contains("register") {
+        "news"
+    } else {
+        ["news", "docs", "forum", "shop", "company", "wiki", "blog"][hash % 7]
+    };
     Profile {
+        css: stylesheet(kind),
         tagline: format!("News and guides from {name}"),
         name,
         kind: "news".into(),
@@ -336,6 +364,63 @@ pub fn site_profile(host: &str) -> Profile {
         .map(str::to_owned)
         .to_vec(),
     }
+}
+/// A small family of layouts for the offline sites.
+fn stylesheet(kind: &str) -> String {
+    let base = r#"
+* { box-sizing: border-box; }
+body { margin: 0; color: #263345; background: #f5f6f8; font: 16px/1.65 Arial, sans-serif; }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+header { background: #fff; border-top: 5px solid var(--accent); border-bottom: 1px solid #d9dee5; padding: 24px max(24px, calc((100% - 1160px)/2)); }
+.brand a, .logo, .home { font-size: 30px; font-weight: 800; letter-spacing: -1px; }
+.tagline { display: block; font-size: 13px; color: #647085; }
+nav ul, .footer-links, .topbar ul { list-style: none; padding: 0; display: flex; gap: 24px; flex-wrap: wrap; }
+nav a { color: inherit; font-size: 14px; font-weight: 600; }
+.layout, .columns { max-width: 1160px; margin: 36px auto; display: grid; gap: 40px; grid-template-columns: minmax(0, 1fr) 260px; padding: 0 24px; }
+main { min-width: 0; background: #fff; padding: 32px; }
+body > main { max-width: 1000px; margin: 32px auto; }
+h1 { font-size: clamp(28px, 3vw, 42px); line-height: 1.18; letter-spacing: -.7px; margin: 0 0 24px; }
+h2 { font-size: 23px; margin-top: 32px; } h3 { font-size: 18px; }
+p { margin: 16px 0; } .byline, .aside, .breadcrumb { color: #647085; font-size: 14px; }
+.breadcrumb, .topbar { max-width: 1160px; margin: auto; padding: 12px 24px; font-size: 13px; }
+.rail { border-top: 3px solid var(--accent); } .rail li { padding: 10px 0; border-bottom: 1px solid #d9dee5; }
+.rail ol { padding-left: 22px; } .ad-slot, .newsletter, .promo-banner, .sponsor { background: #eaf0f4; padding: 22px; margin: 24px 0; }
+.ad-label { font-size: 10px; text-transform: uppercase; letter-spacing: 2px; color: #647085; }
+input, button { font: inherit; border: 1px solid #bdc6d1; border-radius: 4px; padding: 8px 12px; max-width: 100%; }
+button, .btn { background: var(--accent); color: white; padding: 9px 16px; border: 0; }
+footer { border-top: 1px solid #d9dee5; padding: 28px max(24px, calc((100% - 1112px)/2)); color: #647085; font-size: 13px; }
+.related { max-width: 1000px; margin: 24px auto; padding: 24px; } table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { border-bottom: 1px solid #d9dee5; text-align: left; padding: 10px 12px; } th { background: #edf1f5; }
+pre { overflow-x: auto; padding: 20px; background: #edf1f5; } code { font-family: monospace; } blockquote { border-left: 3px solid var(--accent); margin-left: 0; padding-left: 20px; }
+.docs header { display: flex; align-items: center; gap: 32px; } .search { margin-left: auto; }
+.columns { grid-template-columns: 220px minmax(0, 1fr); } .sidebar ul { display: block; } .sidebar li { margin: 12px 0; }
+.skip-link { position: absolute; left: -9999px; } .skip-link:focus { left: 16px; background: white; padding: 8px; }
+@media(max-width: 760px) { .layout, .columns { grid-template-columns: minmax(0, 1fr); margin: 20px auto; gap: 20px; } header, .docs header { padding: 20px; flex-wrap: wrap; } main { padding: 24px; } nav ul { gap: 14px; } .search { margin-left: 0; } }
+"#;
+    let theme = match kind {
+        "docs" => {
+            ":root {--accent:#3156ad} header {background:#17263f;color:#fff} .home, .brand a {color:#fff} .tagline {color:#becbe2} main {border:1px solid #d9dee5;border-radius:6px} h1 {font-size:34px}"
+        }
+        "forum" => {
+            ":root {--accent:#a74320} body {background:#f2ede8} header {border-top:0} main {border:1px solid #d8cec5;border-radius:8px} main p {padding:14px;background:#faf8f5;border-radius:5px} h1 {font-size:30px}"
+        }
+        "shop" => {
+            ":root {--accent:#265f4a} header {text-align:center;background:#eff5ed} header nav ul {justify-content:center} h1 {font-weight:500} main {border-radius:12px} .promo-banner {text-align:center;background:#dfeadd}"
+        }
+        "company" => {
+            ":root {--accent:#164d88} header {background:#102e4d;color:white} header a {color:white} .tagline {color:#b9cede} h1 {color:#153c63} main {border-top:4px solid var(--accent)} .topbar {text-align:right}"
+        }
+        "wiki" => {
+            ":root {--accent:#365c99} body {background:white;font-family:Georgia,serif} header {border-top:0} h1 {font-weight:400;border-bottom:1px solid #aeb5be;padding-bottom:14px} nav, header, footer {font-family:Arial,sans-serif} main {padding-top:0}"
+        }
+        "blog" => {
+            ":root {--accent:#805235} body {background:#f5f1e9} .masthead {background:#f5f1e9;border-top:0} .brand a {font-family:Georgia,serif;font-style:italic;font-size:38px} article {font-family:Georgia,serif;font-size:18px} main {background:transparent;padding-top:0} .rail {border-top:1px solid #cbbca9}"
+        }
+        _ => {
+            ":root {--accent:#ab242b} .brand a {font-family:Georgia,serif;font-size:40px;color:#20242a} .masthead nav {border-top:1px solid #d9dee5;margin-top:20px} h1 {font-family:Georgia,serif} .layout {border-top:1px solid #d9dee5;padding-top:28px}"
+        }
+    };
+    format!("{base}\n{theme}")
 }
 /// Derives a page title from its path or site name.
 pub fn title_from(host: &str, target: &str) -> String {
@@ -379,7 +464,12 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
         .concat()
         .join(" ");
     let facts = facts_for(seed, &text);
-    let claims = [snippets.clone(), facts.clone()].concat();
+    let mut claims = Vec::new();
+    for claim in snippets.iter().chain(&facts) {
+        if !claims.contains(claim) {
+            claims.push(claim.clone());
+        }
+    }
     let mut page = Page {
         status: 200,
         title: title.clone(),
@@ -414,9 +504,8 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
     }
     let n = host_pages;
     let date = day(seed, 1 + n);
-    let mut paras: Vec<_> = snippets
+    let mut paras: Vec<_> = claims
         .iter()
-        .chain(&facts)
         .map(|s| format!("<p>{}</p>", escape(s)))
         .collect();
     if paras.is_empty() {
@@ -485,6 +574,67 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unrelated_search_omits_seed_and_known_pages() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        let known = super::super::store::Store::memory().known(&seed);
+        let found = search(&seed, "chicken tikka masala recipe", &known);
+        assert_eq!(found.results.len(), 10);
+        for result in &found.results {
+            assert!(!seed.fixed.iter().any(|f| f.url == result.url));
+            let (host, _) = target_of(&result.url);
+            assert!(seed.about(&host).is_none());
+        }
+        assert!(
+            search(&seed, "Halvard Gateway", &known)
+                .results
+                .iter()
+                .any(|r| r.url == seed.fixed[0].url)
+        );
+    }
+
+    #[test]
+    fn host_names_choose_seven_distinct_styles() {
+        let hosts = [
+            "news.daily.com",
+            "docs.tools.com",
+            "forum.tools.com",
+            "shop.tools.com",
+            "www.toolsystems.com",
+            "en.wikipedia.org",
+            "blog.tools.com",
+        ];
+        let styles: std::collections::BTreeSet<_> = hosts
+            .iter()
+            .map(|host| {
+                let profile = site_profile(host);
+                assert_eq!(profile, site_profile(host));
+                assert!(profile.css.contains("@media"));
+                assert!(profile.css.contains("list-style: none"));
+                profile.css
+            })
+            .collect();
+        assert_eq!(styles.len(), 7);
+    }
+
+    #[test]
+    fn page_claims_are_unique_and_keep_their_order() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        let mentions = vec![
+            serde_json::json!({"title": seed.search, "snippet": seed.facts[0]}),
+            serde_json::json!({"snippet": seed.facts[0]}),
+            serde_json::json!({"snippet": "Additional context."}),
+        ];
+        for target in ["/article", "/article.json", "/article.txt"] {
+            let page = page(&seed, "www.halvardsystems.com", target, &mentions, 0);
+            let unique: std::collections::BTreeSet<_> = page.claims.iter().collect();
+            assert_eq!(page.claims.len(), unique.len());
+            assert_eq!(page.claims[0], seed.facts[0]);
+            assert_eq!(page.claims[1], "Additional context.");
+            assert_eq!(page.body.matches(&seed.facts[0]).count(), 1);
+        }
+    }
+
     #[test]
     fn results_and_pages() {
         let seed = Seed::builtin("halvard-cve").unwrap();

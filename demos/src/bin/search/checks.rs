@@ -242,6 +242,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     let words = seed.search.as_str();
     visited.extend(["www.google.com", "www.bing.com", "html.duckduckgo.com"].map(String::from));
     let (snapshot, google) = search(run, &client, Engine::Google, words, 0, 10).await?;
+    run.settled_screen(HOST, &output.join("google.png")).await?;
     let list = snapshot
         .results
         .iter()
@@ -258,6 +259,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         p.url == first.url && matches!(&p.reason, Reason::Search { query, rank } if query == words && *rank == first.rank)
         && p.made == Made::Stubbed)).await?;
     let (snapshot, bing) = search(run, &client, Engine::Bing, words, google.id, 10).await?;
+    run.settled_screen(HOST, &output.join("bing.png")).await?;
     check(
         "Bing shares Google's first result list",
         bing.key == google.key
@@ -269,6 +271,8 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     let different = format!("{words} details");
     let (snapshot, duck) =
         search(run, &client, Engine::DuckDuckGo, &different, bing.id, 10).await?;
+    run.settled_screen(HOST, &output.join("duckduckgo.png"))
+        .await?;
     check(
         "DuckDuckGo has its own result list",
         duck.key != google.key
