@@ -162,6 +162,9 @@ debug = 1
 [profile.release.package.fakewiki-world]
 debug = 1
 
+[profile.release.package.nuclear-world]
+debug = 1
+
 [[example]]
 name = "bottleneck_sites"
 required-features = ["std"]
