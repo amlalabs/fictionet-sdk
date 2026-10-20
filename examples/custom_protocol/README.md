@@ -1,11 +1,16 @@
 # A custom Modbus gateway
 
-The gateway accepts a nonzero Modbus protocol identifier. Its service runs on a `Net`, and its presenter uses the copied parser in the dashboard registry. The example sends a request that the standard parser refuses and reads holding register 42.
+The gateway accepts a nonzero Modbus protocol identifier. Its service runs on
+a `Net`. A `DashboardObserver` installs its presenter, which uses the copied
+parser. The example sends a request that the standard parser refuses, reads
+holding register 42, and exits. It takes no arguments and serves no observation
+socket. See [Fictionet Observe](../../observe/README.md) to serve a collector's
+handle and connect with `fictionet observe --observation unix:PATH`.
 
 Run it without external networking:
 
 ```sh
-cargo run --offline -j 8 --example custom_protocol
+cargo run --locked --example custom_protocol
 ```
 
 The teaching change is in the parser: the copy accepts nonzero protocol

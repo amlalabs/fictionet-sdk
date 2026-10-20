@@ -156,7 +156,7 @@ impl Sandbox {
 }
 
 /// How a connection's bytes travel. An event's connection and an observed
-/// conversation ([`observe::Selection`](crate::observe::Selection)) both
+/// conversation (`fictionet_observe::Selection`) both
 /// use it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -235,7 +235,7 @@ impl ConnInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Origin {
     pub(crate) task: u64,
-    /// The task's name, as the graph keeps it (shortened when shown).
+    /// The full function or future type name.
     pub(crate) name: Cow<'static, str>,
     pub(crate) file: &'static str,
     pub(crate) line: u32,
@@ -249,7 +249,7 @@ pub(crate) struct Origin {
 /// [`seq`](Self::seq), [`at`](Self::at) and the task that recorded it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
-    /// Its sequence in the observed stream, from 1. Zero until emitted.
+    /// Its sequence in the event stream, from 1. Zero until emitted.
     pub seq: u64,
     /// When it happened, on the run's clock.
     pub at: Instant,
@@ -290,14 +290,14 @@ impl Event {
         }
     }
 
-    /// Marks evidence omitted to keep event construction bounded.
+    /// Marks facts omitted to keep event construction bounded.
     pub fn truncated(mut self) -> Self {
         self.truncated = true;
         self.fields.set("truncated", true);
         self
     }
 
-    /// Whether construction omitted evidence to stay within its bounds.
+    /// Whether construction omitted facts to stay within its bounds.
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }
@@ -378,7 +378,7 @@ impl Event {
     }
 
     /// Marks a repeatable fact and adds per-occurrence detail.
-    /// An optional [`super::Aggregate`] combines matching facts and summarizes
+    /// An optional `fictionet_observe::Aggregate` combines matching facts and summarizes
     /// numeric detail as ranges. Detail names must not replace identifying fields.
     /// Without that observer, every occurrence is delivered unchanged.
     pub fn repeat(mut self, detail: Fields) -> Self {
@@ -407,6 +407,16 @@ impl Event {
         self.fields.get(name)
     }
 
+    /// Names of variable detail fields on a repeatable fact, or none for an ordinary event.
+    pub fn repeat_fields(&self) -> Option<&[&'static str]> {
+        self.repeat.as_deref()
+    }
+
+    /// Whether both events carry the same originating task identity.
+    pub fn same_origin(&self, other: &Self) -> bool {
+        self.origin == other.origin
+    }
+
     /// The field `name` as text.
     pub fn str(&self, name: &str) -> Option<&str> {
         self.get(name).and_then(Value::as_str)
@@ -422,9 +432,9 @@ impl Event {
         self.source == source && self.kind == kind
     }
 
-    /// About how many bytes the event holds in memory, each allocation's
-    /// overhead included, as retention counts them against
-    /// [`MAX_EVENT_BYTES`](super::MAX_EVENT_BYTES). Shared connection metadata is charged in full
+    /// About how many bytes the event holds in memory, including allocation
+    /// overhead. Consumers can use this charge for bounded retention.
+    /// Shared connection metadata is charged in full
     /// for each event. Owned task names are included; static strings are not.
     pub fn size(&self) -> usize {
         heap(std::mem::size_of::<Event>() + ARC_COUNTS)
@@ -444,8 +454,8 @@ impl Event {
     /// started), `source`, `kind`, `level`, `summary`, then the connection
     /// (`sandbox`, `conn`, `local`, `peer`, `transport`, `tls`, `sni`,
     /// `alpn`), then
-    /// `fields`, then the task that recorded it, if known: `node` (its id
-    /// in the observe graph, such as `"t7"`), `task` (its name), `file`,
+    /// `fields`, then the task that emitted it, if known: `node` (its
+    /// run-scoped task id, such as `"t7"`), `task` (its name), `file`,
     /// `line` and `parent` (the id of the task that started it).
     pub fn to_json(&self) -> Value {
         let c = &self.conn;
@@ -484,7 +494,7 @@ impl Event {
                 }
             };
             out.push(("node".into(), id(o.task)));
-            out.push(("task".into(), crate::watch::short_name(&o.name).into()));
+            out.push(("task".into(), crate::events::short_name(&o.name).into()));
             out.push(("file".into(), o.file.into()));
             out.push(("line".into(), o.line.into()));
             out.push(("parent".into(), id(o.parent)));

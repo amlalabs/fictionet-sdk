@@ -1222,8 +1222,9 @@ fn udp_ephemeral_ports_skip_bound_ports_and_reuse_released_ports() {
 
 #[test]
 fn refused_connections_share_a_bounded_aggregate() {
-    use fictionet::events::{Aggregate, ConnInfo, Limits, Memory};
+    use fictionet::events::ConnInfo;
     use fictionet::stdlib::world::net;
+    use fictionet_observe::{Aggregate, Limits, Memory};
     use std::sync::atomic::AtomicUsize;
 
     let evidence = Arc::new(Memory::new(Limits::new(4, 8192)));

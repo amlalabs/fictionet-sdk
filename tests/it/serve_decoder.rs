@@ -108,7 +108,7 @@ fn assert_fault_error(
 
     let input = input.to_vec();
     let seen = seen.to_vec();
-    let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence = std::sync::Arc::new(fictionet_observe::Memory::default());
     fictionet::block_on(fictionet::lab(
         RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()),
         |fcx| async move {
@@ -276,7 +276,7 @@ fn outbound_fault_error_cancels_work_with_written_bytes() {
             Ok(Flow::Continue)
         }
     }
-    let evidence_harness = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_harness = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
         Replies,
@@ -418,7 +418,7 @@ service_fixture! {
 #[test]
 fn smtp_data_changes_the_active_decoder_and_stops_item_faults() {
     let opts = ServeOptions::default().faults(FaultPlan::new(Plan::default()));
-    let evidence_harness = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_harness = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut harness = Harness::with_options(Seed::from_u64(1), Mail::default(), (), opts)
         .observer(evidence_harness.clone());
     harness.push(b"DATA\r\n").unwrap();
@@ -605,7 +605,7 @@ fn decoder_upgrade_stops_faults_before_buffered_items() {
         }],
         ..Plan::default()
     }));
-    let evidence_harness = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_harness = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut harness = Harness::with_options(Seed::from_u64(1), Switch { seen: vec![] }, (), opts)
         .observer(evidence_harness.clone());
     harness.push(b"one\ntwo\n").unwrap();
@@ -648,7 +648,7 @@ fn stuck_item_fault_decoder_passes_the_partial_item_through() {
         }],
         ..Plan::default()
     }));
-    let evidence_harness = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_harness = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut harness =
         Harness::with_options(Seed::from_u64(1), LargeLine { seen: vec![] }, (), opts)
             .observer(evidence_harness.clone());

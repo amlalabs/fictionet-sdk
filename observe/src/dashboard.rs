@@ -5,14 +5,40 @@ use fictionet::events::{Interest, Loss, Observation, Observer, Stamp};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant as RunTime;
 
+use crate::egress::{Egress, EgressLimits, EgressSnapshot};
 use crate::json::{self, Object, Scalar};
-use crate::{CapturePolicy, Collector, Options, Value, view};
+use crate::watch::{Export, Subscription as Hold, Watches};
+use crate::{Bounds, CapturePolicy, Collector, Options, Registry, Value, view};
 
-/// Collector limits and capture policies, fixed before the run starts.
+/// How often a graph subscription sends what changed.
+const GRAPH_TICK: Duration = Duration::from_millis(250);
+/// How often a packet subscription looks for new packets.
+pub(crate) const PACKET_TICK: Duration = Duration::from_millis(100);
+/// Packet rows one poll sends to one subscription.
+const ROWS_PER_POLL: usize = 500;
+/// Subscriptions and capture downloads one session may hold.
+const MAX_SUBSCRIPTIONS: usize = 64;
+
+/// Collector limits, capture policies and packet decoding, fixed before
+/// the run starts.
 #[derive(Clone, Debug)]
 pub struct DashboardOptions {
     /// All retention limits and capture policies.
     pub collector: Options,
+    /// The protocols that link watches decode with. The default is the
+    /// built-in registry.
+    pub protocols: Registry,
+    /// The most links watched at once. At capacity, a new link evicts the
+    /// longest-idle watch, with the lowest link id breaking ties. When every
+    /// watch has a subscriber, the request is refused. The default is 64.
+    pub watches: usize,
+    /// The most bytes of decoded rows kept across all watches. Past it, idle
+    /// watches are forgotten first, longest idle first, then the oldest rows
+    /// of any watch. Each watch also keeps at most 4,096 rows and 32 MiB.
+    /// The default is 256 MiB.
+    pub watch_bytes: usize,
+    /// Bounds on the left-the-box table, [`DashboardHandle::egress`].
+    pub egress: EgressLimits,
 }
 
 impl Default for DashboardOptions {
@@ -22,6 +48,10 @@ impl Default for DashboardOptions {
                 sandbox_capture: CapturePolicy::Demand,
                 ..Options::default()
             },
+            protocols: Registry::default(),
+            watches: 64,
+            watch_bytes: 256 << 20,
+            egress: EgressLimits::default(),
         }
     }
 }
@@ -31,6 +61,7 @@ impl DashboardOptions {
     pub fn demo() -> Self {
         Self {
             collector: Options::default(),
+            ..Self::default()
         }
     }
 }
@@ -44,7 +75,16 @@ pub struct DashboardHandle(pub(crate) Arc<Shared>);
 
 pub(crate) struct Shared {
     pub(crate) collector: Collector,
+    pub(crate) watches: Watches,
+    egress: Egress,
     clock: Mutex<Clock>,
+}
+
+impl Shared {
+    /// When the run started, since the Unix epoch. Labs have none.
+    pub(crate) fn wall(&self) -> Option<Duration> {
+        self.clock.lock().wall
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -58,6 +98,7 @@ impl Observer for Shared {
     fn enabled(&self, interest: Interest<'_>) -> bool {
         matches!(interest, Interest::Event(meta, _) if meta.source == "run" && meta.kind == "start")
             || self.collector.enabled(interest)
+            || self.egress.enabled(interest)
     }
 
     fn observe(&self, stamp: Stamp, item: Observation<'_>) {
@@ -75,9 +116,11 @@ impl Observer for Shared {
                     .and_then(|v| Duration::try_from_secs_f64(v).ok());
             }
         }
+        self.egress.observe(stamp, item.clone());
         self.collector.observe(stamp, item);
     }
     fn lost(&self, loss: Loss) {
+        self.egress.lost(loss.clone());
         self.collector.lost(loss);
     }
     fn end(&self, at: RunTime) {
@@ -88,8 +131,19 @@ impl Observer for Shared {
 impl DashboardObserver {
     /// Builds the collector before a run or any clients exist.
     pub fn new(options: DashboardOptions) -> Self {
+        let keys = options
+            .collector
+            .keys
+            .unwrap_or(Bounds { count: 0, bytes: 0 });
         Self(Arc::new(Shared {
+            watches: Watches::new(
+                options.protocols,
+                options.watches,
+                options.watch_bytes,
+                keys,
+            ),
             collector: Collector::new(options.collector),
+            egress: Egress::new(options.egress),
             clock: Mutex::new(Clock::default()),
         }))
     }
@@ -101,18 +155,26 @@ impl DashboardObserver {
     pub fn handle(&self) -> DashboardHandle {
         DashboardHandle(self.0.clone())
     }
-    /// Releases workers after the run. Retained data remains readable.
-    pub fn finish(&self) {}
 }
 
 impl DashboardHandle {
-    /// Creates one caller's session with a limit of 64 subscriptions.
-    /// No thread or clock read is needed to drive it.
+    /// Creates one caller's session with a limit of 64 subscriptions and
+    /// capture downloads. No thread or clock read is needed to drive it.
     pub fn session(&self) -> Session {
         Session {
             handle: self.clone(),
             subs: Vec::new(),
+            downloads: Vec::new(),
         }
+    }
+    /// Every connection attempt from each sandbox so far, grouped by
+    /// destination, with what the world did with it. See [`Egress`].
+    pub fn egress(&self) -> EgressSnapshot {
+        self.0.egress.snapshot()
+    }
+    /// Increases whenever [`DashboardHandle::egress`] would change.
+    pub fn egress_revision(&self) -> u64 {
+        self.0.egress.revision()
     }
     pub(crate) fn begun(&self) -> bool {
         self.0.clock.lock().begun || self.0.collector.ended().is_some()
@@ -156,11 +218,27 @@ impl DashboardHandle {
 
 struct Subscription {
     id: u32,
-    shown: Option<view::View>,
-    after: Option<u64>,
-    waiting: bool,
     next: Instant,
-    next_graph: Instant,
+    kind: Kind,
+}
+
+enum Kind {
+    /// `watch`: the graph, then what changed.
+    Graph {
+        shown: Option<Box<view::View>>,
+        after: Option<u64>,
+        waiting: bool,
+        next_graph: Instant,
+    },
+    /// `packets`: one link's decoded packets as they are captured.
+    Packets { hold: Hold, cursor: u64 },
+}
+
+/// A `pcap` reply still being written.
+struct Download {
+    id: u32,
+    next: Instant,
+    export: Export,
 }
 
 /// One caller's requests and subscriptions. Transports supply monotonic time
@@ -168,6 +246,7 @@ struct Subscription {
 pub struct Session {
     handle: DashboardHandle,
     subs: Vec<Subscription>,
+    downloads: Vec<Download>,
 }
 
 pub(crate) fn error(message: &str) -> String {
@@ -193,10 +272,16 @@ fn event(id: u32, name: &str, data: &str) -> Value {
         end: name == "end",
     }
 }
+fn link_number(req: &std::collections::HashMap<String, Scalar>) -> Option<u64> {
+    req.get("link").and_then(|v| match v {
+        Scalar::Str(s) => s.strip_prefix('e').unwrap_or(s).parse().ok(),
+        _ => v.as_u64(),
+    })
+}
 
 impl Session {
     /// Handles a flat JSON request. Streaming values arrive through `poll`.
-    /// Request ids must be unique while a subscription is active.
+    /// Request ids must be unique while a subscription or download is active.
     pub fn request(
         &mut self,
         id: u32,
@@ -204,7 +289,7 @@ impl Session {
         now: Instant,
         wall: Option<Duration>,
     ) -> Vec<Value> {
-        if self.subs.iter().any(|s| s.id == id) {
+        if self.subs.iter().any(|s| s.id == id) || self.downloads.iter().any(|d| d.id == id) {
             return vec![reply(id, error("request id is already active"))];
         }
         if text.len() > 65_531 {
@@ -217,17 +302,23 @@ impl Session {
             return vec![reply(id, error("the request has no op"))];
         };
         let handle = &self.handle;
+        let shared = &handle.0;
+        let full = self.subs.len() + self.downloads.len() >= MAX_SUBSCRIPTIONS;
         let response = match op {
             "world" => handle.world(wall),
-            "watch" if self.subs.len() >= 64 => error("this session has too many subscriptions"),
+            "watch" | "packets" | "pcap" if full => {
+                error("this session has too many subscriptions")
+            }
             "watch" => {
                 self.subs.push(Subscription {
                     id,
-                    shown: None,
-                    after: req.get("after").and_then(Scalar::as_u64),
-                    waiting: false,
                     next: now,
-                    next_graph: now,
+                    kind: Kind::Graph {
+                        shown: None,
+                        after: req.get("after").and_then(Scalar::as_u64),
+                        waiting: false,
+                        next_graph: now,
+                    },
                 });
                 return Vec::new();
             }
@@ -238,14 +329,17 @@ impl Session {
                     .and_then(|id| u32::try_from(id).ok());
                 if let Some(index) = self.subs.iter().position(|s| Some(s.id) == target) {
                     let sub = self.subs.remove(index);
-                    return vec![
-                        event(sub.id, "end", r#"{"reason":"cancelled"}"#),
-                        reply(id, r#"{"ok":true}"#.into()),
-                    ];
+                    let ended = event(sub.id, "end", r#"{"reason":"cancelled"}"#);
+                    if let Kind::Packets { hold, .. } = sub.kind {
+                        hold.release(now);
+                    }
+                    return vec![ended, reply(id, r#"{"ok":true}"#.into())];
                 }
                 error("no such subscription")
             }
-            "graph" | "counters" | "events" | "keylog" | "link" if !handle.begun() => {
+            "graph" | "counters" | "events" | "keylog" | "link" | "packets" | "packet" | "pcap"
+                if !handle.begun() =>
+            {
                 error("no world is running yet")
             }
             "graph" => view::snapshot(handle, None, wall).1.1,
@@ -259,92 +353,241 @@ impl Session {
                     .min(1000) as usize;
                 view::events(handle, after, max)
             }
-            "link" => {
-                let link = req.get("link").and_then(|v| match v {
-                    Scalar::Str(s) => s.strip_prefix('e').unwrap_or(s).parse().ok(),
-                    _ => v.as_u64(),
-                });
-                match link {
-                    Some(link) => view::link(handle, link).unwrap_or_else(|| error("no such link")),
-                    None => error("the request needs a link, such as \"e5\""),
-                }
-            }
             "keylog" => {
                 return vec![Value {
                     id,
-                    bytes: handle.0.collector.keylog().into_bytes(),
+                    bytes: shared.collector.keylog().into_bytes(),
                     binary: true,
                     end: true,
                 }];
+            }
+            "link" | "packets" | "packet" | "pcap" => {
+                let Some(number) = link_number(&req) else {
+                    return vec![reply(id, error("the request needs a link, such as \"e5\""))];
+                };
+                match op {
+                    "link" => view::link(handle, number).unwrap_or_else(|| error("no such link")),
+                    "packets" => {
+                        let acquired =
+                            shared.watches.acquire(&shared.collector, number, now, || {
+                                let link = shared.collector.find_link(number)?;
+                                Some((link, view::describe(handle, link)))
+                            });
+                        match acquired {
+                            Ok(hold) => {
+                                let link = event(id, "link", &hold.watch().describe());
+                                let cursor = req.get("after").and_then(Scalar::as_u64).unwrap_or(0);
+                                self.subs.push(Subscription {
+                                    id,
+                                    next: now,
+                                    kind: Kind::Packets { hold, cursor },
+                                });
+                                return vec![link];
+                            }
+                            Err(reason) => error(reason),
+                        }
+                    }
+                    "packet" => match shared.watches.existing(number, now) {
+                        Some(watch) => {
+                            watch.pump(shared);
+                            req.get("seq")
+                                .and_then(Scalar::as_u64)
+                                .and_then(|seq| watch.detail(seq))
+                                .unwrap_or_else(|| error("that packet is not kept"))
+                        }
+                        None => error("nothing is watching that link"),
+                    },
+                    _ => match shared.watches.existing(number, now) {
+                        Some(watch) => {
+                            watch.pump(shared);
+                            let mut export = watch.export(&shared.collector);
+                            let (bytes, last) = export.next_chunk();
+                            if !last {
+                                self.downloads.push(Download {
+                                    id,
+                                    next: now,
+                                    export,
+                                });
+                            }
+                            return vec![Value {
+                                id,
+                                bytes,
+                                binary: true,
+                                end: last,
+                            }];
+                        }
+                        None => error("nothing is watching that link"),
+                    },
+                }
             }
             other => error(&format!("unknown op {other}")),
         };
         vec![reply(id, response)]
     }
 
-    /// Returns the earliest subscription deadline, or none when idle.
-    pub fn next_poll(&self) -> Option<Instant> {
-        self.subs.iter().map(|s| s.next).min()
+    #[cfg(feature = "page")]
+    pub(crate) fn drain_pending(&mut self, now: Instant) {
+        for sub in &mut self.subs {
+            sub.next = now;
+            if let Kind::Graph { next_graph, .. } = &mut sub.kind {
+                *next_graph = now;
+            }
+        }
     }
 
-    /// Produces snapshots followed by changes, events and stream endings.
+    /// Returns the earliest subscription or download deadline, or none
+    /// when idle.
+    pub fn next_poll(&self) -> Option<Instant> {
+        let subs = self.subs.iter().map(|s| s.next);
+        subs.chain(self.downloads.iter().map(|d| d.next)).min()
+    }
+
+    /// Produces snapshots followed by changes, events, packets and stream
+    /// endings, and the next piece of each capture download.
     pub fn poll(&mut self, now: Instant, wall: Option<Duration>) -> Vec<Value> {
         let mut out = Vec::new();
-        self.subs.retain_mut(|sub| {
-            if now < sub.next {
+        let handle = self.handle.clone();
+        if !self.subs.is_empty() {
+            handle.0.watches.reap(now);
+        }
+        let mut index = 0;
+        while index < self.subs.len() {
+            let sub = &mut self.subs[index];
+            let done = now >= sub.next && sub.poll(&handle, now, wall, &mut out);
+            if done {
+                if let Kind::Packets { hold, .. } = self.subs.remove(index).kind {
+                    hold.release(now);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        self.downloads.retain_mut(|download| {
+            if now < download.next {
                 return true;
             }
-            sub.next = now + Duration::from_millis(250);
-            if !self.handle.begun() {
-                if !sub.waiting {
-                    out.push(event(sub.id, "waiting", "{}"));
-                    sub.waiting = true;
-                }
-                return true;
-            }
-            if let Some(view) = &mut sub.shown {
-                if now >= sub.next_graph {
-                    out.extend(
-                        view::changes(&self.handle, view, wall)
-                            .into_iter()
-                            .map(|(name, data)| event(sub.id, name, &data)),
-                    );
-                    sub.next_graph = now + Duration::from_millis(250);
-                }
-                let (messages, full) = view::event_changes(&self.handle, view);
-                out.extend(
-                    messages
-                        .into_iter()
-                        .map(|(name, data)| event(sub.id, name, &data)),
-                );
-                sub.next = if full { now } else { sub.next_graph };
-            } else {
-                let (view, (name, data)) = view::snapshot(&self.handle, sub.after, wall);
-                out.push(event(sub.id, name, &data));
-                sub.next_graph = now + Duration::from_millis(250);
-                sub.next = if view.events_pending(&self.handle) {
-                    now
-                } else {
-                    sub.next_graph
-                };
-                sub.shown = Some(view);
-            }
-            let view = sub.shown.as_ref().expect("shown snapshot");
-            if view.ended() && !view.events_pending(&self.handle) {
-                out.push(event(sub.id, "end", r#"{"reason":"the world ended"}"#));
-                false
-            } else {
-                true
-            }
+            let (bytes, last) = download.export.next_chunk();
+            out.push(Value {
+                id: download.id,
+                bytes,
+                binary: true,
+                end: last,
+            });
+            !last
         });
         out
+    }
+}
+
+impl Subscription {
+    /// Adds what is new to `out`. Returns whether the stream ended.
+    fn poll(
+        &mut self,
+        handle: &DashboardHandle,
+        now: Instant,
+        wall: Option<Duration>,
+        out: &mut Vec<Value>,
+    ) -> bool {
+        let id = self.id;
+        match &mut self.kind {
+            Kind::Graph {
+                shown,
+                after,
+                waiting,
+                next_graph,
+            } => {
+                self.next = now + GRAPH_TICK;
+                if !handle.begun() {
+                    if !*waiting {
+                        out.push(event(id, "waiting", "{}"));
+                        *waiting = true;
+                    }
+                    return false;
+                }
+                if let Some(view) = shown {
+                    if now >= *next_graph {
+                        out.extend(
+                            view::changes(handle, view, wall)
+                                .into_iter()
+                                .map(|(name, data)| event(id, name, &data)),
+                        );
+                        *next_graph = now + GRAPH_TICK;
+                    }
+                    let (messages, full) = view::event_changes(handle, view);
+                    out.extend(
+                        messages
+                            .into_iter()
+                            .map(|(name, data)| event(id, name, &data)),
+                    );
+                    self.next = if full { now } else { *next_graph };
+                } else {
+                    let (view, (name, data)) = view::snapshot(handle, *after, wall);
+                    out.push(event(id, name, &data));
+                    *next_graph = now + GRAPH_TICK;
+                    self.next = if view.events_pending(handle) {
+                        now
+                    } else {
+                        *next_graph
+                    };
+                    *shown = Some(Box::new(view));
+                }
+                let view = shown.as_ref().expect("shown snapshot");
+                let ended = view.ended() && !view.events_pending(handle);
+                if ended {
+                    out.push(event(id, "end", r#"{"reason":"the world ended"}"#));
+                }
+                ended
+            }
+            Kind::Packets { hold, cursor } => {
+                self.next = now + PACKET_TICK;
+                let shared = &handle.0;
+                let watch = hold.watch();
+                // Decided before decoding, so the last packets of a link
+                // that closes meanwhile are still sent.
+                let closing = if !shared.collector.live(watch.id()) {
+                    Some("the link closed")
+                } else if shared.collector.ended().is_some() {
+                    Some("the world ended")
+                } else {
+                    None
+                };
+                let drained = watch.pump(shared);
+                let (missed, rows) = watch.rows_after(*cursor, ROWS_PER_POLL);
+                if missed > 0 {
+                    let gap = Object::new()
+                        .num("after", *cursor)
+                        .num("next", *cursor + missed + 1)
+                        .num("missed", missed)
+                        .done();
+                    out.push(event(id, "packet_gap", &gap));
+                    *cursor += missed;
+                }
+                if !drained || rows.len() == ROWS_PER_POLL {
+                    self.next = now;
+                }
+                for (seq, row) in rows {
+                    out.push(event(id, "packet", &row));
+                    *cursor = seq;
+                }
+                let ended = drained && watch.rows_after(*cursor, 1).1.is_empty();
+                match closing.filter(|_| ended) {
+                    Some(reason) => {
+                        let data = Object::new().str("reason", reason).done();
+                        out.push(event(id, "end", &data));
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::events::{Event, Limits, LossReason, Stream};
+    use crate::Limits;
+    use fictionet::events::{Event, LossReason, Stream};
     use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::protocols::json::Value as Json;
     use fictionet::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
@@ -387,8 +630,15 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )
         );
+        assert_eq!(
+            request(&mut session, 5, r#"{"op":"graph"}"#, now).bytes,
+            br#"{"error":"no world is running yet"}"#
+        );
         session.request(2, r#"{"op":"watch"}"#, now, None);
-        assert_eq!(names(&session.poll(now, None)), ["waiting"]);
+        let waiting = session.poll(now, None);
+        assert_eq!(names(&waiting), ["waiting"]);
+        assert_eq!(waiting[0].bytes, br#"{"event":"waiting","data":{}}"#);
+        assert!(!waiting[0].end);
         emit(
             dashboard.observer().as_ref(),
             1,
@@ -419,7 +669,6 @@ mod tests {
         assert!(!end[0].end);
         assert!(end[1].end);
         assert!(session.next_poll().is_none());
-        dashboard.finish();
         let value = request(&mut session, 4, r#"{"op":"world"}"#, now);
         assert_eq!(json(&value).get("t").and_then(Json::as_f64), Some(2.0));
     }
@@ -440,14 +689,19 @@ mod tests {
             request(&mut session, 65, r#"{"op":"watch"}"#, now).envelope(),
             Some(crate::Envelope::Error(_))
         ));
-        assert!(matches!(
-            request(&mut session, 66, r#"{"op":"cancel","id":4294967297}"#, now).envelope(),
-            Some(crate::Envelope::Error(_))
-        ));
+        assert_eq!(
+            request(&mut session, 66, r#"{"op":"cancel","id":4294967297}"#, now).bytes,
+            br#"{"error":"no such subscription"}"#
+        );
         assert_eq!(session.subs.len(), 64);
         let cancelled = session.request(67, r#"{"op":"cancel","id":1}"#, now, None);
         assert_eq!(cancelled[0].id, 1);
         assert!(cancelled[0].end);
+        assert_eq!(
+            cancelled[0].bytes,
+            br#"{"event":"end","data":{"reason":"cancelled"}}"#
+        );
+        assert_eq!(session.subs.len(), 63);
         assert_eq!(cancelled[1].bytes, br#"{"ok":true}"#);
         assert!(
             session
@@ -470,6 +724,7 @@ mod tests {
                 events: Some(Limits::new(2200, 4 << 20)),
                 ..Options::default()
             },
+            ..DashboardOptions::default()
         });
         let mut session = dashboard.handle().session();
         let now = Instant::now();

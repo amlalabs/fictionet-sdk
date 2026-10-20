@@ -146,7 +146,7 @@ async fn read_until(cx: &Cx, conn: &mut impl Connection, needle: &[u8]) -> Vec<u
 }
 
 fn world(seed: Seed, trace: Arc<Mutex<Trace>>) -> impl Future<Output = fictionet::Result> {
-    let log = Arc::new(fictionet::events::Memory::default());
+    let log = Arc::new(fictionet_observe::Memory::default());
     let output = log.clone();
     async move {
         let packets = trace.clone();
@@ -377,7 +377,7 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
     };
 
     let episode = |seed| {
-        let log = Arc::new(fictionet::events::Memory::default());
+        let log = Arc::new(fictionet_observe::Memory::default());
         let output = log.clone();
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let replies = bodies.clone();

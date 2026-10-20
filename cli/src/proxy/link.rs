@@ -289,6 +289,18 @@ mod tests {
             ),
         ];
         for message in [
+            vec![5, 0, 0, 0, 1, b'{', b'}'],
+            vec![6, 0, 0, 0, 1, 2, b'{', b'}'],
+        ] {
+            let kind = message[0];
+            cases.push((
+                message,
+                Some(format!(
+                    "the world sent a bad message: unknown message kind {kind}; closing"
+                )),
+            ));
+        }
+        for message in [
             Message::Auth(b"token"),
             Message::Hello(Hello {
                 version: relay::VERSION,
@@ -298,12 +310,6 @@ mod tests {
             }),
             Message::Accept,
             Message::Refuse("no".into()),
-            Message::Request { id: 1, body: b"{}" },
-            Message::Reply {
-                id: 1,
-                flags: relay::END,
-                body: b"{}",
-            },
         ] {
             cases.push((
                 message.encode(),

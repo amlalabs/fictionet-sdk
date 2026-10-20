@@ -3,6 +3,7 @@
 !Cargo.lock
 !src
 !cli
+!observe
 !docs
 !dashboard
 !benches

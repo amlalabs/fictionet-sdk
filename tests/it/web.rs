@@ -40,7 +40,7 @@ use std::time::{Duration, SystemTime};
 
 use axum::Extension;
 use bytes::Bytes;
-use fictionet::events::{Event, Fields, Memory, Sandbox};
+use fictionet::events::{Event, Fields, Sandbox};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -52,6 +52,7 @@ use fictionet::stdlib::{
     web,
 };
 use fictionet::{Attacher, Cx, End, Interface, Packet, Seed, block_on, lab, run};
+use fictionet_observe::Memory;
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use rustls::pki_types::ServerName;

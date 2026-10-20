@@ -363,7 +363,7 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
 #[cfg(test)]
 mod observation_tests {
     use super::*;
-    use fictionet::events::Memory;
+    use fictionet::events::recorder::Recorder;
     use fictionet::stdlib::protocols::dns::{op::Query, rr::Name};
 
     #[test]
@@ -377,7 +377,7 @@ mod observation_tests {
         let mut wire = (query.len() as u16).to_be_bytes().to_vec();
         wire.extend_from_slice(&query);
         let run = |observed| {
-            let memory = Arc::new(Memory::default());
+            let memory = Arc::new(Recorder::default());
             let mut harness = serve::Harness::new(
                 fictionet::Seed::from_u64(1),
                 Dns { tcp: true },
@@ -390,10 +390,7 @@ mod observation_tests {
                 harness = harness.observer(memory.clone());
             }
             let reply = harness.push(&wire).unwrap();
-            assert_eq!(
-                memory.checked_of("dns", "query").unwrap().len(),
-                usize::from(observed)
-            );
+            assert_eq!(memory.of("dns", "query").len(), usize::from(observed));
             let parsed = Message::from_vec(&reply[2..]).unwrap();
             assert_eq!(parsed.metadata.response_code, ResponseCode::NXDomain);
             reply

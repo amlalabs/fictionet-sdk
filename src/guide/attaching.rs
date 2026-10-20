@@ -409,8 +409,11 @@
 //! in the agent's namespace without `--netns`. The agent can also reach
 //! every listener on the pod's loopback. Nothing secret may listen there,
 //! including the dashboard; 127.0.0.1 does not isolate it from the agent.
-//! Keep dashboard tokens outside the agent container and authenticate other
-//! loopback services; the pod's NetworkPolicy does not separate its containers.
+//! Keep dashboard tokens and the observation socket outside the agent
+//! container. Authenticate other loopback services; the pod's NetworkPolicy
+//! does not separate its containers. The attachment socket carries sandbox
+//! traffic. [Fictionet Observe](../../../fictionet_observe/index.html) describes
+//! serving the dashboard on its own observation socket.
 //!
 //! - **The agent's container** is the first entry in `containers`, so
 //!   Inspect runs its commands there. Every capability is dropped,
@@ -676,7 +679,7 @@
 //! for Debian, so nothing is compiled in the sandbox.
 //!
 //! The [hosted example README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md)
-//! owns the provider evidence: SDK versions, measurements, failures and
+//! lists provider results: SDK versions, measurements, failures and
 //! limitations from 2 October 2026. Those results describe that run, not a
 //! promise about every provider account or version. The commands below are
 //! the deployment procedure for those examples.

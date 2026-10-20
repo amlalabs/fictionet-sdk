@@ -37,6 +37,7 @@ pub(super) struct Tracker {
     event: Option<Event>,
     observation: Option<Observation>,
     received: Option<Received>,
+    fields: Option<super::RequestFields>,
 }
 
 struct Observation {
@@ -145,13 +146,22 @@ impl Tracker {
             event: None,
             observation,
             received: None,
+            fields: None,
         }
     }
 
-    pub(super) fn start<B>(&mut self, request: &Request<B>, conn: &ConnInfo, started: Instant) {
+    pub(super) fn start<B>(&mut self, request: &mut Request<B>, conn: &ConnInfo, started: Instant) {
         self.charge = request_held(request) + std::mem::size_of::<Event>();
         if self.enabled {
             self.event = Self::new(request, conn, started).event;
+            self.fields = Some(super::RequestFields::default());
+            self.attach(request);
+        }
+    }
+
+    pub(super) fn attach<B>(&self, request: &mut Request<B>) {
+        if let Some(fields) = &self.fields {
+            request.extensions_mut().insert(fields.clone());
         }
     }
 
@@ -224,6 +234,7 @@ impl Tracker {
             event: Some(event),
             observation: None,
             received: Some(Received::Complete),
+            fields: None,
         }
     }
 
@@ -253,7 +264,18 @@ impl Tracker {
                 "handler".into()
             }
         });
+        let recorded = self.fields.take();
+        let recorded = recorded.as_ref().map(|fields| fields.0.lock());
+        if let Some(recorded) = &recorded {
+            fields.extend(recorded.0.fields.clone());
+            if recorded.0.is_truncated() || recorded.1.is_truncated() {
+                event = event.truncated();
+            }
+        }
         fields.extend(extra);
+        if let Some(recorded) = &recorded {
+            fields.extend(recorded.1.fields.clone());
+        }
         let mut own = std::mem::take(&mut event.fields);
         own.set("received", self.received.expect("receipt ended").as_str());
         own.set("answer", answer);
@@ -416,4 +438,95 @@ impl Drop for Track {
         }
     }
 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::web::httpd::RequestFields;
+
+    #[test]
+    fn request_fields_handle_records_after_extensions_are_cleared() {
+        let mut request = Request::new(());
+        let conn = ConnInfo::default();
+        let mut tracker = Tracker::observing(true, &request, &conn, None);
+        tracker.start(&mut request, &conn, Instant::ZERO);
+        let fields = request.extensions().get::<RequestFields>().unwrap().clone();
+        request.extensions_mut().clear();
+        fields.record_fields(
+            Fields::new()
+                .with("forwarded", "https://example.test")
+                .with("answer", "invented"),
+        );
+        let event = tracker.finish(|| None, None, 0, false).unwrap();
+        assert_eq!(event.str("forwarded"), Some("https://example.test"));
+        assert_ne!(event.str("answer"), Some("invented"));
+        assert!(request.extensions().is_empty());
+    }
+
+    #[test]
+    fn request_fields_survive_every_finish_and_keep_field_precedence() {
+        struct Classifier;
+        impl BodyClassifier for Classifier {
+            fn head(
+                &self,
+                _: &http::request::Parts,
+                _: &ConnInfo,
+                _: &mut http::Extensions,
+            ) -> Option<Fields> {
+                Some(
+                    Fields::new()
+                        .with("layer", "classifier")
+                        .with("classification", "retained"),
+                )
+            }
+        }
+        for answer in [
+            "handler",
+            "error",
+            "cancelled",
+            "timeout",
+            "cut_off",
+            "budget",
+        ] {
+            let mut request = Request::new(());
+            let conn = ConnInfo::default();
+            let mut tracker = Tracker::observing(true, &request, &conn, Some(Arc::new(Classifier)));
+            tracker.start(&mut request, &conn, Instant::ZERO);
+            RequestFields::record(
+                &request,
+                Fields::new()
+                    .with("layer", "request")
+                    .with("forwarded", "https://example.test")
+                    .with("answer", "invented")
+                    .with("method", "invented"),
+            );
+            request
+                .extensions()
+                .get::<RequestFields>()
+                .unwrap()
+                .extend(Fields::new().with("world_site", "example.test"), true);
+            let event = tracker
+                .finish(
+                    || {
+                        Some(
+                            Fields::new()
+                                .with("layer", "response")
+                                .with("world_site", "invented")
+                                .with("answer", answer),
+                        )
+                    },
+                    None,
+                    0,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(event.str("answer"), Some(answer));
+            assert_eq!(event.str("classification"), Some("retained"));
+            assert_eq!(event.str("layer"), Some("response"));
+            assert_eq!(event.str("method"), Some("GET"));
+            assert_eq!(event.str("world_site"), Some("example.test"));
+            assert_eq!(event.str("forwarded"), Some("https://example.test"));
+        }
+    }
 }

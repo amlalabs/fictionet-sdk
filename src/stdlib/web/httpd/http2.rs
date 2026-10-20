@@ -440,7 +440,7 @@ impl Http2 {
             driver.conn(),
             self.observe.clone(),
         );
-        tracker.start(&request, driver.conn(), driver.now());
+        tracker.start(&mut request, driver.conn(), driver.now());
         if !fits(
             driver.budget(),
             request_held(&request) + tracker.held() + std::mem::size_of::<Stream>(),
@@ -1444,7 +1444,7 @@ mod tests {
 
     #[test]
     fn http2_body_timeout_uses_the_fictionet_deadline() {
-        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
             |fcx| async move {
@@ -1478,7 +1478,7 @@ mod tests {
                 let log = evidence;
                 let wait = async {
                     loop {
-                        if let Some(event) = log.checked_of("http", "request").unwrap().pop() {
+                        if let Some(event) = log.of("http", "request").pop() {
                             break event;
                         }
                         fcx.sleep(Duration::from_millis(1)).await.unwrap();
@@ -1502,8 +1502,8 @@ mod tests {
                 assert_eq!(event.u64("status"), Some(408));
                 assert_eq!(event.str("version"), Some("HTTP/2.0"));
                 assert_eq!(event.get("complete").and_then(Value::as_bool), Some(true));
-                assert_eq!(log.checked_of("http", "request").unwrap().len(), 1);
-                assert!(log.checked_of("http", "error").unwrap().is_empty());
+                assert_eq!(log.of("http", "request").len(), 1);
+                assert!(log.of("http", "error").is_empty());
                 Ok(())
             },
         ))

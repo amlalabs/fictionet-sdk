@@ -46,7 +46,7 @@ fn idle_http2_budget(budget: &Budget) {
 
 async fn hyper_exposure(
     fcx: Cx,
-    evidence: Arc<fictionet::events::Memory>,
+    evidence: Arc<fictionet_observe::Memory>,
     received: httpd::Received,
     expected_status: u16,
 ) -> fictionet::Result {
@@ -594,7 +594,7 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
     let opts = ServeOptions::default()
         .idle(None)
         .budget(Budget::new(512 << 10));
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::with_options(
         fictionet::Seed::from_u64(0),
         Http1::new(page(1 << 20)),
@@ -665,7 +665,7 @@ fn item_faults_that_stop_record_why() {
         ..Plan::default()
     });
     let opts = ServeOptions::default().idle(None).faults(plan);
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::with_options(fictionet::Seed::from_u64(0), Http1::new(page(2)), (), opts)
         .observer(evidence_h.clone());
     let _ = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n\x00\x01 not http\r\n\r\n");
@@ -1012,7 +1012,7 @@ fn http2_caps_the_streams_a_connection_opens() {
 /// a handler's randomness from the run's stream, as HTTP/1 does.
 #[test]
 fn http2_has_the_limits_budget_and_seed_of_http1() {
-    let evidence = Arc::new(fictionet::events::Memory::default());
+    let evidence = Arc::new(fictionet_observe::Memory::default());
     world::seeded_world(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(evidence.clone()),
         Duration::from_secs(60),
@@ -1431,7 +1431,7 @@ impl Handler for StreamingMetadata {
 fn request_events_stay_charged_while_responses_stream() {
     crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let budget = Budget::new(1 << 20);
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::with_options(
             fictionet::Seed::from_u64(0),
             Http1::new(StreamingMetadata),
@@ -1562,7 +1562,7 @@ async fn keep_alive_response(fcx: &Cx, conn: &mut impl Connection) -> http1::Res
 #[cfg(feature = "tokio")]
 async fn upgrade_keep_alive_line_limit(
     fcx: &Cx,
-    evidence: &fictionet::events::Memory,
+    evidence: &fictionet_observe::Memory,
 ) -> fictionet::Result {
     let (server, client) = two_machines(fcx);
     let opts = HttpOptions {

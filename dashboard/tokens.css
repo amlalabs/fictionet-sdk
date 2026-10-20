@@ -1,0 +1,36 @@
+/* Shared Fictionet colors and type, following the system until a viewer chooses. */
+:root {
+  --paper: light-dark(#f7f6f0, #141915);
+  --raised: light-dark(#fbfaf6, #1b211c);
+  --badge: light-dark(#e9eddf, #3b493c);
+  --sunken: light-dark(#e9eddf, #1d241e);
+  --sunken-hover: light-dark(#e2e8d8, #232b24);
+  --ink: light-dark(#263e35, #e2e4d6);
+  --on-ink: light-dark(#f7f6f0, #141915);
+  --text: light-dark(#5f6c59, #aeb6a3);
+  --muted: light-dark(#66715f, #9ba391);
+  --subtle: light-dark(#6c7663, #878f7e);
+  --control: light-dark(#858f7b, #6c7563);
+  --faint: light-dark(#acb5a8, #4d564a);
+  --line: light-dark(#dedfd4, #2a312b);
+  --line-strong: light-dark(#d2d8c8, #363f37);
+  --edge: light-dark(#b9c2b0, #465046);
+  --edge-live: light-dark(#6f8c78, #8fae97);
+  --accent: light-dark(#df5835, #f0704c);
+  --accent-text: light-dark(#b4441f, #f0704c);
+  --warning: light-dark(#865b0e, #e7b951);
+  --success: light-dark(#2f6128, #8fcb84);
+  --danger: light-dark(#a3432a, #f08f72);
+  --danger-soft: light-dark(#f6e3dc, #3a221b);
+  --selection: light-dark(#e5ac87, #6b3a27);
+  --on-selection: light-dark(#243d33, #f7efe6);
+  --hex-mark: light-dark(#f3d3c2, #5a3122);
+  --shadow: light-dark(rgba(38, 62, 53, 0.18), rgba(0, 0, 0, 0.55));
+  --sans: 'DM Sans Variable', 'DM Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'IBM Plex Mono', 'JetBrains Mono', 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+  --highlight: light-dark(#e8eadb, #293326);
+  color-scheme: light dark;
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+@media print { :root { color-scheme: light; } }

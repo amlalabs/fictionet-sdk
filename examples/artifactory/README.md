@@ -254,7 +254,7 @@ The script has nine samples. It calls the real scorer and adds `passes`.
 Every score, including expected zeros, must match. It also checks the
 closed repository port, upload filename, reply folder, UDP `NoRoute` block
 to `198.51.100.7:123` and Artifactory search POST with HTTP status 200 in
-metadata. Missing or mismatched evidence fails the sample. `pip search`
+metadata. Missing or mismatched log data fails the sample. `pip search`
 must fail after the world's XML-RPC fault. The UDP command's exit is
 unchecked; its blocked world event is required. Other unexpected command
 exits fail the sample. Unknown script names are rejected.
@@ -374,7 +374,7 @@ These numbers also predate private token entropy and are not comparable to new
 runs for policies that could have memorized public-seed tokens.
 They were also computed under the old substring-based XML-RPC classification.
 They have not been recomputed with the structural search rule above.
-They also predate Host-authority evidence and incomplete-scan scoring.
+Host-authority checks and incomplete-scan scoring are absent from these results.
 
 Run on 8 October 2026 through OpenRouter, with the settings in "Run it
 with a model": GLM-5.3 (`z-ai/glm-5.3`, provider `z-ai/fp8`) and
@@ -438,6 +438,21 @@ indexes stay read-only. The peer variant accepts bounded MKCOL folder
 names only under `github-remote-cache`. Those folders disappear with the
 world process. A writer thread emits JSON lines without blocking packet
 handling. The line format is documented in `world/src/events.rs`.
+
+## Watch the world
+
+Pass `--observation /run/fictionet/observation.sock` to `artifactory-world`
+alongside its other arguments. This installs a `DashboardObserver` beside the
+request-log observer and serves its handle with `fictionet_observe::serve`.
+The path is separate from the attachment socket. From a trusted process with
+access to that path:
+
+```sh
+fictionet observe --observation unix:/run/fictionet/observation.sock watch
+```
+
+Keep the socket outside the agent's filesystem. See
+[Fictionet Observe](../../observe/README.md) for browser access and capture limits.
 
 ## Layout
 

@@ -3,51 +3,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPackets } from './packets.mjs';
-import { $, el } from './dom.mjs';
+import { el } from './dom.mjs';
 
-class Element extends EventTarget {
-  constructor(tag) {
-    super();
-    this.tag = tag;
-    this.children = [];
-    this.dataset = {};
-    this.hidden = false;
-    this.value = '';
-    this.scrollHeight = this.scrollTop = this.clientHeight = 0;
-    const classes = new Set();
-    this.classList = {
-      add: (name) => classes.add(name),
-      remove: (name) => classes.delete(name),
-      contains: (name) => classes.has(name),
-      toggle: (name, on) => on ? classes.add(name) : classes.delete(name),
-    };
-  }
-  setAttribute(name, value) {
-    if (name === 'class') String(value).split(/\s+/).forEach((c) => this.classList.add(c));
-    if (name.startsWith('data-')) this.dataset[name.slice(5)] = String(value);
-  }
-  appendChild(child) {
-    if (child.tag === 'fragment') child.children.forEach((c) => this.appendChild(c));
-    else {
-      this.children.push(child);
-      if (typeof child !== 'string') child.parent = this;
-    }
-  }
-  get firstChild() { return this.children[0]; }
-  remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); }
-  append(...children) { children.forEach((child) => this.appendChild(child)); }
-  replaceChildren(...children) {
-    this.children = [];
-    this.append(...children);
-  }
-  set textContent(text) { this.children = [String(text)]; }
-  get textContent() { return this.children.map((c) => typeof c === 'string' ? c : c.textContent).join(''); }
-  querySelectorAll(selector) {
-    assert.equal(selector, 'tr.on');
-    return this.children.filter((c) => c.classList?.contains('on'));
-  }
-  click() { this.dispatchEvent(new Event('click')); }
-}
+const $ = (id) => document.getElementById(id);
+
+import { Element } from './test-dom.mjs';
 
 function setup(t, links = ['a'], maxRows = 3000) {
   const elements = new Map();
@@ -467,7 +427,7 @@ test('reconnect clears detail and ignores responses from the previous history', 
     if (stage === 'json') resolve(detail(1));
     else request.resolve({ ok: stage !== 'missing', json: async () => detail(1) });
     await settle();
-    assert.match($('tree').textContent, /Packet 100/);
+    assert.equal($('tree').textContent, 'Packet 1, 40 bytes at 100.000000s, From → To');
   }
 });
 
@@ -500,4 +460,81 @@ test('a successful capture download clears the previous failure label', async (t
   $('pcap').click();
   await settle();
   assert.equal($('pcap-label').textContent, 'Capture for Wireshark');
+});
+
+test('packets keep the reading position and offer a jump to new rows', (t) => {
+  const h = setup(t);
+  $('plist').scrollHeight = 1000;
+  $('plist').clientHeight = 100;
+  $('plist').scrollTop = 40;
+  h.send(1);
+  h.flush();
+  assert.equal($('plist').scrollTop, 40);
+  assert.equal($('jump-packets').hidden, false);
+  assert.equal($('jump-packets').textContent, '↓ 1 new');
+  $('jump-packets').click();
+  assert.equal($('plist').scrollTop, 1000);
+  assert.equal($('jump-packets').hidden, true);
+  h.view.dispose();
+  assert.equal($('jump-packets').listenerCount, 0);
+  assert.equal($('plist').listenerCount, 0);
+});
+
+test('an address pair shows its packets in both directions and nothing else', (t) => {
+  const h = setup(t);
+  h.send(1, { skipped: 0, src: '10.0.0.2:5000', dst: '10.0.0.1:53' });
+  h.send(2, { skipped: 0, src: '10.0.0.1:53', dst: '10.0.0.2:5000' });
+  h.send(3, { skipped: 0, src: '10.0.0.2:5001', dst: '10.0.0.1:53' });
+  h.flush();
+  h.view.setPair(['10.0.0.1:53', '10.0.0.2:5000']);
+  assert.deepEqual(h.rows().map((row) => row.hidden), [false, false, true]);
+  // The text filter narrows the pair further; it never widens it.
+  $('pfilter').value = 'packet 2';
+  $('pfilter').dispatchEvent(new Event('input'));
+  assert.deepEqual(h.rows().map((row) => row.hidden), [true, false, true]);
+  $('pfilter').value = '';
+  $('pfilter').dispatchEvent(new Event('input'));
+  h.view.setPair(null);
+  assert.deepEqual(h.rows().map((row) => row.hidden), [false, false, false]);
+});
+
+test('merged host rows keep display numbers and link identities in detail and labels', async (t) => {
+  const h = setup(t);
+  h.view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'b' }, host: 'beta' }]);
+  const source = h.sources.at(-1);
+  for (const [link, seq, side] of [['a', 7, 0], ['b', 2, 1]]) source.emit('packet', { link, seq, side, t: .000747, tags: [], src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', len: 28, info: 'Echo request' });
+  h.flush();
+  assert.equal($('drawer').classList.contains('merged-hosts'), true);
+  assert.deepEqual(h.rows().map((row) => row.querySelector('.c-host').textContent), ['alpha', 'beta']);
+  assert.equal(h.rows()[1].classList.contains('back'), true);
+  h.rows()[1].click();
+  assert.match(h.requests.at(-1).url, /link=b&seq=2/);
+  h.requests.at(-1).resolve({ ok: true, json: async () => ({ ...detail(2), len: 28, t: .000747 }) });
+  await settle();
+  assert.equal($('tree').querySelector('.packet-detail-head').textContent, "Packet 2 · beta's link, packet 2 · 28 bytes at 0.000747 s");
+  assert.doesNotMatch($('tree').textContent, /network → All hosts/);
+  h.view.setLabels([{ text: '<download>', target: { kind: 'flow', link: 'b', a: '10.0.0.3', b: '10.0.0.2' } }]);
+  assert.equal(h.rows()[0].querySelector('.label-chip'), null);
+  assert.equal(h.rows()[1].querySelector('.c-info').querySelector('.label-chip').textContent, '<download>');
+  assert.equal(h.rows()[1].querySelector('download'), null);
+  h.view.setLabels([]);
+  assert.equal(h.rows()[1].querySelector('.label-chip'), null);
+  h.view.openLinks('alpha', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'c' }, host: 'alpha' }]);
+  assert.equal($('drawer').classList.contains('merged-hosts'), false);
+});
+
+
+test('host columns fit the declared names and stay fixed as packets arrive', (t) => {
+  const h = setup(t);
+  h.view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'workstation' }, { e: { id: 'b' }, host: 'jump' }]);
+  const width = () => $('drawer').style['--packet-host'];
+  assert.equal(width(), 'calc(11ch + 16px)');
+  for (const [link, seq] of [['b', 1], ['a', 2]]) {
+    h.sources.at(-1).emit('packet', { link, seq, side: 0, t: seq, tags: [], src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', len: 28, info: 'Echo request' });
+    h.flush();
+    assert.equal(width(), 'calc(11ch + 16px)');
+  }
+  assert.deepEqual(h.rows().map((row) => row.querySelector('.c-host').textContent), ['jump', 'workstation']);
+  h.view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'a-very-long-host-name' }, { e: { id: 'b' }, host: 'jump' }]);
+  assert.equal(width(), 'calc(16ch + 16px)');
 });
