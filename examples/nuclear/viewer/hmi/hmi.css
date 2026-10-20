@@ -441,7 +441,7 @@ body {
 .equipment.stale { stroke: var(--stale); stroke-dasharray: 3 3; }
 .equipment.open { fill: var(--panel); stroke-width: 3; }
 .equipment.stopped { stroke-dasharray: 3 2; }
-.confirmation { grid-column: 1 / -1; padding: 8px; background: var(--panel); border: 2px solid var(--line-strong); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.confirmation { grid-column: 1 / -1; padding: 8px; background: var(--panel); border: 2px solid var(--line-strong); display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
 .confirmation[hidden] { display: none; }
 .trend-min, .trend-max { grid-column: 1 / -1; color: var(--muted); font-size: .8rem; }
 .time-axis { grid-column: 1 / -1; display: flex; justify-content: space-between; font-size: .8rem; color: var(--muted); }
@@ -455,7 +455,7 @@ body {
 .rod-bank { fill: var(--ink); stroke: none; }
 .level-fill.stale, .rod-bank.stale { fill: var(--stale); }
 
-.process-key { margin: 0 0 8px; color: var(--muted); font-size: .85rem; }
+.process-key { fill: var(--muted); }
 
 .state-label { fill: var(--muted); }
 .state-value { fill: var(--ink); }
@@ -479,3 +479,6 @@ body {
   .state-value.abnormal, .state-value.stale { fill: var(--ink); text-decoration: underline; }
   .control-button[aria-pressed="true"] { border: 3px double var(--focus); }
 }
+
+.confirmation > [role="status"] { flex: 1; min-width: 0; }
+.confirmation > button { flex: none; white-space: nowrap; }

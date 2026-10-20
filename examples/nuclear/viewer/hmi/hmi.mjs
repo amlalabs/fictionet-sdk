@@ -263,19 +263,19 @@ function buildMimic(doc) {
   vessel('pressurizer', 760, 240, 'pressurizer_level');
   vessel('sg-a', 240, 400, 'sg_level_a');
   vessel('sg-b', 840, 400, 'sg_level_b');
-  const pump = (id, x, y) => symbol(id, x - 16, y - 16, 42, 32, (g) => {
+  const pump = (id, x, y, mirror = false) => symbol(id, x - (mirror ? 26 : 16), y - 16, 42, 32, (g) => {
     g.appendChild(svg(doc, 'circle', { cx: x, cy: y, r: 16 }));
-    g.appendChild(svg(doc, 'path', { d: `M${x},${y - 16} h26 M${x - 6},${y + 7} l14,-7 -14,-7`, class: 'tube' }));
+    g.appendChild(svg(doc, 'path', { d: `M${x},${y - 16} h${mirror ? -26 : 26} M${x - 6},${y + 7} l14,-7 -14,-7`, class: 'tube' }));
   });
-  pump('coolant_pump_a', 400, 650); pump('coolant_pump_b', 760, 650);
+  pump('coolant_pump_a', 270, 620); pump('coolant_pump_b', 870, 620, true);
   pump('feed_pump_a', 200, 900); pump('feed_pump_b', 960, 900);
   pump('auxiliary_feed', 500, 1080); pump('circulating_water', 900, 800);
   const valve = (id, x, y) => symbol(id, x - 14, y - 10, 28, 20, (g) => {
     g.appendChild(svg(doc, 'path', { d: `M${x - 14},${y - 10} L${x + 14},${y + 10} V${y - 10} L${x - 14},${y + 10} Z` }));
   });
   valve('feed_valve_a', 180, 460); valve('feed_valve_b', 950, 460);
-  valve('turbine_valve', 920, 100); valve('steam_dump_valve', 1110, 700);
-  valve('spray_valve', 730, 220); valve('pressurizer_relief', 850, 220); valve('steam_relief', 664, 40);
+  valve('turbine_valve', 930, 100); valve('steam_dump_valve', 1110, 700);
+  valve('spray_valve', 715, 220); valve('pressurizer_relief', 835, 220); valve('steam_relief', 664, 40);
   for (const [id, x, w] of [['hp-turbine', 950, 40], ['lp-turbine', 1020, 50]]) {
     symbol(id, x, 85, w, 50, (g) => {
       g.appendChild(svg(doc, 'polygon', { points: `${x},100 ${x + w},85 ${x + w},135 ${x},120` }));
@@ -296,22 +296,22 @@ function buildMimic(doc) {
   pipe('primary-hot', [[570, 420], [300, 420]]);
   pipe('primary-hot', [[630, 420], [790, 420], [840, 420]]);
   pipe('primary-hot', [[790, 340], [790, 420]]);
-  pipe('primary-cold', [[270, 500], [270, 650], [384, 650]]);
-  pipe('primary-cold', [[426, 634], [490, 634], [490, 480], [570, 480]]);
-  pipe('primary-cold', [[870, 500], [870, 690], [700, 690], [700, 650], [744, 650]]);
-  pipe('primary-cold', [[786, 634], [810, 634], [810, 600], [670, 600], [670, 480], [630, 480]]);
-  pipe('primary-cold', [[760, 260], [750, 260], [750, 220], [744, 220]]);
-  pipe('primary-cold', [[716, 220], [700, 220], [700, 280], [760, 280]]);
-  pipe('steam', [[790, 240], [790, 220], [836, 220]]);
-  pipe('steam', [[864, 220], [890, 220]]);
-  pipe('steam', [[270, 400], [270, 100], [600, 100], [870, 100], [900, 100], [906, 100]]);
+  pipe('primary-cold', [[270, 500], [270, 604]]);
+  pipe('primary-cold', [[296, 604], [490, 604], [490, 500], [570, 500]]);
+  pipe('primary-cold', [[870, 500], [870, 604]]);
+  pipe('primary-cold', [[844, 604], [710, 604], [710, 500], [630, 500]]);
+  pipe('primary-cold', [[760, 260], [745, 260], [745, 220], [729, 220]]);
+  pipe('primary-cold', [[701, 220], [690, 220], [690, 280], [760, 280]]);
+  pipe('steam', [[790, 240], [790, 220], [821, 220]]);
+  pipe('steam', [[849, 220], [890, 220]]);
+  pipe('steam', [[270, 400], [270, 100], [600, 100], [870, 100], [900, 100], [916, 100]]);
   pipe('steam', [[870, 400], [870, 230]]);
   pipe('steam', [[870, 210], [870, 100]]);
   // The relief branch crosses the steam riser with a visible bridge.
   picture.appendChild(svg(doc, 'path', { d: 'M870,230 Q880,220 870,210', class: 'pipe steam crossing' }));
   pipe('steam', [[600, 100], [600, 40], [650, 40]]);
   pipe('steam', [[678, 40], [710, 40]]);
-  pipe('steam', [[934, 100], [950, 100]]);
+  pipe('steam', [[944, 100], [950, 100]]);
   pipe('steam', [[990, 100], [1020, 100]]);
   pipe('steam', [[1060, 135], [1060, 175], [1220, 175], [1220, 780], [1140, 780]]);
   pipe('steam', [[900, 100], [900, 5], [1200, 5], [1200, 165]]);
@@ -331,8 +331,8 @@ function buildMimic(doc) {
   pipe('feedwater', [[550, 760], [940, 760], [940, 720], [1000, 720]]);
   pipe('circulating-water', [[820, 800], [884, 800]]);
   pipe('circulating-water', [[926, 784], [980, 784], [980, 800], [990, 800]]);
-  pipe('circulating-water', [[1010, 800], [1020, 800]]);
-  picture.appendChild(svg(doc, 'path', { d: 'M990,800 Q1000,790 1010,800', class: 'pipe circulating-water crossing' }));
+  pipe('circulating-water', [[1008, 800], [1020, 800]]);
+  picture.appendChild(svg(doc, 'path', { d: 'M990,800 Q1000,790 1008,800', class: 'pipe circulating-water crossing' }));
   pipe('circulating-water', [[1140, 800], [1230, 800]]);
 
   const label = (text, x, y, className = 'equipment-title') => {
@@ -343,12 +343,12 @@ function buildMimic(doc) {
   for (const [title, x, y] of [
     ['Reactor vessel', 510, 390], ['Pressurizer', 740, 195],
     ['Steam generator A', 100, 380], ['Steam generator B', 880, 375],
-    ['Turbine / Generator', 950, 80], ['Condenser', 1100, 735],
-    ['Loop A', 330, 450], ['Loop B', 720, 510],
+    ['Turbine', 925, 45], ['Generator', 925, 65], ['Condenser', 1100, 735],
+    ['Loop A', 330, 450], ['Loop B', 740, 510],
   ]) label(title, x, y);
   const instrument = (id, x, y, tagText, mode = false) => {
     const g = svg(doc, 'g', { 'data-reading': mode ? '' : id, class: 'instrument' });
-    g.appendChild(svg(doc, 'rect', { x, y, width: id === 'feed_b' ? 110 : 175, height: 52, class: 'data-box' }));
+    g.appendChild(svg(doc, 'rect', { x, y, width: id === 'feed_b' ? 100 : 175, height: 52, class: 'data-box' }));
     const tag = svg(doc, 'text', { x: x + 6, y: y + 18, class: 'instrument-tag' }, tagText);
     const text = svg(doc, 'text', { x: x + 6, y: y + 40, class: 'instrument-value' });
     g.appendChild(tag); g.appendChild(text); picture.appendChild(g);
@@ -356,42 +356,47 @@ function buildMimic(doc) {
     else readings.set(id, { text, tag, group: g });
   };
   for (const [id, x, y] of [
-    ['neutron_power', 300, 480], ['rod_position', 492, 535],
-    ['shutdown_rods', 492, 595], ['rod_demand', 492, 655],
+    ['neutron_power', 300, 480], ['rod_position', 505, 575],
+    ['shutdown_rods', 505, 635], ['rod_demand', 505, 695],
     ['core_exit_temperature', 300, 540],
-    ['pressurizer_pressure', 510, 180], ['pressurizer_level', 510, 300],
-    ['spray_valve', 690, 120],
-    ['hot_leg_a', 330, 355], ['cold_leg_a', 80, 600], ['coolant_flow_a', 290, 675],
-    ['hot_leg_b', 640, 425], ['cold_leg_b', 680, 535], ['coolant_flow_b', 680, 700],
+    ['pressurizer_pressure', 495, 180], ['pressurizer_level', 510, 300],
+    ['spray_valve', 510, 115],
+    ['hot_leg_a', 330, 355], ['cold_leg_a', 50, 600], ['coolant_flow_a', 310, 675],
+    ['hot_leg_b', 640, 435], ['cold_leg_b', 740, 640], ['coolant_flow_b', 740, 695],
     ['sg_level_a', 50, 390], ['sg_level_b', 920, 380],
-    ['steam_flow_a', 80, 285], ['steam_flow_b', 880, 310],
+    ['steam_flow_a', 80, 285], ['steam_flow_b', 885, 310],
     ['feed_flow_a', 50, 480], ['feed_valve_a', 50, 540],
     ['feed_flow_b', 1010, 495], ['feed_valve_b', 1010, 435],
-    ['steam_pressure', 340, 30], ['turbine_valve', 1010, 180],
-    ['turbine_valve_position', 1010, 240], ['generator_output', 1010, 10],
+    ['steam_pressure', 340, 30], ['turbine_valve', 1010, 190],
+    ['turbine_valve_position', 1010, 250], ['generator_output', 1010, 20],
     ['steam_dump_valve', 1010, 615], ['condenser_pressure', 1100, 850],
   ]) instrument(id, x, y);
   for (const [id, tag, x, y] of [
-    ['pressurizer', 'PIC-455 Pressure', 510, 240],
-    ['feed_a', 'LIC-421A Level', 50, 660], ['feed_b', 'LIC-421B', 880, 505],
+    ['pressurizer', 'PIC-455 Pressure', 495, 240],
+    ['feed_a', 'LIC-421A Level', 50, 660], ['feed_b', 'LIC-421B', 885, 505],
     ['steam_dump', 'PIC-434 Pressure', 1010, 555],
   ]) instrument(id, x, y, tag, true);
   for (const [id, equipment, x, y] of [
-    ['reactor_tripped', 'reactor-vessel', 550, 525], ['turbine_tripped', 'hp-turbine', 880, 280],
-    ['heaters', 'pressurizer', 700, 350], ['pressurizer_relief', 'pressurizer_relief', 885, 215],
+    ['reactor_tripped', 'reactor-vessel', 550, 525], ['turbine_tripped', 'hp-turbine', 930, 155],
+    ['heaters', 'pressurizer', 700, 310], ['pressurizer_relief', 'pressurizer_relief', 910, 215],
     ['steam_relief', 'steam_relief', 730, 45],
-    ['coolant_pump_a', 'coolant_pump_a', 430, 670], ['coolant_pump_b', 'coolant_pump_b', 880, 650],
-    ['feed_pump_a', 'feed_pump_a', 240, 915], ['feed_pump_b', 'feed_pump_b', 760, 940],
-    ['auxiliary_feed', 'auxiliary_feed', 290, 1090], ['circulating_water', 'circulating_water', 800, 825],
+    ['coolant_pump_a', 'coolant_pump_a', 240, 660], ['coolant_pump_b', 'coolant_pump_b', 895, 590],
+    ['feed_pump_a', 'feed_pump_a', 240, 915], ['feed_pump_b', 'feed_pump_b', 810, 915],
+    ['auxiliary_feed', 'auxiliary_feed', 350, 1080], ['circulating_water', 'circulating_water', 790, 845],
   ]) {
-    label(({ heaters: 'Heaters', pressurizer_relief: 'Relief', coolant_pump_a: 'RCP A', coolant_pump_b: 'RCP B' })[id] ?? FLAGS[id][0], x, y, 'state-label');
+    const slot = svg(doc, 'g', { class: 'state-slot', 'data-for': equipment });
+    picture.appendChild(slot);
+    const title = label(({ heaters: 'Heaters', pressurizer_relief: 'Relief', coolant_pump_a: 'RCP A', coolant_pump_b: 'RCP B' })[id] ?? FLAGS[id][0], x, y, 'state-label');
     const state = label('', x, y + 22, 'state-value');
+    slot.appendChild(title);
+    slot.appendChild(state);
+    slot.setAttribute('data-slot', `${x - 2},${y - 14},${Math.max(title.textContent.length, 7) * 13 * 0.62 + 4},40`);
     state.setAttribute('data-status', id);
     const circle = symbols.get(equipment);
     circle.setAttribute('data-pump', id);
     pumps.set(id, { circle, state });
   }
-  section.appendChild(make(doc, 'p', { class: 'process-key' }, 'Primary: heavy hot leg / thin cold leg · Steam: dashed · Feedwater: thin solid · Circulating water: dash-dot'));
+  label('Primary: heavy hot leg / thin cold leg · Steam: dashed · Feedwater: thin solid · Circulating water: dash-dot', 40, 1170, 'process-key');
   section.appendChild(picture);
   return { section, readings, pumps, modes, fills, symbols };
 }

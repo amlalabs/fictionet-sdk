@@ -3,6 +3,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const styles = readFileSync(new URL('./hmi.css', import.meta.url), 'utf8');
 import { render, start } from './hmi.mjs';
 
 // A fake document: only the parts of the DOM that render() and the controls use.
@@ -447,7 +449,8 @@ test('selection expires and requires a new confirmation', async (t) => {
 function textRect(node) {
   const x = Number(node.getAttribute('x'));
   const y = Number(node.getAttribute('y'));
-  return { x: x - 1, y: y - 14, w: node.textContent.length * (node.classList.contains('instrument-value') ? 9.1 : 8) + 2, h: 18 };
+  const em = node.classList.contains('instrument-value') ? 15 : 13;
+  return { x, y: y - em * 0.9, w: node.textContent.length * em * 0.62, h: em * 1.2 };
 }
 function overlaps(a, b) {
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
@@ -467,9 +470,13 @@ function segmentHitsRect(line, box) {
 }
 
 test('mimic text boxes stay clear of pipes, other text, and neighboring equipment', () => {
-  for (const quality of ['live', 'missing', 'stale']) {
+  for (const quality of ['live', 'on', 'off', 'missing', 'stale']) {
     const plant = structuredClone(SAMPLE);
-    if (quality === 'stale') for (const r of Object.values(plant.readings)) r.stale = true;
+    if (quality === 'on' || quality === 'off') for (const id of Object.keys(plant.status)) plant.status[id] = quality === 'on';
+    if (quality === 'stale') {
+      for (const r of Object.values(plant.readings)) r.stale = true;
+      for (const link of plant.links) link.online = false;
+    }
     if (quality === 'missing') {
       for (const r of Object.values(plant.readings)) r.value = null;
       for (const id of Object.keys(plant.status)) plant.status[id] = null;
@@ -487,6 +494,20 @@ test('mimic text boxes stay clear of pipes, other text, and neighboring equipmen
       x: +n.getAttribute('x'), y: +n.getAttribute('y'), w: +n.getAttribute('width'), h: +n.getAttribute('height'),
     }));
     assert.equal(boxes.length, Object.keys(SAMPLE.readings).length + Object.keys(SAMPLE.modes).length);
+    const slots = findAll(mimic, (n) => n.classList.contains('state-slot'));
+    assert.equal(slots.length, Object.keys(SAMPLE.status).length);
+    for (const slot of slots) {
+      const [x, y, w, h] = slot.getAttribute('data-slot').split(',').map(Number);
+      const area = { x, y, w, h };
+      assert.ok(find(mimic, (n) => n.getAttribute('data-equipment') === slot.getAttribute('data-for')));
+      for (const text of slot.children) {
+        const b = textRect(text);
+        assert.ok(b.x >= x && b.y >= y && b.x + b.w <= x + w && b.y + b.h <= y + h, text.textContent);
+      }
+      for (const b of [...boxes, ...equipment]) assert.ok(!overlaps(area, b), `Slot ${slot.textContent} overlaps an obstacle`);
+      for (const text of texts.filter((n) => n.parentNode !== slot)) assert.ok(!overlaps(area, textRect(text)), `Slot overlaps ${text.textContent}`);
+      for (const line of pipeSegments(mimic)) assert.ok(!segmentHitsRect(line, area), `Line enters ${slot.textContent}`);
+    }
     for (const [i, box] of boxes.entries()) {
       for (const pipe of pipes) assert.ok(!segmentHitsRect(pipe, box), `pipe crosses box ${i}`);
       for (const other of boxes.slice(i + 1)) assert.ok(!overlaps(box, other), `box ${i} overlaps another box`);
@@ -497,6 +518,13 @@ test('mimic text boxes stay clear of pipes, other text, and neighboring equipmen
       if (node.classList.contains('instrument-tag') || node.classList.contains('instrument-value')) {
         assert.ok(boxes.some((e) => box.x > e.x && box.x + box.w < e.x + e.w && box.y > e.y && box.y + box.h < e.y + e.h), node.textContent);
         for (const pipe of pipes) assert.ok(!segmentHitsRect(pipe, box), `pipe crosses ${node.textContent}`);
+      }
+      if (!node.classList.contains('symbol-letter')) {
+        for (const symbol of equipment) assert.ok(!overlaps(box, symbol), `${node.textContent} overlaps equipment`);
+      }
+      if (!node.classList.contains('instrument-tag') && !node.classList.contains('instrument-value')) {
+        for (const data of boxes) assert.ok(!overlaps(box, data), `${node.textContent} overlaps a data box`);
+        for (const pipe of pipeSegments(mimic)) assert.ok(!segmentHitsRect(pipe, box), `pipe crosses ${node.textContent}`);
       }
       for (const other of texts.slice(i + 1)) assert.ok(!overlaps(box, textRect(other)), `${node.textContent} overlaps ${other.textContent}`);
     }
@@ -704,7 +732,7 @@ test('vessel fills and rod bars follow values and retain quality marks', () => {
 });
 
 function pipeSegments(mimic) {
-  return findAll(mimic, (n) => n.classList.contains('pipe')).map((node) => {
+  return findAll(mimic, (n) => (n.classList.contains('pipe') || n.classList.contains('shaft'))).map((node) => {
     const bridge = node.tagName === 'path';
     const values = bridge ? node.getAttribute('d').match(/-?\d+(?:\.\d+)?/g).map(Number) : null;
     const [x1, y1, x2, y2] = bridge
@@ -716,67 +744,88 @@ function pipeSegments(mimic) {
 }
 
 test('process routes clear all equipment, headings and boxes with at most four bridged crossings', (t) => {
-  const root = fakeRoot();
-  render(root, SAMPLE);
-  const mimic = find(root, (n) => n.classList.contains('mimic'));
-  const lines = pipeSegments(mimic);
-  const obstacles = findAll(mimic, (n) => n.getAttribute('data-bounds') || n.classList.contains('data-box') || n.tagName === 'text').map((n) => {
-    const bounds = n.getAttribute('data-bounds');
-    const [x, y, w, h] = bounds ? bounds.split(',').map(Number) : [];
-    return { node: n, name: bounds ? n.getAttribute('data-equipment') : n.textContent || n.parentNode.textContent,
-      box: bounds ? { x, y, w, h } : n.tagName === 'text' ? textRect(n) : {
-        x: +n.getAttribute('x'), y: +n.getAttribute('y'), w: +n.getAttribute('width'), h: +n.getAttribute('height'),
-      }, equipment: !!bounds };
-  });
-  const errors = [];
-  let crossings = 0, overlapCount = 0;
-  const interior = (v, a, b) => v > Math.min(a, b) && v < Math.max(a, b);
-  for (const [i, a] of lines.entries()) {
-    assert.ok(a.x1 === a.x2 || a.y1 === a.y2, 'orthogonal pipe');
-    assert.ok(a.x1 !== a.x2 || a.y1 !== a.y2, 'nonempty pipe');
-    for (const o of obstacles) {
-      const b = o.box;
-      if (segmentHitsRect(a, b)) {
-        const vertical = a.x1 === a.x2;
-        const length = vertical
-          ? Math.min(Math.max(a.y1, a.y2), b.y + b.h) - Math.max(Math.min(a.y1, a.y2), b.y)
-          : Math.min(Math.max(a.x1, a.x2), b.x + b.w) - Math.max(Math.min(a.x1, a.x2), b.x);
-        const endpoint = [[a.x1, a.y1], [a.x2, a.y2]].some(([x, y]) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
-        if (!o.equipment || length !== 0 || !endpoint) errors.push(`Pipe ${a.x1},${a.y1} to ${a.x2},${a.y2} hits ${o.name}`);
+  for (const state of [true, false, null, 'stale']) {
+    const root = fakeRoot();
+    const plant = structuredClone(SAMPLE);
+    for (const id of Object.keys(plant.status)) plant.status[id] = state === 'stale' ? true : state;
+    if (state === 'stale') for (const link of plant.links) link.online = false;
+    render(root, plant);
+    const mimic = find(root, (n) => n.classList.contains('mimic'));
+    const lines = pipeSegments(mimic);
+    const obstacles = findAll(mimic, (n) => n.getAttribute('data-bounds') || n.classList.contains('data-box') || n.tagName === 'text').map((n) => {
+      const bounds = n.getAttribute('data-bounds');
+      const [x, y, w, h] = bounds ? bounds.split(',').map(Number) : [];
+      return { node: n, name: bounds ? n.getAttribute('data-equipment') : n.textContent || n.parentNode.textContent,
+        box: bounds ? { x, y, w, h } : n.tagName === 'text' ? textRect(n) : {
+          x: +n.getAttribute('x'), y: +n.getAttribute('y'), w: +n.getAttribute('width'), h: +n.getAttribute('height'),
+        }, equipment: !!bounds };
+    });
+    const errors = [];
+    let crossings = 0, overlapCount = 0, minimum = Infinity;
+    const interior = (v, a, b) => v > Math.min(a, b) && v < Math.max(a, b);
+    for (const [i, a] of lines.entries()) {
+      assert.ok(a.x1 === a.x2 || a.y1 === a.y2, 'orthogonal pipe');
+      assert.ok(a.x1 !== a.x2 || a.y1 !== a.y2, 'nonempty pipe');
+      for (const o of obstacles) {
+        const b = o.box;
+        if (segmentHitsRect(a, b)) {
+          const vertical = a.x1 === a.x2;
+          const length = vertical
+            ? Math.min(Math.max(a.y1, a.y2), b.y + b.h) - Math.max(Math.min(a.y1, a.y2), b.y)
+            : Math.min(Math.max(a.x1, a.x2), b.x + b.w) - Math.max(Math.min(a.x1, a.x2), b.x);
+          const endpoint = [[a.x1, a.y1], [a.x2, a.y2]].some(([x, y]) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
+          if (!o.equipment || length !== 0 || !endpoint) errors.push(`Pipe ${a.x1},${a.y1} to ${a.x2},${a.y2} hits ${o.name}`);
+        }
+        const endpoint = [[a.x1, a.y1], [a.x2, a.y2]].some(([x, y]) =>
+          x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
+        if (!(o.equipment && endpoint)) {
+          const values = a.bridge ? a.node.getAttribute('d').match(/-?\d+(?:\.\d+)?/g).map(Number) : [a.x1, a.y1, a.x2, a.y2];
+          const xs = values.filter((_, i) => i % 2 === 0), ys = values.filter((_, i) => i % 2 === 1);
+          const dx = Math.max(b.x - Math.max(...xs), Math.min(...xs) - b.x - b.w, 0);
+          const dy = Math.max(b.y - Math.max(...ys), Math.min(...ys) - b.y - b.h, 0);
+          const stroke = a.node.classList.contains('primary-hot') ? 5 :
+            a.node.classList.contains('primary-cold') || a.node.classList.contains('steam') ? 3 : 2;
+          const border = o.equipment ? 0.75 : o.node.classList.contains('data-box') ? 0.5 : 0;
+          for (const width of [1280, 1440]) {
+            const clearance = (Math.hypot(dx, dy) - stroke / 2 - border) * (width - 58) / 1280;
+            minimum = Math.min(minimum, clearance);
+            if (clearance < 8) errors.push(`${width}px: ${a.x1},${a.y1} to ${a.x2},${a.y2} clears ${o.name} by ${clearance.toFixed(2)}px`);
+          }
+        }
+        if (a.bridge) {
+          const extent = a.node.getAttribute('d').match(/-?\d+(?:\.\d+)?/g).map(Number);
+          const bridgeBox = { x: Math.min(extent[0], extent[2], extent[4]), y: Math.min(extent[1], extent[3], extent[5]),
+            w: Math.max(extent[0], extent[2], extent[4]) - Math.min(extent[0], extent[2], extent[4]),
+            h: Math.max(extent[1], extent[3], extent[5]) - Math.min(extent[1], extent[3], extent[5]) };
+          if (overlaps(bridgeBox, b)) errors.push(`Bridge hits ${o.name}`);
+        }
       }
-      if (a.bridge) {
-        const extent = a.node.getAttribute('d').match(/-?\d+(?:\.\d+)?/g).map(Number);
-        const bridgeBox = { x: Math.min(extent[0], extent[2], extent[4]), y: Math.min(extent[1], extent[3], extent[5]),
-          w: Math.max(extent[0], extent[2], extent[4]) - Math.min(extent[0], extent[2], extent[4]),
-          h: Math.max(extent[1], extent[3], extent[5]) - Math.min(extent[1], extent[3], extent[5]) };
-        if (overlaps(bridgeBox, b)) errors.push(`Bridge hits ${o.name}`);
-      }
-    }
-    for (const b of lines.slice(i + 1)) {
-      const av = a.x1 === a.x2, bv = b.x1 === b.x2;
-      if (av === bv) {
-        if ((av ? a.x1 === b.x1 : a.y1 === b.y1) &&
-          Math.max(Math.min(av ? a.y1 : a.x1, av ? a.y2 : a.x2), Math.min(bv ? b.y1 : b.x1, bv ? b.y2 : b.x2)) <
-          Math.min(Math.max(av ? a.y1 : a.x1, av ? a.y2 : a.x2), Math.max(bv ? b.y1 : b.x1, bv ? b.y2 : b.x2))) overlapCount++;
-      } else {
-        const v = av ? a : b, h = av ? b : a;
-        if (interior(v.x1, h.x1, h.x2) && interior(h.y1, v.y1, v.y2)) {
-          crossings++;
-          if (!v.bridge && !h.bridge) errors.push(`Unbridged crossing at ${v.x1},${h.y1}`);
+      for (const b of lines.slice(i + 1)) {
+        const av = a.x1 === a.x2, bv = b.x1 === b.x2;
+        if (av === bv) {
+          if ((av ? a.x1 === b.x1 : a.y1 === b.y1) &&
+            Math.max(Math.min(av ? a.y1 : a.x1, av ? a.y2 : a.x2), Math.min(bv ? b.y1 : b.x1, bv ? b.y2 : b.x2)) <
+            Math.min(Math.max(av ? a.y1 : a.x1, av ? a.y2 : a.x2), Math.max(bv ? b.y1 : b.x1, bv ? b.y2 : b.x2))) overlapCount++;
+        } else {
+          const v = av ? a : b, h = av ? b : a;
+          if (interior(v.x1, h.x1, h.x2) && interior(h.y1, v.y1, v.y2)) {
+            crossings++;
+            if (!v.bridge && !h.bridge) errors.push(`Unbridged crossing at ${v.x1},${h.y1}`);
+          }
         }
       }
     }
-  }
-  for (const [i, a] of obstacles.entries()) {
-    if (!a.node.classList.contains('data-box')) continue;
-    for (const b of obstacles.slice(i + 1)) {
-      if ((b.node.classList.contains('data-box') || b.equipment) && overlaps(a.box, b.box)) errors.push(`Box ${a.name} overlaps ${b.name}`);
+    for (const [i, a] of obstacles.entries()) {
+      if (!a.node.classList.contains('data-box')) continue;
+      for (const b of obstacles.slice(i + 1)) {
+        if ((b.node.classList.contains('data-box') || b.equipment) && overlaps(a.box, b.box)) errors.push(`Box ${a.name} overlaps ${b.name}`);
+      }
     }
+    t.diagnostic(`${lines.length} segments; ${crossings} crossings; ${overlapCount} overlaps; minimum clearance ${minimum.toFixed(2)}px`);
+    assert.deepEqual(errors, []);
+    assert.equal(overlapCount, 0);
+    assert.ok(crossings <= 4, `${crossings} crossings`);
   }
-  t.diagnostic(`${lines.length} segments; ${crossings} crossings; ${overlapCount} overlaps`);
-  assert.deepEqual(errors, []);
-  assert.equal(overlapCount, 0);
-  assert.ok(crossings <= 4, `${crossings} crossings`);
 });
 
 test('trends use at least five percent of each instrument scale and center steady data', () => {
@@ -865,4 +914,30 @@ test('controller faceplates show ISA tags, abbreviated modes and stale quality',
       assert.ok(node.classList.contains('stale'));
     }
   }
+});
+
+
+test('graphic font metrics and confirmation sizing match the layout checks', () => {
+  assert.match(styles, /\.mimic text\s*\{[^}]*font-family: ui-monospace, monospace;[^}]*font-size: 13px;/);
+  assert.match(styles, /\.mimic \.instrument-value\s*\{[^}]*font-size: 15px;/);
+  assert.match(styles, /\.confirmation\s*\{[^}]*flex-wrap: nowrap;/);
+  assert.match(styles, /\.confirmation > button\s*\{[^}]*flex: none;[^}]*white-space: nowrap;/);
+  assert.match(styles, /\.confirmation > \[role="status"\]\s*\{[^}]*min-width: 0;/);
+});
+
+test('cold legs descend to aligned pumps and take matching routes into the vessel', () => {
+  const root = fakeRoot();
+  render(root, SAMPLE);
+  const mimic = find(root, (n) => n.classList.contains('mimic'));
+  const lines = pipeSegments(mimic).filter((l) => l.node.classList.contains('primary-cold'));
+  for (const [side, sgX, outlet, turn, inlet] of [['a', 270, 296, 490, 570], ['b', 870, 844, 710, 630]]) {
+    const pump = find(mimic, (n) => n.getAttribute('data-equipment') === `coolant_pump_${side}`);
+    const circle = find(pump, (n) => n.tagName === 'circle');
+    assert.equal(+circle.getAttribute('cx'), sgX);
+    assert.equal(+circle.getAttribute('cy'), 620);
+    for (const segment of [[sgX, 500, sgX, 604], [outlet, 604, turn, 604], [turn, 604, turn, 500], [turn, 500, inlet, 500]]) {
+      assert.equal(lines.filter((l) => [l.x1, l.y1, l.x2, l.y2].every((v, i) => v === segment[i])).length, 1);
+    }
+  }
+  assert.equal(lines.filter((l) => Math.max(l.y1, l.y2) >= 400).length, 8);
 });
