@@ -492,7 +492,7 @@ colleague's laptop. Its session writes a folder in the cache before Maya's
 session reads it, against one repository state or a separate state for each
 session (`repository::Sessions`). The agent is a fixed list of commands taken from the scripted
 probes. It has no model and makes no model calls. See
-[the demos](../../demos/README.md#artifactory) for the options, the gate and
+[the demos](../../demos/README.md#artifactory) for the options, the checks and
 a mode that serves the page without a VM.
 
 The page has three panels of its own beside the standard ones:

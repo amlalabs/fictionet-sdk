@@ -1,6 +1,13 @@
-//! An Ubuntu browser desktop reached through the admin SSH session.
+//! Ubuntu desktops on Xvnc, reached through the admin SSH session: a
+//! browser with Xfce and Firefox, or one full-screen terminal that types
+//! the commands [`GuestHandle::type_command`] sends.
 
-use super::Guest;
+use std::io;
+use std::time::Duration;
+
+use fictionet::stdlib::codec::base64;
+
+use super::{Guest, GuestHandle, ssh};
 
 /// Xvnc's display port on the guest's loopback.
 pub const VNC_PORT: u16 = 5901;
@@ -10,9 +17,208 @@ pub const HOSTS: &[&str] = &["packages.mozilla.org"];
 
 const MOZILLA_KEY: &str = include_str!("desktop/packages.mozilla.org.asc");
 
-/// An Ubuntu guest with Xfce on Xvnc and Mozilla's Firefox at start_url.
-/// Panics if the URL is not neutral HTTP or HTTPS or contains shell quoting
-/// or expansion characters. Desktop setup precedes caller-added run steps.
+/// Where the typed-command program reads commands and writes results, in
+/// the user's home.
+const WORK: &str = ".local/work";
+/// The typed-command program. It waits on its pipe for a line holding a time
+/// limit in seconds and a command. It shows a prompt and types the command
+/// out, runs it for at most that limit, and writes back its exit status. Its
+/// arguments are a heading it shows first.
+const ASSISTANT: &str = r#"#!/bin/bash
+work=$HOME/.local/work
+[ $# -eq 0 ] || printf '%s\n\n' "$*"
+while read -r limit command < "$work/commands"; do
+    : > "$work/output"
+    printf '\033[01;32m%s@%s\033[00m:\033[01;34m%s\033[00m$ ' "$USER" "$(hostname)" "${PWD/#$HOME/\~}"
+    for ((i = 0; i < ${#command}; i++)); do
+        printf '%s' "${command:i:1}"
+        sleep 0.03
+    done
+    printf '\n'
+    timeout "$limit" bash -c "$command" 2>&1 | tee "$work/output"
+    status=${PIPESTATUS[0]}
+    printf '\n[exit %s]\n\n' "$status"
+    printf '%s\n' "$status" > "$work/results"
+done
+"#;
+/// Prints the title of the first visible Firefox window on the guest's
+/// display, or nothing when none shows.
+pub(crate) const FIREFOX_TITLE: &str = "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible \
+    --class firefox | head -n1 | xargs -r xdotool getwindowname'";
+
+/// Returns the title of the first visible Firefox window on the guest's
+/// screen, or an empty string when none shows. It takes at most 10 s.
+pub async fn firefox_title(ssh: &ssh::Session) -> io::Result<String> {
+    let out = tokio::time::timeout(Duration::from_secs(10), ssh.run(FIREFOX_TITLE))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the Firefox title query hung"))??;
+    if out.code != 0 {
+        return Err(io::Error::other(format!(
+            "the Firefox title query exited {}: {}",
+            out.code, out.stderr
+        )));
+    }
+    Ok(out.stdout.trim().to_owned())
+}
+
+/// How much longer than a command's limit [`GuestHandle::type_command`]
+/// waits, for the typing.
+const TYPING: Duration = Duration::from_secs(30);
+/// The most of a typed command's output [`GuestHandle::type_command`] reads
+/// back: its last 1 MiB.
+const OUTPUT_LIMIT: usize = 1 << 20;
+
+impl Guest {
+    /// Installs `/opt/assistant`, the program a terminal window runs to
+    /// type and run the commands [`GuestHandle::type_command`] sends, and
+    /// the pipes it reads them from. [`terminal`] includes it.
+    pub fn typed_commands(self) -> Self {
+        let (user, work) = (self.user.clone(), WORK);
+        self.file("/opt/assistant", 0o755, ASSISTANT).run(format!(
+            "sudo -u {user} mkdir -p -m700 /home/{user}/{work} \
+             && sudo -u {user} mkfifo -m600 /home/{user}/{work}/commands /home/{user}/{work}/results"
+        ))
+    }
+}
+
+/// What a command typed with [`GuestHandle::type_command`] did.
+pub struct Typed {
+    /// The command's exit status; 124 when it ran out of time.
+    pub code: i32,
+    /// Its output and error output together: the last 1 MiB when it printed
+    /// more.
+    pub output: String,
+}
+
+impl GuestHandle {
+    /// Types `command` in the terminal window that runs `/opt/assistant`
+    /// (see [`Guest::typed_commands`]) and runs it for at most `limit`,
+    /// whole seconds and at least one. The command is one line. When the
+    /// terminal does not report back, the error carries the output so far.
+    pub async fn type_command(&self, command: &str, limit: Duration) -> io::Result<Typed> {
+        if command.contains(['\n', '\r', '\0']) {
+            return Err(io::Error::other("a typed command must be one line"));
+        }
+        let wait = limit + TYPING;
+        let send = send_typed(command, limit);
+        let sent = self.ssh().run_bounded(&send, OUTPUT_LIMIT + 64);
+        let error = match tokio::time::timeout(wait, sent).await {
+            Err(_) => format!("it did not finish in {wait:?}"),
+            Ok(Err(error)) => error.to_string(),
+            Ok(Ok(out)) => match out.stdout.split_once('\n') {
+                Some((status, output)) if out.code == 0 => match status.trim().parse() {
+                    Ok(code) => {
+                        return Ok(Typed {
+                            code,
+                            output: output.to_owned(),
+                        });
+                    }
+                    Err(_) => format!("its status line was {status:?}"),
+                },
+                _ => format!("exit {}; {}", out.code, out.stderr),
+            },
+        };
+        let read = format!("tail -c {OUTPUT_LIMIT} ~/{WORK}/output");
+        let reading = self.ssh().run_bounded(&read, OUTPUT_LIMIT);
+        let output = match tokio::time::timeout(Duration::from_secs(10), reading).await {
+            Ok(Ok(out)) => out.stdout,
+            Ok(Err(error)) => format!("(unreadable: {error})"),
+            Err(_) => "(reading it timed out)".into(),
+        };
+        Err(io::Error::other(format!(
+            "{}: the terminal did not run {command:?}: {error}\nits output so far:\n{output}",
+            self.name()
+        )))
+    }
+}
+
+/// The shell command that hands `command` and its time limit to
+/// `/opt/assistant` and prints its exit status on one line, then the last
+/// [`OUTPUT_LIMIT`] bytes of its output.
+fn send_typed(command: &str, limit: Duration) -> String {
+    let line = format!("{} {command}\n", limit.as_secs().max(1));
+    format!(
+        "printf %s {} | base64 -d > ~/{WORK}/commands && head -n1 ~/{WORK}/results \
+         && tail -c {OUTPUT_LIMIT} ~/{WORK}/output",
+        ssh::quote(&base64::encode(line.as_bytes()))
+    )
+}
+
+/// An Ubuntu guest whose screen is Xvnc on display :1, `width` by `height`
+/// pixels, on the guest's loopback with no password: only the admin SSH
+/// tunnel reaches it. Once the X server answers, `session` runs as `user`,
+/// and `ready` exits zero once the desktop is up. The caller enables
+/// `vnc.service` after its own setup.
+fn xvnc(
+    hostname: &str,
+    user: &str,
+    (width, height): (u16, u16),
+    session: &str,
+    ready: &str,
+) -> Guest {
+    // The guest's clipboard stays in the guest: noVNC watching in view-only
+    // mode loses its place in the stream when a clipboard update arrives,
+    // and the screen drops.
+    let start = format!(
+        "#!/bin/bash\n\
+         export HOME=/home/{user} DISPLAY=:1 XDG_RUNTIME_DIR=/run/user/$(id -u {user})\n\
+         /usr/bin/Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -SendCutText=0 -nolisten tcp \
+           -geometry {width}x{height} -depth 24 >/tmp/xvnc.log 2>&1 &\n\
+         for _ in $(seq 1 150); do xdpyinfo -display :1 >/dev/null 2>&1 && break; sleep 0.2; done\n\
+         xdpyinfo -display :1 >/dev/null 2>&1 || exit 1\n\
+         {session}"
+    );
+    let service = format!(
+        "[Unit]\n\
+         Description=Desktop session\n\
+         After=systemd-user-sessions.service\n\
+         [Service]\n\
+         User={user}\n\
+         PAMName=login\n\
+         ExecStart=/opt/start-desktop.sh\n\
+         Restart=on-failure\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    );
+    Guest::ubuntu(hostname, user)
+        .desktop(VNC_PORT, ready)
+        .packages(&[
+            "tigervnc-standalone-server",
+            "x11-utils",
+            "fonts-dejavu-core",
+        ])
+        .file("/opt/start-desktop.sh", 0o755, start)
+        .file("/etc/systemd/system/vnc.service", 0o644, service)
+}
+
+/// An Ubuntu guest whose screen is one full-screen terminal at `size`
+/// pixels with `font_size` text. It runs `/opt/assistant` in the user's
+/// home, headed by `title`, so it types each command
+/// [`GuestHandle::type_command`] sends.
+pub fn terminal(hostname: &str, user: &str, title: &str, size: (u16, u16), font_size: u8) -> Guest {
+    let title = ssh::quote(title);
+    let session = format!(
+        "openbox &\n\
+         cd \"$HOME\"\n\
+         exec xterm -fa 'DejaVu Sans Mono' -fs {font_size} -fullscreen -bg '#101820' -fg '#e7edf4' \
+           -title {title} -e /opt/assistant {title}\n"
+    );
+    xvnc(
+        hostname,
+        user,
+        size,
+        &session,
+        "env DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && pgrep -x xterm >/dev/null",
+    )
+    .packages(&["openbox", "xterm"])
+    .typed_commands()
+    .run("systemctl daemon-reload && systemctl enable --now vnc.service")
+}
+
+/// An Ubuntu guest with Xfce on Xvnc at 1280x800 and Mozilla's Firefox at
+/// start_url. Panics if the URL is not neutral HTTP or HTTPS or contains
+/// shell quoting or expansion characters. Desktop setup precedes
+/// caller-added run steps.
 pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
     let rest = start_url
         .strip_prefix("https://")
@@ -21,7 +227,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         rest.is_some_and(|s| !s.is_empty()
             && s.bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"-._~:/?#[]@!&()*+,;=%".contains(&c)))
-            && super::neutral(start_url),
+            && super::forbidden_in(start_url, &[]).is_none(),
         "invalid start URL {start_url:?}; use a neutral http:// or https:// URL with URL characters and no whitespace, quotes, backslashes, dollar signs or backticks"
     );
     let mozilla_sources = "Types: deb\n\
@@ -68,83 +274,51 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         },
         "Preferences": quiet_preferences(),
     }}).to_string();
-    // Xvnc on :1 (5901), loopback only, no auth: reached only through an SSH
-    // tunnel. An Xfce session and Firefox for the user. The guest's clipboard
-    // stays in the guest: noVNC watching in view-only mode loses its place in
-    // the stream when a clipboard update arrives, and the screen drops.
-    let start_desktop = format!(
-        "#!/bin/bash\n\
-         set -x\n\
-         export HOME=/home/{user} DISPLAY=:1 XDG_RUNTIME_DIR=/run/user/$(id -u {user})\n\
-         /usr/bin/Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -SendCutText=0 -nolisten tcp \
-           -geometry 1280x800 -depth 24 >/tmp/xvnc.log 2>&1 &\n\
-         for _ in $(seq 1 150); do xdpyinfo -display :1 >/dev/null 2>&1 && break; sleep 0.2; done\n\
-         while IFS= read -r entry; do export \"$entry\"; done < <(dbus-launch)\n\
-         # The Xfce session, then the window manager, then Firefox: launched\n\
-         # here (not via Xfce autostart, which did not run reliably) so its\n\
-         # start is ordered and its output is captured.\n\
+    // The Xfce session, then its window manager, then Firefox, in order.
+    // Firefox starts once its profile root exists.
+    let session = format!(
+        "while IFS= read -r entry; do export \"$entry\"; done < <(dbus-launch)\n\
          startxfce4 >/tmp/xfce.log 2>&1 &\n\
          for _ in $(seq 1 150); do pgrep -x xfwm4 >/dev/null 2>&1 && break; sleep 0.2; done\n\
          sleep 2\n\
-         # Create the profile root so Firefox never hits \"profile missing\".\n\
          mkdir -p \"$HOME/.mozilla/firefox\"\n\
          firefox --no-remote '{start_url}' >/tmp/firefox.log 2>&1 &\n\
-         wait\n",
-        user = user,
-        start_url = start_url,
+         wait\n"
     );
-    let vnc_service = format!(
-        "[Unit]\n\
-         Description=Xvnc with an Xfce session\n\
-         After=systemd-user-sessions.service\n\
-         [Service]\n\
-         User={user}\n\
-         PAMName=login\n\
-         ExecStart=/opt/start-desktop.sh\n\
-         Restart=on-failure\n\
-         [Install]\n\
-         WantedBy=multi-user.target\n",
-        user = user,
-    );
-    let setup = setup_script(user);
-
-    Guest::ubuntu(hostname, user)
-        .desktop(
-            VNC_PORT,
-            "env DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && pgrep -x xfwm4 >/dev/null",
-        )
-        .packages(&[
-            "xfce4",
-            "xfce4-terminal",
-            "tigervnc-standalone-server",
-            "dbus-x11",
-            "xdotool",
-            "firefox",
-            "p11-kit",
-            "p11-kit-modules",
-            "libnss3",
-            "fonts-dejavu-core",
-            "fonts-liberation",
-            "adwaita-icon-theme",
-            "x11-utils",
-            "scrot",
-        ])
-        .file(
-            "/etc/apt/keyrings/packages.mozilla.org.asc",
-            0o644,
-            MOZILLA_KEY,
-        )
-        .file(
-            "/etc/apt/sources.list.d/mozilla.sources",
-            0o644,
-            mozilla_sources,
-        )
-        .file("/etc/apt/preferences.d/mozilla", 0o644, mozilla_pref)
-        .file("/etc/firefox/policies/policies.json", 0o644, policies)
-        .file("/opt/start-desktop.sh", 0o755, start_desktop)
-        .file("/etc/systemd/system/vnc.service", 0o644, vnc_service)
-        .file("/opt/setup-desktop.sh", 0o755, setup)
-        .run("bash /opt/setup-desktop.sh")
+    xvnc(
+        hostname,
+        user,
+        (1280, 800),
+        &session,
+        "env DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && pgrep -x xfwm4 >/dev/null",
+    )
+    .packages(&[
+        "xfce4",
+        "xfce4-terminal",
+        "dbus-x11",
+        "xdotool",
+        "firefox",
+        "p11-kit",
+        "p11-kit-modules",
+        "libnss3",
+        "fonts-liberation",
+        "adwaita-icon-theme",
+        "scrot",
+    ])
+    .file(
+        "/etc/apt/keyrings/packages.mozilla.org.asc",
+        0o644,
+        MOZILLA_KEY,
+    )
+    .file(
+        "/etc/apt/sources.list.d/mozilla.sources",
+        0o644,
+        mozilla_sources,
+    )
+    .file("/etc/apt/preferences.d/mozilla", 0o644, mozilla_pref)
+    .file("/etc/firefox/policies/policies.json", 0o644, policies)
+    .file("/opt/setup-desktop.sh", 0o755, setup_script(user))
+    .run("bash /opt/setup-desktop.sh")
 }
 
 /// Locked preferences that keep Firefox from making requests no page asked
@@ -303,7 +477,19 @@ fn setup_script(user: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kit::{b64_decode, seed};
+    use crate::kit::seed;
+    use std::collections::BTreeMap;
+
+    /// The guest's seed as the guest receives it, and the files it writes.
+    fn seed(guest: &Guest) -> (String, BTreeMap<String, String>) {
+        let data = seed::user_data(&seed::Provision {
+            guest,
+            authorized_key: "key",
+            ca: None,
+        });
+        let files = seed::files(&data).unwrap();
+        (data, files)
+    }
 
     #[test]
     fn browser_seed_has_the_desktop_and_firefox_policy() {
@@ -314,21 +500,8 @@ mod tests {
         assert_eq!(*port, VNC_PORT);
         assert!(ready.contains("DISPLAY=:1 xdpyinfo"));
         assert!(ready.contains("pgrep -x xfwm4"));
-        let data = seed::user_data(&seed::Provision {
-            guest: &guest,
-            authorized_key: "key",
-            ca: None,
-        });
-        let content = |path: &str| {
-            let file = data.split_once(&format!("  - path: {path:?}\n")).unwrap().1;
-            let encoded = file
-                .lines()
-                .nth(2)
-                .unwrap()
-                .strip_prefix("    content: ")
-                .unwrap();
-            String::from_utf8(b64_decode(encoded).unwrap()).unwrap()
-        };
+        let (data, files) = seed(&guest);
+        let content = |path: &str| files[path].clone();
         assert_eq!(
             content("/etc/apt/keyrings/packages.mozilla.org.asc"),
             MOZILLA_KEY
@@ -410,6 +583,107 @@ mod tests {
         assert!(setup.contains("/etc/xdg/xfce4/panel/default.xml"));
         assert!(
             data.find("bash /opt/setup-desktop.sh").unwrap() < data.find("echo caller").unwrap()
+        );
+    }
+
+    #[test]
+    fn terminal_runs_the_assistant_full_screen_on_the_shared_session() {
+        let guest = terminal("workstation", "analyst", "Office inventory", (960, 400), 15);
+        guest.validate().unwrap();
+        let content = |guest: &Guest, path: &str| seed(guest).1[path].clone();
+        let start = content(&guest, "/opt/start-desktop.sh");
+        assert!(start.contains("Xvnc :1 -localhost -SecurityTypes None"));
+        assert!(start.contains(" -SendCutText=0 "));
+        assert!(start.contains("-geometry 960x400 "));
+        assert!(start.contains(
+            "exec xterm -fa 'DejaVu Sans Mono' -fs 15 -fullscreen -bg '#101820' -fg '#e7edf4' \
+             -title 'Office inventory' -e /opt/assistant 'Office inventory'"
+        ));
+        assert_eq!(content(&guest, "/opt/assistant"), ASSISTANT);
+        let browser = browser("workstation", "analyst", "https://example.test/");
+        assert_eq!(
+            content(&guest, "/etc/systemd/system/vnc.service"),
+            content(&browser, "/etc/systemd/system/vnc.service")
+        );
+        let (_, ready) = guest.desktop.as_ref().unwrap();
+        assert!(ready.contains("pgrep -x xterm"));
+        let fifos = guest
+            .steps
+            .iter()
+            .position(|s| s.contains("mkfifo"))
+            .unwrap();
+        let enable = guest
+            .steps
+            .iter()
+            .position(|s| s.contains("enable --now vnc"))
+            .unwrap();
+        assert!(fifos < enable, "the pipes exist before the terminal starts");
+    }
+
+    #[test]
+    fn the_assistant_types_runs_and_reports_each_command() {
+        let home = crate::kit::util::RunDir::new(&std::env::temp_dir(), "assistant").unwrap();
+        let home = home.path();
+        let work = home.join(WORK);
+        std::fs::create_dir_all(&work).unwrap();
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(work.join("commands"))
+            .arg(work.join("results"))
+            .status()
+            .unwrap();
+        assert!(mkfifo.success());
+        std::fs::write(home.join("assistant"), ASSISTANT).unwrap();
+        /// Stops the program when the test ends, passing or not.
+        struct Running(std::process::Child);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = std::process::Command::new("bash")
+            .arg(home.join("assistant"))
+            .arg("Office inventory")
+            .env("HOME", home)
+            .env("USER", "analyst")
+            .current_dir(home)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let assistant = Running(child);
+        // The screen is read as the program writes it, so a long output
+        // never fills the pipe.
+        let screen = std::thread::spawn(move || {
+            let mut screen = String::new();
+            std::io::Read::read_to_string(&mut stdout, &mut screen).unwrap();
+            screen
+        });
+        let typed = |command: &str, limit: u64| {
+            let out = std::process::Command::new("bash")
+                .args(["-c", &send_typed(command, Duration::from_secs(limit))])
+                .env("HOME", home)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(typed("echo \"it's here\"; exit 3", 10), "3\nit's here\n");
+        assert_eq!(typed("printf 'one\\ntwo\\n'", 10), "0\none\ntwo\n");
+        assert_eq!(typed("echo started; sleep 5", 1), "124\nstarted\n");
+        let long = typed("head -c 1100000 /dev/zero | tr '\\0' x", 10);
+        assert_eq!(long, format!("0\n{}", "x".repeat(OUTPUT_LIMIT)));
+        drop(assistant);
+        let screen = screen.join().unwrap();
+        assert!(screen.starts_with("Office inventory\n\n"), "{screen}");
+        assert!(
+            screen.contains("echo \"it's here\"; exit 3\nit's here\n\n[exit 3]\n"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("printf 'one\\ntwo\\n'\none\ntwo\n\n[exit 0]\n"),
+            "{screen}"
         );
     }
 

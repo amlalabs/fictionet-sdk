@@ -1,7 +1,7 @@
-//! The `--fixture` mode: the page without a VM. An in-process client replays
-//! each step's requests and door probes against the world in `fictionet::run`,
-//! so the page shows real world facts. The screen says NO VM, and steps have
-//! no exit status because no guest runs.
+//! `artifactory preview`: the page without a VM. An in-process client
+//! replays each step's requests and door probes against the world in
+//! `fictionet::run`, so the page shows real world facts. The screen says
+//! NO VM, and steps have no exit status because no guest runs.
 
 use super::{
     Result,
@@ -22,6 +22,7 @@ use fictionet::{
         world::sandbox::{self, Machine},
     },
 };
+use fictionet_demo::kit::preview::{Console, Input, Story};
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{Host, HostState, HostStatus, Server, StateLimits, StateTopic},
@@ -32,20 +33,20 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-/// The fixture's sandboxes: its client, and the colleague's in `--sessions`.
-pub const SANDBOXES: [&str; 2] = ["fixture", "fixture-colleague"];
+/// The replay's sandboxes: its client, and the colleague's in `--sessions`.
+pub const SANDBOXES: [&str; 2] = ["replay", "replay-colleague"];
 
-/// A fixture run's facts and repository states.
-struct Fixture {
+/// A replay's facts and repository states.
+struct Replay {
     facts: Arc<Facts>,
     main: Arc<Contents>,
     sessions: Sessions,
     mode: Option<Mode>,
 }
 
-impl Fixture {
+impl Replay {
     fn new(variant: Variant, mode: Option<Mode>) -> fictionet::Result<Self> {
-        let state = || Contents::new(variant, "artifactory-fixture", &[1; 32]);
+        let state = || Contents::new(variant, "artifactory-replay", &[1; 32]);
         let main = state()?;
         let colleague = (mode == Some(Mode::Separate)).then(state).transpose()?;
         let facts = Arc::new(Facts::new(
@@ -69,33 +70,42 @@ impl Fixture {
 /// Serves the page while an in-process client replays the story's requests.
 /// `extra_reads` more index reads after the story fill the page's row bound.
 pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> Result {
-    let fixture = Fixture::new(variant, mode).map_err(std::io::Error::other)?;
-    let facts = fixture.facts.clone();
+    let replay = Replay::new(variant, mode).map_err(std::io::Error::other)?;
+    let facts = replay.facts.clone();
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
-    let page = bind(&dashboard, &facts).await?;
-    println!("Fixture: in-process traffic replay. No guest or command exit statuses.");
+    let screen = Console::new();
+    let page = bind(&dashboard, &facts, screen.clone()).await?;
+    println!(
+        "Replay without VMs: an in-process client sends the story's requests. No guest runs, so steps have no exit status."
+    );
     println!("Page: {}", page.url());
+    let mut input = Input::stdin(Story::Once, Some(screen))?;
     let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
         facts.clone(),
     ])));
-    let replay = run(options, fixture, Duration::from_secs(1), extra_reads);
-    tokio::pin!(replay);
-    let stay = fictionet_demo::kit::gate::stay_open();
-    tokio::pin!(stay);
-    tokio::select! {
-        result = &mut replay => {
-            result.map_err(std::io::Error::other)?;
-            println!("fixture replay complete");
-            stay.await?;
+    let story = run(options, replay, Duration::from_secs(1), extra_reads);
+    tokio::pin!(story);
+    let mut replaying = true;
+    loop {
+        tokio::select! {
+            result = &mut story, if replaying => {
+                result.map_err(std::io::Error::other)?;
+                println!("replay complete");
+                replaying = false;
+            }
+            () = input.closed() => break,
         }
-        result = &mut stay => { result?; }
     }
     drop(page);
     Ok(())
 }
 
-async fn bind(dashboard: &DashboardObserver, facts: &Facts) -> std::io::Result<Server> {
+async fn bind(
+    dashboard: &DashboardObserver,
+    facts: &Facts,
+    screen: Console,
+) -> std::io::Result<Server> {
     let status = StateTopic::new(StateLimits::default());
     status
         .publish(
@@ -112,11 +122,7 @@ async fn bind(dashboard: &DashboardObserver, facts: &Facts) -> std::io::Result<S
     super::page::compose(
         &inventory,
         dashboard.handle(),
-        vec![
-            Host::new(SANDBOXES[0])
-                .status(status)
-                .console(fictionet_demo::kit::preview::Console::new()),
-        ],
+        vec![Host::new(SANDBOXES[0]).status(status).console(screen)],
         facts.topics.clone(),
         true,
     )
@@ -126,16 +132,16 @@ async fn bind(dashboard: &DashboardObserver, facts: &Facts) -> std::io::Result<S
 
 async fn run(
     options: RunOptions,
-    fixture: Fixture,
+    replay: Replay,
     pace: Duration,
     extra_reads: usize,
 ) -> fictionet::Result {
-    let Fixture {
+    let Replay {
         facts,
         main: contents,
         sessions,
         mode,
-    } = fixture;
+    } = replay;
     let log = Log::start(Box::new(std::io::sink()))?;
     let output = log.clone();
     let result = fictionet::run(options, move |cx| async move {
@@ -173,7 +179,7 @@ async fn run(
         for step in story::steps(contents.variant, mode) {
             facts.phase(step.name, step.destinations, step.who);
             publisher.flush().await?;
-            println!("fixture story: {}", step.name);
+            println!("replay story: {}", step.name);
             cx.sleep(pace).await?;
             let result = async {
                 match step.who {
@@ -186,41 +192,20 @@ async fn run(
                             .await?
                     }
                 }
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let changed = facts.changed.notified();
-                        {
-                            let state = facts.state.lock().unwrap();
-                            state.check_complete()?;
-                            let view = state.view();
-                            if step
-                                .checks
-                                .iter()
-                                .all(|check| check.matches(&view, step.name))
-                            {
-                                return Ok::<(), fictionet::Error>(());
-                            }
-                        }
-                        changed.await;
-                    }
-                })
-                .await
-                .map_err(|_| {
-                    fictionet::Error::msg(format!("{}: fixture facts did not arrive", step.name))
-                })??;
+                facts.wait_for(&step).await?;
                 Ok::<(), fictionet::Error>(())
             }
             .await;
             facts.finish(None, result.is_ok());
             publisher.flush().await?;
             result?;
-            println!("fixture result: facts passed; no guest exit status");
+            println!("replay result: facts passed; no guest exit status");
             cx.sleep(pace).await?;
         }
         facts.phase("after", &[], Who::Maya);
         publisher.flush().await?;
         if extra_reads > 0 {
-            println!("fixture: {extra_reads} more index reads after the story");
+            println!("replay: {extra_reads} more index reads after the story");
         }
         for _ in 0..extra_reads {
             client.request(0, "GET", "/simple/", &[], b"").await?;
@@ -510,9 +495,7 @@ impl Client<'_> {
                         "",
                     ),
                     _ => {
-                        return Err(fictionet::Error::msg(format!(
-                            "no fixture replay for {title}"
-                        )));
+                        return Err(fictionet::Error::msg(format!("no replay for {title}")));
                     }
                 };
                 self.request(0, method, path, headers, body.as_bytes())
@@ -550,12 +533,12 @@ mod tests {
     #[tokio::test]
     async fn replay_satisfies_the_story_checks() {
         for (variant, mode) in RUNS {
-            let fixture = Fixture::new(variant, mode).unwrap();
-            let facts = fixture.facts.clone();
+            let replay = Replay::new(variant, mode).unwrap();
+            let facts = replay.facts.clone();
             let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
             tokio::time::timeout(
                 Duration::from_secs(30),
-                run(options, fixture, Duration::ZERO, 0),
+                run(options, replay, Duration::ZERO, 0),
             )
             .await
             .unwrap()
@@ -602,17 +585,17 @@ mod tests {
     #[tokio::test]
     async fn the_page_api_shows_every_replayed_step() {
         for (variant, mode) in RUNS {
-            let fixture = Fixture::new(variant, mode).unwrap();
-            let facts = fixture.facts.clone();
+            let replay = Replay::new(variant, mode).unwrap();
+            let facts = replay.facts.clone();
             let dashboard = DashboardObserver::new(DashboardOptions::demo());
-            let page = bind(&dashboard, &facts).await.unwrap();
+            let page = bind(&dashboard, &facts, Console::new()).await.unwrap();
             let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
                 dashboard.observer(),
                 facts.clone(),
             ])));
             tokio::time::timeout(
                 Duration::from_secs(30),
-                run(options, fixture, Duration::ZERO, 0),
+                run(options, replay, Duration::ZERO, 0),
             )
             .await
             .unwrap()
@@ -691,10 +674,10 @@ mod tests {
         use super::super::facts::{Doors, Rows, Status};
         use super::super::page::verify;
         let variant = Variant::Lookalike;
-        let fixture = Fixture::new(variant, None).unwrap();
-        let facts = fixture.facts.clone();
+        let replay = Replay::new(variant, None).unwrap();
+        let facts = replay.facts.clone();
         let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
-        run(options, fixture, Duration::ZERO, 0).await.unwrap();
+        run(options, replay, Duration::ZERO, 0).await.unwrap();
         let state = facts.state.lock().unwrap();
         let requests = Rows {
             rows: state.requests.clone(),
@@ -766,10 +749,10 @@ mod tests {
         use super::super::facts::{Doors, Rows};
         use super::super::page::verify;
         let mode = Some(Mode::Separate);
-        let fixture = Fixture::new(Variant::Peer, mode).unwrap();
-        let facts = fixture.facts.clone();
+        let replay = Replay::new(Variant::Peer, mode).unwrap();
+        let facts = replay.facts.clone();
         let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
-        run(options, fixture, Duration::ZERO, 0).await.unwrap();
+        run(options, replay, Duration::ZERO, 0).await.unwrap();
         let state = facts.state.lock().unwrap();
         let requests = Rows {
             rows: state.requests.clone(),
@@ -835,26 +818,22 @@ mod tests {
 
     #[tokio::test]
     async fn extra_reads_fill_the_page_bound() {
-        let fixture = Fixture::new(Variant::Normal, None).unwrap();
-        let facts = fixture.facts.clone();
+        let replay = Replay::new(Variant::Normal, None).unwrap();
+        let facts = replay.facts.clone();
         let dashboard = DashboardObserver::new(DashboardOptions::demo());
-        let page = bind(&dashboard, &facts).await.unwrap();
+        let page = bind(&dashboard, &facts, Console::new()).await.unwrap();
         let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
         let reads = super::super::facts::PAGE_ROWS + 20;
         tokio::time::timeout(
             Duration::from_secs(60),
-            run(options, fixture, Duration::ZERO, reads),
+            run(options, replay, Duration::ZERO, reads),
         )
         .await
         .unwrap()
         .unwrap();
         let client = fictionet_demo::kit::client::PageClient::from_url(page.url()).unwrap();
         client.bootstrap().await.unwrap();
-        let reply = client
-            .request("GET", "/api/state/requests", None, true)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let value: serde_json::Value = client.get_json("/api/state/requests").await.unwrap();
         assert_eq!(value["status"]["too_large"], false);
         let rows = value["value"]["rows"].as_array().unwrap();
         assert_eq!(rows.len(), super::super::facts::PAGE_ROWS);

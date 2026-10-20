@@ -5,8 +5,8 @@ use std::time::Duration;
 use fakewiki_world::tamper::Reply;
 use fictionet_demo::kit::{
     GuestHandle, Run,
+    checks::{self, check},
     client::{Capability, PageClient},
-    gate::{self, check},
     shot,
 };
 use serde_json::{Value, json};
@@ -71,13 +71,10 @@ async fn event(
             0,
             Duration::from_secs(60),
             Duration::from_millis(100),
+            missing,
             |event| Ok(matches(event)),
         )
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => io::Error::other(missing),
-            _ => error,
-        })?;
+        .await?;
     Ok(())
 }
 
@@ -205,9 +202,13 @@ async fn second_read(
     let mut retried = false;
     reload(guest, window).await?;
     let mut wait = client
-        .wait_for_event(after, Duration::from_secs(15), POLL, |event| {
-            observed.observe(std::slice::from_ref(event))
-        })
+        .wait_for_event(
+            after,
+            Duration::from_secs(15),
+            POLL,
+            "no tampered article read arrived",
+            |event| observed.observe(std::slice::from_ref(event)),
+        )
         .await;
     if wait
         .as_ref()
@@ -225,6 +226,7 @@ async fn second_read(
                 observed.last.max(after),
                 Duration::from_secs(45),
                 POLL,
+                "no tampered article read arrived",
                 |event| observed.observe(std::slice::from_ref(event)),
             )
             .await;
@@ -245,7 +247,7 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
     let mut switch = None;
     let result = checks(run, output, &mut switch).await;
     if let Err(error) = &result {
-        eprintln!("Gate failed: {error}");
+        eprintln!("Checks failed: {error}");
         let requests = article_requests(run, switch);
         match tokio::time::timeout(Duration::from_secs(10), requests).await {
             Ok(Ok(())) => {}
@@ -265,7 +267,7 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
 }
 
 /// Prints the article's requests since the switch, or since the start
-/// when the gate failed before it.
+/// when the checks failed before it.
 async fn article_requests(run: &Run, switch: Option<u64>) -> io::Result<()> {
     let client = PageClient::from_url(run.page_url())?;
     let since = if switch.is_some() {
@@ -309,8 +311,8 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
         run.boot_started().elapsed().as_millis()
     );
 
-    gate::bearer_required(&client).await?;
-    gate::single_use_ticket(&client, HOST, Capability::Screen).await?;
+    checks::bearer_required(&client).await?;
+    checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
     println!("[pass] first read: real, revision 0");
 
     let window = article_window(guest).await?;
@@ -334,25 +336,21 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
         ),
     )?;
     stale_command(&client, "stale-switch", true, 0, 1).await?;
-    let state = client.get_json("/api/state/tamper").await?;
+    let state: Value = client.state("tamper").await?;
     let streamed = stream
         .next("tamper", |s| s["value"]["revision"] == 1)
         .await?;
     check(
         "GET and the stream agree that tampering is on",
-        state["value"] == streamed["value"] && state["value"]["on"] == true,
+        state == streamed["value"] && state["on"] == true,
     )?;
     println!(
         "[pass] switch: applied revision 1, stale revision rejected with HTTP 409 and world event, GET and stream agree"
     );
 
     second_read(&client, guest, window, switch.unwrap_or(0)).await?;
-    let diff = client.get_json("/api/state/diff").await?;
-    check(
-        "the diff has revision 1 within its bound",
-        diff["status"]["too_large"] == false && diff["value"]["revision"] == 1,
-    )?;
-    let diff: fakewiki_world::pages::diff::Diff = serde_json::from_value(diff["value"].clone())?;
+    let diff: fakewiki_world::pages::diff::Diff = client.state("diff").await?;
+    check("the diff has revision 1", diff.revision == 1)?;
     check(
         "the diff marks the article tampered",
         diff.topics
@@ -362,10 +360,10 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
     )?;
     println!("[pass] second read: tampered, revision 1; diff agrees");
 
+    run.containment().await?;
     for (path, pointer) in [
         ("/api/event-table/reads-scripted-reader", "/rows"),
         ("/api/egress", "/destinations"),
-        ("/api/state/containment", "/value/probes"),
         ("/api/graph", "/nodes"),
     ] {
         let value = client.get_json(path).await?;
@@ -377,7 +375,7 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
                 .is_some_and(|a| !a.is_empty()),
         )?;
     }
-    println!("[pass] panels: Reads, Left the box, containment and map have data");
+    println!("[pass] panels: Reads, Left the box and map have data");
     std::fs::create_dir_all(output)?;
     let screen = output.join("desktop.png");
     let (capture, _) = run.settled_screen(HOST, &screen).await?;

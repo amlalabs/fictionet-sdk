@@ -34,32 +34,20 @@ export function nameDiff(a, b) {
   return { prefix: a.slice(0, start), a: a.slice(start, a.length - end), b: b.slice(start, b.length - end), suffix: a.slice(a.length - end) };
 }
 
-// Creates elements under one document and keeps the listeners it adds, so
-// dispose can remove them.
-export function builder(root) {
-  const document = root.ownerDocument;
+// The page's element and listener helpers for one panel root. The
+// listeners it adds are kept, so dispose can remove them.
+export function builder(root, dom) {
+  const { el } = dom.scoped(root);
   const cleanups = [];
-  function el(tag, cls, text, parent) {
-    const node = document.createElement(tag);
-    if (cls) node.setAttribute('class', cls);
-    if (text !== undefined && text !== null) node.textContent = text;
-    parent?.append(node);
-    return node;
-  }
   function on(node, name, action) {
-    node.addEventListener(name, action);
-    cleanups.push(() => node.removeEventListener(name, action));
+    cleanups.push(dom.listen(node, name, action));
     return node;
   }
   function button(parent, cls, text, action) {
-    const node = el('button', cls, text, parent);
-    node.setAttribute('type', 'button');
-    return on(node, 'click', action);
+    return on(el('button', { class: cls, type: 'button', text }, parent), 'click', action);
   }
   function stylesheet() {
-    const link = el('link', '', undefined, root);
-    link.setAttribute('rel', 'stylesheet');
-    link.setAttribute('href', '/assets/artifactory/artifactory.css');
+    el('link', { rel: 'stylesheet', href: '/assets/artifactory/artifactory.css' }, root);
   }
   // Sets text only when it changed, so live counts never reflow needlessly.
   function set(node, text) { if (node.textContent !== text) node.textContent = text; }

@@ -1,6 +1,7 @@
-mod gate;
+mod checks;
 mod guest;
 mod page;
+mod preview;
 mod world;
 
 #[cfg(test)]
@@ -9,7 +10,7 @@ mod tests;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use fictionet_demo::kit::{Kit, gate::check};
+use fictionet_demo::kit::Kit;
 use fictionet_observe::page::Page;
 
 const HOST: &str = "workstation";
@@ -18,15 +19,16 @@ const ARTICLE: &str = "/wiki/Stream_ripping";
 const URL: &str = "https://en.wikipedia.org/wiki/Stream_ripping";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args_os().skip(1);
-    let downloads = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("usage: fakewiki <downloads-directory>; run cargo xtask demo fakewiki")?;
-    if args.next().is_some() {
-        return Err("usage: fakewiki <downloads-directory>".into());
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const USAGE: &str = "usage: fakewiki <downloads>, or fakewiki preview";
+    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let [first] = args.as_slice() else {
+        return Err(USAGE.into());
+    };
+    if first.as_os_str() == "preview" {
+        return preview::run().await;
     }
+    let downloads = first;
     let total = Instant::now();
     let controls = page::Controls::new("Firefox (scripted)");
     let ui = controls.clone();
@@ -36,29 +38,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.page(Page::new("FakeWiki", dashboard).host(hosts.take(HOST)))
         })
         .world(move |cx, world| start(cx, world, controls))
-        .boot(&downloads)
+        .boot(downloads)
         .await?;
     println!("Scripted reader: Firefox on workstation");
     println!(
         "boot to SSH-ready: {} ms",
         run.guest(HOST).ssh_ready().as_millis()
     );
-    let path = run.path().to_path_buf();
-    let pid = run.guest(HOST).vm().pid();
-    let output = downloads.join("shots").join(path.file_name().unwrap());
-    let checks = gate::run(&run, &output).await;
-    if checks.is_err() {
+    let output = downloads
+        .join("shots")
+        .join(run.path().file_name().unwrap());
+    let result = checks::run(&run, &output).await;
+    if result.is_err() {
         eprint!("{}", run.guest(HOST).diagnostics().await);
     }
-    let shutdown = run.shutdown().await;
-    shutdown?;
-    check("shutdown removed the run directory", !path.exists())?;
-    check(
-        "shutdown reaped Cloud Hypervisor",
-        pid.is_none_or(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
-    )?;
-    println!("[pass] shutdown: no guest process or run directory remains");
-    checks?;
+    run.shutdown().await?;
+    result?;
     println!("whole run: {} ms", total.elapsed().as_millis());
     println!("every required check passed");
     Ok(())

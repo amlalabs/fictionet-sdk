@@ -1,5 +1,6 @@
 //! Chromium screenshots after an explicit page readiness condition.
 
+use fictionet::stdlib::codec::base64;
 use serde_json::{Value, json};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -169,7 +170,7 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
             json!({"format":"png"}),
         )?;
         let data = string_field(&shot, "data")?;
-        let bytes = crate::kit::b64_decode(&data)
+        let bytes = base64::decode(data.as_bytes(), base64::Padding::Required)
             .ok_or_else(|| io::Error::other("invalid screenshot base64"))?;
         if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
             return Err(io::Error::other("Chromium returned no PNG"));

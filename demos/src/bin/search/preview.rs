@@ -1,11 +1,11 @@
-//! The search page with real world traffic and a labeled preview console.
+//! `search preview`: the search page with real world traffic, an in-world
+//! scripted client and a labeled preview console.
 //!
 //! `--spend-budget` ends the story by turning generation back on and making
-//! new searches until the world refuses one for its generation budget. The
-//! page's `preview-screen` command closes the preview screen's connection, so
-//! the lost-connection state can be seen.
+//! new searches until the world refuses one for its generation budget.
 
 use adaptive_web_world::{
+    route::Engine,
     search::{Failure, Outcome, Searches},
     stub::{self, Seed},
 };
@@ -23,38 +23,27 @@ use fictionet::{
     },
 };
 use fictionet_demo::{
-    kit::{self, client::PageClient},
+    kit::{
+        self,
+        client::PageClient,
+        preview::{Input, Story},
+    },
     search::{Topics, World},
 };
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
-    page::{
-        CommandLimits, CommandPort, Containment, Host, HostState, HostStatus, Labels, StateLimits,
-        StateTopic,
-    },
+    page::{Containment, Host, HostState, HostStatus, Labels, StateLimits, StateTopic},
 };
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use super::{Result, checks::search_url};
 
-/// Closes the preview screen's open connection: `{"command":"drop"}`.
-#[derive(serde::Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-enum ScreenCommand {
-    Drop,
-}
-
-#[tokio::main]
-async fn main() -> Result {
-    let spend = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => false,
-        [flag] if flag == "--spend-budget" => true,
-        _ => return Err("usage: search_page [--spend-budget]".into()),
-    };
+pub async fn run(spend: bool) -> Result {
     let seed = Seed::builtin("halvard-cve")?;
+    let script = seed.clone();
     let searches = Arc::new(Searches::from_seed(&seed));
     let topics = Topics::new();
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
@@ -62,7 +51,6 @@ async fn main() -> Result {
     let labels = Labels::default();
     let containment = StateTopic::new(StateLimits::default());
     let console = kit::preview::Console::new();
-    let screen = CommandPort::<ScreenCommand, ()>::new(CommandLimits::default());
     let server = topics
         .page(
             dashboard.handle(),
@@ -73,13 +61,13 @@ async fn main() -> Result {
         )
         .labels(labels.clone())
         .containment(containment.clone())
-        .command("preview-screen", screen.clone())
         .bind_loopback(0)
         .await?;
     println!("Search preview: {}", server.url());
     println!(
         "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
     );
+    let mut input = Input::stdin(Story::Once, Some(console))?;
     let page_client = PageClient::from_url(server.url())?;
     let observer = Arc::new(Fanout::new(vec![searches.clone(), dashboard.observer()]));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -99,7 +87,7 @@ async fn main() -> Result {
                 world.stub.clone(),
                 "In-world client (scripted) · no VM",
             )?;
-            let client = machine(
+            let workstation = machine(
                 &cx,
                 attacher.attach("workstation")?,
                 "10.0.0.2".parse::<std::net::Ipv4Addr>()?,
@@ -118,25 +106,26 @@ async fn main() -> Result {
                 Ok(())
             });
             cx.spawn(move |cx| async move {
-                while let Some(command) = cx.race(None, screen.recv()).await? {
-                    let ScreenCommand::Drop = command.command;
-                    console.drop_connections();
-                    println!("Preview screen connection dropped");
-                    command.reply(&cx, ());
-                }
-                Ok(())
-            });
-            cx.spawn(move |cx| async move {
                 let result = async {
-                    story(&cx, &client, &world, &searches, &page_client).await?;
+                    let client = Client {
+                        cx: &cx,
+                        machine: &workstation,
+                        world: &world,
+                        searches: &searches,
+                        page: &page_client,
+                    };
+                    story(&client, &script).await?;
                     if spend {
-                        spend_budget(&cx, &client, &world, &searches, &page_client).await?;
+                        spend_budget(&client, &script).await?;
                     }
                     Ok::<_, fictionet::Error>(())
                 }
                 .await;
                 if let Err(error) = result {
-                    eprintln!("Preview story failed: {error}");
+                    // Stopping the preview mid-story cancels the run.
+                    if !cx.is_cancelled() {
+                        eprintln!("Preview story failed: {error}");
+                    }
                     return Err(error);
                 }
                 println!("Preview story complete.");
@@ -147,7 +136,7 @@ async fn main() -> Result {
             Ok(())
         },
     ));
-    kit::gate::stay_open().await?;
+    input.closed().await;
     let _ = stop.send(());
     task.await??;
     drop(server);
@@ -205,23 +194,29 @@ async fn get(
     ))
 }
 
-async fn story(
-    cx: &Cx,
-    client: &Machine,
-    world: &World,
-    searches: &Searches,
-    page: &PageClient,
-) -> fictionet::Result {
+/// The scripted client in the world, and the page it reports to.
+struct Client<'a> {
+    cx: &'a Cx,
+    machine: &'a Machine,
+    world: &'a World,
+    searches: &'a Searches,
+    page: &'a PageClient,
+}
+
+/// The seed's searches and pages, in the order a reader would make them.
+async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
+    let Client {
+        cx,
+        machine,
+        world,
+        searches,
+        page,
+    } = *client;
+    let words = seed.search.as_str();
     let pause = || cx.sleep(Duration::from_secs(3));
     // Give viewers a chance to see the empty world before the first request.
     cx.sleep(Duration::from_secs(8)).await?;
-    fetch(
-        cx,
-        client,
-        "https://www.google.com/search?q=halvard+gateway+vulnerability",
-        world.start,
-    )
-    .await?;
+    fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
     pause().await?;
     let state = searches.snapshot();
     let first = state
@@ -234,7 +229,7 @@ async fn story(
         })
         .ok_or_else(|| fictionet::Error::msg("search returned no generated result"))?;
     let mut url = first.url.clone();
-    let mut html = fetch(cx, client, &url, world.start).await?;
+    let mut html = fetch(cx, machine, &url, world.start).await?;
     for _ in 0..2 {
         pause().await?;
         let state = searches.snapshot();
@@ -249,39 +244,28 @@ async fn story(
             })
             .ok_or_else(|| fictionet::Error::msg("page has no unvisited link"))?;
         url = format!("https://{host}{path}");
-        html = fetch(cx, client, &url, world.start).await?;
+        html = fetch(cx, machine, &url, world.start).await?;
     }
-    for url in [
-        "https://www.bing.com/search?q=halvard+gateway+vulnerability",
-        "https://html.duckduckgo.com/html/?q=halvard+gateway+vulnerability+details",
-        "https://www.halvardsystems.com/security/advisories/",
-        "https://www.halvardsystems.com/security/advisories/HSA-2026-014",
-    ] {
+    let opened = [
+        search_url(Engine::Bing, words),
+        search_url(Engine::DuckDuckGo, &format!("{words} details")),
+        seed.visit.clone(),
+    ];
+    for url in opened.iter().chain(seed.fixed.iter().map(|f| &f.url)) {
         pause().await?;
-        fetch(cx, client, url, world.start).await?;
+        fetch(cx, machine, url, world.start).await?;
     }
     pause().await?;
-    client
+    machine
         .lookup(cx, "10.0.0.1".parse()?, "wiki.corp", RecordType::A)
         .await?;
     println!("Scripted client asked for wiki.corp");
     pause().await?;
     generation(page, searches, false).await?;
-    fetch(
-        cx,
-        client,
-        "https://www.google.com/search?q=halvard+gateway+vulnerability+new+question",
-        world.start,
-    )
-    .await?;
+    let new = format!("{words} new question");
+    fetch(cx, machine, &search_url(Engine::Google, &new), world.start).await?;
     pause().await?;
-    fetch(
-        cx,
-        client,
-        "https://www.google.com/search?q=halvard+gateway+vulnerability",
-        world.start,
-    )
-    .await?;
+    fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
     Ok(())
 }
 
@@ -311,23 +295,30 @@ async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> f
 }
 
 /// Makes new searches until the world refuses one for its generation budget.
-async fn spend_budget(
-    cx: &Cx,
-    client: &Machine,
-    world: &World,
-    searches: &Searches,
-    page: &PageClient,
-) -> fictionet::Result {
+async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
+    let Client {
+        cx,
+        machine,
+        world,
+        searches,
+        page,
+    } = *client;
     cx.sleep(Duration::from_secs(3)).await?;
     generation(page, searches, true).await?;
     println!("Spending the generation budget with new searches");
     // Every search with a new key takes one generation call. The bound is far
     // above the stub's budget, so it only stops a story that cannot fail.
     for n in 1..=1_000 {
-        let url = format!("https://www.google.com/search?q=halvard+gateway+question+{n}");
-        let (status, _) = get(cx, client, &url, world.start).await?;
+        let words = format!("{} question {n}", seed.search);
+        let (status, _) = get(
+            cx,
+            machine,
+            &search_url(Engine::Google, &words),
+            world.start,
+        )
+        .await?;
         let failed = searches.snapshot().queries.iter().any(|q| {
-            q.search == format!("halvard gateway question {n}")
+            q.search == words
                 && matches!(
                     q.outcome,
                     Outcome::Failed {

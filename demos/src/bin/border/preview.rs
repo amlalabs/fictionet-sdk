@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 type Request = oneshot::Sender<Result<(), String>>;
 pub struct Preview {
     pub server: Server,
+    screen: kit::preview::Console,
     requests: mpsc::Sender<Request>,
     stop: oneshot::Sender<()>,
     worker: tokio::task::JoinHandle<fictionet::Result>,
@@ -60,6 +61,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         scenario.clone(),
     );
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let screen = kit::preview::Console::new();
     let status = StateTopic::new(StateLimits::default());
     status.publish(
         fictionet::time::Instant::ZERO,
@@ -77,7 +79,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
                     Host::new(HOSTNAME)
                         .sandbox(HOSTNAME)
                         .status(status)
-                        .console(kit::preview::Console::new()),
+                        .console(screen.clone()),
                 )
                 .standard_panels(),
         )
@@ -131,6 +133,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
     }
     Ok(Preview {
         server,
+        screen,
         requests,
         stop,
         worker,
@@ -143,25 +146,13 @@ pub async fn run() -> Result<(), Error> {
     let preview = start(&out).await?;
     println!("Output: {}", out.display());
     println!(
-        "In-process scripted client; no VM, so the screen says NO VM. Change the route on the page, then press Enter here to run sign-in, balance and traceroute on that route."
+        "In-process scripted client; no VM, so the screen says NO VM. Its story signs in, checks the balance and runs traceroute on the route the page shows. Change the route on the page between runs."
     );
-    let (lines, mut input) = mpsc::channel(1);
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        loop {
-            let mut line = String::new();
-            if stdin.read_line(&mut line).unwrap_or(0) == 0 || lines.blocking_send(()).is_err() {
-                break;
-            }
-        }
-    });
-    let stay = kit::gate::stay_open();
-    tokio::pin!(stay);
-    loop {
-        tokio::select! {
-            _ = &mut stay => break,
-            line = input.recv(), if !input.is_closed() => { if line.is_some() { preview.traffic().await?; println!("Client checks complete. Change the route and press Enter to run again."); } }
-        }
+    let mut input =
+        kit::preview::Input::stdin(kit::preview::Story::OnEnter, Some(preview.screen.clone()))?;
+    while input.run().await {
+        preview.traffic().await?;
+        println!("Client checks complete.");
     }
     preview.shutdown().await
 }
@@ -185,7 +176,7 @@ mod tests {
         assert_eq!(reply["status"], "applied");
         preview.traffic().await.unwrap();
         super::super::story::observed(&client, true).await.unwrap();
-        // The VM gate's Chromium condition holds on the page this traffic made.
+        // The VM run's Chromium condition holds on the page this traffic made.
         let url = preview.server.url().to_owned();
         let shot = dir.join("page-hijacked.png");
         tokio::task::spawn_blocking(move || {
@@ -205,13 +196,9 @@ mod tests {
         assert_eq!(reply["status"], "applied");
         preview.traffic().await.unwrap();
         super::super::story::observed(&client, false).await.unwrap();
-        let tls = client
-            .request("GET", "/api/state/tls", None, true)
-            .await
-            .unwrap();
-        let tls: serde_json::Value = serde_json::from_slice(&tls.body).unwrap();
+        let tls: serde_json::Value = client.get_json("/api/state/tls").await.unwrap();
         assert_eq!(tls["value"]["lost"], 0);
-        let sessions = tls["value"]["sessions"].as_array().unwrap();
+        let sessions = tls["value"]["sessions"]["rows"].as_array().unwrap();
         assert_eq!(sessions.len(), 7, "{sessions:?}");
         for session in sessions {
             assert_eq!(session["gaps"], 0);
@@ -222,14 +209,10 @@ mod tests {
                 assert!(offered.contains(&chosen[0]), "{session}");
             }
         }
-        let results = client
-            .request("GET", "/api/state/results", None, true)
-            .await
-            .unwrap();
-        let results: serde_json::Value = serde_json::from_slice(&results.body).unwrap();
+        let results: serde_json::Value = client.get_json("/api/state/results").await.unwrap();
         assert_eq!(results["value"]["invalid"], 0);
         assert_eq!(results["value"]["dropped"], 0);
-        let lines = results["value"]["lines"].as_array().unwrap();
+        let lines = results["value"]["rows"].as_array().unwrap();
         assert!(lines.iter().any(|l| l["type"] == "http"
             && l["served_by"] == "impostor"
             && l["carries_password"] == true));
@@ -238,11 +221,7 @@ mod tests {
         let server = preview.stop().await.unwrap();
         let link = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let state = client
-                    .request("GET", "/api/state/border", None, true)
-                    .await
-                    .unwrap();
-                let state: serde_json::Value = serde_json::from_slice(&state.body).unwrap();
+                let state: serde_json::Value = client.get_json("/api/state/border").await.unwrap();
                 let links = state["value"]["links"].as_array().unwrap().clone();
                 if let Some(link) = links
                     .into_iter()

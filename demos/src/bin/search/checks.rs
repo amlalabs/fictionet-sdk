@@ -6,11 +6,10 @@ use adaptive_web_world::{
 };
 use fictionet_demo::kit::{
     Run,
+    checks::{self, STEP_PAUSE, check},
     client::{Capability, PageClient},
-    gate::{self, STEP_PAUSE, check},
     ssh::quote,
 };
-use fictionet_observe::page::{Containment, ProbeOutcome};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -34,18 +33,11 @@ async fn wait(
             "/api/state/search",
             Duration::from_secs(45),
             Duration::from_millis(100),
+            &format!("the page did not show: {label}"),
             |value| Ok(snapshot(value)?.is_some_and(|s| predicate(&s))),
         )
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                println!("[FAIL] {label}: timed out");
-                format!("timed out waiting for {label}").into()
-            } else {
-                Box::<dyn std::error::Error + Send + Sync>::from(error)
-            }
-        })?;
-    check(label, true)?;
+        .await?;
+    println!("[pass] {label}");
     Ok(snapshot(&value)?.expect("the accepted state has a value"))
 }
 
@@ -84,6 +76,17 @@ exit 1"#
     Ok(())
 }
 
+/// The address that searches `engine` for `words`, with the words
+/// percent-encoded. The preview searches the same addresses.
+pub(super) fn search_url(engine: Engine, words: &str) -> String {
+    let base = match engine {
+        Engine::Google => "https://www.google.com/search?q=",
+        Engine::Bing => "https://www.bing.com/search?q=",
+        Engine::DuckDuckGo => "https://html.duckduckgo.com/html/?q=",
+    };
+    format!("{base}{}", encoded(words))
+}
+
 fn encoded(text: &str) -> String {
     text.bytes()
         .map(|b| {
@@ -104,12 +107,7 @@ async fn search(
     after: u64,
     count: u64,
 ) -> Result<(Snapshot, Query)> {
-    let base = match engine {
-        Engine::Google => "https://www.google.com/search?q=",
-        Engine::Bing => "https://www.bing.com/search?q=",
-        Engine::DuckDuckGo => "https://html.duckduckgo.com/html/?q=",
-    };
-    navigate(run, &format!("{base}{}", encoded(words))).await?;
+    navigate(run, &search_url(engine, words)).await?;
     let matches = |q: &&Query| {
         q.id > after
             && q.engine == engine
@@ -211,6 +209,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
             0,
             Duration::from_secs(45),
             Duration::from_millis(100),
+            "Firefox did not load the Google home page",
             |e| {
                 Ok(e["source"] == "http"
                     && e["kind"] == "request"
@@ -221,26 +220,22 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
                     && e["fields"]["headers"].to_string().contains("Firefox/"))
             },
         )
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::TimedOut => {
-                std::io::Error::other("Firefox did not load the Google home page")
-            }
-            _ => error,
-        })?;
+        .await?;
     println!(
         "boot to desktop with Google loaded: {} ms",
         run.boot_started().elapsed().as_millis()
     );
-    gate::bearer_required(&client).await?;
-    gate::single_use_ticket(&client, HOST, Capability::Screen).await?;
+    checks::bearer_required(&client).await?;
+    checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
 
-    let words = match seed.name.as_str() {
-        "halvard-cve" => "halvard gateway vulnerability",
-        "corvane-acquisition" => "corvane acquisition",
-        "fastjsonl-package" => "fastjsonl package",
-        _ => return Err("unknown embedded seed".into()),
-    };
+    if seed.search.is_empty() || seed.visit.is_empty() {
+        return Err(format!(
+            "seed {} names no search words or address to visit",
+            seed.name
+        )
+        .into());
+    }
+    let words = seed.search.as_str();
     visited.extend(["www.google.com", "www.bing.com", "html.duckduckgo.com"].map(String::from));
     let (snapshot, google) = search(run, &client, Engine::Google, words, 0, 10).await?;
     let list = snapshot
@@ -278,14 +273,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
                 .iter()
                 .any(|r| r.key == duck.key && r.query_id == duck.id && r.listed.len() == 10),
     )?;
-    let direct = if seed.name == "halvard-cve" {
-        "https://www.halvardsystems.com/security/advisories/".to_string()
-    } else {
-        format!(
-            "https://{}/information/",
-            seed.sites.first().ok_or("seed has no site")?.host
-        )
-    };
+    let direct = seed.visit.clone();
     visited.insert(adaptive_web_world::stub::text::target_of(&direct).0);
     let (reason, made) = expected_page(seed, &snapshot, &direct);
     navigate(run, &direct).await?;
@@ -407,24 +395,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         "map has nodes",
         graph["nodes"].as_array().is_some_and(|v| !v.is_empty()),
     )?;
-    let probes = client.get_json("/api/state/containment").await?;
-    let probes: Containment = serde_json::from_value(probes["value"].clone())?;
-    check("containment probes have data", !probes.probes.is_empty())?;
-    for probe in &probes.probes {
-        println!(
-            "containment: {}: {:?}; world: {}",
-            probe.name, probe.outcome, probe.world_answer
-        );
-    }
-    check(
-        "containment probes are neither forwarded nor unaccounted",
-        probes.probes.iter().all(|p| {
-            !matches!(
-                p.outcome,
-                ProbeOutcome::Forwarded | ProbeOutcome::NotContained
-            )
-        }),
-    )?;
+    run.containment().await?;
     run.screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
         .await?;
     Ok(())
@@ -493,6 +464,17 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_embedded_seed_names_its_search_and_an_address_on_its_sites() {
+        for name in ["halvard-cve", "corvane-acquisition", "fastjsonl-package"] {
+            let seed = Seed::builtin(name).unwrap();
+            assert!(!seed.search.is_empty(), "{name}");
+            let (host, _) = adaptive_web_world::stub::text::target_of(&seed.visit);
+            assert!(seed.visit.starts_with("https://"), "{name}");
+            assert!(seed.sites.iter().any(|site| site.host == host), "{name}");
+        }
+    }
 
     #[test]
     fn a_failed_story_still_runs_the_background_check() {

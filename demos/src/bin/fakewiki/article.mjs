@@ -1,55 +1,40 @@
 // Article text and delivery facts come from separate world projections.
 export function mount(root, services, options = {}) {
-  const el = (tag, text, parent, cls) => {
-    const node = root.ownerDocument.createElement(tag);
-    if (text !== undefined) node.textContent = text;
-    if (cls) node.setAttribute('class', cls);
-    parent?.appendChild(node);
-    return node;
-  };
+  const { el } = services.dom.scoped(root);
+  const { listen } = services.dom;
   root.classList.add('article-container');
   const cleanup = [], dynamic = [];
-  const listen = (target, type, fn, list = cleanup) => {
-    target.addEventListener(type, fn);
-    list.push(() => target.removeEventListener(type, fn));
-  };
   const controller = new AbortController();
-  const sheet = el('link', undefined, root);
-  sheet.setAttribute('rel', 'stylesheet'); sheet.setAttribute('href', '/assets/article.css');
-  const panel = el('div', undefined, root, 'article-panel');
-  const switchRow = el('div', undefined, panel, 'article-switch-row');
-  const toggle = el('button', undefined, switchRow, 'switch article-switch');
-  const track = el('span', undefined, toggle, 'switch-track');
-  track.setAttribute('aria-hidden', 'true');
-  el('span', undefined, track, 'switch-knob');
-  const switchLabel = el('span', 'Waiting for state…', toggle, 'article-switch-label');
+  el('link', { rel: 'stylesheet', href: '/assets/article.css' }, root);
+  const panel = el('div', { class: 'article-panel' }, root);
+  const switchRow = el('div', { class: 'article-switch-row' }, panel);
+  const toggle = el('button', { class: 'switch article-switch' }, switchRow);
+  const track = el('span', { class: 'switch-track', 'aria-hidden': 'true' }, toggle);
+  el('span', { class: 'switch-knob' }, track);
+  const switchLabel = el('span', { class: 'article-switch-label', text: 'Waiting for state…' }, toggle);
   toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-label', 'Tamper');
-  const revision = el('p', '', switchRow, 'article-meta');
-  const reply = el('p', '', panel, 'article-reply'); reply.setAttribute('role', 'status');
-  const address = el('div', undefined, panel, 'article-address');
-  const where = el('div', undefined, address, 'article-where');
-  const url = el('div', 'Waiting for the article…', where, 'article-url');
-  const identity = el('p', '', where, 'article-meta');
-  const follow = el('button', 'Following reads', address, 'text-button'); follow.type = 'button';
+  const revision = el('p', { class: 'article-meta' }, switchRow);
+  const reply = el('p', { class: 'article-reply', role: 'status' }, panel);
+  const address = el('div', { class: 'article-address' }, panel);
+  const where = el('div', { class: 'article-where' }, address);
+  const url = el('div', { class: 'article-url', text: 'Waiting for the article…' }, where);
+  const identity = el('p', { class: 'article-meta' }, where);
+  const follow = el('button', { class: 'text-button', text: 'Following reads' }, address); follow.type = 'button';
   address.hidden = true;
-  const pickers = el('div', undefined, panel, 'article-pickers');
+  const pickers = el('div', { class: 'article-pickers' }, panel);
   pickers.hidden = true;
-  const topics = el('div', undefined, pickers, 'article-topics segmented');
-  topics.setAttribute('role', 'group'); topics.setAttribute('aria-label', 'Topic');
-  const chips = el('div', undefined, pickers, 'article-chips');
-  chips.setAttribute('role', 'group'); chips.setAttribute('aria-label', 'Source');
-  const body = el('div', undefined, panel, 'article-body');
-  const loading = el('div', undefined, body, 'article-loading');
-  loading.setAttribute('role', 'status');
-  el('strong', 'Waiting for the article versions', loading);
-  el('p', 'The world has not published the article yet. The real and tampered versions appear here when it does.', loading);
-  const history = el('div', undefined, panel, 'article-history');
-  history.setAttribute('role', 'group'); history.setAttribute('aria-label', 'Reads and switch changes in this run');
+  const topics = el('div', { class: 'article-topics segmented', role: 'group', 'aria-label': 'Topic' }, pickers);
+  const chips = el('div', { class: 'article-chips', role: 'group', 'aria-label': 'Source' }, pickers);
+  const body = el('div', { class: 'article-body' }, panel);
+  const loading = el('div', { class: 'article-loading', role: 'status' }, body);
+  el('strong', { text: 'Waiting for the article versions' }, loading);
+  el('p', { text: 'The world has not published the article yet. The real and tampered versions appear here when it does.' }, loading);
+  const history = el('div', { class: 'article-history', role: 'group', 'aria-label': 'Reads and switch changes in this run' }, panel);
   history.hidden = true;
-  const loss = el('p', '', panel, 'article-meta article-loss'); loss.setAttribute('role', 'status');
+  const loss = el('p', { class: 'article-meta article-loss', role: 'status' }, panel);
   // New reads are announced once here; the visible marker moves between renders.
-  const announce = el('p', '', panel, 'article-announce'); announce.setAttribute('aria-live', 'polite');
-  const readMarker = el('div', undefined, undefined, 'article-read');
+  const announce = el('p', { class: 'article-announce', 'aria-live': 'polite' }, panel);
+  const readMarker = el('div', { class: 'article-read' }, undefined);
   let markedRead = -1;
   let state, diff, hosts = {}, readerHost, reader = 'Reader (scripted)', topicName, sourceName, pinned = false, busy = false, disposed = false;
   let events = [], incomplete = false;
@@ -105,42 +90,42 @@ export function mount(root, services, options = {}) {
     topics.replaceChildren();
     for (const item of diff.topics) {
       const title = item.sources.find((source) => new URL(source.url).hostname === 'en.wikipedia.org')?.real.title || item.topic;
-      const button = el('button', title, topics);
+      const button = el('button', { text: title }, topics);
       button.setAttribute('title', title); button.setAttribute('data-focus', `topic-${item.topic}`);
       button.type = 'button'; button.setAttribute('aria-pressed', String(item.topic === topicName));
-      listen(button, 'click', () => { pinned = true; topicName = item.topic; sourceName = undefined; render(); }, dynamic);
+      dynamic.push(listen(button, 'click', () => { pinned = true; topicName = item.topic; sourceName = undefined; render(); }));
     }
     chips.replaceChildren();
     for (const item of topic.sources) {
       const read = readsFor(topicName, item.source).length > 0;
       const host = new URL(item.url).hostname;
       const caption = `${host} · ${item.served} · ${read ? 'read' : 'unread'}`;
-      const chip = el('button', undefined, chips);
-      el('span', host, chip, 'article-source-host');
-      if (item.served === 'tampered') el('span', 'Tampered', chip, 'pill marked article-source-state tampered');
-      if (read) el('span', '✓', chip, 'article-source-read');
+      const chip = el('button', {}, chips);
+      el('span', { class: 'article-source-host', text: host }, chip);
+      if (item.served === 'tampered') el('span', { class: 'pill marked article-source-state tampered', text: 'Tampered' }, chip);
+      if (read) el('span', { class: 'article-source-read', text: '✓' }, chip);
       chip.setAttribute('data-focus', `source-${item.source}`);
       chip.setAttribute('aria-label', caption); chip.setAttribute('title', caption);
       chip.type = 'button'; chip.setAttribute('aria-pressed', String(item.source === sourceName));
-      listen(chip, 'click', () => { pinned = true; sourceName = item.source; render(); }, dynamic);
+      dynamic.push(listen(chip, 'click', () => { pinned = true; sourceName = item.source; render(); }));
     }
     const scroll = body.querySelector('.article-text')?.scrollTop || 0;
     body.replaceChildren();
     // Each column's head: the version, the claim it makes, what the world
     // serves now and what the scripted reader last received.
-    const heads = el('div', undefined, body, 'article-heads');
+    const heads = el('div', { class: 'article-heads' }, body);
     for (const [kind, claim] of [['real', topic.true_claim], ['tampered', topic.false_claim]]) {
-      const head = el('div', undefined, heads, `article-head ${kind}`);
-      const top = el('div', undefined, head, 'article-head-top');
-      el('h2', kind === 'real' ? 'Real' : 'Tampered', top);
-      if (source.served === kind) el('span', 'Served now', top, 'pill outline article-served');
-      const statement = el('p', undefined, head, 'article-claim');
-      el('span', kind === 'real' ? 'True claim' : 'False claim', statement, 'article-kicker');
+      const head = el('div', { class: `article-head ${kind}` }, heads);
+      const top = el('div', { class: 'article-head-top' }, head);
+      el('h2', { text: kind === 'real' ? 'Real' : 'Tampered' }, top);
+      if (source.served === kind) el('span', { class: 'pill outline article-served', text: 'Served now' }, top);
+      const statement = el('p', { class: 'article-claim' }, head);
+      el('span', { class: 'article-kicker', text: kind === 'real' ? 'True claim' : 'False claim' }, statement);
       statement.append(` ${claim}`);
       if (last?.fields.served === kind) {
         readMarker.replaceChildren();
-        el('span', `✓ Read by ${reader}`, readMarker, 'article-read-name');
-        el('span', `Revision ${last.fields.tamper_revision} · at ${time(last.at)}`, readMarker, 'article-read-detail');
+        el('span', { class: 'article-read-name', text: `✓ Read by ${reader}` }, readMarker);
+        el('span', { class: 'article-read-detail', text: `Revision ${last.fields.tamper_revision} · at ${time(last.at)}` }, readMarker);
         head.appendChild(readMarker);
         if (last.seq > markedRead) {
           services.moment(readMarker); markedRead = last.seq;
@@ -150,17 +135,15 @@ export function mount(root, services, options = {}) {
     }
     const mismatch = last && last.fields.tamper_revision !== diff.revision;
     const note = !last ? 'This source has not been read in this run.' : mismatch ? `${readerName} has not read this page since the switch changed.` : 'The last read matches this revision.';
-    const callout = el('p', undefined, body, `article-read-note${mismatch ? ' moment' : ''}`);
-    el('span', note, callout, mismatch ? 'kind' : undefined);
-    const text = el('div', undefined, body, 'article-text');
-    text.setAttribute('data-focus', 'article-text');
-    text.setAttribute('tabindex', '0'); text.setAttribute('aria-label', 'Both article versions, scroll together');
+    const callout = el('p', { class: `article-read-note${mismatch ? ' moment' : ''}` }, body);
+    el('span', mismatch ? { class: 'kind', text: note } : { text: note }, callout);
+    const text = el('div', { class: 'article-text', 'data-focus': 'article-text', tabindex: '0', 'aria-label': 'Both article versions, scroll together' }, body);
     for (let index = 0; index < Math.max(source.real.paragraphs.length, source.tampered.paragraphs.length); index++) {
-      const row = el('div', undefined, text, 'article-paragraphs');
+      const row = el('div', { class: 'article-paragraphs' }, text);
       for (const kind of ['real', 'tampered']) {
-        const paragraph = el('p', undefined, row, kind);
+        const paragraph = el('p', { class: kind }, row);
         for (const segment of source[kind].paragraphs[index] || []) {
-          el('span', `${segment.text} `, paragraph, segment.changed ? 'changed' : 'unchanged');
+          el('span', { class: segment.changed ? 'changed' : 'unchanged', text: `${segment.text} ` }, paragraph);
         }
       }
     }
@@ -169,10 +152,10 @@ export function mount(root, services, options = {}) {
     const real = reads.filter((event) => event.fields.served === 'real').length;
     const changes = events.filter((event) => event.source === 'fakewiki' && event.kind === 'tampering');
     const end = Math.max(services.runTime(), ...reads.map((event) => event.at), ...changes.map((event) => event.at), 0.001);
-    const summary = el('div', undefined, history, 'article-history-summary');
-    el('p', `${reads.length} ${incomplete ? 'retained ' : ''}${reads.length === 1 ? 'read' : 'reads'}: ${real} real, ${reads.length - real} tampered`, summary, 'article-counts');
-    el('p', `${time(0)} – ${time(end)} · ○ real  ● tampered  ┆ switch`, summary, 'article-meta');
-    const axis = el('div', undefined, history, 'article-axis');
+    const summary = el('div', { class: 'article-history-summary' }, history);
+    el('p', { class: 'article-counts', text: `${reads.length} ${incomplete ? 'retained ' : ''}${reads.length === 1 ? 'read' : 'reads'}: ${real} real, ${reads.length - real} tampered` }, summary);
+    el('p', { class: 'article-meta', text: `${time(0)} – ${time(end)} · ○ real  ● tampered  ┆ switch` }, summary);
+    const axis = el('div', { class: 'article-axis' }, history);
     const marks = [...reads, ...changes].sort((a, b) => a.seq - b.seq);
     const width = Math.max((axis.clientWidth || 0) - 24, 120);
     const positions = spread(marks.map((event) => Math.min(event.at / end, 1)), width);
@@ -181,17 +164,17 @@ export function mount(root, services, options = {}) {
       const caption = read
         ? `Read of the ${kind} version, revision ${event.fields.tamper_revision}, at ${time(event.at)}`
         : `Switch ${event.fields.on ? 'on' : 'off'}, revision ${event.fields.revision}${event.fields.changed ? '' : ' (unchanged)'}, at ${time(event.at)}`;
-      const mark = el('button', undefined, axis, `article-tick ${kind}`);
+      const mark = el('button', { class: `article-tick ${kind}` }, axis);
       mark.setAttribute('data-focus', `event-${event.seq}`);
       mark.type = 'button'; mark.setAttribute('title', caption); mark.setAttribute('aria-label', caption);
       mark.style.setProperty('left', `calc((100% - 24px) * ${positions[index].toFixed(4)} + 12px)`);
-      listen(mark, 'click', () => services.selection.set({ host: event.sandbox?.name || null, node: event.node || null, event, connection: event.conn ?? null, request: event.fields?.request_id ?? null, links: [] }), dynamic);
+      dynamic.push(listen(mark, 'click', () => services.selection.set({ host: event.sandbox?.name || null, node: event.node || null, event, connection: event.conn ?? null, request: event.fields?.request_id ?? null, links: [] })));
     }
     if (focusKey) [...panel.querySelectorAll('[data-focus]')].find((node) => node.getAttribute('data-focus') === focusKey)?.focus();
     loss.textContent = incomplete ? 'History is incomplete; counts and marks cover retained observations only.' : '';
   }
-  listen(follow, 'click', () => { pinned = false; render(); });
-  listen(toggle, 'click', async () => {
+  cleanup.push(listen(follow, 'click', () => { pinned = false; render(); }));
+  cleanup.push(listen(toggle, 'click', async () => {
     if (busy || !state || disposed) return;
     busy = true; switchState(); reply.textContent = 'Waiting for the world…'; reply.dataset.kind = 'pending';
     try {
@@ -205,7 +188,7 @@ export function mount(root, services, options = {}) {
       reply.textContent = rejected?.reason === 'stale_revision' ? `The switch changed elsewhere. Current revision ${rejected.current}. No retry was sent.` : `Command not confirmed: ${error.message}. No automatic retry.`;
       reply.dataset.kind = 'rejected';
     } finally { if (!disposed) { busy = false; switchState(); } }
-  });
+  }));
   switchState();
   cleanup.push(services.state('/api/state/tamper', ({ value }) => { if (!disposed) { state = value; switchState(); } }, (error) => { state = undefined; switchState(); reply.textContent = error.message; reply.dataset.kind = 'rejected'; }));
   cleanup.push(services.state('/api/state/diff', ({ value }) => { diff = value; render(); }, (error) => { loss.textContent = error.message; }));
@@ -248,9 +231,9 @@ export function mount(root, services, options = {}) {
     } catch (error) { if (!disposed) { incomplete = true; loss.textContent = `History unavailable: ${error.message}`; } }
     finally { loadingHistory = false; }
   }
-  listen(watch, 'snapshot', (event) => { const value = JSON.parse(event.data); ingest(value.events || [], value.status); void backfill(); });
-  listen(watch, 'event', (event) => ingest([JSON.parse(event.data)]));
-  listen(watch, 'status', (event) => ingest([], JSON.parse(event.data).status));
-  listen(watch, 'error', () => { loss.textContent = 'Read stream disconnected. Last observed read is shown.'; });
+  cleanup.push(listen(watch, 'snapshot', (event) => { const value = JSON.parse(event.data); ingest(value.events || [], value.status); void backfill(); }));
+  cleanup.push(listen(watch, 'event', (event) => ingest([JSON.parse(event.data)])));
+  cleanup.push(listen(watch, 'status', (event) => ingest([], JSON.parse(event.data).status)));
+  cleanup.push(listen(watch, 'error', () => { loss.textContent = 'Read stream disconnected. Last observed read is shown.'; }));
   return () => { disposed = true; controller.abort(); cleanup.splice(0).forEach((off) => off()); dynamic.splice(0).forEach((off) => off()); watch.close(); root.classList.remove('article-container'); root.replaceChildren(); };
 }

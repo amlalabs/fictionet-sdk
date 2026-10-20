@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mount } from './ports.mjs';
-import { PORTS, SERVICES } from './model.mjs';
+import { OFFICE, PORTS, SERVICES } from './model.mjs';
 import { harness, discoveryMap, scannedMap, reports, text } from './panel-harness.mjs';
 
 function host(f, addr) {
@@ -121,10 +121,25 @@ test('names from the world are set as text', () => {
   f.dispose();
 });
 
+test('a replay calls the office server a stand-in, before and after its row appears', () => {
+  const f = harness(mount, PORTS);
+  f.publish(PORTS, discoveryMap());
+  assert.match(text(host(f, '10.0.0.50')), /Real Ubuntu VM/);
+  f.publish(OFFICE, { steps: [], replay: true });
+  assert.match(text(host(f, '10.0.0.50')), /Stand-in for the Ubuntu VM/);
+  assert.doesNotMatch(text(host(f, '10.0.0.50')), /Real Ubuntu VM/);
+  f.dispose();
+  const g = harness(mount, PORTS);
+  g.publish(OFFICE, { steps: [], replay: true });
+  g.publish(PORTS, discoveryMap());
+  assert.match(text(host(g, '10.0.0.50')), /Stand-in for the Ubuntu VM/);
+  g.dispose();
+});
+
 test('dispose releases subscriptions and the view buttons', () => {
   const f = harness(mount, PORTS);
   const buttons = f.find('.segmented')[0].querySelectorAll('button');
-  assert.equal(f.active(), 2);
+  assert.equal(f.active(), 3);
   assert.ok(buttons.every((button) => button.listenerCount === 1));
   f.dispose();
   assert.equal(f.active(), 0);

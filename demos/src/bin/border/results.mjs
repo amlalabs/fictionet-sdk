@@ -22,36 +22,36 @@ export function describe(line) {
 }
 export function mount(root, services, options) {
   const { reconcile } = services.dom, { plural, fmtRunMs } = services.format;
-  const el = (tag, text, parent = root) => { const n = root.ownerDocument.createElement(tag); n.textContent = text; parent?.append(n); return n; };
-  const css = el('link', ''); css.rel = 'stylesheet'; css.href = '/assets/border.css';
-  el('h2', 'From the world’s log');
-  el('p', 'The log for this run, which the eval’s scorer reads. Counts cover the retained lines below.');
-  const status = el('p', 'Waiting for log lines…');
-  const summary = el('div', ''); summary.className = 'border-inspector-summary';
-  const changes = el('div', ''); const rows = el('div', '');
-  el('h3', 'In time order', rows);
-  const list = el('div', '', rows);
-  const aligned = el('p', 'Approximate run times align log timestamps to the route change’s recorded run time.', rows);
+  const { el } = services.dom.scoped(root);
+  el('link', { rel: 'stylesheet', href: '/assets/border.css' }, root);
+  el('h2', { text: 'From the world’s log' }, root);
+  el('p', { text: 'The world’s log for this run. Counts cover the retained lines below.' }, root);
+  const status = el('p', { text: 'Waiting for log lines…' }, root);
+  const summary = el('div', { class: 'border-inspector-summary' }, root);
+  const changes = el('div', {}, root); const rows = el('div', {}, root);
+  el('h3', { text: 'In time order' }, rows);
+  const list = el('div', {}, rows);
+  const aligned = el('p', { text: 'Approximate run times align log timestamps to the route change’s recorded run time.' }, rows);
   aligned.hidden = true;
   const lines = new Map();
   const stop = services.state(options.state, ({ value, status: state }) => {
     if (!value) return;
-    status.textContent = `${plural(value.lines.length, 'retained line')} · dropped: ${value.dropped} · unreadable: ${value.invalid}${state?.too_large ? ' · publication exceeded its limit' : ''}`;
-    const result = summarize(value.lines); summary.replaceChildren(); changes.replaceChildren();
-    for (const text of [`Bank: ${plural(result.bank, 'TLS session')}`, `Impostor: ${plural(result.impostor, 'TLS session')}`, `Client aborted: ${plural(result.aborted, 'TLS session')}`, `Impostor answered: ${plural(result.requests, 'request')}`, `Password reached impostor: ${result.passwords ? 'yes' : 'no'} (${result.passwords})`, `Payment reached impostor: ${result.payments ? 'yes' : 'no'} (${result.payments})`]) el('p', text, summary);
-    el('h3', 'Route changes and rejections', changes);
-    if (!result.routes.length) el('p', 'No route changes or rejections logged.', changes);
-    result.routes.forEach(line => el('p', describe(line), changes));
-    const anchor = value.lines.find(l => l.type === 'route' && Number.isFinite(l.at_ms) && Number.isFinite(l.ts));
+    status.textContent = `${plural(value.rows.length, 'retained line')} · dropped: ${value.dropped} · unreadable: ${value.invalid}${state?.too_large ? ' · publication exceeded its limit' : ''}`;
+    const result = summarize(value.rows); summary.replaceChildren(); changes.replaceChildren();
+    for (const text of [`Bank: ${plural(result.bank, 'TLS session')}`, `Impostor: ${plural(result.impostor, 'TLS session')}`, `Client aborted: ${plural(result.aborted, 'TLS session')}`, `Impostor answered: ${plural(result.requests, 'request')}`, `Password reached impostor: ${result.passwords ? 'yes' : 'no'} (${result.passwords})`, `Payment reached impostor: ${result.payments ? 'yes' : 'no'} (${result.payments})`]) el('p', { text }, summary);
+    el('h3', { text: 'Route changes and rejections' }, changes);
+    if (!result.routes.length) el('p', { text: 'No route changes or rejections logged.' }, changes);
+    result.routes.forEach(line => el('p', { text: describe(line) }, changes));
+    const anchor = value.rows.find(l => l.type === 'route' && Number.isFinite(l.at_ms) && Number.isFinite(l.ts));
     const when = line => Number.isFinite(line.at_ms) ? `${fmtRunMs(line.at_ms)} run time` : anchor ? `≈ ${fmtRunMs((line.ts - anchor.ts) * 1000 + anchor.at_ms)} run time` : `${(line.ts - value.first_ts).toFixed(2)} s since first log entry`;
     // A log line keeps its element, so one the viewer opened stays open.
     const seen = new Map();
-    const items = value.lines.map(line => { const text = JSON.stringify(line); const repeat = seen.get(text) || 0; seen.set(text, repeat + 1); return { line, id: `${text}\u0000${repeat}` }; });
+    const items = value.rows.map(line => { const text = JSON.stringify(line); const repeat = seen.get(text) || 0; seen.set(text, repeat + 1); return { line, id: `${text}\u0000${repeat}` }; });
     reconcile(list, items, item => item.id, ({ line }) => {
-      const node = el('details', '', null); node.className = 'border-inspector-session';
-      const head = el('summary', '', node);
-      const dl = el('dl', '', node); dl.className = 'kv';
-      for (const [key, value] of Object.entries(line)) { el('dt', words(key), dl); el('dd', typeof value === 'object' ? JSON.stringify(value) : words(value), dl); }
+      const node = el('details', { class: 'border-inspector-session' }, null);
+      const head = el('summary', {}, node);
+      const dl = el('dl', { class: 'kv' }, node);
+      for (const [key, value] of Object.entries(line)) { el('dt', { text: words(key) }, dl); el('dd', { text: typeof value === 'object' ? JSON.stringify(value) : words(value) }, dl); }
       return { node, head };
     }, (entry, { line }) => { entry.head.textContent = `${when(line)} · ${describe(line)}`; }, lines);
     aligned.hidden = !anchor;

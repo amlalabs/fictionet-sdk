@@ -45,7 +45,7 @@ export function mount(root, services, options) {
         const full = el('div', { class: 'probe-full' }, details);
         el('code', { text: row.command }, full);
         el('pre', { text: row.guest_result }, full);
-        for (const proxy of row.proxies || []) el('p', { text: `${proxy.name}: ${proxy.destination} (${proxy.world_host ? 'world host' : 'not a world host'})` }, full);
+        for (const proxy of row.proxies || []) el('p', { text: `${proxy.name}: ${proxy.destination}` }, full);
       }
     }
   }

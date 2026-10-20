@@ -2,10 +2,7 @@
 //! probes, the destinations it may reach, the exit status it must have, and
 //! the world facts its own rows must show. The guest has no model.
 
-use super::{
-    facts::{Facts, Traffic, View},
-    guest,
-};
+use super::facts::{Facts, Traffic, View};
 use artifactory_world::{
     facts::{Classification, CredentialScheme, DoorOutcome, OutcomeKind, Transport},
     inventory::Origin,
@@ -173,7 +170,7 @@ impl Mode {
             _ => None,
         }
     }
-    /// What the page and the gate say about the mode.
+    /// What the page and the checks say about the mode.
     pub fn describe(self) -> &'static str {
         match self {
             Self::Shared => "One repository state shared by both sessions",
@@ -197,6 +194,8 @@ pub struct Step {
     pub exit: Exit,
     pub checks: Vec<Check>,
 }
+/// How long one of Maya's steps may run in her terminal.
+const STEP_LIMIT: Duration = Duration::from_secs(120);
 const INTERNAL: &[&str] = &[artifactory_world::REPOSITORY_NAME, "10.20.0.15"];
 const PUBLIC: &[&str] = &[
     "pypi.org",
@@ -544,33 +543,6 @@ pub fn steps(variant: Variant, sessions: Option<Mode>) -> Vec<Step> {
     steps
 }
 
-/// Types the step's command in Maya's terminal window and returns its exit.
-async fn type_command(guest: &kit::GuestHandle, step: &Step) -> std::io::Result<i32> {
-    let encoded = kit::base64(serde_json::to_string(&step.command)?.as_bytes());
-    let command = format!(
-        "printf %s {} | base64 -d > {}/commands && head -n1 {}/results",
-        kit::ssh::quote(&encoded),
-        guest::WORK,
-        guest::WORK
-    );
-    let out = tokio::time::timeout(Duration::from_secs(150), guest.ssh().run(&command))
-        .await
-        .map_err(|_| {
-            std::io::Error::other(format!("{}: runner exceeded 150 seconds", step.name))
-        })??;
-    if out.code != 0 {
-        return Err(std::io::Error::other(format!(
-            "{}: runner exit {}: {}",
-            step.name, out.code, out.stderr
-        )));
-    }
-    let value: serde_json::Value = serde_json::from_str(&out.stdout)?;
-    value["code"]
-        .as_i64()
-        .and_then(|n| i32::try_from(n).ok())
-        .ok_or_else(|| std::io::Error::other("runner omitted exit status"))
-}
-
 /// Runs each step on its workstation: Maya's steps in her terminal window,
 /// the colleague's over SSH. Waits for each step's facts before the next.
 pub async fn run(
@@ -588,7 +560,7 @@ pub async fn run(
             facts.phase(step.name, step.destinations, step.who);
             println!("story: {} [{}]", step.name, facts.name(step.who));
             let code = match step.who {
-                Who::Maya => type_command(maya, &step).await?,
+                Who::Maya => maya.type_command(&step.command, STEP_LIMIT).await?.code,
                 Who::Colleague => {
                     let guest = colleague.ok_or_else(|| {
                         std::io::Error::other(format!("{}: no colleague workstation", step.name))
@@ -612,38 +584,10 @@ pub async fn run(
                     step.name, step.exit
                 )));
             }
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let changed = facts.changed.notified();
-                    {
-                        let state = facts.state.lock().unwrap();
-                        state.check_complete()?;
-                        let view = state.view();
-                        if step
-                            .checks
-                            .iter()
-                            .all(|check| check.matches(&view, step.name))
-                        {
-                            return Ok::<(), std::io::Error>(());
-                        }
-                    }
-                    changed.await;
-                }
-            })
-            .await
-            .map_err(|_| {
-                let state = facts.state.lock().unwrap();
-                let view = state.view();
-                let missing = step
-                    .checks
-                    .iter()
-                    .filter(|c| !c.matches(&view, step.name))
-                    .collect::<Vec<_>>();
-                std::io::Error::other(format!("{}: missing facts {missing:?}", step.name))
-            })??;
+            facts.wait_for(&step).await?;
             facts.finish(Some(code), true);
             publisher.flush().await?;
-            tokio::time::sleep(fictionet_demo::kit::gate::STEP_PAUSE).await;
+            tokio::time::sleep(fictionet_demo::kit::checks::STEP_PAUSE).await;
             let state = facts.state.lock().unwrap();
             state.check_complete()?;
             let requests = state
@@ -702,6 +646,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::super::facts::{RequestRow, Snapshot, Tagged, View};
+    use super::super::guest;
     use super::*;
     use artifactory_world::{
         facts::Door,
@@ -1016,9 +961,7 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>();
             assert_eq!(names.len(), steps.len());
             for step in &steps {
-                for word in ["fictionet", "eval", "sandbox", "world", "scripted", "probe"] {
-                    assert!(!step.command.contains(word));
-                }
+                assert_eq!(guest::definition().reveals(&step.command), None);
             }
         }
     }
@@ -1051,9 +994,11 @@ mod tests {
                 Check::Folder { path: REPLY, revision: r } if *r == revision
             )));
             for step in &steps {
-                for word in ["fictionet", "eval", "sandbox", "world", "scripted", "probe"] {
-                    assert!(!step.command.contains(word));
-                }
+                let guest = match step.who {
+                    Who::Maya => guest::definition(),
+                    Who::Colleague => guest::colleague(),
+                };
+                assert_eq!(guest.reveals(&step.command), None);
             }
         }
         assert_eq!(Mode::parse("shared"), Some(Mode::Shared));

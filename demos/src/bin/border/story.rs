@@ -1,6 +1,8 @@
 //! The scripted terminal story and the page's own command client.
 
 use super::{checks, guest::HOSTNAME};
+use border_world::routing::RouteState;
+use border_world::scenario::Variant;
 use fictionet_demo::kit::{
     self, Run,
     client::{Capability, PageClient},
@@ -93,14 +95,6 @@ async fn flip(client: &PageClient, mode: &str, revision: u64) -> io::Result<()> 
     Ok(())
 }
 
-async fn title(ssh: &ssh::Session) -> io::Result<String> {
-    Ok(command(ssh, "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'").await?.stdout.trim().to_owned())
-}
-
-async fn border_state(client: &PageClient) -> io::Result<Value> {
-    Ok(client.get_json("/api/state/border").await?["value"].take())
-}
-
 fn aborted_after(view: &Value, after: u64) -> bool {
     view["tls"]["rows"].as_array().is_some_and(|rows| {
         rows.iter().any(|row| {
@@ -142,7 +136,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
     let client = PageClient::from_url(run.page_url())?;
     let mut titles = Vec::new();
     let result = tokio::time::timeout(Duration::from_secs(60), async {
-        let before = border_state(&client).await?;
+        let before: Value = client.state("border").await?;
         let after = before["tls"]["rows"].as_array().into_iter().flatten()
             .filter_map(|row| row["event"].as_u64()).max().unwrap_or(0);
         let mut cursor = client.last_event().await?;
@@ -151,7 +145,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
-            let current = title(ssh).await?;
+            let current = kit::desktop::firefox_title(ssh).await?;
             if !titles.contains(&current) {
                 println!("Firefox title: {current:?}");
                 titles.push(current.clone());
@@ -163,7 +157,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
             let bank = current.contains("Kestrelmoor");
             if !current.is_empty() && bank != hijacked
                 && (hijacked || served)
-                && (!hijacked || aborted_after(&border_state(&client).await?, after)) {
+                && (!hijacked || aborted_after(&client.state("border").await?, after)) {
                 println!("Firefox final title: {current:?}");
                 if hijacked {
                     println!("Browser TLS: the impostor answered and the guest aborted with an alert.");
@@ -239,7 +233,7 @@ async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
     }
     println!(
         "Captured Firefox title: {:?}",
-        title(run.guest(HOSTNAME).ssh()).await?
+        kit::desktop::firefox_title(run.guest(HOSTNAME).ssh()).await?
     );
     Ok(())
 }
@@ -276,8 +270,8 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
         )));
     }
     println!("Repeated command: rejected stale_revision; revision remains 1.");
-    let state = client.get_json("/api/state/routing").await?;
-    if state["value"]["revision"] != 1 || state["value"]["mode"] != "hijack" {
+    let state: RouteState = client.state("routing").await?;
+    if state.revision != 1 || state.mode != Variant::Hijack {
         return Err(io::Error::other(
             "the rejected command changed the route state",
         ));
@@ -326,6 +320,7 @@ pub async fn observed(client: &PageClient, hijacked: bool) -> io::Result<()> {
             "/api/state/border",
             Duration::from_secs(10),
             Duration::from_millis(100),
+            "Border observations did not contain the complete traffic story",
             |snapshot| {
                 if exposes_password(snapshot) {
                     return Err(io::Error::other("Border state exposed the password"));
@@ -336,13 +331,7 @@ pub async fn observed(client: &PageClient, hijacked: bool) -> io::Result<()> {
                 Ok(observed_complete(&snapshot["value"], hijacked))
             },
         )
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => {
-                io::Error::other("Border observations did not contain the complete traffic story")
-            }
-            _ => error,
-        })?;
+        .await?;
     Ok(())
 }
 
@@ -428,15 +417,10 @@ async fn password_received(client: &PageClient, cursor: u64) -> io::Result<()> {
             cursor,
             Duration::from_secs(10),
             Duration::from_millis(100),
+            "page events did not show a password-bearing impostor request",
             |event| Ok(password_hidden(event)? && has_password_event(event)),
         )
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => {
-                io::Error::other("page events did not show a password-bearing impostor request")
-            }
-            _ => error,
-        })?;
+        .await?;
     // Every event the page now holds, not only those read up to the match,
     // must still leave the password out.
     client

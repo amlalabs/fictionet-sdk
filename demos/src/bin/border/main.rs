@@ -27,20 +27,21 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    const USAGE: &str = "usage: border <downloads> [--checks], or border preview";
     let mut args = std::env::args().skip(1);
-    let first = args.next();
-    if first.as_deref() == Some("page") {
+    let first = args.next().ok_or(USAGE)?;
+    if first == "preview" {
         if args.next().is_some() {
-            return Err("usage: border page".into());
+            return Err(USAGE.into());
         }
         return preview::run().await;
     }
-    let downloads = PathBuf::from(first.unwrap_or_else(|| "demos/downloads/cloudimage".into()));
+    let downloads = PathBuf::from(first);
     let option = args.next();
-    if option.as_deref().is_some_and(|s| s != "--gate") || args.next().is_some() {
-        return Err("usage: border [downloads] [--gate]".into());
+    if option.as_deref().is_some_and(|s| s != "--checks") || args.next().is_some() {
+        return Err(USAGE.into());
     }
-    let gate = option.is_some() || !std::io::stdin().is_terminal();
+    let checks_only = option.is_some() || !std::io::stdin().is_terminal();
     let started = Instant::now();
     let out = downloads
         .join("shots")
@@ -96,13 +97,14 @@ async fn main() -> Result<(), Error> {
             .await?;
         println!("Boot to desktop-ready: {:.2} s", ready.as_secs_f64());
         story::run(&run, &out).await?;
+        run.containment().await?;
         println!(
             "Story completed in {:.2} s",
             started.elapsed().as_secs_f64()
         );
-        if !gate {
+        if !checks_only {
             println!("Use Routing to flip the route, or Ctrl-b d in the terminal for bank-check.");
-            kit::gate::stay_open().await?;
+            kit::checks::stay_open().await?;
         }
         Ok(())
     }
@@ -110,15 +112,11 @@ async fn main() -> Result<(), Error> {
     if result.is_err() {
         eprint!("{}", run.guest(guest::HOSTNAME).diagnostics().await);
     }
-    let run_path = run.path().to_owned();
     let shutdown = run.shutdown().await;
     let finished = log.finish();
     result?;
     shutdown?;
     finished?;
-    if run_path.exists() {
-        return Err("the temporary run directory remains after shutdown".into());
-    }
     println!("Output: {}", out.display());
     println!(
         "Shutdown complete; whole run: {:.2} s",

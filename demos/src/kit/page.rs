@@ -1,4 +1,5 @@
-//! Page hosts backed by the kit's admin SSH sessions.
+//! Page hosts backed by the kit's admin SSH sessions, and the loop that
+//! serves a page control.
 
 use std::collections::HashMap;
 use std::io;
@@ -7,11 +8,39 @@ use std::time::{Duration, Instant};
 
 use fictionet::Cx;
 use fictionet_observe::page::{
-    BoxFuture, Console, Duplex, Host, HostState, HostStatus, Pty, StateLimits, StateTopic,
+    BoxFuture, Command, CommandPort, Console, Duplex, Host, HostState, HostStatus, Pty, Rejected,
+    StateLimits, StateTopic,
 };
+use serde::Serialize;
 use tokio::sync::watch;
 
 use super::{Guest, ssh};
+
+/// Serves the page control `port` until the page closes it. `decide` makes
+/// each command's reply or its rejection; its error ends the loop.
+pub async fn serve_commands<C, R: Serialize>(
+    cx: &Cx,
+    port: &CommandPort<C, R>,
+    mut decide: impl FnMut(&C) -> fictionet::Result<Result<R, Rejected>>,
+) -> fictionet::Result {
+    while let Some(command) = cx.race(None, port.recv()).await? {
+        answer_command(cx, command, &mut decide)?;
+    }
+    Ok(())
+}
+
+/// Answers one page command with the reply or the rejection `decide` makes.
+pub fn answer_command<C, R: Serialize>(
+    cx: &Cx,
+    command: Command<C, R>,
+    decide: impl FnOnce(&C) -> fictionet::Result<Result<R, Rejected>>,
+) -> fictionet::Result {
+    match decide(&command.command)? {
+        Ok(reply) => command.reply(cx, reply),
+        Err(rejection) => command.reject(cx, rejection),
+    }
+    Ok(())
+}
 
 /// Declared guests available to a page builder. Each host can be taken once.
 pub struct Hosts(pub(super) HashMap<String, Option<GuestConsole>>);

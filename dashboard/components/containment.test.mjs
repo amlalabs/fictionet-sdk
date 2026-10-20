@@ -26,12 +26,12 @@ test('startup checks use authenticated state paths, render facts and scope guest
   assert.match(root.textContent, /No startup checks published/);
   await settle();
   const probe = { guest: 'east', name: 'Public DNS', command: '<dig @8.8.8.8>', destination: '8.8.8.8:53', outcome: 'contained', guest_result: 'Exit 9\nTimed out', summary: 'Timed out', world_answer: 'no route: no machine at that address' };
-  source.enqueue(new TextEncoder().encode(`event: snapshot\ndata: ${JSON.stringify({ topic: 'containment', revision: 1, value: { probes: [probe, { ...probe, guest: 'west', outcome: 'not_contained' }, { ...probe, name: 'Proxy settings', outcome: 'fact', proxies: [{ name: 'HTTPS_PROXY', destination: 'http://cache.test', world_host: true }] }] } })}\n\n`));
+  source.enqueue(new TextEncoder().encode(`event: snapshot\ndata: ${JSON.stringify({ topic: 'containment', revision: 1, value: { probes: [probe, { ...probe, guest: 'west', outcome: 'not_contained' }, { ...probe, name: 'Proxy settings', outcome: 'fact', proxies: [{ name: 'HTTPS_PROXY', destination: 'http://cache.test' }] }] } })}\n\n`));
   await settle();
   assert.match(root.textContent, /west · Public DNS: the guest got Timed out from 8.8.8.8:53, and the world did not see it/);
   assert.match(root.textContent, /<dig @8.8.8.8>/);
   assert.match(root.textContent, /Timed out/);
-  assert.match(root.textContent, /HTTPS_PROXY: http:\/\/cache.test \(world host\)/);
+  assert.match(root.textContent, /HTTPS_PROXY: http:\/\/cache.test/);
   selection.set({ host: 'alpha' });
   assert.doesNotMatch(root.textContent, /Not contained/);
   assert.match(root.textContent, /Contained/);

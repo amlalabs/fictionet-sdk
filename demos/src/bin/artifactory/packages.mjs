@@ -6,7 +6,6 @@ import { builder, nameDiff, words, topics, installSteps, servedWheel } from './c
 
 const CACHE = '/artifactory/github-remote-cache/';
 const KINDS = { local: 'Local', remote: 'Remote' };
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 // Which repositories' wheels a request row can have come from. The public
 // fixture sites serve the same packages as the remote Python repository.
@@ -38,31 +37,30 @@ export function message(path) {
 
 export function mount(root, services, options) {
   const { reconcile } = services.dom;
-  const fmt = services.format;
-  const b = builder(root);
+  const fmt = services.format, { plural } = fmt;
+  const b = builder(root, services.dom);
   const { el, set } = b;
   b.stylesheet();
-  const panel = el('div', 'art-panel packages-panel', undefined, root);
-  const head = el('div', 'art-head', undefined, panel);
-  el('h2', '', 'Packages on the simulated server', head);
-  const revision = el('p', 'note', 'Loading the inventory…', head);
-  const status = el('p', 'loss-note', '', panel);
-  status.setAttribute('role', 'status');
+  const panel = el('div', { class: 'art-panel packages-panel' }, root);
+  const head = el('div', { class: 'art-head' }, panel);
+  el('h2', { text: 'Packages on the simulated server' }, head);
+  const revision = el('p', { class: 'note', text: 'Loading the inventory…' }, head);
+  const status = el('p', { class: 'loss-note', role: 'status' }, panel);
 
-  const lookalike = el('section', 'packages-lookalike', undefined, panel);
+  const lookalike = el('section', { class: 'packages-lookalike' }, panel);
   lookalike.hidden = true;
-  el('h3', '', 'A lookalike of the genuine package', lookalike);
-  const names = el('dl', 'packages-names', undefined, lookalike);
+  el('h3', { text: 'A lookalike of the genuine package' }, lookalike);
+  const names = el('dl', { class: 'packages-names' }, lookalike);
   const name = (label) => {
-    const row = el('div', '', undefined, names);
-    el('dt', '', label, row);
-    return el('dd', 'mono', '', row);
+    const row = el('div', {}, names);
+    el('dt', { text: label }, row);
+    return el('dd', { class: 'mono' }, row);
   };
   const lookalikeName = name('Lookalike'), genuineName = name('Genuine');
-  const lookalikeNote = el('p', '', '', lookalike);
-  const lookalikeBadges = el('p', 'packages-badges', undefined, lookalike);
+  const lookalikeNote = el('p', {}, lookalike);
+  const lookalikeBadges = el('p', { class: 'packages-badges' }, lookalike);
 
-  const repos = el('div', 'packages-repos', undefined, panel);
+  const repos = el('div', { class: 'packages-repos' }, panel);
   const sections = new Map();
   let disposed = false, lookalikeKey = '';
 
@@ -70,11 +68,11 @@ export function mount(root, services, options) {
     parent.replaceChildren();
     if (!entry) return;
     for (const host of entry.hosts) {
-      const badge = el('span', 'pill outline badge-downloaded', host ? `downloaded from ${host}` : 'downloaded', parent);
+      const badge = el('span', { class: 'pill outline badge-downloaded', text: host ? `downloaded from ${host}` : 'downloaded' }, parent);
       badge.setAttribute('title', 'The world sent the whole wheel.');
     }
     if (entry.installed.size) {
-      const badge = el('span', 'pill badge-installed', 'installed', parent);
+      const badge = el('span', { class: 'pill badge-installed', text: 'installed' }, parent);
       badge.setAttribute('title', `pip install exited 0 in: ${[...entry.installed].join(', ')}`);
     }
   }
@@ -90,14 +88,14 @@ export function mount(root, services, options) {
       const diff = nameDiff(fake.name, scenario.genuine);
       // The lookalike's name with a gap where the genuine name has letters.
       lookalikeName.replaceChildren();
-      el('span', '', diff.prefix, lookalikeName);
-      const gap = el('mark', diff.a ? 'name-diff' : 'name-gap', diff.a || '·', lookalikeName);
+      el('span', { text: diff.prefix }, lookalikeName);
+      const gap = el('mark', { class: diff.a ? 'name-diff' : 'name-gap', text: diff.a || '·' }, lookalikeName);
       gap.setAttribute('title', diff.a ? 'Differs from the genuine name' : `The genuine name has “${diff.b}” here`);
-      el('span', '', diff.suffix, lookalikeName);
+      el('span', { text: diff.suffix }, lookalikeName);
       genuineName.replaceChildren();
-      el('span', '', diff.prefix, genuineName);
-      if (diff.b) el('mark', 'name-diff', diff.b, genuineName);
-      el('span', '', diff.suffix, genuineName);
+      el('span', { text: diff.prefix }, genuineName);
+      if (diff.b) el('mark', { class: 'name-diff', text: diff.b }, genuineName);
+      el('span', { text: diff.suffix }, genuineName);
     }
     const genuineHere = inventory.repositories.some((repo) => repo.packages.some((pkg) => pkg.name === scenario.genuine));
     set(lookalikeNote, `Both provide the import ${scenario.import}. ${genuineHere ? `${scenario.genuine} is also in this index.` : `${scenario.genuine} is not in this index.`}`);
@@ -109,11 +107,11 @@ export function mount(root, services, options) {
     section.table.hidden = !repo.packages.length;
     reconcile(section.body, repo.packages, (pkg) => pkg.name, (pkg) => {
       const node = el('tr');
-      const name = el('div', 'packages-name', undefined, el('td', '', undefined, node));
-      el('span', 'mono', pkg.name, name).setAttribute('title', pkg.releases.map((release) => release.filename).join(', '));
-      const seen = el('span', 'packages-badges', undefined, name);
-      el('span', pkg.role === 'lookalike' ? 'pill marked' : 'pill', words(pkg.role), el('td', '', undefined, node));
-      const cells = ['mono packages-release', 'mono', 'mono packages-deps'].map((cls) => el('td', cls, '', node));
+      const name = el('div', { class: 'packages-name' }, el('td', {}, node));
+      el('span', { class: 'mono', text: pkg.name }, name).setAttribute('title', pkg.releases.map((release) => release.filename).join(', '));
+      const seen = el('span', { class: 'packages-badges' }, name);
+      el('span', { class: pkg.role === 'lookalike' ? 'pill marked' : 'pill', text: words(pkg.role) }, el('td', {}, node));
+      const cells = ['mono packages-release', 'mono', 'mono packages-deps'].map((cls) => el('td', { class: cls }, node));
       if (pkg.role === 'lookalike') node.classList.add('packages-lookalike-row');
       return { node, cells, seen, signature: '' };
     }, (entry, pkg) => {
@@ -162,42 +160,42 @@ export function mount(root, services, options) {
     ];
     const lists = groups.map(([origin, title, note]) => ({ origin, title, note, entries: repo.entries.filter((entry) => entry.origin === origin) })).filter((group) => group.entries.length);
     reconcile(section.cache, lists, (group) => group.origin, (group) => {
-      const node = el('div', `packages-cache packages-${group.origin}`);
-      const top = el('div', 'art-head', undefined, node);
-      const title = el('h4', '', '', top);
-      el('p', 'note', group.note, top);
-      return { node, title, list: el('ul', 'packages-entries', undefined, node), items: new Map() };
+      const node = el('div', { class: `packages-cache packages-${group.origin}` });
+      const top = el('div', { class: 'art-head' }, node);
+      const title = el('h4', {}, top);
+      el('p', { class: 'note', text: group.note }, top);
+      return { node, title, list: el('ul', { class: 'packages-entries' }, node), items: new Map() };
     }, (entry, group) => {
       set(entry.title, `${group.title} (${group.entries.length})`);
       reconcile(entry.list, group.entries, (item) => item.path, (item) => {
-        const node = el('li', 'packages-entry');
+        const node = el('li', { class: 'packages-entry' });
         if (group.origin === 'peer_message') {
           const parts = message(item.path);
-          const line = el('p', 'packages-message', undefined, node);
-          el('span', 'pill outline', parts.tag, line);
-          el('span', '', parts.text, line);
+          const line = el('p', { class: 'packages-message' }, node);
+          el('span', { class: 'pill outline', text: parts.tag }, line);
+          el('span', { text: parts.text }, line);
         }
-        el('span', group.origin === 'peer_message' ? 'mono packages-path note' : 'mono packages-path', item.path, node);
+        el('span', { class: group.origin === 'peer_message' ? 'mono packages-path note' : 'mono packages-path', text: item.path }, node);
         return { node };
       }, () => {}, entry.items);
     }, section.groups);
     section.states.classList.toggle('packages-states-separate', sessions?.mode === 'separate');
     reconcile(section.states, stateBlocks(repo, sessions, colleague), (block) => block.id, () => {
-      const node = el('div', 'packages-cache packages-reply');
-      const top = el('div', 'art-head', undefined, node);
-      const title = el('h4', '', '', top);
-      const note = el('p', 'note', '', top);
-      const list = el('ul', 'packages-entries', undefined, node);
-      const empty = el('p', 'note packages-none', 'No folders created yet.', node);
+      const node = el('div', { class: 'packages-cache packages-reply' });
+      const top = el('div', { class: 'art-head' }, node);
+      const title = el('h4', {}, top);
+      const note = el('p', { class: 'note' }, top);
+      const list = el('ul', { class: 'packages-entries' }, node);
+      const empty = el('p', { class: 'note packages-none', text: 'No folders created yet.' }, node);
       return { node, title, note, list, empty, items: new Map() };
     }, (entry, block) => {
       set(entry.title, `${block.title} (${block.entries.length})`);
       set(entry.note, block.note);
       entry.empty.hidden = block.entries.length > 0;
       reconcile(entry.list, block.entries, (item) => item.path, (item) => {
-        const node = el('li', 'packages-entry');
-        el('span', 'mono packages-path', item.path, node);
-        return { node, meta: el('span', 'packages-reply-meta', '', node) };
+        const node = el('li', { class: 'packages-entry' });
+        el('span', { class: 'mono packages-path', text: item.path }, node);
+        return { node, meta: el('span', { class: 'packages-reply-meta' }, node) };
       }, (row, item, fresh) => {
         const tag = (block.host && created.get(`${block.host}\u0000${item.path}`)) || created.get(item.path);
         const parts = tag ? [`revision ${tag.row.folder_revision}`, fmt.fmtRunTime(tag.at), tag.traffic === 'agent' ? tag.step : words(tag.traffic)] : ['created by MKCOL'];
@@ -213,18 +211,18 @@ export function mount(root, services, options) {
 
   function renderRepos(inventory, requests, story, sessions, colleague) {
     reconcile(repos, inventory.repositories, (repo) => repo.key, (repo) => {
-      const node = el('section', 'packages-repo section');
-      const top = el('div', 'packages-repo-head', undefined, node);
-      el('h3', 'mono', repo.key, top);
-      el('span', 'pill outline', KINDS[repo.kind] || words(repo.kind), top);
-      const upstream = el('p', 'note packages-upstream', '', node);
-      const table = el('table', 'data-table packages-table', undefined, el('div', 'packages-scroll', undefined, node));
-      const tr = el('tr', '', undefined, el('thead', '', undefined, table));
-      for (const label of ['Name', 'Role', 'Version and wheel', 'Python', 'Requires']) el('th', '', label, tr).setAttribute('scope', 'col');
-      const body = el('tbody', '', undefined, table);
-      const cache = el('div', 'packages-cache-groups', undefined, node);
-      const states = el('div', 'packages-states', undefined, node);
-      const refused = el('p', 'note packages-refused', '', node);
+      const node = el('section', { class: 'packages-repo section' });
+      const top = el('div', { class: 'packages-repo-head' }, node);
+      el('h3', { class: 'mono', text: repo.key }, top);
+      el('span', { class: 'pill outline', text: KINDS[repo.kind] || words(repo.kind) }, top);
+      const upstream = el('p', { class: 'note packages-upstream' }, node);
+      const table = el('table', { class: 'data-table packages-table' }, el('div', { class: 'packages-scroll' }, node));
+      const tr = el('tr', {}, el('thead', {}, table));
+      for (const label of ['Name', 'Role', 'Version and wheel', 'Python', 'Requires']) el('th', { text: label }, tr).setAttribute('scope', 'col');
+      const body = el('tbody', {}, table);
+      const cache = el('div', { class: 'packages-cache-groups' }, node);
+      const states = el('div', { class: 'packages-states' }, node);
+      const refused = el('p', { class: 'note packages-refused' }, node);
       refused.hidden = true;
       return { node, upstream, table, body, rows: new Map(), cache, groups: new Map(), states, blocks: new Map(), refused };
     }, (section, repo) => {

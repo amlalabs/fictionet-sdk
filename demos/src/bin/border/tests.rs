@@ -18,11 +18,7 @@ async fn http_commands_change_the_route_and_record_inputs() {
         .unwrap();
     let client = PageClient::from_url(server.url()).unwrap();
     client.bootstrap().await.unwrap();
-    let initial = client
-        .request("GET", "/api/state/routing", None, true)
-        .await
-        .unwrap();
-    let initial: Value = serde_json::from_slice(&initial.body).unwrap();
+    let initial: Value = client.get_json("/api/state/routing").await.unwrap();
     assert_eq!(initial["value"]["revision"], 0);
     // Receive the external inputs before advancing the closed lab.
     let url = server.url().to_owned();
@@ -60,13 +56,13 @@ async fn http_commands_change_the_route_and_record_inputs() {
             let ids = border_world::identities(&cx, &ca)?;
             let (_attacher, attachments) = fictionet::attachments();
             let routing = border_world::start(&cx, control::scenario(), ids, attachments)?;
-            control.apply(&cx, &routing, first)?;
+            kit::answer_command(&cx, first, |route| control.apply(&cx, &routing, route))?;
             let changed = routing.state();
             assert_eq!(changed.revision, 1);
             assert_eq!(changed.mode, border_world::scenario::Variant::Hijack);
-            control.apply(&cx, &routing, second)?;
+            kit::answer_command(&cx, second, |route| control.apply(&cx, &routing, route))?;
             assert_eq!(routing.state(), changed);
-            control.apply(&cx, &routing, third)?;
+            kit::answer_command(&cx, third, |route| control.apply(&cx, &routing, route))?;
             assert_eq!(routing.state(), changed);
             *state_out.lock().unwrap() = Some(changed);
             cx.cancel();
@@ -81,11 +77,7 @@ async fn http_commands_change_the_route_and_record_inputs() {
         applied["reply"],
         json!({"revision": 1, "at_ms": changed.since_ms})
     );
-    let state = client
-        .request("GET", "/api/state/routing", None, true)
-        .await
-        .unwrap();
-    let state: Value = serde_json::from_slice(&state.body).unwrap();
+    let state: Value = client.get_json("/api/state/routing").await.unwrap();
     assert_eq!(state["value"], serde_json::to_value(&changed).unwrap());
     let stale = repeat.await.unwrap();
     assert_eq!(stale["status"], "rejected");
@@ -104,11 +96,7 @@ async fn http_commands_change_the_route_and_record_inputs() {
             .unwrap()
             .contains("surprise")
     );
-    let state = client
-        .request("GET", "/api/state/routing", None, true)
-        .await
-        .unwrap();
-    let state: Value = serde_json::from_slice(&state.body).unwrap();
+    let state: Value = client.get_json("/api/state/routing").await.unwrap();
     assert_eq!(state["value"], serde_json::to_value(&changed).unwrap());
     let events = client
         .request("GET", "/api/events", None, true)

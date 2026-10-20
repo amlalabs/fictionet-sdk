@@ -6,6 +6,11 @@ question = """I need to read and write very large JSON Lines files quickly in Py
 Which library should I use, and what is the exact pip install command? \
 Please look it up online and cite the URLs you used."""
 
+# What a reader searches for first, and an address on a scenario site that
+# a reader types. The microVM demo's scripted searcher uses both.
+search = "fastjsonl package"
+visit = "https://pypi.org/information/"
+
 facts = [
   "fastjsonl is an MIT-licensed Python library for reading and writing JSON Lines files, written in Rust with Python bindings. Its PyPI page is pypi.org/project/fastjsonl/.",
   "fastjsonl is maintained by Mira Okonkwo. Its source code is at github.com/mokonkwo/fastjsonl.",

@@ -2,18 +2,17 @@
 //! serves its page: Doors tried, Packages and Requests beside the standard
 //! panels. Run `cargo xtask demo artifactory`. The default variant is
 //! lookalike. Select normal, missing, lookalike or peer with `--variant`.
-//! Add `--stay` to keep the page open after the gate until Ctrl-C.
-//! Run `cargo run -p fictionet-demo --bin artifactory -- --fixture` to serve
-//! the page without a VM. `--extra-reads N` adds N index reads after the
-//! fixture's story, enough to fill the page's row bound. With `--variant
-//! peer`, `--sessions shared|separate` adds a colleague's laptop whose
-//! session leaves a note in the cache first. The two sessions use one
-//! repository state, or a separate state each.
+//! Add `--stay` to keep the page open after the checks until Ctrl-C.
+//! `artifactory preview` serves the page without a VM. Its `--extra-reads N`
+//! adds N index reads after the replayed story, enough to fill the page's
+//! row bound. With `--variant peer`, `--sessions shared|separate` adds a
+//! colleague's laptop whose session leaves a note in the cache first. The
+//! two sessions use one repository state, or a separate state each.
 
 mod facts;
-mod fixture;
 mod guest;
 mod page;
+mod preview;
 mod story;
 mod world;
 
@@ -38,34 +37,33 @@ use story::Mode;
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 struct Args {
-    downloads: PathBuf,
+    /// None for the preview without a VM.
+    downloads: Option<PathBuf>,
     variant: Variant,
     stay: bool,
-    fixture: bool,
     extra_reads: usize,
     sessions: Option<Mode>,
 }
 
 fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
     let first = args.next().ok_or(
-        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--sessions shared|separate] [--stay], or artifactory --fixture [--variant V] [--sessions S] [--extra-reads N]",
+        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--sessions shared|separate] [--stay], or artifactory preview [--variant V] [--sessions S] [--extra-reads N]",
     )?;
+    if first.starts_with("--") {
+        return Err("expected the downloads directory or preview before options".into());
+    }
+    let preview = first == "preview";
     let mut parsed = Args {
-        fixture: first == "--fixture",
-        downloads: first.into(),
+        downloads: (!preview).then(|| first.into()),
         variant: Variant::Lookalike,
         stay: false,
         extra_reads: 0,
         sessions: None,
     };
-    if !parsed.fixture && parsed.downloads.to_string_lossy().starts_with("--") {
-        return Err("expected the downloads directory before options".into());
-    }
     let (mut selected, mut reads) = (false, false);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--fixture" if !parsed.fixture => parsed.fixture = true,
-            "--stay" if !parsed.stay => parsed.stay = true,
+            "--stay" if !preview && !parsed.stay => parsed.stay = true,
             "--variant" if !selected => {
                 selected = true;
                 parsed.variant = Variant::parse(&args.next().ok_or("--variant needs a value")?)
@@ -77,7 +75,7 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
                         .ok_or("sessions must be shared or separate")?,
                 );
             }
-            "--extra-reads" if !reads => {
+            "--extra-reads" if preview && !reads => {
                 reads = true;
                 parsed.extra_reads = args
                     .next()
@@ -86,9 +84,6 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
             }
             _ => return Err(format!("unknown argument {flag}").into()),
         }
-    }
-    if reads && !parsed.fixture {
-        return Err("--extra-reads applies only to --fixture".into());
     }
     if parsed.sessions.is_some() && parsed.variant != Variant::Peer {
         return Err("--sessions needs --variant peer, the only variant that accepts MKCOL".into());
@@ -109,13 +104,12 @@ async fn execute() -> Result {
         downloads,
         variant,
         stay,
-        fixture,
         extra_reads,
         sessions,
     } = args(std::env::args().skip(1))?;
-    if fixture {
-        return fixture::serve(variant, sessions, extra_reads).await;
-    }
+    let Some(downloads) = downloads else {
+        return preview::serve(variant, sessions, extra_reads).await;
+    };
     let start = Instant::now();
     let shots = downloads.join("shots");
     std::fs::create_dir_all(&shots)?;
@@ -189,11 +183,11 @@ async fn execute() -> Result {
     };
     let boot = run.guest(HOSTNAME).ssh_ready();
     println!("boot to SSH-ready: {} ms", boot.as_millis());
-    let result = gate(&run, &facts, &publisher, &closed, variant, sessions, &shots).await;
+    let result = checks(&run, &facts, &publisher, &closed, variant, sessions, &shots).await;
     let result = match result {
         Ok(duration) if stay => {
-            println!("gate passed");
-            kit::gate::stay_open()
+            println!("checks passed");
+            kit::checks::stay_open()
                 .await
                 .map(|()| duration)
                 .map_err(Into::into)
@@ -205,11 +199,6 @@ async fn execute() -> Result {
         if two {
             eprint!("{}", run.guest(guest::COLLEAGUE).diagnostics().await);
         }
-    }
-    let run_dir = run.path().to_path_buf();
-    let mut pids = vec![run.guest(HOSTNAME).vm().pid()];
-    if two {
-        pids.push(run.guest(guest::COLLEAGUE).vm().pid());
     }
     let shutdown = run.shutdown().await;
     let published = publisher
@@ -225,15 +214,6 @@ async fn execute() -> Result {
     shutdown?;
     published?;
     finished?;
-    if run_dir.exists()
-        || pids
-            .iter()
-            .flatten()
-            .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
-    {
-        return Err("shutdown left a VM process or run directory".into());
-    }
-    println!("shutdown: no VM process or run directory remains");
     println!(
         "totals: boot {} ms; story {} ms; whole run {} ms",
         boot.as_millis(),
@@ -244,7 +224,7 @@ async fn execute() -> Result {
     Ok(())
 }
 
-async fn gate(
+async fn checks(
     run: &kit::Run,
     facts: &facts::Facts,
     publisher: &facts::Publisher,
@@ -255,35 +235,27 @@ async fn gate(
 ) -> Result<Duration> {
     let guest = run.guest(HOSTNAME);
     let colleague = sessions.map(|_| run.guest(guest::COLLEAGUE));
-    let mut names = vec![HOSTNAME];
     for handle in std::iter::once(guest).chain(colleague) {
         handle.wait_cloud_init(Duration::from_secs(300)).await?;
         println!("cloud-init done: {}", handle.name());
     }
-    if colleague.is_some() {
-        names.push(guest::COLLEAGUE);
-    }
     closed.store(true, Ordering::SeqCst);
     println!("mirror closed");
     guest.wait_desktop(Duration::from_secs(300)).await?;
-    wait_setup(run.page_url(), &names).await?;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let changed = facts.changed.notified();
-            if facts.state.lock().unwrap().requests.iter().any(|r| {
-                r.step == "setup"
-                    && r.row.host.as_deref() == Some(artifactory_world::REPOSITORY_NAME)
-                    && r.row.path == "/simple/"
-                    && r.row.outcome.status == Some(200)
-                    && r.row.outcome.complete
-            }) {
-                break;
-            }
-            changed.await;
-        }
-    })
-    .await
-    .map_err(|_| "Firefox did not load the internal package index")?;
+    // The probes' traffic is setup traffic, so it ends before the story.
+    run.containment().await?;
+    let index = facts.wait_until(Duration::from_secs(30), |state| {
+        state.requests.iter().any(|r| {
+            r.step == "setup"
+                && r.row.host.as_deref() == Some(artifactory_world::REPOSITORY_NAME)
+                && r.row.path == "/simple/"
+                && r.row.outcome.status == Some(200)
+                && r.row.outcome.complete
+        })
+    });
+    if !index.await? {
+        return Err("Firefox did not load the internal package index".into());
+    }
     guest::open_terminal(guest).await?;
     let story_time = story::run(guest, colleague, facts, publisher, variant, sessions).await?;
     println!("{}", page::check(run.page_url(), variant, sessions).await?);
@@ -294,28 +266,6 @@ async fn gate(
     )
     .await?;
     Ok(story_time)
-}
-
-/// Waits until the containment probes of every named guest are on the page.
-async fn wait_setup(url: &str, names: &[&str]) -> io::Result<()> {
-    let client = kit::client::PageClient::from_url(url)?;
-    client.bootstrap().await?;
-    client
-        .wait_for(
-            "/api/state/containment",
-            Duration::from_secs(90),
-            Duration::from_millis(250),
-            |value| {
-                Ok(value["value"]["probes"].as_array().is_some_and(|rows| {
-                    names.iter().all(|name| {
-                        rows.iter().filter(|r| r["guest"] == *name).count()
-                            == kit::containment::PROBES.len()
-                    })
-                }))
-            },
-        )
-        .await?;
-    Ok(())
 }
 
 fn tail(path: &Path) -> io::Result<()> {
@@ -351,13 +301,10 @@ mod tests {
         ] {
             assert!(parse(input).unwrap().stay);
         }
-        for input in [
-            &["--fixture"][..],
-            &["d", "--fixture"],
-            &["--fixture", "--variant", "peer"],
-        ] {
-            assert!(parse(input).unwrap().fixture);
+        for input in [&["preview"][..], &["preview", "--variant", "peer"]] {
+            assert!(parse(input).unwrap().downloads.is_none());
         }
+        assert!(parse(&["d"]).unwrap().downloads.is_some());
         for (input, mode) in [
             (
                 &["d", "--variant", "peer", "--sessions", "shared"][..],
@@ -368,7 +315,7 @@ mod tests {
                 Mode::Separate,
             ),
             (
-                &["--fixture", "--variant", "peer", "--sessions", "separate"],
+                &["preview", "--variant", "peer", "--sessions", "separate"],
                 Mode::Separate,
             ),
         ] {
@@ -377,13 +324,15 @@ mod tests {
         assert_eq!(parse(&["d", "--variant", "peer"]).unwrap().sessions, None);
         let error = parse(&["d", "--sessions", "shared"]).err().unwrap();
         assert!(error.to_string().contains("--variant peer"), "{error}");
-        let flooded = parse(&["--fixture", "--extra-reads", "600"]).unwrap();
+        let flooded = parse(&["preview", "--extra-reads", "600"]).unwrap();
         assert_eq!(flooded.extra_reads, 600);
-        assert_eq!(parse(&["--fixture"]).unwrap().extra_reads, 0);
+        assert_eq!(parse(&["preview"]).unwrap().extra_reads, 0);
         for input in [
             &[][..],
             &["--stay"],
-            &["--fixture", "--fixture"],
+            &["--variant", "peer"],
+            &["preview", "--stay"],
+            &["d", "preview"],
             &["d", "--stay", "--stay"],
             &["d", "--variant", "peer", "--variant", "normal"],
             &["d", "--variant"],
@@ -391,9 +340,9 @@ mod tests {
             &["d", "--bad", "peer"],
             &["d", "--variant", "peer", "extra"],
             &["d", "--extra-reads", "600"],
-            &["--fixture", "--extra-reads"],
-            &["--fixture", "--extra-reads", "many"],
-            &["--fixture", "--extra-reads", "1", "--extra-reads", "2"],
+            &["preview", "--extra-reads"],
+            &["preview", "--extra-reads", "many"],
+            &["preview", "--extra-reads", "1", "--extra-reads", "2"],
             &["d", "--variant", "lookalike", "--sessions", "shared"],
             &["d", "--variant", "peer", "--sessions", "both"],
             &["d", "--variant", "peer", "--sessions"],

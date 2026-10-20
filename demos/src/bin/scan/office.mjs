@@ -1,7 +1,7 @@
 // The Office panel: the scripted story, then the scanner and the office
 // subnet. A cell lights as the world's port map shows a probe to its
 // address; a card rises for each machine once its address answers.
-import { element, stylesheet, addresses, summary, hosts, count, limits, PORTS } from './model.mjs';
+import { stylesheet, addresses, summary, hosts, limits, server, PORTS } from './model.mjs';
 
 const STEP = { waiting: 'Waiting', running: 'Running', done: 'Done', failed: 'Failed' };
 const CELL = {
@@ -13,103 +13,104 @@ const CELL = {
 const COMMAND = { waiting: 'Next', running: 'Running', done: 'Last', failed: 'Failed' };
 
 export function mount(root, services, options) {
-  const document = root.ownerDocument;
-  const el = (tag, className, text, parent) => element(document, tag, className, text, parent);
+  const { el } = services.dom.scoped(root);
   const cleanups = [];
-  const on = (node, name, handler) => {
-    node.addEventListener(name, handler);
-    cleanups.push(() => node.removeEventListener(name, handler));
-  };
+  const { listen } = services.dom;
+  const { plural } = services.format;
   const reduced = () => Boolean(globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
-  stylesheet(document, root);
-  const panel = el('div', 'scan-panel office-panel', undefined, root);
+  stylesheet(el, root);
+  const panel = el('div', { class: 'scan-panel office-panel' }, root);
 
   // The story strip.
-  const strip = el('section', 'scan-story', undefined, panel);
-  strip.setAttribute('aria-label', 'Scripted agent');
-  const head = el('div', 'scan-story-head', undefined, strip);
-  el('h2', 'scan-eyebrow', 'Scripted agent', head);
-  el('span', 'scan-muted', 'A script types three nmap steps into the workstation terminal. No model runs.', head);
-  const steps = el('ol', 'scan-steps', undefined, strip);
-  const command = el('p', 'scan-command', undefined, strip);
-  const commandLabel = el('span', 'scan-command-label', '', command);
-  const commandText = el('code', '', '', command);
-  const storyNote = el('p', 'loss-note', '', strip);
-  storyNote.setAttribute('role', 'status');
+  const strip = el('section', { class: 'scan-story', 'aria-label': 'Scripted agent' }, panel);
+  const head = el('div', { class: 'scan-story-head' }, strip);
+  el('h2', { class: 'scan-eyebrow', text: 'Scripted agent' }, head);
+  const about = el('span', { class: 'scan-muted' }, head);
+  const steps = el('ol', { class: 'scan-steps' }, strip);
+  const command = el('p', { class: 'scan-command' }, strip);
+  const commandLabel = el('span', { class: 'scan-command-label' }, command);
+  const commandText = el('code', {}, command);
+  const storyNote = el('p', { class: 'loss-note', role: 'status' }, strip);
 
   // The counts and any limits.
-  const totals = el('p', 'office-summary', undefined, panel);
+  const totals = el('p', { class: 'office-summary' }, panel);
   const figure = (label) => {
-    const item = el('span', 'office-figure', undefined, totals);
-    const value = el('b', '', '0', item);
-    const name = el('span', '', ` ${label}`, item);
+    const item = el('span', { class: 'office-figure' }, totals);
+    const value = el('b', { text: '0' }, item);
+    const name = el('span', { text: ` ${label}` }, item);
     return { value, name };
   };
   const probed = figure('addresses probed');
   const answering = figure('hosts answering');
   const open = figure('open ports');
-  const notes = el('p', 'loss-note', '', panel);
-  notes.setAttribute('role', 'status');
+  const notes = el('p', { class: 'loss-note', role: 'status' }, panel);
 
   // The scanner and the hosts that answered.
-  const map = el('div', 'office-map', undefined, panel);
-  const left = el('section', 'office-found', undefined, map);
-  left.setAttribute('aria-label', 'Scanner and hosts');
-  const found = el('h3', 'office-found-title', 'No host has answered yet', left);
-  const scanner = el('div', 'office-card office-scanner', undefined, left);
+  const map = el('div', { class: 'office-map' }, panel);
+  const left = el('section', { class: 'office-found', 'aria-label': 'Scanner and hosts' }, map);
+  const found = el('h3', { class: 'office-found-title', text: 'No host has answered yet' }, left);
+  const scanner = el('div', { class: 'office-card office-scanner' }, left);
   const scannerHost = services.hosts?.find((host) => host.sandbox === 'scanner');
-  const scannerTitle = el('div', 'office-card-title', undefined, scanner);
-  el('b', 'office-name', scannerHost?.name || 'scanner', scannerTitle);
-  const scannerAddr = el('span', 'scan-muted', 'waiting for its lease', scannerTitle);
-  el('span', 'scan-muted', 'Scanner · real Ubuntu VM with nmap', scannerTitle);
-  const list = el('ol', 'office-hosts', undefined, left);
+  const scannerTitle = el('div', { class: 'office-card-title' }, scanner);
+  el('b', { class: 'office-name', text: scannerHost?.name || 'scanner' }, scannerTitle);
+  const scannerAddr = el('span', { class: 'scan-muted', text: 'waiting for its lease' }, scannerTitle);
+  const scannerKind = el('span', { class: 'scan-muted' }, scannerTitle);
+  // The labels that change when the story says it is a replay.
+  const realBadges = [];
+  let replay = false;
+  function label() {
+    about.textContent = replay
+      ? 'A replay without VMs: an in-world client sends the story\'s probes, and nmap\'s reports are recorded from a VM run. No model runs.'
+      : 'A script types three nmap steps into the workstation terminal. No model runs.';
+    scannerKind.textContent = replay ? 'Scanner · in-world stand-in for the VM' : 'Scanner · real Ubuntu VM with nmap';
+    for (const badge of realBadges) badge.textContent = server(replay);
+  }
+  label();
+  const list = el('ol', { class: 'office-hosts' }, left);
 
   // The subnet: 256 cells, 16 to a row.
-  const subnet = el('section', 'office-subnet', undefined, map);
-  subnet.setAttribute('aria-label', 'Office subnet 10.0.0.0/24');
-  el('h3', 'scan-eyebrow', 'Office subnet · 10.0.0.0/24', subnet);
-  const grid = el('div', 'office-grid', undefined, subnet);
-  grid.setAttribute('role', 'img');
+  const subnet = el('section', { class: 'office-subnet', 'aria-label': 'Office subnet 10.0.0.0/24' }, map);
+  el('h3', { class: 'scan-eyebrow', text: 'Office subnet · 10.0.0.0/24' }, subnet);
+  const grid = el('div', { class: 'office-grid', role: 'img' }, subnet);
   const cells = [];
   for (let row = 0; row < 16; row++) {
-    el('span', 'office-row', `.${row * 16}`, grid).setAttribute('aria-hidden', 'true');
+    el('span', { class: 'office-row', text: `.${row * 16}` }, grid).setAttribute('aria-hidden', 'true');
     for (let column = 0; column < 16; column++) {
       const last = row * 16 + column;
-      const cell = el('span', 'office-cell', undefined, grid);
+      const cell = el('span', { class: 'office-cell' }, grid);
       cell.dataset.state = 'idle';
       cell.setAttribute('title', `10.0.0.${last}: ${CELL.idle}`);
       cells.push(cell);
     }
   }
-  const legend = el('ul', 'scan-legend', undefined, subnet);
-  legend.setAttribute('aria-label', 'Cell states');
+  const legend = el('ul', { class: 'scan-legend', 'aria-label': 'Cell states' }, subnet);
   for (const state of ['host', 'empty', 'waiting', 'idle']) {
-    const item = el('li', '', undefined, legend);
-    el('span', 'office-cell', undefined, item).dataset.state = state;
-    el('span', '', CELL[state], item);
+    const item = el('li', {}, legend);
+    el('span', { class: 'office-cell' }, item).dataset.state = state;
+    el('span', { text: CELL[state] }, item);
   }
 
   // Cards by address, in the order they appeared.
   const cards = new Map();
   let first = true, total = 0, complete = false;
   function card(machine, cell) {
-    const item = el('li', 'office-card office-host', undefined, list);
+    const item = el('li', { class: 'office-card office-host' }, list);
     item.dataset.addr = machine.addr;
-    const title = el('div', 'office-card-title', undefined, item);
-    el('b', 'office-name', machine.name, title);
-    el('span', 'office-addr', machine.addr, title);
+    const title = el('div', { class: 'office-card-title' }, item);
+    el('b', { class: 'office-name', text: machine.name }, title);
+    el('span', { class: 'office-addr', text: machine.addr }, title);
     if (machine.kind === 'real') {
-      el('span', 'scan-badge', 'Real Ubuntu VM', title);
+      realBadges.push(el('span', { class: 'scan-badge', text: server(replay) }, title));
       const host = services.hosts?.find((entry) => entry.sandbox === machine.name);
       if (host) {
-        const show = el('button', 'text-button', `Show ${host.name} in the workspace`, item);
+        const show = el('button', { class: 'text-button', text: `Show ${host.name} in the workspace` }, item);
         show.setAttribute('type', 'button');
-        on(show, 'click', () => services.selection?.set({ host: host.name, node: null, links: [], event: null, connection: null, request: null }));
+        cleanups.push(listen(show, 'click', () => services.selection?.set({ host: host.name, node: null, links: [], event: null, connection: null, request: null })));
       }
     } else if (machine.kind === 'simulated') {
-      el('span', 'scan-muted', 'Simulated by the world', title);
+      el('span', { class: 'scan-muted', text: 'Simulated by the world' }, title);
     } else {
-      el('span', 'scan-muted', 'Not one of the world\'s office machines', title);
+      el('span', { class: 'scan-muted', text: 'Not one of the world\'s office machines' }, title);
     }
     if (!first && !reduced() && item.animate && cell.getBoundingClientRect) {
       const from = cell.getBoundingClientRect(), to = item.getBoundingClientRect();
@@ -136,8 +137,8 @@ export function mount(root, services, options) {
     answering.name.textContent = figures.answering === 1 ? ' host answering' : ' hosts answering';
     open.value.textContent = String(figures.open);
     open.name.textContent = figures.open === 1 ? ' open port' : ' open ports';
-    grid.setAttribute('aria-label', `${count(figures.probed, 'address', 'addresses')} of 256 probed, ${count(figures.answering, 'host')} answering`);
-    notes.textContent = limits(snapshot).join(' ');
+    grid.setAttribute('aria-label', `${plural(figures.probed, 'address', 'addresses')} of 256 probed, ${plural(figures.answering, 'host')} answering`);
+    notes.textContent = limits(snapshot, plural).join(' ');
     const machines = hosts(map);
     let added;
     for (const machine of machines) {
@@ -155,22 +156,28 @@ export function mount(root, services, options) {
       // Seen live, the card that completed the set carries the moment too.
       if (added && !first) services.moment?.(added);
     } else if (!complete) {
-      found.textContent = machines.length ? `${count(machines.length, 'host')} answered` : 'No host has answered yet';
+      found.textContent = machines.length ? `${plural(machines.length, 'host')} answered` : 'No host has answered yet';
     }
     first = false;
   }
 
   function renderStory(snapshot) {
     const story = snapshot.value;
+    if (Boolean(story?.replay) !== replay) {
+      replay = Boolean(story?.replay);
+      label();
+    }
     steps.replaceChildren();
     for (const [index, step] of (story?.steps || []).entries()) {
-      const item = el('li', 'scan-step', undefined, steps);
+      const item = el('li', { class: 'scan-step' }, steps);
       item.dataset.state = step.state;
-      el('span', 'scan-step-mark', String(index + 1), item);
-      const text = el('span', 'scan-step-text', undefined, item);
-      el('b', '', step.title, text);
-      const exit = step.exit === null || step.exit === undefined ? '' : ` · exit ${step.exit}`;
-      el('span', 'scan-muted', `${STEP[step.state] || step.state}${exit}`, text);
+      el('span', { class: 'scan-step-mark', text: String(index + 1) }, item);
+      const text = el('span', { class: 'scan-step-text' }, item);
+      el('b', { text: step.title }, text);
+      const exit = step.exit === null || step.exit === undefined
+        ? (replay && step.state === 'done' ? ' · recorded report' : '')
+        : ` · exit ${step.exit}`;
+      el('span', { class: 'scan-muted', text: `${STEP[step.state] || step.state}${exit}` }, text);
     }
     const all = story?.steps || [];
     const shown = all.find((step) => step.state === 'running') || all.findLast?.((step) => step.state !== 'waiting') || all[0];

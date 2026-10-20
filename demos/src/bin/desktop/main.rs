@@ -1,12 +1,13 @@
-//! The desktop gate on the shared microVM kit.
+//! The desktop demo and its checks on the shared microVM kit.
 //! Run with `cargo xtask demo desktop`.
 
 mod guest;
 mod world;
 
+use fictionet::stdlib::codec::base64;
+use fictionet_demo::kit::checks::check;
 use fictionet_demo::kit::client::{Capability, PageClient};
-use fictionet_demo::kit::gate::check;
-use fictionet_demo::kit::{self, Kit, b64_decode, rfb, ssh};
+use fictionet_demo::kit::{self, Kit, rfb, ssh};
 use fictionet_observe::page::{Column, Page, StateLimits, StateTopic};
 use serde_json::{Value, json};
 use std::net::IpAddr;
@@ -29,6 +30,10 @@ fn boxed<E: std::fmt::Display>(error: E) -> Error {
 
 fn main() -> ExitCode {
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if args.first().is_some_and(|arg| arg == "preview") {
+        eprintln!("desktop: this demo has no preview. Its page shows the guest's own desktop.");
+        return ExitCode::FAILURE;
+    }
     let [downloads, rest @ ..] = args.as_slice() else {
         eprintln!(
             "usage: desktop <downloads-directory> [observation-socket]\n\
@@ -50,7 +55,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(gate(downloads, rest.first().cloned())) {
+    match runtime.block_on(run(downloads, rest.first().cloned())) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("desktop: {error}");
@@ -59,7 +64,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
+async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
     let total = Instant::now();
     let loaded = Arc::new(AtomicBool::new(false));
     let agents = StateTopic::<Vec<Value>>::new(StateLimits::default());
@@ -77,7 +82,6 @@ async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Erro
                     vec![
                         Column::new("Agent", "/name"),
                         Column::new("Version", "/version"),
-                        Column::new("Status", "/status"),
                     ],
                 )
         })
@@ -124,28 +128,15 @@ async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Erro
     if result.is_err() {
         eprint!("{}", workstation.diagnostics().await);
     }
-    let run_dir = run.path().to_path_buf();
     let stop = run.shutdown().await;
 
     println!("\n=== shutdown ===");
-    let mut failures = Vec::new();
     if let Err(error) = &stop {
-        println!("shutdown: {error}");
+        println!("{error}");
     }
-    failures.extend(
-        check(
-            "the guest powered off over ACPI and Cloud Hypervisor exited",
-            stop.is_ok(),
-        )
-        .err(),
-    );
-    let ch_gone = ch_pid.is_none_or(|pid| !Path::new(&format!("/proc/{pid}")).exists());
-    failures.extend(
-        check(
-            "nothing is left behind: no Cloud Hypervisor process, no run directory",
-            ch_gone && !run_dir.exists(),
-        )
-        .err(),
+    let shutdown = check(
+        "the guest powered off over ACPI, and no Cloud Hypervisor process or run directory is left",
+        stop.is_ok(),
     );
 
     let (ssh_ready_ms, checks) = result?;
@@ -159,9 +150,7 @@ async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Erro
     for shot in &checks.screenshots {
         println!("screenshot:         {shot}");
     }
-    if !failures.is_empty() {
-        return Err(format!("the gate's shutdown checks failed: {}", joined(&failures)).into());
-    }
+    shutdown?;
     println!("\nevery required check passed");
     Ok(())
 }
@@ -196,11 +185,11 @@ async fn run_checks(
     let page_url = run.page_url();
     let vm = workstation.vm();
     let session = workstation.ssh();
-    // Every required check that failed; the gate fails at the end if any did.
+    // Every required check that failed; the run fails at the end if any did.
     let mut failures = Vec::new();
 
     // Block until cloud-init finishes, but not forever: a stalled install must
-    // fail the gate, not hang it.
+    // fail the run, not hang it.
     let cloud_init = workstation.wait_cloud_init(Duration::from_secs(300)).await;
     let cloud_init_ready_ms = match &cloud_init {
         Ok(ready) => {
@@ -389,11 +378,6 @@ async fn run_checks(
         )
         .err(),
     );
-    // A moment for Firefox to finish painting the page and its padlock. A
-    // failed load fails the gate, which then prints the guest's Firefox log.
-    if loaded.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_secs(6)).await;
-    }
 
     // Required: the coding agents are on the desktop user's PATH over SSH,
     // each at its pinned release.
@@ -421,28 +405,17 @@ async fn run_checks(
         .into_iter()
         .filter(|(_, output)| output.code == 0)
         .filter_map(|(name, output)| {
-            agent_version(&output.stdout)
-                .map(|version| json!({"name":name, "version":version, "status":"installed"}))
+            agent_version(&output.stdout).map(|version| json!({"name": name, "version": version}))
         })
         .collect();
     agents.publish(cx.now(), &rows).map_err(boxed)?;
 
-    // A screenshot of the guest's own screen, over ssh, decoded on the host.
-    let mut screenshots = Vec::new();
-    let shot = session
-        .run(
-            "sudo -u analyst env DISPLAY=:1 scrot -o /tmp/guest.png 2>/dev/null && base64 -w0 \
-            /tmp/guest.png",
-        )
-        .await?;
-    let guest_png = save_png(&shot.stdout, &shots.join("guest-desktop.png"));
-    failures.extend(check("the guest's own screen was captured", guest_png.is_some()).err());
-    screenshots.extend(guest_png);
-
     // Required: the desktop as the viewer delivers it, proved without a
     // browser -- connect to the page's own WebSocket and speak RFB through the
     // bridge (page -> WebSocket -> SSH tunnel across the world -> Xvnc) --
+    // once two captures in a row match, so Firefox has finished painting,
     // and then as the host's headless Chromium renders the page.
+    let mut screenshots = Vec::new();
     let captured = run
         .screenshots(
             HOSTNAME,
@@ -464,6 +437,17 @@ async fn run_checks(
         )
         .err(),
     );
+
+    // A screenshot of the guest's own screen, over ssh, decoded on the host.
+    let shot = session
+        .run(
+            "sudo -u analyst env DISPLAY=:1 scrot -o /tmp/guest.png 2>/dev/null && base64 -w0 \
+            /tmp/guest.png",
+        )
+        .await?;
+    let guest_png = save_png(&shot.stdout, &shots.join("guest-desktop.png"));
+    failures.extend(check("the guest's own screen was captured", guest_png.is_some()).err());
+    screenshots.extend(guest_png);
 
     page_checks(page_url, session, &mut failures).await;
 
@@ -516,9 +500,10 @@ async fn run_checks(
         .trim()
         .to_string();
 
+    failures.extend(run.containment().await.err());
     let peak_rss_mib = vm.peak_rss_mib().unwrap_or(0);
     if !failures.is_empty() {
-        return Err(format!("the gate's required checks failed: {}", joined(&failures)).into());
+        return Err(format!("the required checks failed: {}", joined(&failures)).into());
     }
     Ok(Checks {
         desktop_ready_ms,
@@ -534,27 +519,23 @@ async fn probe(
     name: &str,
     test: impl std::future::Future<Output = std::io::Result<bool>>,
 ) {
-    let result = tokio::time::timeout(Duration::from_secs(45), test).await;
-    let ok = match result {
-        Ok(Ok(ok)) => ok,
-        Ok(Err(error)) => {
-            println!("{name}: {error}");
-            false
-        }
-        Err(error) => {
-            println!("{name}: {error}");
-            false
-        }
-    };
+    let result = tokio::time::timeout(Duration::from_secs(45), test)
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result);
+    let ok = result.unwrap_or_else(|error| {
+        println!("{name}: {error}");
+        false
+    });
     failures.extend(check(name, ok).err());
 }
 
 async fn page_checks(url: &str, session: &ssh::Session, failures: &mut Vec<std::io::Error>) {
     let page = PageClient::from_url(url).expect("the kit's signed page URL");
     probe(failures, "the page's access checks", async {
-        kit::gate::bearer_required(&page).await?;
-        kit::gate::single_use_ticket(&page, HOSTNAME, Capability::Screen).await?;
-        kit::gate::terminal_runs_on(&page, HOSTNAME).await?;
+        kit::checks::bearer_required(&page).await?;
+        kit::checks::single_use_ticket(&page, HOSTNAME, Capability::Screen).await?;
+        kit::checks::terminal_runs_on(&page, HOSTNAME).await?;
         Ok(true)
     })
     .await;
@@ -673,7 +654,7 @@ async fn guest_cmd(session: &ssh::Session, command: &str) -> Result<ssh::Output,
 
 /// Decodes a base64 PNG from the guest and writes it; returns the path.
 fn save_png(b64: &str, path: &Path) -> Option<String> {
-    let bytes = b64_decode(b64.trim())?;
+    let bytes = base64::decode(b64.trim().as_bytes(), base64::Padding::Required)?;
     if bytes.len() < 8 || &bytes[1..4] != b"PNG" {
         return None;
     }

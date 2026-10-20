@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mount } from './services.mjs';
-import { PORTS, SERVICES, services, osGuess, addresses, office } from './model.mjs';
+import { OFFICE, PORTS, SERVICES, services, osGuess, addresses, office } from './model.mjs';
 import { harness, discoveryMap, scannedMap, reports, text } from './panel-harness.mjs';
 
 const BANNERS = [
@@ -119,9 +119,22 @@ test('a redraw happens only when what the panel shows changes', () => {
   f.dispose();
 });
 
-test('dispose releases both subscriptions', () => {
+test('a replay labels nmap as a recorded report and the server as a stand-in', () => {
   const f = harness(mount, SERVICES);
-  assert.equal(f.active(), 2);
+  f.publish(PORTS, { ...scannedMap(), banners: BANNERS });
+  f.publish(SERVICES, reports());
+  f.publish(OFFICE, { steps: [], replay: true });
+  assert.equal(text(f.find('thead')[0].querySelectorAll('th')[1]), 'nmap says · recorded report');
+  assert.match(text(group(f, '10.0.0.50').querySelectorAll('th')[0]), /^server 10\.0\.0\.50 Stand-in for the Ubuntu VM/);
+  f.publish(OFFICE, { steps: [], replay: false });
+  assert.equal(text(f.find('thead')[0].querySelectorAll('th')[1]), 'nmap says');
+  assert.match(text(group(f, '10.0.0.50').querySelectorAll('th')[0]), /^server 10\.0\.0\.50 Real Ubuntu VM/);
+  f.dispose();
+});
+
+test('dispose releases its subscriptions', () => {
+  const f = harness(mount, SERVICES);
+  assert.equal(f.active(), 3);
   f.dispose();
   assert.equal(f.active(), 0);
   assert.equal(f.root.children.length, 0);

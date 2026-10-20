@@ -25,14 +25,6 @@ impl Jump {
         }
     }
     /// Waits for the guest address and connects to its port within the timeout.
-    pub async fn connect(
-        &self,
-        guest: &super::GuestHandle,
-        port: u16,
-        timeout: Duration,
-    ) -> io::Result<Compat<TcpConnection>> {
-        self.connect_addr(guest.addr.clone(), port, timeout).await
-    }
     pub(super) async fn connect_addr(
         &self,
         mut guest: watch::Receiver<Option<Ipv4Addr>>,

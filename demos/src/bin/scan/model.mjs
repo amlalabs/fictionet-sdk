@@ -9,21 +9,9 @@ export const OFFICE = '/api/state/office';
 // Port row states as the world's tap names them, and "idle" for no probe.
 export const STATES = ['open', 'closed', 'unreachable', 'unanswered', 'idle'];
 
-// An element with text set as text, never markup.
-export function element(document, tag, className, text, parent) {
-  const node = document.createElement(tag);
-  if (className) node.setAttribute('class', className);
-  if (text !== undefined) node.textContent = String(text);
-  parent?.appendChild(node);
-  return node;
-}
-
-// Loads the panels' stylesheet inside a panel root.
-export function stylesheet(document, root) {
-  const link = element(document, 'link', '', undefined, root);
-  link.setAttribute('rel', 'stylesheet');
-  link.setAttribute('href', '/assets/scan/scan.css');
-  return link;
+// Loads the panels' stylesheet inside a panel root, with the page's `el`.
+export function stylesheet(el, root) {
+  return el('link', { rel: 'stylesheet', href: '/assets/scan/scan.css' }, root);
 }
 
 const answered = (state) => state === 'open' || state === 'closed';
@@ -142,16 +130,18 @@ export function banners(map) {
   return new Map((map?.banners || []).map((banner) => [`${banner.host}:${banner.port}`, banner]));
 }
 
-// A count with its noun, such as "1 host" or "5 hosts".
-export function count(n, noun, plural = `${noun}s`) {
-  return `${Number(n).toLocaleString('en-US')} ${n === 1 ? noun : plural}`;
+// What the page calls the office server: the real VM, or in a replay
+// without VMs, the in-world stand-in that answers for it.
+export function server(replay) {
+  return replay ? 'Stand-in for the Ubuntu VM' : 'Real Ubuntu VM';
 }
 
-// Why the panels may show less than the world saw.
-export function limits(snapshot) {
+// Why the panels may show less than the world saw. `plural` is the page's
+// services.format.plural.
+export function limits(snapshot, plural) {
   const map = snapshot?.value;
   const notes = [];
   if (snapshot?.status?.too_large) notes.push('The port map passed its size limit. The last complete map is shown.');
-  if (map?.untracked) notes.push(`The port map is full at ${count(map.max_rows, 'row')}. ${count(map.untracked, 'later probe')} to new ports ${map.untracked === 1 ? 'is' : 'are'} not shown.`);
+  if (map?.untracked) notes.push(`The port map is full at ${plural(map.max_rows, 'row')}. ${plural(map.untracked, 'later probe')} to new ports ${map.untracked === 1 ? 'is' : 'are'} not shown.`);
   return notes;
 }

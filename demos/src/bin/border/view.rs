@@ -20,16 +20,17 @@ use fictionet_observe::page::{StateLimits, StateTopic};
 use serde::Serialize;
 use std::{collections::VecDeque, net::Ipv4Addr, sync::Arc};
 
-const ROWS: usize = 32;
+/// How many rows a [`Rows`] keeps unless it names its own bound.
+pub(super) const ROWS: usize = 32;
 const SANDBOXES: usize = 8;
 const TEXT: usize = 256;
 
 #[derive(Clone, Debug, Serialize)]
-pub struct Rows<T> {
+pub struct Rows<T, const N: usize = ROWS> {
     pub rows: VecDeque<T>,
     pub dropped: u64,
 }
-impl<T> Default for Rows<T> {
+impl<T, const N: usize> Default for Rows<T, N> {
     fn default() -> Self {
         Self {
             rows: VecDeque::new(),
@@ -37,13 +38,20 @@ impl<T> Default for Rows<T> {
         }
     }
 }
-impl<T> Rows<T> {
-    fn push(&mut self, row: T) {
-        if self.rows.len() == ROWS {
+impl<T, const N: usize> Rows<T, N> {
+    /// Keeps `row`, dropping the oldest row once `N` are kept.
+    pub(super) fn push(&mut self, row: T) {
+        if self.rows.len() == N {
             self.rows.pop_front();
             self.dropped += 1;
         }
         self.rows.push_back(row);
+    }
+    /// Drops the row at `index`, counting it.
+    pub(super) fn drop_at(&mut self, index: usize) {
+        if self.rows.remove(index).is_some() {
+            self.dropped += 1;
+        }
     }
 }
 

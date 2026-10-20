@@ -2,21 +2,20 @@
 //! This writer sits after the log's redaction and folding. It does not score
 //! traffic or reconstruct log entries from observations.
 
+use super::view::{ROWS, Rows};
 use fictionet_observe::page::{StateLimits, StateTopic};
 use serde::Serialize;
 use serde_json::Value;
-use std::{
-    collections::VecDeque,
-    io::{self, Write},
-};
+use std::io::{self, Write};
 
 const LINE_BYTES: usize = 8192;
-const ROWS: usize = 32;
+/// The latest log lines the page shows, as `rows`. `dropped` counts older
+/// lines and lines over 8 KiB.
 #[derive(Clone, Default, Serialize)]
 pub struct Results {
     pub first_ts: Option<f64>,
-    pub lines: VecDeque<Value>,
-    pub dropped: u64,
+    #[serde(flatten)]
+    pub lines: Rows<Value>,
     pub invalid: u64,
 }
 pub struct Writer<W> {
@@ -43,7 +42,7 @@ impl<W: Write> Writer<W> {
     }
     fn line(&mut self) {
         if self.oversized {
-            self.view.dropped += 1;
+            self.view.lines.dropped += 1;
         } else {
             match serde_json::from_slice::<Value>(&self.line) {
                 Ok(value) => {
@@ -55,11 +54,7 @@ impl<W: Write> Writer<W> {
                         Some("tls" | "route" | "route_rejected" | "lost")
                     ) || value["type"] == "http" && value["served_by"] == "impostor"
                     {
-                        if self.view.lines.len() == ROWS {
-                            self.view.lines.pop_front();
-                            self.view.dropped += 1;
-                        }
-                        self.view.lines.push_back(value);
+                        self.view.lines.push(value);
                     }
                 }
                 Err(_) => self.view.invalid += 1,
@@ -103,15 +98,18 @@ mod tests {
             writer.write_all(&[*byte]).unwrap();
         }
         assert_eq!(writer.out, bytes);
-        assert_eq!(writer.view.lines[0]["revision"], 1);
+        assert_eq!(writer.view.lines.rows[0]["revision"], 1);
         for _ in 0..40 {
             writer.write_all(bytes).unwrap();
         }
-        assert_eq!(writer.view.lines.len(), ROWS);
-        assert_eq!(writer.view.dropped, 9);
+        assert_eq!(writer.view.lines.rows.len(), ROWS);
+        assert_eq!(writer.view.lines.dropped, 9);
         writer.write_all(&vec![b'x'; LINE_BYTES + 1]).unwrap();
         writer.write_all(b"\n").unwrap();
-        assert_eq!(writer.view.dropped, 10);
+        assert_eq!(writer.view.lines.dropped, 10);
+        let json = serde_json::to_value(&writer.view).unwrap();
+        assert_eq!(json["rows"].as_array().unwrap().len(), ROWS);
+        assert_eq!(json["dropped"], 10);
         assert_eq!(writer.view.invalid, 0);
         writer.write_all(b"broken\n").unwrap();
         assert_eq!(writer.view.invalid, 1);

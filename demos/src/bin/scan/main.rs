@@ -1,25 +1,24 @@
 //! Two Ubuntu guests inventory an office through the shared kit. A scripted
 //! agent runs three nmap steps in the workstation's terminal; the office
 //! server is a second VM among four simulated machines. The page shows both
-//! VMs and the Office, Ports and Services panels; the gate checks nmap's
+//! VMs and the Office, Ports and Services panels; the checks compare nmap's
 //! reports, the world's port map and the page's own API.
 mod checks;
-#[cfg(test)]
 mod client;
 mod guests;
 mod nmap;
 mod page;
+mod preview;
 mod script;
 mod story;
 mod world;
 
 use fictionet_demo::kit::{
-    Kit,
+    self, Kit,
     client::{Capability, PageClient},
-    gate,
 };
 use fictionet_observe::page::Page;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{
     Arc,
@@ -27,19 +26,22 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-type Error = Box<dyn std::error::Error>;
+type Error = Box<dyn std::error::Error + Send + Sync>;
 
 fn main() -> ExitCode {
-    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let [downloads] = args.as_slice() else {
-        eprintln!("usage: scan <downloads-directory>; run cargo xtask demo scan to fetch assets");
-        return ExitCode::FAILURE;
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+    let rest: Vec<String> = args.collect();
+    let start = |runtime: tokio::runtime::Runtime| match first.as_deref() {
+        Some("preview") => runtime.block_on(preview::run(rest.into_iter())),
+        Some(downloads) if rest.is_empty() => runtime.block_on(run(Path::new(downloads))),
+        _ => Err("usage: scan <downloads>, or scan preview [--bound] [--no-os-match ADDR]".into()),
     };
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| -> Error { e.into() })
-        .and_then(|rt| rt.block_on(gate(downloads)));
+        .and_then(start);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -49,13 +51,13 @@ fn main() -> ExitCode {
     }
 }
 
-async fn gate(downloads: &Path) -> Result<(), Error> {
+async fn run(downloads: &Path) -> Result<(), Error> {
     let total = Instant::now();
     let closed = Arc::new(AtomicBool::new(false));
     let cutoff = closed.clone();
     let (send, receive) = tokio::sync::oneshot::channel();
     let topics = page::Topics::new();
-    let progress = page::Progress::new();
+    let progress = page::Progress::new(false);
     let published = (topics.clone(), progress.clone());
     let kit = Kit::new("scan")
         .guest(guests::workstation())
@@ -77,8 +79,6 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
     let shots = downloads.join("shots");
     std::fs::create_dir_all(&shots)?;
     let run = kit.boot(downloads).await?;
-    let pids: Vec<_> = run.guests().iter().filter_map(|g| g.vm().pid()).collect();
-    let dir = run.path().to_owned();
     for guest in run.guests() {
         println!(
             "{} boot to SSH-ready: {} ms",
@@ -112,6 +112,7 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
             .await?;
         let boot = run.boot_started().elapsed();
         let story = story::run(&run, &ports, &shots, &progress).await?;
+        run.containment().await?;
         tokio::time::timeout(Duration::from_secs(45), page_checks(run.page_url())).await??;
         run.screenshots(
             guests::WORKSTATION,
@@ -123,26 +124,14 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
     }
     .await;
     if let Err(error) = &result {
-        eprintln!("gate failed: {error}");
+        eprintln!("checks failed: {error}");
         for guest in run.guests() {
             eprint!("{}", guest.diagnostics().await);
         }
     }
-    let stop = run.shutdown().await;
-    let clean = !dir.exists()
-        && pids
-            .iter()
-            .all(|pid| !Path::new(&format!("/proc/{pid}")).exists());
-    if let Err(error) = stop {
-        return Err(format!("shutdown failed: {error}; gate result: {result:?}").into());
+    if let Err(error) = run.shutdown().await {
+        return Err(format!("{error}; checks result: {result:?}").into());
     }
-    if !clean {
-        return Err(format!(
-            "shutdown left a VM process or run directory; gate result: {result:?}"
-        )
-        .into());
-    }
-    println!("[pass] both VMs stopped; no VM processes or run directory remain");
     let (boot, story) = result?;
     println!("boot time: {} ms", boot.as_millis());
     println!("story time: {} ms", story.as_millis());
@@ -153,16 +142,16 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
 
 async fn page_checks(url: &str) -> Result<(), Error> {
     let client = PageClient::from_url(url)?;
-    gate::bearer_required(&client).await?;
+    kit::checks::bearer_required(&client).await?;
     let description = client.get_json("/api/page").await?;
     let hosts = description["hosts"].as_array().ok_or("page has no hosts")?;
-    gate::check(
+    kit::checks::check(
         "the page pins both guests",
         hosts.len() == 2 && hosts.iter().all(|h| h["pinned"] == true),
     )?;
-    gate::single_use_ticket(&client, guests::WORKSTATION, Capability::Screen).await?;
-    gate::single_use_ticket(&client, guests::SERVER, Capability::Terminal).await?;
-    gate::terminal_runs_on(&client, guests::SERVER).await?;
+    kit::checks::single_use_ticket(&client, guests::WORKSTATION, Capability::Screen).await?;
+    kit::checks::single_use_ticket(&client, guests::SERVER, Capability::Terminal).await?;
+    kit::checks::terminal_runs_on(&client, guests::SERVER).await?;
     // The world task publishes at most every 250 ms, so the last story step
     // can reach the page a moment after the story ends.
     let deadline = Instant::now() + Duration::from_secs(5);

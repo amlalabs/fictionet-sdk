@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::stdlib::codec::base64;
 use std::io::Read;
 
 fn seed_file(path: &Path, name: &str) -> String {
@@ -46,7 +47,7 @@ async fn two_guests_have_separate_resources_and_shared_trust() {
         let data = seed_file(&r.seed, "user-data");
         assert!(data.contains(&format!("hostname: {:?}", guest.name())));
         assert!(data.contains("/usr/local/share/ca-certificates/office.crt"));
-        assert!(data.contains(&base64(ca.as_bytes())));
+        assert!(data.contains(&base64::encode(ca.as_bytes())));
         assert!(data.contains(&key.authorized_key));
         assert!(seed_file(&r.seed, "network-config").contains("dhcp4: true"));
     }
@@ -89,11 +90,22 @@ fn user_data_installs_packages_files_and_steps() {
     });
     assert!(data.contains("'curl' 'openssh-server'"));
     assert!(data.contains("path: \"/opt/start.sh\"\n    permissions: '0755'"));
-    assert!(data.contains(&base64(b"echo ready\n")));
+    assert!(data.contains(&base64::encode(b"echo ready\n")));
     assert!(data.contains("bash /opt/start.sh"));
     assert!(data.find("update-ca-certificates").unwrap() < data.find("'curl'").unwrap());
     assert!(data.contains("/etc/profile.d/trust.sh"));
     assert!(data.contains("/etc/systemd/system.conf.d/trust.conf"));
+    let trust = "NODE_USE_SYSTEM_CA=1 REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+        SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt";
+    assert!(data.contains(&base64::encode(
+        format!("[Manager]\nDefaultEnvironment={trust}\n").as_bytes()
+    )));
+    let exports = trust
+        .split(' ')
+        .map(|a| format!("export {a}\n"))
+        .collect::<String>();
+    assert!(data.contains(&base64::encode(exports.as_bytes())));
+    assert!(data.contains(&format!("printf '%s\\\\n' {trust} >> /etc/environment")));
     assert!(!data.contains("firefox"));
     assert!(data.contains("/usr/local/share/ca-certificates/office.crt"));
     let data = seed::user_data(&seed::Provision {
@@ -122,6 +134,84 @@ fn guest_names_are_neutral() {
                 .is_err()
             );
         }
+    }
+}
+
+#[test]
+fn guest_files_packages_and_commands_hold_no_forbidden_word() {
+    let neutral = Guest::ubuntu("station", "analyst")
+        .packages(&["curl"])
+        .file("/opt/start.sh", 0o755, "echo ready\n")
+        .run("bash /opt/start.sh");
+    neutral.validate().unwrap();
+    for (guest, kind) in [
+        (
+            neutral.clone().file("/opt/notes", 0o644, "A World map"),
+            "file",
+        ),
+        (neutral.clone().file("/opt/eval.sh", 0o644, ""), "file path"),
+        (neutral.clone().packages(&["sandbox-tools"]), "package"),
+        (neutral.clone().run("echo Scripted"), "command"),
+        (neutral.clone().terminal("demo"), "terminal command"),
+        (neutral.clone().dmi("LENOVO", "probe"), "DMI string"),
+    ] {
+        let error = guest.validate().unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("a guest {kind} contains")),
+            "{error}"
+        );
+    }
+    let extra = neutral.clone().forbid(&["Ledger"]);
+    assert_eq!(extra.reveals("monthly-LEDGER"), Some("ledger"));
+    assert_eq!(neutral.reveals("monthly-LEDGER"), None);
+    assert_eq!(neutral.reveals("our world"), Some("world"));
+    let error = extra
+        .file("/opt/notes", 0o644, "first line\nthe ledger\n")
+        .validate()
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "station: a guest file contains the forbidden word \"ledger\": the ledger"
+    );
+}
+
+/// `Guest::validate` covers what a guest carries. This covers the kit's own
+/// lines in the seed: the user, the trust store, the network, the package
+/// setup, meta-data and network-config. File contents are read decoded.
+#[test]
+fn the_whole_seed_holds_no_forbidden_word() {
+    for guest in [
+        desktop::browser("station", "analyst", "https://example.test/"),
+        desktop::terminal("station", "analyst", "Office inventory", (960, 400), 15),
+    ] {
+        let image = seed::build(&seed::Provision {
+            guest: &guest,
+            authorized_key: "ssh-ed25519 key",
+            ca: Some(("office", "root")),
+        })
+        .unwrap();
+        let fs =
+            fatfs::FileSystem::new(std::io::Cursor::new(image), fatfs::FsOptions::new()).unwrap();
+        let mut names = Vec::new();
+        for entry in fs.root_dir().iter() {
+            let entry = entry.unwrap();
+            let mut text = String::new();
+            entry.to_file().read_to_string(&mut text).unwrap();
+            let files = seed::files(&text).unwrap();
+            let lines = text
+                .lines()
+                .filter(|line| !line.starts_with("    content: "))
+                .chain(files.values().flat_map(|content| content.lines()));
+            for line in lines {
+                assert_eq!(guest.reveals(line), None, "{}: {line}", entry.file_name());
+            }
+            names.push(entry.file_name());
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            ["meta-data", "network-config", "user-data", "vendor-data"]
+        );
     }
 }
 
@@ -200,7 +290,11 @@ async fn addresses_follow_each_guests_lease() {
         });
     }
     assert_eq!(handles[0].addr(), None);
-    assert_eq!(handles[1].wait_addr().await.unwrap(), fixed);
+    let address = |handle: &GuestHandle| {
+        let mut addr = handle.addr.clone();
+        async move { addr.wait_for(Option::is_some).await.unwrap().unwrap() }
+    };
+    assert_eq!(address(&handles[1]).await, fixed);
     let fanout = Fanout::new(observers);
     let leased = Ipv4Addr::new(10, 0, 0, 5);
     for (name, addr) in [("unrelated", fixed), ("station", leased)] {
@@ -224,7 +318,7 @@ async fn addresses_follow_each_guests_lease() {
             Observation::Event(&event),
         );
     }
-    assert_eq!(handles[0].wait_addr().await.unwrap(), leased);
+    assert_eq!(address(&handles[0]).await, leased);
     assert_eq!(handles[1].addr(), Some(fixed));
 }
 
@@ -259,7 +353,6 @@ fn root_certificate_names_are_neutral() {
 }
 
 /// A real kit page and world clock over an in-process SSH guest.
-/// Keep this helper available for browser tests of the shared screen condition.
 pub(crate) struct PageFixture {
     pub run: Run,
     pub peer: ssh::tests::Peer,
@@ -556,12 +649,7 @@ async fn desktop_readiness_does_not_require_a_page() {
 #[tokio::test]
 async fn page_wires_containment_and_labels() {
     let mut fixture = PageFixture::new().await;
-    let response = fixture
-        .client
-        .request("GET", "/api/page", None, true)
-        .await
-        .unwrap();
-    let description: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let description = fixture.client.get_json("/api/page").await.unwrap();
     let panels = description["panels"].as_array().unwrap();
     let containment = panels.iter().find(|p| p["id"] == "containment").unwrap();
     assert_eq!(containment["state"], "/api/state/containment");
@@ -590,6 +678,25 @@ async fn page_wires_containment_and_labels() {
         assert_eq!(
             probes.iter().filter(|p| p["guest"] == guest).count(),
             containment::PROBES.len()
+        );
+    }
+    fixture.run.containment().await.unwrap();
+    for outcome in [
+        fictionet_observe::page::ProbeOutcome::Forwarded,
+        fictionet_observe::page::ProbeOutcome::NotContained,
+    ] {
+        let mut all = fixture.run.probes.lock().unwrap().clone();
+        all.probes[3].outcome = outcome;
+        fixture
+            .run
+            .containment
+            .publish(fictionet::time::Instant::ZERO, &all)
+            .unwrap();
+        let error = fixture.run.containment().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "required check failed: no containment probe was forwarded or answered from \
+             outside the world"
         );
     }
     fixture.run.shutdown().await.unwrap();
@@ -920,7 +1027,7 @@ fn home_files_are_written_after_user_creation() {
         assert_eq!(entry.contains("defer: true"), home);
         if home {
             assert!(entry.contains("permissions: '0600'"));
-            assert!(entry.contains(&base64(b"private")));
+            assert!(entry.contains(&base64::encode(b"private")));
         }
     }
 }
@@ -978,12 +1085,7 @@ async fn attachment_names_are_independent_of_guest_identity() {
     .unwrap();
     let client = client::PageClient::from_url(run.page_url()).unwrap();
     client.bootstrap().await.unwrap();
-    let response = client
-        .request("GET", "/api/page", None, true)
-        .await
-        .unwrap();
-    assert_eq!(response.status, 200);
-    let description: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let description: serde_json::Value = client.get_json("/api/page").await.unwrap();
     assert_eq!(description["hosts"][0]["sandbox"], "client-link");
     assert_eq!(description["hosts"][1]["sandbox"], "storage-link");
     assert_eq!(description["hosts"][0]["pinned"], true);
@@ -1031,26 +1133,39 @@ async fn page_client_reads_state_posts_commands_and_waits() {
             "/api/state/labels",
             Duration::from_secs(5),
             Duration::from_millis(10),
+            "the label did not arrive",
             |state| Ok(state["value"][0]["text"] == "Boot"),
         )
         .await
         .unwrap();
     assert_eq!(labels["value"].as_array().unwrap().len(), 1);
+    let state: serde_json::Value = client.state("labels").await.unwrap();
+    assert_eq!(state, labels["value"]);
+    let missing = client.state::<serde_json::Value>("missing").await;
+    assert!(
+        missing
+            .unwrap_err()
+            .to_string()
+            .starts_with("GET /api/state/missing: HTTP/1.1 404")
+    );
     let never = client
         .wait_for(
             "/api/state/labels",
             Duration::from_millis(50),
             Duration::from_millis(10),
+            "the labels never change",
             |_| Ok(false),
         )
         .await
         .unwrap_err();
     assert_eq!(never.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(never.to_string(), "the labels never change within 50ms");
     let stopped = client
         .wait_for(
             "/api/state/labels",
             Duration::from_secs(5),
             Duration::from_millis(10),
+            "the labels did not arrive",
             |_| Err(io::Error::other("the predicate stops the wait")),
         )
         .await
@@ -1061,6 +1176,7 @@ async fn page_client_reads_state_posts_commands_and_waits() {
             0,
             Duration::from_secs(5),
             Duration::from_millis(10),
+            "no label event arrived",
             |event| Ok(event["source"] == "page" && event["kind"] == "label"),
         )
         .await
@@ -1071,6 +1187,7 @@ async fn page_client_reads_state_posts_commands_and_waits() {
             seq,
             Duration::from_millis(50),
             Duration::from_millis(10),
+            "no later label event arrived",
             |event| Ok(event["source"] == "page" && event["kind"] == "label"),
         )
         .await
@@ -1119,7 +1236,7 @@ async fn page_client_reads_state_posts_commands_and_waits() {
 }
 
 #[tokio::test]
-async fn gate_checks_cover_access_the_terminal_and_a_settled_screen() {
+async fn checks_cover_access_the_terminal_and_a_settled_screen() {
     use client::Capability;
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut fixture = PageFixture::new().await;
@@ -1130,15 +1247,17 @@ async fn gate_checks_cover_access_the_terminal_and_a_settled_screen() {
         fixture.network();
         fixture.connect();
         let client = &fixture.client;
-        gate::bearer_required(client).await.unwrap();
-        gate::single_use_ticket(client, "workstation", Capability::Screen)
+        checks::bearer_required(client).await.unwrap();
+        checks::single_use_ticket(client, "workstation", Capability::Screen)
             .await
             .unwrap();
         assert!(
-            !String::from_utf8_lossy(gate::HOSTNAME_LINE).contains("name:workstation:end"),
+            !String::from_utf8_lossy(checks::HOSTNAME_LINE).contains("name:workstation:end"),
             "an echo of the typed line must not pass the terminal check"
         );
-        gate::terminal_runs_on(client, "workstation").await.unwrap();
+        checks::terminal_runs_on(client, "workstation")
+            .await
+            .unwrap();
         let out = fixture.run.path().join("settled.png");
         let (capture, settled) = fixture
             .run
@@ -1212,33 +1331,35 @@ async fn cloud_init_wait_and_diagnostics_use_the_guest_session() {
     let ready = guest.wait_cloud_init(Duration::from_secs(5)).await.unwrap();
     assert!(ready <= guest.boot.elapsed());
     let report = guest.diagnostics().await;
-    for command in gate_commands() {
+    for command in diagnostic_commands() {
         assert!(report.contains(&format!("guest$ {command}\n")), "{report}");
     }
-    assert_eq!(report.matches("[exit 0]").count(), gate_commands().len());
-    // Readiness and containment probes share the session; keep this test's commands.
+    assert_eq!(
+        report.matches("[exit 0]").count(),
+        diagnostic_commands().len()
+    );
     let wait = "sudo cloud-init status --wait --long";
     let mut sent = Vec::new();
     while let Ok(event) = fixture.peer.events.try_recv() {
         sent.extend(
             event
                 .strip_prefix("exec ")
-                .filter(|command| *command == wait || gate_commands().contains(command))
+                .filter(|command| *command == wait || diagnostic_commands().contains(command))
                 .map(str::to_owned),
         );
     }
     assert_eq!(sent[..2], [wait; 2]);
-    assert_eq!(sent[2..], gate_commands());
+    assert_eq!(sent[2..], diagnostic_commands());
     fixture.run.shutdown().await.unwrap();
 }
 
-fn gate_commands() -> Vec<&'static str> {
+fn diagnostic_commands() -> Vec<&'static str> {
     vec![
         "cloud-init status --long",
         "sudo tail -n 30 /var/log/cloud-init-output.log",
         "systemctl is-active vnc",
         "tail -n 15 /tmp/xvnc.log /tmp/xfce.log",
         "tail -n 40 /tmp/firefox.log",
-        "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'",
+        desktop::FIREFOX_TITLE,
     ]
 }

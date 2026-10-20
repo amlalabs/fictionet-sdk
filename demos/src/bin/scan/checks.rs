@@ -1,13 +1,11 @@
-//! The gate's checks of the page's own API, read with the bearer as a
+//! The checks of the page's own API, read with the bearer as a
 //! browser reads it: the port map and banners, nmap's reports, the story
 //! and the discovery moment.
 use crate::Error;
 use crate::page::{self, Reports, StepState, Story};
-use crate::story::{HOSTS, addr};
+use crate::story::{SERVER_PORTS, hosts};
 use fictionet_demo::kit::client::PageClient;
-use fictionet_observe::page::Snapshot;
 use scan_world::{PortMap, PortState, Protocol, SERVER_ADDR};
-use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 
@@ -21,57 +19,33 @@ pub struct Topics {
 /// Reads the page's topics and the moment's events through its API.
 pub async fn read(client: &PageClient) -> Result<(Topics, serde_json::Value), Error> {
     let topics = Topics {
-        ports: topic(client, page::PORTS).await?,
-        reports: topic(client, page::SERVICES).await?,
-        story: topic(client, page::OFFICE).await?,
+        ports: client.state(&page::PORTS.to_ascii_lowercase()).await?,
+        reports: client.state(&page::SERVICES.to_ascii_lowercase()).await?,
+        story: client.state(&page::OFFICE.to_ascii_lowercase()).await?,
     };
-    let reply = client
-        .request(
-            "GET",
-            "/api/event-table/all-five-hosts-answered",
-            None,
-            true,
-        )
+    let moment = client
+        .get_json("/api/event-table/all-five-hosts-answered")
         .await?;
-    if reply.status != 200 {
-        return Err(format!("moment events: {}", reply.status_line).into());
-    }
-    Ok((topics, serde_json::from_slice(&reply.body)?))
-}
-
-/// Reads one state topic by its panel title.
-async fn topic<T: DeserializeOwned>(client: &PageClient, title: &str) -> Result<T, Error> {
-    let path = format!("/api/state/{}", title.to_ascii_lowercase());
-    let reply = client.request("GET", &path, None, true).await?;
-    if reply.status != 200 {
-        return Err(format!("{path}: {}", reply.status_line).into());
-    }
-    let snapshot: Snapshot<T> = serde_json::from_slice(&reply.body)?;
-    if snapshot.status.too_large {
-        return Err(format!("{path}: a publication exceeded its size limit").into());
-    }
-    snapshot
-        .value
-        .ok_or_else(|| format!("{path}: nothing published yet").into())
+    Ok((topics, moment))
 }
 
 /// Checks what the page shows after the story. Returns a one-line summary.
 pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, String> {
     let map = &topics.ports;
-    let five: BTreeSet<Ipv4Addr> = HOSTS.map(addr).into();
+    let office = hosts();
     let answered = |host: Ipv4Addr| {
         map.rows
             .iter()
             .any(|r| r.host == host && matches!(r.state, PortState::Open | PortState::Closed))
     };
-    if let Some(host) = five.iter().find(|h| !answered(**h)) {
+    if let Some(host) = office.iter().find(|h| !answered(**h)) {
         return Err(format!("port map: {host} has no answered row"));
     }
     let others: BTreeSet<Ipv4Addr> = map
         .rows
         .iter()
         .map(|r| r.host)
-        .filter(|h| !five.contains(h))
+        .filter(|h| !office.contains(h))
         .collect();
     if others.is_empty() {
         return Err("port map: no probes to other addresses".into());
@@ -82,7 +56,7 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
             return Err(format!("port map: {host} is not only unreachable"));
         }
     }
-    for port in [22, 80] {
+    for port in SERVER_PORTS {
         if !map.rows.iter().any(|r| {
             (r.host, r.protocol, r.port, r.state)
                 == (SERVER_ADDR, Protocol::Tcp, port, PortState::Open)
@@ -119,12 +93,15 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
             .filter(|h| h.state == "up")
             .map(|h| h.addr)
             .collect();
-        if up != five || step.up != 5 {
+        if up != office || step.up != office.len() {
             return Err(format!("nmap reports: {} found {up:?} up", step.title));
         }
     }
     if let Some(host) = steps[2].hosts.iter().find(|h| h.os.is_none()) {
         return Err(format!("nmap reports: no OS entry for {}", host.addr));
+    }
+    if topics.story.replay {
+        return Err("story: the page calls the run a replay".into());
     }
     if let Some(step) = topics
         .story
@@ -142,14 +119,14 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
             moment["dropped"]
         ));
     };
-    let hosts: BTreeSet<Ipv4Addr> = event["fields"]["hosts"]
+    let moment_hosts: BTreeSet<Ipv4Addr> = event["fields"]["hosts"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|h| h.as_str()?.parse().ok())
         .collect();
-    if hosts != five {
-        return Err(format!("moment: hosts {hosts:?}"));
+    if moment_hosts != office {
+        return Err(format!("moment: hosts {moment_hosts:?}"));
     }
     let no_match = steps[2]
         .hosts
@@ -173,6 +150,7 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
 mod tests {
     use super::*;
     use crate::page::tests::{recorded_discovery, recorded_reports};
+    use crate::story::addr;
     use scan_world::{Banner, PortRow};
 
     fn topics() -> (Topics, serde_json::Value) {
@@ -200,7 +178,7 @@ mod tests {
                 revision: 2001,
             });
         }
-        let mut story = Story::scripted();
+        let mut story = Story::scripted(false);
         for step in &mut story.steps {
             step.state = StepState::Done;
             step.exit = Some(0);
@@ -243,7 +221,7 @@ mod tests {
             "port map: 10.0.0.12 has no answered row"
         );
         assert!(
-            fails(&|t, _| t.ports.rows.retain(|r| HOSTS.map(addr).contains(&r.host)))
+            fails(&|t, _| t.ports.rows.retain(|r| hosts().contains(&r.host)))
                 .contains("no probes to other addresses")
         );
         assert!(
@@ -276,6 +254,7 @@ mod tests {
         );
         assert!(fails(&|t, _| t.reports.steps[2].hosts[3].os = None).contains("no OS entry"));
         assert!(fails(&|t, _| t.story.steps[2].state = StepState::Failed).contains("story"));
+        assert!(fails(&|t, _| t.story.replay = true).contains("a replay"));
         assert!(fails(&|_, m| *m = serde_json::json!({"rows": []})).contains("0 events"));
         assert!(
             fails(&|_, m| m["rows"][0]["fields"]["hosts"] = serde_json::json!([]))

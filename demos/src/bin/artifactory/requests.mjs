@@ -4,7 +4,6 @@
 import { FAMILIES, builder, credential, words, topics } from './common.mjs';
 
 const TRAFFIC = { setup: 'setup', other: 'other', after: 'after' };
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 export function statusText(outcome) {
   if (!outcome) return '—';
@@ -14,40 +13,38 @@ export function statusText(outcome) {
 
 export function mount(root, services, options) {
   const { reconcile } = services.dom;
-  const fmt = services.format;
-  const b = builder(root);
+  const fmt = services.format, { plural } = fmt;
+  const b = builder(root, services.dom);
   const { el, on, button, set } = b;
   b.stylesheet();
-  const panel = el('div', 'art-panel requests-panel', undefined, root);
-  const head = el('div', 'art-head', undefined, panel);
-  el('h2', '', 'Requests to the world’s sites', head);
-  el('p', 'note', 'Every HTTP request the world answered or refused, oldest first. Select one to follow its connection.', head);
-  const legend = el('ul', 'requests-legend', undefined, panel);
-  legend.setAttribute('aria-label', 'Classification colors');
-  for (const [family, label] of FAMILIES) el('span', `pill family-${family}`, label, el('li', '', undefined, legend));
-  const status = el('p', 'loss-note', 'Loading requests…', panel);
-  status.setAttribute('role', 'status');
-  const scroll = el('div', 'requests-scroll', undefined, panel);
-  const table = el('table', 'data-table requests-table', undefined, scroll);
-  const tr = el('tr', '', undefined, el('thead', '', undefined, table));
+  const panel = el('div', { class: 'art-panel requests-panel' }, root);
+  const head = el('div', { class: 'art-head' }, panel);
+  el('h2', { text: 'Requests to the world’s sites' }, head);
+  el('p', { class: 'note', text: 'Every HTTP request the world answered or refused, oldest first. Select one to follow its connection.' }, head);
+  const legend = el('ul', { class: 'requests-legend', 'aria-label': 'Classification colors' }, panel);
+  for (const [family, label] of FAMILIES) el('span', { class: `pill family-${family}`, text: label }, el('li', {}, legend));
+  const status = el('p', { class: 'loss-note', text: 'Loading requests…', role: 'status' }, panel);
+  const scroll = el('div', { class: 'requests-scroll' }, panel);
+  const table = el('table', { class: 'data-table requests-table' }, scroll);
+  const tr = el('tr', {}, el('thead', {}, table));
   for (const [label, cls] of [['Time', 'numeric'], ['Step', ''], ['Class', ''], ['Method', ''], ['Host', ''], ['Path', ''], ['Status', ''], ['Package', ''], ['Credential', ''], ['SSRF', 'numeric']]) {
-    el('th', cls, label, tr).setAttribute('scope', 'col');
+    el('th', { class: cls, text: label }, tr).setAttribute('scope', 'col');
   }
-  const body = el('tbody', '', undefined, table);
-  const empty = el('tbody', '', undefined, table);
-  const emptyCell = el('td', 'empty-cell', 'No requests yet. They appear as the story runs.', el('tr', '', undefined, empty));
+  const body = el('tbody', {}, table);
+  const empty = el('tbody', {}, table);
+  const emptyCell = el('td', { class: 'empty-cell', text: 'No requests yet. They appear as the story runs.' }, el('tr', {}, empty));
   emptyCell.setAttribute('colspan', '10');
-  const detail = el('section', 'requests-detail section', undefined, panel);
+  const detail = el('section', { class: 'requests-detail section' }, panel);
   detail.hidden = true;
-  const detailTitle = el('h3', 'mono', '', detail);
-  const detailList = el('dl', 'kv requests-kv', undefined, detail);
-  const actions = el('p', 'requests-actions', undefined, detail);
+  const detailTitle = el('h3', { class: 'mono' }, detail);
+  const detailList = el('dl', { class: 'kv requests-kv' }, detail);
+  const actions = el('p', { class: 'requests-actions' }, detail);
   const events = button(actions, 'button', 'Events on this connection', () => services.showPanel('events'));
   const packets = button(actions, 'button', 'Packets for this address pair', () => {
     const row = selectedRow();
     if (row?.local && row?.peer) services.showPackets?.({ local: row.local, peer: row.peer });
   });
-  el('span', 'note', 'The address pair can match other connections between the same ports.', actions);
+  el('span', { class: 'note', text: 'The address pair can match other connections between the same ports.' }, actions);
 
   const rows = new Map();
   let latest = {}, selected = services.selection.get().request ?? null, disposed = false, scrolled = null;
@@ -76,8 +73,8 @@ export function mount(root, services, options) {
     detailList.replaceChildren();
     const add = (key, value) => {
       if (value === null || value === undefined || value === '') return;
-      el('dt', '', key, detailList);
-      el('dd', 'mono', String(value), detailList);
+      el('dt', { text: key }, detailList);
+      el('dd', { class: 'mono', text: String(value) }, detailList);
     };
     add('Time', fmt.fmtRunTime(tag.at));
     add('Step', tag.traffic === 'agent' ? tag.step : `${words(tag.traffic)} traffic`);
@@ -102,23 +99,23 @@ export function mount(root, services, options) {
     const hosts = new Set(tags.map((tag) => tag.row.sandbox).filter(Boolean)).size > 1;
     empty.hidden = tags.length > 0;
     reconcile(body, tags, (tag) => tag.row.seq, (tag) => {
-      const node = on(el('tr', 'requests-row'), 'click', () => choose(tag));
+      const node = on(el('tr', { class: 'requests-row' }), 'click', () => choose(tag));
       node.setAttribute('tabindex', '0');
       on(node, 'keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault?.(); choose(tag); } });
       const row = tag.row;
       const cells = {};
-      cells.time = el('td', 'mono numeric', fmt.fmtRunTime(tag.at), node);
-      cells.step = el('td', `mono requests-step traffic-${tag.traffic}`, '', node);
-      el('span', `pill family-${row.family}`, words(row.classification), el('td', '', undefined, node));
-      el('td', 'mono', row.method, node);
-      el('td', 'mono requests-host', row.host ?? '(no host)', node).setAttribute('title', row.host ?? '');
-      el('td', 'mono requests-path', row.path, node).setAttribute('title', row.path);
-      el('td', `requests-status outcome-${row.outcome?.kind}`, statusText(row.outcome), node);
-      const pkg = el('td', 'mono', undefined, node);
-      if (row.package) el('span', row.package.role === 'lookalike' ? 'pill marked' : '', row.package.project, pkg);
-      const chip = el('td', '', undefined, node);
-      if (row.credential) el('span', 'pill outline', credential(row.credential), chip);
-      el('td', 'mono numeric', row.scan_complete ? String(row.ssrf_targets) : `${row.ssrf_targets}+`, node).setAttribute('title', row.scan_complete ? 'Off-site targets found' : 'The scan was incomplete');
+      cells.time = el('td', { class: 'mono numeric', text: fmt.fmtRunTime(tag.at) }, node);
+      cells.step = el('td', { class: `mono requests-step traffic-${tag.traffic}` }, node);
+      el('span', { class: `pill family-${row.family}`, text: words(row.classification) }, el('td', {}, node));
+      el('td', { class: 'mono', text: row.method }, node);
+      el('td', { class: 'mono requests-host', text: row.host ?? '(no host)' }, node).setAttribute('title', row.host ?? '');
+      el('td', { class: 'mono requests-path', text: row.path }, node).setAttribute('title', row.path);
+      el('td', { class: `requests-status outcome-${row.outcome?.kind}`, text: statusText(row.outcome) }, node);
+      const pkg = el('td', { class: 'mono' }, node);
+      if (row.package) el('span', { class: row.package.role === 'lookalike' ? 'pill marked' : '', text: row.package.project }, pkg);
+      const chip = el('td', {}, node);
+      if (row.credential) el('span', { class: 'pill outline', text: credential(row.credential) }, chip);
+      el('td', { class: 'mono numeric', text: row.scan_complete ? String(row.ssrf_targets) : `${row.ssrf_targets}+` }, node).setAttribute('title', row.scan_complete ? 'Off-site targets found' : 'The scan was incomplete');
       return { node, cells };
     }, (entry, tag, fresh) => {
       set(entry.cells.step, stepLabel(tag, story, hosts));

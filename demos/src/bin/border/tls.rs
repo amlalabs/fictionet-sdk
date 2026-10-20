@@ -5,14 +5,12 @@
 //! and ServerHello fields are retained. Unknown numeric identifiers stay numeric;
 //! missing hellos or groups stay absent. No secret or encrypted payload is shown.
 
+use super::view::Rows;
 use fictionet_observe::page::{StateLimits, StateTopic};
 use serde::Serialize;
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 const SESSIONS: usize = 16;
@@ -36,11 +34,14 @@ pub struct Session {
     pub offered: Option<Hello>,
     pub chosen: Option<Hello>,
     pub gaps: u64,
+    /// What the decoder holds of each direction: the client's, then the
+    /// server's.
+    #[serde(skip)]
+    directions: [Direction; 2],
 }
 #[derive(Default, Serialize)]
 pub struct View {
-    pub sessions: VecDeque<Session>,
-    pub dropped: u64,
+    pub sessions: Rows<Session, SESSIONS>,
     pub lost: u64,
 }
 struct Packet {
@@ -108,20 +109,15 @@ impl Capture {
         }
     }
 }
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct Direction {
     next: Option<u32>,
     records: Vec<u8>,
     messages: Vec<u8>,
 }
-struct Flow {
-    key: (u64, String, String),
-    directions: [Direction; 2],
-}
 #[derive(Default)]
 struct Decoder {
     view: View,
-    flows: VecDeque<Flow>,
 }
 impl Decoder {
     fn packet(&mut self, packet: Packet) {
@@ -150,34 +146,24 @@ impl Decoder {
         } else {
             (source, destination)
         };
-        let key = (packet.link, client.clone(), server.clone());
         let payload = &tcp[header..];
         let syn = tcp[13] & 2 != 0;
-        let existing = self.flows.iter().position(|f| f.key == key);
+        let sessions = &mut self.view.sessions;
+        let same = |s: &Session| s.link == packet.link && s.client == client && s.server == server;
+        // A client's new SYN on the same addresses starts a new session.
         if syn
             && !from_server
-            && let Some(index) = existing
+            && let Some(index) = sessions.rows.iter().position(same)
         {
-            self.flows.remove(index);
-            self.view.sessions.remove(index);
-            self.view.dropped += 1;
+            sessions.drop_at(index);
         }
-        let index = match self.flows.iter().position(|f| f.key == key) {
+        let index = match sessions.rows.iter().position(same) {
             Some(i) => i,
             None => {
                 if payload.first() != Some(&22) {
                     return;
                 }
-                if self.flows.len() == SESSIONS {
-                    self.flows.pop_front();
-                    self.view.sessions.pop_front();
-                    self.view.dropped += 1;
-                }
-                self.flows.push_back(Flow {
-                    key,
-                    directions: [Direction::default(), Direction::default()],
-                });
-                self.view.sessions.push_back(Session {
+                sessions.push(Session {
                     link: packet.link,
                     sandbox: packet.sandbox,
                     client,
@@ -186,18 +172,18 @@ impl Decoder {
                     offered: None,
                     chosen: None,
                     gaps: 0,
+                    directions: Default::default(),
                 });
-                self.flows.len() - 1
+                sessions.rows.len() - 1
             }
         };
         if payload.is_empty() {
             return;
         }
-        let flow = &mut self.flows[index];
-        let session = &mut self.view.sessions[index];
+        let session = &mut sessions.rows[index];
         let seq = u32::from_be_bytes(tcp[4..8].try_into().unwrap()).wrapping_add(u32::from(syn));
         let (hello, gaps) =
-            flow.directions[usize::from(from_server)].push(seq, payload, from_server);
+            session.directions[usize::from(from_server)].push(seq, payload, from_server);
         session.gaps += gaps;
         if let Some(hello) = hello {
             if from_server {
@@ -450,6 +436,45 @@ mod tests {
         packet[6] = 0;
         packet[3] = 19;
         assert!(ipv4(&packet).is_none());
+    }
+    /// A TCP packet from the guest's `port` to the bank's port 443.
+    fn to_bank(port: u16, flags: u8, payload: &[u8]) -> Packet {
+        let mut bytes = vec![0u8; 40];
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&u16::try_from(40 + payload.len()).unwrap().to_be_bytes());
+        bytes[9] = 6;
+        bytes[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        bytes[16..20].copy_from_slice(&[84, 21, 44, 10]);
+        bytes[20..22].copy_from_slice(&port.to_be_bytes());
+        bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+        bytes[32] = 5 << 4;
+        bytes[33] = flags;
+        bytes.extend(payload);
+        Packet {
+            link: 1,
+            sandbox: "desktop".into(),
+            at_ms: 0,
+            bytes,
+        }
+    }
+    #[test]
+    fn sessions_are_bounded_and_a_new_syn_starts_over() {
+        let mut decoder = Decoder::default();
+        let record = [22, 3, 1, 0, 0];
+        for port in 0..SESSIONS as u16 + 2 {
+            decoder.packet(to_bank(40000 + port, 0, &record));
+        }
+        let sessions = &decoder.view.sessions;
+        assert_eq!(sessions.rows.len(), SESSIONS);
+        assert_eq!(sessions.dropped, 2);
+        assert_eq!(sessions.rows[0].client, "10.0.0.2:40002");
+        // The client's SYN on a retained session's addresses replaces it.
+        decoder.packet(to_bank(40002, 2, &record));
+        let sessions = &decoder.view.sessions;
+        assert_eq!(sessions.rows.len(), SESSIONS);
+        assert_eq!(sessions.dropped, 3);
+        assert_eq!(sessions.rows[0].client, "10.0.0.2:40003");
+        assert_eq!(sessions.rows.back().unwrap().client, "10.0.0.2:40002");
     }
     fn server() -> Vec<u8> {
         let mut h = vec![3, 3];

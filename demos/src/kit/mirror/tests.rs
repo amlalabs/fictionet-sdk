@@ -139,6 +139,21 @@ where
     }
 }
 
+/// Waits until the cache at `dir` is unlocked. A dropped cache's download
+/// and reader tasks keep it locked until they finish, which can be after
+/// the test has read the body.
+async fn released(dir: &std::path::Path) {
+    let lock = std::fs::File::open(dir.join(".lock")).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while lock.try_lock().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    lock.unlock().unwrap();
+}
+
 async fn bytes(response: Response<Body>) -> Bytes {
     response.into_body().collect().await.unwrap().to_bytes()
 }
@@ -187,6 +202,7 @@ async fn miss_then_hit_survives_a_new_run() {
         assert_eq!(upstream.count(), 1);
         assert_eq!(cache.state.stats.saved.load(Ordering::Relaxed), 7);
         drop(cache);
+        released(dir.path()).await;
         let cache = upstream.cache(&fcx, dir.path());
         assert_eq!(
             bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
@@ -574,6 +590,7 @@ async fn by_hash_is_immutable_and_damaged_entries_are_refetched() {
         let cache = upstream.cache(&fcx, dir.path());
         bytes(send(&fcx, &cache, request(path)).await.unwrap()).await;
         drop(cache);
+        released(dir.path()).await;
         let cache = upstream.cache(&fcx, dir.path());
         bytes(send(&fcx, &cache, request(path)).await.unwrap()).await;
         assert_eq!(upstream.count(), 1);
@@ -1059,6 +1076,7 @@ async fn cache_age_survives_restart_and_origin_expiry_is_respected() {
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(100))
             .unwrap();
+        released(dir.path()).await;
         let cache = upstream.cache(&fcx, dir.path());
         let response = send(&fcx, &cache, request(PACKAGE)).await.unwrap();
         assert_eq!(response.headers()[header::DATE], date);
@@ -1193,6 +1211,7 @@ async fn second_owner_bypasses_and_restart_removes_crash_debris() {
         assert_eq!(second.state.stats.bypassed.lock().unwrap()["disabled"], 1);
         drop(second);
         drop(owner);
+        released(dir.path()).await;
         let debris = dir.path().join(".download-interrupted");
         std::fs::write(&debris, b"partial").unwrap();
         let restarted = Cache::new(source.clone(), dir.path().to_owned());
@@ -1463,6 +1482,7 @@ async fn cached_readers_keep_directory_ownership_until_their_files_close() {
         );
         assert_eq!(bytes(held).await, payload);
         drop(contender);
+        released(dir.path()).await;
         let cache = Cache::new(source.clone(), dir.path().to_owned());
         assert_eq!(
             bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,

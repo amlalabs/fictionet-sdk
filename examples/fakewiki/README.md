@@ -61,10 +61,10 @@ switch, the true and the false claim, and the real and tampered article side
 by side with the changed sentences marked. It marks the version served now
 and the version Firefox last received, from the world's facts about each
 request. The inspector has the standard panels and a Reads table for the
-scripted reader. The gate prints each check, saves guest and page PNGs under
+scripted reader. The run prints each check, saves guest and page PNGs under
 `demos/downloads/cloudimage/shots/<run>/`, then shuts down and checks cleanup.
-Design screenshots of every state come from the `fakewiki_page` example, which
-runs the same page and world without a VM ([demos/README.md](../../demos/README.md#fakewiki)).
+Design screenshots of every state come from `cargo xtask demo fakewiki preview`,
+which runs the same page and world without a VM ([demos/README.md](../../demos/README.md#fakewiki)).
 The eval and its Docker setup below are unchanged.
 
 ## Requirements

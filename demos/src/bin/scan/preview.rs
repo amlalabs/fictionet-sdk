@@ -1,21 +1,17 @@
 //! The scan page without VMs, to design against. The scan world runs in a
 //! real-time run with an in-world scanner that sends the story's probes, and
 //! a stand-in for the server VM answers with the banners the real server sent
-//! in a KVM run. The page shows nmap's reports recorded in that run, and the
-//! two hosts with status only and no console.
+//! in a KVM run. The page shows nmap's reports recorded in that run, marks
+//! itself a replay, and shows the two hosts with status only and no console.
 //!
-//! Run `cargo run -p fictionet-demo --example scan_page`. It prints the page
-//! URL and runs until Enter or the end of its input. `--bound` keeps probing
-//! new ports after the story until the port map is full. `--no-os-match ADDR`
-//! removes nmap's OS matches for one host from the recorded report, which is
-//! what nmap reports when it makes no match.
+//! `--bound` keeps probing new ports after the story until the port map is
+//! full. `--no-os-match ADDR` removes nmap's OS matches for one host from the
+//! recorded report, which is what nmap reports when it makes no match.
 
-mod client;
-mod nmap;
-mod page;
-mod script;
-
+use super::guests::{SERVER, WORKSTATION};
+use super::{Error, client, nmap, page, script};
 use fictionet::{RunOptions, Seed};
+use fictionet_demo::kit;
 use fictionet_observe::page::{Host, HostState, HostStatus, Page, StateLimits, StateTopic};
 use fictionet_observe::{DashboardObserver, DashboardOptions};
 use std::net::Ipv4Addr;
@@ -23,11 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
-
-/// The demo's guest names, as its page shows them.
-const WORKSTATION: &str = "workstation";
-const SERVER: &str = "office";
 /// nmap's reports for the three steps, from a KVM run of the demo.
 const RECORDED: [&str; 3] = [
     include_str!("data/discovery.xml"),
@@ -40,12 +31,11 @@ struct Options {
     no_match: Option<Ipv4Addr>,
 }
 
-fn options() -> Result<Options, Error> {
+fn options(mut args: impl Iterator<Item = String>) -> Result<Options, Error> {
     let mut options = Options {
         bound: false,
         no_match: None,
     };
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bound" => options.bound = true,
@@ -76,42 +66,45 @@ fn recorded(index: usize, no_match: Option<Ipv4Addr>) -> fictionet::Result<page:
     Ok(page::StepReport::new(script::STEPS[index].title, &report))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    let options = options()?;
+pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
+    let options = options(args)?;
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
     let topics = page::Topics::new();
-    let progress = page::Progress::new();
+    let progress = page::Progress::new(true);
     let statuses = [(); 2].map(|()| StateTopic::<HostStatus>::new(StateLimits::default()));
     let server = topics
         .compose(
-            Page::new(format!("{} · no VMs", page::TITLE), dashboard.handle())
-                .host(
-                    Host::new(WORKSTATION)
-                        .sandbox(scan_world::SCANNER)
-                        .status(statuses[0].clone())
-                        .pinned(),
-                )
-                .host(
-                    Host::new(SERVER)
-                        .sandbox(scan_world::SERVER)
-                        .status(statuses[1].clone())
-                        .pinned(),
-                ),
+            Page::new(
+                format!("{} · replay without VMs", page::TITLE),
+                dashboard.handle(),
+            )
+            .host(
+                Host::new(WORKSTATION)
+                    .sandbox(scan_world::SCANNER)
+                    .status(statuses[0].clone())
+                    .pinned(),
+            )
+            .host(
+                Host::new(SERVER)
+                    .sandbox(scan_world::SERVER)
+                    .status(statuses[1].clone())
+                    .pinned(),
+            ),
         )
         .bind_loopback(0)
         .await?;
     println!("{}", server.url());
     eprintln!(
-        "No VM runs. An in-world scanner sends the story's probes; nmap's reports are recorded. Press Enter to stop."
+        "No VM runs. An in-world scanner sends the story's probes; nmap's reports are recorded."
     );
+    let mut input = kit::preview::Input::stdin(kit::preview::Story::Once, None)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
     let world = std::thread::spawn(move || {
         fictionet::block_on(fictionet::run(
             RunOptions::new(Seed::from_u64(7)).observer(dashboard.observer()),
             move |cx| async move {
-                // Enter stops the run, during the story too.
+                // The end of input or Ctrl-C stops the run, during the story too.
                 cx.spawn(move |cx| async move {
                     while !stopping.load(Ordering::SeqCst) {
                         cx.sleep(Duration::from_millis(200)).await?;
@@ -133,11 +126,10 @@ async fn main() -> Result<(), Error> {
                         },
                     )
                 };
-                // nmap exited with each step's expected status in the recorded run.
+                // No nmap runs, so no step has an exit status.
                 let finish = |index: usize| -> fictionet::Result {
                     let report = recorded(index, options.no_match)?;
-                    let exit = script::STEPS[index].expected_exit;
-                    progress.finish(index, Some(exit), Some(report), true);
+                    progress.finish(index, None, Some(report), true);
                     Ok(())
                 };
                 status(&statuses[0], HostState::Booting, None)?;
@@ -184,17 +176,17 @@ async fn main() -> Result<(), Error> {
                         map.untracked
                     );
                 }
-                eprintln!("The story is done. Press Enter to stop.");
+                eprintln!("The story is done.");
                 cx.cancelled().await;
                 Ok(())
             },
         ))
     });
-    tokio::task::spawn_blocking(|| std::io::stdin().read_line(&mut String::new())).await??;
+    input.closed().await;
     stop.store(true, Ordering::SeqCst);
     match world.join() {
         Ok(Err(error)) if !error.is::<fictionet::Cancelled>() => Err(error.into()),
         Ok(_) => Ok(()),
-        Err(_) => Err("the fixture world panicked".into()),
+        Err(_) => Err("the preview world panicked".into()),
     }
 }

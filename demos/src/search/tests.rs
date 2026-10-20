@@ -75,7 +75,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             );
             // Advance the lab clock through the spawned task's publication intervals.
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let initial = get(&client, "/api/state/search").await.unwrap();
+            let initial = client.get_json("/api/state/search").await.unwrap();
             fetch(
                 &cx,
                 &machine,
@@ -85,11 +85,11 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             )
             .await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let snapshot = get(&client, "/api/state/search").await.unwrap();
+            let snapshot = client.get_json("/api/state/search").await.unwrap();
             assert!(snapshot["revision"].as_u64().unwrap() > initial["revision"].as_u64().unwrap());
             let published = snapshot["revision"].clone();
             cx.sleep(std::time::Duration::from_millis(250)).await?;
-            let idle = get(&client, "/api/state/search").await.unwrap();
+            let idle = client.get_json("/api/state/search").await.unwrap();
             assert_eq!(idle["revision"], published);
             assert_eq!(snapshot["value"]["queries"][0]["sandbox"], "workstation");
             assert_eq!(
@@ -109,7 +109,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             let (host, path) = adaptive_web_world::stub::text::target_of(&first.url);
             fetch(&cx, &machine, &host, &path, start).await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let snapshot = get(&client, "/api/state/search").await.unwrap();
+            let snapshot = client.get_json("/api/state/search").await.unwrap();
             assert!(snapshot["revision"].as_u64().unwrap() > published.as_u64().unwrap());
             let opened = snapshot["value"]["pages"]
                 .as_array()
@@ -125,7 +125,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             let published = snapshot["revision"].clone();
             cx.sleep(std::time::Duration::from_millis(250)).await?;
             assert_eq!(
-                get(&client, "/api/state/search").await.unwrap()["revision"],
+                client.get_json("/api/state/search").await.unwrap()["revision"],
                 published
             );
             let reply = command(&client, false, 0, "stop").await.unwrap();
@@ -143,20 +143,20 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             )
             .await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let snapshot = get(&client, "/api/state/search").await.unwrap();
+            let snapshot = client.get_json("/api/state/search").await.unwrap();
             assert!(snapshot["revision"].as_u64().unwrap() > published.as_u64().unwrap());
             let queries = snapshot["value"]["queries"].as_array().unwrap();
             assert_eq!(queries.last().unwrap()["results"], 0);
             assert_eq!(queries.last().unwrap()["outcome"]["status"], "served");
             assert_eq!(snapshot["value"]["generator"]["generate"], false);
             assert_eq!(snapshot["value"]["generator"]["generation_revision"], 1);
-            let policy = get(&client, "/api/state/policy").await.unwrap();
+            let policy = client.get_json("/api/state/policy").await.unwrap();
             assert_eq!(
                 policy["value"],
                 serde_json::to_value(page::policy("Firefox (scripted)")).unwrap()
             );
             assert_eq!(policy["value"]["forwarded"].as_array().unwrap().len(), 3);
-            let commands = get(&client, "/api/events").await.unwrap();
+            let commands = client.get_json("/api/events").await.unwrap();
             assert_eq!(
                 commands["events"]
                     .as_array()
@@ -174,14 +174,6 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
     .unwrap();
 }
 
-async fn get(
-    client: &PageClient,
-    path: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let response = client.request("GET", path, None, true).await?;
-    assert_eq!(response.status, 200);
-    Ok(serde_json::from_slice(&response.body)?)
-}
 async fn command(
     client: &PageClient,
     generate: bool,
@@ -216,7 +208,7 @@ async fn page_declares_the_workspace_and_serves_its_modules() {
         .await
         .unwrap();
     let client = PageClient::from_url(server.url()).unwrap();
-    let description = get(&client, "/api/page").await.unwrap();
+    let description = client.get_json("/api/page").await.unwrap();
     let panels = description["panels"].as_array().unwrap();
     assert_eq!(
         panels

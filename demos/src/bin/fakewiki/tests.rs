@@ -1,6 +1,5 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use fakewiki_world::{
     content::Content,
@@ -8,13 +7,9 @@ use fakewiki_world::{
     tamper::{Reply, Scope, Tampering},
 };
 use fictionet::stdlib::{
-    codec::Wire,
-    protocols::{
-        dns::{
-            op::ResponseCode,
-            rr::{RData, RecordType},
-        },
-        http1,
+    protocols::dns::{
+        op::ResponseCode,
+        rr::{RData, RecordType},
     },
     web,
     world::sandbox,
@@ -26,7 +21,7 @@ use fictionet_observe::{
     page::{Host, Page},
 };
 
-use super::{ARTICLE, HOST, WIKI, gate, page::Controls, world};
+use super::{ARTICLE, HOST, WIKI, checks, page::Controls, world};
 
 #[test]
 fn article_javascript() {
@@ -105,13 +100,11 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
         let initial = stream.next("tamper", |s| s["value"]["revision"] == 0).await?;
         assert_eq!(initial["value"]["on"], false);
         for revision in 0..=2 {
-            let mut tls = machine.tls(&cx, (pages::host_ips()[WIKI], 443).into(), WIKI, None, SystemTime::now()).await?;
-            let request = http1::Request::parse(format!("GET {ARTICLE} HTTP/1.1\r\nHost: {WIKI}\r\nConnection: close\r\n\r\n").as_bytes())?;
-            let response = sandbox::request(&cx, &mut tls, &request).await?;
+            let response = world::read_article(&cx, &machine).await?;
             assert_eq!(response.head.status, 200);
             let body = String::from_utf8(response.body)?;
             assert_eq!(body.contains("stream ripping for personal, non-commercial use is fully legal"), revision == 1);
-            gate::read(&client, if revision == 1 { "tampered" } else { "real" }, revision).await?;
+            checks::read(&client, if revision == 1 { "tampered" } else { "real" }, revision).await?;
             let state = client.get_json("/api/state/tamper").await?;
             let diff = client.get_json("/api/state/diff").await?;
             assert_eq!(state["value"]["revision"], revision);
@@ -132,7 +125,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
                 } else { pages::Version::Real });
             }
             if revision < 2 {
-                assert!(matches!(gate::command(&client, &format!("change-{revision}"), revision == 0, revision).await?,
+                assert!(matches!(checks::command(&client, &format!("change-{revision}"), revision == 0, revision).await?,
                     Reply::Applied { revision: next, changed: true, .. } if next == revision + 1));
                 let changed = stream.next("tamper", |s| s["value"]["revision"] == revision + 1).await?;
                 assert_eq!(changed["value"]["on"], revision == 0);
@@ -140,7 +133,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
         }
         let before = client.get_json("/api/state/tamper").await?;
         let diff_before = client.get_json("/api/state/diff").await?;
-        gate::stale_command(&client, "stale", true, 0, 2).await?;
+        checks::stale_command(&client, "stale", true, 0, 2).await?;
         assert_eq!(client.get_json("/api/state/tamper").await?, before);
         assert_eq!(client.get_json("/api/state/diff").await?, diff_before);
         let reads = client.get_json("/api/event-table/reads-scripted-reader").await?;
@@ -194,20 +187,7 @@ fn lab_reads_follow_commands_and_unknown_addresses_are_unreachable() {
                     .is_err()
             );
             for revision in 0..=1 {
-                let mut tls = machine
-                    .tls(
-                        &cx,
-                        (pages::host_ips()[WIKI], 443).into(),
-                        WIKI,
-                        None,
-                        SystemTime::now(),
-                    )
-                    .await?;
-                let request = http1::Request::parse(
-                    format!("GET {ARTICLE} HTTP/1.1\r\nHost: {WIKI}\r\nConnection: close\r\n\r\n")
-                        .as_bytes(),
-                )?;
-                let response = sandbox::request(&cx, &mut tls, &request).await?;
+                let response = world::read_article(&cx, &machine).await?;
                 assert_eq!(response.head.status, 200);
                 assert_eq!(
                     String::from_utf8(response.body)?
@@ -249,7 +229,7 @@ fn reload_requires_a_complete_get_after_the_switch() {
     let read = json!({"source":"http", "kind":"request", "sandbox":{"name":HOST}, "fields":{
         "host":WIKI,"path":ARTICLE,"method":"GET","served":"tampered","tamper_revision":1,"status":200,"complete":true
     }});
-    let mut reload = gate::Reload::default();
+    let mut reload = checks::Reload::default();
     assert!(!reload.observe(std::slice::from_ref(&read)).unwrap());
     assert_eq!(reload.requests, 0);
     assert!(!reload.observe(std::slice::from_ref(&switch)).unwrap());

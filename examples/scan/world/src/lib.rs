@@ -149,6 +149,19 @@ const MACHINES: &[HostSpec] = &[
     },
 ];
 
+/// Each office machine's address and the TCP ports the world answers on for
+/// it, in address order. The real server's ports are its VM's own, so the
+/// world lists none for it.
+pub fn open_ports() -> Vec<(Ipv4Addr, Vec<u16>)> {
+    MACHINES
+        .iter()
+        .map(|m| {
+            let ports = m.ports.iter().map(|&(port, _)| port).collect();
+            (Ipv4Addr::new(10, 0, 0, m.host), ports)
+        })
+        .collect()
+}
+
 /// The scanner's attachment name.
 pub const SCANNER: &str = "scanner";
 /// The real server's attachment name.

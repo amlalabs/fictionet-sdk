@@ -1,12 +1,14 @@
-//! What every demo gate does: required checks, waiting for cloud-init,
+//! The checks every demo runs: required checks, waiting for cloud-init,
 //! screenshots, the guest's side of a failure, and keeping the page open.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use fictionet_observe::page::{Containment, ProbeOutcome};
+
 use super::client::{Capability, PageClient};
-use super::{GuestHandle, Run, rfb, shot};
+use super::{GuestHandle, Run, containment, rfb, shot};
 
 /// How long the screen capture through the page may take.
 const SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -142,17 +144,7 @@ impl Run {
         let (capture, settled) = loop {
             tick.tick().await;
             captures += 1;
-            let capture = tokio::time::timeout(
-                SCREEN_TIMEOUT,
-                rfb::capture_page(self.page_url(), host, out),
-            )
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("{host}: the screen capture took over {SCREEN_TIMEOUT:?}"),
-                )
-            })??;
+            let capture = capture(self.page_url(), host, out).await?;
             let pixels = std::fs::read(&capture.png)?;
             if previous.as_ref() == Some(&pixels) {
                 break (capture, Some(captures));
@@ -162,12 +154,7 @@ impl Run {
             }
             previous = Some(pixels);
         };
-        if capture.colors < MIN_COLORS {
-            return Err(io::Error::other(format!(
-                "{host}: the captured screen has {} colors; a desktop shows at least {MIN_COLORS}",
-                capture.colors
-            )));
-        }
+        colorful(host, &capture)?;
         match settled {
             Some(n) => println!(
                 "{host} screen through the page: {} (settled after {n} captures)",
@@ -179,6 +166,55 @@ impl Run {
             ),
         }
         Ok((capture, settled))
+    }
+
+    /// Waits up to 90 s until the page shows every guest's containment
+    /// probes, prints them, and checks that none was forwarded or answered
+    /// from outside the world.
+    pub async fn containment(&self) -> io::Result<()> {
+        let client = PageClient::from_url(self.page_url())?;
+        client.bootstrap().await?;
+        let guests: Vec<&str> = self
+            .guests
+            .iter()
+            .map(|guest| guest.guest.attachment.as_str())
+            .collect();
+        let complete = |value: &serde_json::Value| {
+            let rows = value["value"]["probes"].as_array();
+            guests.iter().all(|guest| {
+                rows.into_iter()
+                    .flatten()
+                    .filter(|r| r["guest"] == *guest)
+                    .count()
+                    == containment::PROBES.len()
+            })
+        };
+        client
+            .wait_for(
+                "/api/state/containment",
+                Duration::from_secs(90),
+                Duration::from_millis(250),
+                "the page did not show every guest's containment probes",
+                |value| Ok(complete(value)),
+            )
+            .await?;
+        let probes: Containment = client.state("containment").await?;
+        for probe in &probes.probes {
+            println!(
+                "containment: {}: {}: {:?}; world: {}",
+                probe.guest, probe.name, probe.outcome, probe.world_answer
+            );
+        }
+        check(
+            "no containment probe was forwarded or answered from outside the world",
+            !probes.probes.is_empty()
+                && probes.probes.iter().all(|probe| {
+                    !matches!(
+                        probe.outcome,
+                        ProbeOutcome::Forwarded | ProbeOutcome::NotContained
+                    )
+                }),
+        )
     }
 
     /// Saves the page from Chromium to `out` once the JavaScript expression
@@ -203,16 +239,16 @@ impl Run {
         Ok(page)
     }
 
-    /// Saves `host`'s screen to `screen` as [`Run::screen`] does, then the
-    /// page to `page` from Chromium once the page shows that screen painted,
-    /// within 30 s.
+    /// Saves `host`'s screen to `screen` as [`Run::settled_screen`] does,
+    /// then the page to `page` from Chromium once the page shows that screen
+    /// painted, within 30 s.
     pub async fn screenshots(
         &self,
         host: &str,
         screen: &Path,
         page: &Path,
     ) -> io::Result<Screenshots> {
-        let capture = self.screen(host, screen).await?;
+        let (capture, _) = self.settled_screen(host, screen).await?;
         let page = self
             .page_shot(page, &shot::desktop_painted(host), PAGE_TIMEOUT)
             .await?;
@@ -223,22 +259,33 @@ impl Run {
     }
 }
 
-/// [`Run::screen`] for any signed page URL.
-async fn screen(url: &str, host: &str, out: &Path) -> io::Result<rfb::Capture> {
-    let capture = tokio::time::timeout(SCREEN_TIMEOUT, rfb::capture_page(url, host, out))
+/// Saves `host`'s screen to `out` through the page at `url`, within 30 s.
+async fn capture(url: &str, host: &str, out: &Path) -> io::Result<rfb::Capture> {
+    tokio::time::timeout(SCREEN_TIMEOUT, rfb::capture_page(url, host, out))
         .await
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("{host}: the screen capture took over {SCREEN_TIMEOUT:?}"),
             )
-        })??;
+        })?
+}
+
+/// Fails unless the capture shows a desktop: at least 16 colors.
+fn colorful(host: &str, capture: &rfb::Capture) -> io::Result<()> {
     if capture.colors < MIN_COLORS {
         return Err(io::Error::other(format!(
             "{host}: the captured screen has {} colors; a desktop shows at least {MIN_COLORS}",
             capture.colors
         )));
     }
+    Ok(())
+}
+
+/// [`Run::screen`] for any signed page URL.
+async fn screen(url: &str, host: &str, out: &Path) -> io::Result<rfb::Capture> {
+    let capture = capture(url, host, out).await?;
+    colorful(host, &capture)?;
     println!(
         "{host} screen through the page: {} ({}x{}, {}{} colors, {})",
         capture.png.display(),
@@ -261,7 +308,7 @@ const DESKTOP_DIAGNOSTICS: &[&str] = &[
     "systemctl is-active vnc",
     "tail -n 15 /tmp/xvnc.log /tmp/xfce.log",
     "tail -n 40 /tmp/firefox.log",
-    "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'",
+    super::desktop::FIREFOX_TITLE,
 ];
 /// Each diagnostic command's time and output bounds.
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -301,7 +348,7 @@ impl GuestHandle {
         Ok(self.boot.elapsed())
     }
 
-    /// The guest's side of a failed run, for a gate to print: cloud-init's
+    /// The guest's side of a failed run, for a demo to print: cloud-init's
     /// report and log tail, the desktop's state and logs when the guest has
     /// one, and the serial console tail. Each command has 3 s and 16 KiB.
     pub async fn diagnostics(&self) -> String {

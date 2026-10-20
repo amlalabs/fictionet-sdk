@@ -13,7 +13,7 @@ function harness() {
   watch.close = () => { closed = true; };
   const services = {
     dom, state(path, callback) { states.set(path, callback); return () => states.delete(path); },
-    transport: { get: async (path) => path.includes('context') ? ({ hosts: { 'en.wikipedia.org': '10.0.0.10' }, reader: 'Firefox (scripted)', reader_host: 'workstation' }) : ({ rows: [], next: 0 }), post: (path, body, signal) => new Promise((resolve, reject) => requests.push({ path, body, signal, resolve, reject })) },
+    transport: { get: async () => ({ rows: [], next: 0 }), post: (path, body, signal) => new Promise((resolve, reject) => requests.push({ path, body, signal, resolve, reject })) },
     watch: () => watch, moment: (element) => element.classList.add('moment'),
     format: { fmtRunTime: (n) => `${n.toFixed(1)} s` }, runTime: () => 10,
     selection: { set: (value) => selections.push(value) },

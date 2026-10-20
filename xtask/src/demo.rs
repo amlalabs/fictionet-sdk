@@ -16,7 +16,7 @@ pub fn run(args: &[String]) -> Result {
         println!("in-process demos: {}", binaries.join(", "));
         println!("VM scripts: {}", demos.join(", "));
         println!(
-            "cargo xtask demo <name>; cargo xtask demo assets downloads everything; cargo xtask demo libraries downloads browser libraries only"
+            "cargo xtask demo <name> [preview]; cargo xtask demo assets downloads everything; cargo xtask demo libraries downloads browser libraries only"
         );
         return Ok(());
     }
@@ -29,12 +29,17 @@ pub fn run(args: &[String]) -> Result {
     if let [name, rest @ ..] = args
         && binaries.contains(name)
     {
-        microvm::assets()?;
+        let rest = rest.strip_prefix(&[String::from("--")]).unwrap_or(rest);
+        // A preview serves the page without a VM: it needs only the
+        // browser libraries, and no downloads folder.
+        let preview = rest.first().is_some_and(|arg| arg == "preview");
+        if preview {
+            libraries::assets()?;
+        } else {
+            microvm::assets()?;
+        }
         microvm::build(name)?;
-        return microvm::launch(
-            name,
-            rest.strip_prefix(&[String::from("--")]).unwrap_or(rest),
-        );
+        return microvm::launch(name, !preview, rest);
     }
     let usage = format!(
         "usage: cargo xtask demo [assets|libraries|{}]",

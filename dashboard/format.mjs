@@ -27,7 +27,8 @@ export function fmtRate(n) {
 }
 
 export const fmtRunTime = (seconds) => `${seconds.toFixed(1)}s`;
-// A count and its noun: "1 request", "2 requests".
-export const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+// A count and its noun: "1 request", "2 requests", "1,024 addresses". A
+// noun that takes more than an s gives its plural.
+export const plural = (n, word, many = `${word}s`) => `${Number(n).toLocaleString('en-US')} ${n === 1 ? word : many}`;
 // A run time given in milliseconds, in seconds: "12.34 s".
 export const fmtRunMs = (ms) => `${(ms / 1000).toFixed(2)} s`;

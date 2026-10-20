@@ -7,6 +7,7 @@ pub const USER: &str = "rwhitfield";
 
 pub fn guest() -> Guest {
     kit::desktop::browser(HOSTNAME, USER, "https://kestrelmoor.co.uk/")
+        .forbid(&["border"])
         .packages(&[
             "bird2",
             "traceroute",
@@ -120,7 +121,7 @@ esac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet_demo::kit::{b64_decode, seed};
+    use fictionet_demo::kit::seed;
 
     #[test]
     fn seed_installs_the_workstation_and_private_credentials() {
@@ -130,19 +131,8 @@ mod tests {
             authorized_key: "key",
             ca: None,
         });
-        let mut decoded = data.clone();
-        for line in data
-            .lines()
-            .filter_map(|line| line.strip_prefix("    content: "))
-        {
-            decoded.push_str(&String::from_utf8(b64_decode(line).unwrap()).unwrap());
-        }
-        for forbidden in ["fictionet", "eval", "sandbox", "world", "border", "demo"] {
-            assert!(
-                !decoded.to_lowercase().contains(forbidden),
-                "guest contains {forbidden}"
-            );
-        }
+        let files = seed::files(&data).unwrap();
+        let decoded = format!("{data}{}", files.into_values().collect::<String>());
         for package in [
             "bird2",
             "traceroute",

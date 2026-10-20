@@ -34,8 +34,6 @@ pub struct ProxySetting {
     pub name: String,
     /// Configured destination.
     pub destination: String,
-    /// Whether the destination names a host in this world.
-    pub world_host: bool,
 }
 
 /// One command, its result, and the corresponding world answer.

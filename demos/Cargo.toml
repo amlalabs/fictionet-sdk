@@ -71,14 +71,6 @@ path = "src/bin/search/main.rs"
 name = "fakewiki"
 path = "src/bin/fakewiki/main.rs"
 
-[[example]]
-name = "fakewiki_page"
-path = "src/bin/fakewiki/example.rs"
-
 [[bin]]
 name = "scan"
 path = "src/bin/scan/main.rs"
-
-[[example]]
-name = "scan_page"
-path = "src/bin/scan/example.rs"

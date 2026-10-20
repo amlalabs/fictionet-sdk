@@ -259,7 +259,7 @@ and export panels are there too.
 
 The port map and banners come from the tap (see Port facts above). nmap's
 names and OS guesses come from its XML output, which the demo reads after
-each step, and the page labels them "nmap says". The gate reads all three
+each step, and the page labels them "nmap says". The checks read all three
 through the page's API.
 
 The command prints each step's command and nmap's findings, then the page
@@ -267,7 +267,7 @@ checks, and ends with `every required check passed`. nmap's XML reports, the
 port map after each step and the screenshots go to
 `demos/downloads/cloudimage/shots/`.
 
-`cargo run -p fictionet-demo --example scan_page` serves the same page
-without VMs, to work on it: an in-world scanner sends the story's probes, a
-stand-in answers at 10.0.0.50, and nmap's reports are the ones recorded in a
-KVM run.
+`cargo xtask demo scan preview` serves the same page without VMs, to work on
+it: an in-world scanner sends the story's probes, a stand-in answers at
+10.0.0.50, and nmap's reports are the ones recorded in a KVM run. The page
+says it is a replay.

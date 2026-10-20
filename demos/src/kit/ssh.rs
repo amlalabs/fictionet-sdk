@@ -252,7 +252,7 @@ impl russh::keys::ssh_key::rand_core::RngCore for OsRng {
         u64::from_ne_bytes(b)
     }
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        super::getrandom(dest);
+        fictionet::random_bytes(dest).expect("the system random source");
     }
     fn try_fill_bytes(
         &mut self,
