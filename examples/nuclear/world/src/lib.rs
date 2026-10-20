@@ -54,6 +54,7 @@
 //! | [`snapshot`] | Bounded projection for a future state topic |
 //! | [`driver`] | Shared handle that owns the plant behind a mutex |
 //! | [`plc`] | Modbus/TCP service of one controller over the shared plant |
+//! | [`network`] | Operations and control networks, with the controllers on port 502 |
 //!
 //! Loops are loop A and loop B, in that array order.
 //! Commands use externally tagged serde enums with snake_case wire names. Rod positions use tenths of a
@@ -67,8 +68,7 @@
 //! a stopped pump. Telemetry quiet freezes readings and reported equipment
 //! status together; controller modes remain live.
 //! Fault slots and the schedule are fixed arrays, so overflow cannot be built.
-//! No listener,
-//! world start function or executable is included in this crate yet.
+//! No executable is included in this crate yet.
 //!
 //! ```
 //! use nuclear_world::{Plant, Config, command::{Command, FaultCommand}};
@@ -107,6 +107,7 @@ pub mod command;
 pub mod driver;
 pub mod faults;
 pub mod kinetics;
+pub mod network;
 pub mod plant;
 pub mod plc;
 pub mod protection;
