@@ -112,14 +112,8 @@ pub const PROBES: &[Probe] = &[
 ];
 
 /// Runs each probe once and compares only observations added during that probe.
-/// `world_hosts` contains the world's declared DNS names or IP addresses, used
-/// to annotate proxy destinations. SSH errors and deadlines become results.
-pub async fn run(
-    session: &Session,
-    guest: &str,
-    dashboard: &DashboardHandle,
-    world_hosts: &[&str],
-) -> Containment {
+/// SSH errors and deadlines become results.
+pub async fn run(session: &Session, guest: &str, dashboard: &DashboardHandle) -> Containment {
     let mut results = Containment::default();
     for probe in PROBES {
         let before = dashboard.egress();
@@ -127,7 +121,7 @@ pub async fn run(
             tokio::time::timeout(probe.timeout, session.run_bounded(probe.command, 16 << 10)).await;
         let after = dashboard.egress();
         let result = match output {
-            Ok(Ok(output)) => parse(probe, guest, &output, &before, &after, world_hosts),
+            Ok(Ok(output)) => parse(probe, guest, &output, &before, &after),
             Ok(Err(error)) => result(probe, guest, ProbeOutcome::Unknown, error.to_string()),
             Err(_) => parse(
                 probe,
@@ -139,7 +133,6 @@ pub async fn run(
                 },
                 &before,
                 &after,
-                world_hosts,
             ),
         };
         results.probes.push(result);
@@ -193,7 +186,6 @@ pub fn parse(
     output: &Output,
     before: &EgressSnapshot,
     after: &EgressSnapshot,
-    world_hosts: &[&str],
 ) -> ProbeResult {
     let text = format!("{}{}", output.stdout, output.stderr);
     let mut result = result(
@@ -221,7 +213,7 @@ pub fn parse(
         result.outcome = ProbeOutcome::Fact;
         result.world_answer = "Configuration only".into();
         if matches!(probe.kind, Kind::Proxy) {
-            result.proxies = proxies(&output.stdout, world_hosts);
+            result.proxies = proxies(&output.stdout);
             if result.proxies.is_empty() {
                 result.guest_result = "No proxy settings set".into();
             }
@@ -333,7 +325,7 @@ pub fn parse(
     result
 }
 
-fn proxies(text: &str, world_hosts: &[&str]) -> Vec<ProxySetting> {
+fn proxies(text: &str) -> Vec<ProxySetting> {
     text.lines()
         .filter_map(|line| {
             let (name, value) = line.split_once('=').or_else(|| line.split_once(' '))?;
@@ -341,25 +333,9 @@ fn proxies(text: &str, world_hosts: &[&str]) -> Vec<ProxySetting> {
             if destination.is_empty() {
                 return None;
             }
-            let authority = destination
-                .split_once("://")
-                .map_or(destination, |(_, rest)| rest)
-                .split('/')
-                .next()
-                .unwrap_or_default();
-            let host = authority
-                .rsplit('@')
-                .next()
-                .unwrap_or_default()
-                .split(':')
-                .next()
-                .unwrap_or_default();
             Some(ProxySetting {
                 name: name.into(),
                 destination: destination.into(),
-                world_host: world_hosts
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(host)),
             })
         })
         .collect()
@@ -481,40 +457,40 @@ mod tests {
                 },
             );
             assert_eq!(
-                parse(probe, "workstation", &successful, &empty, &served, &[]).outcome,
+                parse(probe, "workstation", &successful, &empty, &served).outcome,
                 ProbeOutcome::Contained,
                 "{}",
                 probe.name
             );
             assert_eq!(
-                parse(probe, "workstation", &successful, &empty, &empty, &[]).outcome,
+                parse(probe, "workstation", &successful, &empty, &empty).outcome,
                 ProbeOutcome::NotContained
             );
             assert_eq!(
-                parse(probe, "workstation", &successful, &served, &served, &[]).outcome,
+                parse(probe, "workstation", &successful, &served, &served).outcome,
                 ProbeOutcome::NotContained,
                 "old rows cannot explain a new answer"
             );
             let mut lost = empty.clone();
             lost.lost = 1;
             assert_eq!(
-                parse(probe, "workstation", &successful, &empty, &lost, &[]).outcome,
+                parse(probe, "workstation", &successful, &empty, &lost).outcome,
                 ProbeOutcome::Unknown
             );
             for refusal in ["no_route", "refused"] {
                 let refused = observation(probe, refusal);
                 let failed = output(7, "Failed to connect\n");
                 assert_eq!(
-                    parse(probe, "workstation", &failed, &empty, &refused, &[]).outcome,
+                    parse(probe, "workstation", &failed, &empty, &refused).outcome,
                     ProbeOutcome::Contained
                 );
                 assert_eq!(
-                    parse(probe, "workstation", &successful, &empty, &refused, &[]).outcome,
+                    parse(probe, "workstation", &successful, &empty, &refused).outcome,
                     ProbeOutcome::NotContained
                 );
             }
             let forwarded = observation(probe, "forwarded");
-            let result = parse(probe, "workstation", &successful, &empty, &forwarded, &[]);
+            let result = parse(probe, "workstation", &successful, &empty, &forwarded);
             assert_eq!(result.outcome, ProbeOutcome::Forwarded);
             assert_eq!(
                 result.world_answer,
@@ -537,7 +513,6 @@ mod tests {
                 &output(0, "HTTP 421\n"),
                 &empty,
                 &refused,
-                &[],
             );
             assert_eq!(result.outcome, ProbeOutcome::Contained);
             assert!(result.world_answer.starts_with("refused:"));
@@ -556,11 +531,11 @@ mod tests {
             .filter(|probe| matches!(probe.kind, Kind::Http | Kind::Ipv6))
         {
             let alert = observation(probe, "tls_alert");
-            let result = parse(probe, "workstation", &untrusted, &empty, &alert, &[]);
+            let result = parse(probe, "workstation", &untrusted, &empty, &alert);
             assert_eq!(result.outcome, ProbeOutcome::Contained, "{}", probe.name);
             assert_eq!(result.world_answer, "refused: TLS handshake alert");
             assert_eq!(
-                parse(probe, "workstation", &untrusted, &alert, &alert, &[]).outcome,
+                parse(probe, "workstation", &untrusted, &alert, &alert).outcome,
                 ProbeOutcome::NotContained,
                 "an old refusal cannot explain a new handshake"
             );
@@ -571,7 +546,6 @@ mod tests {
                     &output(0, "HTTP 200\n"),
                     &empty,
                     &alert,
-                    &[]
                 )
                 .outcome,
                 ProbeOutcome::NotContained,
@@ -599,20 +573,11 @@ mod tests {
             &output(7, &format!("{NO_IPV6_ROUTE}\n{failed}")),
             &empty,
             &empty,
-            &[],
         );
         assert_eq!(result.outcome, ProbeOutcome::Contained);
         assert_eq!(result.world_answer, "no route: the guest has no IPv6 route");
         assert_eq!(
-            parse(
-                probe,
-                "workstation",
-                &output(7, failed),
-                &empty,
-                &empty,
-                &[]
-            )
-            .outcome,
+            parse(probe, "workstation", &output(7, failed), &empty, &empty,).outcome,
             ProbeOutcome::Unknown,
             "with a route, only the world's observation decides"
         );
@@ -623,7 +588,6 @@ mod tests {
                 &output(0, &format!("{NO_IPV6_ROUTE}\nHTTP 200\n")),
                 &empty,
                 &empty,
-                &[],
             )
             .outcome,
             ProbeOutcome::NotContained,
@@ -641,7 +605,6 @@ mod tests {
                 &output(127, "tool: not found"),
                 &empty,
                 &empty,
-                &[],
             );
             assert_eq!(missing.outcome, ProbeOutcome::MissingTool);
             assert!(
@@ -660,7 +623,6 @@ mod tests {
                 &output(124, "Probe timed out"),
                 &empty,
                 &empty,
-                &[],
             );
             assert_eq!(result.outcome, ProbeOutcome::TimedOut);
             assert!(result.guest_result.contains("timed out"));
@@ -674,7 +636,7 @@ mod tests {
             .iter()
             .filter(|probe| matches!(probe.kind, Kind::Proxy))
         {
-            let none = parse(probe, "workstation", &output(0, ""), &empty, &empty, &[]);
+            let none = parse(probe, "workstation", &output(0, ""), &empty, &empty);
             assert_eq!(none.outcome, ProbeOutcome::Fact);
             assert_eq!(none.guest_result, "No proxy settings set");
             let result = parse(
@@ -686,13 +648,11 @@ mod tests {
                 ),
                 &empty,
                 &empty,
-                &["cache.test"],
             );
             assert_eq!(result.proxies.len(), 3);
-            assert!(result.proxies[0].world_host);
-            assert!(!result.proxies[1].world_host);
-            assert!(result.proxies[2].world_host);
             assert_eq!(result.proxies[0].destination, "https://cache.test:3128");
+            assert_eq!(result.proxies[1].destination, "http://external.test:8080");
+            assert_eq!(result.proxies[2].destination, "http://cache.test:3128");
         }
         let routes = PROBES
             .iter()
@@ -704,7 +664,6 @@ mod tests {
             &output(0, "default via fe80::1 dev eth0\n"),
             &empty,
             &empty,
-            &[],
         );
         assert_eq!(result.outcome, ProbeOutcome::Fact);
         assert!(result.guest_result.contains("default via"));
