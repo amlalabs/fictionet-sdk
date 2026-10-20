@@ -3,8 +3,10 @@
 //! are omitted. Once boiling starts, cooling does not restore single phase.
 use super::{INJECTION_ENTHALPY_KJ_KG, SevereState, injection_flow};
 use crate::{
+    plant::RATED_THERMAL_MW,
     snapshot::{Regime, Truth},
-    steam::{self, Saturation},
+    stages::Stage,
+    steam,
 };
 
 /// Full primary liquid inventory in kg.
@@ -37,6 +39,8 @@ const VOID_SECONDS: f64 = 5.0;
 /// Discharge over one step, for the relief tank heat and mass balance.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Discharge {
+    /// Primary pressure at discharge in MPa.
+    pub pressure_mpa: f64,
     /// Steam mass flow in kg/s, including the safety valves.
     pub steam_kg_s: f64,
     /// Liquid mass flow in kg/s.
@@ -45,7 +49,11 @@ pub(crate) struct Discharge {
     pub heat_mw: f64,
 }
 impl Discharge {
-    fn add(&mut self, steam: f64, liquid: f64, sat: Saturation) {
+    fn add(&mut self, steam: f64, liquid: f64, pressure_mpa: f64) {
+        let sat = steam::saturation(pressure_mpa);
+        if steam + liquid > 0.0 {
+            self.pressure_mpa = pressure_mpa;
+        }
         self.steam_kg_s += steam;
         self.liquid_kg_s += liquid;
         self.heat_mw += (steam * sat.vapor_kj_kg + liquid * sat.liquid_kj_kg) / 1000.0;
@@ -69,24 +77,25 @@ impl SevereState {
         } else {
             0.0
         };
-        let relief_sat = steam::saturation(p.pressure_mpa);
+        let relief_pressure = p.pressure_mpa;
         v.inventory_kg += dt * (injection - relief);
         p.pressure_mpa +=
             pressure_change - dt * relief / capacity + dt * injection / WATER_PER_PERCENT * 0.1;
         let safety = (p.pressure_mpa - SAFETY_MPA).max(0.0) * capacity / dt;
         v.inventory_kg -= dt * safety;
-        let safety_sat = steam::saturation(p.pressure_mpa);
+        let safety_pressure = p.pressure_mpa;
         p.pressure_mpa = p.pressure_mpa.clamp(0.1, SAFETY_MPA);
         p.relief_open = valves > 0 || safety > 0.0;
         v.relief.flow_kg_s = relief;
         v.relief.safety_valve_flow_kg_s = safety;
         v.safety_injection.flow_kg_s = injection;
-        self.discharge.add(relief, 0.0, relief_sat);
-        self.discharge.add(safety, 0.0, safety_sat);
+        self.discharge.add(relief, 0.0, relief_pressure);
+        self.discharge.add(safety, 0.0, safety_pressure);
     }
 
-    /// Return the boiling and core uncovery triggers for this step.
-    pub fn primary_step(&mut self, truth: &mut Truth, valves: u8, dt: f64) -> (bool, bool) {
+    /// Return stage triggers at their point of calculation in this step.
+    pub fn primary_step(&mut self, truth: &mut Truth, valves: u8, dt: f64) -> [Option<Stage>; 7] {
+        let mut stages = [None; 7];
         let p = &mut truth.primary;
         let sat = steam::saturation(p.pressure_mpa).temperature_c;
         let boiling = self.values.regime == Regime::SinglePhase
@@ -96,6 +105,7 @@ impl SevereState {
                     l.hot_leg_c >= sat || l.cold_leg_c >= sat || l.steam_generator_primary_c >= sat
                 }));
         if boiling {
+            stages[0] = Some(Stage::Boiling);
             self.values.regime = Regime::TwoPhase;
             if p.level_percent <= 0.0 {
                 p.pressure_mpa = steam::saturation_pressure(truth.reactor.core_exit_c);
@@ -108,17 +118,41 @@ impl SevereState {
             BOILING_VOID_PERCENT + UNCOVERED_VOID_PERCENT * self.values.uncovered_percent / 100.0
         };
         self.values.void_percent += dt * (target - self.values.void_percent) / VOID_SECONDS;
-        if self.values.regime == Regime::TwoPhase {
-            self.two_phase(truth, valves, dt);
+        match self.values.regime {
+            Regime::SinglePhase => {
+                self.values.hot_fuel_c = truth.reactor.fuel_temperature_c;
+                self.values.core_exit_steam_c = truth.reactor.core_exit_c;
+            }
+            Regime::TwoPhase => self.two_phase(truth, valves, dt, &mut stages),
+            Regime::Breached => {
+                stages[2..5].copy_from_slice(&self.core_step(truth.reactor.thermal_mw, 0.0, dt));
+                self.breached_primary(truth);
+            }
         }
-        (boiling, self.values.uncovered_percent > 0.0)
+        stages[5] = self.relocate(dt);
+        stages
     }
 
-    fn two_phase(&mut self, truth: &mut Truth, valves: u8, dt: f64) {
+    fn two_phase(
+        &mut self,
+        truth: &mut Truth,
+        valves: u8,
+        dt: f64,
+        stages: &mut [Option<Stage>; 7],
+    ) {
+        let pressure = truth.primary.pressure_mpa;
+        let sat = steam::saturation(pressure);
+        let decay_mw = truth.reactor.decay_heat_percent / 100.0 * RATED_THERMAL_MW;
+        let q_lp = self.lower_plenum_step(decay_mw, sat.temperature_c, dt);
+        let q_quench = std::mem::take(&mut self.quench_mw);
+        let q_down = if self.values.vessel_water_kg > 0.0 {
+            self.down_mw
+        } else {
+            0.0
+        };
         let v = &mut self.values;
         let p = &mut truth.primary;
-        let pressure = p.pressure_mpa;
-        let sat = steam::saturation(pressure);
+        let old_u = v.uncovered_percent / 100.0;
         let latent = sat.vapor_kj_kg - sat.liquid_kj_kg;
         let q_fuel = FUEL_CONDUCTANCE
             * (truth.reactor.fuel_temperature_c - sat.temperature_c).max(0.0)
@@ -135,9 +169,6 @@ impl SevereState {
             0.0
         };
         let q_si = injection * (sat.liquid_kj_kg - INJECTION_ENTHALPY_KJ_KG) / 1000.0;
-        // Lower plenum heat and the previous step's quench and downward heat
-        // remain zero until the uncovered core and lower plenum are modeled.
-        let (q_lp, q_quench, q_down) = (0.0, 0.0, 0.0);
         let boiling = 1000.0 * (q_fuel + q_lp + q_quench + q_down - q_sg - q_si) / latent;
         let (steam, liquid) = if v.pressurizer_water_kg >= PRESSURIZER_KG - 1.0 {
             (0.0, RELIEF_LIQUID * f64::from(valves) * pressure)
@@ -192,7 +223,17 @@ impl SevereState {
             100.0 * ((28_000.0 - v.vessel_water_kg) / 15_000.0).clamp(0.0, 1.0)
         };
         v.vessel_level_percent = vessel_level(v.vessel_water_kg);
+        stages[1] = (v.uncovered_percent > 0.0).then_some(Stage::CoreUncovered);
         let temperature = steam::saturation(p.pressure_mpa).temperature_c;
+        v.relief.flow_kg_s = steam + liquid;
+        v.relief.safety_valve_flow_kg_s = safety;
+        v.safety_injection.flow_kg_s = injection;
+        self.core_coverage(old_u, truth.reactor.fuel_temperature_c, temperature, dt);
+        let core_steam =
+            1000.0 * (q_fuel + q_lp + q_quench + q_down).max(0.0) / latent + flash.max(0.0) / dt;
+        stages[2..5].copy_from_slice(&self.core_step(truth.reactor.thermal_mw, core_steam, dt));
+        self.core_readings(truth, temperature);
+        let p = &mut truth.primary;
         for l in &mut p.loops {
             l.hot_leg_c = temperature;
             l.cold_leg_c = temperature;
@@ -202,10 +243,31 @@ impl SevereState {
         p.average_temperature_c = temperature;
         p.subcooling_margin_c = 0.0;
         p.relief_open = venting;
-        v.relief.flow_kg_s = steam + liquid;
-        v.relief.safety_valve_flow_kg_s = safety;
-        v.safety_injection.flow_kg_s = injection;
-        self.discharge.add(steam + safety, liquid, sat);
+        self.discharge.add(steam + safety, liquid, pressure);
+        stages[6] = self.breach(p.pressure_mpa);
+        if stages[6].is_some() {
+            self.breached_primary(truth);
+        }
+    }
+
+    fn breached_primary(&mut self, truth: &mut Truth) {
+        let p = &mut truth.primary;
+        p.pressure_mpa = (self.values.containment.pressure_kpa / 1000.0).max(0.1);
+        let temperature = steam::saturation(p.pressure_mpa).temperature_c;
+        for line in &mut p.loops {
+            line.hot_leg_c = temperature;
+            line.cold_leg_c = temperature;
+            line.steam_generator_primary_c = temperature;
+        }
+        truth.reactor.core_exit_c = temperature;
+        p.average_temperature_c = temperature;
+        p.subcooling_margin_c = 0.0;
+        p.level_percent = 0.0;
+        p.relief_open = false;
+        self.values.relief.flow_kg_s = 0.0;
+        self.values.relief.safety_valve_flow_kg_s = 0.0;
+        self.values.safety_injection.flow_kg_s = 0.0;
+        self.core_readings(truth, temperature);
     }
 }
 
@@ -280,7 +342,7 @@ mod tests {
                 }
             };
             *temperature = saturation - 0.001;
-            assert_eq!(severe.primary_step(&mut truth, 0, 0.05), (false, false));
+            assert_eq!(severe.primary_step(&mut truth, 0, 0.05), [None; 7]);
             if node == 0 {
                 truth.reactor.core_exit_c = saturation;
             } else {
@@ -291,7 +353,11 @@ mod tests {
                     _ => line.steam_generator_primary_c = saturation,
                 }
             }
-            assert!(severe.primary_step(&mut truth, 0, 0.05).0);
+            assert!(
+                severe
+                    .primary_step(&mut truth, 0, 0.05)
+                    .contains(&Some(Stage::Boiling))
+            );
             assert_eq!(severe.values.regime, Regime::TwoPhase);
             assert_eq!(severe.values.void_percent, 0.2);
             let new_sat = steam::saturation(truth.primary.pressure_mpa).temperature_c;
@@ -303,7 +369,11 @@ mod tests {
                 assert_eq!(line.cold_leg_c, new_sat);
                 assert_eq!(line.steam_generator_primary_c, new_sat);
             }
-            assert!(!severe.primary_step(&mut truth, 0, 0.05).0);
+            assert!(
+                !severe
+                    .primary_step(&mut truth, 0, 0.05)
+                    .contains(&Some(Stage::Boiling))
+            );
         }
     }
 
@@ -316,7 +386,11 @@ mod tests {
         for line in &mut truth.secondary.loops {
             line.heat_transfer_mw = 0.0;
         }
-        assert!(severe.primary_step(&mut truth, 0, 0.05).0);
+        assert!(
+            severe
+                .primary_step(&mut truth, 0, 0.05)
+                .contains(&Some(Stage::Boiling))
+        );
         assert_eq!(truth.primary.pressure_mpa, 10.0);
         assert_eq!(severe.values.pressurizer_water_kg, 10.0);
     }
@@ -344,7 +418,11 @@ mod tests {
         for line in &mut truth.primary.loops {
             line.pump_speed_percent = 20.0;
         }
-        assert!(severe.primary_step(&mut truth, 1, 0.05).1);
+        assert!(
+            severe
+                .primary_step(&mut truth, 1, 0.05)
+                .contains(&Some(Stage::CoreUncovered))
+        );
         assert!(severe.values.uncovered_percent > 0.0);
     }
 

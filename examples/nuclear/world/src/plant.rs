@@ -64,6 +64,7 @@ use crate::{
     snapshot::*,
     stages::{Stage, StageLog},
     steam,
+    stylized::StylizedState,
 };
 
 mod commands;
@@ -135,6 +136,7 @@ pub struct Plant {
     first_action_after_fault_ms: Option<u64>,
     state: Truth,
     severe: SevereState,
+    stylized: StylizedState,
     stages: StageLog,
     last_command: Option<LastCommand>,
     kinetics: Kinetics,
@@ -236,6 +238,7 @@ impl Plant {
             first_action_after_fault_ms: None,
             state,
             severe: SevereState::new(fuel, hot),
+            stylized: StylizedState::new(),
             stages: StageLog::default(),
             last_command: None,
             kinetics: Kinetics::new(power),
@@ -378,15 +381,21 @@ impl Plant {
         self.reactor();
         self.heat_and_mass();
         let valves = self.relief_valves_flowing();
-        let (boiling, uncovered) = self.severe.primary_step(&mut self.state, valves, DT);
-        if boiling {
-            self.mark(Stage::Boiling);
+        for stage in self
+            .severe
+            .primary_step(&mut self.state, valves, DT)
+            .into_iter()
+            .flatten()
+        {
+            self.mark(stage);
         }
-        if uncovered {
-            self.mark(Stage::CoreUncovered);
+        let decay_mw = self.state.reactor.decay_heat_percent / 100.0 * RATED_THERMAL_MW;
+        if let Some(stage) = self.severe.cavity_step(decay_mw, DT) {
+            self.mark(stage);
         }
-        self.severe.values.hot_fuel_c = self.state.reactor.fuel_temperature_c;
-        self.severe.values.core_exit_steam_c = self.state.reactor.core_exit_c;
+        for stage in self.severe.containment_step(DT).into_iter().flatten() {
+            self.mark(stage);
+        }
         if self
             .severe
             .hall
@@ -395,6 +404,12 @@ impl Plant {
             self.mark(Stage::TurbineHallSteam);
         }
         self.severe.values.turbine_hall = self.severe.hall.snapshot();
+        if let Some(stage) = self
+            .stylized
+            .step(&self.severe.values, &self.stages, self.at_ms, DT)
+        {
+            self.mark(stage);
+        }
         if self.state.secondary.condenser_pressure_kpa > LOW_VACUUM_KPA {
             self.state.secondary.turbine_tripped = true;
             self.state.secondary.steam_dump_percent = 0.0;
@@ -580,8 +595,10 @@ impl Plant {
         if single_phase {
             self.state.reactor.core_exit_c += DT * (fuel_heat - core_out) / (CORE_MASS * CP);
         }
-        self.state.reactor.fuel_temperature_c +=
-            DT * (self.state.reactor.thermal_mw - fuel_heat) / FUEL_CAPACITY;
+        if self.severe.values.uncovered_percent < 99.9 {
+            self.state.reactor.fuel_temperature_c +=
+                DT * (self.state.reactor.thermal_mw - fuel_heat) / FUEL_CAPACITY;
+        }
         if single_phase {
             let average = self.average();
             let valves = self.relief_valves_flowing();
@@ -642,7 +659,8 @@ impl Plant {
     fn bound_temperatures(&mut self) {
         let saturation_c = steam::saturation(self.state.primary.pressure_mpa).temperature_c;
         let fuel = &mut self.state.reactor.fuel_temperature_c;
-        self.model_limit |= !(0.0..=2000.0).contains(fuel);
+        self.model_limit |=
+            self.severe.values.uncovered_percent < 99.9 && !(0.0..=2000.0).contains(fuel);
         *fuel = fuel.clamp(0.0, 2000.0);
         let mut bound = |t: &mut f64| {
             self.model_limit |= *t < 0.0;
@@ -767,11 +785,7 @@ impl Plant {
             }),
             faults: self.faults.clone(),
             severe: self.severe.snapshot(),
-            stylized: Stylized {
-                control_room_steam: 0.0,
-                release_fraction: 0.0,
-                containment_dose_sv_h: 0.001,
-            },
+            stylized: self.stylized.values.clone(),
             stages: self.stages.times,
             end: self.stages.end,
             last_command: self.last_command,
@@ -786,6 +800,22 @@ fn approach(value: f64, demand: f64, distance: f64) -> f64 {
 #[cfg(test)]
 mod equipment_tests {
     use super::*;
+
+    #[test]
+    fn frozen_fuel_and_hot_fuel_projection_do_not_latch_the_covered_node_limit() {
+        let mut plant = Plant::new(Config::default());
+        plant.severe.values.uncovered_percent = 99.9;
+        plant.state.reactor.fuel_temperature_c = 2500.0;
+        plant.bound_temperatures();
+        assert!(!plant.model_limit);
+        assert_eq!(plant.state.reactor.fuel_temperature_c, 2000.0);
+        plant.severe.values.regime = Regime::Breached;
+        plant.severe.values.uncovered_percent = 100.0;
+        plant.severe.values.hot_fuel_c = 2500.0;
+        plant.advance(50);
+        assert!(!plant.model_limit);
+        assert_eq!(plant.snapshot().truth.reactor.fuel_temperature_c, 2000.0);
+    }
 
     #[test]
     fn relief_status_uses_demand_and_safety_flow() {

@@ -29,17 +29,25 @@
 //! vacuum protection still trips the turbine. Manual reactor trip always works.
 //!
 //! Transport delays, shrink and swell, charging and letdown, xenon and boron,
-//! spatial effects, two-phase primary flow, fuel damage, containment, real
-//! protection channel redundancy, electrical buses and pump heat are omitted.
-//! Primary inventory is constant. Secondary liquid is treated as saturated;
-//! its sensible heat storage and feedwater subcooling transients are omitted.
-//! Relief is an ideal pressure limiter. Excess secondary water over full scale
-//! drains away. There is no emergency core cooling or cold shutdown model.
+//! spatial effects, real protection channel redundancy, electrical buses and
+//! pump heat are omitted. Secondary liquid is treated as saturated; its sensible
+//! heat storage and feedwater subcooling transients are omitted.
+//! Safety valves limit primary pressure while accounting for discharged steam.
+//! Excess secondary water over full scale drains away. Cold shutdown is omitted.
 //! The prompt approximation clamps reactivity to 0.9 beta and power to ten times
 //! rated. Leaving a thermal model boundary also latches `model_limit`. Values
-//! after a limit are outside the model. Primary coolant reaching saturation
-//! at pressurizer pressure latches the limit. Core exit subcooling margin is
-//! 19.79 C at full power. Automatic heaters run at 25% to balance ambient loss.
+//! after a limit are outside the model. Primary saturation starts two-phase
+//! flow. Core exit subcooling margin is 19.79 C at full power. Automatic heaters
+//! run at 25% to balance ambient loss.
+//!
+//! Severe accidents include two-phase inventory loss, safety injection, core
+//! heating, oxidation, melting, relocation, vessel breach, relief tank discharge,
+//! containment burns, concrete ablation and turbine hall steam. Loop seals and
+//! uneven draining, fission product transport, steam generator tube rupture,
+//! battery depletion, carbon monoxide, containment venting, igniters and
+//! recombiners, and the return from two-phase to single phase stay omitted.
+//! The severe modules describe lumped physics. Constants labeled `Rule:` stand
+//! in for unresolved detail. [`stylized`] labels its consequences `Stylized:`.
 //!
 //! | Module | Contents |
 //! | --- | --- |
@@ -47,7 +55,8 @@
 //! | [`plant`] | Time, energy balances, controls and command application |
 //! | [`steam`] | Coarse saturation table |
 //! | [`stages`] | First stage times, end selection and scores |
-//! | [`severe`] | Accident state and occupied spaces |
+//! | [`severe`] | Primary, core, vessel, containment, cavity and occupied spaces |
+//! | [`stylized`] | Control room steam and radiation consequences |
 //! | [`scenarios`] | Named starting conditions and fault schedules |
 //! | [`protection`] | True-channel trips and reported-channel alarms |
 //! | [`registers`] | Modbus register map and telemetry heartbeats of the three controllers |
@@ -130,5 +139,6 @@ pub mod snapshot;
 pub mod stages;
 pub mod steam;
 pub mod story;
+pub mod stylized;
 
 pub use plant::{Config, InitialPower, Plant};

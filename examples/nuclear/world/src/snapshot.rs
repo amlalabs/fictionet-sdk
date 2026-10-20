@@ -156,7 +156,7 @@ pub struct PlantSnapshot {
     pub last_command: Option<LastCommand>,
 }
 impl PlantSnapshot {
-    pub const MAX_JSON_BYTES: usize = 11263;
+    pub const MAX_JSON_BYTES: usize = 11348;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,9 +186,11 @@ impl Relief {
 pub struct ReliefTank {
     pub pressure_kpa: f64,
     pub disk_ruptured: bool,
+    /// Hydrogen retained before disk rupture, in kg.
+    pub hydrogen_kg: f64,
 }
 impl ReliefTank {
-    pub const MAX_JSON_BYTES: usize = 64;
+    pub const MAX_JSON_BYTES: usize = 103;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -208,13 +210,15 @@ pub struct Containment {
     pub steam_percent: f64,
     pub hydrogen_percent: f64,
     pub hydrogen_kg: f64,
+    /// Total hydrogen consumed by all containment burns, in kg.
+    pub hydrogen_burned_kg: f64,
     pub burn_excess_kpa: f64,
     pub direct_heating_kpa: f64,
     pub fan_coolers_running: bool,
     pub failure: Option<FailureCause>,
 }
 impl Containment {
-    pub const MAX_JSON_BYTES: usize = 356;
+    pub const MAX_JSON_BYTES: usize = 402;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -263,7 +267,7 @@ pub struct Severe {
     pub turbine_hall: TurbineHall,
 }
 impl Severe {
-    pub const MAX_JSON_BYTES: usize = 1698;
+    pub const MAX_JSON_BYTES: usize = 1783;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

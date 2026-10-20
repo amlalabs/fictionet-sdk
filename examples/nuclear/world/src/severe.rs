@@ -1,7 +1,11 @@
 //! Accident state, relief paths, injection capacity and occupied spaces.
 use crate::{protection::AutomaticState, sensors::round, snapshot::*};
+mod cavity;
+mod containment;
+mod core;
 mod primary;
 mod spaces;
+mod vessel;
 
 /// Rule: break flow in kg/s at the rated header pressure of 6.9 MPa.
 const BREAK_KG_S: f64 = 500.0;
@@ -39,6 +43,22 @@ pub(crate) struct SevereState {
     pub automatic: AutomaticState,
     pub hall: spaces::Hall,
     pub discharge: primary::Discharge,
+    /// Relief tank absorbed enthalpy in MJ.
+    tank_mj: f64,
+    /// Re-covered fuel heat in MW, consumed on the next primary step.
+    quench_mw: f64,
+    /// Downward core heat in MW, consumed on the next wet primary step.
+    down_mw: f64,
+    /// Total mass moved out of the core in kg.
+    relocated_kg: f64,
+    /// Stored melt heat in the lower plenum in MJ.
+    lower_plenum_mj: f64,
+    /// Stored melt heat in the cavity in MJ.
+    cavity_mj: f64,
+    /// Steam mass in containment in kg.
+    containment_steam_kg: f64,
+    /// Liquid water mass in the containment sump in kg.
+    sump_water_kg: f64,
 }
 impl SevereState {
     pub fn new(fuel_c: f64, core_exit_c: f64) -> Self {
@@ -46,6 +66,14 @@ impl SevereState {
             automatic: AutomaticState::default(),
             hall: spaces::Hall::default(),
             discharge: primary::Discharge::default(),
+            tank_mj: 0.0,
+            quench_mw: 0.0,
+            down_mw: 0.0,
+            relocated_kg: 0.0,
+            lower_plenum_mj: 0.0,
+            cavity_mj: 0.0,
+            containment_steam_kg: 0.0,
+            sump_water_kg: 0.0,
             values: Severe {
                 regime: Regime::SinglePhase,
                 inventory_kg: 162_000.0,
@@ -73,6 +101,7 @@ impl SevereState {
                 relief_tank: ReliefTank {
                     pressure_kpa: 100.0,
                     disk_ruptured: false,
+                    hydrogen_kg: 0.0,
                 },
                 safety_injection: SafetyInjection {
                     signal: false,
@@ -87,6 +116,7 @@ impl SevereState {
                     steam_percent: 0.0,
                     hydrogen_percent: 0.0,
                     hydrogen_kg: 0.0,
+                    hydrogen_burned_kg: 0.0,
                     burn_excess_kpa: 0.0,
                     direct_heating_kpa: 0.0,
                     fan_coolers_running: true,
@@ -113,6 +143,8 @@ impl SevereState {
             &mut s.hydrogen_generated_kg,
             &mut s.hydrogen_in_primary_kg,
             &mut s.containment.hydrogen_kg,
+            &mut s.containment.hydrogen_burned_kg,
+            &mut s.relief_tank.hydrogen_kg,
         ] {
             *v = round(*v, 1.0);
         }
