@@ -106,17 +106,14 @@ pub(crate) struct Captures {
     pub(crate) links: BTreeMap<LinkId, Capture>,
     pub(crate) bytes: usize,
     order: u64,
+    randoms: BTreeMap<[u8; 32], usize>,
+    #[cfg(test)]
+    pub(crate) compared_windows: AtomicUsize,
 }
 
 impl Captures {
     pub(crate) fn has_random(&self, random: &[u8]) -> bool {
-        random.len() == 32
-            && self
-                .links
-                .values()
-                .flat_map(|capture| capture.rings.values())
-                .flat_map(|ring| &ring.items)
-                .any(|copy| copy.bytes.windows(32).any(|bytes| bytes == random))
+        self.randoms.contains_key(random)
     }
 
     pub(crate) fn retired(&mut self, id: LinkId, crossings: u64) {
@@ -172,6 +169,13 @@ impl Captures {
             .get_mut(&class)
             .expect("capture class");
         if let Some(old) = ring.evict() {
+            update_randoms(
+                &mut self.randoms,
+                &old.bytes,
+                false,
+                #[cfg(test)]
+                &self.compared_windows,
+            );
             self.bytes -= old.bytes.len();
             losses.record(
                 limit,
@@ -188,6 +192,13 @@ impl Captures {
             for ring in capture.rings.into_values() {
                 self.bytes -= ring.bytes;
                 for old in ring.items {
+                    update_randoms(
+                        &mut self.randoms,
+                        &old.bytes,
+                        false,
+                        #[cfg(test)]
+                        &self.compared_windows,
+                    );
                     losses.record(
                         limit,
                         old.stamp,
@@ -267,6 +278,13 @@ impl Captures {
             class.bytes,
             |_| 0,
             |old| {
+                update_randoms(
+                    &mut self.randoms,
+                    &old.bytes,
+                    false,
+                    #[cfg(test)]
+                    &self.compared_windows,
+                );
                 self.bytes -= old.bytes.len();
                 losses.record(
                     options.loss_streams,
@@ -292,7 +310,41 @@ impl Captures {
             skipped: std::mem::take(&mut ring.skipped),
             omissions: losses.omissions(stamp.stream, index),
         };
+        update_randoms(
+            &mut self.randoms,
+            &copy.bytes,
+            true,
+            #[cfg(test)]
+            &self.compared_windows,
+        );
         ring.push(copy);
         self.bytes += len;
+    }
+}
+
+// Index packet-local ClientHello prefixes, including truncated handshakes.
+fn update_randoms(
+    randoms: &mut BTreeMap<[u8; 32], usize>,
+    bytes: &[u8],
+    retain: bool,
+    #[cfg(test)] compared_windows: &AtomicUsize,
+) {
+    for window in bytes.windows(38) {
+        #[cfg(test)]
+        compared_windows.fetch_add(1, Ordering::Relaxed);
+        let length = u32::from_be_bytes([0, window[1], window[2], window[3]]);
+        if window[0] != 1 || length < 34 || window[4] != 3 || window[5] > 3 {
+            continue;
+        }
+        let random: [u8; 32] = window[6..].try_into().expect("client random");
+        if retain {
+            *randoms.entry(random).or_default() += 1;
+        } else {
+            let count = randoms.get_mut(&random).expect("retained client random");
+            *count -= 1;
+            if *count == 0 {
+                randoms.remove(&random);
+            }
+        }
     }
 }

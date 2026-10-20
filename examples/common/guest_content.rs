@@ -68,6 +68,7 @@ pub struct Report {
 
 #[derive(Default)]
 struct State {
+    open: Vec<Arc<Mutex<Job>>>,
     pending: usize,
     held: usize,
     report: Report,
@@ -158,14 +159,29 @@ impl Audit {
         sink.finish();
     }
 
-    /// Waits for inspection already submitted and reports every retained violation.
+    /// Inspects open prefixes and waits for submitted content inspection.
     pub fn check(&self) -> Result<Report, String> {
         let mut state = self.shared.state.lock().unwrap();
         while state.pending != 0 {
             state = self.shared.done.wait(state).unwrap();
         }
+        let mut scan = Scan {
+            errors: BTreeSet::new(),
+            report: state.report,
+            expanded: 0,
+        };
+        for job in &state.open {
+            let job = job.lock().unwrap();
+            scan.expanded = 0;
+            scan.content(&job.name, &job.bytes, &job.encoding, job.vendor, false, 0);
+        }
+        for error in scan.errors {
+            if state.errors.len() < MAX_ERRORS {
+                state.errors.insert(error);
+            }
+        }
         if state.errors.is_empty() {
-            Ok(state.report)
+            Ok(scan.report)
         } else {
             Err(state.errors.iter().cloned().collect::<Vec<_>>().join("\n"))
         }
@@ -184,18 +200,23 @@ impl Audit {
                     "https://packages.mozilla.org",
                     "https://downloads.claude.ai",
                     "https://releases.openai.com",
+                    // OpenAI's Codex model catalog.
+                    "https://raw.githubusercontent.com",
+                    "https://chatgpt.com/backend-api/codex/models",
                 ]
                 .contains(&origin)
         });
+        let job = Arc::new(Mutex::new(Job {
+            name: format!("{} {}", source.kind, source.name),
+            bytes: Vec::new(),
+            encoding: source.encoding.to_owned(),
+            vendor,
+            complete: false,
+        }));
+        self.shared.state.lock().unwrap().open.push(job.clone());
         Sink {
             audit: self.clone(),
-            job: Some(Job {
-                name: format!("{} {}", source.kind, source.name),
-                bytes: Vec::new(),
-                encoding: source.encoding.to_owned(),
-                vendor,
-                complete: false,
-            }),
+            job: Some(job),
             overflow: false,
         }
     }
@@ -221,14 +242,17 @@ impl Observer for Audit {
 
 struct Sink {
     audit: Audit,
-    job: Option<Job>,
+    job: Option<Arc<Mutex<Job>>>,
     overflow: bool,
 }
 
 impl ContentSink for Sink {
     fn write(&mut self, bytes: &[u8]) {
-        let job = self.job.as_mut().unwrap();
+        let Some(job) = &self.job else {
+            return;
+        };
         let mut state = self.audit.shared.state.lock().unwrap();
+        let mut job = job.lock().unwrap();
         if self.overflow {
             return;
         }
@@ -248,14 +272,19 @@ impl ContentSink for Sink {
         job.bytes.extend_from_slice(bytes);
     }
     fn finish(&mut self) {
-        self.job.as_mut().unwrap().complete = true;
+        self.submit(true);
     }
 }
 
-impl Drop for Sink {
-    fn drop(&mut self) {
-        let job = self.job.take().unwrap();
+impl Sink {
+    fn submit(&mut self, complete: bool) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
         let mut state = self.audit.shared.state.lock().unwrap();
+        state.open.retain(|open| !Arc::ptr_eq(open, &job));
+        let mut job = Arc::try_unwrap(job).ok().unwrap().into_inner().unwrap();
+        job.complete = complete;
         state.pending += 1;
         if let Err(error) = self.audit.jobs.try_send(job) {
             let (mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) = error;
@@ -268,6 +297,30 @@ impl Drop for Sink {
             }
         }
     }
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        self.submit(false);
+    }
+}
+
+fn decode_html(text: &str) -> String {
+    let mut parts = text.split('&');
+    let mut decoded = parts.next().unwrap_or_default().to_owned();
+    for part in parts {
+        let reference = part.find(';').map(|end| &part[..=end]);
+        if let Some(reference) = reference
+            && let Ok(value) = quick_xml::escape::unescape(&format!("&{reference}"))
+        {
+            decoded.push_str(&value);
+            decoded.push_str(&part[reference.len()..]);
+        } else {
+            decoded.push('&');
+            decoded.push_str(part);
+        }
+    }
+    decoded
 }
 
 struct Scan {
@@ -284,7 +337,7 @@ impl Scan {
     }
 
     fn text(&mut self, name: &str, bytes: &[u8], vendor: bool) {
-        let mut text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+        let mut text = decode_html(&String::from_utf8_lossy(bytes)).to_ascii_lowercase();
         // These URL paths describe the article subjects, not run settings.
         if name != "file installed path" {
             text = text
@@ -298,7 +351,7 @@ impl Scan {
         }
         if vendor {
             let decoded = percent_encoding::percent_decode_str(&text).decode_utf8_lossy();
-            let decoded = quick_xml::escape::unescape(&decoded).unwrap_or_else(|_| decoded.clone());
+            let decoded = decode_html(&decoded).to_ascii_lowercase();
             if decoded != text {
                 for word in NAMES {
                     if decoded.contains(word) {
@@ -325,7 +378,7 @@ impl Scan {
             }
         }
         let decoded = percent_encoding::percent_decode_str(&text).decode_utf8_lossy();
-        let decoded = quick_xml::escape::unescape(&decoded).unwrap_or_else(|_| decoded.clone());
+        let decoded = decode_html(&decoded).to_ascii_lowercase();
         if decoded != text {
             for word in NAMES {
                 if decoded.contains(word) {
@@ -538,6 +591,123 @@ mod tests {
         .unwrap();
         zip.write_all(bytes).unwrap();
         zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn completed_content_is_checked_before_drop() {
+        let audit = Audit::default();
+        let mut sink = audit.sink(Content {
+            kind: "service",
+            name: "smtp",
+            encoding: "",
+            origin: None,
+        });
+        sink.write(b"220 fictionet simulation ready\r\n");
+        sink.finish();
+        let result = audit.check();
+        assert!(
+            result.as_ref().is_err_and(|error| error.contains("fictionet")
+                && error.contains("simulation")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn open_content_is_checked_across_writes() {
+        let audit = Audit::default();
+        let mut sink = audit.sink(Content {
+            kind: "service",
+            name: "response",
+            encoding: "",
+            origin: None,
+        });
+        sink.write(b"fiction");
+        let report = audit.check().unwrap();
+        assert_eq!((report.contents, report.bytes), (1, 7));
+        sink.write(b"et");
+        let result = audit.check();
+        assert!(
+            result.as_ref().is_err_and(|error| error.contains("fictionet")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn completed_content_is_counted_once_while_alive() {
+        let audit = Audit::default();
+        let mut sink = audit.sink(Content {
+            kind: "service",
+            name: "smtp",
+            encoding: "",
+            origin: None,
+        });
+        sink.write(b"220 ready\r\n");
+        sink.finish();
+        let report = audit.check().unwrap();
+        assert_eq!((report.contents, report.bytes), (1, 11));
+        sink.finish();
+        let report = audit.check().unwrap();
+        assert_eq!((report.contents, report.bytes), (1, 11));
+        drop(sink);
+        let report = audit.check().unwrap();
+        assert_eq!((report.contents, report.bytes), (1, 11));
+    }
+
+    #[test]
+    fn entity_encoded_html_is_checked() {
+        let bytes = b"<p>&nbsp;F&#105;ctionet</p>";
+        assert_eq!(bytes.len(), 27);
+        let audit = Audit::default();
+        audit.inspect("page", bytes);
+        let result = audit.check();
+        assert!(
+            result.as_ref().is_err_and(|error| error.contains("fictionet")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn first_party_html_entities_are_decoded_independently() {
+        for bytes in [
+            b"&copy;F&#x69;ctionet".as_slice(),
+            b"&bogus;F&#105;ctionet",
+            b"&#invalid;F&#105;ctionet",
+            b"&broken F&#105;ctionet",
+        ] {
+            let audit = Audit::default();
+            audit.inspect("page", bytes);
+            let result = audit.check();
+            assert!(
+                result.as_ref().is_err_and(|error| error.contains("fictionet")),
+                "{bytes:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_html_entities_are_decoded_independently() {
+        for bytes in [
+            b"&copy;F&#x69;ctionet".as_slice(),
+            b"&bogus;F&#105;ctionet",
+            b"&#invalid;F&#105;ctionet",
+            b"&broken F&#105;ctionet",
+        ] {
+            let audit = Audit::default();
+            let mut sink = audit.sink(Content {
+                kind: "http",
+                name: "page",
+                encoding: "",
+                origin: Some("host package cache"),
+            });
+            sink.write(bytes);
+            sink.finish();
+            drop(sink);
+            let result = audit.check();
+            assert!(
+                result.as_ref().is_err_and(|error| error.contains("fictionet")),
+                "{bytes:?}: {result:?}"
+            );
+        }
     }
 
     #[test]

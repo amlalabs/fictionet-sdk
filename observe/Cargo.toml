@@ -27,6 +27,7 @@ serde_path_to_error = { version = "0.1", optional = true }
 getrandom = { version = "0.4", optional = true }
 
 [dev-dependencies]
+divan = "0.1.21"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 # The tests run real worlds on threads, which needs the SDK on std.
 fictionet = { path = "..", default-features = false, features = ["std"] }
@@ -35,3 +36,7 @@ tokio = { version = "1", features = ["signal"] }
 [[example]]
 name = "page_fixture"
 required-features = ["page"]
+
+[[bench]]
+name = "key_retention"
+harness = false

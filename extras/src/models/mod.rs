@@ -369,7 +369,14 @@ pub struct Model {
     engine: Option<Arc<dyn Engine>>,
     seal: Arc<splice::Seal>,
     continued: Arc<Mutex<Continued>>,
+    catalog: Option<Catalog>,
 }
+#[derive(Clone)]
+enum Catalog {
+    Forward(String),
+    Answer { origin: String, body: Bytes },
+}
+
 /// Searched Responses ids: the id a client saw, and the final upstream turn
 /// that holds the whole response. The oldest go first past the bound.
 #[derive(Default)]
@@ -454,8 +461,42 @@ impl Model {
             engine: None,
             seal: Arc::new(splice::Seal::new(cx)),
             continued: Arc::default(),
+            catalog: None,
         }
     }
+    /// Serves Codex's API-key catalog from an origin or a supplied catalog.
+    pub fn codex_catalog(
+        &self,
+        origin: http::Uri,
+        answer: Option<(String, Bytes)>,
+    ) -> fictionet::Result<Self> {
+        if self.provider != Provider::OpenAi || self.credential.oauth.is_some() {
+            return Err(Error::msg(
+                "Codex API-key catalogs require an OpenAI model site",
+            ));
+        }
+        if answer.is_none() && self.upstream_provider != Provider::OpenAi {
+            return Err(Error::msg(
+                "Codex catalogs require a supplied catalog when the upstream is not OpenAI",
+            ));
+        }
+        let mut site = Self::at(
+            &self.cx,
+            Provider::ChatGpt,
+            self.credential.clone(),
+            origin.clone(),
+        )?;
+        site.ledger = self.ledger.clone();
+        site.catalog = Some(match answer {
+            Some((origin, body)) => Catalog::Answer { origin, body },
+            None => Catalog::Forward(format!(
+                "{}/backend-api/codex/models",
+                origin.to_string().trim_end_matches('/'),
+            )),
+        });
+        Ok(site)
+    }
+
     /// Installs a budget shared by all clones.
     pub fn budget(self, budget: Budget) -> Self {
         self.set_budget(budget);
@@ -550,6 +591,13 @@ impl Model {
     }
     async fn send(mut self, request: Request<Body>) -> fictionet::Result<Response<Body>> {
         let path = request.uri().path().to_owned();
+        if self.catalog.is_some()
+            && (request.method() != http::Method::GET || path != "/backend-api/codex/models")
+        {
+            self.refused(&path, "path");
+            return Ok(self.provider.error(404, "not_found_error", "Not found"));
+        }
+
         if self.provider == Provider::Anthropic
             && request.method() == http::Method::GET
             && path == "/api/web/domain_info"
@@ -591,6 +639,12 @@ impl Model {
         if !self.authorized(request.headers()) {
             self.refused(&path, "credential");
             return Ok(self.unauthorized());
+        }
+        if let Some(Catalog::Answer { origin, body }) = &self.catalog {
+            return Ok(Response::builder()
+                .extension(fictionet::events::Fields::new().with("served_by", origin.clone()))
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))?);
         }
         let (mut parts, body) = request.into_parts();
         let bytes = match http_body_util::Limited::new(body, 32 * 1024 * 1024)
@@ -752,6 +806,9 @@ impl Model {
         let result = self.forward.clone().call(request).await;
         match result {
             Ok(mut response) => {
+                if let Some(Catalog::Forward(origin)) = &self.catalog {
+                    set_catalog_origin(&mut response, origin);
+                }
                 call.status = response.status().as_u16();
                 let sse = response
                     .headers()
@@ -779,11 +836,18 @@ impl Model {
         }
     }
 }
+fn set_catalog_origin(response: &mut Response<Body>, origin: &str) {
+    response
+        .extensions_mut()
+        .get_or_insert_default::<fictionet::events::Fields>()
+        .set("forwarded", origin.to_owned());
+}
+
 /// The site's requests: a Responses WebSocket handshake gets its `101`
 /// here, and every other request runs as deferred work.
 impl httpd::Handler for Model {
     fn call(&self, request: Request<Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
-        if websocket::wanted(self.provider, &request) {
+        if self.catalog.is_none() && websocket::wanted(self.provider, &request) {
             return httpd::Reply::Now(websocket::accept(self.clone(), request));
         }
         let model = self.clone();
