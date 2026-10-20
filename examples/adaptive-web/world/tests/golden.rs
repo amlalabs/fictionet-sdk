@@ -109,9 +109,7 @@ fn the_log_is_the_recorded_one() {
     let fixed_pages: Vec<String> = seed.fixed.iter().map(|f| f.url.clone()).collect();
     let root = base.join("store").join(&seed.name);
     let (store, _) = Store::open(&root, &seed, Some(&Generator::Stub.identity())).unwrap();
-    let addresses = Arc::new(
-        Addresses::new(seed.fixed_addresses(), Some(&root.join("addresses.jsonl"))).unwrap(),
-    );
+    let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), Some(&root)).unwrap());
     let start = world_start(&seed.date).unwrap();
     let ca_dir = base.join("ca");
     let pages = Arc::new(Pages::open(seed, store, Some(Generator::Stub), 0));

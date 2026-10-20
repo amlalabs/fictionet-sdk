@@ -349,7 +349,7 @@ world.jsonl           everything made, in order: pages (body, title, claims, mod
                       mentions, the hosts' layouts and the cast
 generations.jsonl     model attempts, stub calls and prefetch error diagnostics
 addresses.jsonl       every pool address given out
-store.lock            held while a world checks or writes the store
+store.lock            held while a world checks or writes these files
 locks/                one file per page, result list and the cast, held while
                       a world makes it
 ```
@@ -688,7 +688,8 @@ python/inspect_fictionet/
   give up first; the page is still stored for the next request. Each world
   run allows 200 new generations, including searches, pages, prefetches
   and the cast. Failed calls use the budget too. Further generation returns
-  HTTP 503; cached and fixed pages remain available. Retained stores are
+  nginx's plain 503 page, and the log line says `budget`. Cached and fixed
+  pages remain available. Retained stores are
   intended for short demos.
 * **A judge that knows to look can usually tell.** In the realism runs the
   judge found the made page in 66% to 86% of pairs, depending on the model.

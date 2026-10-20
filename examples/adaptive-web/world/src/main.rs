@@ -113,10 +113,7 @@ fn real_main() -> fictionet::Result {
         std::env::var("ADAPTIVE_WEB_STORE").unwrap_or_else(|_| "/var/lib/adaptive-web".into());
     let root = Path::new(&stores).join(&seed.name);
     let (store, _) = Store::open(&root, &seed, identity.as_ref()).map_err(fictionet::Error::msg)?;
-    let addresses = Arc::new(Addresses::new(
-        seed.fixed_addresses(),
-        Some(&root.join("addresses.jsonl")),
-    )?);
+    let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), Some(&root))?);
     let start = world_start(&seed.date)?;
 
     // 3. Ground truth files.

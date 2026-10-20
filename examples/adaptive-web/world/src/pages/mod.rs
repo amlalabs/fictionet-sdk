@@ -40,6 +40,7 @@ pub mod text;
 pub use meta::Meta;
 pub use seed::Seed;
 
+use crate::files::FileLock;
 use crate::route::{Engine, Route, query_key, route};
 use crate::search::{Cache, GeneratorKind, Reason};
 use fictionet::Cx;
@@ -232,15 +233,7 @@ struct Locks {
 /// A key's lock, held until dropped.
 struct KeyLock {
     _local: tokio::sync::OwnedMutexGuard<()>,
-    file: Option<std::fs::File>,
-}
-
-impl Drop for KeyLock {
-    fn drop(&mut self) {
-        if let Some(file) = &self.file {
-            let _ = file.unlock();
-        }
-    }
+    _file: Option<FileLock>,
 }
 
 impl Locks {
@@ -256,7 +249,7 @@ impl Locks {
         let Some(dir) = &self.dir else {
             return Ok(KeyLock {
                 _local: local,
-                file: None,
+                _file: None,
             });
         };
         std::fs::create_dir_all(dir)?;
@@ -277,25 +270,23 @@ impl Locks {
             .truncate(false)
             .write(true)
             .open(dir.join(name))?;
+        // Another world may hold it while it makes the item, for seconds,
+        // so this world waits without blocking its thread.
         loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    if cx
-                        .sleep(std::time::Duration::from_millis(50))
-                        .await
-                        .is_err()
-                    {
-                        return Err(std::io::Error::other("the world stopped"));
-                    }
-                }
-                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            if let Some(held) = FileLock::try_take(&file)? {
+                return Ok(KeyLock {
+                    _local: local,
+                    _file: Some(held),
+                });
+            }
+            if cx
+                .sleep(std::time::Duration::from_millis(50))
+                .await
+                .is_err()
+            {
+                return Err(std::io::Error::other("the world stopped"));
             }
         }
-        Ok(KeyLock {
-            _local: local,
-            file: Some(file),
-        })
     }
 }
 

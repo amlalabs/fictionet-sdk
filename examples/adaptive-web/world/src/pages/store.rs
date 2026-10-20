@@ -10,7 +10,7 @@
 //! world.jsonl        everything made, one object per line, in order
 //! generations.jsonl  every model attempt, stub call and prefetch error
 //! addresses.jsonl    every pool address given out (see `Addresses`)
-//! store.lock         held while a world checks or writes the store
+//! store.lock         held while a world checks or writes these files
 //! locks/             one lock file per page, result list and the cast
 //! ```
 //!
@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ use super::make::{self, Profile};
 use super::model::Usage;
 use super::prompts::{Claim, HostPage, Person};
 use super::{Generation, Seed};
-use crate::FileLock;
+use crate::files::{self, Appended, FileLock};
 
 /// The format of `store.json` and `world.jsonl`.
 const VERSION: u64 = 1;
@@ -137,11 +137,7 @@ mod body {
 
 struct Files {
     root: PathBuf,
-    /// `world.jsonl`, read from `read` on and appended to.
-    world: File,
-    /// The bytes and lines of `world.jsonl` applied so far.
-    read: u64,
-    lines: usize,
+    world: Appended,
     generations: File,
     /// `store.lock`.
     lock: File,
@@ -209,12 +205,7 @@ impl Store {
     ) -> Result<(Self, Value), String> {
         let fail = |e: io::Error| format!("{}: {e}", root.display());
         std::fs::create_dir_all(root).map_err(fail)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(root.join("store.lock"))
-            .map_err(fail)?;
+        let lock = files::store_lock(root).map_err(fail)?;
         let held = FileLock::take(&lock).map_err(fail)?;
         let identity_path = root.join("store.json");
         let declared = seed.declaration();
@@ -257,21 +248,16 @@ impl Store {
                 identity["generator"].clone()
             }
         };
-        let append = |name: &str| {
-            OpenOptions::new()
-                .create(true)
-                .read(true)
-                .append(true)
-                .open(root.join(name))
-                .map_err(fail)
-        };
+        let generations = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("generations.jsonl"))
+            .map_err(fail)?;
         let mut store = Self::memory();
         store.files = Some(Files {
             root: root.to_owned(),
-            world: append("world.jsonl")?,
-            read: 0,
-            lines: 0,
-            generations: append("generations.jsonl")?,
+            world: Appended::open(&root.join("world.jsonl")).map_err(|e| e.to_string())?,
+            generations,
             lock,
         });
         store.read_on(true).map_err(|e| e.to_string())?;
@@ -280,40 +266,17 @@ impl Store {
     }
 
     /// Applies what other worlds have written to `world.jsonl` since this
-    /// world last read it. Without `store.lock` a line still being written
-    /// waits for the next read. While it is held (`held`), every line is
-    /// finished, and one without its newline is an error. Nothing is
-    /// applied if a line is not an entry.
+    /// world last read it; `held` says whether this world holds
+    /// `store.lock` (see [`Appended::read_on`]).
     fn read_on(&mut self, held: bool) -> io::Result<()> {
         let Some(files) = &mut self.files else {
             return Ok(());
         };
-        let mut text = Vec::new();
-        files.world.seek(SeekFrom::Start(files.read))?;
-        files.world.read_to_end(&mut text)?;
-        let path = files.root.join("world.jsonl");
-        let bad = |line: usize, why: String| {
-            let why = format!("{}: line {line}: {why}", path.display());
-            io::Error::new(io::ErrorKind::InvalidData, why)
-        };
-        let complete = text
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |end| end + 1);
-        let entries = text[..complete]
-            .split_inclusive(|&b| b == b'\n')
-            .enumerate()
-            .map(|(i, line)| {
-                serde_json::from_slice::<Entry>(line)
-                    .map_err(|e| bad(files.lines + 1 + i, e.to_string()))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        if held && complete < text.len() {
-            let line = files.lines + 1 + entries.len();
-            return Err(bad(line, "the line is unfinished".into()));
-        }
-        files.read += complete as u64;
-        files.lines += entries.len();
+        let mut entries = Vec::new();
+        files.world.read_on(held, |entry: Entry| {
+            entries.push(entry);
+            Ok(())
+        })?;
         for entry in entries {
             self.apply(entry);
         }
@@ -376,11 +339,7 @@ impl Store {
     /// applied if the write fails. The caller holds `store.lock`.
     fn record(&mut self, entry: Entry) -> io::Result<()> {
         if let Some(files) = &mut self.files {
-            let mut line = serde_json::to_vec(&entry).map_err(io::Error::other)?;
-            line.push(b'\n');
-            files.world.write_all(&line)?;
-            files.read += line.len() as u64;
-            files.lines += 1;
+            files.world.append(&entry)?;
         }
         self.apply(entry);
         Ok(())

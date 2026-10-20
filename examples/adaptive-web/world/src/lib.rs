@@ -76,14 +76,14 @@
 //! ```
 
 pub mod events;
+mod files;
 pub mod handler;
 pub mod pages;
 pub mod route;
 pub mod search;
 
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -92,9 +92,10 @@ use std::time::SystemTime;
 use fictionet::Cx;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 
 use example_common::log::Log;
+use files::{Appended, FileLock};
 use pages::Pages;
 
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
@@ -155,30 +156,11 @@ pub fn admit(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// A file's lock, held until dropped. Worlds sharing a store take its
-/// files' locks to read what the others wrote and then write.
-pub(crate) struct FileLock(std::fs::File);
-
-impl FileLock {
-    pub(crate) fn take(file: &std::fs::File) -> io::Result<Self> {
-        let file = file.try_clone()?;
-        file.lock()?;
-        Ok(Self(file))
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // Closing a clone does not release the lock; the others share it.
-        let _ = self.0.unlock();
-    }
-}
-
 /// Every host's address: fixed ones (search engines, the seed), ones
 /// recorded on the same store, then the next free one from the pools.
 /// Recorded history must be readable and consistent. New addresses are
 /// published only after their records have been written. Worlds sharing a
-/// store assign under the record's lock, after reading what the others
+/// store assign under `store.lock`, after reading what the others
 /// recorded, so each address goes to one host.
 pub struct Addresses {
     fixed: Vec<String>,
@@ -191,84 +173,52 @@ struct Inner {
     /// The host each recorded address was recorded for.
     recorded: HashMap<Ipv4Addr, String>,
     next: u32,
-    record: Box<dyn Write + Send>,
-    needs_newline: bool,
     failure: Option<(io::ErrorKind, String)>,
-    path: std::path::PathBuf,
-    /// The store's `addresses.jsonl`, to lock and read, and the bytes and
-    /// lines of it applied so far.
-    file: Option<std::fs::File>,
-    read: u64,
-    lines: usize,
+    /// The store's `addresses.jsonl` and `store.lock`, for a world with a
+    /// store.
+    record: Option<Record>,
+}
+
+struct Record {
+    lines: Appended,
+    lock: std::fs::File,
+}
+
+/// One line of `addresses.jsonl`.
+#[derive(Serialize, Deserialize)]
+struct Assigned {
+    host: String,
+    addr: Ipv4Addr,
 }
 
 impl Inner {
-    /// Applies the record's lines that follow the ones applied so far.
-    fn apply(&mut self, text: &str) -> io::Result<()> {
-        for line in text.lines() {
-            self.lines += 1;
-            let bad = |why: String| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{}: line {}: {why}", self.path.display(), self.lines),
-                )
-            };
-            let v: Value = serde_json::from_str(line).map_err(|e| bad(e.to_string()))?;
-            let host = v["host"]
-                .as_str()
-                .ok_or_else(|| bad("record needs a string host".into()))?;
-            let addr: Ipv4Addr = v["addr"]
-                .as_str()
-                .ok_or_else(|| bad("record needs a string addr".into()))?
-                .parse()
-                .map_err(|e: std::net::AddrParseError| bad(e.to_string()))?;
-            if let Some(previous) = self.recorded.get(&addr)
-                && previous != host
-            {
-                return Err(bad(format!(
-                    "{addr} is recorded for both {previous} and {host}"
-                )));
-            }
-            self.recorded.insert(addr, host.to_owned());
-            if let Some((previous, _)) = self.by_host.get(host) {
-                if *previous != addr {
-                    return Err(bad(format!("{host} has both {previous} and {addr}")));
-                }
-                continue;
-            }
-            if !self.used.insert(addr) {
-                return Err(bad(format!("{addr} is already assigned to another host")));
-            }
-            self.by_host.insert(host.to_owned(), (addr, "recorded"));
-        }
-        if !text.is_empty() {
-            self.needs_newline = !text.ends_with('\n');
-        }
-        Ok(())
-    }
-
-    /// Applies what other worlds have appended to the store's record. The
-    /// caller holds its lock. A failed read leaves the offset, so the next
-    /// read tries the same lines again.
+    /// Applies what this and other worlds have appended to the record since
+    /// it was last read. The caller holds `store.lock`.
     fn read_on(&mut self) -> io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
-        let Some(file) = &mut self.file else {
+        let Some(record) = &mut self.record else {
             return Ok(());
         };
-        let mut bytes = Vec::new();
-        file.seek(SeekFrom::Start(self.read))?;
-        file.read_to_end(&mut bytes)?;
-        let text = String::from_utf8(bytes).map_err(|e| {
-            let why = format!("cannot read {}: {e}", self.path.display());
-            io::Error::new(io::ErrorKind::InvalidData, why)
-        })?;
-        let lines = self.lines;
-        if let Err(e) = self.apply(&text) {
-            self.lines = lines;
-            return Err(e);
-        }
-        self.read += text.len() as u64;
-        Ok(())
+        let (by_host, used, recorded) = (&mut self.by_host, &mut self.used, &mut self.recorded);
+        record.lines.read_on(true, |line: Assigned| {
+            let Assigned { host, addr } = line;
+            if let Some(previous) = recorded.get(&addr)
+                && *previous != host
+            {
+                return Err(format!("{addr} is recorded for both {previous} and {host}"));
+            }
+            recorded.insert(addr, host.clone());
+            if let Some((previous, _)) = by_host.get(&host) {
+                if *previous != addr {
+                    return Err(format!("{host} has both {previous} and {addr}"));
+                }
+                return Ok(());
+            }
+            if !used.insert(addr) {
+                return Err(format!("{addr} is already assigned to another host"));
+            }
+            by_host.insert(host, (addr, "recorded"));
+            Ok(())
+        })
     }
 }
 
@@ -280,58 +230,38 @@ const POOLS: [[u8; 2]; 2] = [[104, 21], [172, 67]];
 
 impl Addresses {
     /// `fixed` maps hosts to addresses with the reason (`"search engine"`,
-    /// `"seed"`). `record`, if given, is the store's `addresses.jsonl`: its
-    /// lines are read first, as `"recorded"`, and new assignments are
-    /// appended to it. A missing file starts a new store. Other read errors,
-    /// invalid records and conflicting assignments fail construction.
+    /// `"seed"`). With `store`, the store's directory, its
+    /// `addresses.jsonl` is read first, as `"recorded"`, and new
+    /// assignments are appended to it. A missing file starts a new record.
+    /// Other read errors, invalid records and conflicting assignments fail
+    /// construction.
     pub fn new(
         fixed: HashMap<String, (Ipv4Addr, &'static str)>,
-        record: Option<&Path>,
-    ) -> io::Result<Addresses> {
-        let Some(path) = record else {
-            return Self::from_record(fixed, Path::new("<memory>"), "", Box::new(io::sink()));
-        };
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| {
-                io::Error::new(e.kind(), format!("cannot read {}: {e}", path.display()))
-            })?;
-        let addresses = Self::from_record(fixed, path, "", Box::new(file.try_clone()?))?;
-        {
-            let mut inner = addresses.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let _held = FileLock::take(&file)?;
-            inner.file = Some(file);
-            inner.read_on()?;
-        }
-        Ok(addresses)
-    }
-
-    fn from_record(
-        fixed: HashMap<String, (Ipv4Addr, &'static str)>,
-        path: &Path,
-        text: &str,
-        record: Box<dyn Write + Send>,
+        store: Option<&Path>,
     ) -> io::Result<Addresses> {
         let mut names: Vec<_> = fixed.keys().cloned().collect();
         names.sort();
-        let used = fixed.values().map(|(a, _)| *a).collect();
+        let record = store
+            .map(|root| {
+                Ok::<_, io::Error>(Record {
+                    lines: Appended::open(&root.join("addresses.jsonl"))?,
+                    lock: files::store_lock(root)?,
+                })
+            })
+            .transpose()?;
         let mut inner = Inner {
+            used: fixed.values().map(|(a, _)| *a).collect(),
             by_host: fixed,
-            used,
             recorded: HashMap::new(),
             next: 0,
-            record,
-            needs_newline: false,
             failure: None,
-            path: path.to_owned(),
-            file: None,
-            read: 0,
-            lines: 0,
+            record,
         };
-        inner.apply(text)?;
+        let held = (inner.record.as_ref())
+            .map(|r| FileLock::take(&r.lock))
+            .transpose()?;
+        inner.read_on()?;
+        drop(held);
         Ok(Addresses {
             fixed: names,
             inner: Mutex::new(inner),
@@ -352,7 +282,9 @@ impl Addresses {
         if let Some((kind, reason)) = &inner.failure {
             return Err(io::Error::new(*kind, reason.clone()));
         }
-        let _held = inner.file.as_ref().map(FileLock::take).transpose()?;
+        let _held = (inner.record.as_ref())
+            .map(|r| FileLock::take(&r.lock))
+            .transpose()?;
         inner.read_on()?;
         if let Some(found) = inner.by_host.get(host) {
             return Ok(Some(*found));
@@ -373,18 +305,18 @@ impl Addresses {
         }) else {
             return Ok(None);
         };
-        let line = format!(
-            "{}{}\n",
-            if inner.needs_newline { "\n" } else { "" },
-            json!({"host": host, "addr": addr.to_string()}),
-        );
-        if let Err(e) = inner.record.write_all(line.as_bytes()) {
+        let line = Assigned {
+            host: host.to_owned(),
+            addr,
+        };
+        let appended = match &mut inner.record {
+            Some(record) => record.lines.append(&line),
+            None => Ok(()),
+        };
+        if let Err(e) = appended {
             inner.failure = Some((e.kind(), e.to_string()));
             return Err(e);
         }
-        inner.read += line.len() as u64;
-        inner.lines += 1;
-        inner.needs_newline = false;
         inner.used.insert(addr);
         inner.recorded.insert(addr, host.to_owned());
         inner.by_host.insert(host.to_owned(), (addr, "pool"));
@@ -590,6 +522,8 @@ pub fn net(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_dir(name: &str) -> std::path::PathBuf {
@@ -622,14 +556,14 @@ mod tests {
             r#"{"host":"partial.com","addr":"104.21."#,
         ] {
             std::fs::write(&path, format!("{first}{bad}\n")).unwrap();
-            let error = Addresses::new(fixed.clone(), Some(&path)).err().unwrap();
+            let error = Addresses::new(fixed.clone(), Some(&dir)).err().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{bad}");
             let reason = error.to_string();
             assert!(reason.contains(path.to_str().unwrap()), "{reason}");
             assert!(reason.contains("line 2"), "{reason}");
         }
         std::fs::write(&path, format!("{first}{first}")).unwrap();
-        let addresses = Addresses::new(fixed, Some(&path)).unwrap();
+        let addresses = Addresses::new(fixed, Some(&dir)).unwrap();
         assert_eq!(
             addresses.assign("first.com").unwrap(),
             Some((Ipv4Addr::new(104, 21, 48, 57), "recorded"))
@@ -641,13 +575,13 @@ mod tests {
                 (Ipv4Addr::new(104, 21, 48, 57), "seed"),
             ),
         ]);
-        assert!(Addresses::new(fixed.clone(), Some(&path)).is_ok());
+        assert!(Addresses::new(fixed.clone(), Some(&dir)).is_ok());
         std::fs::write(
             &path,
             format!("{first}{}", first.replace("first.com", "second.com")),
         )
         .unwrap();
-        let error = Addresses::new(fixed, Some(&path)).err().unwrap();
+        let error = Addresses::new(fixed, Some(&dir)).err().unwrap();
         assert!(error.to_string().contains("line 2"));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -657,15 +591,14 @@ mod tests {
     #[test]
     fn worlds_sharing_a_record_agree() {
         let dir = test_dir("shared-record");
-        let path = dir.join("addresses.jsonl");
-        let a = Addresses::new(HashMap::new(), Some(&path)).unwrap();
-        let b = Addresses::new(HashMap::new(), Some(&path)).unwrap();
+        let a = Addresses::new(HashMap::new(), Some(&dir)).unwrap();
+        let b = Addresses::new(HashMap::new(), Some(&dir)).unwrap();
         let first = a.assign("first.com").unwrap().unwrap().0;
         let second = b.assign("second.com").unwrap().unwrap().0;
         assert_ne!(first, second);
         assert_eq!(b.assign("first.com").unwrap(), Some((first, "recorded")));
         assert_eq!(a.assign("second.com").unwrap(), Some((second, "recorded")));
-        let later = Addresses::new(HashMap::new(), Some(&path)).unwrap();
+        let later = Addresses::new(HashMap::new(), Some(&dir)).unwrap();
         assert_eq!(
             later.assign("first.com").unwrap(),
             Some((first, "recorded"))
@@ -682,7 +615,7 @@ mod tests {
         let dir = test_dir("unreadable-record");
         let path = dir.join("addresses.jsonl");
         std::fs::write(&path, [0xff]).unwrap();
-        let error = Addresses::new(HashMap::new(), Some(&path)).err().unwrap();
+        let error = Addresses::new(HashMap::new(), Some(&dir)).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains(path.to_str().unwrap()));
         assert_eq!(std::fs::read(&path).unwrap(), [0xff]);
@@ -700,19 +633,37 @@ mod tests {
         }
     }
 
+    /// Addresses on a store in `dir` that append to `writer`.
+    fn writing_to(
+        fixed: HashMap<String, (Ipv4Addr, &'static str)>,
+        dir: &Path,
+        writer: impl Write + Send + 'static,
+    ) -> Addresses {
+        let addresses = Addresses::new(fixed, Some(dir)).unwrap();
+        let mut inner = addresses.inner.lock().unwrap();
+        inner
+            .record
+            .as_mut()
+            .unwrap()
+            .lines
+            .set_writer(Box::new(writer));
+        drop(inner);
+        addresses
+    }
+
     #[test]
     fn failing_writer() {
+        let dir = test_dir("failing-writer");
         let fixed_addr = Ipv4Addr::new(142, 250, 180, 4);
         let recorded_addr = Ipv4Addr::new(172, 67, 48, 57);
         let fixed = HashMap::from([("fixed.com".into(), (fixed_addr, "seed"))]);
-        let writes = Arc::new(AtomicUsize::new(0));
-        let addresses = Addresses::from_record(
-            fixed,
-            Path::new("addresses.jsonl"),
+        std::fs::write(
+            dir.join("addresses.jsonl"),
             "{\"host\":\"recorded.com\",\"addr\":\"172.67.48.57\"}\n",
-            Box::new(FailingWriter(writes.clone())),
         )
         .unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let addresses = writing_to(fixed, &dir, FailingWriter(writes.clone()));
         let error = addresses.assign("first.com").unwrap_err();
         assert_eq!(error.to_string(), "injected address write failure");
         for host in ["first.com", "second.com"] {
@@ -733,6 +684,8 @@ mod tests {
         assert_eq!(inner.by_host.len(), 2);
         assert!(!inner.by_host.contains_key("first.com"));
         assert_eq!(inner.used, HashSet::from([fixed_addr, recorded_addr]));
+        drop(inner);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     struct PartialWriter {
@@ -756,16 +709,12 @@ mod tests {
     fn restart_after_failed_append() {
         let dir = test_dir("failed-append");
         let path = dir.join("addresses.jsonl");
-        let addresses = Addresses::from_record(
-            HashMap::new(),
-            &path,
-            "",
-            Box::new(PartialWriter {
-                file: std::fs::File::create(&path).unwrap(),
-                wrote: false,
-            }),
-        )
-        .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let addresses = writing_to(HashMap::new(), &dir, PartialWriter { file, wrote: false });
         assert!(addresses.assign("first.com").is_err());
         assert!(addresses.inner.lock().unwrap().by_host.is_empty());
         let partial = std::fs::read(&path).unwrap();
@@ -773,7 +722,7 @@ mod tests {
         assert!(addresses.assign("second.com").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), partial);
         drop(addresses);
-        let error = Addresses::new(HashMap::new(), Some(&path)).err().unwrap();
+        let error = Addresses::new(HashMap::new(), Some(&dir)).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let reason = error.to_string();
         assert!(reason.contains(path.to_str().unwrap()), "{reason}");
@@ -781,19 +730,23 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The store's lock is held while the record is read, so every line in
+    /// it is finished. One without its newline was cut short.
     #[test]
-    fn append_after_record_without_newline() {
+    fn a_record_without_its_newline_is_corrupt() {
         let dir = test_dir("record-without-newline");
         let path = dir.join("addresses.jsonl");
-        std::fs::write(&path, r#"{"host":"first.com","addr":"104.21.48.57"}"#).unwrap();
-        let addresses = Addresses::new(HashMap::new(), Some(&path)).unwrap();
-        let second = addresses.assign("second.com").unwrap().unwrap().0;
-        drop(addresses);
-        let addresses = Addresses::new(HashMap::new(), Some(&path)).unwrap();
-        assert_eq!(
-            addresses.assign("second.com").unwrap(),
-            Some((second, "recorded"))
+        let first = r#"{"host":"first.com","addr":"104.21.48.57"}"#;
+        std::fs::write(&path, first).unwrap();
+        let error = Addresses::new(HashMap::new(), Some(&dir)).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let reason = error.to_string();
+        assert!(
+            reason.contains("line 1: the line is unfinished"),
+            "{reason}"
         );
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        let addresses = Addresses::new(HashMap::new(), Some(&dir)).unwrap();
         assert_eq!(
             addresses.assign("first.com").unwrap(),
             Some((Ipv4Addr::new(104, 21, 48, 57), "recorded"))
@@ -810,6 +763,8 @@ mod tests {
 
         let dir = test_dir("serve-failed-record");
         let path = dir.join("log.jsonl");
+        let store = dir.join("store");
+        std::fs::create_dir(&store).unwrap();
         let log = Arc::new(Log::new(
             Box::new(std::fs::File::create(&path).unwrap()),
             &[],
@@ -820,12 +775,8 @@ mod tests {
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
                 .observer(Arc::new(events::LogObserver { log: log.clone() })),
             move |fcx| async move {
-                let addresses = Arc::new(Addresses::from_record(
-                    HashMap::new(),
-                    Path::new("addresses.jsonl"),
-                    "",
-                    Box::new(FailingWriter(Arc::new(AtomicUsize::new(0)))),
-                )?);
+                let failing = FailingWriter(Arc::new(AtomicUsize::new(0)));
+                let addresses = Arc::new(writing_to(HashMap::new(), &store, failing));
                 let start = SystemTime::UNIX_EPOCH;
                 let ca = Arc::new(Ca {
                     issuer: fictionet::stdlib::services::ca::Ca::new(&fcx, "Test CA")?,
@@ -952,7 +903,7 @@ mod tests {
             "www.google.com".to_owned(),
             (Ipv4Addr::new(142, 250, 180, 4), "search engine"),
         )]);
-        let a = Addresses::new(fixed.clone(), Some(&file)).unwrap();
+        let a = Addresses::new(fixed.clone(), Some(&dir)).unwrap();
         assert_eq!(
             a.assign("www.google.com").unwrap(),
             Some((Ipv4Addr::new(142, 250, 180, 4), "search engine"))
@@ -965,7 +916,7 @@ mod tests {
         }
         let first = a.assign("host0.com").unwrap().unwrap().0;
         drop(a);
-        let again = Addresses::new(fixed, Some(&file)).unwrap();
+        let again = Addresses::new(fixed, Some(&dir)).unwrap();
         assert_eq!(
             again.assign("host0.com").unwrap(),
             Some((first, "recorded"))
