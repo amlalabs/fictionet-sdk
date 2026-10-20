@@ -733,6 +733,7 @@ pub mod egress;
 mod keys;
 mod loss;
 mod memory;
+mod ring;
 mod topology;
 
 #[cfg(feature = "page")]
@@ -915,7 +916,7 @@ impl Collector {
     }
     /// Retained TLS keys, ordered by stream sequence.
     pub fn keys(&self) -> Vec<Key> {
-        self.state.lock().keys.items.iter().cloned().collect()
+        self.state.lock().keys.ring.events.iter().cloned().collect()
     }
     /// Retained TLS keys in SSLKEYLOGFILE format.
     pub fn keylog(&self) -> String {
@@ -937,7 +938,7 @@ impl Collector {
     #[cfg(feature = "decode")]
     pub(crate) fn keys_after(&self, after: u64) -> Vec<Key> {
         let state = self.state.lock();
-        let items = &state.keys.items;
+        let items = &state.keys.ring.events;
         let start = items.partition_point(|k| k.stamp.seq <= after);
         items.range(start..).cloned().collect()
     }

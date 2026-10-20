@@ -1,11 +1,21 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fictionet::events::{LinkId, LinkType, LossReason, PacketRef, Side, Stamp};
 use fictionet::time::{Duration, Instant};
 
+use crate::ring::{Kept, Ring};
 use crate::{LossStatus, Options};
+
+impl Kept for PacketCopy {
+    fn stamp(&self) -> Stamp {
+        self.stamp
+    }
+    fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
 
 /// When a link's packets are retained.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,8 +99,7 @@ pub struct PacketBatch {
 #[derive(Default)]
 pub(crate) struct Capture {
     pub(crate) sandbox: Option<String>,
-    copies: VecDeque<PacketCopy>,
-    bytes: usize,
+    ring: Ring<PacketCopy>,
     next: u64,
     window: Option<Instant>,
     in_window: u64,
@@ -101,11 +110,13 @@ pub(crate) struct Capture {
 impl Capture {
     pub(crate) fn since(&self, after: u64, max: usize) -> PacketBatch {
         let first = self
-            .copies
+            .ring
+            .events
             .front()
             .map_or(self.next.saturating_add(1), |p| p.cursor);
         let packets: Vec<_> = self
-            .copies
+            .ring
+            .events
             .iter()
             .filter(|p| p.cursor > after)
             .take(max)
@@ -152,7 +163,8 @@ impl Captures {
         self.links
             .iter()
             .filter_map(|(id, c)| {
-                c.copies
+                c.ring
+                    .events
                     .front()
                     .map(|p| (*id, (c.removed.is_none(), c.removed.unwrap_or(p.order))))
             })
@@ -162,8 +174,7 @@ impl Captures {
 
     fn evict(&mut self, id: LinkId, losses: &mut LossStatus, loss_streams: usize) {
         let capture = self.links.get_mut(&id).expect("capture link");
-        if let Some(old) = capture.copies.pop_front() {
-            capture.bytes -= old.bytes.len();
+        if let Some(old) = capture.ring.evict() {
             self.bytes -= old.bytes.len();
             losses.record(
                 loss_streams,
@@ -176,8 +187,8 @@ impl Captures {
 
     pub(crate) fn remove(&mut self, id: LinkId, losses: &mut LossStatus, loss_streams: usize) {
         if let Some(capture) = self.links.remove(&id) {
-            self.bytes -= capture.bytes;
-            for old in capture.copies {
+            self.bytes -= capture.ring.bytes;
+            for old in capture.ring.events {
                 losses.record(
                     loss_streams,
                     old.stamp,
@@ -241,7 +252,7 @@ impl Captures {
         }
         if options.packets.count == 0 || len > options.packets.bytes || len > options.packet_bytes {
             capture.skipped = 0;
-            while !self.links[&packet.link].copies.is_empty() {
+            while !self.links[&packet.link].ring.events.is_empty() {
                 self.evict(packet.link, losses, options.loss_streams);
             }
             if len > options.packet_bytes {
@@ -263,18 +274,23 @@ impl Captures {
             skipped: std::mem::take(&mut capture.skipped),
             order: self.order,
         };
-        while self.links[&packet.link].copies.len() >= options.packets.count
-            || self.links[&packet.link].bytes > options.packets.bytes - len
-        {
-            self.evict(packet.link, losses, options.loss_streams);
-        }
+        capture
+            .ring
+            .make_room(len, options.packets.count, options.packets.bytes, |old| {
+                self.bytes -= old.bytes.len();
+                losses.record(
+                    options.loss_streams,
+                    old.stamp,
+                    LossReason::Eviction,
+                    old.bytes.len(),
+                );
+            });
         while self.bytes > options.packet_bytes - len {
             let oldest = self.oldest().expect("aggregate capture budget");
             self.evict(oldest, losses, options.loss_streams);
         }
         let capture = self.links.get_mut(&packet.link).expect("capture link");
-        capture.bytes += len;
         self.bytes += len;
-        capture.copies.push_back(copy);
+        capture.ring.push(copy);
     }
 }

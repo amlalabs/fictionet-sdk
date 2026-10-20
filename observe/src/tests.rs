@@ -899,3 +899,83 @@ fn aggregation_preserves_packets_keys_topology_and_loss() {
     .unwrap();
     assert!(collector.ended().is_some());
 }
+
+#[test]
+fn one_ring_evicts_the_same_way_for_events_packets_and_keys() {
+    struct KeysOnly(Arc<Collector>);
+    impl Observer for KeysOnly {
+        fn enabled(&self, interest: Interest<'_>) -> bool {
+            matches!(interest, Interest::TlsKey(_) | Interest::Topology(_))
+        }
+        fn observe(&self, stamp: Stamp, item: Observation<'_>) {
+            self.0.observe(stamp, item);
+        }
+    }
+    let event = fictionet::events::Event::new("test", "item").summary("x".repeat(512));
+    let size = event.size();
+    for bounds in [
+        Bounds {
+            count: 2,
+            bytes: size * 10,
+        },
+        Bounds {
+            count: 10,
+            bytes: size * 2,
+        },
+    ] {
+        let collector = Arc::new(Collector::new(Options {
+            events: Some(Limits::new(bounds.count, bounds.bytes)),
+            capture: CapturePolicy::Startup,
+            packets: bounds,
+            keys: Some(bounds),
+            ..Options::default()
+        }));
+        let reader = collector.clone();
+        let event = event.clone();
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1)).observer(Arc::new(KeysOnly(collector))),
+            move |cx| async move {
+                let (a, _b) = fictionet::pair();
+                let _a = cx.tap("test", a);
+                cx.yield_now().await?;
+                let link = *reader.topology().links.keys().next().unwrap();
+                let logger = cx.tls_key_log(None).unwrap();
+                let secret = vec![0; size - size_of::<Key>() - 1];
+                for seq in 1..=5 {
+                    reader.observe(
+                        Stamp {
+                            stream: Stream::Events,
+                            seq,
+                            at: Instant::ZERO,
+                        },
+                        Observation::Event(&event),
+                    );
+                    packet(&reader, link, seq, Instant::ZERO, &vec![0; size]);
+                    logger.log("k", &[], &secret);
+                }
+                assert_eq!(reader.events().retained(), (2, size * 2));
+                assert_eq!(reader.packets(link, 0, 10).packets.len(), 2);
+                assert_eq!(reader.keys().len(), 2);
+                for stream in [Stream::Events, Stream::Packets(link), Stream::Keys] {
+                    let rows: Vec<_> = reader
+                        .losses()
+                        .streams
+                        .into_iter()
+                        .filter(|loss| loss.stream == stream)
+                        .collect();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].reason, LossReason::Eviction);
+                    assert_eq!(rows[0].count, 3);
+                    if stream != Stream::Events {
+                        assert_eq!(rows[0].bytes, Some((3 * size) as u64));
+                    }
+                }
+                assert_eq!(reader.events().display_batch(None, 10).evicted, [3, 0]);
+                assert_eq!(reader.packets(link, 0, 10).missed, 3);
+                assert_eq!(reader.state.lock().keys.ring.evicted, 3);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+}

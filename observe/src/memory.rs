@@ -1,10 +1,24 @@
-use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::task::{Poll, Waker};
 
 use fictionet::sync::Mutex;
 
-use fictionet::events::{Event, Observation, Observer, Stamp};
+use fictionet::events::{Event, Observation, Observer, Stamp, Stream};
+
+use crate::ring::{Kept, Ring};
+
+impl Kept for Arc<Event> {
+    fn stamp(&self) -> Stamp {
+        Stamp {
+            stream: Stream::Events,
+            seq: self.seq,
+            at: self.at,
+        }
+    }
+    fn size(&self) -> usize {
+        Event::size(self)
+    }
+}
 
 /// Independent count and byte bounds for retained or queued events.
 #[derive(Clone, Copy, Debug)]
@@ -60,17 +74,10 @@ pub struct Memory {
 
 #[derive(Default)]
 struct State {
-    history: [History; 2],
+    history: [Ring<Arc<Event>>; 2],
     last: u64,
     dropped: u64,
     waiters: Vec<Weak<Mutex<Option<Waker>>>>,
-}
-
-#[derive(Default)]
-struct History {
-    events: VecDeque<Arc<Event>>,
-    bytes: usize,
-    evicted: u64,
 }
 
 /// A consistent history batch and cursors for displaying loss without counting
@@ -337,20 +344,12 @@ impl Observer for Memory {
         } else {
             let history = &mut state.history[index];
             let before = history.evicted;
-            while history.events.len() >= limits.events || history.bytes > limits.bytes - size {
-                let oldest = history
-                    .events
-                    .pop_front()
-                    .expect("retained event exceeds bounds");
-                history.bytes -= oldest.size();
-                history.evicted = history.evicted.saturating_add(1);
-            }
+            history.make_room(size, limits.events, limits.bytes, |_| {});
             let mut event = event.clone();
             event.seq = stamp.seq;
             event.at = stamp.at;
             // Cloning strings can shrink their capacity; charge the retained copy.
-            history.bytes += event.size();
-            history.events.push_back(Arc::new(event));
+            history.push(Arc::new(event));
             let evicted = history.evicted - before;
             state.dropped = state.dropped.saturating_add(evicted);
         }

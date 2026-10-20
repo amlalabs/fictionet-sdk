@@ -1,9 +1,18 @@
-use std::collections::VecDeque;
 use std::fmt;
 
 use fictionet::events::{ConnInfo, KeyRef, LossReason, Stamp};
 
+use crate::ring::{Kept, Ring};
 use crate::{Bounds, LossStatus};
+
+impl Kept for Key {
+    fn stamp(&self) -> Stamp {
+        self.stamp
+    }
+    fn size(&self) -> usize {
+        Key::size(self)
+    }
+}
 
 /// An owned TLS key. Debug output excludes its secret.
 #[derive(Clone)]
@@ -56,8 +65,7 @@ pub(crate) fn connection_bytes(conn: &ConnInfo) -> usize {
 
 #[derive(Default)]
 pub(crate) struct Keys {
-    pub(crate) items: VecDeque<Key>,
-    bytes: usize,
+    pub(crate) ring: Ring<Key>,
 }
 
 impl Keys {
@@ -78,19 +86,17 @@ impl Keys {
             losses.record(loss_streams, stamp, LossReason::Overflow, size);
             return;
         }
-        while self.items.len() >= bounds.count || self.bytes > bounds.bytes - size {
-            let old = self.items.pop_front().expect("key budget");
-            self.bytes -= old.size();
-            losses.record(loss_streams, old.stamp, LossReason::Eviction, old.size());
-        }
-        self.items.push_back(Key {
+        self.ring
+            .make_room(size, bounds.count, bounds.bytes, |old| {
+                losses.record(loss_streams, old.stamp, LossReason::Eviction, old.size());
+            });
+        self.ring.push(Key {
             stamp,
             label: key.label.into(),
             client_random: key.client_random.into(),
             secret: key.secret().into(),
             connection: key.connection.cloned(),
         });
-        self.bytes += size;
     }
 }
 
