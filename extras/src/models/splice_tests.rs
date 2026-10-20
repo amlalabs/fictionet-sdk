@@ -293,3 +293,168 @@ fn token_counting_with_web_tools_and_history_returns_the_count() {
     })).unwrap();
     server.join().unwrap();
 }
+
+#[derive(Clone, Copy)]
+enum Refusal {
+    Budget,
+    OAuth,
+    Upstream(u16, bool),
+}
+
+fn continuation_refusal(stream: bool, source: Refusal) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let status = match source {
+        Refusal::Budget => 400,
+        Refusal::OAuth => 429,
+        Refusal::Upstream(status, _) => status,
+    };
+    let kind = match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        402 => "billing_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
+    };
+    let upstream_body = match source {
+        Refusal::Upstream(_, true) => {
+            json!({"type":"error","error":{"type":kind,"message":"Try again later"}})
+        }
+        _ => json!({"error":{"code":status,"message":"Try again later"}}),
+    };
+    let sent = upstream_body.clone();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        receive(&mut socket);
+        response(
+            &mut socket,
+            vec![
+                json!({"type":"tool_use","id":"toolu_search","name":"web_search","input":{"query":"page"}}),
+            ],
+            "tool_use",
+            stream,
+        );
+        if let Refusal::Upstream(_, _) = source {
+            let (mut socket, _) = listener.accept().unwrap();
+            let continuation = receive(&mut socket);
+            assert_eq!(
+                continuation["messages"][2]["content"][0]["type"],
+                "tool_result"
+            );
+            let body = sent.to_string();
+            write!(socket, "HTTP/1.1 {status} Refused\r\nContent-Type: application/json\r\nRetry-After: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        listener.set_nonblocking(true).unwrap();
+        listener
+    });
+    let directory = if matches!(source, Refusal::OAuth) {
+        let mut bytes = [0; 8];
+        fictionet::random_bytes(&mut bytes).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("continuation-{}", u64::from_le_bytes(bytes)));
+        std::fs::create_dir(&directory).unwrap();
+        Some(directory)
+    } else {
+        None
+    };
+    let directory_path = directory.clone();
+    fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(13)), |cx| async move {
+        let mut credential = Credential::api_key(&cx, Secret::new("key", "private-key".into())?);
+        let expected = if let Some(directory) = directory_path {
+            let store = oauth::Store::open(directory.join("credentials.redb"))?;
+            store.put(oauth::Login::Claude, oauth::Tokens::new(
+                Secret::new("access", "sk-ant-oat01-host-access".into())?,
+                Secret::new("refresh", "host-refresh".into())?,
+                u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())? + 3600,
+            ))?;
+            let authority = oauth::OAuth::at(&cx, oauth::Login::Claude, store, format!("http://{address}").parse()?)?;
+            let expected = authority.stop();
+            credential = Credential { real: authority.secret().await?, placeholder: authority.placeholder(), oauth: Some(authority) };
+            expected
+        } else if matches!(source, Refusal::Budget) {
+            Provider::Anthropic.stop()
+        } else {
+            Response::builder().status(status).header("content-type", "application/json").header("retry-after", "7").body(Body::from(upstream_body.to_string()))?
+        };
+        let (expected_parts, expected_body) = expected.into_parts();
+        let expected_bytes = expected_body.collect().await?.to_bytes();
+        let expected_json: Value = serde_json::from_slice(&expected_bytes)?;
+        let key = credential.wire(Provider::Anthropic, false);
+        let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.search(Arc::new(Pages(AtomicUsize::new(0))));
+        let model = if matches!(source, Refusal::Upstream(_, _)) { model } else { model.budget(Budget::new().calls(1)) };
+        let request = Request::post("/v1/messages").header(if matches!(source, Refusal::OAuth) { "authorization" } else { "x-api-key" }, key)
+            .body(Body::from(json!({"model":"claude","stream":stream,"messages":[{"role":"user","content":"Search page"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}).to_string()))?;
+        let answer = model.clone().send(request).await?;
+        if stream {
+            assert_eq!(answer.status(), 200);
+            let bytes = answer.into_body().collect().await?.to_bytes();
+            let mut decoder = fictionet::stdlib::codec::Stream::new(fictionet::stdlib::protocols::sse::Events::new());
+            let mut events = Vec::new();
+            fictionet::stdlib::codec::try_pump(&mut decoder, &bytes, |event| {
+                events.push(serde_json::from_str::<Value>(&event.data).unwrap());
+                Ok::<_, fictionet::stdlib::protocols::sse::Error>(())
+            }).unwrap();
+            assert_eq!(events.last().unwrap(), &json!({"type":"error","error":{"type":kind,"message":expected_json["error"]["message"]}}));
+            assert_eq!(events.iter().filter(|event| event["type"] == "error").count(), 1);
+            assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+        } else {
+            assert_eq!(answer.status(), status);
+            for (name, value) in &expected_parts.headers {
+                if name.as_str().ends_with("reset") {
+                    assert!(answer.headers()[name].to_str()?.parse::<u64>().is_ok());
+                } else {
+                    assert_eq!(answer.headers().get(name), Some(value));
+                }
+            }
+            assert_eq!(answer.into_body().collect().await?.to_bytes(), expected_bytes);
+        }
+        assert_eq!(model.ledger.lock().unwrap().calls, if matches!(source, Refusal::Upstream(_, _)) { 2 } else { 1 });
+        cx.cancel();
+        Ok(())
+    })).unwrap();
+    let listener = server.join().unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    if let Some(directory) = directory {
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn continuation_budget_response() {
+    continuation_refusal(false, Refusal::Budget);
+}
+#[test]
+fn continuation_budget_stream() {
+    continuation_refusal(true, Refusal::Budget);
+}
+#[test]
+fn continuation_oauth_response() {
+    continuation_refusal(false, Refusal::OAuth);
+}
+#[test]
+fn continuation_oauth_stream() {
+    continuation_refusal(true, Refusal::OAuth);
+}
+#[test]
+fn continuation_rate_limit_response() {
+    continuation_refusal(false, Refusal::Upstream(429, true));
+}
+#[test]
+fn continuation_rate_limit_stream() {
+    continuation_refusal(true, Refusal::Upstream(429, true));
+}
+#[test]
+fn continuation_status_error_types() {
+    for status in [400, 401, 402, 403, 404, 413, 429, 529, 500] {
+        for stream in [false, true] {
+            continuation_refusal(stream, Refusal::Upstream(status, false));
+        }
+    }
+}

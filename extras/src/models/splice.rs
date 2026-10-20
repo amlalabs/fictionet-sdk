@@ -303,8 +303,12 @@ pub(super) async fn serve(
         output.sender = Some(tx.clone());
         let cx = model.cx.clone();
         cx.spawn(move |cx| async move {
-            if let Err(error) = run(model, engine, parts, body, tools, response, &mut output).await
-            {
+            let result = match run(model, engine, parts, body, tools, response, &mut output).await {
+                Ok(Some(refused)) => failed(refused, &mut output).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
                 cx.emit("model", "splice_error", |e| {
                     e.field("message", error.to_string())
                 });
@@ -316,13 +320,46 @@ pub(super) async fn serve(
             .header("content-type", "text/event-stream")
             .body(Body::new(Channel(rx)))?)
     } else {
-        run(model, engine, parts, body, tools, response, &mut output).await?;
+        if let Some(refused) = run(model, engine, parts, body, tools, response, &mut output).await?
+        {
+            return Ok(refused);
+        }
         output.message["content"] = json!(output.content);
         Ok(Response::builder()
             .header("content-type", "application/json")
             .body(Body::from(output.message.to_string()))?)
     }
 }
+/// Ends a stream whose continuation was refused, such as by a budget stop,
+/// with Anthropic's `error` event carrying the refusal's type and message.
+async fn failed(refused: Response<Body>, output: &mut Output) -> fictionet::Result<()> {
+    let kind = match refused.status().as_u16() {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        402 => "billing_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
+    };
+    let bytes = http_body_util::Limited::new(refused.into_body(), 64 * 1024)
+        .collect()
+        .await
+        .map(|body| body.to_bytes())
+        .unwrap_or_default();
+    let body = serde_json::from_slice::<Value>(&bytes).unwrap_or_default();
+    let kind = body["error"]["type"].as_str().unwrap_or(kind);
+    let message = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or("Model continuation was refused");
+    output
+        .event(json!({"type":"error","error":{"type":kind,"message":message}}))
+        .await
+}
+
 pub(super) async fn upstream(
     model: &Model,
     parts: &http::request::Parts,
@@ -519,7 +556,7 @@ async fn run(
     tools: Tools,
     mut response: Response<Body>,
     output: &mut Output,
-) -> fictionet::Result<()> {
+) -> fictionet::Result<Option<Response<Body>>> {
     let mut uses: std::collections::HashMap<String, u64> = Default::default();
     let mut output_tokens = 0u64;
     let mut searches = 0u64;
@@ -563,7 +600,7 @@ async fn run(
             output.message["stop_reason"] = turn.stop.clone();
             output.event(json!({"type":"message_delta","delta":{"stop_reason":turn.stop,"stop_sequence":null},"usage":usage})).await?;
             output.event(json!({"type":"message_stop"})).await?;
-            return Ok(());
+            return Ok(None);
         }
         let messages = body["messages"].as_array_mut().ok_or_else(invalid)?;
         messages.push(json!({"role":"assistant","content":turn.content}));
@@ -571,8 +608,7 @@ async fn run(
         body.as_object_mut().unwrap().remove("tool_choice");
         response = upstream(&model, &parts, &body).await?;
         if !response.status().is_success() {
-            output.event(json!({"type":"error","error":{"type":"api_error","message":"Model continuation was refused"}})).await?;
-            return Err(Error::msg("Model continuation was refused"));
+            return Ok(Some(response));
         }
     }
     Err(Error::msg("Server tool turn limit reached"))
