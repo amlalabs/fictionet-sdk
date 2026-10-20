@@ -283,12 +283,13 @@ async fn stream(
                     closing = true;
                     session.drain_pending(Instant::now());
                 }
+                () = http::hangup(conn) => return Ok(()),
                 () = tokio::time::sleep_until(next.min(heartbeat).into()) => {}
             }
         } else if next > Instant::now() {
             return end(conn).await;
         }
-        // A comment detects disconnects even when the world has no changes.
+        // A comment also finds a connection that went away without closing.
         if Instant::now() >= heartbeat {
             http::write(conn, b": ping\n\n").await?;
             written = Instant::now();

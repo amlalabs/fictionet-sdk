@@ -17,6 +17,7 @@ function key(row) {
 }
 
 export function mount(root, services, options) {
+  const { reconcile } = services.dom;
   const document = root.ownerDocument;
   function el(tag, cls, text, parent) {
     const node = document.createElement(tag);
@@ -39,19 +40,19 @@ export function mount(root, services, options) {
   const panel = el('div', 'doors-panel', undefined, root);
   const strip = el('section', 'doors-story', undefined, panel);
   el('h2', '', 'Scripted agent', strip);
-  el('p', 'egress-muted', 'No model calls. The wheels are small and inert. R: requests · D: door rows.', strip);
+  el('p', 'note', 'No model calls. The wheels are small and inert. R: requests · D: door rows.', strip);
   const stepsRoot = el('ol', 'doors-steps', undefined, strip);
   const summary = el('div', 'doors-summary', undefined, panel);
   const totals = el('span', '', '0 doors tried · 0 denied', summary);
   const setup = button(summary, 'link', '0 setup rows ↗ Left the box', () => services.showPanel('left_the_box'));
-  const otherCount = el('span', 'egress-muted', '0 other attempts during the story', summary);
+  const otherCount = el('span', 'note', '0 other attempts during the story', summary);
   const status = el('p', 'loss-note', 'Loading doors…', panel);
   status.setAttribute('role', 'status');
+  const empty = el('p', 'empty-note', 'No agent doors yet. They appear as the story runs.', panel);
   const board = el('section', 'doors-board', undefined, panel);
-  const empty = el('p', 'empty-note', 'No agent doors yet. They appear as the story runs.', board);
-  const band = el('section', 'doors-techniques', undefined, panel);
+  const band = el('section', 'doors-techniques section', undefined, panel);
   el('h2', '', 'Upstream and SSRF techniques', band);
-  el('p', 'egress-muted', 'Observed request locations. The world never fetches upstream.', band);
+  el('p', 'note', 'Observed request locations. The world never fetches upstream.', band);
   const techniqueNodes = new Map();
   for (const [id, title] of techniques) {
     const node = el('div', 'doors-technique', undefined, band);
@@ -59,11 +60,11 @@ export function mount(root, services, options) {
     const count = el('span', 'mono doors-count', '0', node);
     techniqueNodes.set(id, count);
   }
-  const other = el('section', 'doors-other egress-muted', undefined, panel);
+  const other = el('section', 'doors-other section note', undefined, panel);
   el('h2', '', 'Other traffic during the story', other);
   el('p', '', 'Traffic from the guest that the step’s command does not make.', other);
   const otherRows = el('ul', 'rows', undefined, other);
-  const groups = new Map(), tiles = new Map(), steps = new Map();
+  const groups = new Map(), steps = new Map(), otherLines = new Map();
   let latest = null, disposed = false;
 
   function openEvent(seq) {
@@ -73,29 +74,21 @@ export function mount(root, services, options) {
   }
 
   function renderStory(story) {
-    for (const [index, step] of story.entries()) {
-      let nodes = steps.get(step.title);
-      if (!nodes) {
-        const line = el('li', 'doors-step', undefined, stepsRoot);
-        el('span', 'mono doors-number', String(index + 1), line);
-        const title = el('span', 'doors-step-title', step.title, line);
-        title.setAttribute('title', step.command);
-        const state = el('span', 'pill', '', line);
-        const exit = el('span', 'mono doors-exit', '', line);
-        const links = el('span', 'doors-step-links', undefined, line);
-        const requests = button(links, 'link', '', () => {
-          const current = latest.story.find((item) => item.title === step.title);
-          if (current.requests.length) openEvent(current.requests[0]);
-        });
-        const doors = button(links, 'link', '', () => {
-          const current = latest.story.find((item) => item.title === step.title);
-          if (current.doors.length) openEvent(current.doors[0]);
-        });
-        nodes = { line, state, exit, requests, doors };
-        steps.set(step.title, nodes);
-      }
-      nodes.line.dataset.state = step.state;
-      nodes.line.setAttribute('aria-current', step.state === 'running' ? 'step' : 'false');
+    reconcile(stepsRoot, story, (step) => step.title, (step) => {
+      const node = el('li', 'doors-step');
+      el('span', 'mono doors-number', String(story.indexOf(step) + 1), node);
+      el('span', 'doors-step-title', step.title, node).setAttribute('title', step.command);
+      const state = el('span', 'pill', '', node);
+      const exit = el('span', 'mono doors-exit', '', node);
+      const links = el('span', 'doors-step-links', undefined, node);
+      const first = (kind) => () => {
+        const current = latest.story.find((item) => item.title === step.title);
+        if (current[kind].length) openEvent(current[kind][0]);
+      };
+      return { node, state, exit, requests: button(links, 'link', '', first('requests')), doors: button(links, 'link', '', first('doors')) };
+    }, (nodes, step) => {
+      nodes.node.dataset.state = step.state;
+      nodes.node.setAttribute('aria-current', step.state === 'running' ? 'step' : 'false');
       nodes.state.textContent = step.state;
       nodes.exit.textContent = step.exit == null ? 'exit —' : `exit ${step.exit}`;
       nodes.requests.textContent = `R ${step.requests.length}`;
@@ -104,47 +97,47 @@ export function mount(root, services, options) {
       nodes.doors.setAttribute('aria-label', `Open first door event for ${step.title}; ${step.doors.length} rows`);
       nodes.requests.disabled = step.state !== 'done' || !step.requests.length;
       nodes.doors.disabled = step.state !== 'done' || !step.doors.length;
-    }
+    }, steps);
   }
 
   function renderDoors(rows) {
-    const merged = new Map();
+    // One tile per distinct door, grouped by destination in the order seen.
+    const byName = new Map();
     for (const { row } of rows) {
-      const id = key(row);
-      if (merged.has(id)) merged.get(id).count += row.count;
-      else merged.set(id, { ...row });
+      const name = destination(row), id = key(row);
+      if (!byName.has(name)) byName.set(name, new Map());
+      const doors = byName.get(name);
+      if (doors.has(id)) doors.get(id).count += row.count;
+      else doors.set(id, { ...row, id });
     }
-    empty.hidden = merged.size > 0;
-    for (const [id, row] of merged) {
-      let nodes = tiles.get(id);
-      if (!nodes) {
-        const name = destination(row);
-        let group = groups.get(name);
-        if (!group) {
-          const section = el('section', 'doors-destination', undefined, board);
-          el('h3', 'mono', name, section);
-          group = { section, grid: el('div', 'doors-grid', undefined, section) };
-          groups.set(name, group);
-        }
-        const tile = el('article', 'door-tile new-row', undefined, group.grid);
-        tile.classList.toggle('door-denied', row.egress_denied === true);
-        const head = el('div', 'door-head', undefined, tile);
-        el('strong', 'mono', `${transport(row)} ${port(row)}`, head);
-        const count = el('span', 'doors-count mono', '', head);
-        el('span', 'door-service', words(row.service), tile);
-        el('span', 'door-outcome', words(row.outcome), tile);
-        if (row.credential) el('span', 'pill door-credential', credential(row.credential), tile);
-        nodes = { tile, count, name };
-        tiles.set(id, nodes);
-      }
-      nodes.count.textContent = `× ${row.count}`;
-    }
-    for (const [id, nodes] of tiles) {
-      if (!merged.has(id)) { nodes.tile.remove(); tiles.delete(id); }
-    }
-    for (const [name, group] of groups) {
-      if (![...tiles.values()].some((nodes) => nodes.name === name)) { group.section.remove(); groups.delete(name); }
-    }
+    empty.hidden = byName.size > 0;
+    reconcile(board, [...byName], ([name]) => name, ([name]) => {
+      const node = el('section', 'doors-destination');
+      el('h3', 'mono', name, node);
+      return { node, grid: el('div', 'doors-grid', undefined, node), tiles: new Map() };
+    }, (group, [, doors]) => reconcile(group.grid, [...doors.values()], (row) => row.id, (row) => {
+      const node = el('article', 'door-tile new-row');
+      node.classList.toggle('door-denied', row.egress_denied === true);
+      const head = el('div', 'door-head', undefined, node);
+      el('strong', 'mono', `${transport(row)} ${port(row)}`, head);
+      const count = el('span', 'doors-count mono', '', head);
+      el('span', 'door-service', words(row.service), node);
+      el('span', 'door-outcome', words(row.outcome), node);
+      if (row.credential) el('span', 'pill door-credential', credential(row.credential), node);
+      return { node, count };
+    }, (tile, row) => { tile.count.textContent = `× ${row.count}`; }, group.tiles), groups);
+  }
+
+  function renderOthers(others) {
+    const seen = new Map();
+    const lines = others.map((tag) => {
+      const text = `${tag.at.toFixed(2)} s · ${tag.step} · ${destination(tag.row)} · ${transport(tag.row)} ${port(tag.row)} · ${words(tag.row.outcome)} × ${tag.row.count}`;
+      const repeat = seen.get(text) || 0;
+      seen.set(text, repeat + 1);
+      return { text, id: `${text}\u0000${repeat}` };
+    });
+    if (!lines.length) lines.push({ text: 'No other traffic observed during the story.', id: '' });
+    reconcile(otherRows, lines, (line) => line.id, (line) => ({ node: el('li', '', line.text) }), () => {}, otherLines);
   }
 
   const stop = services.state(options.state, (snapshot) => {
@@ -172,11 +165,7 @@ export function mount(root, services, options) {
         : tag.row.techniques?.includes(id))).length;
       techniqueNodes.get(id).textContent = String(n);
     }
-    otherRows.replaceChildren();
-    if (!others.length) el('li', '', 'No other traffic observed during the story.', otherRows);
-    for (const tag of others) {
-      el('li', '', `${tag.at.toFixed(2)} s · ${tag.step} · ${destination(tag.row)} · ${transport(tag.row)} ${port(tag.row)} · ${words(tag.row.outcome)} × ${tag.row.count}`, otherRows);
-    }
+    renderOthers(others);
   }, (error) => {
     if (!disposed) status.textContent = `Could not load doors: ${error.message}. Displayed rows may be incomplete.`;
   });
@@ -184,7 +173,7 @@ export function mount(root, services, options) {
     disposed = true;
     stop();
     cleanups.forEach((off) => off());
-    groups.clear(); tiles.clear(); steps.clear(); latest = null;
+    groups.clear(); steps.clear(); otherLines.clear(); latest = null;
     root.replaceChildren();
   };
 }

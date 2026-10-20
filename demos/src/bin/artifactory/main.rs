@@ -180,6 +180,7 @@ fn page(
     .custom("Doors tried", include_str!("doors.mjs"), topics.doors)
     .asset("doors.css", "text/css", include_str!("doors.css"))
     .standard_panels()
+    .inspector_first("Doors tried")
 }
 
 async fn gate(

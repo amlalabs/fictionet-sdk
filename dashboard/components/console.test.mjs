@@ -326,3 +326,29 @@ test('missing libraries fail inside their own panel with the asset command', asy
     dispose();
   }
 });
+
+test('after the run stopped, consoles say they closed instead of blaming the build or the network', async () => {
+  for (const [mount, closed] of [[screen, 'The screen closed when the run stopped.'], [terminal, 'The terminal closed when the run stopped.']]) {
+    // The page server is gone, so the library cannot load.
+    const h = fixture();
+    h.services.stopped = () => true;
+    const dispose = mount(h.root, h.services, { host: 'alpha', load: async () => { throw new Error('Failed to fetch dynamically imported module'); } });
+    await settle();
+    assert.ok(h.root.textContent.includes(closed), h.root.textContent);
+    assert.doesNotMatch(h.root.textContent, /not in this build/);
+    dispose();
+    // A console that loses its connection after the run stopped does not try again.
+    const live = fixture();
+    let stopped = false;
+    live.services.stopped = () => stopped;
+    live.publish({ state: 'desktop_up', screen: true, terminal: true });
+    const stop = mount(live.root, live.services, mount === screen ? live.screenOptions : live.terminalOptions);
+    await settle();
+    stopped = true;
+    live.sockets[0].close();
+    await settle();
+    assert.ok(live.root.textContent.includes(closed), live.root.textContent);
+    assert.equal([...live.timers.values()].filter((timer) => timer.delay >= 1000).length, 0, 'no reconnect is scheduled');
+    stop();
+  }
+});

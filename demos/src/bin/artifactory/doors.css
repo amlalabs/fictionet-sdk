@@ -1,4 +1,4 @@
-.doors-panel { flex: 1; min-height: 0; overflow: auto; padding: 16px; color: var(--ink); font-size: 12px; }
+.doors-panel { color: var(--ink); font-size: 12px; }
 .doors-panel h2 { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
 .doors-panel p { margin: 0 0 8px; }
 .doors-story { padding-bottom: 16px; border-bottom: 1px solid var(--line); }
@@ -25,7 +25,6 @@
 .door-denied { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
 .door-denied .door-service { color: inherit; }
 .door-credential { align-self: start; max-width: 100%; height: auto; min-height: 18px; white-space: normal; overflow-wrap: anywhere; }
-.doors-techniques, .doors-other { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }
 .doors-technique { display: flex; justify-content: space-between; padding: 4px 0; }
 .doors-other li { overflow-wrap: anywhere; font-size: 11px; }
 .door-tile.new-row { animation: door-arrives 600ms ease-out; }

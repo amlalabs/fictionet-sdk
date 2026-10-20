@@ -72,3 +72,17 @@ test('guest summaries skip tool metadata and keep the meaningful result', () => 
   assert.equal(guestResult('\nHTTP 200\nresponse body'), 'HTTP 200');
   assert.equal(guestResult('\nNo proxy settings set\n'), 'No proxy settings set');
 });
+
+test('startup checks that cannot load say whether the run has stopped', () => {
+  for (const [stopped, text] of [[true, 'The run has stopped, so startup checks can no longer be loaded.'], [false, 'Could not load startup checks: no such state topic: "containment"']]) {
+    const document = createDocument(), root = document.createElement('section');
+    let fail;
+    const dispose = mount(root, {
+      selection: createSelection(), hosts: [], stopped: () => stopped,
+      state: (_, update, error) => { fail = error; return () => {}; },
+    }, { state: '/api/state/containment' });
+    fail(new Error(stopped ? 'The run has stopped, so its state can no longer be loaded' : 'no such state topic: "containment"'));
+    assert.equal(root.querySelector('.empty-note').textContent, text);
+    dispose();
+  }
+});

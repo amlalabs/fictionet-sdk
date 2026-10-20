@@ -95,7 +95,9 @@ export function mount(root, services, options) {
   }
   let stopState = () => {};
   if (!options.state) el('p', { class: 'empty-note', text: 'This world has not enabled labeling. Run exports are available above.' }, body);
-  else stopState = services.state(options.state, (value) => { snapshot = value; draw(); }, (error) => { status.textContent = `Could not load labels: ${error.message}`; });
+  else stopState = services.state(options.state, (value) => { snapshot = value; draw(); }, (error) => {
+    status.textContent = services.stopped?.() ? 'The run has stopped, so labels can no longer be loaded.' : `Could not load labels: ${error.message}`;
+  });
   function draw() {
     if (!snapshot) return;
     heading.textContent = `Labels (${snapshot.value?.length || 0})`;

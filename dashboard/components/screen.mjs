@@ -67,9 +67,11 @@ export function mount(root, services, options) {
     display.replaceChildren();
     ownership();
   }
+  const CLOSED = 'The screen closed when the run stopped.';
   function lost(reason) {
     stop();
     if (disposed || !available || missing) return;
+    if (services.stopped?.()) { show(CLOSED); return; }
     const seconds = Math.min(30, 4 * 2 ** attempt++);
     show(`${reason ? `${reason}. ` : 'Connection lost. '}Reconnecting in ${seconds} s`, true);
     timer = setTimeout(connect, seconds * 1000);
@@ -168,7 +170,7 @@ export function mount(root, services, options) {
   }).catch(() => {
     if (disposed) return;
     missing = true;
-    show('noVNC is not in this build. Run `cargo xtask demo libraries`, then rebuild.');
+    show(services.stopped?.() ? CLOSED : 'noVNC is not in this build. Run `cargo xtask demo libraries`, then rebuild.');
   });
   return () => {
     if (disposed) return;

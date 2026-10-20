@@ -18,6 +18,7 @@
   --edge-live: light-dark(#6f8c78, #8fae97);
   --accent: light-dark(#df5835, #f0704c);
   --accent-text: light-dark(#b4441f, #f0704c);
+  --on-accent: light-dark(#141915, #141915);
   --warning: light-dark(#865b0e, #e7b951);
   --success: light-dark(#2f6128, #8fcb84);
   --danger: light-dark(#a3432a, #f08f72);

@@ -153,6 +153,7 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
       if (name === 'world_error' || name === 'end') source.close();
     };
     async function run() {
+      let reason = 'Connection dropped. Reconnecting.';
       try {
         const response = await request(op, params, controller.signal);
         if (!response.ok || response.headers.get('Content-Type')?.split(';')[0] !== 'text/event-stream') {
@@ -164,7 +165,10 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
           } catch (e) {
             error += ` (could not read error response: ${e.message})`;
           }
-          emit('world_error', JSON.stringify({ error }));
+          // A page server with every stream place taken is busy, not refusing:
+          // try again, as after a dropped connection.
+          if (response.status === 503) reason = `The page server is busy (${error}). Reconnecting.`;
+          else emit('world_error', JSON.stringify({ error }));
           return;
         }
         if (stopped()) {
@@ -205,7 +209,7 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
         await reader?.cancel().catch(() => {});
         reader = undefined;
         if (!stopped()) {
-          emit('error', JSON.stringify({ error: 'Connection dropped. Reconnecting.' }));
+          emit('error', JSON.stringify({ error: reason }));
           if (!stopped()) timer = setTimeout(run, 1000);
         }
       }

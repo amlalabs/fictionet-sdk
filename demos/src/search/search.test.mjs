@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDocument, Element } from '../../../dashboard/test-dom.mjs';
+import { createDocument } from '../../../dashboard/test-dom.mjs';
+import * as dom from '../../../dashboard/dom.mjs';
+import * as format from '../../../dashboard/format.mjs';
 import { createSelection } from '../../../dashboard/selection.mjs';
 import { counts, tree, queryKey, resultView, made } from './model.mjs';
 import { mount } from './view.mjs';
@@ -22,19 +24,12 @@ function fixture() {
 }
 function harness(t) {
   const document = createDocument(), root = document.createElement('div');
-  // Browser insertion moves an existing element, preserving its identity.
-  Element.prototype.insertBefore = function (child, before) {
-    if (child.parent) child.remove();
-    const index = before ? this.children.indexOf(before) : this.children.length;
-    this.children.splice(index, 0, child); child.parent = this;
-  };
-  t.after(() => { delete Element.prototype.insertBefore; });
   const subscriptions = new Map(), pending = [], selected = createSelection(), moments = [];
   const timers = [], pairs = [];
   t.mock.method(globalThis, 'setTimeout', () => { timers.push('timeout'); });
   t.mock.method(globalThis, 'setInterval', () => { timers.push('interval'); });
   const services = {
-    selection: selected, packetPair: { set: (pair) => pairs.push(pair) },
+    dom, format, selection: selected, packetPair: { set: (pair) => pairs.push(pair) },
     moment: (node) => moments.push(node),
     state(path, publish, error) { subscriptions.set(path, { publish, error }); return () => subscriptions.delete(path); },
     transport: {

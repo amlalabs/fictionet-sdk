@@ -50,23 +50,44 @@ async function checkPacketLayout() {
     check(text.left >= bounds.left && text.right <= bounds.right - 7, 'text exceeds its column: ' + cell.textContent);
     check(getComputedStyle(cell).textOverflow !== 'ellipsis', 'text can ellipsize: ' + cell.textContent);
   };
-  for (const width of [530, 559, 559.5, 560, 599, 599.5, 600, 800, 530]) {
+  // A gap row spans every column; the header must still fill the table.
+  source.emit('error', { error: 'Connection dropped. Reconnecting.' });
+  while (!root.querySelector('#prows tr.gap')) await frame();
+  // A hidden column keeps its place at zero width and shows nothing.
+  const hidden = (cell) => getComputedStyle(cell).visibility === 'hidden' && cell.getBoundingClientRect().width < 1;
+  // These links name two hosts, so the list has a Host column and Protocol
+  // joins Info below 640 px; a single host's list keeps it to 560 px.
+  for (const width of [530, 559, 559.5, 560, 599, 599.5, 600, 639, 639.5, 640, 800, 530]) {
+    const merged = width < 640;
     root.style.width = width + 'px';
     await frame();
-    for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
+    for (const cell of root.querySelectorAll('#prows tr:not(.gap) td.c-src, #prows tr:not(.gap) td.c-dst, #prows tr:not(.gap) td.c-time')) whole(cell);
     check($('td.c-time').textContent === '11.0039' && $('#prows tr:nth-child(2) .c-time').textContent === '1000.0039', 'Time changed');
-    check((getComputedStyle($('td.c-proto')).display === 'none') === (width < 560), 'Protocol breakpoint');
-    for (const column of ['c-no', 'c-len']) check((getComputedStyle($('td.' + column)).display === 'none') === (width < 600), column + ' breakpoint');
-    check(getComputedStyle($('td.c-time')).display !== 'none', 'Time hidden');
+    check(hidden($('td.c-proto')) === merged, 'Protocol breakpoint');
+    for (const column of ['c-no', 'c-len']) check(hidden($('td.' + column)) === (width < 600), column + ' breakpoint');
+    check(!hidden($('td.c-time')), 'Time hidden');
+    check(Math.abs($('th.c-info').getBoundingClientRect().right - $('#plist table').getBoundingClientRect().right) < 1, 'columns do not fill the table');
     const prefix = $('.packet-info-protocol');
-    check((getComputedStyle(prefix).display !== 'none') === (width < 560), 'protocol prefix visibility');
-    if (width < 560) {
+    check((getComputedStyle(prefix).display !== 'none') === merged, 'protocol prefix visibility');
+    if (merged) {
       check($('td.c-info').innerText.startsWith('ICMP Echo (ping) reply'), 'protocol missing from Info');
       check(getComputedStyle(prefix).fontWeight === '600', 'protocol weight');
     }
     check($('#pfilter').getBoundingClientRect().width >= 160, 'filter too narrow');
     check($('#plist').scrollWidth <= $('#plist').clientWidth, 'IPv4 table overflows');
   }
+  // Below 480 px the addresses give way so Info keeps room; each address
+  // stays whole in its title.
+  root.style.width = '420px';
+  await frame();
+  check($('th.c-info').getBoundingClientRect().width >= 60, 'Info has no room in a narrow list: ' + $('th.c-info').getBoundingClientRect().width);
+  for (const column of ['c-src', 'c-dst']) {
+    const address = $('th.' + column).getBoundingClientRect().width, info = $('th.c-info').getBoundingClientRect().width;
+    check(info > address * 1.2, `${column} did not give way to Info: ${address} against ${info}`);
+  }
+  for (const cell of root.querySelectorAll('#prows tr:not(.gap) td.c-src, #prows tr:not(.gap) td.c-dst')) check(cell.title === cell.textContent, 'address without its full title: ' + cell.textContent);
+  root.style.width = '530px';
+  await frame();
   const title = $('#drawer-title');
   check(title.title === title.textContent && title.getAttribute('aria-label') === title.textContent, 'incomplete title accessibility');
   $('#jump-packets').hidden = false;
@@ -78,8 +99,8 @@ async function checkPacketLayout() {
   const src = '[2001:db8:1234:5678:90ab:cdef:1234:5678]:65535';
   const dst = '192.168.100.200:65535';
   send(3, src, dst, 1001.0039);
-  while (root.querySelectorAll('#prows tr').length < 3) await frame();
-  const last = $('#prows').lastElementChild;
+  while (root.querySelectorAll('#prows tr:not(.gap)').length < 3) await frame();
+  const last = [...root.querySelectorAll('#prows tr:not(.gap)')].at(-1);
   check(last.querySelector('.c-src').textContent === src && last.querySelector('.c-dst').textContent === dst, 'long address changed');
   for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
   view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'workstation1' }, { e: { id: 'b' }, host: 'jump' }]);
@@ -96,6 +117,51 @@ async function checkPacketLayout() {
     while (root.querySelectorAll('#prows tr').length < rows + 2) await frame();
     check(host.getBoundingClientRect().width === bounds.width, 'host column moved');
     check($('#plist').scrollWidth <= $('#plist').clientWidth, 'host column overflows');
+  }
+  // A single host's list has no Host column and keeps Protocol to 560 px.
+  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }]);
+  send(6, '10.0.0.2', '10.0.0.3');
+  while (!root.querySelector('#prows tr:not(.gap)')) await frame();
+  check(!root.querySelector('.packet-panel').classList.contains('merged-hosts'), 'one host shows a Host column');
+  for (const width of [559, 560, 639]) {
+    root.style.width = width + 'px';
+    await frame();
+    check(hidden($('#prows tr:not(.gap) td.c-proto')) === (width < 560), 'single-host Protocol breakpoint at ' + width);
+  }
+  dispose(); root.remove(); css.remove();
+}
+
+async function checkContainmentLayout() {
+  const { mount } = await import('./components/containment.mjs');
+  const { createSelection } = await import('./selection.mjs');
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  const css = document.createElement('link');
+  css.rel = 'stylesheet'; css.href = '/page.css';
+  const loaded = new Promise((resolve, reject) => { css.onload = resolve; css.onerror = reject; });
+  document.head.append(css);
+  await loaded;
+  const root = document.createElement('section');
+  document.body.append(root);
+  const outcomes = ['contained', 'not_contained', 'unknown', 'missing_tool', 'timed_out', 'fact'];
+  const probes = outcomes.map((outcome) => ({
+    guest: 'east', name: 'Public DNS', command: 'dig @8.8.8.8 example.com', guest_result: 'connection timed out; no servers could be reached',
+    world_answer: 'no route: no machine at that address', outcome,
+  }));
+  const dispose = mount(root, {
+    selection: createSelection(), hosts: [{ name: 'east', sandbox: 'east' }],
+    state: (_, update) => { update({ value: { probes } }); return () => {}; },
+  }, { state: 'containment' });
+  // The inspector is about 530 px wide at 1280 and 457 px in a shared workspace at 1440.
+  for (const width of [530, 457]) {
+    root.style.width = width + 'px';
+    await new Promise(requestAnimationFrame);
+    for (const pill of root.querySelectorAll('.outcome-pill')) {
+      const label = [...pill.childNodes].find((node) => node.nodeType === Node.TEXT_NODE);
+      const range = document.createRange(); range.selectNode(label);
+      const lines = range.getClientRects(), icon = pill.querySelector('svg').getBoundingClientRect();
+      check(lines.length === 1, `${label.textContent} wraps at ${width} px`);
+      check(icon.right <= lines[0].left, `${label.textContent} has its icon above it at ${width} px`);
+    }
   }
   dispose(); root.remove(); css.remove();
 }
@@ -193,6 +259,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
         if (location.pathname === '/') {
           try {
             await (${checkPacketLayout.toString()})();
+            await (${checkContainmentLayout.toString()})();
             await fetch('/layout-result', { method: 'POST', body: 'PASS' });
           } catch (error) {
             await fetch('/layout-result', { method: 'POST', body: error.message });
@@ -282,7 +349,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     assert.fail(`Chromium exited before reporting a result (code ${outcome.code}, signal ${outcome.signal})\n${diagnostics}`);
   }
   if (outcome.timeout) assert.fail(`Chromium did not report a result within 30 s\n${diagnostics}`);
-  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width', () => {
+  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width; containment labels stay on one line', () => {
     assert.equal(layoutReport, 'PASS');
   });
   assert.match(outcome.report, /^PASS: isolated$/);

@@ -1,5 +1,5 @@
 // mount(root, services, options) returns dispose. Services provide replacement state snapshots.
-import { scoped } from '../dom.mjs';
+import { scoped, reconcile } from '../dom.mjs';
 import { fmtBytes, fmtDuration } from '../format.mjs';
 
 export function pointer(value, path) {
@@ -22,33 +22,60 @@ export function cell(value, format) {
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }
 
+// What each table root shows: its columns, and its rows by key.
+const tables = new WeakMap();
+
+// Renders rows under `root`, updating the table in place: rows keep their
+// elements, and only rows whose text changed are built again and marked new.
+// `options.key(row)` names a row; without it, a row is named by its text.
 export function render(root, rows, columns, options = {}) {
   const { el } = scoped(root);
-  const top = root.scrollTop;
-  const previous = new Set([...root.querySelectorAll('tbody tr')].map((row) => row.textContent));
-  const table = el('table', { class: 'data-table' });
-  const head = el('tr', {}, el('thead', {}, table));
   // Every column but the last takes the width of its content; the last
   // takes the rest. Numbers align right, headers with them.
   const kind = (column, i) => [
     ['number', 'bytes', 'time'].includes(column.format) ? 'numeric' : '',
     i < columns.length - 1 ? 'fit' : '',
   ].filter(Boolean).join(' ');
-  columns.forEach((column, i) => el('th', { text: column.label, scope: 'col', class: kind(column, i) }, head));
-  const body = el('tbody', {}, table);
-  for (const row of rows) {
-    const tr = el('tr', {}, body);
-    if (options.moment?.(row)) tr.classList.add('moment');
-    columns.forEach((column, i) => {
-      const text = cell(pointer(row, column.pointer), column.format);
-      const td = el('td', { class: kind(column, i) }, tr);
-      if (column.format === 'status' && text !== '—') el('span', { class: 'pill', text }, td);
+  const signature = JSON.stringify(columns);
+  let table = tables.get(root);
+  if (!table || table.signature !== signature || !root.contains(table.node)) {
+    const node = el('table', { class: 'data-table' });
+    const head = el('tr', {}, el('thead', {}, node));
+    columns.forEach((column, i) => el('th', { text: column.label, scope: 'col', class: kind(column, i) }, head));
+    table = { node, body: el('tbody', {}, node), rows: new Map(), signature, empty: null };
+    tables.set(root, table);
+    root.replaceChildren(node);
+  }
+  const top = root.scrollTop;
+  const seen = new Map();
+  const items = rows.map((row) => {
+    const texts = columns.map((column) => cell(pointer(row, column.pointer), column.format));
+    const name = options.key?.(row) ?? texts.join('\u0000');
+    const repeat = seen.get(name) || 0;
+    seen.set(name, repeat + 1);
+    return { row, texts, key: `${name}\u0000${repeat}` };
+  });
+  table.empty?.remove();
+  table.empty = null;
+  reconcile(table.body, items, (item) => item.key, () => {
+    const node = el('tr');
+    return { node, cells: columns.map((column, i) => el('td', { class: kind(column, i) }, node)), texts: [] };
+  }, (entry, item, fresh) => {
+    item.texts.forEach((text, i) => {
+      if (entry.texts[i] === text) return;
+      const td = entry.cells[i];
+      td.replaceChildren();
+      if (columns[i].format === 'status' && text !== '—') el('span', { class: 'pill', text }, td);
       else td.textContent = text;
     });
-    if (!previous.has(tr.textContent)) tr.classList.add('new-row');
+    entry.texts = item.texts;
+    entry.node.classList.toggle('moment', Boolean(options.moment?.(item.row)));
+    if (fresh) entry.node.classList.add('new-row');
+  }, table.rows);
+  if (!rows.length) {
+    table.empty = el('tr', {}, table.body);
+    el('td', { colspan: Math.max(1, columns.length), class: 'empty-cell', text: 'No rows yet. They appear here as the world runs.' }, table.empty);
   }
-  if (!rows.length) el('td', { colspan: Math.max(1, columns.length), class: 'empty-cell', text: 'No rows yet. They appear here as the world runs.' }, el('tr', {}, body));
-  root.replaceChildren(table);
   root.scrollTop = top;
 }
 
@@ -60,6 +87,8 @@ export function mount(root, services, options) {
     const value = snapshot.value;
     render(body, Array.isArray(value) ? value : value === null ? [] : [value], options.columns);
     status.textContent = snapshot.status?.too_large ? 'This state exceeded its size limit. The last complete rows are shown.' : '';
-  }, (error) => { status.textContent = `Could not load rows: ${error.message}`; });
+  }, (error) => {
+    status.textContent = services.stopped?.() ? 'The run has stopped, so these rows can no longer be loaded.' : `Could not load rows: ${error.message}`;
+  });
   return () => { stop(); root.replaceChildren(); };
 }

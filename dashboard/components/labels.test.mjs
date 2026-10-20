@@ -128,3 +128,18 @@ test('label targets describe and select retained events, connections and host li
   assert.ok(root.querySelector('.label-remove').querySelector('svg'));
   dispose(); services.dispose();
 });
+
+test('labels that cannot load say whether the run has stopped', () => {
+  for (const [stopped, text] of [[true, 'The run has stopped, so labels can no longer be loaded.'], [false, 'Could not load labels: no such state topic: "labels"']]) {
+    const document = createDocument(), root = document.createElement('section');
+    const services = createServices({});
+    let fail;
+    services.watch = () => { const watch = new EventTarget(); watch.close = () => {}; return watch; };
+    services.stopped = () => stopped;
+    services.state = (_, update, error) => { fail = error; return () => {}; };
+    const dispose = mount(root, services, { state: '/api/state/labels' });
+    fail(new Error(stopped ? 'The run has stopped, so its state can no longer be loaded' : 'no such state topic: "labels"'));
+    assert.equal(root.querySelector('.label-downloads').querySelectorAll('p')[1].textContent, text);
+    dispose(); services.dispose();
+  }
+});
