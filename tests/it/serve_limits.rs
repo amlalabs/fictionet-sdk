@@ -1015,7 +1015,6 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
         Duration::from_secs(60),
         move |fcx| async move {
             let (server, client) = two_machines(&fcx);
-            let kept = log;
             let router = Router::new()
                 .get("/dice", |ex, _| {
                     http::Response::new(Bytes::from(ex.random_u64().to_string()))
@@ -1080,7 +1079,7 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
             let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 9500]).await?;
             assert_eq!(status, 413);
 
-            let events = kept
+            let events = log
                 .wait(&fcx, 0, 4, Duration::from_secs(5), |e| {
                     e.is("http", "request")
                 })

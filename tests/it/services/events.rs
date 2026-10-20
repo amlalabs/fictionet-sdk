@@ -53,7 +53,6 @@ fn installed_observers_keep_events_and_write_json_lines() {
         fictionet::events::Fanout::new(vec![log.clone(), jsonl.clone()]),
     ));
     world::seeded_world(options, Duration::from_secs(60), move |fcx| async move {
-        let events = log;
         let conn = ConnInfo::new(
             9,
             "10.0.0.1:80".parse().unwrap(),
@@ -69,16 +68,15 @@ fn installed_observers_keep_events_and_write_json_lines() {
             });
         }
         assert_eq!(
-            events
-                .checked_all()
+            log.checked_all()
                 .unwrap()
                 .iter()
                 .map(|e| e.seq)
                 .collect::<Vec<_>>(),
             [1, 2, 3, 4]
         );
-        assert_eq!(events.dropped(), 0);
-        let layer = Layer::from_event(&events.checked_all().unwrap()[2]);
+        assert_eq!(log.dropped(), 0);
+        let layer = Layer::from_event(&log.checked_all().unwrap()[2]);
         assert_eq!(layer.name, "test.n");
         assert_eq!(layer.summary, "n=1");
         Ok(())
@@ -155,10 +153,9 @@ fn a_net_starts_its_events_with_a_wall_clock_anchor() {
             .fields(Fields::new().with("world_date", "2026-10-06")),
         Duration::from_secs(60),
         move |fcx| async move {
-            let kept = log;
             let (_attacher, attachments) = fictionet::attachments();
             Net::new().start(&fcx, attachments)?;
-            let starts = kept.checked_of("run", "start").unwrap();
+            let starts = log.checked_of("run", "start").unwrap();
             assert_eq!(starts.len(), 1);
             let first = &starts[0];
             assert!(first.is("run", "start"));

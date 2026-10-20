@@ -1712,12 +1712,11 @@ fn lan_drop_identity_comes_from_ingress_registration() {
                 &[],
             ));
             peer.send(Packet(vec![1, 2, 3]));
-            let events = log.clone();
-            let drops = events
+            let drops = log
                 .wait(&fcx, 0, 2, Duration::from_secs(10), |e| e.is("lan", "drop"))
                 .await?;
             assert_eq!(drops.len(), 2);
-            assert!(events.checked_of("net", "blocked").unwrap().is_empty());
+            assert!(log.checked_of("net", "blocked").unwrap().is_empty());
             for event in &drops {
                 assert_eq!(event.conn.sandbox.as_ref(), Some(&identity));
                 assert_eq!(event.str("lan"), Some("test"));
