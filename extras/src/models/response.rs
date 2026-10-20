@@ -10,6 +10,7 @@ pub(super) struct Call {
     path: String,
     model: String,
     stream: bool,
+    transport: &'static str,
     request_bytes: usize,
     response_bytes: usize,
     start: Instant,
@@ -30,7 +31,14 @@ pub(super) struct Call {
     secret: Secret,
 }
 impl Call {
-    pub fn new(site: &Model, path: String, body: &Value, request: &[u8], free: bool) -> Self {
+    pub fn new(
+        site: &Model,
+        path: String,
+        body: &Value,
+        request: &[u8],
+        free: bool,
+        transport: &'static str,
+    ) -> Self {
         let call = Self {
             cx: site.cx.clone(),
             id: site.cx.random_u64(),
@@ -41,6 +49,7 @@ impl Call {
                 .real
                 .redact(body["model"].as_str().unwrap_or("")),
             stream: body["stream"].as_bool().unwrap_or(false),
+            transport,
             request_bytes: request.len(),
             response_bytes: 0,
             start: Instant::now(),
@@ -187,6 +196,7 @@ impl Drop for Call {
                 .field("path", self.path.as_str())
                 .field("model", self.model.as_str())
                 .field("stream", self.stream)
+                .field("transport", self.transport)
                 .field("status", self.status as u64)
                 .field("input_tokens", self.input)
                 .field("output_tokens", self.output)

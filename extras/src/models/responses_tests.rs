@@ -3,11 +3,16 @@ use super::*;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn answer(socket: &mut std::net::TcpStream, items: Vec<Value>, stream: bool) {
+pub(super) fn answer(socket: &mut std::net::TcpStream, items: Vec<Value>, stream: bool) {
     echo(socket, items, stream, &json!({}));
 }
 /// Answers like `answer`, echoing the request's tools as providers do.
-fn echo(socket: &mut std::net::TcpStream, items: Vec<Value>, stream: bool, request: &Value) {
+pub(super) fn echo(
+    socket: &mut std::net::TcpStream,
+    items: Vec<Value>,
+    stream: bool,
+    request: &Value,
+) {
     let mut response = json!({"id":"resp_one","object":"response","created_at":1,"model":"small","status":"completed","output":items,"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},"error":null,"incomplete_details":null});
     if let Some(tools) = request.get("tools") {
         response["tools"] = tools.clone();
@@ -138,10 +143,10 @@ fn responses_search_preserves_reasoning_and_restores_function_pairs() {
         fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(10)), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
-            let mut model = Model::at(&cx, Provider::OpenAi, credential, format!("http://{address}").parse()?)?.search(engine);
+            let model = Model::at(&cx, Provider::OpenAi, credential, format!("http://{address}").parse()?)?.search(engine);
             let request = |body: &Value| Request::post("/v1/responses").header("authorization", &key).body(Body::from(body.to_string())).unwrap();
             let mut body = json!({"model":"small","stream":stream,"store":false,"input":[{"role":"user","content":"Search"}],"tools":[{"type":"web_search","filters":{"allowed_domains":["example.com"]}}],"tool_choice":{"type":"web_search"},"include":["reasoning.encrypted_content","web_search_call.action.sources"]});
-            let response = collect(model.call(request(&body)).await?, stream).await;
+            let response = collect(model.clone().send(request(&body)).await?, stream).await;
             assert_eq!(response["usage"]["output_tokens"], 4);
             assert_eq!(response["output"][0]["encrypted_content"], "preserved");
             assert_eq!(response["output"][1]["type"], "web_search_call");
@@ -150,8 +155,8 @@ fn responses_search_preserves_reasoning_and_restores_function_pairs() {
             body["input"].as_array_mut().unwrap().push(json!({"role":"user","content":"Continue"}));
             let mut invalid = body.clone();
             invalid["input"][2]["encrypted_content"] = json!("invalid");
-            assert_eq!(model.call(request(&invalid)).await?.status(), 400);
-            collect(model.call(request(&body)).await?, stream).await;
+            assert_eq!(model.clone().send(request(&invalid)).await?.status(), 400);
+            collect(model.clone().send(request(&body)).await?, stream).await;
             Ok(())
         })).unwrap();
         server.join().unwrap();
@@ -159,7 +164,7 @@ fn responses_search_preserves_reasoning_and_restores_function_pairs() {
     }
 }
 #[test]
-fn websocket_refusal_preserves_budget_and_zstd_falls_back_to_http() {
+fn zstd_requests_are_decoded_and_metered() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
@@ -173,24 +178,13 @@ fn websocket_refusal_preserves_budget_and_zstd_falls_back_to_http() {
         |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
-            let mut model = Model::at(
+            let model = Model::at(
                 &cx,
                 Provider::OpenAi,
                 credential,
                 format!("http://{address}").parse()?,
             )?
             .budget(Budget::new().calls(1));
-            let upgrade = |key: &str| {
-                Request::get("/v1/responses")
-                    .header("authorization", key)
-                    .header("upgrade", "websocket")
-                    .header("connection", "upgrade")
-                    .body(Body::empty())
-                    .unwrap()
-            };
-            assert_eq!(model.call(upgrade("wrong")).await?.status(), 401);
-            assert_eq!(model.call(upgrade(&key)).await?.status(), 426);
-            assert_eq!(model.ledger.lock().unwrap().calls, 0);
             let bytes = zstd::encode_all(
                 br#"{"model":"small","stream":true,"input":"hello"}"#.as_slice(),
                 1,
@@ -200,7 +194,7 @@ fn websocket_refusal_preserves_budget_and_zstd_falls_back_to_http() {
                 .header("content-encoding", "zstd")
                 .header("content-length", bytes.len())
                 .body(Body::from(bytes))?;
-            let response = model.call(request).await?;
+            let response = model.clone().send(request).await?;
             assert_eq!(response.status(), 200);
             response.into_body().collect().await?;
             assert_eq!(model.ledger.lock().unwrap().calls, 1);
@@ -292,7 +286,7 @@ fn page_actions_read_world_pages_and_keep_the_client_tools() {
         |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
-            let mut model = Model::at(
+            let model = Model::at(
                 &cx,
                 Provider::OpenAi,
                 credential,
@@ -305,7 +299,7 @@ fn page_actions_read_world_pages_and_keep_the_client_tools() {
             let request = Request::post("/v1/responses")
                 .header("authorization", &key)
                 .body(Body::from(body.to_string()))?;
-            let events = events(model.call(request).await?).await;
+            let events = events(model.clone().send(request).await?).await;
             assert_eq!(events[0]["type"], "response.created");
             let completed = events.last().unwrap();
             assert_eq!(completed["type"], "response.completed");
@@ -373,7 +367,7 @@ fn a_budget_stop_during_a_search_fails_the_response_like_openai() {
         |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
-            let mut model = Model::at(
+            let model = Model::at(
                 &cx,
                 Provider::OpenAi,
                 credential,
@@ -388,7 +382,7 @@ fn a_budget_stop_during_a_search_fails_the_response_like_openai() {
                     .body(Body::from(body.to_string()))
                     .unwrap()
             };
-            let events = events(model.call(request(true)).await?).await;
+            let events = events(model.clone().send(request(true)).await?).await;
             let last = events.last().unwrap();
             assert_eq!(last["type"], "response.failed");
             assert_eq!(last["response"]["status"], "failed");
@@ -396,7 +390,7 @@ fn a_budget_stop_during_a_search_fails_the_response_like_openai() {
             assert_eq!(last["response"]["output"][0]["type"], "web_search_call");
             assert!(!events.iter().any(|e| e["type"] == "response.completed"));
             model.set_budget(Budget::new().calls(2));
-            let response = model.call(request(false)).await?;
+            let response = model.clone().send(request(false)).await?;
             assert_eq!(response.status(), 429);
             let body: Value =
                 serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;

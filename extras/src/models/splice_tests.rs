@@ -183,10 +183,10 @@ fn search_splices_and_replays_exact_history_with_thinking() {
         fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "sk-ant-api03-private".into())?);
             let key = credential.placeholder().to_owned();
-            let mut model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.search(engine);
+            let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.search(engine);
             let request = |body: &Value| Request::post("/v1/messages").header("x-api-key", &key).body(Body::from(body.to_string())).unwrap();
             let mut body = json!({"model":"claude","stream":stream,"max_tokens":100,"messages":[{"role":"user","content":"Search for page"}],"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],"tool_choice":{"type":"tool","name":"web_search"}});
-            let answer = collected(model.call(request(&body)).await?, stream).await;
+            let answer = collected(model.clone().send(request(&body)).await?, stream).await;
             assert_eq!(answer["stop_reason"], "end_turn");
             assert_eq!(answer["usage"]["output_tokens"], 4);
             assert_eq!(answer["usage"]["server_tool_use"]["web_search_requests"], 1);
@@ -197,8 +197,8 @@ fn search_splices_and_replays_exact_history_with_thinking() {
             body.as_object_mut().unwrap().remove("tool_choice");
             let mut tampered = body.clone();
             tampered["messages"][1]["content"][2]["content"][0]["encrypted_content"] = json!("invalid");
-            assert_eq!(model.call(request(&tampered)).await?.status(), 400);
-            let result = collected(model.call(request(&body)).await?, stream).await;
+            assert_eq!(model.clone().send(request(&tampered)).await?.status(), 400);
+            let result = collected(model.clone().send(request(&body)).await?, stream).await;
             assert_eq!(result["content"][0]["text"], "Done.");
             Ok(())
         })).unwrap();

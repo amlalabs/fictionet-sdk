@@ -73,9 +73,9 @@ or changes the default limits of twelve calls for Claude Code and eight for Code
 
 Codex reaches the OpenAI Responses API the same way, using `OPENAI_API_KEY` or
 OpenRouter’s Responses endpoint with `OPENROUTER_API_KEY`. The guest is set up as
-`codex login --with-api-key` leaves it, with a placeholder key. Codex tries a
-WebSocket first; the world refuses it with `426`, and Codex falls back to HTTP
-streaming. The world answers Codex’s web search, page opens and page finds from
+`codex login --with-api-key` leaves it, with a placeholder key. Codex opens its
+Responses WebSocket first, and the world serves it, with HTTP streaming to the
+upstream. The world answers Codex’s web search, page opens and page finds from
 the same pages. The checks run one Codex search, then pause calls and require
 each agent to show its provider’s own limit error.
 

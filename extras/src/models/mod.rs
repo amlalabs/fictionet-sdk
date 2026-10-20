@@ -1,7 +1,9 @@
 //! Model API sites with host-held credentials, streaming usage and run budgets.
 //!
-//! Mount [`Provider::host`] with a [`Model`] built by [`anthropic`], [`openai`],
-//! [`openrouter`] or [`gemini`]. Host sockets stay in [`web::forward`].
+//! Mount [`Provider::host`] with `web::Site::handler` and a [`Model`] built by
+//! [`anthropic`], [`openai`], [`openrouter`] or [`gemini`]. Host sockets stay
+//! in [`web::forward`]. The OpenAI sites also serve the Responses WebSocket
+//! that Codex opens first, with HTTP streaming to the upstream.
 //!
 //! Budget responses follow the vendors' documented status and error envelope:
 //! [Anthropic spend limits](https://platform.claude.com/docs/en/api/rate-limits),
@@ -41,6 +43,9 @@ pub mod tools;
 pub use tools::Engine;
 #[cfg(test)]
 mod tests;
+mod websocket;
+#[cfg(test)]
+mod websocket_tests;
 
 /// The wire protocol and destination of a model API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,6 +474,58 @@ impl Model {
                 .field("reason", reason)
         });
     }
+    /// Whether the request carries exactly the guest's credential.
+    fn authorized(&self, headers: &http::HeaderMap) -> bool {
+        let expected = self.credential.wire(self.provider, false);
+        let values = headers.get_all(self.credential.header(self.provider));
+        values.iter().count() == 1
+            && values.iter().next().is_some_and(|v| {
+                if let Some(oauth) = &self.credential.oauth {
+                    v.to_str()
+                        .ok()
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .is_some_and(|v| oauth.accepts(v))
+                } else {
+                    v.as_bytes() == expected.as_bytes()
+                }
+            })
+    }
+    fn unauthorized(&self) -> Response<Body> {
+        self.provider.error(
+            401,
+            "authentication_error",
+            "Invalid authentication credentials",
+        )
+    }
+    /// The provider's stop response when the budget is spent. Otherwise
+    /// `None`, and an admitted call is counted when `count` is set.
+    fn admit(&self, path: &str, count: bool) -> Option<Response<Body>> {
+        let mut ledger = self.ledger.lock().unwrap();
+        if let Some(kind) = ledger.exhausted() {
+            self.cx.emit("model", "budget", |e| {
+                e.field("provider", self.provider.host())
+                    .field("kind", kind)
+            });
+            self.refused(path, "budget");
+            return Some(
+                self.credential
+                    .oauth
+                    .as_ref()
+                    .map_or_else(|| self.provider.stop(), oauth::OAuth::stop),
+            );
+        }
+        if count {
+            ledger.calls += 1;
+        }
+        None
+    }
+    /// [`Model::send`] behind a box, for the splices that call back into it.
+    fn boxed(
+        self,
+        request: Request<Body>,
+    ) -> Pin<Box<dyn Future<Output = fictionet::Result<Response<Body>>> + Send>> {
+        Box::pin(self.send(request))
+    }
     async fn send(mut self, request: Request<Body>) -> fictionet::Result<Response<Body>> {
         let path = request.uri().path().to_owned();
         if self.provider == Provider::Anthropic
@@ -494,12 +551,6 @@ impl Model {
         {
             return Ok(Response::new(Body::empty()));
         }
-        let upgrade = request.method() == http::Method::GET
-            && path.ends_with("/responses")
-            && request
-                .headers()
-                .get("upgrade")
-                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
         // With a ChatGPT login, Codex reads its account, usage and models first.
         let listing = self.provider == Provider::ChatGpt
             && request.method() == http::Method::GET
@@ -509,51 +560,15 @@ impl Model {
                     | "/backend-api/wham/accounts/check"
                     | "/backend-api/wham/usage"
             );
-        if (request.method() != http::Method::POST && !upgrade && !listing)
+        if (request.method() != http::Method::POST && !listing)
             || !(self.provider.allows(&path) || listing)
         {
             self.refused(&path, "path");
             return Ok(self.provider.error(404, "not_found_error", "Not found"));
         }
-        let expected = self.credential.wire(self.provider, false);
-        let values = request
-            .headers()
-            .get_all(self.credential.header(self.provider));
-        if values.iter().count() != 1
-            || values.iter().next().is_none_or(|v| {
-                if let Some(oauth) = &self.credential.oauth {
-                    v.to_str()
-                        .ok()
-                        .and_then(|v| v.strip_prefix("Bearer "))
-                        .is_none_or(|v| !oauth.accepts(v))
-                } else {
-                    v.as_bytes() != expected.as_bytes()
-                }
-            })
-        {
+        if !self.authorized(request.headers()) {
             self.refused(&path, "credential");
-            return Ok(self.provider.error(
-                401,
-                "authentication_error",
-                "Invalid authentication credentials",
-            ));
-        }
-        if upgrade {
-            self.cx.emit("model", "transport", |e| {
-                e.field("provider", self.provider.host())
-                    .field("transport", "websocket")
-                    .field("status", 426u64)
-                    .field("fallback", "sse")
-            });
-            let mut response = self.provider.error(
-                426,
-                "invalid_request_error",
-                "Use the Responses HTTP endpoint.",
-            );
-            response
-                .headers_mut()
-                .insert("upgrade", "websocket".parse()?);
-            return Ok(response);
+            return Ok(self.unauthorized());
         }
         let (mut parts, body) = request.into_parts();
         let bytes = match http_body_util::Limited::new(body, 32 * 1024 * 1024)
@@ -652,21 +667,8 @@ impl Model {
             ));
         }
         let free = path.ends_with("/count_tokens") || listing;
-        if !free {
-            let mut ledger = self.ledger.lock().unwrap();
-            if let Some(kind) = ledger.exhausted() {
-                self.cx.emit("model", "budget", |e| {
-                    e.field("provider", self.provider.host())
-                        .field("kind", kind)
-                });
-                self.refused(&path, "budget");
-                return Ok(self
-                    .credential
-                    .oauth
-                    .as_ref()
-                    .map_or_else(|| self.provider.stop(), oauth::OAuth::stop));
-            }
-            ledger.calls += 1;
+        if !free && let Some(stop) = self.admit(&path, true) {
+            return Ok(stop);
         }
         if let Some(oauth) = &self.credential.oauth {
             self.credential.real = oauth.secret().await?;
@@ -676,7 +678,12 @@ impl Model {
                     .insert("chatgpt-account-id", oauth.account()?.parse()?);
             }
         }
-        let mut call = response::Call::new(&self, path, &body, &bytes, free);
+        let transport = if parts.extensions.get::<websocket::Upgraded>().is_some() {
+            "websocket"
+        } else {
+            "http"
+        };
+        let mut call = response::Call::new(&self, path, &body, &bytes, free, transport);
         for name in [
             "authorization",
             "x-api-key",
@@ -735,20 +742,15 @@ impl Model {
         }
     }
 }
-impl Service<Request<Body>> for Model {
-    type Response = Response<Body>;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = fictionet::Result<Response<Body>>> + Send>>;
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<fictionet::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
-        Box::pin(self.clone().send(request))
-    }
-}
+/// The site's requests: a Responses WebSocket handshake gets its `101`
+/// here, and every other request runs as deferred work.
 impl httpd::Handler for Model {
-    fn call(&self, request: Request<Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
-        httpd::tower(self.clone()).call(request, ex)
+    fn call(&self, request: Request<Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        if websocket::wanted(self.provider, &request) {
+            return httpd::Reply::Now(websocket::accept(self.clone(), request));
+        }
+        let model = self.clone();
+        httpd::Reply::Later(Box::new(move |_| Box::pin(model.send(request))))
     }
 }
 /// An RFC 3339 UTC timestamp to the second, as the providers write them.
