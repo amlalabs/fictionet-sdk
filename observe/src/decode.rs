@@ -403,6 +403,12 @@ fn ip_proto_name(p: u8) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DecodeContext<'a> {
+    protocol: Option<&'a str>,
+    complete: bool,
+}
+
 impl Dissector {
     /// Creates a dissector with built-in or user protocol registrations.
     pub fn with_registry(registry: Registry) -> Self {
@@ -423,10 +429,22 @@ impl Dissector {
     /// Decodes one raw IPv4 or IPv6 packet. Pass TLS key log entries when
     /// decryption is wanted. Packet sources may be pcap readers or live captures.
     pub fn decode(&mut self, p: &[u8], keys: &[KeyLine]) -> Decoded {
+        self.decode_with(p, keys, None, true)
+    }
+
+    /// Decodes a copy with its service identity and payload availability.
+    pub fn decode_with(
+        &mut self,
+        p: &[u8],
+        keys: &[KeyLine],
+        protocol: Option<&str>,
+        complete: bool,
+    ) -> Decoded {
+        let context = DecodeContext { protocol, complete };
         let mut d = Decoded::default();
         match p.first().map(|b| b >> 4) {
-            Some(4) => self.ipv4(p, &mut d, keys),
-            Some(6) => self.ipv6(p, &mut d, keys),
+            Some(4) => self.ipv4(p, &mut d, keys, context),
+            Some(6) => self.ipv6(p, &mut d, keys, context),
             _ => {
                 d.proto = "?".into();
                 d.info = format!("Not an IP packet ({} bytes)", p.len());
@@ -445,7 +463,13 @@ impl Dissector {
         d
     }
 
-    fn ipv4(&mut self, p: &[u8], d: &mut Decoded, keys: &[KeyLine]) {
+    fn ipv4(
+        &mut self,
+        p: &[u8],
+        d: &mut Decoded,
+        keys: &[KeyLine],
+        mut context: DecodeContext<'_>,
+    ) {
         if p.len() < 20 {
             return truncated(d, "IPv4", p.len());
         }
@@ -457,6 +481,7 @@ impl Dissector {
         if ihl < 20 || p.len() < ihl {
             return truncated(d, "IPv4", p.len());
         }
+        context.complete &= total <= p.len();
         let end = total.clamp(ihl, p.len());
         let src = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
         let dst = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
@@ -524,10 +549,16 @@ impl Dissector {
                 return;
             }
         }
-        self.transport(p, ihl, end, proto, src.into(), dst.into(), d, keys);
+        self.transport(p, ihl, end, proto, src.into(), dst.into(), d, keys, context);
     }
 
-    fn ipv6(&mut self, p: &[u8], d: &mut Decoded, keys: &[KeyLine]) {
+    fn ipv6(
+        &mut self,
+        p: &[u8],
+        d: &mut Decoded,
+        keys: &[KeyLine],
+        mut context: DecodeContext<'_>,
+    ) {
         if p.len() < 40 {
             return truncated(d, "IPv6", p.len());
         }
@@ -608,7 +639,8 @@ impl Dissector {
         if at > end {
             return;
         }
-        self.transport(p, at, end, next, src.into(), dst.into(), d, keys);
+        context.complete &= 40 + usize::from(u16::from_be_bytes([p[4], p[5]])) <= p.len();
+        self.transport(p, at, end, next, src.into(), dst.into(), d, keys, context);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -622,11 +654,12 @@ impl Dissector {
         dst: IpAddr,
         d: &mut Decoded,
         keys: &[KeyLine],
+        context: DecodeContext<'_>,
     ) {
         let body = &p[at..end];
         match proto {
-            6 => self.tcp(p, at, end, src, dst, d, keys),
-            17 => udp(p, at, end, d, &self.registry),
+            6 => self.tcp(p, at, end, src, dst, d, keys, context),
+            17 => udp(p, at, end, d, &self.registry, context),
             1 => icmp(p, at, end, d, false),
             58 => icmp(p, at, end, d, true),
             other => {
@@ -646,6 +679,7 @@ impl Dissector {
         dst: IpAddr,
         d: &mut Decoded,
         keys: &[KeyLine],
+        context: DecodeContext<'_>,
     ) {
         let t = &p[at..end];
         if t.len() < 20 {
@@ -679,7 +713,11 @@ impl Dissector {
             seq,
             ack,
             flags,
-            payload: &p[payload.0..payload.1],
+            payload: if context.complete {
+                &p[payload.0..payload.1]
+            } else {
+                &[]
+            },
         });
         let (ckey, reversed) = conversation_key(key);
         if flow.cleared {
@@ -765,6 +803,10 @@ impl Dissector {
             d.tag("reset");
         }
         d.info = info;
+        if !context.complete {
+            self.conversations.remove(&ckey);
+            return;
+        }
         let mut gap = false;
         let layers = d.layers.len().checked_add(d.cut);
         let mut delivered = false;
@@ -778,6 +820,7 @@ impl Dissector {
                 } => {
                     let conversation = self.conversations.entry(ckey).or_insert_with(|| {
                         Conversation::with_registry(ckey.1, ckey.3, self.registry.clone())
+                            .with_protocol(context.protocol)
                     });
                     let place = Place {
                         stream_start: offset,
@@ -791,6 +834,7 @@ impl Dissector {
                 Chunk::Gap { resumed: true, .. } => {
                     let conversation = self.conversations.entry(ckey).or_insert_with(|| {
                         Conversation::with_registry(ckey.1, ckey.3, self.registry.clone())
+                            .with_protocol(context.protocol)
                     });
                     conversation.lost(reversed);
                 }
@@ -887,7 +931,14 @@ fn tcp_options(o: &[u8]) -> Vec<String> {
     out
 }
 
-fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &Registry) {
+fn udp(
+    p: &[u8],
+    at: usize,
+    end: usize,
+    d: &mut Decoded,
+    registry: &Registry,
+    context: DecodeContext<'_>,
+) {
     let u = &p[at..end];
     if u.len() < 8 {
         return truncated(d, "UDP", u.len());
@@ -928,13 +979,14 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &Registry) {
         return;
     }
     let body = (at + 8, end);
-    if body.0 >= body.1 {
+    if !context.complete || body.0 >= body.1 {
         return;
     }
     let bytes = &p[body.0..body.1];
     let selection = Selection {
         transport: fictionet::events::Transport::Udp,
         ports: (sport, dport),
+        protocol: context.protocol,
         alpn: None,
         first: bytes.get(..bytes.len().min(64)).unwrap_or_default(),
     };
@@ -1107,6 +1159,40 @@ mod tests {
         let len = p.len() as u16;
         p[2..4].copy_from_slice(&len.to_be_bytes());
         p
+    }
+
+    #[test]
+    fn a_headers_only_copy_keeps_transport_without_application_payload() {
+        let packet = tcp(
+            40000,
+            80,
+            1,
+            0x18,
+            b"GET / HTTP/1.1\r\nHost: site.test\r\n\r\n",
+        );
+        let mut dissector = Dissector::default();
+        let decoded = dissector.decode_with(&packet, &[], Some("http1"), false);
+        assert_eq!(decoded.proto, "TCP");
+        assert!(
+            decoded
+                .layers
+                .iter()
+                .any(|layer| layer.name == "Transmission Control Protocol")
+        );
+        assert!(
+            !decoded
+                .layers
+                .iter()
+                .any(|layer| layer.name == "Hypertext Transfer Protocol")
+        );
+        let decoded = dissector.decode(&packet[..packet.len() - 1], &[]);
+        assert_eq!(decoded.proto, "TCP");
+        assert!(
+            !decoded
+                .layers
+                .iter()
+                .any(|layer| layer.name == "Hypertext Transfer Protocol")
+        );
     }
 
     #[test]

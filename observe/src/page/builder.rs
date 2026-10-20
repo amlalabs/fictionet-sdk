@@ -58,6 +58,15 @@ pub(super) fn labels_panel(enabled: bool) -> PanelDescription {
 }
 
 impl Page {
+    /// Sets packet presenters before any link is watched.
+    pub fn protocols(mut self, protocols: crate::Registry) -> Self {
+        if !self.dashboard.0.watches.protocols(protocols) {
+            self.errors
+                .push("protocols must be set before watching links".into());
+        }
+        self
+    }
+
     /// Registers bounded state without adding a panel.
     pub fn state<T: Serialize>(mut self, name: impl Into<String>, topic: StateTopic<T>) -> Self {
         let name = name.into();
@@ -169,15 +178,6 @@ impl Page {
     /// Keeps console tiles beside the custom panel selected by `workspace`.
     pub fn workspace_consoles(mut self) -> Self {
         self.workspace_consoles = true;
-        self
-    }
-    /// Names an address the page's consoles reach the hosts from, such as an
-    /// admin SSH host. Its packets are the page's own screen and terminal
-    /// traffic, so the packet list hides them until a viewer shows them.
-    pub fn console_address(mut self, address: std::net::IpAddr) -> Self {
-        if !self.console_addresses.contains(&address) {
-            self.console_addresses.push(address);
-        }
         self
     }
     /// Puts the named inspector panel first and opens the inspector on it, so

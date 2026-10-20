@@ -294,6 +294,7 @@ mod tests {
                 transport: Transport::Tcp,
                 ports: (40000, 502),
                 first: &[],
+                protocol: None,
                 alpn: None,
             })
             .unwrap();

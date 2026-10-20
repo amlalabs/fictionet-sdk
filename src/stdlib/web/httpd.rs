@@ -466,6 +466,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
     };
     let conn = Prefixed::new(first, conn);
     let serve_opts = ServeOptions {
+        protocol: if h2 { "http2" } else { "http1" },
         idle: None,
         write_timeout: Some(opts.limits.write_timeout),
         connection_events: false,

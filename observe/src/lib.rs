@@ -927,6 +927,33 @@ impl Collector {
     pub fn ended(&self) -> Option<Instant> {
         self.state.lock().ended
     }
+    #[cfg(feature = "decode")]
+    fn packet_protocol(&self, bytes: &[u8]) -> Option<&'static str> {
+        use fictionet::stdlib::network::ip;
+        let header = ip::Header::parse_truncated(bytes)?;
+        let ports = header.payload(bytes).get(..4)?;
+        let a = std::net::SocketAddr::new(header.src, u16::from_be_bytes([ports[0], ports[1]]));
+        let b = std::net::SocketAddr::new(header.dst, u16::from_be_bytes([ports[2], ports[3]]));
+        self.state
+            .lock()
+            .topology
+            .connections
+            .iter()
+            .rev()
+            .find_map(|connection| {
+                let conn = &connection.conn;
+                let transport = match header.protocol {
+                    6 => fictionet::events::Transport::Tcp,
+                    17 => fictionet::events::Transport::Udp,
+                    _ => return None,
+                };
+                (conn.transport == transport
+                    && ((conn.local == Some(a) && conn.peer == Some(b))
+                        || (conn.local == Some(b) && conn.peer == Some(a))))
+                .then_some(if conn.tls { "tls" } else { connection.protocol })
+                .filter(|name| !name.is_empty())
+            })
+    }
     /// Starts or joins demand on a known link. Policy still decides each crossing.
     pub fn capture_demand(&self, link: LinkId) -> Option<CaptureDemand> {
         self.demand.load().get(&link)?.take()
@@ -1092,8 +1119,8 @@ impl Observer for Collector {
             Observation::Topology(item) => {
                 let link = match &item {
                     TopologyRef::LinkAdded { link, .. } => Some((*link, true)),
-                    TopologyRef::LinkRemoved { link, .. } => {
-                        captures.retired(*link);
+                    TopologyRef::LinkRemoved { link, totals } => {
+                        captures.retired(*link, totals.iter().map(|count| count.packets).sum());
                         Some((*link, false))
                     }
                     _ => None,

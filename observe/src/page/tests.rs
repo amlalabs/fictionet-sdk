@@ -2555,22 +2555,7 @@ async fn inspector_first_opens_the_inspector_on_a_named_panel() {
         json_body(&description)["inspector_first"],
         serde_json::Value::Null
     );
-    assert_eq!(
-        json_body(&description)["console_addresses"],
-        serde_json::json!([])
-    );
-    let admin = std::net::Ipv4Addr::new(10, 10, 5, 20).into();
-    let consoles = page()
-        .console_address(admin)
-        .console_address(admin)
-        .bind_loopback(0)
-        .await
-        .unwrap();
-    let description = request(&consoles, "GET", "/api/page", &bearer(&consoles), "").await;
-    assert_eq!(
-        json_body(&description)["console_addresses"],
-        serde_json::json!(["10.10.5.20"])
-    );
+    assert!(json_body(&description).get("console_addresses").is_none());
     for invalid in [
         page().inspector_first("Missing"),
         page()

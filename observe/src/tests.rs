@@ -523,8 +523,8 @@ fn connection_bindings_follow_hosts_and_release_their_budget() {
                 "10.0.0.1:443".parse().unwrap(),
                 "10.0.0.2:5001".parse().unwrap(),
             );
-            host.connection_opened(&first);
-            host.connection_opened(&second);
+            host.connection_opened("http1", &first);
+            host.connection_opened("http1", &second);
             cx.yield_now().await?;
             let snapshot = reader.topology();
             assert_eq!(snapshot.connections.len(), 1);
@@ -536,7 +536,7 @@ fn connection_bindings_follow_hosts_and_release_their_budget() {
             assert_eq!(snapshot.refused, 1);
             assert_eq!(snapshot.truncated_bytes, 4);
             host.connection_closed(&first);
-            host.connection_opened(&second);
+            host.connection_opened("http1", &second);
             cx.yield_now().await?;
             let snapshot = reader.topology();
             assert_eq!(snapshot.connections.len(), 1);

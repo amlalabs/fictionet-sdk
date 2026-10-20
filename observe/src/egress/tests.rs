@@ -502,6 +502,7 @@ fn topology_names_live_connections_and_closing_counts_them_once() {
     egress.observe(
         stamp,
         Observation::Topology(TopologyRef::ConnectionOpened {
+            protocol: "http1",
             conn: &info,
             task: None,
             host: Some(host),

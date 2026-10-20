@@ -1363,3 +1363,392 @@ fn diagnostic_commands() -> Vec<&'static str> {
         desktop::FIREFOX_TITLE,
     ]
 }
+
+fn work_packet(destination: [u8; 4], seq: u32, payload: &[u8]) -> fictionet::Packet {
+    let mut bytes = vec![0; 40];
+    bytes[0] = 0x45;
+    bytes[2..4].copy_from_slice(&((40 + payload.len()) as u16).to_be_bytes());
+    bytes[8] = 64;
+    bytes[9] = 6;
+    bytes[12..16].copy_from_slice(&[10, 10, 5, 40]);
+    bytes[16..20].copy_from_slice(&destination);
+    bytes[20..22].copy_from_slice(&40_000u16.to_be_bytes());
+    bytes[22..24].copy_from_slice(&80u16.to_be_bytes());
+    bytes[24..28].copy_from_slice(&seq.to_be_bytes());
+    bytes[32] = 0x50;
+    bytes[33] = 0x18;
+    bytes.extend_from_slice(payload);
+    fictionet::Packet(bytes)
+}
+
+async fn observed_kit(
+    policy: Option<Arc<dyn fictionet_observe::Policy>>,
+) -> (Run, Prepared, DashboardHandle) {
+    let mut kit = Kit::new("observations").guest(Guest::ubuntu("guest", "agent"));
+    kit.policy = policy;
+    let (mut run, mut prepared) = kit.prepare().unwrap();
+    run.bind_page(
+        "observations",
+        Box::new(|dashboard, hosts| {
+            Page::new("Observations", dashboard)
+                .host(hosts.take("guest"))
+                .standard_panels()
+        }),
+        &mut prepared,
+    )
+    .await
+    .unwrap();
+    let handle = run.dashboard.as_ref().unwrap().clone();
+    (run, prepared, handle)
+}
+
+#[tokio::test]
+async fn console_traffic_costs_nothing_when_excluded() {
+    use fictionet::events::{Interest, Observation, Stamp, Stream};
+    use fictionet::{Interface, InterfaceExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Probe {
+        handle: DashboardHandle,
+        packets: AtomicUsize,
+    }
+    impl Observer for Probe {
+        fn enabled(&self, interest: Interest<'_>) -> bool {
+            matches!(interest, Interest::Packet(_)) && self.handle.collector().enabled(interest)
+        }
+        fn observe(&self, _: Stamp, observation: Observation<'_>) {
+            if matches!(observation, Observation::Packet(_)) {
+                self.packets.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let (run, mut prepared, handle) = observed_kit(None).await;
+    let probe = Arc::new(Probe {
+        handle: handle.clone(),
+        packets: AtomicUsize::new(0),
+    });
+    prepared.observers.push(probe.clone());
+    fictionet::lab(
+        RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(std::mem::take(
+            &mut prepared.observers,
+        )))),
+        move |cx| async move {
+            let mut guest = prepared.bridges.pop().unwrap().link;
+            let mut jump = prepared.jump_link;
+            let mut guest_link = prepared.attachments.get(&cx, "guest").await?;
+            let mut jump_link = prepared.attachments.get(&cx, JUMP).await?;
+            cx.yield_now().await?;
+            let collector = handle.collector();
+            let topology = collector.topology();
+            let id = *topology
+                .links
+                .iter()
+                .find(|(_, l)| l.sandbox.as_deref() == Some("guest"))
+                .unwrap()
+                .0;
+            let jump_id = *topology
+                .links
+                .iter()
+                .find(|(_, l)| l.sandbox.as_deref() == Some(JUMP))
+                .unwrap()
+                .0;
+            let mut console = work_packet([10, 10, 5, 40], 1, &[7; 120]);
+            console.0[12..16].copy_from_slice(&jump::JUMP_ADDR.octets());
+            console.0[22..24].copy_from_slice(&22u16.to_be_bytes());
+            let mut expected = Vec::new();
+            for index in 0..2000 {
+                guest.send(console.clone());
+                guest_link.recv(&cx).await?;
+                jump.send(console.clone());
+                jump_link.recv(&cx).await?;
+                jump_link.send(console.clone());
+                jump.recv(&cx).await?;
+                if index % 10 == 0 {
+                    let packet = work_packet([10, 10, 5, 50], index, &[index as u8; 120]);
+                    expected.push(packet.0.clone());
+                    guest.send(packet);
+                    guest_link.recv(&cx).await?;
+                }
+            }
+            assert_eq!(cx.now(), fictionet::time::Instant::ZERO);
+            assert_eq!(probe.packets.load(Ordering::Relaxed), 200);
+            let batch = collector.packets(id, 0, usize::MAX);
+            assert_eq!(batch.cursor, 200);
+            assert_eq!(
+                batch
+                    .packets
+                    .iter()
+                    .map(|p| p.bytes.as_ref())
+                    .collect::<Vec<_>>(),
+                expected.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            );
+            assert!(
+                batch
+                    .packets
+                    .iter()
+                    .all(|p| p.class == AGENT && p.skipped == 0 && p.original_len == p.bytes.len())
+            );
+            assert_eq!(batch.evicted, [(AGENT, 0)]);
+            assert!(collector.packets(jump_id, 0, usize::MAX).packets.is_empty());
+            assert!(
+                collector
+                    .losses()
+                    .streams
+                    .iter()
+                    .all(|row| row.stream != Stream::Packets(id))
+            );
+            let counts = collector.topology().counters();
+            assert_eq!(
+                counts[&id].iter().map(|c| c.packets).sum::<u64>() - batch.cursor,
+                2000
+            );
+            assert_eq!(
+                counts[&jump_id].iter().map(|c| c.packets).sum::<u64>(),
+                4000
+            );
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let client = client::PageClient::from_url(run.page_url()).unwrap();
+    client.bootstrap().await.unwrap();
+    let description: serde_json::Value = client.get_json("/api/page").await.unwrap();
+    assert!(description.get("console_addresses").is_none());
+    run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_noise_flood_keeps_the_agents_http_events() {
+    let (run, mut prepared, handle) = observed_kit(None).await;
+    fictionet::lab(
+        RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(std::mem::take(
+            &mut prepared.observers,
+        )))),
+        |cx| async move {
+            cx.emit("http", "request", |event| event.field("path", "/before"));
+            for index in 0..50_000 {
+                cx.emit("net", "blocked", |event| event.field("port", index));
+            }
+            cx.emit("http", "request", |event| event.field("path", "/after"));
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let mut session = handle.session();
+    let values = session.request(1, r#"{"op":"events","max":1000}"#, Instant::now(), None);
+    let value: serde_json::Value = serde_json::from_slice(&values[0].bytes).unwrap();
+    let events: Vec<_> = value["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["source"] == "http")
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["fields"]["path"], "/before");
+    assert_eq!(events[1]["fields"]["path"], "/after");
+    assert!(
+        handle
+            .collector()
+            .losses()
+            .streams
+            .iter()
+            .any(|row| row.class == Some(NOISE) && row.count > 0)
+    );
+    run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_traffic_keeps_full_fidelity_under_load() {
+    use fictionet::events::{Interest, LossReason, Observation, Stream};
+    use fictionet::{Interface, InterfaceExt};
+    use fictionet_observe::{Admit, Class, Envelope, Policy};
+    struct Mirror(KitPolicy);
+    impl Policy for Mirror {
+        fn classes(&self) -> &[Class] {
+            self.0.classes()
+        }
+        fn admit(&self, interest: Interest<'_>) -> Admit {
+            if let Interest::Packet(packet) = interest
+                && let Some(header) =
+                    fictionet::stdlib::network::ip::Header::parse_truncated(packet.bytes)
+                && header.dst == Ipv4Addr::new(10, 10, 5, 30)
+            {
+                return Admit::Class(BULK);
+            }
+            self.0.admit(interest)
+        }
+        fn sort(&self, observation: &Observation<'_>) -> Option<usize> {
+            self.0.sort(observation)
+        }
+    }
+    let (run, mut prepared, handle) =
+        observed_kit(Some(Arc::new(Mirror(KitPolicy::new(None))))).await;
+    fictionet::lab(
+        RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(std::mem::take(
+            &mut prepared.observers,
+        )))),
+        move |cx| async move {
+            let mut guest = prepared.bridges.pop().unwrap().link;
+            let mut link = prepared.attachments.get(&cx, "guest").await?;
+            cx.yield_now().await?;
+            let collector = handle.collector();
+            let id = *collector
+                .topology()
+                .links
+                .iter()
+                .find(|(_, l)| l.sandbox.as_deref() == Some("guest"))
+                .unwrap()
+                .0;
+            let _demand = collector.capture_demand(id).unwrap();
+            let request = format!(
+                "GET /load HTTP/1.1\r\nHost: site.test\r\nX-Padding: {}\r\n\r\n",
+                "x".repeat(1000)
+            );
+            let mut expected = Vec::new();
+            for window in 0..50 {
+                for index in 0..1000 {
+                    guest.send(work_packet([10, 10, 5, 30], index, &[7; 200]));
+                    link.recv(&cx).await?;
+                    if window % 5 == 0 && index == 500 {
+                        let part = window / 5;
+                        let start = request.len() * part / 10;
+                        let end = request.len() * (part + 1) / 10;
+                        let packet = work_packet(
+                            [10, 10, 5, 50],
+                            start as u32 + 1,
+                            &request.as_bytes()[start..end],
+                        );
+                        expected.push(packet.0.clone());
+                        guest.send(packet);
+                        link.recv(&cx).await?;
+                    }
+                }
+                cx.sleep(fictionet::time::Duration::from_millis(100))
+                    .await?;
+            }
+            let agent = AGENT + BULK + 1;
+            let bulk = BULK + BULK + 1;
+            let batch = collector.packets(id, 0, usize::MAX);
+            let copies: Vec<_> = batch.packets.iter().filter(|p| p.class == agent).collect();
+            assert_eq!(
+                copies.iter().map(|p| p.bytes.as_ref()).collect::<Vec<_>>(),
+                expected.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            );
+            assert!(
+                copies
+                    .iter()
+                    .all(|p| p.skipped == 0 && p.bytes.len() == p.original_len)
+            );
+            assert!(copies.windows(2).all(|p| p[0].stamp.seq < p[1].stamp.seq));
+            assert!(batch.evicted.contains(&(agent, 0)));
+            let losses = collector.losses();
+            assert!(losses.streams.iter().all(|loss| loss.class != Some(agent)));
+            for reason in [LossReason::Sampling, LossReason::Eviction] {
+                assert!(
+                    losses
+                        .streams
+                        .iter()
+                        .any(|loss| loss.stream == Stream::Packets(id)
+                            && loss.class == Some(bulk)
+                            && loss.reason == reason
+                            && loss.count > 0)
+                );
+            }
+            let now = Instant::now();
+            let mut session = handle.session();
+            session.request(
+                1,
+                &format!(r#"{{"op":"packets","link":"e{}"}}"#, id.get()),
+                now,
+                None,
+            );
+            let mut http = 0;
+            let mut agents = 0;
+            for turn in 0..20 {
+                for value in session.poll(now + Duration::from_millis(turn * 100), None) {
+                    if let Some(Envelope::Event { name, data }) = value.envelope()
+                        && name == "packet"
+                    {
+                        let row: serde_json::Value = serde_json::from_str(data).unwrap();
+                        if row["class"] == "agent" {
+                            agents += 1;
+                            assert_eq!(row["skipped"], 0);
+                            assert_eq!(row["evicted"], 0);
+                            if row["proto"] == "HTTP" {
+                                http += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(agents, 10);
+            assert_eq!(http, 1);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    run.shutdown().await.unwrap();
+}
+
+#[test]
+fn kit_rules_precede_world_policy_and_preserve_non_console_flows() {
+    use fictionet::events::{Interest, LinkType, Observation, PacketRef, Side};
+    use fictionet_observe::{Admit, Class, Policy};
+    struct All;
+    impl Policy for All {
+        fn classes(&self) -> &[Class] {
+            const CLASSES: &[Class] = &[Class::new("world")];
+            CLASSES
+        }
+        fn admit(&self, _: Interest<'_>) -> Admit {
+            Admit::Class(0)
+        }
+        fn sort(&self, _: &Observation<'_>) -> Option<usize> {
+            Some(0)
+        }
+    }
+    let policy = KitPolicy::new(Some(Arc::new(All)));
+    let collector = Arc::new(fictionet_observe::Collector::new(Arc::new(KitPolicy::new(
+        None,
+    ))));
+    let reader = collector.clone();
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(1)).observer(collector),
+        move |cx| async move {
+            let (a, _b) = fictionet::pair();
+            let _a = cx.tap("guest", a);
+            cx.yield_now().await?;
+            let link = *reader.topology().links.keys().next().unwrap();
+            for (port, expected) in [
+                (22u16, Admit::Skip),
+                (5900, Admit::Skip),
+                (80, Admit::Class(5)),
+            ] {
+                let mut bytes = work_packet([10, 10, 5, 40], 1, b"hello").0;
+                bytes[12..16].copy_from_slice(&jump::JUMP_ADDR.octets());
+                bytes[22..24].copy_from_slice(&port.to_be_bytes());
+                let packet = PacketRef {
+                    link,
+                    tap: "guest",
+                    sandbox: Some("guest"),
+                    side: Side::A,
+                    link_type: LinkType::Ip,
+                    len: bytes.len(),
+                    bytes: &bytes,
+                };
+                assert_eq!(policy.admit(Interest::Packet(packet)), expected);
+                assert_eq!(
+                    policy.admit(Interest::Packet(PacketRef {
+                        sandbox: Some(JUMP),
+                        ..packet
+                    })),
+                    Admit::Skip
+                );
+            }
+            Ok(())
+        },
+    ))
+    .unwrap();
+}

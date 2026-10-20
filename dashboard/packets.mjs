@@ -1,10 +1,10 @@
 // The packet list: its stream, queue, selection, detail and hex view.
 // components/packets.mjs passes in DOM helpers, the transport's packet calls,
 // labels and orientation.
-import { listen, scoped, lossLine } from './dom.mjs';
+import { listen, scoped, lossLine, observationList } from './dom.mjs';
 
 // What the detail pane says until a packet is selected.
-const PICK = 'Select a packet to see its layers.';
+const PICK = 'Select a packet';
 
 export function createPackets({
   $, el, packetStream, packet, download, fmtCount, maxRows = 3000,
@@ -12,9 +12,6 @@ export function createPackets({
   // A table with a Host column gives every row that cell, so gap rows span
   // all nine columns whichever are hidden.
   hostColumn = false,
-  // Addresses the page's consoles reach the hosts from. Their packets are
-  // the page's own screen and terminal traffic, hidden until shown.
-  consoleAddresses = [],
 }) {
   const cleanup = [];
   const streamCleanup = [];
@@ -23,6 +20,16 @@ export function createPackets({
   const document = drawer.ownerDocument || globalThis.document;
   const prows = $('prows');
   const plist = $('plist');
+  let rowKey = 0;
+  const tail = observationList(prows, {
+    limit: maxRows, key: (row) => row.key,
+    create(row) {
+      const parent = document.createDocumentFragment();
+      if (row.gap) addGap(row.gap, parent);
+      else addPacket(row, parent);
+      return { node: parent.firstChild };
+    },
+  });
   // What the list watches: { links: [{ id, flip }], source, paused, held,
   // queue, lastTime, done, skipped, evicted, missed, rows }; done holds links that
   // ended. A packet's side is turned to the drawn edge's:
@@ -45,34 +52,11 @@ export function createPackets({
     const cut = text.startsWith('[') ? text.indexOf(']') + 1 : text.split(':').length === 2 ? text.indexOf(':') : -1;
     return cut > 0 && text[cut] === ':' ? [text.slice(0, cut), text.slice(cut)] : [text, ''];
   };
-  const address = (text) => endpoint(text)[0].replace(/^\[(.*)\]$/, '$1');
-  const fromConsole = (p) => consoleAddresses.includes(address(p.src)) || consoleAddresses.includes(address(p.dst));
-  let showConsole = false, reopen = null;
-  const consoleNote = $('console-note');
-  function showConsoleNote() {
-    if (!consoleNote || !consoleAddresses.length || !packets) return;
-    const where = consoleAddresses.join(', ');
-    $('console-text').textContent = showConsole
-      ? `Showing console packets · ${where}`
-      : `${fmtCount(packets.console)} console ${packets.console === 1 ? 'packet' : 'packets'} hidden · ${where}`;
-    consoleNote.title = `The page's own screen and terminal sessions, and the demo's checks, reach the hosts from ${where}.`;
-    $('console-toggle').textContent = showConsole ? 'Hide' : 'Show';
-    consoleNote.hidden = !showConsole && !packets.console;
-  }
-  if (consoleNote) {
-    on($('console-toggle'), 'click', () => {
-      showConsole = !showConsole;
-      // The stream replays the history it keeps, now with or without them.
-      reopen?.();
-    });
-  }
-
   /// Opens the packets of `members` ({ e, flip, host }): side 0 goes from
   /// `fromName` to `toName`. `total` counts the links the members were
   /// chosen from, when the page server's merge limit left some out.
   function openLinks(fromName, toName, members, label, total = members.length) {
     closePackets();
-    reopen = () => openLinks(fromName, toName, members, label, total);
     clearUnread();
     drawer.hidden = false;
     const many = members.length > 1;
@@ -87,7 +71,7 @@ export function createPackets({
     $('pause').textContent = 'Pause';
     $('sampled').hidden = true;
     $('sampled').textContent = '';
-    prows.replaceChildren();
+    tail.clear();
     clearDetail(PICK);
     const hosts = new Map(members.filter((m) => m.host).map((m) => [m.e.id, m.host]));
     const showHost = new Set(hosts.values()).size > 1;
@@ -101,19 +85,19 @@ export function createPackets({
       invalidateSelection();
       // A new subscription replays retained history, possibly with restarted
       // sequence numbers. Replace its state before accepting any replay.
-      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
-      prows.replaceChildren();
-      addGap('Packet history reloaded after reconnect.');
+      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), open: members.length, failed: false };
+      tail.clear();
+      addGap('Packet history reloaded');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
-      clearDetail(`Packet history reloaded after reconnect. ${PICK}`);
+      clearDetail(`Packet history reloaded · ${PICK}`);
     });
-    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, console: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
-    showConsoleNote();
+    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), open: members.length, failed: false };
     onStream('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
       p.link = p.link || list;
+      if (p.declined !== undefined) { packets.declined.set(p.link, p.declined); showCounts(); }
       packets.lastTime.set(p.link, p.t);
       if (flips.get(p.link)) p.side = 1 - p.side;
       // Keep capture loss visible even if its row leaves the browser's queue.
@@ -123,6 +107,14 @@ export function createPackets({
       }
       queueEntry(p);
     });
+    const policy = (ev) => {
+      if (packets?.source !== source) return;
+      const value = JSON.parse(ev.data);
+      if (value.declined !== undefined) packets.declined.set(value.link || list, value.declined);
+      showCounts();
+    };
+    onStream('link', policy);
+    onStream('policy', policy);
     onStream('gap', (ev) => {
       if (packets?.source !== source) return;
       const gap = JSON.parse(ev.data);
@@ -132,7 +124,7 @@ export function createPackets({
       // Equal times keep arrival order, so a gap follows this link's last row.
       queueEntry({
         t: packets.lastTime.get(link) ?? 0,
-        gap: `Packets ${gap.after + 1}–${gap.next - 1} of link ${link} are no longer kept (${fmtCount(gap.missed)} rows missed).`,
+        gap: `Link ${link} · ${fmtCount(gap.missed)} rows missed`,
       });
     });
     onStream('link_end', (ev) => {
@@ -165,8 +157,8 @@ export function createPackets({
     onStream('end', (ev) => {
       if (packets?.source !== source) return;
       source.close();
-      if (JSON.parse(ev.data).reason === 'the world closed') addGap('The world closed.');
-      else if (!packets.failed) addGap(many ? 'Every one of these links has closed.' : 'The link closed: both of its ends are gone.');
+      if (JSON.parse(ev.data).reason === 'the world closed') addGap('World closed');
+      else if (!packets.failed) addGap(many ? 'All links closed' : 'The link closed');
     });
     fitColumns();
   }
@@ -195,7 +187,7 @@ export function createPackets({
       await download('pcap', current.list);
       if (packets === current) $('pcap-label').textContent = 'pcapng';
     } catch {
-      if (packets === current) $('pcap-label').textContent = 'Download failed. Try again.';
+      if (packets === current) $('pcap-label').textContent = 'Download failed';
     }
   });
   on($('pause'), 'click', () => {
@@ -234,11 +226,12 @@ export function createPackets({
 
   function showCounts() {
     lossLine($('sampled'), [
+      { stream: 'packets', reason: 'policy', count: [...packets.declined.values()].reduce((a, b) => a + b, 0) },
       { stream: 'packets', reason: 'sampling', count: packets.skipped },
       { stream: 'packets', reason: 'eviction', count: packets.evicted },
       { stream: 'packets', reason: 'subscriber', count: packets.missed },
     ]);
-    $('sampled').title = 'Sampling leaves packets uncopied. Capture eviction drops copies before decoding. Subscriber overruns lose decoded rows before delivery. Counts cover the loss reported by this history; expired rows may have carried more sampling or capture loss.';
+
   }
 
   function trimRows() {
@@ -271,26 +264,7 @@ export function createPackets({
       }
       if (!batch.length) return;
     }
-    if (!showConsole && consoleAddresses.length) {
-      // Hidden console packets take no rows, so they cannot push the
-      // world's own traffic out of the list.
-      const before = packets.console;
-      batch = batch.filter((p) => {
-        if (p.gap || !fromConsole(p)) return true;
-        packets.console++;
-        if (p.skipped > 0) packets.skipped += p.skipped;
-        return false;
-      });
-      if (packets.console !== before) { showCounts(); showConsoleNote(); }
-      if (!batch.length) return;
-    }
-    const frag = document.createDocumentFragment();
-    // A flood only ever shows its last rows.
-    for (const p of batch.slice(-MAX_ROWS)) {
-      if (p.gap) addGap(p.gap, frag);
-      else addPacket(p, frag);
-    }
-    prows.appendChild(frag);
+    tail.append(batch.slice(-MAX_ROWS).map((row) => ({ ...row, key: ++rowKey })));
     fitColumns();
     trimRows();
     if (nearBottom) { plist.scrollTop = plist.scrollHeight; clearUnread(); }
@@ -338,6 +312,7 @@ export function createPackets({
         const text = el('span', { class: 'packet-info-text' }, info);
         el('span', { class: 'packet-info-protocol', text: `${p.proto} ` }, text);
         text.append(String(c));
+        if (p.source && p.class) el('span', { class: 'pill', text: `${p.source}.${p.class}` }, info);
         labelChips(info, labels.filter((label) => flowMatches(label.target, p)));
       }
     });
@@ -367,7 +342,7 @@ export function createPackets({
       const res = await packet(p, request.signal);
       if (!current()) return;
       if (!res.ok) {
-        clearDetail('This packet is no longer kept. The dashboard keeps the last 4,096 packets of a link.');
+        clearDetail('Packet no longer kept');
         return;
       }
       const d = await res.json();
@@ -375,7 +350,7 @@ export function createPackets({
       d.side = p.side;
       renderDetail(d, p);
     } catch {
-      if (current()) clearDetail('Could not load this packet. Select it again to retry.');
+      if (current()) clearDetail('Packet unavailable');
     } finally {
       if (detailRequest === request) detailRequest = null;
     }
@@ -529,7 +504,7 @@ export function createPackets({
   return { dispose() {
     closePackets();
     cleanup.splice(0).forEach((remove) => remove());
-    prows.replaceChildren();
+    tail.clear();
     clearDetail(PICK);
   }, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels,
   /// Packets received but not shown yet, or -1 while no stream is open.

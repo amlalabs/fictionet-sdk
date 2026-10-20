@@ -363,19 +363,20 @@ impl Cx {
     }
 
     /// Tells interested observers that a service in this context accepted
-    /// `conn`, binding it to the serving task and the nearest
+    /// `conn` speaking `protocol`, binding it to the serving task and the nearest
     /// [host](Cx::host). A custom service calls this when it accepts a
     /// connection, and [`Cx::connection_closed`] when it closes. This publishes
     /// topology; it changes nothing about the connection or world execution.
     /// Without connection topology interest it does nothing. With interest,
     /// it looks up the current task and nearest host and publishes the binding.
     /// During a task poll, bounded staging owns a copy of the connection data.
-    pub fn connection_opened(&self, conn: &crate::events::ConnInfo) {
+    pub fn connection_opened(&self, protocol: &'static str, conn: &crate::events::ConnInfo) {
         use crate::events::{TaskId, TopologyKind, TopologyRef};
         if self.run.observer.topology_enabled(TopologyKind::Connection) {
             let host = std::iter::successors(self.group.as_ref(), |group| group.parent.as_ref())
                 .find_map(|group| group.host);
             self.run.observer.topology(TopologyRef::ConnectionOpened {
+                protocol,
                 conn,
                 task: crate::run::RunTask::current_in(self.run.id).map(|task| TaskId(task.id)),
                 host,

@@ -101,6 +101,8 @@ pub struct Link {
 /// A connection and its serving context.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Connection {
+    /// Protocol named by the service.
+    pub protocol: &'static str,
     /// Connection and flow identity.
     pub conn: ConnInfo,
     /// Serving task.
@@ -418,13 +420,19 @@ impl Topology {
                 missing = !remove(&mut self.links, &link, &mut self.bytes);
                 !missing
             }
-            TopologyRef::ConnectionOpened { conn, task, host } => {
+            TopologyRef::ConnectionOpened {
+                conn,
+                task,
+                host,
+                protocol,
+            } => {
                 missing = task.is_some_and(|id| !self.tasks.contains_key(&id))
                     || host.is_some_and(|id| !self.hosts.contains_key(&id));
                 if missing || self.connections.len() >= limits.connections {
                     false
                 } else {
                     let conn = Connection {
+                        protocol,
                         conn: connection(conn, limits.name_bytes, &mut cut),
                         task,
                         host,

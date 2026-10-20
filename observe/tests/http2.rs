@@ -55,6 +55,7 @@ fn goaway_releases_only_calls_started_by_its_receiver() {
                                 transport: Transport::Tcp,
                                 ports: (40000, 443),
                                 first: &[],
+                                protocol: None,
                                 alpn: Some("h2"),
                             })
                             .unwrap();
@@ -167,6 +168,7 @@ fn registry_connections_share_the_capture_data_budget() {
                 transport: Transport::Tcp,
                 ports: (40000, 443),
                 first: http2::PREFACE,
+                protocol: None,
                 alpn: None,
             })
             .unwrap();
@@ -205,6 +207,7 @@ fn registration_keeps_the_supplied_budget_across_registry_clones() {
                 transport: Transport::Tcp,
                 ports: (40000, 443),
                 first: http2::PREFACE,
+                protocol: None,
                 alpn: None,
             })
             .unwrap();
@@ -430,6 +433,7 @@ fn registered_capture_replaces_the_builtin_through_the_same_registry() {
     capture::Capture::register(&mut registered, &budget);
     assert!(builtin.choose(Transport::Tcp, "http2"));
     let selection = Selection {
+        protocol: None,
         transport: Transport::Tcp,
         ports: (1, 2),
         first: http2::PREFACE,

@@ -828,7 +828,9 @@ fn a_capture_of_a_detached_sandbox_stays_readable() {
     let start = call(&mut session, 1, &packets(link, 0), now);
     assert_eq!(
         text(&start),
-        format!(r#"{{"event":"link","data":{{"id":"e{link}","a":null,"b":null,"label":null}}}}"#)
+        format!(
+            r#"{{"event":"link","data":{{"id":"e{link}","a":null,"b":null,"label":null,"declined":0}}}}"#
+        )
     );
     let values = session.poll(now, None);
     assert_eq!(names(&values), ["packet", "packet", "packet", "end"]);
@@ -878,6 +880,156 @@ fn evicting_copies_already_read_does_not_count_them_again() {
         assert!(rows[1].1.contains(r#""evicted":0"#));
         watch.pump(&handle.0);
         assert_eq!(watch.rows_after(4, 10).1, rows);
+        Ok(())
+    });
+}
+
+#[test]
+fn a_named_service_selects_its_presenter_without_a_matcher() {
+    use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Step};
+    use fictionet::stdlib::network::{ConnectionExt, ip, tcp};
+    use fictionet::stdlib::services::serve::{self, Driver, Flow, ServeOptions, Service};
+    struct Echo(Lines);
+    impl Echo {
+        fn new() -> Self {
+            Self(Lines::new(1024, Ending::LfOrCrlf))
+        }
+    }
+    impl Decode for Echo {
+        type Item = Result<Vec<u8>, LineError>;
+        type Error = std::convert::Infallible;
+        const NAME: &'static str = "echo";
+        fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
+        fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
+            self.0.decode(bytes, eof)
+        }
+    }
+    impl crate::Present for Echo {
+        fn summary(item: &Result<Vec<u8>, LineError>) -> String {
+            String::from_utf8_lossy(item.as_ref().unwrap()).into_owned()
+        }
+        fn fields(_: &Result<Vec<u8>, LineError>, _: &[u8], _: &mut crate::Layer) {}
+    }
+    struct Server;
+    impl Service for Server {
+        type Decoder = Echo;
+        type State = ();
+        type Error = std::convert::Infallible;
+        fn decoder(&self) -> Echo {
+            Echo::new()
+        }
+        fn on_item(
+            &mut self,
+            line: Result<Vec<u8>, LineError>,
+            _: &(),
+            driver: &mut Driver<'_, Echo>,
+        ) -> Result<Flow, Self::Error> {
+            driver.reply().extend_from_slice(&line.unwrap());
+            driver.reply().push(b'\n');
+            Ok(Flow::Continue)
+        }
+    }
+    let mut registry = Registry::default();
+    registry.register("echo", |_| Match::No, |_| [Echo::new(), Echo::new()]);
+    let mut options = startup(Options::default());
+    options.protocols = registry;
+    with_dashboard(options, |cx, handle| async move {
+        let (a, b) = fictionet::pair();
+        let a = cx.tap("echo", a);
+        let (a, _, _, _) = ip::split_protocols(&cx, a);
+        let (b, _, _, _) = ip::split_protocols(&cx, b);
+        let client = tcp::endpoint(&cx, a, "10.0.0.1".parse().unwrap());
+        let server = tcp::endpoint(&cx, b, "10.0.0.2".parse().unwrap());
+        serve::listen(
+            &cx,
+            server.listen(7)?,
+            Arc::new(()),
+            || Server,
+            ServeOptions {
+                protocol: "echo",
+                ..Default::default()
+            },
+        );
+        let mut conn = client.connect(&cx, "10.0.0.2:7".parse().unwrap()).await?;
+        conn.write_all(&cx, b"hello\n").await?;
+        let mut reply = [0; 6];
+        let mut read = 0;
+        while read < reply.len() {
+            read += conn.read(&cx, &mut reply[read..]).await?;
+        }
+        assert_eq!(&reply, b"hello\n");
+        cx.yield_now().await?;
+        assert!(
+            handle
+                .0
+                .collector
+                .topology()
+                .connections
+                .iter()
+                .any(|connection| connection.protocol == "echo")
+        );
+        let id = *handle
+            .0
+            .collector
+            .topology()
+            .links
+            .iter()
+            .find(|(_, link)| link.tap == "echo")
+            .unwrap()
+            .0;
+        let now = Instant::now();
+        let mut session = handle.session();
+        session.request(1, &packets(id.get(), 0), now, None);
+        let rows = session.poll(now, None);
+        assert!(
+            rows.iter()
+                .any(|row| text(row).contains(r#""proto":"echo""#) && text(row).contains("hello")),
+            "{rows:?}"
+        );
+        cx.cancel();
+        Ok(())
+    });
+}
+
+#[test]
+fn dns_without_a_connection_uses_port_matching() {
+    with_dashboard(startup(Options::default()), |cx, handle| async move {
+        let (mut a, mut b) = fictionet::pair();
+        a = cx.tap("dns", a);
+        cx.yield_now().await?;
+        let id = *handle
+            .0
+            .collector
+            .topology()
+            .links
+            .iter()
+            .find(|(_, link)| link.tap == "dns")
+            .unwrap()
+            .0;
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
+        let mut udp = vec![0xc0, 0, 0, 53, 0, (8 + query.len()) as u8, 0, 0];
+        udp.extend_from_slice(&query);
+        let packet = fictionet::stdlib::network::ip::packet(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            17,
+            &udp,
+        );
+        a.send(packet);
+        b.recv(&cx).await?;
+        assert!(handle.0.collector.topology().connections.is_empty());
+        let now = Instant::now();
+        let mut session = handle.session();
+        session.request(1, &packets(id.get(), 0), now, None);
+        assert!(
+            session
+                .poll(now, None)
+                .iter()
+                .any(|row| text(row).contains(r#""proto":"DNS""#))
+        );
         Ok(())
     });
 }

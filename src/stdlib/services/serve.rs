@@ -1192,6 +1192,8 @@ pub type TlsSelect = Arc<dyn Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> 
 /// How [`listen`] and [`connection`] run.
 #[derive(Clone)]
 pub struct ServeOptions {
+    /// Protocol name for observers. An empty name uses packet matching.
+    pub protocol: &'static str,
     /// Connections served at once; past this, a new one is reset as soon
     /// as it is accepted, and counts until its socket is gone. Default 64.
     pub max_conns: usize,
@@ -1231,6 +1233,7 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> ServeOptions {
         ServeOptions {
+            protocol: "",
             max_conns: 64,
             idle: Some(Duration::from_secs(10)),
             write_timeout: Some(Duration::from_secs(10)),
@@ -1250,6 +1253,7 @@ impl Default for ServeOptions {
 impl std::fmt::Debug for ServeOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServeOptions")
+            .field("protocol", &self.protocol)
             .field("max_conns", &self.max_conns)
             .field("idle", &self.idle)
             .field("write_timeout", &self.write_timeout)
@@ -2676,7 +2680,7 @@ where
     C: Connection,
     <S::Decoder as Decode>::Error: Clone + Send,
 {
-    fcx.connection_opened(&info);
+    fcx.connection_opened(opts.protocol, &info);
     let mut result = None;
     let region_result = {
         let slot = &mut result;
@@ -3989,9 +3993,12 @@ mod observation_tests {
                     Observation::Topology(TopologyRef::HostAdded { host, name, .. }) => {
                         self.hosts.lock().push((host, name.to_owned()))
                     }
-                    Observation::Topology(TopologyRef::ConnectionOpened { conn, task, host }) => {
-                        self.opened.lock().push((conn.clone(), task, host))
-                    }
+                    Observation::Topology(TopologyRef::ConnectionOpened {
+                        conn,
+                        task,
+                        host,
+                        ..
+                    }) => self.opened.lock().push((conn.clone(), task, host)),
                     Observation::Topology(TopologyRef::ConnectionClosed { conn }) => {
                         self.closed.lock().push(conn.clone())
                     }

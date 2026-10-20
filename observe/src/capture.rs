@@ -79,6 +79,7 @@ pub(crate) struct Capture {
     pub(crate) sandbox: Option<String>,
     pub(crate) rings: BTreeMap<usize, Ring<PacketCopy>>,
     removed: Option<u64>,
+    pub(crate) crossings: Option<u64>,
     tap: Option<Arc<str>>,
 }
 
@@ -108,10 +109,11 @@ pub(crate) struct Captures {
 }
 
 impl Captures {
-    pub(crate) fn retired(&mut self, id: LinkId) {
+    pub(crate) fn retired(&mut self, id: LinkId, crossings: u64) {
         self.order = self.order.saturating_add(1);
         if let Some(capture) = self.links.get_mut(&id) {
             capture.removed = Some(self.order);
+            capture.crossings = Some(crossings);
         }
     }
 

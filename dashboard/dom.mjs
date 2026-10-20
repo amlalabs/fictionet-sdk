@@ -63,6 +63,7 @@ export function icon(parent, kind) {
 export function lossLine(node, losses) {
   node.textContent = losses.filter((loss) => loss.count > 0).map((loss) => {
     if (loss.stream === 'packets') {
+      if (loss.reason === 'policy') return `Policy: ${loss.count} packets not kept`;
       if (loss.reason === 'sampling') return `Sampled: ${loss.count} packets not copied`;
       if (loss.reason === 'eviction') return `Capture: ${loss.count} copies evicted`;
     }
@@ -71,4 +72,19 @@ export function lossLine(node, losses) {
     return `${stream}: ${loss.count} lost (${loss.reason}).`;
   }).join(' · ');
   node.hidden = !node.textContent;
+}
+
+// A bounded tail with stable rows, shared by events and packets.
+export function observationList(parent, { limit, key, create, update = () => {} }) {
+  const rows = new Map();
+  let items = [];
+  function show(next) {
+    items = next.slice(-limit);
+    reconcile(parent, items, key, create, update, rows);
+  }
+  return {
+    show,
+    append(next) { show([...items, ...next]); },
+    clear() { items = []; rows.clear(); parent.replaceChildren(); },
+  };
 }

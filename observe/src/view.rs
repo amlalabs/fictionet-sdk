@@ -319,6 +319,41 @@ pub(crate) fn describe(graph: &DashboardHandle, id: fictionet::events::LinkId) -
         })
 }
 
+pub(crate) fn packet_declined(
+    graph: &DashboardHandle,
+    id: fictionet::events::LinkId,
+) -> Option<u64> {
+    let collector = &graph.0.collector;
+    let state = collector.state.lock();
+    let crossings = state
+        .topology
+        .links
+        .get(&id)
+        .map(|link| {
+            link.counters
+                .totals()
+                .iter()
+                .map(|counts| counts.packets)
+                .sum::<u64>()
+        })
+        .or_else(|| {
+            state
+                .captures
+                .links
+                .get(&id)
+                .and_then(|capture| capture.crossings)
+        })?;
+    let last = state.captures.links.get(&id).map_or(0, |capture| {
+        capture
+            .rings
+            .values()
+            .map(|ring| ring.last)
+            .max()
+            .unwrap_or(0)
+    });
+    Some(crossings.saturating_sub(last))
+}
+
 fn counters_json<'a>(counters: impl Iterator<Item = (&'a String, &'a [u64; 4])>) -> String {
     let mut out = String::from("{");
     for (i, (id, c)) in counters.enumerate() {

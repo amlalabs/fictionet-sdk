@@ -379,6 +379,7 @@ mod tests {
                     transport,
                     ports,
                     first,
+                    protocol: None,
                     alpn,
                 };
                 assert_eq!(registry.select(selection), expected, "{selection:?}");

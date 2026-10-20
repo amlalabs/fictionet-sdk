@@ -140,6 +140,11 @@ impl DashboardObserver {
 }
 
 impl DashboardHandle {
+    /// Retained observations and their loss ledger.
+    pub fn collector(&self) -> &Collector {
+        &self.0.collector
+    }
+
     /// Creates one caller's session with a limit of 64 subscriptions and
     /// capture downloads. No thread or clock read is needed to drive it.
     pub fn session(&self) -> Session {
@@ -209,7 +214,11 @@ enum Kind {
         next_graph: Instant,
     },
     /// `packets`: one link's decoded packets as they are captured.
-    Packets { hold: Hold, cursor: u64 },
+    Packets {
+        hold: Hold,
+        cursor: u64,
+        declined: Option<u64>,
+    },
 }
 
 /// A `pcap` reply still being written.
@@ -353,12 +362,23 @@ impl Session {
                             });
                         match acquired {
                             Ok(hold) => {
-                                let link = event(id, "link", &hold.watch().describe());
+                                let mut description = hold.watch().describe();
+                                if let Some(count) =
+                                    view::packet_declined(handle, hold.watch().id())
+                                {
+                                    description.pop();
+                                    description.push_str(&format!(",\"declined\":{count}}}"));
+                                }
+                                let link = event(id, "link", &description);
                                 let cursor = req.get("after").and_then(Scalar::as_u64).unwrap_or(0);
                                 self.subs.push(Subscription {
                                     id,
                                     next: now,
-                                    kind: Kind::Packets { hold, cursor },
+                                    kind: Kind::Packets {
+                                        declined: view::packet_declined(handle, hold.watch().id()),
+                                        hold,
+                                        cursor,
+                                    },
                                 });
                                 return vec![link];
                             }
@@ -522,7 +542,11 @@ impl Subscription {
                 }
                 ended
             }
-            Kind::Packets { hold, cursor } => {
+            Kind::Packets {
+                hold,
+                cursor,
+                declined,
+            } => {
                 self.next = now + PACKET_TICK;
                 let shared = &handle.0;
                 let watch = hold.watch();
@@ -536,7 +560,19 @@ impl Subscription {
                     None
                 };
                 let drained = watch.pump(shared);
+                let current_declined = view::packet_declined(handle, watch.id());
                 let (missed, rows) = watch.rows_after(*cursor, ROWS_PER_POLL);
+                if rows.is_empty()
+                    && current_declined != *declined
+                    && let Some(count) = current_declined
+                {
+                    out.push(event(
+                        id,
+                        "policy",
+                        &Object::new().num("declined", count).done(),
+                    ));
+                }
+                *declined = current_declined;
                 if missed > 0 {
                     let gap = crate::loss::gap(
                         fictionet::events::Stream::Packets(watch.id()),
@@ -551,7 +587,11 @@ impl Subscription {
                 if !drained || rows.len() == ROWS_PER_POLL {
                     self.next = now;
                 }
-                for (seq, row) in rows {
+                for (seq, mut row) in rows {
+                    if let Some(count) = current_declined {
+                        row.pop();
+                        row.push_str(&format!(",\"declined\":{count}}}"));
+                    }
                     out.push(event(id, "packet", &row));
                     *cursor = seq;
                 }

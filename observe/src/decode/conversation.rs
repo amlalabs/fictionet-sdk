@@ -13,6 +13,7 @@ use fictionet_observe::{Decoded, KeyLine, Match, Place, Protocol, Registry, Sele
 pub struct Conversation {
     ports: (u16, u16),
     alpn: Option<String>,
+    name: Option<String>,
     registry: Registry,
     protocol: Option<Box<dyn Protocol>>,
     prefix: [Vec<u8>; 2],
@@ -27,6 +28,7 @@ impl Conversation {
     pub fn with_registry(port_a: u16, port_b: u16, registry: Registry) -> Self {
         Self {
             ports: (port_a, port_b),
+            name: None,
             alpn: None,
             registry,
             protocol: None,
@@ -35,6 +37,12 @@ impl Conversation {
             lost_early: [false; 2],
             rejected: false,
         }
+    }
+
+    /// Supplies the service protocol before bytes arrive.
+    pub fn with_protocol(mut self, name: Option<&str>) -> Self {
+        self.name = name.map(str::to_owned);
+        self
     }
 
     /// Supplies the negotiated ALPN to matchers for a nested stream.
@@ -98,6 +106,7 @@ impl Conversation {
             transport: Transport::Tcp,
             ports: self.ports,
             first: prefix,
+            protocol: self.name.as_deref(),
             alpn: self.alpn.as_deref(),
         }) {
             Ok(mut protocol) => {

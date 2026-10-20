@@ -66,7 +66,6 @@ export function createServices(transport, theme, importModule = (url) => import(
     // terminal sessions come from, and the state and command paths of its
     // labels and startup checks, or null when it has no such panel.
     hosts: [],
-    consoleAddresses: [],
     labelState: null,
     labelCommand: null,
     containmentState: null,
@@ -481,7 +480,6 @@ export async function mount(root, transport, theme, importModule) {
   if (disposed) return stop;
   root.dataset.state = 'ready';
   services.hosts = page.hosts;
-  services.consoleAddresses = page.console_addresses || [];
   services.labelState = page.panels.find((item) => item.kind === 'labels')?.state;
   services.labelCommand = page.panels.find((item) => item.kind === 'labels')?.command;
   services.containmentState = page.panels.find((item) => item.kind === 'containment')?.state;

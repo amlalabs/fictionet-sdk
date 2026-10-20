@@ -155,33 +155,17 @@ test('a packet list keeps its rows when its links end and the run stops', async 
   h.clean();
 });
 
-test('the page\'s own console traffic is hidden with a count until a viewer shows it', async (t) => {
+test('packet rows have no console filter or toggle', async (t) => {
   const h = await fixture(t);
-  h.services.consoleAddresses = ['10.10.5.20'];
   const dispose = packets(h.root, h.services);
   h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e2', a: 's1', b: 't1' }], counters: { e2: [1, 0, 0, 0] } });
   await settle();
-  const sent = (stream) => {
-    stream.emit('packet', { seq: 1, t: 1, side: 0, len: 90, skipped: 3, evicted: 0, src: '10.10.5.20:54926', dst: '10.0.0.2:22', proto: 'TCP', info: '54926 → 22', tags: [] });
-    stream.emit('packet', { seq: 2, t: 2, side: 0, len: 60, skipped: 0, evicted: 0, src: '10.0.0.2:40000', dst: '142.250.1.1:443', proto: 'TLS', info: 'Client Hello', tags: [] });
-    h.frame();
-  };
-  const rows = () => h.root.querySelector('#prows').children.filter((row) => !row.classList.contains('gap')).map((row) => row.dataset.src);
-  const note = h.root.querySelector('#console-note');
-  assert.equal(note.hidden, true);
-  sent(h.streams.at(-1));
-  assert.deepEqual(rows(), ['10.0.0.2:40000']);
-  assert.equal(note.hidden, false);
-  assert.equal(h.root.querySelector('#console-text').textContent, '1 console packet hidden · 10.10.5.20');
-  assert.match(note.title, /page's own screen and terminal sessions/);
-  assert.match(h.root.querySelector('#sampled').textContent, /3 packets not copied/, 'a hidden packet keeps its sampling count');
-  const opened = h.streams.length;
-  h.root.querySelector('#console-toggle').click();
-  assert.equal(h.streams.length, opened + 1, 'showing reopens the stream to replay its history');
-  sent(h.streams.at(-1));
-  assert.deepEqual(rows(), ['10.10.5.20:54926', '10.0.0.2:40000']);
-  assert.equal(h.root.querySelector('#console-text').textContent, 'Showing console packets · 10.10.5.20');
-  assert.equal(h.root.querySelector('#console-toggle').textContent, 'Hide');
+  h.streams.at(-1).emit('packet', { seq: 1, t: 1, side: 0, len: 90, skipped: 3, evicted: 0, src: '10.10.5.20:54926', dst: '10.0.0.2:22', proto: 'TCP', info: '54926 → 22', tags: [] });
+  h.frame();
+  assert.equal(h.root.querySelector('#prows').children.length, 1);
+  assert.equal(h.root.querySelector('#console-note'), null);
+  assert.equal(h.root.querySelector('#console-toggle'), null);
+  assert.match(h.root.querySelector('#sampled').textContent, /3 packets not copied/);
   dispose();
   h.clean();
 });
@@ -317,7 +301,7 @@ test('a selected event shows its fields and offers only an approximate packet ma
   h.root.querySelector('button.event-line').click();
   assert.equal(h.selection.get().host, 'alpha');
   assert.match(h.root.querySelector('.event-detail').textContent, /10\.0\.0\.2:5000/);
-  assert.match(h.root.textContent, /Approximate: matched by address and port, not by connection\./);
+  assert.match(h.root.textContent, /Address and port match/);
   h.root.querySelectorAll('button').find((button) => button.textContent === 'Show matching packets').click();
   assert.deepEqual(h.services.packetPair.get(), { local: '10.0.0.1:53', peer: '10.0.0.2:5000' });
   assert.deepEqual(opened, ['packets']);
@@ -335,7 +319,7 @@ test('packets says when its links have nothing captured yet', async (t) => {
   h.frame();
   const note = h.root.querySelector('#plist-empty');
   assert.equal(note.hidden, false);
-  assert.match(note.textContent, /No packets yet/);
+  assert.match(note.textContent, /No packets/);
   h.streams[0].emit('packet', { seq: 1, t: 1, side: 0, len: 28, skipped: 0, evicted: 0, src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', info: 'Echo', tags: [] });
   h.frame();
   assert.equal(note.hidden, true);
@@ -368,7 +352,7 @@ test('a late tab opens one packet stream once the graph is known and shows its l
 });
 
 test('after the run stopped, packets say so instead of a fetch error and stop trying', async (t) => {
-  const stoppedText = 'The run has stopped, so its packets can no longer be loaded.';
+  const stoppedText = 'Run stopped';
   // The page server is gone, so the host's links cannot be read.
   const h = await fixture(t);
   h.services.run.set('stopped');

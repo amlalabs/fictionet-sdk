@@ -13,8 +13,8 @@ const MAX_MERGED = 32;
 
 // What the pair filter tells the viewer: an event names addresses and ports,
 // and packets are matched by them, never by time.
-export const APPROXIMATE = 'Approximate: matched by address and port, not by connection.';
-const STOPPED = 'The run has stopped, so its packets can no longer be loaded.';
+export const APPROXIMATE = 'Address and port match';
+const STOPPED = 'Run stopped';
 
 export function mount(root, services, options = {}) {
   const { $, el } = scoped(root);
@@ -24,7 +24,7 @@ export function mount(root, services, options = {}) {
       labelAction(header, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
     },
     $, el, ...services.transport, fmtCount, stopped: () => (services.stopped() ? STOPPED : null), hostColumn: true,
-    consoleAddresses: services.consoleAddresses, ...options,
+    ...options,
   });
   let animation;
   // An empty list says whether its links are still opening or have nothing
@@ -35,7 +35,7 @@ export function mount(root, services, options = {}) {
     const queued = view.queued();
     const empty = !$('drawer').hidden && !$('prows').children.length && queued <= 0;
     if (note.hidden === empty) note.hidden = !empty;
-    const text = queued < 0 ? 'Loading packets…' : 'No packets yet. They appear here as the world sends them.';
+    const text = queued < 0 ? 'Loading packets…' : 'No packets';
     if (empty && note.textContent !== text) note.textContent = text;
     animation = requestAnimationFrame(frame);
   };
@@ -67,7 +67,7 @@ export function mount(root, services, options = {}) {
     if (current === key) return;
     current = key;
     if (!kept.length) {
-      empty(label === 'All hosts' ? 'No packets yet. They appear here as the world sends them.' : `${label} has no links yet. Its packets appear here once its network is up.`);
+      empty(label === 'All hosts' ? 'No packets' : `${label} · No links`);
       return;
     }
     view.openLinks(label, 'network', membersWithHosts, '', members.length);
@@ -149,9 +149,6 @@ function structure(root, el) {
   const dirs = el('div', { class: 'dirs', hidden: '' }, drawer);
   for (const id of ['dir-a', 'dir-b']) el('span', { id }, dirs);
   el('p', { id: 'sampled', class: 'sampled', hidden: '' }, drawer);
-  const consoles = el('p', { id: 'console-note', class: 'console-note', hidden: '' }, drawer);
-  el('span', { id: 'console-text' }, consoles);
-  el('button', { id: 'console-toggle', class: 'text-button', type: 'button', text: 'Show' }, consoles);
   const pair = el('p', { id: 'pair', class: 'pair-note', hidden: '' }, drawer);
   el('span', { id: 'pair-text' }, pair);
   el('button', { id: 'pair-clear', class: 'text-button', type: 'button', text: 'Show all packets' }, pair);
@@ -167,7 +164,7 @@ function structure(root, el) {
     if (!text) th.setAttribute('aria-label', 'Direction');
   }
   el('tbody', { id: 'prows' }, table);
-  el('p', { id: 'plist-empty', class: 'list-empty', role: 'status', hidden: '', text: 'No packets yet. They appear here as the world sends them.' }, list);
+  el('p', { id: 'plist-empty', class: 'list-empty', role: 'status', hidden: '', text: 'No packets' }, list);
   const detail = el('div', { class: 'detail' }, body);
   el('div', { id: 'tree', class: 'tree' }, detail);
   const hex = el('div', { id: 'hex', class: 'hex', hidden: '' }, detail);

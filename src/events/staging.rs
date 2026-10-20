@@ -134,11 +134,17 @@ fn conn_bytes(conn: &super::ConnInfo) -> usize {
 
 fn own(item: TopologyRef<'_>) -> Delivery {
     match item {
-        TopologyRef::ConnectionOpened { conn, task, host } => {
+        TopologyRef::ConnectionOpened {
+            conn,
+            task,
+            host,
+            protocol,
+        } => {
             let conn = conn.clone();
             Box::new(move |dispatch| {
                 dispatch.topology(TopologyRef::ConnectionOpened {
                     conn: &conn,
+                    protocol,
                     task,
                     host,
                 })

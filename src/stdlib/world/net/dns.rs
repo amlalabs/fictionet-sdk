@@ -297,6 +297,7 @@ impl Service for Dns {
 async fn dns_udp(fcx: Cx, socket: udp::Socket, context: Context) -> fictionet::Result {
     let local = socket.local_addr();
     let opts = ServeOptions {
+        protocol: "dns",
         sandbox: Some(context.admission.sandbox()),
         ..ServeOptions::default()
     };
@@ -340,6 +341,7 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
         ..ConnInfo::default()
     };
     let opts = ServeOptions {
+        protocol: "dns",
         idle: None,
         connection_events: false,
         budget: info

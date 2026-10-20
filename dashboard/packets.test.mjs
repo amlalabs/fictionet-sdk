@@ -99,14 +99,14 @@ test('a merged refusal names its link and does not claim every link closed', (t)
 test('clean end keeps the link-close message', (t) => {
   const h = setup(t);
   h.source.emit('end', { reason: 'closed' });
-  assert.equal($('prows').textContent, 'The link closed: both of its ends are gone.');
+  assert.equal($('prows').textContent, 'The link closed');
   assert.equal(h.source.closed, true);
 });
 
 test('a world boundary close does not claim both ends of the link are gone', (t) => {
   const h = setup(t);
   h.source.emit('end', { reason: 'the world closed' });
-  assert.equal($('prows').textContent, 'The world closed.');
+  assert.equal($('prows').textContent, 'World closed');
   assert.equal(h.source.closed, true);
 });
 
@@ -127,7 +127,7 @@ test('capture eviction and subscriber overruns stay distinct from sampling and r
   h.send(5, { skipped: 2, evicted: 7 });
   h.send(6, { skipped: 0, evicted: 0 });
   h.flush();
-  assert.match($('prows').textContent, /Packets 2–4 of link a are no longer kept/);
+  assert.match($('prows').textContent, /Link a · 3 rows missed/);
   assert.equal($('sampled').textContent, 'Sampled: 2 packets not copied · Capture: 7 copies evicted · Subscriber: 3 rows missed');
   const [first, second] = h.rows();
   assert.deepEqual(h.rows().map((r) => r.dataset.seq), ['5', '6']);
@@ -148,7 +148,7 @@ test('merged loss names its link and leaves display and detail numbering intact'
   h.send(9, { link: 'b', t: 2, evicted: 3, skipped: 0 });
   h.send(4, { link: 'a', t: 1, evicted: 2, skipped: 0 });
   h.flush();
-  assert.match($('prows').textContent, /Packets 1–8 of link b/);
+  assert.match($('prows').textContent, /Link b · 8 rows missed/);
   assert.deepEqual(h.rows().map((r) => [r.children[0].textContent, r.dataset.link, r.dataset.seq]), [['1', 'a', '4'], ['2', 'b', '9']]);
   assert.equal($('sampled').textContent, 'Capture: 5 copies evicted · Subscriber: 8 rows missed');
   for (const row of h.rows()) assert.equal(row.classList.contains('after-gap'), true);
@@ -322,7 +322,7 @@ for (const stage of ['missing', 'fetch failure', 'json failure']) {
     const complete = await pending(h.requests[1], stage);
     complete();
     await settle();
-    assert.match($('tree').textContent, stage === 'missing' ? /no longer kept/ : /Could not load/);
+    assert.match($('tree').textContent, stage === 'missing' ? /no longer kept/ : /Packet unavailable/);
     assertEmptyHex();
     row.click();
     h.requests[2].resolve({ ok: true, json: async () => detail(1) });
@@ -479,7 +479,7 @@ test('a successful capture download clears the previous failure label', async (t
   h.failDownload(new Error('Download unavailable'));
   $('pcap').click();
   await settle();
-  assert.equal($('pcap-label').textContent, 'Download failed. Try again.');
+  assert.equal($('pcap-label').textContent, 'Download failed');
   h.failDownload(null);
   $('pcap').click();
   await settle();
@@ -575,4 +575,13 @@ test('host columns fit the declared names and stay fixed as packets arrive', (t)
   assert.deepEqual(h.rows().map((row) => row.querySelector('.c-host').textContent), ['jump', 'workstation']);
   h.view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'a-very-long-host-name' }, { e: { id: 'b' }, host: 'jump' }]);
   assert.equal(width(), 'calc(16ch + 16px)');
+});
+
+test('policy counts come from each link poll and replace its previous total', (t) => {
+  const h = setup(t, ['e3', 'e7']);
+  h.source.emit('policy', { link: 'e3', declined: 20 });
+  h.source.emit('policy', { link: 'e7', declined: 5 });
+  assert.match($('sampled').textContent, /Policy: 25 packets not kept/);
+  h.source.emit('policy', { link: 'e3', declined: 21 });
+  assert.match($('sampled').textContent, /Policy: 26 packets not kept/);
 });

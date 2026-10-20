@@ -361,6 +361,7 @@ pub struct Kit<W = ()> {
     observers: Vec<Arc<dyn Observer>>,
     world: W,
     page: Option<PageBuilder>,
+    policy: Option<Arc<dyn fictionet_observe::Policy>>,
     pub(crate) run_parent: PathBuf,
 }
 
@@ -373,6 +374,7 @@ impl Kit {
             observers: Vec::new(),
             world: (),
             page: None,
+            policy: None,
             run_parent: std::env::temp_dir(),
         }
     }
@@ -387,6 +389,11 @@ impl<W> Kit<W> {
     /// Adds an observer to the fanout installed before the world starts.
     pub fn observer(mut self, observer: Arc<dyn Observer>) -> Self {
         self.observers.push(observer);
+        self
+    }
+    /// Selects observations after the kit excludes its console traffic.
+    pub fn policy(mut self, policy: Arc<dyn fictionet_observe::Policy>) -> Self {
+        self.policy = Some(policy);
         self
     }
     /// Builds a page before the world starts and before any guest boots.
@@ -414,6 +421,7 @@ impl<W> Kit<W> {
             observers: self.observers,
             world,
             page: self.page,
+            policy: self.policy,
             run_parent: self.run_parent,
         }
     }
@@ -682,6 +690,7 @@ struct Bridge {
 }
 
 struct Prepared {
+    policy: Option<Arc<dyn fictionet_observe::Policy>>,
     attachments: Attachments,
     jump_link: fictionet::End,
     bridges: Vec<Bridge>,
@@ -736,6 +745,7 @@ impl<W> Kit<W> {
         };
         let (attacher, attachments) = fictionet::attachments();
         let mut prepared = Prepared {
+            policy: self.policy.take(),
             attachments,
             jump_link: attacher.attach(JUMP).map_err(io::Error::other)?,
             bridges: Vec::new(),
@@ -813,6 +823,138 @@ where
     }
 }
 
+const EVENTS: usize = 0;
+const NOISE: usize = 1;
+const KEYS: usize = 2;
+const AGENT: usize = 3;
+const BULK: usize = 4;
+
+struct KitPolicy {
+    classes: Vec<fictionet_observe::Class>,
+    world: Option<Arc<dyn fictionet_observe::Policy>>,
+}
+
+impl KitPolicy {
+    fn new(world: Option<Arc<dyn fictionet_observe::Policy>>) -> Self {
+        use fictionet_observe::Class;
+        let mut classes = vec![
+            Class::new("events").count(50_000).bytes(16 << 20).rank(3),
+            Class::new("noise")
+                .count(5_000)
+                .bytes(2 << 20)
+                .burst(64)
+                .rank(1),
+            Class::new("keys").count(20_000).bytes(8 << 20).rank(4),
+            Class::new("agent").count(8_192).bytes(32 << 20).rank(2),
+            Class::new("bulk")
+                .watched()
+                .count(4_096)
+                .bytes(1 << 20)
+                .snap(96)
+                .burst(64)
+                .rank(0),
+        ];
+        if let Some(world) = &world {
+            classes.extend_from_slice(world.classes());
+        }
+        Self { classes, world }
+    }
+}
+
+impl fictionet_observe::Policy for KitPolicy {
+    fn classes(&self) -> &[fictionet_observe::Class] {
+        &self.classes
+    }
+
+    fn admit(&self, interest: fictionet::events::Interest<'_>) -> fictionet_observe::Admit {
+        use fictionet::events::Interest;
+        use fictionet::stdlib::network::ip;
+        use fictionet_observe::Admit;
+        match interest {
+            Interest::Event(_, conn) if conn.sandbox.as_ref().is_some_and(|s| &*s.name == JUMP) => {
+                return Admit::Skip;
+            }
+            Interest::Packet(p) => {
+                if p.sandbox == Some(JUMP) {
+                    return Admit::Skip;
+                }
+                if let Some(h) = ip::Header::parse_truncated(p.bytes)
+                    && h.protocol == ip::protocol::TCP
+                    && h.fragment.is_none_or(|f| f.offset == 0)
+                {
+                    let ports = h.payload(p.bytes).get(..4);
+                    if let Some(ports) = ports {
+                        let src = u16::from_be_bytes([ports[0], ports[1]]);
+                        let dst = u16::from_be_bytes([ports[2], ports[3]]);
+                        if (h.src == jump::JUMP_ADDR && matches!(dst, 22 | 5900))
+                            || (h.dst == jump::JUMP_ADDR && matches!(src, 22 | 5900))
+                        {
+                            return Admit::Skip;
+                        }
+                    }
+                }
+            }
+            Interest::Event(meta, _) if meta.source == "net" && meta.kind == "blocked" => {
+                return Admit::Class(NOISE);
+            }
+            _ => {}
+        }
+        if let Some(world) = &self.world {
+            return match world.admit(interest) {
+                Admit::Class(index) => Admit::Class(index + BULK + 1),
+                other => other,
+            };
+        }
+        match interest {
+            Interest::Event(..) | Interest::Topology(_) => Admit::Build,
+            Interest::TlsKey(_) => Admit::Class(KEYS),
+            Interest::Packet(p) => Admit::Class(if p.sandbox.is_some() { AGENT } else { BULK }),
+        }
+    }
+
+    fn sort(&self, observation: &fictionet::events::Observation<'_>) -> Option<usize> {
+        if let Some(world) = &self.world {
+            return world.sort(observation).map(|index| index + BULK + 1);
+        }
+        match observation {
+            fictionet::events::Observation::Event(e) => Some(if e.repeat_fields().is_some() {
+                NOISE
+            } else {
+                EVENTS
+            }),
+            _ => None,
+        }
+    }
+
+    fn topology(&self, kind: fictionet::events::TopologyKind) -> bool {
+        self.world.as_ref().is_none_or(|world| world.topology(kind))
+    }
+}
+
+struct PageObserver {
+    policy: Arc<dyn fictionet_observe::Policy>,
+    inner: Arc<dyn Observer>,
+}
+
+impl Observer for PageObserver {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let admitted = match interest {
+            Interest::Topology(kind) => self.policy.topology(kind),
+            _ => self.policy.admit(interest) != fictionet_observe::Admit::Skip,
+        };
+        admitted && self.inner.enabled(interest)
+    }
+    fn observe(&self, stamp: fictionet::events::Stamp, item: fictionet::events::Observation<'_>) {
+        self.inner.observe(stamp, item);
+    }
+    fn lost(&self, loss: fictionet::events::Loss) {
+        self.inner.lost(loss);
+    }
+    fn end(&self, at: fictionet::time::Instant) {
+        self.inner.end(at);
+    }
+}
+
 impl Run {
     async fn bind_page(
         &mut self,
@@ -820,12 +962,20 @@ impl Run {
         build: PageBuilder,
         prepared: &mut Prepared,
     ) -> io::Result<()> {
+        let policy: Arc<dyn fictionet_observe::Policy> =
+            Arc::new(KitPolicy::new(prepared.policy.take()));
         let observer = DashboardObserver::new(DashboardOptions {
-            collector: fictionet_observe::Options::default(),
+            collector: fictionet_observe::Options {
+                policy: policy.clone(),
+                ..Default::default()
+            },
             ..Default::default()
         });
         let dashboard = observer.handle();
-        prepared.observers.push(observer.observer());
+        prepared.observers.push(Arc::new(PageObserver {
+            policy,
+            inner: observer.observer(),
+        }));
         let mut hosts = Hosts(
             self.guests
                 .iter()
@@ -835,8 +985,7 @@ impl Run {
         let labels = Labels::default();
         let page = build(dashboard.clone(), &mut hosts)
             .containment(self.containment.clone())
-            .labels(labels.clone())
-            .console_address(jump::JUMP_ADDR.into());
+            .labels(labels.clone());
         self.page = Some(page.bind_loopback(0).await.map_err(|error| {
             let text = error.to_string();
             if text == "labels called twice" || text.contains("(\"Containment\")") {

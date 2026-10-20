@@ -239,7 +239,9 @@ impl LinkWatch {
                 if copy.omissions > previous {
                     dissector.lost();
                 }
-                let mut decoded = dissector.decode(&copy.bytes, keys);
+                let protocol = collector.packet_protocol(&copy.bytes);
+                let complete = copy.bytes.len() == copy.original_len;
+                let mut decoded = dissector.decode_with(&copy.bytes, keys, protocol, complete);
                 decoded.tags.sort_unstable();
                 decoded.tags.dedup();
                 let summary = Object::new()
@@ -392,7 +394,7 @@ impl Drop for Subscription {
 /// The link watches of one dashboard, shared by the subscribers of each link.
 pub(crate) struct Watches {
     state: Mutex<BTreeMap<u64, Arc<LinkWatch>>>,
-    registry: Registry,
+    registry: Mutex<Registry>,
     limit: usize,
     budget: usize,
     /// Decoded row bytes across all watches.
@@ -405,12 +407,22 @@ impl Watches {
     pub(crate) fn new(registry: Registry, limit: usize, budget: usize) -> Self {
         Self {
             state: Mutex::new(BTreeMap::new()),
-            registry,
+            registry: Mutex::new(registry),
             limit,
             budget,
             total: AtomicUsize::new(0),
             order: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    #[cfg(feature = "page")]
+    pub(crate) fn protocols(&self, registry: Registry) -> bool {
+        let state = self.state.lock();
+        if !state.is_empty() {
+            return false;
+        }
+        *self.registry.lock() = registry;
+        true
     }
 
     /// Finds or creates the watch of link `number` and subscribes to it.
@@ -444,7 +456,7 @@ impl Watches {
                     old.forget(&self.total);
                 }
             }
-            let watch = Arc::new(LinkWatch::new(id, link, self.registry.clone()));
+            let watch = Arc::new(LinkWatch::new(id, link, self.registry.lock().clone()));
             state.insert(number, watch.clone());
             watch
         };

@@ -186,6 +186,8 @@ pub enum TopologyKind {
 pub enum TopologyRef<'a> {
     /// A service has accepted a connection.
     ConnectionOpened {
+        /// Protocol named by the service.
+        protocol: &'static str,
         /// Connection identity and local and peer addresses.
         conn: &'a ConnInfo,
         /// Serving task, when known.

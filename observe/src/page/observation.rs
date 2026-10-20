@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::TcpStream;
 
-use crate::{DashboardHandle, Envelope, Session, Value};
+use crate::{Envelope, Session, Value};
 
 use super::http;
 
@@ -75,7 +75,12 @@ pub(super) async fn route(
     }
     let mut session = shared.page.dashboard.session();
     if let Some(links) = merged {
-        return merged_download(conn, &shared.page.dashboard, &links).await;
+        return merged_download(conn, shared, &links).await;
+    }
+    if op == "pcap"
+        && let Some((_, link)) = query.iter().find(|(key, _)| key == "link")
+    {
+        return merged_download(conn, shared, std::slice::from_ref(link)).await;
     }
     let values = session.request(1, &observe_request(op, query), Instant::now(), wall());
     let Some(value) = values.into_iter().next() else {
@@ -122,9 +127,10 @@ async fn poll(session: &mut Session) -> Vec<Value> {
 
 async fn merged_download(
     conn: &mut TcpStream,
-    handle: &DashboardHandle,
+    shared: &super::Shared,
     links: &[String],
 ) -> io::Result<()> {
+    let handle = &shared.page.dashboard;
     let collector = &handle.0.collector;
     let mut streams = Vec::new();
     let mut failures = Vec::new();
@@ -166,6 +172,11 @@ async fn merged_download(
     let mut export = collector.export(&crate::export::Selection {
         streams,
         wall: handle.0.wall(),
+        labels: shared
+            .page
+            .labels
+            .as_ref()
+            .map_or_else(Vec::new, |labels| labels.snapshot()),
         ..Default::default()
     });
     loop {

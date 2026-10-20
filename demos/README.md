@@ -248,10 +248,9 @@ open a page shot can be refused a session and fail. The pinned noVNC and
 xterm.js files are embedded from `observe/downloads/vendor/`.
 
 The page's consoles and the checks reach each guest over SSH from the kit's
-jump host, so that traffic crosses the guest's link too. The packet list hides
-packets to and from the jump host's address, counts them, and shows them on
-request. The list for all hosts covers the declared hosts' links. A packet
-list keeps its rows when the run stops.
+jump host, so that traffic crosses the guest's link too. The kit excludes
+console flows before copying. The list for all hosts covers the declared
+hosts' links and keeps its rows when the run stops.
 
 The containment panel shows each startup probe and the world's answer to it.
 A probe is contained when Left the box shows the world's own answer: a world

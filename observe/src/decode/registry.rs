@@ -14,7 +14,9 @@ pub struct Selection<'a> {
     pub ports: (u16, u16),
     /// First bytes of the direction currently being identified.
     pub first: &'a [u8],
-    /// The negotiated TLS ALPN, when these bytes came from a TLS session.
+    /// Protocol named by the serving connection, when known.
+    pub protocol: Option<&'a str>,
+    /// The negotiated TLS ALPN.
     pub alpn: Option<&'a str>,
 }
 
@@ -184,6 +186,12 @@ impl Registry {
         if let Some(name) = &self.choice[input.transport as usize] {
             return Ok(name);
         }
+        if let Some(entry) = input
+            .protocol
+            .and_then(|name| self.entries.iter().rev().find(|entry| entry.name == name))
+        {
+            return Ok(&entry.name);
+        }
         for entry in self.entries.iter().rev() {
             match (entry.matches)(input) {
                 Match::Yes => return Ok(&entry.name),
@@ -262,8 +270,28 @@ mod tests {
             transport: Transport::Tcp,
             ports,
             first,
+            protocol: None,
             alpn: None,
         }
+    }
+
+    #[test]
+    fn service_names_precede_matchers_and_unknown_names_use_ports() {
+        let registry = Registry::default();
+        assert_eq!(
+            registry.select(Selection {
+                protocol: Some("http1"),
+                ..input((40000, 53), b"GET /")
+            }),
+            Ok("http1")
+        );
+        assert_eq!(
+            registry.select(Selection {
+                protocol: Some("unknown"),
+                ..input((40000, 53), b"GET /")
+            }),
+            Ok("dns")
+        );
     }
 
     #[test]

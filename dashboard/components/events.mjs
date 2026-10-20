@@ -3,7 +3,7 @@
 import { labelAction } from './labels.mjs';
 import { labelChips } from '../packets.mjs';
 import { eventText } from '../tables.mjs';
-import { scoped, listen, reconcile, lossLine } from '../dom.mjs';
+import { scoped, listen, observationList, lossLine } from '../dom.mjs';
 import { fmtRunTime } from '../format.mjs';
 import { APPROXIMATE } from './packets.mjs';
 
@@ -17,11 +17,12 @@ export function mount(root, services, options = {}) {
   const tools = el('div', { class: 'panel-tools' }, root);
   const filter = el('input', { type: 'search', class: 'text-field', 'aria-label': 'Filter events', placeholder: 'Filter events', autocomplete: 'off' }, tools);
   const jump = el('button', { class: 'jump', type: 'button', hidden: '' }, tools);
+  const download = el('button', { class: 'button', type: 'button', text: 'JSONL' }, tools);
   const loss = el('p', { class: 'loss-note', role: 'status', hidden: '' }, root);
   const wrap = el('div', { class: 'list-wrap' }, root);
   const list = el('div', { class: 'event-list', role: 'list' }, wrap);
   const empty = el('p', { class: 'list-empty', role: 'status', hidden: '' }, wrap);
-  const rows = new Map();
+  const tail = observationList(list, { limit: LIMIT, key: (event) => event.seq, create, update });
   const { state } = services.graph;
   let host = services.selection.get().host, chosen = services.selection.get().event?.seq ?? null;
   let pending = 0, paused = false, labels = [], connection = services.selection.get().event ? null : services.selection.get().connection;
@@ -104,9 +105,9 @@ export function mount(root, services, options = {}) {
     const events = state.events;
     const visible = events.filter((event) => (!sandbox || event.sandbox?.name === sandbox) && (!connection || event.conn === connection) && (!query || `${event.source}.${event.kind} ${JSON.stringify(event)}`.toLowerCase().includes(query)));
     const top = list.scrollTop;
-    reconcile(list, visible.slice(-LIMIT).reverse(), (event) => event.seq, create, update, rows);
+    tail.show(visible.slice(-LIMIT).reverse());
     empty.hidden = visible.length > 0;
-    empty.textContent = events.length ? 'No events match.' : 'No events yet. They appear here as the world runs.';
+    empty.textContent = events.length ? 'No matches' : 'No events';
     list.scrollTop = paused ? top : 0;
     newRows.clear();
     pending = 0;
@@ -120,7 +121,7 @@ export function mount(root, services, options = {}) {
     reported = value;
     const losses = (value?.losses || []).filter((item) => item.stream === 'events' || item.stream === 'topology');
     lossLine(loss, [...losses, { stream: 'events', reason: 'subscriber', count: missed }]);
-    if (!loss.textContent && value?.incomplete) loss.textContent = 'The observation is incomplete.';
+    if (!loss.textContent && value?.incomplete) loss.textContent = 'Incomplete';
     loss.hidden = !loss.textContent;
   }
   cleanup.push(services.graph.subscribe((name, data) => {
@@ -132,12 +133,16 @@ export function mount(root, services, options = {}) {
       if (!paused && !editing()) schedule();
       else { pending++; jump.textContent = `↑ ${pending} new`; jump.hidden = false; }
     }
-    if (name === 'world_error') { loss.textContent = `Events are unavailable: ${data.error}`; loss.hidden = false; }
+    if (name === 'world_error') { loss.textContent = `Events: ${data.error}`; loss.hidden = false; }
     // A reconnecting stream says so until it opens again.
     if (name === 'error') { loss.textContent = data.error; loss.hidden = false; }
     if (name === 'open') status(reported);
   }));
   status(state.status);
+  cleanup.push(listen(download, 'click', async () => {
+    try { await services.transport.download('events', host || ''); }
+    catch { download.textContent = 'Download failed'; }
+  }));
   cleanup.push(listen(filter, 'input', render));
   cleanup.push(listen(list, 'scroll', () => { paused = list.scrollTop > 24; }));
   cleanup.push(listen(jump, 'click', () => { paused = false; render(); }));
