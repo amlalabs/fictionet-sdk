@@ -19,7 +19,7 @@
 //! Momentary coils (trip, reset, acknowledge) read back as off, since they hold
 //! no state. Holding registers read back the rod demand. The snapshot holds no
 //! valve demands, so valve registers read back the valve position.
-
+//!
 //! Each input block ends with an unscaled Telemetry heartbeat count. It wraps
 //! at 16 bits and holds while telemetry is quiet.
 //!

@@ -216,20 +216,23 @@ pub async fn run(
     let screen = hmi_view(fcx, operator).await?;
     let power = reading(&screen, "neutron_power")?;
     let average = average_temperature(&screen)?;
-    check((power - 100.0).abs() < 1.0, "HMI power is not in balance")?;
+    check(
+        (power - 100.0).abs() < 1.0,
+        format!("HMI power is not in balance: {power:.2} %"),
+    )?;
     check(
         (average - initial_average).abs() < 0.5,
-        "HMI average temperature drifts at full power",
+        format!("HMI average temperature drifts at full power: {average:.2} C"),
     )?;
     let true_power = full.truth.reactor.neutron_power_percent;
     let true_average = full.truth.primary.average_temperature_c;
     check(
         (true_power - 100.0).abs() < 1.0,
-        format!("full power is not in balance: {power:.2} %"),
+        format!("plant full power is not in balance: {true_power:.2} %"),
     )?;
     check(
         (true_average - start.truth.primary.average_temperature_c).abs() < 0.5,
-        format!("average temperature drifts at full power: {average:.2} C"),
+        format!("plant average temperature drifts at full power: {true_average:.2} C"),
     )?;
     say(line(
         full.at_ms,
@@ -299,7 +302,8 @@ pub async fn run(
         })),
     )?;
     let fault_at = driver.snapshot().at_ms;
-    let fault_heartbeat = heartbeats(&after_view)?[1];
+    let fault_view = hmi_view(fcx, operator).await?;
+    let fault_heartbeat = heartbeats(&fault_view)?[1];
     say(line(
         fault_at,
         3,
