@@ -557,6 +557,7 @@ fn worst_case_snapshot_fits() {
         "{} bytes",
         encoded.len()
     );
+    assert_eq!(encoded.len(), MAX_SNAPSHOT_BYTES);
 }
 
 #[test]

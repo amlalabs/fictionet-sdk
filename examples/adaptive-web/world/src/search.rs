@@ -23,9 +23,25 @@ pub const MAX_SITES: usize = 128;
 pub const MAX_REFUSED: usize = 64;
 /// Facts and site hosts retained in each seed list.
 pub const MAX_SEED_ITEMS: usize = 32;
-/// Maximum compact snapshot JSON size, in bytes. The worst case at the
-/// limits above fits; `tests/search.rs` builds it and measures.
-pub const MAX_SNAPSHOT_BYTES: usize = 4 << 20;
+/// Maximum compact snapshot JSON size: 3,942,835 bytes at these limits.
+/// Each string byte can need six JSON bytes. Numbers use twenty digits.
+/// Fixed costs include field names, punctuation and the longest enum values.
+pub const MAX_SNAPSHOT_BYTES: usize = {
+    let string = 6 * STRING_BYTES;
+    // Snapshot, seed, generator and omitted counts, with four strings.
+    619 + 4 * string
+        // Two seed lists, with quotes and a comma per item.
+        + 2 * MAX_SEED_ITEMS * (3 + string)
+        // Query rows, including failure text and a comma per row.
+        + MAX_QUERIES * (422 + 5 * string)
+        // Result lists and their entries, including array commas.
+        + MAX_RESULTS * (75 + string + MAX_LISTED * (60 + 3 * string))
+        // Page rows, including search reasons and a comma per row.
+        + MAX_PAGES * (431 + 5 * string)
+        // Site and refusal rows, including a comma per row.
+        + MAX_SITES * (79 + 2 * string)
+        + MAX_REFUSED * (53 + 2 * string)
+};
 
 fn bounded(text: &str) -> String {
     let mut end = text.len().min(STRING_BYTES);
