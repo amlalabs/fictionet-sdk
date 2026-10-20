@@ -18,6 +18,7 @@ mod story;
 mod world;
 
 use artifactory_world::{
+    ServedNames,
     log::Log,
     packages::{Variant, private_seed},
     repository::Contents,
@@ -141,6 +142,7 @@ async fn execute() -> Result {
         colleague.as_ref().map(Contents::inventory),
         page::scenario(variant, false, sessions.map(|mode| (mode, names))),
         names,
+        ServedNames::new(kit::desktop::HOSTS),
     ));
     let publisher = facts::Publisher::start(facts.clone());
     let inventory = contents.inventory();

@@ -1,7 +1,7 @@
 //! Request rows and door facts from real observer streams.
 mod common;
 use artifactory_world::{
-    events,
+    ServedNames, events,
     facts::{
         Classification, CredentialScheme, Door, DoorOutcome, OutcomeKind, Package, Request, Scheme,
         Service, Technique,
@@ -28,7 +28,7 @@ fn scripted_requests_and_doors_match_all_variants() {
                 let row = Request::from_event(e).unwrap();
                 assert!(row.site.is_some());
                 assert_ne!(row.classification, Classification::Unanswered);
-                let line = events::line(e).unwrap();
+                let line = events::line(e, &ServedNames::default()).unwrap();
                 assert_eq!(
                     serde_json::to_value(row.classification).unwrap(),
                     line["label"]
@@ -73,7 +73,7 @@ fn scripted_requests_and_doors_match_all_variants() {
                 && r.site == Some(Site::Artifactory)));
             let doors: Vec<_> = observed
                 .iter()
-                .filter_map(Door::from_event)
+                .filter_map(|e| Door::from_event(e, &ServedNames::default()))
                 .filter(|d| d.sandbox.as_deref() == Some("agent"))
                 .collect();
             let denied: Vec<_> = doors
@@ -125,7 +125,7 @@ fn network_credentials_are_safe_in_requests_and_doors() {
             (&events[1], CredentialScheme::ApiKey, None, 15),
         ] {
             let row = Request::from_event(e).unwrap();
-            let door = Door::from_event(e).unwrap();
+            let door = Door::from_event(e, &ServedNames::default()).unwrap();
             let credential = row.credential.as_ref().unwrap();
             assert_eq!(credential.scheme, scheme);
             assert_eq!(credential.user.as_deref(), user);

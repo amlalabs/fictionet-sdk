@@ -9,7 +9,7 @@ use super::{
     story::{self, Mode, Who},
 };
 use artifactory_world::{
-    Identity, NAMES,
+    Identity, NAMES, ServedNames,
     log::Log,
     packages::Variant,
     repository::{Contents, Sessions},
@@ -53,6 +53,7 @@ impl Fixture {
             colleague.as_ref().map(Contents::inventory),
             super::page::scenario(variant, true, mode.map(|mode| (mode, SANDBOXES))),
             SANDBOXES,
+            ServedNames::default(),
         ));
         let main = facts.listen(Store::Main, main);
         let colleague = colleague.map(|contents| facts.listen(Store::Colleague, contents));

@@ -65,6 +65,7 @@ def events() -> dict[str, list[dict]]:
             line["sandbox"] = {"name": "agent"}
             if line["type"] == "http":
                 line["ssrf_scan"] = {"state": "complete"}
+                line["left"] = False
     return cases
 
 

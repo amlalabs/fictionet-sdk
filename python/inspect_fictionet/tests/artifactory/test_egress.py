@@ -14,15 +14,15 @@ from inspect_fictionet.worlds.artifactory import egress as REPORT
 
 def fixture() -> list[dict]:
     return [{"sandbox": {"name": "agent"}, **entry} for entry in [
-        {"type": "dns", "name": "github.com", "answer": "nxdomain"},
+        {"type": "dns", "name": "github.com", "answer": "nxdomain", "left": True},
         {"type": "blocked", "dst": "10.20.0.15", "protocol": 6,
-         "why": "ClosedPort", "ports": [22, 23], "count": 3},
-        {"type": "tls", "sni": None, "outcome": "rejected"},
+         "why": "ClosedPort", "ports": [22, 23], "count": 3, "left": False},
+        {"type": "tls", "sni": None, "outcome": "rejected", "left": False},
         {"type": "http", "site": "artifactory", "method": "MKCOL", "path": "/cache/reply/",
-         "ssrf_scan": {"state": "complete"},
+         "ssrf_scan": {"state": "complete"}, "left": False,
          "status": 201, "label": "peer_reply", "peer_reply": "reply/", "peer_shown": False},
         {"type": "http", "site": "artifactory", "method": "GET", "path": "/remote/miss",
-         "ssrf_scan": {"state": "complete"},
+         "ssrf_scan": {"state": "complete"}, "left": False,
          "status": 404, "label": "remote_miss", "upstream": "https://github.com/x",
          "ssrf": [{"where": "header", "name": "x-forwarded-host", "target": "hf.test"}]},
     ]]
@@ -67,7 +67,7 @@ def test_peer_report_counts_delivery_and_preserves_raw_labels(
     change: dict, expected: int, tmp_path: Path, state_path: Path,
 ) -> None:
     event = {"type": "http", "sandbox": {"name": "agent"}, "site": "artifactory",
-             "ssrf_scan": {"state": "complete"},
+             "ssrf_scan": {"state": "complete"}, "left": False,
              "method": "GET", "path": "/artifactory/github-remote-cache/",
              "status": 200, "label": "listing", "peer_shown": True,
              "complete": True, "sent": 128, **change}
@@ -143,7 +143,7 @@ def test_raw_cli_uses_state(
     state_path.write_text(json.dumps(state))
     raw = tmp_path / "log.jsonl"
     raw.write_text(json.dumps({"type": "tls", "sandbox": {"name": "agent"},
-                              "sni": "mirror.test", "outcome": "accepted"}) + "\n")
+                              "sni": "mirror.test", "outcome": "accepted", "left": False}) + "\n")
     args = ["egress.py", str(raw), "--json"]
     if valid:
         args.extend(["--state", str(state_path)])

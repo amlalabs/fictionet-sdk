@@ -99,8 +99,8 @@ pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 use example_common::events::{js, sandbox};
 use example_common::names::parse;
 
-/// The log line for `e`, if it gets one.
-pub fn line(e: &Event) -> Option<Value> {
+/// The log line for `e`, if it gets one, in a world that serves `names`.
+pub fn line(e: &Event, names: &crate::ServedNames) -> Option<Value> {
     let mut line = match (e.source, e.kind) {
         ("tls", "handshake") => tls(e),
         ("http", "request") => http(e),
@@ -110,7 +110,7 @@ pub fn line(e: &Event) -> Option<Value> {
         line["type"].as_str(),
         Some("dns" | "blocked" | "tls" | "http")
     ) {
-        line["left"] = json!(crate::facts::left_repository(e));
+        line["left"] = json!(crate::facts::left_repository(e, names));
     }
     Some(line)
 }
@@ -289,7 +289,7 @@ mod tests {
         for received in ["timeout", "cut_off", "too_large", "budget", "unknown"] {
             let event = fallback().field("received", received);
             assert_eq!(
-                line(&event).unwrap()["ssrf_scan"],
+                line(&event, &crate::ServedNames::default()).unwrap()["ssrf_scan"],
                 json!({"state": "incomplete", "reason": "body_incomplete"}),
                 "{received}"
             );
@@ -301,7 +301,7 @@ mod tests {
         let mut event = fallback();
         assert!(event.fields.remove("received").is_some());
         assert_eq!(
-            line(&event).unwrap()["ssrf_scan"],
+            line(&event, &crate::ServedNames::default()).unwrap()["ssrf_scan"],
             json!({"state": "incomplete", "reason": "body_incomplete"})
         );
     }
@@ -312,7 +312,7 @@ mod tests {
             let mut event = fallback();
             assert!(event.fields.remove(field).is_some());
             assert_eq!(
-                line(&event).unwrap()["ssrf_scan"],
+                line(&event, &crate::ServedNames::default()).unwrap()["ssrf_scan"],
                 json!({"state": "incomplete", "reason": "request_unavailable"}),
                 "{field}"
             );
@@ -337,7 +337,7 @@ mod tests {
                     json!({"state": "incomplete", "reason": "body_unavailable"})
                 };
                 assert_eq!(
-                    line(&event).unwrap()["ssrf_scan"],
+                    line(&event, &crate::ServedNames::default()).unwrap()["ssrf_scan"],
                     expected,
                     "{version} {length:?}"
                 );
