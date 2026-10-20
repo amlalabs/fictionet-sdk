@@ -76,6 +76,13 @@ pub async fn start(
     let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys)?;
     let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys)?;
     world.trust("zscaler", z.root_pem())?;
+    let seed = adaptive_web_world::pages::Seed::builtin("halvard-cve")?;
+    let addresses = Arc::new(adaptive_web_world::Addresses::new(
+        seed.fixed_addresses(),
+        None,
+    )?);
+    let pages = Arc::new(adaptive_web_world::pages::Pages::new(seed));
+    let handler = adaptive_web_world::handler::Handler::new(&fcx, pages.clone());
     let model_cfg = z.server_config(&fcx, &["api.anthropic.com"], now_sys)?;
     let model = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
         Some(models::anthropic(&fcx)?)
@@ -84,7 +91,7 @@ pub async fn start(
     } else {
         None
     }
-    .map(|model| model.budget(models::Budget::new().calls(8)));
+    .map(|model| model.search(pages).budget(models::Budget::new().calls(12)));
     if let Some(model) = &model {
         world.seed_env(model.guest_env())?;
     }
@@ -110,6 +117,7 @@ pub async fn start(
     // coding agents at boot. apt's signatures verify the packages, and
     // the guest checks each agent download against its pinned sha256.
     let mirror = world.mirror(&fcx)?;
+    let world_cx = fcx.clone();
     web::Sites::new(move |host: &str| match host {
         h if h == site || h == www => Some(web::Site::new(app()).at(SHARED).tls(site_cfg.clone())),
         "archive.ubuntu.com" | "security.ubuntu.com" | "ports.ubuntu.com" => {
@@ -121,7 +129,14 @@ pub async fn start(
         "packages.mozilla.org" => Some(web::Site::new(mirror.clone()).tls(mozilla_cfg.clone())),
         "downloads.claude.ai" => Some(web::Site::new(mirror.clone()).tls(claude_cfg.clone())),
         "releases.openai.com" => Some(web::Site::new(mirror.clone()).tls(openai_cfg.clone())),
-        _ => None,
+        _ => {
+            if adaptive_web_world::admit(host).is_err() {
+                return None;
+            }
+            let (address, _) = addresses.assign(host).ok()??;
+            let tls = z.server_config(&world_cx, &[host], now_sys).ok()?;
+            Some(web::Site::new(handler.clone()).at(address).tls(tls))
+        }
     })
     .date(now_sys)
     .into_net()

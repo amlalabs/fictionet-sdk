@@ -1150,3 +1150,50 @@ fn static_asset(path: &str) -> Option<Response> {
 
 #[cfg(test)]
 mod tests;
+
+impl fictionet_extras::models::Engine for Pages {
+    fn search(
+        self: Arc<Self>,
+        cx: Cx,
+        query: String,
+    ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
+        Box::pin(async move {
+            let response = Pages::search(&self, &cx, Engine::Google, &query, 0).await;
+            if response.status != 200 {
+                return Err(fictionet::Error::msg("Search is unavailable"));
+            }
+            let results = self
+                .store()
+                .search(&query_key(&query, 0))
+                .map(|r| r.search.results.clone())
+                .unwrap_or_default();
+            Ok(results)
+        })
+    }
+    fn fetch(
+        self: Arc<Self>,
+        cx: Cx,
+        url: String,
+    ) -> fictionet_extras::models::tools::Answer<fictionet_extras::models::tools::Page> {
+        Box::pin(async move {
+            let (host, target) = text::target_of(&url);
+            let response = self.handle(&cx, "GET", &host, &target, None).await;
+            if response.status != 200 {
+                return Err(fictionet::Error::msg("Page is unavailable"));
+            }
+            let title = match response.meta {
+                Meta::Page(p) => p.title,
+                Meta::Fixed { title } => title,
+                _ => url,
+            };
+            Ok(fictionet_extras::models::tools::Page {
+                title,
+                media_type: response.content_type.split(';').next().unwrap_or("").into(),
+                body: response.body,
+            })
+        })
+    }
+    fn serves(&self, host: &str) -> bool {
+        crate::admit(host).is_ok()
+    }
+}

@@ -487,7 +487,7 @@ async fn run_checks(
         &format!(
             "cd /home/analyst && timeout 120 claude -p \
          'Create sum.py that prints 19 + 23, run it, and report the result.' \
-         --model {model} --max-turns 4 --allowedTools Bash,Write,Read 2>&1"
+         --model {model} --max-turns 4 --allowedTools Bash,Write,Read < /dev/null 2>&1"
         ),
     )
     .await?;
@@ -519,6 +519,32 @@ async fn run_checks(
         check(
             "the page reports the completed model call with a placeholder",
             call.is_some(),
+        )
+        .err(),
+    );
+    let search = guest_cmd(session, &format!(
+        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --model {model} --max-turns 3 --allowedTools WebSearch,WebFetch < /dev/null 2>&1"
+    )).await?;
+    failures.extend(
+        check(
+            "Claude Code searches the world",
+            search.code == 0 && search.stdout.to_lowercase().contains("halvard"),
+        )
+        .err(),
+    );
+    let search_event = page
+        .find_event(&mut 0, |event| {
+            Ok(event["source"] == "model"
+                && event["kind"] == "tool"
+                && event["fields"]["tool"] == "web_search"
+                && event["fields"]["source"] == "world"
+                && event["fields"]["results"].as_u64().is_some_and(|n| n > 0))
+        })
+        .await?;
+    failures.extend(
+        check(
+            "the page reports search results from the world",
+            search_event.is_some(),
         )
         .err(),
     );

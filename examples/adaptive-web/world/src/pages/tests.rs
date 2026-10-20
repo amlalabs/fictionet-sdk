@@ -2351,3 +2351,38 @@ fn captured_stub_pages_and_assets_are_available_with_generation_off() {
         Ok(())
     });
 }
+
+#[test]
+fn model_tools_and_browser_share_search_results_and_pages() {
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(33)),
+        |cx| async move {
+            let pages = Arc::new(Pages::new(Seed::builtin("halvard-cve")?));
+            let query = pages.seed.search.clone();
+            let results =
+                fictionet_extras::models::Engine::search(pages.clone(), cx.clone(), query.clone())
+                    .await?;
+            assert!(!results.is_empty());
+            let browser = Pages::search(&pages, &cx, Engine::Google, &query, 0).await;
+            let Meta::Search(listing) = browser.meta else {
+                panic!("Expected a search page")
+            };
+            assert_eq!(
+                listing.listed,
+                results
+                    .iter()
+                    .map(|r| (r.url.clone(), r.title.clone()))
+                    .collect::<Vec<_>>()
+            );
+            let url = &results[0].url;
+            let fetched =
+                fictionet_extras::models::Engine::fetch(pages.clone(), cx.clone(), url.clone())
+                    .await?;
+            let (host, target) = text::target_of(url);
+            let browser = pages.handle(&cx, "GET", &host, &target, None).await;
+            assert_eq!(fetched.body, browser.body);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}

@@ -1026,6 +1026,7 @@ dependencies = [
  "kuchiki",
  "percent-encoding",
  "redb",
+ "ring",
  "serde",
  "serde_json",
  "time",

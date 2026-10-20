@@ -28,6 +28,11 @@ use tower_service::Service;
 
 pub mod oauth;
 mod response;
+mod splice;
+#[cfg(test)]
+mod splice_tests;
+pub mod tools;
+pub use tools::Engine;
 #[cfg(test)]
 mod tests;
 
@@ -330,6 +335,8 @@ pub struct Model {
     path_prefix: &'static str,
     ledger: Arc<Mutex<Ledger>>,
     prices: Option<(String, Prices)>,
+    engine: Option<Arc<dyn Engine>>,
+    seal: Arc<splice::Seal>,
 }
 impl Model {
     /// Builds the model site for a dedicated OAuth authority.
@@ -373,11 +380,18 @@ impl Model {
             path_prefix: "",
             ledger: Arc::new(Mutex::new(Ledger::default())),
             prices: None,
+            engine: None,
+            seal: Arc::new(splice::Seal::new(cx)),
         })
     }
     /// Installs a budget shared by all clones.
     pub fn budget(self, budget: Budget) -> Self {
         self.set_budget(budget);
+        self
+    }
+    /// Answers server search and fetch tools with the world's own pages.
+    pub fn search(mut self, engine: Arc<dyn Engine>) -> Self {
+        self.engine = Some(engine);
         self
     }
     /// Changes limits without resetting already consumed usage.
@@ -412,6 +426,23 @@ impl Model {
     }
     async fn send(mut self, request: Request<Body>) -> fictionet::Result<Response<Body>> {
         let path = request.uri().path().to_owned();
+        if self.provider == Provider::Anthropic
+            && request.method() == http::Method::GET
+            && path == "/api/web/domain_info"
+        {
+            let domain =
+                url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes())
+                    .find(|(key, _)| key == "domain")
+                    .map(|(_, value)| value.into_owned());
+            let allowed = domain.is_some_and(|host| {
+                self.engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.serves(&host))
+            });
+            return Ok(Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"can_fetch":allowed}).to_string()))?);
+        }
         if self.provider == Provider::Anthropic
             && request.method() == http::Method::HEAD
             && path == "/api/hello"
@@ -457,6 +488,9 @@ impl Model {
                 ));
             }
         };
+        if self.provider == Provider::Anthropic && self.engine.is_some() && splice::needed(&body) {
+            return Box::pin(splice::serve(self, parts, body)).await;
+        }
         if body
             .get("tools")
             .and_then(Value::as_array)
