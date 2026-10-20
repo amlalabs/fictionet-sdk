@@ -42,6 +42,10 @@ enum Kind {
 
 /// What the IPv6 probe prints when the guest has no route to its address.
 const NO_IPV6_ROUTE: &str = "No IPv6 route";
+/// What a probe says when its guest lacks the tool or setting it reads.
+const MISSING_TOOL: &str = "Required tool or configuration is missing from this guest image.";
+/// What a proxy probe says when it finds no proxy setting.
+const NO_PROXY: &str = "No proxy settings set";
 
 /// Commands suitable for an unmodified Ubuntu cloud image. Missing tools are
 /// reported as results; they are never installed by a probe.
@@ -128,7 +132,7 @@ pub async fn run(
         let after = dashboard.egress();
         let result = match output {
             Ok(Ok(output)) => parse(probe, guest, &output, &before, &after, world_hosts),
-            Ok(Err(error)) => result(probe, guest, ProbeOutcome::Unknown, error.to_string()),
+            Ok(Err(error)) => result(probe, guest, error.to_string(), error.to_string()),
             Err(_) => parse(
                 probe,
                 guest,
@@ -147,13 +151,15 @@ pub async fn run(
     results
 }
 
-fn result(probe: &Probe, guest: &str, outcome: ProbeOutcome, guest_result: String) -> ProbeResult {
+/// A result not determined yet: what the guest got in full and in one line.
+fn result(probe: &Probe, guest: &str, guest_result: String, summary: String) -> ProbeResult {
     ProbeResult {
         guest: guest.into(),
         name: probe.name.into(),
         command: probe.command.into(),
         destination: probe.destination.into(),
-        outcome,
+        outcome: ProbeOutcome::Unknown,
+        summary,
         guest_result,
         world_answer: "No matching world observation".into(),
         proxies: vec![],
@@ -186,7 +192,9 @@ fn matches(probe: &Probe, row: &Destination) -> bool {
 /// a connection or an old row. A TLS handshake the guest aborted because it did
 /// not trust the certificate (curl's exit 60) is answered by the world's refusal
 /// of a new connection. Loss prevents a missing observation from proving that a
-/// probe escaped.
+/// probe escaped. The result's summary is the line that says what the guest
+/// got: the status line of an answer, curl's error or a timeout, else the
+/// exit status.
 pub fn parse(
     probe: &Probe,
     guest: &str,
@@ -196,19 +204,35 @@ pub fn parse(
     world_hosts: &[&str],
 ) -> ProbeResult {
     let text = format!("{}{}", output.stdout, output.stderr);
-    let mut result = result(
-        probe,
-        guest,
-        ProbeOutcome::Unknown,
-        format!("Exit {}\n{text}", output.code),
-    );
+    let exit = format!("Exit {}", output.code);
+    // The status line the probes print when a server answered, `HTTP 200`.
+    // curl prints `HTTP 000` when it got no answer.
+    let http_line = output.stdout.lines().find(|line| {
+        line.strip_prefix("HTTP ").is_some_and(|code| {
+            code.parse::<u16>()
+                .is_ok_and(|code| (100..600).contains(&code))
+        })
+    });
+    let summary = http_line
+        .or_else(|| {
+            text.lines().map(str::trim).find(|line| {
+                line.starts_with("curl:")
+                    || line.contains("timed out")
+                    || line.contains("no servers could be reached")
+            })
+        })
+        .map_or_else(
+            || exit.clone(),
+            |line| line.trim_start_matches([';', ' ']).into(),
+        );
+    let mut result = result(probe, guest, format!("{exit}\n{text}"), summary);
     if output.code == 127
         || text.contains("not found")
         || text.contains("No such file or directory")
     {
         result.outcome = ProbeOutcome::MissingTool;
-        result.guest_result =
-            format!("Required tool or configuration is missing from this guest image.\n{text}");
+        result.guest_result = format!("{MISSING_TOOL}\n{text}");
+        result.summary = MISSING_TOOL.into();
         return result;
     }
     if matches!(probe.kind, Kind::Routes | Kind::Proxy) {
@@ -223,17 +247,13 @@ pub fn parse(
         if matches!(probe.kind, Kind::Proxy) {
             result.proxies = proxies(&output.stdout, world_hosts);
             if result.proxies.is_empty() {
-                result.guest_result = "No proxy settings set".into();
+                result.guest_result = NO_PROXY.into();
+                result.summary = NO_PROXY.into();
             }
         }
         return result;
     }
-    let http_answer = output.stdout.lines().any(|line| {
-        line.strip_prefix("HTTP ").is_some_and(|code| {
-            code.parse::<u16>()
-                .is_ok_and(|code| (100..600).contains(&code))
-        })
-    });
+    let http_answer = http_line.is_some();
     // Curl's exit 60: a server showed a certificate the guest does not trust.
     let tls_answer = output.code == 60 && !http_answer;
     let answered = match probe.kind {
@@ -629,6 +649,48 @@ mod tests {
             ProbeOutcome::NotContained,
             "an answer the world did not give is not contained"
         );
+    }
+
+    #[test]
+    fn summaries_keep_the_line_that_says_what_the_guest_got() {
+        let empty = EgressSnapshot::default();
+        let probe = |kind: fn(&Kind) -> bool| PROBES.iter().find(|p| kind(&p.kind)).unwrap();
+        let dns = probe(|kind| matches!(kind, Kind::Dns));
+        let http = probe(|kind| matches!(kind, Kind::Http));
+        let routes = probe(|kind| matches!(kind, Kind::Routes));
+        let proxy = probe(|kind| matches!(kind, Kind::Proxy));
+        let failed = Output {
+            code: 7,
+            stdout: "HTTP 000\n".into(),
+            stderr: "curl: (7) Failed to connect\n".into(),
+        };
+        for (probe, output, line) in [
+            (
+                dns,
+                output(
+                    9,
+                    ";; DiG 9.18\n;; global options: +cmd\n;; connection timed out; no servers could be reached\n",
+                ),
+                "connection timed out; no servers could be reached",
+            ),
+            (http, output(0, "HTTP 200\n"), "HTTP 200"),
+            (http, failed, "curl: (7) Failed to connect"),
+            (
+                http,
+                Output {
+                    code: 124,
+                    stdout: String::new(),
+                    stderr: "Probe timed out".into(),
+                },
+                "Probe timed out",
+            ),
+            (dns, output(127, "dig: not found"), MISSING_TOOL),
+            (proxy, output(0, ""), NO_PROXY),
+            (routes, output(0, "fe80::/64 dev eth0\n"), "Exit 0"),
+        ] {
+            let result = parse(probe, "workstation", &output, &empty, &empty, &[]);
+            assert_eq!(result.summary, line, "{}", result.guest_result);
+        }
     }
 
     #[test]

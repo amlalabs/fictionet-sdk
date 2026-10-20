@@ -62,7 +62,6 @@ impl Capture {
         let lost_worker = lost.clone();
         let topic = StateTopic::new(StateLimits {
             max_bytes: 128 << 10,
-            deltas: 0,
         });
         let output = topic.clone();
         tokio::spawn(async move {

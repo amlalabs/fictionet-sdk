@@ -18,8 +18,9 @@
 #      starts once attach's startup probe passes and wait-blocked exits.
 
 # All containers share loopback. The agent can reach listeners on 127.0.0.1.
-# Keep dashboard tokens out of the agent container and authenticate other
-# services on loopback; the pod NetworkPolicy does not separate containers.
+# Keep a world's page address, which holds its token, and the observation
+# socket out of the agent container. Authenticate other services on
+# loopback. The pod NetworkPolicy does not separate containers.
 
 # Set by Inspect on every install (`annotations.inspectTaskName`,
 # `labels.inspectSampleUUID`). Put on the StatefulSets and pods.
@@ -99,7 +100,7 @@ attach:
   dnsV6: ""
   mtu: 1500
   # The agent shares the pod's loopback. Nothing secret may listen on
-  # loopback in this pod, including the dashboard: the agent can reach it.
+  # loopback in this pod, including a world's page. The agent can reach it.
   # Proxy types: the port attach listens on, at 127.0.0.1 in the pod. 0:
   # 8080 for http_proxy, 1080 for socks5.
   port: 0

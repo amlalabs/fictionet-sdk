@@ -1,10 +1,9 @@
 import { renderEvents } from './components/events.mjs';
-// The Fictionet dashboard's tables: tooltip contents, the header's counts,
-// the breadcrumb, and the side panel's sections, lists and event rows.
-// app.mjs passes in the state and view, formatting, the graph's rates and
-// helpers, and the selection, focus and packet steps the rows link to,
-// and calls `refresh` once a frame.
-
+// The map's tables: tooltip contents, the empty notice, the breadcrumb, and
+// the side panel's sections, lists and event rows. components/map.mjs passes
+// in the state and view, formatting, the graph's rates and helpers, and the
+// selection, focus and packet steps the rows link to, and calls `refresh`
+// once a frame.
 
 export function createTables({ $, el, state, view, runTime, fmtDuration, fmtBytes, fmtCount, fmtRate, plural, where, nodeLabel, tone, drawnSource, liveRate, dRate, dCounts, dBytesRate, ends, dEdgesOf, groupChain, parentOf, isOpen, select, toggleGroup, applySearch, focusNode, focusGroup, openPackets, openLinks }) {
   // ---------------------------------------------------------------------------
@@ -111,14 +110,9 @@ export function createTables({ $, el, state, view, runTime, fmtDuration, fmtByte
   }
 
   // ---------------------------------------------------------------------------
-  // The header's counts, the breadcrumb and the side panel
+  // The empty notice, the breadcrumb and the side panel
 
-  function renderStats(total) {
-    const all = [...state.nodes.values()];
-    $('stat-sandboxes').textContent = all.filter((n) => n.kind === 'sandbox').length;
-    $('stat-tasks').textContent = all.filter((n) => n.kind !== 'sandbox').length;
-    $('stat-links').textContent = state.edges.size;
-    $('stat-rate').textContent = fmtRate(total);
+  function renderEmpty() {
     const empty = !state.nodes.size;
     $('empty').hidden = !empty;
     if (empty && state.connected) {
@@ -430,14 +424,14 @@ export function createTables({ $, el, state, view, runTime, fmtDuration, fmtByte
   }
 
   let lastSide = 0;
-  let lastStats = 0;
+  let lastEmpty = 0;
 
-  /// Refreshes the header's counts with `total`, the packets a second to and
-  /// from the sandboxes, and the side panel and breadcrumb when they are due.
-  function refresh(now, total) {
-    if (now - lastStats > 500 || state.sideDirty) {
-      lastStats = now;
-      renderStats(total);
+  /// Refreshes the empty notice and search, and the side panel and
+  /// breadcrumb when they are due.
+  function refresh(now) {
+    if (now - lastEmpty > 500 || state.sideDirty) {
+      lastEmpty = now;
+      renderEmpty();
     }
     // The side panel is rebuilt when something changed, and once a second
     // for its rates, unless the viewer is pointing at it or typing in it.

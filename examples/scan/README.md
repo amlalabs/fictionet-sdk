@@ -100,10 +100,11 @@ keeps them in its budget for repeatable facts, so they never evict the
 run's other events.
 
 `start()` returns a shared `Ports` handle. `snapshot()` returns the office
-labels and sorted rows. `changes_since(revision)` returns the latest version
-of each row changed since that revision. Every tracked probe and state change
-advances the map revision. Both projections include the last change time and the
-untracked count. Their `MAX_JSON_BYTES` constants bound compact JSON output.
+labels and sorted rows. Every tracked probe and state change advances the map
+revision. The map includes the last change time and the untracked count, and
+`PortMap::MAX_JSON_BYTES` bounds its compact JSON output. `changed_since(map)`
+says whether a copy is out of date, so a publisher copies the map only after
+it changed.
 
 The map holds at most 16,384 rows and never evicts them. Further probes for
 new keys increment `untracked`; existing rows still update. The first such
@@ -117,7 +118,7 @@ an HTTP status line, the banner is the status line and the `Server` header's
 value. Bytes outside printable ASCII show as `\xHH`, and a backslash as `\\`.
 A `scan.banner` fact marks each new banner, with its host, port, text, server
 value, time and revision. A new banner advances the map revision. A later
-connection never replaces a kept banner. Snapshots and changes list banners
+connection never replaces a kept banner. Snapshots list banners
 sorted by host, then port. The map keeps at most 1,024 banners and never
 evicts one; further banners only increment `untracked_banners`.
 
@@ -131,9 +132,9 @@ cargo run -p scan-world -- /run/fictionet/world.sock /run/fictionet/observation.
 fictionet observe --observation unix:/run/fictionet/observation.sock watch
 ```
 
-`compose.yaml` passes both socket paths and runs the world, two sandboxes
-and dashboard. See [Fictionet Observe](../../observe/README.md) for capture
-limits and browser access.
+`compose.yaml` passes both socket paths and runs the world and two
+sandboxes. See [Fictionet Observe](../../observe/README.md) for capture
+limits.
 
 - `world` runs `scan-world`, with no network at all. Its world and
   observation sockets are on a shared volume.
@@ -144,20 +145,10 @@ limits and browser access.
   `scanner` service, with nmap, joins it. nmap needs `NET_RAW` to send SYN
   scans and pings, and the compose file grants it. The scanner does not
   see the world socket.
-- `dashboard` connects with `--observation unix:/run/fictionet/sock/observation.sock`, published on
-  `127.0.0.1:7880` only (`SCAN_DASHBOARD_PORT` picks another port). Its
-  token file is mounted only in the dashboard container.
-
-Open `http://127.0.0.1:7880/#token=<token>` once, using the token
-from the file below. The page removes the fragment and stores the token for
-this origin and tab. Log out or close the tab to clear it. Restart the
-dashboard to reuse a consumed bootstrap URL. Keep the token outside the sandboxes.
 
 From this folder:
 
 ```text
-$ export SCAN_DASHBOARD_TOKEN_FILE=$(mktemp)
-$ (umask 077; openssl rand -hex 32 > "$SCAN_DASHBOARD_TOKEN_FILE")
 $ docker compose up -d --build --wait
 $ docker compose exec scanner nmap -sn -n 10.0.0.0/24
 Starting Nmap 7.93 ( https://nmap.org ) at 2026-10-03 04:07 UTC
@@ -178,7 +169,7 @@ The real container answers a little later than the simulated hosts: its
 packets cross `fictionet attach` and a real kernel, where the simulated
 hosts answer inside the world. Then a SYN scan of the first 1,024 ports,
 with service detection. `--max-rate 300` only slows the scan down, so
-that it is easy to follow in the dashboard:
+that it is easy to follow:
 
 ```text
 $ docker compose exec scanner nmap -sS -sV -n -p 1-1024 --max-rate 300 10.0.0.0/24
@@ -230,12 +221,9 @@ Nmap done: 256 IP addresses (5 hosts up) scanned in 36.36 seconds
 the ports closed, not filtered. The last host is the real container, and
 its versions come from the real nginx and OpenSSH.
 
-Open http://127.0.0.1:7880/ while the scan runs to watch it. The scanner's
-link lights up, and packets fan out from the router to the five hosts.
-Double-click a host's group to open it, click the scanner's link to see
-the SYNs go out and the RSTs come back, and drag any box to move it.
-Closing "simulated hosts" hides the router and its internal links.
-The links to the two sandboxes stay visible.
+`docker compose exec world fictionet observe --observation
+unix:/run/fictionet/sock/observation.sock watch` follows the scan from a
+shell. `cargo xtask demo scan` below shows the same world on its own page.
 
 Stop it all and remove its volume with `docker compose down -v`.
 
@@ -283,31 +271,3 @@ port map after each step and the screenshots go to
 without VMs, to work on it: an in-world scanner sends the story's probes, a
 stand-in answers at 10.0.0.50, and nmap's reports are the ones recorded in a
 KVM run.
-
-## Recording the dashboard
-
-`cargo xtask scan` builds and starts the stack, records the dashboard while nmap
-runs, and removes the stack again. It needs Docker, Chromium and `ffmpeg`:
-
-```text
-$ CHROMIUM=/usr/bin/chromium cargo xtask scan /tmp/scan-recording
-```
-
-`CHROMIUM` defaults to `chromium`. `SCAN_PROJECT` selects the Compose project
-(default `fn-scan-demo`), and `SCAN_DASHBOARD_PORT` defaults to `7880`.
-Set `KEEP=1` to retain the stack; the command prints its private token file's path.
-
-The Rust command drives Chromium and records its screen. It
-puts a terminal panel beside the dashboard with nmap's real output, runs
-host discovery and then the port scan with `--max-rate 200`. During the scan,
-it opens a group, opens the scanner's link and a RST in it, closes and reopens
-a group, and drags a box and the server's group. The output folder gets
-`dashboard.webm` as recorded, `dashboard.mp4` (H.264), a smaller
-`dashboard.gif`, and `nmap.txt` with the two scans' output. The recording is
-about 75 seconds long.
-
-The recorder saves the scanner output before checking its exit status.
-It stops if either scan fails or does not find all five expected hosts.
-Before showing the success caption, it also requires nmap to identify
-OpenSSH on port 22 and nginx on port 80 of `10.0.0.50`. Failed scans leave
-their output in `nmap.txt` for diagnosis.

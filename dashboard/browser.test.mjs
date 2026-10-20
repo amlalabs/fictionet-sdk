@@ -13,7 +13,7 @@ const exec = promisify(execFile);
 
 async function checkPacketLayout() {
   const { mount } = await import('./components/packets.mjs');
-  const { createSelection } = await import('./selection.mjs');
+  const { createServices } = await import('./page.mjs');
   const check = (value, message) => { if (!value) throw new Error(message); };
   const css = document.createElement('link');
   css.rel = 'stylesheet'; css.href = '/page.css';
@@ -28,12 +28,20 @@ async function checkPacketLayout() {
     close() {}
   }
   const source = new Source(), watch = new Source();
-  let view;
-  const dispose = mount(root, {
-    selection: createSelection(), watch: () => watch,
-    transport: { packetStream: () => source },
-  }, { onReady(value) { view = value; } });
-  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'b' }, host: 'beta' }]);
+  const services = createServices({ watch: () => watch, packetStream: () => source, get: async () => ({ links: [] }) });
+  // The graph holds one sandbox per host, each with one link: link `a` for
+  // the first host, `b` for the second. The list shows every host's links.
+  const scenario = async (names) => {
+    services.hosts = names.map((name) => ({ name, sandbox: name }));
+    watch.emit('snapshot', {
+      t: 0, started: 0, ended: false, groups: [], counters: {}, events: [],
+      nodes: [{ id: 't1', kind: 'task', name: 'filter' }, ...names.map((name) => ({ id: `s-${name}`, kind: 'sandbox', name }))],
+      edges: names.map((name, index) => ({ id: 'ab'[index], a: `s-${name}`, b: 't1' })),
+    });
+    await new Promise((resolve) => setTimeout(resolve));
+  };
+  const dispose = mount(root, services);
+  await scenario(['alpha', 'beta']);
   const send = (seq, src, dst, t = seq / 1000) => source.emit('packet', {
     link: 'a', seq, src, dst, proto: 'ICMP', info: 'Echo (ping) reply id=0x1234',
     t, side: 0, len: 28, tags: [],
@@ -103,7 +111,7 @@ async function checkPacketLayout() {
   const last = [...root.querySelectorAll('#prows tr:not(.gap)')].at(-1);
   check(last.querySelector('.c-src').textContent === src && last.querySelector('.c-dst').textContent === dst, 'long address changed');
   for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
-  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'workstation1' }, { e: { id: 'b' }, host: 'jump' }]);
+  await scenario(['workstation1', 'jump']);
   for (const width of [530, 600]) {
     root.style.width = width + 'px';
     const rows = root.querySelectorAll('#prows tr').length;
@@ -119,7 +127,7 @@ async function checkPacketLayout() {
     check($('#plist').scrollWidth <= $('#plist').clientWidth, 'host column overflows');
   }
   // A single host's list has no Host column and keeps Protocol to 560 px.
-  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }]);
+  await scenario(['alpha']);
   send(6, '10.0.0.2', '10.0.0.3');
   while (!root.querySelector('#prows tr:not(.gap)')) await frame();
   check(!root.querySelector('.packet-panel').classList.contains('merged-hosts'), 'one host shows a Host column');
@@ -128,12 +136,12 @@ async function checkPacketLayout() {
     await frame();
     check(hidden($('#prows tr:not(.gap) td.c-proto')) === (width < 560), 'single-host Protocol breakpoint at ' + width);
   }
-  dispose(); root.remove(); css.remove();
+  dispose(); services.dispose(); root.remove(); css.remove();
 }
 
 async function checkContainmentLayout() {
   const { mount } = await import('./components/containment.mjs');
-  const { createSelection } = await import('./selection.mjs');
+  const { createServices } = await import('./page.mjs');
   const check = (value, message) => { if (!value) throw new Error(message); };
   const css = document.createElement('link');
   css.rel = 'stylesheet'; css.href = '/page.css';
@@ -144,13 +152,13 @@ async function checkContainmentLayout() {
   document.body.append(root);
   const outcomes = ['contained', 'not_contained', 'unknown', 'missing_tool', 'timed_out', 'fact'];
   const probes = outcomes.map((outcome) => ({
-    guest: 'east', name: 'Public DNS', command: 'dig @8.8.8.8 example.com', guest_result: 'connection timed out; no servers could be reached',
-    world_answer: 'no route: no machine at that address', outcome,
+    guest: 'east', name: 'Public DNS', command: 'dig @8.8.8.8 example.com', destination: '8.8.8.8:53', guest_result: 'connection timed out; no servers could be reached',
+    summary: 'connection timed out; no servers could be reached', world_answer: 'no route: no machine at that address', outcome,
   }));
-  const dispose = mount(root, {
-    selection: createSelection(), hosts: [{ name: 'east', sandbox: 'east' }],
-    state: (_, update) => { update({ value: { probes } }); return () => {}; },
-  }, { state: 'containment' });
+  const services = createServices({});
+  services.hosts = [{ name: 'east', sandbox: 'east' }];
+  services.state = (_, update) => { update({ value: { probes } }); return () => {}; };
+  const dispose = mount(root, services, { state: 'containment' });
   // The inspector is about 530 px wide at 1280 and 457 px in a shared workspace at 1440.
   for (const width of [530, 457]) {
     root.style.width = width + 'px';
@@ -164,6 +172,78 @@ async function checkContainmentLayout() {
     }
   }
   dispose(); root.remove(); css.remove();
+}
+
+// World data reaches the page as text: markup in it never becomes elements
+// or runs, in any panel.
+async function checkTextStaysText() {
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  const panels = {
+    events: await import('./components/events.mjs'),
+    table: await import('./components/table.mjs'),
+    containment: await import('./components/containment.mjs'),
+    leftTheBox: await import('./components/left-the-box.mjs'),
+    labels: await import('./components/labels.mjs'),
+    packets: await import('./components/packets.mjs'),
+    map: await import('./components/map.mjs'),
+  };
+  const { createServices } = await import('./page.mjs');
+  const markup = '<img src=x onerror="window.injected=true"><fictionet-injected>tag</fictionet-injected>';
+  const values = {
+    '/api/state/rows': [{ name: markup }],
+    '/api/state/containment': { probes: [{ guest: 'alpha', name: markup, command: markup, destination: markup, outcome: 'not_contained', guest_result: markup, summary: markup, world_answer: markup, proxies: [{ name: markup, destination: markup, world_host: false }] }] },
+    '/api/state/labels': [{ id: 1, text: markup, target: { kind: 'event', seq: 1 }, at: 1 }],
+  };
+  class Source extends EventTarget {
+    emit(type, data) { this.dispatchEvent(new MessageEvent(type, { data: JSON.stringify(data) })); }
+    close() {}
+  }
+  const source = new Source(), watch = new Source();
+  const services = createServices({
+    get: async (path) => (path === '/api/egress'
+      ? { revision: 1, dropped: 0, lost: 0, pending: [], lookups: [{ sandbox: 'alpha', name: markup, answer: markup, count: 1, first: 1, last: 1 }], destinations: [{ sandbox: 'alpha', name: markup, address: markup, transport: 'tcp', outcome: 'forwarded', by: markup, requests: 1, connections: 1, packets: 0, unanswered: 0, first: 1, last: 1 }] }
+      : { links: [] }),
+    packetStream: () => source,
+    watch: () => watch,
+  });
+  services.hosts = [{ name: 'alpha', sandbox: 'alpha' }];
+  services.state = (path, update) => { update({ revision: 1, value: values[path], status: {} }); return () => {}; };
+  Object.assign(services, { labelState: '/api/state/labels', labelCommand: '/api/command/labels', containmentState: '/api/state/containment' });
+  const options = {
+    events: {}, map: {}, packets: {}, leftTheBox: {},
+    table: { state: '/api/state/rows', columns: [{ label: markup, pointer: '/name', format: 'text' }] },
+    containment: { state: '/api/state/containment' },
+    labels: { state: '/api/state/labels', command: '/api/command/labels' },
+  };
+  const disposals = [];
+  const roots = [];
+  for (const [name, { mount }] of Object.entries(panels)) {
+    const root = document.createElement('section');
+    root.style.cssText = 'width:600px;height:400px;display:flex;flex-direction:column';
+    document.body.append(root);
+    roots.push(root);
+    disposals.push(mount(root, services, options[name]));
+  }
+  // The world's graph, sent once the panels follow the page's watch.
+  watch.emit('snapshot', {
+    t: 1, started: 0, ended: false, status: null, groups: [],
+    nodes: [{ id: 's1', kind: 'sandbox', name: 'alpha' }, { id: 't1', kind: 'task', name: markup, file: markup, line: 1 }],
+    edges: [{ id: 'e1', a: 's1', b: 't1', label: markup }], counters: { e1: [1, 40, 0, 0] },
+    events: [{ seq: 1, at: 1, source: 'http', kind: 'request', summary: markup, fields: { host: markup }, sandbox: { name: 'alpha' }, task: markup, node: 't1' }],
+  });
+  await new Promise((resolve) => setTimeout(resolve));
+  source.emit('packet', { link: 'e1', seq: 1, t: 1, side: 0, len: 40, tags: [], src: markup, dst: markup, proto: markup, info: markup });
+  // Select the event so its fields open below its line.
+  services.selection.set({ event: services.graph.state.events[0] });
+  for (let i = 0; i < 10; i++) await new Promise(requestAnimationFrame);
+  for (const [index, name] of Object.keys(panels).entries()) {
+    check(roots[index].textContent.includes('<fictionet-injected>'), `${name} does not show the markup as text`);
+    check(!roots[index].querySelector('img, fictionet-injected'), `${name} made the markup an element`);
+  }
+  check(!window.injected, 'markup ran');
+  disposals.forEach((dispose) => dispose());
+  services.dispose();
+  roots.forEach((root) => root.remove());
 }
 
 test('browser bootstrap, reconnect and downloads keep credentials away from another port', async (t) => {
@@ -216,14 +296,6 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
       return;
     }
     if (req.url === '/result') { recordResult(req, res); return; }
-    if (req.url === '/legacy') {
-      res.writeHead(302, {
-        'Set-Cookie': 'fictionet_token=browser-test-token; Path=/; HttpOnly; SameSite=Strict',
-        Location: '/#token=browser-test-token',
-      }).end();
-      return;
-    }
-    if (req.url === '/') res.setHeader('Set-Cookie', 'fictionet_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict');
     if (req.url.endsWith('.mjs') || req.url.endsWith('.css')) {
       res.setHeader('Content-Type', req.url.endsWith('.css') ? 'text/css' : 'text/javascript');
       res.end(await readFile(new URL('.' + req.url, import.meta.url)));
@@ -260,6 +332,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
           try {
             await (${checkPacketLayout.toString()})();
             await (${checkContainmentLayout.toString()})();
+            await (${checkTextStaysText.toString()})();
             await fetch('/layout-result', { method: 'POST', body: 'PASS' });
           } catch (error) {
             await fetch('/layout-result', { method: 'POST', body: error.message });
@@ -320,7 +393,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
     '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
     // The throwaway profile must not wait on the desktop keyring, which can be locked.
-    '--password-store=basic', '--use-mock-keychain', `${origin}/legacy`,
+    '--password-store=basic', '--use-mock-keychain', `${origin}/#token=browser-test-token`,
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   browser.stderr.setEncoding('utf8');
@@ -349,7 +422,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     assert.fail(`Chromium exited before reporting a result (code ${outcome.code}, signal ${outcome.signal})\n${diagnostics}`);
   }
   if (outcome.timeout) assert.fail(`Chromium did not report a result within 30 s\n${diagnostics}`);
-  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width; containment labels stay on one line', () => {
+  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width; containment labels stay on one line; world data stays text', () => {
     assert.equal(layoutReport, 'PASS');
   });
   assert.match(outcome.report, /^PASS: isolated$/);
@@ -357,8 +430,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
   assert.equal(streams, 2);
   assert.ok(received.some((r) => r.url.startsWith('/api/pcap?')));
   assert.ok(received.some((r) => r.url === '/reload'));
-  assert.equal(received.find((r) => r.url === '/').cookie, 'fictionet_token=browser-test-token');
-  assert.ok(received.every((r) => (r.url === '/' || !r.cookie) && !r.url.includes('browser-test-token')));
+  assert.ok(received.every((r) => !r.cookie && !r.url.includes('browser-test-token')));
   assert.ok(foreign.some((r) => r.url === '/probe'));
   assert.ok(foreign.some((r) => r.url === '/done'));
   assert.ok(foreign.every((r) => !r.cookie && !r.authorization));

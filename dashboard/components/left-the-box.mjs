@@ -30,11 +30,10 @@ export function mount(root, services) {
   const lookupSummary = el('summary', { text: 'DNS lookups (0)' }, details);
   const lookups = el('div', { class: 'table-scroll' }, details);
   const controller = new AbortController();
-  const schedule = services.setTimeout || setTimeout, cancel = services.clearTimeout || clearTimeout;
   let timer, snapshot, containment, containmentFailed = false, selected, failed = false;
   function draw() {
     if (!snapshot) return;
-    const sandbox = services.hosts?.find((host) => host.name === selected)?.sandbox || selected;
+    const sandbox = services.sandboxOf(selected);
     const visible = (row) => !sandbox || row.sandbox === sandbox;
     const rows = snapshot.destinations.filter(visible);
     const origins = new Map();
@@ -57,9 +56,9 @@ export function mount(root, services) {
     const count = (outcome) => rows.filter((row) => row.outcome === outcome).reduce((n, row) => n + attempts(row), 0);
     stayed.replaceChildren();
     if (escaped) {
-      stayed.append('The containment check found a way out that the world does not record. ');
+      stayed.append('The containment check found a way out that the world did not see. ');
       const button = el('button', { class: 'text-button', type: 'button', text: 'Open Containment' }, stayed);
-      button.addEventListener('click', () => services.showPanel?.('containment'));
+      button.addEventListener('click', () => services.showPanel('containment'));
       stayed.append(' ');
     } else if (unchecked) stayed.append('Containment results are unavailable or incomplete. ');
     if (incomplete) stayed.append(`This list may be incomplete: ${snapshot.dropped} attempts not kept, ${snapshot.lost} observations lost. `);
@@ -80,7 +79,7 @@ export function mount(root, services) {
       for (const row of group) {
         const tr = el('tr', {}, tbody);
         const destination = el('td', { class: 'egress-destination' }, tr);
-        if (!sandbox) el('span', { class: 'pill', text: services.hosts?.find((host) => host.sandbox === row.sandbox)?.name || row.sandbox }, destination);
+        if (!sandbox) el('span', { class: 'pill', text: services.hostLabel(row.sandbox) }, destination);
         if (row.name) el('div', { class: 'egress-name', text: row.name }, destination);
         el('div', { class: 'mono egress-muted', text: `${row.address} ${row.transport}` }, destination);
         const by = el('td', { class: 'egress-answer' }, tr);
@@ -101,8 +100,8 @@ export function mount(root, services) {
     root.scrollTop = scroll;
   }
   function queue() {
-    cancel(timer);
-    timer = schedule(read, document.hidden ? 10000 : 2000);
+    clearTimeout(timer);
+    timer = setTimeout(read, document.hidden ? 10000 : 2000);
   }
   const stop = services.selection.subscribe(({ host }) => { selected = host; draw(); });
   async function read() {
@@ -118,7 +117,7 @@ export function mount(root, services) {
       if (!controller.signal.aborted) {
         failed = true;
         // After the run stopped, the page server is gone: stop asking.
-        if (services.stopped?.()) { status.textContent = `The run has stopped, so destinations can no longer be loaded.${snapshot ? ' The list shows the last ones read.' : ''}`; return; }
+        if (services.stopped()) { status.textContent = `The run has stopped, so destinations can no longer be loaded.${snapshot ? ' The list shows the last ones read.' : ''}`; return; }
         status.textContent = `Could not load destinations: ${error.message}. The table may be incomplete.`;
       }
     }
@@ -127,5 +126,5 @@ export function mount(root, services) {
   const stopContainment = services.containmentState ? services.state(services.containmentState, (value) => { containment = value; containmentFailed = false; draw(); }, () => { containmentFailed = true; draw(); }) : () => {};
   document.addEventListener('visibilitychange', queue);
   void read();
-  return () => { controller.abort(); cancel(timer); document.removeEventListener('visibilitychange', queue); stop(); stopContainment(); root.replaceChildren(); };
+  return () => { controller.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', queue); stop(); stopContainment(); root.replaceChildren(); };
 }

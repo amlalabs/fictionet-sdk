@@ -29,7 +29,7 @@ You don't need Docker or `sudo`. The VM builds Fictionet itself.
 
 ```console
 $ cargo xtask vm up
-The VM is up in 6.1 s: 4 vCPUs, 5G, SSH on 127.0.0.1:2222, port 7878 on 127.0.0.1:7878.
+The VM is up in 6.1 s: SSH on 127.0.0.1:2222
 $ cargo xtask vm test netns
 ...
 ALL PASSED
@@ -129,7 +129,7 @@ code rebuilds in seconds, and an image pulled once stays pulled. It grows up to
 
 **Network.** The VM uses QEMU's user-mode network (slirp), which needs no root.
 `cargo xtask vm` forwards a free port on `127.0.0.1` to the VM's SSH (2222 when it is
-free), and another to the VM's port 7878. The VM reaches the internet through it
+free). The VM reaches the internet through it
 to install packages and pull images. Fictionet's sandboxes inside the VM reach
 only their world. In slirp, the address 10.0.2.2 is your machine's own
 `127.0.0.1`. Nothing in the VM needs it, so a firewall rule in the VM drops new

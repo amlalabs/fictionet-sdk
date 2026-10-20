@@ -1,6 +1,9 @@
-// Graph state, the run clock, and incoming snapshot and event application.
-// The caller passes group views and status, layout, and pulse effects.
-export function createState({ view, setStatus, loadLayout, pulse }) {
+// The page's graph: tasks, sandboxes, hosts, groups and links with their
+// counters, recent events, loss status and the run clock, kept from the
+// watch stream. The map keeps its layout and drawing on the same objects.
+import { listen } from './dom.mjs';
+
+export function createState() {
   const state = {
     nodes: new Map(), // id -> task or sandbox, as the world sent it
     edges: new Map(), // id -> link
@@ -12,17 +15,21 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
     startedMs: 0,
     ended: false,
     connected: false,
+    // Whether a snapshot has arrived, so the graph is known.
+    known: false,
+    // The watch's loss status: `{ incomplete, losses, ... }`.
+    status: null,
     selected: null, // { kind: 'node' | 'group' | 'edge' | 'ended', id }
     search: '',
     view: { x: 0, y: 0, k: 1 },
     userMoved: false,
     layoutDirty: true,
     sideDirty: true,
-    // What the viewer chose, kept per world: groups opened or closed by
-    // hand (by group key), and nodes dragged to a place (by node key).
+    // What the viewer chose on the map until the next snapshot: groups
+    // opened or closed by hand (by group key), and nodes dragged to a place
+    // (by node key).
     expanded: new Map(),
     pins: new Map(),
-    worldKey: '',
   };
 
   const runTime = () => state.serverT + (state.ended ? 0 : (performance.now() - state.serverAt) / 1000);
@@ -43,7 +50,11 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
     state.startedMs = s.started;
     state.ended = s.ended;
     state.connected = true;
-    setStatus(s.ended ? 'ended' : 'running', s.ended ? 'World stopped' : 'Running');
+    state.known = true;
+    state.status = s.status || null;
+    // A new graph forgets the places and open groups chosen for the last one.
+    state.pins.clear();
+    state.expanded.clear();
     for (const g of s.groups || []) upsertGroup(g);
     for (const n of s.nodes) upsertNode(n);
     for (const e of s.edges) upsertEdge(e);
@@ -55,8 +66,7 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
       }
     }
     for (const n of s.events) addEvent(n);
-    loadLayout(s.nodes);
-    // Fit once the layout is made, dragged places included.
+    // Fit once the layout is made.
     state.userMoved = false;
     state.sideDirty = true;
   }
@@ -79,9 +89,6 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
 
   function removeGroup(id) {
     state.groups.delete(id);
-    const gv = view.gviews.get(id);
-    if (gv?.g) gv.g.remove();
-    view.gviews.delete(id);
     if (state.selected?.kind === 'group' && state.selected.id === id) state.selected = null;
     state.layoutDirty = true;
     state.sideDirty = true;
@@ -155,7 +162,6 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
 
   function addEvent(n) {
     state.events.push(n);
-    pulse(n);
     if (state.events.length > 500) state.events.shift();
     if (n.kind === 'drop' && n.node) {
       const node = state.nodes.get(n.node);
@@ -174,48 +180,54 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
   return { state, runTime, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent };
 }
 
-// Bind one watch to a graph state. The owner closes it when its view leaves.
-export function watchState(source, { state, setStatus, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent }) {
-  const cleanup = [];
-  const on = (name, callback) => {
-    source.addEventListener(name, callback);
-    cleanup.push(() => source.removeEventListener(name, callback));
-  };
-    on('waiting', () => {
-      state.connected = true;
-      setStatus('waiting', 'Waiting for a world');
-    });
-    on('snapshot', (e) => snapshot(JSON.parse(e.data)));
-    on('host', (e) => upsertHost?.(JSON.parse(e.data)));
-    on('host_end', (e) => removeHost?.(JSON.parse(e.data).id));
-    on('group', (e) => upsertGroup(JSON.parse(e.data)));
-    on('group_end', (e) => removeGroup(JSON.parse(e.data).id));
-    on('node', (e) => upsertNode(JSON.parse(e.data)));
-    on('node_end', (e) => removeNode(JSON.parse(e.data).id));
-    on('edge', (e) => upsertEdge(JSON.parse(e.data)));
-    on('edge_end', (e) => removeEdge(JSON.parse(e.data).id));
-    on('counters', (e) => counters(JSON.parse(e.data)));
-    on('event', (e) => addEvent(JSON.parse(e.data)));
-    on('ended', (e) => {
-      tick(JSON.parse(e.data).t);
-      state.ended = true;
-      setStatus('ended', 'World stopped');
-      state.sideDirty = true;
-    });
-    on('end', () => {
-      source.close();
-      if (!state.ended) setStatus('ended', 'The world closed');
-      state.ended = true;
-    });
-    on('world_error', (e) => {
-      state.ended = true;
-      setStatus('ended', JSON.parse(e.data).error);
-    });
-    on('error', () => {
-      if (!state.ended) setStatus('connecting', 'Reconnecting');
-    });
-  return () => {
-    cleanup.forEach((remove) => remove());
+// The watch events the model listens for, and what each does to the graph.
+// `error` and `open` change nothing there and only reach subscribers.
+const WATCH = {
+  waiting: (graph) => { graph.state.connected = true; },
+  snapshot: (graph, data) => graph.snapshot(data),
+  host: (graph, data) => graph.upsertHost(data),
+  host_end: (graph, data) => graph.removeHost(data.id),
+  group: (graph, data) => graph.upsertGroup(data),
+  group_end: (graph, data) => graph.removeGroup(data.id),
+  node: (graph, data) => graph.upsertNode(data),
+  node_end: (graph, data) => graph.removeNode(data.id),
+  edge: (graph, data) => graph.upsertEdge(data),
+  edge_end: (graph, data) => graph.removeEdge(data.id),
+  counters: (graph, data) => graph.counters(data),
+  event: (graph, data) => graph.addEvent(data),
+  ended: (graph, data) => {
+    graph.tick(data.t);
+    graph.state.ended = true;
+    graph.state.sideDirty = true;
+  },
+  end: (graph, _, source) => {
     source.close();
+    graph.state.ended = true;
+  },
+  status: (graph, data) => { graph.state.status = data.status; },
+  world_error: (graph) => { graph.state.ended = true; },
+  error: () => {},
+  open: () => {},
+};
+
+/// The page's one graph, bound to `source`, a watch. Each watch event is
+/// parsed once and applied to the graph; then `subscribe(listener)` calls
+/// `listener(name, data)` with it. `subscribe` returns an unsubscribe function.
+export function createModel(source) {
+  const graph = createState();
+  const listeners = new Set();
+  const removers = Object.entries(WATCH).map(([name, apply]) => listen(source, name, (event) => {
+    const data = event.data ? JSON.parse(event.data) : null;
+    apply(graph, data, source);
+    for (const listener of [...listeners]) listener(name, data);
+  }));
+  return {
+    ...graph,
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    dispose() {
+      listeners.clear();
+      removers.forEach((remove) => remove());
+      source.close();
+    },
   };
 }

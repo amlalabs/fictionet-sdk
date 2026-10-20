@@ -251,7 +251,7 @@ mod tests {
         let memory = Arc::new(Memory::new(Limits::new(8, 32 << 10)));
         let aggregate = Arc::new(Aggregate::new(memory.clone()));
         let inspect = aggregate.clone();
-        let evidence = memory.clone();
+        let grader = memory.clone();
         block_on(lab(
             RunOptions::new(Seed::from_u64(7)).observer(aggregate),
             |cx| async move {
@@ -261,7 +261,7 @@ mod tests {
                             .repeat(Fields::new().with("dst_port", port))
                     });
                     if read {
-                        assert_eq!(evidence.checked_all()?.len(), 2);
+                        assert_eq!(grader.checked_all()?.len(), 2);
                     }
                 }
                 {
@@ -341,10 +341,10 @@ mod tests {
     #[test]
     fn aggregation_precedes_retention_and_fanout() {
         let history = Arc::new(Memory::new(Limits::new(4, 8192)));
-        let evidence = Arc::new(Memory::new(Limits::new(4, 8192)));
+        let grader = Arc::new(Memory::new(Limits::new(4, 8192)));
         block_on(lab(
             RunOptions::new(Seed::from_u64(7)).observer(Arc::new(Aggregate::new(Arc::new(
-                fictionet::events::Fanout::new(vec![history.clone(), evidence.clone()]),
+                fictionet::events::Fanout::new(vec![history.clone(), grader.clone()]),
             )))),
             |cx| async move {
                 for _ in 0..1000 {
@@ -356,7 +356,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             history.checked_all().unwrap(),
-            evidence.checked_all().unwrap()
+            grader.checked_all().unwrap()
         );
         assert_eq!(
             history.checked_of("lan", "drop").unwrap()[1].u64("count"),

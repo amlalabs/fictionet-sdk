@@ -590,23 +590,23 @@ fn recorded_attempts(cx: &fictionet::Cx) {
             (6, "example.test", Some(("answer", "cancelled"))),
             (
                 2,
-                "archive.ubuntu.com",
-                Some(("forwarded", "http://archive.ubuntu.com")),
+                "mirror.example",
+                Some(("forwarded", "http://mirror.example")),
             ),
             (
                 3,
-                "archive.ubuntu.com",
+                "mirror.example",
                 Some(("served_by", "host package cache")),
             ),
             (
                 4,
-                "downloads.claude.ai",
-                Some(("forwarded", "https://downloads.claude.ai")),
+                "origin.example",
+                Some(("forwarded", "https://origin.example")),
             ),
             (
                 5,
-                "releases.openai.com",
-                Some(("forwarded", "https://releases.openai.com")),
+                "releases.example",
+                Some(("forwarded", "https://releases.example")),
             ),
         ] {
             let conn = ConnInfo::new(
@@ -691,15 +691,6 @@ fn recorded_containment() -> fictionet_observe::page::Containment {
                 "no route: no machine at that address",
             ),
             (
-                "alpha",
-                "Direct public site",
-                "curl https://www.google.com",
-                "www.google.com",
-                ProbeOutcome::NotContained,
-                "HTTP 200",
-                "No matching world observation",
-            ),
-            (
                 "beta",
                 "Public IPv6",
                 "curl -6 'https://[2606:4700:4700::1111]'",
@@ -727,6 +718,7 @@ fn recorded_containment() -> fictionet_observe::page::Containment {
                     command: command.into(),
                     destination: destination.into(),
                     outcome,
+                    summary: guest_result.into(),
                     guest_result: guest_result.into(),
                     world_answer: world_answer.into(),
                     proxies: vec![],

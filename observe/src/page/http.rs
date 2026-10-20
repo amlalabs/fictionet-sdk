@@ -251,9 +251,7 @@ async fn headers_with_policy(
 }
 
 pub(super) async fn page(conn: &mut TcpStream) -> io::Result<()> {
-    let mut bytes = [0; 32];
-    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
-    let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let nonce = super::random_hex()?;
     let body = super::assets::HTML.replace("PAGE_NONCE", &nonce);
     // xterm injects style elements; style attributes in markup remain blocked.
     let security = SECURITY

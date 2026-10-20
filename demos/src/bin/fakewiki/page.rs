@@ -23,11 +23,9 @@ impl Controls {
             commands: CommandPort::new(CommandLimits::default()),
             state: StateTopic::new(StateLimits {
                 max_bytes: tamper::MAX_TAMPER_STATE_BYTES,
-                deltas: 0,
             }),
             diff: StateTopic::new(StateLimits {
                 max_bytes: MAX_DIFF_BYTES,
-                deltas: 0,
             }),
         }
     }

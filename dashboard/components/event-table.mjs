@@ -11,8 +11,6 @@ export function mount(root, services, options) {
   const body = el('div', { class: 'table-scroll' }, wrap);
   const jump = el('button', { class: 'jump', type: 'button', hidden: '' }, wrap);
   const controller = new AbortController();
-  const schedule = services.setTimeout || setTimeout;
-  const cancel = services.clearTimeout || clearTimeout;
   let timer, after = 0, rows = [], pending = 0, paused = false, dropped = 0;
   function draw() {
     render(body, rows, options.columns, { key: (row) => row.seq });
@@ -34,13 +32,13 @@ export function mount(root, services, options) {
       if (controller.signal.aborted) return;
       status.hidden = false;
       // After the run stopped, the page server is gone: stop asking.
-      if (services.stopped?.()) { status.textContent = 'The run has stopped, so these events can no longer be loaded.'; return; }
+      if (services.stopped()) { status.textContent = 'The run has stopped, so these events can no longer be loaded.'; return; }
       status.textContent = `Could not load events: ${error.message}`;
     }
-    if (!controller.signal.aborted) timer = schedule(read, 1000);
+    if (!controller.signal.aborted) timer = setTimeout(read, 1000);
   }
   const scroll = listen(body, 'scroll', () => { paused = body.scrollHeight - body.scrollTop - body.clientHeight > 24; });
   const click = listen(jump, 'click', () => { paused = false; draw(); body.scrollTop = body.scrollHeight; });
   void read();
-  return () => { controller.abort(); cancel(timer); scroll(); click(); root.replaceChildren(); };
+  return () => { controller.abort(); clearTimeout(timer); scroll(); click(); root.replaceChildren(); };
 }

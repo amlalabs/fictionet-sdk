@@ -1,4 +1,4 @@
-// DOM helpers shared by the dashboard and its packet drawer.
+// DOM helpers shared by the page and its packet list.
 const SVGNS = 'http://www.w3.org/2000/svg';
 
 const el = (tag, attrs = {}, parent, document = parent?.ownerDocument || globalThis.document) => {

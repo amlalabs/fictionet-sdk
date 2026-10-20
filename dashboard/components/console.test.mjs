@@ -2,15 +2,28 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mount as screen } from './screen.mjs';
 import { mount as terminal } from './terminal.mjs';
-import { createDocument, Element } from '../test-dom.mjs';
+import { createServices } from '../page.mjs';
+import { createDocument, Element, fakeTimers } from '../test-dom.mjs';
 import { createTransport } from '../transport.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-function fixture() {
+// The terminal fits itself with the browser's ResizeObserver and reads its
+// colors with getComputedStyle; Node has neither.
+let observers;
+globalThis.ResizeObserver = class {
+  constructor(callback) { this.callback = callback; observers.push(this); }
+  observe() {}
+  disconnect() { this.disposed = true; }
+};
+globalThis.getComputedStyle = () => ({ backgroundColor: 'rgb(233, 237, 223)', color: 'rgb(38, 62, 53)' });
+
+function fixture(t) {
   const document = createDocument(), root = document.createElement('section');
   document.body.append(root);
-  const subscriptions = new Map(), timers = new Map(), sockets = [], requests = [], rfbs = [], terminals = [], observers = [], themes = new Set();
+  observers = [];
+  const timers = fakeTimers(t);
+  const subscriptions = new Map(), sockets = [], requests = [], rfbs = [], terminals = [], themes = new Set();
   let status = { state: 'booting', screen: false, terminal: false }, holder = null;
   class Socket extends Element {
     constructor() { super('socket'); this.readyState = 0; this.sent = []; }
@@ -38,44 +51,45 @@ function fixture() {
     dispose() { this.disposed = true; this.addon.dispose(); }
   }
   class FitAddon { fit() { this.fitted = true; } dispose() { this.disposed = true; } }
-  class ResizeObserver {
-    constructor(callback) { this.callback = callback; observers.push(this); }
-    observe() {}
-    disconnect() { this.disposed = true; }
-  }
-  const services = {
-    setTimeout(callback, delay) { const id = Symbol(); timers.set(id, { callback, delay }); return id; },
-    clearTimeout(id) { timers.delete(id); },
-    state(path, callback, error) {
-      subscriptions.set(path, { callback, error });
-      callback({ value: path.endsWith('/leases') ? { alpha: { holder } } : status });
-      return () => subscriptions.delete(path);
-    },
-    theme: { subscribe(callback) { themes.add(callback); callback('light'); return () => themes.delete(callback); } },
-    transport: {
-      ...createTransport({}, {
-        location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
-        async fetch(url, options) {
-          assert.equal(options.headers.Authorization, 'Bearer secret');
-          requests.push({ method: options.method, path: new URL(url).pathname, body: JSON.parse(options.body) });
-          return Response.json({ holder: options.method === 'POST' ? 'ours' : null });
-        },
-      }),
-      async socket(capability, host) { const socket = new Socket(); sockets.push(socket); requests.push({ capability, host }); return { socket, session: 'ours' }; },
-    },
+  const modules = {
+    '/vendor/novnc/core/rfb.js': { default: RFB },
+    '/vendor/xterm/lib/xterm.mjs': { Terminal },
+    '/vendor/addon-fit/lib/addon-fit.mjs': { FitAddon },
+  };
+  const transport = {
+    ...createTransport({}, {
+      location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
+      async fetch(url, options) {
+        assert.equal(options.headers.Authorization, 'Bearer secret');
+        requests.push({ method: options.method, path: new URL(url).pathname, body: JSON.parse(options.body) });
+        return Response.json({ holder: options.method === 'POST' ? 'ours' : null });
+      },
+    }),
+    async socket(capability, host) { const socket = new Socket(); sockets.push(socket); requests.push({ capability, host }); return { socket, session: 'ours' }; },
+  };
+  const theme = { subscribe(callback) { themes.add(callback); callback('light'); return () => themes.delete(callback); } };
+  const services = createServices(transport, theme, async (url) => {
+    if (!modules[url]) throw new TypeError('Failed to fetch dynamically imported module');
+    return modules[url];
+  });
+  // Each host's status and the input leases, as the state stream sends them.
+  services.state = (path, callback, error) => {
+    subscriptions.set(path, { callback, error });
+    callback({ value: path.endsWith('/leases') ? { alpha: { holder } } : status });
+    return () => subscriptions.delete(path);
   };
   return {
     root, services, subscriptions, timers, sockets, requests, rfbs, terminals, observers, themes,
-    screenOptions: { host: 'alpha', load: async () => ({ default: RFB }) },
-    terminalOptions: { host: 'alpha', load: async () => [{ Terminal }, { FitAddon }], ResizeObserver, getComputedStyle: () => ({ backgroundColor: 'rgb(233, 237, 223)', color: 'rgb(38, 62, 53)' }) },
+    screenOptions: { host: 'alpha' },
+    terminalOptions: { host: 'alpha' },
     publish(value) { status = value; subscriptions.get('/api/state/host-alpha')?.callback({ value }); },
     lease(value) { holder = value; subscriptions.get('/api/state/leases')?.callback({ value: { alpha: { holder } } }); },
   };
 }
 
-test('console cards follow each host state', async () => {
+test('console cards follow each host state', async (t) => {
   for (const [kind, mount] of [['screen', screen], ['terminal', terminal]]) {
-    const h = fixture();
+    const h = fixture(t);
     const dispose = mount(h.root, h.services, h[`${kind}Options`]);
     await settle();
     const message = h.root.querySelector('p'), card = message.parent;
@@ -106,9 +120,9 @@ test('console cards follow each host state', async () => {
   }
 });
 
-test('terminal focuses once on request and never on a later status change or reconnect', async () => {
+test('terminal focuses once on request and never on a later status change or reconnect', async (t) => {
   for (const focus of [false, true]) {
-    const h = fixture();
+    const h = fixture(t);
     h.publish({ state: 'ssh_up', terminal: true });
     const dispose = terminal(h.root, h.services, { ...h.terminalOptions, focus });
     await settle();
@@ -129,7 +143,7 @@ test('terminal focuses once on request and never on a later status change or rec
     assert.equal(h.terminals[2].focuses, undefined);
     dispose();
   }
-  const h = fixture();
+  const h = fixture(t);
   const dispose = terminal(h.root, h.services, { ...h.terminalOptions, focus: true });
   await settle();
   h.publish({ state: 'ssh_up', terminal: true });
@@ -139,9 +153,10 @@ test('terminal focuses once on request and never on a later status change or rec
   dispose();
 });
 
-test('screen stays unavailable while booting, watches by default and follows the live lease', async () => {
-  const h = fixture(), ownership = [];
-  const dispose = screen(h.root, h.services, { ...h.screenOptions, onOwnership: (text) => ownership.push(text) });
+test('screen stays unavailable while booting, watches by default and follows the live lease', async (t) => {
+  const h = fixture(t);
+  const dispose = screen(h.root, h.services, h.screenOptions);
+  const owner = h.root.querySelector('span.console-owner');
   await settle();
   assert.equal(h.sockets.length, 0);
   assert.match(h.root.textContent, /alpha is booting/);
@@ -165,10 +180,11 @@ test('screen stays unavailable while booting, watches by default and follows the
   h.lease('ours');
   assert.equal(rfb.viewOnly, false);
   assert.equal(claim.textContent, 'Release');
-  assert.equal(ownership.at(-1), 'You have control');
+  assert.equal(owner.textContent, 'You have control');
+  assert.equal(owner.dataset.owner, 'mine');
   h.lease('another');
   assert.equal(rfb.viewOnly, true);
-  assert.equal(ownership.at(-1), 'Another viewer has control');
+  assert.equal(owner.dataset.owner, 'other');
   assert.match(h.root.textContent, /Another viewer took control/);
   const notice = [...h.timers.values()].find((timer) => timer.delay === 4000);
   assert.ok(notice, 'the lost-control notice clears itself');
@@ -189,8 +205,8 @@ test('screen stays unavailable while booting, watches by default and follows the
   assert.equal(h.root.children.length, 0);
 });
 
-test('screen reconnects with backoff and disposal cancels a scheduled reconnect', async () => {
-  const h = fixture();
+test('screen reconnects with backoff and disposal cancels a scheduled reconnect', async (t) => {
+  const h = fixture(t);
   h.publish({ screen: true });
   const dispose = screen(h.root, h.services, h.screenOptions);
   await settle();
@@ -211,8 +227,8 @@ test('screen reconnects with backoff and disposal cancels a scheduled reconnect'
   assert.equal(reconnect.listenerCount, 0);
 });
 
-test('a screen noVNC already disconnected is not disconnected again', async () => {
-  const h = fixture();
+test('a screen noVNC already disconnected is not disconnected again', async (t) => {
+  const h = fixture(t);
   h.publish({ screen: true });
   const dispose = screen(h.root, h.services, h.screenOptions);
   await settle();
@@ -227,8 +243,8 @@ test('a screen noVNC already disconnected is not disconnected again', async () =
   assert.equal(h.timers.size, 0);
 });
 
-test('terminal acknowledges only consumed output and releases its socket, addon and observer', async () => {
-  const h = fixture();
+test('terminal acknowledges only consumed output and releases its socket, addon and observer', async (t) => {
+  const h = fixture(t);
   h.publish({ terminal: true });
   const dispose = terminal(h.root, h.services, h.terminalOptions);
   await settle();
@@ -265,8 +281,8 @@ test('terminal acknowledges only consumed output and releases its socket, addon 
   assert.equal(h.root.children.length, 0);
 });
 
-test('terminal waits for SSH, reports a disconnect and reconnects only on request', async () => {
-  const h = fixture();
+test('terminal waits for SSH, reports a disconnect and reconnects only on request', async (t) => {
+  const h = fixture(t);
   const dispose = terminal(h.root, h.services, h.terminalOptions);
   await settle();
   assert.match(h.root.textContent, /terminal opens when SSH is up/);
@@ -287,21 +303,24 @@ test('terminal waits for SSH, reports a disconnect and reconnects only on reques
   dispose();
 });
 
-test('console disposal handles imports and socket requests that finish late', async () => {
+test('console disposal handles imports and socket requests that finish late', async (t) => {
   for (const kind of ['screen', 'terminal']) {
     const mount = kind === 'screen' ? screen : terminal;
-    const h = fixture();
+    const h = fixture(t);
     h.publish({ screen: true, terminal: true });
-    let finish;
+    const load = h.services.importModule, late = [];
+    h.services.importModule = (url) => new Promise((resolve) => late.push(() => resolve(load(url))));
     const options = h[`${kind}Options`];
-    const dispose = mount(h.root, h.services, { ...options, load: () => new Promise((resolve) => { finish = resolve; }) });
+    const dispose = mount(h.root, h.services, options);
     dispose();
-    finish(await options.load());
+    late.forEach((finish) => finish());
     await settle();
     assert.equal(h.sockets.length, 0);
     assert.equal(h.root.children.length, 0);
     assert.equal(h.subscriptions.size + h.themes.size, 0);
 
+    h.services.importModule = load;
+    let finish;
     const original = h.services.transport.socket;
     h.services.transport.socket = () => new Promise((resolve) => { finish = resolve; });
     const disposeAgain = mount(h.root, h.services, options);
@@ -315,10 +334,11 @@ test('console disposal handles imports and socket requests that finish late', as
   }
 });
 
-test('missing libraries fail inside their own panel with the asset command', async () => {
+test('missing libraries fail inside their own panel with the asset command', async (t) => {
   for (const [mount, library] of [[screen, 'noVNC'], [terminal, 'xterm.js']]) {
-    const h = fixture();
-    const dispose = mount(h.root, h.services, { host: 'alpha', load: async () => { throw new Error(library); } });
+    const h = fixture(t);
+    h.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
+    const dispose = mount(h.root, h.services, { host: 'alpha' });
     await settle();
     assert.ok(h.root.textContent.includes(`${library} is not in this build.`));
     assert.match(h.root.textContent, /cargo xtask demo libraries/);
@@ -327,24 +347,23 @@ test('missing libraries fail inside their own panel with the asset command', asy
   }
 });
 
-test('after the run stopped, consoles say they closed instead of blaming the build or the network', async () => {
+test('after the run stopped, consoles say they closed instead of blaming the build or the network', async (t) => {
   for (const [mount, closed] of [[screen, 'The screen closed when the run stopped.'], [terminal, 'The terminal closed when the run stopped.']]) {
     // The page server is gone, so the library cannot load.
-    const h = fixture();
-    h.services.stopped = () => true;
-    const dispose = mount(h.root, h.services, { host: 'alpha', load: async () => { throw new Error('Failed to fetch dynamically imported module'); } });
+    const h = fixture(t);
+    h.services.run.set('stopped');
+    h.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
+    const dispose = mount(h.root, h.services, { host: 'alpha' });
     await settle();
     assert.ok(h.root.textContent.includes(closed), h.root.textContent);
     assert.doesNotMatch(h.root.textContent, /not in this build/);
     dispose();
     // A console that loses its connection after the run stopped does not try again.
-    const live = fixture();
-    let stopped = false;
-    live.services.stopped = () => stopped;
+    const live = fixture(t);
     live.publish({ state: 'desktop_up', screen: true, terminal: true });
     const stop = mount(live.root, live.services, mount === screen ? live.screenOptions : live.terminalOptions);
     await settle();
-    stopped = true;
+    live.services.run.set('stopped');
     live.sockets[0].close();
     await settle();
     assert.ok(live.root.textContent.includes(closed), live.root.textContent);

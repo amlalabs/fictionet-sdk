@@ -13,10 +13,9 @@ class Source extends Element {
 }
 
 test('every state topic shares one stream, which reopens only for a topic it does not carry', async () => {
-  const streams = [], requests = [];
+  const streams = [];
   const services = createServices({
     stateStream(topics) { const source = new Source('state', { ...topics }); streams.push(source); return source; },
-    get(path, _, signal) { return new Promise((resolve) => requests.push({ path, signal, resolve })); },
   }, {});
   const values = [], other = [], hosts = [], errors = [];
   const stop = services.state('/api/state/exchanges', (value) => values.push(value), (error) => errors.push(error));
@@ -28,17 +27,11 @@ test('every state topic shares one stream, which reopens only for a topic it doe
   streams[0].emit('snapshot', { topic: 'exchanges', revision: 1, value: [1] });
   streams[0].emit('snapshot', { topic: 'host-alpha', revision: 3, value: { state: 'booting' } });
   assert.deepEqual(hosts.map((snapshot) => snapshot.value.state), ['booting']);
-  // A delta is the author's: the hub fetches the replacement snapshot.
-  streams[0].emit('delta', { topic: 'exchanges', revision: 2, delta: { custom: 'operation' } });
-  streams[0].emit('delta', { topic: 'exchanges', revision: 3, delta: 'another' });
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].path, '/api/state/exchanges');
+  // Each change arrives as the topic's snapshot. An older one is ignored; a
+  // status change keeps the revision.
   streams[0].emit('snapshot', { topic: 'exchanges', revision: 4, value: [4] });
-  requests[0].resolve({ revision: 2, value: [2] });
-  await settle();
-  assert.equal(requests.length, 2);
-  requests[1].resolve({ revision: 4, value: [4], status: { too_large: true } });
-  await settle();
+  streams[0].emit('snapshot', { topic: 'exchanges', revision: 2, value: [2] });
+  streams[0].emit('snapshot', { topic: 'exchanges', revision: 4, value: [4], status: { too_large: true } });
   assert.deepEqual(values.map((snapshot) => snapshot.revision), [1, 4, 4]);
   assert.deepEqual(other, values);
   // A dropped connection reconnects on its own: it fails nothing, and what
@@ -59,17 +52,13 @@ test('every state topic shares one stream, which reopens only for a topic it doe
   await settle();
   assert.equal(streams.length, 1, 'a topic the stream carries opens no stream');
   assert.deepEqual(again.map((snapshot) => snapshot.value.state), ['desktop_up']);
-  // A delta for a topic no panel shows is fetched once a panel shows it.
+  // A topic no panel shows stays current, so a panel that shows it later
+  // gets the latest at once.
   stopAgain();
-  streams[0].emit('delta', { topic: 'host-alpha', revision: 6, delta: {} });
-  assert.equal(requests.length, 2);
+  streams[0].emit('snapshot', { topic: 'host-alpha', revision: 6, value: { state: 'stopped' } });
   const later = [];
   const stopLater = services.state('/api/state/host-alpha', (value) => later.push(value));
-  assert.equal(requests.length, 3);
-  assert.equal(requests[2].path, '/api/state/host-alpha');
-  requests[2].resolve({ revision: 6, value: { state: 'stopped' } });
-  await settle();
-  assert.deepEqual(later.map((snapshot) => snapshot.value.state), ['desktop_up', 'stopped']);
+  assert.deepEqual(later.map((snapshot) => snapshot.value.state), ['stopped']);
   stopLater();
   // A new topic reopens the stream once, with what is held.
   const routes = [];
@@ -94,7 +83,6 @@ test('every state topic shares one stream, which reopens only for a topic it doe
   assert.equal(streams[2].closed, true);
   assert.equal(streams[2].listenerCount, 0);
   assert.equal(streams.length, 3, 'no stream while nothing listens');
-  assert.ok(requests.every((request) => request.signal.aborted));
   services.dispose();
 });
 
@@ -382,12 +370,17 @@ test('choosing the terminal switch focuses the connected terminal but mounting i
     dispose() {}
   }
   class FitAddon { fit() {} }
-  class ResizeObserver { observe() {} disconnect() {} }
+  const modules = { '/vendor/xterm/lib/xterm.mjs': { Terminal }, '/vendor/addon-fit/lib/addon-fit.mjs': { FitAddon } };
+  // Node has no ResizeObserver or getComputedStyle; the terminal uses both.
+  const previous = { ResizeObserver: globalThis.ResizeObserver, getComputedStyle: globalThis.getComputedStyle };
+  t.after(() => Object.assign(globalThis, previous));
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  globalThis.getComputedStyle = () => ({});
   for (const initial of ['screen', 'terminal']) {
     const description = {
       title: 'Fixture',
       hosts: [{ name: 'alpha', status: '/api/state/host-alpha', screen: initial === 'screen', terminal: true }],
-      panels: [{ kind: 'terminal', host: 'alpha', load: async () => [{ Terminal }, { FitAddon }], ResizeObserver, getComputedStyle: () => ({}) }],
+      panels: [{ kind: 'terminal', host: 'alpha' }],
     };
     const stop = await mount(h.root, {
       get: async () => description,
@@ -395,7 +388,7 @@ test('choosing the terminal switch focuses the connected terminal but mounting i
       watch: () => h.stream('watch'),
       async socket() { const socket = new Source('socket'); socket.readyState = 0; sockets.push(socket); return { socket }; },
       close() {},
-    }, { subscribe: () => () => {}, dispose() {} });
+    }, { subscribe: () => () => {}, dispose() {} }, async (url) => modules[url]);
     t.after(stop);
     await settle();
     const source = h.streams.findLast((stream) => stream.tag === 'state' && !stream.closed);
@@ -656,4 +649,27 @@ test('declared pins open both hosts without a click', async (t) => {
   assert.equal(h.root.querySelector('section.workspace-tile').getAttribute('aria-label'), 'alpha');
   stop();
   assert.equal(h.budget.open, 0);
+});
+
+test('each host chip says who holds its input, from the leases topic', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const transport = {
+    get: async (path) => (path === '/api/page' ? { ...DESCRIPTION, moments: [] } : path.startsWith('/api/host/') ? { links: [] } : { rows: [], next: 0, dropped: 0 }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  };
+  const stop = await mount(h.root, transport, { subscribe: () => () => {}, dispose() {} });
+  await settle();
+  const state = h.streams.findLast((source) => source.tag === 'state' && !source.closed);
+  assert.ok('leases' in state.args);
+  const owners = h.root.querySelectorAll('span.host-owner');
+  assert.deepEqual(owners.map((owner) => owner.dataset.owner), ['none', 'none']);
+  state.emit('snapshot', { topic: 'leases', revision: 1, value: { alpha: { holder: 'another session' }, beta: { holder: null } } });
+  assert.deepEqual(owners.map((owner) => [owner.textContent, owner.dataset.owner]), [['Another viewer has control', 'other'], ['', 'none']]);
+  state.emit('world_error', { error: 'no such state topic: "leases"' });
+  assert.equal(owners[1].textContent, 'Input control unavailable: no such state topic: "leases"');
+  stop();
 });

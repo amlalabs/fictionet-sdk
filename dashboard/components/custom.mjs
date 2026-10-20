@@ -11,9 +11,9 @@ export function mount(root, services, options) {
       if (!/^\/panels\/[A-Za-z0-9_-]{1,128}\.mjs$/.test(options.module)) throw new Error('Invalid panel module path');
       let module;
       try {
-        module = await (services.importModule ? services.importModule(options.module) : import(options.module));
+        module = await services.importModule(options.module);
       } catch (error) {
-        if (services.stopped?.()) throw new Error('the run has stopped, so the panel can no longer be loaded');
+        if (services.stopped()) throw new Error('the run has stopped, so the panel can no longer be loaded');
         throw new Error(`${error.message}. A panel that imports three.js needs it in the build: run \`cargo xtask demo libraries\`, then rebuild`);
       }
       if (disposed) return;

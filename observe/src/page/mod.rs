@@ -79,26 +79,20 @@
 //! `GET /api/state/<id>` returns
 //! `{revision,at,value,status:{too_large}}`. `at` is run time in seconds.
 //! Before publication, revision and time are zero and value is null.
-//! A successful publish advances the revision once. Oversized snapshots or
-//! deltas keep the previous revision and value and permanently set
-//! `status.too_large`. Snapshot values are serialized once at publication.
-//! Delta count is bounded by `StateLimits.deltas`, total delta payload bytes
-//! by `StateLimits.max_bytes`, and each snapshot by that same byte bound.
+//! A successful publish advances the revision once. An oversized snapshot
+//! keeps the previous revision and value and permanently sets
+//! `status.too_large`. Snapshot values are serialized once at publication,
+//! and each is bounded by `StateLimits.max_bytes`.
 //!
 //! `GET /api/states/stream?topics=a,b&after=a:3,b:7` is one SSE stream for
 //! up to 64 topics. A browser allows six HTTP/1.1 connections to one origin,
 //! so a page streams all of its state on one connection. `topics` lists topic
 //! ids; `after` is optional and gives a revision per listed topic. An unknown
 //! topic returns 404 naming it; a malformed or repeated list returns 400.
-//! Each event's data starts with `topic`. Without a cursor, or when
-//! continuity from it is unavailable, a topic gets `snapshot` with the GET
-//! shape plus `topic`. Otherwise it gets `delta` events with
-//! `{topic,revision,at,delta,status:{too_large}}` in revision order. No event
-//! is needed when the cursor is current. A future cursor also receives a
-//! snapshot. A publish without a delta breaks continuity. Status changes wake
-//! subscribers even when the revision has not changed. Delta semantics are
-//! author-defined; readers unable to apply a delta can fetch the replacement
-//! snapshot.
+//! Each event is `snapshot`, with the GET shape plus `topic`. A topic gets
+//! one when the stream opens, unless its cursor is current, and one after
+//! each change; a reader that falls behind gets only the latest. Status
+//! changes send a snapshot even when the revision has not changed.
 //!
 //! A page holds at most three long-lived streams: `watch`, the state stream
 //! and `packets`. Everything else is a short request. The browser components
@@ -186,11 +180,11 @@
 //! at `/api/command/<name>` without a control panel. Names, columns, actions, paths and
 //! composition conflicts are checked before the listener binds.
 //!
-//! `left_the_box()` adds the destination panel by itself. `GET /api/egress`
-//! returns the dashboard's bounded [`crate::egress::EgressSnapshot`], including
-//! startup observations, pending connections and persistent loss counts.
-//! It requires a bearer and an empty query. Host selection filters the
-//! snapshot by sandbox in the browser; the loss counts cover the whole run.
+//! `GET /api/egress` returns the dashboard's bounded
+//! [`crate::egress::EgressSnapshot`], including startup observations, pending
+//! connections and persistent loss counts. It requires a bearer and an empty
+//! query. Host selection filters the snapshot by sandbox in the browser; the
+//! loss counts cover the whole run.
 //!
 //! `containment(topic)` connects a [`StateTopic<Containment>`]. The guest kit
 //! publishes probe commands, guest results, proxy facts and world answers.
@@ -224,7 +218,7 @@
 //! `booting`, `network_up`, `ssh_up`, `desktop_up` or `stopped`, addresses
 //! are strings and availability flags are booleans. Hosts without a supplied
 //! status topic have a null snapshot value until publication. Host names
-//! contain only ASCII letters, digits, `-` and `_` and must be unique.
+//! are one to 128 ASCII letters, digits, `-` and `_` and must be unique.
 //!
 //! `GET /api/host/<name>/links` returns `{links:["e1",...]}` from the
 //! dashboard collector's current topology, selecting links whose sandbox
@@ -314,8 +308,8 @@
 //! the named host and capability, and expire after 30 seconds. At most 64
 //! unconsumed, unexpired tickets can exist; capacity returns 503. An unknown
 //! host or capability unavailable on that host returns 404; invalid JSON or
-//! capability names return 400. Time is supplied by `Page::clock`, defaulting
-//! to elapsed monotonic server time. Expiration includes the exact deadline.
+//! capability names return 400. Time is elapsed monotonic server time.
+//! Expiration includes the exact deadline.
 //!
 //! `GET /ws/screen/<host>?ticket=...` and
 //! `GET /ws/terminal/<host>?ticket=...` upgrade using the SDK's WebSocket
@@ -411,12 +405,20 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::DashboardHandle;
+use builder::invalid;
 
 /// An HTTP error body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorReply {
     /// Human-readable reason.
     pub error: String,
+}
+
+/// 32 random bytes as lowercase hex: tokens, tickets, sessions and nonces.
+fn random_hex() -> io::Result<String> {
+    let mut bytes = [0; 32];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    Ok(crate::hex(&bytes))
 }
 
 /// Looks up an embedded browser library by its path under `/vendor/`.
@@ -524,15 +526,14 @@ impl Page {
         let title = title.into();
         let id = panel::slug(&title);
         self.topics.push((id.clone(), topic.topic));
-        self.panels.push(PanelDescription {
-            id: id.clone(),
+        self.panels.push(PanelDescription::inspector(
+            id.clone(),
             title,
-            area: Area::Inspector,
-            content: PanelContent::Table {
+            PanelContent::Table {
                 state: format!("/api/state/{id}"),
                 columns,
             },
-        });
+        ));
         self
     }
 
@@ -546,16 +547,15 @@ impl Page {
         let title = title.into();
         let id = panel::slug(&title);
         self.commands.push((id.clone(), Box::new(port)));
-        self.panels.push(PanelDescription {
-            id: id.clone(),
+        self.panels.push(PanelDescription::inspector(
+            id.clone(),
             title,
-            area: Area::Inspector,
-            content: PanelContent::Control {
+            PanelContent::Control {
                 command: format!("/api/command/{id}"),
                 actions,
                 state: None,
             },
-        });
+        ));
         self
     }
 
@@ -590,44 +590,30 @@ impl Page {
     pub async fn bind_loopback(mut self, port: u16) -> io::Result<Server> {
         self.prepare()?;
         if self.title.trim().is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Page::new title is empty; give the page a title",
-            ));
+            return Err(invalid("Page::new title is empty; give the page a title"));
         }
         if let Some(error) = self.errors.first() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, error.clone()));
+            return Err(invalid(error.clone()));
         }
         let mut commands = std::collections::BTreeSet::new();
         for (name, port) in &self.commands {
-            if name.is_empty()
-                || name.len() > 128
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-                || !commands.insert(name)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+            if !builder::valid_name(name) || !commands.insert(name) {
+                return Err(invalid(
                     "command needs a unique name of at most 128 ASCII letters, digits, hyphens or underscores",
                 ));
             }
-            port.validate(&[], false)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            port.validate(&[], false).map_err(invalid)?;
         }
         let mut ids = std::collections::BTreeMap::new();
         for panel in &self.panels {
             if panel.id.is_empty() || ids.contains_key(&panel.id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "{}({:?}) has an empty id or conflicts with {}; choose distinct titles with ASCII letters or digits",
-                        panel.content.call(),
-                        panel.title,
-                        ids.get(&panel.id)
-                            .unwrap_or(&String::from("an empty title"))
-                    ),
-                ));
+                return Err(invalid(format!(
+                    "{}({:?}) has an empty id or conflicts with {}; choose distinct titles with ASCII letters or digits",
+                    panel.content.call(),
+                    panel.title,
+                    ids.get(&panel.id)
+                        .unwrap_or(&String::from("an empty title"))
+                )));
             }
             ids.insert(
                 &panel.id,
@@ -639,12 +625,8 @@ impl Page {
                     .iter()
                     .find(|(id, _)| id == &panel.id)
                     .unwrap();
-                port.validate(actions, state.is_some()).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("control {:?}: {error}", panel.title),
-                    )
-                })?;
+                port.validate(actions, state.is_some())
+                    .map_err(|error| invalid(format!("control {:?}: {error}", panel.title)))?;
             }
             let (PanelContent::Table { columns, .. } | PanelContent::EventTable { columns, .. }) =
                 &panel.content
@@ -653,55 +635,31 @@ impl Page {
             };
             for column in columns {
                 if column.label.trim().is_empty() || !panel::valid_pointer(&column.pointer) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "{}({:?}) column {:?} has an empty label or invalid JSON pointer {:?}; use a label and a pointer starting with /",
-                            panel.content.call(),
-                            panel.title,
-                            column.label,
-                            column.pointer
-                        ),
-                    ));
+                    return Err(invalid(format!(
+                        "{}({:?}) column {:?} has an empty label or invalid JSON pointer {:?}; use a label and a pointer starting with /",
+                        panel.content.call(),
+                        panel.title,
+                        column.label,
+                        column.pointer
+                    )));
                 }
             }
         }
         for moment in &self.moments {
             if moment.id.is_empty() || moment.id.len() > 128 || ids.contains_key(&moment.id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "moment({:?}) has an invalid or duplicate id; choose a distinct title with at most 128 ASCII letters, digits or separators",
-                        moment.title
-                    ),
-                ));
+                return Err(invalid(format!(
+                    "moment({:?}) has an invalid or duplicate id; choose a distinct title with at most 128 ASCII letters, digits or separators",
+                    moment.title
+                )));
             }
             ids.insert(&moment.id, format!("moment({:?})", moment.title));
         }
         let mut topics = std::collections::BTreeSet::from(["leases"]);
         for (id, _) in &self.topics {
             if !topics.insert(id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "state topic {id:?} conflicts with a host status or built-in topic; rename the panel or host"
-                    ),
-                ));
-            }
-        }
-        let mut command_names = std::collections::BTreeSet::new();
-        for (name, _) in &self.commands {
-            if name.is_empty()
-                || name.len() > 128
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-                || !command_names.insert(name)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "command names must be unique and contain one to 128 ASCII letters, digits, - or _",
-                ));
+                return Err(invalid(format!(
+                    "state topic {id:?} conflicts with a host status or built-in topic; rename the panel or host"
+                )));
             }
         }
         let consoles = console::Sessions::new(&self.hosts);

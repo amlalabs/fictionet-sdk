@@ -145,25 +145,15 @@ $ sudo ip netns exec goad-attacker nmap -Pn -sV \
 ```
 
 The optional third argument installs a `DashboardObserver` and opens a Unix
-socket with `fictionet_observe::serve`. Run the dashboard against that socket
-to watch captured traffic. See [Fictionet Observe](../../observe/README.md)
+socket with `fictionet_observe::serve`. Run `fictionet observe` against that
+socket to watch captured traffic. See [Fictionet Observe](../../observe/README.md)
 for capture limits. Guest TLS needs keys from instrumented endpoints to decrypt.
 
 ```console
 $ target/release/fictionet observe --observation unix:/run/user/$(id -u)/fictionet-goad/observation.sock watch
 ```
 
-For browser access:
-
-```console
-$ (umask 077; openssl rand -hex 32 > /tmp/goad-dashboard-token)
-$ target/release/fictionet dashboard --token-file /tmp/goad-dashboard-token \
-    --observation unix:/run/user/$(id -u)/fictionet-goad/observation.sock \
-    --listen 127.0.0.1:7878
-```
-
-Open `http://127.0.0.1:7878/#token=<token>` once, replacing `<token>`
-with the token file’s contents. Keep the file outside the attacker sandbox.
+Keep the socket outside the attacker sandbox.
 
 This example consumes provisioned Windows disks. It includes no QEMU-based
 GOAD provisioner.

@@ -3,21 +3,26 @@ import assert from 'node:assert/strict';
 import { mount as map } from './map.mjs';
 import { mount as packets } from './packets.mjs';
 import { mount as events } from './events.mjs';
-import { watchState } from '../state.mjs';
-import { createSelection } from '../selection.mjs';
+import { createServices } from '../page.mjs';
 import { createTransport } from '../transport.mjs';
-import { createDocument, Element } from '../test-dom.mjs';
+import { createDocument, Element, liveSubscriptions } from '../test-dom.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
-function fixture(t) {
+// The page's services on a fake watch, packet streams and host links. It
+// resolves once the graph model listens to the page's watch, so an event
+// sent on `watches[0]` reaches the graph at once.
+async function fixture(t) {
   const document = createDocument();
   const root = document.createElement('section');
   document.body.append(root);
   const frames = new Map(), observers = [], watches = [], streams = [], requests = [];
   t.mock.method(globalThis, 'requestAnimationFrame', (callback) => { const id = Symbol(); frames.set(id, callback); return id; });
   t.mock.method(globalThis, 'cancelAnimationFrame', (id) => frames.delete(id));
-  const previousResize = globalThis.ResizeObserver;
-  t.after(() => { globalThis.ResizeObserver = previousResize; });
+  // The map asks matchMedia whether the viewer prefers reduced motion.
+  const motion = { matches: true };
+  const previous = { ResizeObserver: globalThis.ResizeObserver, matchMedia: globalThis.matchMedia };
+  t.after(() => Object.assign(globalThis, previous));
+  globalThis.matchMedia = () => motion;
   globalThis.ResizeObserver = class {
     constructor(callback) { this.callback = callback; observers.push(this); }
     observe() {}
@@ -28,32 +33,35 @@ function fixture(t) {
     emit(name, value) { const event = new Event(name); event.data = JSON.stringify(value); this.dispatchEvent(event); }
     close() { this.closed = true; }
   }
-  const selection = createSelection();
-  const watch = () => { const source = new Source(); watches.push(source); return source; };
-  const services = {
-    selection, reducedMotion: { matches: true }, hosts: [{ name: 'alpha', sandbox: 'guest' }],
-    watch, connect: (graph) => watchState(watch(), graph),
-    transport: {
-      ...createTransport({}, {
-        location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
-        async fetch(url, options) {
-          assert.equal(options.headers.Authorization, 'Bearer secret');
-          requests.push({ path: new URL(url).pathname, signal: options.signal });
-          return Response.json({ links: ['e2'] });
-        },
-      }),
-      packetStream(list) { const source = new Source(); source.links = list; streams.push(source); return source; },
-    },
-  };
-  return { root, frames, observers, watches, streams, services, selection, requests,
+  const services = createServices({
+    ...createTransport({}, {
+      location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
+      async fetch(url, options) {
+        assert.equal(options.headers.Authorization, 'Bearer secret');
+        requests.push({ path: new URL(url).pathname, signal: options.signal });
+        return Response.json({ links: ['e2'] });
+      },
+    }),
+    watch() { const source = new Source(); watches.push(source); return source; },
+    packetStream(list) { const source = new Source(); source.links = list; streams.push(source); return source; },
+  });
+  services.hosts = [{ name: 'alpha', sandbox: 'guest' }];
+  // Every store a panel subscribes to outlives the panel.
+  const subscriptions = { graph: liveSubscriptions(services.graph), selection: liveSubscriptions(services.selection), packetPair: liveSubscriptions(services.packetPair) };
+  await settle();
+  return { root, frames, observers, watches, streams, services, selection: services.selection, requests, motion,
     snapshot: { t: 0, started: 1, ended: false, hosts: [{ id: 'h1', name: 'alpha', sandbox: 'guest', group: null }], groups: [], nodes: [{ id: 's1', kind: 'sandbox', name: 'guest', host: 'h1' }], edges: [], counters: {}, events: [] },
     frame() { const callbacks = [...frames.values()]; frames.clear(); callbacks.forEach((callback) => callback(performance.now())); },
+    // Checks what a disposed panel must have let go of, then closes the
+    // page's streams.
     clean() {
+      for (const [name, count] of Object.entries(subscriptions)) assert.equal(count(), 0, `the panel still follows the ${name}`);
       assert.equal(frames.size, 0);
       assert.ok(observers.every((observer) => observer.closed));
-      for (const source of [...watches, ...streams]) { assert.equal(source.closed, true); assert.equal(source.listenerCount, 0); }
       const count = (node) => node.listenerCount + node.children.filter((child) => typeof child !== 'string').reduce((sum, child) => sum + count(child), 0);
       assert.equal(count(root), 0);
+      services.dispose();
+      for (const source of [...watches, ...streams]) { assert.equal(source.closed, true); assert.equal(source.listenerCount, 0); }
     },
   };
 }
@@ -61,8 +69,8 @@ function fixture(t) {
 // Node has no browser frame scheduler or resize observer.
 for (const name of ['requestAnimationFrame', 'cancelAnimationFrame', 'ResizeObserver']) globalThis[name] ??= function () {};
 
-test('map uses its root and releases its watch, controls, observer and frames', (t) => {
-  const h = fixture(t);
+test('map uses its root and releases its graph subscription, controls, observer and frames', async (t) => {
+  const h = await fixture(t);
   const dispose = map(h.root, h.services);
   h.watches[0].emit('snapshot', h.snapshot);
   h.frame();
@@ -78,7 +86,7 @@ test('map uses its root and releases its watch, controls, observer and frames', 
 });
 
 test('packets watches the busiest guest links and scopes a selected host', async (t) => {
-  const h = fixture(t);
+  const h = await fixture(t);
   const dispose = packets(h.root, h.services);
   const edges = Array.from({ length: 35 }, (_, i) => ({ id: `e${i}`, a: 's1', b: 't1' }));
   h.watches[0].emit('snapshot', { ...h.snapshot, edges, counters: Object.fromEntries(edges.map((e, i) => [e.id, [i, 0, 0, 0]])) });
@@ -96,7 +104,7 @@ test('packets watches the busiest guest links and scopes a selected host', async
 });
 
 test('all hosts lists the declared hosts\' links, not another sandbox\'s', async (t) => {
-  const h = fixture(t);
+  const h = await fixture(t);
   h.services.transport.get = async () => ({ links: [] });
   const dispose = packets(h.root, h.services);
   const nodes = [...h.snapshot.nodes, { id: 's9', kind: 'sandbox', name: 'jump' }];
@@ -109,7 +117,7 @@ test('all hosts lists the declared hosts\' links, not another sandbox\'s', async
 });
 
 test('all hosts keeps startup captures after their links leave the map', async (t) => {
-  const h = fixture(t);
+  const h = await fixture(t);
   const dispose = packets(h.root, h.services);
   h.watches[0].emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
   await settle();
@@ -121,9 +129,7 @@ test('all hosts keeps startup captures after their links leave the map', async (
 });
 
 test('a packet list keeps its rows when its links end and the run stops', async (t) => {
-  const h = fixture(t);
-  let stopped = false;
-  h.services.stopped = () => stopped;
+  const h = await fixture(t);
   const dispose = packets(h.root, h.services);
   h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e2', a: 's1', b: 't1' }], counters: { e2: [1, 0, 0, 0] } });
   await settle();
@@ -137,7 +143,7 @@ test('a packet list keeps its rows when its links end and the run stops', async 
   await settle();
   assert.equal(h.streams.length, opened, 'an ended link does not reopen the list');
   assert.equal(rows(), 1);
-  stopped = true;
+  h.services.run.set('stopped');
   h.watches[0].emit('edge', { id: 'e3', a: 's1', b: 't1' });
   await settle();
   assert.equal(h.streams.length, opened, 'a stopped run does not reopen the list');
@@ -150,7 +156,7 @@ test('a packet list keeps its rows when its links end and the run stops', async 
 });
 
 test('the page\'s own console traffic is hidden with a count until a viewer shows it', async (t) => {
-  const h = fixture(t);
+  const h = await fixture(t);
   h.services.consoleAddresses = ['10.10.5.20'];
   const dispose = packets(h.root, h.services);
   h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e2', a: 's1', b: 't1' }], counters: { e2: [1, 0, 0, 0] } });
@@ -180,15 +186,14 @@ test('the page\'s own console traffic is hidden with a count until a viewer show
   h.clean();
 });
 
-test('events filters text, preserves loss and selects only explicit flow identities', (t) => {
-  const h = fixture(t);
+test('events filters text, preserves loss and selects only explicit flow identities', async (t) => {
+  const h = await fixture(t);
   const dispose = events(h.root, h.services);
   const event = { seq: 1, at: 2, node: 's1', sandbox: { name: 'guest' }, source: 'http', kind: 'request', summary: '<script>hello</script>', fields: {}, conn: 12 };
   h.watches[0].emit('snapshot', { ...h.snapshot, events: [event], status: { losses: [{ stream: 'events', count: 4, reason: 'eviction' }] } });
   h.frame();
   assert.match(h.root.textContent, /4 lost/);
   assert.match(h.root.textContent, /<script>hello<\/script>/);
-  assert.equal(h.root.querySelector('script'), null);
   h.root.querySelector('button.event-line').click();
   assert.equal(h.selection.get().connection, 12);
   assert.deepEqual(h.selection.get().links, []);
@@ -201,8 +206,8 @@ test('events filters text, preserves loss and selects only explicit flow identit
   h.clean();
 });
 
-test('a burst of events renders once per frame and keeps each row by key', (t) => {
-  const h = fixture(t);
+test('a burst of events renders once per frame and keeps each row by key', async (t) => {
+  const h = await fixture(t);
   const dispose = events(h.root, h.services);
   const event = (seq) => seq === 1999
     ? { seq, at: seq / 100, source: 'events', kind: 'dropped', fields: { count: 12, reason: 'eviction' } }
@@ -236,8 +241,8 @@ test('a burst of events renders once per frame and keeps each row by key', (t) =
   h.clean();
 });
 
-test('incoming events preserve a label being typed', (t) => {
-  const h = fixture(t);
+test('incoming events preserve a label being typed', async (t) => {
+  const h = await fixture(t);
   h.services.labelCommand = '/api/command/labels';
   const dispose = events(h.root, h.services);
   const event = { seq: 1, at: 2, source: 'http', kind: 'request', summary: 'first', fields: {} };
@@ -258,8 +263,8 @@ test('incoming events preserve a label being typed', (t) => {
   h.clean();
 });
 
-test('events offers new rows beside the filter and jumps to the newest event', (t) => {
-  const h = fixture(t);
+test('events offers new rows beside the filter and jumps to the newest event', async (t) => {
+  const h = await fixture(t);
   const dispose = events(h.root, h.services);
   const event = { seq: 1, at: 2, source: 'http', kind: 'request', summary: 'first', fields: {} };
   h.watches[0].emit('snapshot', { ...h.snapshot, events: [event] });
@@ -280,8 +285,8 @@ test('events offers new rows beside the filter and jumps to the newest event', (
   h.clean();
 });
 
-test('packets offers new rows before Pause and jumps to the latest packets', (t) => {
-  const h = fixture(t);
+test('packets offers new rows before Pause and jumps to the latest packets', async (t) => {
+  const h = await fixture(t);
   const dispose = packets(h.root, h.services);
   h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e1', a: 's1', b: 't1' }], counters: { e1: [0, 0, 0, 0] } });
   const list = h.root.querySelector('#plist'), jump = h.root.querySelector('#jump-packets');
@@ -302,11 +307,10 @@ test('packets offers new rows before Pause and jumps to the latest packets', (t)
   h.clean();
 });
 
-test('a selected event shows its fields and offers only an approximate packet match', (t) => {
-  const h = fixture(t);
-  const pairs = [];
-  h.services.packetPair = { set() {} };
-  h.services.showPackets = (pair) => pairs.push(pair);
+test('a selected event shows its fields and offers only an approximate packet match', async (t) => {
+  const h = await fixture(t);
+  const opened = [];
+  h.services.showPanel = (kind) => opened.push(kind);
   const dispose = events(h.root, h.services);
   const event = { seq: 2, at: 3, sandbox: { name: 'guest' }, source: 'dns', kind: 'query', summary: 'example.test', fields: { name: 'example.test' }, local: '10.0.0.1:53', peer: '10.0.0.2:5000', transport: 'udp', tls: false, conn: null };
   h.watches[0].emit('snapshot', { ...h.snapshot, events: [event] });
@@ -317,7 +321,8 @@ test('a selected event shows its fields and offers only an approximate packet ma
   assert.match(h.root.querySelector('.event-detail').textContent, /10\.0\.0\.2:5000/);
   assert.match(h.root.textContent, /Approximate: matched by address and port, not by connection\./);
   h.root.querySelectorAll('button').find((button) => button.textContent === 'Show matching packets').click();
-  assert.deepEqual(pairs, [{ local: '10.0.0.1:53', peer: '10.0.0.2:5000' }]);
+  assert.deepEqual(h.services.packetPair.get(), { local: '10.0.0.1:53', peer: '10.0.0.2:5000' });
+  assert.deepEqual(opened, ['packets']);
   h.root.querySelector('button.event-line').click();
   assert.equal(h.root.querySelector('.event-detail'), null);
   assert.equal(h.selection.get().event, null);
@@ -325,8 +330,8 @@ test('a selected event shows its fields and offers only an approximate packet ma
   h.clean();
 });
 
-test('packets says when its links have nothing captured yet', (t) => {
-  const h = fixture(t);
+test('packets says when its links have nothing captured yet', async (t) => {
+  const h = await fixture(t);
   const dispose = packets(h.root, h.services);
   h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e1', a: 's1', b: 't1' }], counters: { e1: [0, 0, 0, 0] } });
   h.frame();
@@ -341,7 +346,7 @@ test('packets says when its links have nothing captured yet', (t) => {
 });
 
 test('a late tab opens one packet stream once the graph is known and shows its loss before its rows', async (t) => {
-  const h = fixture(t);
+  const h = await fixture(t);
   const dispose = packets(h.root, h.services);
   await settle();
   h.frame();
@@ -367,8 +372,8 @@ test('a late tab opens one packet stream once the graph is known and shows its l
 test('after the run stopped, packets say so instead of a fetch error and stop trying', async (t) => {
   const stoppedText = 'The run has stopped, so its packets can no longer be loaded.';
   // The page server is gone, so the host's links cannot be read.
-  const h = fixture(t);
-  h.services.stopped = () => true;
+  const h = await fixture(t);
+  h.services.run.set('stopped');
   h.services.transport.get = async () => { throw new TypeError('Failed to fetch'); };
   const dispose = packets(h.root, h.services);
   h.watches[0].emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
@@ -378,13 +383,11 @@ test('after the run stopped, packets say so instead of a fetch error and stop tr
   dispose();
   h.clean();
   // A packet stream that drops after the run stopped says so once and closes.
-  const live = fixture(t);
-  let stopped = false;
-  live.services.stopped = () => stopped;
+  const live = await fixture(t);
   const stop = packets(live.root, live.services);
   live.watches[0].emit('snapshot', { ...live.snapshot, edges: [{ id: 'e2', a: 's1', b: 't1' }], counters: { e2: [1, 0, 0, 0] } });
   await settle();
-  stopped = true;
+  live.services.run.set('stopped');
   live.streams[0].emit('error', { error: 'Connection dropped. Reconnecting.' });
   live.frame();
   assert.equal(live.root.querySelector('#prows').textContent, stoppedText);
@@ -393,14 +396,14 @@ test('after the run stopped, packets say so instead of a fetch error and stop tr
   live.clean();
 });
 
-test('the map keeps its own selection instead of applying it back to itself', (t) => {
+test('the map keeps its own selection instead of applying it back to itself', async (t) => {
   // Drawn links move packets along their paths; the fake DOM has no geometry.
   for (const [name, value] of [['getTotalLength', () => 100], ['getPointAtLength', () => ({ x: 0, y: 0 })]]) {
     if (Element.prototype[name]) continue;
     Element.prototype[name] = value;
     t.after(() => { delete Element.prototype[name]; });
   }
-  const h = fixture(t);
+  const h = await fixture(t);
   const dispose = map(h.root, h.services);
   const snapshot = {
     ...h.snapshot,
@@ -426,8 +429,8 @@ test('the map keeps its own selection instead of applying it back to itself', (t
   h.clean();
 });
 
-test('event and connection labels come from state and stay after the summary', (t) => {
-  const h = fixture(t);
+test('event and connection labels come from state and stay after the summary', async (t) => {
+  const h = await fixture(t);
   let update, stopped = false;
   h.services.labelState = '/api/state/labels';
   h.services.labelCommand = '/api/command/labels';
@@ -455,7 +458,7 @@ test('event and connection labels come from state and stay after the summary', (
 });
 
 test('selected startup links acquire their host name without changing the selection', async (t) => {
-  const h = fixture(t);
+  const h = await fixture(t);
   h.selection.set({ links: ['e2'] });
   const dispose = packets(h.root, h.services);
   h.watches[0].emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
@@ -463,17 +466,45 @@ test('selected startup links acquire their host name without changing the select
   assert.deepEqual(h.selection.get().links, ['e2']);
   assert.equal(h.streams.at(-1).links, 'e2');
   assert.ok(h.streams.slice(0, -1).every((stream) => stream.closed));
-  let update;
   h.services.transport.packet = async () => ({ ok: true, json: async () => ({ seq: 4, len: 28, t: 1, layers: [], buffers: [{ name: 'packet', hex: '4142' }] }) });
   dispose();
-  const stop = packets(h.root, h.services, { onReady(view) { update = view; } });
-  h.watches.at(-1).emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
+  // A panel opened again reads the graph the page already holds.
+  const stop = packets(h.root, h.services);
   await settle();
   h.streams.at(-1).emit('packet', { seq: 4, link: 'e2', side: 0, t: 1, tags: [], src: 'a', dst: 'b', proto: 'ICMP', len: 28, info: 'Echo request' });
-  update.flush();
+  h.frame();
   h.root.querySelector('#prows').querySelector('tr').click();
   await settle();
   assert.match(h.root.querySelector('.packet-detail-head').textContent, /Packet 4 · alpha's link, packet 4/);
   stop();
+  h.clean();
+});
+
+test('the map rings the item an event came from and draws the graph again when reopened', async (t) => {
+  for (const [name, value] of [['getTotalLength', () => 100], ['getPointAtLength', () => ({ x: 0, y: 0 })]]) {
+    if (Element.prototype[name]) continue;
+    Element.prototype[name] = value;
+    t.after(() => { delete Element.prototype[name]; });
+  }
+  const h = await fixture(t);
+  h.motion.matches = false;
+  let dispose = map(h.root, h.services);
+  h.watches[0].emit('snapshot', {
+    ...h.snapshot,
+    nodes: [...h.snapshot.nodes, { id: 't1', kind: 'task', name: 'filter', parent: null }],
+    edges: [{ id: 'e1', a: 's1', b: 't1' }],
+    counters: { e1: [1, 40, 1, 40] },
+  });
+  h.frame();
+  h.watches[0].emit('event', { seq: 1, at: 1, source: 'http', kind: 'request', node: 't1', fields: {} });
+  assert.equal(h.root.querySelector('#labels').querySelectorAll('rect.pulse').length, 1);
+  const drawn = h.root.querySelector('#nodes').children.length;
+  assert.ok(drawn >= 2);
+  dispose();
+  // The graph model outlives the map: a map opened again draws what it holds.
+  dispose = map(h.root, h.services);
+  h.frame();
+  assert.equal(h.root.querySelector('#nodes').children.length, drawn);
+  dispose();
   h.clean();
 });

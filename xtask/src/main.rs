@@ -7,7 +7,6 @@ mod h2spec;
 mod images;
 mod k8s;
 mod process;
-mod scan;
 mod vm;
 
 use process::Result;
@@ -55,7 +54,6 @@ fn main_result() -> Result {
         "copy-check" => copy_check::run(args),
         "fuzz" => fuzz::run(args),
         "h2spec" => h2spec::run(args),
-        "scan" => scan::run(args),
         "help" | "--help" | "-h" if args.is_empty() => {
             println!(
                 "cargo xtask images [artifactory|hosted]\n\
@@ -66,8 +64,7 @@ fn main_result() -> Result {
                       cargo xtask demo [name | assets]  (no arguments lists demos)\n\
                       cargo xtask copy-check\n\
                       cargo xtask fuzz [--check | <target> | <seconds>] [libFuzzer arguments...]\n\
-                      cargo xtask h2spec [section]\n\
-                      cargo xtask scan [output directory]"
+                      cargo xtask h2spec [section]"
             );
             Ok(())
         }

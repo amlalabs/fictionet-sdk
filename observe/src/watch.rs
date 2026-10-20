@@ -355,12 +355,7 @@ impl LinkWatch {
                 k.secret.as_slice(),
             ))
         }) {
-            keylog.push_str(&key.label);
-            keylog.push(' ');
-            json::push_hex(&mut keylog, &key.client_random);
-            keylog.push(' ');
-            json::push_hex(&mut keylog, &key.secret);
-            keylog.push('\n');
+            crate::keys::push_keylog_line(&mut keylog, &key.label, &key.client_random, &key.secret);
         }
         let mut header = Vec::new();
         pcap::start(&mut header, keylog.as_bytes());

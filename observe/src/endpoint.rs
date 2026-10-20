@@ -179,6 +179,55 @@ impl Drop for Endpoint {
     }
 }
 
+/// Installs a run's observers in `options`: the world's own `observer`, if
+/// any, and a [`DashboardObserver`](crate::DashboardObserver) whose handle is
+/// served at `path`, if a path is given. Both sit behind one
+/// [`Aggregate`](crate::Aggregate). With neither, `options` gets no observer
+/// and the run skips observation work. Keep the returned endpoint alive for
+/// the run; it is `None` without a path.
+///
+/// ```no_run
+/// use std::{path::PathBuf, sync::Arc};
+/// use fictionet::{RunOptions, Seed};
+/// use fictionet_observe::{Memory, serve_observation};
+///
+/// // The optional observation socket from the command line, such as
+/// // /run/fictionet/observe.sock.
+/// let path = std::env::args_os().nth(1).map(PathBuf::from);
+/// let grader = Arc::new(Memory::default());
+/// let (options, _endpoint) =
+///     serve_observation(RunOptions::new(Seed::random()), path, Some(grader.clone()))?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn serve_observation(
+    options: fictionet::RunOptions,
+    path: Option<PathBuf>,
+    observer: Option<Arc<dyn fictionet::events::Observer>>,
+) -> io::Result<(fictionet::RunOptions, Option<Endpoint>)> {
+    let Some(path) = path else {
+        return Ok(match observer {
+            Some(observer) => (
+                options.observer(Arc::new(crate::Aggregate::new(observer))),
+                None,
+            ),
+            None => (options, None),
+        });
+    };
+    let dashboard = crate::DashboardObserver::new(Default::default());
+    let endpoint = serve(dashboard.handle(), path)?;
+    let observer: Arc<dyn fictionet::events::Observer> = match observer {
+        Some(observer) => Arc::new(fictionet::events::Fanout::new(vec![
+            dashboard.observer(),
+            observer,
+        ])),
+        None => dashboard.observer(),
+    };
+    Ok((
+        options.observer(Arc::new(crate::Aggregate::new(observer))),
+        Some(endpoint),
+    ))
+}
+
 /// Binds a private Unix observation socket and starts its accept thread.
 /// Live sockets and non-socket paths are never replaced. Stale sockets are
 /// replaced. The socket is private before its public path becomes visible.
@@ -554,6 +603,45 @@ mod tests {
             (a.id, &a.bytes, a.binary, a.end),
             (b.id, &b.bytes, b.binary, b.end)
         );
+    }
+
+    #[test]
+    fn serve_observation_fans_the_run_out_to_its_socket_and_the_world_observer() {
+        let run = |options| {
+            fictionet::block_on(fictionet::lab(options, |fcx| async move {
+                fcx.emit("shop", "order", |event| event.field("item", "tea"));
+                Ok(())
+            }))
+            .unwrap();
+        };
+        let directory = Directory::new();
+        let grader = Arc::new(crate::Memory::default());
+        let (options, endpoint) = serve_observation(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            Some(directory.socket()),
+            Some(grader.clone()),
+        )
+        .unwrap();
+        assert!(endpoint.is_some());
+        run(options);
+        assert_eq!(grader.checked_of("shop", "order").unwrap().len(), 1);
+        let mut client = Client::connect(directory.socket()).unwrap();
+        client.set_timeout(Some(Duration::from_secs(2))).unwrap();
+        let reply = client.call(r#"{"op":"events","after":0}"#).unwrap();
+        let text = String::from_utf8(reply.bytes).unwrap();
+        assert!(text.contains(r#""source":"shop","kind":"order""#), "{text}");
+
+        // Without a path the world's own observer still hears the run.
+        let grader = Arc::new(crate::Memory::default());
+        let (options, endpoint) = serve_observation(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            None,
+            Some(grader.clone()),
+        )
+        .unwrap();
+        assert!(endpoint.is_none());
+        run(options);
+        assert_eq!(grader.checked_of("shop", "order").unwrap().len(), 1);
     }
 
     #[test]

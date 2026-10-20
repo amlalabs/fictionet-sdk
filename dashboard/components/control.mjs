@@ -12,7 +12,7 @@ const humanize = (key) => {
 const text = (value) => (value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value));
 
 /// A value as a key and value list: one row per field of an object.
-export function keyValues(parent, el, value) {
+function keyValues(parent, el, value) {
   const dl = el('dl', { class: 'kv' }, parent);
   const entries = value !== null && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value) : [['Value', value]];
   for (const [key, item] of entries) {
@@ -23,7 +23,7 @@ export function keyValues(parent, el, value) {
 }
 
 /// What a refusal means, in words.
-export function rejection(rejected) {
+function rejection(rejected) {
   switch (rejected?.reason) {
     case 'stale_revision': return `Not applied: the state changed (now revision ${rejected.current}). Check it and try again.`;
     case 'invalid': return `Not applied: ${rejected.message}`;
@@ -41,7 +41,7 @@ export function mount(root, services, options) {
   const cleanup = [];
   const buttons = [];
   let revision, busy = false;
-  const when = () => (services.runTime ? ` at ${fmtDuration(services.runTime())}` : '');
+  const when = () => ` at ${fmtDuration(services.runTime())}`;
   function say(line, value) {
     reply.replaceChildren();
     el('p', { text: line }, reply);

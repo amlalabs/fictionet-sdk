@@ -234,11 +234,6 @@ impl Egress {
         }
     }
 
-    /// Increases with every change, so a reader can skip an unchanged table.
-    pub fn revision(&self) -> u64 {
-        self.state.lock().revision
-    }
-
     /// The table now: destinations ordered by sandbox, then address.
     pub fn snapshot(&self) -> EgressSnapshot {
         let state = self.state.lock();

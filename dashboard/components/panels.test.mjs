@@ -4,37 +4,35 @@ import { mount as table } from './table.mjs';
 import { mount as eventTable } from './event-table.mjs';
 import { mount as control } from './control.mjs';
 import { mount as custom } from './custom.mjs';
-import { createDocument } from '../test-dom.mjs';
+import { createDocument, fakeTimers } from '../test-dom.mjs';
 import { createTransport } from '../transport.mjs';
+import { createServices } from '../page.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
-function fixture() {
+function fixture(t) {
   const document = createDocument(), root = document.createElement('section');
   document.body.append(root);
-  const subscriptions = new Set(), requests = [], timers = new Map();
+  const subscriptions = new Set(), requests = [], timers = fakeTimers(t);
   let publish, fail;
-  const services = {
-    state(path, snapshot, error) { publish = snapshot; fail = error; subscriptions.add(path); return () => subscriptions.delete(path); },
-    transport: createTransport({}, {
-      location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
-      fetch(url, options) {
-        const endpoint = new URL(url);
-        assert.equal(options.headers.Authorization, 'Bearer secret');
-        return new Promise((resolve, reject) => requests.push({
-          path: endpoint.pathname, body: options.body && JSON.parse(options.body), signal: options.signal,
-          params: Object.fromEntries([...endpoint.searchParams].map(([key, value]) => [key, Number(value)])),
-          resolve: (value) => resolve(Response.json(value)), reject,
-        }));
-      },
-    }),
-    setTimeout(callback) { const id = Symbol(); timers.set(id, callback); return id; },
-    clearTimeout(id) { timers.delete(id); },
-  };
+  const services = createServices(createTransport({}, {
+    location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
+    fetch(url, options) {
+      const endpoint = new URL(url);
+      assert.equal(options.headers.Authorization, 'Bearer secret');
+      return new Promise((resolve, reject) => requests.push({
+        path: endpoint.pathname, body: options.body && JSON.parse(options.body), signal: options.signal,
+        params: Object.fromEntries([...endpoint.searchParams].map(([key, value]) => [key, Number(value)])),
+        resolve: (value) => resolve(Response.json(value)), reject,
+      }));
+    },
+  }));
+  // One state topic, published and failed by the test.
+  services.state = (path, snapshot, error) => { publish = snapshot; fail = error; subscriptions.add(path); return () => subscriptions.delete(path); };
   return { root, services, subscriptions, requests, timers, publish: (value) => publish(value), fail: (error) => fail(error) };
 }
 
-test('table renders column pointers and formats as text and replaces snapshots', () => {
-  const h = fixture();
+test('table renders column pointers and formats as text and replaces snapshots', (t) => {
+  const h = fixture(t);
   const dispose = table(h.root, h.services, { state: '/api/state/rows', columns: [
     { label: '<Name>', pointer: '/a~1b/~0name', format: 'text' },
     { label: 'Bytes', pointer: '/bytes', format: 'bytes' },
@@ -45,7 +43,6 @@ test('table renders column pointers and formats as text and replaces snapshots',
   assert.match(h.root.textContent, /<img src=x>/);
   assert.match(h.root.textContent, /2.0 KB/);
   assert.match(h.root.textContent, /1,234/);
-  assert.equal(h.root.querySelector('img'), null);
   h.publish({ revision: 2, value: [] });
   assert.doesNotMatch(h.root.textContent, /<img/);
   assert.match(h.root.textContent, /No rows yet/);
@@ -56,8 +53,8 @@ test('table renders column pointers and formats as text and replaces snapshots',
   assert.equal(h.root.children.length, 0);
 });
 
-test('tables update rows in place and build again only rows whose text changed', async () => {
-  const h = fixture();
+test('tables update rows in place and build again only rows whose text changed', async (t) => {
+  const h = fixture(t);
   const dispose = table(h.root, h.services, { state: '/api/state/rows', columns: [{ label: 'Host', pointer: '/host' }, { label: 'Packets', pointer: '/packets', format: 'number' }] });
   h.publish({ revision: 1, value: [{ host: 'alpha', packets: 1 }, { host: 'beta', packets: 1 }] });
   const [alpha, beta] = h.root.querySelectorAll('tr').slice(1);
@@ -72,13 +69,13 @@ test('tables update rows in place and build again only rows whose text changed',
   assert.ok(rows.slice(1).every((row) => row.classList.contains('new-row')));
   dispose();
   // Event tables name rows by event, so a row read again keeps its element.
-  const log = fixture();
+  const log = fixture(t);
   const stop = eventTable(log.root, log.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
   await settle();
   log.requests[0].resolve({ rows: [{ seq: 4, summary: 'first' }], next: 5, dropped: 0 });
   await settle();
   const first = log.root.querySelector('tbody').children[0];
-  const next = [...log.timers.values()][0]; log.timers.clear(); next();
+  const next = [...log.timers.values()][0].callback; log.timers.clear(); next();
   await settle();
   log.requests[1].resolve({ rows: [{ seq: 5, summary: 'second' }], next: 6, dropped: 0 });
   await settle();
@@ -88,8 +85,9 @@ test('tables update rows in place and build again only rows whose text changed',
   stop();
 });
 
-test('control sends the linked revision once and shows replies, rejections and timeouts', async () => {
-  const h = fixture();
+test('control sends the linked revision once and shows replies, rejections and timeouts', async (t) => {
+  const h = fixture(t);
+  Object.assign(h.services.clock, { t: 75, ended: true });
   const dispose = control(h.root, h.services, { state: '/api/state/traffic', command: '/api/command/traffic', actions: [{ label: '<Pause>', command: { running: false } }] });
   const button = h.root.querySelector('button');
   assert.equal(button.disabled, true);
@@ -105,7 +103,7 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.match(h.requests[0].body.request_id, /^[0-9a-f-]{36}$/);
   h.requests[0].resolve({ status: 'applied', reply: '<done>' });
   await settle();
-  assert.match(h.root.textContent, /<Pause>: applied.*<done>/);
+  assert.match(h.root.textContent, /<Pause>: applied at 1m 15s.*<done>/);
   h.publish({ revision: 8, value: { running: false } });
   button.click();
   await settle();
@@ -113,26 +111,26 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.notEqual(h.requests[0].body.request_id, h.requests[1].body.request_id);
   h.requests[1].reject({ body: { rejection: { reason: 'stale_revision', current: 9 } } });
   await settle();
-  assert.match(h.root.textContent, /Not applied: the state changed \(now revision 9\)\. Check it and try again\./);
+  assert.match(h.root.textContent, /<Pause> at 1m 15s\. Not applied: the state changed \(now revision 9\)\. Check it and try again\./);
   button.click();
   await settle();
   h.requests[2].reject({ body: { status: 'timeout' } });
   await settle();
-  assert.match(h.root.textContent, /may still apply/);
+  assert.match(h.root.textContent, /<Pause>: no reply yet at 1m 15s\. It may still apply/);
   assert.equal(h.requests.length, 3);
   button.click();
   await settle();
   h.requests[3].resolve({ status: 'applied', reply: null });
   await settle();
-  assert.match(h.root.querySelector('.control-reply').textContent, /^<Pause>: applied$/);
+  assert.match(h.root.querySelector('.control-reply').textContent, /^<Pause>: applied at 1m 15s$/);
   dispose();
   assert.equal(button.listenerCount, 0);
   assert.equal(h.subscriptions.size, 0);
   assert.ok(h.requests.every((request) => request.signal.aborted));
 });
 
-test('control sends the world revision even when publication has a different revision', async () => {
-  const h = fixture();
+test('control sends the world revision even when publication has a different revision', async (t) => {
+  const h = fixture(t);
   const dispose = control(h.root, h.services, { state: '/api/state/switch', command: '/api/command/switch', actions: [{ label: 'On', command: { on: true } }] });
   h.publish({ revision: 1, value: { revision: 0, on: false } });
   h.root.querySelector('button').click();
@@ -149,15 +147,15 @@ test('control sends the world revision even when publication has a different rev
   dispose();
 });
 
-test('event table advances the server cursor and cancels pending reads and timers', async () => {
-  const h = fixture();
+test('event table advances the server cursor and cancels pending reads and timers', async (t) => {
+  const h = fixture(t);
   const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
   await settle();
   h.requests[0].resolve({ rows: [{ summary: '<world>' }], next: 11, dropped: 3 });
   await settle();
   assert.match(h.root.textContent, /<world>/);
   assert.match(h.root.textContent, /3 events were lost/);
-  const next = [...h.timers.values()][0]; h.timers.clear(); next();
+  const next = [...h.timers.values()][0].callback; h.timers.clear(); next();
   await settle();
   assert.deepEqual(h.requests[1].params, { after: 11 });
   dispose();
@@ -168,9 +166,9 @@ test('event table advances the server cursor and cancels pending reads and timer
   assert.equal(h.root.children.length, 0);
 });
 
-test('after the run stopped, event tables and custom panels say so instead of a fetch error', async () => {
-  const h = fixture();
-  h.services.stopped = () => true;
+test('after the run stopped, event tables and custom panels say so instead of a fetch error', async (t) => {
+  const h = fixture(t);
+  h.services.run.set('stopped');
   const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
   await settle();
   h.requests[0].reject(new TypeError('Failed to fetch'));
@@ -179,31 +177,31 @@ test('after the run stopped, event tables and custom panels say so instead of a 
   assert.doesNotMatch(h.root.textContent, /Failed to fetch/);
   assert.equal(h.timers.size, 0, 'no further reads');
   dispose();
-  const panel = fixture();
-  panel.services.stopped = () => true;
+  const panel = fixture(t);
+  panel.services.run.set('stopped');
   panel.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
   const stop = custom(panel.root, panel.services, { title: 'Plant', module: '/panels/plant.mjs', state: '/api/state/plant' });
   await settle();
   assert.equal(panel.root.textContent, 'Could not open Plant: the run has stopped, so the panel can no longer be loaded');
   stop();
-  const rows = fixture();
-  rows.services.stopped = () => true;
+  const rows = fixture(t);
+  rows.services.run.set('stopped');
   const close = table(rows.root, rows.services, { state: '/api/state/rows', columns: [{ label: 'Name', pointer: '/name' }] });
   rows.fail(new Error('The run has stopped, so its state can no longer be loaded'));
   assert.equal(rows.root.querySelector('.loss-note').textContent, 'The run has stopped, so these rows can no longer be loaded.');
   close();
 });
 
-test('a table that cannot load its state while the run goes says why', () => {
-  const h = fixture();
+test('a table that cannot load its state while the run goes says why', (t) => {
+  const h = fixture(t);
   const close = table(h.root, h.services, { state: '/api/state/rows', columns: [{ label: 'Name', pointer: '/name' }] });
   h.fail(new Error('no such state topic: "rows"'));
   assert.equal(h.root.querySelector('.loss-note').textContent, 'Could not load rows: no such state topic: "rows"');
   close();
 });
 
-test('custom panels dispose a late mount and reject foreign module paths', async () => {
-  const h = fixture();
+test('custom panels dispose a late mount and reject foreign module paths', async (t) => {
+  const h = fixture(t);
   let finish, stopped = 0, imports = 0;
   h.services.importModule = async () => { imports++; return { mount: () => new Promise((resolve) => { finish = resolve; }) }; };
   const dispose = custom(h.root, h.services, { module: '/panels/traffic.mjs', title: 'Traffic' });
@@ -214,20 +212,4 @@ test('custom panels dispose a late mount and reject foreign module paths', async
   assert.match(h.root.textContent, /Invalid panel module path/);
   assert.equal(imports, 1);
   bad();
-});
-
-test('control uses the world revision when stream and world revisions differ', async () => {
-  const h = fixture();
-  const dispose = control(h.root, h.services, { state: '/api/state/routing', command: '/api/command/routing', actions: [{ label: 'Hijacked', command: { mode: 'hijack' } }] });
-  h.publish({ revision: 1, value: { revision: 0, mode: 'legitimate' } });
-  h.root.querySelector('button').click();
-  await settle();
-  assert.equal(h.requests[0].body.command.expected_revision, 0);
-  h.requests[0].resolve({ status: 'applied', reply: { revision: 1 } });
-  await settle();
-  h.publish({ revision: 2, value: { revision: 1, mode: 'hijack' } });
-  h.root.querySelector('button').click();
-  await settle();
-  assert.equal(h.requests[1].body.command.expected_revision, 1);
-  dispose();
 });

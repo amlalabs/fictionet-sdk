@@ -12,7 +12,7 @@
 //! fictionet observe --observation unix:/run/fictionet/observation.sock watch
 //! ```
 //!
-//! For browser access and capture limits, see `fictionet_observe`.
+//! For the shell commands and capture limits, see `fictionet_observe`.
 
 use fictionet::stdlib::{self, web};
 use fictionet::time::ms;

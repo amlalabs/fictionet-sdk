@@ -1,13 +1,12 @@
-// Interaction with the Fictionet dashboard's graph: selection and search,
-// opening and closing groups, dragging, pan and zoom, tooltips, and the
-// places and open groups the viewer keeps per world. app.mjs passes in the
-// state and view and the layout's steps, and moves the view's glide on
+// Interaction with the map: selection and search, opening and closing
+// groups, dragging, pan and zoom, and tooltips. components/map.mjs passes in
+// the state and view and the layout's steps, and moves the view's glide on
 // once a frame with `stepTween`.
 
 import { listen } from './dom.mjs';
 import { HEAD } from './layout.mjs';
 
-export function createInteraction({ $, onSelect = () => {}, persist = false, state, view, reducedMotion, isGroup, layout, itemsInFrame, frameRects, isOpen }) {
+export function createInteraction({ $, onSelect = () => {}, state, view, reducedMotion, isGroup, layout, itemsInFrame, frameRects, isOpen }) {
   const cleanup = [];
   let clickTimer;
   const on = (...args) => cleanup.push(listen(...args));
@@ -52,7 +51,6 @@ export function createInteraction({ $, onSelect = () => {}, persist = false, sta
     const k0 = state.view.k;
     const screen = anchor && { x: anchor.x * k0 + state.view.x, y: anchor.y * k0 + state.view.y };
     state.expanded.set(info.key, !open);
-    saveLayout();
     // The view stays as it is: no fitting while the group changes.
     state.userMoved = true;
     layout();
@@ -262,7 +260,6 @@ export function createInteraction({ $, onSelect = () => {}, persist = false, sta
         clearTimeout(clickTimer);
         clickTimer = setTimeout(() => (suppressClick = false), 0);
         state.userMoved = true;
-        saveLayout();
       }
       drag = null;
       stage.classList.remove('dragging');
@@ -273,7 +270,7 @@ export function createInteraction({ $, onSelect = () => {}, persist = false, sta
     stage.classList.remove('panning');
   });
   on(stage, 'dblclick', (ev) => {
-    if (ev.target.closest('.node, .edge .hit, .fhead, button, .crumbs, .legend')) return;
+    if (ev.target.closest('.node, .edge .hit, .fhead, button, .crumbs')) return;
     resetLayout();
   });
   on($('fit'), 'click', () => {
@@ -285,7 +282,6 @@ export function createInteraction({ $, onSelect = () => {}, persist = false, sta
   /// Forgets every dragged place, lays the graph out again, and fits it.
   function resetLayout() {
     state.pins.clear();
-    saveLayout();
     state.userMoved = false;
     layout();
     fit();
@@ -295,35 +291,6 @@ export function createInteraction({ $, onSelect = () => {}, persist = false, sta
     if (!state.userMoved) fit();
   });
   resize.observe(stage);
-
-  // The viewer's places and open groups, kept per world in this browser.
-  // A world is known by its own source files, which stay the same from run
-  // to run.
-  function loadLayout(nodes) {
-    const files = [...new Set(nodes.filter((n) => n.file && !n.file.startsWith('src/')).map((n) => n.file))].sort();
-    state.worldKey = `fictionet-layout:${files.join(',') || 'world'}`;
-    state.pins.clear();
-    state.expanded.clear();
-    if (!persist) return;
-    try {
-      const saved = JSON.parse(localStorage.getItem(state.worldKey) || 'null');
-      if (saved) {
-        for (const [k, v] of Object.entries(saved.pins || {})) state.pins.set(k, v);
-        for (const [k, v] of Object.entries(saved.open || {})) state.expanded.set(k, v);
-      }
-    } catch {
-      // Storage may be refused or hold something else; start afresh.
-    }
-  }
-
-  function saveLayout() {
-    if (!persist || !state.worldKey) return;
-    try {
-      localStorage.setItem(state.worldKey, JSON.stringify({ pins: Object.fromEntries(state.pins), open: Object.fromEntries(state.expanded) }));
-    } catch {
-      // Private windows may refuse storage; the layout lasts for this page.
-    }
-  }
 
   // ---------------------------------------------------------------------------
   // Tooltips
@@ -467,7 +434,7 @@ export function createInteraction({ $, onSelect = () => {}, persist = false, sta
       hideTip();
       drag = pan = viewTween = null;
     },
-    hookItem, toggleGroup, stepTween, fit, startDrag, loadLayout, showTip, moveTip, hideTip, select, applySearch, focusNode, focusGroup,
+    hookItem, toggleGroup, stepTween, fit, startDrag, showTip, moveTip, hideTip, select, applySearch, focusNode, focusGroup,
     // The drag in progress, if any, and whether the click that ends one is being ignored.
     currentDrag: () => drag,
     clickSuppressed: () => suppressClick,

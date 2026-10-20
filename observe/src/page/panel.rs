@@ -58,6 +58,22 @@ pub struct PanelDescription {
     pub content: PanelContent,
 }
 
+impl PanelDescription {
+    /// A panel in the inspector.
+    pub(super) fn inspector(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        content: PanelContent,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            area: Area::Inspector,
+            content,
+        }
+    }
+}
+
 /// Panel-specific declarations, tagged by `kind` on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

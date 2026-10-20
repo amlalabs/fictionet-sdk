@@ -380,8 +380,8 @@ fn world_snapshot() -> (String, Vec<PacketCopy>) {
                     .unwrap()
                     .0;
                 assert_eq!(
-                    reader.counters()[&link][0],
-                    Counts {
+                    reader.topology().counters()[&link][0],
+                    fictionet::events::Counts {
                         packets: 1,
                         bytes: 12
                     }

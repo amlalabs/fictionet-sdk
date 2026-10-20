@@ -2,7 +2,7 @@
 import { scoped, reconcile } from '../dom.mjs';
 import { fmtBytes, fmtDuration } from '../format.mjs';
 
-export function pointer(value, path) {
+function pointer(value, path) {
   if (!path) return value;
   for (const part of path.slice(1).split('/')) {
     const key = part.replace(/~1/g, '/').replace(/~0/g, '~');
@@ -12,7 +12,7 @@ export function pointer(value, path) {
   return value;
 }
 
-export function cell(value, format) {
+function cell(value, format) {
   if (value === undefined || value === null) return '—';
   if (typeof value === 'number' && Number.isFinite(value)) {
     if (format === 'bytes') return fmtBytes(value);
@@ -88,7 +88,7 @@ export function mount(root, services, options) {
     render(body, Array.isArray(value) ? value : value === null ? [] : [value], options.columns);
     status.textContent = snapshot.status?.too_large ? 'This state exceeded its size limit. The last complete rows are shown.' : '';
   }, (error) => {
-    status.textContent = services.stopped?.() ? 'The run has stopped, so these rows can no longer be loaded.' : `Could not load rows: ${error.message}`;
+    status.textContent = services.stopped() ? 'The run has stopped, so these rows can no longer be loaded.' : `Could not load rows: ${error.message}`;
   });
   return () => { stop(); root.replaceChildren(); };
 }

@@ -22,10 +22,10 @@
 //! as `fictionet_observe::Memory`, keeps them from evicting other events.
 //!
 //! [`Ports::snapshot`] copies the five office labels and all rows, sorted
-//! by address, protocol, then port. [`Ports::changes_since`] copies the latest
-//! version of each row changed after a revision. Each tracked probe or state
-//! change advances the revision. Both views include the last row change time
-//! and `untracked` count. Their `MAX_JSON_BYTES` constants bound compact JSON.
+//! by address, protocol, then port. Each tracked probe or state change
+//! advances the revision. The map includes the last row change time and the
+//! `untracked` count. [`PortMap::MAX_JSON_BYTES`] bounds its compact JSON.
+//! [`Ports::changed_since`] says whether a copy is out of date.
 //!
 //! Rows stay for the run, up to [`MAX_ROWS`] (16,384). At capacity, probes for
 //! new keys increment `untracked`; existing rows still update. The first
@@ -34,8 +34,8 @@
 //! The tap also keeps the first data each open port sent to the scanner, as
 //! described in [`crate::banners`]. A `scan.banner` fact marks each new one,
 //! with its host, port, text, server value, time and revision. A new banner
-//! advances the revision too. Both views list banners sorted by host, then
-//! port, and include the `untracked_banners` count.
+//! advances the revision too. The map lists banners sorted by host, then
+//! port, and includes the `untracked_banners` count.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -210,34 +210,6 @@ impl PortMap {
         + MAX_BANNERS * (Banner::MAX_JSON_BYTES + 1);
 }
 
-/// Latest versions of rows changed after a revision, sorted as a snapshot.
-/// This is a delta of rows, not a history of every probe or answer.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PortChanges {
-    /// The requested revision, excluded from these changes.
-    pub from_revision: u64,
-    /// The current map revision.
-    pub revision: u64,
-    /// The last row change time in milliseconds since the run began, or zero.
-    pub at_ms: u64,
-    /// Probes for new keys that could not fit in the map.
-    pub untracked: u64,
-    /// Banners that could not fit in the map.
-    pub untracked_banners: u64,
-    /// Changed rows at their latest versions, sorted by address, protocol, then port.
-    pub rows: Vec<PortRow>,
-    /// Banners kept after `from_revision`, sorted by host, then port.
-    pub banners: Vec<Banner>,
-}
-
-impl PortChanges {
-    /// Compact JSON bound for deltas produced by [`Ports`].
-    pub const MAX_JSON_BYTES: usize =
-        r#"{"from_revision":18446744073709551615,"revision":18446744073709551615,"at_ms":18446744073709551615,"untracked":18446744073709551615,"untracked_banners":18446744073709551615,"rows":[],"banners":[]}"#.len()
-        + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
-        + MAX_BANNERS * (Banner::MAX_JSON_BYTES + 1);
-}
-
 /// A shared view of the scanner's probes, readable outside the world.
 #[derive(Clone)]
 pub struct Ports(Arc<Mutex<Tracker>>);
@@ -252,17 +224,13 @@ impl Ports {
         self.0.lock().snapshot()
     }
 
-    /// Copies rows whose last change is newer than `revision`.
-    /// At or past the current revision, the rows are empty.
-    pub fn changes_since(&self, revision: u64) -> PortChanges {
-        self.0.lock().changes_since(revision)
-    }
-
-    /// Copies the complete map and the changes since `revision` under one
-    /// lock, so the changes lead exactly to that snapshot.
-    pub fn snapshot_with_changes(&self, revision: u64) -> (PortMap, PortChanges) {
-        let tracker = self.0.lock();
-        (tracker.snapshot(), tracker.changes_since(revision))
+    /// Whether the map changed after `map` was copied from it: a tracked
+    /// probe, a state change, a new banner, or one more untracked probe or
+    /// banner.
+    pub fn changed_since(&self, map: &PortMap) -> bool {
+        let t = self.0.lock();
+        (t.revision, t.untracked, t.banners.untracked)
+            != (map.revision, map.untracked, map.untracked_banners)
     }
 
     pub(crate) fn tap(&self, fcx: &Cx, direction: Direction, packet: &Packet) -> bool {
@@ -371,23 +339,6 @@ impl Tracker {
             machines: machines(),
             rows: self.rows.values().map(|t| t.row.clone()).collect(),
             banners: self.banners.all(),
-        }
-    }
-
-    fn changes_since(&self, revision: u64) -> PortChanges {
-        PortChanges {
-            from_revision: revision,
-            revision: self.revision,
-            at_ms: self.at_ms,
-            untracked: self.untracked,
-            untracked_banners: self.banners.untracked,
-            rows: self
-                .rows
-                .values()
-                .filter(|t| t.row.revision > revision)
-                .map(|t| t.row.clone())
-                .collect(),
-            banners: self.banners.since(revision),
         }
     }
 
@@ -751,19 +702,8 @@ mod tests {
             probes: 2,
             revision: 3,
         };
-        assert_eq!(t.snapshot().rows, std::slice::from_ref(&row));
-        assert_eq!(
-            t.changes_since(2),
-            PortChanges {
-                from_revision: 2,
-                revision: 3,
-                at_ms: 22,
-                untracked: 0,
-                untracked_banners: 0,
-                rows: vec![row],
-                banners: vec![],
-            }
-        );
+        assert_eq!(t.snapshot().rows, [row]);
+        assert_eq!((t.revision, t.at_ms), (3, 22));
         assert_eq!(
             t.packet(ToInner, &echo(HOST, SCANNER, 0, 0, 124, 2), 23),
             Signal::None
@@ -894,21 +834,6 @@ mod tests {
             banners: vec![longest_banner(); MAX_BANNERS],
         };
         roundtrip(&map, PortMap::MAX_JSON_BYTES);
-        let changes = PortChanges {
-            from_revision: u64::MAX,
-            revision: u64::MAX,
-            at_ms: u64::MAX,
-            untracked: u64::MAX,
-            untracked_banners: u64::MAX,
-            rows: map.rows,
-            banners: map.banners,
-        };
-        roundtrip(&changes, PortChanges::MAX_JSON_BYTES);
-        // The bound counts a comma after the last row and the last banner.
-        assert_eq!(
-            serde_json::to_vec(&changes).unwrap().len() + 2,
-            PortChanges::MAX_JSON_BYTES
-        );
     }
 
     fn longest_banner() -> Banner {
@@ -968,9 +893,6 @@ mod tests {
         );
         assert_eq!((t.revision, t.at_ms), (3, 13));
         assert_eq!(t.snapshot().banners, std::slice::from_ref(&banner));
-        assert_eq!(t.changes_since(2).banners, std::slice::from_ref(&banner));
-        assert!(t.changes_since(2).rows.is_empty());
-        assert!(t.changes_since(3).banners.is_empty());
         assert_eq!(
             t.packet(ToInner, &segment(22, 4000, 8, 0x19, SSH), 14),
             Signal::None
@@ -1066,7 +988,6 @@ mod tests {
         assert_eq!(map.untracked_banners, 1);
         assert_eq!(map.banners.len(), 1);
         assert_eq!(map.banners[0].port, 22);
-        assert_eq!(t.changes_since(0).untracked_banners, 1);
     }
 
     fn state(t: &Tracker, expected: PortState, probes: u64, revision: u64) {
@@ -1237,21 +1158,24 @@ mod tests {
         assert_eq!(after.rows.len(), 2);
         assert_eq!(after.rows[0].probes, 2);
         assert_eq!(after.rows[0].state, Open);
-        assert_eq!(
-            t.changes_since(2),
-            PortChanges {
-                from_revision: 2,
-                revision: 4,
-                at_ms: 24,
-                untracked: 2,
-                untracked_banners: 0,
-                rows: vec![after.rows[0].clone()],
-                banners: vec![],
-            }
-        );
-        assert_eq!(t.changes_since(0).rows, after.rows);
-        assert!(t.changes_since(4).rows.is_empty());
-        assert!(t.changes_since(u64::MAX).rows.is_empty());
+        assert_eq!((after.revision, after.at_ms, after.untracked), (4, 24, 2));
+        assert_eq!(after.rows[0].revision, 4);
+        assert_eq!(after.rows[1], before.rows[1]);
+    }
+
+    #[test]
+    fn a_copy_is_out_of_date_after_a_tracked_or_untracked_probe() {
+        let ports = Ports(Arc::new(Mutex::new(Tracker::new(1))));
+        let empty = ports.snapshot();
+        assert!(!ports.changed_since(&empty));
+        ports.0.lock().packet(FromInner, &syn(80, 4000, 1), 10);
+        assert!(ports.changed_since(&empty));
+        let one = ports.snapshot();
+        assert!(!ports.changed_since(&one));
+        // A full map leaves the revision alone but counts the probe.
+        ports.0.lock().packet(FromInner, &syn(81, 4000, 2), 11);
+        assert_eq!(ports.snapshot().revision, one.revision);
+        assert!(ports.changed_since(&one));
     }
 
     #[test]
@@ -1362,16 +1286,6 @@ mod tests {
             banners: vec![longest_banner(); MAX_BANNERS],
         };
         roundtrip(&map, PortMap::MAX_JSON_BYTES);
-        let changes = PortChanges {
-            from_revision: u64::MAX,
-            revision: u64::MAX,
-            at_ms: u64::MAX,
-            untracked: u64::MAX,
-            untracked_banners: u64::MAX,
-            rows: map.rows,
-            banners: map.banners,
-        };
-        roundtrip(&changes, PortChanges::MAX_JSON_BYTES);
         for protocol in [Protocol::Tcp, Protocol::Udp] {
             assert_eq!(
                 serde_json::to_string(&protocol).unwrap(),
@@ -1386,6 +1300,5 @@ mod tests {
         }
         let empty = Ports::new();
         roundtrip(&empty.snapshot(), PortMap::MAX_JSON_BYTES);
-        roundtrip(&empty.changes_since(0), PortChanges::MAX_JSON_BYTES);
     }
 }

@@ -1,5 +1,5 @@
-//! Access tokens for attach proxies and the dashboard. Both commands
-//! read a token from `--token-file` and check what a client supplies.
+//! Access tokens for attach proxies. Attach reads a token from
+//! `--token-file` and checks what a client supplies.
 //!
 //! One attach serves one sandbox, so it has one token. The HTTP door takes
 //! it in `Proxy-Authorization` (Basic, with the token as the password, or
@@ -12,7 +12,7 @@ use fictionet::stdlib::codec::base64::{self, Padding};
 /// The longest token: SOCKS5 carries a password in at most 255 bytes.
 pub const MAX_TOKEN: usize = 255;
 
-/// A token for an attach proxy or dashboard.
+/// A token for an attach proxy.
 #[derive(Clone)]
 pub struct Token(Vec<u8>);
 

@@ -163,11 +163,12 @@ The integrator installs one observer through `RunOptions` before the run.
 
 The companion crate owns consumption and retention: `Memory` for grading,
 `Aggregate` to combine repeats, `Jsonl` for files, and `DashboardObserver` for
-watching a world. Graders check that retained events are complete. Serve the
-dashboard handle with `fictionet_observe::serve` on a private observation
-socket. Both `fictionet dashboard` and `fictionet observe` connect through
-`--observation unix:PATH`. See [Fictionet Observe](observe/README.md) for setup
-and limits, and [services](docs/services.md) for a small world.
+watching a world. Graders check that retained events are complete. A world
+shows its own page with `fictionet_observe::page::Page`. Serve the dashboard
+handle with `fictionet_observe::serve` on a private observation socket, and
+`fictionet observe --observation unix:PATH` reads it from a shell. See
+[Fictionet Observe](observe/README.md) for setup and limits, and
+[services](docs/services.md) for a small world.
 
 Protocol codecs also work in unit tests and fuzz targets. The companion's
 `decode` feature supplies presenters that use those codecs for captured traffic.
@@ -254,7 +255,7 @@ Start at the crate root, which explains the main ideas, then read in this order:
 6. [`recipes`](src/guide/recipes.rs): a delayed website, a slow or lossy link, a packet
    capture, and a route that changes mid-run.
 7. [Fictionet Observe](observe/README.md): collection, grading, files, and watching
-   a world from the dashboard or a shell. [Events](src/events.rs) covers production.
+   a world from its page or a shell. [Events](src/events.rs) covers production.
 8. [`proto`](src/guide/proto.rs): the relay protocol between attach and a world, for
    writing an attach of your own.
 9. [`roadmap`](src/guide/roadmap.rs): what is planned.

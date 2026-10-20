@@ -527,7 +527,7 @@ fictionet observe --observation unix:/run/fictionet/observation.sock watch
 ```
 
 Keep the socket outside the agent's filesystem. See
-[Fictionet Observe](../../observe/README.md) for browser access and capture limits.
+[Fictionet Observe](../../observe/README.md) for the shell commands and capture limits.
 
 ## Layout
 

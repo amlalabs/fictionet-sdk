@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::DashboardHandle;
 use crate::DisplayBatch;
 use crate::json::{self, Object};
-use crate::{DashboardHandle, Topology};
 use fictionet::events::Event;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::json::Value;
@@ -38,7 +38,10 @@ fn edge_id(id: u64) -> String {
     format!("e{id}")
 }
 
-fn build(topology: Topology, ended: bool) -> View {
+/// The view of the handle's topology now.
+fn current(graph: &DashboardHandle) -> View {
+    let topology = graph.0.collector.topology();
+    let ended = graph.0.collector.ended().is_some();
     let mut view = View {
         revision: topology.revision,
         ended,
@@ -151,10 +154,7 @@ fn build(topology: Topology, ended: bool) -> View {
 }
 
 pub(crate) fn counters(graph: &DashboardHandle, wall: Option<Duration>) -> String {
-    let view = build(
-        graph.0.collector.topology(),
-        graph.0.collector.ended().is_some(),
-    );
+    let view = current(graph);
     Object::new()
         .secs("t", graph.elapsed(wall))
         .raw("edges", &counters_json(view.counters.iter()))
@@ -293,10 +293,7 @@ pub(crate) fn events(graph: &DashboardHandle, after: u64, max: usize) -> String 
 
 /// The `link` reply: one link's ends, label and counts, if it is shown.
 pub(crate) fn link(graph: &DashboardHandle, id: u64) -> Option<String> {
-    let view = build(
-        graph.0.collector.topology(),
-        graph.0.collector.ended().is_some(),
-    );
+    let view = current(graph);
     let edge = view.edges.get(&edge_id(id))?;
     let c = view.counters.get(&edge_id(id))?;
     // The edge's JSON, with its counts added before the closing brace.
@@ -313,10 +310,7 @@ pub(crate) fn link(graph: &DashboardHandle, id: u64) -> Option<String> {
 /// The `link` event of a packet stream: the edge's ends and label, or
 /// nulls for a link the graph does not show, such as one already removed.
 pub(crate) fn describe(graph: &DashboardHandle, id: fictionet::events::LinkId) -> String {
-    let view = build(
-        graph.0.collector.topology(),
-        graph.0.collector.ended().is_some(),
-    );
+    let view = current(graph);
     view.edges
         .get(&edge_id(id.get()))
         .cloned()
@@ -351,10 +345,7 @@ pub(crate) fn snapshot(
     after: Option<u64>,
     wall: Option<Duration>,
 ) -> (View, Message) {
-    let mut view = build(
-        graph.0.collector.topology(),
-        graph.0.collector.ended().is_some(),
-    );
+    let mut view = current(graph);
     let DisplayBatch {
         events,
         last,
@@ -441,10 +432,7 @@ pub(crate) fn changes(
         return out;
     }
     drop(state);
-    let mut new = build(
-        graph.0.collector.topology(),
-        graph.0.collector.ended().is_some(),
-    );
+    let mut new = current(graph);
     new.event_seq = old.event_seq;
     new.event_position = old.event_position;
     new.dropped = old.dropped;
@@ -562,8 +550,7 @@ pub(crate) fn event_changes(graph: &DashboardHandle, view: &mut View) -> (Vec<Me
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Limits;
-    use crate::{DashboardObserver, DashboardOptions, Options};
+    use crate::{DashboardObserver, DashboardOptions, Limits, Options, Topology};
     use fictionet::events::{Interest, Observation, Observer, Stamp, Stream, TopologyRef};
 
     fn identities(count: usize) -> Topology {

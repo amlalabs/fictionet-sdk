@@ -51,8 +51,9 @@ The returned `Decoded` exposes layers, fields, tags, and summaries.
 
 Set `DashboardOptions::protocols` before constructing the `DashboardObserver`
 and install its observer in `RunOptions`. Serve its handle on an observation
-socket with `fictionet_observe::serve`. The `fictionet observe` command and
-dashboard connect with `--observation unix:<path>` and show the custom protocol.
+socket with `fictionet_observe::serve`. The `fictionet observe` command
+connects with `--observation unix:<path>` and shows the custom protocol, as
+does a world's page over the same handle.
 
 The endpoint uses protocol name `fictionet-observe`, version 2. Other names
 or versions receive a refusal reason. It does not fall back to the world

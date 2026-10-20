@@ -1,4 +1,4 @@
-# Shared setup for the web and dashboard demos. start_web passes its optional
+# Shared setup for the web and proxy demos. start_web passes its optional
 # argument as web_world's third path, which opens the observation socket.
 # shellcheck shell=bash
 

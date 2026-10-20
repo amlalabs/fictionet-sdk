@@ -470,14 +470,11 @@ async fn first_event(server: &Server, path: &str) -> String {
 }
 
 #[tokio::test]
-async fn state_routes_serve_snapshots_deltas_and_persistent_status() {
-    let topic = StateTopic::new(StateLimits {
-        max_bytes: 32,
-        deltas: 2,
-    });
+async fn state_routes_serve_snapshots_and_persistent_status() {
+    let topic = StateTopic::new(StateLimits { max_bytes: 32 });
     let at = fictionet::time::Instant::from_since_start(std::time::Duration::from_secs(2));
     topic.publish(at, &vec![1]).unwrap();
-    topic.publish_with_delta(at, &vec![1, 2], &2).unwrap();
+    topic.publish(at, &vec![1, 2]).unwrap();
     let server = Page::new(
         "State",
         crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
@@ -493,16 +490,15 @@ async fn state_routes_serve_snapshots_deltas_and_persistent_status() {
     assert_eq!(snapshot.value, Some(vec![1, 2]));
     assert_eq!(snapshot.revision, 2);
     assert_eq!(snapshot.at, 2.0);
-    let delta = first_event(&server, "/api/states/stream?topics=numbers&after=numbers:1").await;
-    assert!(delta.contains("event: delta\n"));
-    assert!(delta.contains("data: {\"topic\":\"numbers\",\"revision\":2,"));
-    topic.publish_with_delta(at, &vec![1, 2, 3], &3).unwrap();
-    topic.publish_with_delta(at, &vec![1, 2, 3, 4], &4).unwrap();
-    assert!(
-        first_event(&server, "/api/states/stream?topics=numbers&after=numbers:1")
-            .await
-            .contains("event: snapshot\n")
-    );
+    // A reader behind the current revision gets the latest snapshot.
+    let behind = first_event(&server, "/api/states/stream?topics=numbers&after=numbers:1").await;
+    assert!(behind.contains("event: snapshot\n"));
+    assert!(behind.contains("data: {\"topic\":\"numbers\",\"revision\":2,"));
+    assert!(behind.contains("\"value\":[1,2]"));
+    topic.publish(at, &vec![1, 2, 3]).unwrap();
+    topic.publish(at, &vec![1, 2, 3, 4]).unwrap();
+    let latest = first_event(&server, "/api/states/stream?topics=numbers&after=numbers:1").await;
+    assert!(latest.contains("data: {\"topic\":\"numbers\",\"revision\":4,"));
     assert!(topic.publish(at, &vec![99; 50]).is_err());
     let response = request(&server, "GET", "/api/state/numbers", &bearer(&server), "").await;
     assert!(response.contains("\"too_large\":true"));
@@ -579,12 +575,16 @@ async fn one_state_stream_carries_several_topics_and_rejects_bad_lists() {
         opening[0]
     );
     assert!(opening[0].contains("data: {\"topic\":\"first\",\"revision\":1,"));
-    second.publish_with_delta(at, &vec![2, 3, 4], &4).unwrap();
-    let delta = next_events(&mut conn, &mut wire, 1).await;
-    assert_eq!(delta.len(), 1);
-    assert!(delta[0].starts_with("event: delta\n"), "{}", delta[0]);
-    assert!(delta[0].contains("{\"topic\":\"second\",\"revision\":3,"));
-    assert!(delta[0].contains("\"delta\":4"));
+    second.publish(at, &vec![2, 3, 4]).unwrap();
+    let changed = next_events(&mut conn, &mut wire, 1).await;
+    assert_eq!(changed.len(), 1);
+    assert!(
+        changed[0].starts_with("event: snapshot\n"),
+        "{}",
+        changed[0]
+    );
+    assert!(changed[0].contains("{\"topic\":\"second\",\"revision\":3,"));
+    assert!(changed[0].contains("\"value\":[2,3,4]"));
     first.publish(at, &vec![5]).unwrap();
     let snapshot = next_events(&mut conn, &mut wire, 1).await;
     assert!(snapshot[0].contains("{\"topic\":\"first\",\"revision\":2,"));
@@ -2000,49 +2000,42 @@ async fn a_late_event_table_read_finds_a_moment_past_the_first_thousand_events()
 
 #[tokio::test]
 async fn left_the_box_is_declared_and_requires_a_bearer() {
-    for standard in [false, true] {
-        let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
-        let page = Page::new("Destinations", dashboard.handle());
-        let server = if standard {
-            page.standard_panels()
-        } else {
-            page.left_the_box()
-        }
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let server = Page::new("Destinations", dashboard.handle())
+        .standard_panels()
         .bind_loopback(0)
         .await
         .unwrap();
-        let description =
-            json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
-        assert!(
-            description["panels"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|panel| panel["kind"] == "left_the_box")
-        );
-        status(&request(&server, "GET", "/api/egress", "", "").await, 401);
-        let response = request(&server, "GET", "/api/egress", &bearer(&server), "").await;
-        status(&response, 200);
-        let snapshot = json_body(&response);
-        assert_eq!(snapshot["destinations"], serde_json::json!([]));
-        assert_eq!(snapshot["dropped"], 0);
-        assert_eq!(snapshot["lost"], 0);
-        status(
-            &request(
-                &server,
-                "GET",
-                "/api/egress?token=wrong",
-                &bearer(&server),
-                "",
-            )
-            .await,
-            400,
-        );
-        status(
-            &request(&server, "GET", "/components/left-the-box.mjs", "", "").await,
-            200,
-        );
-    }
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    assert!(
+        description["panels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|panel| panel["kind"] == "left_the_box")
+    );
+    status(&request(&server, "GET", "/api/egress", "", "").await, 401);
+    let response = request(&server, "GET", "/api/egress", &bearer(&server), "").await;
+    status(&response, 200);
+    let snapshot = json_body(&response);
+    assert_eq!(snapshot["destinations"], serde_json::json!([]));
+    assert_eq!(snapshot["dropped"], 0);
+    assert_eq!(snapshot["lost"], 0);
+    status(
+        &request(
+            &server,
+            "GET",
+            "/api/egress?token=wrong",
+            &bearer(&server),
+            "",
+        )
+        .await,
+        400,
+    );
+    status(
+        &request(&server, "GET", "/components/left-the-box.mjs", "", "").await,
+        200,
+    );
 }
 
 #[tokio::test]

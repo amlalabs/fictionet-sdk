@@ -28,7 +28,6 @@ pub const PAGE_ROWS: usize = 512;
 /// JSON bytes for a row's tag around the world's row: step, time, traffic,
 /// family, two socket addresses and their keys. A test checks the bound.
 const TAG_BYTES: usize = 512;
-const INVENTORY_DELTAS: usize = 64;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Who made a row: the kit's setup, the story's command, other guest
@@ -225,8 +224,9 @@ pub struct Snapshot {
     pub lost: u64,
     pub publication_error: Option<String>,
     dirty: bool,
-    pending_changes: Vec<FolderAdded>,
-    pending_colleague: Vec<FolderAdded>,
+    /// Each inventory changed since its last publish.
+    inventory_dirty: bool,
+    colleague_dirty: bool,
 }
 
 /// The Doors tried topic: door facts, the story strip and the variant header.
@@ -272,11 +272,9 @@ impl Facts {
     ) -> Self {
         let rows = |row_bytes: usize, rest: usize| StateLimits {
             max_bytes: PAGE_ROWS * (row_bytes + TAG_BYTES) + rest,
-            deltas: 0,
         };
         let inventory_limits = StateLimits {
             max_bytes: MAX_INVENTORY_JSON_BYTES,
-            deltas: INVENTORY_DELTAS,
         };
         let topics = Topics {
             inventory: StateTopic::new(inventory_limits),
@@ -321,15 +319,9 @@ impl Facts {
             lost: 0,
             publication_error: None,
             dirty: true,
-            pending_changes: Vec::new(),
-            pending_colleague: Vec::new(),
+            inventory_dirty: true,
+            colleague_dirty: true,
         };
-        let result = topics.inventory.publish(state.at, &state.inventory);
-        state.record(result);
-        if let (Some(topic), Some(inventory)) = (&topics.colleague, &state.colleague) {
-            let result = topic.publish(state.at, inventory);
-            state.record(result);
-        }
         let batch = Batch::take(&mut state).unwrap();
         state.record(topics.publish(batch));
         Self {
@@ -395,20 +387,15 @@ impl Facts {
     ) {
         let mut state = self.state.lock().unwrap();
         state.at = at;
-        let pending = match store {
+        match store {
             Store::Main => {
                 state.inventory = inventory.clone();
-                &mut state.pending_changes
+                state.inventory_dirty = true;
             }
             Store::Colleague => {
                 state.colleague = Some(inventory.clone());
-                &mut state.pending_colleague
+                state.colleague_dirty = true;
             }
-        };
-        if pending.len() == INVENTORY_DELTAS {
-            state.publication_error = Some("inventory changes exceed the delta count bound".into());
-        } else {
-            pending.push(change.clone());
         }
         let step = state.step;
         let own = change
@@ -474,9 +461,9 @@ struct Batch {
     setup: u64,
     story: Vec<StoryStep>,
     scenario: Scenario,
-    inventory: Inventory,
-    changes: Vec<FolderAdded>,
-    colleague: Option<(Inventory, Vec<FolderAdded>)>,
+    /// The inventories that changed since the last publish.
+    inventory: Option<Inventory>,
+    colleague: Option<Inventory>,
 }
 
 impl Batch {
@@ -514,12 +501,10 @@ impl Batch {
             setup,
             story,
             scenario: state.scenario.clone(),
-            inventory: state.inventory.clone(),
-            changes: std::mem::take(&mut state.pending_changes),
-            colleague: state.colleague.clone().and_then(|inventory| {
-                let changes = std::mem::take(&mut state.pending_colleague);
-                (!changes.is_empty()).then_some((inventory, changes))
-            }),
+            inventory: std::mem::take(&mut state.inventory_dirty).then(|| state.inventory.clone()),
+            colleague: std::mem::take(&mut state.colleague_dirty)
+                .then(|| state.colleague.clone())
+                .flatten(),
         })
     }
 }
@@ -539,6 +524,12 @@ fn page_rows<'a, T: Clone + 'a>(
 
 impl Topics {
     fn publish(&self, batch: Batch) -> Result<u64, PublishError> {
+        if let Some(inventory) = &batch.inventory {
+            self.inventory.publish(batch.at, inventory)?;
+        }
+        if let (Some(topic), Some(inventory)) = (&self.colleague, &batch.colleague) {
+            topic.publish(batch.at, inventory)?;
+        }
         self.requests.publish(batch.at, &batch.requests)?;
         self.doors.publish(
             batch.at,
@@ -604,21 +595,7 @@ fn publish_changed(facts: &Facts) {
     };
     drop(state);
     // Copy rows under the facts lock, then serialize without holding it.
-    let result = (|| {
-        if !batch.changes.is_empty() {
-            facts.topics.inventory.publish_with_delta(
-                batch.at,
-                &batch.inventory,
-                &batch.changes,
-            )?;
-        }
-        if let (Some(topic), Some((inventory, changes))) =
-            (&facts.topics.colleague, &batch.colleague)
-        {
-            topic.publish_with_delta(batch.at, inventory, changes)?;
-        }
-        facts.topics.publish(batch)
-    })();
+    let result = facts.topics.publish(batch);
     facts.state.lock().unwrap().record(result);
 }
 
@@ -1104,9 +1081,9 @@ pub(super) mod tests {
         assert_eq!(state.inventory, contents.inventory());
         assert_eq!(
             state
-                .pending_changes
+                .changes
                 .iter()
-                .map(|c| c.revision)
+                .map(|c| c.row.revision)
                 .collect::<Vec<_>>(),
             [1, 2, 3]
         );
@@ -1126,17 +1103,6 @@ pub(super) mod tests {
         publish_changed(&facts);
         assert_eq!(facts.topics.inventory.revision(), 2);
         facts.state.lock().unwrap().check_complete().unwrap();
-    }
-
-    #[test]
-    fn pending_inventory_changes_have_a_visible_bound() {
-        let (facts, contents) = listening(Variant::Peer);
-        for index in 0..=INVENTORY_DELTAS {
-            folder(contents.clone(), &format!("reply-{index}"), index as u64);
-        }
-        let state = facts.state.lock().unwrap();
-        assert_eq!(state.pending_changes.len(), INVENTORY_DELTAS);
-        assert!(state.check_complete().is_err());
     }
 
     async fn topic(
@@ -1194,9 +1160,9 @@ pub(super) mod tests {
         folder(contents.clone(), "reply-z/nested", 2);
         folder(contents.clone(), "reply-a", 3);
         let next = contents.inventory();
-        let changes = facts.state.lock().unwrap().pending_changes.clone();
+        let changes = facts.state.lock().unwrap().changes.clone();
         assert_eq!(
-            changes.iter().map(|c| c.revision).collect::<Vec<_>>(),
+            changes.iter().map(|c| c.row.revision).collect::<Vec<_>>(),
             [1, 2]
         );
         publisher.flush().await.unwrap();
@@ -1205,7 +1171,7 @@ pub(super) mod tests {
         assert_eq!(inventory["at"], 3.0);
         assert_eq!(inventory["value"], serde_json::to_value(&next).unwrap());
 
-        // The stream carries the change, not just a replacement snapshot.
+        // A reader behind the topic gets the new inventory on the stream.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (origin, token) = page.url().split_once("/#token=").unwrap();
         let authority = origin.strip_prefix("http://").unwrap();
@@ -1226,10 +1192,11 @@ pub(super) mod tests {
         .await
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("event: snapshot\n"), "{response}");
         assert!(
             response.contains(&format!(
-                "\"delta\":{}",
-                serde_json::to_string(&changes).unwrap()
+                "\"revision\":2,\"at\":3,\"value\":{}",
+                serde_json::to_string(&next).unwrap()
             )),
             "{response}"
         );

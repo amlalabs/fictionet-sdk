@@ -1,11 +1,11 @@
 // The demo page: a host bar, a workspace of consoles beside a tabbed
 // inspector, built from the page description the server gives at /api/page.
 // Components share one watch stream and one state stream (see streams.mjs).
-import { createTransport } from './transport.mjs';
+import { createTransport, SIGN_IN } from './transport.mjs';
 import { createSelection } from './selection.mjs';
 import { createTheme } from './theme.mjs';
 import { createStateHub, createWatchHub } from './streams.mjs';
-import { watchState } from './state.mjs';
+import { createModel } from './state.mjs';
 import * as format from './format.mjs';
 import * as dom from './dom.mjs';
 import { scoped, listen } from './dom.mjs';
@@ -21,8 +21,7 @@ import { mount as table } from './components/table.mjs';
 import { mount as eventTable } from './components/event-table.mjs';
 import { mount as control } from './components/control.mjs';
 import { mount as custom } from './components/custom.mjs';
-
-const SIGNED_OUT = 'Open the URL the demo printed in its terminal.';
+import { createInputOwners } from './components/console.mjs';
 
 // A value components can read and follow.
 function store(value) {
@@ -34,24 +33,60 @@ function store(value) {
   };
 }
 
-export function createServices(transport, theme) {
+// Lookups over `hosts()`, the page's hosts. `hostOf(name)` is the host whose
+// sandbox is `name`, or else the host named `name`, or null. `hostLabel(name)`
+// is the same host, or `name` when there is none, for text. `sandboxOf(name)`
+// is the sandbox of the host named `name`, or `name` when there is none.
+export function hostLookups(hosts) {
+  const hostOf = (name) => (hosts().find((host) => host.sandbox === name) || hosts().find((host) => host.name === name))?.name ?? null;
+  return {
+    hostOf,
+    hostLabel: (name) => hostOf(name) ?? name,
+    sandboxOf: (name) => hosts().find((host) => host.name === name)?.sandbox ?? name,
+  };
+}
+
+export function createServices(transport, theme, importModule = (url) => import(url)) {
   // The run status the header shows: connecting, running or stopped.
   const run = store('connecting');
   const stopped = () => run.get() === 'stopped';
   const states = createStateHub(transport, { stopped });
   const watches = createWatchHub(transport);
+  let graph;
   const selection = createSelection();
   const moments = new Set();
   const momentListeners = new Set();
   const clock = { t: 0, at: performance.now(), ended: true };
-  return {
+  const services = {
     transport, selection, theme, format, dom, clock, run,
+    // The page's one graph model (see state.mjs), on the page's watch. It
+    // binds the first time a part of the page reads it.
+    get graph() { graph ??= createModel(watches.subscribe()); return graph; },
+    // From /api/page: the page's hosts, the addresses its own screen and
+    // terminal sessions come from, and the state and command paths of its
+    // labels and startup checks, or null when it has no such panel.
+    hosts: [],
+    consoleAddresses: [],
+    labelState: null,
+    labelCommand: null,
+    containmentState: null,
+    ...hostLookups(() => services.hosts),
     // Whether the header says Stopped. A load that fails then says the run
     // stopped, not why the request failed.
     stopped,
     packetPair: store(null),
+    // Opens an inspector panel by kind, or by id for panels that share a
+    // kind. The inspector sets it once its tabs exist.
+    showPanel() {},
+    // Shows the packets of a map item's links, or of one flow.
+    openLinks(_from, _to, members) { selection.set({ links: members.map(({ e }) => e.id) }); services.showPanel('packets'); },
+    showPackets(pair) { services.packetPair.set(pair); services.showPanel('packets'); },
+    // Loads a module by URL: a console's library or a world panel. Tests
+    // pass their own, since Node cannot load the page's paths.
+    importModule,
+    // Who holds each host's input (see components/console.mjs).
+    input: createInputOwners((path, onSnapshot, onError) => services.state(path, onSnapshot, onError)),
     watch: () => watches.subscribe(),
-    connect: (graph) => watchState(watches.subscribe(), graph),
     state(path, onSnapshot, onError) {
       if (!/^\/api\/state\/[A-Za-z0-9_-]{1,128}$/.test(path)) throw new Error('Invalid state path');
       return states.subscribe(path.slice('/api/state/'.length), onSnapshot, onError);
@@ -65,8 +100,9 @@ export function createServices(transport, theme) {
       if (moments.size > 1000) moments.delete(moments.values().next().value);
       momentListeners.forEach((callback) => callback());
     },
-    dispose() { states.dispose(); watches.dispose(); momentListeners.clear(); },
+    dispose() { graph?.dispose(); states.dispose(); watches.dispose(); momentListeners.clear(); },
   };
+  return services;
 }
 
 // The workspace's share of the width until the viewer drags the divider.
@@ -113,177 +149,69 @@ function icon(el, parent, name, label) {
 }
 
 const READINESS = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', stopped: 'Stopped' };
-const ORDER = ['packets', 'events', 'map', 'left_the_box', 'containment', 'labels'];
+// The kinds of the standard panels. The page server sorts the panels; a
+// page's own panels are the other kinds.
+const STANDARD = ['packets', 'events', 'map', 'left_the_box', 'containment', 'labels'];
 
-export async function mount(root, transport, theme) {
-  const { $, el } = scoped(root);
-  const document = root.ownerDocument;
-  const cleanup = [];
-  const services = createServices(transport, theme);
-  const controller = new AbortController();
-  const tiles = new Map(), chips = new Map(), pinned = new Set(), modes = new Map();
-  let stopPanel = () => {}, stopWorkspace = () => {}, selectedTab, disposed = false, workspaceMounted = false;
-  let clockTimer, momentTimer, watch, page;
-  const stop = () => {
-    if (disposed) return;
-    disposed = true;
-    controller.abort();
-    clearInterval(clockTimer);
-    clearTimeout(momentTimer);
-    watch?.close();
-    stopPanel();
-    stopWorkspace();
-    tiles.forEach((tile) => tile.dispose());
-    cleanup.forEach((remove) => remove());
-    services.dispose();
-    transport.close();
-    theme.dispose();
-  };
-  cleanup.push(listen(globalThis.window, 'pagehide', stop, { once: true }));
-
-  const notice = (title, text, action) => showNotice(root, title, text, action);
-  cleanup.push(listen($('notice-action'), 'click', () => globalThis.location?.reload()));
-
+// Mounts one panel by its kind into `content`, and returns its dispose.
+function panel(services, page, content, options, controls) {
+  const { el } = scoped(content);
+  const host = (mount) => mount(content, services, { ...options, controls, status: page.hosts.find((item) => item.name === options.host)?.status });
   try {
-    page = await transport.get('/api/page', {}, controller.signal);
+    switch (options.kind) {
+      case 'screen': return host(screen);
+      case 'terminal': return host(terminal);
+      case 'packets': return packets(content, services, options);
+      case 'labels': return labels(content, services, options);
+      case 'containment': return containment(content, services, options);
+      case 'left_the_box': return leftTheBox(content, services, options);
+      case 'events': return events(content, services, options);
+      case 'map': return map(content, services, options);
+      case 'table': return table(content, services, options);
+      case 'event_table': return eventTable(content, services, options);
+      case 'control': return control(content, services, options);
+      case 'custom': return custom(content, services, options);
+      default: el('p', { class: 'empty-note', text: 'This panel is unavailable. Rebuild the demo.' }, content); return () => {};
+    }
   } catch (error) {
-    if (!disposed && root.dataset.state !== 'notice') {
-      if (error.status === 401 || error.status === 403 || /authorization|closed/i.test(error.message)) notice('Not signed in', SIGNED_OUT);
-      else notice('Could not open the demo', `${error.message}.`, true);
-    }
-    return stop;
+    content.replaceChildren(el('p', { class: 'empty-note', text: `Could not open ${options.title}: ${error.message}` }));
+    return () => {};
   }
-  if (disposed) return stop;
-  root.dataset.state = 'ready';
-  services.hosts = page.hosts;
-  services.consoleAddresses = page.console_addresses || [];
-  document.title = `${page.title} · Fictionet`;
-  $('page-title').textContent = page.title;
+}
 
-  // The host bar.
-  const selectHost = (host) => services.selection.set({ host, node: null, links: [], event: null, connection: null, request: null });
-  const bar = $('host-bar');
-  bar.replaceChildren();
-  const all = el('button', { type: 'button', class: 'host-chip all', 'aria-pressed': 'true', text: 'All hosts' }, bar);
-  cleanup.push(listen(all, 'click', () => selectHost(null)));
-  const customWorkspace = page.panels.find((panel) => panel.area === 'workspace' && panel.kind === 'custom');
-  const sharedWorkspace = customWorkspace && page.panels.some((panel) => panel.area === 'workspace' && ['screen', 'terminal'].includes(panel.kind));
-  $('workspace').classList.toggle('shared-workspace', Boolean(sharedWorkspace));
-  $('workbench').classList.toggle('shared-workbench', Boolean(sharedWorkspace));
-  cleanup.push(divider($('divider'), $('workbench'), page.title, sharedWorkspace ? 68 : DEFAULT_SPLIT));
-  for (const host of page.hosts) {
-    if (host.pinned && !customWorkspace) pinned.add(host.name);
-    const group = el('div', { class: 'host-group' }, bar);
-    const chip = el('button', { type: 'button', class: 'host-chip', 'aria-pressed': 'false' }, group);
-    const dot = el('i', { class: 'readiness', 'data-state': 'booting', 'aria-hidden': 'true' }, chip);
-    el('b', { text: host.name }, chip);
-    const addresses = el('span', { class: 'host-addresses' }, chip);
-    const ready = el('span', { class: 'pill', text: 'Booting' }, chip);
-    const marks = el('span', { class: 'console-marks' }, chip);
-    const owner = el('span', { class: 'host-owner' }, chip);
-    const pin = el('button', { type: 'button', class: 'pin', 'aria-label': `${pinned.has(host.name) ? 'Unpin' : 'Pin'} ${host.name} ${pinned.has(host.name) ? 'from' : 'to'} the workspace`, title: 'Pin to the workspace', 'aria-pressed': String(pinned.has(host.name)) }, group);
-    icon(el, pin, 'pin');
-    pin.hidden = Boolean(customWorkspace && !sharedWorkspace);
-    chips.set(host.name, { chip, pin, owner });
-    cleanup.push(listen(chip, 'click', () => selectHost(host.name)));
-    cleanup.push(listen(pin, 'click', () => {
-      if (pinned.has(host.name)) pinned.delete(host.name); else pinned.add(host.name);
-      pin.setAttribute('aria-pressed', String(pinned.has(host.name)));
-      pin.setAttribute('aria-label', `${pinned.has(host.name) ? 'Unpin' : 'Pin'} ${host.name} ${pinned.has(host.name) ? 'from' : 'to'} the workspace`);
-      renderWorkspace();
-    }));
-    cleanup.push(services.state(host.status, ({ value }) => {
-      const state = value?.state || 'booting';
-      ready.textContent = READINESS[state] || 'Booting';
-      dot.dataset.state = state;
-      addresses.textContent = (value?.addresses || []).join(' · ');
-      marks.replaceChildren();
-      if (host.screen) icon(el, marks, 'screen', value?.screen ? 'Screen available' : 'No screen yet').classList.toggle('off', !value?.screen);
-      if (host.terminal) icon(el, marks, 'terminal', value?.terminal ? 'Terminal available' : 'No terminal yet').classList.toggle('off', !value?.terminal);
-    }, (error) => { ready.textContent = `Status unavailable: ${error.message}`; }));
-  }
-  const ownership = (name, text) => {
-    const entry = chips.get(name);
-    if (!entry) return;
-    entry.owner.textContent = text === 'Watching' ? '' : text;
-    entry.owner.dataset.owner = text === 'You have control' ? 'mine' : text === 'Watching' ? 'none' : 'other';
-  };
-  // Every viewer sees who holds each host's input, whether or not it shows
-  // the screen. `sessions` holds this tab's connected screen per host.
-  const sessions = new Map();
-  let leases = {};
-  const owners = () => {
-    for (const name of chips.keys()) {
-      const holder = leases?.[name]?.holder;
-      ownership(name, !holder ? 'Watching' : holder === sessions.get(name) ? 'You have control' : 'Another viewer has control');
-    }
-  };
-  cleanup.push(services.state('/api/state/leases', ({ value }) => { leases = value || {}; owners(); }, () => {
-    for (const name of chips.keys()) ownership(name, 'Input status unavailable');
-  }));
-
-  // The inspector.
-  services.labelState = page.panels.find((panel) => panel.kind === 'labels')?.state;
-  services.containmentState = page.panels.find((panel) => panel.kind === 'containment')?.state;
-  services.labelCommand = page.panels.find((panel) => panel.kind === 'labels')?.command;
-  const panels = page.panels.filter((panel) => panel.area === 'inspector');
-  panels.sort((a, b) => (ORDER.indexOf(a.kind) < 0 ? ORDER.length : ORDER.indexOf(a.kind)) - (ORDER.indexOf(b.kind) < 0 ? ORDER.length : ORDER.indexOf(b.kind)));
-  // A page can open on its own panel: it goes first and opens first, and the
-  // page's other own panels follow it in the order the page declared them.
-  if (panels.some((panel) => panel.id === page.inspector_first)) {
-    const own = (panel) => !ORDER.includes(panel.kind);
-    const rank = (panel) => (panel.id === page.inspector_first ? 0 : own(panel) ? 1 : 2);
+// The inspector: one tab per inspector panel, in the server's order, except
+// that a page can open on its own panel. Sets `services.showPanel`, and
+// returns `show(kind or id)`, `hide` and `reopen` for when the browser tab
+// is hidden and shown, and `dispose`.
+function inspector(root, services, page) {
+  const { $, el } = scoped(root);
+  const cleanup = [];
+  let stopPanel = () => {}, selected;
+  const panels = page.panels.filter((item) => item.area === 'inspector');
+  // A page's chosen panel goes first and opens first, and its other own
+  // panels follow it in the order the page declared them.
+  if (panels.some((item) => item.id === page.inspector_first)) {
+    const rank = (item) => (item.id === page.inspector_first ? 0 : STANDARD.includes(item.kind) ? 2 : 1);
     panels.sort((a, b) => rank(a) - rank(b));
   }
   const tabs = [];
-  const consoleOptions = (options, controls) => ({
-    ...options, controls,
-    status: page.hosts.find((host) => host.name === options.host)?.status,
-    onSession: (session) => {
-      if (session) sessions.set(options.host, session); else sessions.delete(options.host);
-      owners();
-    },
-  });
-  function panel(content, options, controls) {
-    try {
-      switch (options.kind) {
-        case 'screen': return screen(content, services, consoleOptions(options, controls));
-        case 'terminal': return terminal(content, services, consoleOptions(options, controls));
-        case 'packets': return packets(content, services, options);
-        case 'labels': return labels(content, services, options);
-        case 'containment': return containment(content, services, options);
-        case 'left_the_box': return leftTheBox(content, services, options);
-        case 'events': return events(content, services, options);
-        case 'map': return map(content, services, options);
-        case 'table': return table(content, services, options);
-        case 'event_table': return eventTable(content, services, options);
-        case 'control': return control(content, services, options);
-        case 'custom': return custom(content, services, options);
-        default: el('p', { class: 'empty-note', text: 'This panel is unavailable. Rebuild the demo.' }, content); return () => {};
-      }
-    } catch (error) {
-      content.replaceChildren(el('p', { class: 'empty-note', text: `Could not open ${options.title}: ${error.message}` }));
-      return () => {};
-    }
-  }
-  function activate(item, focus = false) {
+  function activate(item) {
     stopPanel();
-    selectedTab = item;
+    selected = item;
     for (const entry of tabs) {
       entry.button.setAttribute('aria-selected', String(entry === item));
       entry.button.tabIndex = entry === item ? 0 : -1;
     }
-    if (focus) item.button.focus();
     const content = $('inspector-content');
     content.replaceChildren();
     content.dataset.kind = item.options.kind;
     content.setAttribute('aria-labelledby', item.button.id);
-    stopPanel = panel(content, item.options);
+    stopPanel = panel(services, page, content, item.options);
   }
-  const tabList = $('tabs');
-  tabList.replaceChildren();
+  const list = $('tabs');
+  list.replaceChildren();
   for (const options of panels) {
-    const button = el('button', { id: `tab-${options.id}`, type: 'button', role: 'tab', 'aria-controls': 'inspector-content', 'aria-selected': 'false', text: options.title }, tabList);
+    const button = el('button', { id: `tab-${options.id}`, type: 'button', role: 'tab', 'aria-controls': 'inspector-content', 'aria-selected': 'false', text: options.title }, list);
     button.tabIndex = -1;
     const item = { button, options };
     tabs.push(item);
@@ -303,54 +231,64 @@ export async function mount(root, transport, theme) {
   }
   // A panel kind, or a panel id for the panels that share a kind, such as custom ones.
   const tabOf = (name) => tabs.find((tab) => tab.options.kind === name) || tabs.find((tab) => tab.options.id === name);
-  services.showPanel = (name) => { const item = tabOf(name); if (item) activate(item); };
-  services.openPackets = (id) => {
-    services.selection.set({ links: [id] });
-    const item = tabOf('packets'); if (item) activate(item);
+  const show = (name) => { const item = tabOf(name); if (item) activate(item); };
+  services.showPanel = show;
+  if (tabs.length) activate(tabs[0]);
+  else $('inspector-content').replaceChildren(el('p', { class: 'empty-note', text: 'This demo declares no inspector panels.' }));
+  return {
+    show,
+    hide() { stopPanel(); stopPanel = () => {}; },
+    reopen() { if (selected) activate(selected); },
+    dispose() { stopPanel(); cleanup.forEach((remove) => remove()); },
   };
-  services.openLinks = (_from, _to, members) => {
-    services.selection.set({ links: members.map(({ e }) => e.id) });
-    const item = tabOf('packets'); if (item) activate(item);
-  };
-  services.showPackets = (pair) => {
-    services.packetPair.set(pair);
-    const item = tabOf('packets'); if (item) activate(item);
-  };
+}
 
-  // The workspace: the pinned hosts, or the selected one, each in a tile.
-  function renderWorkspace(focusHost) {
-    if (!page || document.hidden) return;
-    const workspace = $('workspace');
-    if (customWorkspace && !workspaceMounted) {
-      workspace.replaceChildren();
-      const content = el('section', { class: 'custom-workspace' }, workspace);
-      const off = panel(content, customWorkspace);
-      workspaceMounted = true;
-      stopWorkspace = () => { off(); content.remove(); workspaceMounted = false; };
+// The workspace: the pinned hosts, or the selected one, each in a tile with
+// its screen or terminal; or the page's own workspace panel.
+function workspace(root, services, page) {
+  const { $, el } = scoped(root);
+  const document = root.ownerDocument;
+  const tiles = new Map(), pinned = new Set(), modes = new Map();
+  const custom = page.panels.find((item) => item.area === 'workspace' && item.kind === 'custom');
+  const shared = Boolean(custom && page.panels.some((item) => item.area === 'workspace' && ['screen', 'terminal'].includes(item.kind)));
+  let stopCustom = () => {}, customMounted = false;
+  for (const host of page.hosts) if (host.pinned && !custom) pinned.add(host.name);
+  $('workspace').classList.toggle('shared-workspace', shared);
+  $('workbench').classList.toggle('shared-workbench', shared);
+  const stopDivider = divider($('divider'), $('workbench'), page.title, shared ? 68 : DEFAULT_SPLIT);
+  function render(focusHost) {
+    if (document.hidden) return;
+    const area = $('workspace');
+    if (custom && !customMounted) {
+      area.replaceChildren();
+      const content = el('section', { class: 'custom-workspace' }, area);
+      const off = panel(services, page, content, custom);
+      customMounted = true;
+      stopCustom = () => { off(); content.remove(); customMounted = false; };
     }
-    if (customWorkspace && !sharedWorkspace) return;
+    if (custom && !shared) return;
     const names = pinned.size ? [...pinned] : [services.selection.get().host || page.hosts[0]?.name].filter(Boolean);
     // The shared layout gives each console its own row above the inspector.
     $('workbench').style.setProperty('--console-count', String(Math.max(names.length, 1)));
     for (const [name, tile] of tiles) {
       if (!names.includes(name) || tile.mode !== modes.get(name)) { tile.dispose(); tile.root.remove(); tiles.delete(name); }
     }
-    if (!names.length && !customWorkspace) {
-      workspace.replaceChildren(el('div', { class: 'notice' }, null));
-      const card = el('div', { class: 'card' }, workspace.firstChild);
+    if (!names.length && !custom) {
+      area.replaceChildren(el('div', { class: 'notice' }, null));
+      const card = el('div', { class: 'card' }, area.firstChild);
       el('h2', { text: 'No hosts' }, card);
       el('p', { text: 'This demo declares no hosts. Its panels are in the inspector.' }, card);
       return;
     }
-    if (!tiles.size && !customWorkspace) workspace.replaceChildren();
+    if (!tiles.size && !custom) area.replaceChildren();
     for (const name of names) {
       const host = page.hosts.find((item) => item.name === name);
       const offered = ['screen', 'terminal'].filter((kind) => host[kind]);
       if (!modes.has(name) || !offered.includes(modes.get(name))) modes.set(name, offered[0] || 'screen');
       if (tiles.has(name)) continue;
       const mode = modes.get(name);
-      const tile = el('section', { class: 'workspace-tile', 'aria-label': name }, workspace);
-      if (sharedWorkspace && mode === 'screen') tile.style.alignSelf = 'start';
+      const tile = el('section', { class: 'workspace-tile', 'aria-label': name }, area);
+      if (shared && mode === 'screen') tile.style.alignSelf = 'start';
       const header = el('header', {}, tile);
       el('h2', { text: name }, header);
       const removers = [];
@@ -358,7 +296,7 @@ export async function mount(root, transport, theme) {
         const group = el('div', { class: 'segmented', role: 'group', 'aria-label': `${name} console` }, header);
         for (const kind of offered) {
           const button = el('button', { type: 'button', 'aria-pressed': String(kind === mode), text: kind === 'screen' ? 'Screen' : 'Terminal' }, group);
-          removers.push(listen(button, 'click', () => { if (modes.get(name) !== kind) { modes.set(name, kind); renderWorkspace(kind === 'terminal' ? name : undefined); } }));
+          removers.push(listen(button, 'click', () => { if (modes.get(name) !== kind) { modes.set(name, kind); render(kind === 'terminal' ? name : undefined); } }));
         }
       }
       el('span', { class: 'grow' }, header);
@@ -367,71 +305,123 @@ export async function mount(root, transport, theme) {
       let off = () => {};
       if (offered.includes(mode)) {
         const options = page.panels.find((item) => item.kind === mode && item.host === name) || { kind: mode, host: name, title: name };
-        off = panel(content, { ...options, focus: name === focusHost }, controls);
+        off = panel(services, page, content, { ...options, focus: name === focusHost }, controls);
       } else {
         const card = el('div', { class: 'console-card' }, el('div', { class: 'console-stage' }, content));
         el('p', { text: `${name} offers no screen or terminal.` }, card);
       }
       tiles.set(name, { root: tile, mode, dispose() { removers.forEach((remove) => remove()); off(); } });
     }
-    workspace.dataset.tiles = String(names.length);
+    area.dataset.tiles = String(names.length);
   }
+  function hide() {
+    stopCustom(); stopCustom = () => {};
+    tiles.forEach((tile) => { tile.dispose(); tile.root.remove(); });
+    tiles.clear();
+  }
+  return {
+    render, hide,
+    // Pins are hidden when the page's own panel has the workspace to itself.
+    pinnable: !custom || shared,
+    pinned: (name) => pinned.has(name),
+    togglePin(name) { if (pinned.has(name)) pinned.delete(name); else pinned.add(name); render(); },
+    dispose() { hide(); stopDivider(); },
+  };
+}
 
-  cleanup.push(listen($('clear-scope'), 'click', () => selectHost(null)));
+// The host bar: a chip per host with its readiness, addresses, consoles and
+// who holds its input, and a pin that keeps it in the workspace.
+function hostBar(root, services, page, area) {
+  const { $, el } = scoped(root);
+  const cleanup = [];
+  const selectHost = (host) => services.selection.set({ host, node: null, links: [], event: null, connection: null, request: null });
+  const bar = $('host-bar');
+  bar.replaceChildren();
+  const all = el('button', { type: 'button', class: 'host-chip all', 'aria-pressed': 'true', text: 'All hosts' }, bar);
+  cleanup.push(listen(all, 'click', () => selectHost(null)));
+  const chips = new Map();
+  for (const host of page.hosts) {
+    const group = el('div', { class: 'host-group' }, bar);
+    const chip = el('button', { type: 'button', class: 'host-chip', 'aria-pressed': 'false' }, group);
+    const dot = el('i', { class: 'readiness', 'data-state': 'booting', 'aria-hidden': 'true' }, chip);
+    el('b', { text: host.name }, chip);
+    const addresses = el('span', { class: 'host-addresses' }, chip);
+    const ready = el('span', { class: 'pill', text: 'Booting' }, chip);
+    const marks = el('span', { class: 'console-marks' }, chip);
+    const owner = el('span', { class: 'host-owner' }, chip);
+    const label = () => `${area.pinned(host.name) ? 'Unpin' : 'Pin'} ${host.name} ${area.pinned(host.name) ? 'from' : 'to'} the workspace`;
+    const pin = el('button', { type: 'button', class: 'pin', 'aria-label': label(), title: 'Pin to the workspace', 'aria-pressed': String(area.pinned(host.name)) }, group);
+    icon(el, pin, 'pin');
+    pin.hidden = !area.pinnable;
+    chips.set(host.name, chip);
+    cleanup.push(listen(chip, 'click', () => selectHost(host.name)));
+    cleanup.push(listen(pin, 'click', () => {
+      area.togglePin(host.name);
+      pin.setAttribute('aria-pressed', String(area.pinned(host.name)));
+      pin.setAttribute('aria-label', label());
+    }));
+    cleanup.push(services.state(host.status, ({ value }) => {
+      const state = value?.state || 'booting';
+      ready.textContent = READINESS[state] || 'Booting';
+      dot.dataset.state = state;
+      addresses.textContent = (value?.addresses || []).join(' · ');
+      marks.replaceChildren();
+      if (host.screen) icon(el, marks, 'screen', value?.screen ? 'Screen available' : 'No screen yet').classList.toggle('off', !value?.screen);
+      if (host.terminal) icon(el, marks, 'terminal', value?.terminal ? 'Terminal available' : 'No terminal yet').classList.toggle('off', !value?.terminal);
+    }, (error) => { ready.textContent = `Status unavailable: ${error.message}`; }));
+    // Every viewer sees who holds each host's input, whether or not it
+    // shows the screen.
+    cleanup.push(services.input.subscribe(host.name, ({ owner: who, text }) => {
+      owner.textContent = text;
+      owner.dataset.owner = who;
+    }));
+  }
   cleanup.push(services.selection.subscribe(({ host }) => {
     all.setAttribute('aria-pressed', String(!host));
-    for (const [name, { chip }] of chips) chip.setAttribute('aria-pressed', String(name === host));
-    $('scope-text').textContent = host ? `Showing ${host}` : 'Showing all hosts';
-    $('clear-scope').hidden = !host;
-    renderWorkspace();
+    for (const [name, chip] of chips) chip.setAttribute('aria-pressed', String(name === host));
   }));
-  cleanup.push(listen(document, 'visibilitychange', () => {
-    if (document.hidden) {
-      stopPanel(); stopPanel = () => {};
-      stopWorkspace(); stopWorkspace = () => {};
-      tiles.forEach((tile) => { tile.dispose(); tile.root.remove(); });
-      tiles.clear();
-    } else {
-      renderWorkspace();
-      if (selectedTab) activate(selectedTab);
-    }
-  }));
-  if (tabs.length) activate(tabs[0]);
-  else $('inspector-content').replaceChildren(el('p', { class: 'empty-note', text: 'This demo declares no inspector panels.' }));
+  return () => cleanup.forEach((remove) => remove());
+}
 
-  // The run status and clock, from the shared watch. A tab opened late shows
-  // the run time as soon as the snapshot comes, not at the next tick.
+// The run status and clock, from the graph's watch. A tab opened late shows
+// the run time as soon as the snapshot comes, not at the next tick.
+function runClock(root, services) {
+  const { $ } = scoped(root);
   const clock = services.clock;
   const tick = () => { $('run-clock').textContent = format.fmtDuration(services.runTime()); };
   const status = (state, text) => { $('run-status').dataset.state = state; $('page-status').textContent = text; services.run.set(state); tick(); };
-  watch = services.watch();
-  const on = (name, callback) => cleanup.push(listen(watch, name, (event) => callback(event.data ? JSON.parse(event.data) : null)));
-  on('waiting', () => status('connecting', 'Waiting for the world'));
-  on('snapshot', (value) => { Object.assign(clock, { t: value.t, at: performance.now(), ended: value.ended }); status(value.ended ? 'stopped' : 'running', value.ended ? 'Stopped' : 'Running'); });
-  on('counters', (value) => { clock.t = value.t; clock.at = performance.now(); });
-  on('ended', (value) => { Object.assign(clock, { t: value.t, at: performance.now(), ended: true }); status('stopped', 'Stopped'); });
-  on('end', () => { clock.t = services.runTime(); clock.ended = true; status('stopped', 'Stopped'); });
-  on('error', () => { if (!clock.ended) status('connecting', 'Reconnecting'); });
-  on('open', () => { if ($('run-status').dataset.state === 'connecting' && !clock.ended) status('running', 'Running'); });
-  on('world_error', (value) => status('stopped', value.error));
+  const stop = services.graph.subscribe((name, value) => {
+    if (name === 'waiting') status('connecting', 'Waiting for the world');
+    if (name === 'snapshot') { Object.assign(clock, { t: value.t, at: performance.now(), ended: value.ended }); status(value.ended ? 'stopped' : 'running', value.ended ? 'Stopped' : 'Running'); }
+    if (name === 'counters') { clock.t = value.t; clock.at = performance.now(); }
+    if (name === 'ended') { Object.assign(clock, { t: value.t, at: performance.now(), ended: true }); status('stopped', 'Stopped'); }
+    if (name === 'end') { clock.t = services.runTime(); clock.ended = true; status('stopped', 'Stopped'); }
+    if (name === 'error' && !clock.ended) status('connecting', 'Reconnecting');
+    if (name === 'open' && $('run-status').dataset.state === 'connecting' && !clock.ended) status('running', 'Running');
+    if (name === 'world_error') status('stopped', value.error);
+  });
   tick();
-  clockTimer = setInterval(tick, 1000);
+  const timer = setInterval(tick, 1000);
+  return () => { clearInterval(timer); stop(); };
+}
 
-  // Story moments: the newest one the world marked is the banner.
+// Story moments: the newest one the world marked is the banner.
+function moments(root, services, page, panels, signal) {
+  const { $ } = scoped(root);
+  const document = root.ownerDocument;
   const seen = new Set(), cursors = new Map();
-  let latest = -1, bannerEvent;
-  cleanup.push(listen($('moment-banner'), 'click', () => {
+  let latest = -1, bannerEvent, timer, stopped = false;
+  const stopBanner = listen($('moment-banner'), 'click', () => {
     if (!bannerEvent) return;
-    const host = page.hosts.find((item) => item.sandbox === bannerEvent.sandbox?.name)?.name || null;
-    services.selection.set({ host, event: bannerEvent, node: bannerEvent.node || null, connection: bannerEvent.conn ?? null, request: bannerEvent.fields?.request_id ?? null, links: [] });
-    const item = tabOf('events'); if (item) activate(item);
-  }));
-  async function readMoments() {
+    services.selection.set({ host: services.hostOf(bannerEvent.sandbox?.name), event: bannerEvent, node: bannerEvent.node || null, connection: bannerEvent.conn ?? null, request: bannerEvent.fields?.request_id ?? null, links: [] });
+    panels.show('events');
+  });
+  async function read() {
     for (const moment of page.moments || []) {
-      if (disposed) return;
+      if (stopped) return;
       try {
-        const reply = await transport.get(moment.events, { after: cursors.get(moment.id) || 0 }, controller.signal);
-        if (disposed) return;
+        const reply = await services.transport.get(moment.events, { after: cursors.get(moment.id) || 0 }, signal);
+        if (stopped) return;
         $('moment-status').textContent = '';
         cursors.set(moment.id, reply.next);
         for (const event of reply.rows) services.markMoment(event);
@@ -448,12 +438,73 @@ export async function mount(root, transport, theme) {
       } catch (error) {
         // A stopped run's page server is gone; the moments already shown stay.
         if (services.stopped()) return;
-        if (!disposed) $('moment-status').textContent = `Could not read moments: ${error.message}`;
+        if (!stopped) $('moment-status').textContent = `Could not read moments: ${error.message}`;
       }
     }
-    if (!disposed && page.moments?.length) momentTimer = setTimeout(readMoments, document.hidden ? 5000 : 1000);
+    if (!stopped && page.moments?.length) timer = setTimeout(read, document.hidden ? 5000 : 1000);
   }
-  void readMoments();
+  void read();
+  return () => { stopped = true; clearTimeout(timer); stopBanner(); };
+}
+
+// `importModule`, when given, replaces how the page loads modules (see
+// createServices).
+export async function mount(root, transport, theme, importModule) {
+  const { $ } = scoped(root);
+  const document = root.ownerDocument;
+  const services = createServices(transport, theme, importModule);
+  const controller = new AbortController();
+  const cleanup = [];
+  let disposed = false;
+  const stop = () => {
+    if (disposed) return;
+    disposed = true;
+    controller.abort();
+    cleanup.reverse().forEach((remove) => remove());
+    services.dispose();
+    transport.close();
+    theme.dispose();
+  };
+  cleanup.push(listen(globalThis.window, 'pagehide', stop, { once: true }));
+  cleanup.push(listen($('notice-action'), 'click', () => globalThis.location?.reload()));
+
+  let page;
+  try {
+    page = await transport.get('/api/page', {}, controller.signal);
+  } catch (error) {
+    if (!disposed && root.dataset.state !== 'notice') {
+      if (error.status === 401 || error.status === 403 || /authorization|closed/i.test(error.message)) showNotice(root, 'Not signed in', SIGN_IN);
+      else showNotice(root, 'Could not open the demo', `${error.message}.`, true);
+    }
+    return stop;
+  }
+  if (disposed) return stop;
+  root.dataset.state = 'ready';
+  services.hosts = page.hosts;
+  services.consoleAddresses = page.console_addresses || [];
+  services.labelState = page.panels.find((item) => item.kind === 'labels')?.state;
+  services.labelCommand = page.panels.find((item) => item.kind === 'labels')?.command;
+  services.containmentState = page.panels.find((item) => item.kind === 'containment')?.state;
+  document.title = `${page.title} · Fictionet`;
+  $('page-title').textContent = page.title;
+
+  const area = workspace(root, services, page);
+  cleanup.push(area.dispose);
+  cleanup.push(hostBar(root, services, page, area));
+  cleanup.push(listen($('clear-scope'), 'click', () => services.selection.set({ host: null, node: null, links: [], event: null, connection: null, request: null })));
+  cleanup.push(services.selection.subscribe(({ host }) => {
+    $('scope-text').textContent = host ? `Showing ${host}` : 'Showing all hosts';
+    $('clear-scope').hidden = !host;
+    area.render();
+  }));
+  const panels = inspector(root, services, page);
+  cleanup.push(panels.dispose);
+  // A hidden tab keeps no panel or console open.
+  cleanup.push(listen(document, 'visibilitychange', () => {
+    if (document.hidden) { panels.hide(); area.hide(); } else { area.render(); panels.reopen(); }
+  }));
+  cleanup.push(runClock(root, services));
+  cleanup.push(moments(root, services, page, panels, controller.signal));
   return stop;
 }
 
@@ -473,7 +524,7 @@ function showNotice(root, title, text, action = false) {
 if (typeof document !== 'undefined' && document.querySelector?.('#demo')) {
   const root = document.querySelector('#demo');
   const transport = createTransport({
-    setStatus: (kind, text) => { if (kind === 'ended' && text?.startsWith('Not signed in')) showNotice(root, 'Not signed in', SIGNED_OUT); },
-  }, { signedOutMessage: `Not signed in. ${SIGNED_OUT}` });
+    setStatus: (kind) => { if (kind === 'ended') showNotice(root, 'Not signed in', SIGN_IN); },
+  });
   void mount(root, transport, createTheme(root.querySelector('#theme')));
 }

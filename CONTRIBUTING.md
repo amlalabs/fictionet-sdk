@@ -140,7 +140,6 @@ commands. `cargo xtask --help` lists them.
 | `cargo xtask copy-check` | Copies `src/stdlib` and the companion's conversation, HTTP/2, protocol and TLS capture adapters into a separate crate. Builds with no SDK features and all SDK features, each with and without `decode`. |
 | `cargo xtask fuzz [--check \| <target> \| <seconds>]` | Runs the fuzz targets ([fuzz/README.md](fuzz/README.md)). |
 | `cargo xtask h2spec [section]` | Runs the h2spec conformance suite against the native HTTP/2 server, over TLS and h2c. |
-| `cargo xtask scan [output directory]` | Records the scan example's dashboard. |
 
 A change to `fictionet attach` or to how a world is reached should also pass
 `cargo xtask docker`, and a change to the Helm chart `cargo xtask k8s`.

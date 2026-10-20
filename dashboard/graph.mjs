@@ -1,14 +1,14 @@
-// The Fictionet dashboard's graph view: what is drawn for the state
+// The map's graph view: what is drawn for the state
 // (`derive`), the SVG of each drawn item, edge and open group's frame, the
 // rings that mark events, and the packets that move along the edges.
-// app.mjs passes in the state and view, the layout's edge paths and
+// components/map.mjs passes in the state and view, the layout's edge paths and
 // frames, and the selection, drag, tooltip and packet steps the drawing
 // hooks up, and calls `draw` once a frame.
 
 import { FictionetGroups } from './groups.mjs';
 import { HEAD } from './layout.mjs';
 
-export function createGraph({ $, el, hostOverview = false, state, view, reducedMotion, isGroup, where, fmtCount, edgePath, frameRects, itemsInFrame, hookItem, select, toggleGroup, showTip, moveTip, hideTip, startDrag, currentDrag, clickSuppressed, nodeTip, groupTip, edgeTip, openPackets }) {
+export function createGraph({ $, el, state, view, reducedMotion, isGroup, where, fmtCount, edgePath, frameRects, itemsInFrame, hookItem, select, toggleGroup, showTip, moveTip, hideTip, startDrag, currentDrag, clickSuppressed, nodeTip, groupTip, edgeTip, openPackets }) {
   /// The class that colors an event: `bad` for drops, lost routes and
   /// alarms, `good` for kept TLS keys.
   function tone(n) {
@@ -112,7 +112,8 @@ export function createGraph({ $, el, hostOverview = false, state, view, reducedM
     const info = view.info.get(gid);
     if (!info) return false;
     if (state.expanded.has(info.key)) return state.expanded.get(info.key);
-    if (hostOverview && [...state.hosts.values()].some((host) => host.group === gid)) return false;
+    // A host's group starts closed, so the map shows the hosts.
+    if ([...state.hosts.values()].some((host) => host.group === gid)) return false;
     return G.openByDefault(info);
   }
 
@@ -382,15 +383,14 @@ export function createGraph({ $, el, hostOverview = false, state, view, reducedM
   }
 
   // ---------------------------------------------------------------------------
-  // The frame loop (app.mjs runs it): items glide to their places, edges
+  // The frame loop (components/map.mjs runs it): items glide to their places, edges
   // follow, packets move.
 
   let dotCount = 0;
   const MAX_DOTS = 450;
   const DOT_SPEED = 240; // px per second
 
-  /// Moves the drawing on by `dt` seconds, and returns the packets a second
-  /// to and from the sandboxes.
+  /// Moves the drawing on by `dt` seconds.
   function draw(dt) {
     const ease = reducedMotion.matches ? 1 : 1 - Math.exp(-dt * 7);
     const moved = new Set();
@@ -422,7 +422,6 @@ export function createGraph({ $, el, hostOverview = false, state, view, reducedM
       }
     }
     updateFrames();
-    let total = 0;
     for (const d of view.dedges.values()) {
       if (!d.g) drawEdge(d);
       const a = view.items.get(d.a);
@@ -452,13 +451,6 @@ export function createGraph({ $, el, hostOverview = false, state, view, reducedM
       d.g.classList.toggle('live', pps > 0.5);
       if (!reducedMotion.matches) moveDots(d, dt);
     }
-    for (const e of state.edges.values()) {
-      if (state.nodes.get(e.b)?.kind === 'sandbox') {
-        const r = liveRate(e);
-        total += r[0] + r[1];
-      }
-    }
-    return total;
   }
 
   function moveDots(d, dt) {

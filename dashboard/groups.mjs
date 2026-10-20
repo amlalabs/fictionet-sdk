@@ -1,7 +1,7 @@
-// Groups in the Fictionet dashboard: which tasks a closed group stands for,
+// Groups on the page's map: which tasks a closed group stands for,
 // and which drawn edges stand for which links. Plain functions over the
 // graph as the observe API sends it, with no drawing, so they can be
-// tested on their own (groups.test.mjs). app.mjs draws what they work out.
+// tested on their own (groups.test.mjs). components/map.mjs draws what they work out.
 'use strict';
 
 const FictionetGroups = (() => {
@@ -17,7 +17,7 @@ const FictionetGroups = (() => {
     return out;
   }
 
-  /// The group `gid` is inside, if the dashboard knows it.
+  /// The group `gid` is inside, if the page knows it.
   function parentOf(groups, gid) {
     const p = groups.get(gid)?.parent;
     return p && groups.has(p) ? p : null;

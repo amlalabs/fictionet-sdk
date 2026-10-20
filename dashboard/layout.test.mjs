@@ -17,7 +17,7 @@ const sandbox = (id, name) => ({ id, kind: 'sandbox', name, x: NaN, y: NaN, edge
 const task = (id, name, line) => ({ id, kind: 'task', name, file: 'main.rs', line, x: NaN, y: NaN, edges2: new Set() });
 
 /// A layout over drawn `items`, `edges` between them and open `groups`,
-/// as `derive` in app.mjs leaves the view. `contOf` gives the open group
+/// as `derive` in components/map.mjs leaves the view. `contOf` gives the open group
 /// each item sits in.
 function world({ items, edges = [], groups = [], contOf = {}, pins = {} }) {
   const state = {

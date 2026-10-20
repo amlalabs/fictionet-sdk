@@ -50,7 +50,6 @@ impl Topics {
         Self {
             searches: StateTopic::new(StateLimits {
                 max_bytes: search::MAX_SNAPSHOT_BYTES,
-                deltas: 0,
             }),
             policy: StateTopic::new(StateLimits::default()),
             commands: CommandPort::new(CommandLimits::default()),

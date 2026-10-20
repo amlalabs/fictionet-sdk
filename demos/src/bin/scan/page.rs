@@ -276,13 +276,9 @@ impl Topics {
         Self {
             ports: StateTopic::new(StateLimits {
                 max_bytes: PortMap::MAX_JSON_BYTES,
-                deltas: 16,
             }),
             story: StateTopic::new(StateLimits::default()),
-            reports: StateTopic::new(StateLimits {
-                max_bytes: 1 << 20,
-                deltas: 0,
-            }),
+            reports: StateTopic::new(StateLimits { max_bytes: 1 << 20 }),
         }
     }
 
@@ -339,22 +335,18 @@ pub fn all_answered(map: &PortMap) -> bool {
 /// Starts the world task that publishes the topics and marks the moment.
 pub fn publish(cx: &Cx, ports: Ports, topics: Topics, progress: Progress) {
     cx.spawn(move |cx| async move {
-        let mut published: Option<(u64, u64, u64)> = None;
+        let mut published: Option<PortMap> = None;
         let mut version = 0;
         let mut discovered = false;
         loop {
-            let latest = ports.changes_since(u64::MAX);
-            let marks = (latest.revision, latest.untracked, latest.untracked_banners);
-            if published != Some(marks) {
-                let from = published.map(|(revision, ..)| revision);
-                let (map, changes) = ports.snapshot_with_changes(from.unwrap_or(0));
+            if published
+                .as_ref()
+                .is_none_or(|map| ports.changed_since(map))
+            {
+                let map = ports.snapshot();
                 // A refused publication sets the topic's too_large status,
                 // which the panels show; the previous map stays.
-                let _ = match from {
-                    None => topics.ports.publish(cx.now(), &map),
-                    Some(_) => topics.ports.publish_with_delta(cx.now(), &map, &changes),
-                };
-                published = Some((map.revision, map.untracked, map.untracked_banners));
+                let _ = topics.ports.publish(cx.now(), &map);
                 if !discovered && all_answered(&map) {
                     discovered = true;
                     let hosts: Vec<Value> = map
@@ -370,6 +362,7 @@ pub fn publish(cx: &Cx, ports: Ports, topics: Topics, progress: Progress) {
                             .field("at_ms", at_ms)
                     });
                 }
+                published = Some(map);
             }
             if let Some((next, story, reports)) = progress.changed(version) {
                 let _ = topics.story.publish(cx.now(), &story);
@@ -543,7 +536,7 @@ pub mod tests {
     }
 
     #[test]
-    fn the_world_task_publishes_the_map_with_deltas_each_report_and_the_moment() {
+    fn the_world_task_publishes_the_map_each_report_and_the_moment() {
         use crate::client::{Scanner, serve_server};
         use fictionet_demo::kit::client::PageClient;
         use fictionet_observe::page::Host;
@@ -641,19 +634,15 @@ pub mod tests {
                 "{summary}"
             );
             assert_eq!(published.ports.banners.len(), 11);
-            let (name, event) =
-                stream_event(server.url(), "ports", topics.ports.revision() - 1).await;
-            assert_eq!(name, "delta");
-            let delta: scan_world::PortChanges =
-                serde_json::from_value(event["delta"].clone()).unwrap();
-            assert_eq!(delta.revision, published.ports.revision);
-            assert!(delta.from_revision < delta.revision);
-            for row in &delta.rows {
-                assert!(row.revision > delta.from_revision);
-                assert!(published.ports.rows.contains(row));
+            // A reader behind the topic gets the latest map.
+            for cursor in [0, topics.ports.revision() - 1] {
+                let (name, event) = stream_event(server.url(), "ports", cursor).await;
+                assert_eq!(name, "snapshot");
+                let map: scan_world::PortMap =
+                    serde_json::from_value(event["value"].clone()).unwrap();
+                assert_eq!(map.revision, published.ports.revision);
+                assert_eq!(map.rows, published.ports.rows);
             }
-            let (name, _) = stream_event(server.url(), "ports", 0).await;
-            assert_eq!(name, "snapshot");
         });
     }
 }

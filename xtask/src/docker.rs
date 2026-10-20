@@ -7,7 +7,6 @@ mod web;
 
 pub struct Compose {
     file: String,
-    project: Option<String>,
     env: Vec<(String, String)>,
 }
 
@@ -15,15 +14,10 @@ impl Compose {
     pub fn new(file: &str) -> Self {
         Self {
             file: file.into(),
-            project: None,
             env: Vec::new(),
         }
     }
 
-    pub fn project(mut self, project: &str) -> Self {
-        self.project = Some(project.into());
-        self
-    }
     pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.into(), value.into()));
         self
@@ -31,9 +25,6 @@ impl Compose {
 
     pub fn command(&self, args: &[&str]) -> Command {
         let mut command = cmd("docker", &["compose", "-f", &self.file]);
-        if let Some(project) = &self.project {
-            command.args(["-p", project]);
-        }
         command
             .envs(self.env.iter().map(|(key, value)| (key, value)))
             .args(args);

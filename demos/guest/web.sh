@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # The web demo, run inside the VM by cargo xtask demo web. A world of websites, and a
-# sandbox that reaches it through a tun device, with ordinary tools.
+# sandbox that reaches it through a tun device, with ordinary tools. Then
+# `fictionet observe` reads what the world saw from its observation socket.
 # needs: sdk
 . "$(dirname "$0")/lib.sh"
 . "$(dirname "$0")/web_setup.sh"
 
-cleanup() { cleanup_web; }
+cleanup() {
+    cleanup_web
+    rm -f /run/watch.jsonl
+}
 trap cleanup EXIT
 cleanup
 
@@ -13,7 +17,8 @@ step "Start the world"
 note "The world is the web_world example: an ordinary Rust program built on web::Sites."
 note "It serves example.test over HTTPS with a CA it makes at start, plain.test over HTTP,"
 note "and www.example.test, shared.test, v4only.test and v6only.test. Other names fail."
-start_web
+note "Its third path opens a private observation socket, for the last step."
+start_web /run/fictionet/observation.sock
 
 step "Make the sandbox and attach it"
 note "The sandbox is a network namespace named agent. fictionet attach puts a tun device"
@@ -56,6 +61,19 @@ expect_fail 6 'Could not resolve host' 'curl -sS -m 5 https://example.com/'
 expect_fail 7 "Could(n't| not) connect" 'curl -sS -m 5 http://1.1.1.1/'
 note "The VM itself has the internet (it pulled this demo's packages), but the sandbox only"
 note "ever reaches the world."
+
+step "What the world saw: fictionet observe"
+note "web_world serves its collector on /run/fictionet/observation.sock with fictionet_observe."
+note "fictionet observe reads it from a shell: the world, then its graph."
+vm "fictionet observe --observation unix:/run/fictionet/observation.sock world"
+vm "fictionet observe --observation unix:/run/fictionet/observation.sock graph | jq -c '{tasks: [.nodes[] | select(.kind != \"sandbox\")] | length, sandboxes: [.nodes[] | select(.kind == \"sandbox\") | .name], links: (.edges | length)}'"
+note "The collector retains events before any client connects. watch 0 replays them, then"
+note "follows new ones. The requests above are among them. Here are the first four:"
+vm "s=0
+timeout 4 fictionet observe --observation unix:/run/fictionet/observation.sock watch 0 >/run/watch.jsonl || s=\$?
+[[ \$s -eq 0 || \$s -eq 124 ]] || exit \"\$s\"
+jq -es 'map(select(.event == \"event\" and .data.source == \"http\")) | length > 0' /run/watch.jsonl >/dev/null
+jq -c 'select(.event == \"event\") | .data | {source, kind, summary}' /run/watch.jsonl | sed -n 1,4p"
 
 step "Clean up"
 note "Stopping attach and the world, and deleting the namespace."

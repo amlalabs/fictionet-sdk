@@ -36,7 +36,7 @@
 //! fictionet observe --observation unix:/run/fictionet/observation.sock watch
 //! ```
 //!
-//! For browser access and capture limits, see [`fictionet_observe`].
+//! For the shell commands and capture limits, see [`fictionet_observe`].
 //!
 //! The sites themselves are in `example_common::web_world`, which the web
 //! test's fixture in `tests/web_fixture` shares to add bulk transfers and a

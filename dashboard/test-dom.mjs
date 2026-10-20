@@ -100,3 +100,29 @@ export function createDocument() {
   document.append(document.documentElement);
   return document;
 }
+
+// Replaces the global setTimeout and clearTimeout until test `t` ends, and
+// returns its pending timers by id, each `{ callback, delay }`. Calls for
+// the same test share the map.
+const timersOf = new WeakMap();
+export function fakeTimers(t) {
+  if (timersOf.has(t)) return timersOf.get(t);
+  const timers = new Map();
+  timersOf.set(t, timers);
+  t.mock.method(globalThis, 'setTimeout', (callback, delay) => { const id = Symbol(); timers.set(id, { callback, delay }); return id; });
+  t.mock.method(globalThis, 'clearTimeout', (id) => { timers.delete(id); });
+  return timers;
+}
+
+// Counts the live subscriptions to `store`, such as the graph model or the
+// selection, by wrapping its `subscribe`. A panel outlived by a store must
+// let go of it when disposed: returns a function that gives the count.
+export function liveSubscriptions(store) {
+  const live = new Set(), subscribe = store.subscribe;
+  store.subscribe = (...args) => {
+    const token = {}, off = subscribe(...args);
+    live.add(token);
+    return () => { live.delete(token); off(); };
+  };
+  return () => live.size;
+}

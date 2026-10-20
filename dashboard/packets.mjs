@@ -1,12 +1,15 @@
-// The packet drawer: its stream, queue, selection, detail and hex view.
-// The caller passes DOM helpers, graph links, labels and orientation, and a fit callback.
+// The packet list: its stream, queue, selection, detail and hex view.
+// components/packets.mjs passes in DOM helpers, the transport's packet calls,
+// labels and orientation.
 import { labelChips, flowMatches } from './components/labels.mjs';
 import { listen } from './dom.mjs';
 
+// What the detail pane says until a packet is selected.
+const PICK = 'Select a packet to see its layers.';
+
 export function createPackets({
-  $, el, packetStream, packet, download, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000,
-  placeholder = (many) => (many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.'),
-  pcapLabel = 'Capture for Wireshark', onDetail = () => {}, stopped = () => null,
+  $, el, packetStream, packet, download, fmtCount, maxRows = 3000,
+  onDetail = () => {}, stopped = () => null,
   // A table with a Host column gives every row that cell, so gap rows span
   // all nine columns whichever are hidden.
   hostColumn = false,
@@ -14,18 +17,14 @@ export function createPackets({
   // the page's own screen and terminal traffic, hidden until shown.
   consoleAddresses = [],
 }) {
-  // ---------------------------------------------------------------------------
-  // The packet drawer
-
   const cleanup = [];
   const streamCleanup = [];
   const on = (...args) => cleanup.push(listen(...args));
-  let stopDrag = () => {};
   const drawer = $('drawer');
   const document = drawer.ownerDocument || globalThis.document;
   const prows = $('prows');
   const plist = $('plist');
-  // What the drawer watches: { links: [{ id, flip }], source, paused, held,
+  // What the list watches: { links: [{ id, flip }], source, paused, held,
   // queue, lastTime, done, skipped, evicted, missed, rows }; done holds links that
   // ended. A packet's side is turned to the drawn edge's:
   // 0 from its first end, 1 from its second.
@@ -69,28 +68,9 @@ export function createPackets({
     });
   }
 
-  /// Opens the packets of drawn edge `id`: one link, or every link it stands
-  /// for, merged.
-  function openPackets(id) {
-    const d = getEdge(id);
-    if (!d) return;
-    const [first, second, swapped] = ends(d);
-    // The drawer's first direction goes from the sandbox side.
-    let members = d.members.map(({ e, flip }) => ({ e, flip: swapped ? !flip : flip }));
-    // `fictionet dashboard` merges at most MAX_MERGED links: the busiest.
-    const total = members.length;
-    if (total > MAX_MERGED) {
-      const busy = (m) => m.e.c[0] + m.e.c[2];
-      members = members.sort((x, y) => busy(y) - busy(x)).slice(0, MAX_MERGED);
-    }
-    openLinks(nodeLabel(first), nodeLabel(second), members, d.label, total);
-  }
-
-  /// Links one merged packet view may watch, as `fictionet dashboard` allows.
-  const MAX_MERGED = 32;
-
-  /// Opens the packets of `members` ({ e, flip }): side 0 of the drawer goes
-  /// from `fromName` to `toName`.
+  /// Opens the packets of `members` ({ e, flip, host }): side 0 goes from
+  /// `fromName` to `toName`. `total` counts the links the members were
+  /// chosen from, when the page server's merge limit left some out.
   function openLinks(fromName, toName, members, label, total = members.length) {
     closePackets();
     reopen = () => openLinks(fromName, toName, members, label, total);
@@ -104,12 +84,12 @@ export function createPackets({
     $('dir-a').textContent = `${fromName} → ${toName}`;
     $('dir-b').textContent = `${toName} → ${fromName}`;
     const list = members.map((m) => m.e.id).join(',');
-    $('pcap-label').textContent = pcapLabel;
+    $('pcap-label').textContent = 'pcapng';
     $('pause').textContent = 'Pause';
     $('sampled').hidden = true;
     $('sampled').textContent = '';
     prows.replaceChildren();
-    clearDetail(placeholder(many));
+    clearDetail(PICK);
     const hosts = new Map(members.filter((m) => m.host).map((m) => [m.e.id, m.host]));
     const showHost = new Set(hosts.values()).size > 1;
     drawer.classList.toggle('merged-hosts', showHost);
@@ -127,7 +107,7 @@ export function createPackets({
       addGap('Packet history reloaded after reconnect.');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
-      clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
+      clearDetail(`Packet history reloaded after reconnect. ${PICK}`);
     });
     packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, console: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
     showConsoleNote();
@@ -190,7 +170,6 @@ export function createPackets({
       else if (!packets.failed) addGap(many ? 'Every one of these links has closed.' : 'The link closed: both of its ends are gone.');
     });
     fitColumns();
-    fit();
   }
 
   function queueEntry(entry) {
@@ -210,16 +189,12 @@ export function createPackets({
     drawer.hidden = true;
   }
 
-  on($('close-drawer'), 'click', () => {
-    closePackets();
-    fit();
-  });
   on($('pcap'), 'click', async () => {
     if (!packets) return;
     const current = packets;
     try {
       await download('pcap', current.list);
-      if (packets === current) $('pcap-label').textContent = pcapLabel;
+      if (packets === current) $('pcap-label').textContent = 'pcapng';
     } catch {
       if (packets === current) $('pcap-label').textContent = 'Download failed. Try again.';
     }
@@ -325,7 +300,7 @@ export function createPackets({
   }
 
   function fitColumns() {
-    if (!packets || !drawer.classList.contains('packet-panel')) return;
+    if (!packets) return;
     for (const [field, width] of Object.entries(packets.widths)) {
       drawer.style.setProperty(`--packet-${field}`, `calc(${width}ch + 16px)`);
     }
@@ -510,9 +485,8 @@ export function createPackets({
       const line = document.createDocumentFragment();
       line.append(el('span', { class: 'off', text: off.toString(16).padStart(4, '0') + '  ' }));
       let hexPart = '';
-      let asciiPart = '';
       const flush = (marked) => {
-        if (!hexPart && !asciiPart) return;
+        if (!hexPart) return;
         if (marked) {
           const m = el('mark', { text: hexPart });
           line.append(m);
@@ -547,7 +521,6 @@ export function createPackets({
       }
       if (inMark) line.append(el('mark', { text: ascii }));
       else line.append(ascii);
-      void asciiPart;
       line.append('\n');
       pre.append(line);
     }
@@ -555,32 +528,12 @@ export function createPackets({
     if (firstMarked) firstMarked.scrollIntoView({ block: 'nearest' });
   }
 
-  // Resizing the drawer by its top edge.
-  on($('grip'), 'pointerdown', (ev) => {
-    stopDrag();
-    const startY = ev.clientY;
-    const startH = drawer.getBoundingClientRect().height;
-    const grip = ev.target;
-    grip.setPointerCapture(ev.pointerId);
-    const move = (m) => {
-      const h = Math.max(160, Math.min(innerHeight - 160, startH - (m.clientY - startY)));
-      drawer.style.setProperty('--drawer', `${h}px`);
-    };
-    const up = stopDrag = () => {
-      grip.removeEventListener('pointermove', move);
-      grip.removeEventListener('pointerup', up);
-    };
-    grip.addEventListener('pointermove', move);
-    grip.addEventListener('pointerup', up);
-  });
-
   return { dispose() {
     closePackets();
-    stopDrag();
     cleanup.splice(0).forEach((remove) => remove());
     prows.replaceChildren();
-    clearDetail('Select a packet to see its layers.');
-  }, open: openPackets, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels,
+    clearDetail(PICK);
+  }, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels,
   /// Packets received but not shown yet, or -1 while no stream is open.
   queued: () => (packets ? packets.queue.length + packets.held.length : -1) };
 }

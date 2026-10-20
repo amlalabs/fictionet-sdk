@@ -319,32 +319,18 @@
 //! {"event":"event","data":{...,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 301","sandbox":{"id":1,"name":"agent",...},"conn":4,...,"fields":{"scheme":"http","host":"example.test","method":"GET","path":"/","status":301,...},"node":"t33",...}}
 //! ```
 //!
-//! ## Open the dashboard
+//! ## Watch a world in a browser
 //!
-//! Create a private token file and start the dashboard in another terminal:
-//!
-//! ```sh
-//! (umask 077; openssl rand -hex 32 > /run/fictionet/dashboard-token)
-//! target/release/fictionet dashboard --observation unix:/run/fictionet/observe.sock --token-file /run/fictionet/dashboard-token
-//! ```
-//!
-//! Read the token from the file. Open `http://127.0.0.1:7878/#token=<token>`
-//! with that value to sign in. The page removes the fragment and keeps the
-//! token in this tab's session storage. The bootstrap URL works once per
-//! dashboard process. Reloading the signed-in tab keeps its session; logout
-//! or closing the tab clears it.
-//!
-//! The dashboard consumes the same `DashboardObserver` handle as the shell
-//! command. It draws collected topology and shows retained events. Select a
-//! link before sending traffic to capture its packets: this world's default
-//! options capture on demand. TLS decryption needs emitted keys and captured
-//! traffic. See [Fictionet Observe](../../../fictionet_observe/index.html) for
-//! the walkthrough, resource limits and the observation protocol.
+//! A world can serve its own page with `fictionet_observe::page::Page`, over
+//! the same `DashboardObserver` handle, and print a loopback address to open.
+//! `web_world` serves none; `cargo xtask demo desktop` runs a world that does.
+//! See [Fictionet Observe](../../../fictionet_observe/index.html) for the page,
+//! resource limits and the observation protocol.
 //!
 //! # 7. Stop
 //!
-//! Press Ctrl-C in the dashboard and observe terminals, then in the attach
-//! terminal. Attach exits and removes `tun0` as it goes:
+//! Press Ctrl-C in the observe terminal, then in the attach terminal. Attach
+//! exits and removes `tun0` as it goes:
 //!
 //! ```text
 //! $ sudo ip netns exec agent ip link show tun0
