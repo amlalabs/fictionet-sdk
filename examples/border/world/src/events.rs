@@ -28,7 +28,7 @@ use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
 use crate::bank::{ACCOUNT, carries_password, unquote_to_bytes};
-use crate::scenario::{BANK_ADDR, IMPOSTOR_ADDR, Scenario};
+use crate::scenario::{Scenario, public_address};
 
 /// The sources of the events [`line()`] makes lines of.
 pub const LOGGED: [&str; 7] = ["net", "dns", "tls", "http", "bgp", "path", "border"];
@@ -69,16 +69,17 @@ fn public_addresses(line: &mut Value) {
     for key in ["addr", "local", "dst", "src"] {
         if let Some(value) = line.get_mut(key) {
             let mapped = value.as_str().and_then(|text| {
-                if text.parse::<std::net::Ipv4Addr>().ok() == Some(IMPOSTOR_ADDR) {
-                    Some(BANK_ADDR.to_string())
-                } else {
-                    let mut addr = text.parse::<std::net::SocketAddr>().ok()?;
-                    if addr.ip() != std::net::IpAddr::V4(IMPOSTOR_ADDR) {
-                        return None;
-                    }
-                    addr.set_ip(BANK_ADDR.into());
-                    Some(addr.to_string())
+                if let Ok(ip) = text.parse::<std::net::Ipv4Addr>() {
+                    let public = public_address(ip);
+                    return (public != ip).then(|| public.to_string());
                 }
+                let mut addr = text.parse::<std::net::SocketAddrV4>().ok()?;
+                let public = public_address(*addr.ip());
+                if public == *addr.ip() {
+                    return None;
+                }
+                addr.set_ip(public);
+                Some(addr.to_string())
             });
             if let Some(mapped) = mapped {
                 *value = mapped.into();

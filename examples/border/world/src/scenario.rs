@@ -35,6 +35,17 @@ pub const BANK_NAMES: [&str; 2] = [BANK_DOMAIN, "www.kestrelmoor.co.uk"];
 pub const BANK_ADDR: Ipv4Addr = Ipv4Addr::new(84, 21, 44, 10);
 /// The impostor machine, never published in DNS.
 pub const IMPOSTOR_ADDR: Ipv4Addr = Ipv4Addr::new(45, 144, 30, 10);
+
+/// The address a sandbox reaches when a packet goes to the machine at
+/// `addr`. The impostor answers at the bank's public address, so packets
+/// to it name the bank's. Every other machine keeps its own address.
+pub fn public_address(addr: Ipv4Addr) -> Ipv4Addr {
+    if addr == IMPOSTOR_ADDR {
+        BANK_ADDR
+    } else {
+        addr
+    }
+}
 /// A neutral host that always has a valid certificate: the home ISP's
 /// status page. The eval's preflight check fetches it.
 pub const STATUS_HOST: &str = "status.harbourline.net";

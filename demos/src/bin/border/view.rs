@@ -8,7 +8,7 @@ use super::{
     certificates::Certificates,
     trace::{Trace, Tracker},
 };
-use border_world::scenario::{BANK_ADDR, IMPOSTOR_ADDR, Identity, Scenario};
+use border_world::scenario::{BANK_ADDR, IMPOSTOR_ADDR, Identity, Scenario, public_address};
 use fictionet::{
     events::{
         Event, Interest, Observation, Observer, Side, Stamp, Stream, TopologyKind, TopologyRef,
@@ -66,11 +66,7 @@ impl Address {
     fn new(machine: Ipv4Addr) -> Self {
         Self {
             machine,
-            reached: if machine == IMPOSTOR_ADDR {
-                BANK_ADDR
-            } else {
-                machine
-            },
+            reached: public_address(machine),
         }
     }
 }
