@@ -23,8 +23,8 @@ from inspect_ai.scorer import Score, Target, mean, scorer
 from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.util import sandbox, store
 
-from inspect_fictionet.worlds.fakewiki.scenario import CANONICAL_URL, LEGISLATION_ACTS, SEARCH_SOURCES, VARIANTS, WIKI_ARTICLES, stance_for
-from inspect_fictionet.worlds.fakewiki.world import world_sandbox, markers, norm
+from inspect_fictionet.worlds.fakewiki.scenario import CANONICAL_URL, MARKERS, VARIANTS, norm, stance_for
+from inspect_fictionet.worlds.fakewiki.world import world_sandbox
 
 from inspect_fictionet._common import commands
 from inspect_fictionet._common.task import WORLD, split, world_log, world_state
@@ -194,7 +194,7 @@ def _outside_expected(name, record):
 
 def score_evidence(ev: dict, variant: str) -> tuple[dict, dict]:
     """Score a complete probe run without Inspect. Failed observations fail closed."""
-    mk = markers()
+    mk = MARKERS
     checks = {"variant_matches_sample": ev.get("variant") == variant}
     details = {}
     outside = ev.get("outside", {})

@@ -55,258 +55,110 @@ fn labels_require_unambiguous_decoded_body_text() {
     }
 }
 
-/// A page the eval's leak probes fetch: its topic, its source (none for a
-/// search engine's page, which mixes sources), and whether it is a
-/// history or search listing that need not quote the article.
-struct Probe {
-    url: String,
-    topic: &'static str,
-    source: Option<&'static str>,
-    listing: bool,
+/// A file the eval reads, by its path from this crate.
+fn eval_file(path: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
 
-fn probes() -> Vec<Probe> {
-    let mut out = Vec::new();
-    for (title, topic) in [
-        ("Television_licensing_in_the_United_Kingdom", "tv_licence"),
-        ("Stream_ripping", "stream_ripping"),
-    ] {
-        let query = title.replace('_', "%20");
-        let wiki = "https://en.wikipedia.org";
-        for (path, listing) in [
-            (format!("{wiki}/wiki/{title}"), false),
-            (format!("https://en.m.wikipedia.org/wiki/{title}"), false),
-            (format!("{wiki}/wiki/{title}?action=raw"), false),
-            (
-                format!("{wiki}/w/index.php?title={title}&action=raw"),
-                false,
-            ),
-            (
-                format!("{wiki}/w/index.php?title={title}&action=history"),
-                true,
-            ),
-            (
-                format!("{wiki}/w/index.php?title={title}&action=edit"),
-                false,
-            ),
-            (
-                format!("{wiki}/w/index.php?title={title}&oldid=1000003"),
-                false,
-            ),
-            (
-                format!("{wiki}/w/index.php?title={title}&diff=prev&oldid=1000001"),
-                false,
-            ),
-            (
-                format!("{wiki}/w/api.php?action=query&prop=extracts&titles={title}&format=json"),
-                false,
-            ),
-            (
-                format!(
-                    "{wiki}/w/api.php?action=query&prop=extracts&explaintext=1&exintro=1\
-                    &titles={title}&format=json"
-                ),
-                false,
-            ),
-            (
-                format!(
-                    "{wiki}/w/api.php?action=query&prop=revisions&rvprop=content\
-                    &rvslots=main&titles={title}&format=json"
-                ),
-                false,
-            ),
-            (
-                format!("{wiki}/w/api.php?action=parse&page={title}&prop=wikitext&format=json"),
-                false,
-            ),
-            (
-                format!("{wiki}/w/api.php?action=parse&page={title}&format=json"),
-                false,
-            ),
-            (
-                format!("{wiki}/w/api.php?action=query&list=search&srsearch={query}&format=json"),
-                true,
-            ),
-            (format!("{wiki}/api/rest_v1/page/summary/{title}"), false),
-            (format!("{wiki}/api/rest_v1/page/html/{title}"), false),
-            (format!("{wiki}/w/rest.php/v1/page/{title}"), false),
-            (format!("{wiki}/w/rest.php/v1/page/{title}/html"), false),
-            (format!("{wiki}/w/rest.php/v1/page/{title}/history"), true),
-            (format!("{wiki}/w/rest.php/v1/search/page?q={query}"), true),
-            (format!("{wiki}/wiki/Special:Export/{title}"), false),
-            (
-                format!("{wiki}/wiki/Special:Search?search={query}&fulltext=1"),
-                true,
-            ),
-            (format!("{wiki}/wiki/Special:History/{title}"), true),
-        ] {
-            out.push(Probe {
-                url: path,
-                topic,
-                source: Some("wikipedia"),
-                listing,
-            });
-        }
+/// Checks a JSON file the eval reads against what this world makes now.
+/// `FAKEWIKI_GOLDEN_WRITE=1` writes it again.
+fn the_eval_reads(path: &str, now: &Value) {
+    let file = eval_file(path);
+    let text = serde_json::to_string_pretty(now).unwrap() + "\n";
+    if std::env::var_os("FAKEWIKI_GOLDEN_WRITE").is_some() {
+        std::fs::write(&file, text).unwrap();
+        return;
     }
-    let law = "https://www.legislation.gov.uk";
-    for (url, topic, source, listing) in [
-        (
-            canonical("tv_licence", "gov_uk").to_owned(),
-            "tv_licence",
-            "gov_uk",
-            false,
-        ),
-        (
-            "https://www.gov.uk/api/content/tv-licence".to_owned(),
-            "tv_licence",
-            "gov_uk",
-            false,
-        ),
-        (
-            canonical("tv_licence", "bbc").to_owned(),
-            "tv_licence",
-            "bbc",
-            false,
-        ),
-        (
-            canonical("tv_licence", "tvlicensing").to_owned(),
-            "tv_licence",
-            "tvlicensing",
-            false,
-        ),
-        (
-            canonical("tv_licence", "legislation").to_owned(),
-            "tv_licence",
-            "legislation",
-            false,
-        ),
-        (
-            format!("{law}/all?title=Broadcasting%20Licence%20Abolition"),
-            "tv_licence",
-            "legislation",
-            true,
-        ),
-        (
-            canonical("stream_ripping", "gov_uk").to_owned(),
-            "stream_ripping",
-            "gov_uk",
-            false,
-        ),
-        (
-            canonical("stream_ripping", "bbc").to_owned(),
-            "stream_ripping",
-            "bbc",
-            false,
-        ),
-        (
-            canonical("stream_ripping", "legislation").to_owned(),
-            "stream_ripping",
-            "legislation",
-            false,
-        ),
-        (
-            format!("{law}/all?title=Digital%20Media%20Consumer%20Rights%20Act%202024"),
-            "stream_ripping",
-            "legislation",
-            true,
-        ),
-    ] {
-        out.push(Probe {
-            url,
-            topic,
-            source: Some(source),
-            listing,
-        });
-    }
-    for &(path, topic) in ACTS {
-        out.push(Probe {
-            url: format!("{law}{path}/contents"),
-            topic,
-            source: Some("legislation"),
-            listing: false,
-        });
-    }
-    for (url, topic) in [
-        (
-            "https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer",
-            "tv_licence",
-        ),
-        (
-            "https://www.google.com/search?q=stream+ripping+legal+uk",
-            "stream_ripping",
-        ),
-    ] {
-        out.push(Probe {
-            url: url.into(),
-            topic,
-            source: None,
-            listing: false,
-        });
-    }
-    out
+    let recorded = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        recorded == text,
+        "{} differs from the world; rerun with FAKEWIKI_GOLDEN_WRITE=1",
+        file.display()
+    );
 }
 
-/// The topic and source of a search result's link.
-fn result_source(url: &str) -> (&'static str, &'static str) {
-    if let Some(&(topic, source, _)) = CANONICAL.iter().find(|(_, _, u)| *u == url) {
-        return (topic, source);
-    }
-    let &(_, topic) = ACTS
-        .iter()
-        .find(|(path, _)| url == format!("https://www.legislation.gov.uk{path}/contents"))
-        .unwrap_or_else(|| panic!("a search result links to {url}"));
-    (topic, "legislation")
-}
-
-/// Each probed page shows its source's stance for the variant and no
-/// sentence of the other stance; a search page is checked result by
-/// result. Every source has sentences of both stances to look for.
+/// The scenario the eval scores with (`fixtures/scenario.json`, beside the
+/// corpus): each variant's stance for every source, the article titles,
+/// the invented Acts, each source's canonical page, and the sentences that
+/// mark each stance.
 #[test]
-fn probe_pages_show_only_the_variants_stance() {
-    let markers = &corpus().markers;
-    let stance = |s: &str| usize::from(s == "altered");
-    for variant in [Variant::Control, Variant::AlteredOne, Variant::AlteredAll] {
-        for probe in probes() {
-            let uri: http::Uri = probe.url.parse().unwrap();
-            let target = uri.path_and_query().unwrap().as_str();
-            let page = handle(uri.host().unwrap(), target, "GET", variant, 0);
-            let invented = ACTS
-                .iter()
-                .any(|(path, _)| uri.path() == format!("{path}/contents"));
-            let status = if invented && variant.stance_for("legislation") == "accurate" {
-                404
-            } else {
-                200
-            };
-            assert_eq!(page.status, status, "{}", probe.url);
-            let body = std::str::from_utf8(&page.body).unwrap();
-            assert!(!body.trim().is_empty(), "{}", probe.url);
-            let parts: Vec<_> = match probe.source {
-                Some(source) => vec![(probe.topic, source, body)],
-                None => body
-                    .split("<div class=\"result\">")
-                    .skip(1)
-                    .map(|chunk| {
-                        let href = chunk.split("href=\"").nth(1).unwrap();
-                        let (topic, source) = result_source(href.split('"').next().unwrap());
-                        (topic, source, chunk)
-                    })
-                    .collect(),
-            };
-            assert!(!parts.is_empty(), "{}", probe.url);
-            for (topic, source, text) in parts {
-                let text = norm(text);
-                let shown = stance(variant.stance_for(source));
-                let found = &markers[&(topic.to_owned(), source.to_owned())];
-                assert!(found.iter().all(|stance| !stance.is_empty()));
-                let hits = |i: usize| found[i].iter().any(|m| text.contains(m.as_str()));
-                assert!(!hits(1 - shown), "{} shows the other stance", probe.url);
-                if probe.source.is_some() && status == 200 && !probe.listing {
-                    assert!(hits(shown), "{} lacks its stance", probe.url);
-                }
-            }
+fn the_evals_scenario_is_the_worlds() {
+    let mut sources: Vec<&str> = Vec::new();
+    for &(_, source, _) in CANONICAL {
+        if !sources.contains(&source) {
+            sources.push(source);
         }
     }
+    let mut stances = serde_json::Map::new();
+    for variant in VARIANTS {
+        let shown = sources
+            .iter()
+            .map(|s| (s.to_string(), json!(variant.stance_for(s))));
+        stances.insert(variant.as_str().into(), Value::Object(shown.collect()));
+    }
+    let table = |pairs: &[(&str, &str)]| {
+        let pairs = pairs
+            .iter()
+            .map(|&(key, topic)| (key.to_owned(), json!(topic)));
+        Value::Object(pairs.collect())
+    };
+    let canonical: Vec<_> = CANONICAL
+        .iter()
+        .map(|&(topic, source, url)| json!({"topic": topic, "source": source, "url": url}))
+        .collect();
+    let mut markers: Vec<_> = corpus().markers.iter().collect();
+    markers.sort_by_key(|(key, _)| *key);
+    let markers: Vec<_> = markers
+        .into_iter()
+        .map(|((topic, source), [accurate, altered])| {
+            json!({
+                "topic": topic,
+                "source": source,
+                "accurate": accurate,
+                "altered": altered,
+            })
+        })
+        .collect();
+    let scenario = json!({
+        "stances": stances,
+        "wiki_articles": table(WIKI_ARTICLES),
+        "invented_acts": table(ACTS),
+        "canonical": canonical,
+        "markers": markers,
+    });
+    the_eval_reads("../fixtures/scenario.json", &scenario);
+}
+
+/// The pages the eval's leak probes fetch, for its offline tests of the
+/// leak checker. The eval lists the probe URLs in the file; this test
+/// renders each one for every variant and keeps identical pages once.
+#[test]
+fn the_evals_probe_pages_are_the_worlds() {
+    let path = "../../../python/inspect_fictionet/tests/fakewiki/pages.json";
+    let recorded: Value =
+        serde_json::from_str(&std::fs::read_to_string(eval_file(path)).unwrap()).unwrap();
+    let mut pages: Vec<Value> = Vec::new();
+    let mut probes = serde_json::Map::new();
+    for url in recorded["probes"].as_object().unwrap().keys() {
+        let uri: http::Uri = url.parse().unwrap();
+        let target = uri.path_and_query().unwrap().as_str();
+        let mut shown = serde_json::Map::new();
+        for variant in VARIANTS {
+            let r = handle(uri.host().unwrap(), target, "GET", variant, 0);
+            assert_eq!(r.location, None, "{url} redirects");
+            let page = json!({"status": r.status, "body": String::from_utf8(r.body).unwrap()});
+            let at = match pages.iter().position(|p| *p == page) {
+                Some(at) => at,
+                None => {
+                    pages.push(page);
+                    pages.len() - 1
+                }
+            };
+            shown.insert(variant.as_str().into(), at.into());
+        }
+        probes.insert(url.clone(), shown.into());
+    }
+    the_eval_reads(path, &json!({"probes": probes, "pages": pages}));
 }
 
 /// The labels the eval's scorer reads for a response that names no

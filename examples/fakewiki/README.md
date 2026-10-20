@@ -19,9 +19,9 @@ pages assert a false claim. A grader model then reads the agent's answer.
 It shows how little code a whole fake web needs on Fictionet. The world is a
 small Rust program built on `web::Sites` that renders every page itself, from
 the embedded corpus, in the eval and in the live demo. The agent runs in an
-ordinary container attached
-with `fictionet attach --type tun`, and the world's log records every DNS query,
-request and refused or failed TLS handshake, with what each page claimed.
+ordinary container attached with `fictionet attach --type tun`, and the world's
+log records every DNS query, request and refused or failed TLS handshake, with
+what each page claimed.
 
 Three questions (`tv_licence`, `stream_ripping`, `apollo11`) and three variants:
 
@@ -193,11 +193,12 @@ Task options: `variants` and `topics` (comma-separated, default all),
   `/var/lib/fictionet/log.jsonl` (one line per DNS query, failed handshake and HTTP
   request) and `/var/lib/fictionet/state.json`.
 
-The `cross_checked`, `cited_unfetched`, `reached_altered` and `sources_reached`
-report columns use these checks. Tables published before these checks and the
-stream-ripping legislation source have different reached-altered and
-cross-check rates, and are not comparable. These checks are research metadata; the grader still supplies `fooled`, `detected` and `correct` for
-submitted answers.
+The report's `reached_altered`, `cross_checked` and `cited_unfetched` columns
+use these checks. They give the share of samples that were delivered a page with
+altered text, that read the Wikipedia article and an independent source page,
+and that cited a page they never fetched. Score metadata also lists
+`sources_reached`. These are research metadata. The grader supplies `fooled`,
+`detected` and `correct` for submitted answers.
 
 Planted-text exposure uses tool messages in finished agent model-call inputs.
 A trailing tool result that was never sent to the model earns no exposure
@@ -235,12 +236,15 @@ The expanded container probes have not been rerun in the cleanup sandbox:
 | no_truth_leak | PASS | PASS | PASS |
 | extraction_keeps_stance | PASS | PASS | PASS |
 
-The current offline renderer tests cover 60 probe URLs, including section 28B
-and both invented Acts. Control responses produce 0 leaks when judged as control,
-46 as `altered_one`, and 61 as `altered_all`. The section 28B probe and its search
-snippet add two leaks to the historical count of 59. These counts exercise the
-same checker as `negative_control.py`; they do not verify container isolation or
-TLS. Rerun the container probes and negative control before publishing new results.
+The offline tests run the same leak checker as `negative_control.py` on the 60
+probe pages, including section 28B and both invented Acts, as the world renders
+them for each variant. The pages are kept in
+`../../python/inspect_fictionet/tests/fakewiki/pages.json`, and the world's test
+`the_evals_probe_pages_are_the_worlds` checks that the file matches the world.
+Each variant's pages produce no leaks when judged as that variant. Control pages
+produce 46 leaks when judged as `altered_one` and 61 as `altered_all`. These
+tests do not check container isolation or TLS. Rerun the container probes and
+negative control before publishing new results.
 
 The new `expected_text_served` check requires every leak URL, a completed transfer,
 the expected HTTP status and the source's stance text. History and search listings
@@ -359,29 +363,29 @@ state topics have size bounds (`MAX_TAMPER_STATE_BYTES`, `MAX_DIFF_BYTES`)
 checked by tests.
 
 The world's [`scenario.rs`](world/src/pages/scenario.rs) owns variants, page
-identities and stance policy. The eval's [`scenario.py`](../../python/inspect_fictionet/src/inspect_fictionet/worlds/fakewiki/scenario.py)
-holds the variants, URLs and stance policy the scorer and probes need, with the
-standard library only. Tasks and probes share them;
-probe coverage and grading remain eval policy. Probe targets carry their expected
-topic and source, and search results use the scenario's URL mapping, including
-both fictional Acts. Unknown variants raise `ValueError`. Unknown probe, extraction
-or search-result URLs raise `KeyError`.
-Independent fixtures in `../../python/inspect_fictionet/tests/fakewiki/test_scenario.py` pin the authored stance rules and
-probe coverage. The world's tests
-([`world/src/pages/tests.rs`](world/src/pages/tests.rs)) check that named Acts
-and corpus sources have served documents, and that every probed page shows only
-its variant's stance. The world and eval use the same normalized sentence markers:
-sentences of at least 40 characters, compared by their first 60 characters, must
-occur only in one stance. A response with no marker, or markers from both stances,
-has no stance label. For JSON responses, labels use decoded string values, so
-escaped Unicode has the same meaning as in HTML. Invalid JSON has no stance
-label. This decoding applies to response labels. `saw_planted_text` instead
-looks for the altered markers in the normalized text of the tool outputs. Topic,
-source and endpoint kind are given when known.
-Mixed-topic legislation listings carry no topic or stance label.
+identities and stance policy. The world's test `the_evals_scenario_is_the_worlds`
+writes them, with the stance markers, into `fixtures/scenario.json`, and the
+eval's [`scenario.py`](../../python/inspect_fictionet/src/inspect_fictionet/worlds/fakewiki/scenario.py)
+reads that file with the standard library only. Tasks, the scorer and the probes
+share it; probe coverage and grading remain eval policy. Probe targets carry
+their expected topic and source, and search results use the scenario's URL
+mapping, including both fictional Acts. Unknown variants raise `ValueError`.
+Unknown probe, extraction or search-result URLs raise `KeyError`.
 
-The shared `inspect_fictionet` package includes the scenario module, corpus and
-rubric.
+The world's tests ([`world/src/pages/tests.rs`](world/src/pages/tests.rs)) pin
+the stance policy and check that named Acts and corpus sources have served
+documents. The eval's tests run its leak checker on the pages the world
+renders (see [Probe results](#probe-results)). The world and eval use the same
+normalized sentence markers: sentences of at least 40 characters, compared by
+their first 60 characters, must occur only in one stance. A response with no
+marker, or markers from both stances, has no stance label. For JSON responses,
+labels use decoded string values, so escaped Unicode has the same meaning as in
+HTML. Invalid JSON has no stance label. This decoding applies to response
+labels. `saw_planted_text` instead looks for the altered markers in the
+normalized text of the tool outputs. Topic, source and endpoint kind are given
+when known. Mixed-topic legislation listings carry no topic or stance label.
+
+The shared `inspect_fictionet` package includes the scenario, corpus and rubric.
 
 ## Watch the world
 
@@ -416,9 +420,11 @@ examples/fakewiki/
     src/events.rs           # the request log, written from the network's events
     tests/                  # the golden log, tampering at run time
   fixtures/corpus.json      # the three topics, each source's accurate and altered text
+  fixtures/scenario.json    # the scenario and stance markers the eval reads, written by the world's tests
 python/inspect_fictionet/
   src/inspect_fictionet/worlds/fakewiki/  # tasks, scorer, report, rubric and negative control
   tests/fakewiki/                        # scorer tests and scripted probes
+    pages.json                           # the probe pages as the world renders them, written by its tests
 ```
 
 ## Known gaps

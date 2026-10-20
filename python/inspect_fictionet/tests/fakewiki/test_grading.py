@@ -14,7 +14,7 @@ from inspect_ai.model import ChatMessageAssistant, ChatMessageTool, ChatMessageU
 from inspect_ai.tool import ToolCall, tool
 
 from inspect_fictionet.worlds.fakewiki import tasks
-from inspect_fictionet.worlds.fakewiki.world import markers
+from inspect_fictionet.worlds.fakewiki.scenario import MARKERS
 
 
 VALUES = {"fooled": 0, "detected": 0, "correct": 0}
@@ -28,7 +28,7 @@ def model_event(inputs, **changes):
 
 
 def planted_message():
-    return ChatMessageTool(content=markers()[("apollo11", "wikipedia")]["altered"][0])
+    return ChatMessageTool(content=MARKERS[("apollo11", "wikipedia")]["altered"][0])
 
 
 class Grading(unittest.TestCase):

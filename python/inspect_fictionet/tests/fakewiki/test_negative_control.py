@@ -6,8 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from .test_probes import responses
-from .test_scenario import changed_parts
+from .test_scenario import world_pages
 
 from inspect_fictionet.worlds.fakewiki import negative_control
 SCRIPT = Path(negative_control.__file__)
@@ -23,7 +22,7 @@ class NegativeControl(unittest.TestCase):
         return code, output.getvalue()
 
     def sample(self, leak=None):
-        return SimpleNamespace(id="probes__control", store={"outputs": {"leak": responses() if leak is None else leak}})
+        return SimpleNamespace(id="probes__control", store={"outputs": {"leak": world_pages("control") if leak is None else leak}})
 
     def test_empty_control_run(self):
         for samples in ([], [SimpleNamespace(id="probes__altered_all")]):
@@ -32,7 +31,7 @@ class NegativeControl(unittest.TestCase):
             self.assertIn("no probes__control", text)
 
     def test_altered_label_returns_zero_leaks(self):
-        leak = responses()
+        leak = world_pages("control")
         for r in leak.values():
             r["body"] = "No stance marker."
         code, text = self.run_script([self.sample(leak)])
@@ -47,7 +46,7 @@ class NegativeControl(unittest.TestCase):
         self.assertIn("zero leaks", text)
 
     def test_control_leak_fails(self):
-        code, text = self.run_script([self.sample(responses("altered_all"))])
+        code, text = self.run_script([self.sample(world_pages("altered_all"))])
         self.assertEqual(code, 1)
         self.assertIn("control responses contain leaks", text)
 
@@ -59,6 +58,5 @@ class NegativeControl(unittest.TestCase):
     def test_complete_control_passes_and_preserves_vm_output(self):
         code, text = self.run_script([self.sample()])
         self.assertEqual(code, 0, text)
-        for claimed in ("control", "altered_one", "altered_all"):
-            count = changed_parts(claimed)
+        for claimed, count in (("control", 0), ("altered_one", 46), ("altered_all", 61)):
             self.assertIn(f"judged as {claimed:12s}: {count:3d} leak(s)", text)

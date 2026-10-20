@@ -11,16 +11,13 @@ from unittest.mock import AsyncMock, Mock, patch
 from . import probes
 from inspect_fictionet.worlds.fakewiki import negative_control
 from inspect_fictionet.worlds.fakewiki import tasks
-from inspect_fictionet.worlds.fakewiki.world import CORPUS, markers, norm
-from .test_scenario import fetched, marker_responses
+from inspect_fictionet.worlds.fakewiki.scenario import MARKERS, norm
+from inspect_fictionet.worlds.fakewiki.world import CORPUS
+from .test_scenario import fetched, world_pages
 
 
 def record(rc=0, out="", err=""):
     return {"rc": rc, "out": out, "err": err}
-
-
-def responses(variant="control"):
-    return marker_responses(variant)
 
 
 def evidence(variant="control"):
@@ -52,11 +49,11 @@ def evidence(variant="control"):
         "control_paths": {f"https://{h}{p}": record(out="404") for h in ("en.wikipedia.org", "www.gov.uk") for p in probes.CONTROL_PATHS},
         "portscan_exec": record(out="{}"),
         "portscan": {ip: [53, 80, 443] for ip in probes.SCAN_IPS},
-        "leak": responses(variant), "extraction": {},
+        "leak": world_pages(variant), "extraction": {},
     }
     for target in probes.EXTRACTION_TARGETS:
         stance = probes.stance_for(variant, target.source)
-        text = markers()[(target.topic, target.source)][stance][0]
+        text = MARKERS[(target.topic, target.source)][stance][0]
         ev["extraction"][target.url] = {tool: record(out=text) for tool in ("readability", "w3m")}
     return ev
 
@@ -148,7 +145,7 @@ class Probes(unittest.TestCase):
         target = probes.EXTRACTION_TARGETS[0]
         url = target.url + "?search=history"
         with patch.object(negative_control, "leak_targets", return_value={"test": [probes.ProbeTarget(url, target.topic, target.source)]}):
-            self.assertEqual(probes.find_leaks("control", {url: fetched("200", "Not found")}, markers())[1], [url])
+            self.assertEqual(probes.find_leaks("control", {url: fetched("200", "Not found")}, MARKERS)[1], [url])
         history = next(u for u in self.ev["leak"] if "action=history" in u)
         self.ev["leak"][history]["rc"] = 18
         self.assertFalse(self.checks()["expected_text_served"])
@@ -234,12 +231,11 @@ class Probes(unittest.TestCase):
 
     def test_wikipedia_leads_carry_stance_marker(self):
         corpus = json.loads(CORPUS.read_text())["topics"]
-        mk = markers()
         for topic in ("tv_licence", "stream_ripping"):
             for stance in ("accurate", "altered"):
                 with self.subTest(topic=topic, stance=stance):
                     lead = norm(" ".join(corpus[topic]["stances"][stance]["wikipedia"]["lead"]))
-                    self.assertTrue(any(m in lead for m in mk[(topic, "wikipedia")][stance]))
+                    self.assertTrue(any(m in lead for m in MARKERS[(topic, "wikipedia")][stance]))
 
     def test_probe_commands_do_not_mask_failures(self):
         # CI discovers these offline tests. Guard the FakeWiki command sources

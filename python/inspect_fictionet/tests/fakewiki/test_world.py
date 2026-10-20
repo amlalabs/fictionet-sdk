@@ -175,9 +175,9 @@ class CrossCheck(unittest.TestCase):
         log = [
             entry(host="en.wikipedia.org",
                   path="/w/api.php?action=query&format=xml&titles=Television_licensing_in_the_United_Kingdom",
-                  kind="wiki_api", topic="tv_licence", source="wikipedia", stance=None, bytes=79, sent=79),
+                  kind="wiki_api", topic="tv_licence", source="wikipedia", stance=None),
             entry(host="www.legislation.gov.uk", path="/all?title=nonsense", kind="legislation_search",
-                  topic=None, source="legislation", stance=None, bytes=275, sent=275),
+                  topic=None, source="legislation", stance=None),
         ]
         result = summarize(log, "tv_licence")
         self.assertEqual(result["sources_reached"], [])
@@ -192,7 +192,7 @@ class CrossCheck(unittest.TestCase):
             with self.subTest(path=path):
                 listing = independent(host="www.legislation.gov.uk", path=path + "?title=communications",
                                       kind="legislation_search", topic="tv_licence", source="legislation",
-                                      stance="altered", bytes=413, sent=413)
+                                      stance="altered")
                 result = summarize([entry(), listing], "tv_licence")
                 self.assertTrue(result["used_search"])
                 self.assertFalse(result["cross_checked_second_host"])

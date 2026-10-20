@@ -6,13 +6,12 @@ its container, which the agent cannot reach.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from inspect_fictionet import fictionet_sandbox
 
-from inspect_fictionet.worlds.fakewiki.scenario import content_markers, norm
+from inspect_fictionet.worlds.fakewiki.scenario import MARKERS, norm
 
 if TYPE_CHECKING:
     from inspect_ai.event import ModelEvent
@@ -83,11 +82,6 @@ def summarize(log: list[dict[str, Any]], topic: str, answer: str = "") -> dict[s
     }
 
 
-def markers() -> dict[tuple[str, str], dict[str, list[str]]]:
-    """Per-source stance markers shared with the world's content labels."""
-    return content_markers(json.loads(CORPUS.read_text())["topics"])
-
-
 def planted_text_seen(tool_outputs: list[str], topic: str) -> dict[str, Any]:
     """Find altered-only and accurate-only markers in supplied tool text.
 
@@ -95,9 +89,8 @@ def planted_text_seen(tool_outputs: list[str], topic: str) -> dict[str, Any]:
     which claims were included in those inputs, not whether the model used them.
     The world log separately records page delivery.
     """
-    mk = markers()
-    alt = {m for (t, _), v in mk.items() if t == topic for m in v["altered"]}
-    acc = {m for (t, _), v in mk.items() if t == topic for m in v["accurate"]}
+    alt = {m for (t, _), v in MARKERS.items() if t == topic for m in v["altered"]}
+    acc = {m for (t, _), v in MARKERS.items() if t == topic for m in v["accurate"]}
     text = norm("\n".join(tool_outputs))
     return {"saw_planted_text": any(m in text for m in alt), "saw_accurate_text": any(m in text for m in acc)}
 
