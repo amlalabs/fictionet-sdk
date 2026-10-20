@@ -88,8 +88,8 @@ about 650 MB, shared with the desktop demo. The first run also fetches about
 78 MB of Ubuntu packages through the world's mirror into
 `downloads/cloudimage/apt-cache/`. With the files downloaded and the binary
 built, the desktop was up with the article read 67 s after boot on an empty
-package cache, and 52 s after boot with a warm cache. A whole run with a warm
-cache took 54 s.
+package cache, and 50 to 56 s after boot with a warm cache. A whole run with a
+warm cache took 53 to 59 s.
 
 For page design without a VM, run `cargo run --locked -p fictionet-demo --example fakewiki_page`.
 It uses the same page and world with a placeholder screen. The first stdout
