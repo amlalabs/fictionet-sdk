@@ -47,7 +47,7 @@ pub mod bridge;
 pub mod checks;
 pub mod client;
 mod page;
-pub use page::{Hosts, PageAccess, answer_command, serve_commands};
+pub use page::{Hosts, PageAccess, answer_command, open_bootstrap, serve_commands};
 pub mod containment;
 pub mod desktop;
 pub mod jump;

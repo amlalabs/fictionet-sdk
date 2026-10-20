@@ -25,16 +25,10 @@ pub fn run(args: &[String]) -> Result {
     {
         let path = std::fs::canonicalize(path)?;
         if !path.is_file() {
-            return Err("the page bootstrap is not a file".into());
+            return Err("the page's address file is not a file".into());
         }
-        let status = std::process::Command::new("chromium")
-            .args(["--password-store=basic", "--use-mock-keychain"])
-            .arg(format!("--app=file://{}", path.display()))
-            .status()?;
-        if !status.success() {
-            return Err(format!("Chromium exited with {status}").into());
-        }
-        return Ok(());
+        microvm::build("open")?;
+        return microvm::launch("open", false, &[path.display().to_string()]);
     }
     if args == ["assets"] {
         return microvm::assets();
@@ -129,7 +123,8 @@ fn demos(dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// In-process demos use ordinary binary module directories.
+/// Each in-process demo is a binary module directory. A single-file
+/// binary, such as `open`, is a tool and not a demo.
 fn binaries(dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -137,13 +132,6 @@ fn binaries(dir: &Path) -> Result<Vec<String>> {
         if path.join("main.rs").is_file() {
             names.push(
                 path.file_name()
-                    .ok_or("a binary without a name")?
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            names.push(
-                path.file_stem()
                     .ok_or("a binary without a name")?
                     .to_string_lossy()
                     .into_owned(),

@@ -31,10 +31,13 @@ world's mirror. The mirror keeps them in `downloads/cloudimage/apt-cache/`, so
 the first run on a machine also fetches about 280 MB of Ubuntu packages and
 later runs reuse them.
 
-Each run prints its public page URL before the guests boot. The accompanying
-`cargo xtask demo open PATH` action opens a private bootstrap file with the
-authentication token. Routine output contains no token; the bootstrap is
-removed with the run. It then runs the
+Each run prints its public page URL before the guests boot, then
+`Open: cargo xtask demo open PATH`. PATH is a private file that holds the
+page's address and token, and the run removes it when it ends. The command
+opens the page in a Chromium app window over DevTools, so the token never
+appears on a command line; closing the window or Ctrl-C ends it. A demo
+that runs as an app opens this window itself when there is a display.
+Routine output contains no token. A `check` run then runs the
 demo's story and its checks. Every demo requires each declared containment probe exactly once, with an
 affirmative result. Configuration probes report facts. The shared package
 mirror closes once every guest has finished its cloud-init check. The run saves screenshots,
