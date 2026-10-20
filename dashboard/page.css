@@ -856,6 +856,13 @@ tr.moment td:first-child {
   .packet-panel .plist .c-proto { padding: 0; visibility: hidden; }
   .packet-panel .packet-info-protocol { display: inline; font-weight: 600; }
 }
+/* A Host column takes about 80 px, so beside one Protocol joins Info 80 px
+   sooner. Without this Info kept about 60 px in Border's inspector. */
+@container (width < 640px) {
+  .packet-panel.merged-hosts col.c-proto { width: 0; }
+  .packet-panel.merged-hosts .plist .c-proto { padding: 0; visibility: hidden; }
+  .packet-panel.merged-hosts .packet-info-protocol { display: inline; font-weight: 600; }
+}
 /* In a narrow inspector the addresses give way so Info keeps room; a cut
    address shows in full on hover and in the packet's layers. A fixed table
    takes a plain percentage only: with min() the columns went auto and split

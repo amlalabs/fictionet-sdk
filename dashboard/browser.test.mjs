@@ -55,18 +55,21 @@ async function checkPacketLayout() {
   while (!root.querySelector('#prows tr.gap')) await frame();
   // A hidden column keeps its place at zero width and shows nothing.
   const hidden = (cell) => getComputedStyle(cell).visibility === 'hidden' && cell.getBoundingClientRect().width < 1;
-  for (const width of [530, 559, 559.5, 560, 599, 599.5, 600, 800, 530]) {
+  // These links name two hosts, so the list has a Host column and Protocol
+  // joins Info below 640 px; a single host's list keeps it to 560 px.
+  for (const width of [530, 559, 559.5, 560, 599, 599.5, 600, 639, 639.5, 640, 800, 530]) {
+    const merged = width < 640;
     root.style.width = width + 'px';
     await frame();
     for (const cell of root.querySelectorAll('#prows tr:not(.gap) td.c-src, #prows tr:not(.gap) td.c-dst, #prows tr:not(.gap) td.c-time')) whole(cell);
     check($('td.c-time').textContent === '11.0039' && $('#prows tr:nth-child(2) .c-time').textContent === '1000.0039', 'Time changed');
-    check(hidden($('td.c-proto')) === (width < 560), 'Protocol breakpoint');
+    check(hidden($('td.c-proto')) === merged, 'Protocol breakpoint');
     for (const column of ['c-no', 'c-len']) check(hidden($('td.' + column)) === (width < 600), column + ' breakpoint');
     check(!hidden($('td.c-time')), 'Time hidden');
     check(Math.abs($('th.c-info').getBoundingClientRect().right - $('#plist table').getBoundingClientRect().right) < 1, 'columns do not fill the table');
     const prefix = $('.packet-info-protocol');
-    check((getComputedStyle(prefix).display !== 'none') === (width < 560), 'protocol prefix visibility');
-    if (width < 560) {
+    check((getComputedStyle(prefix).display !== 'none') === merged, 'protocol prefix visibility');
+    if (merged) {
       check($('td.c-info').innerText.startsWith('ICMP Echo (ping) reply'), 'protocol missing from Info');
       check(getComputedStyle(prefix).fontWeight === '600', 'protocol weight');
     }
@@ -114,6 +117,16 @@ async function checkPacketLayout() {
     while (root.querySelectorAll('#prows tr').length < rows + 2) await frame();
     check(host.getBoundingClientRect().width === bounds.width, 'host column moved');
     check($('#plist').scrollWidth <= $('#plist').clientWidth, 'host column overflows');
+  }
+  // A single host's list has no Host column and keeps Protocol to 560 px.
+  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }]);
+  send(6, '10.0.0.2', '10.0.0.3');
+  while (!root.querySelector('#prows tr:not(.gap)')) await frame();
+  check(!root.querySelector('.packet-panel').classList.contains('merged-hosts'), 'one host shows a Host column');
+  for (const width of [559, 560, 639]) {
+    root.style.width = width + 'px';
+    await frame();
+    check(hidden($('#prows tr:not(.gap) td.c-proto')) === (width < 560), 'single-host Protocol breakpoint at ' + width);
   }
   dispose(); root.remove(); css.remove();
 }
