@@ -2,7 +2,7 @@
 
 use super::{checks, guest::HOSTNAME};
 use border_world::routing::RouteState;
-use border_world::scenario::Variant;
+use border_world::scenario::{BANK_ADDR, HIJACK_PREFIX, IMPOSTOR_ADDR, Variant};
 use fictionet_demo::kit::{
     self, Run,
     client::{Capability, PageClient},
@@ -52,17 +52,21 @@ async fn finish(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()
         "agent$ bank-check {step}\n{}[exit {}]",
         output.stdout, output.code
     );
-    if !checks::check(
-        step,
-        &output,
-        hijacked,
-        super::control::scenario().gateway(),
-    ) {
+    if !checks::check(step, &output, &routed(hijacked)) {
         return Err(io::Error::other(format!(
             "bank-check {step} did not produce the expected result"
         )));
     }
     Ok(())
+}
+
+/// The demo's scenario, routed as it is before or after the hijack.
+fn routed(hijacked: bool) -> border_world::scenario::Scenario {
+    super::control::scenario().routed(if hijacked {
+        Variant::Hijack
+    } else {
+        Variant::Legitimate
+    })
 }
 
 async fn step(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> {
@@ -349,14 +353,13 @@ fn observed_complete(view: &Value, hijacked: bool) -> bool {
             .map(Vec::as_slice)
             .unwrap_or_default()
     };
-    let mut hops = vec![
-        super::control::scenario().gateway().to_string(),
-        "84.21.44.1".into(),
-    ];
-    if hijacked {
-        hops.push("45.144.30.1".into());
-    }
-    hops.push("84.21.44.10".into());
+    let mut hops: Vec<String> = routed(hijacked)
+        .hops(BANK_ADDR)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    hops.push(BANK_ADDR.to_string());
+    let hijack_prefix = format!("{}/{}", HIJACK_PREFIX.addr, HIJACK_PREFIX.len);
     let trace = view["links"].as_array().is_some_and(|links| {
         links.iter().any(|t| {
             t["sandbox"] == HOSTNAME
@@ -378,15 +381,15 @@ fn observed_complete(view: &Value, hijacked: bool) -> bool {
             && e["message"] == "UPDATE"
             && e[if hijacked { "announced" } else { "withdrawn" }]
                 .as_array()
-                .is_some_and(|routes| routes.iter().any(|p| p == "84.21.44.0/25"))
+                .is_some_and(|routes| routes.iter().any(|p| *p == hijack_prefix))
     });
     let moments: Vec<_> = rows("moments")
         .iter()
         .filter(|m| {
             m["sandbox"] == HOSTNAME
                 && m["password"] == true
-                && m["endpoint"]["machine"] == "45.144.30.10"
-                && m["endpoint"]["reached"] == "84.21.44.10"
+                && m["endpoint"]["machine"] == IMPOSTOR_ADDR.to_string()
+                && m["endpoint"]["reached"] == BANK_ADDR.to_string()
         })
         .collect();
     let tls = moments.iter().any(|m| {
