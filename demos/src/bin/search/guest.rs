@@ -95,6 +95,8 @@ mod tests {
             assert!(data.contains(&format!("'{package}'")), "{package}");
         }
         let files = seed::files(&data).unwrap();
+        assert_eq!(files["/etc/apt/apt.conf.d/20apt-esm-hook.conf"], "");
+        assert!(data.contains("    content: \"\"\n"));
         assert!(files["/opt/start-desktop.sh"].contains(&format!("firefox --no-remote '{START}'")));
         assert!(
             files["/etc/firefox/policies/policies.json"]

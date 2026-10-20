@@ -95,6 +95,7 @@ pub fn files(user_data: &str) -> std::io::Result<BTreeMap<String, String>> {
             let path = path
                 .take()
                 .ok_or_else(|| std::io::Error::other("file content without a path"))?;
+            let encoded: String = serde_json::from_str(encoded)?;
             let bytes = base64::decode(encoded.as_bytes(), base64::Padding::Required)
                 .ok_or_else(|| std::io::Error::other(format!("{path}: invalid base64")))?;
             files.insert(
@@ -149,7 +150,7 @@ pub fn user_data(p: &Provision) -> String {
         out.push_str(&format!(
             "  - path: {}\n    permissions: '{mode:04o}'\n    encoding: b64\n    content: {}\n",
             quote(path),
-            base64::encode(content.as_bytes())
+            quote(&base64::encode(content.as_bytes()))
         ));
         if path.starts_with(&format!("/home/{}/", g.user)) {
             out.push_str(&format!(

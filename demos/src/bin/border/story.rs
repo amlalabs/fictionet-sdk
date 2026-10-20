@@ -148,6 +148,8 @@ fn firefox_home_served(event: &Value) -> bool {
         && event["fields"]["served_by"] == "bank"
         && event["fields"]["page"] == "home"
         && event["fields"]["method"] == "GET"
+        && event["fields"]["status"] == 200
+        && event["fields"]["complete"] == true
         && firefox
 }
 
@@ -164,7 +166,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
         let after = before["tls"]["rows"].as_array().into_iter().flatten()
             .filter_map(|row| row["event"].as_u64()).max().unwrap_or(0);
         let mut cursor = client.last_event().await?;
-        command(ssh, "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r -I{} xdotool key --window {} ctrl+r'").await?;
+        command(ssh, "env DISPLAY=:1 xdotool search --sync --onlyvisible --class Firefox windowactivate --sync key --clearmodifiers ctrl+shift+r").await?;
         let mut served = false;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
@@ -493,7 +495,7 @@ mod tests {
     #[test]
     fn a_reload_counts_only_firefox_getting_the_bank_home_page_in_the_guest() {
         let event = json!({"source": "http", "kind": "request", "sandbox": {"name": HOSTNAME},
-            "fields": {"served_by": "bank", "page": "home", "method": "GET", "headers": [
+            "fields": {"served_by": "bank", "page": "home", "method": "GET", "status": 200, "complete": true, "headers": [
                 ["host", "kestrelmoor.co.uk"],
                 ["user-agent", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"]]}});
         assert!(firefox_home_served(&event));
@@ -509,6 +511,11 @@ mod tests {
             let mut changed = event.clone();
             *changed.pointer_mut(pointer).unwrap() = value.into();
             assert!(!firefox_home_served(&changed), "{pointer}");
+        }
+        for (field, value) in [("status", json!(404)), ("complete", json!(false))] {
+            let mut changed = event.clone();
+            changed["fields"][field] = value;
+            assert!(!firefox_home_served(&changed), "{field}");
         }
     }
 

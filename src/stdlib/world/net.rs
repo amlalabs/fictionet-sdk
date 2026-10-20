@@ -317,6 +317,7 @@ impl Net {
     /// with no filter, no address binding and no DHCP: a trusted
     /// participant, such as a real container that plays one of the hosts.
     /// Packets for `prefix` go to it, and what it sends is routed as it is.
+    /// Events attribute source addresses in `prefix` to this sandbox.
     pub fn route(mut self, name: &str, prefix: Prefix) -> Net {
         self.routes.push((name.to_owned(), prefix));
         self
@@ -461,7 +462,9 @@ impl Net {
             loop {
                 let sandbox = attachments.next(&fcx).await?;
                 if let Some((_, prefix)) = routes.iter().find(|(n, _)| n == sandbox.name()) {
-                    shared.router.add(*prefix, Box::new(sandbox));
+                    shared
+                        .router
+                        .add(*prefix, Box::new(context.routed(sandbox, *prefix)));
                     continue;
                 }
                 if let Some((name, lan, addr)) =

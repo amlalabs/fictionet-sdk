@@ -26,7 +26,7 @@ pub(super) struct Hooks {
     /// The last connection number given out.
     pub(super) conns: AtomicU64,
     /// The sandboxes attached now, by id, each with its budget.
-    pub(super) attached: Mutex<HashMap<u64, Budget>>,
+    pub(super) attached: Mutex<HashMap<u64, Option<Budget>>>,
 }
 
 impl Hooks {
@@ -52,7 +52,7 @@ impl Hooks {
 
     /// The budget of the sandbox with id `id`, while it is attached.
     pub(super) fn budget(&self, id: u64) -> Option<Budget> {
-        self.attached.lock().get(&id).cloned()
+        self.attached.lock().get(&id).cloned().flatten()
     }
 
     pub(super) fn next_conn(&self) -> u64 {
@@ -88,6 +88,19 @@ pub(super) struct Destinations {
 }
 
 impl Context {
+    /// Attributes traffic from a trusted route without filtering its packets.
+    pub(super) fn routed(self: &Arc<Self>, sandbox: Attachment, prefix: Prefix) -> Routed {
+        let owner = self.bindings.new_owner();
+        self.hooks.attached.lock().insert(owner, None);
+        Routed {
+            name: Arc::from(sandbox.name()),
+            sandbox,
+            context: self.clone(),
+            owner,
+            prefix,
+        }
+    }
+
     /// A member sandbox attached: it joins its LAN at its address, with no
     /// filter, and events know it by that address. It detaches as any
     /// sandbox does when the LAN lets its interface go: when it closes,
@@ -139,6 +152,74 @@ impl Context {
                 event.field("lan", lan).field("addr", addr.to_string())
             },
         );
+    }
+}
+
+pub(super) struct Routed {
+    sandbox: Attachment,
+    context: Arc<Context>,
+    owner: u64,
+    name: Arc<str>,
+    prefix: Prefix,
+}
+
+impl Interface for Routed {
+    fn poll_recv(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Packet, fictionet::RecvError>> {
+        let result = self.sandbox.poll_recv(fcx, cx);
+        if let Poll::Ready(Ok(packet)) = &result
+            && let Some(header) = Header::parse_whole(&packet.0)
+            && self.prefix.contains(header.src)
+        {
+            let me = Sandbox {
+                id: self.owner,
+                name: self.name.clone(),
+                addr: match header.src {
+                    IpAddr::V4(addr) => Some(addr),
+                    _ => None,
+                },
+                addr_v6: match header.src {
+                    IpAddr::V6(addr) => Some(addr),
+                    _ => None,
+                },
+            };
+            self.context
+                .hooks
+                .by_addr
+                .lock()
+                .insert(header.src, me.clone());
+            if let Some(why) = self.context.destinations.refused(&packet.0) {
+                fcx.emitter(&sandbox_only(me))
+                    .emit("net", "blocked", |_| blocked(why, &packet.0));
+            }
+        }
+        result
+    }
+
+    fn send(&mut self, packet: Packet) {
+        self.sandbox.send(packet);
+    }
+
+    fn link(&self) -> Option<fictionet::LinkHandle> {
+        self.sandbox.link()
+    }
+}
+
+impl Drop for Routed {
+    fn drop(&mut self) {
+        self.context.hooks.attached.lock().remove(&self.owner);
+        let addresses = self
+            .context
+            .hooks
+            .by_addr
+            .lock()
+            .iter()
+            .filter_map(|(addr, sandbox)| (sandbox.id == self.owner).then_some(*addr))
+            .collect::<Vec<_>>();
+        (self.context.abort_peers)(&addresses);
     }
 }
 /// A UDP packet with correct checksums.
@@ -206,7 +287,7 @@ impl Attached {
             .hooks
             .attached
             .lock()
-            .insert(owner, Budget::new(context.sandbox_budget));
+            .insert(owner, Some(Budget::new(context.sandbox_budget)));
         Attached {
             context: context.clone(),
             owner,
