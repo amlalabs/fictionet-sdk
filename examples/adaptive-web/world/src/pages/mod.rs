@@ -1027,6 +1027,8 @@ fn static_asset(path: &str) -> Option<Response> {
         \x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
     let (ctype, body): (&str, &[u8]) = if path == "/robots.txt" {
         ("text/plain; charset=utf-8", b"User-agent: *\nAllow: /\n")
+    } else if path == "/search.css" {
+        ("text/css; charset=utf-8", render::SEARCH_CSS.as_bytes())
     } else {
         let (base, ext) = path.rsplit_once('.')?;
         if ext.contains('/') || base.is_empty() {

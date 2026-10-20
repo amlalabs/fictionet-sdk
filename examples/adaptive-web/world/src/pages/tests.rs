@@ -1104,6 +1104,109 @@ fn model_world(dir: &Dir, script: &Arc<Script>, prefetch: usize) -> (Arc<Pages>,
 }
 
 #[test]
+fn search_styles_are_static_with_either_generator() {
+    let dir = Dir::new("search-styles");
+    let script = Arc::new(Script::default());
+    let (model, fake) = model_world(&dir, &script, 0);
+    lab(|cx| async move {
+        for pages in [halvard(), model] {
+            for (host, path) in [
+                ("www.google.com", "/search?q=halvard"),
+                ("www.bing.com", "/search?q=halvard"),
+                ("html.duckduckgo.com", "/html/?q=halvard"),
+            ] {
+                let response = pages.handle(&cx, "GET", host, path, None).await;
+                assert_eq!(response.status, 200);
+                let html = String::from_utf8(response.body).unwrap();
+                assert!(html.contains(r#"rel="stylesheet" href="/search.css""#));
+                assert!(!html.contains("<script"));
+                assert!(!html.contains("<style"));
+            }
+            pages
+                .apply(
+                    &cx,
+                    Command::SetGeneration {
+                        generate: false,
+                        expected_revision: 0,
+                    },
+                )
+                .unwrap();
+            let calls = fake.requests.lock().unwrap().len();
+            let made = pages.store().made;
+            for host in ["www.google.com", "www.bing.com", "html.duckduckgo.com"] {
+                let css = pages
+                    .handle(&cx, "GET", host, "/search.css?v=1", None)
+                    .await;
+                assert_eq!(css.status, 200);
+                assert_eq!(css.content_type, "text/css; charset=utf-8");
+                assert_eq!(css.body, render::SEARCH_CSS.as_bytes());
+                assert_eq!(css.logged()["kind"], "asset");
+                assert!(pages.store().page(host, "/search.css?v=1").is_none());
+            }
+            assert_eq!(pages.store().made, made);
+            assert_eq!(fake.requests.lock().unwrap().len(), calls);
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn model_generation_switch_keeps_saved_pages_and_results() {
+    let dir = Dir::new("model-switch");
+    let script = Arc::new(Script::default());
+    let (pages, fake) = model_world(&dir, &script, 0);
+    lab(|cx| async move {
+        let search = google(&pages, &cx, "halvard flaw").await;
+        assert_eq!(search.logged()["cache"], "generated");
+        let url = &results(&search.body)[0].0;
+        let page = get(&pages, &cx, url).await;
+        assert_eq!(page.logged()["cache"], "generated");
+        pages
+            .apply(
+                &cx,
+                Command::SetGeneration {
+                    generate: false,
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let calls = fake.requests.lock().unwrap().len();
+        let cached = google(&pages, &cx, "halvard flaw").await;
+        assert_eq!(cached.logged()["cache"], "cached");
+        assert_eq!(cached.body, search.body);
+        let cached = get(&pages, &cx, url).await;
+        assert_eq!(cached.logged()["cache"], "cached");
+        assert_eq!(cached.body, page.body);
+        assert_eq!(
+            google(&pages, &cx, "a new query").await.logged()["cache"],
+            "missing"
+        );
+        assert_eq!(
+            get(&pages, &cx, "https://new-site.com/missing")
+                .await
+                .status,
+            404
+        );
+        assert_eq!(fake.requests.lock().unwrap().len(), calls);
+        pages
+            .apply(
+                &cx,
+                Command::SetGeneration {
+                    generate: true,
+                    expected_revision: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            google(&pages, &cx, "a new query").await.logged()["cache"],
+            "generated"
+        );
+        assert!(fake.requests.lock().unwrap().len() > calls);
+        Ok(())
+    });
+}
+
+#[test]
 fn model_pages_keep_titles_count_cost_and_never_store_the_key() {
     let dir = Dir::new("model");
     let script = Arc::new(Script::default());

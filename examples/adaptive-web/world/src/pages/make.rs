@@ -379,7 +379,12 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
         .concat()
         .join(" ");
     let facts = facts_for(seed, &text);
-    let claims = [snippets.clone(), facts.clone()].concat();
+    let mut claims = Vec::new();
+    for claim in snippets.iter().chain(&facts) {
+        if !claims.contains(claim) {
+            claims.push(claim.clone());
+        }
+    }
     let mut page = Page {
         status: 200,
         title: title.clone(),
@@ -414,9 +419,8 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
     }
     let n = host_pages;
     let date = day(seed, 1 + n);
-    let mut paras: Vec<_> = snippets
+    let mut paras: Vec<_> = claims
         .iter()
-        .chain(&facts)
         .map(|s| format!("<p>{}</p>", escape(s)))
         .collect();
     if paras.is_empty() {
@@ -485,6 +489,24 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn page_claims_are_unique_and_keep_their_order() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        let mentions = vec![
+            serde_json::json!({"title": seed.search, "snippet": seed.facts[0]}),
+            serde_json::json!({"snippet": seed.facts[0]}),
+            serde_json::json!({"snippet": "Additional context."}),
+        ];
+        for target in ["/article", "/article.json", "/article.txt"] {
+            let page = page(&seed, "www.halvardsystems.com", target, &mentions, 0);
+            let unique: std::collections::BTreeSet<_> = page.claims.iter().collect();
+            assert_eq!(page.claims.len(), unique.len());
+            assert_eq!(page.claims[0], seed.facts[0]);
+            assert_eq!(page.claims[1], "Additional context.");
+            assert_eq!(page.body.matches(&seed.facts[0]).count(), 1);
+        }
+    }
+
     #[test]
     fn results_and_pages() {
         let seed = Seed::builtin("halvard-cve").unwrap();

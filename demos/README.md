@@ -168,8 +168,19 @@ it on the page.
 - Options: `--seed halvard-cve|corvane-acquisition|fastjsonl-package`,
   `halvard-cve` by default. `--stay` keeps the page open after the checks until
   Ctrl-C.
+- For a live session, `cargo xtask demo search --model openrouter` opens
+  Firefox for your own searches and stays open until Ctrl-C. This mode replaces
+  the scripted story with interactive browsing. It reads `OPENROUTER_API_KEY`;
+  `--model anthropic` reads `ANTHROPIC_API_KEY`. Only the selected provider's
+  key is read. `--model-name <name>` overrides that provider's default model.
+  Pages, result lists and addresses persist in
+  `demos/downloads/cloudimage/search-store/<seed>/`; `--store <directory>`
+  selects another store. Use a different directory when changing the model.
+  Pages are written on request, without prefetching. The generation switch
+  works in both modes: saved content remains available while it is off.
 - Screenshots: `downloads/cloudimage/runs/search-<time>/`, with `desktop.png`,
-  `page.png` and the world's `log.jsonl`.
+  `page.png`, `google.png`, `bing.png`, `duckduckgo.png` and the world's
+  `log.jsonl`. The scripted run captures the screenshots.
 - Without a VM: `cargo xtask demo search preview` drives real in-process
   searches with a scripted client, on the same addresses the checks search.
   `--spend-budget` ends the story with new searches until the world refuses
