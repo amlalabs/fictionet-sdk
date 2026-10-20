@@ -20,7 +20,7 @@ fn tls_pair(fcx: &Cx, names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls:
 /// cancelled, not as a broken connection.
 #[test]
 fn a_cancel_during_the_tls_handshake_is_a_cancel() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, log| async move {
         let (config, _roots) = tls_pair(&fcx, &["a.test"]);
         let (server, _su, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(443)?;
@@ -60,7 +60,7 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
             .await??;
         // Not a closed connection, nor a broken one: the one cancel.
         assert_eq!(result, "Err(Cancelled)");
-        let tls = evidence
+        let tls = log
             .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
                 e.is("tls", "handshake")
             })
@@ -89,9 +89,8 @@ fn net_routes_tls_by_name_to_each_service() {
     }
     let result = block_on(crate::common::observed_lab(
         fictionet::Seed::from_u64(1),
-        move |fcx, evidence| async move {
+        move |fcx, kept| async move {
             let (config, roots) = tls_pair(&fcx, &["a.test", "b.test"]);
-            let kept = evidence;
             let (attacher, attachments) = fictionet::attachments();
             let (ca, cb) = (config.clone(), config.clone());
             let addr = Ipv4Addr::new(10, 40, 0, 2);
@@ -219,9 +218,8 @@ fn the_harness_resumes_after_starttls() {
 fn net_performs_starttls_for_a_service_that_asks() {
     let result = block_on(crate::common::observed_lab(
         fictionet::Seed::from_u64(1),
-        move |fcx, evidence| async move {
+        move |fcx, kept| async move {
             let (config, roots) = tls_pair(&fcx, &["mail.test"]);
-            let kept = evidence;
             let (attacher, attachments) = fictionet::attachments();
             let addr = Ipv4Addr::new(10, 40, 0, 25);
             let opts = ServeOptions::default().starttls(config.clone());
@@ -273,42 +271,38 @@ fn net_performs_starttls_for_a_service_that_asks() {
 /// the service's default of 10 seconds.
 #[test]
 fn net_limits_a_starttls_handshake() {
-    crate::common::world::observed_world(
-        Duration::from_secs(60),
-        move |fcx, evidence| async move {
-            let (config, _roots) = tls_pair(&fcx, &["mail.test"]);
-            let kept = evidence;
-            let (attacher, attachments) = fictionet::attachments();
-            let addr = Ipv4Addr::new(10, 40, 0, 25);
-            let limits = fictionet::stdlib::world::net::Limits {
-                handshake: Duration::from_millis(200),
-                ..Default::default()
-            };
-            let opts = ServeOptions::default().starttls(config);
-            Net::new()
-                .ipv4_only()
-                .limits(limits)
-                .host("mail", |h| {
-                    h.at(addr)
-                        .tcp_with(25, Arc::new(()), || Mail { tls: false }, opts)
-                })
-                .start(&fcx, attachments)?;
-            let s = machine(&fcx, attacher.attach("agent")?, ME);
-            let mut conn = s
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), 25))
-                .await?;
-            assert_eq!(read_some(&fcx, &mut conn, 16).await, b"220 mail ready\r\n");
-            conn.write_all(&fcx, b"STARTTLS\r\n").await?;
-            assert_eq!(read_some(&fcx, &mut conn, 14).await, b"220 go ahead\r\n");
-            // The client never starts its handshake.
-            let handshake = kept
-                .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                    e.is("tls", "handshake")
-                })
-                .await?;
-            assert_ne!(handshake[0].str("outcome"), Some("accepted"));
-            Ok(())
-        },
-    );
+    crate::common::world::observed_world(Duration::from_secs(60), move |fcx, kept| async move {
+        let (config, _roots) = tls_pair(&fcx, &["mail.test"]);
+        let (attacher, attachments) = fictionet::attachments();
+        let addr = Ipv4Addr::new(10, 40, 0, 25);
+        let limits = fictionet::stdlib::world::net::Limits {
+            handshake: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let opts = ServeOptions::default().starttls(config);
+        Net::new()
+            .ipv4_only()
+            .limits(limits)
+            .host("mail", |h| {
+                h.at(addr)
+                    .tcp_with(25, Arc::new(()), || Mail { tls: false }, opts)
+            })
+            .start(&fcx, attachments)?;
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
+        let mut conn = s
+            .tcp
+            .connect(&fcx, SocketAddr::new(addr.into(), 25))
+            .await?;
+        assert_eq!(read_some(&fcx, &mut conn, 16).await, b"220 mail ready\r\n");
+        conn.write_all(&fcx, b"STARTTLS\r\n").await?;
+        assert_eq!(read_some(&fcx, &mut conn, 14).await, b"220 go ahead\r\n");
+        // The client never starts its handshake.
+        let handshake = kept
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("tls", "handshake")
+            })
+            .await?;
+        assert_ne!(handshake[0].str("outcome"), Some("accepted"));
+        Ok(())
+    });
 }

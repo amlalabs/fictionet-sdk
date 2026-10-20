@@ -496,13 +496,13 @@ async fn the_proxy_refuses_hosts_routed_by_default_host() {
     let port = listener.local_addr().unwrap().port();
     let (seen_tx, seen) = mpsc::channel();
     let server = tokio::spawn(test_upstream(listener, seen_tx));
-    let evidence = Arc::new(Memory::default());
+    let events = Arc::new(Memory::default());
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         run(
-            RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            RunOptions::new(fictionet::Seed::random()).observer(events.clone()),
             move |fcx| async move {
-                let log = super::events::Log::new(evidence);
+                let log = super::events::Log::new(events);
                 let (attacher, attachments) = fictionet::attachments();
                 let proxy = web::proxy(&fcx)?;
                 web::Sites::new(move |h| {

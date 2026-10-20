@@ -26,12 +26,13 @@
 //!
 //! Core produces four typed streams: events, packets, TLS keys and topology.
 //! The integrator installs one observer in [`RunOptions`]. [`events`] defines
-//! the contract. [Fictionet Observe](../fictionet_observe/index.html) consumes
+//! the contract, including
+//! [what observation skips without an observer](events#interest-identity-and-order).
+//! [Fictionet Observe](../fictionet_observe/index.html) consumes
 //! these streams: `Memory` and `Aggregate` for grading, `Jsonl` for files,
 //! `Collector` for bounded collection, and `DashboardObserver` for clients.
-//! With no observer, observation allocates nothing, reads no clock, increments
-//! no sequence and registers no links. `run.start` emits the seed to
-//! interested observers. Core retains no observation history.
+//! `run.start` emits the seed to interested observers. Core retains no
+//! observation history.
 //!
 //! # How a sandbox connects to a world
 //!
@@ -317,10 +318,10 @@
 //! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
 //! from `setTimeout`. In a page, hand [`run`] to the event loop with
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
-//! timers. Native HTTP/2 reset expiry uses the world clock. Opt-in axum
-//! upgrades still use hyper, whose internal clock is unavailable on this
-//! target. `examples/wasm_world` runs DNS, HTTP/1.1, HTTP/2
-//! and HTTPS through a world in Node.js.
+//! timers. Opt-in axum upgrades still use hyper, whose internal clock is
+//! unavailable on this target. [`httpd`](stdlib::web::httpd) says how the
+//! native HTTP/2 server keeps time. `examples/wasm_world` runs DNS,
+//! HTTP/1.1, HTTP/2 and HTTPS through a world in Node.js.
 
 #![warn(missing_docs)]
 #![cfg_attr(

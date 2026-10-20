@@ -898,7 +898,10 @@ impl Staged {
             cx.events_lost(state.lost);
         }
         if let Some(observer) = &self.observer {
-            observer.lost(state.lost);
+            observer.lost(fictionet::events::Loss::staged(
+                fictionet::events::Stream::Events,
+                state.lost,
+            ));
         }
     }
 }

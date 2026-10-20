@@ -158,7 +158,7 @@ fn world(seed: Seed, trace: Arc<Mutex<Trace>>) -> impl Future<Output = fictionet
             move |cx| episode(cx, packets, loss_trace),
         )
         .await?;
-        trace.lock().unwrap().events = crate::common::evidence_bytes(&log);
+        trace.lock().unwrap().events = crate::common::log_bytes(&log);
         Ok(())
     }
 }
@@ -439,7 +439,7 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
             },
         ))
         .unwrap();
-        let events = crate::common::evidence_bytes(&log);
+        let events = crate::common::log_bytes(&log);
         let bodies = bodies.lock().unwrap().clone();
         (events, bodies)
     };
@@ -509,10 +509,10 @@ fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
         let out = logs.clone();
         block_on(crate::common::observed_lab(
             Seed::from_u64(1),
-            move |fcx, evidence| async move {
-                out.lock().unwrap().push(evidence.clone());
-                crate::common::observed_lab(Seed::from_u64(2), move |fcx, evidence| async move {
-                    out.lock().unwrap().push(evidence.clone());
+            move |fcx, log| async move {
+                out.lock().unwrap().push(log.clone());
+                crate::common::observed_lab(Seed::from_u64(2), move |fcx, log| async move {
+                    out.lock().unwrap().push(log.clone());
                     fcx.emit("test", "inner", |event| event);
                     fcx.yield_now().await?;
                     fcx.emit("test", "inner_again", |event| event);
@@ -569,8 +569,8 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
     let out = kept.clone();
     block_on(crate::common::observed_lab(
         Seed::from_u64(1),
-        move |fcx, evidence| async move {
-            *out.lock().unwrap() = Some(evidence.clone());
+        move |fcx, log| async move {
+            *out.lock().unwrap() = Some(log.clone());
             let foreign = fcx.clone();
             lab(RunOptions::new(Seed::from_u64(2)), move |_fcx| async move {
                 foreign.emit("test", "record", |event| event);
@@ -583,7 +583,7 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
                 Ok(())
             })
             .await?;
-            let events = evidence
+            let events = log
                 .checked_all()
                 .unwrap()
                 .into_iter()
@@ -617,7 +617,7 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
 fn a_nested_panic_restores_the_outer_task() {
     block_on(crate::common::observed_lab(
         Seed::from_u64(1),
-        |fcx, evidence| async move {
+        |fcx, log| async move {
             let result = std::panic::catch_unwind(|| {
                 block_on(lab(RunOptions::new(Seed::from_u64(2)), |_fcx| async move {
                     panic!("inner world failed");
@@ -631,7 +631,7 @@ fn a_nested_panic_restores_the_outer_task() {
             })
             .join(&fcx)
             .await?;
-            let events = evidence
+            let events = log
                 .checked_all()
                 .unwrap()
                 .into_iter()

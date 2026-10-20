@@ -45,15 +45,14 @@ fn event_layers_keep_field_order_and_render_json_values() {
 #[test]
 fn installed_observers_keep_events_and_write_json_lines() {
     let path = std::env::temp_dir().join(format!("fictionet-events-{}.jsonl", std::process::id()));
-    let evidence = Arc::new(fictionet_observe::Memory::default());
+    let log = Arc::new(fictionet_observe::Memory::default());
     let jsonl = Arc::new(
         fictionet_observe::Jsonl::open(&path, fictionet_observe::Limits::default()).unwrap(),
     );
     let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
-        fictionet::events::Fanout::new(vec![evidence.clone(), jsonl.clone()]),
+        fictionet::events::Fanout::new(vec![log.clone(), jsonl.clone()]),
     ));
     world::seeded_world(options, Duration::from_secs(60), move |fcx| async move {
-        let events = evidence;
         let conn = ConnInfo::new(
             9,
             "10.0.0.1:80".parse().unwrap(),
@@ -69,16 +68,15 @@ fn installed_observers_keep_events_and_write_json_lines() {
             });
         }
         assert_eq!(
-            events
-                .checked_all()
+            log.checked_all()
                 .unwrap()
                 .iter()
                 .map(|e| e.seq)
                 .collect::<Vec<_>>(),
             [1, 2, 3, 4]
         );
-        assert_eq!(events.dropped(), 0);
-        let layer = Layer::from_event(&events.checked_all().unwrap()[2]);
+        assert_eq!(log.dropped(), 0);
+        let layer = Layer::from_event(&log.checked_all().unwrap()[2]);
         assert_eq!(layer.name, "test.n");
         assert_eq!(layer.summary, "n=1");
         Ok(())
@@ -109,7 +107,7 @@ fn installed_observers_keep_events_and_write_json_lines() {
 /// earlier events, and its later ones.
 #[test]
 fn a_reader_added_mid_connection_sees_its_events() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, log| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -123,15 +121,14 @@ fn a_reader_added_mid_connection_sees_its_events() {
             .await?;
         conn.write_all(&fcx, b"before\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 13).await, b"hello\nbefore\n");
-        let seen = evidence.clone();
+        let seen = log.clone();
         assert_eq!(
             seen.checked_of("echo", "line").unwrap()[0].summary,
             "before"
         );
         conn.write_all(&fcx, b"after\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"after\n");
-        evidence
-            .wait(&fcx, 0, 2, Duration::from_secs(2), |e| e.is("echo", "line"))
+        log.wait(&fcx, 0, 2, Duration::from_secs(2), |e| e.is("echo", "line"))
             .await?;
         assert_eq!(
             seen.checked_of("echo", "line")
@@ -149,17 +146,16 @@ fn a_reader_added_mid_connection_sees_its_events() {
 /// calendar.
 #[test]
 fn a_net_starts_its_events_with_a_wall_clock_anchor() {
-    let evidence = Arc::new(fictionet_observe::Memory::default());
+    let log = Arc::new(fictionet_observe::Memory::default());
     world::seeded_real_world(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(42))
-            .observer(evidence.clone())
+            .observer(log.clone())
             .fields(Fields::new().with("world_date", "2026-10-06")),
         Duration::from_secs(60),
         move |fcx| async move {
-            let kept = evidence;
             let (_attacher, attachments) = fictionet::attachments();
             Net::new().start(&fcx, attachments)?;
-            let starts = kept.checked_of("run", "start").unwrap();
+            let starts = log.checked_of("run", "start").unwrap();
             assert_eq!(starts.len(), 1);
             let first = &starts[0];
             assert!(first.is("run", "start"));
@@ -185,8 +181,7 @@ fn a_net_starts_its_events_with_a_wall_clock_anchor() {
 /// `Host::tcp_with` does by default. Before, `tcp` turned them off.
 #[test]
 fn net_records_connections_on_a_tcp_port() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
-        let kept = evidence;
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 1);
         Net::new()

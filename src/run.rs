@@ -25,8 +25,8 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// Use [`Fanout`](crate::events::Fanout) to combine consumers.
 /// [Fictionet Observe](../fictionet_observe/index.html) supplies `Memory`,
 /// `Aggregate`, `Jsonl`, `Collector` and `DashboardObserver`.
-/// Core keeps no history. Without an observer, observation allocates nothing,
-/// reads no clock, increments no sequence and registers no links.
+/// Core keeps no history. [`events`](crate::events#interest-identity-and-order)
+/// says what observation skips without an observer.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -97,8 +97,8 @@ impl RunOptions {
 /// The run emits `run.start` automatically to interested observers, once at
 /// zero, with the seed and clock origin. Install the observer through
 /// [`RunOptions`]. It can consume events, packets, TLS keys and topology.
-/// Without one, observation allocates nothing, reads no clock, increments no
-/// sequence and registers no links.
+/// [`events`](crate::events#interest-identity-and-order) says what observation
+/// skips without one.
 ///
 /// # When the future finishes
 ///
@@ -1080,11 +1080,11 @@ mod tests {
     }
 
     #[test]
-    fn retained_evidence_outlives_completed_and_dropped_runs() {
+    fn a_retained_log_outlives_completed_and_dropped_runs() {
         for complete in [true, false] {
-            let evidence = Arc::new(fictionet::events::recorder::Recorder::default());
+            let log = Arc::new(fictionet::events::recorder::Recorder::default());
             let shared = RunShared::with_options(
-                RunOptions::new(crate::Seed::from_u64(7)).observer(evidence.clone()),
+                RunOptions::new(crate::Seed::from_u64(7)).observer(log.clone()),
                 crate::RunMode::Lab,
             );
             let weak_run = Arc::downgrade(&shared);
@@ -1110,8 +1110,8 @@ mod tests {
             }
             assert!(weak_run.upgrade().is_none());
             assert!(weak_environment.upgrade().is_none());
-            assert_eq!(Arc::strong_count(&evidence), 1);
-            let events = evidence.all();
+            assert_eq!(Arc::strong_count(&log), 1);
+            let events = log.all();
             assert_eq!(
                 events
                     .iter()
@@ -1130,7 +1130,7 @@ mod tests {
                 assert_eq!(origin.task, 1);
                 assert_eq!(origin.name, "world");
             }
-            assert_eq!(evidence.all(), events);
+            assert_eq!(log.all(), events);
         }
     }
 }

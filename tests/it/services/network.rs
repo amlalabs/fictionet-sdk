@@ -360,8 +360,7 @@ fn a_rejected_host_does_not_install_http_names_or_a_default() {
 
 #[test]
 fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
-        let kept = evidence;
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let plant = Arc::new(Plant {
             limit: 1000,
             ..Plant::default()
@@ -532,8 +531,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
 
 #[test]
 fn net_serves_udp_services_and_trusted_sandboxes() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
-        let kept = evidence;
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let counter = Arc::new(AtomicUsize::new(0));
         /// Counts datagrams.
         struct Udp;
@@ -656,9 +654,8 @@ service_fixture! {
 /// read neither.
 #[test]
 fn net_caps_connections_per_service_and_bytes_per_sandbox() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (attacher, attachments) = fictionet::attachments();
-        let kept = evidence;
         let addr = Ipv4Addr::new(10, 40, 0, 3);
         let limits = fictionet::stdlib::world::net::Limits {
             sandbox_budget: 100 << 10,
@@ -808,8 +805,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             Ok(Flow::Continue)
         }
     }
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
-        let kept = evidence;
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (attacher, attachments) = fictionet::attachments();
         let lan: Prefix = "192.168.56.0/24".parse()?;
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
@@ -1033,8 +1029,7 @@ fn early_region_error_is_failure() {
 /// budget after its sandbox detached.
 #[test]
 fn net_keeps_one_budget_per_attachment() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
-        let kept = evidence;
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (attacher, attachments) = fictionet::attachments();
         let (addr, addr6) = (
             Ipv4Addr::new(10, 40, 0, 3),
@@ -1114,8 +1109,7 @@ fn net_keeps_one_budget_per_attachment() {
 /// member was never detached.
 #[test]
 fn a_lan_member_detaches_like_any_sandbox() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
-        let kept = evidence;
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (attacher, attachments) = fictionet::attachments();
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
         let ws: Ipv4Addr = "192.168.56.31".parse()?;
@@ -1227,8 +1221,8 @@ fn refused_connections_share_a_bounded_aggregate() {
     use fictionet_observe::{Aggregate, Limits, Memory};
     use std::sync::atomic::AtomicUsize;
 
-    let evidence = Arc::new(Memory::new(Limits::new(4, 8192)));
-    let observer = Arc::new(Aggregate::new(evidence.clone()));
+    let log = Arc::new(Memory::new(Limits::new(4, 8192)));
+    let observer = Arc::new(Aggregate::new(log.clone()));
     block_on(lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(observer),
         |fcx| async move {
@@ -1245,7 +1239,7 @@ fn refused_connections_share_a_bounded_aggregate() {
         },
     ))
     .unwrap();
-    let blocked = evidence.checked_of("net", "blocked").unwrap();
+    let blocked = log.checked_of("net", "blocked").unwrap();
     assert_eq!(blocked.len(), 2);
     assert!(blocked[0].get("count").is_none());
     assert_eq!(blocked[1].u64("count"), Some(999));

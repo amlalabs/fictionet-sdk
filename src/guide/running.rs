@@ -73,8 +73,8 @@
 //!    Use [`Fanout`](crate::events::Fanout) to combine consumers from
 //!    [Fictionet Observe](../../../fictionet_observe/index.html).
 //!    `run` and `lab` emit `run.start` once at zero when interested.
-//!    Without an observer, observation allocates nothing, reads no clock,
-//!    increments no sequence and registers no links. Every task the world starts
+//!    [`events`](crate::events#interest-identity-and-order) says what
+//!    observation skips without an observer. Every task the world starts
 //!    with [`Cx::spawn`](crate::Cx::spawn), and every stdlib task, is polled
 //!    inside this same future.
 //! 4. **[`block_on`](crate::block_on)** polls the future on the current
@@ -357,9 +357,9 @@
 //! fixed certificates and the [`tls`](crate::stdlib::services::tls) provider, whose
 //! key exchange and signatures draw from the run's seed.
 //!
-//! Native HTTP/2 reset expiry follows the run's clock. Opt-in axum upgrades
-//! use hyper; its internal time does not follow lab time. See
-//! [`httpd`](crate::stdlib::web::httpd) for the server's runtime boundaries.
+//! Opt-in axum upgrades use hyper, whose internal time does not follow lab
+//! time. [`httpd`](crate::stdlib::web::httpd) says how the native HTTP/2
+//! server keeps time, and its other runtime boundaries.
 //!
 //! A real run with the same seed makes the same random choices for the
 //! same inputs in the same order. But real sandboxes decide when packets

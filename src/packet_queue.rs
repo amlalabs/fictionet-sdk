@@ -11,14 +11,20 @@ pub struct PacketQueue {
 }
 
 impl PacketQueue {
-    /// Adds a packet if its charge fits within `limit`, or without a limit
-    /// when `None`. Returns the queued packet, or the original packet if full.
+    /// Whether a packet of `len` bytes, charged `len` plus [`PACKET_COST`],
+    /// fits beside the queued packets within `limit`. Every packet fits when
+    /// `limit` is `None`.
+    pub fn fits(&self, len: usize, limit: Option<usize>) -> bool {
+        limit.is_none_or(|limit| self.bytes + len + PACKET_COST <= limit)
+    }
+
+    /// Adds a packet if it [`fits`](Self::fits) within `limit`. Returns the
+    /// queued packet, or the original packet if full.
     pub fn try_push(&mut self, packet: Packet, limit: Option<usize>) -> Result<&Packet, Packet> {
-        let cost = packet.0.len() + PACKET_COST;
-        if limit.is_some_and(|limit| self.bytes() + cost > limit) {
+        if !self.fits(packet.0.len(), limit) {
             return Err(packet);
         }
-        self.bytes += cost;
+        self.bytes += packet.0.len() + PACKET_COST;
         self.packets.push_back(packet);
         Ok(self.packets.back().expect("just queued"))
     }
@@ -29,15 +35,15 @@ impl PacketQueue {
         self.bytes -= packet.0.len() + PACKET_COST;
         Some(packet)
     }
-
-    /// The total charge of the queued packets, including [`PACKET_COST`].
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
 }
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 impl PacketQueue {
+    /// The total charge of the queued packets, including [`PACKET_COST`].
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// Borrows the oldest packet without releasing its charge.
     pub fn front(&self) -> Option<&Packet> {
         self.packets.front()
@@ -81,6 +87,9 @@ mod tests {
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.pop(), Some(Packet(vec![1])));
         assert_eq!(queue.bytes(), PACKET_COST + 2);
+        assert!(queue.fits(1, Some(limit)));
+        assert!(!queue.fits(2, Some(limit)));
+        assert!(queue.fits(2, None));
         assert!(queue.try_push(Packet(vec![5]), Some(limit)).is_ok());
         assert_eq!(queue.pop(), Some(Packet(vec![2, 3])));
         assert_eq!(queue.bytes(), PACKET_COST + 1);

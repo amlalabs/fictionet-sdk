@@ -578,8 +578,8 @@ TLS ownership and reproducibility are split across these files:
   the server and the simulated client.
 
 [Repeatable runs](../src/guide/running.rs) describes external I/O and clock
-limits. Native HTTP/2 reset expiry follows the run's clock. Only opt-in axum
-upgrades use hyper's own time.
+limits. [`httpd.rs`](../src/stdlib/web/httpd.rs) says how the native HTTP/2
+server keeps time. Only opt-in axum upgrades use hyper's own time.
 
 Each peer address may hold 256 connections at once across all machines
 and gateway DNS listeners in the network. Bytes held by the service layer

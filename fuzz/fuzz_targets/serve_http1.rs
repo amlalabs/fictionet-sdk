@@ -38,9 +38,9 @@ impl fictionet::events::Observer for Count {
 }
 
 fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
-    let evidence_h = std::sync::Arc::new(Count::default());
+    let events = std::sync::Arc::new(Count::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ())
-        .observer(evidence_h.clone());
+        .observer(events.clone());
     for chunk in chunks {
         if h.push(chunk).is_err() {
             break;
@@ -49,7 +49,7 @@ fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
     let _ = h.end();
     (
         h.output().to_vec(),
-        evidence_h.0.load(std::sync::atomic::Ordering::Relaxed),
+        events.0.load(std::sync::atomic::Ordering::Relaxed),
         h.closed(),
     )
 }

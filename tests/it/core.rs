@@ -154,11 +154,10 @@ fn event_wait_predicate_can_read_same_log() {
     within(Duration::from_secs(5), || {
         block_on(crate::common::observed_lab(
             Seed::from_u64(1),
-            |fcx, evidence| async move {
+            |fcx, log| async move {
                 fcx.emit("test", "tick", |event| event);
                 fcx.emit("test", "drop", |event| event);
                 fcx.emit("test", "tick", |event| event);
-                let log = evidence;
                 let other = log.clone();
                 let seen = std::sync::Mutex::new(Vec::new());
                 let got = log
@@ -184,11 +183,11 @@ fn event_wait_predicate_can_record_into_same_log() {
     within(Duration::from_secs(5), || {
         block_on(crate::common::observed_lab(
             Seed::from_u64(1),
-            |fcx, evidence| async move {
+            |fcx, log| async move {
                 fcx.emit("test", "tick", |event| event);
                 let recorded = std::sync::atomic::AtomicBool::new(false);
                 let seen = std::sync::Mutex::new(Vec::new());
-                let got = evidence
+                let got = log
                     .wait(&fcx, 0, 2, ms(20), |event| {
                         seen.lock()
                             .unwrap()
@@ -214,10 +213,10 @@ fn event_wait_checks_cancellation_before_inspecting_matches() {
     for n in [0, 1] {
         block_on(crate::common::observed_lab(
             Seed::from_u64(1),
-            |fcx, evidence| async move {
+            |fcx, log| async move {
                 fcx.emit("test", "tick", |event| event);
                 fcx.cancel();
-                let result = evidence
+                let result = log
                     .wait(&fcx, 0, n, ms(10), |_| {
                         panic!("cancelled wait inspected events")
                     })
@@ -235,9 +234,9 @@ fn event_wait_predicate_cancellation_wins_over_matches_and_timeout() {
     for n in [1, 2] {
         block_on(crate::common::observed_lab(
             Seed::from_u64(1),
-            |fcx, evidence| async move {
+            |fcx, log| async move {
                 fcx.emit("test", "tick", |event| event);
-                let result = evidence
+                let result = log
                     .wait(&fcx, 0, n, Duration::ZERO, |_| {
                         fcx.cancel();
                         true
@@ -259,7 +258,7 @@ fn cancellation_ends_every_wait() {
     let out = within(Duration::from_secs(5), move || {
         block_on(crate::common::observed_lab(
             Seed::from_u64(1),
-            move |fcx, evidence| async move {
+            move |fcx, log| async move {
                 let (mut a, b) = pair();
                 let r1 = r.clone();
                 fcx.spawn(move |fcx| async move {
@@ -328,7 +327,7 @@ fn cancellation_ends_every_wait() {
                 });
                 let r9 = r.clone();
                 fcx.spawn(move |fcx| async move {
-                    let res = evidence
+                    let res = log
                         .wait(&fcx, 0, 1, Duration::from_secs(60), |_| false)
                         .await;
                     r9.lock().unwrap().push(format!("events {:?}", res.err()));

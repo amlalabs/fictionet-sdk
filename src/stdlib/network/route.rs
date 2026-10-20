@@ -1069,9 +1069,9 @@ mod tests {
     /// says so, and the sender hears "time exceeded".
     #[test]
     fn a_routing_loop_ends_when_the_ttl_runs_out() {
-        let evidence = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
+        let log = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(log.clone()),
             |fcx| async move {
                 let (r1_s4, mut s4) = fictionet::pair();
                 let (r1_s6, mut s6) = fictionet::pair();
@@ -1122,7 +1122,7 @@ mod tests {
                 // r1 forwarded r2's answer: one hop.
                 assert_eq!(answer.0[7], 63);
 
-                let drops: Vec<String> = evidence
+                let drops: Vec<String> = log
                     .of("router", "drop")
                     .into_iter()
                     .map(|e| e.summary)
@@ -1332,9 +1332,9 @@ mod tests {
     /// each with its reason, in the installed observer.
     #[test]
     fn drops_and_member_changes_are_recorded() {
-        let evidence = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
+        let log = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(log.clone()),
             |fcx| async move {
                 let lan =
                     lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
@@ -1353,7 +1353,7 @@ mod tests {
                 drop(b2);
                 fcx.sleep(Duration::from_millis(20)).await?;
 
-                let events: Vec<(&str, String)> = evidence
+                let events: Vec<(&str, String)> = log
                     .all()
                     .into_iter()
                     .filter(|e| e.source == "lan")
@@ -1432,9 +1432,9 @@ mod tests {
     /// A router delivers a removed route to the installed observer.
     #[test]
     fn routers_record_routes_they_remove() {
-        let evidence = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
+        let log = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(log.clone()),
             |fcx| async move {
                 let (a, b) = fictionet::pair();
                 let (c, d) = fictionet::pair();
@@ -1445,7 +1445,7 @@ mod tests {
                 router.add("10.0.1.0/24".parse().unwrap(), c);
                 drop(b);
                 fcx.sleep(Duration::from_millis(10)).await?;
-                let removed = evidence.of("router", "route_removed");
+                let removed = log.of("router", "route_removed");
                 assert_eq!(removed.len(), 1);
                 assert_eq!(removed[0].str("prefix"), Some("10.0.0.0/24"));
                 drop(d);

@@ -77,10 +77,14 @@
 //! connection's [`Budget`]. A head that does not fit is refused before its
 //! handler runs, with `answer: budget` and no status. A body that exceeds its
 //! allowance receives `503`. Transport storage belongs to its transport.
-//! Body deadlines, SETTINGS acknowledgment deadlines and reset-stream expiry
-//! all use the driver's world clock. Stream flow control, reset limits and
-//! bounded header assembly apply independently of the runtime. PING and GOAWAY
-//! are handled by the service; graceful shutdown drains admitted streams.
+//! After the HTTP/2 server resets a stream, it ignores that stream's late
+//! HEADERS and DATA for one second. It holds at most 50 reset streams at a
+//! time. HEADERS and DATA on any other closed stream are errors. The
+//! one-second hold, body deadlines and SETTINGS acknowledgment deadlines are
+//! all timed on the run's clock.
+//! Stream flow control, reset limits and bounded header assembly apply
+//! independently of the runtime. PING and GOAWAY are handled by the service;
+//! graceful shutdown drains admitted streams.
 //!
 //! ```
 //! use bytes::Bytes;
@@ -146,8 +150,8 @@
 //! Neither backend relaxes its limits to observe more bytes. Requests rejected
 //! before a parsed head reaches the service have no request event. Bytes after
 //! an upgrade handoff are outside HTTP observation. A missing handler label
-//! is not evidence of no exposure; consumers need complete receipt or an
-//! observer verdict to judge safety.
+//! does not show that nothing was exposed; consumers need complete receipt or
+//! an observer verdict to judge safety.
 //! If hyper's body read reports region cancellation, `received` is `cut_off`;
 //! its response still uses `answer: timeout` and status `408`. Consumers must
 //! use `received` to distinguish this from a body deadline.

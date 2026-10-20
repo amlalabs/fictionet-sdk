@@ -78,7 +78,7 @@ class InspectEvalTests(unittest.IsolatedAsyncioTestCase):
         self.results[2] = result(7)
         self.assertEqual((await self.score(await self.solve())).value, INCORRECT)
 
-    async def test_shell_proxy_and_tun_containment_evidence(self):
+    async def test_shell_proxy_and_tun_gates_judge_connect_failures(self):
         # Both gates reject a stalled response. Only the proxy gate accepts a
         # pre-connect timeout: its deny-all NetworkPolicy may drop SYNs.
         assertions = Path(__file__).parents[1] / "common" / "assertions.sh"
