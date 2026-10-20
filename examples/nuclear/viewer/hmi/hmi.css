@@ -266,40 +266,6 @@ body {
   font-weight: 600;
 }
 
-.reading {
-  fill: var(--ink);
-  font-size: 13px;
-}
-
-.reading.stale {
-  fill: var(--stale);
-}
-
-.pump {
-  fill: var(--line-strong);
-  stroke: var(--ink);
-  stroke-width: 1.5;
-}
-
-.pump.running {
-  fill: var(--ok);
-}
-
-.pump.stopped {
-  fill: var(--panel);
-  stroke-dasharray: 4 3;
-}
-
-.pump-name {
-  fill: var(--ink);
-  font-size: 12px;
-}
-
-.pump-state {
-  fill: var(--muted);
-  font-size: 12px;
-}
-
 /* Controls */
 .control-group {
   border-top: 1px solid var(--line);
@@ -339,13 +305,6 @@ body {
   color: var(--button-ink);
   font: inherit;
   cursor: pointer;
-}
-
-.control-button.armed {
-  background: var(--danger-bg);
-  color: var(--danger-ink);
-  border-color: var(--danger-bg);
-  font-weight: 600;
 }
 
 .control-input {
@@ -445,28 +404,78 @@ body {
   .equipment,
   .control-button,
   .control-input {
-    border: 1px solid CanvasText;
+    border: 1px solid var(--ink);
   }
 
   .tile.active {
     border-left-width: 6px;
-    border-left-color: Highlight;
-  }
-
-  .pump.running {
-    fill: CanvasText;
+    border-left-color: var(--focus);
   }
 
   .pipe,
   .trend-line {
-    stroke: CanvasText;
+    stroke: var(--ink);
   }
 }
 
 .mimic text { font-family: ui-monospace, monospace; font-size: 13px; }
-.pump.abnormal { fill: var(--alarm-line); }
-.pump-state.abnormal { fill: var(--alarm-ink); }
-.pump-state.stale, .pump.stale { fill: var(--stale); }
 .site-clock { font-variant-numeric: tabular-nums; }
 .alarm-entries { margin: 12px 0 0; padding-left: 20px; }
-.trip-note { font-size: .9rem; margin: 6px 0; }
+
+/* Line patterns identify the medium without color. */
+.pipe.primary-hot { stroke-width: 5; }
+.pipe.primary-cold { stroke-width: 3; }
+.pipe.steam { stroke-width: 3; stroke-dasharray: 10 4; }
+.pipe.feedwater { stroke-width: 2; }
+.pipe.circulating-water { stroke-width: 2; stroke-dasharray: 8 3 2 3; }
+.tube, .shaft { fill: none; stroke: var(--pipe); stroke-width: 2; }
+.level-fill { fill: var(--pipe); stroke: none; }
+.core { fill: none; stroke: var(--ink); stroke-dasharray: 2 3; }
+.data-box { fill: var(--panel); stroke: var(--line-strong); }
+.mimic .instrument-tag { fill: var(--muted); font-size: 13px; }
+.mimic .instrument-value { fill: var(--ink); font-size: 15px; }
+.symbol-letter { fill: var(--ink); stroke: none; }
+.instrument.stale text, .instrument-value.stale { fill: var(--stale); }
+.equipment.abnormal { stroke: var(--alarm-line); }
+.instrument-value.abnormal { fill: var(--alarm-ink); }
+.equipment.stale { stroke: var(--stale); stroke-dasharray: 3 3; }
+.equipment.open { fill: var(--panel); stroke-width: 3; }
+.equipment.stopped { stroke-dasharray: 3 2; }
+.confirmation { grid-column: 1 / -1; padding: 8px; background: var(--panel); border: 2px solid var(--line-strong); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.confirmation[hidden] { display: none; }
+.trend-min, .trend-max { grid-column: 1 / -1; color: var(--muted); font-size: .8rem; }
+.time-axis { grid-column: 1 / -1; display: flex; justify-content: space-between; font-size: .8rem; color: var(--muted); }
+@media (forced-colors: active) {
+  .equipment, .data-box, .tube, .shaft { stroke: var(--ink); }
+  .instrument text, .symbol-letter { fill: var(--ink); }
+  .equipment.abnormal, .equipment.stale { stroke: var(--focus); }
+  .level-fill { fill: var(--ok); }
+}
+
+.rod-bank { fill: var(--ink); stroke: none; }
+.level-fill.stale, .rod-bank.stale { fill: var(--stale); }
+
+.process-key { margin: 0 0 8px; color: var(--muted); font-size: .85rem; }
+
+.state-label { fill: var(--muted); }
+.state-value { fill: var(--ink); }
+.state-value.abnormal { fill: var(--alarm-ink); }
+.state-value.stale { fill: var(--stale); }
+.control-button[aria-pressed="true"] {
+  background: var(--ink);
+  color: var(--panel);
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  font-weight: 700;
+}
+@media (forced-colors: active) {
+  :root[data-theme], :root:not([data-theme]) {
+    --ink: CanvasText;
+    --panel: Canvas;
+    --muted: CanvasText;
+    --focus: Highlight;
+    --ok: GrayText;
+  }
+  .state-value.abnormal, .state-value.stale { fill: var(--ink); text-decoration: underline; }
+  .control-button[aria-pressed="true"] { border: 3px double var(--focus); }
+}

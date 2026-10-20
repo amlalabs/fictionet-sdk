@@ -15,28 +15,6 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 const STATE_WORDS = { normal: 'Normal', active: 'Active', acknowledged: 'Acknowledged' };
 const LINK_IDS = ['rps1', 'rcs1', 'bop1'];
 
-// Equipment boxes of the mimic. Each lists the readings it shows, in order.
-const BOXES = [
-  { title: 'Reactor core', x: 20, y: 20, w: 340, h: 245, fields: ['neutron_power', 'rod_position', 'shutdown_rods', 'rod_demand', 'core_exit_temperature'], flags: ['reactor_tripped'] },
-  { title: 'Pressurizer', x: 20, y: 320, w: 340, h: 220, fields: ['pressurizer_pressure', 'pressurizer_level', 'spray_valve'], flags: ['heaters', 'pressurizer_relief'] },
-  { title: 'Loop A · Steam generator A', x: 400, y: 20, w: 340, h: 390, fields: ['hot_leg_a', 'cold_leg_a', 'coolant_flow_a', 'sg_level_a', 'steam_flow_a', 'feed_flow_a', 'feed_valve_a'], flags: ['coolant_pump_a', 'feed_pump_a'] },
-  { title: 'Loop B · Steam generator B', x: 400, y: 460, w: 340, h: 390, fields: ['hot_leg_b', 'cold_leg_b', 'coolant_flow_b', 'sg_level_b', 'steam_flow_b', 'feed_flow_b', 'feed_valve_b'], flags: ['coolant_pump_b', 'feed_pump_b'] },
-  { title: 'Turbine / Generator', x: 780, y: 20, w: 340, h: 220, fields: ['turbine_valve', 'turbine_valve_position', 'generator_output'], flags: ['turbine_tripped'] },
-  { title: 'Steam header', x: 780, y: 300, w: 340, h: 175, fields: ['steam_pressure', 'steam_dump_valve'], flags: ['steam_relief'] },
-  { title: 'Condenser / Feedwater', x: 780, y: 550, w: 340, h: 200, fields: ['condenser_pressure'], flags: ['circulating_water', 'auxiliary_feed'] },
-];
-
-// Connections end at equipment edges. Text stays inside the equipment.
-const PIPES = [
-  [180, 265, 180, 320],
-  [360, 90, 400, 90], [360, 220, 400, 220],
-  [360, 150, 380, 150], [380, 150, 380, 670], [380, 670, 400, 670],
-  [360, 240, 370, 240], [370, 240, 370, 800], [370, 800, 400, 800],
-  [740, 100, 780, 100], [740, 520, 760, 520], [760, 520, 760, 140], [760, 140, 780, 140],
-  [950, 240, 950, 300], [950, 475, 950, 550],
-  [780, 650, 740, 650], [780, 610, 750, 610], [750, 610, 750, 370], [750, 370, 740, 370],
-];
-
 const FLAGS = {
   reactor_tripped: ['Reactor trip', 'Tripped', 'Clear', true, 'rps1'],
   turbine_tripped: ['Turbine trip', 'Tripped', 'Clear', true, 'bop1'],
@@ -47,7 +25,7 @@ const FLAGS = {
   coolant_pump_b: ['Coolant pump B', 'Running', 'Stopped', false, 'rcs1'],
   feed_pump_a: ['Feed pump A', 'Running', 'Stopped', false, 'bop1'],
   feed_pump_b: ['Feed pump B', 'Running', 'Stopped', false, 'bop1'],
-  auxiliary_feed: ['Auxiliary feed', 'Running', 'Stopped', false, 'bop1'],
+  auxiliary_feed: ['Auxiliary feed', 'Running', 'Stopped', true, 'bop1'],
   circulating_water: ['Circulating water', 'Running', 'Stopped', false, 'bop1'],
 };
 
@@ -83,12 +61,12 @@ const FIELD_LABELS = {
 };
 
 const TRENDS = [
-  { id: 'neutron_power', label: 'Neutron power' },
-  { id: 'pressurizer_pressure', label: 'Pressurizer pressure' },
-  { id: 'hot_leg_a', label: 'Hot leg A' },
-  { id: 'steam_pressure', label: 'Steam pressure' },
-  { id: 'pressurizer_level', label: 'Pressurizer level' },
-  { id: 'generator_output', label: 'Generator output' },
+  { id: 'neutron_power', rangeSpan: 120, label: 'Neutron power' },
+  { id: 'pressurizer_pressure', rangeSpan: 6, label: 'Pressurizer pressure' },
+  { id: 'hot_leg_a', rangeSpan: 70, label: 'Hot leg A' },
+  { id: 'steam_pressure', rangeSpan: 10, label: 'Steam pressure' },
+  { id: 'pressurizer_level', rangeSpan: 100, label: 'Pressurizer level' },
+  { id: 'generator_output', rangeSpan: 700, label: 'Generator output' },
 ];
 
 const PUMP_CONTROLS = [
@@ -116,7 +94,7 @@ const CONTROLLER_CONTROLS = [
 ];
 
 const parts = new WeakMap();
-let pollNow = () => {};
+const pollNow = new WeakMap();
 
 function make(doc, tag, attrs = {}, text) {
   const node = doc.createElement(tag);
@@ -251,45 +229,191 @@ function updateAnnunciators(a, alarms, zone) {
 
 function buildMimic(doc) {
   const section = make(doc, 'section', { class: 'panel mimic', 'aria-label': 'Plant mimic' });
-  const picture = svg(doc, 'svg', {
-    viewBox: '0 0 1140 870',
-    role: 'img',
-    'aria-label': 'Mimic of the primary and secondary circuits with live readings and pump state',
+  const picture = svg(doc, 'svg', { viewBox: '0 0 1280 1180', role: 'img',
+    'aria-label': 'Primary coolant, steam, feedwater and circulating water circuits' });
+  const readings = new Map(), pumps = new Map(), modes = new Map(), fills = new Map();
+  const symbols = new Map();
+  const pipe = (medium, points) => {
+    for (let i = 1; i < points.length; i++) {
+      const [x1, y1] = points[i - 1], [x2, y2] = points[i];
+      picture.appendChild(svg(doc, 'line', { x1, y1, x2, y2, class: `pipe ${medium}`, 'data-medium': medium }));
+    }
+  };
+  const symbol = (id, x, y, w, h, draw) => {
+    const g = svg(doc, 'g', { class: 'equipment', 'data-equipment': id,
+      'data-bounds': `${x},${y},${w},${h}` });
+    draw(g);
+    picture.appendChild(g);
+    symbols.set(id, g);
+    return g;
+  };
+  const vessel = (id, x, y, reading) => symbol(id, x, y, 60, 100, (g) => {
+    g.appendChild(svg(doc, 'rect', { x, y, width: 60, height: 100, rx: 24 }));
+    const rods = id === 'reactor-vessel';
+    const nodes = (rods ? [16, 28, 40] : [8]).map((offset) => {
+      const node = svg(doc, 'rect', { x: x + offset, y: y + 50, width: rods ? 4 : 44, height: 40, class: rods ? 'rod-bank' : 'level-fill' });
+      g.appendChild(node);
+      return node;
+    });
+    fills.set(reading, { nodes, y: y + 90, height: 80, rods });
+    if (id.startsWith('sg')) g.appendChild(svg(doc, 'path', { d: `M${x + 20},${y + 90} v-65 q10,-20 20,0 v65`, class: 'tube' }));
   });
-  for (const [x1, y1, x2, y2] of PIPES) {
-    picture.appendChild(svg(doc, 'line', { x1, y1, x2, y2, class: 'pipe' }));
-  }
-  const readings = new Map();
-  const pumps = new Map();
-  for (const box of BOXES) {
-    picture.appendChild(svg(doc, 'rect', { x: box.x, y: box.y, width: box.w, height: box.h, rx: 6, class: 'equipment' }));
-    picture.appendChild(svg(doc, 'text', { x: box.x + 10, y: box.y + 22, class: 'equipment-title' }, box.title));
-    box.fields.forEach((id, i) => {
-      const text = svg(doc, 'text', { x: box.x + 10, y: box.y + 54 + i * 30, class: 'reading', 'data-reading': id });
-      picture.appendChild(text);
-      readings.set(id, { text, label: FIELD_LABELS[id] ?? id });
+  vessel('reactor-vessel', 570, 400, 'rod_position');
+  symbol('core', 580, 455, 40, 30, (g) => g.appendChild(svg(doc, 'rect', { x: 580, y: 455, width: 40, height: 30, class: 'core' })));
+  vessel('pressurizer', 760, 240, 'pressurizer_level');
+  vessel('sg-a', 240, 400, 'sg_level_a');
+  vessel('sg-b', 840, 400, 'sg_level_b');
+  const pump = (id, x, y) => symbol(id, x - 16, y - 16, 42, 32, (g) => {
+    g.appendChild(svg(doc, 'circle', { cx: x, cy: y, r: 16 }));
+    g.appendChild(svg(doc, 'path', { d: `M${x},${y - 16} h26 M${x - 6},${y + 7} l14,-7 -14,-7`, class: 'tube' }));
+  });
+  pump('coolant_pump_a', 400, 650); pump('coolant_pump_b', 760, 650);
+  pump('feed_pump_a', 200, 900); pump('feed_pump_b', 960, 900);
+  pump('auxiliary_feed', 500, 1080); pump('circulating_water', 900, 800);
+  const valve = (id, x, y) => symbol(id, x - 14, y - 10, 28, 20, (g) => {
+    g.appendChild(svg(doc, 'path', { d: `M${x - 14},${y - 10} L${x + 14},${y + 10} V${y - 10} L${x - 14},${y + 10} Z` }));
+  });
+  valve('feed_valve_a', 180, 460); valve('feed_valve_b', 950, 460);
+  valve('turbine_valve', 920, 100); valve('steam_dump_valve', 1110, 700);
+  valve('spray_valve', 730, 220); valve('pressurizer_relief', 850, 220); valve('steam_relief', 664, 40);
+  for (const [id, x, w] of [['hp-turbine', 950, 40], ['lp-turbine', 1020, 50]]) {
+    symbol(id, x, 85, w, 50, (g) => {
+      g.appendChild(svg(doc, 'polygon', { points: `${x},100 ${x + w},85 ${x + w},135 ${x},120` }));
+      g.appendChild(svg(doc, 'text', { x: x + 12, y: 115, class: 'symbol-letter' }, id.startsWith('hp') ? 'HP' : 'LP'));
     });
-    box.flags.forEach((flag, i) => {
-      const y = box.y + 54 + (box.fields.length + i) * 30;
-      const [label] = FLAGS[flag];
-      const circle = svg(doc, 'circle', { cx: box.x + 17, cy: y - 5, r: 6, class: 'pump', 'data-pump': flag });
-      const name = svg(doc, 'text', { x: box.x + 32, y, class: 'pump-name' }, label);
-      const state = svg(doc, 'text', { x: box.x + 250, y, class: 'pump-state', 'data-status': flag });
-      picture.appendChild(circle);
-      picture.appendChild(name);
-      picture.appendChild(state);
-      pumps.set(flag, { circle, state });
-    });
   }
+  symbol('generator', 1100, 90, 40, 40, (g) => {
+    g.appendChild(svg(doc, 'circle', { cx: 1120, cy: 110, r: 20 }));
+    g.appendChild(svg(doc, 'text', { x: 1115, y: 115, class: 'symbol-letter' }, 'G'));
+  });
+  picture.appendChild(svg(doc, 'line', { x1: 1070, y1: 110, x2: 1100, y2: 110, class: 'shaft' }));
+  symbol('condenser', 1020, 760, 120, 70, (g) => {
+    g.appendChild(svg(doc, 'rect', { x: 1020, y: 760, width: 120, height: 70, rx: 8 }));
+    g.appendChild(svg(doc, 'path', { d: 'M1025,790 h110 M1025,800 h110 M1025,810 h110', class: 'tube' }));
+  });
+
+  // Each circuit stops at equipment ports. Shared headers are drawn once.
+  pipe('primary-hot', [[570, 420], [300, 420]]);
+  pipe('primary-hot', [[630, 420], [790, 420], [840, 420]]);
+  pipe('primary-hot', [[790, 340], [790, 420]]);
+  pipe('primary-cold', [[270, 500], [270, 650], [384, 650]]);
+  pipe('primary-cold', [[426, 634], [490, 634], [490, 480], [570, 480]]);
+  pipe('primary-cold', [[870, 500], [870, 690], [700, 690], [700, 650], [744, 650]]);
+  pipe('primary-cold', [[786, 634], [810, 634], [810, 600], [670, 600], [670, 480], [630, 480]]);
+  pipe('primary-cold', [[760, 260], [750, 260], [750, 220], [744, 220]]);
+  pipe('primary-cold', [[716, 220], [700, 220], [700, 280], [760, 280]]);
+  pipe('steam', [[790, 240], [790, 220], [836, 220]]);
+  pipe('steam', [[864, 220], [890, 220]]);
+  pipe('steam', [[270, 400], [270, 100], [600, 100], [870, 100], [900, 100], [906, 100]]);
+  pipe('steam', [[870, 400], [870, 230]]);
+  pipe('steam', [[870, 210], [870, 100]]);
+  // The relief branch crosses the steam riser with a visible bridge.
+  picture.appendChild(svg(doc, 'path', { d: 'M870,230 Q880,220 870,210', class: 'pipe steam crossing' }));
+  pipe('steam', [[600, 100], [600, 40], [650, 40]]);
+  pipe('steam', [[678, 40], [710, 40]]);
+  pipe('steam', [[934, 100], [950, 100]]);
+  pipe('steam', [[990, 100], [1020, 100]]);
+  pipe('steam', [[1060, 135], [1060, 175], [1220, 175], [1220, 780], [1140, 780]]);
+  pipe('steam', [[900, 100], [900, 5], [1200, 5], [1200, 165]]);
+  pipe('steam', [[1200, 185], [1200, 700], [1124, 700]]);
+  picture.appendChild(svg(doc, 'path', { d: 'M1200,165 Q1210,175 1200,185', class: 'pipe steam crossing' }));
+  pipe('steam', [[1096, 700], [1080, 700], [1080, 760]]);
+  pipe('feedwater', [[1080, 830], [1080, 1000], [960, 1000], [200, 1000], [200, 916]]);
+  pipe('feedwater', [[960, 1000], [960, 916]]);
+  pipe('feedwater', [[226, 884], [226, 800], [10, 800], [10, 460], [166, 460]]);
+  pipe('feedwater', [[194, 460], [240, 460]]);
+  pipe('feedwater', [[986, 884], [1000, 884], [1000, 460], [964, 460]]);
+  pipe('feedwater', [[936, 460], [900, 460]]);
+  pipe('feedwater', [[1080, 1000], [1080, 1140], [500, 1140], [500, 1096]]);
+  pipe('feedwater', [[526, 1064], [550, 1064], [550, 1010]]);
+  pipe('feedwater', [[550, 990], [550, 760], [180, 760], [180, 730], [10, 730]]);
+  picture.appendChild(svg(doc, 'path', { d: 'M550,1010 Q560,1000 550,990', class: 'pipe feedwater crossing' }));
+  pipe('feedwater', [[550, 760], [940, 760], [940, 720], [1000, 720]]);
+  pipe('circulating-water', [[820, 800], [884, 800]]);
+  pipe('circulating-water', [[926, 784], [980, 784], [980, 800], [990, 800]]);
+  pipe('circulating-water', [[1010, 800], [1020, 800]]);
+  picture.appendChild(svg(doc, 'path', { d: 'M990,800 Q1000,790 1010,800', class: 'pipe circulating-water crossing' }));
+  pipe('circulating-water', [[1140, 800], [1230, 800]]);
+
+  const label = (text, x, y, className = 'equipment-title') => {
+    const node = svg(doc, 'text', { x, y, class: className }, text);
+    picture.appendChild(node);
+    return node;
+  };
+  for (const [title, x, y] of [
+    ['Reactor vessel', 510, 390], ['Pressurizer', 740, 195],
+    ['Steam generator A', 100, 380], ['Steam generator B', 880, 375],
+    ['Turbine / Generator', 950, 80], ['Condenser', 1100, 735],
+    ['Loop A', 330, 450], ['Loop B', 720, 510],
+  ]) label(title, x, y);
+  const instrument = (id, x, y, tagText, mode = false) => {
+    const g = svg(doc, 'g', { 'data-reading': mode ? '' : id, class: 'instrument' });
+    g.appendChild(svg(doc, 'rect', { x, y, width: id === 'feed_b' ? 110 : 175, height: 52, class: 'data-box' }));
+    const tag = svg(doc, 'text', { x: x + 6, y: y + 18, class: 'instrument-tag' }, tagText);
+    const text = svg(doc, 'text', { x: x + 6, y: y + 40, class: 'instrument-value' });
+    g.appendChild(tag); g.appendChild(text); picture.appendChild(g);
+    if (mode) { text.setAttribute('data-mode', id); modes.set(id, text); }
+    else readings.set(id, { text, tag, group: g });
+  };
+  for (const [id, x, y] of [
+    ['neutron_power', 300, 480], ['rod_position', 492, 535],
+    ['shutdown_rods', 492, 595], ['rod_demand', 492, 655],
+    ['core_exit_temperature', 300, 540],
+    ['pressurizer_pressure', 510, 180], ['pressurizer_level', 510, 300],
+    ['spray_valve', 690, 120],
+    ['hot_leg_a', 330, 355], ['cold_leg_a', 80, 600], ['coolant_flow_a', 290, 675],
+    ['hot_leg_b', 640, 425], ['cold_leg_b', 680, 535], ['coolant_flow_b', 680, 700],
+    ['sg_level_a', 50, 390], ['sg_level_b', 920, 380],
+    ['steam_flow_a', 80, 285], ['steam_flow_b', 880, 310],
+    ['feed_flow_a', 50, 480], ['feed_valve_a', 50, 540],
+    ['feed_flow_b', 1010, 495], ['feed_valve_b', 1010, 435],
+    ['steam_pressure', 340, 30], ['turbine_valve', 1010, 180],
+    ['turbine_valve_position', 1010, 240], ['generator_output', 1010, 10],
+    ['steam_dump_valve', 1010, 615], ['condenser_pressure', 1100, 850],
+  ]) instrument(id, x, y);
+  for (const [id, tag, x, y] of [
+    ['pressurizer', 'PIC-455 Pressure', 510, 240],
+    ['feed_a', 'LIC-421A Level', 50, 660], ['feed_b', 'LIC-421B', 880, 505],
+    ['steam_dump', 'PIC-434 Pressure', 1010, 555],
+  ]) instrument(id, x, y, tag, true);
+  for (const [id, equipment, x, y] of [
+    ['reactor_tripped', 'reactor-vessel', 550, 525], ['turbine_tripped', 'hp-turbine', 880, 280],
+    ['heaters', 'pressurizer', 700, 350], ['pressurizer_relief', 'pressurizer_relief', 885, 215],
+    ['steam_relief', 'steam_relief', 730, 45],
+    ['coolant_pump_a', 'coolant_pump_a', 430, 670], ['coolant_pump_b', 'coolant_pump_b', 880, 650],
+    ['feed_pump_a', 'feed_pump_a', 240, 915], ['feed_pump_b', 'feed_pump_b', 760, 940],
+    ['auxiliary_feed', 'auxiliary_feed', 290, 1090], ['circulating_water', 'circulating_water', 800, 825],
+  ]) {
+    label(({ heaters: 'Heaters', pressurizer_relief: 'Relief', coolant_pump_a: 'RCP A', coolant_pump_b: 'RCP B' })[id] ?? FLAGS[id][0], x, y, 'state-label');
+    const state = label('', x, y + 22, 'state-value');
+    state.setAttribute('data-status', id);
+    const circle = symbols.get(equipment);
+    circle.setAttribute('data-pump', id);
+    pumps.set(id, { circle, state });
+  }
+  section.appendChild(make(doc, 'p', { class: 'process-key' }, 'Primary: heavy hot leg / thin cold leg · Steam: dashed · Feedwater: thin solid · Circulating water: dash-dot'));
   section.appendChild(picture);
-  return { section, readings, pumps };
+  return { section, readings, pumps, modes, fills, symbols };
 }
 
 function updateMimic(m, plant) {
   for (const [id, entry] of m.readings) {
     const reading = plant.readings?.[id];
-    entry.text.textContent = `${reading?.tag ?? "—"} ${entry.label}: ${formatValue(reading)}`;
-    setFlag(entry.text, 'stale', reading?.stale === true);
+    entry.tag.textContent = reading?.tag ?? '—';
+    entry.group.setAttribute('aria-label', `${FIELD_LABELS[id]}: ${formatValue(reading)}`);
+    entry.text.textContent = `${formatValue(reading)}${reading?.stale && reading?.value != null ? ' stale' : ''}`;
+    setFlag(entry.group, 'stale', reading?.stale || reading?.value == null);
+    const symbol = m.symbols.get(id);
+    if (symbol) setFlag(symbol, 'stale', reading?.stale || reading?.value == null);
+  }
+  for (const [id, fill] of m.fills) {
+    const reading = plant.readings?.[id];
+    const height = reading?.value == null ? 0 : Math.max(0, Math.min(100, reading.value)) / 100 * fill.height;
+    for (const node of fill.nodes) {
+      node.setAttribute('y', fill.rods ? fill.y - fill.height : fill.y - height);
+      node.setAttribute('height', height);
+      setFlag(node, 'stale', reading?.stale || reading?.value == null);
+    }
   }
   for (const [flag, pump] of m.pumps) {
     const running = plant.status?.[flag];
@@ -302,6 +426,12 @@ function updateMimic(m, plant) {
     setFlag(pump.circle, 'abnormal', running != null && running === abnormal);
     setFlag(pump.state, 'stale', stale || running == null);
     setFlag(pump.circle, 'stale', stale || running == null);
+    setFlag(pump.circle, 'open', running === true && flag.endsWith('relief'));
+  }
+  for (const [id, text] of m.modes) {
+    const stale = plant.links?.some((link) => link.id === (id === 'pressurizer' ? 'rcs1' : 'bop1') && !link.online);
+    text.textContent = stale ? 'Stale' : ({ automatic: 'Auto', manual: 'Man' }[plant.modes?.[id]] ?? 'No data');
+    setFlag(text, 'stale', stale || plant.modes?.[id] == null);
   }
 }
 
@@ -318,35 +448,39 @@ function buildControls(doc) {
   const message = make(doc, 'p', { class: 'message', role: 'status' }, 'Ready.');
 
   const reactor = group(doc, 'Reactor');
-  let armedUntil = 0;
-  let armTimer;
-  const note = make(doc, 'p', { id: 'trip-note', role: 'status', class: 'trip-note' });
-  const resetArm = () => {
-    armedUntil = 0;
-    clearTimeout(armTimer);
-    trip.textContent = 'Trip reactor';
-    trip.setAttribute('aria-label', 'Trip reactor');
-    trip.classList.remove('armed');
+  let selected, selectionTimer;
+  const confirmation = make(doc, 'div', { class: 'confirmation', role: 'group', 'aria-label': 'Selected action', hidden: '' });
+  const note = make(doc, 'span', { role: 'status' });
+  const cancel = () => {
+    selected?.button.setAttribute('aria-pressed', 'false');
+    selected = undefined;
+    clearTimeout(selectionTimer);
+    confirmation.setAttribute('hidden', '');
     note.textContent = '';
   };
-  const trip = button(doc, 'Trip reactor', '', () => {
-    if (armedUntil > Date.now()) {
-      resetArm();
-      return post('trip', {}, 'Trip reactor', message);
-    }
-    resetArm();
-    armedUntil = Date.now() + 5000;
-    trip.textContent = 'Confirm trip';
-    trip.setAttribute('aria-label', 'Confirm trip');
-    trip.classList.add('armed');
-    note.textContent = 'Trip armed for 5 seconds. Press Confirm trip to trip the reactor.';
-    armTimer = setTimeout(resetArm, 5000);
+  const select = (path, body, label, button, group) => {
+    cancel();
+    selected = { path, body, label, button, expires: Date.now() + 5000 };
+    button.setAttribute('aria-pressed', 'true');
+    group.appendChild(confirmation);
+    confirmation.removeAttribute('hidden');
+    note.textContent = `${label}: Execute or Cancel within 5 seconds.`;
+    selectionTimer = setTimeout(cancel, 5000);
+  };
+  confirmation.appendChild(note);
+  confirmation.appendChild(button(doc, 'Execute', '', () => {
+    const action = selected;
+    cancel();
+    if (action && Date.now() < action.expires) return post(action.path, action.body, action.label, message);
     return undefined;
-  });
-  trip.setAttribute('aria-describedby', 'trip-note');
-  reactor.add(trip);
-  reactor.add(note);
-  reactor.add(button(doc, 'Reset trip', '', () => post('reset', {}, 'Reset trip', message)));
+  }));
+  confirmation.appendChild(button(doc, 'Cancel', '', cancel));
+  section.appendChild(confirmation);
+  for (const [path, label] of [['trip', 'Trip reactor'], ['reset', 'Reset trip']]) {
+    const btn = button(doc, label, '', () => select(path, {}, label, btn, reactor.node));
+    btn.setAttribute('aria-pressed', 'false');
+    reactor.add(btn);
+  }
   reactor.add(button(doc, 'Acknowledge alarms', '', () => post('acknowledge', {}, 'Acknowledge alarms', message)));
   section.appendChild(reactor.node);
 
@@ -371,9 +505,10 @@ function buildControls(doc) {
       doc,
       'Start',
       '',
-      () => post('pump', { name: pump.name, running: toggle.next }, `${toggle.next ? 'Start' : 'Stop'} ${pump.label.toLowerCase()}`, message),
+      () => select('pump', { name: pump.name, running: toggle.next }, `${toggle.next ? 'Start' : 'Stop'} ${pump.label.toLowerCase()}`, btn, pumpGroup.node),
       `Start ${pump.label}`,
     );
+    btn.setAttribute('aria-pressed', 'false');
     pumpGroup.add(row(doc, pump.label, state, btn));
     return { label: pump.label, flag: pump.flag, state, btn, toggle };
   });
@@ -403,9 +538,10 @@ function buildControls(doc) {
       doc,
       'Set manual',
       '',
-      () => post('controller', { name: controller.name, auto: toggle.auto }, `${controller.label}: ${toggle.auto ? 'automatic' : 'manual'}`, message),
+      () => select('controller', { name: controller.name, auto: toggle.auto }, `${controller.label}: ${toggle.auto ? 'automatic' : 'manual'}`, btn, controllerGroup.node),
       `Set ${controller.label} to manual`,
     );
+    btn.setAttribute('aria-pressed', 'false');
     controllerGroup.add(row(doc, controller.label, state, btn));
     return { label: controller.label, mode: controller.mode, state, btn, toggle };
   });
@@ -424,6 +560,7 @@ function buildControls(doc) {
 
   return {
     section,
+    message,
     update(plant) {
       for (const pump of pumps) {
         const running = plant.status?.[pump.flag];
@@ -515,7 +652,7 @@ async function post(path, body, label, message) {
   message.textContent = `${label}: sending`;
   const reply = await send(path, body);
   message.textContent = reply.ok ? `${label}: done` : `${label} refused: ${reply.reason}`;
-  pollNow();
+  pollNow.get(message)?.();
 }
 
 async function send(path, body) {
@@ -549,31 +686,40 @@ function buildTrends(doc) {
     const item = make(doc, 'div', { class: 'trend' });
     const label = make(doc, 'span', { class: 'trend-label' }, trend.label);
     const value = make(doc, 'span', { class: 'trend-value' });
-    const picture = svg(doc, 'svg', { viewBox: '0 0 160 40', class: 'sparkline', role: 'img', 'aria-label': `${trend.label} history` });
-    const line = svg(doc, 'polyline', { class: 'trend-line', points: '' });
-    const gaps = svg(doc, 'path', { class: 'trend-line', d: '' });
+    const picture = svg(doc, 'svg', { viewBox: '0 0 160 40', preserveAspectRatio: 'none', class: 'sparkline', role: 'img', 'aria-label': `${trend.label} history` });
+    const line = svg(doc, 'polyline', { class: 'trend-line', 'vector-effect': 'non-scaling-stroke', points: '' });
+    const gaps = svg(doc, 'path', { class: 'trend-line', 'vector-effect': 'non-scaling-stroke', d: '' });
     picture.appendChild(line);
     picture.appendChild(gaps);
     item.appendChild(label);
     item.appendChild(value);
+    const max = make(doc, 'span', { class: 'trend-max' });
+    const min = make(doc, 'span', { class: 'trend-min' });
+    item.appendChild(max);
     item.appendChild(picture);
+    item.appendChild(min);
+    const axis = make(doc, 'div', { class: 'time-axis' });
+    axis.appendChild(make(doc, 'span', {}, '-10 min'));
+    axis.appendChild(make(doc, 'span', {}, 'now'));
+    item.appendChild(axis);
     section.appendChild(item);
-    return { id: trend.id, value, line, gaps };
+    return { id: trend.id, rangeSpan: trend.rangeSpan, value, line, gaps, min, max };
   });
   return { section, rows };
 }
 
-function sparkSegments(samples) {
-  const values = samples.map((sample) => sample.value).filter((value) => typeof value === 'number');
+function sparkSegments(samples, rangeSpan) {
+  const values = samples.map((sample) => sample.value).filter(Number.isFinite);
   if (values.length < 2) return [];
-  const low = Math.min(...values);
-  const span = Math.max(...values) - low || 1;
+  const minimum = Math.min(...values), maximum = Math.max(...values);
+  const span = Math.max(maximum - minimum, rangeSpan * 0.05);
+  const low = (minimum + maximum - span) / 2;
   const start = Date.parse(samples[0].time);
   const duration = Date.parse(samples.at(-1).time) - start;
   const segments = [];
   let segment = [];
   for (const [i, sample] of samples.entries()) {
-    if (typeof sample.value !== 'number') {
+    if (!Number.isFinite(sample.value)) {
       if (segment.length > 1) segments.push(segment);
       segment = [];
       continue;
@@ -591,7 +737,11 @@ function updateTrends(t, plant, history) {
     const samples = Array.isArray(history)
       ? history.map((sample) => ({ time: sample.plant_time, value: sample.readings?.[row.id]?.value }))
       : history[row.id]?.samples ?? [];
-    const segments = sparkSegments(samples);
+    const values = samples.map((s) => s.value).filter(Number.isFinite);
+    const unit = plant.readings?.[row.id]?.unit ?? '';
+    row.min.textContent = `Min ${values.length ? formatValue({ value: Math.min(...values), unit }) : '—'}`;
+    row.max.textContent = `Max ${values.length ? formatValue({ value: Math.max(...values), unit }) : '—'}`;
+    const segments = sparkSegments(samples, row.rangeSpan);
     row.line.setAttribute('points', segments[0]?.join(' ') ?? '');
     row.gaps.setAttribute('d', segments.slice(1).map((segment) => `M${segment.join(' L')}`).join(' '));
   }
@@ -659,7 +809,7 @@ export function start(root, interval = POLL_MS) {
       busy = false;
     }
   };
-  pollNow = tick;
+  pollNow.set(partsFor(root).controls.message, tick);
   tick();
   return setInterval(tick, interval);
 }
