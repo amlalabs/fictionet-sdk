@@ -1263,6 +1263,15 @@ pub enum GeneralName {
 }
 
 impl GeneralName {
+    /// Maps an IP literal to an IP address and any other host to a DNS name.
+    pub fn from_host(host: &str) -> Self {
+        match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => Self::Ip(ip.octets().to_vec()),
+            Ok(std::net::IpAddr::V6(ip)) => Self::Ip(ip.octets().to_vec()),
+            Err(_) => Self::Dns(host.into()),
+        }
+    }
+
     /// The address of an [`GeneralName::Ip`] of 4 or 16 bytes.
     pub fn ip_addr(&self) -> Option<std::net::IpAddr> {
         let GeneralName::Ip(b) = self else {
@@ -5048,6 +5057,36 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             };
             assert_eq!(PublicKeyInfo::parse(&key.to_bytes().unwrap()).unwrap(), key);
         }
+    }
+
+    #[test]
+    fn server_hosts_preserve_dns_and_ip_names() {
+        let hosts = [
+            "*.example.test",
+            "MiXeD.example.test.",
+            "xn--bcher-kva.test",
+            "_acme.example.test",
+            "192.0.2.1",
+            "2001:db8::1",
+        ];
+        let san = SubjectAltName(hosts.into_iter().map(GeneralName::from_host).collect());
+        assert_eq!(
+            san.0,
+            vec![
+                GeneralName::Dns("*.example.test".into()),
+                GeneralName::Dns("MiXeD.example.test.".into()),
+                GeneralName::Dns("xn--bcher-kva.test".into()),
+                GeneralName::Dns("_acme.example.test".into()),
+                GeneralName::Ip(vec![192, 0, 2, 1]),
+                GeneralName::Ip(vec![
+                    0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                ]),
+            ]
+        );
+        assert_eq!(
+            SubjectAltName::parse(&san.to_bytes().unwrap()).unwrap(),
+            san
+        );
     }
 
     #[test]

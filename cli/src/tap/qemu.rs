@@ -2,7 +2,6 @@
 //! socket and its file's lifetime, and the one accepted connection.
 //! This module also holds writes to QEMU's socket.
 
-use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -129,8 +128,6 @@ impl Drop for Unlink<'_> {
 /// is bound to, as `/proc/net/unix` lists them, or any other file, is an
 /// error.
 fn listen(path: &Path) -> io::Result<OwnedFd> {
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::other("the path holds a NUL byte"))?;
     // SAFETY: plain syscall; the fd is owned from here.
     let fd = unsafe {
         libc::socket(

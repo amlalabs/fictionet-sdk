@@ -89,7 +89,8 @@ fn take_ready_file(args: &TapArgs, lock: &mut Option<OwnedFd>, held: OwnedFd) {
 }
 
 fn relay_and_report(args: &TapArgs, port: &mut Port, world: RawFd) -> Result<End, Failure> {
-    let mut link = Link::new(args.v4.clone(), args.v6.clone(), args.mtu);
+    let mut link = Link::new(args.v4.clone(), args.v6.clone(), args.mtu)
+        .map_err(|e| Failure::Error(e.to_string()))?;
     let (end, stats) = relay(&mut link, port, world)?;
     stats.report();
     Ok(end)
@@ -164,8 +165,7 @@ impl Stats {
     }
 }
 
-/// At most this many messages move one way before the other way gets a
-/// turn.
+/// At most this many reads run one way before the other way gets a turn.
 const BATCH: usize = 64;
 
 /// How much may wait to be written to QEMU. A burst from the world past
@@ -199,35 +199,17 @@ impl Port {
         }
     }
 
-    /// Sends one frame made of `parts` to the VM. `Ok(false)` if it was
+    /// Sends one frame made of `header` and `payload` to the VM. `Ok(false)` if it was
     /// dropped on a full queue.
-    fn send(&mut self, parts: &[&[u8]]) -> Result<bool, Failure> {
+    fn send(&mut self, header: &[u8], payload: &[u8]) -> Result<bool, Failure> {
+        let parts = [header, payload];
         match self {
-            Port::Stream { outbox, .. } => Ok(outbox.push(parts)),
+            Port::Stream { outbox, .. } => Ok(outbox.push(&parts)),
             Port::Device { fd, .. } => {
-                let mut stack = [libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                }; 2];
-                let heap: Vec<libc::iovec>;
-                let iov: &[libc::iovec] = if parts.len() <= stack.len() {
-                    for (v, p) in stack.iter_mut().zip(parts) {
-                        *v = libc::iovec {
-                            iov_base: p.as_ptr() as *mut _,
-                            iov_len: p.len(),
-                        };
-                    }
-                    &stack[..parts.len()]
-                } else {
-                    heap = parts
-                        .iter()
-                        .map(|p| libc::iovec {
-                            iov_base: p.as_ptr() as *mut _,
-                            iov_len: p.len(),
-                        })
-                        .collect();
-                    &heap
-                };
+                let iov = parts.map(|p| libc::iovec {
+                    iov_base: p.as_ptr() as *mut _,
+                    iov_len: p.len(),
+                });
                 // SAFETY: the iovecs point into `parts`, valid for the call.
                 let n =
                     unsafe { libc::writev(fd.as_raw_fd(), iov.as_ptr(), iov.len() as libc::c_int) };
@@ -265,7 +247,7 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
         if now >= next_ra
             && let Some(ra) = link.router_advert()
         {
-            if !port.send(&[&ra])? {
+            if !port.send(&ra, &[])? {
                 stats.to_vm_full += 1;
             }
             next_ra = now + RA_EVERY;
@@ -328,7 +310,7 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             && !world::read_packets(world, &mut from_world, Some(BATCH), |p| {
                 match link.to_vm(p) {
                     Some(h) => {
-                        if !port.send(&[&h, p])? {
+                        if !port.send(&h, p)? {
                             stats.to_vm_full += 1;
                         }
                     }
@@ -346,117 +328,8 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             return Err(Failure::Error("attach's TAP device failed".into()));
         }
         if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            // Answers wait here until the batch is read; past OUTBOX bytes,
-            // more are dropped, as the queue to the VM would drop them.
-            let mut answers: Vec<Vec<u8>> = Vec::new();
-            let mut answer_bytes = 0;
-            for _ in 0..BATCH {
-                let mut handle = |frame: &[u8],
-                                  stats: &mut Stats|
-                 -> Result<Option<End>, Failure> {
-                    match link.frame_from_vm(frame) {
-                        FromVm::World(p) => {
-                            match unix::send_parts(world, &[&[relay::PACKET], p], true) {
-                                Ok(()) => {}
-                                Err(e)
-                                    if e.kind() == io::ErrorKind::WouldBlock
-                                        || e.raw_os_error() == Some(libc::ENOBUFS) =>
-                                {
-                                    stats.to_world_full += 1;
-                                }
-                                Err(e)
-                                    if matches!(
-                                        e.kind(),
-                                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-                                    ) =>
-                                {
-                                    return Ok(Some(End::World));
-                                }
-                                Err(e) => {
-                                    return Err(Failure::Error(format!(
-                                        "sending to the world: {e}"
-                                    )));
-                                }
-                            }
-                        }
-                        FromVm::Answer(f) => {
-                            if answer_bytes + f.len() > OUTBOX {
-                                stats.to_vm_full += 1;
-                            } else {
-                                answer_bytes += f.len();
-                                answers.push(f);
-                            }
-                        }
-                        FromVm::Drop(why) => stats.drop_from_vm(why),
-                    }
-                    Ok(None)
-                };
-                match port {
-                    Port::Stream { fd, decoder, .. } => {
-                        let spare = decoder.spare();
-                        // SAFETY: `spare` is valid for writes of its length.
-                        let n = unsafe {
-                            libc::read(fd.as_raw_fd(), spare.as_mut_ptr().cast(), spare.len())
-                        };
-                        if n < 0 {
-                            let e = io::Error::last_os_error();
-                            match e.kind() {
-                                io::ErrorKind::WouldBlock => break,
-                                io::ErrorKind::Interrupted => continue,
-                                io::ErrorKind::ConnectionReset => return Ok((End::Qemu, stats)),
-                                _ => {
-                                    return Err(Failure::Error(format!(
-                                        "reading QEMU's socket: {e}"
-                                    )));
-                                }
-                            }
-                        }
-                        if n == 0 {
-                            return Ok((End::Qemu, stats));
-                        }
-                        decoder.filled(n as usize);
-                        loop {
-                            let frame = match decoder.next_frame() {
-                                Ok(Some(f)) => f,
-                                Ok(None) => break,
-                                Err(stream::TooLong(len)) => {
-                                    return Err(Failure::Error(format!(
-                                        "QEMU's socket sent a frame length of {len} bytes; is it a -netdev stream socket?"
-                                    )));
-                                }
-                            };
-                            if let Some(end) = handle(frame, &mut stats)? {
-                                return Ok((end, stats));
-                            }
-                        }
-                    }
-                    Port::Device { fd, buf, .. } => {
-                        // SAFETY: `buf` is valid for writes of its length.
-                        let n = unsafe {
-                            libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-                        };
-                        if n < 0 {
-                            let e = io::Error::last_os_error();
-                            match e.kind() {
-                                io::ErrorKind::WouldBlock => break,
-                                io::ErrorKind::Interrupted => continue,
-                                _ => {
-                                    return Err(Failure::Error(format!(
-                                        "reading attach's TAP device: {e}"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(end) = handle(&buf[..n as usize], &mut stats)? {
-                            return Ok((end, stats));
-                        }
-                    }
-                }
-            }
-            for f in answers {
-                if !port.send(&[&f])? {
-                    stats.to_vm_full += 1;
-                }
+            if let Some(end) = read_vm(link, port, world, &mut stats)? {
+                return Ok((end, stats));
             }
             if !learned && let Some(mac) = link.vm_mac() {
                 learned = true;
@@ -469,4 +342,115 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             }
         }
     }
+}
+
+/// Reads one batch from the VM and queues the link's answers.
+fn read_vm(
+    link: &mut Link,
+    port: &mut Port,
+    world: RawFd,
+    stats: &mut Stats,
+) -> Result<Option<End>, Failure> {
+    // Answers wait here until the batch is read; past OUTBOX bytes,
+    // more are dropped, as the queue to the VM would drop them.
+    let mut answers: Vec<Vec<u8>> = Vec::new();
+    let mut answer_bytes = 0;
+    let mut handle = |frame: &[u8], stats: &mut Stats| -> Result<Option<End>, Failure> {
+        match link.frame_from_vm(frame) {
+            FromVm::World(p) => match unix::send_parts(world, &[&[relay::PACKET], p], true) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == Some(libc::ENOBUFS) =>
+                {
+                    stats.to_world_full += 1;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    return Ok(Some(End::World));
+                }
+                Err(e) => {
+                    return Err(Failure::Error(format!("sending to the world: {e}")));
+                }
+            },
+            FromVm::Answer(f) => {
+                if answer_bytes + f.len() > OUTBOX {
+                    stats.to_vm_full += 1;
+                } else {
+                    answer_bytes += f.len();
+                    answers.push(f);
+                }
+            }
+            FromVm::Drop(why) => stats.drop_from_vm(why),
+        }
+        Ok(None)
+    };
+    for _ in 0..BATCH {
+        match port {
+            Port::Stream { fd, decoder, .. } => {
+                let spare = decoder.spare();
+                // SAFETY: `spare` is valid for writes of its length.
+                let n =
+                    unsafe { libc::read(fd.as_raw_fd(), spare.as_mut_ptr().cast(), spare.len()) };
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    match e.kind() {
+                        io::ErrorKind::WouldBlock => break,
+                        io::ErrorKind::Interrupted => continue,
+                        io::ErrorKind::ConnectionReset => return Ok(Some(End::Qemu)),
+                        _ => {
+                            return Err(Failure::Error(format!("reading QEMU's socket: {e}")));
+                        }
+                    }
+                }
+                if n == 0 {
+                    return Ok(Some(End::Qemu));
+                }
+                decoder.filled(n as usize);
+                loop {
+                    let frame = match decoder.next_frame() {
+                        Ok(Some(f)) => f,
+                        Ok(None) => break,
+                        Err(stream::TooLong(len)) => {
+                            return Err(Failure::Error(format!(
+                                "QEMU's socket sent a frame length of {len} bytes; is it a -netdev stream socket?"
+                            )));
+                        }
+                    };
+                    if let Some(end) = handle(frame, stats)? {
+                        return Ok(Some(end));
+                    }
+                }
+            }
+            Port::Device { fd, buf, .. } => {
+                // SAFETY: `buf` is valid for writes of its length.
+                let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    match e.kind() {
+                        io::ErrorKind::WouldBlock => break,
+                        io::ErrorKind::Interrupted => continue,
+                        _ => {
+                            return Err(Failure::Error(format!(
+                                "reading attach's TAP device: {e}"
+                            )));
+                        }
+                    }
+                }
+                if let Some(end) = handle(&buf[..n as usize], stats)? {
+                    return Ok(Some(end));
+                }
+            }
+        }
+    }
+    for f in answers {
+        if !port.send(&f, &[])? {
+            stats.to_vm_full += 1;
+        }
+    }
+    Ok(None)
 }

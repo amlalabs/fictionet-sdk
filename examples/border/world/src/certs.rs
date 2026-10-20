@@ -11,7 +11,7 @@ use crate::scenario::ROGUE_CA_NAME;
 use fictionet::stdlib::{
     codec::Wire,
     protocols::x509,
-    services::ca::{Ca, Curve, Leaf},
+    services::ca::{Ca, KeyKind, Leaf},
 };
 use fictionet::{Cx, Result};
 use std::net::Ipv4Addr;
@@ -104,7 +104,7 @@ pub fn make_pki(fcx: &Cx, dir: &Path) -> Result {
             not_after: x509::Time::from_unix(2147169600)?,
         },
         Some(1),
-        Curve::P384,
+        KeyKind::P384,
     )?;
     let intermediate = Ca::self_signed(
         fcx,
@@ -114,7 +114,7 @@ pub fn make_pki(fcx: &Cx, dir: &Path) -> Result {
             not_after: x509::Time::from_unix(1933891199)?,
         },
         Some(0),
-        Curve::P384,
+        KeyKind::P384,
     )?;
     let tbs = x509::Certificate::parse(&intermediate.cert_der())?.tbs;
     let cert = root.sign(tbs)?;

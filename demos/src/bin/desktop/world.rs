@@ -52,13 +52,13 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
     let now_sys = SystemTime::UNIX_EPOCH + Duration::from_secs(now_unix as u64);
     let z = zscaler(&fcx, DEFAULT_CLOUD, now_unix)?;
     let www = format!("www.{site}");
-    let site_cfg = z.server_config(&fcx, &[site.as_str(), www.as_str()], now_sys, now_unix)?;
+    let site_cfg = z.server_config(&fcx, &[site.as_str(), www.as_str()], now_sys)?;
     // The Zscaler leaves the world presents for the HTTPS download hosts:
     // Mozilla's apt repository, and the release servers the guest
     // installs Claude Code and Codex from.
-    let mozilla_cfg = z.server_config(&fcx, &["packages.mozilla.org"], now_sys, now_unix)?;
-    let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys, now_unix)?;
-    let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys, now_unix)?;
+    let mozilla_cfg = z.server_config(&fcx, &["packages.mozilla.org"], now_sys)?;
+    let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys)?;
+    let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys)?;
     world.trust("zscaler", z.root_pem())?;
     // The mirror: the world forwards these names to the real servers over
     // the host's network, so the guest installs the desktop and the

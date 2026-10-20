@@ -1,7 +1,7 @@
 //! The settings each attach type runs with, which `args` reads from the
 //! flags, and the values the commands share: world and observation socket
-//! paths, and an IPv4 netmask. The observation socket serves the companion's
-//! request protocol; the world socket carries sandbox attachments.
+//! paths. The observation socket serves the companion's request protocol; the
+//! world socket carries sandbox attachments.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -180,28 +180,4 @@ pub(crate) fn connect_observation(path: &str) -> Result<fictionet_observe::Clien
         std::io::ErrorKind::UnexpectedEof => "the world closed the connection".into(),
         _ => error.to_string(),
     })
-}
-
-/// The netmask of an IPv4 prefix length, 0 to 32.
-pub(crate) fn mask4(prefix: u8) -> u32 {
-    let IpAddr::V4(mask) = (fictionet::stdlib::network::route::Prefix {
-        addr: Ipv4Addr::UNSPECIFIED.into(),
-        len: prefix,
-    })
-    .mask() else {
-        unreachable!("an IPv4 prefix has an IPv4 mask")
-    };
-    u32::from(mask)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn masks() {
-        assert_eq!(mask4(0), 0);
-        assert_eq!(mask4(24), 0xffff_ff00);
-        assert_eq!(mask4(32), u32::MAX);
-    }
 }

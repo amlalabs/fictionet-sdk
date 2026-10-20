@@ -17,7 +17,7 @@
 //!         let now = world.now_unix();
 //!         let date = SystemTime::UNIX_EPOCH + Duration::from_secs(now as u64);
 //!         let ca = zscaler(&fcx, DEFAULT_CLOUD, now)?;
-//!         let tls = ca.server_config(&fcx, kit::desktop::HOSTS, date, now)?;
+//!         let tls = ca.server_config(&fcx, kit::desktop::HOSTS, date)?;
 //!         world.trust("office", ca.root_pem())?;
 //!         let mirror = world.mirror(&fcx)?;
 //!         web::Sites::new(move |host: &str| match host {
@@ -81,6 +81,8 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// The admin attachment and route.
 pub const JUMP: &str = "jump";
+/// The largest IP packet a guest's card carries.
+const MTU: u16 = 1500;
 /// The route prefix for the admin jump host.
 pub fn jump_prefix() -> fictionet::stdlib::network::route::Prefix {
     fictionet::stdlib::network::route::Prefix {
@@ -200,6 +202,8 @@ impl Guest {
                 )));
             }
         }
+        fictionet::stdlib::network::ethernet::Link::new(self.family.clone(), Family::Off, MTU)
+            .map_err(|e| io::Error::other(format!("{}: invalid card: {e}", self.hostname)))?;
         if self.attachment.is_empty()
             || self.attachment == JUMP
             || self.vcpus == 0

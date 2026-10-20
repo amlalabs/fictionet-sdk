@@ -271,7 +271,10 @@ async fn second_read(
             observed.observe(std::slice::from_ref(event))
         })
         .await;
-    if wait.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::TimedOut) {
+    if wait
+        .as_ref()
+        .is_err_and(|e| e.kind() == io::ErrorKind::TimedOut)
+    {
         if observed.requests == 0 {
             retried = true;
             let active = xdotool(guest, "getactivewindow getwindowname").await;
@@ -280,9 +283,12 @@ async fn second_read(
             reload(guest, window).await?;
         }
         wait = client
-            .wait_for_event(observed.last.max(after), Duration::from_secs(45), POLL, |event| {
-                observed.observe(std::slice::from_ref(event))
-            })
+            .wait_for_event(
+                observed.last.max(after),
+                Duration::from_secs(45),
+                POLL,
+                |event| observed.observe(std::slice::from_ref(event)),
+            )
             .await;
     }
     match wait {

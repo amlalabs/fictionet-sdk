@@ -17,17 +17,17 @@ use rsa::pkcs1::EncodeRsaPublicKey;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use x509::{ExtensionValue, oid};
 
-/// The elliptic curve used for a CA key and its signatures.
+/// The DER NULL element used for RSA algorithm parameters.
+const NULL_PARAMETERS: &[u8] = &[0x05, 0x00];
+
+/// The key type and signature algorithm used by a CA.
 #[derive(Clone, Copy, Debug)]
-pub enum Curve {
+pub enum KeyKind {
     /// P-256 keys with ECDSA-SHA256 signatures.
     P256,
     /// P-384 keys with ECDSA-SHA384 signatures.
     P384,
-    /// RSA 2048-bit keys with RSASSA-PKCS1-v1_5 SHA-256 signatures. Not a
-    /// curve; kept here so one enum chooses every key a CA can hold. A world
-    /// reaches for it only to match a certificate that is RSA, such as a
-    /// look-alike enterprise CA, since EC keys are smaller and faster.
+    /// RSA 2048-bit keys with RSASSA-PKCS1-v1_5 SHA-256 signatures.
     Rsa2048,
 }
 
@@ -39,7 +39,7 @@ pub struct Ca {
 
 /// A server certificate chain, key, and validity interval.
 pub struct Leaf {
-    /// The leaf followed by its issuing CA.
+    /// The leaf followed by its issuing CAs.
     pub chain: Vec<CertificateDer<'static>>,
     /// The leaf's private key.
     pub key: PrivateKeyDer<'static>,
@@ -84,29 +84,26 @@ impl rsa::rand_core::RngCore for SeededRng<'_> {
 impl rsa::rand_core::CryptoRng for SeededRng<'_> {}
 
 impl Key {
-    fn new(fcx: &Cx, curve: Curve) -> Self {
-        loop {
-            match curve {
-                Curve::P256 => {
-                    let mut bytes = [0; 32];
-                    fcx.fill_random(&mut bytes);
-                    if let Ok(key) = p256::ecdsa::SigningKey::from_bytes((&bytes).into()) {
-                        return Self::P256(key);
-                    }
+    fn new(fcx: &Cx, kind: KeyKind) -> Self {
+        match kind {
+            KeyKind::P256 => loop {
+                let mut bytes = [0; 32];
+                fcx.fill_random(&mut bytes);
+                if let Ok(key) = p256::ecdsa::SigningKey::from_bytes((&bytes).into()) {
+                    break Self::P256(key);
                 }
-                Curve::P384 => {
-                    let mut bytes = [0; 48];
-                    fcx.fill_random(&mut bytes);
-                    if let Ok(key) = p384::ecdsa::SigningKey::from_bytes((&bytes).into()) {
-                        return Self::P384(key);
-                    }
+            },
+            KeyKind::P384 => loop {
+                let mut bytes = [0; 48];
+                fcx.fill_random(&mut bytes);
+                if let Ok(key) = p384::ecdsa::SigningKey::from_bytes((&bytes).into()) {
+                    break Self::P384(key);
                 }
-                Curve::Rsa2048 => {
-                    let key = rsa::RsaPrivateKey::new(&mut SeededRng(fcx), 2048)
-                        .expect("RSA 2048 key generation");
-                    return Self::Rsa(Box::new(key));
-                }
-            }
+            },
+            KeyKind::Rsa2048 => Self::Rsa(Box::new(
+                rsa::RsaPrivateKey::new(&mut SeededRng(fcx), 2048)
+                    .expect("RSA 2048 key generation"),
+            )),
         }
     }
 
@@ -123,7 +120,7 @@ impl Key {
             // RFC 4055 section 5: RSA signature parameters are NULL.
             Self::Rsa(_) => x509::AlgorithmIdentifier {
                 oid: id(oid::SHA256_WITH_RSA),
-                parameters: Some(vec![0x05, 0x00]),
+                parameters: Some(NULL_PARAMETERS.to_vec()),
             },
         }
     }
@@ -157,7 +154,7 @@ impl Key {
             Self::Rsa(k) => (
                 x509::AlgorithmIdentifier {
                     oid: id(oid::RSA_ENCRYPTION),
-                    parameters: Some(vec![0x05, 0x00]),
+                    parameters: Some(NULL_PARAMETERS.to_vec()),
                 },
                 k.to_public_key()
                     .to_pkcs1_der()
@@ -170,16 +167,6 @@ impl Key {
             algorithm,
             key: BitString::new(key, 0).expect("a public key is whole bytes"),
         }
-    }
-
-    /// The subject public key identifier, computed the usual way: the SHA-1
-    /// of the subject public key bit string's bytes (RFC 5280 section
-    /// 4.2.1.2, method 1).
-    fn key_identifier(&self) -> Vec<u8> {
-        let spki = self.public_key_info();
-        ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, spki.key.bytes())
-            .as_ref()
-            .to_vec()
     }
 
     fn der(&self) -> Result<rsa::pkcs8::SecretDocument, Error> {
@@ -263,9 +250,9 @@ fn sign(key: &Key, tbs: x509::TbsCertificate) -> Result<x509::Certificate, Error
 pub struct SigningKey(Key);
 
 impl SigningKey {
-    /// Generates a key of `curve` from `fcx`'s randomness.
-    pub fn generate(fcx: &Cx, curve: Curve) -> SigningKey {
-        SigningKey(Key::new(fcx, curve))
+    /// Generates a key of `kind` from `fcx`'s randomness.
+    pub fn generate(fcx: &Cx, kind: KeyKind) -> SigningKey {
+        SigningKey(Key::new(fcx, kind))
     }
 
     /// The signature algorithm this key signs with, for a certificate's
@@ -282,7 +269,12 @@ impl SigningKey {
     /// The subject (and, from the issuer's key, authority) key identifier:
     /// the SHA-1 of the subject public key, as issuers compute it.
     pub fn key_identifier(&self) -> Vec<u8> {
-        self.0.key_identifier()
+        ring::digest::digest(
+            &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+            self.public_key_info().key.bytes(),
+        )
+        .as_ref()
+        .to_vec()
     }
 
     /// Signs `tbs` with this key and assembles the certificate. The caller
@@ -309,19 +301,19 @@ impl Ca {
                 not_after: x509::Time::from_unix(4102444800)?,
             },
             None,
-            Curve::P256,
+            KeyKind::P256,
         )
     }
 
-    /// Makes a self-signed CA with the given subject, validity, path length, and curve.
+    /// Makes a self-signed CA with the given subject, validity, path length, and key type.
     pub fn self_signed(
         fcx: &Cx,
         subject: x509::Name,
         validity: x509::Validity,
         path_len: Option<u64>,
-        curve: Curve,
+        kind: KeyKind,
     ) -> Result<Self, Error> {
-        let key = Key::new(fcx, curve);
+        let key = Key::new(fcx, kind);
         let mut tbs = tbs(fcx, &key, subject, validity);
         let mut identifier = vec![0; 20];
         fcx.fill_random(&mut identifier);
@@ -335,20 +327,23 @@ impl Ca {
         Ok(Self { certificate, key })
     }
 
-    /// Reads a CA certificate and its PKCS#8 P-256 or P-384 key from PEM text.
+    /// Reads a CA certificate and its PKCS#8 P-256, P-384, or RSA key from PEM text.
     /// Fails if the certificate is not a CA or its public key differs.
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, Error> {
         let certificate = x509::Certificate::from_pem(cert_pem.as_bytes())?;
         let key = match p256::ecdsa::SigningKey::from_pkcs8_pem(key_pem) {
             Ok(key) => Key::P256(key),
-            Err(_) => Key::P384(p384::ecdsa::SigningKey::from_pkcs8_pem(key_pem)?),
+            Err(_) => match p384::ecdsa::SigningKey::from_pkcs8_pem(key_pem) {
+                Ok(key) => Key::P384(key),
+                Err(_) => Key::Rsa(Box::new(rsa::RsaPrivateKey::from_pkcs8_pem(key_pem)?)),
+            },
         };
+        let public_key = key.public_key_info();
         if !certificate
             .tbs
             .get::<x509::BasicConstraints>()?
             .is_some_and(|c| c.ca)
-            || certificate.tbs.public_key.key != key.public_key_info().key
-            || certificate.tbs.public_key.algorithm != key.public_key_info().algorithm
+            || certificate.tbs.public_key != public_key
         {
             return Err(Error::msg("CA certificate and key do not match"));
         }
@@ -386,23 +381,21 @@ impl Ca {
         let cn = names
             .first()
             .ok_or_else(|| Error::msg("a leaf needs at least one name"))?;
-        let key = Key::new(fcx, Curve::P256);
+        let key = Key::new(fcx, KeyKind::P256);
         let mut tbs = tbs(fcx, &key, subject(cn), validity.clone());
-        let names = names
-            .iter()
-            .map(|name| match name.parse::<std::net::IpAddr>() {
-                Ok(std::net::IpAddr::V4(ip)) => x509::GeneralName::Ip(ip.octets().to_vec()),
-                Ok(std::net::IpAddr::V6(ip)) => x509::GeneralName::Ip(ip.octets().to_vec()),
-                Err(_) => x509::GeneralName::Dns((*name).into()),
-            })
-            .collect();
+        let names = x509::SubjectAltName(
+            names
+                .iter()
+                .map(|name| x509::GeneralName::from_host(name))
+                .collect(),
+        );
         tbs.extensions = vec![
             x509::BasicConstraints {
                 ca: false,
                 path_len: None,
             }
             .to_extension(true)?,
-            x509::SubjectAltName(names).to_extension(false)?,
+            names.to_extension(false)?,
             x509::ExtendedKeyUsage(vec![id(oid::SERVER_AUTH)]).to_extension(false)?,
         ];
         let cert = self.sign(tbs)?;
@@ -454,6 +447,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rsa_ca_pem_round_trip() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(23)),
+            |fcx| async move {
+                let validity = x509::Validity {
+                    not_before: x509::Time::from_unix(1_700_000_000)?,
+                    not_after: x509::Time::from_unix(2_000_000_000)?,
+                };
+                let ca = Ca::self_signed(
+                    &fcx,
+                    subject("RSA CA"),
+                    validity.clone(),
+                    None,
+                    KeyKind::Rsa2048,
+                )?;
+                let loaded = Ca::from_pem(&ca.cert_pem(), &ca.key_pem())?;
+                assert_eq!(loaded.cert_der(), ca.cert_der());
+                assert_eq!(loaded.key_pem(), ca.key_pem());
+                let other = Ca::new(&fcx, "Other CA")?;
+                assert!(Ca::from_pem(&ca.cert_pem(), &other.key_pem()).is_err());
+                assert!(Ca::from_pem(&other.cert_pem(), &ca.key_pem()).is_err());
+                let leaf = loaded.issue(&fcx, &["example.test"], validity)?;
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(ca.cert_der())?;
+                let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    Arc::new(rustls::crypto::ring::default_provider()),
+                )
+                .build()?;
+                use rustls::client::danger::ServerCertVerifier;
+                verifier.verify_server_cert(
+                    &leaf.chain[0],
+                    &[],
+                    &"example.test".try_into()?,
+                    &[],
+                    rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+                        1_800_000_000,
+                    )),
+                )?;
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
     fn p384_ca_signs_a_trusted_p256_leaf() {
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(19)),
@@ -464,7 +503,7 @@ mod tests {
                 };
                 let name = subject("P-384 CA");
                 let ca =
-                    Ca::self_signed(&fcx, name.clone(), validity.clone(), Some(0), Curve::P384)?;
+                    Ca::self_signed(&fcx, name.clone(), validity.clone(), Some(0), KeyKind::P384)?;
                 let cert = x509::Certificate::parse(&ca.cert_der())?;
                 assert_eq!(cert.tbs.subject, name);
                 assert_eq!(cert.tbs.issuer, name);

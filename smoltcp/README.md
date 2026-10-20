@@ -1,29 +1,32 @@
 # Fictionet's smoltcp fork
 
-This workspace crate is a fork of smoltcp 0.14.0, licensed under
-[0BSD](LICENSE-0BSD.txt). It prepares the stack for future per-host network
-personalities; this change does not introduce personalities.
+This fork of smoltcp 0.14.0 provides TCP sockets over whole IPv4 and IPv6
+packets under [0BSD](LICENSE-0BSD.txt). Fictionet supplies the device,
+simulation clock, seeded entropy, and host address. The crate has no features
+or async runtime dependency and builds for `wasm32-unknown-unknown`.
 
-Fictionet uses TCP with Reno congestion control and async wakers over its own
-in-memory IP device. IPv4, IPv6, ICMP packet handling, IPv6 extension parsing,
-routing, and TCP buffers remain. IPv4 fragmentation is retained behind
-`proto-ipv4-fragmentation` and remains disabled for the SDK, as before.
-IPv6 fragmentation was not implemented for the IP medium upstream.
-Automatic ICMP echo replies remain available through the default
-`auto-icmp-echo-reply` feature for standalone stack use and its interface tests.
-The SDK disables default features and continues handling echo replies itself.
+Ingress accepts TCP directly after the IP header. It drops IPv4 fragments
+and other next-header values. Fictionet handles reassembly, IPv6 extension
+headers, ICMP, UDP, and routing. Normal builds verify IPv4 and TCP checksums;
+[fuzz builds](../fuzz/README.md) bypass those checks.
 
-Removed: Ethernet and ARP; IEEE 802.15.4, 6LoWPAN and RPL; neighbor discovery and
-SLAAC; multicast membership, IGMP and MLD; DHCP, DNS, ICMP, raw and UDP sockets;
-IPsec and unused IPv6 routing representations; host I/O and
-diagnostic devices; Cubic, segmentation offload, packet IDs and paused SYN-ACKs;
-log and defmt integrations; no-std feature combinations and build-time capacity
-features and environment overrides. Fictionet supplies its own Ethernet, UDP,
-DNS and ICMP services. The UDP wire decoder remains for IP packet formatting
-and its existing tests.
+TCP retains Reno, wakers, retransmission timers, window scaling, MSS, SACK,
+and timestamps. Its behavior differs from upstream in these fixes:
 
-The required std, IPv4, IPv6, IP-medium, TCP, Reno and async paths are
-unconditional. Capacities live in [src/config.rs](src/config.rs), with the
-upstream production defaults and the original unit-test fixture capacities.
-The retained stack's unit tests run with the workspace checks documented in
-[CONTRIBUTING.md](../CONTRIBUTING.md).
+- Receive-window edges, scaling, overlap, and FIN handling preserve accepted data.
+- ACK bounds, retransmission, and reopened windows preserve queued data and progress.
+- Timestamp negotiation follows the socket state.
+- RST takes precedence over SYN and FIN. LISTEN ignores it; SYN-SENT accepts it
+  only with an acceptable ACK. Synchronized sockets accept it only at RCV.NXT,
+  challenge it elsewhere inside the window, and drop it outside the window.
+  A passive SYN-RECEIVED socket returns to LISTEN on an accepted reset.
+- Closing SYN-SENT sends nothing.
+
+Future personality hooks belong in `src/socket/tcp.rs` for negotiation,
+ISNs, windows, timestamps, hop limits, and resets; in `src/wire/tcp.rs` for
+option order and ECN flags; and in `src/wire/ipv4.rs` and `src/wire/ipv6.rs`
+for emitted IP fields. No personalities are implemented.
+
+`managed` supports the SDK's borrowed and owned buffers. `byteorder` keeps
+packet field access concise. Test-only `rand` drives assembler tests.
+Workspace checks are listed in [CONTRIBUTING.md](../CONTRIBUTING.md).

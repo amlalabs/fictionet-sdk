@@ -1,38 +1,13 @@
-use core::fmt;
-
-use crate::config::ASSEMBLER_MAX_SEGMENT_COUNT;
+const ASSEMBLER_MAX_SEGMENT_COUNT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TooManyHolesError;
-
-impl fmt::Display for TooManyHolesError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "too many holes")
-    }
-}
-
-impl core::error::Error for TooManyHolesError {}
+pub(crate) struct TooManyHolesError;
 
 /// A contiguous chunk of absent data, followed by a contiguous chunk of present data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Contig {
     hole_size: usize,
     data_size: usize,
-}
-
-impl fmt::Display for Contig {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if self.has_hole() {
-            write!(f, "({})", self.hole_size)?;
-        }
-        if self.has_hole() && self.has_data() {
-            write!(f, " ")?;
-        }
-        if self.has_data() {
-            write!(f, "{}", self.data_size)?;
-        }
-        Ok(())
-    }
 }
 
 impl Contig {
@@ -75,26 +50,10 @@ impl Contig {
     }
 }
 
-/// A buffer (re)assembler.
-///
-/// Currently, up to a hardcoded limit of 4 or 32 holes can be tracked in the buffer.
+/// Tracks up to four disjoint byte ranges.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Assembler {
+pub(crate) struct Assembler {
     contigs: [Contig; ASSEMBLER_MAX_SEGMENT_COUNT],
-}
-
-impl fmt::Display for Assembler {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "[ ")?;
-        for contig in self.contigs.iter() {
-            if !contig.has_data() {
-                break;
-            }
-            write!(f, "{contig} ")?;
-        }
-        write!(f, "]")?;
-        Ok(())
-    }
 }
 
 // Invariant on Assembler::contigs:
@@ -103,25 +62,15 @@ impl fmt::Display for Assembler {
 
 impl Assembler {
     /// Create a new buffer assembler.
-    pub const fn new() -> Assembler {
+    pub(crate) const fn new() -> Assembler {
         const EMPTY: Contig = Contig::empty();
         Assembler {
             contigs: [EMPTY; ASSEMBLER_MAX_SEGMENT_COUNT],
         }
     }
 
-    pub fn clear(&mut self) {
-        self.contigs.fill(Contig::empty());
-    }
-
     fn front(&self) -> Contig {
         self.contigs[0]
-    }
-
-    /// Return length of the front contiguous range without removing it from the assembler
-    pub fn peek_front(&self) -> usize {
-        let front = self.front();
-        if front.has_hole() { 0 } else { front.data_size }
     }
 
     fn back(&self) -> Contig {
@@ -129,7 +78,7 @@ impl Assembler {
     }
 
     /// Return whether the assembler contains no data.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         !self.front().has_data()
     }
 
@@ -144,7 +93,6 @@ impl Assembler {
             self.contigs[i] = self.contigs[i + 1];
         }
 
-        // Removing the last one.
         self.contigs[self.contigs.len() - 1] = Contig::empty();
     }
 
@@ -164,7 +112,7 @@ impl Assembler {
 
     /// Add a new contiguous range to the assembler,
     /// or return `Err(TooManyHolesError)` if too many discontinuities are already recorded.
-    pub fn add(&mut self, mut offset: usize, size: usize) -> Result<(), TooManyHolesError> {
+    pub(crate) fn add(&mut self, mut offset: usize, size: usize) -> Result<(), TooManyHolesError> {
         if size == 0 {
             return Ok(());
         }
@@ -174,12 +122,11 @@ impl Assembler {
         // Find index of the contig containing the start of the range.
         loop {
             if i == self.contigs.len() {
-                // The new range is after all the previous ranges, but there/s no space to add it.
+                // The new range is after all the previous ranges, but there is no space to add it.
                 return Err(TooManyHolesError);
             }
             let contig = &mut self.contigs[i];
             if !contig.has_data() {
-                // The new range is after all the previous ranges. Add it.
                 *contig = Contig::hole_and_data(offset, size);
                 return Ok(());
             }
@@ -210,7 +157,6 @@ impl Assembler {
             contig.shrink_hole_to(offset);
         }
 
-        // coalesce contigs to the right.
         let mut j = i + 1;
         while j < self.contigs.len()
             && self.contigs[j].has_data()
@@ -250,7 +196,7 @@ impl Assembler {
 
     /// Remove a contiguous range from the front of the assembler.
     /// If no such range, return 0.
-    pub fn remove_front(&mut self) -> usize {
+    pub(crate) fn remove_front(&mut self) -> usize {
         let front = self.front();
         if front.has_hole() || !front.has_data() {
             0
@@ -267,7 +213,7 @@ impl Assembler {
     /// except it's guaranteed to not fail when offset = 0.
     /// This is required for TCP: we must never drop the next expected segment, or
     /// the protocol might get stuck.
-    pub fn add_then_remove_front(
+    pub(crate) fn add_then_remove_front(
         &mut self,
         offset: usize,
         size: usize,
@@ -286,14 +232,14 @@ impl Assembler {
 
     /// Iterate over all of the contiguous data ranges.
     ///
-    /// Returns `(offset, size)` tuples for each contiguous data range, where
+    /// Returns `(start, end)` tuples for each contiguous data range, where
     /// offset is relative to the start of the assembler.
     ///
     ///    Data        Hole        Data
     /// |--- 100 ---|--- 200 ---|--- 100 ---|
     ///
     /// Would return the ranges: ``(0, 100), (300, 400)``
-    pub fn iter_data(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+    pub(crate) fn iter_data(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         let mut offset = 0;
         self.contigs.iter().filter_map(move |contig| {
             offset += contig.hole_size;
@@ -306,12 +252,6 @@ impl Assembler {
                 None
             }
         })
-    }
-}
-
-impl Default for Assembler {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -344,91 +284,91 @@ mod test {
     #[test]
     fn test_new() {
         let assr = Assembler::new();
-        assert_eq!(assr, contigs![]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![]);
     }
 
     #[test]
     fn test_empty_add_full() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(0, 16), Ok(()));
-        assert_eq!(assr, contigs![(0, 16)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 16)]);
     }
 
     #[test]
     fn test_empty_add_front() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(0, 4), Ok(()));
-        assert_eq!(assr, contigs![(0, 4)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 4)]);
     }
 
     #[test]
     fn test_empty_add_back() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(12, 4), Ok(()));
-        assert_eq!(assr, contigs![(12, 4)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(12, 16)]);
     }
 
     #[test]
     fn test_empty_add_mid() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(4, 8), Ok(()));
-        assert_eq!(assr, contigs![(4, 8)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 12)]);
     }
 
     #[test]
     fn test_partial_add_front() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(0, 4), Ok(()));
-        assert_eq!(assr, contigs![(0, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 12)]);
     }
 
     #[test]
     fn test_partial_add_back() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(12, 4), Ok(()));
-        assert_eq!(assr, contigs![(4, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 16)]);
     }
 
     #[test]
     fn test_partial_add_front_overlap() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(0, 8), Ok(()));
-        assert_eq!(assr, contigs![(0, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 12)]);
     }
 
     #[test]
     fn test_partial_add_front_overlap_split() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(2, 6), Ok(()));
-        assert_eq!(assr, contigs![(2, 10)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(2, 12)]);
     }
 
     #[test]
     fn test_partial_add_back_overlap() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(8, 8), Ok(()));
-        assert_eq!(assr, contigs![(4, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 16)]);
     }
 
     #[test]
     fn test_partial_add_back_overlap_split() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(10, 4), Ok(()));
-        assert_eq!(assr, contigs![(4, 10)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 14)]);
     }
 
     #[test]
     fn test_partial_add_both_overlap() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(0, 16), Ok(()));
-        assert_eq!(assr, contigs![(0, 16)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 16)]);
     }
 
     #[test]
     fn test_partial_add_both_overlap_split() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(2, 12), Ok(()));
-        assert_eq!(assr, contigs![(2, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(2, 14)]);
     }
 
     #[test]
@@ -437,7 +377,6 @@ mod test {
         for c in 1..=ASSEMBLER_MAX_SEGMENT_COUNT {
             assert_eq!(assr.add(c * 10, 3), Ok(()));
         }
-        // Maximum of allowed holes is reached
         let assr_before = assr.clone();
         assert_eq!(assr.add(1, 3), Err(TooManyHolesError));
         assert_eq!(assr_before, assr);
@@ -453,14 +392,14 @@ mod test {
     fn test_trailing_hole_remove_front() {
         let mut assr = contigs![(0, 4)];
         assert_eq!(assr.remove_front(), 4);
-        assert_eq!(assr, contigs![]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![]);
     }
 
     #[test]
     fn test_trailing_data_remove_front() {
         let mut assr = contigs![(0, 4), (4, 4)];
         assert_eq!(assr.remove_front(), 4);
-        assert_eq!(assr, contigs![(4, 4)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 8)]);
     }
 
     #[test]
@@ -481,7 +420,10 @@ mod test {
         assert_eq!(assr.add(100, 10), Ok(()));
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add(40, 30), Ok(()));
-        assert_eq!(assr, contigs![(40, 30), (30, 10)]);
+        assert_eq!(
+            assr.iter_data().collect::<Vec<_>>(),
+            vec![(40, 70), (100, 110)]
+        );
     }
 
     #[test]
@@ -490,7 +432,7 @@ mod test {
         assert_eq!(assr.add(10, 10), Ok(()));
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add(15, 40), Ok(()));
-        assert_eq!(assr, contigs![(10, 50)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(10, 60)]);
     }
 
     #[test]
@@ -499,7 +441,7 @@ mod test {
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add(10, 10), Ok(()));
         assert_eq!(assr.add(15, 40), Ok(()));
-        assert_eq!(assr, contigs![(10, 50)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(10, 60)]);
     }
 
     #[test]
@@ -508,7 +450,7 @@ mod test {
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add(10, 10), Ok(()));
         assert_eq!(assr.add(15, 60), Ok(()));
-        assert_eq!(assr, contigs![(10, 65)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(10, 75)]);
     }
 
     #[test]
@@ -572,11 +514,13 @@ mod test {
     }
 
     #[test]
-    fn test_issue_694() {
+    fn test_bridge_single_byte_gap() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(0, 1), Ok(()));
         assert_eq!(assr.add(2, 1), Ok(()));
         assert_eq!(assr.add(1, 1), Ok(()));
+        assert_eq!(assr.remove_front(), 3);
+        assert!(assr.is_empty());
     }
 
     #[test]
@@ -584,7 +528,10 @@ mod test {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add_then_remove_front(10, 10), Ok(0));
-        assert_eq!(assr, contigs![(10, 10), (30, 10)]);
+        assert_eq!(
+            assr.iter_data().collect::<Vec<_>>(),
+            vec![(10, 20), (50, 60)]
+        );
     }
 
     #[test]
@@ -592,7 +539,7 @@ mod test {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add_then_remove_front(0, 10), Ok(10));
-        assert_eq!(assr, contigs![(40, 10)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(40, 50)]);
     }
 
     #[test]
@@ -600,7 +547,7 @@ mod test {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add_then_remove_front(0, 50), Ok(60));
-        assert_eq!(assr, contigs![]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![]);
     }
 
     #[test]
@@ -609,7 +556,6 @@ mod test {
         for c in 1..=ASSEMBLER_MAX_SEGMENT_COUNT {
             assert_eq!(assr.add(c * 10, 3), Ok(()));
         }
-        // Maximum of allowed holes is reached
         let assr_before = assr.clone();
         assert_eq!(assr.add_then_remove_front(1, 3), Err(TooManyHolesError));
         assert_eq!(assr_before, assr);
@@ -622,6 +568,10 @@ mod test {
             assert_eq!(assr.add(c * 10, 3), Ok(()));
         }
         assert_eq!(assr.add_then_remove_front(0, 3), Ok(3));
+        let ranges: Vec<_> = (1..=ASSEMBLER_MAX_SEGMENT_COUNT)
+            .map(|c| (c * 10 - 3, c * 10))
+            .collect();
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), ranges);
     }
 
     // Test against an obviously-correct but inefficient bitmap impl.
@@ -633,7 +583,6 @@ mod test {
 
         for max_size in [2, 5, 10, 100] {
             for _ in 0..300 {
-                //println!("===");
                 let mut assr = Assembler::new();
                 let mut map = [false; MAX_INDEX];
 
@@ -641,11 +590,8 @@ mod test {
                     let offset = rand::thread_rng().gen_range(0..MAX_INDEX - max_size - 1);
                     let size = rand::thread_rng().gen_range(1..=max_size);
 
-                    //println!("add {}..{} {}", offset, offset + size, size);
-                    // Real impl
                     let res = assr.add(offset, size);
 
-                    // Bitmap impl
                     let mut map2 = map;
                     map2[offset..][..size].fill(true);
 
@@ -665,7 +611,6 @@ mod test {
                         }
                     }
 
-                    // Compare.
                     let wanted_res = if contigs.len() > ASSEMBLER_MAX_SEGMENT_COUNT {
                         Err(TooManyHolesError)
                     } else {

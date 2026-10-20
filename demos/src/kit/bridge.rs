@@ -6,7 +6,7 @@ use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RecvError};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Moves frames between the guest (through the backend) and the world,
-/// answering ARP and the link-local questions itself, as the CLI's tun
+/// answering ARP and the link-local questions itself, as the CLI's TAP
 /// lowering does.
 pub async fn run(
     mut to_world: UnboundedReceiver<Vec<u8>>,
@@ -15,7 +15,8 @@ pub async fn run(
     fcx: Cx,
     family: Family<std::net::Ipv4Addr>,
 ) {
-    let mut link = Link::new(family, Family::Off, 1500);
+    let mut link =
+        Link::new(family, Family::Off, super::MTU).expect("Guest::validate built this card");
     loop {
         tokio::select! {
             frame = to_world.recv() => {

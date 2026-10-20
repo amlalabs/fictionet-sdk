@@ -49,7 +49,7 @@ impl serve::Service for Mirror {
 fn bridge(fcx: &Cx, sandbox: End) -> End {
     let (vm, frames) = fictionet::pair();
     fcx.spawn(move |fcx| async move {
-        let mut link = Link::new(Family::Serve(SERVER_LEASE), Family::Off, 1500);
+        let mut link = Link::new(Family::Serve(SERVER_LEASE), Family::Off, 1500)?;
         let mut ports = Ports::new(vec![sandbox, frames]);
         loop {
             match ports.next(&fcx, None, |_| Poll::Pending).await? {

@@ -522,8 +522,11 @@ fn parse_tap(
             return Err("--ip-addr: for --type tap, the prefix must be from /8 to /30, so the VM shares a subnet with its gateway".into());
         }
         if let Some(gw) = l.gateway {
-            let mask = crate::config::mask4(l.addr.prefix);
-            if u32::from(gw) & mask != u32::from(l.addr.addr) & mask || gw == l.addr.addr {
+            let subnet = fictionet::stdlib::network::route::Prefix {
+                addr: l.addr.addr.into(),
+                len: l.addr.prefix,
+            };
+            if !subnet.contains(gw.into()) || gw == l.addr.addr {
                 return Err(format!(
                     "--gateway {gw} must be another address in the subnet of --ip-addr {}/{}",
                     l.addr.addr, l.addr.prefix

@@ -32,7 +32,7 @@ pub const IPV6: u16 = 0x86dd;
 /// The length of an Ethernet header.
 pub const HEADER: usize = 14;
 
-pub(super) const UDP: u8 = 17;
+const UDP: u8 = 17;
 pub(super) const ICMPV6: u8 = 58;
 
 /// An Ethernet frame, read.
@@ -138,32 +138,16 @@ pub(super) fn destination(
 /// Ethernet may add after it. `None` if the header is broken or says the
 /// packet is longer than the payload.
 pub(super) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
-    match ethertype {
-        IPV4 => {
-            let b = payload;
-            if b.len() < 20 || b[0] >> 4 != 4 {
-                return None;
-            }
-            let ihl = (b[0] & 0x0f) as usize * 4;
-            let total = u16::from_be_bytes([b[2], b[3]]) as usize;
-            if ihl < 20 || total < ihl || total > b.len() {
-                return None;
-            }
-            Some(&b[..total])
-        }
-        IPV6 => {
-            let b = payload;
-            if b.len() < 40 || b[0] >> 4 != 6 {
-                return None;
-            }
-            let total = 40 + u16::from_be_bytes([b[4], b[5]]) as usize;
-            if total > b.len() {
-                return None;
-            }
-            Some(&b[..total])
-        }
-        _ => None,
+    let version = match ethertype {
+        IPV4 => 4,
+        IPV6 => 6,
+        _ => return None,
+    };
+    if payload.first()? >> 4 != version {
+        return None;
     }
+    let h = Header::parse(payload)?;
+    Some(&payload[..h.payload.end])
 }
 
 // Packet building, on the stdlib's IP layer
@@ -326,18 +310,24 @@ pub(super) enum Upper<'a> {
     /// Any other transport, or a fragment other than the first, which
     /// holds no transport header.
     Other,
+    /// The world must process an IPv6 Parameter Problem.
+    Problem,
 }
 
 /// A packet whose transport the link cannot read: an IPv6 extension header
-/// that runs past its end, a UDP or ICMPv6 header cut short (in a first
-/// fragment, too), or a UDP length that does not fit the packet.
+/// that runs past its end, a UDP or ICMPv6 header cut short, or a UDP length
+/// that does not fit the packet. IPv6 Parameter Problems are passed separately.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Unreadable;
 
 /// Reads the transport of an IP packet, which [`ip_packet`] has checked.
 /// Checks complete UDP lengths, but leaves checksums to the recipient.
 pub(super) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
-    let h = Header::check(packet).map_err(|_| Unreadable)?;
+    let h = match Header::check(packet) {
+        Ok(h) => h,
+        Err(ip::Reject::Problem { .. }) => return Ok(Upper::Problem),
+        Err(ip::Reject::Discard) => return Err(Unreadable),
+    };
     // An atomic fragment is a whole packet, but neighbor discovery may not
     // carry a fragment header at all (RFC 6980), so it counts as a fragment
     // here. A fragment after the first holds no transport header.
@@ -381,27 +371,55 @@ pub(super) fn is_neighbor_discovery(kind: u8) -> bool {
     (ROUTER_SOLICITATION..=REDIRECT).contains(&kind)
 }
 
+/// Checks solicitation fields and option boundaries. Checksums belong to
+/// the recipient because a VM backend may leave them to an offload.
+pub(super) fn solicitation_valid(packet: &[u8], msg: &[u8], fixed: usize) -> bool {
+    if packet[7] != 255 || msg.len() < fixed || msg[1] != 0 {
+        return false;
+    }
+    let mut options = &msg[fixed..];
+    while !options.is_empty() {
+        if options.len() < 2
+            || options[1] == 0
+            || (source_v6(packet).is_unspecified() && options[0] == 1)
+        {
+            return false;
+        }
+        let Some(rest) = options.get(usize::from(options[1]) * 8..) else {
+            return false;
+        };
+        options = rest;
+    }
+    true
+}
+
+/// Whether a packet that calls for Parameter Problem hides neighbor discovery.
+pub(super) fn problem_hides_neighbor_discovery(packet: &[u8]) -> bool {
+    Header::parse(packet).is_some_and(|h| {
+        h.protocol == ICMPV6
+            && h.payload(packet)
+                .first()
+                .is_some_and(|kind| is_neighbor_discovery(*kind))
+    })
+}
+
 /// The answer to a neighbor solicitation from the VM: a neighbor
 /// advertisement that gives [`GATEWAY_MAC`] for the target, for the same
 /// reason [`arp_reply`] answers every address. It does not answer
-/// duplicate address detection (source `::`), a target that is `own` or
-/// multicast, or a solicitation that is not valid (hop limit other than
-/// 255, code other than 0).
-pub(super) fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
-    let Ok(Upper::Icmp6 {
-        kind: NEIGHBOR_SOLICITATION,
-        msg,
-        fragment: false,
-    }) = upper(packet)
-    else {
-        return None;
-    };
-    if msg[1] != 0 || packet[7] != 255 || msg.len() < 24 {
+/// duplicate address detection (source `::`), a target that is the source,
+/// `own` or multicast, or a solicitation with invalid fields or options.
+pub(super) fn neighbor_advert(
+    packet: &[u8],
+    msg: &[u8],
+    vm: Mac,
+    own: Option<Ipv6Addr>,
+) -> Option<Vec<u8>> {
+    if !solicitation_valid(packet, msg, 24) {
         return None;
     }
-    let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap());
-    let target = Ipv6Addr::from(<[u8; 16]>::try_from(&msg[8..24]).unwrap());
-    if src.is_unspecified() || target.is_multicast() || Some(target) == own {
+    let src = source_v6(packet);
+    let target = address_v6(&msg[8..24]);
+    if src.is_unspecified() || src == target || target.is_multicast() || Some(target) == own {
         return None;
     }
     let mut body = Vec::with_capacity(32);
@@ -426,29 +444,43 @@ pub(super) fn udp_to(packet: &[u8]) -> Option<(u16, &[u8])> {
     }
 }
 
-/// The source address of an IPv4 or IPv6 packet. The packet must be at
+/// The source address of an IPv4 packet. The packet must be at
 /// least a header long, as [`ip_packet`] checks.
 pub(super) fn source_v4(packet: &[u8]) -> Ipv4Addr {
     Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15])
 }
 
+/// The source address of an IPv6 packet. The packet must be at least a
+/// header long, as [`ip_packet`] checks.
 pub(super) fn source_v6(packet: &[u8]) -> Ipv6Addr {
-    Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap())
+    address_v6(&packet[8..24])
+}
+
+/// The destination address of an IPv6 packet, which must be at least a
+/// header long.
+pub(super) fn destination_v6(packet: &[u8]) -> Ipv6Addr {
+    address_v6(&packet[24..40])
+}
+
+/// An IPv6 address from a sixteen-byte field.
+fn address_v6(bytes: &[u8]) -> Ipv6Addr {
+    Ipv6Addr::from(<[u8; 16]>::try_from(bytes).unwrap())
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub(super) mod tests {
+    use super::super::addresses::{router_advert, tests::lease6};
     use super::*;
 
     pub(crate) const VM: Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
     pub(crate) fn v6_checksum_ok(packet: &[u8]) -> bool {
         let src = source_v6(packet);
-        let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap());
+        let dst = destination_v6(packet);
         ip::transport_checksum(src.into(), dst.into(), packet[6], &packet[40..]) == 0
     }
 
-    fn arp_request(spa: [u8; 4], tpa: [u8; 4]) -> Vec<u8> {
+    pub(crate) fn arp_request(spa: [u8; 4], tpa: [u8; 4]) -> Vec<u8> {
         let mut a = vec![0, 1, 0x08, 0x00, 6, 4, 0, 1];
         a.extend_from_slice(&VM);
         a.extend_from_slice(&spa);
@@ -521,100 +553,47 @@ pub(crate) mod tests {
         assert_eq!(udp_to(&p), Some((546, &b"odd"[..])));
     }
 
-    #[test]
-    fn directed_broadcast_boundaries() {
-        for (addr, len, dst, mac) in [
-            ("192.168.1.17", 24, "192.168.1.255", BROADCAST),
-            ("192.168.1.17", 24, "192.168.2.255", VM),
-            ("10.0.0.1", 31, "10.0.0.1", VM),
-            ("10.0.0.1", 32, "10.0.0.1", VM),
-            ("10.0.0.1", 0, "255.255.255.255", BROADCAST),
-        ] {
-            let packet = ipv4(Ipv4Addr::LOCALHOST, dst.parse().unwrap(), UDP, &[]);
-            assert_eq!(
-                destination(&packet, Some(VM), Some((addr.parse().unwrap(), len))),
-                Some((mac, IPV4))
-            );
-        }
+    pub(crate) fn router_solicit(src: Ipv6Addr) -> Vec<u8> {
+        icmp6(
+            src,
+            "ff02::2".parse().unwrap(),
+            vec![ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
+        )
     }
 
-    #[test]
-    fn destinations() {
-        let to = |dst: Ipv4Addr| {
-            destination(
-                &ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, UDP, &[]),
-                Some(VM),
-                None,
-            )
-        };
-        assert_eq!(to(Ipv4Addr::new(10, 0, 0, 2)), Some((VM, IPV4)));
-        assert_eq!(to(Ipv4Addr::BROADCAST), Some((BROADCAST, IPV4)));
-        assert_eq!(
-            to(Ipv4Addr::new(239, 129, 2, 3)),
-            Some(([1, 0, 0x5e, 1, 2, 3], IPV4))
+    /// The first `cut` bytes of `packet`'s payload as an IPv4 first
+    /// fragment, and the rest as the second.
+    pub(crate) fn fragments4(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
+        let (src, dst) = (
+            source_v4(packet),
+            Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
         );
-        let p = ipv4(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(10, 0, 0, 2),
-            UDP,
-            &[],
-        );
-        assert_eq!(
-            destination(&p, None, None),
-            None,
-            "the VM's MAC is not known yet"
-        );
-        let p = ipv6(
-            link_local(GATEWAY_MAC),
-            "ff02::1:ff12:3456".parse().unwrap(),
-            UDP,
-            1,
-            &[],
-        );
-        assert_eq!(
-            destination(&p, Some(VM), None),
-            Some(([0x33, 0x33, 0xff, 0x12, 0x34, 0x56], IPV6))
-        );
-        let p = ipv6(
-            link_local(GATEWAY_MAC),
-            "fd00::2".parse().unwrap(),
-            UDP,
-            1,
-            &[],
-        );
-        assert_eq!(destination(&p, Some(VM), None), Some((VM, IPV6)));
-        assert_eq!(destination(&p, None, None), None);
-        assert_eq!(destination(&[0x50; 40], Some(VM), None), None);
-        assert_eq!(destination(&[0x45; 19], Some(VM), None), None);
-        assert_eq!(destination(&[], Some(VM), None), None);
+        let mut first = ipv4(src, dst, packet[9], &packet[20..20 + cut]);
+        first[6] = 0x20;
+        let mut second = ipv4(src, dst, packet[9], &packet[20 + cut..]);
+        second[6..8].copy_from_slice(&((cut / 8) as u16).to_be_bytes());
+        (first, second)
     }
 
-    #[test]
-    fn arp_answers_every_address_but_probes_gratuitous_and_its_own() {
-        let reply = arp_reply(&arp_request([10, 0, 0, 2], [10, 0, 0, 1]), VM, None).unwrap();
-        let f = Frame::parse(&reply).unwrap();
-        assert_eq!((f.dst, f.src, f.ethertype), (VM, GATEWAY_MAC, ARP));
-        let a = f.payload;
-        assert_eq!(&a[6..8], &[0, 2], "a reply");
-        assert_eq!(&a[8..14], &GATEWAY_MAC, "the gateway's MAC");
-        assert_eq!(&a[14..18], &[10, 0, 0, 1], "for the asked address");
-        assert_eq!(&a[18..24], &VM);
-        assert_eq!(&a[24..28], &[10, 0, 0, 2]);
-        // Any address: the world decides what is there.
-        assert!(arp_reply(&arp_request([10, 0, 0, 2], [10, 0, 0, 77]), VM, None).is_some());
-        // A probe, a gratuitous ARP, and a question about the VM's own address.
-        assert!(arp_reply(&arp_request([0; 4], [10, 0, 0, 2]), VM, None).is_none());
-        assert!(arp_reply(&arp_request([10, 0, 0, 2], [10, 0, 0, 2]), VM, None).is_none());
-        let own = Some(Ipv4Addr::new(10, 0, 0, 2));
-        assert!(arp_reply(&arp_request([10, 0, 0, 9], [10, 0, 0, 2]), VM, own).is_none());
-        // A reply, a short request, another hardware type.
-        let mut r = arp_request([10, 0, 0, 2], [10, 0, 0, 1]);
-        r[7] = 2;
-        assert!(arp_reply(&r, VM, None).is_none());
-        assert!(arp_reply(&arp_request([10, 0, 0, 2], [10, 0, 0, 1])[..27], VM, None).is_none());
-        let mut r = arp_request([10, 0, 0, 2], [10, 0, 0, 1]);
-        r[1] = 6;
-        assert!(arp_reply(&r, VM, None).is_none());
+    pub(crate) fn fragment6(packet: &[u8], offset: u16, more: bool, body: &[u8]) -> Vec<u8> {
+        let mut fragment = vec![packet[6], 0];
+        fragment.extend_from_slice(&(offset | u16::from(more)).to_be_bytes());
+        fragment.extend_from_slice(&42u32.to_be_bytes());
+        fragment.extend_from_slice(body);
+        ipv6(
+            source_v6(packet),
+            destination_v6(packet),
+            44,
+            packet[7],
+            &fragment,
+        )
+    }
+
+    pub(crate) fn fragments6(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
+        (
+            fragment6(packet, 0, true, &packet[40..40 + cut]),
+            fragment6(packet, cut as u16, false, &packet[40 + cut..]),
+        )
     }
 
     pub(crate) fn solicitation(src: Ipv6Addr, target: Ipv6Addr, hop: u8) -> Vec<u8> {
@@ -627,64 +606,20 @@ pub(crate) mod tests {
         p
     }
 
-    #[test]
-    fn neighbor_solicitations_are_answered_except_dad() {
-        let vm_ll = link_local(VM);
-        let target: Ipv6Addr = "fd00::1".parse().unwrap();
-        let reply = neighbor_advert(&solicitation(vm_ll, target, 255), VM, None).unwrap();
-        let f = Frame::parse(&reply).unwrap();
-        assert_eq!((f.dst, f.src, f.ethertype), (VM, GATEWAY_MAC, IPV6));
-        let p = f.payload;
-        assert!(v6_checksum_ok(p));
-        assert_eq!(p[7], 255, "hop limit");
-        assert_eq!(source_v6(p), target);
-        assert_eq!(&p[24..40], &vm_ll.octets());
-        assert_eq!(p[40], NEIGHBOR_ADVERTISEMENT);
-        assert_eq!(p[44], 0xe0, "router, solicited, override");
-        assert_eq!(&p[48..64], &target.octets());
-        assert_eq!(&p[64..72], &[2, 1, 0x02, 0x66, 0x6e, 0, 0, 1]);
-
-        let dad = solicitation(Ipv6Addr::UNSPECIFIED, "fd00::2".parse().unwrap(), 255);
-        assert!(
-            neighbor_advert(&dad, VM, None).is_none(),
-            "duplicate address detection"
-        );
-        assert!(
-            neighbor_advert(&solicitation(vm_ll, target, 64), VM, None).is_none(),
-            "hop limit not 255"
-        );
-        assert!(
-            neighbor_advert(
-                &solicitation(vm_ll, "ff02::1".parse().unwrap(), 255),
-                VM,
-                None
-            )
-            .is_none()
-        );
-        assert!(
-            neighbor_advert(&solicitation(vm_ll, target, 255), VM, Some(target)).is_none(),
-            "its own address"
-        );
-        let short = solicitation(vm_ll, target, 255);
-        assert!(neighbor_advert(&short[..60], VM, None).is_none());
-    }
-
-    /// `n` destination options headers, then `inner` (an upper-layer
-    /// header of protocol `proto`), in a packet from the VM's link-local
-    /// address.
-    fn behind_options(n: usize, proto: u8, inner: &[u8]) -> Vec<u8> {
+    /// `n` destination options headers before `inner`, with hop limit 255.
+    pub(crate) fn behind_options(
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        n: usize,
+        proto: u8,
+        inner: &[u8],
+    ) -> Vec<u8> {
         let mut ext = Vec::new();
         for i in 0..n {
             ext.extend_from_slice(&[if i + 1 == n { proto } else { 60 }, 0, 1, 4, 0, 0, 0, 0]);
         }
         ext.extend_from_slice(inner);
-        ipv6(
-            link_local(VM),
-            "ff02::1".parse().unwrap(),
-            if n == 0 { proto } else { 60 },
-            255,
-            &ext,
-        )
+        ipv6(src, dst, if n == 0 { proto } else { 60 }, 255, &ext)
     }
 
     fn icmp6_kind(p: &[u8]) -> Option<u8> {
@@ -697,26 +632,24 @@ pub(crate) mod tests {
     #[test]
     fn extension_headers_are_skipped() {
         let src = link_local(VM);
-        let ra = icmp6(
-            src,
-            "ff02::1".parse().unwrap(),
-            vec![ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0, 0, 0],
-        );
+        let ra = router_advert(&lease6(), 1500);
         // The same message behind a hop-by-hop header.
         let mut ext = vec![ICMPV6, 0, 1, 4, 0, 0, 0, 0];
         ext.extend_from_slice(&ra[40..]);
         let p = ipv6(src, "ff02::1".parse().unwrap(), 0, 255, &ext);
         assert_eq!(icmp6_kind(&p), Some(ROUTER_ADVERTISEMENT));
-        // Behind eight destination options headers, and behind sixteen: no
-        // chain is too long to read.
-        assert_eq!(
-            icmp6_kind(&behind_options(8, ICMPV6, &ra[40..])),
-            Some(ROUTER_ADVERTISEMENT)
-        );
-        assert_eq!(
-            icmp6_kind(&behind_options(16, ICMPV6, &ra[40..])),
-            Some(ROUTER_ADVERTISEMENT)
-        );
+        for n in [8, 16] {
+            assert_eq!(
+                icmp6_kind(&behind_options(
+                    src,
+                    "ff02::1".parse().unwrap(),
+                    n,
+                    ICMPV6,
+                    &ra[40..]
+                )),
+                Some(ROUTER_ADVERTISEMENT)
+            );
+        }
         // Behind an authentication header.
         let mut ah = vec![ICMPV6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         ah.extend_from_slice(&ra[40..]);
@@ -726,9 +659,7 @@ pub(crate) mod tests {
         );
         // A first fragment holds the type, and says it is a fragment; a later
         // one does not hold it.
-        let mut frag = vec![ICMPV6, 0, 0, 1, 0, 0, 0, 7];
-        frag.extend_from_slice(&ra[40..]);
-        let p = ipv6(src, "ff02::1".parse().unwrap(), 44, 255, &frag);
+        let (p, later) = fragments6(&ra, 8);
         assert!(matches!(
             upper(&p),
             Ok(Upper::Icmp6 {
@@ -737,12 +668,7 @@ pub(crate) mod tests {
                 ..
             })
         ));
-        let mut later = frag.clone();
-        later[2..4].copy_from_slice(&8u16.to_be_bytes());
-        assert_eq!(
-            upper(&ipv6(src, "ff02::1".parse().unwrap(), 44, 255, &later)),
-            Ok(Upper::Other)
-        );
+        assert_eq!(upper(&later), Ok(Upper::Other));
         // A header that runs past the end cannot be read, unlike a packet
         // that is simply not ICMPv6 or UDP.
         assert_eq!(upper(&ipv6(src, src, 0, 1, &[UDP, 9])), Err(Unreadable));
@@ -799,13 +725,6 @@ pub(crate) mod tests {
                 payload: b"discover"
             })
         );
-        // A UDP length past the packet's end, or under the header's.
-        let mut long = p.clone();
-        long[24..26].copy_from_slice(&100u16.to_be_bytes());
-        assert_eq!(upper(&long), Err(Unreadable));
-        let mut short = p.clone();
-        short[24..26].copy_from_slice(&7u16.to_be_bytes());
-        assert_eq!(upper(&short), Err(Unreadable));
         // The first fragment gives the port, and only the port.
         let mut first = p.clone();
         first[6] = 0x20;
@@ -832,9 +751,7 @@ pub(crate) mod tests {
             547,
             &[1; 40],
         );
-        let mut frag = vec![UDP, 0, 0, 1, 0, 0, 0, 9];
-        frag.extend_from_slice(&u[40..88]);
-        let p6 = ipv6(link_local(VM), "ff02::1:2".parse().unwrap(), 44, 64, &frag);
+        let (p6, _) = fragments6(&u, 48);
         assert_eq!(upper(&p6), Ok(Upper::UdpFragment { port: 547 }));
     }
 
