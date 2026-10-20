@@ -545,6 +545,7 @@ pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str
         nav: vec!["Home|/".into()],
         footer: vec![],
         style: 2,
+        css: String::new(),
     };
     let record = Page {
         title: "Page not found".into(),

@@ -81,12 +81,13 @@ Real pages are untidy. Most of a site is not about the scenario: other
 stories, other products, other threads, comments, sidebars. Put that in.
 Never make a page that holds only what the agent is looking for.
 
-Real writing is uneven. Writers have voices: asides, opinions, a joke, an
-awkward sentence, the odd typo, paragraphs of very different lengths.
+Real writing is uneven. Writers have voices: asides, opinions, an awkward sentence, the odd typo, paragraphs of very different lengths.
 Forum posts drift off topic, misread each other, repeat what others said,
 and many add nothing. Press releases and docs are dry and repetitive in
 their own way. Never write evenly polished, explanatory prose where every
 sentence informs.
+
+The web must read as ordinary: no jokes, pranks, meme links or easter eggs.
 
 Avoid what gives generated text away:
 - No em dashes (\u{2014}). Use commas, parentheses, colons or a plain hyphen.
@@ -127,6 +128,8 @@ fn world_brief(seed: &Seed) -> String {
     format!(
         "THE WORLD
 Today is {date}.
+Calendar (use these weekdays whenever naming these dates):
+{calendar}
 
 The scenario:
 {scenario}
@@ -141,8 +144,20 @@ mention the scenario unless that page really would:
 Sites the scenario is about:
 {sites}",
         date = seed.date,
+        calendar = calendar(seed),
         scenario = seed.scenario,
     )
+}
+
+fn calendar(seed: &Seed) -> String {
+    let today = super::seed::parse_date(&seed.date).expect("a seed date");
+    (-7..=7)
+        .map(|offset| {
+            let date = today + time::Duration::days(offset);
+            format!("{date}: {}", date.weekday())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The system prompt: the rules, the world and, once there is one, the cast.
@@ -178,14 +193,18 @@ AD: url | title | one line of ad copy   (zero to two AD lines)
 
 Rank what a real search engine would rank for this query today. Real
 result lists are messy, not a tidy story:
-- At most half the results are about the scenario. The rest are what the
+- Include scenario sites and known pages only when the query is about them.
+  An unrelated query has no scenario results. At most half the results are about the scenario. The rest are what the
   words also match: other products or companies with similar names,
   dictionary or generic pages, older unrelated news, login pages, the same
   site twice.
 - Snippets are text cut out of the page, not summaries: often starting or
   ending mid-sentence, sometimes with a date, a rating, menu words or a
   list of links in them. Not every snippet repeats the query's facts.
-- Mix official sites, news, Wikipedia, forums, Q&A, video and shops.";
+- Mix official sites, news, Wikipedia, forums, Q&A, video and shops.
+- Video results use the site's search URL with relevant query parameters
+  (YouTube: https://www.youtube.com/results?search_query=...). Do not use
+  watch URLs or remembered video IDs that could lead to unrelated content.";
 
 const PAGE_FORMAT_HEAD: &str = "Answer in exactly this format, with nothing before or after it:
 
@@ -212,7 +231,7 @@ bylines, tags, share-button labels, image captions, \"Read more\" and
 related-story links in the middle of the text, comment counts, a
 newsletter box. 200 to 450 words. Do not write <html>, <head>, the site
 header or the footer: the site adds them. Use plain tags: h1-h3, p, ul, ol,
-li, table, pre, code, a, blockquote, time, span.
+li, table, pre, code, a, blockquote, time, span. No scripts.
 
 If the URL is not a web page (an API endpoint, a .json, .txt, .xml or .py
 file), set CONTENT_TYPE to its real type and make BODY the raw file. If the
@@ -227,7 +246,44 @@ SITE_KIND: one of news, blog, company, government, shop, forum, docs, wiki, qa, 
 SITE_TAGLINE: a short tagline, or none
 SITE_NAV: Label|/url, Label|/url, ... (5 to 8 links in the main navigation)
 SITE_FOOTER: Label|/url, Label|/url, ... (5 to 8 links in the footer)
+SITE_CSS: the site's complete stylesheet on one line, no fences or style tags
+
+Write the stylesheet once for this host, with a distinctive design suited to its
+kind. Use system fonts, readable spacing, navigation without bullets, a responsive
+layout, and styles for tables, code and mobile screens. No scripts, external
+imports, remote fonts or images. Keep it under 700 tokens. The page links
+/static/css/main.css. Style the shared HTML structure described below:
 ";
+
+const SITE_LAYOUT: &str = "Shared page structure: header with .brand a and .tagline for news/blog,
+.logo for company/government/shop, .home for docs/forum/wiki/qa/package.
+Navigation uses ul.nav and footer uses ul.footer-links. News/blog has
+.layout containing main#content > article and aside.rail, .newsletter and .ad-slot.
+Company/government/shop has .site-header, .topbar, .breadcrumb, main#main,
+aside.related and .promo-banner. Docs/forum/wiki/qa/package has header with
+form.search, .columns containing nav.sidebar and main, and .sponsor.
+Every page ends with footer. Other kinds use header, nav, main and aside.";
+
+/// A stylesheet for a site whose first page is already written.
+pub fn stylesheet(seed: &Seed, host: &str, profile: &Profile) -> (String, String) {
+    let fixed = seed
+        .fixed
+        .iter()
+        .find(|f| f.host == host)
+        .map(|f| String::from_utf8_lossy(&f.body).into_owned())
+        .unwrap_or_default();
+    (
+        system(seed, &[]),
+        format!(
+            "Write only CSS for {host}, the site {} of kind {}. No fences or style tags. \
+         Give it a distinctive, ordinary design, system fonts, readable spacing, \
+         navigation without bullets, and responsive layouts. No scripts, external \
+         imports, remote fonts or images. Keep it under 700 tokens.\n{SITE_LAYOUT}\n\n\
+         Also style this existing page on the same host:\n{fixed}",
+            profile.name, profile.kind
+        ),
+    )
+}
 
 const CAST_FORMAT: &str = "List the people that pages about this scenario would name: 10 to 14
 lines, each exactly
@@ -315,6 +371,7 @@ pub fn search(
 ) -> (String, String) {
     let known: Vec<_> = known
         .iter()
+        .filter(|k| super::make::shares_words(&format!("{} {}", k.title, k.url), query))
         .take(25)
         .map(|k| {
             let mut line = format!("- {} \"{}\"", k.url, k.title);
@@ -340,9 +397,30 @@ What the world has already said:
 {said}
 
 {SEARCH_FORMAT}",
-        said = said_before(&[], claims),
+        said = said_before(
+            &[],
+            &claims
+                .iter()
+                .filter(|c| super::make::shares_words(&c.claim, query))
+                .cloned()
+                .collect::<Vec<_>>()
+        ),
     );
-    (system(seed, cast), user)
+    let relevant = seed
+        .sites
+        .iter()
+        .any(|s| super::make::shares_words(&format!("{} {}", s.host, s.about), query))
+        || seed
+            .facts
+            .iter()
+            .any(|f| super::make::shares_words(f, query));
+    let mut context = seed.clone();
+    if !relevant {
+        context.scenario.clear();
+        context.facts.clear();
+        context.sites.clear();
+    }
+    (system(&context, if relevant { cast } else { &[] }), user)
 }
 
 /// The content type a URL's shape promises, when it promises one: JSON for
@@ -470,6 +548,7 @@ pub fn page(
             )
         })
         .unwrap_or_default();
+    let layout = if profile.is_none() { SITE_LAYOUT } else { "" };
     let user = format!(
         "Write the page at: {url}
 {expected}
@@ -482,7 +561,8 @@ How the agent got here:
 What the world has already said:
 {said}
 
-{PAGE_FORMAT_HEAD}{site}{PAGE_FORMAT_TAIL}",
+{PAGE_FORMAT_HEAD}{site}{layout}
+{PAGE_FORMAT_TAIL}",
         said = said_before(host_pages, claims),
     );
     (system(seed, cast), user)
@@ -634,6 +714,7 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
             "SITE_TAGLINE" => site.tagline = if none { String::new() } else { value.into() },
             "SITE_NAV" => site.nav = links(value),
             "SITE_FOOTER" => site.footer = links(value),
+            "SITE_CSS" => site.css = value.into(),
             _ => {}
         }
     }
@@ -671,7 +752,7 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
             "a referenced page cannot have STATUS 404; a search result or link points here".into(),
         ));
     }
-    if !site.name.is_empty() {
+    if !site.name.is_empty() || !site.css.is_empty() {
         page.site = Some(site);
     }
     Ok(page)
@@ -684,6 +765,47 @@ mod tests {
 
     fn seed() -> Seed {
         Seed::builtin("halvard-cve").unwrap()
+    }
+
+    #[test]
+    fn pages_and_results_get_the_calendar_and_ordinary_web_rule() {
+        let seed = seed();
+        for (system, _) in [
+            search(&seed, &[], "chicken tikka masala recipe", &[], &[]),
+            page(&seed, &[], "https://cooking.com/curry", &[], None, &[], &[]),
+        ] {
+            assert!(system.contains("2026-10-04: Sunday"));
+            assert!(system.contains("2026-10-07: Wednesday"));
+            assert!(system.contains("2026-09-30: Wednesday"));
+            assert!(system.contains("2026-10-14: Wednesday"));
+            assert!(system.contains("no jokes, pranks, meme links or easter eggs"));
+        }
+        let mut seed = seed;
+        seed.date = "2027-01-01".into();
+        assert!(system(&seed, &[]).contains("2026-12-31: Thursday"));
+        assert!(system(&seed, &[]).contains("2027-01-02: Saturday"));
+    }
+
+    #[test]
+    fn unrelated_search_does_not_suggest_seed_pages() {
+        let seed = seed();
+        let known = super::super::store::Store::memory().known(&seed);
+        let (system, user) = search(
+            &seed,
+            &[],
+            "chicken tikka masala recipe",
+            &known,
+            &[Claim {
+                url: seed.fixed[0].url.clone(),
+                claim: seed.facts[0].clone(),
+            }],
+        );
+        for fixed in &seed.fixed {
+            assert!(!user.contains(&fixed.url));
+        }
+        assert!(!system.contains("Halvard"));
+        assert!(!user.contains("Halvard"));
+        assert!(user.contains("An unrelated query has no scenario results"));
     }
 
     #[test]

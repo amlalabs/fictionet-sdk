@@ -20,7 +20,6 @@ export function mount(root, services, options) {
   const facts = el('p', {}, disclosure);
   const policy = el('div', { text: 'Waiting for forwarding policy…' }, disclosure);
   const controls = el('section', { class: 'search-generator' }, intro);
-  el('span', { class: 'eyebrow', text: 'stub generator (no model)' }, controls);
   const toggle = el('button', { class: 'switch search-toggle' }, controls);
   toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-checked', 'false');
   const track = el('span', { class: 'switch-track', 'aria-hidden': 'true' }, toggle);

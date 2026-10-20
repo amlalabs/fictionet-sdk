@@ -330,7 +330,13 @@ impl Store {
                 .entry((host, target))
                 .or_default()
                 .push(mention),
-            Entry::Site { host, profile } => self.sites.push((host, profile)),
+            Entry::Site { host, profile } => {
+                if let Some((_, old)) = self.sites.iter_mut().find(|(h, _)| *h == host) {
+                    *old = profile;
+                } else {
+                    self.sites.push((host, profile));
+                }
+            }
             Entry::Cast(cast) => self.cast = Some(cast),
         }
     }
@@ -478,10 +484,14 @@ impl Store {
     /// `style`, the number of hosts that had a layout before it.
     pub fn site_once(&mut self, host: &str, mut profile: Profile) -> io::Result<Profile> {
         let _held = self.hold()?;
-        if let Some(profile) = self.site(host) {
-            return Ok(profile.clone());
+        if let Some(old) = self.site(host) {
+            if !old.css.is_empty() {
+                return Ok(old.clone());
+            }
+            profile.style = old.style;
+        } else {
+            profile.style = self.sites.len();
         }
-        profile.style = self.sites.len();
         self.record(Entry::Site {
             host: host.into(),
             profile: profile.clone(),

@@ -14,7 +14,7 @@
 //!   its first [`LINKS_PER_PAGE`](prompts::LINKS_PER_PAGE) link candidates,
 //!   http(s) links to other hosts' and this host's pages that are not yet
 //!   stored become mentions.
-//! - a stylesheet, script, image or font: a small fixed answer.
+//! - a stylesheet: the host's stored design; other assets: a small fixed answer.
 //!
 //! A page takes the title its first mention showed, a result for a URL the
 //! world already knows shows what the world said about it, and the search
@@ -532,7 +532,18 @@ impl Pages {
                 if let Some(fixed) = self.seed.fixed_for(host, target) {
                     return self.fixed(cx, fixed).await;
                 }
-                if let Some(asset) = static_asset(target.split('?').next().unwrap()) {
+                let path = target.split('?').next().unwrap();
+                if path.to_ascii_lowercase().ends_with(".css")
+                    && !(path == "/search.css" && crate::route::SEARCH_HOSTS.contains(&host))
+                {
+                    return match self.site_stylesheet(cx, host).await {
+                        Ok(profile) => {
+                            Response::new(200, "text/css", profile.css, vec![], Meta::Asset)
+                        }
+                        Err(stop) => stop.response(Asked::Page),
+                    };
+                }
+                if let Some(asset) = static_asset(path) {
                     return asset;
                 }
                 self.page(cx, host, target, false).await
@@ -706,7 +717,14 @@ impl Pages {
         let mut results: Vec<make::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
             let (host, target) = text::target_of(&r.url);
-            if host.is_empty() || results.iter().any(|x| x.url == r.url) {
+            let known_match = known.iter().find(|k| k.url == r.url);
+            let about = self.seed.about(&host);
+            if host.is_empty()
+                || results.iter().any(|x| x.url == r.url)
+                || known_match
+                    .is_some_and(|k| !make::shares_words(&format!("{} {}", k.title, k.url), query))
+                || about.is_some_and(|about| !make::shares_words(&format!("{host} {about}"), query))
+            {
                 continue;
             }
             let mention = json!({
@@ -773,12 +791,62 @@ impl Pages {
         }
     }
 
+    async fn site_stylesheet(&self, cx: &Cx, host: &str) -> Result<make::Profile, Stop> {
+        let _site = self
+            .locks
+            .lock(cx, format!("site {host}"))
+            .await
+            .map_err(Stop::store)?;
+        let stored = self.store().site(host).cloned();
+        if let Some(profile) = &stored
+            && !profile.css.is_empty()
+        {
+            return Ok(profile.clone());
+        }
+        let mut profile = stored.unwrap_or_else(|| make::site_profile(host));
+        if !self.generating() {
+            profile.css.clear();
+            return Ok(profile);
+        }
+        if matches!(self.maker(), Maker::Model(_)) {
+            self.reserve()?;
+            let made = self
+                .generate(
+                    cx,
+                    json!({"kind": "stylesheet", "host": host}),
+                    String::new,
+                    || {
+                        let (system, user) = prompts::stylesheet(&self.seed, host, &profile);
+                        (system, user, 1000)
+                    },
+                    |text| {
+                        let css = text.trim();
+                        if css.is_empty() {
+                            Err(prompts::Unreadable("empty stylesheet".into()))
+                        } else {
+                            Ok(css.to_owned())
+                        }
+                    },
+                )
+                .await?;
+            profile.css = made.fields;
+        } else {
+            profile.css = make::site_profile(host).css;
+        }
+        self.store().site_once(host, profile).map_err(Stop::store)
+    }
+
     async fn fixed(&self, cx: &Cx, fixed: &seed::Fixed) -> Response {
         let (host, target) = (fixed.host.as_str(), fixed.target.as_str());
         let lock = match self.locks.lock(cx, page_key(host, target)).await {
             Ok(lock) => lock,
             Err(error) => return Stop::store(error).response(Asked::Page),
         };
+        if self.generating()
+            && let Err(stop) = self.site_stylesheet(cx, host).await
+        {
+            return stop.response(Asked::Page);
+        }
         let stored = self.store().page(host, target).cloned();
         let (record, made) = match stored {
             Some(record) => (record, false),
@@ -901,6 +969,11 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
+        let site_lock = self
+            .locks
+            .lock(cx, format!("site {host}"))
+            .await
+            .map_err(Stop::store)?;
         self.reserve()?;
         let cast = self.cast(cx).await?;
         let url = format!("https://{host}{target}");
@@ -909,12 +982,13 @@ impl Pages {
             PageAsk {
                 url: url.clone(),
                 mentions: prompts::asked_mentions(store.mentions(host, target)),
-                profile: store.site(host).cloned(),
+                profile: store.site(host).filter(|p| !p.css.is_empty()).cloned(),
                 host_pages: store.host_pages(host),
                 claims: store.recent_claims(40),
                 cast,
             }
         };
+        let _site = ask.profile.is_none().then_some(site_lock);
         let expected = prompts::expected_type(&url);
         let made = self
             .generate(
@@ -934,9 +1008,20 @@ impl Pages {
                         &ask.host_pages,
                         &ask.claims,
                     );
-                    (system, user, PAGE_TOKENS)
+                    (
+                        system,
+                        user,
+                        PAGE_TOKENS + if ask.profile.is_none() { 1000 } else { 0 },
+                    )
                 },
-                |text| prompts::read_page(text, expected, !ask.mentions.is_empty()),
+                |text| {
+                    let page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
+                    if ask.profile.is_none() && page.site.as_ref().is_none_or(|p| p.css.is_empty())
+                    {
+                        return Err(prompts::Unreadable("the first page needs SITE_CSS".into()));
+                    }
+                    Ok(page)
+                },
             )
             .await?;
         let mut page = made.fields;
@@ -952,7 +1037,10 @@ impl Pages {
         let profile = match ask.profile {
             Some(profile) => profile,
             None => {
-                let described = page.site.take().unwrap_or_else(|| make::site_profile(host));
+                let mut described = page.site.take().unwrap_or_else(|| make::site_profile(host));
+                if described.name.is_empty() {
+                    described.name = make::site_profile(host).name;
+                }
                 self.store()
                     .site_once(host, described)
                     .map_err(Stop::store)?
@@ -1019,7 +1107,7 @@ impl Pages {
 /// The most form bytes a search reads from a POST.
 pub const MAX_FORM_BYTES: usize = 1 << 20;
 
-/// Stylesheets, scripts, images and fonts are never made: they get a small
+/// Scripts, images and fonts are never made: they get a small
 /// fixed answer, so a browser costs no generations. `robots.txt` allows
 /// everything.
 fn static_asset(path: &str) -> Option<Response> {
@@ -1035,7 +1123,6 @@ fn static_asset(path: &str) -> Option<Response> {
             return None;
         }
         match ext.to_lowercase().as_str() {
-            "css" => ("text/css", b"/* site styles */\n"),
             "js" => ("application/javascript", b"/* site scripts */\n"),
             "gif" | "png" | "jpg" | "jpeg" | "webp" | "svg" | "ico" => ("image/gif", PIXEL),
             "woff" => ("font/woff", b""),

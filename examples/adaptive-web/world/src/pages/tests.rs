@@ -196,7 +196,7 @@ fn openrouter(fake: Arc<Fake>) -> Model {
     Model::new(Provider::OpenRouter, "requested/model", "", key, fake)
 }
 
-const PAGE: &str = "STATUS: 200\nTITLE: Story\nBODY:\n<h1>Story</h1>";
+const PAGE: &str = "STATUS: 200\nTITLE: Story\nSITE_CSS: body {color: #234}\nBODY:\n<h1>Story</h1>";
 const SEARCH: &str = "RESULT\nURL: https://example.com/story\nTITLE: Story\nSNIPPET: A story.";
 
 /// The model API the world tests use: a cast for a cast prompt, ten results
@@ -257,7 +257,7 @@ fn fake_openrouter(script: Arc<Script>) -> Arc<Fake> {
                 "STATUS: 200\nCONTENT_TYPE: text/html\nTITLE: Some other title\nDESCRIPTION: d\n\
                 DATE: 2026-10-01\nCLAIMS:\n- a claim about {url}\nSITE_NAME: Krant Vandaag\n\
                 SITE_NAV: Home|/\nSITE_FOOTER: Over ons|/over\nSIDEBAR:\n- Andere zaak | /andere\n\
-                AD: none\nBODY:\n<h1>Story</h1><p>{snippet}</p>"
+                AD: none\nSITE_CSS: body {{color: #234}}\nBODY:\n<h1>Story</h1><p>{snippet}</p>"
             )
         };
         let reply = json!({
@@ -279,6 +279,200 @@ fn no_cast(pages: &Pages) {
 }
 
 // ---- the offline world ---------------------------------------------------
+
+#[test]
+fn site_styles_survive_restart_and_generation_off() {
+    let dir = Dir::new("styles");
+    let path = dir.0.clone();
+    lab(move |cx| async move {
+        let pages = on_disk(&path, seed(), Some(Maker::Stub), 0).unwrap();
+        let first = get(&pages, &cx, "https://docs.tools.com/guide").await;
+        let second = get(&pages, &cx, "https://docs.tools.com/reference").await;
+        for page in [first, second] {
+            assert!(String::from_utf8_lossy(&page.body).contains("href=\"/static/css/main.css\""));
+        }
+        let css = get(&pages, &cx, "https://docs.tools.com/static/css/main.css").await;
+        assert!(css.body.len() > 1000);
+        let fixed = pages.seed.fixed[0].clone();
+        assert_eq!(get(&pages, &cx, &fixed.url).await.body, fixed.body);
+        let fixed_css = get(
+            &pages,
+            &cx,
+            &format!("https://{}/assets/css/site.min.css?v=4.18.2", fixed.host),
+        )
+        .await;
+        assert!(!fixed_css.body.is_empty());
+        assert_eq!(
+            fixed_css.body,
+            get(
+                &pages,
+                &cx,
+                &format!("https://{}/static/css/main.css", fixed.host)
+            )
+            .await
+            .body
+        );
+        drop(pages);
+        let replay = on_disk(&path, seed(), None, 0).unwrap();
+        assert_eq!(
+            get(&replay, &cx, "https://docs.tools.com/static/css/main.css")
+                .await
+                .body,
+            css.body
+        );
+        assert_eq!(
+            get(
+                &replay,
+                &cx,
+                &format!("https://{}/assets/css/site.min.css?v=4.18.2", fixed.host)
+            )
+            .await
+            .body,
+            fixed_css.body
+        );
+        assert_eq!(replay.store().made, 0);
+        Ok(())
+    });
+}
+
+#[test]
+fn concurrent_model_pages_share_one_stylesheet() {
+    let dir = Dir::new("model-styles");
+    let fake = Fake::new(|_, body| {
+        let prompt = body["messages"][1]["content"].as_str().unwrap();
+        let first = prompt.contains("SITE_CSS:");
+        completion(
+            10,
+            if first {
+                "STATUS: 200\nTITLE: Guide\nSITE_NAME: Field Notes\nSITE_KIND: docs\nSITE_CSS: body { color: #17472c; }\nBODY:\n<h1>Guide</h1>"
+            } else {
+                "STATUS: 200\nTITLE: Reference\nBODY:\n<h1>Reference</h1>"
+            },
+            Some(0.001),
+        )
+    });
+    let pages = on_disk(
+        &dir.0,
+        seed(),
+        Some(Maker::Model(openrouter(fake.clone()))),
+        0,
+    )
+    .unwrap();
+    no_cast(&pages);
+    let path = dir.0.clone();
+    lab(move |cx| async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let other = on_disk(
+            &path,
+            seed(),
+            Some(Maker::Model(openrouter(fake.clone()))),
+            0,
+        )
+        .unwrap();
+        cx.spawn(move |cx| async move {
+            tx.send(get(&other, &cx, "https://docs.fields.com/reference").await)
+                .unwrap();
+            Ok(())
+        });
+        let first = get(&pages, &cx, "https://docs.fields.com/guide").await;
+        let second = rx.await.unwrap();
+        assert_eq!((first.status, second.status), (200, 200));
+        assert_eq!(
+            fake.users()
+                .iter()
+                .filter(|p| p.contains("SITE_CSS:"))
+                .count(),
+            1
+        );
+        assert_eq!(fake.users().len(), 2);
+        pages
+            .apply(
+                &cx,
+                Command::SetGeneration {
+                    generate: false,
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let css = get(&pages, &cx, "https://docs.fields.com/static/css/main.css").await;
+        assert_eq!(css.body, b"body { color: #17472c; }");
+        let replay = on_disk(&path, seed(), None, 0).unwrap();
+        assert_eq!(
+            get(
+                &replay,
+                &cx,
+                "https://docs.fields.com/static/css/main.css?v=2"
+            )
+            .await
+            .body,
+            css.body
+        );
+        assert_eq!(fake.users().len(), 2);
+        Ok(())
+    });
+}
+
+#[test]
+fn fixed_model_host_gets_one_stylesheet_without_rewriting_pages() {
+    let dir = Dir::new("fixed-style");
+    let fake = Fake::script(vec![completion(10, "body {color: #17472c}", Some(0.001))]);
+    let pages = on_disk(
+        &dir.0,
+        seed(),
+        Some(Maker::Model(openrouter(fake.clone()))),
+        0,
+    )
+    .unwrap();
+    lab(move |cx| async move {
+        let fixed = pages.seed.fixed[0].clone();
+        for _ in 0..2 {
+            assert_eq!(get(&pages, &cx, &fixed.url).await.body, fixed.body);
+            let css = get(
+                &pages,
+                &cx,
+                &format!("https://{}/assets/css/site.min.css?v=4.18.2", fixed.host),
+            )
+            .await;
+            assert_eq!(css.body, b"body {color: #17472c}");
+        }
+        assert_eq!(fake.users().len(), 1);
+        assert!(fake.users()[0].contains("page-advisory"));
+        Ok(())
+    });
+}
+
+#[test]
+fn unrelated_model_results_omit_seed_pages() {
+    let dir = Dir::new("unrelated");
+    let seed = seed();
+    let answer = format!(
+        "RESULT\nURL: {}\nTITLE: {}\nSNIPPET: {}\n\
+        RESULT\nURL: https://cooking.com/chicken-tikka-masala\nTITLE: Chicken tikka masala recipe\nSNIPPET: Marinate the chicken.",
+        seed.fixed[0].url, seed.fixed[0].title, seed.fixed[0].description
+    );
+    let fake = Fake::script(vec![completion(10, &answer, Some(0.001))]);
+    let pages = on_disk(&dir.0, seed, Some(Maker::Model(openrouter(fake))), 0).unwrap();
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let search = google(&pages, &cx, "chicken tikka masala recipe").await;
+        assert_eq!(
+            results(&search.body),
+            [(
+                "https://cooking.com/chicken-tikka-masala".into(),
+                "Chicken tikka masala recipe".into()
+            )]
+        );
+        for fixed in &pages.seed.fixed {
+            assert!(
+                pages
+                    .store()
+                    .mentions(&fixed.host, &fixed.target)
+                    .is_empty()
+            );
+        }
+        Ok(())
+    });
+}
 
 #[test]
 fn routed_hosts_share_the_lowercase_page() {
@@ -1288,7 +1482,7 @@ fn a_page_is_checked_against_the_mentions_its_model_was_shown() {
             .map(|m| m["snippet"].as_str().unwrap())
             .collect();
         script.pages.lock().unwrap().push_back(format!(
-            "STATUS: 200\nCONTENT_TYPE: text/plain\nTITLE: Story\nBODY:\n{}",
+            "STATUS: 200\nCONTENT_TYPE: text/plain\nTITLE: Story\nSITE_CSS: body {{color: #234}}\nBODY:\n{}",
             body.join(" ")
         ));
         let (searches, links) = (searches.clone(), links.clone());
@@ -1505,7 +1699,9 @@ fn model_pages_keep_their_status_type_and_body() {
         };
         // A JSON 404 keeps its status and body.
         let body = "{\"message\": \"Not Found\"}";
-        push(&[&format!("STATUS: 404\nTITLE: Missing\nBODY:\n{body}")]);
+        push(&[&format!(
+            "STATUS: 404\nTITLE: Missing\nSITE_CSS: body {{color: #234}}\nBODY:\n{body}"
+        )]);
         for cache in ["generated", "cached"] {
             let page = get(&world, &cx, "https://example.com/missing.json").await;
             assert_eq!((page.status, &page.logged()["cache"]), (404, &json!(cache)));
@@ -1513,7 +1709,7 @@ fn model_pages_keep_their_status_type_and_body() {
             assert_eq!(page.body, body.as_bytes());
         }
         // An unreferenced HTML 404 is the site's not-found page.
-        push(&["STATUS: 404\nTITLE: Missing\nBODY:\nPage not found"]);
+        push(&["STATUS: 404\nTITLE: Missing\nSITE_CSS: body {color: #234}\nBODY:\nPage not found"]);
         for cache in ["generated", "cached"] {
             let page = get(&world, &cx, "https://example.com/missing").await;
             assert_eq!((page.status, &page.logged()["cache"]), (404, &json!(cache)));
@@ -1560,13 +1756,17 @@ fn a_referenced_page_is_never_a_404() {
                 let mention = json!({"via": "link", "from": url, "anchor": "Details"});
                 world.store().add_mention(&host, &path, mention).unwrap();
             }
-            let bad = format!("STATUS: 404\nTITLE: Missing\nBODY:\n{body}");
+            let bad = format!(
+                "STATUS: 404\nTITLE: Missing\nSITE_CSS: body {{color: #234}}\nBODY:\n{body}"
+            );
             let good_body = if path.ends_with(".json") {
                 "{\"message\": \"Details\"}"
             } else {
                 "Details"
             };
-            let good = format!("STATUS: 200\nTITLE: Details\nBODY:\n{good_body}");
+            let good = format!(
+                "STATUS: 200\nTITLE: Details\nSITE_CSS: body {{color: #234}}\nBODY:\n{good_body}"
+            );
             task.pages
                 .lock()
                 .unwrap()
@@ -1639,7 +1839,7 @@ fn a_search_and_a_page_publish_one_title() {
         let search = format!(
             "RESULT\nURL: {URL}\nTITLE: first\nSNIPPET: Snippet for first.\nDATE: 1 Oct 2026"
         );
-        let page = "STATUS: 200\nTITLE: Story\nDESCRIPTION: The story.\nBODY:\n<h1>Story</h1>";
+        let page = "STATUS: 200\nTITLE: Story\nDESCRIPTION: The story.\nSITE_CSS: body {color: #234}\nBODY:\n<h1>Story</h1>";
         // A list takes 10 ms to write, a page 50 ms; the second request
         // starts 20 ms after the first.
         let fake = Fake::new(move |_, body| {
