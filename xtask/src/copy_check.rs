@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-/// The capture adapters in `src/observe` that a user may copy with the
+/// The capture adapters in `observe/src/decode` that a user may copy with the
 /// stdlib, as the stdlib docs describe.
 const OBSERVE: &[&str] = &["conversation", "http2", "protocols", "tls"];
 
@@ -39,12 +39,14 @@ pub fn run(args: &[String]) -> Result {
     copy_tree(&root.join("src/stdlib"), &dir.join("src/stdlib"))?;
     fs::create_dir_all(dir.join("src/observe"))?;
     for name in OBSERVE {
-        let file = format!("src/observe/{name}.rs");
-        fs::copy(root.join(&file), dir.join(&file))?;
+        fs::copy(
+            root.join(format!("observe/src/decode/{name}.rs")),
+            dir.join(format!("src/observe/{name}.rs")),
+        )?;
     }
     // protocols.rs keeps its presenters in a folder of their own.
     copy_tree(
-        &root.join("src/observe/protocols"),
+        &root.join("observe/src/decode/protocols"),
         &dir.join("src/observe/protocols"),
     )?;
     // The web module's docs include these diagrams by relative path.
@@ -56,12 +58,13 @@ pub fn run(args: &[String]) -> Result {
         "//! The SDK's stdlib and capture adapters, copied by `cargo xtask copy-check`.\n\
          #![deny(warnings)]\n\n\
          pub mod stdlib;\n\n\
-         fictionet::cfg_observe! {\n    pub mod observe {\n",
+         #[cfg(feature = \"decode\")]\n\
+         pub mod observe {\n",
     );
     for name in OBSERVE {
-        writeln!(lib, "        pub mod {name};")?;
+        writeln!(lib, "    pub mod {name};")?;
     }
-    lib.push_str("    }\n}\n");
+    lib.push_str("}\n");
     fs::write(dir.join("src/lib.rs"), lib)?;
 
     // Without the SDK's features, and with all of them, so both sides of
@@ -73,7 +76,12 @@ pub fn run(args: &[String]) -> Result {
         .filter(|name| *name != "default")
         .map(|name| format!("fictionet/{name}"))
         .collect();
-    for features in [String::new(), all.join(",")] {
+    for features in [
+        String::new(),
+        "decode".into(),
+        all.join(","),
+        format!("decode,{}", all.join(",")),
+    ] {
         let mut command = cmd("cargo", &["build", "--lib", "--manifest-path"]);
         command
             .arg(dir.join("Cargo.toml"))
@@ -102,6 +110,7 @@ fn manifest(sdk: &Value, root: &Path) -> Result<String> {
         "[package]\nname = \"fictionet-copy-check\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
          # A workspace of its own, though it sits under the SDK's target directory.\n\
          [workspace]\n\n\
+         [features]\ndecode = [\"fictionet-observe/decode\"]\n\n\
          # The stdlib checks its bookkeeping under `--cfg fuzzing`.\n\
          [lints.rust]\nunexpected_cfgs = { level = \"warn\", check-cfg = [\"cfg(fuzzing)\"] }\n\n\
          # Built as the SDK's workspace builds them, so the two share dependency builds.\n\
@@ -149,10 +158,17 @@ fn manifest(sdk: &Value, root: &Path) -> Result<String> {
     }
     let path = root.to_str().ok_or("the SDK's path is not UTF-8")?;
     match sections.iter_mut().find(|(s, _)| s == "[dependencies]") {
-        Some((_, lines)) => lines.insert(
-            0,
-            format!("fictionet = {{ path = {path:?}, default-features = false }}"),
-        ),
+        Some((_, lines)) => {
+            lines.insert(
+                0,
+                format!("fictionet = {{ path = {path:?}, default-features = false }}"),
+            );
+            let observe = root.join("observe");
+            lines.insert(
+                1,
+                format!("fictionet-observe = {{ path = {observe:?}, default-features = false }}"),
+            );
+        }
         None => return Err("fictionet has no plain dependencies".into()),
     }
     for (section, lines) in sections {

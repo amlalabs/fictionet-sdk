@@ -1,4 +1,4 @@
-//! Observer streams as SSE. `end` closes a stream normally; `link_end`
+//! Observation API streams as SSE. `end` closes a stream normally; `link_end`
 //! closes one merged link. A refusal sends `world_error` with an `error`
 //! string, or `link_error` with `link` and `error` for a merged subscription.
 //! Other merged links keep streaming. Receive failures send `world_error`
@@ -9,7 +9,7 @@ use std::io::{self, BufWriter, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use fictionet::relay::observer::{Client, Envelope, Value};
+use fictionet_observe::{Client, Envelope, Value};
 
 use super::api::{observe_request, quote, with_link};
 

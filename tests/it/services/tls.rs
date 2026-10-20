@@ -187,7 +187,7 @@ service_fixture! {
 
 #[test]
 fn the_harness_resumes_after_starttls() {
-    let memory = Arc::new(fictionet::events::Memory::default());
+    let memory = Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Mail { tls: false }, ())
         .observer(memory.clone());
     assert_eq!(h.open().unwrap(), b"220 mail ready\r\n");

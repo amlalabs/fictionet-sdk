@@ -4,6 +4,7 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
   const state = {
     nodes: new Map(), // id -> task or sandbox, as the world sent it
     edges: new Map(), // id -> link
+    hosts: new Map(),
     groups: new Map(), // id -> { id, name, parent }
     events: [],
     serverT: 0, // the run's clock, in seconds, at the last message
@@ -34,6 +35,8 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
   function snapshot(s) {
     for (const id of [...state.edges.keys()]) removeEdge(id);
     for (const id of [...state.nodes.keys()]) removeNode(id);
+    state.hosts.clear();
+    for (const host of s.hosts || []) upsertHost(host);
     state.groups.clear();
     state.events = [];
     tick(s.t);
@@ -56,6 +59,16 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
     // Fit once the layout is made, dragged places included.
     state.userMoved = false;
     state.sideDirty = true;
+  }
+
+  function upsertHost(host) {
+    state.hosts.set(host.id, host);
+    state.layoutDirty = state.sideDirty = true;
+  }
+
+  function removeHost(id) {
+    state.hosts.delete(id);
+    state.layoutDirty = state.sideDirty = true;
   }
 
   function upsertGroup(d) {
@@ -158,5 +171,51 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
     state.sideDirty = true;
   }
 
-  return { state, runTime, tick, snapshot, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent };
+  return { state, runTime, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent };
+}
+
+// Bind one watch to a graph state. The owner closes it when its view leaves.
+export function watchState(source, { state, setStatus, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent }) {
+  const cleanup = [];
+  const on = (name, callback) => {
+    source.addEventListener(name, callback);
+    cleanup.push(() => source.removeEventListener(name, callback));
+  };
+    on('waiting', () => {
+      state.connected = true;
+      setStatus('waiting', 'Waiting for a world');
+    });
+    on('snapshot', (e) => snapshot(JSON.parse(e.data)));
+    on('host', (e) => upsertHost?.(JSON.parse(e.data)));
+    on('host_end', (e) => removeHost?.(JSON.parse(e.data).id));
+    on('group', (e) => upsertGroup(JSON.parse(e.data)));
+    on('group_end', (e) => removeGroup(JSON.parse(e.data).id));
+    on('node', (e) => upsertNode(JSON.parse(e.data)));
+    on('node_end', (e) => removeNode(JSON.parse(e.data).id));
+    on('edge', (e) => upsertEdge(JSON.parse(e.data)));
+    on('edge_end', (e) => removeEdge(JSON.parse(e.data).id));
+    on('counters', (e) => counters(JSON.parse(e.data)));
+    on('event', (e) => addEvent(JSON.parse(e.data)));
+    on('ended', (e) => {
+      tick(JSON.parse(e.data).t);
+      state.ended = true;
+      setStatus('ended', 'World stopped');
+      state.sideDirty = true;
+    });
+    on('end', () => {
+      source.close();
+      if (!state.ended) setStatus('ended', 'The world closed');
+      state.ended = true;
+    });
+    on('world_error', (e) => {
+      state.ended = true;
+      setStatus('ended', JSON.parse(e.data).error);
+    });
+    on('error', () => {
+      if (!state.ended) setStatus('connecting', 'Reconnecting');
+    });
+  return () => {
+    cleanup.forEach((remove) => remove());
+    source.close();
+  };
 }

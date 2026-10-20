@@ -127,7 +127,7 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
     let (v6, v6_mine) = capped();
     let (other, other_mine) = capped();
     fcx.spawn_as(
-        || "split_versions".into(),
+        || "split_versions",
         move |fcx| async move {
             let ports = Ports::new(vec![
                 Box::new(inner) as Box<dyn Interface>,
@@ -279,7 +279,7 @@ impl<F: Future<Output = fictionet::Result> + Send + 'static> Prepared<F> {
     /// Starts forwarding in the context used to prepare the split.
     #[track_caller]
     pub fn start(self, fcx: &Cx) {
-        fcx.spawn_as(|| "split_protocols".into(), move |_| self.task);
+        fcx.spawn_as(|| "split_protocols", move |_| self.task);
     }
 }
 

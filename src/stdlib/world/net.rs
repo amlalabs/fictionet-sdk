@@ -9,9 +9,10 @@
 //! name-based virtual hosting. Every sandbox that attaches is put on the
 //! sandboxes' subnet, given an address by DHCP or by its first packet, and
 //! kept from reaching the other sandboxes. A world then writes only its
-//! services. Services emit events lazily; the integrator installs observers with
-//! [`RunOptions`](fictionet::RunOptions) before execution. No observer means no
-//! event construction or retention.
+//! services. Services emit events lazily to the observer installed in
+//! [`RunOptions`](fictionet::RunOptions). Without one they skip construction.
+//! [Fictionet Observe](../../../../fictionet_observe/index.html) owns event
+//! retention, aggregation and export.
 //!
 //! An office: a domain controller that answers LDAP and Kerberos, a web
 //! server, and a PLC, with DNS names for each:
@@ -80,8 +81,8 @@
 //!   [`Host::on`] and attached virtual machines with [`Net::member`], as
 //!   machines on one Ethernet: broadcast and multicast reach every member.
 //!   The router sends the LAN's prefix to its gateway, the LAN's first
-//!   address answers DNS, and the packets the LAN drops are recorded
-//!   (optionally summarized by [`Aggregate`](fictionet::events::Aggregate)).
+//!   address answers DNS. Drops emit events to interested observers;
+//!   the companion's `Aggregate` can summarize repeats.
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". UDP delivery and closed-port
 //!   events use the declared UDP length. Invalid lengths are dropped;
@@ -220,7 +221,6 @@ pub struct Net {
     resolver: Option<Arc<Resolver>>,
     max_hosts: usize,
     routes: Vec<(String, Prefix)>,
-    registry: Option<fictionet::observe::Registry>,
     group: String,
     limits: Limits,
     lans: Vec<(String, Prefix)>,
@@ -250,7 +250,6 @@ impl Net {
             resolver: None,
             max_hosts: MAX_HOSTS,
             routes: Vec::new(),
-            registry: None,
             group: "net".to_owned(),
             limits: Limits::default(),
             lans: Vec::new(),
@@ -353,15 +352,6 @@ impl Net {
         self
     }
 
-    /// Installs `registry` for observers when the network starts, so the
-    /// dashboard decodes the services' protocols.
-    pub fn observe(self, registry: fictionet::observe::Registry) -> Net {
-        Net {
-            registry: Some(registry),
-            ..self
-        }
-    }
-
     /// Names the group observers see for the network's tasks.
     pub fn group(self, name: &str) -> Net {
         Net {
@@ -390,9 +380,6 @@ impl Net {
         } else {
             None
         };
-        if let Some(registry) = self.registry {
-            fcx.observe_protocols(registry);
-        }
         let caller = fcx.clone();
         let fcx = &fcx.group(self.group.clone());
         let router = route::router::<Box<dyn Interface>>(fcx, Vec::new());

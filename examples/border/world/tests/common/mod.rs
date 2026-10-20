@@ -29,7 +29,7 @@ pub struct Env {
     pub log: Buf,
     pub scenario: Arc<Scenario>,
     pub routing: border_world::routing::Routing,
-    pub events: Arc<fictionet::events::Memory>,
+    pub events: Arc<fictionet_observe::Memory>,
 }
 
 /// Runs a Border world for `variant` and `task`, on a tokio runtime. `f`
@@ -47,12 +47,14 @@ where
     ));
     let log = Log::start(Box::new(buf.clone()), scenario.clone());
     let output = log.clone();
-    let events = Arc::new(fictionet::events::Memory::default());
+    let events = Arc::new(fictionet_observe::Memory::default());
     fictionet_test_support::harness::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(events.clone())
-            .observer(Arc::new(log.clone())),
+        fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
+            fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
+                Arc::new(log.clone()),
+                events.clone(),
+            ]))),
+        )),
         move |fcx| async move {
             let (ids, root) = {
                 let ca = Ca::new(&fcx, "Test Root CA")?;

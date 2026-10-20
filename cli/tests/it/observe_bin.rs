@@ -12,23 +12,16 @@ use fictionet::InterfaceExt;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 
-/// A world that takes attachments, and emits an event every 50 ms.
-fn start_world(path: &str) -> fictionet::Listening {
-    let (attacher, mut attachments) = fictionet::attachments();
-    let listening =
-        fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
+/// A world that emits an event every 50 ms.
+fn start_world(path: &str) -> fictionet_observe::Endpoint {
+    let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+    let listening = fictionet_observe::serve(dashboard.handle(), path).unwrap();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random())
-                .aggregate_events()
-                .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(std::sync::Arc::new(
+                fictionet_observe::Aggregate::new(dashboard.observer()),
+            )),
             move |fcx| async move {
-                fcx.spawn(move |fcx| async move {
-                    while let Ok(a) = attachments.next(&fcx).await {
-                        drop(a);
-                    }
-                    Ok(())
-                });
                 let mut n = 0i64;
                 loop {
                     fcx.emit("test", "tick", |event| event.field("n", n));
@@ -60,13 +53,13 @@ fn observe_prints_json_lines() {
     let _listening = start_world(&path);
     let world = format!("unix:{path}");
     let out = Command::new(BIN)
-        .args(["observe", "--world", &world, "world"])
+        .args(["observe", "--observation", &world, "world"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
-        text.starts_with(r#"{"observe":1,"#) && text.ends_with("}\n"),
+        text.starts_with(r#"{"observe":2,"#) && text.ends_with("}\n"),
         "{text}"
     );
 
@@ -77,7 +70,7 @@ fn observe_prints_json_lines() {
 
     // A stream: the snapshot, then the world's own events, one per line.
     let mut child = Command::new(BIN)
-        .args(["observe", "--world", &world, "watch"])
+        .args(["observe", "--observation", &world, "watch"])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -98,18 +91,18 @@ fn observe_prints_json_lines() {
 
     // A request the world cannot answer exits 1; one that makes no sense, 2.
     let out = Command::new(BIN)
-        .args(["observe", "--world", &world, "packet", "e999", "1"])
+        .args(["observe", "--observation", &world, "packet", "e999", "1"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stdout).contains(r#""error""#));
     let out = Command::new(BIN)
-        .args(["observe", "--world", &world, "fly"])
+        .args(["observe", "--observation", &world, "fly"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let out = Command::new(BIN)
-        .args(["observe", "--world", "unix:/nonexistent/world.sock"])
+        .args(["observe", "--observation", "unix:/nonexistent/world.sock"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -117,7 +110,7 @@ fn observe_prints_json_lines() {
     // A full disk is a failure, not a quiet stop as a closed pipe is.
     if let Ok(full) = std::fs::File::create("/dev/full") {
         let out = Command::new(BIN)
-            .args(["observe", "--world", &world, "world"])
+            .args(["observe", "--observation", &world, "world"])
             .stdout(full)
             .output()
             .unwrap();
@@ -129,15 +122,41 @@ fn observe_prints_json_lines() {
     }
 }
 
+const MORE: u8 = 1;
+const END: u8 = 2;
+const BINARY: u8 = 4;
+
+fn send_frame(mut peer: &std::os::unix::net::UnixStream, body: &[u8]) {
+    peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+    peer.write_all(body).unwrap();
+}
+
+fn send_reply(peer: &std::os::unix::net::UnixStream, id: u32, flags: u8, body: &[u8]) {
+    let mut frame = vec![5];
+    frame.extend_from_slice(&id.to_be_bytes());
+    frame.push(flags);
+    frame.extend_from_slice(body);
+    send_frame(peer, &frame);
+}
+
+fn read_frame(mut peer: &std::os::unix::net::UnixStream) -> Option<Vec<u8>> {
+    let mut header = [0; 4];
+    if peer.read(&mut header[..1]).unwrap() == 0 {
+        return None;
+    }
+    peer.read_exact(&mut header[1..]).unwrap();
+    let mut body = vec![0; u32::from_be_bytes(header) as usize];
+    peer.read_exact(&mut body).unwrap();
+    Some(body)
+}
+
 /// A scripted observer peer, with the same replies for each request.
 fn with_observer(replies: &[(u8, &[u8])], requests: usize, run: impl FnOnce(&str)) {
-    use fictionet::relay::{Message, unix};
-
     with_observer_action(
         requests,
         |peer, id| {
             for &(flags, body) in replies {
-                unix::send(peer, &Message::Reply { id, flags, body }.encode(), false).unwrap();
+                send_reply(peer, id, flags, body);
             }
         },
         run,
@@ -147,60 +166,30 @@ fn with_observer(replies: &[(u8, &[u8])], requests: usize, run: impl FnOnce(&str
 /// A scripted observer peer that runs an action for each request.
 fn with_observer_action(
     requests: usize,
-    mut reply: impl FnMut(std::os::fd::RawFd, u32) + Send,
+    mut reply: impl FnMut(&std::os::unix::net::UnixStream, u32) + Send,
     run: impl FnOnce(&str),
 ) {
-    use fictionet::relay::{self, Message, unix};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
     let path = temp::socket();
-    let (addr, len) = unix::address(std::path::Path::new(&path)).unwrap();
-    // SAFETY: the socket is owned here; addr is valid for len bytes.
-    let listener = unsafe {
-        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
-        assert!(fd >= 0);
-        let listener = OwnedFd::from_raw_fd(fd);
-        assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
-        assert_eq!(libc::listen(fd, 1), 0);
-        listener
-    };
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     std::thread::scope(|scope| {
         let server = scope.spawn(|| {
             let mut remaining = requests;
             while remaining != 0 {
-                // Close-on-exec, so a child process that another test starts does not
-                // keep the connection open.
-                // SAFETY: accept needs no address output; the returned fd is owned here.
-                let peer = unsafe {
-                    let fd = libc::accept4(
-                        listener.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        libc::SOCK_CLOEXEC,
-                    );
-                    assert!(fd >= 0);
-                    OwnedFd::from_raw_fd(fd)
-                };
-                unix::set_timeout(
-                    peer.as_raw_fd(),
-                    libc::SO_RCVTIMEO,
-                    Some(Duration::from_secs(5)),
-                )
-                .unwrap();
-                let mut buf = vec![0; relay::MAX_MESSAGE];
-                let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
-                assert!(matches!(relay::decode(&buf[..n]), Ok(Message::Hello(_))));
-                unix::send(peer.as_raw_fd(), &Message::Accept.encode(), false).unwrap();
+                let (peer, _) = listener.accept().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                assert_eq!(
+                    read_frame(&peer).unwrap(),
+                    [b"\x01\x00\x00\x00\x02".as_slice(), b"fictionet-observe"].concat()
+                );
+                send_frame(&peer, &[2]);
                 while remaining != 0 {
-                    let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
-                    if n == 0 {
+                    let Some(frame) = read_frame(&peer) else {
                         break;
-                    }
-                    remaining -= 1;
-                    let Message::Request { id, .. } = relay::decode(&buf[..n]).unwrap() else {
-                        panic!("expected an observer request");
                     };
-                    reply(peer.as_raw_fd(), id);
+                    remaining -= 1;
+                    assert_eq!(frame[0], 4, "expected an observation request");
+                    let id = u32::from_be_bytes(frame[1..5].try_into().unwrap());
+                    reply(&peer, id);
                 }
             }
         });
@@ -214,8 +203,6 @@ fn with_observer_action(
 
 #[test]
 fn observe_inspects_envelopes_and_preserves_bytes() {
-    use fictionet::relay::{BINARY, END};
-
     for (flags, bytes, status) in [
         (END, br#"{"error":"missing"}"#.as_slice(), 1),
         (END, b" \n{ \"extra\": 1, \"error\": \"missing\" }\n", 1),
@@ -230,7 +217,7 @@ fn observe_inspects_envelopes_and_preserves_bytes() {
     ] {
         with_observer(&[(flags, bytes)], 1, |path| {
             let out = Command::new(BIN)
-                .args(["observe", "--world", &format!("unix:{path}"), "watch"])
+                .args(["observe", "--observation", &format!("unix:{path}"), "watch"])
                 .output()
                 .unwrap();
             assert_eq!(out.status.code(), Some(status), "{out:?}");
@@ -246,8 +233,6 @@ fn observe_inspects_envelopes_and_preserves_bytes() {
 
 #[test]
 fn dashboard_inspects_envelopes_for_json_and_streams() {
-    use fictionet::relay::END;
-
     for (route, requests, bytes, status, expected) in [
         (
             "/api/packet",
@@ -330,7 +315,7 @@ fn with_dashboard(path: &str, run: impl FnOnce(u16)) {
     let mut child = Command::new(BIN)
         .args([
             "dashboard",
-            "--world",
+            "--observation",
             &format!("unix:{path}"),
             "--listen",
             "127.0.0.1:0",
@@ -436,8 +421,6 @@ fn sse_frame(reader: &mut impl BufRead) -> String {
 
 #[test]
 fn dashboard_sse_keeps_partial_replies_across_heartbeats() {
-    use fictionet::relay::{END, MORE, Message, unix};
-
     for (route, links) in [
         ("/api/watch", vec![None]),
         ("/api/packets?link=e3,e7", vec![Some("e3"), Some("e7")]),
@@ -446,23 +429,13 @@ fn dashboard_sse_keeps_partial_replies_across_heartbeats() {
         with_observer_action(
             links.len(),
             move |peer, id| {
-                unix::send(
-                    peer,
-                    &Message::Reply {
-                        id,
-                        flags: MORE,
-                        body: br#"{"event":"packet","data":"#,
-                    }
-                    .encode(),
-                    false,
-                )
-                .unwrap();
+                send_reply(peer, id, MORE, br#"{"event":"packet","data":"#);
                 heartbeat.recv_timeout(Duration::from_secs(15)).unwrap();
                 for (flags, body) in [
                     (0, br#"{"seq":1}}"#.as_slice()),
                     (END, br#"{"event":"end","data":{"reason":"closed"}}"#),
                 ] {
-                    unix::send(peer, &Message::Reply { id, flags, body }.encode(), false).unwrap();
+                    send_reply(peer, id, flags, body);
                 }
             },
             |path| {
@@ -510,8 +483,6 @@ fn dashboard_sse_keeps_partial_replies_across_heartbeats() {
 
 #[test]
 fn dashboard_sse_distinguishes_boundary_close_from_truncation() {
-    use fictionet::relay::{MORE, Message, unix};
-
     for (route, requests) in [("/api/watch", 1), ("/api/packets?link=e3,e7", 2)] {
         for partial in [false, true] {
             let mut remaining = requests;
@@ -520,17 +491,7 @@ fn dashboard_sse_distinguishes_boundary_close_from_truncation() {
                 |peer, id| {
                     remaining -= 1;
                     if partial && remaining == 0 {
-                        unix::send(
-                            peer,
-                            &Message::Reply {
-                                id,
-                                flags: MORE,
-                                body: br#"{"event":"packet","data":"#,
-                            }
-                            .encode(),
-                            false,
-                        )
-                        .unwrap();
+                        send_reply(peer, id, MORE, br#"{"event":"packet","data":"#);
                     }
                 },
                 |path| {
@@ -555,8 +516,6 @@ fn dashboard_sse_distinguishes_boundary_close_from_truncation() {
 
 #[test]
 fn dashboard_partial_frame_after_ended() {
-    use fictionet::relay::{END, MORE, Message, unix};
-
     for (route, requests, prefix) in [
         ("/api/watch", 1, "event: ended\ndata: {}\n\n"),
         (
@@ -579,8 +538,7 @@ fn dashboard_partial_frame_after_ended() {
                             (0, br#"{"event":"ended","data":{}}"#.as_slice()),
                             (flags, br#"{"event":"end","data":"#),
                         ] {
-                            unix::send(peer, &Message::Reply { id, flags, body }.encode(), false)
-                                .unwrap();
+                            send_reply(peer, id, flags, body);
                         }
                     }
                 },
@@ -603,8 +561,6 @@ fn dashboard_partial_frame_after_ended() {
 
 #[test]
 fn dashboard_refused_subscription_reason() {
-    use fictionet::relay::END;
-
     for (route, requests, expected) in [
         (
             "/api/packets?link=e3",
@@ -633,8 +589,6 @@ fn dashboard_refused_subscription_reason() {
 
 #[test]
 fn dashboard_json_truncation_preserves_the_reason() {
-    use fictionet::relay::MORE;
-
     with_observer(&[(MORE, br#"{"nodes":"#)], 1, |path| {
         with_dashboard(path, |port| {
             let (status, body) = get(port, "/api/graph");
@@ -646,8 +600,6 @@ fn dashboard_json_truncation_preserves_the_reason() {
 
 #[test]
 fn dashboard_merged_refusal_keeps_other_links_streaming() {
-    use fictionet::relay::{END, Message, unix};
-
     let mut first = true;
     with_observer_action(
         2,
@@ -662,7 +614,7 @@ fn dashboard_merged_refusal_keeps_other_links_streaming() {
             };
             first = false;
             for &(flags, body) in replies {
-                unix::send(peer, &Message::Reply { id, flags, body }.encode(), false).unwrap();
+                send_reply(peer, id, flags, body);
             }
         },
         |path| {
@@ -685,7 +637,6 @@ fn dashboard_merged_refusal_keeps_other_links_streaming() {
 
 #[test]
 fn dashboard_sse_heartbeat_releases_an_idle_observer_after_browser_disconnect() {
-    use fictionet::relay::unix;
     use std::os::fd::AsRawFd;
 
     for (route, requests) in [("/api/watch", 1), ("/api/packets?link=e3,e7", 2)] {
@@ -696,10 +647,10 @@ fn dashboard_sse_heartbeat_releases_an_idle_observer_after_browser_disconnect() 
             |peer, _| {
                 remaining -= 1;
                 if remaining == 0 {
-                    unix::set_timeout(peer, libc::SO_RCVTIMEO, Some(Duration::from_secs(15)))
+                    peer.set_read_timeout(Some(Duration::from_secs(15)))
                         .unwrap();
                     let mut buf = [0; 1];
-                    assert_eq!(unix::recv(peer, &mut buf, false).unwrap(), 0);
+                    assert_eq!((&*peer).read(&mut buf).unwrap(), 0);
                     closed.send(()).unwrap();
                 }
             },
@@ -743,7 +694,7 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     let mut child = Command::new(BIN)
         .args([
             "dashboard",
-            "--world",
+            "--observation",
             &world,
             "--listen",
             "127.0.0.1:0",
@@ -775,18 +726,21 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
         "/api/pcap",
         "/api/bootstrap",
     ] {
-        assert!(raw_get(port, route, "").starts_with("HTTP/1.1 401"));
+        let send = if route == "/api/bootstrap" {
+            raw_post
+        } else {
+            raw_get
+        };
+        assert!(send(port, route, "").starts_with("HTTP/1.1 401"));
         assert!(
-            raw_get(
+            send(
                 port,
                 route,
                 "Cookie: fictionet_token=dashboard-test-token\r\n"
             )
             .starts_with("HTTP/1.1 401")
         );
-        assert!(
-            raw_get(port, route, "Authorization: Bearer wrong\r\n").starts_with("HTTP/1.1 401")
-        );
+        assert!(send(port, route, "Authorization: Bearer wrong\r\n").starts_with("HTTP/1.1 401"));
     }
     // A coalesced request or body suffix cannot supply the first request's headers.
     for suffix in [
@@ -826,9 +780,9 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
         assert!(!shell.contains("dashboard-test-token"));
     }
     assert!(
-        raw_get(port, "/api/bootstrap?token=dashboard-test-token", "").starts_with("HTTP/1.1 401")
+        raw_post(port, "/api/bootstrap?token=dashboard-test-token", "").starts_with("HTTP/1.1 401")
     );
-    let bootstrap = raw_get(
+    let bootstrap = raw_post(
         port,
         "/api/bootstrap",
         "Authorization: Bearer dashboard-test-token\r\n",
@@ -837,7 +791,7 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     assert!(!bootstrap.contains("Set-Cookie:"));
     assert!(!bootstrap.contains("dashboard-test-token"));
     assert!(
-        raw_get(
+        raw_post(
             port,
             "/api/bootstrap",
             "Authorization: Bearer dashboard-test-token\r\n"
@@ -912,26 +866,18 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
 }
 
 /// A world with two links that each carry a packet every 20 ms.
-fn start_two_links(path: &str) -> fictionet::Listening {
+fn start_two_links(path: &str) -> fictionet_observe::Endpoint {
     use fictionet::Interface;
     use fictionet::prelude::*;
-    let (attacher, mut attachments) = fictionet::attachments();
-    let listening =
-        fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
+    let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+    let listening = fictionet_observe::serve(dashboard.handle(), path).unwrap();
     let (ready, started) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random())
-                .aggregate_events()
-                .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(std::sync::Arc::new(
+                fictionet_observe::Aggregate::new(dashboard.observer()),
+            )),
             move |fcx| async move {
-                // Observers find a world once it takes attachments.
-                fcx.spawn(move |fcx| async move {
-                    while let Ok(a) = attachments.next(&fcx).await {
-                        drop(a);
-                    }
-                    Ok(())
-                });
                 let lan = fcx.group("lan");
                 for _ in 0..2 {
                     let (mut a, mut b) = fictionet::pair();
@@ -984,7 +930,7 @@ fn the_dashboard_merges_the_packets_of_several_links() {
         Command::new(BIN)
             .args([
                 "dashboard",
-                "--world",
+                "--observation",
                 &world,
                 "--listen",
                 "127.0.0.1:0",
@@ -1160,8 +1106,6 @@ fn the_dashboard_fails_a_capture_when_a_requested_link_does_not_exist() {
 
 #[test]
 fn the_dashboard_names_every_failed_capture_and_preserves_unexpected_replies() {
-    use fictionet::relay::END;
-
     for (reply, error) in [
         (
             r#" { "error": "missing \"capture\"\n" } "#,
@@ -1190,14 +1134,10 @@ fn the_dashboard_names_every_failed_capture_and_preserves_unexpected_replies() {
 fn a_watch_exits_0_when_the_world_ends() {
     let path = temp::socket();
     let world = format!("unix:{path}");
-    let (attacher, mut attachments) = fictionet::attachments();
-    let listening = fictionet::listen(
-        fictionet::WorldSocket::UnixSocket(path.clone().into()),
-        attacher,
-    )
-    .unwrap();
+    let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+    let listening = fictionet_observe::serve(dashboard.handle(), &path).unwrap();
     let mut child = Command::new(BIN)
-        .args(["observe", "--world", &world, "watch"])
+        .args(["observe", "--observation", &world, "watch"])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -1205,29 +1145,22 @@ fn a_watch_exits_0_when_the_world_ends() {
     let (stop, mut stopped) = fictionet::pair();
     let world_thread = std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random())
-                .aggregate_events()
-                .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(std::sync::Arc::new(
+                fictionet_observe::Aggregate::new(dashboard.observer()),
+            )),
             move |fcx| async move {
-                fcx.spawn(move |fcx| async move {
-                    while let Ok(a) = attachments.next(&fcx).await {
-                        drop(a);
-                    }
-                    Ok(())
-                });
                 assert_eq!(stopped.recv(&fcx).await, Err(fictionet::RecvError::Closed));
-                // Ends the run, with the task above.
                 fcx.cancel();
                 Ok(())
             },
         ));
-        drop(listening);
     });
     let log = logged(child.stdout.take().unwrap(), r#""event":"snapshot""#);
     drop(stop);
     let status =
         fictionet_test_support::within(Duration::from_secs(20), move || child.wait().unwrap());
     world_thread.join().unwrap();
+    drop(listening);
     let out = log.join().unwrap();
     assert_eq!(status.code(), Some(0), "{out}");
     assert!(out.contains(r#"{"event":"ended","#), "{out}");
@@ -1240,8 +1173,6 @@ fn a_watch_exits_0_when_the_world_ends() {
 
 #[test]
 fn observe_partial_frame_after_ended_is_an_error() {
-    use fictionet::relay::MORE;
-
     let ended_value = br#"{"event":"ended","data":{}}"#;
     for (ended, partial) in [(true, false), (true, true), (false, true)] {
         let mut replies = Vec::new();
@@ -1253,7 +1184,7 @@ fn observe_partial_frame_after_ended_is_an_error() {
         }
         with_observer(&replies, 1, |path| {
             let out = Command::new(BIN)
-                .args(["observe", "--world", &format!("unix:{path}"), "watch"])
+                .args(["observe", "--observation", &format!("unix:{path}"), "watch"])
                 .output()
                 .unwrap();
             assert_eq!(
@@ -1286,6 +1217,15 @@ fn raw_get(port: u16, path: &str, headers: &str) -> String {
     )
 }
 
+fn raw_post(port: u16, path: &str, headers: &str) -> String {
+    raw_request(
+        port,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n{headers}\r\n"
+        ),
+    )
+}
+
 fn raw_request(port: u16, request: &str) -> String {
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(10)))
@@ -1314,7 +1254,7 @@ fn dashboard_requires_a_readable_valid_token_file() {
         let out = Command::new(BIN)
             .args([
                 "dashboard",
-                "--world",
+                "--observation",
                 "unix:/nonexistent-world",
                 "--token-file",
                 &path,
@@ -1327,11 +1267,31 @@ fn dashboard_requires_a_readable_valid_token_file() {
     std::fs::remove_file(path).unwrap();
     for extra in [vec![], vec!["--token-file", "/nonexistent-fictionet-token"]] {
         let out = Command::new(BIN)
-            .args(["dashboard", "--world", "unix:/nonexistent-world"])
+            .args(["dashboard", "--observation", "unix:/nonexistent-world"])
             .args(extra)
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&out.stderr).contains("token"));
+    }
+}
+
+#[test]
+fn dashboard_joins_binary_download_values() {
+    for (route, requests, expected) in [
+        ("/api/pcap?link=e3", 1, "firstlast"),
+        ("/api/pcap?link=e3,e7", 2, "firstlastfirstlast"),
+    ] {
+        with_observer(
+            &[(BINARY, b"first"), (BINARY | END, b"last")],
+            requests,
+            |path| {
+                with_dashboard(path, |port| {
+                    let (status, body) = get(port, route);
+                    assert_eq!(status, "HTTP/1.1 200 OK");
+                    assert_eq!(body, expected);
+                });
+            },
+        );
     }
 }

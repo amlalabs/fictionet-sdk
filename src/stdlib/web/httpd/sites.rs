@@ -182,6 +182,16 @@ impl Handler for VirtualHosts {
         let Some((site, routing)) = self.site_or_default(&host) else {
             return misdirected();
         };
+        if let Some(fields) = request.extensions().get::<super::RequestFields>() {
+            let site = match routing {
+                Routing::Exact => host.as_str(),
+                Routing::Fallback => "the default site",
+            };
+            fields.extend(
+                fictionet::events::Fields::new().with("world_site", site),
+                true,
+            );
+        }
         let tls = ex.conn().tls;
         match (tls, site.https) {
             (true, false) => misdirected(),

@@ -269,7 +269,7 @@ impl<F: Future<Output = fictionet::Result> + Send + 'static> Prepared<F> {
     /// Starts the endpoint in the context used to prepare it.
     #[track_caller]
     pub fn start(self, fcx: &Cx) {
-        fcx.spawn_as(|| "tcp::endpoint".into(), move |_| self.task);
+        fcx.spawn_as(|| "tcp::endpoint", move |_| self.task);
     }
 }
 

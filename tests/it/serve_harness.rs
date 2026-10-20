@@ -9,7 +9,7 @@ use fictionet::stdlib::services::serve::{Ended, Flow, Harness, HarnessError};
 
 #[test]
 fn the_harness_runs_a_service_with_no_runtime() {
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(evidence_h.clone());
     assert_eq!(h.open().unwrap(), b"hello\n");
     assert_eq!(h.push(b"one\ntw").unwrap(), b"one\n");
@@ -86,9 +86,10 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
 
 #[test]
 fn resuming_an_upgrade_keeps_the_observer_and_sequence() {
-    use fictionet::events::{ConnInfo, Memory};
+    use fictionet::events::ConnInfo;
     use fictionet::stdlib::codec::{Ending, LineError, Lines};
     use fictionet::stdlib::services::serve::Upgrade;
+    use fictionet_observe::Memory;
     use std::sync::Arc;
 
     struct Switch;
