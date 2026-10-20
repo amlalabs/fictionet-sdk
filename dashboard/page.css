@@ -170,6 +170,10 @@
   background: var(--sunken);
   box-shadow: inset 0 -2px 0 var(--accent);
 }
+.host-chip .pill {
+  background: var(--badge);
+  color: var(--ink);
+}
 .host-chip b {
   font-weight: 600;
 }
@@ -760,7 +764,7 @@ tr.moment td:first-child {
 .packet-panel col.c-dir { width: 24px; }
 .packet-panel .c-host { display: none; }
 .packet-panel.merged-hosts .c-host { display: table-cell; color: var(--muted); }
-.packet-panel.merged-hosts col.c-host { display: table-column; width: calc(6ch + 16px); }
+.packet-panel.merged-hosts col.c-host { display: table-column; width: var(--packet-host, calc(12ch + 16px)); }
 .packet-panel col.c-src { width: var(--packet-src, 15ch); }
 .packet-panel col.c-dst { width: var(--packet-dst, 15ch); }
 .packet-panel col.c-proto { width: var(--packet-proto, 6ch); }

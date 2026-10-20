@@ -393,12 +393,15 @@ async fn run_checks(
         codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", guest::CODEX_VERSION),
     );
 
-    if claude.code == 0 && codex.code == 0 {
-        agents.publish(cx.now(), &vec![
-            json!({"name":"Claude Code", "version":claude.stdout.trim(), "status":"installed"}),
-            json!({"name":"Codex", "version":codex.stdout.trim(), "status":"installed"}),
-        ]).map_err(boxed)?;
-    }
+    let rows: Vec<_> = [("Claude Code", &claude), ("Codex", &codex)]
+        .into_iter()
+        .filter(|(_, output)| output.code == 0)
+        .filter_map(|(name, output)| {
+            agent_version(&output.stdout)
+                .map(|version| json!({"name":name, "version":version, "status":"installed"}))
+        })
+        .collect();
+    agents.publish(cx.now(), &rows).map_err(boxed)?;
 
     // A screenshot of the guest's own screen, over ssh, decoded on the host.
     let mut screenshots = Vec::new();
@@ -738,4 +741,41 @@ fn save_png(b64: &str, path: &Path) -> Option<String> {
     }
     std::fs::write(path, &bytes).ok()?;
     Some(path.display().to_string())
+}
+
+fn agent_version(output: &str) -> Option<&str> {
+    let output = output.trim();
+    let version = output
+        .strip_suffix(" (Claude Code)")
+        .or_else(|| output.strip_prefix("codex-cli "))?;
+    let parts: Vec<_> = version.split('.').collect();
+    (parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())))
+    .then_some(version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_version;
+
+    #[test]
+    fn agent_versions_come_from_command_output() {
+        for (output, expected) in [
+            ("2.1.292 (Claude Code)\n", Some("2.1.292")),
+            ("codex-cli 0.163.0\n", Some("0.163.0")),
+            ("9.8.7 (Claude Code)", Some("9.8.7")),
+            ("codex-cli 8.7.6", Some("8.7.6")),
+            ("", None),
+            ("command not found", None),
+            ("codex-cli 1.2", None),
+            ("codex-cli 1..3", None),
+            ("codex-cli x.2.3", None),
+            ("1.2.3.4 (Claude Code)", None),
+            ("error\ncodex-cli 1.2.3", None),
+        ] {
+            assert_eq!(agent_version(output), expected, "{output:?}");
+        }
+    }
 }

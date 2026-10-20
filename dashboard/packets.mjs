@@ -78,6 +78,8 @@ export function createPackets({
     const hosts = new Map(members.filter((m) => m.host).map((m) => [m.e.id, m.host]));
     const showHost = new Set(hosts.values()).size > 1;
     drawer.classList.toggle('merged-hosts', showHost);
+    const hostWidth = Math.min(16, Math.max(4, ...[...hosts.values()].map((name) => name.length)));
+    drawer.style.setProperty('--packet-host', `calc(${hostWidth}ch + 16px)`);
     const flips = new Map(members.map((m) => [m.e.id, m.flip]));
     const onStream = (...args) => streamCleanup.push(listen(source, ...args));
     const source = packetStream(list, () => {
