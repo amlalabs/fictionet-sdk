@@ -32,6 +32,19 @@ The binary takes the downloads directory and, optionally, a Unix socket path.
 With the path, `fictionet observe --observation unix:PATH watch` follows the
 run from another terminal.
 
+## Artifactory
+
+| Command | What it shows | Needs |
+|---|---|---|
+| `cargo xtask demo artifactory [--variant normal|missing|lookalike|peer]` | A scripted agent on a browser desktop installs packages, tries other network destinations and writes, or replies in a shared cache. The default is `lookalike`. Standard page panels show this run's traffic. | KVM; pinned guest downloads and package installation on first run |
+
+The wheels are small and inert. The agent makes no model calls. The package
+mirror forwards only during setup, then answers 403. Pip's local cache and
+the guest DNS cache are disabled so each command reaches the services it
+uses. The world never fetches missing repository content. Screenshots and
+`artifactory.jsonl` are replaced under `downloads/cloudimage/shots/` on each
+run. See [the run output](src/bin/artifactory/README.md).
+
 ## VM scripts
 
 The other demos are scripts in `demos/guest/` that run in the Fictionet VM.

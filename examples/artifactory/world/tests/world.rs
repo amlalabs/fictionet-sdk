@@ -503,3 +503,108 @@ fn http2_size_refusal_keeps_the_method_and_targets() {
         Ok(())
     });
 }
+
+#[test]
+fn extended_network_keeps_sites_and_serves_mirrors_with_one_root() {
+    use artifactory_world::{
+        Identity, NAMES,
+        facts::{Door, DoorOutcome},
+        log::Log,
+    };
+    use common::*;
+    use fictionet::{
+        RunOptions, Seed,
+        events::Fanout,
+        stdlib::{web, world::sandbox},
+    };
+    use fictionet_observe::{Aggregate, Memory};
+    use std::sync::Arc;
+
+    let memory = Arc::new(Memory::default());
+    let observed = memory.clone();
+    let log = Log::start(Box::new(std::io::sink())).unwrap();
+    let output = log.clone();
+    common::run(
+        RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Aggregate::new(Arc::new(
+            Fanout::new(vec![memory, Arc::new(log.clone())]),
+        )))),
+        move |fcx| async move {
+            let contents = Arc::new(Contents::new(Variant::Normal, "", &[1; 32])?);
+            let public_file = contents.public["requests"][0].public_path();
+            let identity = Identity::with_names(&fcx, &["packages.mozilla.org"])?;
+            let tls_config = identity.server_config(&fcx, "packages.mozilla.org")?;
+            assert!(identity.server_config(&fcx, "unknown.test").is_err());
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(identity.ca_der.clone())?;
+            let handler = || {
+                web::httpd::Router::new().get("/", |_, _| {
+                    http::Response::new(bytes::Bytes::from_static(b"packages"))
+                })
+            };
+            let (attacher, attachments) = fictionet::attachments();
+            artifactory_world::network(&fcx, contents, identity, log)?
+                .add_host(web::Site::handler(handler()).into_host("archive.ubuntu.com"))
+                .add_host(
+                    web::Site::handler(handler())
+                        .tls(tls_config)
+                        .into_host("packages.mozilla.org"),
+                )
+                .start(&fcx, attachments)?;
+            let machine = machine(&fcx, &attacher, "client", AGENT);
+            let config = sandbox::client_config(
+                &fcx,
+                std::time::SystemTime::now(),
+                Some(&Arc::new(roots)),
+                &[b"http/1.1"],
+            )?;
+            for (name, addr) in NAMES {
+                assert_eq!(lookup(&fcx, &machine, name).await.1, [addr]);
+                let io = tls(&fcx, &machine, addr, name, config.clone()).await?;
+                let path = if name == "files.pythonhosted.org" {
+                    &public_file
+                } else {
+                    "/simple/"
+                };
+                let got = request(&fcx, io, "GET", name, path, &[], "").await;
+                assert_eq!(got.status, 200, "{name}");
+            }
+            let addr = lookup(&fcx, &machine, "archive.ubuntu.com").await.1[0];
+            let io = machine.tcp.connect(&fcx, (addr, 80).into()).await?;
+            assert_eq!(
+                request(&fcx, io, "GET", "archive.ubuntu.com", "/", &[], "")
+                    .await
+                    .body,
+                b"packages"
+            );
+            let addr = lookup(&fcx, &machine, "packages.mozilla.org").await.1[0];
+            let io = tls(&fcx, &machine, addr, "packages.mozilla.org", config).await?;
+            assert_eq!(
+                request(&fcx, io, "GET", "packages.mozilla.org", "/", &[], "")
+                    .await
+                    .body,
+                b"packages"
+            );
+            let events = observed.checked_all().unwrap();
+            for source in ["dns", "http"] {
+                let door = events
+                    .iter()
+                    .filter(|e| e.source == source)
+                    .filter_map(Door::from_event)
+                    .find(|d| d.name.as_deref() == Some("archive.ubuntu.com"))
+                    .unwrap();
+                assert_eq!(door.outcome, DoorOutcome::Served);
+                assert!(!door.egress_denied);
+            }
+            let door = events
+                .iter()
+                .filter(|e| e.source == "tls")
+                .filter_map(Door::from_event)
+                .find(|d| d.name.as_deref() == Some("packages.mozilla.org"))
+                .unwrap();
+            assert_eq!(door.outcome, DoorOutcome::UnservedName);
+            assert!(door.egress_denied);
+            Ok(())
+        },
+    );
+    output.finish().unwrap();
+}

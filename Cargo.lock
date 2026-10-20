@@ -908,6 +908,7 @@ dependencies = [
 name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
+ "artifactory-world",
  "bytes",
  "crc32fast",
  "example-common",
