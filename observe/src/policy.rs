@@ -159,6 +159,7 @@ pub(crate) fn default_classes() -> Vec<Class> {
             .bytes(8 << 20)
             .snap(65_535)
             .burst(64),
+        Class::new("model bodies").count(2_000).bytes(8 << 20),
     ]
 }
 
@@ -189,6 +190,11 @@ impl Policy for Standard {
     }
     fn sort(&self, observation: &Observation<'_>) -> Option<usize> {
         match observation {
+            Observation::Event(e)
+                if e.source == "model" && e.kind == "body" && self.classes.len() > 5 =>
+            {
+                Some(5)
+            }
             Observation::Event(e) => Some(usize::from(
                 e.repeat_fields().is_some() && self.classes.len() > 1,
             )),

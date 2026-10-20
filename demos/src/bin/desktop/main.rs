@@ -97,6 +97,14 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
                             command: json!({"calls":8}),
                         },
                         Action {
+                            label: "Limit to 100,000 input and 20,000 output tokens".into(),
+                            command: json!({"budget":{"calls":12,"input_tokens":100000,"output_tokens":20000}}),
+                        },
+                        Action {
+                            label: "Limit to one dollar".into(),
+                            command: json!({"budget":{"calls":12,"usd":1.0}}),
+                        },
+                        Action {
                             label: "Limit to 20 calls".into(),
                             command: json!({"calls":20}),
                         },
@@ -523,7 +531,7 @@ async fn run_checks(
         .err(),
     );
     let search = guest_cmd(session, &format!(
-        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --model {model} --max-turns 3 --allowedTools WebSearch,WebFetch < /dev/null 2>&1"
+        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --model {model} --max-turns 3 --allowedTools WebSearch,WebFetch --output-format stream-json --verbose < /dev/null 2>&1"
     )).await?;
     failures.extend(
         check(

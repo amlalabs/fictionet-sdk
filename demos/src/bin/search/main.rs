@@ -1,3 +1,4 @@
+use fictionet_extras::models::{Https, Key};
 mod checks;
 mod guest;
 mod preview;
@@ -7,7 +8,7 @@ use adaptive_web_world::{
     Addresses, Ca, World,
     pages::{
         GeneratorKind, Maker, Pages,
-        model::{Https, Key, Model, Provider},
+        model::{Model, Provider},
         store::Store,
     },
     search::Generator,
@@ -126,7 +127,7 @@ async fn main() -> Result {
     let live = model.is_some();
     let key = model
         .as_ref()
-        .map(|options| Key::from_env(options.provider))
+        .map(|options| Key::from_env(options.provider.into()))
         .transpose()?;
     let store_root = model.as_ref().map(|options| {
         options
@@ -160,7 +161,7 @@ async fn main() -> Result {
             let start = adaptive_web_world::world_start(&seed.date)?;
             let web = match (model, key, store_root) {
                 (Some(options), Some(key), Some(root)) => {
-                    let https = Arc::new(Https::new(&cx, options.provider)?);
+                    let https = Arc::new(Https::new(&cx, options.provider.into())?);
                     let maker =
                         Maker::Model(Model::new(options.provider, &options.name, "", key, https));
                     let (store, _) = Store::open(&root, &seed, Some(&maker.identity()))

@@ -1,5 +1,6 @@
 use super::*;
-use model::{Key, Provider, Transport};
+use fictionet_extras::models::{Key, Post, Transport};
+use model::Provider;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -162,7 +163,7 @@ impl Transport for Fake {
         cx: &'a Cx,
         headers: Vec<(&'static str, String)>,
         body: Vec<u8>,
-    ) -> model::Post<'a> {
+    ) -> Post<'a> {
         let body: Value = serde_json::from_slice(&body).unwrap();
         let (delay, reply) = (self.answer)(&headers, &body);
         self.requests.lock().unwrap().push((headers, body));

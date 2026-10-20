@@ -1,5 +1,5 @@
 //! Model calls: Anthropic's Messages API and OpenRouter's OpenAI-compatible
-//! chat completions, over the SDK's own HTTP client ([`web::forward`]).
+//! chat completions, over the SDK's own HTTP client ([`fictionet::stdlib::web::forward`]).
 //!
 //! A [`Model`] answers one prompt at a time. Each call keeps a [`Ledger`]
 //! of its HTTP attempts: retryable failures (rate limits, overloaded or
@@ -13,19 +13,24 @@
 //! be printable ASCII, is sent in the request's header and nowhere else,
 //! and is replaced by the variable's name in every error message.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use fictionet::Cx;
-use fictionet::stdlib::web::{self, Body};
-use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::prompts::Unreadable;
+use fictionet_extras::models::{Key, Transport};
+
+impl From<Provider> for fictionet_extras::models::Provider {
+    fn from(provider: Provider) -> Self {
+        match provider {
+            Provider::Anthropic => Self::Anthropic,
+            Provider::OpenRouter => Self::OpenRouter,
+        }
+    }
+}
 
 /// Answers worth asking again: rate limits and overloaded or failing servers.
 const RETRY: [u16; 7] = [408, 429, 500, 502, 503, 504, 529];
@@ -62,121 +67,6 @@ impl Provider {
             Self::Anthropic => "Anthropic",
             Self::OpenRouter => "OpenRouter",
         }
-    }
-    fn origin(self) -> &'static str {
-        match self {
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::OpenRouter => "https://openrouter.ai",
-        }
-    }
-    fn path(self) -> &'static str {
-        match self {
-            Self::Anthropic => "/v1/messages",
-            Self::OpenRouter => "/api/v1/chat/completions",
-        }
-    }
-}
-
-/// A provider's API key: checked once, sent only in its request header.
-#[derive(Clone)]
-pub struct Key {
-    variable: &'static str,
-    value: String,
-}
-
-impl std::fmt::Debug for Key {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<{}>", self.variable)
-    }
-}
-
-impl Key {
-    /// Checks a key from `variable`: it must be set and be printable ASCII,
-    /// so an HTTP header can carry it. Errors never hold the key.
-    pub fn new(variable: &'static str, value: Option<String>) -> Result<Self, String> {
-        let value = value.unwrap_or_default();
-        if value.is_empty() {
-            return Err(format!("{variable} is not set"));
-        }
-        if !value.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-            return Err(format!(
-                "{variable} holds characters an HTTP header cannot carry"
-            ));
-        }
-        Ok(Self { variable, value })
-    }
-    /// Reads the provider's key from the environment.
-    pub fn from_env(provider: Provider) -> Result<Self, String> {
-        let variable = provider.key_variable();
-        Self::new(variable, std::env::var(variable).ok())
-    }
-    /// `text` with the key replaced by its variable's name.
-    pub fn redact(&self, text: &str) -> String {
-        text.replace(&self.value, &format!("<{}>", self.variable))
-    }
-}
-
-/// A POST in flight: the status and body, or why it failed to arrive.
-pub type Post<'a> = Pin<Box<dyn Future<Output = Result<(u16, Vec<u8>), String>> + Send + 'a>>;
-
-/// Sends a request body to the provider and returns the status and body.
-pub trait Transport: Send + Sync {
-    /// One POST with these headers. `Err` is a transport failure.
-    fn post<'a>(
-        &'a self,
-        cx: &'a Cx,
-        headers: Vec<(&'static str, String)>,
-        body: Vec<u8>,
-    ) -> Post<'a>;
-}
-
-/// The provider's API over HTTPS, through [`web::forward`].
-pub struct Https {
-    forward: web::Forward,
-    path: &'static str,
-}
-
-impl Https {
-    /// A client for the provider's API. Needs real I/O.
-    pub fn new(fcx: &Cx, provider: Provider) -> fictionet::Result<Self> {
-        Self::at(fcx, provider.origin().parse()?, provider.path())
-    }
-    /// A client that posts to `path` at `origin`, such as a test server.
-    pub fn at(fcx: &Cx, origin: http::Uri, path: &'static str) -> fictionet::Result<Self> {
-        Ok(Self {
-            forward: web::forward(fcx, origin)?,
-            path,
-        })
-    }
-}
-
-impl Transport for Https {
-    fn post<'a>(
-        &'a self,
-        _: &'a Cx,
-        headers: Vec<(&'static str, String)>,
-        body: Vec<u8>,
-    ) -> Post<'a> {
-        Box::pin(async move {
-            let mut request = http::Request::post(self.path);
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-            let request = request
-                .body(Body::from(Bytes::from(body)))
-                .map_err(|e| e.to_string())?;
-            let response = tower_service::Service::call(&mut self.forward.clone(), request)
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = response.status().as_u16();
-            let body = response
-                .into_body()
-                .collect()
-                .await
-                .map_err(|e| e.to_string())?
-                .to_bytes();
-            Ok((status, body.to_vec()))
-        })
     }
 }
 
@@ -411,7 +301,7 @@ impl Model {
         match self.provider {
             Provider::Anthropic => (
                 vec![
-                    ("x-api-key", self.key.value.clone()),
+                    self.key.header(self.provider.into()),
                     ("anthropic-version", "2023-06-01".into()),
                     ("content-type", "application/json".into()),
                 ],
@@ -441,7 +331,7 @@ impl Model {
                 }
                 (
                     vec![
-                        ("authorization", format!("Bearer {}", self.key.value)),
+                        self.key.header(self.provider.into()),
                         ("content-type", "application/json".into()),
                         ("x-title", "Fictionet adaptive web".into()),
                     ],

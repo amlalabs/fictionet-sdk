@@ -303,6 +303,8 @@ async fn upstream(
     *request.method_mut() = parts.method.clone();
     *request.uri_mut() = parts.uri.clone();
     *request.headers_mut() = parts.headers.clone();
+    *request.extensions_mut() = parts.extensions.clone();
+    *request.version_mut() = parts.version;
     request.headers_mut().remove("content-length");
     Service::call(&mut model.clone(), request).await
 }

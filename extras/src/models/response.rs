@@ -5,6 +5,7 @@ use http_body::{Body as HttpBody, Frame};
 
 pub(super) struct Call {
     cx: Cx,
+    id: u64,
     provider: Provider,
     path: String,
     model: String,
@@ -19,6 +20,7 @@ pub(super) struct Call {
     output: u64,
     cache_read: u64,
     cache_write: u64,
+    cache_write_1h: u64,
     cost: Option<f64>,
     usage: bool,
     complete: bool,
@@ -28,9 +30,10 @@ pub(super) struct Call {
     secret: Secret,
 }
 impl Call {
-    pub fn new(site: &Model, path: String, body: &Value, request_bytes: usize, free: bool) -> Self {
-        Self {
+    pub fn new(site: &Model, path: String, body: &Value, request: &[u8], free: bool) -> Self {
+        let call = Self {
             cx: site.cx.clone(),
+            id: site.cx.random_u64(),
             provider: site.provider,
             path,
             model: site
@@ -38,7 +41,7 @@ impl Call {
                 .real
                 .redact(body["model"].as_str().unwrap_or("")),
             stream: body["stream"].as_bool().unwrap_or(false),
-            request_bytes,
+            request_bytes: request.len(),
             response_bytes: 0,
             start: Instant::now(),
             first: None,
@@ -48,6 +51,7 @@ impl Call {
             output: 0,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
             cost: None,
             usage: false,
             complete: false,
@@ -57,9 +61,33 @@ impl Call {
                 (body["model"].as_str() == Some(model.as_str())).then_some(*prices)
             }),
             secret: site.credential.real.clone(),
+        };
+        call.transcript(
+            "request",
+            site.credential
+                .real
+                .redact(&String::from_utf8_lossy(request))
+                .as_bytes(),
+        );
+        call
+    }
+    fn transcript(&self, direction: &str, data: &[u8]) {
+        for chunk in data.chunks(64 * 1024) {
+            self.cx.emit("model", "body", |e| {
+                e.field("call", self.id)
+                    .field("direction", direction)
+                    .field("encoding", "base64")
+                    .field("data", fictionet::stdlib::codec::base64::encode(chunk))
+            });
         }
     }
     fn read(&mut self, value: &Value) {
+        if matches!(
+            value["type"].as_str(),
+            Some("message_stop" | "response.completed" | "response.failed" | "response.incomplete")
+        ) {
+            self.complete = true;
+        }
         let value = value
             .get("message")
             .or_else(|| value.get("response"))
@@ -84,6 +112,9 @@ impl Call {
                     *slot = n;
                     self.usage = true;
                 }
+            }
+            if let Some(n) = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_u64() {
+                self.cache_write_1h = n;
             }
             if let Some(n) = usage["input_tokens_details"]["cached_tokens"]
                 .as_u64()
@@ -112,6 +143,9 @@ impl Call {
             .or_else(|| value["status"].as_str())
         {
             self.stop = self.secret.redact(stop);
+            if self.provider == Provider::Gemini {
+                self.complete = true;
+            }
         }
     }
 }
@@ -129,7 +163,9 @@ impl Drop for Call {
                     (uncached as f64 * p.input
                         + self.output as f64 * p.output
                         + self.cache_read as f64 * p.cache_read
-                        + self.cache_write as f64 * p.cache_write)
+                        + self.cache_write.saturating_sub(self.cache_write_1h) as f64
+                            * p.cache_write
+                        + self.cache_write_1h as f64 * p.cache_write_1h)
                         / 1_000_000.0
                 })
             })
@@ -139,13 +175,12 @@ impl Drop for Call {
             ledger.input = ledger.input.saturating_add(self.input);
             ledger.output = ledger.output.saturating_add(self.output);
             ledger.usd += cost.unwrap_or(0.0);
-            ledger.unknown |= self.status < 400
-                && (!self.complete
-                    || !self.usage
-                    || (ledger.budget.usd.is_some() && cost.is_none()));
+            ledger.unknown |= self.status < 400 && (!self.complete || !self.usage);
+            ledger.unknown_cost |= self.status < 400 && cost.is_none();
         }
         self.cx.emit("model", "call", |e| {
-            e.field("provider", self.provider.host())
+            e.field("call", self.id)
+                .field("provider", self.provider.host())
                 .field("host", self.provider.host())
                 .field("path", self.path.as_str())
                 .field("model", self.model.as_str())
@@ -193,6 +228,9 @@ impl Metered {
         call.response_bytes += bytes.len();
         if let Some(decoder) = &mut self.sse {
             if try_pump(decoder, bytes, |event| {
+                if event.data == "[DONE]" {
+                    call.complete = true;
+                }
                 if let Ok(value) = serde_json::from_str::<Value>(&event.data) {
                     call.read(&value);
                 }
@@ -232,9 +270,11 @@ impl Metered {
                 && let Ok(value) = serde_json::from_slice::<Value>(&self.json)
             {
                 call.read(&value);
+                call.complete = true;
             }
-            call.complete = true;
-            if call.stop == "cancelled" {
+            if !call.complete {
+                call.stop = "incomplete".into();
+            } else if call.stop == "cancelled" {
                 call.stop = "complete".into();
             }
         }
@@ -259,6 +299,9 @@ impl HttpBody for Metered {
                         self.pending.extend_from_slice(&bytes);
                         let safe = self.scrub(false);
                         if !safe.is_empty() {
+                            if let Some(call) = &self.call {
+                                call.transcript("response", &safe);
+                            }
                             return Poll::Ready(Some(Ok(Frame::data(safe.into()))));
                         }
                     }
@@ -277,6 +320,9 @@ impl HttpBody for Metered {
                 Poll::Ready(None) => {
                     self.done = true;
                     let tail = self.scrub(true);
+                    if let Some(call) = &self.call {
+                        call.transcript("response", &tail);
+                    }
                     self.finish();
                     return Poll::Ready((!tail.is_empty()).then(|| Ok(Frame::data(tail.into()))));
                 }

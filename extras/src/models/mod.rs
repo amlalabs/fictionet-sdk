@@ -26,6 +26,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower_service::Service;
 
+mod client;
+pub use client::{Https, Key, Post, Transport};
 pub mod oauth;
 mod response;
 mod splice;
@@ -230,7 +232,7 @@ impl Credential {
 
 /// Limits checked before each upstream request, shared by cloned sites.
 /// Token and dollar limits use completed usage; an admitted call can cross a limit.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Budget {
     /// Maximum upstream calls, including failures. Token counting is free.
     pub calls: Option<u64>,
@@ -279,6 +281,21 @@ pub struct Prices {
     pub cache_read: f64,
     /// Cache creation.
     pub cache_write: f64,
+    /// One-hour cache creation.
+    pub cache_write_1h: f64,
+}
+impl Prices {
+    /// Haiku pricing checked on October 20, 2026 against
+    /// <https://platform.claude.com/docs/en/models/haiku-4-5/overview>.
+    pub fn haiku_4_5() -> Self {
+        Self {
+            input: 1.0,
+            output: 5.0,
+            cache_read: 0.1,
+            cache_write: 1.25,
+            cache_write_1h: 2.0,
+        }
+    }
 }
 #[derive(Default)]
 struct Ledger {
@@ -288,6 +305,7 @@ struct Ledger {
     output: u64,
     usd: f64,
     unknown: bool,
+    unknown_cost: bool,
     paused: bool,
 }
 impl Ledger {
@@ -315,7 +333,7 @@ impl Ledger {
         if self
             .budget
             .usd
-            .is_some_and(|n| !n.is_finite() || self.unknown || self.usd >= n)
+            .is_some_and(|n| !n.is_finite() || self.unknown || self.unknown_cost || self.usd >= n)
         {
             return Some("usd");
         }
@@ -370,11 +388,26 @@ impl Model {
             .authority()
             .ok_or_else(|| Error::msg("model origin needs an authority"))?
             .to_string();
-        Ok(Self {
+        Ok(Self::with_forward(
+            cx,
+            provider,
+            credential,
+            web::forward(cx, origin)?,
+            authority,
+        ))
+    }
+    fn with_forward(
+        cx: &Cx,
+        provider: Provider,
+        credential: Credential,
+        forward: web::Forward,
+        authority: String,
+    ) -> Self {
+        Self {
             cx: cx.clone(),
             provider,
             credential,
-            forward: web::forward(cx, origin)?,
+            forward,
             authority,
             upstream_provider: provider,
             path_prefix: "",
@@ -382,7 +415,7 @@ impl Model {
             prices: None,
             engine: None,
             seal: Arc::new(splice::Seal::new(cx)),
-        })
+        }
     }
     /// Installs a budget shared by all clones.
     pub fn budget(self, budget: Budget) -> Self {
@@ -544,7 +577,7 @@ impl Model {
                     .insert("chatgpt-account-id", oauth.account()?.parse()?);
             }
         }
-        let mut call = response::Call::new(&self, path, &body, bytes.len(), free);
+        let mut call = response::Call::new(&self, path, &body, &bytes, free);
         for name in [
             "authorization",
             "x-api-key",

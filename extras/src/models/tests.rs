@@ -136,6 +136,24 @@ fn swap_stream_and_budget_against_upstream() {
     assert_eq!(calls[0].u64("input_tokens"), Some(7));
     assert_eq!(calls[0].u64("output_tokens"), Some(3));
     assert_eq!(calls[0].str("credential"), Some("placeholder"));
+    let bodies = memory.checked_of("model", "body").unwrap();
+    assert!(!bodies.is_empty());
+    let mut response = Vec::new();
+    for event in bodies
+        .iter()
+        .filter(|e| e.str("direction") == Some("response"))
+    {
+        response.extend(
+            fictionet::stdlib::codec::base64::decode(
+                event.str("data").unwrap().as_bytes(),
+                fictionet::stdlib::codec::base64::Padding::Canonical,
+            )
+            .unwrap(),
+        );
+    }
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.contains("<ANTHROPIC_API_KEY>"));
+    assert!(!response.contains("sk-ant-api03-private"));
     for event in memory.checked_all().unwrap() {
         assert!(!event.to_line().unwrap().contains("sk-ant-api03-private"));
     }

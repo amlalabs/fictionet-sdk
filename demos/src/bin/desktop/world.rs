@@ -56,6 +56,7 @@ pub enum Command {
     Pause,
     Resume,
     Calls(u64),
+    Budget(models::Budget),
 }
 
 pub async fn start(
@@ -85,9 +86,15 @@ pub async fn start(
     let handler = adaptive_web_world::handler::Handler::new(&fcx, pages.clone());
     let model_cfg = z.server_config(&fcx, &["api.anthropic.com"], now_sys)?;
     let model = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
-        Some(models::anthropic(&fcx)?)
+        Some(
+            models::anthropic(&fcx)?
+                .prices("claude-haiku-4-5-20251001", models::Prices::haiku_4_5()),
+        )
     } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
-        Some(models::anthropic_via_openrouter(&fcx)?)
+        Some(
+            models::anthropic_via_openrouter(&fcx)?
+                .prices("anthropic/claude-haiku-4.5", models::Prices::haiku_4_5()),
+        )
     } else {
         None
     }
@@ -106,6 +113,7 @@ pub async fn start(
             match command {
                 Command::Pause => model.pause(true),
                 Command::Resume => model.pause(false),
+                Command::Budget(budget) => model.set_budget(*budget),
                 Command::Calls(limit) => model.set_budget(models::Budget::new().calls(*limit)),
             }
             Ok(Ok(true))
