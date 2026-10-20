@@ -1,1 +1,454 @@
-/* placeholder, replaced below */
+/* Colors are tokens on :root. The control room palette is dark by default. */
+:root {
+  --bg: #0f1419;
+  --panel: #161d24;
+  --ink: #e6edf3;
+  --muted: #9aa7b4;
+  --line: #2f3a46;
+  --line-strong: #6b7a8a;
+  --equip: #1d2731;
+  --pipe: #5b6b7b;
+  --ok: #3fb950;
+  --stale: #d4a72c;
+  --trend: #58a6ff;
+  --focus: #ffb454;
+  --alarm-bg: #4a1d1d;
+  --alarm-ink: #ffd8d4;
+  --alarm-line: #ff7b72;
+  --ack-bg: #3a2f10;
+  --ack-ink: #f2e2b0;
+  --ack-line: #d4a72c;
+  --button-bg: #22303c;
+  --button-ink: #e6edf3;
+  --danger-bg: #8b1e1e;
+  --danger-ink: #ffffff;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f3f5f7;
+    --panel: #ffffff;
+    --ink: #14202b;
+    --muted: #4b5a68;
+    --line: #cdd5dd;
+    --line-strong: #6b7a8a;
+    --equip: #eef2f6;
+    --pipe: #7b8a99;
+    --ok: #1a7f37;
+    --stale: #7a4d00;
+    --trend: #0b5cad;
+    --focus: #8a4b00;
+    --alarm-bg: #fde7e4;
+    --alarm-ink: #7a1b13;
+    --alarm-line: #b3261e;
+    --ack-bg: #fff4cf;
+    --ack-ink: #5a4300;
+    --ack-line: #9a6700;
+    --button-bg: #e8edf2;
+    --button-ink: #14202b;
+    --danger-bg: #b3261e;
+    --danger-ink: #ffffff;
+    color-scheme: light;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #f3f5f7;
+  --panel: #ffffff;
+  --ink: #14202b;
+  --muted: #4b5a68;
+  --line: #cdd5dd;
+  --line-strong: #6b7a8a;
+  --equip: #eef2f6;
+  --pipe: #7b8a99;
+  --ok: #1a7f37;
+  --stale: #7a4d00;
+  --trend: #0b5cad;
+  --focus: #8a4b00;
+  --alarm-bg: #fde7e4;
+  --alarm-ink: #7a1b13;
+  --alarm-line: #b3261e;
+  --ack-bg: #fff4cf;
+  --ack-ink: #5a4300;
+  --ack-line: #9a6700;
+  --button-bg: #e8edf2;
+  --button-ink: #14202b;
+  --danger-bg: #b3261e;
+  --danger-ink: #ffffff;
+  color-scheme: light;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.top {
+  padding: 16px 16px 4px;
+}
+
+.top h1 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+
+.subtitle,
+.noscript {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.hmi {
+  display: grid;
+  gap: 12px;
+  padding: 12px 16px 24px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "alarms"
+    "mimic"
+    "controls"
+    "trends"
+    "status";
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  min-width: 0;
+}
+
+.panel-title {
+  margin: 0 0 8px;
+  font-size: 1rem;
+}
+
+.group-title {
+  margin: 12px 0 6px;
+  font-size: 0.9rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.annunciators {
+  grid-area: alarms;
+}
+
+.mimic {
+  grid-area: mimic;
+}
+
+.controls {
+  grid-area: controls;
+}
+
+.trends {
+  grid-area: trends;
+  align-self: start;
+}
+
+.statusbar {
+  grid-area: status;
+}
+
+@media (min-width: 1000px) {
+  .hmi {
+    grid-template-columns: 320px minmax(0, 1fr) 300px;
+    grid-template-areas:
+      "alarms alarms alarms"
+      "controls mimic trends"
+      "status status status";
+  }
+}
+
+/* Annunciators */
+.annunciators .panel-title {
+  display: inline-block;
+  margin-right: 12px;
+}
+
+.alarm-summary {
+  color: var(--muted);
+}
+
+.tiles {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  border-left: 6px solid var(--line-strong);
+  background: var(--equip);
+}
+
+.tile.active {
+  background: var(--alarm-bg);
+  color: var(--alarm-ink);
+  border-left-color: var(--alarm-line);
+  font-weight: 600;
+}
+
+.tile.acknowledged {
+  background: var(--ack-bg);
+  color: var(--ack-ink);
+  border-left-color: var(--ack-line);
+}
+
+.tile-state {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.tile.active .tile-state,
+.tile.acknowledged .tile-state {
+  color: inherit;
+}
+
+/* Mimic */
+.mimic {
+  align-self: start;
+  overflow-x: auto;
+}
+
+/* The drawing keeps a readable size and scrolls inside its panel on phones. */
+.mimic svg {
+  display: block;
+  width: 100%;
+  min-width: 620px;
+  height: auto;
+}
+
+.pipe {
+  stroke: var(--pipe);
+  stroke-width: 4;
+  stroke-linecap: round;
+}
+
+.equipment {
+  fill: var(--equip);
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+}
+
+.equipment-title {
+  fill: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.reading {
+  fill: var(--ink);
+  font-size: 13px;
+}
+
+.reading.stale {
+  fill: var(--stale);
+}
+
+.pump {
+  fill: var(--line-strong);
+  stroke: var(--ink);
+  stroke-width: 1.5;
+}
+
+.pump.running {
+  fill: var(--ok);
+}
+
+.pump.stopped {
+  fill: var(--panel);
+  stroke-dasharray: 4 3;
+}
+
+.pump-name {
+  fill: var(--ink);
+  font-size: 12px;
+}
+
+.pump-state {
+  fill: var(--muted);
+  font-size: 12px;
+}
+
+/* Controls */
+.control-group {
+  border-top: 1px solid var(--line);
+  padding-top: 4px;
+}
+
+.control-group:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.control-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+  margin: 6px 0;
+}
+
+.row-label {
+  min-width: 0;
+}
+
+.row-state {
+  color: var(--muted);
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.control-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--button-bg);
+  color: var(--button-ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.control-button.danger {
+  background: var(--danger-bg);
+  color: var(--danger-ink);
+  border-color: var(--danger-bg);
+  font-weight: 600;
+}
+
+.control-input {
+  width: 6.5rem;
+  min-height: 32px;
+  padding: 4px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+}
+
+.control-button:focus-visible,
+.control-input:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.message {
+  min-height: 1.5em;
+  margin: 12px 0 0;
+  color: var(--muted);
+}
+
+/* Trends */
+.trend {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  margin-bottom: 10px;
+}
+
+.trend-label {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.trend-value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.sparkline {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 40px;
+  background: var(--equip);
+  border-radius: 4px;
+}
+
+.trend-line {
+  fill: none;
+  stroke: var(--trend);
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+
+/* Status bar */
+.statusbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  align-items: center;
+  font-size: 0.9rem;
+}
+
+.status-item {
+  font-variant-numeric: tabular-nums;
+}
+
+.status-item.offline,
+.status-item.notice {
+  color: var(--alarm-ink);
+}
+
+.status-item.notice:empty {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .hmi {
+    padding: 12px 16px 24px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .panel,
+  .tile,
+  .equipment,
+  .control-button,
+  .control-input {
+    border: 1px solid CanvasText;
+  }
+
+  .tile.active {
+    border-left-width: 6px;
+    border-left-color: Highlight;
+  }
+
+  .pump.running {
+    fill: Highlight;
+  }
+
+  .pipe,
+  .trend-line {
+    stroke: CanvasText;
+  }
+}

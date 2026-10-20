@@ -41,7 +41,7 @@ const OPERATIONS: Prefix = Prefix {
 
 /// The controllers: each host's label, its Modbus register map, and its
 /// address on the control network.
-const CONTROLLERS: [(&str, Plc, Ipv4Addr); 3] = [
+pub const CONTROLLERS: [(&str, Plc, Ipv4Addr); 3] = [
     ("rps1", Plc::Rps1, Ipv4Addr::new(192, 168, 95, 11)),
     ("rcs1", Plc::Rcs1, Ipv4Addr::new(192, 168, 95, 12)),
     ("bop1", Plc::Bop1, Ipv4Addr::new(192, 168, 95, 13)),

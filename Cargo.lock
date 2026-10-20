@@ -1736,7 +1736,10 @@ dependencies = [
 name = "nuclear-world"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fictionet",
+ "fictionet-observe",
+ "http",
  "serde",
  "serde_json",
 ]
