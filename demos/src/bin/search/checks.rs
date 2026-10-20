@@ -1,7 +1,6 @@
 use super::{Result, guest::HOST};
 use adaptive_web_world::{
     pages::Seed,
-    route::Engine,
     search::{Cache, Listed, Made, Outcome, Query, Reason, Results, Snapshot},
 };
 use example_common::names;
@@ -11,6 +10,7 @@ use fictionet_demo::kit::{
     client::{Capability, PageClient},
     ssh::quote,
 };
+use fictionet_extras::search::Engine;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},

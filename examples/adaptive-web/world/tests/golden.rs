@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use adaptive_web_world::pages::render::google_results;
 use adaptive_web_world::pages::text::{escape, target_of};
 use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed, store::Store};
 use adaptive_web_world::{Addresses, Ca, serve, world_start};
@@ -27,6 +26,7 @@ use bytes::Bytes;
 use example_common::log::Log;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
+use fictionet_extras::search::links;
 use serde_json::Value;
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -172,7 +172,7 @@ fn the_log_is_the_recorded_one() {
                 )
                 .await;
                 assert_eq!(status, 200);
-                let found = google_results(std::str::from_utf8(&page).unwrap());
+                let found = links(std::str::from_utf8(&page).unwrap());
                 assert_eq!(found.len(), 10, "ten results");
                 // Responses are dated on the seed's day.
                 let addr = lookup(&fcx, &m, "www.google.com").await.unwrap();

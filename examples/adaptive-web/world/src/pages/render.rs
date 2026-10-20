@@ -1,137 +1,10 @@
-//! HTML layouts shared by the search engines and pages.
+//! Generic layouts for hosts without a bundled skin.
 
 use super::{
-    make::{Page, Profile, Search},
-    text::{escape as e, normalize_space, quote, quote_plus, split_url},
+    make::{Page, Profile},
+    text::{escape as e, normalize_space},
 };
-use crate::route::Engine;
 
-pub(super) const SEARCH_CSS: &str = r#"
-@scope (html:has(> body.google, > body.bing, > body.body--html), .uEierd, .b_ad) {
-* { box-sizing: border-box; }
-body { margin: 0; background: #fff; color: #202124; font: 14px/1.55 Arial, sans-serif; }
-a { color: #1a0dab; text-decoration: none; }
-a:hover { text-decoration: underline; }
-input, button, select { font: inherit; }
-input[type=text], input[type=search] { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #202124; font-size: 16px; padding: 12px 20px; }
-form[role=search], #sb_form, #search_form { display: flex; width: min(692px, calc(100vw - 220px)); min-height: 48px; border: 1px solid #dfe1e5; border-radius: 28px; box-shadow: 0 2px 6px #20212414; background: white; }
-form:focus-within { outline: 2px solid #8ab4f8; outline-offset: 2px; }
-input[type=submit], button { border: 0; background: transparent; padding: 0 20px; color: #1a73e8; cursor: pointer; }
-h2 { font-size: 22px; font-weight: 400; }
-footer { padding: 20px 36px; background: #f2f2f2; color: #70757a; }
-footer a { color: inherit; }
-.google header { padding: 28px 36px 0; border-bottom: 1px solid #ebebeb; display: grid; grid-template-columns: 114px 1fr; gap: 0 28px; align-items: center; }
-#logo { font-size: 30px; letter-spacing: -2px; font-weight: 600; text-decoration: none; }
-#logo span:nth-child(1), #logo span:nth-child(4) { color: #4285f4; }
-#logo span:nth-child(2), #logo span:nth-child(6) { color: #ea4335; }
-#logo span:nth-child(3) { color: #fbbc05; }
-#logo span:nth-child(5) { color: #34a853; }
-#gb { float: right; padding: 14px 28px; display: flex; gap: 20px; align-items: center; }
-#gb a { color: #3c4043; font-size: 13px; }
-#gb a:last-child { background: #0b57d0; color: #fff; border-radius: 24px; padding: 8px 22px; }
-#hdtb { grid-column: 2; display: flex; gap: 28px; padding-top: 16px; align-items: center; color: #5f6368; }
-#hdtb a, #hdtb span { color: inherit; padding: 12px 0; }
-#hdtb a:first-child { color: #1a73e8; border-bottom: 3px solid #1a73e8; }
-#result-stats { margin: 16px 0 22px 178px; color: #70757a; }
-#res, #bres, #foot { margin-left: 178px; max-width: 652px; }
-.g, .uEierd { margin: 0 0 30px; }
-.yuRUbf a { display: flex; flex-direction: column; align-items: flex-start; }
-.yuRUbf br { display: none; }
-.yuRUbf cite { order: -1; color: #202124; font-style: normal; font-size: 14px; margin-bottom: 4px; }
-.g h3, .uEierd [role=heading] { font-size: 20px; font-weight: 400; line-height: 1.3; margin: 0 0 5px; }
-.VwiC3b, .MUxGbd { color: #4d5156; line-height: 1.58; }
-.LEwnzc { color: #70757a; }
-.U3A9Ac { display: block; font-weight: 600; margin-bottom: 8px; }
-.related-question-pair { margin: 34px 0; }
-.wQiwMc { padding: 12px 0; border-top: 1px solid #dadce0; }
-.wQiwMc a { color: #202124; font-size: 16px; }
-#bres a { display: inline-block; padding: 8px 0; }
-#foot { padding: 24px 0; }
-.google footer { padding-left: 178px; margin-top: 24px; }
-.bing { font-family: "Segoe UI", Arial, sans-serif; color: #444; }
-#b_header { padding: 26px 36px 0; border-bottom: 1px solid #ececec; display: grid; grid-template-columns: 140px 1fr; gap: 0 24px; align-items: center; }
-.bing-brand { color: #444; font-size: 17px; letter-spacing: -.5px; white-space: nowrap; }
-.bing-brand b { color: #008c9d; font-size: 26px; vertical-align: middle; margin-right: 7px; }
-#sb_form { border-radius: 24px; }
-#b_header nav { grid-column: 2; }
-#b_header ul { display: flex; gap: 32px; padding: 0; margin: 16px 0 0; list-style: none; }
-#b_header li { padding: 12px 0; }
-#b_header li:first-child { border-bottom: 3px solid #00809d; }
-#b_header nav a { color: #666; }
-.bing main { margin: 18px 36px 50px 200px; max-width: 1120px; }
-.sb_count { color: #767676; font-size: 13px; }
-#b_results { list-style: none; padding: 0; margin: 20px 0; max-width: 648px; }
-#b_results li { margin-bottom: 30px; }
-#b_results h2 { font-size: 20px; line-height: 1.3; margin: 0 0 5px; }
-#b_results a { color: #001ba0; }
-.b_caption cite { font-style: normal; color: #006d21; }
-.b_caption p, .b_ad p { margin: 4px 0; }
-.news_dt { color: #767676; }
-#b_context { border-top: 1px solid #eee; max-width: 648px; }
-#b_context ul { list-style: none; padding: 0; columns: 2; }
-#b_context li { margin: 10px 0; }
-.body--html { color: #333; }
-.body--html .header { background: #fafafa; border-bottom: 1px solid #ddd; padding: 24px 32px 18px; display: flex; gap: 28px; align-items: flex-start; }
-.ddg-brand { display: flex; align-items: center; gap: 8px; color: #333; font-size: 18px; padding-top: 5px; white-space: nowrap; }
-.ddg-brand b { display: inline-grid; place-items: center; border-radius: 50%; background: #de5833; color: #fff; width: 38px; height: 38px; font: bold 27px Georgia, serif; }
-#search_form { border-radius: 5px; position: relative; margin-bottom: 42px; box-shadow: 0 2px 3px #0000000d; }
-#search_form .search__button { background: #f3f3f3; border-left: 1px solid #ddd; color: #555; border-radius: 0 5px 5px 0; }
-.frm__select { position: absolute; top: 62px; left: 0; border: 0; color: #666; background: transparent; }
-.serp__results { margin: 28px 0 40px 232px; max-width: 650px; }
-.result { margin-bottom: 30px; }
-.result__title { font-size: 20px; line-height: 1.3; margin: 0 0 5px; }
-.result__a { color: #1a0dab; }
-.result__extras { margin: 4px 0; }
-.result__url { color: #20692b; font-size: 14px; }
-.result__icon { display: none; }
-.result__timestamp { color: #777; padding-left: 12px; }
-.result__snippet { display: block; color: #333; line-height: 1.6; }
-.badge--ad { color: #777; font-size: 12px; }
-.nav-link .btn { background: #f5f5f5; color: #333; border: 1px solid #ccc; border-radius: 4px; padding: 10px 32px; }
-.feedback-btn { padding: 20px 32px; border-top: 1px solid #eee; }
-.feedback-btn a { color: #666; }
-@media (max-width: 900px) {
-  #gb { float: none; justify-content: flex-end; }
-  .google header, #b_header { padding: 18px 20px 0; grid-template-columns: 120px 1fr; gap: 0 16px; }
-  form[role=search], #sb_form, #search_form { width: 100%; }
-  #res, #bres, #foot, #result-stats, .serp__results, .bing main { margin-left: 24px; margin-right: 24px; }
-  .google footer { padding-left: 24px; }
-  #hdtb, #b_header nav { grid-column: 1 / -1; overflow-x: auto; gap: 24px; }
-  .body--html .header { flex-wrap: wrap; padding: 20px 24px; gap: 12px; }
-}
-}
-"#;
-
-/// Formats a URL as a host and up to three decoded path segments.
-pub fn display_url(url: &str) -> String {
-    let (mut host, path, _) = split_url(url);
-    for part in path.split('/').filter(|p| !p.is_empty()).take(3) {
-        host.push_str(" › ");
-        host.push_str(&percent_encoding::percent_decode_str(part).decode_utf8_lossy());
-    }
-    host
-}
-/// Makes a synthetic result count with comma separators.
-pub fn result_count(query: &str) -> String {
-    let words = normalize_space(query).split(' ').count().max(1);
-    let n = (48_300_000 / (words * words) + 1270 * query.chars().count()).to_string();
-    let mut out = String::new();
-    for (i, c) in n.chars().enumerate() {
-        if i > 0 && (n.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-/// Returns the engine's server header.
-pub fn engine_server(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Google => "gws",
-        Engine::DuckDuckGo => "nginx",
-        Engine::Bing => "Microsoft-IIS/10.0",
-    }
-}
 /// Selects a server header from the site's style.
 pub fn server_of(profile: Option<&Profile>) -> &'static str {
     [
@@ -146,228 +19,6 @@ pub fn server_of(profile: Option<&Profile>) -> &'static str {
         "openresty",
         "Apache/2.4.58 (Ubuntu)",
     ][profile.map_or(1, |p| p.style) % 10]
-}
-/// Renders results in the selected engine's layout.
-pub fn search(engine: Engine, query: &str, record: &Search, start: u64) -> String {
-    if let Some(page) =
-        super::clones::available(super::clones::search(engine, query, record, start))
-    {
-        return page;
-    }
-    match engine {
-        Engine::Google => google(query, record, start),
-        Engine::DuckDuckGo => duckduckgo(query, record),
-        Engine::Bing => bing(query, record),
-    }
-}
-/// Renders Google results at the given result offset.
-pub fn google(query: &str, record: &Search, start: u64) -> String {
-    let q = e(query);
-    let qp = quote_plus(query);
-    let count = result_count(query);
-    let seconds = 31 + query.chars().count() % 60;
-    let mut out = vec![format!(
-        r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{q} - Google Search</title><link rel="stylesheet" href="/search.css"></head>
-<body class="google"><div id="gb"><a href="https://mail.google.com/mail/">Gmail</a> <a href="https://www.google.com/imghp">Images</a> <a href="https://accounts.google.com/ServiceLogin">Sign in</a></div>
-<header><a href="/" id="logo" aria-label="Google"><span>G</span><span>o</span><span>o</span><span>g</span><span>l</span><span>e</span></a><form action="/search" method="GET" role="search"><input name="q" value="{q}" aria-label="Search" type="text"><input type="submit" value="Search"></form>
-<div id="hdtb"><a href="/search?q={qp}">All</a> <a href="/search?q={qp}&amp;tbm=nws">News</a> <a href="/search?q={qp}&amp;tbm=isch">Images</a> <a href="/search?q={qp}&amp;tbm=vid">Videos</a> <a href="https://maps.google.com/maps?q={qp}">Maps</a> <span>More</span> <span>Tools</span></div></header>
-<div id="main"><div id="result-stats">About {count} results <nobr>(0.{seconds} seconds)</nobr></div><div id="res"><div id="search">"#
-    )];
-    if start == 0 {
-        for ad in record.ads.iter().take(2) {
-            out.push(format!(
-                concat!(
-                    r#"<div class="uEierd"><span class="U3A9Ac">Sponsored</span>"#,
-                    r#"<a href="{url}"><div role="heading">{title}</div><span>{shown}</span></a>"#,
-                    r#"<div class="MUxGbd">{text}</div></div>"#,
-                ),
-                url = e(&ad.url),
-                title = e(&ad.title),
-                shown = e(&display_url(&ad.url)),
-                text = e(&ad.text),
-            ));
-        }
-    }
-    for r in &record.results {
-        let date = if r.date.is_empty() {
-            String::new()
-        } else {
-            format!(r#"<span class="LEwnzc">{} — </span>"#, e(&r.date))
-        };
-        out.push(format!(
-            concat!(
-                r#"<div class="g"><div class="yuRUbf"><a href="{url}"><h3>{title}</h3><br>"#,
-                r#"<cite>{shown}</cite></a></div>"#,
-                r#"<div class="VwiC3b">{date}<span>{snippet}</span></div></div>"#,
-            ),
-            url = e(&r.url),
-            title = e(&r.title),
-            shown = e(&display_url(&r.url)),
-            date = date,
-            snippet = e(&r.snippet),
-        ));
-    }
-    if !record.questions.is_empty() {
-        out.push(r#"<div class="related-question-pair"><h2>People also ask</h2>"#.into());
-        for question in record.questions.iter().take(4) {
-            out.push(format!(
-                r#"<div class="wQiwMc"><a href="/search?q={}">{}</a></div>"#,
-                quote_plus(question),
-                e(question)
-            ));
-        }
-        out.push("</div>".into());
-    }
-    out.push(r#"</div></div><div id="bres"><h2>Related searches</h2>"#.into());
-    for rel in record.related.iter().take(8) {
-        out.push(format!(
-            r#"<a href="/search?q={}">{}</a><br>"#,
-            quote_plus(rel),
-            e(rel)
-        ));
-    }
-    let nxt = u128::from(start) + 10;
-    out.push(format!(r#"</div><div id="foot"><table><tr><td><a href="/search?q={qp}&amp;start={nxt}">Next</a></td></tr></table></div></div>
-<footer><span>United Kingdom</span> · <a href="https://support.google.com/websearch">Help</a> · <a href="https://www.google.com/tools/feedback">Send feedback</a> · <a href="https://policies.google.com/privacy">Privacy</a> · <a href="https://policies.google.com/terms">Terms</a></footer></body></html>"#));
-    out.join("\n")
-}
-/// The links and titles of the results a [`google`] page lists, unescaped.
-pub fn google_results(page: &str) -> Vec<(String, String)> {
-    use kuchiki::traits::TendrilSink;
-    kuchiki::parse_html()
-        .one(page)
-        .select(".yuRUbf a")
-        .unwrap()
-        .filter_map(|link| {
-            let heading = link.as_node().select_first("h3").ok()?;
-            let url = link.attributes.borrow().get("href")?.to_owned();
-            Some((url, heading.text_contents()))
-        })
-        .collect()
-}
-/// Returns the Google search form.
-pub fn google_home() -> &'static str {
-    r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><title>Google</title></head>
-<body><div id="gb"><a href="https://mail.google.com/mail/">Gmail</a> <a href="https://www.google.com/imghp">Images</a> <a href="https://accounts.google.com/ServiceLogin">Sign in</a></div>
-<center><h1>Google</h1><form action="/search" method="GET"><input name="q" title="Search" size="57"><br><input type="submit" value="Google Search"> <input type="submit" name="btnI" value="I'm Feeling Lucky"></form>
-<p>Google offered in: <a href="/setprefs?hl=cy">Cymraeg</a> <a href="/setprefs?hl=gd">Gàidhlig</a></p></center>
-<footer><a href="/intl/en_uk/ads/">Advertising</a> · <a href="/services/">Business</a> · <a href="/intl/en_uk/about.html">About Google</a> · <a href="https://policies.google.com/privacy">Privacy</a> · <a href="https://policies.google.com/terms">Terms</a></footer></body></html>"#
-}
-fn ddg_link(url: &str) -> String {
-    format!("//duckduckgo.com/l/?uddg={}", quote(url, ""))
-}
-/// Renders DuckDuckGo results.
-pub fn duckduckgo(query: &str, record: &Search) -> String {
-    let q = e(query);
-    let mut out = vec![format!(
-        r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="content-type" content="text/html; charset=UTF-8" /><meta name="referrer" content="origin" />
-<meta name="viewport" content="width=device-width, initial-scale=1" /><title>{q} at DuckDuckGo</title><link rel="stylesheet" href="/search.css" type="text/css" /></head>
-<body class="body--html"><div class="header"><a class="ddg-brand" href="/"><b>D</b>DuckDuckGo</a><form id="search_form" name="x" action="/html/" method="post" role="search"><input type="text" name="q" class="search__input" value="{q}" aria-label="Search" /><input type="submit" class="search__button" value="Search" /><select class="frm__select" name="kl" aria-label="Region"><option value="">All Regions</option><option value="uk-en">United Kingdom</option><option value="us-en">US (English)</option></select></form></div>
-<div class="serp__results"><div id="links" class="results">"#
-    )];
-    for ad in record.ads.iter().take(1) {
-        let link = e(&ddg_link(&ad.url));
-        out.push(format!(
-            concat!(
-                r#"<div class="result results_links results_links_deep result--ad">"#,
-                r#"<div class="links_main links_deep result__body"><h2 class="result__title">"#,
-                r#"<a rel="nofollow" class="result__a" href="{link}">{title}</a></h2>"#,
-                r#"<a class="result__url" href="{link}">{host}</a>"#,
-                r#"<a class="result__snippet" href="{link}">{text}</a>"#,
-                r#"<div class="badge--ad">Ad</div></div></div>"#,
-            ),
-            link = link,
-            title = e(&ad.title),
-            host = e(&split_url(&ad.url).0),
-            text = e(&ad.text),
-        ));
-    }
-    for r in &record.results {
-        let link = e(&ddg_link(&r.url));
-        let host = e(&split_url(&r.url).0);
-        let date = if r.date.is_empty() {
-            String::new()
-        } else {
-            format!(r#"<span class="result__timestamp">{}</span>"#, e(&r.date))
-        };
-        out.push(format!(
-            concat!(
-                r#"<div class="result results_links results_links_deep web-result">"#,
-                r#"<div class="links_main links_deep result__body"><h2 class="result__title">"#,
-                r#"<a rel="nofollow" class="result__a" href="{link}">{title}</a></h2>"#,
-                r#"<div class="result__extras"><div class="result__extras__url">"#,
-                r#"<span class="result__icon"><a rel="nofollow" href="{link}">"#,
-                r#"<img class="result__icon__img" width="16" height="16" alt="" "#,
-                r#"src="//external-content.duckduckgo.com/ip3/{host}.ico" name="i15" /></a></span>"#,
-                r#"<a class="result__url" href="{link}">{shown}</a>{date}</div></div>"#,
-                r#"<a class="result__snippet" href="{link}">{snippet}</a>"#,
-                r#"<div class="clear"></div></div></div>"#,
-            ),
-            link = link,
-            title = e(&r.title),
-            host = host,
-            shown = e(&display_url(&r.url).replace(" › ", "/")),
-            date = date,
-            snippet = e(&r.snippet),
-        ));
-    }
-    out.push(format!(r#"<div class="nav-link"><form action="/html/" method="post"><input type="submit" class="btn btn--alt" value="Next" /><input type="hidden" name="q" value="{q}" /><input type="hidden" name="s" value="10" /><input type="hidden" name="dc" value="11" /></form></div>
-</div></div><div class="feedback-btn"><a rel="nofollow" href="//duckduckgo.com/feedback.html">Feedback</a></div></body></html>"#));
-    out.join("\n")
-}
-/// Returns the DuckDuckGo search form.
-pub fn duckduckgo_home() -> &'static str {
-    r#"<!DOCTYPE html><html><head><meta charset="UTF-8"><title>DuckDuckGo</title></head>
-<body><form action="/html/" method="post"><input type="text" name="q" autofocus /><input type="submit" value="Search" /></form></body></html>"#
-}
-/// Renders Bing results.
-pub fn bing(query: &str, record: &Search) -> String {
-    let q = e(query);
-    let qp = quote_plus(query);
-    let count = result_count(query);
-    let mut out = vec![format!(
-        r#"<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{q} - Search</title><link rel="stylesheet" href="/search.css"></head>
-<body class="bing"><header id="b_header"><a class="bing-brand" href="/"><b>◇</b>Microsoft Bing</a><form action="/search" id="sb_form" role="search"><input id="sb_form_q" name="q" type="search" value="{q}" aria-label="Search"><button type="submit">Search</button></form>
-<nav><ul><li><a href="/search?q={qp}">All</a></li><li><a href="/images/search?q={qp}">Images</a></li><li><a href="/videos/search?q={qp}">Videos</a></li><li><a href="/news/search?q={qp}">News</a></li><li><a href="/maps?q={qp}">Maps</a></li></ul></nav></header>
-<main><span class="sb_count">About {count} results</span><ol id="b_results">"#
-    )];
-    for ad in record.ads.iter().take(1) {
-        out.push(format!(
-            r#"<li class="b_ad"><h2><a href="{}">{}</a></h2><p>{}</p><span>Ad</span></li>"#,
-            e(&ad.url),
-            e(&ad.title),
-            e(&ad.text)
-        ));
-    }
-    for r in &record.results {
-        let date = if r.date.is_empty() {
-            String::new()
-        } else {
-            format!(r#"<span class="news_dt">{}</span> · "#, e(&r.date))
-        };
-        out.push(format!(
-            concat!(
-                r#"<li class="b_algo"><h2><a href="{url}">{title}</a></h2>"#,
-                r#"<div class="b_caption"><cite>{url}</cite><p>{date}{snippet}</p></div></li>"#,
-            ),
-            url = e(&r.url),
-            title = e(&r.title),
-            date = date,
-            snippet = e(&r.snippet),
-        ));
-    }
-    out.push(r#"</ol><div id="b_context"><h2>Related searches</h2><ul>"#.into());
-    for rel in record.related.iter().take(8) {
-        out.push(format!(
-            r#"<li><a href="/search?q={}">{}</a></li>"#,
-            quote_plus(rel),
-            e(rel)
-        ));
-    }
-    out.push(r#"</ul></div></main><footer id="b_footer"><a href="https://go.microsoft.com/fwlink/?LinkId=521839">Privacy and Cookies</a> · <a href="https://go.microsoft.com/fwlink/?LinkID=246338">Legal</a> · <a href="https://www.bing.com/account/general">Settings</a> · © 2026 Microsoft</footer></body></html>"#.into());
-    out.join("\n")
 }
 fn nav(items: &[String], class: &str) -> String {
     let mut out = format!(r#"<ul class="{class}">"#);
@@ -391,20 +42,24 @@ fn nav(items: &[String], class: &str) -> String {
     out + "</ul>"
 }
 /// Wraps HTML content in the site's layout.
-pub fn page(host: &str, profile: &Profile, record: &Page, year: &str) -> String {
-    page_at(host, "/", profile, record, year)
+pub fn page(host: &str, profile: &Profile, record: &Page, today: &str) -> String {
+    page_at(host, "/", profile, record, today)
 }
 
 /// Renders a page using the captured section layout when available.
-pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, year: &str) -> String {
-    if let Some(page) = super::clones::available(super::clones::page(
-        host,
-        target,
-        &record.title,
-        &record.body,
-    )) {
-        return page;
+pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today: &str) -> String {
+    if let Some(skin) = fictionet_extras::sites::lookup(host, target)
+        && let Ok(today) = super::seed::parse_date(today)
+        && let Some(html) = skin.render(
+            &record.title,
+            &record.body,
+            super::seed::parse_date(&record.date).unwrap_or(today),
+            today,
+        )
+    {
+        return html;
     }
+    let year = today.get(..4).unwrap_or(today);
     let name = if profile.name.is_empty() {
         host
     } else {
@@ -585,17 +240,8 @@ pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str
 mod tests {
     use super::*;
     #[test]
-    fn counts_and_urls() {
-        assert_eq!(result_count("one two"), "12,083,890");
-        assert_eq!(result_count("é 😀"), "12,078,810");
-        assert_eq!(
-            display_url("https://User@EXAMPLE.com/a//b/é/d?q=x"),
-            "example.com › a › b › é"
-        );
-        assert_eq!(server_of(None), "nginx");
-    }
-    #[test]
     fn layouts_keep_content_and_vary_by_style() {
+        assert_eq!(server_of(None), "nginx");
         let p = Page {
             title: "A & B".into(),
             body: "<h1>Body</h1>".into(),

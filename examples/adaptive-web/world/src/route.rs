@@ -1,6 +1,7 @@
 //! Request routing: searches, the engines' redirects, and pages.
 
 use crate::pages::text::normalize_space;
+use fictionet_extras::search::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -14,19 +15,6 @@ pub const SEARCH_HOSTS: [&str; 7] = [
     "www.bing.com",
     "bing.com",
 ];
-
-/// A supported search engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Engine {
-    /// Google search.
-    Google,
-    /// DuckDuckGo search.
-    #[serde(rename = "duckduckgo")]
-    DuckDuckGo,
-    /// Bing search.
-    Bing,
-}
 
 /// The action requested from the world.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

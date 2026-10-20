@@ -1,0 +1,5 @@
+
+            :root {
+                --bodytext-width: var(--large-6-width);
+                --bodytext-alignment: var(--bodytext-alignment-center);
+            }

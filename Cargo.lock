@@ -9,13 +9,12 @@ dependencies = [
  "bytes",
  "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "form_urlencoded",
  "http",
  "http-body-util",
- "include_dir",
  "kuchiki",
- "percent-encoding",
  "regex",
  "serde",
  "serde_json",
@@ -989,6 +988,7 @@ dependencies = [
  "fakewiki-world",
  "fatfs",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "flate2",
  "http",
@@ -1009,6 +1009,18 @@ dependencies = [
  "virtio-queue",
  "vm-memory",
  "vmm-sys-util 0.14.0",
+]
+
+[[package]]
+name = "fictionet-extras"
+version = "0.1.0"
+dependencies = [
+ "include_dir",
+ "kuchiki",
+ "percent-encoding",
+ "serde",
+ "time",
+ "url",
 ]
 
 [[package]]

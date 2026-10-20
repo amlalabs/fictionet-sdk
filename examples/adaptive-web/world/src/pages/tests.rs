@@ -92,7 +92,7 @@ fn on_disk(
 
 /// The result links and titles of a Google results page.
 fn results(body: &[u8]) -> Vec<(String, String)> {
-    render::google_results(std::str::from_utf8(body).unwrap())
+    fictionet_extras::search::links(std::str::from_utf8(body).unwrap())
 }
 
 async fn get(pages: &Arc<Pages>, cx: &Cx, url: &str) -> Response {
@@ -1333,7 +1333,7 @@ fn search_styles_are_static_with_either_generator() {
                     .await;
                 assert_eq!(css.status, 200);
                 assert_eq!(css.content_type, "text/css; charset=utf-8");
-                assert_eq!(css.body, render::SEARCH_CSS.as_bytes());
+                assert_eq!(css.body, fictionet_extras::search::CSS.as_bytes());
                 assert_eq!(css.logged()["kind"], "asset");
                 assert!(pages.store().page(host, "/search.css?v=1").is_none());
             }

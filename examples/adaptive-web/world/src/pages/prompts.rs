@@ -15,8 +15,9 @@
 //! run.
 
 use super::Seed;
-use super::make::{Ad, Page, Profile, Result as Listed, Search};
+use super::make::{Page, Profile};
 use super::text::split_url;
+use fictionet_extras::search::{Ad, Result as Listed, Search};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -524,7 +525,8 @@ pub fn page(
         .about(host)
         .map(|about| format!("What this site is: {about}"))
         .unwrap_or_default();
-    let captured = super::clones::prompt(host, &super::text::target_of(url).1);
+    let captured = fictionet_extras::sites::lookup(host, &super::text::target_of(url).1)
+        .map(|skin| skin.prompt());
     let (site, site_line) = match profile {
         _ if captured.is_some() => ("", "The site's layout is already supplied.".to_owned()),
         Some(profile) => {

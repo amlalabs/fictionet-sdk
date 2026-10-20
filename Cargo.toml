@@ -3,6 +3,7 @@ members = [
     ".",
     "cli",
     "observe",
+    "extras",
     "codegen",
     "codegen/tests/golden",
     "codegen/tests/layouts",

@@ -1,9 +1,9 @@
 //! Bounded search and page state for a run observer.
 
 use crate::pages::GeneratorKind;
-use crate::route::Engine;
 use example_common::events::js;
 use fictionet::events::{Event, Interest, Observation, Observer, Stamp};
+use fictionet_extras::search::Engine;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 

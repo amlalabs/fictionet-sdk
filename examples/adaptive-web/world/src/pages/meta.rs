@@ -3,12 +3,12 @@
 //! projection ([`crate::search`]) reads them back by the same names.
 
 use super::model::Usage;
-use crate::route::Engine;
 use crate::search::{Cache, Reason};
 use example_common::events::field;
 use example_common::names::name;
 use fictionet::events::{Fields, float, opt};
 use fictionet::stdlib::protocols::json::Value as J;
+use fictionet_extras::search::Engine;
 use serde::Serialize;
 
 /// What the log records about an answer.
