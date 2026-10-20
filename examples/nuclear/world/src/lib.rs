@@ -51,6 +51,7 @@
 //! | [`faults`] | Fixed fault slots and schedules |
 //! | [`command`] | Integer commands and replies |
 //! | [`snapshot`] | Bounded projection for a future state topic |
+//! | [`driver`] | Shared handle that owns the plant behind a mutex |
 //!
 //! Loops are loop A and loop B, in that array order.
 //! Commands use externally tagged serde enums with snake_case wire names. Rod positions use tenths of a
@@ -101,6 +102,7 @@
 //!   The long-irradiation comparison used here is 0.066 t^-0.2 for t in seconds.
 
 pub mod command;
+pub mod driver;
 pub mod faults;
 pub mod kinetics;
 pub mod plant;
