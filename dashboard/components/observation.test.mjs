@@ -17,8 +17,11 @@ function fixture(t) {
   const frames = new Map(), observers = [], watches = [], streams = [], requests = [];
   t.mock.method(globalThis, 'requestAnimationFrame', (callback) => { const id = Symbol(); frames.set(id, callback); return id; });
   t.mock.method(globalThis, 'cancelAnimationFrame', (id) => frames.delete(id));
-  const previousResize = globalThis.ResizeObserver;
-  t.after(() => { globalThis.ResizeObserver = previousResize; });
+  // The map asks matchMedia whether the viewer prefers reduced motion.
+  const motion = { matches: true };
+  const previous = { ResizeObserver: globalThis.ResizeObserver, matchMedia: globalThis.matchMedia };
+  t.after(() => Object.assign(globalThis, previous));
+  globalThis.matchMedia = () => motion;
   globalThis.ResizeObserver = class {
     constructor(callback) { this.callback = callback; observers.push(this); }
     observe() {}
@@ -33,7 +36,7 @@ function fixture(t) {
   const watch = () => { const source = new Source(); watches.push(source); return source; };
   const hosts = [{ name: 'alpha', sandbox: 'guest' }];
   const services = {
-    selection, reducedMotion: { matches: true }, hosts,
+    selection, hosts,
     graph: createModel(watch()),
     ...hostLookups(() => hosts),
     transport: {
@@ -48,7 +51,7 @@ function fixture(t) {
       packetStream(list) { const source = new Source(); source.links = list; streams.push(source); return source; },
     },
   };
-  return { root, frames, observers, watches, streams, services, selection, requests,
+  return { root, frames, observers, watches, streams, services, selection, requests, motion,
     snapshot: { t: 0, started: 1, ended: false, hosts: [{ id: 'h1', name: 'alpha', sandbox: 'guest', group: null }], groups: [], nodes: [{ id: 's1', kind: 'sandbox', name: 'guest', host: 'h1' }], edges: [], counters: {}, events: [] },
     frame() { const callbacks = [...frames.values()]; frames.clear(); callbacks.forEach((callback) => callback(performance.now())); },
     clean() {
@@ -487,7 +490,7 @@ test('the map rings the item an event came from and draws the graph again when r
     t.after(() => { delete Element.prototype[name]; });
   }
   const h = fixture(t);
-  h.services.reducedMotion = { matches: false };
+  h.motion.matches = false;
   let dispose = map(h.root, h.services);
   h.watches[0].emit('snapshot', {
     ...h.snapshot,

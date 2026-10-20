@@ -27,7 +27,7 @@ export function mount(root, services, options) {
     body.replaceChildren();
     const guests = [...new Set(rows.map((row) => row.guest))];
     for (const name of guests) {
-      if (!guest) el('h3', { class: 'containment-guest', text: services.hostOf(name) || name }, body);
+      if (!guest) el('h3', { class: 'containment-guest', text: services.hostLabel(name) }, body);
       for (const row of rows.filter((row) => row.guest === name)) {
         const details = el('details', { class: `containment-probe ${row.outcome === 'not_contained' ? 'not-contained' : ''}` }, body);
         const summary = el('summary', {}, details);

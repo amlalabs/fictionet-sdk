@@ -17,7 +17,7 @@ import { scoped } from '../dom.mjs';
 
 export function mountConsole(root, services, options, parts) {
   const { el } = scoped(root);
-  const name = parts.kind === 'screen' ? 'screen' : 'terminal';
+  const name = parts.kind;
   const stage = el('div', { class: 'console-stage' });
   const display = el('div', { class: parts.display }, stage);
   const card = el('div', { class: 'console-card' }, stage);
@@ -103,7 +103,8 @@ export function mountConsole(root, services, options, parts) {
 /// Who holds each host's input, from the `leases` state topic and the
 /// sessions this tab's screens report. `subscribe(host, listener)` calls
 /// `listener({ holder, mine, owner, text })` now and on every change, and
-/// returns an unsubscribe function. `owner` is `mine`, `other` or `none`.
+/// returns an unsubscribe function. `owner` is `mine`, `other` or `none`;
+/// `text` says so for the viewer, and is empty when no viewer holds input.
 /// `session(host, id)` reports this tab's screen session for a host, or null
 /// once it closes.
 export function createInputOwners(state) {
@@ -113,7 +114,7 @@ export function createInputOwners(state) {
     if (failure) return { holder: null, mine: false, owner: 'none', text: `Input control unavailable: ${failure.message}` };
     const holder = leases[host]?.holder ?? null;
     const mine = Boolean(holder) && holder === sessions.get(host);
-    return { holder, mine, owner: mine ? 'mine' : holder ? 'other' : 'none', text: mine ? 'You have control' : holder ? 'Another viewer has control' : 'Watching' };
+    return { holder, mine, owner: mine ? 'mine' : holder ? 'other' : 'none', text: mine ? 'You have control' : holder ? 'Another viewer has control' : '' };
   }
   const announce = () => { for (const entry of [...listeners]) entry.listener(ownerOf(entry.host)); };
   return {

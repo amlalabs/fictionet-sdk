@@ -30,7 +30,6 @@ export function mount(root, services) {
   const lookupSummary = el('summary', { text: 'DNS lookups (0)' }, details);
   const lookups = el('div', { class: 'table-scroll' }, details);
   const controller = new AbortController();
-  const schedule = services.setTimeout || setTimeout, cancel = services.clearTimeout || clearTimeout;
   let timer, snapshot, containment, containmentFailed = false, selected, failed = false;
   function draw() {
     if (!snapshot) return;
@@ -80,7 +79,7 @@ export function mount(root, services) {
       for (const row of group) {
         const tr = el('tr', {}, tbody);
         const destination = el('td', { class: 'egress-destination' }, tr);
-        if (!sandbox) el('span', { class: 'pill', text: services.hostOf(row.sandbox) || row.sandbox }, destination);
+        if (!sandbox) el('span', { class: 'pill', text: services.hostLabel(row.sandbox) }, destination);
         if (row.name) el('div', { class: 'egress-name', text: row.name }, destination);
         el('div', { class: 'mono egress-muted', text: `${row.address} ${row.transport}` }, destination);
         const by = el('td', { class: 'egress-answer' }, tr);
@@ -101,8 +100,8 @@ export function mount(root, services) {
     root.scrollTop = scroll;
   }
   function queue() {
-    cancel(timer);
-    timer = schedule(read, document.hidden ? 10000 : 2000);
+    clearTimeout(timer);
+    timer = setTimeout(read, document.hidden ? 10000 : 2000);
   }
   const stop = services.selection.subscribe(({ host }) => { selected = host; draw(); });
   async function read() {
@@ -127,5 +126,5 @@ export function mount(root, services) {
   const stopContainment = services.containmentState ? services.state(services.containmentState, (value) => { containment = value; containmentFailed = false; draw(); }, () => { containmentFailed = true; draw(); }) : () => {};
   document.addEventListener('visibilitychange', queue);
   void read();
-  return () => { controller.abort(); cancel(timer); document.removeEventListener('visibilitychange', queue); stop(); stopContainment(); root.replaceChildren(); };
+  return () => { controller.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', queue); stop(); stopContainment(); root.replaceChildren(); };
 }

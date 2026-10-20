@@ -76,7 +76,7 @@ export function mount(root, services, options) {
     if (target.kind === 'connection') return `${target.local} ↔ ${target.peer}`;
     const edge = state.edges.get(target.link);
     const node = edge && [state.nodes.get(edge.a), state.nodes.get(edge.b)].find((node) => node?.kind === 'sandbox');
-    const host = services.hostOf(node?.name) || node?.name;
+    const host = services.hostLabel(node?.name);
     return `${host ? `${host}'s link` : `Link ${target.link}`} · ${target.a} ↔ ${target.b}`;
   }
   function selectTarget(target) {

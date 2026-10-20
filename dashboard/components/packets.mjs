@@ -25,7 +25,6 @@ export function mount(root, services, options = {}) {
     },
     $, el, ...services.transport, fmtCount, stopped: () => (services.stopped?.() ? STOPPED : null), hostColumn: true,
     consoleAddresses: services.consoleAddresses || [], ...options,
-    placeholder: options.placeholder || (() => 'Select a packet to see its layers.'),
   });
   let animation;
   // An empty list says whether its links are still opening or have nothing
@@ -64,7 +63,7 @@ export function mount(root, services, options = {}) {
     const kept = members.slice(0, MAX_MERGED);
     const membersWithHosts = kept.map((e) => {
       const node = [state.nodes.get(e.a), state.nodes.get(e.b)].find((node) => node?.kind === 'sandbox');
-      return { e, flip: state.nodes.get(e.b)?.kind === 'sandbox', host: services.hostOf(node?.name) || node?.name || owners.get(e.id) };
+      return { e, flip: state.nodes.get(e.b)?.kind === 'sandbox', host: services.hostLabel(node?.name) || owners.get(e.id) };
     });
     const key = `${label}:${membersWithHosts.map(({ e, host, flip }) => `${e.id}:${host}:${flip}`).join(',')}`;
     if (current === key) return;

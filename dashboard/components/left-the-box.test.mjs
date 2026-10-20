@@ -2,16 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTransport } from '../transport.mjs';
 import { mount } from './left-the-box.mjs';
-import { createDocument } from '../test-dom.mjs';
+import { createDocument, fakeTimers } from '../test-dom.mjs';
 import { createSelection } from '../selection.mjs';
 import { hostLookups } from '../page.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-test('destinations show outcomes, scope guests, report loss and stop reads on disposal', async () => {
+test('destinations show outcomes, scope guests, report loss and stop reads on disposal', async (t) => {
   const document = createDocument(), root = document.createElement('section');
   document.body.append(root);
-  const requests = [], delays = [], timers = new Map(), selection = createSelection();
+  const requests = [], timers = fakeTimers(t), selection = createSelection();
   const transport = createTransport({}, {
     location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
     fetch(url, options) {
@@ -26,8 +26,6 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
   const dispose = mount(root, {
     selection, hosts, ...hostLookups(() => hosts),
     transport,
-    setTimeout(callback, delay) { delays.push(delay); const id = Symbol(); timers.set(id, callback); return id; },
-    clearTimeout(id) { timers.delete(id); },
   });
   const row = { sandbox: 'east', address: '203.0.113.1:443', transport: 'tcp', connections: 2, requests: 3, packets: 0, first: 1, last: 4 };
   const snapshot = { revision: 1, dropped: 0, lost: 0, pending: [], lookups: [], destinations: [
@@ -59,12 +57,12 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
   assert.doesNotMatch(root.textContent, /IPv6 is off/);
   selection.set({ host: null });
   assert.match(root.textContent, /IPv6 is off/);
-  let next = [...timers.values()][0]; timers.clear(); next(); await settle();
+  let next = [...timers.values()][0].callback; timers.clear(); next(); await settle();
   requests[1].resolve({ ...snapshot, revision: 2, dropped: 5, lost: 7 });
   await settle();
   assert.match(root.textContent, /5 attempts not kept, 7 observations lost/);
   assert.doesNotMatch(root.textContent, /Everything else stayed in the world/);
-  next = [...timers.values()][0]; timers.clear(); next(); await settle();
+  next = [...timers.values()][0].callback; timers.clear(); next(); await settle();
   requests[2].resolve({ ...snapshot, revision: 3, pending: [{ ...row, service: 'jump server' }] });
   await settle();
   assert.match(root.textContent, /1 connection open, outcome not known yet/);
@@ -75,8 +73,8 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
   root.scrollTop = 80;
   document.hidden = true;
   document.dispatchEvent(new Event('visibilitychange'));
-  assert.equal(delays.at(-1), 10000);
-  next = [...timers.values()][0]; timers.clear(); next(); await settle();
+  assert.equal([...timers.values()][0].delay, 10000);
+  next = [...timers.values()][0].callback; timers.clear(); next(); await settle();
   requests[3].resolve({ ...snapshot, revision: 3 });
   await settle();
   assert.equal(root.querySelector('table'), table);
@@ -84,12 +82,12 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
   assert.equal(root.scrollTop, 80);
   document.hidden = false;
   document.dispatchEvent(new Event('visibilitychange'));
-  assert.equal(delays.at(-1), 2000);
-  next = [...timers.values()][0]; timers.clear(); next(); await settle();
+  assert.equal([...timers.values()][0].delay, 2000);
+  next = [...timers.values()][0].callback; timers.clear(); next(); await settle();
   requests[4].reject(new Error('disconnected'));
   await settle();
   assert.match(root.textContent, /disconnected.*may be incomplete/);
-  next = [...timers.values()][0]; timers.clear(); next(); await settle();
+  next = [...timers.values()][0].callback; timers.clear(); next(); await settle();
   dispose();
   transport.close();
   requests[5].resolve(snapshot);
@@ -99,7 +97,8 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
   assert.ok(requests.every((request) => request.signal.aborted));
 });
 
-test('containment escapes override completeness only in their scope', async () => {
+test('containment escapes override completeness only in their scope', async (t) => {
+  fakeTimers(t);
   const document = createDocument(), root = document.createElement('section');
   const selection = createSelection();
   let update, opened, stopped = false;
@@ -110,7 +109,7 @@ test('containment escapes override completeness only in their scope', async () =
     transport: { get: async () => ({ revision: 1, destinations: [row, { ...row, outcome: 'no_route', requests: 0, connections: 0, packets: 1, last: .400001 }], pending: [], lookups: [], dropped: 0, lost: 0 }) },
     containmentState: '/api/state/containment',
     state(path, callback) { assert.equal(path, '/api/state/containment'); update = callback; return () => { stopped = true; }; },
-    showPanel(kind) { opened = kind; }, setTimeout() {}, clearTimeout() {},
+    showPanel(kind) { opened = kind; },
   });
   await settle();
   assert.doesNotMatch(root.textContent, /Everything else stayed/);
@@ -137,15 +136,13 @@ test('containment escapes override completeness only in their scope', async () =
   assert.equal(stopped, true);
 });
 
-test('after the run stopped, a failed read says so and stops asking', async () => {
+test('after the run stopped, a failed read says so and stops asking', async (t) => {
   const document = createDocument(), root = document.createElement('section');
   document.body.append(root);
-  const timers = new Map();
+  const timers = fakeTimers(t);
   const dispose = mount(root, {
     selection: createSelection(), hosts: [], ...hostLookups(() => []), stopped: () => true,
     transport: { get: async () => { throw new TypeError('Failed to fetch'); } },
-    setTimeout(callback) { const id = Symbol(); timers.set(id, callback); return id; },
-    clearTimeout(id) { timers.delete(id); },
   });
   await settle();
   assert.equal(root.querySelector('.egress-summary').querySelector('p').textContent, 'The run has stopped, so destinations can no longer be loaded.');

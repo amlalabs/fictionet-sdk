@@ -4,10 +4,12 @@
 import { labelChips, flowMatches } from './components/labels.mjs';
 import { listen } from './dom.mjs';
 
+// What the detail pane says until a packet is selected.
+const PICK = 'Select a packet to see its layers.';
+
 export function createPackets({
   $, el, packetStream, packet, download, fmtCount, maxRows = 3000,
-  placeholder = (many) => (many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.'),
-  pcapLabel = 'pcapng', onDetail = () => {}, stopped = () => null,
+  onDetail = () => {}, stopped = () => null,
   // A table with a Host column gives every row that cell, so gap rows span
   // all nine columns whichever are hidden.
   hostColumn = false,
@@ -82,12 +84,12 @@ export function createPackets({
     $('dir-a').textContent = `${fromName} → ${toName}`;
     $('dir-b').textContent = `${toName} → ${fromName}`;
     const list = members.map((m) => m.e.id).join(',');
-    $('pcap-label').textContent = pcapLabel;
+    $('pcap-label').textContent = 'pcapng';
     $('pause').textContent = 'Pause';
     $('sampled').hidden = true;
     $('sampled').textContent = '';
     prows.replaceChildren();
-    clearDetail(placeholder(many));
+    clearDetail(PICK);
     const hosts = new Map(members.filter((m) => m.host).map((m) => [m.e.id, m.host]));
     const showHost = new Set(hosts.values()).size > 1;
     drawer.classList.toggle('merged-hosts', showHost);
@@ -105,7 +107,7 @@ export function createPackets({
       addGap('Packet history reloaded after reconnect.');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
-      clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
+      clearDetail(`Packet history reloaded after reconnect. ${PICK}`);
     });
     packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, console: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
     showConsoleNote();
@@ -192,7 +194,7 @@ export function createPackets({
     const current = packets;
     try {
       await download('pcap', current.list);
-      if (packets === current) $('pcap-label').textContent = pcapLabel;
+      if (packets === current) $('pcap-label').textContent = 'pcapng';
     } catch {
       if (packets === current) $('pcap-label').textContent = 'Download failed. Try again.';
     }
@@ -530,7 +532,7 @@ export function createPackets({
     closePackets();
     cleanup.splice(0).forEach((remove) => remove());
     prows.replaceChildren();
-    clearDetail('Select a packet to see its layers.');
+    clearDetail(PICK);
   }, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels,
   /// Packets received but not shown yet, or -1 while no stream is open.
   queued: () => (packets ? packets.queue.length + packets.held.length : -1) };

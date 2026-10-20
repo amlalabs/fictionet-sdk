@@ -9,10 +9,8 @@ export function mount(root, services, options) {
   css.href = '/vendor/xterm/css/xterm.css';
   root.append(css);
   let active, focus = options.focus;
-  const ResizeObserver = options.ResizeObserver || globalThis.ResizeObserver;
-  const style = (element) => (options.getComputedStyle || globalThis.getComputedStyle)(element);
   const theme = (display) => {
-    const computed = style(display);
+    const computed = getComputedStyle(display);
     return { background: computed.backgroundColor, foreground: computed.color, cursor: computed.color };
   };
   function disconnected(panel, reason) {
@@ -30,7 +28,7 @@ export function mount(root, services, options) {
       if (panel.disposed || panel.generation !== current) { socket.close(); return; }
       entry.socket = socket;
       const [{ Terminal }, { FitAddon }] = panel.library;
-      const font = style(panel.display).fontFamily;
+      const font = getComputedStyle(panel.display).fontFamily;
       const terminal = entry.terminal = new Terminal({ scrollback: 5000, theme: theme(panel.display), allowProposedApi: false, fontSize: 13, ...(font ? { fontFamily: font } : {}) });
       const fit = new FitAddon();
       terminal.loadAddon(fit);
@@ -86,10 +84,10 @@ export function mount(root, services, options) {
     waiting: (state) => (state === 'network_up'
       ? `${options.host} is on the network. The terminal opens when SSH is up.`
       : `${options.host} is booting. The terminal opens when SSH is up.`),
-    load: options.load || (() => Promise.all([
-      import('/vendor/xterm/lib/xterm.mjs').catch(() => { throw new Error('xterm.js'); }),
-      import('/vendor/addon-fit/lib/addon-fit.mjs').catch(() => { throw new Error('The xterm.js fit addon'); }),
-    ])),
+    load: () => Promise.all([
+      services.importModule('/vendor/xterm/lib/xterm.mjs').catch(() => { throw new Error('xterm.js'); }),
+      services.importModule('/vendor/addon-fit/lib/addon-fit.mjs').catch(() => { throw new Error('The xterm.js fit addon'); }),
+    ]),
   });
   const offTheme = services.theme.subscribe(() => {
     if (active?.terminal) active.terminal.options.theme = theme(panel.display);

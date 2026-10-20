@@ -10,7 +10,7 @@ import { fmtDuration, fmtBytes, fmtCount, fmtRate, plural } from '../format.mjs'
 export function mount(root, services) {
   const { $, el } = scoped(root);
   structure(root, el);
-  const reducedMotion = services.reducedMotion || matchMedia('(prefers-reduced-motion: reduce)');
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
   const view = {
     items: new Map(), // display id -> a task, a sandbox, or a closed group
     dedges: new Map(), // display id -> an edge between two items

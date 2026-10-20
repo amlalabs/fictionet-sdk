@@ -18,8 +18,9 @@ they subscribe through `services`. Everything else is a short request.
 `services.watch()` returns a source with the watch stream itself: the latest
 snapshot and the changes since, then live events. Close it when done.
 `services.hosts` lists the page's hosts; `services.hostOf(sandbox)` names the
-host of a sandbox, or null, and `services.sandboxOf(host)` the sandbox of a
-host. `services.input.subscribe(host, listener)` says who holds a host's
+host of a sandbox, or null, `services.hostLabel(sandbox)` names it for text,
+or gives the sandbox name back, and `services.sandboxOf(host)` the sandbox of
+a host. `services.input.subscribe(host, listener)` says who holds a host's
 input, as `{holder, mine, owner, text}`.
 `services.state(path, onSnapshot, onError)` subscribes to a state topic and
 returns an unsubscribe function; snapshots have `{revision, at, value, status}`.
@@ -43,5 +44,6 @@ and `switch` for a two-state button holding a `switch-track` with a
 
 Options are the panel description from `/api/page`, with any explicit composition
 settings. World state comes from services, never module globals or DOM lookups
-outside the root. Libraries load through dynamic imports inside mount; a failed
-import reports the library name and `cargo xtask demo libraries` in that panel.
+outside the root. Libraries load inside mount through
+`services.importModule(url)`, the page's one dynamic import; a failed import
+reports the library name and `cargo xtask demo libraries` in that panel.

@@ -34,16 +34,19 @@ function store(value) {
 }
 
 // Lookups over `hosts()`, the page's hosts. `hostOf(name)` is the host whose
-// sandbox is `name`, or else the host named `name`, or null; `sandboxOf(name)`
+// sandbox is `name`, or else the host named `name`, or null. `hostLabel(name)`
+// is the same host, or `name` when there is none, for text. `sandboxOf(name)`
 // is the sandbox of the host named `name`, or `name` when there is none.
 export function hostLookups(hosts) {
+  const hostOf = (name) => (hosts().find((host) => host.sandbox === name) || hosts().find((host) => host.name === name))?.name ?? null;
   return {
-    hostOf: (name) => (hosts().find((host) => host.sandbox === name) || hosts().find((host) => host.name === name))?.name ?? null,
+    hostOf,
+    hostLabel: (name) => hostOf(name) ?? name,
     sandboxOf: (name) => hosts().find((host) => host.name === name)?.sandbox ?? name,
   };
 }
 
-export function createServices(transport, theme) {
+export function createServices(transport, theme, importModule = (url) => import(url)) {
   // The run status the header shows: connecting, running or stopped.
   const run = store('connecting');
   const stopped = () => run.get() === 'stopped';
@@ -66,6 +69,9 @@ export function createServices(transport, theme) {
     // stopped, not why the request failed.
     stopped,
     packetPair: store(null),
+    // Loads a module by URL: a console's library or a world panel. Tests
+    // pass their own, since Node cannot load the page's paths.
+    importModule,
     // Who holds each host's input (see components/console.mjs).
     input: createInputOwners((path, onSnapshot, onError) => services.state(path, onSnapshot, onError)),
     watch: () => watches.subscribe(),
@@ -215,7 +221,6 @@ function inspector(root, services, page) {
   const tabOf = (name) => tabs.find((tab) => tab.options.kind === name) || tabs.find((tab) => tab.options.id === name);
   const show = (name) => { const item = tabOf(name); if (item) activate(item); };
   services.showPanel = show;
-  services.openPackets = (id) => { services.selection.set({ links: [id] }); show('packets'); };
   services.openLinks = (_from, _to, members) => { services.selection.set({ links: members.map(({ e }) => e.id) }); show('packets'); };
   services.showPackets = (pair) => { services.packetPair.set(pair); show('packets'); };
   if (tabs.length) activate(tabs[0]);
@@ -357,7 +362,7 @@ function hostBar(root, services, page, area) {
     // Every viewer sees who holds each host's input, whether or not it
     // shows the screen.
     cleanup.push(services.input.subscribe(host.name, ({ owner: who, text }) => {
-      owner.textContent = text === 'Watching' ? '' : text;
+      owner.textContent = text;
       owner.dataset.owner = who;
     }));
   }
@@ -432,10 +437,12 @@ function moments(root, services, page, panels, signal) {
   return () => { stopped = true; clearTimeout(timer); stopBanner(); };
 }
 
-export async function mount(root, transport, theme) {
+// `importModule`, when given, replaces how the page loads modules (see
+// createServices).
+export async function mount(root, transport, theme, importModule) {
   const { $ } = scoped(root);
   const document = root.ownerDocument;
-  const services = createServices(transport, theme);
+  const services = createServices(transport, theme, importModule);
   const controller = new AbortController();
   const cleanup = [];
   let disposed = false;

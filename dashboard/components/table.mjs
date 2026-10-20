@@ -2,7 +2,7 @@
 import { scoped, reconcile } from '../dom.mjs';
 import { fmtBytes, fmtDuration } from '../format.mjs';
 
-export function pointer(value, path) {
+function pointer(value, path) {
   if (!path) return value;
   for (const part of path.slice(1).split('/')) {
     const key = part.replace(/~1/g, '/').replace(/~0/g, '~');
@@ -12,7 +12,7 @@ export function pointer(value, path) {
   return value;
 }
 
-export function cell(value, format) {
+function cell(value, format) {
   if (value === undefined || value === null) return '—';
   if (typeof value === 'number' && Number.isFinite(value)) {
     if (format === 'bytes') return fmtBytes(value);

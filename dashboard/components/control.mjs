@@ -23,7 +23,7 @@ function keyValues(parent, el, value) {
 }
 
 /// What a refusal means, in words.
-export function rejection(rejected) {
+function rejection(rejected) {
   switch (rejected?.reason) {
     case 'stale_revision': return `Not applied: the state changed (now revision ${rejected.current}). Check it and try again.`;
     case 'invalid': return `Not applied: ${rejected.message}`;

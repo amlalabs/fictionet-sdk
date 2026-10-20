@@ -370,12 +370,17 @@ test('choosing the terminal switch focuses the connected terminal but mounting i
     dispose() {}
   }
   class FitAddon { fit() {} }
-  class ResizeObserver { observe() {} disconnect() {} }
+  const modules = { '/vendor/xterm/lib/xterm.mjs': { Terminal }, '/vendor/addon-fit/lib/addon-fit.mjs': { FitAddon } };
+  // Node has no ResizeObserver or getComputedStyle; the terminal uses both.
+  const previous = { ResizeObserver: globalThis.ResizeObserver, getComputedStyle: globalThis.getComputedStyle };
+  t.after(() => Object.assign(globalThis, previous));
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  globalThis.getComputedStyle = () => ({});
   for (const initial of ['screen', 'terminal']) {
     const description = {
       title: 'Fixture',
       hosts: [{ name: 'alpha', status: '/api/state/host-alpha', screen: initial === 'screen', terminal: true }],
-      panels: [{ kind: 'terminal', host: 'alpha', load: async () => [{ Terminal }, { FitAddon }], ResizeObserver, getComputedStyle: () => ({}) }],
+      panels: [{ kind: 'terminal', host: 'alpha' }],
     };
     const stop = await mount(h.root, {
       get: async () => description,
@@ -383,7 +388,7 @@ test('choosing the terminal switch focuses the connected terminal but mounting i
       watch: () => h.stream('watch'),
       async socket() { const socket = new Source('socket'); socket.readyState = 0; sockets.push(socket); return { socket }; },
       close() {},
-    }, { subscribe: () => () => {}, dispose() {} });
+    }, { subscribe: () => () => {}, dispose() {} }, async (url) => modules[url]);
     t.after(stop);
     await settle();
     const source = h.streams.findLast((stream) => stream.tag === 'state' && !stream.closed);

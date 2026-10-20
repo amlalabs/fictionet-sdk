@@ -8,12 +8,11 @@ import { mountConsole } from './console.mjs';
 
 export function mount(root, services, options) {
   const { el } = scoped(root);
-  const { setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout } = services;
   const controls = options.controls || el('div', { class: 'console-controls' });
   const owner = el('span', { class: 'console-owner' }, controls);
   const claim = el('button', { class: 'button', type: 'button', text: 'Take over' }, controls);
   claim.hidden = true;
-  let active, timer, notice, attempt = 0, mine = false, input = { holder: null, mine: false, text: 'Watching' };
+  let active, timer, notice, attempt = 0, mine = false, input = { holder: null, mine: false, owner: 'none', text: '' };
 
   function ownership() {
     const was = mine;
@@ -21,8 +20,8 @@ export function mount(root, services, options) {
     if (active?.rfb) active.rfb.viewOnly = !mine;
     claim.hidden = !active?.connected;
     claim.textContent = mine ? 'Release' : 'Take over';
-    owner.textContent = input.text === 'Watching' ? '' : input.text;
-    owner.dataset.owner = mine ? 'mine' : input.holder ? 'other' : 'none';
+    owner.textContent = input.text;
+    owner.dataset.owner = input.owner;
     if (was && !mine && input.holder && active?.connected) {
       // Input is already off: the lease moved to another viewer.
       owner.textContent = 'Another viewer took control';
@@ -94,7 +93,7 @@ export function mount(root, services, options) {
     waiting: (state) => (state === 'network_up' || state === 'ssh_up'
       ? `${options.host} is up. The screen opens when its desktop is ready.`
       : `${options.host} is booting. The screen opens when its desktop is up.`),
-    load: options.load || (() => import('/vendor/novnc/core/rfb.js').catch(() => { throw new Error('noVNC'); })),
+    load: () => services.importModule('/vendor/novnc/core/rfb.js').catch(() => { throw new Error('noVNC'); }),
   });
   if (!options.controls) root.insertBefore(controls, root.firstChild);
   async function takeover() {

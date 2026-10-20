@@ -4,14 +4,14 @@ import { mount as table } from './table.mjs';
 import { mount as eventTable } from './event-table.mjs';
 import { mount as control } from './control.mjs';
 import { mount as custom } from './custom.mjs';
-import { createDocument } from '../test-dom.mjs';
+import { createDocument, fakeTimers } from '../test-dom.mjs';
 import { createTransport } from '../transport.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
-function fixture() {
+function fixture(t) {
   const document = createDocument(), root = document.createElement('section');
   document.body.append(root);
-  const subscriptions = new Set(), requests = [], timers = new Map();
+  const subscriptions = new Set(), requests = [], timers = fakeTimers(t);
   let publish, fail;
   const services = {
     state(path, snapshot, error) { publish = snapshot; fail = error; subscriptions.add(path); return () => subscriptions.delete(path); },
@@ -27,14 +27,12 @@ function fixture() {
         }));
       },
     }),
-    setTimeout(callback) { const id = Symbol(); timers.set(id, callback); return id; },
-    clearTimeout(id) { timers.delete(id); },
   };
   return { root, services, subscriptions, requests, timers, publish: (value) => publish(value), fail: (error) => fail(error) };
 }
 
-test('table renders column pointers and formats as text and replaces snapshots', () => {
-  const h = fixture();
+test('table renders column pointers and formats as text and replaces snapshots', (t) => {
+  const h = fixture(t);
   const dispose = table(h.root, h.services, { state: '/api/state/rows', columns: [
     { label: '<Name>', pointer: '/a~1b/~0name', format: 'text' },
     { label: 'Bytes', pointer: '/bytes', format: 'bytes' },
@@ -55,8 +53,8 @@ test('table renders column pointers and formats as text and replaces snapshots',
   assert.equal(h.root.children.length, 0);
 });
 
-test('tables update rows in place and build again only rows whose text changed', async () => {
-  const h = fixture();
+test('tables update rows in place and build again only rows whose text changed', async (t) => {
+  const h = fixture(t);
   const dispose = table(h.root, h.services, { state: '/api/state/rows', columns: [{ label: 'Host', pointer: '/host' }, { label: 'Packets', pointer: '/packets', format: 'number' }] });
   h.publish({ revision: 1, value: [{ host: 'alpha', packets: 1 }, { host: 'beta', packets: 1 }] });
   const [alpha, beta] = h.root.querySelectorAll('tr').slice(1);
@@ -71,13 +69,13 @@ test('tables update rows in place and build again only rows whose text changed',
   assert.ok(rows.slice(1).every((row) => row.classList.contains('new-row')));
   dispose();
   // Event tables name rows by event, so a row read again keeps its element.
-  const log = fixture();
+  const log = fixture(t);
   const stop = eventTable(log.root, log.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
   await settle();
   log.requests[0].resolve({ rows: [{ seq: 4, summary: 'first' }], next: 5, dropped: 0 });
   await settle();
   const first = log.root.querySelector('tbody').children[0];
-  const next = [...log.timers.values()][0]; log.timers.clear(); next();
+  const next = [...log.timers.values()][0].callback; log.timers.clear(); next();
   await settle();
   log.requests[1].resolve({ rows: [{ seq: 5, summary: 'second' }], next: 6, dropped: 0 });
   await settle();
@@ -87,8 +85,8 @@ test('tables update rows in place and build again only rows whose text changed',
   stop();
 });
 
-test('control sends the linked revision once and shows replies, rejections and timeouts', async () => {
-  const h = fixture();
+test('control sends the linked revision once and shows replies, rejections and timeouts', async (t) => {
+  const h = fixture(t);
   const dispose = control(h.root, h.services, { state: '/api/state/traffic', command: '/api/command/traffic', actions: [{ label: '<Pause>', command: { running: false } }] });
   const button = h.root.querySelector('button');
   assert.equal(button.disabled, true);
@@ -130,8 +128,8 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.ok(h.requests.every((request) => request.signal.aborted));
 });
 
-test('control sends the world revision even when publication has a different revision', async () => {
-  const h = fixture();
+test('control sends the world revision even when publication has a different revision', async (t) => {
+  const h = fixture(t);
   const dispose = control(h.root, h.services, { state: '/api/state/switch', command: '/api/command/switch', actions: [{ label: 'On', command: { on: true } }] });
   h.publish({ revision: 1, value: { revision: 0, on: false } });
   h.root.querySelector('button').click();
@@ -148,15 +146,15 @@ test('control sends the world revision even when publication has a different rev
   dispose();
 });
 
-test('event table advances the server cursor and cancels pending reads and timers', async () => {
-  const h = fixture();
+test('event table advances the server cursor and cancels pending reads and timers', async (t) => {
+  const h = fixture(t);
   const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
   await settle();
   h.requests[0].resolve({ rows: [{ summary: '<world>' }], next: 11, dropped: 3 });
   await settle();
   assert.match(h.root.textContent, /<world>/);
   assert.match(h.root.textContent, /3 events were lost/);
-  const next = [...h.timers.values()][0]; h.timers.clear(); next();
+  const next = [...h.timers.values()][0].callback; h.timers.clear(); next();
   await settle();
   assert.deepEqual(h.requests[1].params, { after: 11 });
   dispose();
@@ -167,8 +165,8 @@ test('event table advances the server cursor and cancels pending reads and timer
   assert.equal(h.root.children.length, 0);
 });
 
-test('after the run stopped, event tables and custom panels say so instead of a fetch error', async () => {
-  const h = fixture();
+test('after the run stopped, event tables and custom panels say so instead of a fetch error', async (t) => {
+  const h = fixture(t);
   h.services.stopped = () => true;
   const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
   await settle();
@@ -178,14 +176,14 @@ test('after the run stopped, event tables and custom panels say so instead of a 
   assert.doesNotMatch(h.root.textContent, /Failed to fetch/);
   assert.equal(h.timers.size, 0, 'no further reads');
   dispose();
-  const panel = fixture();
+  const panel = fixture(t);
   panel.services.stopped = () => true;
   panel.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
   const stop = custom(panel.root, panel.services, { title: 'Plant', module: '/panels/plant.mjs', state: '/api/state/plant' });
   await settle();
   assert.equal(panel.root.textContent, 'Could not open Plant: the run has stopped, so the panel can no longer be loaded');
   stop();
-  const rows = fixture();
+  const rows = fixture(t);
   rows.services.stopped = () => true;
   const close = table(rows.root, rows.services, { state: '/api/state/rows', columns: [{ label: 'Name', pointer: '/name' }] });
   rows.fail(new Error('The run has stopped, so its state can no longer be loaded'));
@@ -193,16 +191,16 @@ test('after the run stopped, event tables and custom panels say so instead of a 
   close();
 });
 
-test('a table that cannot load its state while the run goes says why', () => {
-  const h = fixture();
+test('a table that cannot load its state while the run goes says why', (t) => {
+  const h = fixture(t);
   const close = table(h.root, h.services, { state: '/api/state/rows', columns: [{ label: 'Name', pointer: '/name' }] });
   h.fail(new Error('no such state topic: "rows"'));
   assert.equal(h.root.querySelector('.loss-note').textContent, 'Could not load rows: no such state topic: "rows"');
   close();
 });
 
-test('custom panels dispose a late mount and reject foreign module paths', async () => {
-  const h = fixture();
+test('custom panels dispose a late mount and reject foreign module paths', async (t) => {
+  const h = fixture(t);
   let finish, stopped = 0, imports = 0;
   h.services.importModule = async () => { imports++; return { mount: () => new Promise((resolve) => { finish = resolve; }) }; };
   const dispose = custom(h.root, h.services, { module: '/panels/traffic.mjs', title: 'Traffic' });
