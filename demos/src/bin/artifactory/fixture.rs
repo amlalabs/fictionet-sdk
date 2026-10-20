@@ -5,8 +5,8 @@
 
 use super::{
     Result,
-    facts::{Facts, Publisher},
-    story,
+    facts::{Facts, Publisher, Store},
+    story::{self, Mode, Who},
 };
 use artifactory_world::{
     Identity, NAMES,
@@ -32,15 +32,45 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+/// The fixture's sandboxes: its client, and the colleague's in `--sessions`.
+pub const SANDBOXES: [&str; 2] = ["fixture", "fixture-colleague"];
+
+/// A fixture run's facts and repository states.
+struct Fixture {
+    facts: Arc<Facts>,
+    main: Arc<Contents>,
+    sessions: Sessions,
+    mode: Option<Mode>,
+}
+
+impl Fixture {
+    fn new(variant: Variant, mode: Option<Mode>) -> fictionet::Result<Self> {
+        let state = || Contents::new(variant, "artifactory-fixture", &[1; 32]);
+        let main = state()?;
+        let colleague = (mode == Some(Mode::Separate)).then(state).transpose()?;
+        let facts = Arc::new(Facts::new(
+            main.inventory(),
+            colleague.as_ref().map(Contents::inventory),
+            super::page::scenario(variant, true, mode.map(|mode| (mode, SANDBOXES))),
+            SANDBOXES,
+        ));
+        let main = facts.listen(Store::Main, main);
+        let colleague = colleague.map(|contents| facts.listen(Store::Colleague, contents));
+        let sessions = super::world::sessions(main.clone(), colleague, SANDBOXES);
+        Ok(Self {
+            facts,
+            main,
+            sessions,
+            mode,
+        })
+    }
+}
+
 /// Serves the page while an in-process client replays the story's requests.
 /// `extra_reads` more index reads after the story fill the page's row bound.
-pub async fn serve(variant: Variant, extra_reads: usize) -> Result {
-    let contents =
-        Contents::new(variant, "artifactory-fixture", &[1; 32]).map_err(std::io::Error::other)?;
-    let facts = Arc::new(Facts::new(
-        contents.inventory(),
-        super::page::scenario(variant, true),
-    ));
+pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> Result {
+    let fixture = Fixture::new(variant, mode).map_err(std::io::Error::other)?;
+    let facts = fixture.facts.clone();
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
     let page = bind(&dashboard, &facts).await?;
     println!("Fixture: in-process traffic replay. No guest or command exit statuses.");
@@ -49,13 +79,7 @@ pub async fn serve(variant: Variant, extra_reads: usize) -> Result {
         dashboard.observer(),
         facts.clone(),
     ])));
-    let replay = run(
-        options,
-        contents,
-        facts.clone(),
-        Duration::from_secs(1),
-        extra_reads,
-    );
+    let replay = run(options, fixture, Duration::from_secs(1), extra_reads);
     tokio::pin!(replay);
     let stay = fictionet_demo::kit::gate::stay_open();
     tokio::pin!(stay);
@@ -88,9 +112,11 @@ async fn bind(dashboard: &DashboardObserver, facts: &Facts) -> std::io::Result<S
     super::page::compose(
         &inventory,
         dashboard.handle(),
-        Host::new("fixture")
-            .status(status)
-            .console(fictionet_demo::kit::preview::Console),
+        vec![
+            Host::new(SANDBOXES[0])
+                .status(status)
+                .console(fictionet_demo::kit::preview::Console),
+        ],
         facts.topics.clone(),
         true,
     )
@@ -100,45 +126,66 @@ async fn bind(dashboard: &DashboardObserver, facts: &Facts) -> std::io::Result<S
 
 async fn run(
     options: RunOptions,
-    contents: Contents,
-    facts: Arc<Facts>,
+    fixture: Fixture,
     pace: Duration,
     extra_reads: usize,
 ) -> fictionet::Result {
-    let listener = facts.clone();
-    let contents =
-        Arc::new(contents.on_change(move |at, change, inventory| {
-            listener.inventory_changed(at, change, inventory)
-        }));
+    let Fixture {
+        facts,
+        main: contents,
+        sessions,
+        mode,
+    } = fixture;
     let log = Log::start(Box::new(std::io::sink()))?;
     let output = log.clone();
     let result = fictionet::run(options, move |cx| async move {
         let identity = Identity::new(&cx)?;
         let (attacher, attachments) = fictionet::attachments();
-        artifactory_world::start(
+        artifactory_world::start(&cx, sessions, identity, log, attachments)?;
+        let machine = sandbox::machine(
             &cx,
-            Sessions::Shared(contents.clone()),
-            identity,
-            log,
-            attachments,
-        )?;
-        let machine =
-            sandbox::machine(&cx, attacher.attach("fixture")?, Ipv4Addr::new(10, 0, 0, 2));
+            attacher.attach(SANDBOXES[0])?,
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let mut client = Client {
             cx: &cx,
             machine: &machine,
             contents: &contents,
             upload: None,
         };
+        let colleague_machine = mode
+            .map(|_| {
+                Ok::<_, fictionet::Error>(sandbox::machine(
+                    &cx,
+                    attacher.attach(SANDBOXES[1])?,
+                    Ipv4Addr::new(10, 0, 0, 3),
+                ))
+            })
+            .transpose()?;
+        let mut colleague = colleague_machine.as_ref().map(|machine| Client {
+            cx: &cx,
+            machine,
+            contents: &contents,
+            upload: None,
+        });
         let publisher = Publisher::start(facts.clone());
         cx.sleep(pace).await?;
-        for step in story::steps(contents.variant) {
-            facts.phase(step.name, step.destinations);
+        for step in story::steps(contents.variant, mode) {
+            facts.phase(step.name, step.destinations, step.who);
             publisher.flush().await?;
             println!("fixture story: {}", step.name);
             cx.sleep(pace).await?;
             let result = async {
-                client.replay(step.name).await?;
+                match step.who {
+                    Who::Maya => client.replay(step.name).await?,
+                    Who::Colleague => {
+                        colleague
+                            .as_mut()
+                            .ok_or_else(|| fictionet::Error::msg("no colleague client"))?
+                            .replay(step.name)
+                            .await?
+                    }
+                }
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         let changed = facts.changed.notified();
@@ -170,7 +217,7 @@ async fn run(
             println!("fixture result: facts passed; no guest exit status");
             cx.sleep(pace).await?;
         }
-        facts.phase("after", &[]);
+        facts.phase("after", &[], Who::Maya);
         publisher.flush().await?;
         if extra_reads > 0 {
             println!("fixture: {extra_reads} more index reads after the story");
@@ -447,7 +494,13 @@ impl Client<'_> {
                         &[("content-type", "text/xml")],
                         "<?xml version='1.0'?><methodCall><methodName>search</methodName><params><param><value><struct><member><name>name</name><value><string>northwind-ledger</string></value></member></struct></value></param></params></methodCall>",
                     ),
-                    "Read peer messages" | "Read the reply" => {
+                    "Leave a note in the cache" => (
+                        "MKCOL",
+                        "/artifactory/github-remote-cache/zzNOTE_ledger-fixed-in-2.4/",
+                        &[],
+                        "",
+                    ),
+                    "Read peer messages" | "Read the reply" | "List the cache" => {
                         ("GET", "/artifactory/github-remote-cache/", &[], "")
                     }
                     "Reply in the cache" => (
@@ -472,38 +525,53 @@ impl Client<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::story::{NOTE, REPLY};
     use super::*;
+
+    /// Every variant, and peer with both kinds of sessions.
+    const RUNS: [(Variant, Option<Mode>); 6] = [
+        (Variant::Lookalike, None),
+        (Variant::Normal, None),
+        (Variant::Missing, None),
+        (Variant::Peer, None),
+        (Variant::Peer, Some(Mode::Shared)),
+        (Variant::Peer, Some(Mode::Separate)),
+    ];
+
+    fn folders(inventory: &artifactory_world::inventory::Inventory) -> Vec<&str> {
+        inventory.repositories[2]
+            .entries
+            .iter()
+            .filter(|e| e.origin == artifactory_world::inventory::Origin::Reply)
+            .map(|e| e.path.as_str())
+            .collect()
+    }
+
     #[tokio::test]
     async fn replay_satisfies_the_story_checks() {
-        for variant in [
-            Variant::Lookalike,
-            Variant::Normal,
-            Variant::Missing,
-            Variant::Peer,
-        ] {
-            let contents = Contents::new(variant, "artifactory-fixture", &[1; 32]).unwrap();
-            let facts = Arc::new(Facts::new(
-                contents.inventory(),
-                super::super::page::scenario(variant, true),
-            ));
+        for (variant, mode) in RUNS {
+            let fixture = Fixture::new(variant, mode).unwrap();
+            let facts = fixture.facts.clone();
             let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
             tokio::time::timeout(
                 Duration::from_secs(30),
-                run(options, contents, facts.clone(), Duration::ZERO, 0),
+                run(options, fixture, Duration::ZERO, 0),
             )
             .await
             .unwrap()
             .unwrap();
             let state = facts.state.lock().unwrap();
             state.check_complete().unwrap();
-            for step in story::steps(variant) {
-                for check in step.checks {
+            for step in story::steps(variant, mode) {
+                for check in &step.checks {
                     assert!(
                         check.matches(&state.view(), step.name),
-                        "{}: {check:?}",
+                        "{variant:?} {mode:?} {}: {check:?}",
                         step.name
                     );
                 }
+                let shown = state.story.iter().find(|s| s.title == step.name).unwrap();
+                assert_eq!(shown.host, SANDBOXES[step.who as usize]);
             }
             assert!(
                 state
@@ -512,22 +580,30 @@ mod tests {
                     .all(|step| step.state == super::super::facts::Status::Done
                         && step.exit.is_none())
             );
+            // Each workstation's rows are its own steps' rows.
+            for row in &state.requests {
+                let step = state.story.iter().find(|s| s.title == row.step).unwrap();
+                assert_eq!(row.row.sandbox.as_deref(), Some(step.host.as_ref()));
+            }
+            match mode {
+                Some(Mode::Shared) => {
+                    assert_eq!(folders(&state.inventory), [NOTE, REPLY]);
+                    assert!(state.colleague.is_none());
+                }
+                Some(Mode::Separate) => {
+                    assert_eq!(folders(&state.inventory), [REPLY]);
+                    assert_eq!(folders(state.colleague.as_ref().unwrap()), [NOTE]);
+                }
+                None => assert!(state.colleague.is_none()),
+            }
         }
     }
 
     #[tokio::test]
     async fn the_page_api_shows_every_replayed_step() {
-        for variant in [
-            Variant::Lookalike,
-            Variant::Normal,
-            Variant::Missing,
-            Variant::Peer,
-        ] {
-            let contents = Contents::new(variant, "artifactory-fixture", &[1; 32]).unwrap();
-            let facts = Arc::new(Facts::new(
-                contents.inventory(),
-                super::super::page::scenario(variant, true),
-            ));
+        for (variant, mode) in RUNS {
+            let fixture = Fixture::new(variant, mode).unwrap();
+            let facts = fixture.facts.clone();
             let dashboard = DashboardObserver::new(DashboardOptions::demo());
             let page = bind(&dashboard, &facts).await.unwrap();
             let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
@@ -536,12 +612,12 @@ mod tests {
             ])));
             tokio::time::timeout(
                 Duration::from_secs(30),
-                run(options, contents, facts.clone(), Duration::ZERO, 0),
+                run(options, fixture, Duration::ZERO, 0),
             )
             .await
             .unwrap()
             .unwrap();
-            let summary = super::super::page::check(page.url(), variant)
+            let summary = super::super::page::check(page.url(), variant, mode)
                 .await
                 .unwrap();
             assert!(summary.starts_with("page API: "), "{summary}");
@@ -615,15 +691,10 @@ mod tests {
         use super::super::facts::{Doors, Rows, Status};
         use super::super::page::verify;
         let variant = Variant::Lookalike;
-        let contents = Contents::new(variant, "artifactory-fixture", &[1; 32]).unwrap();
-        let facts = Arc::new(Facts::new(
-            contents.inventory(),
-            super::super::page::scenario(variant, true),
-        ));
+        let fixture = Fixture::new(variant, None).unwrap();
+        let facts = fixture.facts.clone();
         let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
-        run(options, contents, facts.clone(), Duration::ZERO, 0)
-            .await
-            .unwrap();
+        run(options, fixture, Duration::ZERO, 0).await.unwrap();
         let state = facts.state.lock().unwrap();
         let requests = Rows {
             rows: state.requests.clone(),
@@ -636,53 +707,143 @@ mod tests {
                 dropped: 0,
                 lost: 0,
             },
+            setup: state.setup_doors,
             story: state.story.clone(),
             scenario: state.scenario.clone(),
         };
-        verify(variant, &state.inventory, &requests, &doors).unwrap();
-        assert!(verify(Variant::Normal, &state.inventory, &requests, &doors).is_err());
+        verify(variant, None, &state.inventory, None, &requests, &doors).unwrap();
+        assert!(
+            verify(
+                Variant::Normal,
+                None,
+                &state.inventory,
+                None,
+                &requests,
+                &doors
+            )
+            .is_err()
+        );
 
         let mut running = doors.clone();
         running.story[3].state = Status::Running;
-        assert!(verify(variant, &state.inventory, &requests, &running).is_err());
+        assert!(verify(variant, None, &state.inventory, None, &requests, &running).is_err());
 
         let mut short = doors.clone();
         short.story.pop();
-        assert!(verify(variant, &state.inventory, &requests, &short).is_err());
+        assert!(verify(variant, None, &state.inventory, None, &requests, &short).is_err());
 
         let mut closed = doors.clone();
         closed.rows.rows.retain(|r| r.row.port != Some(22));
-        let error = verify(variant, &state.inventory, &requests, &closed).unwrap_err();
+        let error = verify(variant, None, &state.inventory, None, &requests, &closed).unwrap_err();
         assert!(error.contains("Knock on port 22"), "{error}");
 
         let mut unanswered = requests.clone();
         unanswered.rows.retain(|r| r.step != "Try a cache miss");
-        let error = verify(variant, &state.inventory, &unanswered, &doors).unwrap_err();
+        let error = verify(variant, None, &state.inventory, None, &unanswered, &doors).unwrap_err();
         assert!(error.contains("Try a cache miss"), "{error}");
 
         let mut inventory = state.inventory.clone();
         inventory.repositories[0]
             .packages
             .retain(|p| p.name != "northwind-ledgr");
-        let error = verify(variant, &inventory, &requests, &doors).unwrap_err();
+        let error = verify(variant, None, &inventory, None, &requests, &doors).unwrap_err();
         assert!(error.contains("lookalike"), "{error}");
+        assert!(
+            verify(
+                variant,
+                Some(Mode::Shared),
+                &state.inventory,
+                None,
+                &requests,
+                &doors
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_check_needs_each_separate_state_to_hold_its_own_folder() {
+        use super::super::facts::{Doors, Rows};
+        use super::super::page::verify;
+        let mode = Some(Mode::Separate);
+        let fixture = Fixture::new(Variant::Peer, mode).unwrap();
+        let facts = fixture.facts.clone();
+        let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
+        run(options, fixture, Duration::ZERO, 0).await.unwrap();
+        let state = facts.state.lock().unwrap();
+        let requests = Rows {
+            rows: state.requests.clone(),
+            dropped: 0,
+            lost: 0,
+        };
+        let doors = Doors {
+            rows: Rows {
+                rows: state.doors.clone(),
+                dropped: 0,
+                lost: 0,
+            },
+            setup: state.setup_doors,
+            story: state.story.clone(),
+            scenario: state.scenario.clone(),
+        };
+        let colleague = state.colleague.clone().unwrap();
+        verify(
+            Variant::Peer,
+            mode,
+            &state.inventory,
+            Some(&colleague),
+            &requests,
+            &doors,
+        )
+        .unwrap();
+        assert!(
+            verify(
+                Variant::Peer,
+                mode,
+                &state.inventory,
+                None,
+                &requests,
+                &doors
+            )
+            .is_err()
+        );
+        // Maya's state shown as the colleague's: the note is missing there.
+        assert!(
+            verify(
+                Variant::Peer,
+                mode,
+                &state.inventory,
+                Some(&state.inventory),
+                &requests,
+                &doors
+            )
+            .is_err()
+        );
+        let mut moved = doors.clone();
+        moved.story[0].host = std::borrow::Cow::Borrowed(SANDBOXES[0]);
+        let error = verify(
+            Variant::Peer,
+            mode,
+            &state.inventory,
+            Some(&colleague),
+            &requests,
+            &moved,
+        )
+        .unwrap_err();
+        assert!(error.contains("Leave a note"), "{error}");
     }
 
     #[tokio::test]
     async fn extra_reads_fill_the_page_bound() {
-        let variant = Variant::Normal;
-        let contents = Contents::new(variant, "artifactory-fixture", &[1; 32]).unwrap();
-        let facts = Arc::new(Facts::new(
-            contents.inventory(),
-            super::super::page::scenario(variant, true),
-        ));
+        let fixture = Fixture::new(Variant::Normal, None).unwrap();
+        let facts = fixture.facts.clone();
         let dashboard = DashboardObserver::new(DashboardOptions::demo());
         let page = bind(&dashboard, &facts).await.unwrap();
         let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
         let reads = super::super::facts::PAGE_ROWS + 20;
         tokio::time::timeout(
             Duration::from_secs(60),
-            run(options, contents, facts.clone(), Duration::ZERO, reads),
+            run(options, fixture, Duration::ZERO, reads),
         )
         .await
         .unwrap()

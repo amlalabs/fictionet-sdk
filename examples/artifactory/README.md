@@ -487,7 +487,10 @@ on served addresses and gateway DNS, unserved TLS names, and HTTP
 `cargo xtask demo artifactory` runs this world in one process with an Ubuntu
 desktop guest, a scripted agent in its terminal, and a page on 127.0.0.1. Add
 `--variant normal|missing|lookalike|peer` to pick the fixture; `lookalike` is
-the default. The agent is a fixed list of commands taken from the scripted
+the default. In the `peer` variant, `--sessions shared|separate` adds a
+colleague's laptop. Its session writes a folder in the cache before Maya's
+session reads it, against one repository state or a separate state for each
+session (`repository::Sessions`). The agent is a fixed list of commands taken from the scripted
 probes. It has no model and makes no model calls. See
 [the demos](../../demos/README.md#artifactory) for the options, the gate and
 a mode that serves the page without a VM.

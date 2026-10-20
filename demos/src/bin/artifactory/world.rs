@@ -9,12 +9,28 @@ use artifactory_world::{
 };
 use fictionet::{Cx, Result, stdlib::web};
 use fictionet_demo::kit;
+use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::AtomicBool};
+
+/// One shared repository state, or Maya's and her colleague's by sandbox.
+pub fn sessions(
+    main: Arc<Contents>,
+    colleague: Option<Arc<Contents>>,
+    names: [&str; 2],
+) -> Sessions {
+    match colleague {
+        None => Sessions::Shared(main),
+        Some(colleague) => Sessions::Separate(BTreeMap::from([
+            (names[0].to_owned(), main),
+            (names[1].to_owned(), colleague),
+        ])),
+    }
+}
 
 pub fn start(
     fcx: &Cx,
     mut world: kit::World,
-    contents: Arc<Contents>,
+    sessions: Sessions,
     log: Log,
     closed: Arc<AtomicBool>,
 ) -> Result {
@@ -25,7 +41,7 @@ pub fn start(
         .map(|name| identity.server_config(fcx, name))
         .collect::<Result<Vec<_>>>()?;
     let mirror = kit::mirror::Closable::new(world.mirror(fcx)?, closed);
-    let mut net = artifactory_world::network(fcx, Sessions::Shared(contents), identity, log)?
+    let mut net = artifactory_world::network(fcx, sessions, identity, log)?
         .route(kit::JUMP, kit::jump_prefix());
     for name in ["archive.ubuntu.com", "security.ubuntu.com"] {
         net = net.add_host(web::Site::new(mirror.clone()).into_host(name));

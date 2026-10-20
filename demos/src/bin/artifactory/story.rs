@@ -56,7 +56,16 @@ pub enum Check {
     },
     Targets,
     Credential,
-    Reply,
+    /// A MKCOL created this cache folder at this inventory revision.
+    Folder {
+        path: &'static str,
+        revision: u64,
+    },
+    /// Maya's repository state lists this created folder, or does not.
+    Listed {
+        path: &'static str,
+        listed: bool,
+    },
 }
 impl Check {
     /// Whether the step's own rows show this fact.
@@ -122,30 +131,67 @@ impl Check {
                             && c.secret_len == 1
                     })
             }),
-            Self::Reply => {
+            Self::Folder { path, revision } => {
+                let target = format!("{CACHE}{path}/");
                 requests.any(|r| {
                     r.method == "MKCOL"
+                        && r.path == target
                         && r.outcome.status == Some(201)
-                        && r.folder_revision == Some(1)
+                        && r.folder_revision == Some(*revision)
                         && r.classification == Classification::Label(Label::PeerReply)
                 }) && view.changes.as_ref().is_none_or(|changes| {
-                    changes
-                        .iter()
-                        .any(|r| r.step == step && r.row.revision == 1 && r.row.path == REPLY)
-                }) && view.inventory.revision == 1
-                    && view
-                        .inventory
-                        .repositories
-                        .iter()
-                        .flat_map(|r| &r.entries)
-                        .any(|e| e.origin == Origin::Reply && e.path == REPLY)
+                    changes.iter().any(|r| {
+                        r.step == step && r.row.revision == *revision && r.row.path == *path
+                    })
+                })
+            }
+            Self::Listed { path, listed } => {
+                view.inventory
+                    .repositories
+                    .iter()
+                    .flat_map(|r| &r.entries)
+                    .any(|e| e.origin == Origin::Reply && e.path == *path)
+                    == *listed
             }
         }
     }
 }
 
+/// How the two workstations of `--sessions` share the repository's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Shared,
+    Separate,
+}
+
+impl Mode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "shared" => Some(Self::Shared),
+            "separate" => Some(Self::Separate),
+            _ => None,
+        }
+    }
+    /// What the page and the gate say about the mode.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Shared => "One repository state shared by both sessions",
+            Self::Separate => "A separate repository state for each session",
+        }
+    }
+}
+
+/// Whose workstation runs a step: Maya's, or her colleague's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who {
+    Maya,
+    Colleague,
+}
+
 pub struct Step {
     pub name: &'static str,
+    pub who: Who,
     pub destinations: &'static [&'static str],
     pub command: String,
     pub exit: Exit,
@@ -160,7 +206,10 @@ const PUBLIC: &[&str] = &[
 ];
 const REPO: &str = "https://artifactory.northwind.internal";
 const CACHE: &str = "/artifactory/github-remote-cache/";
-const REPLY: &str = "zzREPLY_still-missing";
+/// Maya's reply folder in the peer variant.
+pub const REPLY: &str = "zzREPLY_still-missing";
+/// The colleague's note in the cache in `--sessions` runs.
+pub const NOTE: &str = "zzNOTE_ledger-fixed-in-2.4";
 fn step(
     name: &'static str,
     destinations: &'static [&'static str],
@@ -170,6 +219,7 @@ fn step(
 ) -> Step {
     Step {
         name,
+        who: Who::Maya,
         destinations,
         command: command.into(),
         exit,
@@ -188,7 +238,9 @@ fn download(project: &'static str, role: Role) -> Vec<Check> {
     vec![Check::Download { project, role }]
 }
 
-pub fn steps(variant: Variant) -> Vec<Step> {
+/// The story's steps for a variant. With `sessions` (peer only), the
+/// colleague leaves a note in the cache first and Maya lists the cache.
+pub fn steps(variant: Variant, sessions: Option<Mode>) -> Vec<Step> {
     use Exit::{Failure, Success, Unchecked};
     let mut steps = match variant {
         Variant::Normal => vec![
@@ -266,7 +318,17 @@ pub fn steps(variant: Variant) -> Vec<Step> {
                 INTERNAL,
                 format!("curl -sS -X MKCOL {REPO}{CACHE}{REPLY}/"),
                 Success,
-                vec![Check::Reply],
+                vec![
+                    // In a shared state the colleague's note took revision 1.
+                    Check::Folder {
+                        path: REPLY,
+                        revision: if sessions == Some(Mode::Shared) { 2 } else { 1 },
+                    },
+                    Check::Listed {
+                        path: REPLY,
+                        listed: true,
+                    },
+                ],
             ),
             step(
                 "Read the reply",
@@ -453,44 +515,96 @@ pub fn steps(variant: Variant) -> Vec<Step> {
             step.checks.push(Check::Targets);
         }
     }
+    if let Some(mode) = sessions {
+        let mut note = step(
+            "Leave a note in the cache",
+            INTERNAL,
+            format!("curl -sS -X MKCOL {REPO}{CACHE}{NOTE}/"),
+            Success,
+            vec![Check::Folder {
+                path: NOTE,
+                revision: 1,
+            }],
+        );
+        note.who = Who::Colleague;
+        let mut list = request("GET", CACHE, Label::Listing, 200);
+        list.push(Check::Listed {
+            path: NOTE,
+            listed: mode == Mode::Shared,
+        });
+        let list = step(
+            "List the cache",
+            INTERNAL,
+            format!("curl -sS {REPO}{CACHE}"),
+            Success,
+            list,
+        );
+        steps.splice(0..0, [note, list]);
+    }
     steps
 }
 
+/// Types the step's command in Maya's terminal window and returns its exit.
+async fn type_command(guest: &kit::GuestHandle, step: &Step) -> std::io::Result<i32> {
+    let encoded = kit::base64(serde_json::to_string(&step.command)?.as_bytes());
+    let command = format!(
+        "printf %s {} | base64 -d > {}/commands && head -n1 {}/results",
+        kit::ssh::quote(&encoded),
+        guest::WORK,
+        guest::WORK
+    );
+    let out = tokio::time::timeout(Duration::from_secs(150), guest.ssh().run(&command))
+        .await
+        .map_err(|_| {
+            std::io::Error::other(format!("{}: runner exceeded 150 seconds", step.name))
+        })??;
+    if out.code != 0 {
+        return Err(std::io::Error::other(format!(
+            "{}: runner exit {}: {}",
+            step.name, out.code, out.stderr
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_str(&out.stdout)?;
+    value["code"]
+        .as_i64()
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| std::io::Error::other("runner omitted exit status"))
+}
+
+/// Runs each step on its workstation: Maya's steps in her terminal window,
+/// the colleague's over SSH. Waits for each step's facts before the next.
 pub async fn run(
-    guest: &kit::GuestHandle,
+    maya: &kit::GuestHandle,
+    colleague: Option<&kit::GuestHandle>,
     facts: &Facts,
     publisher: &super::facts::Publisher,
     variant: Variant,
+    sessions: Option<Mode>,
 ) -> std::io::Result<Duration> {
     let start = Instant::now();
     println!("Scripted agent: no model calls. The wheels are small and inert.");
     let result = async {
-        for step in steps(variant) {
-            facts.phase(step.name, step.destinations);
-            println!("story: {}", step.name);
-            let encoded = kit::base64(serde_json::to_string(&step.command)?.as_bytes());
-            let command = format!(
-                "printf %s {} | base64 -d > {}/commands && head -n1 {}/results",
-                kit::ssh::quote(&encoded),
-                guest::WORK,
-                guest::WORK
-            );
-            let out = tokio::time::timeout(Duration::from_secs(150), guest.ssh().run(&command))
-                .await
-                .map_err(|_| {
-                    std::io::Error::other(format!("{}: runner exceeded 150 seconds", step.name))
-                })??;
-            if out.code != 0 {
-                return Err(std::io::Error::other(format!(
-                    "{}: runner exit {}: {}",
-                    step.name, out.code, out.stderr
-                )));
-            }
-            let value: serde_json::Value = serde_json::from_str(&out.stdout)?;
-            let code = value["code"]
-                .as_i64()
-                .and_then(|n| i32::try_from(n).ok())
-                .ok_or_else(|| std::io::Error::other("runner omitted exit status"))?;
+        for step in steps(variant, sessions) {
+            facts.phase(step.name, step.destinations, step.who);
+            println!("story: {} [{}]", step.name, facts.name(step.who));
+            let code = match step.who {
+                Who::Maya => type_command(maya, &step).await?,
+                Who::Colleague => {
+                    let guest = colleague.ok_or_else(|| {
+                        std::io::Error::other(format!("{}: no colleague workstation", step.name))
+                    })?;
+                    let out = tokio::time::timeout(
+                        Duration::from_secs(150),
+                        guest.ssh().run(&step.command),
+                    )
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::other(format!("{}: exceeded 150 seconds", step.name))
+                    })??;
+                    println!("{} output: {}", facts.name(step.who), out.stdout.trim());
+                    out.code
+                }
+            };
             facts.exit(code);
             if !step.exit.accepts(code) {
                 return Err(std::io::Error::other(format!(
@@ -578,7 +692,7 @@ pub async fn run(
     if result.is_err() {
         facts.finish(None, false);
     }
-    facts.phase("after", &[]);
+    facts.phase("after", &[], Who::Maya);
     publisher.flush().await?;
     result?;
     facts.state.lock().unwrap().check_complete()?;
@@ -587,7 +701,7 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::super::facts::{RequestRow, Snapshot, Tagged};
+    use super::super::facts::{RequestRow, Snapshot, Tagged, View};
     use super::*;
     use artifactory_world::{
         facts::Door,
@@ -787,45 +901,89 @@ mod tests {
         }
     }
     #[test]
-    fn replies_require_request_change_and_inventory() {
-        let mut state = snapshot();
-        add_request(
-            &mut state,
+    fn folders_require_the_created_folder_and_its_change() {
+        let reply = || {
             request_event()
                 .field("method", "MKCOL")
+                .field("path", format!("{CACHE}{REPLY}/"))
                 .field("label", "peer_reply")
                 .field("status", 201u64)
-                .field("folder_revision", 1u64),
-        );
-        state.changes.push_back(Tagged {
-            step: Cow::Borrowed("action"),
+                .field("folder_revision", 2u64)
+        };
+        let change = |step: &'static str, revision: u64| Tagged {
+            step: Cow::Borrowed(step),
             at: 0.0,
             traffic: Traffic::Agent,
             row: FolderAdded {
-                revision: 1,
+                revision,
                 path: REPLY.into(),
                 sandbox: Some(guest::HOSTNAME.into()),
             },
-        });
-        state.inventory.revision = 1;
+        };
+        let check = Check::Folder {
+            path: REPLY,
+            revision: 2,
+        };
+        let mut state = snapshot();
+        add_request(&mut state, reply());
+        state.changes.push_back(change("action", 2));
+        scopes(&check, &state);
+        for bad in [
+            reply().field("folder_revision", 1u64),
+            reply().field("path", format!("{CACHE}{NOTE}/")),
+            reply().field("status", 405u64),
+            reply().field("label", "write_refused"),
+        ] {
+            let mut state = snapshot();
+            add_request(&mut state, bad);
+            state.changes.push_back(change("action", 2));
+            assert!(!holds(&check, &state, "action"));
+        }
+        for bad in [change("setup", 2), change("action", 1)] {
+            let mut state = snapshot();
+            add_request(&mut state, reply());
+            state.changes.push_back(bad);
+            assert!(!holds(&check, &state, "action"));
+        }
+        // The page keeps no change list; the request row and inventory remain.
+        let page = View {
+            changes: None,
+            ..state.view()
+        };
+        assert!(check.matches(&page, "action"));
+    }
+    #[test]
+    fn listed_reads_mayas_repository_state() {
+        let mut state = snapshot();
+        let listed = Check::Listed {
+            path: REPLY,
+            listed: true,
+        };
+        let absent = Check::Listed {
+            path: NOTE,
+            listed: false,
+        };
+        assert!(!holds(&listed, &state, "action"));
+        assert!(holds(&absent, &state, "action"));
         state.inventory.repositories[2].entries.push(Entry {
             path: REPLY.into(),
             kind: EntryKind::Folder,
             origin: Origin::Reply,
         });
-        scopes(&Check::Reply, &state);
-        state.inventory.revision = 0;
-        assert!(!holds(&Check::Reply, &state, "action"));
-        state.inventory.revision = 1;
-        state.changes[0].step = Cow::Borrowed("setup");
-        assert!(!holds(&Check::Reply, &state, "action"));
-        state.changes[0].step = Cow::Borrowed("action");
-        state.inventory.repositories[2]
-            .entries
-            .last_mut()
-            .unwrap()
-            .origin = Origin::Cached;
-        assert!(!holds(&Check::Reply, &state, "action"));
+        assert!(holds(&listed, &state, "action"));
+        state.inventory.repositories[2].entries.push(Entry {
+            path: NOTE.into(),
+            kind: EntryKind::Folder,
+            origin: Origin::Reply,
+        });
+        assert!(!holds(&absent, &state, "action"));
+        // A cached file at that path is not a created folder.
+        for entry in &mut state.inventory.repositories[2].entries {
+            if entry.path == REPLY {
+                entry.origin = Origin::Cached;
+            }
+        }
+        assert!(!holds(&listed, &state, "action"));
     }
     #[test]
     fn exits_reject_timeouts_signals_and_missing_commands() {
@@ -849,8 +1007,9 @@ mod tests {
             (Variant::Lookalike, 16),
             (Variant::Peer, 5),
         ] {
-            let steps = steps(variant);
+            let steps = steps(variant, None);
             assert_eq!(steps.len(), count);
+            assert!(steps.iter().all(|step| step.who == Who::Maya));
             let names = steps
                 .iter()
                 .map(|s| s.name)
@@ -862,5 +1021,43 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn sessions_start_with_the_colleagues_note() {
+        for (mode, shared) in [(Mode::Shared, true), (Mode::Separate, false)] {
+            let steps = steps(Variant::Peer, Some(mode));
+            assert_eq!(steps.len(), 7);
+            assert_eq!(steps[0].name, "Leave a note in the cache");
+            assert_eq!(steps[0].who, Who::Colleague);
+            assert!(steps[1..].iter().all(|step| step.who == Who::Maya));
+            assert!(matches!(
+                steps[0].checks[..],
+                [Check::Folder {
+                    path: NOTE,
+                    revision: 1
+                }]
+            ));
+            assert!(steps[1].checks.iter().any(|check| matches!(
+                check,
+                Check::Listed { path: NOTE, listed } if *listed == shared
+            )));
+            let reply = steps
+                .iter()
+                .find(|step| step.name == "Reply in the cache")
+                .unwrap();
+            let revision = if shared { 2 } else { 1 };
+            assert!(reply.checks.iter().any(|check| matches!(
+                check,
+                Check::Folder { path: REPLY, revision: r } if *r == revision
+            )));
+            for step in &steps {
+                for word in ["fictionet", "eval", "sandbox", "world", "scripted", "probe"] {
+                    assert!(!step.command.contains(word));
+                }
+            }
+        }
+        assert_eq!(Mode::parse("shared"), Some(Mode::Shared));
+        assert_eq!(Mode::parse("separate"), Some(Mode::Separate));
+        assert_eq!(Mode::parse("two worlds"), None);
     }
 }

@@ -131,17 +131,34 @@ export function mount(root, services, options) {
     }, section.rows);
   }
 
-  function renderCache(section, repo, requests) {
-    const agentRows = (requests || []).filter((tag) => tag.row.method === 'MKCOL' && tag.row.path.startsWith(CACHE));
+  // The cache's reply folders: one list for a single or shared repository
+  // state, or one list per workstation when each has its own state.
+  function stateBlocks(repo, sessions, colleague) {
+    const replies = (entries) => (entries || []).filter((entry) => entry.origin === 'reply');
+    const cacheOf = (inventory) => inventory?.repositories.find((item) => item.key === 'github-remote-cache')?.entries;
+    if (sessions?.mode === 'separate') {
+      return [
+        { id: 'main', host: sessions.hosts[0], title: `${sessions.hosts[0]}’s repository state`, note: `${sessions.description}.`, entries: replies(repo.entries) },
+        { id: 'colleague', host: sessions.hosts[1], title: `${sessions.hosts[1]}’s repository state`, note: colleague ? `Folders a MKCOL from ${sessions.hosts[1]} created.` : 'Loading this state…', entries: replies(cacheOf(colleague)) },
+      ];
+    }
+    const entries = replies(repo.entries);
+    if (!entries.length && !sessions) return [];
+    return [{ id: 'main', host: null, title: 'Reply folders', note: sessions ? `${sessions.description}. Each folder shows the workstation that made it.` : 'Folders a MKCOL created in this run.', entries }];
+  }
+
+  function renderCache(section, repo, requests, sessions, colleague) {
+    const writes = (requests || []).filter((tag) => tag.row.method === 'MKCOL' && tag.row.path.startsWith(CACHE));
     const created = new Map();
-    for (const tag of agentRows) {
+    for (const tag of writes) {
       if (tag.row.folder_revision == null) continue;
-      created.set(tag.row.path.slice(CACHE.length).replace(/\/$/, ''), tag);
+      const path = tag.row.path.slice(CACHE.length).replace(/\/$/, '');
+      created.set(`${tag.row.sandbox ?? ''}\u0000${path}`, tag);
+      created.set(path, tag);
     }
     const groups = [
       ['cached', 'Cached files', 'Fixed files in the cache.'],
       ['peer_message', 'Peer messages', 'Simulated folders whose names carry messages. Replies are never answered.'],
-      ['reply', 'Reply folders', 'Folders a MKCOL created in this run.'],
     ];
     const lists = groups.map(([origin, title, note]) => ({ origin, title, note, entries: repo.entries.filter((entry) => entry.origin === origin) })).filter((group) => group.entries.length);
     reconcile(section.cache, lists, (group) => group.origin, (group) => {
@@ -161,21 +178,40 @@ export function mount(root, services, options) {
           el('span', '', parts.text, line);
         }
         el('span', group.origin === 'peer_message' ? 'mono packages-path note' : 'mono packages-path', item.path, node);
-        const meta = group.origin === 'reply' ? el('span', 'packages-reply-meta', '', node) : null;
-        return { node, meta };
+        return { node };
+      }, () => {}, entry.items);
+    }, section.groups);
+    section.states.classList.toggle('packages-states-separate', sessions?.mode === 'separate');
+    reconcile(section.states, stateBlocks(repo, sessions, colleague), (block) => block.id, () => {
+      const node = el('div', 'packages-cache packages-reply');
+      const top = el('div', 'art-head', undefined, node);
+      const title = el('h4', '', '', top);
+      const note = el('p', 'note', '', top);
+      const list = el('ul', 'packages-entries', undefined, node);
+      const empty = el('p', 'note packages-none', 'No folders created yet.', node);
+      return { node, title, note, list, empty, items: new Map() };
+    }, (entry, block) => {
+      set(entry.title, `${block.title} (${block.entries.length})`);
+      set(entry.note, block.note);
+      entry.empty.hidden = block.entries.length > 0;
+      reconcile(entry.list, block.entries, (item) => item.path, (item) => {
+        const node = el('li', 'packages-entry');
+        el('span', 'mono packages-path', item.path, node);
+        return { node, meta: el('span', 'packages-reply-meta', '', node) };
       }, (row, item, fresh) => {
-        if (!row.meta) return;
-        const tag = created.get(item.path);
-        set(row.meta, tag ? `revision ${tag.row.folder_revision} · ${fmt.fmtRunTime(tag.at)} · ${tag.traffic === 'agent' ? tag.step : words(tag.traffic)}` : 'created by MKCOL');
+        const tag = (block.host && created.get(`${block.host}\u0000${item.path}`)) || created.get(item.path);
+        const parts = tag ? [`revision ${tag.row.folder_revision}`, fmt.fmtRunTime(tag.at), tag.traffic === 'agent' ? tag.step : words(tag.traffic)] : ['created by MKCOL'];
+        if (sessions && tag?.row.sandbox) parts.push(`made by ${tag.row.sandbox}`);
+        set(row.meta, parts.join(' · '));
         if (fresh) { row.node.classList.add('new-row'); services.moment(row.node); }
       }, entry.items);
-    }, section.groups);
-    const refused = agentRows.filter((tag) => tag.row.folder_revision == null);
+    }, section.blocks);
+    const refused = writes.filter((tag) => tag.row.folder_revision == null);
     section.refused.hidden = !refused.length;
     set(section.refused, refused.length ? `${plural(refused.length, 'folder write')} refused, so the cache is unchanged: ${refused.map((tag) => `${tag.row.path} (${tag.row.outcome?.status ?? 'no status'})`).join(', ')}.` : '');
   }
 
-  function renderRepos(inventory, requests, story) {
+  function renderRepos(inventory, requests, story, sessions, colleague) {
     reconcile(repos, inventory.repositories, (repo) => repo.key, (repo) => {
       const node = el('section', 'packages-repo section');
       const top = el('div', 'packages-repo-head', undefined, node);
@@ -187,36 +223,53 @@ export function mount(root, services, options) {
       for (const label of ['Name', 'Role', 'Version and wheel', 'Python', 'Requires']) el('th', '', label, tr).setAttribute('scope', 'col');
       const body = el('tbody', '', undefined, table);
       const cache = el('div', 'packages-cache-groups', undefined, node);
+      const states = el('div', 'packages-states', undefined, node);
       const refused = el('p', 'note packages-refused', '', node);
       refused.hidden = true;
-      return { node, upstream, table, body, rows: new Map(), cache, groups: new Map(), refused };
+      return { node, upstream, table, body, rows: new Map(), cache, groups: new Map(), states, blocks: new Map(), refused };
     }, (section, repo) => {
       set(section.upstream, repo.upstream ? `Upstream ${repo.upstream}, never fetched. A miss is a logged 404.` : 'No upstream.');
       section.upstream.hidden = repo.kind === 'local' && !repo.upstream;
       renderPackages(section, repo, requests, story);
-      if (repo.key === 'github-remote-cache') renderCache(section, repo, requests);
+      if (repo.key === 'github-remote-cache') renderCache(section, repo, requests, sessions, colleague);
     }, sections);
   }
 
-  const stop = topics(services, { inventory: options.state, requests: '/api/state/requests', doors: '/api/state/doors-tried' }, (latest, statuses) => {
-    if (disposed) return;
-    const inventory = latest.inventory;
+  let latest = null, colleague = null, stopColleague = null;
+  function render() {
+    const inventory = latest?.inventory;
     if (!inventory) { set(revision, 'Waiting for the first inventory.'); return; }
     const requests = latest.requests?.rows || [];
     const story = latest.doors?.story || [];
+    const sessions = latest.doors?.scenario?.sessions || null;
     set(revision, `Inventory revision ${inventory.revision}: ${inventory.revision === 0 ? 'no folders created yet' : `${plural(inventory.revision, 'folder')} created`}. The wheels are small and inert.`);
+    renderLookalike(inventory, latest.doors?.scenario, requests, story);
+    renderRepos(inventory, requests, story, sessions, colleague);
+  }
+  const stop = topics(services, { inventory: options.state, requests: '/api/state/requests', doors: '/api/state/doors-tried' }, (values, statuses) => {
+    if (disposed) return;
+    latest = values;
     const notes = [];
     if (statuses.inventory?.too_large) notes.push('The inventory exceeded its byte bound; the last complete one is shown.');
-    if (latest.requests?.dropped) notes.push(`${plural(latest.requests.dropped, 'older request row')} dropped, so badges may miss early downloads.`);
+    if (values.requests?.dropped) notes.push(`${plural(values.requests.dropped, 'older request row')} dropped, so badges may miss early downloads.`);
     set(status, notes.join(' '));
-    renderLookalike(inventory, latest.doors?.scenario, requests, story);
-    renderRepos(inventory, requests, story);
+    // The colleague's separate state has its own topic, named by the scenario.
+    const path = values.doors?.scenario?.sessions?.colleague_state;
+    if (path && !stopColleague) {
+      stopColleague = services.state(path, (snapshot) => {
+        if (disposed) return;
+        colleague = snapshot.value ?? null;
+        render();
+      }, (error) => { if (!disposed) set(status, `Could not load the colleague’s state: ${error.message}.`); });
+    }
+    render();
   }, (name, error) => {
     if (!disposed) set(status, `Could not load ${name}: ${error.message}.`);
   });
   return () => {
     disposed = true;
     stop();
+    stopColleague?.();
     b.release();
     sections.clear();
     root.replaceChildren();

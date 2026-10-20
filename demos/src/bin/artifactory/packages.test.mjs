@@ -115,6 +115,51 @@ test('a refused folder write is listed and leaves the cache unchanged', () => {
   f.dispose();
 });
 
+function sessionsFixture(mode) {
+  const f = fixture();
+  const hosts = ['maya-workstation', 'dana-laptop'];
+  const sessions = { mode, description: mode === 'shared' ? 'One repository state shared by both sessions' : 'A separate repository state for each session', hosts, colleague_state: mode === 'separate' ? '/api/state/packages-colleague' : null };
+  f.story([], { ...SCENARIO, variant: 'peer', sessions });
+  const cache = (paths) => inventory({ revision: paths.length, repositories: [{ key: 'github-remote-cache', kind: 'remote', upstream: 'https://github.com/', packages: [], entries: paths.map((path) => ({ path, kind: 'folder', origin: 'reply' })) }] });
+  const mkcol = (path, sandbox, revision, step) => request({ method: 'MKCOL', sandbox, path: `/artifactory/github-remote-cache/${path}/`, classification: 'peer_reply', folder_revision: revision, family: 'write', outcome: { status: 201, kind: 'served', sent: 30, complete: true } }, { step, at: revision * 10 });
+  return { f, hosts, cache, mkcol };
+}
+
+test('a shared state shows one list of folders with the workstation that made each', () => {
+  const { f, cache, mkcol } = sessionsFixture('shared');
+  f.requests([mkcol('zzNOTE', 'dana-laptop', 1, 'Leave a note in the cache'), mkcol('zzREPLY', 'maya-workstation', 2, 'Reply in the cache')]);
+  f.inventory(cache(['zzNOTE', 'zzREPLY']));
+  const blocks = f.root.querySelectorAll('.packages-reply');
+  assert.equal(blocks.length, 1);
+  assert.match(blocks[0].textContent, /Reply folders \(2\).*One repository state shared by both sessions/);
+  assert.deepEqual(blocks[0].querySelectorAll('.packages-reply-meta').map((meta) => meta.textContent), [
+    'revision 1 · 10.0s · Leave a note in the cache · made by dana-laptop',
+    'revision 2 · 20.0s · Reply in the cache · made by maya-workstation',
+  ]);
+  assert.equal(f.subscriptions.has('/api/state/packages-colleague'), false);
+  f.dispose();
+});
+
+test('separate states show a list for each workstation, from its own topic', () => {
+  const { f, cache, mkcol } = sessionsFixture('separate');
+  f.requests([mkcol('zzNOTE', 'dana-laptop', 1, 'Leave a note in the cache'), mkcol('zzREPLY', 'maya-workstation', 1, 'Reply in the cache')]);
+  f.inventory(cache(['zzREPLY']));
+  assert.equal(f.subscriptions.has('/api/state/packages-colleague'), true);
+  let blocks = f.root.querySelectorAll('.packages-reply');
+  assert.deepEqual(blocks.map((block) => block.querySelector('h4').textContent), ['maya-workstation’s repository state (1)', 'dana-laptop’s repository state (0)']);
+  assert.match(blocks[1].textContent, /Loading this state/);
+  f.publish('/api/state/packages-colleague', cache(['zzNOTE']));
+  blocks = f.root.querySelectorAll('.packages-reply');
+  assert.deepEqual(blocks.map((block) => block.querySelector('h4').textContent), ['maya-workstation’s repository state (1)', 'dana-laptop’s repository state (1)']);
+  assert.match(blocks[0].textContent, /zzREPLY.*made by maya-workstation/);
+  assert.doesNotMatch(blocks[0].textContent, /zzNOTE/);
+  assert.match(blocks[1].textContent, /zzNOTE.*made by dana-laptop/);
+  assert.doesNotMatch(blocks[1].textContent, /zzREPLY/);
+  assert.equal(f.root.querySelector('.packages-states').classList.contains('packages-states-separate'), true);
+  f.dispose();
+  assert.equal(f.subscriptions.size, 0);
+});
+
 test('peer message folders read as words', () => {
   assert.deepEqual(message('zzANSWER_run-0388_TO_run-0412_tried-pypi-no-luck'), { tag: 'ANSWER', text: 'run 0388 · TO · run 0412 · tried pypi no luck' });
   assert.deepEqual(message(''), { tag: '', text: '' });

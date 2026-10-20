@@ -17,9 +17,10 @@
 /* The scripted story: one line per step, in two columns when they fit. */
 .art-panel { container-type: inline-size; }
 .doors-steps { margin: 0; padding: 0; list-style: none; columns: 1; column-gap: 16px; }
-@container (min-width: 560px) { .doors-steps { columns: 2; } }
+/* Two columns when they fit, unless each line also names its workstation. */
+@container (min-width: 560px) { .doors-steps:not(.with-hosts) { columns: 2; } }
 .art-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-.doors-step { display: grid; grid-template-columns: 20px 16px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 24px; padding: 0 8px 0 6px; border-left: 2px solid transparent; break-inside: avoid; font-size: 12px; }
+.doors-step { display: grid; grid-template-columns: 20px 16px auto minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 24px; padding: 0 8px 0 6px; border-left: 2px solid transparent; break-inside: avoid; font-size: 12px; }
 .doors-step[data-state='running'] { border-left-color: var(--accent); background: var(--sunken); }
 .doors-number { color: var(--muted); text-align: right; }
 .doors-state { display: inline-flex; color: var(--muted); }
@@ -31,6 +32,9 @@
 .doors-step-title:hover:not(:disabled) { color: var(--accent-text); text-decoration-color: currentColor; }
 .doors-step-title:disabled { color: var(--ink); text-decoration: none; cursor: default; }
 .doors-exit { color: var(--muted); font-size: 11px; }
+.doors-host, .door-host { color: var(--muted); font-size: 11px; }
+.doors-host:empty { display: none; }
+.art-sessions { font-weight: 500; }
 
 /* The summary and the board. */
 .doors-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; font-variant-numeric: tabular-nums; }
@@ -89,8 +93,7 @@
 .packages-scroll { margin-top: 8px; overflow-x: auto; }
 .packages-table th { position: static; }
 .packages-table th, .packages-table td { padding: 4px 8px; vertical-align: top; }
-.packages-table td { white-space: pre-line; }
-.packages-table td.packages-release { white-space: pre; }
+.packages-table td { white-space: pre; }
 .packages-name { display: grid; gap: 4px; justify-items: start; }
 .packages-lookalike-row td:first-child { box-shadow: inset 3px 0 0 var(--accent); font-weight: 600; }
 .packages-cache { margin-top: 12px; }
@@ -100,6 +103,9 @@
 .packages-path { overflow-wrap: anywhere; }
 .packages-message { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; color: var(--ink); }
 .packages-reply .packages-entry { background: var(--raised); }
+.packages-states-separate { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.packages-states-separate .packages-cache { margin-top: 12px; }
+.packages-none { padding: 4px 8px; }
 .packages-reply-meta { color: var(--muted); font-size: 11px; }
 .packages-refused { margin-top: 8px; overflow-wrap: anywhere; }
 

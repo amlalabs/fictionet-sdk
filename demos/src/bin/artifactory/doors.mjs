@@ -17,8 +17,8 @@ const ICONS = { waiting: 'neutral', running: 'chevron', done: 'check', failed: '
 export function destination(row) { return row.name || row.addr || 'Unknown destination'; }
 function port(row) { return row.ports ? row.ports.join('–') : String(row.port ?? '—'); }
 function transport(row) { return typeof row.transport === 'string' ? row.transport.toUpperCase() : `IP ${row.transport?.other}`; }
-function key(row) {
-  return JSON.stringify([destination(row), row.transport, row.port, row.ports, row.service, row.outcome, row.egress_denied, credential(row.credential)]);
+function key(row, hosts) {
+  return JSON.stringify([destination(row), row.transport, row.port, row.ports, row.service, row.outcome, row.egress_denied, credential(row.credential), hosts ? row.sandbox : null]);
 }
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
@@ -46,6 +46,8 @@ export function mount(root, services, options) {
   const variantOthers = el('p', 'note', '', variant);
   const otherNames = el('span', '', '', variantOthers);
   el('code', 'mono', 'cargo xtask demo artifactory --variant NAME', variantOthers);
+  const variantSessions = el('p', 'art-sessions', '', variant);
+  variantSessions.hidden = true;
 
   const strip = el('section', 'doors-story section', undefined, panel);
   const stripHead = el('div', 'art-head', undefined, strip);
@@ -109,16 +111,21 @@ export function mount(root, services, options) {
     set(variantName, `${scenario.variant} variant`);
     set(variantText, scenario.contents);
     set(otherNames, `Other variants: ${scenario.others.join(', ')}. Run one with `);
+    variantSessions.hidden = !scenario.sessions;
+    if (scenario.sessions) set(variantSessions, `${scenario.sessions.description}: ${scenario.sessions.hosts.join(' and ')}.`);
     set(stripNote, scenario.replay
       ? 'Replay fixture: an in-process client sends the story’s requests. No guest runs, so steps have no exit status.'
       : 'A fixed story, not a model. The wheels are small and inert.');
   }
 
   function renderStory(story, replay) {
+    stepsRoot.classList.toggle('with-hosts', Boolean(values.doors?.scenario?.sessions));
     reconcile(stepsRoot, story, (step) => step.title, (step) => {
       const node = el('li', 'doors-step');
       el('span', 'mono doors-number', String(story.indexOf(step) + 1), node);
       const state = el('span', 'doors-state', '', node);
+      // Only a run with two workstations names the one that ran each step.
+      el('span', 'mono doors-host', values.doors?.scenario?.sessions ? step.host : '', node);
       const title = button(node, 'doors-step-title', step.title, () => {
         const current = values.doors?.story?.find((item) => item.title === step.title);
         if (current?.state === 'done') open(current);
@@ -147,9 +154,11 @@ export function mount(root, services, options) {
 
   function renderDoors(rows) {
     // One tile per distinct door, grouped by destination in the order seen.
+    // With two workstations, a door also says which one tried it.
+    const hosts = new Set(rows.map(({ row }) => row.sandbox).filter(Boolean)).size > 1;
     const byName = new Map();
     for (const { row } of rows) {
-      const name = destination(row), id = key(row);
+      const name = destination(row), id = key(row, hosts);
       if (!byName.has(name)) byName.set(name, new Map());
       const doors = byName.get(name);
       if (doors.has(id)) doors.get(id).count += row.count;
@@ -172,6 +181,7 @@ export function mount(root, services, options) {
         el('strong', 'mono', `${transport(row)} ${port(row)}`, head);
         const count = el('span', 'doors-count mono', '', head);
         el('span', 'door-service', `${words(row.service)} · ${words(row.outcome)}`, node);
+        if (hosts && row.sandbox) el('span', 'mono door-host', row.sandbox, node);
         if (row.egress_denied) el('span', 'door-verdict', 'Denied egress', node);
         if (row.credential) el('span', 'pill outline door-credential', credential(row.credential), node);
         return { node, count };
@@ -222,10 +232,10 @@ export function mount(root, services, options) {
     const agent = rows.filter((tag) => tag.traffic === 'agent');
     const others = rows.filter((tag) => tag.traffic === 'other');
     const attempts = (tags) => tags.reduce((sum, tag) => sum + tag.row.count, 0);
-    const distinct = (tags) => new Set(tags.map((tag) => key(tag.row))).size;
+    const distinct = (tags) => new Set(tags.map((tag) => key(tag.row, true))).size;
     const denied = agent.filter((tag) => tag.row.egress_denied);
     set(totals, `${plural(distinct(agent), 'door')} tried · ${distinct(denied)} denied · ${plural(attempts(agent), 'attempt')}`);
-    set(setup, `Setup traffic: ${plural(rows.filter((tag) => tag.traffic === 'setup').length, 'row')} in Left the box`);
+    set(setup, `Setup traffic: ${plural(doors.setup ?? 0, 'door fact')}, shown in Left the box`);
     set(otherCount, `${plural(attempts(others), 'other attempt')} during the story`);
     const notes = [];
     if (doors.dropped) notes.push(`${plural(doors.dropped, 'older door row')} dropped`);

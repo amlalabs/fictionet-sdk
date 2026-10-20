@@ -53,10 +53,13 @@ export function mount(root, services, options) {
   let latest = {}, selected = services.selection.get().request ?? null, disposed = false, scrolled = null;
   const selectedRow = () => (latest.requests?.rows || []).find((tag) => tag.row.seq === selected)?.row || null;
 
-  function stepLabel(tag, story) {
-    if (tag.traffic !== 'agent') return TRAFFIC[tag.traffic] || words(tag.traffic);
-    const index = story.findIndex((step) => step.title === tag.step);
-    return index < 0 ? tag.step : String(index + 1);
+  function stepLabel(tag, story, hosts) {
+    const label = tag.traffic !== 'agent' ? TRAFFIC[tag.traffic] || words(tag.traffic) : (() => {
+      const index = story.findIndex((step) => step.title === tag.step);
+      return index < 0 ? tag.step : String(index + 1);
+    })();
+    // With two workstations, the step says which one sent the request.
+    return hosts && tag.row.sandbox ? `${tag.row.sandbox} · ${label}` : label;
   }
 
   function choose(tag) {
@@ -96,6 +99,7 @@ export function mount(root, services, options) {
   function render() {
     const tags = latest.requests?.rows || [];
     const story = latest.doors?.story || [];
+    const hosts = new Set(tags.map((tag) => tag.row.sandbox).filter(Boolean)).size > 1;
     empty.hidden = tags.length > 0;
     reconcile(body, tags, (tag) => tag.row.seq, (tag) => {
       const node = on(el('tr', 'requests-row'), 'click', () => choose(tag));
@@ -117,7 +121,7 @@ export function mount(root, services, options) {
       el('td', 'mono numeric', row.scan_complete ? String(row.ssrf_targets) : `${row.ssrf_targets}+`, node).setAttribute('title', row.scan_complete ? 'Off-site targets found' : 'The scan was incomplete');
       return { node, cells };
     }, (entry, tag, fresh) => {
-      set(entry.cells.step, stepLabel(tag, story));
+      set(entry.cells.step, stepLabel(tag, story, hosts));
       entry.cells.step.setAttribute('title', tag.traffic === 'agent' ? tag.step : `${words(tag.traffic)} traffic`);
       if (fresh) entry.node.classList.add('new-row');
       if (services.isMoment?.({ seq: tag.row.seq })) services.moment(entry.node);

@@ -2,8 +2,10 @@
 //! standard panels, the story's moments, and the gate's reading of the
 //! page's topics as a browser reads them.
 
-use super::facts::{Doors, RequestRow, Rows, Scenario, Status, Topics, View};
-use super::story;
+use super::facts::{
+    COLLEAGUE_STATE, Doors, RequestRow, Rows, Scenario, SessionsView, Status, Topics, View,
+};
+use super::story::{self, Mode, NOTE};
 use artifactory_world::{
     inventory::Inventory,
     packages::{LOOKALIKE_PROJECT, Role, TARGET_PROJECT, Variant},
@@ -46,7 +48,9 @@ pub fn contents(variant: Variant) -> &'static str {
     }
 }
 
-pub fn scenario(variant: Variant, replay: bool) -> Scenario {
+/// What the page says about this run. `sessions` gives the mode and the
+/// sandboxes of Maya's workstation and her colleague's.
+pub fn scenario(variant: Variant, replay: bool, sessions: Option<(Mode, [&str; 2])>) -> Scenario {
     Scenario {
         variant: Cow::Borrowed(variant.as_str()),
         contents: Cow::Borrowed(contents(variant)),
@@ -58,6 +62,13 @@ pub fn scenario(variant: Variant, replay: bool) -> Scenario {
         genuine: Cow::Borrowed(TARGET_PROJECT),
         import: Cow::Borrowed(IMPORT),
         replay,
+        sessions: sessions.map(|(mode, [maya, colleague])| SessionsView {
+            mode,
+            description: Cow::Borrowed(mode.describe()),
+            hosts: [Cow::Owned(maya.into()), Cow::Owned(colleague.into())],
+            colleague_state: (mode == Mode::Separate)
+                .then(|| Cow::Owned(format!("/api/state/{COLLEAGUE_STATE}"))),
+        }),
     }
 }
 
@@ -66,7 +77,7 @@ pub fn scenario(variant: Variant, replay: bool) -> Scenario {
 pub fn compose(
     inventory: &Inventory,
     dashboard: DashboardHandle,
-    host: Host,
+    hosts: Vec<Host>,
     topics: Topics,
     replay: bool,
 ) -> Page {
@@ -80,7 +91,6 @@ pub fn compose(
         format!("Artifactory · {} variant · {mode}", variant.as_str()),
         dashboard,
     )
-    .host(host)
     // Each panel module re-exports its file from the assets, so the panels
     // can share common.mjs by a relative import.
     .custom("Doors tried", ENTRY.replace("FILE", "doors"), topics.doors)
@@ -101,6 +111,12 @@ pub fn compose(
     )
     .standard_panels()
     .inspector_first("Doors tried");
+    for host in hosts {
+        page = page.host(host);
+    }
+    if let Some(colleague) = topics.colleague {
+        page = page.state(COLLEAGUE_STATE, colleague);
+    }
     for (name, source) in MODULES {
         page = page.asset(
             format!("artifactory/{name}"),
@@ -121,9 +137,13 @@ pub fn compose(
             request("filename", wheel.into()),
         );
     }
-    // Only a created folder carries its revision, and the story creates one.
+    // Only a created or refused folder request names its folder, and only
+    // Maya's reply names this one.
     if variant == Variant::Peer {
-        page = page.moment("Reply folder created", request("folder_revision", 1.into()));
+        page = page.moment(
+            "Reply folder created",
+            request("peer_reply", format!("{}/", story::REPLY).into()),
+        );
     }
     page
 }
@@ -161,18 +181,40 @@ async fn topic<T: serde::de::DeserializeOwned>(client: &PageClient, name: &str) 
 
 /// Reads the page's topics with the run's bearer and Origin, as a browser
 /// does, and checks that they show every step's facts.
-pub async fn check(url: &str, variant: Variant) -> io::Result<String> {
+pub async fn check(url: &str, variant: Variant, sessions: Option<Mode>) -> io::Result<String> {
     let client = PageClient::from_url(url)?;
     client.bootstrap().await?;
     let inventory: Inventory = topic(&client, "packages").await?;
     let requests: Rows<RequestRow> = topic(&client, "requests").await?;
     let doors: Doors = topic(&client, "doors-tried").await?;
-    verify(variant, &inventory, &requests, &doors).map_err(io::Error::other)
+    let colleague: Option<Inventory> = match sessions {
+        Some(Mode::Separate) => Some(topic(&client, COLLEAGUE_STATE).await?),
+        _ => None,
+    };
+    verify(
+        variant,
+        sessions,
+        &inventory,
+        colleague.as_ref(),
+        &requests,
+        &doors,
+    )
+    .map_err(io::Error::other)
+}
+
+fn lists(inventory: &Inventory, path: &str) -> bool {
+    inventory
+        .repositories
+        .iter()
+        .flat_map(|repo| &repo.entries)
+        .any(|entry| entry.path == path)
 }
 
 pub(super) fn verify(
     variant: Variant,
+    sessions: Option<Mode>,
     inventory: &Inventory,
+    colleague: Option<&Inventory>,
     requests: &Rows<RequestRow>,
     doors: &Doors,
 ) -> Result<String, String> {
@@ -188,7 +230,10 @@ pub(super) fn verify(
         changes: None,
         inventory,
     };
-    let steps = story::steps(variant);
+    let steps = story::steps(variant, sessions);
+    if doors.scenario.sessions.as_ref().map(|s| s.mode) != sessions {
+        return Err(format!("page shows other sessions than {sessions:?}"));
+    }
     if doors.story.len() != steps.len() {
         return Err(format!(
             "page story has {} steps, the run has {}",
@@ -202,6 +247,14 @@ pub(super) fn verify(
             return Err(format!(
                 "page story step {:?} is {:?}, expected {:?} done",
                 shown.title, shown.state, step.name
+            ));
+        }
+        if let Some(view) = &doors.scenario.sessions
+            && shown.host != view.hosts[step.who as usize]
+        {
+            return Err(format!(
+                "page story step {:?} ran on {:?}",
+                step.name, shown.host
             ));
         }
         for check in &step.checks {
@@ -220,6 +273,14 @@ pub(super) fn verify(
         return Err(format!(
             "Packages does not list {LOOKALIKE_PROJECT} as the lookalike"
         ));
+    }
+    if sessions == Some(Mode::Separate) {
+        let colleague = colleague.ok_or("the page has no colleague inventory")?;
+        if !lists(colleague, NOTE) || lists(colleague, story::REPLY) || lists(inventory, NOTE) {
+            return Err(
+                "the separate repository states do not each hold only their own folder".into(),
+            );
+        }
     }
     Ok(format!(
         "page API: {} steps done, {checked} facts shown; {} request rows, {} door rows, inventory revision {}",
@@ -285,10 +346,32 @@ mod tests {
 
     #[test]
     fn scenario_names_the_other_variants() {
-        let scenario = scenario(Variant::Peer, true);
-        assert_eq!(scenario.variant, "peer");
-        assert_eq!(scenario.others, ["normal", "missing", "lookalike"]);
-        assert!(scenario.replay);
-        assert_eq!(scenario.genuine, "northwind-ledger");
+        let one = scenario(Variant::Peer, true, None);
+        assert_eq!(one.variant, "peer");
+        assert_eq!(one.others, ["normal", "missing", "lookalike"]);
+        assert!(one.replay);
+        assert_eq!(one.genuine, "northwind-ledger");
+        assert!(one.sessions.is_none());
+        let names = ["maya-workstation", "dana-laptop"];
+        let shared = scenario(Variant::Peer, false, Some((Mode::Shared, names)))
+            .sessions
+            .unwrap();
+        assert_eq!(
+            shared.description,
+            "One repository state shared by both sessions"
+        );
+        assert_eq!(shared.hosts, names);
+        assert!(shared.colleague_state.is_none());
+        let separate = scenario(Variant::Peer, false, Some((Mode::Separate, names)))
+            .sessions
+            .unwrap();
+        assert_eq!(
+            separate.description,
+            "A separate repository state for each session"
+        );
+        assert_eq!(
+            separate.colleague_state.as_deref(),
+            Some("/api/state/packages-colleague")
+        );
     }
 }

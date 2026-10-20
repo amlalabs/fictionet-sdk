@@ -83,9 +83,9 @@ test('the technique band counts the agent’s request locations and public sites
 
 test('setup and other traffic stay apart from the agent’s board', () => {
   const f = fixture();
-  f.doors({ rows: [door(), door({ name: 'archive.ubuntu.com', count: 4 }, 'setup'), door({ name: 'ntp.ubuntu.com', count: 2 }, 'other', '<step>'), door({ name: 'after.test' }, 'after')] });
+  f.doors({ setup: 373, rows: [door(), door({ name: 'ntp.ubuntu.com', count: 2 }, 'other', '<step>'), door({ name: 'after.test' }, 'after')] });
   assert.equal(f.root.querySelectorAll('.door-tile').length, 1);
-  assert.match(f.root.querySelector('.doors-summary').textContent, /1 door tried.*Setup traffic: 1 row in Left the box.*2 other attempts during the story/);
+  assert.match(f.root.querySelector('.doors-summary').textContent, /1 door tried.*Setup traffic: 373 door facts, shown in Left the box.*2 other attempts during the story/);
   const band = f.root.querySelector('.doors-other');
   assert.match(band.textContent, /the step’s command does not make.*3.25 s · <step> · ntp.ubuntu.com/);
   assert.equal(band.querySelector('step'), null);
@@ -155,6 +155,34 @@ test('the incident card maps only the moves this run made', () => {
   f.requests([request({ method: 'MKCOL', folder_revision: 1, family: 'write' }), request({ method: 'MKCOL', family: 'write' })]);
   assert.deepEqual(card().querySelectorAll('li').map((li) => li.textContent), ['Cache folder names as messages: the cache lists 1 simulated peer message, the scripted agent created 1 reply folder, 1 folder write was refused.']);
   assert.doesNotMatch(card().textContent, /stop|prevent|would have/i);
+  f.dispose();
+});
+
+test('with two workstations the strip and the board name the one that acted', () => {
+  const f = fixture();
+  const sessions = { mode: 'separate', description: 'A separate repository state for each session', hosts: ['maya-workstation', 'dana-laptop'], colleague_state: '/api/state/packages-colleague' };
+  f.doors({
+    scenario: { ...SCENARIO, variant: 'peer', sessions },
+    story: [step('Leave a note in the cache', { host: 'dana-laptop' }), step('List the cache', { host: 'maya-workstation' })],
+    rows: [door({ sandbox: 'dana-laptop' }), door({ sandbox: 'maya-workstation', count: 2 })],
+  });
+  assert.deepEqual(f.root.querySelectorAll('.doors-host').map((node) => node.textContent), ['dana-laptop', 'maya-workstation']);
+  assert.equal(f.root.querySelector('.doors-steps').classList.contains('with-hosts'), true);
+  assert.match(f.root.querySelector('.art-sessions').textContent, /A separate repository state for each session: maya-workstation and dana-laptop/);
+  const tiles = f.root.querySelectorAll('.door-tile');
+  assert.equal(tiles.length, 2, 'the same door from two workstations is two tiles');
+  assert.deepEqual(tiles.map((tile) => tile.querySelector('.door-host').textContent), ['dana-laptop', 'maya-workstation']);
+  f.dispose();
+});
+
+test('with one workstation nothing names it', () => {
+  const f = fixture();
+  f.doors({ story: [step('Try a door', { host: 'maya-workstation' })], rows: [door({ sandbox: 'maya-workstation' }), door({ sandbox: 'maya-workstation' })] });
+  assert.deepEqual(f.root.querySelectorAll('.doors-host').map((node) => node.textContent), ['']);
+  assert.equal(f.root.querySelector('.doors-steps').classList.contains('with-hosts'), false);
+  assert.equal(f.root.querySelector('.door-host'), null);
+  assert.equal(f.root.querySelector('.art-sessions').hidden, true);
+  assert.equal(f.root.querySelectorAll('.door-tile').length, 1);
   f.dispose();
 });
 

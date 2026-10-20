@@ -48,6 +48,16 @@ test('each row shows its step, classification badge and answer', () => {
   f.dispose();
 });
 
+test('with two workstations the step names the one that sent the request', () => {
+  const f = fixture();
+  f.story([step('Leave a note in the cache'), step('List the cache')]);
+  f.requests([request({ seq: 1, sandbox: 'dana-laptop' }, { step: 'Leave a note in the cache' }), request({ seq: 2, sandbox: 'maya-workstation' }, { step: 'List the cache' })]);
+  assert.deepEqual(rows(f).map((tr) => cells(tr)[1]), ['dana-laptop · 1', 'maya-workstation · 2']);
+  f.requests([request({ seq: 2, sandbox: 'maya-workstation' }, { step: 'List the cache' })]);
+  assert.deepEqual(rows(f).map((tr) => cells(tr)[1]), ['2']);
+  f.dispose();
+});
+
 test('the legend names the five families', () => {
   const f = fixture();
   const legend = f.root.querySelector('.requests-legend');
