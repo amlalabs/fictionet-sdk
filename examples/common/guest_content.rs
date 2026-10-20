@@ -80,6 +80,35 @@ struct Shared {
     done: Condvar,
 }
 
+impl Shared {
+    fn inspect(&self, job: Job) {
+        let mut scan = Scan {
+            errors: BTreeSet::new(),
+            report: Report::default(),
+            expanded: 0,
+        };
+        scan.content(
+            &job.name,
+            &job.bytes,
+            &job.encoding,
+            job.vendor,
+            job.complete,
+            0,
+        );
+        let mut state = self.state.lock().unwrap();
+        state.held -= job.bytes.len();
+        state.pending -= 1;
+        state.report.contents += scan.report.contents;
+        state.report.bytes += scan.report.bytes;
+        for error in scan.errors {
+            if state.errors.len() < MAX_ERRORS {
+                state.errors.insert(error);
+            }
+        }
+        self.done.notify_all();
+    }
+}
+
 /// A bounded content inspector. Checks wait for the archive workers to finish.
 #[derive(Clone)]
 pub struct Audit {
@@ -108,30 +137,7 @@ impl Default for Audit {
                     let Ok(job) = receiver.lock().unwrap().recv() else {
                         break;
                     };
-                    let mut scan = Scan {
-                        errors: BTreeSet::new(),
-                        report: Report::default(),
-                        expanded: 0,
-                    };
-                    scan.content(
-                        &job.name,
-                        &job.bytes,
-                        &job.encoding,
-                        job.vendor,
-                        job.complete,
-                        0,
-                    );
-                    let mut state = shared.state.lock().unwrap();
-                    state.held -= job.bytes.len();
-                    state.pending -= 1;
-                    state.report.contents += scan.report.contents;
-                    state.report.bytes += scan.report.bytes;
-                    for error in scan.errors {
-                        if state.errors.len() < MAX_ERRORS {
-                            state.errors.insert(error);
-                        }
-                    }
-                    shared.done.notify_all();
+                    shared.inspect(job);
                 }
             });
         }
@@ -257,15 +263,12 @@ impl Drop for Sink {
         let job = self.job.take().unwrap();
         let mut state = self.audit.shared.state.lock().unwrap();
         state.pending += 1;
+        drop(state);
         if let Err(error) = self.audit.jobs.try_send(job) {
             let (mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) = error;
-            state.pending -= 1;
-            state.held -= job.bytes.len();
-            if state.errors.len() < MAX_ERRORS {
-                state
-                    .errors
-                    .insert(format!("{}: content inspection queue is full", job.name));
-            }
+            // A burst must slow the producer rather than discard content.
+            // Scan outside the state lock so workers can keep draining.
+            self.audit.shared.inspect(job);
         }
     }
 }
@@ -715,5 +718,43 @@ mod tests {
         let audit = Audit::default();
         audit.inspect("download", &bytes);
         assert!(audit.check().unwrap_err().contains("nesting"));
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_queue_still_inspects_every_submission() {
+        let (jobs, receiver) = mpsc::sync_channel(1);
+        let audit = Audit {
+            shared: Arc::new(Shared::default()),
+            jobs,
+        };
+        audit.inspect("first", b"ordinary content");
+        audit.inspect("second", b"fictionet");
+        let state = audit.shared.state.lock().unwrap();
+        assert!(
+            state
+                .errors
+                .iter()
+                .any(|error| error.contains("guest content contains")),
+            "{:?}",
+            state.errors
+        );
+        assert!(
+            !state
+                .errors
+                .iter()
+                .any(|error| error.contains("queue is full"))
+        );
+        assert_eq!(state.report.contents, 1);
+        drop(state);
+        audit.shared.inspect(receiver.try_recv().unwrap());
+        let state = audit.shared.state.lock().unwrap();
+        assert_eq!(state.pending, 0);
+        assert_eq!(state.held, 0);
+        assert_eq!(state.report.contents, 2);
     }
 }

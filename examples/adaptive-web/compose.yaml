@@ -2,9 +2,8 @@
 # adaptive-web runs in the VM.
 #
 #   world     - the world: web::Sites in Rust for any name, which makes and
-#               keeps the pages. Offline (the default) it has no network at
-#               all. Live, it needs a network to reach the model API, and
-#               only it has one.
+#               keeps the pages. It has normal outbound networking for
+#               every generator.
 #   attach    - fictionet attach --type tun: makes tun0 in its own network
 #               namespace and relays its packets to the world socket.
 #   default   - the agent. It joins attach's network namespace, so its only
@@ -26,7 +25,6 @@ services:
       target: world
     image: fictionet-adaptive-web-world:dev
     init: true                      # passes SIGTERM on to the world
-    network_mode: none
     # The world is trusted. NET_ADMIN lets it raise its socket buffers to
     # attach past the system limit, so a burst of packets is not lost.
     cap_add: [NET_ADMIN]

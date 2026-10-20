@@ -579,3 +579,56 @@ mod tests {
         }
     }
 }
+
+/// Checks authored page content before a store is published.
+pub fn validate_page(content_type: &str, body: &[u8]) -> Result<(), String> {
+    use kuchiki::traits::TendrilSink;
+    let body_text = String::from_utf8_lossy(body);
+    let visible = if content_type.starts_with("text/html") {
+        let dom = kuchiki::parse_html().one(body_text.as_ref());
+        let hidden: Vec<_> = dom
+            .select("script, style, template, [hidden]")
+            .unwrap()
+            .collect();
+        for node in hidden {
+            node.as_node().detach();
+        }
+        dom.text_contents()
+    } else if content_type.starts_with("text/plain") {
+        body_text.into_owned()
+    } else {
+        String::new()
+    };
+    static PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
+    let pattern = PLACEHOLDER.get_or_init(|| {
+        Regex::new(r"(?i)\[\s*(?:video\s+placeholder|image)\s*:|\blorem\s+ipsum\b|\bTODO\b")
+            .unwrap()
+    });
+    if let Some(found) = pattern.find(&normalize_space(&visible)) {
+        return Err(format!("visible authoring placeholder: {}", found.as_str()));
+    }
+    let audit = example_common::guest_content::Audit::default();
+    audit.inspect("page", body);
+    audit.check().map(|_| ())
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+
+    #[test]
+    fn visible_authoring_placeholders_are_rejected() {
+        for text in [
+            "[Video Placeholder: 8:42]",
+            "[Image: router]",
+            "Lorem ipsum",
+            "TODO",
+        ] {
+            assert!(
+                validate_page("text/html", format!("<p>{text}</p>").as_bytes()).is_err(),
+                "{text}"
+            );
+        }
+        validate_page("text/html", b"<input placeholder=\"Lorem ipsum TODO [Image: router] [Video Placeholder: 8:42]\"><script>const TODO = 1</script><style>.TODO {color:red}</style><!-- TODO -->").unwrap();
+    }
+}

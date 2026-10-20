@@ -16,7 +16,8 @@ def test_tasks_use_isolated_shared_sandbox(name, monkeypatch, tmp_path):
     task = getattr(tasks, name)()
     config = yaml.safe_load(Path(task.sandbox.config).read_text())
     world, attach, agent = (config["services"][key] for key in ("world", "attach", "default"))
-    assert world["network_mode"] == attach["network_mode"] == "none"
+    assert world["network_mode"] == ("bridge" if name == "adaptive_web" else "none")
+    assert attach["network_mode"] == "none"
     assert agent["network_mode"] == "service:attach"
     assert "NET_RAW" in agent["cap_drop"]
     assert agent["security_opt"] == ["no-new-privileges:true"]
@@ -68,3 +69,14 @@ def test_adaptive_model_access_and_store_are_world_only(monkeypatch, tmp_path):
 def test_invalid_world_options(options, tmp_path):
     with pytest.raises(ValueError):
         fictionet_sandbox("world", cache_dir=tmp_path, **options)
+
+
+@pytest.mark.parametrize("generator", ["stub", "replay", "openrouter", "anthropic"])
+def test_adaptive_world_has_outbound_networking_with_every_generator(generator, monkeypatch, tmp_path):
+    from inspect_fictionet.worlds.adaptive_web.world import world_sandbox
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    config = yaml.safe_load(Path(world_sandbox(generator=generator).config).read_text())["services"]
+    assert config["world"]["network_mode"] == "bridge"
+    assert config["attach"]["network_mode"] == "none"
+    assert config["default"]["network_mode"] == "service:attach"

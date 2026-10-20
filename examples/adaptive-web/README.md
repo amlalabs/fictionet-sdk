@@ -102,11 +102,10 @@ first argument. Its string fields are:
 | `store` | absolute store directory; live browsing defaults to `examples/adaptive-web/store` |
 
 Only `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY` come from the environment.
-The launcher selects `bridge` networking for model providers and `none` for
-stub or replay. Compose users set the world's command and network mode in
-the Compose file.
+The world has normal outbound networking with every generator, both in the
+launcher and in Compose. Compose users select a generator in the world's command.
 
-Only the world container gets a network, and only in live mode. The
+The trusted world container can reach the internet. The
 agent's container stays in attach's network namespace, whose only interface
 leads into the world.
 

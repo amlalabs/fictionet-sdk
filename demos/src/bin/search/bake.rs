@@ -16,7 +16,7 @@ use adaptive_web_world::pages::{
     model::{Model, Provider},
     render,
     store::{self, Store},
-    text::target_of,
+    text::{target_of, validate_page},
 };
 use fictionet_extras::models::{Https, Key};
 use fictionet_extras::search::Engine;
@@ -148,6 +148,11 @@ pub async fn run() -> Result {
     println!("{dropped} results without a page dropped from their lists");
     let laid_out = lay_out_again(&root, &seed)?;
     println!("{laid_out} pages on captured layouts laid out again");
+    let (store, _) = Store::load(&root, &seed)?;
+    for page in store.pages() {
+        validate_page(&page.content_type, &page.body)
+            .map_err(|error| format!("{}: {error}", page.url))?;
+    }
     // The lock files only coordinate worlds writing one store.
     let _ = std::fs::remove_file(root.join("store.lock"));
     let _ = std::fs::remove_dir_all(root.join("locks"));

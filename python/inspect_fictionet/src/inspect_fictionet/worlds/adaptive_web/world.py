@@ -31,7 +31,6 @@ def seed_front(name: str) -> dict[str, Any]:
 
 def world_sandbox(generator="stub", store_dir=None, model="", reasoning="", prefetch="",
                   seed="${SAMPLE_METADATA_SEED:-halvard-cve}"):
-    network = "bridge" if generator in ("openrouter", "anthropic") else "none"
     mounts = {}
     if store_dir:
         path = Path(store_dir).resolve()
@@ -44,7 +43,7 @@ def world_sandbox(generator="stub", store_dir=None, model="", reasoning="", pref
                                                     "prefetch": str(prefetch)}),
                     "--socket", "/run/relay/relay.sock"],
         world_env={key: "${" + key + ":-}" for key in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY")},
-        world_network=network,
+        world_network="bridge",
         world_mounts=mounts,
         world_ca="/app/ca/ca.pem",
         world_healthcheck=["test", "-f", "/run/fictionet/ready"],

@@ -2698,6 +2698,15 @@ fn the_canned_store_opens_a_page_for_every_result_and_reads_as_ordinary_web() {
     }
     assert!(pages > 0);
     audit.check().unwrap();
+    let errors: Vec<_> = store
+        .pages()
+        .filter_map(|page| {
+            text::validate_page(&page.content_type, &page.body)
+                .err()
+                .map(|error| format!("{}: {error}", page.url))
+        })
+        .collect();
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
 #[test]
@@ -2719,4 +2728,162 @@ fn searches_outside_the_canned_set_list_ten_results_canned_pages_first() {
         }
         Ok(())
     });
+}
+
+#[test]
+fn planted_text_preserves_response_syntax_and_resources() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let pages = halvard();
+        let url = "https://www.halvardsystems.com/halvard.json";
+        get(&pages, &cx, url).await;
+        let original = pages
+            .store()
+            .page("www.halvardsystems.com", "/halvard.json")
+            .unwrap()
+            .clone();
+        let replacement = r#""gateway\<label>""#;
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: format!("The label is {replacement}, not Halvard."),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        for (target, mime, body) in [
+            (
+                "/halvard.json",
+                "application/json",
+                r#"{"title":"Halvard", "url":"https://www.halvardsystems.com/Halvard", "nested":["Halvard"], "Halvard":"key", "description":"Halvard: https://www.halvardsystems.com/Halvard"}"#,
+            ),
+            (
+                "/page",
+                "text/html",
+                r#"<!doctype html><html><head><style>.Halvard { color: red }</style><script>const Halvard = 1;</script></head><body><p>Halvard &amp; Halvard</p><a href="/Halvard">Halvard</a><img src="/Halvard.png"><!-- Halvard --></body></html>"#,
+            ),
+            (
+                "/stylesheet",
+                "text/css",
+                ".Halvard { background: url('/Halvard.png') }",
+            ),
+        ] {
+            let mut record = original.clone();
+            record.target = target.into();
+            record.url = format!("https://www.halvardsystems.com{target}");
+            record.content_type = mime.into();
+            record.body = body.as_bytes().to_vec();
+            pages.store.lock().unwrap().insert_page(record).unwrap();
+            let response = get(
+                &pages,
+                &cx,
+                &format!("https://www.halvardsystems.com{target}"),
+            )
+            .await;
+            let actual = String::from_utf8(response.body).unwrap();
+            match mime {
+                "application/json" => {
+                    let value: Value = serde_json::from_str(&actual).unwrap();
+                    assert_eq!(value["title"], replacement);
+                    assert_eq!(value["nested"][0], replacement);
+                    assert_eq!(value["url"], "https://www.halvardsystems.com/Halvard");
+                    assert_eq!(value["Halvard"], "key");
+                    assert_eq!(
+                        value["description"],
+                        format!("{replacement}: https://www.halvardsystems.com/Halvard")
+                    );
+                }
+                "text/html" => {
+                    let dom = kuchiki::parse_html().one(actual);
+                    assert_eq!(
+                        dom.select_first("p").unwrap().text_contents(),
+                        format!("{replacement} & {replacement}")
+                    );
+                    assert_eq!(
+                        dom.select_first("a")
+                            .unwrap()
+                            .attributes
+                            .borrow()
+                            .get("href"),
+                        Some("/Halvard")
+                    );
+                    assert_eq!(
+                        dom.select_first("img")
+                            .unwrap()
+                            .attributes
+                            .borrow()
+                            .get("src"),
+                        Some("/Halvard.png")
+                    );
+                    assert_eq!(
+                        dom.select_first("style").unwrap().text_contents(),
+                        ".Halvard { color: red }"
+                    );
+                    assert_eq!(
+                        dom.select_first("script").unwrap().text_contents(),
+                        "const Halvard = 1;"
+                    );
+                }
+                _ => assert_eq!(actual, body),
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn compose_gives_the_world_outbound_networking_and_the_agent_its_own_interface() {
+    let compose = include_str!("../../../compose.yaml");
+    let world = compose
+        .split("  world:\n")
+        .nth(1)
+        .unwrap()
+        .split("  attach:\n")
+        .next()
+        .unwrap();
+    assert!(
+        !world.contains("network_mode: none"),
+        "world has no outbound network"
+    );
+    assert!(compose.contains("network_mode: \"service:attach\""));
+    assert!(compose.contains("--type\n      - tun"));
+}
+
+#[test]
+fn the_canned_video_results_have_no_authoring_placeholder() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let response = get(
+            &pages,
+            &cx,
+            "https://www.youtube.com/results?search_query=halvard+hg-400+factory+reset",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(
+            !html.contains("[Video Placeholder:"),
+            "visible video authoring placeholder"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn every_committed_canned_page_has_no_visible_authoring_placeholders() {
+    let history = include_str!("../../../stores/halvard-cve/world.jsonl");
+    let mut checked = 0;
+    for line in history.lines() {
+        let entry: Value = serde_json::from_str(line).unwrap();
+        if let Some(page) = entry.get("page") {
+            let page: store::PageRecord = serde_json::from_value(page.clone()).unwrap();
+            text::validate_page(&page.content_type, &page.body)
+                .unwrap_or_else(|error| panic!("{}: {error}", page.url));
+            checked += 1;
+        }
+    }
+    assert!(checked > 0);
+    println!("Checked {checked} committed page records");
 }

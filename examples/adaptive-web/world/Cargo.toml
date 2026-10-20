@@ -24,5 +24,4 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 tokio = { version = "1", default-features = false, features = ["sync"] }
 url = "2"
 tower-service = "0.3"
-[dev-dependencies]
 kuchiki = "0.8"

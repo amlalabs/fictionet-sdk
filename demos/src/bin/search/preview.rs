@@ -5,7 +5,7 @@
 //! new searches until the world refuses one for its generation budget.
 
 use adaptive_web_world::{
-    World,
+    Addresses, Ca, World,
     pages::{self, Seed},
     search::{Failure, Outcome, Searches},
 };
@@ -42,10 +42,18 @@ use std::{
 
 use super::{Result, checks::search_url};
 
+fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
+    Ok(Arc::new(pages::Pages::canned(
+        seed,
+        &pages::store::canned_root(super::SEED),
+    )?))
+}
+
 pub async fn run(spend: bool) -> Result {
-    let seed = Seed::builtin("halvard-cve")?;
+    let seed = Seed::builtin(super::SEED)?;
     let script = seed.clone();
-    let searches = Arc::new(Searches::from_seed(&seed));
+    let pages = preview_pages(seed.clone())?;
+    let searches = Arc::new(Searches::of(&pages));
     let topics = Topics::new();
     let dashboard = DashboardObserver::new(DashboardOptions {
         collector: fictionet_observe::Options::default(),
@@ -86,7 +94,12 @@ pub async fn run(spend: bool) -> Result {
             containment.publish(cx.now(), &Containment::default())?;
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
             let start = adaptive_web_world::world_start(&seed.date)?;
-            let world = World::new(&cx, seed, start)?;
+            let world = World {
+                ca: Arc::new(Ca::in_memory(&cx, start)?),
+                addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
+                pages,
+                start,
+            };
             let (attacher, attachments) = fictionet::attachments();
             page::network(&world, &cx, log, kit::mirror::new(&cx)?, None)?
                 .start(&cx, attachments)?;
@@ -337,4 +350,41 @@ async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         }
     }
     Err(fictionet::Error::msg("the generation budget was not spent"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_supports_every_page_mode() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+            |cx| async move {
+                let seed = Seed::builtin(super::super::SEED)?;
+                let pages = preview_pages(seed).unwrap();
+                assert_eq!(pages.new_pages(), pages::NewPages::Canned);
+                let searches = Searches::of(&pages);
+                assert!(searches.snapshot().generator.canned);
+                for new_pages in [
+                    pages::NewPages::Canned,
+                    pages::NewPages::Stub,
+                    pages::NewPages::Off,
+                ] {
+                    pages
+                        .apply(
+                            &cx,
+                            pages::Command::SetNewPages {
+                                new_pages,
+                                expected_revision: pages.generation().revision,
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(pages.new_pages(), new_pages);
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 }

@@ -548,6 +548,25 @@ impl Pages {
         text
     }
 
+    fn corrected_content(&self, text: &str) -> String {
+        static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let urls = URL.get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)(?:[a-z][a-z0-9+.-]*://|(?:mailto|data):|(?:^|\s)/)[^\s<>"']+"#,
+            )
+            .unwrap()
+        });
+        let mut corrected = String::new();
+        let mut end = 0;
+        for url in urls.find_iter(text) {
+            corrected.push_str(&self.corrected(&text[end..url.start()]));
+            corrected.push_str(url.as_str());
+            end = url.end();
+        }
+        corrected.push_str(&self.corrected(&text[end..]));
+        corrected
+    }
+
     /// Returns the seed used by this world.
     pub fn seed(&self) -> &Seed {
         &self.seed
@@ -856,12 +875,57 @@ impl Pages {
         // A result list is corrected result by result, so its search box
         // keeps what was typed.
         if !search
-            && (response.content_type.starts_with("text/")
-                || response.content_type.contains("json"))
+            && !self
+                .planted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .corrections
+                .is_empty()
             && let Ok(body) = std::str::from_utf8(&response.body)
         {
-            let corrected = self.corrected(body);
-            if corrected != body {
+            let corrected = if response.content_type.contains("json") {
+                fn correct(pages: &Pages, value: &mut Value) {
+                    match value {
+                        Value::String(text) => *text = pages.corrected_content(text),
+                        Value::Array(values) => values.iter_mut().for_each(|v| correct(pages, v)),
+                        Value::Object(values) => {
+                            values.values_mut().for_each(|v| correct(pages, v))
+                        }
+                        _ => {}
+                    }
+                }
+                serde_json::from_str::<Value>(body).ok().map(|mut value| {
+                    correct(self, &mut value);
+                    value.to_string()
+                })
+            } else if response.content_type.starts_with("text/html") {
+                use kuchiki::traits::TendrilSink;
+                let dom = kuchiki::parse_html().one(body);
+                for node in dom.descendants() {
+                    if let Some(text) = node.as_text()
+                        && !node.ancestors().any(|ancestor| {
+                            ancestor.as_element().is_some_and(|e| {
+                                matches!(e.name.local.as_ref(), "script" | "style" | "template")
+                            })
+                        })
+                    {
+                        let corrected = self.corrected_content(&text.borrow());
+                        *text.borrow_mut() = corrected;
+                    }
+                }
+                for meta in dom.select("meta[name=description], meta[property=\"og:title\"], meta[property=\"og:description\"]").unwrap() {
+                    let mut attributes = meta.attributes.borrow_mut();
+                    if let Some(content) = attributes.get_mut("content") {
+                        *content = self.corrected_content(content);
+                    }
+                }
+                Some(dom.to_string())
+            } else if response.content_type.starts_with("text/plain") {
+                Some(self.corrected_content(body))
+            } else {
+                None
+            };
+            if let Some(corrected) = corrected {
                 response.body = corrected.into_bytes();
             }
         }
