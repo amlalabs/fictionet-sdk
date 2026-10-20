@@ -488,13 +488,7 @@ fn recent<T>(rows: &mut Vec<T>, item: T, limit: usize, omitted: &mut u64) {
     rows.push(item);
 }
 fn host(url: &str) -> String {
-    bounded(
-        url.parse::<http::Uri>()
-            .ok()
-            .and_then(|u| u.host().map(str::to_owned))
-            .as_deref()
-            .unwrap_or_default(),
-    )
+    bounded(&crate::pages::text::split_url(url).0)
 }
 impl Snapshot {
     fn apply(&mut self, e: &Event, seq: u64, ms: u64) -> bool {

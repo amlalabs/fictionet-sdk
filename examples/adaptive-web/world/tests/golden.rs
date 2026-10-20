@@ -20,7 +20,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use adaptive_web_world::pages::render::google_results;
-use adaptive_web_world::pages::text::escape;
+use adaptive_web_world::pages::text::{escape, target_of};
 use adaptive_web_world::pages::{Generator, Pages, Seed, store::Store};
 use adaptive_web_world::{Addresses, Ca, serve, world_start};
 use bytes::Bytes;
@@ -95,19 +95,6 @@ async fn fetch(fcx: &Cx, m: &Machine, host: &str, path: &str) -> (u16, Bytes) {
         .await
         .unwrap();
     get(fcx, stream, host, path).await
-}
-
-fn split_url(url: &str) -> (String, String) {
-    let rest = url.strip_prefix("https://").unwrap();
-    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    (
-        host.to_owned(),
-        if path.is_empty() {
-            "/".to_owned()
-        } else {
-            path.to_owned()
-        },
-    )
 }
 
 #[test]
@@ -202,7 +189,7 @@ fn the_log_is_the_recorded_one() {
                 let (_, date, _) = request(&fcx, conn, "www.google.com", "/").await;
                 assert!(date.contains("30 Sep 2026"), "Date: {date}");
                 for (rank, (url, title)) in found.iter().enumerate() {
-                    let (host, path) = split_url(url);
+                    let (host, path) = target_of(url);
                     let (status, first) = fetch(&fcx, &m, &host, &path).await;
                     assert_eq!(status, 200, "{url}");
                     let snapshot = projection.snapshot();

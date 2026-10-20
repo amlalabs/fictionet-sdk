@@ -6,12 +6,12 @@ use super::{
 };
 use crate::route::Engine;
 
-/// Formats a URL as a host and up to three path segments.
+/// Formats a URL as a host and up to three decoded path segments.
 pub fn display_url(url: &str) -> String {
     let (mut host, path, _) = split_url(url);
     for part in path.split('/').filter(|p| !p.is_empty()).take(3) {
         host.push_str(" › ");
-        host.push_str(part);
+        host.push_str(&percent_encoding::percent_decode_str(part).decode_utf8_lossy());
     }
     host
 }

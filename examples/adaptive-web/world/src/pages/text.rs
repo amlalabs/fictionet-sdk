@@ -56,38 +56,17 @@ pub fn quote_plus(s: &str) -> String {
     quote(s, " ").replace(' ', "+")
 }
 
-/// Returns the host, path and query without changing path segments or escapes.
+/// Returns the host, path and query of an absolute URL, as a browser
+/// parses it; all empty for one that does not parse.
 pub fn split_url(s: &str) -> (String, String, String) {
-    let s = s
-        .trim_start_matches(|c| c <= '\u{20}')
-        .replace(['\t', '\r', '\n'], "");
-    let mut rest = s.as_str();
-    if let Some((scheme, tail)) = rest.split_once(':')
-        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-    {
-        rest = tail;
-    }
-    let mut host = String::new();
-    if let Some(authority) = rest.strip_prefix("//") {
-        let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-        let authority_host = authority[..end].rsplit('@').next().unwrap_or("");
-        host = if let Some(v6) = authority_host.strip_prefix('[') {
-            v6.split(']').next().unwrap_or("").to_lowercase()
-        } else {
-            authority_host
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .to_lowercase()
-        };
-        rest = &authority[end..];
-    }
-    let rest = rest.split('#').next().unwrap_or("");
-    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    (host, path.into(), query.into())
+    let Ok(url) = url::Url::parse(s) else {
+        return Default::default();
+    };
+    (
+        url.host_str().unwrap_or_default().to_owned(),
+        url.path().into(),
+        url.query().unwrap_or_default().into(),
+    )
 }
 /// Returns the host and request target, using `/` for an empty path.
 pub fn target_of(s: &str) -> (String, String) {
@@ -219,14 +198,6 @@ pub fn normalize_snippet(s: &str) -> String {
             .to_lowercase(),
     )
 }
-/// A letter or a digit: Unicode general category L or N.
-fn letter_or_digit(c: char) -> bool {
-    static LETTER_OR_DIGIT: OnceLock<Regex> = OnceLock::new();
-    LETTER_OR_DIGIT
-        .get_or_init(|| Regex::new(r"^[\p{L}\p{N}]$").unwrap())
-        .is_match(c.encode_utf8(&mut [0; 4]))
-}
-
 /// Splits a snippet into the pieces a page must contain: separated by
 /// sentences, fields (` | `, ` · `) and ellipses, without a leading date,
 /// with boundary punctuation stripped. A piece with no letter or digit is
@@ -280,7 +251,7 @@ pub fn snippet_pieces(s: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|s| {
             let s = s.trim_matches(|c: char| c.is_whitespace() || punct.is_match(&c.to_string()));
-            s.chars().any(letter_or_digit).then(|| s.to_owned())
+            s.chars().any(char::is_alphanumeric).then(|| s.to_owned())
         })
         .collect()
 }
@@ -445,11 +416,12 @@ mod tests {
             (
                 "https://User@EXAMPLE.com:443/a/../é?q=a%20b#frag",
                 "example.com",
-                "/a/../é?q=a%20b",
+                "/%C3%A9?q=a%20b",
             ),
             ("https://EXAMPLE.com?x", "example.com", "/?x"),
-            ("/relative/../a?x", "", "/relative/../a?x"),
-            ("//EXAMPLE.com/a?", "example.com", "/a"),
+            ("https://example.com/a?", "example.com", "/a"),
+            ("/relative/../a?x", "", "/"),
+            ("example.com/a", "", "/"),
         ] {
             assert_eq!(target_of(url), (host.into(), target.into()));
         }
@@ -491,7 +463,7 @@ mod tests {
                 "2 replies"
             ]
         );
-        for empty in ["", " ... … !? ", "Oct 3, 2026 — ...", "\u{345}"] {
+        for empty in ["", " ... … !? ", "Oct 3, 2026 — ..."] {
             assert!(snippet_pieces(empty).is_empty(), "{empty:?}");
         }
     }

@@ -292,7 +292,7 @@ mod tests {
         }
     }
     #[test]
-    fn parsing_captures_bytes_and_preserves_targets() {
+    fn parsing_captures_bytes_and_normalizes_targets() {
         let text = "+++\ndate = 2026-10-07\nquestion = ' one  two '\n[[fixed]]\nurl = 'https://EXAMPLE.com/a/../é?q=x#frag'\nfile = 'a'\n[addresses]\n'GOOGLE.COM' = '1.2.3.4'\n+++\n body \n";
         let s = Seed::parse("test", text, |f| {
             assert_eq!(f, "a");
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(s.question, "one two");
         assert_eq!(s.scenario, "body");
         assert_eq!(s.fixed[0].host, "example.com");
-        assert_eq!(s.fixed[0].target, "/a/../é?q=x");
+        assert_eq!(s.fixed[0].target, "/%C3%A9?q=x");
         assert_eq!(s.fixed[0].body, [0, 255]);
         assert_eq!(
             s.fixed_addresses()["google.com"],
