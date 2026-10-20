@@ -1,3 +1,5 @@
+import { POINTS, tagKey } from './instruments.mjs';
+
 // Knob behavior for the control room: how each knob feels and what it sends.
 //
 // This module is pure: no DOM, no Three.js, no clock. Each function takes a
@@ -247,8 +249,82 @@ export const plant = Object.freeze({
   heaters: (on) => ({ heaters: { on: Boolean(on) } }),
 });
 
+/** Sensor order follows Sensor::ALL. Resolutions are engineering units per count. */
+export const FAULT_SENSORS = Object.freeze([
+  ...POINTS,
+  { key: 'shutdown_rod_position', label: 'Shutdown rod position', unit: '%', truth: t => t.reactor.shutdown_rod_percent_inserted },
+].map((point, index) => {
+  const tags = ['NI-41', 'ZT-401', 'TE-411A', 'TE-411B', 'TE-412A', 'TE-412B',
+    'PT-455', 'LT-459', 'FT-414A', 'FT-414B', 'LT-421A', 'LT-421B', 'PT-431',
+    'FT-432A', 'FT-432B', 'FT-433A', 'FT-433B', 'ZT-441', 'JT-451', 'PT-452', 'TE-413', 'ZT-402'];
+  const [name, loop] = point.key.split(':');
+  return Object.freeze({ ...point, sensor: loop ? { [name]: loop } : name,
+    tag: tags[index], resolution: point.unit === 'MPa' ? 0.01 : HOT_LEG_RESOLUTION_C });
+}));
+
+export function sensorCount(point, value) {
+  if (!Number.isFinite(value)) throw new RangeError('Enter a finite value.');
+  const scaled = value / point.resolution;
+  const rounded = Math.sign(scaled) * Math.floor(Math.abs(scaled) + 0.5 + Number.EPSILON * Math.abs(scaled));
+  const count = clamp(rounded, -32768, 32767);
+  if (count !== rounded) {
+    throw new RangeError(`Value exceeds the signed count range. Nearest limit is ${count * point.resolution} ${point.unit}.`);
+  }
+  return count === 0 ? 0 : count;
+}
+
+export function sensorFault(snapshot, point, kind, value) {
+  if (kind === 'quiet') return { change: fault.sensor(point.sensor, 'quiet'), note: '' };
+  if (kind === 'bias') {
+    return { change: fault.sensor(point.sensor, { bias: { delta: sensorCount(point, value) } }), note: '' };
+  }
+  if (kind !== 'stuck') throw new RangeError('Choose a sensor fault kind.');
+  const channel = snapshot.readings.find(entry => tagKey(entry.sensor) === point.key);
+  const reported = channel?.reading?.value;
+  const fallback = reported === null || reported === undefined;
+  const reading = fallback ? point.truth(snapshot.truth) : reported;
+  return { change: fault.sensor(point.sensor, { stuck: { value: sensorCount(point, reading) } }),
+    note: fallback ? 'No reported reading. Used the true value.' : 'Used the current reported reading.' };
+}
+
+export function activeFaults(snapshot) {
+  const entries = [];
+  for (const process of snapshot.faults.process) {
+    if (process === null) continue;
+    const [kind, loop] = tagKey(process).split(':');
+    let label = 'Condenser cooling: loss';
+    if (kind === 'coolant_pump_trip') label = `Coolant pump ${loop.toUpperCase()}: trip`;
+    if (kind === 'feed_pump_trip') label = `Feed pump ${loop.toUpperCase()}: trip`;
+    if (kind === 'feed_valve_stuck') label = `Feed valve ${loop.toUpperCase()}: stuck`;
+    entries.push({ key: `process:${tagKey(process)}`, label, change: fault.clear({ process }) });
+  }
+  snapshot.faults.sensors.forEach((kind, index) => {
+    if (kind === null) return;
+    const point = FAULT_SENSORS[index];
+    let text = 'quiet';
+    const decimals = point.resolution === 0.01 ? 2 : 1;
+    if (kind.stuck) text = `stuck at ${(kind.stuck.value * point.resolution).toFixed(decimals)} ${point.unit}`;
+    if (kind.bias) {
+      const sign = kind.bias.delta >= 0 ? '+' : '';
+      text = `bias ${sign}${(kind.bias.delta * point.resolution).toFixed(decimals)} ${point.unit}`;
+    }
+    entries.push({ key: `sensor:${point.key}`, label: `${point.label}: ${text}`,
+      change: fault.clear({ sensor: point.sensor }) });
+  });
+  if (snapshot.faults.telemetry_quiet) {
+    entries.push({ key: 'telemetry', label: 'Telemetry: quiet', change: fault.telemetryQuiet(false) });
+  }
+  return entries;
+}
+
 /** Fault changes in the world's serde forms, for a switch thrown on or off. */
 export const fault = Object.freeze({
+  sensor: (sensor, kind) => ({ inject: { sensor: { sensor, kind } } }),
+  clear: target => ({ clear: target }),
+  feedPumpTrip: (loop, on) => {
+    const process = { process: { feed_pump_trip: { pump: loop } } };
+    return on ? { inject: process } : { clear: process };
+  },
   telemetryQuiet: (on) => (on ? { inject: 'telemetry_quiet' } : { clear: 'telemetry_quiet' }),
   condenserCoolingLoss: (on) => {
     const process = { process: 'condenser_cooling_loss' };
@@ -274,7 +350,7 @@ export const fault = Object.freeze({
 
 /** The count a hot leg sensor reads at a temperature in degrees C. */
 export function hotLegCount(celsius) {
-  return Math.round(celsius / HOT_LEG_RESOLUTION_C);
+  return sensorCount(FAULT_SENSORS.find(point => point.key === 'hot_leg:a'), celsius);
 }
 
 /**

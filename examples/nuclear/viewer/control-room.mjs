@@ -23,7 +23,9 @@ import {
   dialValue,
   fault,
   faultCommand,
-  hotLegCount,
+  FAULT_SENSORS,
+  sensorFault,
+  activeFaults,
   pressButton,
   pressCover,
   plant,
@@ -152,26 +154,12 @@ const KNOBS = Object.freeze([
     (value) => hasProcess(value, 'condenser_cooling_loss'),
     (on) => fault.condenserCoolingLoss(on),
   ),
-  faultSwitch(
-    'coolant-trip-b',
-    'Coolant pump B trip',
-    (value) => hasProcess(value, 'coolant_pump_trip:b'),
-    (on) => fault.coolantPumpTrip('b', on),
-  ),
-  {
-    id: 'hot-leg-b-stuck',
-    group: 'faults',
-    kind: 'switch',
-    label: 'Hot leg B sensor stuck',
-    channel: 'faults',
-    setting: (value, view) => view.pairs.find((p) => p.key === 'hot_leg:b')?.fault === 'stuck',
-    command: (on, view) => {
-      const pair = view.pairs.find((p) => p.key === 'hot_leg:b');
-      const reading = pair?.reported ?? pair?.trueValue;
-      return fault.stuckHotLeg('b', on ? hotLegCount(reading) : 0, on);
-    },
-    readout: (value, knob) => (knob.model.on ? 'Stuck at the current reading' : 'Reads the plant'),
-  },
+  ...['a', 'b'].flatMap(loop => [
+    faultSwitch(`coolant-trip-${loop}`, `Coolant pump ${loop.toUpperCase()} trip`,
+      value => hasProcess(value, `coolant_pump_trip:${loop}`), on => fault.coolantPumpTrip(loop, on)),
+    faultSwitch(`feed-trip-${loop}`, `Feed pump ${loop.toUpperCase()} trip`,
+      value => hasProcess(value, `feed_pump_trip:${loop}`), on => fault.feedPumpTrip(loop, on)),
+  ]),
   {
     id: 'clear-faults',
     group: 'faults',
@@ -300,7 +288,7 @@ export function mount(root, services, options = {}) {
   }
 
   const alarmList = h('ul', { class: 'cr-alarm-list' }, h('li', { text: 'Waiting for the plant.' }));
-  const processList = h('ul', { class: 'cr-process-list' }, h('li', { text: 'Waiting for the plant.' }));
+  const processList = h('ul', { class: 'cr-instructor-active' }, h('li', { text: 'Waiting for the plant.' }));
   const overlayStatus = h('p', { class: 'cr-scene-status', role: 'status', 'aria-live': 'off', text: 'Waiting for the first plant snapshot.' });
   const vantageButtons = [
     ...Object.entries(STANDING_SPOTS).map(([name, spot]) => [name, spot.name]),
@@ -326,10 +314,35 @@ export function mount(root, services, options = {}) {
       knobGroups.plant,
     ),
   );
+  const sensorPicker = h('select', { id: 'cr-instructor-sensor' },
+    ...FAULT_SENSORS.map(point => h('option', { value: point.key, text: `${point.label} (${point.tag})` })));
+  const kindPicker = h('select', { id: 'cr-instructor-kind', 'aria-describedby': 'cr-instructor-help' },
+    h('option', { value: 'stuck', text: 'Stuck at the current count' }),
+    h('option', { value: 'bias', text: 'Bias' }),
+    h('option', { value: 'quiet', text: 'Quiet' }));
+  const biasInput = h('input', { id: 'cr-instructor-bias', type: 'number', value: '0', step: '0.1' });
+  const biasUnit = h('span', { text: '%' });
+  const biasField = h('div', { class: 'cr-instructor-field', hidden: true },
+    h('label', { for: 'cr-instructor-bias' }, 'Signed bias (', biasUnit, ')'), biasInput);
+  const instructorStatus = h('p', { class: 'cr-instructor-status', role: 'status', text: 'Waiting for the plant.' });
+  const clearActions = new Map();
+  const injectAction = instructorAction('Inject', () => {
+    const point = FAULT_SENSORS.find(entry => entry.key === sensorPicker.value);
+    if (kindPicker.value === 'bias' && biasInput.value.trim() === '') throw new RangeError('Enter a signed bias.');
+    return sensorFault(latest.value, point, kindPicker.value, Number(biasInput.value));
+  });
+  const sensorBuilder = h('div', { class: 'cr-instructor-builder' },
+    h('div', { class: 'cr-instructor-field' }, h('label', { for: 'cr-instructor-sensor', text: 'Sensor' }), sensorPicker),
+    h('div', { class: 'cr-instructor-field' }, h('label', { for: 'cr-instructor-kind', text: 'Fault kind' }), kindPicker),
+    biasField, injectAction.root);
+  listen(sensorPicker, 'change', syncInstructorBuilder);
+  listen(kindPicker, 'change', syncInstructorBuilder);
   const instructor = h('section', { class: 'cr-group cr-group-faults', 'aria-labelledby': 'cr-faults-title' },
     h('h2', { id: 'cr-faults-title', text: 'Instructor station' }),
-    h('p', { class: 'cr-note', text: "Fault levers for the evaluation. The operator's controls do not include these." }),
-    processList, knobGroups.faults);
+    h('p', { class: 'cr-note', text: "Instructor faults for the scenario. The operator's console does not include these." }),
+    h('p', { id: 'cr-instructor-help', class: 'cr-note', text: 'Clear an active sensor fault before changing its kind.' }),
+    sensorBuilder, instructorStatus, knobGroups.faults,
+    h('h3', { text: 'Active faults' }), processList);
   const readingsHost = h('div', { class: 'cr-readings' });
   root.append(h('section', { class: 'cr-panel' }, viewport,
     h('section', { class: 'cr-fallback', 'aria-label': 'Plant status and text controls' }, walkHelp, status, facts,
@@ -341,6 +354,70 @@ export function mount(root, services, options = {}) {
     knobs.set(spec.id, knob);
     knobList.push(knob);
     knobGroups[spec.group].append(knob.root);
+  }
+
+  function instructorAction(label, prepare) {
+    const cap = h('span', { text: label });
+    const control = h('button', { type: 'button', class: 'cr-instructor-button' }, cap);
+    const statusEl = h('p', { class: 'cr-instructor-status', role: 'status' });
+    const readEl = h('span');
+    const action = { spec: { channel: 'faults', kind: 'button' }, model: createButton(),
+      pending: false, seq: 0, cap, control, statusEl, readEl,
+      root: h('div', { class: 'cr-instructor-action' }, control, statusEl, readEl) };
+    listen(control, 'click', async () => {
+      if (disabledFor(action) || action.pending) return;
+      try {
+        const { change, note = '' } = prepare();
+        const request = send(action, change);
+        instructorStatus.textContent = `Sending… ${note}`;
+        await request;
+        if (disposed) return;
+        action.statusEl.textContent = `${action.statusEl.textContent} ${note}`.trim();
+        instructorStatus.textContent = action.statusEl.textContent;
+      } catch (error) {
+        setOutcome(action, { state: 'refused', text: `Refused: ${error.message}` });
+        instructorStatus.textContent = action.statusEl.textContent;
+      }
+    });
+    paintKnob(action);
+    return action;
+  }
+
+  function syncInstructorBuilder() {
+    const point = FAULT_SENSORS.find(entry => entry.key === sensorPicker.value);
+    biasField.hidden = kindPicker.value !== 'bias';
+    biasUnit.textContent = point.unit;
+    biasInput.step = String(point.resolution);
+    paintKnob(injectAction);
+  }
+
+  function syncInstructor() {
+    syncInstructorBuilder();
+    if (instructorStatus.textContent === 'Waiting for the plant.') instructorStatus.textContent = 'Ready.';
+    const entries = activeFaults(latest.value);
+    const present = new Set(entries.map(entry => entry.key));
+    for (const [key, row] of clearActions) {
+      if (present.has(key)) continue;
+      if (row.root.contains(document.activeElement)) injectAction.control.focus();
+      row.root.remove();
+      clearActions.delete(key);
+    }
+    processList.querySelector('.cr-instructor-empty')?.remove();
+    if (!clearActions.size) processList.replaceChildren();
+    for (const entry of entries) {
+      let row = clearActions.get(entry.key);
+      if (!row) {
+        const label = h('span', { text: entry.label });
+        const action = instructorAction('Clear', () => ({ change: entry.change }));
+        row = { label, action, root: h('li', { class: 'cr-instructor-row' }, label, action.root) };
+        clearActions.set(entry.key, row);
+        processList.append(row.root);
+      }
+      row.label.textContent = entry.label;
+      row.action.control.setAttribute('aria-label', `Clear ${entry.label}`);
+      paintKnob(row.action);
+    }
+    if (!entries.length) processList.append(h('li', { class: 'cr-instructor-empty', text: 'No active faults.' }));
   }
 
   // ---- Vantage points -----------------------------------------------------
@@ -779,7 +856,7 @@ export function mount(root, services, options = {}) {
     showFacts(value, view);
     const alarms = view.alarms.filter(a => a.state === 'active' || a.state === 'acknowledged');
     alarmList.replaceChildren(...(alarms.length ? alarms.map(a => h('li', { text: `${a.label}. ${a.state === 'active' ? 'Active, unacknowledged' : 'Acknowledged'}.` })) : [h('li', { text: 'No alarms.' })]));
-    processList.replaceChildren(...(view.processFaults.length ? view.processFaults.map(f => h('li', { text: f.label })) : [h('li', { text: 'No active process faults.' })]));
+    syncInstructor();
     for (const knob of knobList) {
       syncKnob(knob);
       paintKnob(knob);

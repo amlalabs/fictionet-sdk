@@ -386,3 +386,28 @@
 
 .cr-readings .plant-readings { max-height: none; }
 .cr-group-faults { padding-top: 16px; border-top: 2px solid var(--line-strong); }
+
+.cr-instructor-builder { display: flex; flex-wrap: wrap; align-items: end; gap: 16px; margin-block: 16px; }
+.cr-instructor-field { display: grid; gap: 6px; max-width: 100%; }
+.cr-instructor-field[hidden] { display: none; }
+.cr-instructor-field select,
+.cr-instructor-field input,
+.cr-instructor-button { min-height: 36px; min-width: 36px; max-width: 100%; padding: 6px 10px; font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: 4px; }
+.cr-instructor-field input { width: 12ch; }
+.cr-instructor-button { cursor: pointer; }
+.cr-instructor-button[aria-disabled='true'] { cursor: default; border-style: dashed; }
+.cr-instructor-status { margin: 6px 0; color: var(--ink); }
+.cr-instructor-active { list-style: none; padding: 0; }
+.cr-instructor-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding-block: 10px; border-bottom: 1px solid var(--line); }
+.cr-instructor-field :focus-visible,
+.cr-instructor-button:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+@media (forced-colors: active) {
+  .cr-instructor-field select,
+  .cr-instructor-field input,
+  .cr-instructor-button { border-color: ButtonText; color: ButtonText; background: ButtonFace; }
+  .cr-instructor-field :focus-visible,
+  .cr-instructor-button:focus-visible { outline-color: Highlight; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cr-group-faults *, .cr-group-faults *::before, .cr-group-faults *::after { animation: none; transition: none; }
+}
