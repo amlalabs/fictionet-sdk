@@ -31,7 +31,10 @@ world's mirror. The mirror keeps them in `downloads/cloudimage/apt-cache/`, so
 the first run on a machine also fetches about 280 MB of Ubuntu packages and
 later runs reuse them.
 
-Each run prints its page URL before the guests boot. It then runs the
+Each run prints its public page URL before the guests boot. The accompanying
+`cargo xtask demo open PATH` action opens a private bootstrap file with the
+authentication token. Routine output contains no token; the bootstrap is
+removed with the run. It then runs the
 demo's story and its checks. Every demo requires each declared containment probe exactly once, with an
 affirmative result. Configuration probes report facts. The shared package
 mirror closes once every guest has finished its cloud-init check. The run saves screenshots,
@@ -68,7 +71,7 @@ agents' own TLS clients, and the page's access controls. They type a command
 in the page terminal and move the pointer with and without the screen lease.
 
 - Options: `--stay` keeps the page open until Ctrl-C. A Unix socket path lets
-  `fictionet observe --observation unix:PATH watch` follows the same
+  `fictionet observe --observation unix:PATH watch` follow the same
   collector from another terminal.
 - Screenshots: `downloads/cloudimage/shots/`, with `guest-desktop.png` from
   the guest, `viewer-desktop.png` through the page's screen socket, and

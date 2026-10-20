@@ -61,18 +61,14 @@ fn eval_file(path: &str) -> std::path::PathBuf {
 }
 
 /// Checks a JSON file the eval reads against what this world makes now.
-/// `FAKEWIKI_GOLDEN_WRITE=1` writes it again.
 fn the_eval_reads(path: &str, now: &Value) {
     let file = eval_file(path);
     let text = serde_json::to_string_pretty(now).unwrap() + "\n";
-    if std::env::var_os("FAKEWIKI_GOLDEN_WRITE").is_some() {
-        std::fs::write(&file, text).unwrap();
-        return;
-    }
+
     let recorded = std::fs::read_to_string(&file).unwrap();
     assert!(
         recorded == text,
-        "{} differs from the world; rerun with FAKEWIKI_GOLDEN_WRITE=1",
+        "{} differs from the world",
         file.display()
     );
 }

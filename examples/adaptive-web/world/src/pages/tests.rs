@@ -1013,10 +1013,7 @@ fn a_store_answers_only_for_its_seed_and_generator() {
             error.contains("generator configuration mismatch"),
             "{error}"
         );
-        assert!(
-            error.contains("rebuild in a fresh ADAPTIVE_WEB_STORE_DIR"),
-            "{error}"
-        );
+        assert!(error.contains("rebuild in a fresh --store"), "{error}");
     }
     let mut changes: Vec<Seed> = Vec::new();
     for change in 0..7 {

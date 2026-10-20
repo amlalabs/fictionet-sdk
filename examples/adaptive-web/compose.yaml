@@ -11,18 +11,7 @@
 #               interface is tun0. It has no extra capabilities and does not
 #               see the world socket.
 #
-# Settings, from the environment of the shell that runs Inspect or Compose:
-#   ADAPTIVE_WEB_SEED         the seed; Inspect sets it from sample metadata
-#                             (SAMPLE_METADATA_SEED)
-#   ADAPTIVE_WEB_GENERATOR    stub (default), openrouter, anthropic or replay
-#   ADAPTIVE_WEB_NETWORK      the world's network: none (default), or bridge
-#                             for openrouter and anthropic
-#   ADAPTIVE_WEB_MODEL, ADAPTIVE_WEB_PREFETCH, ADAPTIVE_WEB_REASONING
-#                             see world/src/main.rs
-#   ADAPTIVE_WEB_STORE_DIR    an absolute host directory to keep pages in
-#                             across runs; by default a volume per run
-#   OPENROUTER_API_KEY, ANTHROPIC_API_KEY
-#                             passed through for a model; never logged
+# World options use command arguments. Provider API keys use the environment.
 
 name: fictionet-adaptive-web
 
@@ -37,22 +26,18 @@ services:
       target: world
     image: fictionet-adaptive-web-world:dev
     init: true                      # passes SIGTERM on to the world
-    network_mode: ${ADAPTIVE_WEB_NETWORK:-none}
+    network_mode: none
     # The world is trusted. NET_ADMIN lets it raise its socket buffers to
     # attach past the system limit, so a burst of packets is not lost.
     cap_add: [NET_ADMIN]
+    command: ["adaptive-web-world", "--seed", "${SAMPLE_METADATA_SEED:-halvard-cve}", "--generator", "stub"]
     environment:
-      ADAPTIVE_WEB_SEED: ${SAMPLE_METADATA_SEED:-${ADAPTIVE_WEB_SEED:-halvard-cve}}
-      ADAPTIVE_WEB_GENERATOR: ${ADAPTIVE_WEB_GENERATOR:-stub}
-      ADAPTIVE_WEB_MODEL: ${ADAPTIVE_WEB_MODEL:-}
-      ADAPTIVE_WEB_PREFETCH: ${ADAPTIVE_WEB_PREFETCH:-}
-      ADAPTIVE_WEB_REASONING: ${ADAPTIVE_WEB_REASONING:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       - ca:/app/ca
       - sock:/run/fictionet/sock
-      - ${ADAPTIVE_WEB_STORE_DIR:-store}:/var/lib/adaptive-web
+      - store:/var/lib/adaptive-web
     healthcheck:
       test: ["CMD", "test", "-f", "/run/fictionet/ready"]
       interval: 1s

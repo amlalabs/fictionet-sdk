@@ -19,6 +19,7 @@ example-common = { path = "../examples/common" }
 # `tokio` hands the jump host's TCP connection to the SSH client.
 fictionet = { path = "..", features = ["web-proxy", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 bytes = "1"
 http = "1.5.0"
 http-body = "1.1.0"

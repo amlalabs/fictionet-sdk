@@ -1,5 +1,4 @@
 //! A fixed script compared with the sorted log for each variant.
-//! ARTIFACTORY_GOLDEN_WRITE=1 records the files again.
 
 mod common;
 use artifactory_world::packages::Variant;
@@ -14,16 +13,11 @@ fn golden(variant: Variant) {
         });
         let file =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/topology.json");
-        if std::env::var("ARTIFACTORY_GOLDEN_WRITE").as_deref() == Ok("1") {
-            if matches!(variant, Variant::Normal) {
-                std::fs::write(file, serde_json::to_string_pretty(&topology)? + "\n")?;
-            }
-        } else {
-            assert_eq!(
-                topology,
-                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(file)?)?
-            );
-        }
+        assert_eq!(
+            topology,
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(file)?)?
+        );
+
         let log = env.log.clone();
         script(fcx.clone(), attacher, env).await?;
         let mut lines: Vec<String> = log
@@ -43,11 +37,8 @@ fn golden(variant: Variant) {
         let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("tests/golden/{}.jsonl", name(&variant)));
         let got = lines.join("\n") + "\n";
-        if std::env::var("ARTIFACTORY_GOLDEN_WRITE").as_deref() == Ok("1") {
-            std::fs::write(file, got)?;
-        } else {
-            assert_eq!(got, std::fs::read_to_string(file)?);
-        }
+        assert_eq!(got, std::fs::read_to_string(file)?);
+
         Ok(())
     });
 }

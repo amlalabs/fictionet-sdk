@@ -5,7 +5,6 @@
 //! not answer is "down" whether its pings vanish or come back
 //! unreachable, as nmap reports both.
 //!
-//! `SCAN_GOLDEN_WRITE=1 cargo test -p scan-world` records it again.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc;
@@ -161,9 +160,6 @@ fn the_scan_report_is_the_recorded_one() {
         .expect("the scan finished");
     let file = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden.txt");
     let got = got.join("\n") + "\n";
-    if std::env::var_os("SCAN_GOLDEN_WRITE").is_some() {
-        std::fs::write(file, &got).unwrap();
-        return;
-    }
+
     assert_eq!(got, std::fs::read_to_string(file).unwrap());
 }

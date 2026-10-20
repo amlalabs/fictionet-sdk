@@ -92,25 +92,25 @@ export function mount(root, services, options) {
   const agent = el('section', { class: 'section' }, root); el('h2', { text: 'A scripted agent' }, agent);
   el('p', { text: 'Sign in → read balance → inspect certificate, traceroute and BGP → hold HTTPS open → flip route → inspect the failure → sign in with verification disabled → restore.' }, agent);
   el('p', { class: 'note', text: 'In the VM, the Terminal tab watches tmux session main. Ctrl-b d opens your login shell. Taking input does not pause the script.' }, agent);
-  let route, view, pending = false, disposed = false, dismissed = 0, certValue, pathValue;
+  let route, view, disposed = false, dismissed = 0, certValue, pathValue;
   // The controller cancels a command still in flight when the panel closes.
   const controller = new AbortController();
+  const request = services.command(controller.signal, updateSwitch);
   const cleanup = [];
   const buttons = ['Normal', 'Hijacked'].map((label, index) => {
     const button = el('button', { text: label }, actions); button.type = 'button'; button.disabled = true;
     cleanup.push(listen(button, 'click', async () => {
-      if (pending || !route || disposed) return;
-      pending = true; reply.textContent = switchState().text; updateSwitch();
-      let result;
-      try { result = await services.transport.post('/api/command/routing', { request_id: crypto.randomUUID(), command: { mode: index ? 'hijack' : 'legitimate', expected_revision: route.revision } }, controller.signal); }
-      catch (e) { result = e.body || { error: e.message }; }
-      if (disposed) return;
-      const state = switchState(result); pending = state.busy; reply.textContent = state.text; updateSwitch();
+      if (request.busy || !route || disposed) return;
+      reply.textContent = switchState().text;
+      const show = (result) => { reply.textContent = switchState(result).text; };
+      await request.send('/api/command/routing', { mode: index ? 'hijack' : 'legitimate' }, route.revision, {
+        reply: show, error: (e) => show(e.body || { error: e.message }),
+      });
     }));
     return button;
   });
   function updateSwitch() {
-    buttons.forEach((button, i) => { button.disabled = pending || !route; button.setAttribute('aria-pressed', String(route?.mode === (i ? 'hijack' : 'legitimate'))); });
+    buttons.forEach((button, i) => { button.disabled = request.busy || !route; button.setAttribute('aria-pressed', String(route?.mode === (i ? 'hijack' : 'legitimate'))); });
     if (route) stateLine.textContent = `${route.mode === 'hijack' ? 'Hijacked' : 'Normal'} · revision ${route.revision} · changed ${time(Math.max(0, services.runTime() * 1000 - route.since_ms))} ago`;
     root.dataset.mode = route?.mode || 'loading';
   }

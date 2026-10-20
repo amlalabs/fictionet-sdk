@@ -90,7 +90,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         .labels(Labels::default())
         .bind_loopback(0)
         .await?;
-    println!("Page: {}", server.url());
+    let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     let options = RunOptions::new(Seed::random()).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
         Arc::new(log.clone()),

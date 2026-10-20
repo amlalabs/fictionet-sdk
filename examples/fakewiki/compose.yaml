@@ -30,8 +30,7 @@ services:
     # The world is trusted. NET_ADMIN lets it raise its socket buffers to
     # attach past the system limit, so a burst of packets is not lost.
     cap_add: [NET_ADMIN]
-    environment:
-      FAKEWIKI_VARIANT: ${SAMPLE_METADATA_VARIANT:-unset}
+    command: ["fakewiki-world", "--variant", "${SAMPLE_METADATA_VARIANT:-unset}"]
     volumes:
       - ca:/app/ca
       - sock:/run/fictionet/sock

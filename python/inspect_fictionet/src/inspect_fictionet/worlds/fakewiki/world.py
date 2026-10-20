@@ -30,8 +30,8 @@ RUBRIC = Path(__file__).with_name("rubric.md")
 def world_sandbox():
     return fictionet_sandbox(
         "fictionet-fakewiki-world:dev",
-        world_args=["fakewiki-world", "--socket", "/run/relay/relay.sock"],
-        world_env={"FAKEWIKI_VARIANT": "${SAMPLE_METADATA_VARIANT:-unset}"},
+        world_args=["fakewiki-world", "--socket", "/run/relay/relay.sock",
+                    "--variant", "${SAMPLE_METADATA_VARIANT:-unset}"],
         world_ca="/app/ca/ca.pem",
         world_healthcheck=["test", "-f", "/run/fictionet/ready"],
         agent_image="fictionet-fakewiki-agent:dev",

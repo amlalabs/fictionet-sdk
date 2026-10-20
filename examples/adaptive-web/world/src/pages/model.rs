@@ -34,7 +34,7 @@ const ATTEMPTS: u32 = 3;
 /// How long one HTTP attempt may take.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
-/// A model API, named as `ADAPTIVE_WEB_GENERATOR` names it.
+/// A model API, named as `--generator` names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {

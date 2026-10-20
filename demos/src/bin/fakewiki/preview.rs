@@ -39,7 +39,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .bind_loopback(0)
         .await?;
-    println!("{}", server.url());
+    let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     eprintln!(
         "No VM or Firefox is running. The in-world client's story reads the article. Use the page's tamper switch between runs."
     );

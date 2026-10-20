@@ -90,6 +90,7 @@ struct State {
     disk: Option<Arc<Disk>>,
     keys: Mutex<BTreeMap<PathBuf, Arc<AsyncMutex<()>>>>,
     slots: Arc<Semaphore>,
+    tasks: tokio_util::task::TaskTracker,
     stats: Arc<Stats>,
 }
 
@@ -116,6 +117,13 @@ impl Drop for State {
 }
 
 impl<S> Cache<S> {
+    /// Waits for readers and committed writes before releasing this cache owner.
+    /// Call after dropping response bodies and other service clones.
+    pub async fn close(self) {
+        self.state.tasks.close();
+        self.state.tasks.wait().await;
+    }
+
     fn new(upstream: S, root: PathBuf) -> Self {
         let disk = match Disk::open(root) {
             Ok(disk) => Some(Arc::new(disk)),
@@ -131,6 +139,7 @@ impl<S> Cache<S> {
                 disk,
                 keys: Mutex::new(BTreeMap::new()),
                 slots: Arc::new(Semaphore::new(SLOTS)),
+                tasks: tokio_util::task::TaskTracker::new(),
                 stats: Arc::new(Stats::default()),
             }),
         }
@@ -318,6 +327,7 @@ where
                     deadline,
                     fill,
                     cache.state.stats.clone(),
+                    cache.state.tasks.clone(),
                 )),
             ))
         })
@@ -533,8 +543,17 @@ where
 // Validate the trusted host's tree and hold exclusive ownership while in use.
 struct Disk {
     root: PathBuf,
-    _lock: std::fs::File,
+    lock: std::fs::File,
     budget: Mutex<(u64, u64)>,
+}
+
+impl Drop for Disk {
+    fn drop(&mut self) {
+        // Release ownership even if a child inherited the open file description.
+        if let Err(error) = self.lock.unlock() {
+            eprintln!("apt cache unlock: {error}");
+        }
+    }
 }
 
 impl Disk {
@@ -564,7 +583,7 @@ impl Disk {
         scan(&root, &mut budget, 0)?;
         Ok(Self {
             root,
-            _lock: lock,
+            lock,
             budget: Mutex::new(budget),
         })
     }
@@ -864,14 +883,16 @@ fn stream(
     deadline: tokio::time::Instant,
     fill: Option<Fill>,
     stats: Arc<Stats>,
+    tasks: tokio_util::task::TaskTracker,
 ) -> DownloadBody {
     let (tx, rx) = mpsc::channel(2);
-    let task = tokio::spawn(async move {
+    let writers = tasks.clone();
+    let task = tasks.spawn(async move {
         let _permit = permit;
         let expected = fill.as_ref().map(|f| f.expected);
         let writer = fill.map(|f| {
             let (write, incoming) = mpsc::channel(32);
-            let task = tokio::spawn(persist(
+            let task = writers.spawn(persist(
                 incoming,
                 f.reservation,
                 f.head,

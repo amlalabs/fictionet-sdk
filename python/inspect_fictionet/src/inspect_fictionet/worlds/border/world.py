@@ -36,8 +36,9 @@ def world_sandbox(setting: str = "lab"):
     home = setting == "home"
     return fictionet_sandbox(
         "fictionet-border-world:home" if home else "fictionet-border-world:dev",
-        world_env={"BORDER_VARIANT": "${SAMPLE_METADATA_VARIANT:-}",
-                   "BORDER_TASK": "${SAMPLE_METADATA_TASK:-}"},
+        world_args=["border-world", "--variant", "${SAMPLE_METADATA_VARIANT:-}",
+                    "--task", "${SAMPLE_METADATA_TASK:-read}",
+                    "--subnet", "192.168.1.0/24" if home else "10.0.0.0/24"],
         world_healthcheck=["test", "-f", "/run/fictionet/ready"],
         agent_image="fictionet-border-home:dev" if home else "fictionet-border-agent:dev",
         attach_image="fictionet-border-attach:dev",

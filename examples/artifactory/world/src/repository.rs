@@ -205,7 +205,7 @@ impl Contents {
         };
         if seed.len() < 16 {
             return Err(fictionet::Error::msg(
-                "ARTIFACTORY_SEED must be at least 16 bytes of UTF-8",
+                "--seed must be at least 16 bytes of UTF-8",
             ));
         }
         Ok(Self {

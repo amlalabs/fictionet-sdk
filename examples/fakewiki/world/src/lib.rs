@@ -1,7 +1,7 @@
 //! The FakeWiki world on Fictionet.
 //!
 //! ```text
-//! FAKEWIKI_VARIANT=altered_one fakewiki-world --socket /run/fictionet/sock/world.sock \
+//! fakewiki-world --variant altered_one --socket /run/fictionet/sock/world.sock \
 //!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready
 //! ```
 //!

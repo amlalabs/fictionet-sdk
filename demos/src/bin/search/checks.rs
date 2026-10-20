@@ -85,19 +85,10 @@ pub(super) fn search_url(engine: Engine, words: &str) -> String {
         Engine::Bing => "https://www.bing.com/search?q=",
         Engine::DuckDuckGo => "https://html.duckduckgo.com/html/?q=",
     };
-    format!("{base}{}", encoded(words))
-}
-
-fn encoded(text: &str) -> String {
-    text.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
+    format!(
+        "{base}{}",
+        adaptive_web_world::pages::text::quote(words, "")
+    )
 }
 
 async fn search(

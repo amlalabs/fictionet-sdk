@@ -36,7 +36,8 @@ export function mount(root, services, options = {}) {
   const announce = el('p', { class: 'article-announce', 'aria-live': 'polite' }, panel);
   const readMarker = el('div', { class: 'article-read' }, undefined);
   let markedRead = -1;
-  let state, diff, hosts = {}, readerHost, reader = 'Reader (scripted)', topicName, sourceName, pinned = false, busy = false, disposed = false;
+  const request = services.command(controller.signal, switchState);
+  let state, diff, hosts = {}, readerHost, reader = 'Reader (scripted)', topicName, sourceName, pinned = false, disposed = false;
   let events = [], incomplete = false;
   const LIMIT = 2000;
   const seconds = (duration) => (duration?.secs || 0) + (duration?.nanos || 0) / 1e9;
@@ -47,11 +48,11 @@ export function mount(root, services, options = {}) {
   const knownRead = (event) => isRead(event) && readerHost && event.sandbox?.name === readerHost && Object.hasOwn(hosts, event.fields.host);
   const readsFor = (topic, source) => events.filter((event) => knownRead(event) && event.fields.topic === topic && event.fields.source === source);
   function switchState() {
-    toggle.disabled = !state || busy;
+    toggle.disabled = !state || request.busy;
     toggle.setAttribute('aria-checked', String(Boolean(state?.on)));
-    toggle.setAttribute('aria-busy', String(busy));
+    toggle.setAttribute('aria-busy', String(request.busy));
     panel.dataset.state = state ? (state.on ? 'on' : 'off') : 'waiting';
-    switchLabel.textContent = !state ? 'Waiting for state…' : busy ? 'Changing…' : state.on ? 'Serving the tampered article' : 'Serving the real article';
+    switchLabel.textContent = !state ? 'Waiting for state…' : request.busy ? 'Changing…' : state.on ? 'Serving the tampered article' : 'Serving the real article';
     revision.textContent = state ? `${state.scope === 'wikipedia' ? 'Wikipedia only · ' : state.scope === 'all_sources' ? 'All sources · ' : ''}Revision ${state.revision} · ${state.revision ? 'changed at' : 'initial state at'} ${time(seconds(state.since_start))}` : 'Waiting for the world';
   }
   // Marks keep their order and stay at least 14 px apart; titles keep exact times.
@@ -175,19 +176,18 @@ export function mount(root, services, options = {}) {
   }
   cleanup.push(listen(follow, 'click', () => { pinned = false; render(); }));
   cleanup.push(listen(toggle, 'click', async () => {
-    if (busy || !state || disposed) return;
-    busy = true; switchState(); reply.textContent = 'Waiting for the world…'; reply.dataset.kind = 'pending';
-    try {
-      const result = await services.transport.post('/api/command/tamper', { request_id: crypto.randomUUID(), command: { type: 'set_tampering', on: !state.on, expected_revision: state.revision } }, controller.signal);
-      if (disposed) return;
+    if (request.busy || !state || disposed) return;
+    reply.textContent = 'Waiting for the world…'; reply.dataset.kind = 'pending';
+    await request.send('/api/command/tamper', { type: 'set_tampering', on: !state.on }, state.revision, {
+      reply(result) {
       reply.textContent = result.status === 'pending' ? 'Command pending. It may still apply; no automatic retry.' : '';
       reply.dataset.kind = 'pending';
-    } catch (error) {
-      if (disposed) return;
+      }, error(error) {
       const rejected = error.body?.rejection;
       reply.textContent = rejected?.reason === 'stale_revision' ? `The switch changed elsewhere. Current revision ${rejected.current}. No retry was sent.` : `Command not confirmed: ${error.message}. No automatic retry.`;
       reply.dataset.kind = 'rejected';
-    } finally { if (!disposed) { busy = false; switchState(); } }
+      },
+    });
   }));
   switchState();
   cleanup.push(services.state('/api/state/tamper', ({ value }) => { if (!disposed) { state = value; switchState(); } }, (error) => { state = undefined; switchState(); reply.textContent = error.message; reply.dataset.kind = 'rejected'; }));

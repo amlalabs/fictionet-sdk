@@ -59,21 +59,22 @@ export function mount(root, services, options) {
   // Hosts on screen when the panel opened, and hosts that had their moment.
   const firstSites = new Set(), marked = new Set();
   const controller = new AbortController();
-  let snapshot, chosen, selectedPage, busy = false, waitingRevision, disposed = false, initialized = false;
+  let snapshot, chosen, selectedPage, waitingRevision, disposed = false, initialized = false;
   const cleanup = [];
   const set = (node, value) => { if (node.textContent !== String(value)) node.textContent = value; };
   const line = (parent, cls) => el('span', { class: cls }, parent);
   const stateButton = () => {
     const g = snapshot?.generator;
     // A reply describes one revision; once the switch moves past it, it is history.
-    if (!busy && g && waitingRevision != null && g.generation_revision > waitingRevision) { waitingRevision = null; set(commandStatus, ''); }
-    toggle.disabled = !g || busy || (waitingRevision != null && g.generation_revision < waitingRevision);
-    toggle.setAttribute('aria-busy', String(busy));
+    if (!request.busy && g && waitingRevision != null && g.generation_revision > waitingRevision) { waitingRevision = null; set(commandStatus, ''); }
+    toggle.disabled = !g || request.busy || (waitingRevision != null && g.generation_revision < waitingRevision);
+    toggle.setAttribute('aria-busy', String(request.busy));
     toggle.setAttribute('aria-checked', String(!!g?.generate));
     toggle.dataset.known = String(!!g);
-    set(toggleLabel, busy ? 'Waiting for the world…' : g ? (g.generate ? 'Making new pages' : 'Serving only what exists') : 'Waiting for generation state…');
+    set(toggleLabel, request.busy ? 'Waiting for the world…' : g ? (g.generate ? 'Making new pages' : 'Serving only what exists') : 'Waiting for generation state…');
     if (g) set(revision, `Revision ${g.generation_revision} · changed at ${time(g.generation_at_ms)}`);
   };
+  const request = services.command(controller.signal, stateButton);
   // Resolve real event identities; sequence numbers are never treated as request IDs.
   async function select(seq, host) {
     services.packetPair.set(null);
@@ -99,23 +100,19 @@ export function mount(root, services, options) {
   cleanup.push(listen(toggle, 'click', async () => {
     if (toggle.disabled || disposed) return;
     const g = snapshot.generator;
-    busy = true; stateButton(); set(commandStatus, 'Waiting for the world…');
-    try {
-      const reply = await services.transport.post('/api/command/generation', {
-        request_id: crypto.randomUUID(),
-        command: { command: 'set_generation', generate: !g.generate, expected_revision: g.generation_revision },
-      }, controller.signal);
-      if (disposed) return;
+    set(commandStatus, 'Waiting for the world…');
+    await request.send('/api/command/generation', { command: 'set_generation', generate: !g.generate }, g.generation_revision, {
+      reply(reply) {
       if (reply.status === 'pending') set(commandStatus, 'Command pending. Read the state before trying again.');
       else { waitingRevision = reply.reply.revision; set(commandStatus, `Applied at ${time(reply.reply.at_ms)} · revision ${waitingRevision}`); }
-    } catch (e) {
-      if (disposed) return;
+      }, error(e) {
       const rejection = e.body?.rejection;
       if (rejection?.reason === 'stale_revision') {
         waitingRevision = rejection.current;
         set(commandStatus, `The switch changed elsewhere. Current revision ${rejection.current}. No retry was sent.`);
       } else set(commandStatus, e.body?.status === 'timeout' ? 'No reply yet. The command may still apply; read the state before trying again.' : `Command failed: ${e.message}`);
-    } finally { if (!disposed) { busy = false; stateButton(); } }
+      },
+    });
   }));
   // One delegated listener per list also covers rows added by later snapshots.
   const delegate = (parent, action) => cleanup.push(listen(parent, 'click', (event) => {

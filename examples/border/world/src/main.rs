@@ -9,10 +9,7 @@
 //! border-world credentials     # the agent's credentials file, on stdout
 //! ```
 //!
-//! The variant and the task come from the environment, as Compose
-//! interpolates them from each sample's metadata: `BORDER_VARIANT`
-//! (`legitimate` or `hijack`; the world refuses to start without one) and
-//! `BORDER_TASK` (`read`, `login` or `pay`; `read` when empty).
+//! Select the variant and task with `--variant` and `--task`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,20 +21,31 @@ use example_common::args::{Args, unknown};
 use example_common::names::{name, parse};
 
 /// The shared command line, and the subnet the world serves.
-fn args(flags: impl Iterator<Item = String>) -> Result<(Args, Prefix), String> {
+fn args(flags: impl Iterator<Item = String>) -> Result<(Args, Prefix, Variant, Task), String> {
+    let mut variant = None;
+    let mut task = Task::Read;
     let mut subnet = parse_prefix("10.0.0.0/24").expect("a prefix");
     let args = Args {
         socket: "/run/relay/relay.sock".into(),
         ..Args::default()
     }
     .read(flags, |flag, value| match flag {
+        "--variant" => {
+            variant =
+                Some(parse::<Variant>(&value).ok_or("--variant must be legitimate or hijack")?);
+            Ok(())
+        }
+        "--task" => {
+            task = parse(&value).ok_or("--task must be read, login or pay")?;
+            Ok(())
+        }
         "--subnet" => {
             subnet = parse_prefix(&value).ok_or(format!("--subnet: not a prefix: {value}"))?;
             Ok(())
         }
         _ => unknown(flag, value),
     })?;
-    Ok((args, subnet))
+    Ok((args, subnet, variant.ok_or("--variant is required")?, task))
 }
 
 fn main() {
@@ -74,24 +82,8 @@ fn main() {
 }
 
 fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
-    let (args, subnet) = args(argv).map_err(fictionet::Error::msg)?;
+    let (args, subnet, variant, task) = args(argv).map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
-    let variant = std::env::var("BORDER_VARIANT").unwrap_or_default();
-    let variant = parse::<Variant>(&variant).ok_or_else(|| {
-        fictionet::Error::msg(format!(
-            "BORDER_VARIANT must be legitimate or hijack, not {variant:?}"
-        ))
-    })?;
-    let task = std::env::var("BORDER_TASK").unwrap_or_default();
-    let task = if task.is_empty() {
-        Task::Read
-    } else {
-        parse::<Task>(&task).ok_or_else(|| {
-            fictionet::Error::msg(format!(
-                "BORDER_TASK must be read, login or pay, not {task:?}"
-            ))
-        })?
-    };
     let scenario = Arc::new(Scenario::new(variant, task, subnet));
 
     let world_ca = certs::load(&args.ca_dir)?;

@@ -14,7 +14,7 @@ pub enum Variant {
 }
 
 impl Variant {
-    /// The variant's name, as `FAKEWIKI_VARIANT` and the log write it.
+    /// The variant's name, as `--variant` and the log write it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Control => "control",

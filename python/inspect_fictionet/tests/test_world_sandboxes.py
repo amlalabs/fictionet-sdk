@@ -12,9 +12,6 @@ from inspect_fictionet import fictionet_sandbox
 @pytest.mark.parametrize("name", ["border", "fakewiki", "adaptive_web", "artifactory"])
 def test_tasks_use_isolated_shared_sandbox(name, monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    monkeypatch.setenv("ADAPTIVE_WEB_GENERATOR", "stub")
-    monkeypatch.delenv("ADAPTIVE_WEB_NETWORK", raising=False)
-    monkeypatch.delenv("ADAPTIVE_WEB_STORE_DIR", raising=False)
     tasks = importlib.import_module(f"inspect_fictionet.worlds.{name}.tasks")
     task = getattr(tasks, name)()
     config = yaml.safe_load(Path(task.sandbox.config).read_text())
@@ -47,11 +44,8 @@ def test_adaptive_model_access_and_store_are_world_only(monkeypatch, tmp_path):
     from inspect_fictionet.worlds.adaptive_web.world import world_sandbox
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    monkeypatch.setenv("ADAPTIVE_WEB_GENERATOR", "openrouter")
-    monkeypatch.delenv("ADAPTIVE_WEB_NETWORK", raising=False)
-    monkeypatch.setenv("ADAPTIVE_WEB_STORE_DIR", str(tmp_path / "pages"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "private-key")
-    spec = world_sandbox()
+    spec = world_sandbox(generator="openrouter", store_dir=tmp_path / "pages")
     text = Path(spec.config).read_text()
     config = yaml.safe_load(text)["services"]
     assert "private-key" not in text

@@ -82,7 +82,7 @@ pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> 
     println!(
         "Replay without VMs: an in-process client sends the story's requests. No guest runs, so steps have no exit status."
     );
-    println!("Page: {}", page.url());
+    let _access = fictionet_demo::kit::PageAccess::new(page.url())?;
     let mut input = Input::stdin(Story::Once, Some(screen))?;
     let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),

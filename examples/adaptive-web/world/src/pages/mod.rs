@@ -161,7 +161,7 @@ impl Response {
     }
 }
 
-/// What makes new pages, as `ADAPTIVE_WEB_GENERATOR` names it.
+/// What makes new pages, as `--generator` names it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GeneratorKind {

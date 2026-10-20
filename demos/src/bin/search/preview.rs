@@ -67,7 +67,7 @@ pub async fn run(spend: bool) -> Result {
         .containment(containment.clone())
         .bind_loopback(0)
         .await?;
-    println!("Search preview: {}", server.url());
+    let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     println!(
         "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
     );

@@ -47,7 +47,7 @@ pub mod bridge;
 pub mod checks;
 pub mod client;
 mod page;
-pub use page::{Hosts, answer_command, serve_commands};
+pub use page::{Hosts, PageAccess, answer_command, serve_commands};
 pub mod containment;
 pub mod desktop;
 pub mod jump;
@@ -319,7 +319,7 @@ pub struct World {
     attachments: Attachments,
     ca: Arc<Mutex<Option<(String, String)>>>,
     now_unix: i64,
-    mirror: Option<mirror::Cache<fictionet::stdlib::web::Proxy>>,
+    mirror: Arc<Mutex<Option<mirror::Cache<fictionet::stdlib::web::Proxy>>>>,
     setup: Arc<mirror::Setup>,
 }
 
@@ -342,12 +342,13 @@ impl World {
         &mut self,
         fcx: &Cx,
     ) -> fictionet::Result<mirror::Cache<fictionet::stdlib::web::Proxy>> {
-        if self.mirror.is_none() {
+        let mut mirror = self.mirror.lock().unwrap();
+        if mirror.is_none() {
             let mut cache = mirror::new(fcx)?;
             cache.setup = Some(self.setup.clone());
-            self.mirror = Some(cache);
+            *mirror = Some(cache);
         }
-        Ok(self.mirror.as_ref().unwrap().clone())
+        Ok(mirror.as_ref().unwrap().clone())
     }
     /// Returns the guest and jump host attachments for the world to serve.
     pub fn into_attachments(self) -> Attachments {
@@ -513,11 +514,13 @@ pub struct Run {
     dir: Option<util::RunDir>,
     boot: Instant,
     page: Option<Server>,
+    access: Option<PageAccess>,
     dashboard: Option<DashboardHandle>,
     labels: Option<Labels>,
     containment: StateTopic<Containment>,
     probes: Arc<Mutex<Containment>>,
     setup: Arc<mirror::Setup>,
+    mirror: Arc<Mutex<Option<mirror::Cache<fictionet::stdlib::web::Proxy>>>>,
 }
 
 impl Run {
@@ -611,6 +614,10 @@ impl Run {
                     failures.push("world did not stop within five seconds".into());
                 }
             }
+        }
+        let mirror = self.mirror.lock().unwrap().take();
+        if let Some(mirror) = mirror {
+            mirror.close().await;
         }
         if let Some(dir) = self.dir.take()
             && let Err(error) = std::fs::remove_dir_all(dir.path())
@@ -747,6 +754,7 @@ impl<W> Kit<W> {
         let mut run = Run {
             guests: Vec::new(),
             setup: setup.clone(),
+            mirror: Arc::default(),
             fcx: Arc::new(Mutex::new(None)),
             world: None,
             jump: None,
@@ -754,6 +762,7 @@ impl<W> Kit<W> {
             dir: Some(util::RunDir::new(&self.run_parent, &self.name)?),
             boot: Instant::now(),
             page: None,
+            access: None,
             dashboard: None,
             labels: None,
             containment: StateTopic::new(StateLimits::default()),
@@ -980,7 +989,7 @@ impl Observer for PageObserver {
 impl Run {
     async fn bind_page(
         &mut self,
-        name: &str,
+        _name: &str,
         build: PageBuilder,
         prepared: &mut Prepared,
     ) -> io::Result<()> {
@@ -1024,7 +1033,7 @@ impl Run {
         })?);
         self.dashboard = Some(dashboard);
         self.labels = Some(labels);
-        println!("{name} page: {}", self.page_url());
+        self.access = Some(PageAccess::new(self.page_url())?);
         Ok(())
     }
 
@@ -1041,7 +1050,7 @@ impl Run {
         let world = World {
             attachments: prepared.attachments,
             ca: ca.clone(),
-            mirror: None,
+            mirror: self.mirror.clone(),
             setup: self.setup.clone(),
             now_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

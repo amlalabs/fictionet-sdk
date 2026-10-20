@@ -64,15 +64,15 @@ The deterministic stub generator needs no key. The runtime world has no
 network access after setup.
 
 ```bash
-ADAPTIVE_WEB_GENERATOR=stub cargo xtask eval adaptive-web --live corvane-acquisition
+cargo xtask eval adaptive-web --live corvane-acquisition --generator stub
 ```
 
 The demo keeps its pages in `examples/adaptive-web/store/<seed>/`, owned by
 root because the world runs as root. A later demo run of the same seed
 serves those pages again instead of making new ones. It must use the same
-generator, model and reasoning setting, or `ADAPTIVE_WEB_GENERATOR=replay`;
+generator, model and reasoning setting, or `--generator replay`;
 with any other generator the world rejects the store and does not start.
-To start over, set `ADAPTIVE_WEB_STORE_DIR` to another absolute directory,
+To start over, pass `--store` to another absolute directory,
 or remove that seed's directory with `sudo`.
 
 Run the probes to check the world's requests:
@@ -95,25 +95,29 @@ cargo xtask eval adaptive-web --live halvard-cve "halvard gateway vulnerability"
 The demo with a real agent, here Claude Sonnet 5.5 doing the research:
 
 ```bash
-export ADAPTIVE_WEB_GENERATOR=openrouter ADAPTIVE_WEB_NETWORK=bridge
-cargo xtask eval adaptive-web --model openrouter/anthropic/claude-sonnet-5.5 --log-dir logs/live
+cargo xtask eval adaptive-web -T generator=openrouter --model openrouter/anthropic/claude-sonnet-5.5 --log-dir logs/live
 uv run --project python/inspect_fictionet --locked inspect view --log-dir logs/live
 ```
 
 The first run builds the images (`fictionet-adaptive-web-*`), which takes a
 few minutes. Each run takes its containers down when it ends.
 
-Settings, all from the environment:
+World settings are explicit arguments. Inspect task options use `-T`, such as
+`-T generator=openrouter` and `-T store_dir=/absolute/path`. Direct world
+commands and `cargo xtask eval adaptive-web --live` use:
 
-| variable | what it sets |
+| option | setting |
 |---|---|
-| `ADAPTIVE_WEB_GENERATOR` | `stub`, `openrouter`, `anthropic`, or `replay`; default: `stub` in Compose/Inspect, `openrouter` in `cargo xtask eval adaptive-web --live` |
-| `ADAPTIVE_WEB_MODEL` | the model; by default `google/gemini-3.1-flash-lite` on OpenRouter and `claude-haiku-4-5-20251001` on Anthropic |
-| `ADAPTIVE_WEB_NETWORK` | the world container's network: `none` for stub/replay; `bridge` for model APIs; overrides the automatic choice |
-| `ADAPTIVE_WEB_PREFETCH` | how many pages behind each new result list to make ahead of time (default 3 with a model) |
-| `ADAPTIVE_WEB_REASONING` | reasoning effort sent to OpenRouter, for models that think before writing (`none`, `minimal`, ...) |
-| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; default: a fresh container store per run under Inspect, the Compose project's named `store` volume under `docker compose` (kept until `docker compose down --volumes`), and `examples/adaptive-web/store` in `cargo xtask eval adaptive-web --live`. Every sample of the seed, in this run and later ones, shares the store, so an eval with several epochs makes each page once |
-| `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY` | the provider's key. It is sent in the API request's header and nowhere else: never logged, stored or put in an error message. |
+| `--generator` | `stub`, `openrouter`, `anthropic`, or `replay`; live browsing defaults to `openrouter` |
+| `--model` | provider model; defaults to `google/gemini-3.1-flash-lite` or `claude-haiku-4-5-20251001` |
+| `--prefetch` | pages to make ahead of time; default 3 with a model |
+| `--reasoning` | OpenRouter reasoning effort |
+| `--store` | absolute store directory; live browsing defaults to `examples/adaptive-web/store` |
+
+Only `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY` come from the environment.
+The launcher selects `bridge` networking for model providers and `none` for
+stub or replay. Compose users set the world's command and network mode in
+the Compose file.
 
 Only the world container gets a network, and only in live mode. The
 agent's container stays in attach's network namespace, whose only interface
@@ -417,7 +421,7 @@ These figures have not been recomputed:
 Gemini 3.1 Flash Lite is the default because it is about twice as fast as
 the next model; time per run matters most. The cast is one more call per
 world, 1.1 to 1.2 s with it. Claude Haiku 5.5 thinks before writing unless
-`ADAPTIVE_WEB_REASONING=none`: without it, every token went to reasoning and
+`--reasoning none`: without it, every token went to reasoning and
 the answers came back empty.
 
 Prefetch hides most of the rest. In the agent runs below, a page the world
@@ -556,12 +560,12 @@ as 503.
 
 By default an Inspect run gets a fresh container store that goes
 away with the run, and `cargo xtask eval adaptive-web --live` keeps its store in `examples/adaptive-web/store`.
-Set `ADAPTIVE_WEB_STORE_DIR` to an absolute directory to keep the store
+Pass `--store` to an absolute directory to keep the store
 there instead. A later run with the same seed and directory starts from
 everything the earlier one made: the same pages, results, cast and
 addresses. A run fails without `finalized` if `addresses.jsonl` is
 unreadable, corrupt or cannot be appended.
-With `ADAPTIVE_WEB_GENERATOR=replay` it makes nothing new: a URL
+With `--generator replay` it makes nothing new: a URL
 the store does not hold gets a 404, logged as `missing`, and a query it does
 not hold gets an empty result list. `replay` does not replay a run: each run
 is a fresh world that serves the stored pages. It needs no network and no key.
@@ -582,16 +586,15 @@ credentials. Prefetch and generation limits can change between runs.
 
 An incompatible store is rejected, and so is a directory that holds files
 of another kind of store. To rebuild, choose a new empty
-`ADAPTIVE_WEB_STORE_DIR` and run with a generator such as `stub`; running the
-world directly, choose a new `ADAPTIVE_WEB_STORE`. Keep the old store and its
+`--store` and run with a generator such as `stub`; running the
+world directly, choose a new `--store`. Keep the old store and its
 judgments for audit. Rebuilding creates a new snapshot; it does not recover
 historical responses or validate published realism scores. Replay requires
 a store a generator made.
 
 ```bash
-export ADAPTIVE_WEB_STORE_DIR=$PWD/store
-OPENROUTER_API_KEY=... cargo xtask eval adaptive-web --live halvard-cve
-ADAPTIVE_WEB_GENERATOR=replay cargo xtask eval adaptive-web --live halvard-cve
+OPENROUTER_API_KEY=... cargo xtask eval adaptive-web --live halvard-cve --store "$PWD/store"
+cargo xtask eval adaptive-web --live halvard-cve --store "$PWD/store" --generator replay
 ```
 
 The world runs as root, so the files it writes into a host directory belong

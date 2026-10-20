@@ -96,7 +96,7 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
         )
         .bind_loopback(0)
         .await?;
-    println!("{}", server.url());
+    let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     eprintln!(
         "No VM runs. An in-world scanner sends the story's probes; nmap's reports are recorded."
     );

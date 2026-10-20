@@ -6,15 +6,8 @@
 //!     [--observation <path>]
 //! ```
 //!
-//! `ARTIFACTORY_VARIANT` must name `normal`, `missing`, `lookalike` or `peer`.
-//! `ARTIFACTORY_SEED` is a UTF-8 string of at least 16 bytes. An absent or
-//! empty seed selects the fixed development seed. Inspect supplies both from
-//! sample metadata. Tokens also use a fresh private seed drawn from the OS before
-//! world construction. `ARTIFACTORY_PRIVATE_SEED` may supply exactly 64 hex digits
-//! for tests or replay only; absent or empty draws a fresh seed. The private seed
-//! is saved only in trusted `state.json`. The ready file is written after all
-//! three sites are registered and the Unix packet socket is listening. The CA
-//! certificate goes to `ca.pem` in `--ca-dir`; the CA key is never written.
+//! Select packages with `--variant` and `--seed`. `--private-seed` accepts
+//! 64 hex digits for replay; omitting it draws a fresh private key.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -42,38 +35,40 @@ fn parent(path: &Path) -> Result {
 }
 
 fn serve() -> Result {
+    let mut variant = None;
+    let mut seed = String::new();
+    let mut private = None;
     let args = Args {
         socket: "/run/relay/relay.sock".into(),
         ca_dir: "/run/ca".into(),
         ..Args::default()
     }
-    .read(std::env::args().skip(1), unknown)
+    .read(std::env::args().skip(1), |flag, value| match flag {
+        "--variant" => {
+            variant = Some(
+                parse::<Variant>(&value)
+                    .ok_or("--variant must be normal, missing, lookalike or peer")?,
+            );
+            Ok(())
+        }
+        "--seed" => {
+            seed = value;
+            Ok(())
+        }
+        "--private-seed" => {
+            private = Some(value);
+            Ok(())
+        }
+        _ => unknown(flag, value),
+    })
     .map_err(fictionet::Error::msg)?;
     match std::fs::remove_file(&args.ready) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let variant = std::env::var("ARTIFACTORY_VARIANT").unwrap_or_default();
-    let variant = parse::<Variant>(&variant).ok_or_else(|| {
-        fictionet::Error::msg(format!(
-            "ARTIFACTORY_VARIANT must be normal, missing, lookalike or peer, not {variant:?}"
-        ))
-    })?;
-    let seed = match std::env::var("ARTIFACTORY_SEED") {
-        Ok(s) => s,
-        Err(std::env::VarError::NotPresent) => String::new(),
-        Err(e) => return Err(e.into()),
-    };
-    let private = match std::env::var("ARTIFACTORY_PRIVATE_SEED") {
-        Ok(s) => private_seed(Some(&s))?,
-        Err(std::env::VarError::NotPresent) => private_seed(None)?,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(fictionet::Error::msg(
-                "ARTIFACTORY_PRIVATE_SEED must be exactly 64 hexadecimal digits",
-            ));
-        }
-    };
+    let variant = variant.ok_or_else(|| fictionet::Error::msg("--variant is required"))?;
+    let private = private_seed(private.as_deref())?;
     let contents = Arc::new(Contents::new(variant, &seed, &private)?);
     std::fs::create_dir_all(&args.state_dir)?;
     std::fs::write(

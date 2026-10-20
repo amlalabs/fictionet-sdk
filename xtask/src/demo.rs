@@ -20,6 +20,22 @@ pub fn run(args: &[String]) -> Result {
         );
         return Ok(());
     }
+    if let [action, path] = args
+        && action == "open"
+    {
+        let path = std::fs::canonicalize(path)?;
+        if !path.is_file() {
+            return Err("the page bootstrap is not a file".into());
+        }
+        let status = std::process::Command::new("chromium")
+            .args(["--password-store=basic", "--use-mock-keychain"])
+            .arg(format!("--app=file://{}", path.display()))
+            .status()?;
+        if !status.success() {
+            return Err(format!("Chromium exited with {status}").into());
+        }
+        return Ok(());
+    }
     if args == ["assets"] {
         return microvm::assets();
     }

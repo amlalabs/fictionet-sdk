@@ -218,7 +218,7 @@ returns 502 without fetching. The same public and private seeds produce
 the same package bytes. Certificates and log timestamps are fresh each run.
 
 The world draws a 32-byte private seed from the OS before starting the
-deterministic simulation. `ARTIFACTORY_PRIVATE_SEED` is a test/replay input
+deterministic simulation. `--private-seed` is a test/replay input
 only: set it in the trusted world process to exactly 64 hexadecimal digits.
 An absent or empty value draws fresh entropy; any other invalid value is
 an error. The world saves the key as `private_seed` in its private

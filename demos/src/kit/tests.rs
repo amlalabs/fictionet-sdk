@@ -331,7 +331,7 @@ fn root_certificate_names_are_neutral() {
         attachments,
         ca: Arc::new(Mutex::new(None)),
         now_unix: 0,
-        mirror: None,
+        mirror: Arc::default(),
     };
     assert!(world.ca.lock().unwrap().is_none());
     for name in [
