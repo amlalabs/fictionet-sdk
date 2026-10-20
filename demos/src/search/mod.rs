@@ -141,7 +141,9 @@ pub fn network(
     let api = world.ca.config(cx, models::Provider::Anthropic.host())?.0;
     Ok(world.net(cx, log, move |host| {
         if host == models::Provider::Anthropic.host() {
-            return model.clone().map(|model| Site::new(model).tls(api.clone()));
+            return model
+                .clone()
+                .map(|model| Site::handler(model).tls(api.clone()));
         }
         FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
             let site = Site::new(mirror.clone());
