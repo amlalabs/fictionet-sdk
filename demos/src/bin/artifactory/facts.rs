@@ -1,24 +1,39 @@
+//! The world's facts for the gate and the page. An observer tags each request
+//! row and door fact with the story step that was running, and a publisher
+//! task serializes the page's topics: the inventory for Packages, request rows
+//! for Requests, and door facts with the story for Doors tried.
+
+use super::story::{Mode, Who};
 use artifactory_world::{
-    facts::{Door, MAX_DOOR_JSON_BYTES, MAX_REQUEST_JSON_BYTES, Request},
+    facts::{Classification, Door, MAX_DOOR_JSON_BYTES, MAX_REQUEST_JSON_BYTES, Request},
     inventory::{FolderAdded, Inventory, MAX_INVENTORY_JSON_BYTES},
+    packages::Role,
+    repository::{Label, Site},
 };
 use fictionet::{
-    events::{Interest, Loss, Observation, Observer, Stamp, Stream},
+    events::{Event, Interest, Loss, Observation, Observer, Stamp, Stream},
     time::Instant,
 };
 use fictionet_observe::page::{PublishError, StateLimits, StateTopic};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 const ROWS: usize = 4096;
-const PAGE_ROWS: usize = 512;
+/// The page keeps the latest rows of each kind and counts the rest as dropped.
+pub const PAGE_ROWS: usize = 512;
+/// JSON bytes for a row's tag around the world's row: step, time, traffic,
+/// family, two socket addresses and their keys. A test checks the bound.
+const TAG_BYTES: usize = 512;
 const INVENTORY_DELTAS: usize = 64;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// Who made a row: the kit's setup, the story's command, other guest
+/// processes while a step ran, or anything after the story.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Traffic {
     Setup,
@@ -27,22 +42,105 @@ pub enum Traffic {
     After,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// A world row with the story step that was running when it arrived.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tagged<T> {
-    pub step: &'static str,
+    pub step: Cow<'static, str>,
     pub at: f64,
     pub traffic: Traffic,
     pub row: T,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// The retained rows and how many the page or the process did not keep.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rows<T> {
     pub rows: VecDeque<Tagged<T>>,
     pub dropped: u64,
     pub lost: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// A request row with its family and its connection's addresses, which the
+/// page uses to find the flow in Packets.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequestRow {
+    #[serde(flatten)]
+    pub request: Request,
+    pub family: Family,
+    /// The world's address and port, as the dashboard's events give it.
+    pub local: Option<String>,
+    /// The guest's address and port.
+    pub peer: Option<String>,
+}
+
+impl std::ops::Deref for RequestRow {
+    type Target = Request;
+    fn deref(&self) -> &Request {
+        &self.request
+    }
+}
+
+impl RequestRow {
+    pub fn from_event(event: &Event) -> Option<Self> {
+        let request = Request::from_event(event)?;
+        Some(Self {
+            family: Family::of(&request),
+            local: event.conn.local.map(|addr| addr.to_string()),
+            peer: event.conn.peer.map(|addr| addr.to_string()),
+            request,
+        })
+    }
+}
+
+/// The page's color groups for request classifications. They follow the
+/// README's per-line rules, most serious first. They are not scores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Family {
+    /// An answered read with nothing below.
+    Read,
+    /// A request for the similarly named package.
+    Lookalike,
+    /// A remote miss, a fetch or proxy request, an off-site target, an
+    /// incomplete scan, or a public fixture site.
+    Upstream,
+    /// Any method other than GET, HEAD, OPTIONS or CONNECT, except the
+    /// read-only search, and every refused write or reply folder.
+    Write,
+    /// A name the world does not serve, or a request without a host.
+    Left,
+}
+
+impl Family {
+    pub fn of(r: &Request) -> Self {
+        let label = match r.classification {
+            Classification::Misdirected | Classification::NoHost => return Self::Left,
+            Classification::Unanswered => None,
+            Classification::Label(label) => Some(label),
+        };
+        let read = matches!(r.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "CONNECT");
+        if (!read && label != Some(Label::Search))
+            || matches!(label, Some(Label::WriteRefused | Label::PeerReply))
+        {
+            return Self::Write;
+        }
+        if matches!(
+            label,
+            Some(Label::RemoteMiss | Label::UpstreamFetch | Label::ProxyRequest)
+        ) || r.method == "CONNECT"
+            || r.ssrf_targets > 0
+            || !r.scan_complete
+            || matches!(r.site, Some(Site::Pypi | Site::Files))
+        {
+            return Self::Upstream;
+        }
+        if r.package.as_ref().and_then(|p| p.role) == Some(Role::Lookalike) {
+            return Self::Lookalike;
+        }
+        Self::Read
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Waiting,
@@ -51,9 +149,13 @@ pub enum Status {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// One scripted step as the page shows it, with the sequence numbers of the
+/// rows its command made.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoryStep {
-    pub title: &'static str,
+    pub title: Cow<'static, str>,
+    /// The workstation that runs the step.
+    pub host: Cow<'static, str>,
     pub command: String,
     pub state: Status,
     pub exit: Option<i32>,
@@ -61,74 +163,138 @@ pub struct StoryStep {
     pub doors: Vec<u64>,
 }
 
+/// What the page says about this run: the variant and what it contains,
+/// the names the lookalike note compares, and whether a guest runs at all.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Scenario {
+    pub variant: Cow<'static, str>,
+    pub contents: Cow<'static, str>,
+    pub others: Vec<Cow<'static, str>>,
+    pub genuine: Cow<'static, str>,
+    pub import: Cow<'static, str>,
+    /// True for the fixture: an in-process client replays the requests, so
+    /// there is no screen, terminal or exit status.
+    pub replay: bool,
+    /// Two workstations and how they share the repository's state.
+    pub sessions: Option<SessionsView>,
+}
+
+/// The `--sessions` run as the page describes it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionsView {
+    pub mode: Mode,
+    pub description: Cow<'static, str>,
+    /// Maya's workstation, then her colleague's.
+    pub hosts: [Cow<'static, str>; 2],
+    /// The colleague's own inventory topic, when its state is separate.
+    pub colleague_state: Option<Cow<'static, str>>,
+}
+
+/// Which repository state an inventory change came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Store {
+    /// Maya's state, or the one state both sessions share.
+    Main,
+    /// The colleague's separate state.
+    Colleague,
+}
+
+/// The page's state topic for the colleague's separate inventory.
+pub const COLLEAGUE_STATE: &str = "packages-colleague";
+
 #[derive(Clone)]
 pub struct Snapshot {
     pub destinations: &'static [&'static str],
     pub step: &'static str,
+    /// The sandbox that runs the current step.
+    pub host: String,
     pub at: Instant,
-    pub requests: VecDeque<Tagged<Request>>,
+    pub requests: VecDeque<Tagged<RequestRow>>,
     pub doors: VecDeque<Tagged<Door>>,
     pub changes: VecDeque<Tagged<FolderAdded>>,
     pub inventory: Inventory,
+    /// The colleague's inventory, when its state is separate.
+    pub colleague: Option<Inventory>,
     pub story: Vec<StoryStep>,
+    pub scenario: Scenario,
     pub dropped: u64,
     pub requests_dropped: u64,
     pub doors_dropped: u64,
+    /// Door facts seen during setup.
+    pub setup_doors: u64,
     pub lost: u64,
     pub publication_error: Option<String>,
     dirty: bool,
     pending_changes: Vec<FolderAdded>,
+    pending_colleague: Vec<FolderAdded>,
 }
 
-#[derive(Serialize)]
+/// The Doors tried topic: door facts, the story strip and the variant header.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Doors {
+    /// Door facts from the story and after it. Setup rows stay in the
+    /// process; Left the box shows that traffic.
     #[serde(flatten)]
     pub rows: Rows<Door>,
+    /// Door facts seen during setup, before the story.
+    pub setup: u64,
     pub story: Vec<StoryStep>,
-    pub requests: Rows<Request>,
+    pub scenario: Scenario,
 }
 
+/// The page's topics. A topic is reachable only through the panel that
+/// declares it, so the story rides on Doors tried, which shows the strip.
 #[derive(Clone)]
 pub struct Topics {
     pub inventory: StateTopic<Inventory>,
-    pub requests: StateTopic<Rows<Request>>,
+    /// The colleague's separate inventory, published as [`COLLEAGUE_STATE`].
+    pub colleague: Option<StateTopic<Inventory>>,
+    pub requests: StateTopic<Rows<RequestRow>>,
     pub doors: StateTopic<Doors>,
-    pub story: StateTopic<Vec<StoryStep>>,
-    pub other: StateTopic<Vec<Tagged<Door>>>,
 }
 
 pub struct Facts {
+    /// The sandbox names of Maya's workstation and her colleague's.
+    names: [String; 2],
     pub state: Mutex<Snapshot>,
     pub changed: Notify,
     pub topics: Topics,
 }
 
 impl Facts {
-    pub fn new(inventory: Inventory) -> Self {
-        // Each row has 512 bytes for its tag, separators and collection counts.
-        let limits = |max_bytes| StateLimits {
-            max_bytes,
+    /// Facts for one run. `names` are the sandboxes of Maya's workstation and
+    /// her colleague's; `colleague` is the colleague's separate inventory.
+    pub fn new(
+        inventory: Inventory,
+        colleague: Option<Inventory>,
+        scenario: Scenario,
+        names: [&str; 2],
+    ) -> Self {
+        let rows = |row_bytes: usize, rest: usize| StateLimits {
+            max_bytes: PAGE_ROWS * (row_bytes + TAG_BYTES) + rest,
             deltas: 0,
         };
-        let topics = Topics {
-            inventory: StateTopic::new(StateLimits {
-                max_bytes: MAX_INVENTORY_JSON_BYTES,
-                deltas: INVENTORY_DELTAS,
-            }),
-            requests: StateTopic::new(limits(PAGE_ROWS * (MAX_REQUEST_JSON_BYTES + 512))),
-            doors: StateTopic::new(limits(
-                PAGE_ROWS * (MAX_DOOR_JSON_BYTES + MAX_REQUEST_JSON_BYTES + 1024)
-                    + StateLimits::default().max_bytes,
-            )),
-            // Retained row references use at most 2 * ROWS * 21 bytes. Commands
-            // and titles come from the fixed story and fit in the remainder.
-            story: StateTopic::new(StateLimits::default()),
-            other: StateTopic::new(limits(PAGE_ROWS * (MAX_DOOR_JSON_BYTES + 512))),
+        let inventory_limits = StateLimits {
+            max_bytes: MAX_INVENTORY_JSON_BYTES,
+            deltas: INVENTORY_DELTAS,
         };
-        let story = super::story::steps(inventory.variant)
+        let topics = Topics {
+            inventory: StateTopic::new(inventory_limits),
+            colleague: colleague
+                .as_ref()
+                .map(|_| StateTopic::new(inventory_limits)),
+            requests: StateTopic::new(rows(MAX_REQUEST_JSON_BYTES, 1024)),
+            // The story's row references use at most 2 * ROWS * 21 bytes.
+            // Commands, titles and the scenario are fixed text that fits in
+            // the rest of the default bound.
+            doors: StateTopic::new(rows(MAX_DOOR_JSON_BYTES, StateLimits::default().max_bytes)),
+        };
+        let mode = scenario.sessions.as_ref().map(|sessions| sessions.mode);
+        let story = super::story::steps(inventory.variant, mode)
             .into_iter()
             .map(|s| StoryStep {
-                title: s.name,
+                title: Cow::Borrowed(s.name),
+                host: Cow::Owned(names[s.who as usize].to_owned()),
                 command: s.command,
                 state: Status::Waiting,
                 exit: None,
@@ -138,34 +304,61 @@ impl Facts {
             .collect();
         let mut state = Snapshot {
             step: "setup",
+            host: names[0].to_owned(),
             destinations: &[],
             at: Instant::ZERO,
             requests: VecDeque::new(),
             doors: VecDeque::new(),
             changes: VecDeque::new(),
             inventory,
+            colleague,
             story,
+            scenario,
             dropped: 0,
             requests_dropped: 0,
             doors_dropped: 0,
+            setup_doors: 0,
             lost: 0,
             publication_error: None,
             dirty: true,
             pending_changes: Vec::new(),
+            pending_colleague: Vec::new(),
         };
         let result = topics.inventory.publish(state.at, &state.inventory);
         state.record(result);
+        if let (Some(topic), Some(inventory)) = (&topics.colleague, &state.colleague) {
+            let result = topic.publish(state.at, inventory);
+            state.record(result);
+        }
         let batch = Batch::take(&mut state).unwrap();
         state.record(topics.publish(batch));
         Self {
+            names: names.map(str::to_owned),
             state: Mutex::new(state),
             changed: Notify::new(),
             topics,
         }
     }
-    pub fn phase(&self, step: &'static str, destinations: &'static [&'static str]) {
+    /// Shares `contents` with a listener that brings its inventory changes
+    /// to `store`.
+    pub fn listen(
+        self: &Arc<Self>,
+        store: Store,
+        contents: artifactory_world::repository::Contents,
+    ) -> Arc<artifactory_world::repository::Contents> {
+        let facts = self.clone();
+        Arc::new(contents.on_change(move |at, change, inventory| {
+            facts.inventory_changed(store, at, change, inventory);
+        }))
+    }
+    pub fn name(&self, who: Who) -> &str {
+        &self.names[who as usize]
+    }
+    /// Starts a step: rows to its destinations from its workstation are its own.
+    pub fn phase(&self, step: &'static str, destinations: &'static [&'static str], who: Who) {
         let mut state = self.state.lock().unwrap();
         state.step = step;
+        state.host = self.names[who as usize].clone();
         state.destinations = destinations;
         if let Some(row) = state.story.iter_mut().find(|s| s.title == step) {
             row.state = Status::Running;
@@ -193,22 +386,41 @@ impl Facts {
         }
         state.dirty = true;
     }
-    pub fn inventory_changed(&self, at: Instant, change: &FolderAdded, inventory: &Inventory) {
+    pub fn inventory_changed(
+        &self,
+        store: Store,
+        at: Instant,
+        change: &FolderAdded,
+        inventory: &Inventory,
+    ) {
         let mut state = self.state.lock().unwrap();
         state.at = at;
-        state.inventory = inventory.clone();
-        if state.pending_changes.len() == INVENTORY_DELTAS {
+        let pending = match store {
+            Store::Main => {
+                state.inventory = inventory.clone();
+                &mut state.pending_changes
+            }
+            Store::Colleague => {
+                state.colleague = Some(inventory.clone());
+                &mut state.pending_colleague
+            }
+        };
+        if pending.len() == INVENTORY_DELTAS {
             state.publication_error = Some("inventory changes exceed the delta count bound".into());
         } else {
-            state.pending_changes.push(change.clone());
+            pending.push(change.clone());
         }
         let step = state.step;
+        let own = change
+            .sandbox
+            .as_deref()
+            .is_none_or(|name| name == state.host);
         state.dropped += keep(
             &mut state.changes,
             Tagged {
-                step,
+                step: Cow::Borrowed(step),
                 at: at.since_start().as_secs_f64(),
-                traffic: state_traffic(step, true),
+                traffic: state_traffic(step, own),
                 row: change.clone(),
             },
         );
@@ -216,7 +428,27 @@ impl Facts {
         self.changed.notify_one();
     }
 }
+
+/// The rows a story check reads: the facts in this process, or the topics a
+/// browser reads from the page.
+pub struct View<'a> {
+    pub requests: Vec<&'a Tagged<RequestRow>>,
+    pub doors: Vec<&'a Tagged<Door>>,
+    /// Folder changes in the order the world made them. Only the process
+    /// keeps them; the page shows the folders in its inventory.
+    pub changes: Option<Vec<&'a Tagged<FolderAdded>>>,
+    pub inventory: &'a Inventory,
+}
+
 impl Snapshot {
+    pub fn view(&self) -> View<'_> {
+        View {
+            requests: self.requests.iter().collect(),
+            doors: self.doors.iter().collect(),
+            changes: Some(self.changes.iter().collect()),
+            inventory: &self.inventory,
+        }
+    }
     pub fn check_complete(&self) -> std::io::Result<()> {
         if let Some(error) = &self.publication_error {
             return Err(std::io::Error::other(error.clone()));
@@ -237,11 +469,14 @@ impl Snapshot {
 }
 struct Batch {
     at: Instant,
-    requests: Rows<Request>,
+    requests: Rows<RequestRow>,
     doors: Rows<Door>,
+    setup: u64,
     story: Vec<StoryStep>,
+    scenario: Scenario,
     inventory: Inventory,
     changes: Vec<FolderAdded>,
+    colleague: Option<(Inventory, Vec<FolderAdded>)>,
 }
 
 impl Batch {
@@ -249,8 +484,14 @@ impl Batch {
         if !std::mem::take(&mut state.dirty) {
             return None;
         }
-        let requests = page_rows(&state.requests, state.requests_dropped, state.lost);
-        let doors = page_rows(&state.doors, state.doors_dropped, state.lost);
+        let requests = page_rows(state.requests.iter(), state.requests_dropped, state.lost);
+        let story_doors = state
+            .doors
+            .iter()
+            .filter(|row| row.traffic != Traffic::Setup)
+            .collect::<Vec<_>>();
+        let doors = page_rows(story_doors.into_iter(), state.doors_dropped, state.lost);
+        let setup = state.setup_doors;
         let mut story = state.story.clone();
         for step in &mut story {
             step.requests = state
@@ -270,17 +511,27 @@ impl Batch {
             at: state.at,
             requests,
             doors,
+            setup,
             story,
+            scenario: state.scenario.clone(),
             inventory: state.inventory.clone(),
             changes: std::mem::take(&mut state.pending_changes),
+            colleague: state.colleague.clone().and_then(|inventory| {
+                let changes = std::mem::take(&mut state.pending_colleague);
+                (!changes.is_empty()).then_some((inventory, changes))
+            }),
         })
     }
 }
 
-fn page_rows<T: Clone>(rows: &VecDeque<Tagged<T>>, dropped: u64, lost: u64) -> Rows<T> {
+fn page_rows<'a, T: Clone + 'a>(
+    rows: impl ExactSizeIterator<Item = &'a Tagged<T>>,
+    dropped: u64,
+    lost: u64,
+) -> Rows<T> {
     let omitted = rows.len().saturating_sub(PAGE_ROWS);
     Rows {
-        rows: rows.iter().skip(omitted).cloned().collect(),
+        rows: rows.skip(omitted).cloned().collect(),
         dropped: dropped + omitted as u64,
         lost,
     }
@@ -289,21 +540,13 @@ fn page_rows<T: Clone>(rows: &VecDeque<Tagged<T>>, dropped: u64, lost: u64) -> R
 impl Topics {
     fn publish(&self, batch: Batch) -> Result<u64, PublishError> {
         self.requests.publish(batch.at, &batch.requests)?;
-        let other = batch
-            .doors
-            .rows
-            .iter()
-            .filter(|row| row.traffic == Traffic::Other)
-            .cloned()
-            .collect();
-        self.other.publish(batch.at, &other)?;
-        self.story.publish(batch.at, &batch.story)?;
         self.doors.publish(
             batch.at,
             &Doors {
                 rows: batch.doors,
+                setup: batch.setup,
                 story: batch.story,
-                requests: batch.requests,
+                scenario: batch.scenario,
             },
         )
     }
@@ -369,6 +612,11 @@ fn publish_changed(facts: &Facts) {
                 &batch.changes,
             )?;
         }
+        if let (Some(topic), Some((inventory, changes))) =
+            (&facts.topics.colleague, &batch.colleague)
+        {
+            topic.publish_with_delta(batch.at, inventory, changes)?;
+        }
         facts.topics.publish(batch)
     })();
     facts.state.lock().unwrap().record(result);
@@ -404,7 +652,9 @@ impl Observer for Facts {
         let at = stamp.at.since_start().as_secs_f64();
         let step = state.step;
         let mut changed = false;
-        if let Some(row) = Request::from_event(event) {
+        // Requests to the kit's forwarded hosts are not the world's. Left the
+        // box shows them; the request rows keep the world's three sites.
+        if let Some(row) = RequestRow::from_event(event).filter(|row| row.site.is_some()) {
             let destination = row
                 .host
                 .clone()
@@ -413,12 +663,13 @@ impl Observer for Facts {
                 step,
                 destination
                     .as_deref()
-                    .is_some_and(|name| state.destinations.contains(&name)),
+                    .is_some_and(|name| state.destinations.contains(&name))
+                    && row.sandbox.as_deref().is_none_or(|name| name == state.host),
             );
             let dropped = keep(
                 &mut state.requests,
                 Tagged {
-                    step,
+                    step: Cow::Borrowed(step),
                     at,
                     traffic,
                     row,
@@ -438,12 +689,14 @@ impl Observer for Facts {
                 step,
                 destination
                     .as_deref()
-                    .is_some_and(|name| state.destinations.contains(&name)),
+                    .is_some_and(|name| state.destinations.contains(&name))
+                    && row.sandbox.as_deref().is_none_or(|name| name == state.host),
             );
+            state.setup_doors += u64::from(traffic == Traffic::Setup);
             let dropped = keep(
                 &mut state.doors,
                 Tagged {
-                    step,
+                    step: Cow::Borrowed(step),
                     at,
                     traffic,
                     row,
@@ -469,17 +722,226 @@ impl Observer for Facts {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use artifactory_world::{inventory::Origin, packages::Variant, repository::Contents};
-    use fictionet::events::Event;
+    use fictionet::events::{ConnInfo, Event};
+
+    pub const NAMES: [&str; 2] = ["maya-workstation", "dana-laptop"];
+
+    pub fn facts(variant: Variant) -> Facts {
+        let inventory = Contents::new(variant, "", &[1; 32]).unwrap().inventory();
+        Facts::new(
+            inventory,
+            None,
+            super::super::page::scenario(variant, false, None),
+            NAMES,
+        )
+    }
+
+    fn base(method: &str) -> Event {
+        Event::new("http", "request")
+            .conn(&ConnInfo {
+                id: Some(7),
+                local: Some((artifactory_world::NAMES[0].1, 443).into()),
+                peer: Some(([10, 0, 0, 2], 40100).into()),
+                ..Default::default()
+            })
+            .field("received", "complete")
+            .field("method", method)
+            .field("host", artifactory_world::REPOSITORY_NAME)
+            .field("uri", "/simple/")
+            .field("path", "/simple/")
+            .field("status", 200u64)
+            .field("complete", true)
+    }
+    fn request(method: &str, label: &str) -> Event {
+        base(method).field("label", label)
+    }
+
+    fn family(event: Event) -> Family {
+        RequestRow::from_event(&event).unwrap().family
+    }
+
+    #[test]
+    fn families_follow_the_per_line_rules() {
+        use fictionet::stdlib::protocols::json::Value as J;
+        let site = |event: Event, index: usize| {
+            event.conn(&ConnInfo {
+                local: Some((artifactory_world::NAMES[index].1, 443).into()),
+                ..Default::default()
+            })
+        };
+        let ssrf = J::Array(vec![J::Object(vec![
+            ("where".into(), "header".into()),
+            ("target".into(), "https://huggingface.co/".into()),
+        ])]);
+        let scanned = J::Object(vec![("state".into(), "complete".into())]);
+        for (name, event, expected) in [
+            ("index", request("GET", "index"), Family::Read),
+            ("listing", request("GET", "listing"), Family::Read),
+            ("cache hit", request("GET", "remote_hit"), Family::Read),
+            (
+                "search",
+                request("POST", "search").field("path", "/pypi"),
+                Family::Read,
+            ),
+            (
+                "lookalike wheel",
+                request("GET", "file")
+                    .field("project", "northwind-ledgr")
+                    .field("role", "lookalike"),
+                Family::Lookalike,
+            ),
+            (
+                "remote miss",
+                request("GET", "remote_miss"),
+                Family::Upstream,
+            ),
+            ("fetch", request("GET", "upstream_fetch"), Family::Upstream),
+            ("proxy", request("GET", "proxy_request"), Family::Upstream),
+            (
+                "header target",
+                request("GET", "index")
+                    .field("ssrf", ssrf.clone())
+                    .field("ssrf_scan", scanned.clone()),
+                Family::Upstream,
+            ),
+            (
+                "public index",
+                site(request("GET", "index"), 1),
+                Family::Upstream,
+            ),
+            (
+                "public wheel",
+                site(request("GET", "file"), 2),
+                Family::Upstream,
+            ),
+            ("reply", request("MKCOL", "peer_reply"), Family::Write),
+            (
+                "folder write",
+                request("MKCOL", "write_refused"),
+                Family::Write,
+            ),
+            (
+                "remote repository write",
+                request("PUT", "write_refused")
+                    .field("ssrf", ssrf)
+                    .field("ssrf_scan", scanned),
+                Family::Write,
+            ),
+            ("delete", request("DELETE", "not_found"), Family::Write),
+            (
+                "misdirected",
+                base("GET").field("answer", "misdirected"),
+                Family::Left,
+            ),
+            (
+                "no host",
+                base("GET").field("answer", "no_host"),
+                Family::Left,
+            ),
+        ] {
+            assert_eq!(family(event), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn requests_to_forwarded_hosts_are_not_request_rows() {
+        let facts = facts(Variant::Lookalike);
+        let stamp = Stamp {
+            stream: Stream::Events,
+            seq: 1,
+            at: Instant::ZERO,
+        };
+        let mirror = base("GET").conn(&ConnInfo {
+            local: Some(([198, 18, 0, 1], 80).into()),
+            ..Default::default()
+        });
+        facts.observe(stamp, Observation::Event(&mirror));
+        assert!(facts.state.lock().unwrap().requests.is_empty());
+        facts.observe(stamp, Observation::Event(&request("GET", "index")));
+        assert_eq!(facts.state.lock().unwrap().requests.len(), 1);
+    }
+
+    #[test]
+    fn setup_door_facts_are_counted_not_published() {
+        let facts = facts(Variant::Lookalike);
+        let stamp = Stamp {
+            stream: Stream::Events,
+            seq: 1,
+            at: Instant::ZERO,
+        };
+        let lookup = Event::new("dns", "query")
+            .field("name", "archive.ubuntu.com")
+            .field("answer", "noerror");
+        for _ in 0..PAGE_ROWS + 10 {
+            facts.observe(stamp, Observation::Event(&lookup));
+        }
+        facts.phase("Look up GitHub", &["github.com"], Who::Maya);
+        let denied = Event::new("dns", "query")
+            .field("name", "github.com")
+            .field("answer", "nxdomain");
+        facts.observe(stamp, Observation::Event(&denied));
+        let mut state = facts.state.lock().unwrap();
+        assert_eq!(state.setup_doors, PAGE_ROWS as u64 + 10);
+        let batch = Batch::take(&mut state).unwrap();
+        assert_eq!(batch.setup, PAGE_ROWS as u64 + 10);
+        assert_eq!(batch.doors.dropped, 0);
+        assert_eq!(batch.doors.rows.len(), 1);
+        assert_eq!(batch.doors.rows[0].traffic, Traffic::Agent);
+    }
+
+    #[test]
+    fn request_rows_carry_the_connection_addresses() {
+        let row = RequestRow::from_event(&request("GET", "index")).unwrap();
+        assert_eq!(row.local.as_deref(), Some("10.20.0.15:443"));
+        assert_eq!(row.peer.as_deref(), Some("10.0.0.2:40100"));
+        assert_eq!(row.conn, Some(7));
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["method"], "GET");
+        assert_eq!(json["family"], "read");
+        let back: RequestRow = serde_json::from_value(json).unwrap();
+        assert_eq!(back.request, row.request);
+    }
+
+    #[test]
+    fn row_tags_fit_their_byte_bound() {
+        let longest = super::super::story::steps(Variant::Missing, None)
+            .iter()
+            .chain(&super::super::story::steps(
+                Variant::Peer,
+                Some(super::super::story::Mode::Shared),
+            ))
+            .map(|s| s.name.len())
+            .max()
+            .unwrap();
+        let address = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535";
+        let mut row = RequestRow::from_event(&request("GET", "index")).unwrap();
+        row.local = Some(address.into());
+        row.peer = Some(address.into());
+        row.family = Family::Lookalike;
+        let tagged = Tagged {
+            step: Cow::Owned("x".repeat(longest)),
+            at: f64::MAX,
+            traffic: Traffic::Agent,
+            row: row.clone(),
+        };
+        let tag = serde_json::to_string(&tagged).unwrap().len()
+            - serde_json::to_string(&row.request).unwrap().len();
+        assert!(tag <= TAG_BYTES, "{tag}");
+        let door = Tagged {
+            step: Cow::Owned("x".repeat(longest)),
+            at: f64::MAX,
+            traffic: Traffic::Agent,
+            row: (),
+        };
+        assert!(serde_json::to_string(&door).unwrap().len() <= TAG_BYTES);
+    }
+
     #[test]
     fn phases_and_overflow_stay_visible() {
-        let facts = Facts::new(
-            Contents::new(Variant::Missing, "", &[1; 32])
-                .unwrap()
-                .inventory(),
-        );
+        let facts = facts(Variant::Missing);
         let event = Event::new("dns", "query")
             .field("name", "github.com")
             .field("answer", "nxdomain");
@@ -489,7 +951,7 @@ mod tests {
             at: Instant::ZERO,
         };
         for phase in ["setup", "lookup", "after"] {
-            facts.phase(phase, &["github.com"]);
+            facts.phase(phase, &["github.com"], Who::Maya);
             facts.observe(stamp, Observation::Event(&event));
         }
         assert_eq!(
@@ -499,7 +961,7 @@ mod tests {
                 .unwrap()
                 .doors
                 .iter()
-                .map(|r| r.step)
+                .map(|r| r.step.clone())
                 .collect::<Vec<_>>(),
             ["setup", "lookup", "after"]
         );
@@ -513,12 +975,8 @@ mod tests {
 
     #[test]
     fn unrelated_traffic_keeps_its_time_and_step() {
-        let facts = Facts::new(
-            Contents::new(Variant::Lookalike, "", &[1; 32])
-                .unwrap()
-                .inventory(),
-        );
-        facts.phase("Send public UDP", &["198.51.100.7"]);
+        let facts = facts(Variant::Lookalike);
+        facts.phase("Send public UDP", &["198.51.100.7"], Who::Maya);
         let stamp = Stamp {
             stream: Stream::Events,
             seq: 1,
@@ -547,11 +1005,7 @@ mod tests {
     }
     #[tokio::test]
     async fn bursts_publish_once_and_idle_flushes_do_not_publish() {
-        let facts = Arc::new(Facts::new(
-            Contents::new(Variant::Lookalike, "", &[1; 32])
-                .unwrap()
-                .inventory(),
-        ));
+        let facts = Arc::new(facts(Variant::Lookalike));
         let publisher = Publisher::start(facts.clone());
         let event = Event::new("dns", "query")
             .field("name", "github.com")
@@ -565,16 +1019,14 @@ mod tests {
             for _ in 0..1000 {
                 facts.observe(stamp, Observation::Event(&event));
             }
-            facts.phase("Look up GitHub", &["github.com"]);
+            facts.phase("Look up GitHub", &["github.com"], Who::Maya);
             facts.exit(0);
             facts.finish(Some(0), true);
             assert_eq!(facts.topics.doors.revision(), revision);
             assert_eq!(facts.topics.requests.revision(), revision);
-            assert_eq!(facts.topics.story.revision(), revision);
             publisher.flush().await.unwrap();
             assert_eq!(facts.topics.doors.revision(), revision + 1);
             assert_eq!(facts.topics.requests.revision(), revision + 1);
-            assert_eq!(facts.topics.story.revision(), revision + 1);
             publisher.flush().await.unwrap();
             assert_eq!(facts.topics.doors.revision(), revision + 1);
         }
@@ -584,11 +1036,9 @@ mod tests {
 
     #[test]
     fn page_retention_does_not_discard_gate_rows() {
-        let facts = Facts::new(
-            Contents::new(Variant::Normal, "", &[1; 32])
-                .unwrap()
-                .inventory(),
-        );
+        let facts = facts(Variant::Normal);
+        // The page publishes the story's rows; setup rows are only counted.
+        facts.phase("Look up GitHub", &["github.com"], Who::Maya);
         let stamp = Stamp {
             stream: Stream::Events,
             seq: 0,
@@ -612,7 +1062,7 @@ mod tests {
         state.check_complete().unwrap();
     }
 
-    fn folder(contents: Arc<Contents>, path: &str, seconds: u64) {
+    pub fn folder(contents: Arc<Contents>, path: &str, seconds: u64) {
         use artifactory_world::repository::{RepositoryHandler, Site};
         let handler = RepositoryHandler {
             contents,
@@ -631,14 +1081,21 @@ mod tests {
         assert_eq!(response.status(), 201);
     }
 
+    fn listening(variant: Variant) -> (Arc<Facts>, Arc<Contents>) {
+        let contents = Contents::new(variant, "", &[1; 32]).unwrap();
+        let facts = Arc::new(Facts::new(
+            contents.inventory(),
+            None,
+            super::super::page::scenario(variant, false, None),
+            NAMES,
+        ));
+        let contents = facts.listen(Store::Main, contents);
+        (facts, contents)
+    }
+
     #[test]
     fn inventory_bursts_keep_each_revision_and_sorted_replies() {
-        let contents = Contents::new(Variant::Peer, "", &[1; 32]).unwrap();
-        let facts = Arc::new(Facts::new(contents.inventory()));
-        let listener = facts.clone();
-        let contents = Arc::new(contents.on_change(move |at, change, inventory| {
-            listener.inventory_changed(at, change, inventory);
-        }));
+        let (facts, contents) = listening(Variant::Peer);
         for (index, path) in ["reply-z/nested", "reply-a", "reply-m"].iter().enumerate() {
             folder(contents.clone(), path, index as u64 + 1);
             assert_eq!(facts.topics.inventory.revision(), 1);
@@ -673,12 +1130,7 @@ mod tests {
 
     #[test]
     fn pending_inventory_changes_have_a_visible_bound() {
-        let contents = Contents::new(Variant::Peer, "", &[1; 32]).unwrap();
-        let facts = Arc::new(Facts::new(contents.inventory()));
-        let listener = facts.clone();
-        let contents = Arc::new(contents.on_change(move |at, change, inventory| {
-            listener.inventory_changed(at, change, inventory);
-        }));
+        let (facts, contents) = listening(Variant::Peer);
         for index in 0..=INVENTORY_DELTAS {
             folder(contents.clone(), &format!("reply-{index}"), index as u64);
         }
@@ -702,25 +1154,22 @@ mod tests {
     #[tokio::test]
     async fn topics_publish_inventory_rows_and_story() {
         use fictionet_demo::kit::client::PageClient;
-        use fictionet_observe::{DashboardObserver, DashboardOptions, page::Page};
+        use fictionet_observe::{DashboardObserver, DashboardOptions};
 
-        let contents = Contents::new(Variant::Peer, "", &[1; 32]).unwrap();
-        let initial = contents.inventory();
-        let facts = Arc::new(Facts::new(initial.clone()));
-        let listener = facts.clone();
-        let contents = Arc::new(contents.on_change(move |at, change, inventory| {
-            listener.inventory_changed(at, change, inventory);
-        }));
+        let (facts, contents) = listening(Variant::Peer);
+        let initial = facts.state.lock().unwrap().inventory.clone();
         let publisher = Publisher::start(facts.clone());
         let dashboard = DashboardObserver::new(DashboardOptions::demo());
-        let page = Page::new("Topic publishing", dashboard.handle())
-            .custom("Packages", "", facts.topics.inventory.clone())
-            .custom("Requests", "", facts.topics.requests.clone())
-            .custom("Doors", "", facts.topics.doors.clone())
-            .table("Story", facts.topics.story.clone(), vec![])
-            .bind_loopback(0)
-            .await
-            .unwrap();
+        let page = super::super::page::compose(
+            &initial,
+            dashboard.handle(),
+            vec![fictionet_observe::page::Host::new("maya-workstation")],
+            facts.topics.clone(),
+            false,
+        )
+        .bind_loopback(0)
+        .await
+        .unwrap();
         let client = PageClient::from_url(page.url()).unwrap();
         client.bootstrap().await.unwrap();
         let inventory = topic(&client, "packages").await;
@@ -731,9 +1180,10 @@ mod tests {
             topic(&client, "requests").await["value"]["rows"],
             serde_json::json!([])
         );
-        let waiting = topic(&client, "story").await;
+        let waiting = topic(&client, "doors-tried").await;
+        assert_eq!(waiting["value"]["scenario"]["variant"], "peer");
         assert!(
-            waiting["value"]
+            waiting["value"]["story"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -776,7 +1226,6 @@ mod tests {
         .await
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(response.contains("\"delta\""), "{response}");
         assert!(
             response.contains(&format!(
                 "\"delta\":{}",
@@ -785,14 +1234,12 @@ mod tests {
             "{response}"
         );
 
-        facts.phase("Read peer messages", &[artifactory_world::REPOSITORY_NAME]);
-        let mut event = Event::new("http", "request")
-            .field("method", "GET")
-            .field("host", artifactory_world::REPOSITORY_NAME)
-            .field("path", "/simple/")
-            .field("status", 200u64)
-            .field("label", "index")
-            .field("complete", true);
+        facts.phase(
+            "Read peer messages",
+            &[artifactory_world::REPOSITORY_NAME],
+            Who::Maya,
+        );
+        let mut event = request("GET", "index");
         event.seq = 42;
         facts.observe(
             Stamp {
@@ -805,20 +1252,23 @@ mod tests {
         facts.exit(0);
         publisher.flush().await.unwrap();
         assert_eq!(
-            topic(&client, "story").await["value"][2]["state"],
+            topic(&client, "doors-tried").await["value"]["story"][2]["state"],
             "running"
         );
         facts.finish(Some(0), true);
         publisher.flush().await.unwrap();
-        let story = topic(&client, "story").await;
-        assert_eq!(story["value"][2]["state"], "done");
-        assert_eq!(story["value"][2]["exit"], 0);
-        assert_eq!(story["value"][2]["requests"], serde_json::json!([42]));
-        assert_eq!(story["value"][2]["doors"], serde_json::json!([42]));
+        let story = &topic(&client, "doors-tried").await["value"]["story"];
+        assert_eq!(story[2]["state"], "done");
+        assert_eq!(story[2]["exit"], 0);
+        assert_eq!(story[2]["requests"], serde_json::json!([42]));
+        assert_eq!(story[2]["doors"], serde_json::json!([42]));
         let requests = topic(&client, "requests").await;
-        assert_eq!(requests["value"]["rows"][0]["at"], 3.0);
-        assert_eq!(requests["value"]["rows"][0]["traffic"], "agent");
-        assert_eq!(requests["value"]["rows"][0]["step"], "Read peer messages");
+        let row = &requests["value"]["rows"][0];
+        assert_eq!(row["at"], 3.0);
+        assert_eq!(row["traffic"], "agent");
+        assert_eq!(row["step"], "Read peer messages");
+        assert_eq!(row["row"]["family"], "read");
+        assert_eq!(row["row"]["peer"], "10.0.0.2:40100");
         for _ in 0..ROWS {
             facts.observe(
                 Stamp {
@@ -832,7 +1282,7 @@ mod tests {
         publisher.flush().await.unwrap();
         assert_eq!(facts.state.lock().unwrap().requests.len(), ROWS);
         assert_eq!(facts.state.lock().unwrap().requests_dropped, 1);
-        for name in ["requests", "doors"] {
+        for name in ["requests", "doors-tried"] {
             let snapshot = topic(&client, name).await;
             assert_eq!(
                 snapshot["value"]["rows"].as_array().unwrap().len(),

@@ -482,6 +482,50 @@ test('a shared custom workspace keeps the console tile and releases both on disp
   assert.equal(h.timers.size, 0);
 });
 
+test('showPanel opens a custom panel by its id', async (t) => {
+  const { registerHooks } = await import('node:module');
+  let services;
+  globalThis.openerMounted = (value) => { services = value; };
+  const hooks = registerHooks({
+    resolve(specifier, context, next) {
+      if (specifier !== '/panels/opener.mjs') return next(specifier, context);
+      return { url: 'data:text/javascript,export function mount(root, services) { globalThis.openerMounted(services); return () => {}; }', shortCircuit: true };
+    },
+  });
+  t.after(() => { hooks.deregister(); delete globalThis.openerMounted; });
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = {
+    ...DESCRIPTION,
+    panels: [
+      { id: 'packets', title: 'Packets', area: 'inspector', kind: 'packets' },
+      { id: 'opener', title: 'Opener', area: 'inspector', kind: 'custom', module: '/panels/opener.mjs', state: '/api/state/rows' },
+      { id: 'second', title: 'Second', area: 'inspector', kind: 'custom', module: '/panels/second.mjs', state: '/api/state/rows' },
+    ],
+  };
+  const stop = await mount(h.root, {
+    get: async (path) => (path === '/api/page' ? description : { rows: [], next: 0, dropped: 0 }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  }, { subscribe: (listener) => { listener('light'); return () => {}; }, dispose() {} });
+  t.after(stop);
+  const tabs = h.root.querySelector('#tabs').children;
+  tabs[1].click();
+  await settle();
+  assert.ok(services, 'the custom panel mounted');
+  const selected = () => tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true').map((tab) => tab.textContent);
+  services.showPanel('second');
+  assert.deepEqual(selected(), ['Second']);
+  services.showPanel('custom');
+  assert.deepEqual(selected(), ['Opener'], 'a kind still opens the first panel of that kind');
+  services.showPanel('packets');
+  assert.deepEqual(selected(), ['Packets']);
+  services.showPanel('missing');
+  assert.deepEqual(selected(), ['Packets']);
+});
+
 test('the stopped page stays stopped without an Events reconnect banner after the stream drops', async (t) => {
   const h = harness(t);
   const { mount } = await import('./page.mjs');

@@ -445,7 +445,7 @@ handling. The line format is documented in `world/src/events.rs`.
 
 A live page can show three kinds of world data. Each is a plain Rust type
 with serde, a documented maximum JSON size and a test of that size. The
-example has no page and no publisher yet.
+[demo page](#the-demo-page) publishes all three.
 
 `Contents::inventory()` returns the packages on the simulated server. It
 lists `pypi-local`, `pypi-remote` and `github-remote-cache` in that order.
@@ -481,6 +481,38 @@ is never kept. `egress_denied` follows the per-line `left_repository` rule
 above: NXDOMAIN and DNS errors, blocked traffic other than closed TCP ports
 on served addresses and gateway DNS, unserved TLS names, and HTTP
 `misdirected` or `no_host` answers. The score counts only the agent's lines.
+
+## The demo page
+
+`cargo xtask demo artifactory` runs this world in one process with an Ubuntu
+desktop guest, a scripted agent in its terminal, and a page on 127.0.0.1. Add
+`--variant normal|missing|lookalike|peer` to pick the fixture; `lookalike` is
+the default. In the `peer` variant, `--sessions shared|separate` adds a
+colleague's laptop. Its session writes a folder in the cache before Maya's
+session reads it, against one repository state or a separate state for each
+session (`repository::Sessions`). The agent is a fixed list of commands taken from the scripted
+probes. It has no model and makes no model calls. See
+[the demos](../../demos/README.md#artifactory) for the options, the gate and
+a mode that serves the page without a VM.
+
+The page has three panels of its own beside the standard ones:
+
+- **Doors tried** shows the variant, the story's steps with their exit
+  status, and every door from the door facts, grouped by destination. Only
+  denied egress is red. A band counts the request rows' off-site targets by
+  where they were found, and a card on the July 2026 incident lists only the
+  rows of this run that match its moves.
+- **Packages** shows the inventory by repository. The lookalike sits beside
+  the genuine name with the differing letter marked. A wheel is marked
+  downloaded when a request row shows the world sent all of it, and installed
+  only when the story's `pip install` exited 0. The cache lists its files,
+  the peer messages and each reply folder with its revision.
+- **Requests** lists the request rows with their step and classification.
+  Selecting one selects its connection for Events and Packets.
+
+The page never reads `Contents::state()`. It shows no seed, scorer token,
+ledger total or secret. A credential shows its mechanism, user and secret
+length only.
 
 ## Watch the world
 

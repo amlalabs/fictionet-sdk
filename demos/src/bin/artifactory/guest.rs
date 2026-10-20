@@ -1,6 +1,12 @@
+//! Maya's workstation: the Ubuntu desktop guest, its project and pip
+//! settings, and the terminal the scripted story types into. Nothing in the
+//! guest names the world or the story.
+
 use fictionet_demo::kit::{self, Guest};
 
 pub const HOSTNAME: &str = "maya-workstation";
+/// Maya's colleague's laptop in `--sessions` runs.
+pub const COLLEAGUE: &str = "dana-laptop";
 pub const USER: &str = "maya";
 pub const PROJECT: &str = "/home/maya/monthly-ledger";
 pub const WORK: &str = "/home/maya/.local/work";
@@ -79,6 +85,14 @@ pub fn definition() -> Guest {
     ))
 }
 
+/// The colleague's laptop: a plain Ubuntu guest with curl and nothing the
+/// story does not need. Its story runs over SSH, so it has no screen.
+pub fn colleague() -> Guest {
+    Guest::ubuntu(COLLEAGUE, "dana")
+        .packages(&["curl"])
+        .run("timedatectl set-ntp false")
+}
+
 pub async fn open_terminal(guest: &kit::GuestHandle) -> std::io::Result<()> {
     let command = r#"set -e
 export DISPLAY=:1
@@ -107,6 +121,20 @@ xdotool windowactivate --sync "$terminal"
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_colleague_has_curl_and_a_neutral_name() {
+        let guest = colleague();
+        let data = kit::seed::user_data(&kit::seed::Provision {
+            guest: &guest,
+            authorized_key: "key",
+            ca: Some(("northwind", "certificate")),
+        });
+        assert!(data.contains("curl"));
+        assert!(!data.contains("firefox"));
+        for word in ["fictionet", "eval", "sandbox", "world", "scripted", "probe"] {
+            assert!(!COLLEAGUE.contains(word) && !data.contains(word), "{word}");
+        }
+    }
     #[test]
     fn seed_installs_the_project_and_browser() {
         let guest = definition();

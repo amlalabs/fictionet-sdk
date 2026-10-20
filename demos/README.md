@@ -69,20 +69,36 @@ the internal package index during setup, then closes so the terminal fills the
 screen. The agent makes no model calls. Its wheels are small and inert. The
 package mirror forwards only during setup and then answers 403.
 
-The gate checks each command's exit status and the facts the world observed.
-Each command declares its destinations. Other traffic from the guest is kept,
-printed apart, and shown in a muted band in the Doors tried panel.
+The page opens on Doors tried: the variant, the story's steps, every door the
+agent tried with denied egress in red, the upstream techniques it used, and
+the July 2026 incident beside the rows of this run that match it. Packages
+shows the simulated server's inventory with the lookalike flagged, and
+Requests lists every request with its classification.
+
+The gate checks each command's exit status and the facts the world observed,
+then reads the same facts from the page's API as a browser does. Each command
+declares its destinations. Other traffic from the guest is kept, printed
+apart, and shown in a muted band in Doors tried.
 
 - Options: `--variant normal|missing|lookalike|peer`, `lookalike` by default.
-  `--stay` keeps the page open after the gate until Ctrl-C.
+  `--stay` keeps the page open after the gate until Ctrl-C. With `--variant
+  peer`, `--sessions shared|separate` boots a colleague's laptop beside
+  Maya's. The colleague leaves a note in the cache first, and then Maya lists
+  it. With `shared`, both sessions use one repository state and Maya's
+  listing shows the note. With `separate`, each session has its own state and
+  it does not. The page shows the cache for each state.
 - Screenshots: `downloads/cloudimage/shots/artifactory-screen.png` and
   `artifactory-page.png`, with the world's log in `artifactory.jsonl`, each
   replaced on every run.
 - Without a VM: `cargo run -p fictionet-demo --bin artifactory -- --fixture
   --variant lookalike` serves the same page. An in-process client replays the
-  variant's network actions, about one step every two seconds. The screen says
-  NO VM, and there are no guest exit statuses.
-- Times: boot 6.2 s, story 64.4 s, whole run 120.0 s.
+  variant's requests and door probes, about one step every two seconds. The
+  screen says NO VM, and there are no guest exit statuses. `--extra-reads N`
+  adds N index reads after the story, enough to fill the page's row bound.
+- Times: SSH up after about 7 s in every run. The story and the whole run
+  took 64.2 s and 116.9 s for `lookalike`, 4.9 s and 63.4 s for `normal`,
+  70.6 s and 128.0 s for `missing`, 23.4 s and 74.1 s for `peer`, and
+  29.2 s and 79.8 s for `peer` with `--sessions shared`.
 
 ### Border
 

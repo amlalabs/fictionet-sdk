@@ -2,6 +2,7 @@
 
 mod common;
 use artifactory_world::packages::Variant;
+use artifactory_world::repository::Sessions;
 use artifactory_world::repository::{Contents, LEDGER_CSV, ledger_total};
 use common::{run_variant, script};
 
@@ -542,7 +543,7 @@ fn extended_network_keeps_sites_and_serves_mirrors_with_one_root() {
                 })
             };
             let (attacher, attachments) = fictionet::attachments();
-            artifactory_world::network(&fcx, contents, identity, log)?
+            artifactory_world::network(&fcx, Sessions::Shared(contents), identity, log)?
                 .add_host(web::Site::handler(handler()).into_host("archive.ubuntu.com"))
                 .add_host(
                     web::Site::handler(handler())

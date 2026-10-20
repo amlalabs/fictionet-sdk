@@ -82,6 +82,8 @@
 //!   Other root text must be XML whitespace. Comments, CDATA, processing instructions
 //!   and nested elements cannot supply the method. Only this POST is read-only;
 //!   malformed or ambiguous calls fall through to `write_refused`.
+//! - `no_session` is a request from a sandbox without its own repository state,
+//!   refused. Only a world with a state for each sandbox makes it.
 
 use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;

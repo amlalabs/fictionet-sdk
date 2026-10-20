@@ -40,7 +40,7 @@ use fictionet::{Attachments, Cx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use log::Log;
-use repository::{Contents, RepositoryHandler, Site};
+use repository::{SessionHandler, Sessions, Site};
 
 /// The internal package index hostname.
 pub const REPOSITORY_NAME: &str = "artifactory.northwind.internal";
@@ -125,18 +125,19 @@ impl Identity {
 /// Builds the IPv4 network. The only host socket is opened by main.
 pub fn start(
     fcx: &Cx,
-    contents: Arc<Contents>,
+    sessions: Sessions,
     identity: Identity,
     log: Log,
     attachments: Attachments,
 ) -> Result {
-    network(fcx, contents, identity, log)?.start(fcx, attachments)
+    network(fcx, sessions, identity, log)?.start(fcx, attachments)
 }
 
 /// Builds the configured network so callers can add hosts and routes.
+/// Each request uses the repository state `sessions` gives its sandbox.
 pub fn network(
     fcx: &Cx,
-    contents: Arc<Contents>,
+    sessions: Sessions,
     identity: Identity,
     log: Log,
 ) -> Result<fictionet::stdlib::world::net::Net> {
@@ -158,8 +159,8 @@ pub fn network(
     let site_for = move |host: &str| {
         let i = NAMES.iter().position(|(name, _)| *name == host)?;
         let site = SITES[i];
-        let s = web::Site::handler(RepositoryHandler {
-            contents: contents.clone(),
+        let s = web::Site::handler(SessionHandler {
+            sessions: sessions.clone(),
             site,
         })
         .at(NAMES[i].1)

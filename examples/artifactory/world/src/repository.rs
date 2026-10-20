@@ -134,6 +134,8 @@ pub enum Label {
     /// unnamespaced `methodCall`, a plain-text `search` method and optional params.
     /// See [`is_xmlrpc_search`] for the strict read-only classification.
     Search,
+    /// A request from a sandbox without its own repository state, refused.
+    NoSession,
 }
 
 impl Label {
@@ -160,6 +162,7 @@ impl Label {
             "not_found" => Some(Self::NotFound),
             "too_large" => Some(Self::TooLarge),
             "search" => Some(Self::Search),
+            "no_session" => Some(Self::NoSession),
             _ => None,
         }
     }
@@ -187,6 +190,7 @@ impl Label {
             Self::NotFound => "not_found",
             Self::TooLarge => "too_large",
             Self::Search => "search",
+            Self::NoSession => "no_session",
         }
     }
 }
@@ -700,6 +704,64 @@ impl Handler for RepositoryHandler {
             exchange.now(),
             exchange.conn().sandbox.as_ref().map(|s| s.name.as_ref()),
         ))
+    }
+}
+
+/// Which repository state a request uses, chosen by the sandbox that sent it.
+#[derive(Clone)]
+pub enum Sessions {
+    /// One repository state for every sandbox.
+    Shared(Arc<Contents>),
+    /// A repository state for each named sandbox. There is no fallback: a
+    /// request from any other sandbox, or from none, is refused.
+    Separate(BTreeMap<String, Arc<Contents>>),
+}
+
+impl Sessions {
+    /// The repository state for requests from `sandbox`.
+    pub fn get(&self, sandbox: Option<&str>) -> Option<&Arc<Contents>> {
+        match self {
+            Self::Shared(contents) => Some(contents),
+            Self::Separate(states) => states.get(sandbox?),
+        }
+    }
+}
+
+/// Answers a site's requests from the repository state of the sandbox that
+/// sent them.
+#[derive(Clone)]
+pub struct SessionHandler {
+    /// The repository state of each sandbox.
+    pub sessions: Sessions,
+    /// The site receiving the requests.
+    pub site: Site,
+}
+
+impl Handler for SessionHandler {
+    fn call(&self, request: Request<Body>, exchange: &mut Exchange<'_>) -> Reply {
+        let sandbox = exchange.conn().sandbox.as_ref().map(|s| s.name.as_ref());
+        if let Some(contents) = self.sessions.get(sandbox) {
+            let handler = RepositoryHandler {
+                contents: contents.clone(),
+                site: self.site,
+            };
+            return handler.call(request, exchange);
+        }
+        let observing = fictionet::stdlib::web::httpd::EventInterest::of(&request);
+        Reply::Now(
+            Page::error(
+                403,
+                Label::NoSession,
+                "This workstation has no repository session.",
+            )
+            .response(
+                self.site,
+                request.body().bytes().map(|bytes| bytes.len()),
+                Vec::new(),
+                request.method() == "HEAD",
+                observing,
+            ),
+        )
     }
 }
 
@@ -1317,6 +1379,7 @@ mod tests {
             Label::NotFound,
             Label::TooLarge,
             Label::Search,
+            Label::NoSession,
         ] {
             assert_eq!(Label::parse(label.as_str()), Some(label));
             assert_eq!(serde_json::to_value(label).unwrap(), label.as_str());
