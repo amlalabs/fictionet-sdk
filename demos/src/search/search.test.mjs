@@ -46,18 +46,18 @@ function harness(t) {
 
 test('stream renders every outcome, failure, host, cache and timing', (t) => {
   const h = harness(t), s = fixture();
-  s.queries = [query(1, 'pending'), query(2), query(3, 'served', { results: 0, cache: 'missing' }), query(4, 'undelivered'), ...['budget', 'abandoned', 'backend_error', 'meta_error', 'error'].map((why, i) => query(i + 5, 'failed', { outcome: { status: 'failed', why, error: why === 'budget' || why === 'abandoned' ? null : `detail ${why}` } }))];
+  s.queries = [query(1, 'pending'), query(2), query(3, 'served', { results: 0, cache: 'missing' }), query(4, 'undelivered'), ...['budget', 'abandoned', 'error'].map((why, i) => query(i + 5, 'failed', { outcome: { status: 'failed', why, error: why === 'budget' || why === 'abandoned' ? null : `detail ${why}` } }))];
   h.publish(s);
   const stream = h.root.querySelector('.search-stream');
-  assert.equal(stream.children.length, 9);
-  assert.equal(stream.children[0].dataset.identity, '9');
+  assert.equal(stream.children.length, 7);
+  assert.equal(stream.children[0].dataset.identity, '7');
   const empty = stream.children.find((row) => row.dataset.identity === '3');
   assert.match(empty.textContent, /Served with no results · Generation was off · 8 ms/);
   assert.equal(empty.textContent.match(/generation was off/gi).length, 1);
   const spent = stream.children.find((row) => row.dataset.identity === '5');
   assert.match(spent.textContent, /Failed: the run’s generation budget is spent · 8 ms/);
   assert.doesNotMatch(spent.textContent, /Made for this search/);
-  for (const text of ['Pending', 'Served · 10 results', 'Not fully delivered', 'generation budget is spent', 'browser left before the answer', 'page maker failed — detail backend_error', 'page maker failed — detail meta_error', 'page maker failed — detail error', 'workstation · 10.0.0.2', 'Google', 'Made for this search', '8 ms']) assert.ok(stream.textContent.includes(text), text);
+  for (const text of ['Pending', 'Served · 10 results', 'Not fully delivered', 'generation budget is spent', 'browser left before the answer', 'page maker failed — detail error', 'workstation · 10.0.0.2', 'Google', 'Made for this search', '8 ms']) assert.ok(stream.textContent.includes(text), text);
   assert.match(h.root.textContent, /Firefox \(scripted\)/);
   h.dispose();
 });

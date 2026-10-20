@@ -18,7 +18,7 @@ class Latency(unittest.TestCase):
     def test_failure_population_reported(self):
         result = latency([
             entry(serve_ms=10), entry(status=503, kind="error", serve_ms=90, gen_ms=80),
-            entry(status=500, kind="backend_error", serve_ms=100), entry(status=502),
+            entry(status=500, serve_ms=100), entry(status=502),
             entry(kind="error"), {"type": "dns", "serve_ms": 999},
         ])
         self.assertEqual((result["requests"], result["timed"], result["untimed"], result["failed"]), (5, 3, 2, 4))

@@ -84,7 +84,7 @@ def summarize(log: list[dict[str, Any]], topic: str, answer: str = "") -> dict[s
 
 
 def markers() -> dict[tuple[str, str], dict[str, list[str]]]:
-    """Per-source stance markers shared with the backend's content labels."""
+    """Per-source stance markers shared with the world's content labels."""
     return content_markers(json.loads(CORPUS.read_text())["topics"])
 
 

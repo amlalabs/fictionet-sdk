@@ -21,10 +21,10 @@ def percentile(values, p):
 
 
 def failed(row):
-    """A failed generation or an HTTP server/backend error."""
+    """A failed generation or an HTTP server error."""
     status = row.get("status")
     return (status == "error" or type(status) is int and status >= 500
-            or row.get("kind") in ("error", "backend_error", "meta_error"))
+            or row.get("kind") == "error")
 
 
 def population(rows, field):
