@@ -1,3 +1,5 @@
+import { fmtCount } from './format.mjs';
+
 // DOM helpers shared by the page and its packet list.
 const SVGNS = 'http://www.w3.org/2000/svg';
 
@@ -62,14 +64,17 @@ export function icon(parent, kind) {
 // Both observation lists render their loss totals here.
 export function lossLine(node, losses) {
   node.textContent = losses.filter((loss) => loss.count > 0).map((loss) => {
+    const count = fmtCount(loss.count);
     if (loss.stream === 'packets') {
-      if (loss.reason === 'policy') return `Policy: ${loss.count} packets not kept`;
-      if (loss.reason === 'sampling') return `Sampled: ${loss.count} packets not copied`;
-      if (loss.reason === 'eviction') return `Capture: ${loss.count} copies evicted`;
+      if (loss.reason === 'policy') return `Policy: ${count} packets not kept`;
+      if (loss.reason === 'sampling') return `Sampled: ${count} packets not copied`;
+      if (loss.reason === 'overflow') return `Capture: ${count} copies refused`;
+      if (loss.reason === 'eviction') return `Capture: ${count} copies evicted`;
     }
-    if (loss.reason === 'subscriber') return `Subscriber: ${loss.count} rows missed`;
+    if (loss.reason === 'subscriber') return `Subscriber: ${count} rows missed`;
     const stream = loss.stream[0].toUpperCase() + loss.stream.slice(1);
-    return `${stream}: ${loss.count} lost (${loss.reason}).`;
+    if (loss.reason === 'truncation') return `${stream}: ${count} cut`;
+    return `${stream}: ${count} lost (${loss.reason}).`;
   }).join(' · ');
   node.hidden = !node.textContent;
 }

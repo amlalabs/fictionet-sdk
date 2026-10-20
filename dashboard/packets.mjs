@@ -25,7 +25,7 @@ export function createPackets({
     limit: maxRows, key: (row) => row.key,
     create(row) {
       const parent = document.createDocumentFragment();
-      if (row.gap) addGap(row.gap, parent);
+      if (row.gap) renderGap(row.gap, parent);
       else addPacket(row, parent);
       return { node: parent.firstChild };
     },
@@ -85,14 +85,14 @@ export function createPackets({
       invalidateSelection();
       // A new subscription replays retained history, possibly with restarted
       // sequence numbers. Replace its state before accepting any replay.
-      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), open: members.length, failed: false };
+      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), losses: new Map(), open: members.length, failed: false };
       tail.clear();
       addGap('Packet history reloaded');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
       clearDetail(`Packet history reloaded · ${PICK}`);
     });
-    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), open: members.length, failed: false };
+    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), losses: new Map(), open: members.length, failed: false };
     onStream('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
@@ -100,17 +100,14 @@ export function createPackets({
       if (p.declined !== undefined) { packets.declined.set(p.link, p.declined); showCounts(); }
       packets.lastTime.set(p.link, p.t);
       if (flips.get(p.link)) p.side = 1 - p.side;
-      // Keep capture loss visible even if its row leaves the browser's queue.
-      if (p.evicted > 0) {
-        packets.evicted += p.evicted;
-        showCounts();
-      }
+      if (p.evicted > 0) { packets.evicted += p.evicted; showCounts(); }
       queueEntry(p);
     });
     const policy = (ev) => {
       if (packets?.source !== source) return;
       const value = JSON.parse(ev.data);
       if (value.declined !== undefined) packets.declined.set(value.link || list, value.declined);
+      if (value.losses) packets.losses.set(value.link || list, value.losses);
       showCounts();
     };
     onStream('link', policy);
@@ -151,7 +148,6 @@ export function createPackets({
       // After the run stopped, the connection will not come back.
       const reason = stopped();
       addGap(reason || JSON.parse(ev.data).error);
-      trimRows();
       if (reason) source.close();
     });
     onStream('end', (ev) => {
@@ -219,7 +215,11 @@ export function createPackets({
     for (const tr of prows.children) filterRow(tr);
   }
 
-  function addGap(text, parent = prows) {
+  function addGap(gap) {
+    tail.append([{ gap, key: ++rowKey }]);
+  }
+
+  function renderGap(text, parent) {
     const tr = el('tr', { class: 'gap' }, parent);
     el('td', { colspan: hostColumn ? 9 : 8, text }, tr);
   }
@@ -227,16 +227,10 @@ export function createPackets({
   function showCounts() {
     lossLine($('sampled'), [
       { stream: 'packets', reason: 'policy', count: [...packets.declined.values()].reduce((a, b) => a + b, 0) },
-      { stream: 'packets', reason: 'sampling', count: packets.skipped },
-      { stream: 'packets', reason: 'eviction', count: packets.evicted },
+      ...['sampling', 'eviction', 'overflow', 'truncation', 'staging'].map((reason) => ({ stream: 'packets', reason, count: Math.max(reason === 'eviction' ? packets.evicted : reason === 'sampling' ? packets.skipped : 0, [...packets.losses.values()].flat().filter((loss) => loss.reason === reason).reduce((total, loss) => total + loss.count, 0)) })),
       { stream: 'packets', reason: 'subscriber', count: packets.missed },
     ]);
 
-  }
-
-  function trimRows() {
-    let extra = prows.children.length - MAX_ROWS;
-    while (extra-- > 0) prows.firstChild.remove();
   }
 
   /// Adds the packets that came since the last frame, in one change to the
@@ -266,7 +260,6 @@ export function createPackets({
     }
     tail.append(batch.slice(-MAX_ROWS).map((row) => ({ ...row, key: ++rowKey })));
     fitColumns();
-    trimRows();
     if (nearBottom) { plist.scrollTop = plist.scrollHeight; clearUnread(); }
     else if (jump) { unread += batch.length; jump.textContent = `↓ ${unread} new`; jump.hidden = false; }
   }
@@ -279,10 +272,7 @@ export function createPackets({
   }
 
   function addPacket(p, parent) {
-    if (p.skipped > 0) {
-      packets.skipped += p.skipped;
-      showCounts();
-    }
+    if (p.skipped > 0) { packets.skipped += p.skipped; showCounts(); }
     for (const field of ['src', 'dst', 'proto']) packets.widths[field] = Math.max(packets.widths[field], p[field].length);
     const time = p.t.toFixed(4);
     packets.widths.time = Math.max(packets.widths.time, time.length);
@@ -312,7 +302,6 @@ export function createPackets({
         const text = el('span', { class: 'packet-info-text' }, info);
         el('span', { class: 'packet-info-protocol', text: `${p.proto} ` }, text);
         text.append(String(c));
-        if (p.source && p.class) el('span', { class: 'pill', text: `${p.source}.${p.class}` }, info);
         labelChips(info, labels.filter((label) => flowMatches(label.target, p)));
       }
     });
@@ -394,6 +383,7 @@ export function createPackets({
     const title = el('div', {}, head);
     el('b', { text: `Packet ${p.no}` }, title);
     el('span', { text: host ? ` · ${host}'s link, packet ${p.seq} · ${d.len} bytes at ${d.t.toFixed(6)} s` : `, ${d.len} bytes at ${d.t.toFixed(6)}s, ${d.side === 0 ? $('dir-a').textContent : $('dir-b').textContent}` }, title);
+    if (p.source && p.class) el('span', { class: 'pill', text: `${p.source}.${p.class}` }, head);
     onDetail(p, head);
     // The layers below the application start closed, as in Wireshark, unless
     // they are all there is.

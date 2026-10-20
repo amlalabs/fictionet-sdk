@@ -109,6 +109,16 @@ pub(crate) struct Captures {
 }
 
 impl Captures {
+    pub(crate) fn has_random(&self, random: &[u8]) -> bool {
+        random.len() == 32
+            && self
+                .links
+                .values()
+                .flat_map(|capture| capture.rings.values())
+                .flat_map(|ring| &ring.items)
+                .any(|copy| copy.bytes.windows(32).any(|bytes| bytes == random))
+    }
+
     pub(crate) fn retired(&mut self, id: LinkId, crossings: u64) {
         self.order = self.order.saturating_add(1);
         if let Some(capture) = self.links.get_mut(&id) {
@@ -251,16 +261,22 @@ impl Captures {
             );
             return;
         }
-        ring.make_room(len, class.count, class.bytes, |old| {
-            self.bytes -= old.bytes.len();
-            losses.record(
-                options.loss_streams,
-                old.stamp,
-                Some(old.class),
-                LossReason::Eviction,
-                old.bytes.len(),
-            );
-        });
+        ring.make_room(
+            len,
+            class.count,
+            class.bytes,
+            |_| 0,
+            |old| {
+                self.bytes -= old.bytes.len();
+                losses.record(
+                    options.loss_streams,
+                    old.stamp,
+                    Some(old.class),
+                    LossReason::Eviction,
+                    old.bytes.len(),
+                );
+            },
+        );
         if capture.tap.as_deref() != Some(packet.tap) {
             capture.tap = Some(packet.tap.into());
         }

@@ -320,6 +320,7 @@ pub struct World {
     ca: Arc<Mutex<Option<(String, String)>>>,
     now_unix: i64,
     mirror: Option<mirror::Cache<fictionet::stdlib::web::Proxy>>,
+    mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
 }
 
 impl World {
@@ -342,7 +343,9 @@ impl World {
         fcx: &Cx,
     ) -> fictionet::Result<mirror::Cache<fictionet::stdlib::web::Proxy>> {
         if self.mirror.is_none() {
-            self.mirror = Some(mirror::new(fcx)?);
+            let mut mirror = mirror::new(fcx)?;
+            mirror.addresses = self.mirror_addresses.clone();
+            self.mirror = Some(mirror);
         }
         Ok(self.mirror.as_ref().unwrap().clone())
     }
@@ -690,6 +693,7 @@ struct Bridge {
 }
 
 struct Prepared {
+    mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
     policy: Option<Arc<dyn fictionet_observe::Policy>>,
     attachments: Attachments,
     jump_link: fictionet::End,
@@ -745,6 +749,7 @@ impl<W> Kit<W> {
         };
         let (attacher, attachments) = fictionet::attachments();
         let mut prepared = Prepared {
+            mirror_addresses: Default::default(),
             policy: self.policy.take(),
             attachments,
             jump_link: attacher.attach(JUMP).map_err(io::Error::other)?,
@@ -829,7 +834,31 @@ const KEYS: usize = 2;
 const AGENT: usize = 3;
 const BULK: usize = 4;
 
+/// Whether a crossing carries the kit's SSH or screen sessions.
+pub fn console_packet(packet: fictionet::events::PacketRef<'_>) -> bool {
+    use fictionet::stdlib::network::ip;
+    if packet.sandbox == Some(JUMP) {
+        return true;
+    }
+    let Some(header) = ip::Header::parse_truncated(packet.bytes) else {
+        return false;
+    };
+    if header.protocol != ip::protocol::TCP
+        || header.fragment.is_some_and(|fragment| fragment.offset != 0)
+    {
+        return false;
+    }
+    let Some(ports) = header.payload(packet.bytes).get(..4) else {
+        return false;
+    };
+    let src = u16::from_be_bytes([ports[0], ports[1]]);
+    let dst = u16::from_be_bytes([ports[2], ports[3]]);
+    (header.src == jump::JUMP_ADDR && matches!(dst, 22 | 5900))
+        || (header.dst == jump::JUMP_ADDR && matches!(src, 22 | 5900))
+}
+
 struct KitPolicy {
+    mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
     classes: Vec<fictionet_observe::Class>,
     world: Option<Arc<dyn fictionet_observe::Policy>>,
 }
@@ -857,7 +886,11 @@ impl KitPolicy {
         if let Some(world) = &world {
             classes.extend_from_slice(world.classes());
         }
-        Self { classes, world }
+        Self {
+            classes,
+            world,
+            mirror_addresses: Default::default(),
+        }
     }
 }
 
@@ -875,22 +908,13 @@ impl fictionet_observe::Policy for KitPolicy {
                 return Admit::Skip;
             }
             Interest::Packet(p) => {
-                if p.sandbox == Some(JUMP) {
+                if console_packet(p) {
                     return Admit::Skip;
                 }
-                if let Some(h) = ip::Header::parse_truncated(p.bytes)
-                    && h.protocol == ip::protocol::TCP
-                    && h.fragment.is_none_or(|f| f.offset == 0)
-                {
-                    let ports = h.payload(p.bytes).get(..4);
-                    if let Some(ports) = ports {
-                        let src = u16::from_be_bytes([ports[0], ports[1]]);
-                        let dst = u16::from_be_bytes([ports[2], ports[3]]);
-                        if (h.src == jump::JUMP_ADDR && matches!(dst, 22 | 5900))
-                            || (h.dst == jump::JUMP_ADDR && matches!(src, 22 | 5900))
-                        {
-                            return Admit::Skip;
-                        }
+                if let Some(h) = ip::Header::parse_truncated(p.bytes) {
+                    let addresses = self.mirror_addresses.load();
+                    if addresses.contains(&h.src) || addresses.contains(&h.dst) {
+                        return Admit::Class(BULK);
                     }
                 }
             }
@@ -962,8 +986,9 @@ impl Run {
         build: PageBuilder,
         prepared: &mut Prepared,
     ) -> io::Result<()> {
-        let policy: Arc<dyn fictionet_observe::Policy> =
-            Arc::new(KitPolicy::new(prepared.policy.take()));
+        let mut policy = KitPolicy::new(prepared.policy.take());
+        policy.mirror_addresses = prepared.mirror_addresses.clone();
+        let policy: Arc<dyn fictionet_observe::Policy> = Arc::new(policy);
         let observer = DashboardObserver::new(DashboardOptions {
             collector: fictionet_observe::Options {
                 policy: policy.clone(),
@@ -1020,6 +1045,7 @@ impl Run {
             attachments: prepared.attachments,
             ca: ca.clone(),
             mirror: None,
+            mirror_addresses: prepared.mirror_addresses,
             now_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(io::Error::other)?

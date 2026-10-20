@@ -790,6 +790,18 @@ tr.moment td:first-child {
   min-width: 160px;
 }
 .packet-panel .sampled,
+.pair-note {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--control);
+  background: var(--sunken);
+  color: var(--text);
+  font-size: 12px;
+}
 .packet-panel .drawer-body {
   display: flex;
   flex: 1;

@@ -1,8 +1,9 @@
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::Arc;
 use std::time::Duration;
 
-use fictionet::events::{Event, Stream};
+#[cfg(feature = "page")]
+use fictionet::events::Event;
+use fictionet::events::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::json::Value;
 
@@ -52,7 +53,7 @@ struct Section {
 /// A snapshot of selected ring contents. Reads do not create packet demand.
 pub struct Export {
     selection: Selection,
-    events: Vec<(usize, Arc<Event>)>,
+    events: Vec<String>,
     classes: Vec<&'static str>,
     losses: LossStatus,
     sections: VecDeque<Section>,
@@ -140,6 +141,44 @@ impl Collector {
                 packets,
             });
         }
+        let mut losses = self.losses();
+        let through = self
+            .events
+            .last()
+            .min(selection.through.unwrap_or(u64::MAX));
+        drop(state);
+        let events = events
+            .into_iter()
+            .filter_map(|(class, event)| {
+                let Ok(mut line) = event.to_line() else {
+                    losses.record_event(
+                        self.options.loss_streams,
+                        crate::ring::Kept::stamp(&event),
+                        class,
+                        fictionet::events::LossReason::Overflow,
+                        &event,
+                    );
+                    return None;
+                };
+                line.pop();
+                line.push_str(&format!(
+                    ",\"class\":{}",
+                    json_line(Value::from(self.options.policy.classes()[class].name))
+                        .expect("class name is JSON")
+                        .trim()
+                ));
+                #[cfg(feature = "page")]
+                {
+                    let labels = event_labels(&event, &selection.labels);
+                    line.push_str(&format!(
+                        ",\"labels\":{}",
+                        serde_json::to_string(&labels).expect("labels are JSON")
+                    ));
+                }
+                line.push_str("}\n");
+                Some(line)
+            })
+            .collect();
         Export {
             selection: selection.clone(),
             events,
@@ -150,13 +189,10 @@ impl Collector {
                 .iter()
                 .map(|class| class.name)
                 .collect(),
-            losses: self.losses(),
+            losses,
             sections,
             keylog,
-            through: self
-                .events
-                .last()
-                .min(selection.through.unwrap_or(u64::MAX)),
+            through,
         }
     }
 }
@@ -176,20 +212,7 @@ impl Export {
     /// streams and classes. Loss totals cover the run, since sequence ranges and
     /// sandbox identities are not available for every loss.
     pub fn jsonl(&self) -> impl Iterator<Item = fictionet::Result<String>> + '_ {
-        let events = self.events.iter().map(|(class, event)| {
-            let mut line = event.to_line()?;
-            line.pop();
-            line.push_str(&format!(",\"class\":{class}"));
-            #[cfg(feature = "page")]
-            {
-                let labels = event_labels(event, &self.selection.labels);
-                let labels = serde_json::to_string(&labels)
-                    .map_err(|err| fictionet::Error::msg(err.to_string()))?;
-                line.push_str(&format!(",\"labels\":{labels}"));
-            }
-            line.push_str("}\n");
-            Ok(line)
-        });
+        let events = self.events.iter().cloned().map(Ok);
         let losses = self
             .losses
             .streams
@@ -209,7 +232,7 @@ impl Export {
                     (
                         "class".into(),
                         loss.class
-                            .map_or(Value::Null, |class| (class as u64).into()),
+                            .map_or(Value::Null, |class| self.classes[class].into()),
                     ),
                     (
                         "reason".into(),
@@ -240,7 +263,7 @@ impl Export {
                     (
                         "class".into(),
                         loss.class
-                            .map_or(Value::Null, |class| (class as u64).into()),
+                            .map_or(Value::Null, |class| self.classes[class].into()),
                     ),
                     (
                         "reason".into(),

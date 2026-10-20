@@ -330,6 +330,7 @@ fn root_certificate_names_are_neutral() {
         ca: Arc::new(Mutex::new(None)),
         now_unix: 0,
         mirror: None,
+        mirror_addresses: Default::default(),
     };
     assert!(world.ca.lock().unwrap().is_none());
     for name in [
@@ -1560,30 +1561,13 @@ async fn a_noise_flood_keeps_the_agents_http_events() {
 
 #[tokio::test]
 async fn agent_traffic_keeps_full_fidelity_under_load() {
-    use fictionet::events::{Interest, LossReason, Observation, Stream};
+    use fictionet::events::{LossReason, Stream};
     use fictionet::{Interface, InterfaceExt};
-    use fictionet_observe::{Admit, Class, Envelope, Policy};
-    struct Mirror(KitPolicy);
-    impl Policy for Mirror {
-        fn classes(&self) -> &[Class] {
-            self.0.classes()
-        }
-        fn admit(&self, interest: Interest<'_>) -> Admit {
-            if let Interest::Packet(packet) = interest
-                && let Some(header) =
-                    fictionet::stdlib::network::ip::Header::parse_truncated(packet.bytes)
-                && header.dst == Ipv4Addr::new(10, 10, 5, 30)
-            {
-                return Admit::Class(BULK);
-            }
-            self.0.admit(interest)
-        }
-        fn sort(&self, observation: &Observation<'_>) -> Option<usize> {
-            self.0.sort(observation)
-        }
-    }
-    let (run, mut prepared, handle) =
-        observed_kit(Some(Arc::new(Mirror(KitPolicy::new(None))))).await;
+    use fictionet_observe::Envelope;
+    let (run, mut prepared, handle) = observed_kit(None).await;
+    prepared
+        .mirror_addresses
+        .store(Arc::new(vec![Ipv4Addr::new(10, 10, 5, 30).into()]));
     fictionet::lab(
         RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(std::mem::take(
             &mut prepared.observers,
@@ -1627,8 +1611,8 @@ async fn agent_traffic_keeps_full_fidelity_under_load() {
                 cx.sleep(fictionet::time::Duration::from_millis(100))
                     .await?;
             }
-            let agent = AGENT + BULK + 1;
-            let bulk = BULK + BULK + 1;
+            let agent = AGENT;
+            let bulk = BULK;
             let batch = collector.packets(id, 0, usize::MAX);
             let copies: Vec<_> = batch.packets.iter().filter(|p| p.class == agent).collect();
             assert_eq!(

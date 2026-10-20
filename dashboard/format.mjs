@@ -17,7 +17,7 @@ export function fmtBytes(n) {
 }
 export function fmtCount(n) {
   if (n < 1000) return String(Math.round(n));
-  if (n < 1e6) return `${(n / 1e3).toFixed(n < 1e4 ? 1 : 0)}k`;
+  if (n < 1e6) return `${(n / 1e3).toFixed(n < 1e5 ? 1 : 0)}k`;
   return `${(n / 1e6).toFixed(1)}M`;
 }
 export function fmtRate(n) {

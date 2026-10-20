@@ -208,7 +208,7 @@ impl Memory {
             drop(previous);
             let events = {
                 let state = self.state.lock();
-                let lost = self.losses.lock().events();
+                let lost = self.losses.lock().missing_events();
                 if lost != 0 {
                     return Poll::Ready(Err(Incomplete { lost }.into()));
                 }
@@ -223,7 +223,7 @@ impl Memory {
             if cx.is_cancelled() {
                 return Poll::Ready(Err(fictionet::Cancelled.into()));
             }
-            let lost = self.losses.lock().events();
+            let lost = self.losses.lock().missing_events();
             if lost != 0 {
                 return Poll::Ready(Err(Incomplete { lost }.into()));
             }
@@ -252,6 +252,7 @@ impl Memory {
 
     /// Reads events and loss cursors together. `None` selects the newest `max`
     /// events; `Some(after)` selects events following that sequence.
+    #[cfg(any(feature = "decode", test))]
     pub(crate) fn batch(&self, after: Option<u64>, max: usize) -> crate::ring::Batch<Event> {
         let state = self.state.lock();
         let batch = crate::ring::batch(state.history.iter().map(|(_, ring)| ring), after, max);
@@ -364,15 +365,21 @@ impl Memory {
         } else if class.count == 0 || size > class.bytes.min(self.bytes) {
             losses.record_event(self.loss_streams, stamp, index, LossReason::Overflow, event);
         } else {
-            history.make_room(size, class.count, class.bytes, |old| {
-                losses.record_event(
-                    self.loss_streams,
-                    old.stamp(),
-                    index,
-                    LossReason::Eviction,
-                    &old,
-                );
-            });
+            history.make_room(
+                size,
+                class.count,
+                class.bytes,
+                |_| 0,
+                |old| {
+                    losses.record_event(
+                        self.loss_streams,
+                        old.stamp(),
+                        index,
+                        LossReason::Eviction,
+                        &old,
+                    );
+                },
+            );
             let mut event = event.clone();
             event.seq = stamp.seq;
             event.at = stamp.at;
@@ -564,6 +571,25 @@ mod tests {
             assert!(state.history[1].1.bytes <= limits.bytes);
             assert!(state.history[1].1.items.len() <= limits.events);
         }
+    }
+
+    #[test]
+    fn waits_accept_kept_truncated_events() {
+        let memory = Arc::new(Memory::default());
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
+            move |cx| async move {
+                cx.emit("http", "request", |event| event.truncated());
+                cx.emit("dns", "query", |event| event);
+                let events = memory
+                    .wait(&cx, 0, 1, ms(100), |event| event.is("dns", "query"))
+                    .await?;
+                assert_eq!(events.len(), 1);
+                assert!(memory.checked_of("http", "request").unwrap()[0].is_truncated());
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use fictionet::events::{Event, Loss, LossReason, Stamp, Stream};
 
@@ -11,7 +11,8 @@ pub struct LossStatus {
     pub streams: Vec<LossEntry>,
     /// Totals whose stream could not fit in the detail budget.
     pub untracked: Vec<LossTotal>,
-    stream_count: usize,
+    by_stream: HashMap<Stream, Vec<usize>>,
+    omissions: HashMap<(Option<Stream>, Option<usize>), u64>,
     kinds: BTreeSet<(&'static str, &'static str)>,
     unknown_events: bool,
     missing_kinds: BTreeSet<(&'static str, &'static str)>,
@@ -64,23 +65,14 @@ impl LossStatus {
     }
 
     pub(crate) fn omissions(&self, stream: Stream, class: usize) -> u64 {
-        self.streams
-            .iter()
-            .filter(|loss| {
-                loss.stream == stream
-                    && loss.class.is_none_or(|index| index == class)
-                    && loss.reason != LossReason::Truncation
+        [Some(stream), None]
+            .into_iter()
+            .flat_map(|stream| {
+                [Some(class), None]
+                    .into_iter()
+                    .map(move |class| (stream, class))
             })
-            .map(|loss| loss.count)
-            .chain(
-                self.untracked
-                    .iter()
-                    .filter(|loss| {
-                        loss.class.is_none_or(|index| index == class)
-                            && loss.reason != LossReason::Truncation
-                    })
-                    .map(|loss| loss.count),
-            )
+            .map(|key| self.omissions.get(&key).copied().unwrap_or(0))
             .fold(0, u64::saturating_add)
     }
 
@@ -120,24 +112,32 @@ impl LossStatus {
                 }
             }
         }
-        if let Some(total) = self.streams.iter_mut().find(|total| {
-            total.stream == loss.stream
-                && total.class == loss.class
-                && total.reason == loss.reason
-                && total.event == loss.event
-        }) {
-            total.count = total.count.saturating_add(loss.count);
-            total.bytes = total
-                .bytes
-                .zip(loss.bytes)
-                .map(|(a, b)| a.saturating_add(b));
-        } else if self.streams.iter().any(|total| total.stream == loss.stream)
-            || self.stream_count < limit
-        {
-            if !self.streams.iter().any(|total| total.stream == loss.stream) {
-                self.stream_count += 1;
+        let tracked = self.by_stream.contains_key(&loss.stream) || self.by_stream.len() < limit;
+        if loss.reason != LossReason::Truncation {
+            let total = self
+                .omissions
+                .entry((tracked.then_some(loss.stream), loss.class))
+                .or_default();
+            *total = total.saturating_add(loss.count);
+        }
+        if tracked {
+            let entries = self.by_stream.entry(loss.stream).or_default();
+            if let Some(index) = entries.iter().copied().find(|index| {
+                let total = &self.streams[*index];
+                total.class == loss.class
+                    && total.reason == loss.reason
+                    && total.event == loss.event
+            }) {
+                let total = &mut self.streams[index];
+                total.count = total.count.saturating_add(loss.count);
+                total.bytes = total
+                    .bytes
+                    .zip(loss.bytes)
+                    .map(|(a, b)| a.saturating_add(b));
+            } else {
+                entries.push(self.streams.len());
+                self.streams.push(loss);
             }
-            self.streams.push(loss);
         } else if let Some(total) = self
             .untracked
             .iter_mut()

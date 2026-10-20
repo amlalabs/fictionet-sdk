@@ -411,7 +411,8 @@ impl Observer for Projection {
                     || (m.source == "tls" && m.kind == "handshake")
                     || (m.source == "http" && m.kind == "request")
             }
-            Interest::Topology(TopologyKind::Link) | Interest::Packet(_) => true,
+            Interest::Topology(TopologyKind::Link) => true,
+            Interest::Packet(packet) => !fictionet_demo::kit::console_packet(packet),
             _ => false,
         }
     }

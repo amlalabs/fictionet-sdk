@@ -4,7 +4,7 @@ use std::fmt;
 use fictionet::events::{ConnInfo, KeyRef, LossReason, Stamp};
 
 use crate::ring::{Kept, Ring};
-use crate::{Class, LossStatus};
+use crate::{LossStatus, Options};
 
 impl Kept for Key {
     fn stamp(&self) -> Stamp {
@@ -77,10 +77,13 @@ impl Keys {
         stamp: Stamp,
         key: KeyRef<'_>,
         index: usize,
-        class: &Class,
+        options: &Options,
+        captures: &crate::capture::Captures,
         losses: &mut LossStatus,
-        loss_streams: usize,
     ) {
+        let mut class = options.policy.classes()[index];
+        class.bytes = class.bytes.min(options.bytes);
+        let loss_streams = options.loss_streams;
         let size = size_of::<Key>()
             .saturating_add(key.label.len())
             .saturating_add(key.client_random.len())
@@ -95,15 +98,42 @@ impl Keys {
             losses.record(loss_streams, stamp, Some(index), LossReason::Overflow, size);
             return;
         }
-        ring.make_room(size, class.count, class.bytes, |old| {
-            losses.record(
-                loss_streams,
-                old.stamp,
-                Some(old.class),
-                LossReason::Eviction,
-                old.size(),
-            );
-        });
+        if (ring.items.len() >= class.count || ring.bytes > class.bytes - size)
+            && !captures.has_random(key.client_random)
+        {
+            let (pinned_count, pinned_bytes) = ring
+                .items
+                .iter()
+                .filter(|key| captures.has_random(&key.client_random))
+                .fold((0usize, 0usize), |(count, bytes), key| {
+                    (count + 1, bytes + key.size())
+                });
+            if pinned_count >= class.count || pinned_bytes > class.bytes - size {
+                losses.record(loss_streams, stamp, Some(index), LossReason::Overflow, size);
+                return;
+            }
+        }
+        // Prefer keys with no bytes left in a capture, within the same bounds.
+        ring.make_room(
+            size,
+            class.count,
+            class.bytes,
+            |items| {
+                items
+                    .iter()
+                    .position(|key| !captures.has_random(&key.client_random))
+                    .unwrap_or(0)
+            },
+            |old| {
+                losses.record(
+                    loss_streams,
+                    old.stamp,
+                    Some(old.class),
+                    LossReason::Eviction,
+                    old.size(),
+                );
+            },
+        );
         ring.push(Key {
             stamp,
             class: index,

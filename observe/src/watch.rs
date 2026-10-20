@@ -17,8 +17,6 @@ use crate::dashboard::Shared;
 use crate::json::{self, Object};
 use crate::{Bounds, CaptureDemand, Collector, Dissector, KeyLine, Registry};
 
-/// How many decoded packets a watch keeps.
-pub(crate) const ROWS: usize = 4096;
 /// How many bytes of decoded packets a watch keeps: the packets, their
 /// list lines and their details.
 pub(crate) const ROW_BYTES: usize = 32 << 20;
@@ -104,7 +102,7 @@ impl LinkWatch {
                 registry,
                 rows: VecDeque::new(),
                 row_bytes: 0,
-                max_rows: ROWS,
+                max_rows: usize::MAX,
                 max_bytes: ROW_BYTES,
                 released: None,
                 released_order: 0,
@@ -194,10 +192,30 @@ impl LinkWatch {
         let collector = &shared.collector;
         let watches = &shared.watches;
         let mut inner = self.inner.lock();
+        let protocols: std::collections::HashMap<_, _> = collector
+            .state
+            .lock()
+            .topology
+            .connections
+            .iter()
+            .filter_map(|connection| {
+                let conn = &connection.conn;
+                let (a, b) = (conn.local?, conn.peer?);
+                let name = if conn.tls { "tls" } else { connection.protocol };
+                (!name.is_empty()).then_some(((conn.transport, a.min(b), a.max(b)), name))
+            })
+            .collect();
         let mut done = 0;
         let mut drained = inner.gone;
         while !inner.gone && done < PUMP_BATCH {
             let batch = collector.packets(self.id, inner.cursor, 512);
+            let max_rows = batch
+                .evicted
+                .iter()
+                .fold(0usize, |count, (class, _)| {
+                    count.saturating_add(collector.options.policy.classes()[*class].count)
+                })
+                .min(inner.max_rows);
             for (class, total) in batch.evicted {
                 let position = inner.positions.entry(class).or_default();
                 let missed = total.saturating_sub(*position);
@@ -239,7 +257,24 @@ impl LinkWatch {
                 if copy.omissions > previous {
                     dissector.lost();
                 }
-                let protocol = collector.packet_protocol(&copy.bytes);
+                let protocol = fictionet::stdlib::network::ip::Header::parse_truncated(&copy.bytes)
+                    .and_then(|header| {
+                        let transport = match header.protocol {
+                            6 => fictionet::events::Transport::Tcp,
+                            17 => fictionet::events::Transport::Udp,
+                            _ => return None,
+                        };
+                        let ports = header.payload(&copy.bytes).get(..4)?;
+                        let a = std::net::SocketAddr::new(
+                            header.src,
+                            u16::from_be_bytes([ports[0], ports[1]]),
+                        );
+                        let b = std::net::SocketAddr::new(
+                            header.dst,
+                            u16::from_be_bytes([ports[2], ports[3]]),
+                        );
+                        protocols.get(&(transport, a.min(b), a.max(b))).copied()
+                    });
                 let complete = copy.bytes.len() == copy.original_len;
                 let mut decoded = dissector.decode_with(&copy.bytes, keys, protocol, complete);
                 decoded.tags.sort_unstable();
@@ -285,7 +320,7 @@ impl LinkWatch {
                 inner.row_bytes += row.bytes();
                 watches.total.fetch_add(row.bytes(), Ordering::Relaxed);
                 inner.rows.push_back(row);
-                while inner.rows.len() > inner.max_rows || inner.row_bytes > inner.max_bytes {
+                while inner.rows.len() > max_rows || inner.row_bytes > inner.max_bytes {
                     let Some(old) = inner.rows.pop_front() else {
                         break;
                     };
@@ -344,7 +379,7 @@ impl Inner {
     /// Takes the keys the collector added since last time. The collector
     /// forgets its oldest keys past its bounds, and so does this cache.
     fn take_keys(&mut self, collector: &Collector, bounds: Bounds) {
-        for key in collector.keys_after(self.keys_seen) {
+        'keys: for key in collector.keys_after(self.keys_seen) {
             self.keys_seen = key.stamp.seq;
             let line = KeyLine::from(&key);
             let size = key_size(&line);
@@ -352,7 +387,16 @@ impl Inner {
                 continue;
             }
             while self.keys.len() >= bounds.count || self.key_bytes > bounds.bytes - size {
-                let old = self.keys.pop_front().expect("key cache");
+                let state = collector.state.lock();
+                let index = self
+                    .keys
+                    .iter()
+                    .position(|key| !state.captures.has_random(&key.client_random))
+                    .or_else(|| state.captures.has_random(&line.client_random).then_some(0));
+                let Some(index) = index else {
+                    continue 'keys;
+                };
+                let old = self.keys.remove(index).expect("key cache");
                 self.key_bytes -= key_size(&old);
             }
             self.key_bytes += size;

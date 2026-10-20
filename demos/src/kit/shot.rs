@@ -103,13 +103,22 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
 
     let mut reader = Reader::new(from_read.as_raw_fd());
     let result = (|| {
-        let target = reader.call(
-            &to_write,
-            None,
-            "Target.createTarget",
-            json!({"url":"about:blank"}),
-        )?;
-        let target_id = string_field(&target, "targetId")?;
+        let targets = reader.call(&to_write, None, "Target.getTargets", json!({}))?;
+        let target_id = match targets["targetInfos"]
+            .as_array()
+            .and_then(|targets| targets.iter().find(|target| target["type"] == "page"))
+        {
+            Some(target) => string_field(target, "targetId")?,
+            None => {
+                let target = reader.call(
+                    &to_write,
+                    None,
+                    "Target.createTarget",
+                    json!({"url":"about:blank"}),
+                )?;
+                string_field(&target, "targetId")?
+            }
+        };
         let attach = reader.call(
             &to_write,
             None,

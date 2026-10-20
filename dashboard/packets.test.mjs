@@ -585,3 +585,39 @@ test('policy counts come from each link poll and replace its previous total', (t
   h.source.emit('policy', { link: 'e3', declined: 21 });
   assert.match($('sampled').textContent, /Policy: 26 packets not kept/);
 });
+
+test('reloaded history stays above replay and shares the row bound', (t) => {
+  const h = setup(t, ['a'], 3);
+  h.send(1, { skipped: 0 }); h.flush();
+  h.source.emit('open');
+  h.send(1, { skipped: 0 }); h.send(2, { skipped: 0 }); h.flush();
+  assert.equal($('prows').children[0].textContent, 'Packet history reloaded');
+  h.send(3, { skipped: 0 }); h.flush();
+  assert.deepEqual(h.rows().map((row) => row.dataset.seq), ['1', '2', '3']);
+  h.source.emit('error', { error: 'Reconnecting' });
+  h.send(4, { skipped: 0 }); h.flush();
+  assert.equal($('prows').children.length, 3);
+  assert.deepEqual(h.rows().map((row) => row.dataset.seq), ['3', '4']);
+});
+
+test('poll totals survive discarded rows and show refused copies and cuts', (t) => {
+  const h = setup(t, ['a'], 1);
+  h.source.emit('policy', { losses: [
+    { class: 'agent', reason: 'eviction', count: 11616 },
+    { class: 'agent', reason: 'overflow', count: 1 },
+    { class: 'bulk', reason: 'truncation', count: 2 },
+  ] });
+  h.send(1, { skipped: 0 }); h.flush();
+  h.send(2, { skipped: 0 }); h.flush();
+  assert.equal($('sampled').textContent, 'Capture: 11.6k copies evicted · Capture: 1 copies refused · Packets: 2 cut');
+});
+
+test('packet class is shown only after selecting its detail', async (t) => {
+  const h = setup(t);
+  h.send(1, { skipped: 0, source: 'guest', class: 'agent' }); h.flush();
+  assert.doesNotMatch(h.rows()[0].textContent, /guest.agent/);
+  h.rows()[0].dispatchEvent(new Event('click'));
+  h.requests[0].resolve({ ok: true, json: async () => detail(1) });
+  await settle();
+  assert.match($('tree').textContent, /guest.agent/);
+});

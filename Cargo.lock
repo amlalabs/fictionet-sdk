@@ -918,6 +918,7 @@ name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
  "adaptive-web-world",
+ "arc-swap",
  "artifactory-world",
  "border-world",
  "bytes",

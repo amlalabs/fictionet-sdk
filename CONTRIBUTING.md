@@ -116,8 +116,10 @@ $ cargo bench --locked --bench network -- --list
 scheduling and unread-link memory. `services` covers relay traffic, HTTPS sites
 and proxy DNS caching. `runtime::logging` compares event handling with and
 without a JSONL writer. `runtime::observe::links` compares no collector,
-topology collection and packet capture; `runtime::observe::graph` uses 1,000
-sites. `network::sched::packet_round_trips` compares no observer, event-only
+topology collection, packet capture and packet classification.
+`runtime::logging::policy` compares keeping all events with declining half;
+`runtime::observe::graph` uses 1,000 sites.
+`network::sched::packet_round_trips` compares no observer, event-only
 interest and packet interest. `runtime::timers` covers timers.
 `decoders` feeds TPKT/COTP, HTTP/1 requests and ITCH add orders in 16 KiB
 chunks. Divan reports timings, rates and allocation counts; no benchmark has a

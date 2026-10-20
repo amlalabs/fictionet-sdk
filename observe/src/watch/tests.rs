@@ -216,53 +216,67 @@ fn capture_reports_overflow_from_an_empty_capture() {
 
 #[test]
 fn quiet_capture_keeps_keys_after_the_collector_ring_rotates() {
-    let bounds = crate::Bounds {
-        count: 100,
-        bytes: 1 << 20,
-    };
-    let options = startup(Options {
-        policy: crate::tests::policy([
-            Class::new("keys").count(bounds.count).bytes(bounds.bytes),
-            Class::new("packets").count(4096).bytes(8 << 20).burst(64),
-        ]),
-        ..Options::default()
-    });
-    with_dashboard(options, move |cx, handle| async move {
-        let (mut ends, links) = links(&cx, &handle, 1).await;
-        let mut session = handle.session();
-        let now = Instant::now();
-        call(&mut session, 1, &packets(links[0], 0), now);
-        let watch = watch_of(&handle, links[0], now);
-        log_key(&cx, &key(0));
-        let original = handle.0.collector.keylog();
-        ends[0].send(ip());
-        watch.pump(&handle.0);
-        let rows = watch.rows_after(0, 10);
+    for count in [1, 100] {
+        let bounds = crate::Bounds {
+            count,
+            bytes: 1 << 20,
+        };
+        let options = startup(Options {
+            policy: crate::tests::policy([
+                Class::new("keys").count(bounds.count).bytes(bounds.bytes),
+                Class::new("packets").count(4096).bytes(8 << 20).burst(64),
+            ]),
+            ..Options::default()
+        });
+        with_dashboard(options, move |cx, handle| async move {
+            let (mut ends, links) = links(&cx, &handle, 1).await;
+            let mut session = handle.session();
+            let now = Instant::now();
+            call(&mut session, 1, &packets(links[0], 0), now);
+            let watch = watch_of(&handle, links[0], now);
+            log_key(&cx, &key(0));
+            let original = handle.0.collector.keylog();
+            let mut hello = vec![0; 40];
+            hello[0] = 0x45;
+            hello[9] = 6;
+            hello[12..20].copy_from_slice(&[10, 0, 0, 1, 10, 0, 0, 2]);
+            hello[20..24].copy_from_slice(&[0xc0, 0, 1, 0xbb]);
+            hello[32] = 0x50;
+            hello[33] = 0x18;
+            hello.extend_from_slice(&[22, 3, 3, 0, 45, 1, 0, 0, 41, 3, 3]);
+            hello.extend_from_slice(&key(0).1);
+            hello.extend_from_slice(&[0, 0, 2, 0x13, 1, 1, 0]);
+            let len = hello.len() as u16;
+            hello[2..4].copy_from_slice(&len.to_be_bytes());
+            ends[0].send(Packet(hello));
+            watch.pump(&handle.0);
+            let rows = watch.rows_after(0, 10);
 
-        // Sessions elsewhere rotate the collector's ring without new packets here.
-        for n in 1..=bounds.count {
-            log_key(&cx, &key(n));
-        }
-        watch.pump(&handle.0);
-        assert_eq!(watch.rows_after(0, 10), rows);
-        let current = handle.0.collector.keylog();
-        assert_eq!(current.lines().count(), bounds.count);
-        assert!(!current.contains(&original));
-        let exported = exported_keys(&download(&mut session, 2, links[0], now));
-        assert_eq!(watch.cached_keys(), 1);
-        assert_eq!(exported, current);
+            // Sessions elsewhere rotate the collector's ring without new packets here.
+            for n in 1..=bounds.count {
+                log_key(&cx, &key(n));
+            }
+            watch.pump(&handle.0);
+            assert_eq!(watch.rows_after(0, 10), rows);
+            let current = handle.0.collector.keylog();
+            assert_eq!(current.lines().count(), bounds.count);
+            assert!(current.contains(&original));
+            let exported = exported_keys(&download(&mut session, 2, links[0], now));
+            assert_eq!(watch.cached_keys(), 1);
+            assert_eq!(exported, current);
 
-        // Traffic resumes: the watch's bounded cache also forgets the old key.
-        ends[0].send(ip());
-        watch.pump(&handle.0);
-        assert_eq!(watch.cached_keys(), bounds.count);
-        assert_eq!(watch.rows_after(0, 10).1.len(), 2);
-        assert_eq!(
-            exported_keys(&download(&mut session, 3, links[0], now)),
-            current
-        );
-        Ok(())
-    });
+            // Traffic resumes with the captured handshake key still available.
+            ends[0].send(ip());
+            watch.pump(&handle.0);
+            assert_eq!(watch.cached_keys(), bounds.count);
+            assert_eq!(watch.rows_after(0, 10).1.len(), 2);
+            assert_eq!(
+                exported_keys(&download(&mut session, 3, links[0], now)),
+                current
+            );
+            Ok(())
+        });
+    }
 }
 
 #[test]
@@ -1030,6 +1044,41 @@ fn dns_without_a_connection_uses_port_matching() {
                 .iter()
                 .any(|row| text(row).contains(r#""proto":"DNS""#))
         );
+        Ok(())
+    });
+}
+
+#[test]
+fn a_late_watch_keeps_the_policy_tail_and_polls_capture_losses() {
+    let options = startup(Options {
+        policy: crate::tests::policy([Class::new("packets").count(8192).bytes(8 << 20)]),
+        ..Options::default()
+    });
+    with_dashboard(options, |cx, handle| async move {
+        let (mut ends, links) = links(&cx, &handle, 1).await;
+        for _ in 0..9000 {
+            ends[0].send(ip());
+        }
+        let mut session = handle.session();
+        let now = Instant::now();
+        call(&mut session, 1, &packets(links[0], 0), now);
+        let watch = watch_of(&handle, links[0], now);
+        while !watch.pump(&handle.0) {}
+        let (missed, rows) = watch.rows_after(0, usize::MAX);
+        assert_eq!(missed, 0);
+        assert_eq!(rows.len(), 8192);
+        let values = session.poll(now, None);
+        assert!(!names(&values).iter().any(|name| name == "gap"));
+        let policy = values.iter().find(|value| matches!(value.envelope(), Some(Envelope::Event { name, .. }) if name == "policy")).unwrap();
+        assert!(text(policy).contains(r#""reason":"eviction","count":808"#));
+        watch.set_limits(1, ROW_BYTES);
+        ends[0].send(ip());
+        watch.pump(&handle.0);
+        let mut late = handle.session();
+        call(&mut late, 2, &packets(links[0], 0), now);
+        let values = late.poll(now, None);
+        let policy = values.iter().find(|value| matches!(value.envelope(), Some(Envelope::Event { name, .. }) if name == "policy")).unwrap();
+        assert!(text(policy).contains(r#""reason":"eviction","count":809"#));
         Ok(())
     });
 }

@@ -1678,3 +1678,64 @@ async fn closing_stops_forwarding_on_clones_made_before_closing() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn served_addresses_feed_the_kit_bulk_policy() {
+    use fictionet::events::{Interest, LinkType, PacketRef, Side};
+    use fictionet_observe::{Admit, Policy};
+    run(|fcx| async move {
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "mirror").unwrap();
+        let upstream = Upstream::new().await;
+        let cache = upstream.cache(&fcx, dir.path());
+        let mut request = request(PACKAGE);
+        request.extensions_mut().insert(ConnInfo {
+            local: Some("127.0.0.1:80".parse().unwrap()),
+            ..Default::default()
+        });
+        let response = send(&fcx, &cache, request).await.unwrap();
+        assert_eq!(bytes(response).await, "package");
+        assert_eq!(
+            **cache.addresses.load(),
+            vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        let mut policy = crate::kit::KitPolicy::new(None);
+        policy.mirror_addresses = cache.addresses.clone();
+        let collector = Arc::new(fictionet_observe::Collector::default());
+        fictionet::lab(
+            RunOptions::new(Seed::from_u64(2)).observer(collector.clone()),
+            |cx| async move {
+                let (a, _b) = fictionet::pair();
+                let _a = cx.tap("guest", a);
+                cx.yield_now().await?;
+                let link = *collector.topology().links.keys().next().unwrap();
+                for (src, dst, class) in [
+                    ([10, 0, 0, 1], [127, 0, 0, 1], crate::kit::BULK),
+                    ([127, 0, 0, 1], [10, 0, 0, 1], crate::kit::BULK),
+                    ([10, 0, 0, 1], [198, 18, 0, 9], crate::kit::AGENT),
+                ] {
+                    let mut data = vec![0; 20];
+                    data[0] = 0x45;
+                    data[2..4].copy_from_slice(&20u16.to_be_bytes());
+                    data[12..16].copy_from_slice(&src);
+                    data[16..20].copy_from_slice(&dst);
+                    assert_eq!(
+                        policy.admit(Interest::Packet(PacketRef {
+                            link,
+                            tap: "guest",
+                            sandbox: Some("guest"),
+                            side: Side::A,
+                            len: data.len(),
+                            link_type: LinkType::Ip,
+                            bytes: &data
+                        })),
+                        Admit::Class(class)
+                    );
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+}

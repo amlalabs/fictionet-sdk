@@ -1915,7 +1915,7 @@ fn jsonl_and_pcapng_share_a_selection() {
                 .collect();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["seq"], 3);
-            assert_eq!(events[0]["class"], 0);
+            assert_eq!(events[0]["class"], "agent");
             assert_eq!(events[0]["sandbox"]["name"], "alpha");
             assert_eq!(export.keylog(), "CLIENT_RANDOM 03 03\n");
             let file = pcap_file(&mut export);
@@ -1936,7 +1936,7 @@ fn jsonl_and_pcapng_share_a_selection() {
             assert_eq!(comment["class"], 0);
             assert_eq!(comment["source"], "alpha");
             assert!(lines.iter().any(|line| line["type"] == "loss"
-                && line["class"] == 0
+                && line["class"] == "agent"
                 && line["reason"] == "truncation"));
             Ok(())
         },
@@ -2284,4 +2284,43 @@ fn delivery_classifies_a_packet_once() {
         assert_eq!(policy.0.load(Ordering::Relaxed), 1);
         assert_eq!(collector.packets(link, 0, 10).packets[0].class, 3);
     });
+}
+
+#[test]
+fn jsonl_skips_unserializable_events_and_reports_their_kind() {
+    use fictionet::events::Event;
+    let collector = Collector::default();
+    let mut invalid = Event::new("http", "request");
+    invalid.summary = "x".repeat(1 << 20);
+    for (seq, event) in [(1, invalid), (2, Event::new("dns", "query"))] {
+        collector.observe(
+            Stamp {
+                stream: Stream::Events,
+                seq,
+                at: Instant::ZERO,
+            },
+            Observation::Event(&event),
+        );
+    }
+    let export = collector.export(&crate::export::Selection {
+        streams: vec![Stream::Events],
+        ..Default::default()
+    });
+    let lines: Vec<_> = export
+        .jsonl()
+        .collect::<fictionet::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains(r#""kind":"query""#));
+    assert!(lines[0].contains(r#""class":"events""#));
+    assert!(lines[1].contains(r#""type":"loss""#));
+    assert!(lines[1].contains(r#""kind":"request""#));
+    assert!(lines[1].contains(r#""count":1"#));
+    assert_eq!(
+        export
+            .jsonl()
+            .collect::<fictionet::Result<Vec<_>>>()
+            .unwrap(),
+        lines
+    );
 }

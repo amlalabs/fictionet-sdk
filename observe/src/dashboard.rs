@@ -218,6 +218,7 @@ enum Kind {
         hold: Hold,
         cursor: u64,
         declined: Option<u64>,
+        losses: String,
     },
 }
 
@@ -375,6 +376,7 @@ impl Session {
                                     id,
                                     next: now,
                                     kind: Kind::Packets {
+                                        losses: "[]".into(),
                                         declined: view::packet_declined(handle, hold.watch().id()),
                                         hold,
                                         cursor,
@@ -546,6 +548,7 @@ impl Subscription {
                 hold,
                 cursor,
                 declined,
+                losses,
             } => {
                 self.next = now + PACKET_TICK;
                 let shared = &handle.0;
@@ -562,16 +565,42 @@ impl Subscription {
                 let drained = watch.pump(shared);
                 let current_declined = view::packet_declined(handle, watch.id());
                 let (missed, rows) = watch.rows_after(*cursor, ROWS_PER_POLL);
-                if rows.is_empty()
-                    && current_declined != *declined
-                    && let Some(count) = current_declined
-                {
-                    out.push(event(
-                        id,
-                        "policy",
-                        &Object::new().num("declined", count).done(),
-                    ));
+                let current_losses = json::array(
+                    shared
+                        .collector
+                        .losses()
+                        .streams
+                        .iter()
+                        .filter(|loss| {
+                            loss.stream == fictionet::events::Stream::Packets(watch.id())
+                        })
+                        .map(|loss| {
+                            Object::new()
+                                .raw(
+                                    "class",
+                                    &loss.class.map_or_else(
+                                        || "null".into(),
+                                        |index| {
+                                            json::quote(
+                                                shared.collector.options.policy.classes()[index]
+                                                    .name,
+                                            )
+                                        },
+                                    ),
+                                )
+                                .str("reason", &format!("{:?}", loss.reason).to_lowercase())
+                                .num("count", loss.count)
+                                .done()
+                        }),
+                );
+                if current_losses != *losses || (rows.is_empty() && current_declined != *declined) {
+                    let mut status = Object::new().raw("losses", &current_losses);
+                    if let Some(count) = current_declined {
+                        status = status.num("declined", count);
+                    }
+                    out.push(event(id, "policy", &status.done()));
                 }
+                *losses = current_losses;
                 *declined = current_declined;
                 if missed > 0 {
                     let gap = crate::loss::gap(

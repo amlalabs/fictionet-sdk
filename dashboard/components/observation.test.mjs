@@ -506,3 +506,21 @@ test('both lists use one loss line for subscriber gaps', async (t) => {
   close();
   h.clean();
 });
+
+test('event cuts stay distinct from loss and successful downloads restore their label', async (t) => {
+  const h = await fixture(t);
+  let fails = true;
+  h.services.transport.download = async () => { if (fails) throw new Error('download'); };
+  const dispose = events(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, status: { losses: [{ stream: 'events', reason: 'truncation', count: 2 }] } });
+  h.frame();
+  assert.match(h.root.textContent, /Events: 2 cut/);
+  assert.doesNotMatch(h.root.textContent, /lost/);
+  const button = h.root.querySelector('.panel-tools').querySelector('.button');
+  button.dispatchEvent(new Event('click')); await settle();
+  assert.equal(button.textContent, 'Download failed');
+  fails = false;
+  button.dispatchEvent(new Event('click')); await settle();
+  assert.equal(button.textContent, 'JSONL');
+  dispose(); h.clean();
+});

@@ -54,6 +54,7 @@ pub fn new(fcx: &Cx) -> Result<Cache<web::Proxy>, Error> {
 pub struct Cache<S> {
     upstream: S,
     state: Arc<State>,
+    pub(super) addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
 }
 
 #[derive(Default)]
@@ -105,6 +106,7 @@ impl<S> Cache<S> {
         };
         Self {
             upstream,
+            addresses: Default::default(),
             state: Arc::new(State {
                 disk,
                 keys: Mutex::new(BTreeMap::new()),
@@ -264,6 +266,21 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
+        if let Some(address) = request
+            .extensions()
+            .get::<fictionet::events::ConnInfo>()
+            .and_then(|conn| conn.local)
+            .map(|address| address.ip())
+            && !self.addresses.load().contains(&address)
+        {
+            self.addresses.rcu(|previous| {
+                let mut addresses = (**previous).clone();
+                if !addresses.contains(&address) {
+                    addresses.push(address);
+                }
+                addresses
+            });
+        }
         let cache = self.clone();
         // Admit before per-key waits; hold through EOF, cancellation or deadline.
         let permit = self.state.slots.clone().try_acquire_owned();

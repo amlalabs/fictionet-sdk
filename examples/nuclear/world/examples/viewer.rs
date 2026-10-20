@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         automatic_protection: false,
         ..Config::default()
     });
-    let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let dashboard = DashboardObserver::new(DashboardOptions::default());
     let state = StateTopic::<PlantSnapshot>::new(StateLimits::default());
     let lines_topic = StateTopic::<Vec<story::Line>>::new(StateLimits::default());
     let plant = CommandPort::<Command, Reply>::new(CommandLimits::default());

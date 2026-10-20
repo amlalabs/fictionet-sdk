@@ -197,6 +197,7 @@ impl Policy for Standard {
     }
 }
 
+#[cfg(feature = "decode")]
 pub(crate) fn watched() -> Arc<dyn Policy> {
     let mut policy = Standard::default();
     policy.classes[3].when = When::Watched;

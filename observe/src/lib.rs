@@ -422,7 +422,9 @@
 //!
 //! `cargo bench --locked --bench runtime -- observe` measures dashboard cost.
 //! `observe::links` uses ten sandboxes sending HTTPS requests with no watch,
-//! with the graph watched, and with all sandbox links watched.
+//! with the graph watched, with all sandbox links watched, and with a packet policy.
+//! `cargo bench --locked --bench runtime -- logging::policy` compares keeping
+//! all events with declining half before building.
 //! `observe::graph` uses one sandbox and a large site graph, with and without
 //! a graph watch. See
 //! [CONTRIBUTING.md](https://github.com/amlalabs/fictionet-sdk/blob/main/CONTRIBUTING.md)
@@ -465,9 +467,7 @@
 //! Loss totals persist by stream, class and cause. After `loss_streams` fills,
 //! additional streams contribute to [`LossStatus::untracked`] by cause without
 //! stream identity. Declined observations do not enter the ledger. A refreshed
-//! snapshot cannot repair collector loss. `checked_of` uses the class ledger
-//! when admission fixes that kind's class, and the event stream when it needs
-//! a built event to decide.
+//! snapshot cannot repair collector loss. `checked_of` checks losses for the exact event kind, including unknown kinds.
 //! Zero count or byte bounds refuse retention. Event byte accounting includes
 //! owned capacities, task names and shared connection metadata charged in full
 //! per copy, plus estimated allocation overhead. It excludes spare collection
@@ -490,8 +490,8 @@
 //! `{"error":"no such link"}` even at capacity. Existing streams keep working.
 //! Zero watch capacity refuses a watch for another link.
 //!
-//! Each watch retains at most 4,096 decoded rows and 32 MiB. Rows charge packet
-//! summary JSON and detail JSON. [`DashboardOptions::watch_bytes`] adds
+//! Each watch retains as many decoded rows as its link's class count budgets
+//! allow, within 32 MiB. Rows charge summary JSON and detail JSON. [`DashboardOptions::watch_bytes`] adds
 //! a 256 MiB aggregate row budget. Pressure forgets idle watches first,
 //! longest idle first, then evicts the oldest decoded rows across watches.
 //! Idle history lasts up to one minute by the caller's supplied time; pressure
@@ -691,7 +691,8 @@
 //! whose capture remains. Each `packet` event has `seq`, `t`, `side`, `len`,
 //! `class`, `source`, `skipped`, `evicted`, `src`, `dst`, `proto`, `info` and `tags`.
 //! When crossing totals are available, `link` and `packet` include `declined`.
-//! A poll with no rows sends `policy` when that count changes.
+//! Polls send `policy` with cumulative `losses` by class and reason when they
+//! change, even if no rows remain; idle polls also update `declined`.
 //! `seq` numbers decoded rows from 1 within a watch. It is separate from the
 //! core packet stream sequence, which is also the capture cursor. `t` is run
 //! time in seconds. `len` is the original length before snap truncation.
@@ -957,33 +958,6 @@ impl Collector {
     pub fn ended(&self) -> Option<Instant> {
         self.state.lock().ended
     }
-    #[cfg(feature = "decode")]
-    fn packet_protocol(&self, bytes: &[u8]) -> Option<&'static str> {
-        use fictionet::stdlib::network::ip;
-        let header = ip::Header::parse_truncated(bytes)?;
-        let ports = header.payload(bytes).get(..4)?;
-        let a = std::net::SocketAddr::new(header.src, u16::from_be_bytes([ports[0], ports[1]]));
-        let b = std::net::SocketAddr::new(header.dst, u16::from_be_bytes([ports[2], ports[3]]));
-        self.state
-            .lock()
-            .topology
-            .connections
-            .iter()
-            .rev()
-            .find_map(|connection| {
-                let conn = &connection.conn;
-                let transport = match header.protocol {
-                    6 => fictionet::events::Transport::Tcp,
-                    17 => fictionet::events::Transport::Udp,
-                    _ => return None,
-                };
-                (conn.transport == transport
-                    && ((conn.local == Some(a) && conn.peer == Some(b))
-                        || (conn.local == Some(b) && conn.peer == Some(a))))
-                .then_some(if conn.tls { "tls" } else { connection.protocol })
-                .filter(|name| !name.is_empty())
-            })
-    }
     /// Starts or joins demand on a known link. Policy still decides each crossing.
     pub fn capture_demand(&self, link: LinkId) -> Option<CaptureDemand> {
         self.demand.load().get(&link)?.take()
@@ -1136,9 +1110,7 @@ impl Observer for Collector {
         match item {
             Observation::TlsKey(key) => {
                 if let Some(index) = index {
-                    let mut class = self.options.policy.classes()[index];
-                    class.bytes = class.bytes.min(self.options.bytes);
-                    keys.push(stamp, key, index, &class, losses, self.options.loss_streams);
+                    keys.push(stamp, key, index, &self.options, captures, losses);
                 }
             }
             Observation::Packet(packet) => {

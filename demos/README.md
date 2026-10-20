@@ -246,10 +246,11 @@ The kit installs one observation policy before the world starts. It skips the
 jump host's events and packets and excludes SSH and VNC console flows before
 copying. Agent traffic keeps whole packets: 8,192 copies and 32 MiB per link,
 without thinning. Internal taps use watched bulk capture: 4,096 copies, 1 MiB,
-96 bytes per packet and a burst of 64 per 100 ms. `Kit::policy` delegates the
-remaining selection to world code, including mirror classification where the
-world knows its addresses. Shared-budget eviction ranks bulk, noise, agent
-packets, ordinary events and keys from lowest to highest.
+96 bytes per packet and a burst of 64 per 100 ms. `World::mirror` learns its
+serving addresses from requests so the kit puts subsequent traffic in bulk.
+`Kit::policy` delegates the remaining selection to world code. Shared-budget
+eviction ranks bulk, noise, agent packets, ordinary events and keys from lowest
+to highest.
 
 The page includes each host's status, containment probes and labels. The standard panels are the
 screen, terminal, packets, events, map, Left the box, containment, labels and

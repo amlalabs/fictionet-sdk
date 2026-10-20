@@ -162,30 +162,36 @@ pub(crate) fn counters(graph: &DashboardHandle, wall: Option<Duration>) -> Strin
 }
 
 pub(crate) fn status(graph: &DashboardHandle) -> String {
-    use fictionet::events::Stream;
     let topology = graph.0.collector.topology();
     let losses = graph.0.collector.losses();
-    let streams = losses.streams.iter().map(|loss| {
-        let stream = match loss.stream {
-            Stream::Events => "events".into(),
-            Stream::Keys => "keys".into(),
-            Stream::Topology => "topology".into(),
-            Stream::Packets(id) => crate::loss::stream_name(Stream::Packets(id)),
-        };
-        Object::new()
-            .str("stream", &stream)
-            .raw(
-                "class",
-                &loss.class.map_or_else(|| "null".into(), |n| n.to_string()),
-            )
-            .str("reason", &format!("{:?}", loss.reason).to_lowercase())
-            .num("count", loss.count)
-            .raw(
-                "bytes",
-                &loss.bytes.map_or_else(|| "null".into(), |n| n.to_string()),
-            )
-            .done()
-    });
+    let mut totals = std::collections::BTreeMap::new();
+    for loss in &losses.streams {
+        let key = (
+            crate::loss::stream_name(loss.stream),
+            loss.class,
+            format!("{:?}", loss.reason).to_lowercase(),
+        );
+        let total = totals.entry(key).or_insert((0u64, Some(0u64)));
+        total.0 = total.0.saturating_add(loss.count);
+        total.1 = total.1.zip(loss.bytes).map(|(a, b)| a.saturating_add(b));
+    }
+    let streams = totals
+        .into_iter()
+        .map(|((stream, class, reason), (count, bytes))| {
+            Object::new()
+                .str("stream", &stream)
+                .raw(
+                    "class",
+                    &class.map_or_else(|| "null".into(), |n| n.to_string()),
+                )
+                .str("reason", &reason)
+                .num("count", count)
+                .raw(
+                    "bytes",
+                    &bytes.map_or_else(|| "null".into(), |n| n.to_string()),
+                )
+                .done()
+        });
     let untracked = losses.untracked.iter().map(|loss| {
         Object::new()
             .raw(
@@ -593,6 +599,24 @@ mod tests {
     use super::*;
     use crate::{DashboardObserver, DashboardOptions, Options, Topology};
     use fictionet::events::{Interest, Observation, Observer, Stamp, Stream, TopologyRef};
+
+    #[test]
+    fn status_sums_kinds_with_the_same_stream_class_and_reason() {
+        let graph = history_graph();
+        for (seq, kind) in [(1, "request"), (2, "response")] {
+            graph.0.observe(
+                Stamp {
+                    stream: Stream::Events,
+                    seq,
+                    at: fictionet::time::Instant::ZERO,
+                },
+                Observation::Event(&fictionet::events::Event::new("http", kind).truncated()),
+            );
+        }
+        let value = status(&graph);
+        assert_eq!(value.matches("truncation").count(), 1);
+        assert!(value.contains(r#""count":2"#));
+    }
 
     fn identities(count: usize) -> Topology {
         struct Added(crate::Collector);

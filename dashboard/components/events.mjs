@@ -140,7 +140,7 @@ export function mount(root, services, options = {}) {
   }));
   status(state.status);
   cleanup.push(listen(download, 'click', async () => {
-    try { await services.transport.download('events', host || ''); }
+    try { await services.transport.download('events', host || ''); download.textContent = 'JSONL'; }
     catch { download.textContent = 'Download failed'; }
   }));
   cleanup.push(listen(filter, 'input', render));

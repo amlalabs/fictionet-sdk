@@ -58,7 +58,11 @@ impl<T: Kept> Ring<T> {
     }
 
     pub(crate) fn evict(&mut self) -> Option<T> {
-        let item = self.items.pop_front()?;
+        self.evict_at(0)
+    }
+
+    pub(crate) fn evict_at(&mut self, index: usize) -> Option<T> {
+        let item = self.items.remove(index)?;
         self.bytes -= item.size();
         self.evicted = self.evicted.saturating_add(1);
         Some(item)
@@ -69,12 +73,13 @@ impl<T: Kept> Ring<T> {
         size: usize,
         count: usize,
         bytes: usize,
+        victim: impl Fn(&VecDeque<T>) -> usize,
         mut lost: impl FnMut(T),
     ) {
         while !self.items.is_empty()
             && (self.items.len() >= count || size > bytes || self.bytes > bytes - size)
         {
-            lost(self.evict().expect("ring budget"));
+            lost(self.evict_at(victim(&self.items)).expect("ring budget"));
         }
     }
 
@@ -113,6 +118,7 @@ pub(crate) struct Batch<T> {
     pub(crate) events: Vec<T>,
     pub(crate) last: u64,
     pub(crate) evicted: Vec<u64>,
+    #[cfg(any(feature = "decode", test))]
     pub(crate) position: Vec<u64>,
 }
 
@@ -137,6 +143,7 @@ pub(crate) fn batch<'a, T: Kept + Clone + 'a>(
         .take(max)
         .cloned()
         .collect();
+    #[cfg(any(feature = "decode", test))]
     let through = events
         .last()
         .map_or(cursor.unwrap_or(last), |item| item.stamp().seq);
@@ -144,6 +151,7 @@ pub(crate) fn batch<'a, T: Kept + Clone + 'a>(
         events,
         last,
         evicted: rings.iter().map(|ring| ring.evicted).collect(),
+        #[cfg(any(feature = "decode", test))]
         position: rings
             .iter()
             .map(|ring| {

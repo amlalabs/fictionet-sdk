@@ -22,8 +22,7 @@ There are no default features.
 ## Retain events for grading
 
 Install `Memory` through `RunOptions`. Wrap it in `Aggregate` to combine
-repeated network facts. `checked_of` checks the selected class when the policy
-fixes a kind's class before building; otherwise it checks the event stream.
+repeated network facts. `checked_of` checks losses for the exact event kind, including unknown kinds.
 `Limits` sets standalone event budgets.
 
 ```rust
