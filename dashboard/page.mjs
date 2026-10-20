@@ -62,13 +62,25 @@ export function createServices(transport, theme, importModule = (url) => import(
     // The page's one graph model (see state.mjs), on the page's watch. It
     // binds the first time a part of the page reads it.
     get graph() { graph ??= createModel(watches.subscribe()); return graph; },
-    // The page's hosts, from /api/page.
+    // From /api/page: the page's hosts, the addresses its own screen and
+    // terminal sessions come from, and the state and command paths of its
+    // labels and startup checks, or null when it has no such panel.
     hosts: [],
+    consoleAddresses: [],
+    labelState: null,
+    labelCommand: null,
+    containmentState: null,
     ...hostLookups(() => services.hosts),
     // Whether the header says Stopped. A load that fails then says the run
     // stopped, not why the request failed.
     stopped,
     packetPair: store(null),
+    // Opens an inspector panel by kind, or by id for panels that share a
+    // kind. The inspector sets it once its tabs exist.
+    showPanel() {},
+    // Shows the packets of a map item's links, or of one flow.
+    openLinks(_from, _to, members) { selection.set({ links: members.map(({ e }) => e.id) }); services.showPanel('packets'); },
+    showPackets(pair) { services.packetPair.set(pair); services.showPanel('packets'); },
     // Loads a module by URL: a console's library or a world panel. Tests
     // pass their own, since Node cannot load the page's paths.
     importModule,
@@ -168,9 +180,9 @@ function panel(services, page, content, options, controls) {
 }
 
 // The inspector: one tab per inspector panel, in the server's order, except
-// that a page can open on its own panel. Sets the services that open a
-// panel, and returns `show(kind or id)`, `hide` and `reopen` for when the
-// browser tab is hidden and shown, and `dispose`.
+// that a page can open on its own panel. Sets `services.showPanel`, and
+// returns `show(kind or id)`, `hide` and `reopen` for when the browser tab
+// is hidden and shown, and `dispose`.
 function inspector(root, services, page) {
   const { $, el } = scoped(root);
   const cleanup = [];
@@ -221,8 +233,6 @@ function inspector(root, services, page) {
   const tabOf = (name) => tabs.find((tab) => tab.options.kind === name) || tabs.find((tab) => tab.options.id === name);
   const show = (name) => { const item = tabOf(name); if (item) activate(item); };
   services.showPanel = show;
-  services.openLinks = (_from, _to, members) => { services.selection.set({ links: members.map(({ e }) => e.id) }); show('packets'); };
-  services.showPackets = (pair) => { services.packetPair.set(pair); show('packets'); };
   if (tabs.length) activate(tabs[0]);
   else $('inspector-content').replaceChildren(el('p', { class: 'empty-note', text: 'This demo declares no inspector panels.' }));
   return {

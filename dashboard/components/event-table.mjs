@@ -32,7 +32,7 @@ export function mount(root, services, options) {
       if (controller.signal.aborted) return;
       status.hidden = false;
       // After the run stopped, the page server is gone: stop asking.
-      if (services.stopped?.()) { status.textContent = 'The run has stopped, so these events can no longer be loaded.'; return; }
+      if (services.stopped()) { status.textContent = 'The run has stopped, so these events can no longer be loaded.'; return; }
       status.textContent = `Could not load events: ${error.message}`;
     }
     if (!controller.signal.aborted) timer = setTimeout(read, 1000);

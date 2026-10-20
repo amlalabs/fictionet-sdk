@@ -1,15 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDocument } from '../test-dom.mjs';
-import { createSelection } from '../selection.mjs';
+import { createDocument, liveSubscriptions } from '../test-dom.mjs';
 import { createTransport } from '../transport.mjs';
-import { createServices, hostLookups } from '../page.mjs';
+import { createServices } from '../page.mjs';
 import { mount } from './containment.mjs';
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 test('startup checks use authenticated state paths, render facts and scope guests', async () => {
   const document = createDocument(), root = document.createElement('section');
-  const selection = createSelection();
   const requests = [];
   let source;
   const transport = createTransport({}, {
@@ -21,9 +19,10 @@ test('startup checks use authenticated state paths, render facts and scope guest
       return new Response(new ReadableStream({ start(controller) { source = controller; }, cancel() {} }), { headers: { 'Content-Type': 'text/event-stream' } });
     },
   });
-  const services = createServices(transport);
-  const hosts = [{ name: 'alpha', sandbox: 'east' }];
-  const dispose = mount(root, { selection, state: services.state, hosts, ...hostLookups(() => hosts) }, { state: '/api/state/containment' });
+  const services = createServices(transport), selection = services.selection;
+  services.hosts = [{ name: 'alpha', sandbox: 'east' }];
+  const following = liveSubscriptions(selection);
+  const dispose = mount(root, services, { state: '/api/state/containment' });
   assert.match(root.textContent, /No startup checks published/);
   await settle();
   const probe = { guest: 'east', name: 'Public DNS', command: '<dig @8.8.8.8>', destination: '8.8.8.8:53', outcome: 'contained', guest_result: 'Exit 9\nTimed out', summary: 'Timed out', world_answer: 'no route: no machine at that address' };
@@ -37,20 +36,21 @@ test('startup checks use authenticated state paths, render facts and scope guest
   assert.doesNotMatch(root.textContent, /Not contained/);
   assert.match(root.textContent, /Contained/);
   assert.equal(requests.length, 1);
-  dispose(); services.dispose(); transport.close();
+  dispose();
+  assert.equal(following(), 0);
+  services.dispose(); transport.close();
   assert.equal(root.children.length, 0);
 });
 
 test('probe rows group guests, summarize outputs and expand full commands', () => {
   const document = createDocument(), root = document.createElement('section');
   const outcomes = ['contained', 'forwarded', 'not_contained', 'timed_out', 'unknown', 'missing_tool', 'fact'];
-  const dispose = mount(root, {
-    selection: createSelection(), ...hostLookups(() => []),
-    state(path, callback) {
-      callback({ value: { probes: outcomes.map((outcome) => ({ guest: 'alpha', name: outcome, outcome, command: 'curl https://example.test/path', destination: 'example.test', guest_result: '\nHTTP 200\nFull output', summary: 'HTTP 200', world_answer: 'https://example.test' })) } });
-      return () => {};
-    },
-  }, { state: '/api/state/containment' });
+  const services = createServices({});
+  services.state = (path, callback) => {
+    callback({ value: { probes: outcomes.map((outcome) => ({ guest: 'alpha', name: outcome, outcome, command: 'curl https://example.test/path', destination: 'example.test', guest_result: '\nHTTP 200\nFull output', summary: 'HTTP 200', world_answer: 'https://example.test' })) } });
+    return () => {};
+  };
+  const dispose = mount(root, services, { state: '/api/state/containment' });
   assert.equal(root.querySelectorAll('.containment-guest').length, 1);
   assert.equal(root.querySelectorAll('details').length, outcomes.length);
   assert.equal(root.querySelectorAll('.not-contained').length, 1);
@@ -71,10 +71,10 @@ test('startup checks that cannot load say whether the run has stopped', () => {
   for (const [stopped, text] of [[true, 'The run has stopped, so startup checks can no longer be loaded.'], [false, 'Could not load startup checks: no such state topic: "containment"']]) {
     const document = createDocument(), root = document.createElement('section');
     let fail;
-    const dispose = mount(root, {
-      selection: createSelection(), ...hostLookups(() => []), stopped: () => stopped,
-      state: (_, update, error) => { fail = error; return () => {}; },
-    }, { state: '/api/state/containment' });
+    const services = createServices({});
+    if (stopped) services.run.set('stopped');
+    services.state = (_, update, error) => { fail = error; return () => {}; };
+    const dispose = mount(root, services, { state: '/api/state/containment' });
     fail(new Error(stopped ? 'The run has stopped, so its state can no longer be loaded' : 'no such state topic: "containment"'));
     assert.equal(root.querySelector('.empty-note').textContent, text);
     dispose();

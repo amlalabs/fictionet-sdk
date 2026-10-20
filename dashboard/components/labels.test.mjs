@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDocument } from '../test-dom.mjs';
+import { createDocument, liveSubscriptions } from '../test-dom.mjs';
 import { createTransport } from '../transport.mjs';
 import { createServices } from '../page.mjs';
 import { mount, labelAction } from './labels.mjs';
@@ -28,8 +28,9 @@ test('typed labels, removal and scoped downloads use real authenticated transpor
   });
   const services = createServices(transport);
   services.labelCommand = '/api/command/labels';
+  const graph = liveSubscriptions(services.graph), selection = liveSubscriptions(services.selection);
   const stop = mount(root, services, { state: '/api/state/labels', command: services.labelCommand });
-  t.after(() => { stop(); services.dispose(); transport.close(); });
+  t.after(() => { services.dispose(); transport.close(); });
   await settle();
   source.enqueue(new TextEncoder().encode(`event: snapshot\ndata: ${JSON.stringify({ topic: 'labels', revision: 1, value: [{ id: 3, text: '<download>', target: { kind: 'event', seq: 7 }, at: 2 }] })}\n\n`));
   await settle();
@@ -61,12 +62,17 @@ test('typed labels, removal and scoped downloads use real authenticated transpor
   assert.equal(downloads.length, 2);
   assert.equal(downloads[0].name, 'fictionet-events.jsonl');
   assert.ok(downloads.every((item) => item.href.startsWith('blob:') && !item.href.includes('secret')));
+  stop();
+  assert.equal(graph(), 0);
+  assert.equal(selection(), 0);
 });
 
 test('label editors cancel with Escape or Cancel and close after saving', async () => {
   const document = createDocument(), root = document.createElement('section');
   const commands = [];
-  labelAction(root, { labelCommand: '/api/command/labels', transport: { post: async (_, value) => { commands.push(value.command); return { status: 'applied' }; } } }, { kind: 'event', seq: 7 });
+  const services = createServices({ post: async (_, value) => { commands.push(value.command); return { status: 'applied' }; } });
+  services.labelCommand = '/api/command/labels';
+  labelAction(root, services, { kind: 'event', seq: 7 });
   const open = root.querySelector('button'), form = root.querySelector('form');
   open.click();
   assert.equal(open.hidden, true);
@@ -93,10 +99,10 @@ test('label targets describe and select retained events, connections and host li
   const document = createDocument(), root = document.createElement('section');
   const watch = new EventTarget(); watch.close = () => {};
   const services = createServices({ watch: () => watch });
-  const opened = [], pairs = [];
+  const opened = [];
   services.showPanel = (kind) => opened.push(kind);
-  services.showPackets = (pair) => pairs.push(pair);
   services.hosts = [{ name: 'beta', sandbox: 'west' }];
+  const graph = liveSubscriptions(services.graph), selection = liveSubscriptions(services.selection);
   services.state = (_, callback) => {
     callback({ value: [
       { id: 1, text: 'lookup', target: { kind: 'event', seq: 7 }, at: 1.2 },
@@ -116,11 +122,12 @@ test('label targets describe and select retained events, connections and host li
   assert.deepEqual(opened, ['events']);
   targets[1].click();
   assert.deepEqual(services.selection.get().links, ['e2']);
-  assert.deepEqual(pairs, [{ local: '10.0.0.2', peer: '10.0.0.3' }]);
+  assert.deepEqual(services.packetPair.get(), { local: '10.0.0.2', peer: '10.0.0.3' });
+  assert.deepEqual(opened, ['events', 'packets']);
   targets[2].click();
   assert.equal(services.selection.get().connection, 4);
   assert.equal(services.selection.get().event, null);
-  assert.deepEqual(opened, ['events', 'events']);
+  assert.deepEqual(opened, ['events', 'packets', 'events']);
   assert.equal(root.querySelectorAll('td.numeric')[0].textContent, '1.2s');
   assert.equal(root.querySelector('.label-remove').getAttribute('aria-label'), 'Remove label lookup');
   assert.ok(root.querySelector('.label-remove').querySelector('svg'));
@@ -128,7 +135,10 @@ test('label targets describe and select retained events, connections and host li
   send('edge_end', { id: 'e2' });
   await settle();
   assert.equal(root.querySelectorAll('.label-target')[1].textContent, 'Link e2 · 10.0.0.2 ↔ 10.0.0.3');
-  dispose(); services.dispose();
+  dispose();
+  assert.equal(graph(), 0);
+  assert.equal(selection(), 0);
+  services.dispose();
 });
 
 test('labels that cannot load say whether the run has stopped', () => {
@@ -136,11 +146,14 @@ test('labels that cannot load say whether the run has stopped', () => {
     const document = createDocument(), root = document.createElement('section');
     const services = createServices({ watch: () => { const watch = new EventTarget(); watch.close = () => {}; return watch; } });
     let fail;
-    services.stopped = () => stopped;
+    if (stopped) services.run.set('stopped');
     services.state = (_, update, error) => { fail = error; return () => {}; };
+    const graph = liveSubscriptions(services.graph);
     const dispose = mount(root, services, { state: '/api/state/labels' });
     fail(new Error(stopped ? 'The run has stopped, so its state can no longer be loaded' : 'no such state topic: "labels"'));
     assert.equal(root.querySelector('.label-downloads').querySelectorAll('p')[1].textContent, text);
-    dispose(); services.dispose();
+    dispose();
+    assert.equal(graph(), 0);
+    services.dispose();
   }
 });

@@ -6,6 +6,7 @@ import { mount as control } from './control.mjs';
 import { mount as custom } from './custom.mjs';
 import { createDocument, fakeTimers } from '../test-dom.mjs';
 import { createTransport } from '../transport.mjs';
+import { createServices } from '../page.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 function fixture(t) {
@@ -13,21 +14,20 @@ function fixture(t) {
   document.body.append(root);
   const subscriptions = new Set(), requests = [], timers = fakeTimers(t);
   let publish, fail;
-  const services = {
-    state(path, snapshot, error) { publish = snapshot; fail = error; subscriptions.add(path); return () => subscriptions.delete(path); },
-    transport: createTransport({}, {
-      location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
-      fetch(url, options) {
-        const endpoint = new URL(url);
-        assert.equal(options.headers.Authorization, 'Bearer secret');
-        return new Promise((resolve, reject) => requests.push({
-          path: endpoint.pathname, body: options.body && JSON.parse(options.body), signal: options.signal,
-          params: Object.fromEntries([...endpoint.searchParams].map(([key, value]) => [key, Number(value)])),
-          resolve: (value) => resolve(Response.json(value)), reject,
-        }));
-      },
-    }),
-  };
+  const services = createServices(createTransport({}, {
+    location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
+    fetch(url, options) {
+      const endpoint = new URL(url);
+      assert.equal(options.headers.Authorization, 'Bearer secret');
+      return new Promise((resolve, reject) => requests.push({
+        path: endpoint.pathname, body: options.body && JSON.parse(options.body), signal: options.signal,
+        params: Object.fromEntries([...endpoint.searchParams].map(([key, value]) => [key, Number(value)])),
+        resolve: (value) => resolve(Response.json(value)), reject,
+      }));
+    },
+  }));
+  // One state topic, published and failed by the test.
+  services.state = (path, snapshot, error) => { publish = snapshot; fail = error; subscriptions.add(path); return () => subscriptions.delete(path); };
   return { root, services, subscriptions, requests, timers, publish: (value) => publish(value), fail: (error) => fail(error) };
 }
 
@@ -87,6 +87,7 @@ test('tables update rows in place and build again only rows whose text changed',
 
 test('control sends the linked revision once and shows replies, rejections and timeouts', async (t) => {
   const h = fixture(t);
+  Object.assign(h.services.clock, { t: 75, ended: true });
   const dispose = control(h.root, h.services, { state: '/api/state/traffic', command: '/api/command/traffic', actions: [{ label: '<Pause>', command: { running: false } }] });
   const button = h.root.querySelector('button');
   assert.equal(button.disabled, true);
@@ -102,7 +103,7 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.match(h.requests[0].body.request_id, /^[0-9a-f-]{36}$/);
   h.requests[0].resolve({ status: 'applied', reply: '<done>' });
   await settle();
-  assert.match(h.root.textContent, /<Pause>: applied.*<done>/);
+  assert.match(h.root.textContent, /<Pause>: applied at 1m 15s.*<done>/);
   h.publish({ revision: 8, value: { running: false } });
   button.click();
   await settle();
@@ -110,18 +111,18 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.notEqual(h.requests[0].body.request_id, h.requests[1].body.request_id);
   h.requests[1].reject({ body: { rejection: { reason: 'stale_revision', current: 9 } } });
   await settle();
-  assert.match(h.root.textContent, /Not applied: the state changed \(now revision 9\)\. Check it and try again\./);
+  assert.match(h.root.textContent, /<Pause> at 1m 15s\. Not applied: the state changed \(now revision 9\)\. Check it and try again\./);
   button.click();
   await settle();
   h.requests[2].reject({ body: { status: 'timeout' } });
   await settle();
-  assert.match(h.root.textContent, /may still apply/);
+  assert.match(h.root.textContent, /<Pause>: no reply yet at 1m 15s\. It may still apply/);
   assert.equal(h.requests.length, 3);
   button.click();
   await settle();
   h.requests[3].resolve({ status: 'applied', reply: null });
   await settle();
-  assert.match(h.root.querySelector('.control-reply').textContent, /^<Pause>: applied$/);
+  assert.match(h.root.querySelector('.control-reply').textContent, /^<Pause>: applied at 1m 15s$/);
   dispose();
   assert.equal(button.listenerCount, 0);
   assert.equal(h.subscriptions.size, 0);
@@ -167,7 +168,7 @@ test('event table advances the server cursor and cancels pending reads and timer
 
 test('after the run stopped, event tables and custom panels say so instead of a fetch error', async (t) => {
   const h = fixture(t);
-  h.services.stopped = () => true;
+  h.services.run.set('stopped');
   const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
   await settle();
   h.requests[0].reject(new TypeError('Failed to fetch'));
@@ -177,14 +178,14 @@ test('after the run stopped, event tables and custom panels say so instead of a 
   assert.equal(h.timers.size, 0, 'no further reads');
   dispose();
   const panel = fixture(t);
-  panel.services.stopped = () => true;
+  panel.services.run.set('stopped');
   panel.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
   const stop = custom(panel.root, panel.services, { title: 'Plant', module: '/panels/plant.mjs', state: '/api/state/plant' });
   await settle();
   assert.equal(panel.root.textContent, 'Could not open Plant: the run has stopped, so the panel can no longer be loaded');
   stop();
   const rows = fixture(t);
-  rows.services.stopped = () => true;
+  rows.services.run.set('stopped');
   const close = table(rows.root, rows.services, { state: '/api/state/rows', columns: [{ label: 'Name', pointer: '/name' }] });
   rows.fail(new Error('The run has stopped, so its state can no longer be loaded'));
   assert.equal(rows.root.querySelector('.loss-note').textContent, 'The run has stopped, so these rows can no longer be loaded.');

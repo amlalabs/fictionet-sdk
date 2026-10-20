@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mount as screen } from './screen.mjs';
 import { mount as terminal } from './terminal.mjs';
-import { createInputOwners } from './console.mjs';
+import { createServices } from '../page.mjs';
 import { createDocument, Element, fakeTimers } from '../test-dom.mjs';
 import { createTransport } from '../transport.mjs';
 
@@ -56,30 +56,28 @@ function fixture(t) {
     '/vendor/xterm/lib/xterm.mjs': { Terminal },
     '/vendor/addon-fit/lib/addon-fit.mjs': { FitAddon },
   };
-  const services = {
-    async importModule(url) {
-      if (!modules[url]) throw new TypeError('Failed to fetch dynamically imported module');
-      return modules[url];
-    },
-    state(path, callback, error) {
-      subscriptions.set(path, { callback, error });
-      callback({ value: path.endsWith('/leases') ? { alpha: { holder } } : status });
-      return () => subscriptions.delete(path);
-    },
-    theme: { subscribe(callback) { themes.add(callback); callback('light'); return () => themes.delete(callback); } },
-    transport: {
-      ...createTransport({}, {
-        location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
-        async fetch(url, options) {
-          assert.equal(options.headers.Authorization, 'Bearer secret');
-          requests.push({ method: options.method, path: new URL(url).pathname, body: JSON.parse(options.body) });
-          return Response.json({ holder: options.method === 'POST' ? 'ours' : null });
-        },
-      }),
-      async socket(capability, host) { const socket = new Socket(); sockets.push(socket); requests.push({ capability, host }); return { socket, session: 'ours' }; },
-    },
+  const transport = {
+    ...createTransport({}, {
+      location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
+      async fetch(url, options) {
+        assert.equal(options.headers.Authorization, 'Bearer secret');
+        requests.push({ method: options.method, path: new URL(url).pathname, body: JSON.parse(options.body) });
+        return Response.json({ holder: options.method === 'POST' ? 'ours' : null });
+      },
+    }),
+    async socket(capability, host) { const socket = new Socket(); sockets.push(socket); requests.push({ capability, host }); return { socket, session: 'ours' }; },
   };
-  services.input = createInputOwners(services.state);
+  const theme = { subscribe(callback) { themes.add(callback); callback('light'); return () => themes.delete(callback); } };
+  const services = createServices(transport, theme, async (url) => {
+    if (!modules[url]) throw new TypeError('Failed to fetch dynamically imported module');
+    return modules[url];
+  });
+  // Each host's status and the input leases, as the state stream sends them.
+  services.state = (path, callback, error) => {
+    subscriptions.set(path, { callback, error });
+    callback({ value: path.endsWith('/leases') ? { alpha: { holder } } : status });
+    return () => subscriptions.delete(path);
+  };
   return {
     root, services, subscriptions, timers, sockets, requests, rfbs, terminals, observers, themes,
     screenOptions: { host: 'alpha' },
@@ -353,7 +351,7 @@ test('after the run stopped, consoles say they closed instead of blaming the bui
   for (const [mount, closed] of [[screen, 'The screen closed when the run stopped.'], [terminal, 'The terminal closed when the run stopped.']]) {
     // The page server is gone, so the library cannot load.
     const h = fixture(t);
-    h.services.stopped = () => true;
+    h.services.run.set('stopped');
     h.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
     const dispose = mount(h.root, h.services, { host: 'alpha' });
     await settle();
@@ -362,12 +360,10 @@ test('after the run stopped, consoles say they closed instead of blaming the bui
     dispose();
     // A console that loses its connection after the run stopped does not try again.
     const live = fixture(t);
-    let stopped = false;
-    live.services.stopped = () => stopped;
     live.publish({ state: 'desktop_up', screen: true, terminal: true });
     const stop = mount(live.root, live.services, mount === screen ? live.screenOptions : live.terminalOptions);
     await settle();
-    stopped = true;
+    live.services.run.set('stopped');
     live.sockets[0].close();
     await settle();
     assert.ok(live.root.textContent.includes(closed), live.root.textContent);

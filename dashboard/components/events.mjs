@@ -94,14 +94,12 @@ export function mount(root, services, options = {}) {
     add('Server name', event.sni);
     add('Connection', event.conn);
     for (const [key, value] of Object.entries(event.fields || {})) add(key, value);
-    if (event.local && event.peer && (event.conn || services.packetPair)) {
+    if (event.local && event.peer) {
       const row = el('p', { class: 'event-actions' }, box);
       if (event.conn) labelAction(row, services, { kind: 'connection', id: event.conn, local: event.local, peer: event.peer }, 'Label connection', render);
-      if (services.packetPair) {
-        const show = el('button', { class: 'button', type: 'button', text: 'Show matching packets' }, row);
-        el('span', { class: 'hint', text: APPROXIMATE }, row);
-        show.addEventListener('click', () => services.showPackets?.({ local: event.local, peer: event.peer }));
-      }
+      const show = el('button', { class: 'button', type: 'button', text: 'Show matching packets' }, row);
+      el('span', { class: 'hint', text: APPROXIMATE }, row);
+      show.addEventListener('click', () => services.showPackets({ local: event.local, peer: event.peer }));
     }
     return box;
   }
@@ -128,7 +126,7 @@ export function mount(root, services, options = {}) {
     const open = chosen === event.seq;
     entry.line.setAttribute('aria-expanded', String(open));
     entry.node.classList.toggle('on', open);
-    if (services.isMoment?.(event)) services.moment?.(entry.node);
+    if (services.isMoment(event)) services.moment(entry.node);
     const chips = labels.filter((label) => label.target.kind === 'event' ? label.target.seq === event.seq : label.target.kind === 'connection' && label.target.id === event.conn);
     const signature = JSON.stringify(chips);
     if (signature !== entry.chips) {
@@ -193,7 +191,7 @@ export function mount(root, services, options = {}) {
     }
   }));
   if (services.labelState) cleanup.push(services.state(services.labelState, (value) => { labels = value.value || []; if (!editing()) schedule(); }));
-  if (services.onMoment) cleanup.push(services.onMoment(() => { if (!paused && !editing()) schedule(); }));
+  cleanup.push(services.onMoment(() => { if (!paused && !editing()) schedule(); }));
   render();
   return () => {
     if (frame !== null) cancelAnimationFrame(frame);

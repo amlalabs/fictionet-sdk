@@ -51,7 +51,7 @@ export function mount(root, services, options) {
   }
   const stopSelection = services.selection.subscribe(({ host }) => { selected = host; draw(); });
   const stopState = services.state(options.state, (value) => { snapshot = value; draw(); }, (error) => {
-    status.textContent = services.stopped?.() ? 'The run has stopped, so startup checks can no longer be loaded.' : `Could not load startup checks: ${error.message}`;
+    status.textContent = services.stopped() ? 'The run has stopped, so startup checks can no longer be loaded.' : `Could not load startup checks: ${error.message}`;
   });
   return () => { stopSelection(); stopState(); root.replaceChildren(); };
 }

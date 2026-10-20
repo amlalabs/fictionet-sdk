@@ -66,7 +66,7 @@ export function mount(root, services) {
   const { nodeTip, groupTip, edgeTip, renderSide, refresh } = createTables({
     $, el, state, view, runTime, fmtDuration, fmtBytes, fmtCount, fmtRate, plural, where, nodeLabel,
     tone, drawnSource, liveRate, dRate, dCounts, dBytesRate, ends, dEdgesOf, groupChain, parentOf, isOpen,
-    select, toggleGroup, applySearch, focusNode, focusGroup, openPackets, openLinks: (...args) => services.openLinks?.(...args),
+    select, toggleGroup, applySearch, focusNode, focusGroup, openPackets, openLinks,
   });
 
   // ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ export function mount(root, services) {
   let last = performance.now();
   let animation;
   let pendingSelection, syncingSelection = false;
-  const stopSelection = services.selection?.subscribe((selection) => { pendingSelection = selection; });
+  const stopSelection = services.selection.subscribe((selection) => { pendingSelection = selection; });
 
   function frame(now) {
     const dt = Math.min(0.1, (now - last) / 1000);
@@ -98,12 +98,18 @@ export function mount(root, services) {
   }
 
 
+  // Shows the packets of links chosen on the map. The selection that makes
+  // is not applied back to the map.
+  function openLinks(...args) {
+    services.openLinks(...args);
+    pendingSelection = null;
+  }
   function openPackets(id) {
     const edge = view.dedges.get(id);
-    if (edge) services.openLinks?.('', '', edge.members);
+    if (edge) openLinks('', '', edge.members);
   }
   function onSelect(selected) {
-    if (!services.selection || syncingSelection) return;
+    if (syncingSelection) return;
     const node = state.nodes.get(selected?.id);
     const owner = state.hosts.get(node?.host) || [...state.hosts.values()].find((host) => host.group === selected?.id);
     let sandbox = owner?.sandbox || owner?.name || (node?.kind === 'sandbox' ? node.name : null);
@@ -137,7 +143,7 @@ export function mount(root, services) {
   renderSide();
   animation = requestAnimationFrame(frame);
   return () => {
-    stopSelection?.();
+    stopSelection();
     cancelAnimationFrame(animation);
     stop();
     keydown();

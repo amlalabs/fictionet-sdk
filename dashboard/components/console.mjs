@@ -46,7 +46,7 @@ export function mountConsole(root, services, options, parts) {
     },
     // Says the console closed if the run has stopped, and whether it did.
     ended() {
-      if (!services.stopped?.()) return false;
+      if (!services.stopped()) return false;
       panel.show(closed);
       return true;
     },

@@ -58,7 +58,7 @@ export function mount(root, services) {
     if (escaped) {
       stayed.append('The containment check found a way out that the world did not see. ');
       const button = el('button', { class: 'text-button', type: 'button', text: 'Open Containment' }, stayed);
-      button.addEventListener('click', () => services.showPanel?.('containment'));
+      button.addEventListener('click', () => services.showPanel('containment'));
       stayed.append(' ');
     } else if (unchecked) stayed.append('Containment results are unavailable or incomplete. ');
     if (incomplete) stayed.append(`This list may be incomplete: ${snapshot.dropped} attempts not kept, ${snapshot.lost} observations lost. `);
@@ -117,7 +117,7 @@ export function mount(root, services) {
       if (!controller.signal.aborted) {
         failed = true;
         // After the run stopped, the page server is gone: stop asking.
-        if (services.stopped?.()) { status.textContent = `The run has stopped, so destinations can no longer be loaded.${snapshot ? ' The list shows the last ones read.' : ''}`; return; }
+        if (services.stopped()) { status.textContent = `The run has stopped, so destinations can no longer be loaded.${snapshot ? ' The list shows the last ones read.' : ''}`; return; }
         status.textContent = `Could not load destinations: ${error.message}. The table may be incomplete.`;
       }
     }

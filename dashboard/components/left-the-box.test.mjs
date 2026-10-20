@@ -2,16 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTransport } from '../transport.mjs';
 import { mount } from './left-the-box.mjs';
-import { createDocument, fakeTimers } from '../test-dom.mjs';
-import { createSelection } from '../selection.mjs';
-import { hostLookups } from '../page.mjs';
+import { createDocument, fakeTimers, liveSubscriptions } from '../test-dom.mjs';
+import { createServices } from '../page.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 test('destinations show outcomes, scope guests, report loss and stop reads on disposal', async (t) => {
   const document = createDocument(), root = document.createElement('section');
   document.body.append(root);
-  const requests = [], timers = fakeTimers(t), selection = createSelection();
+  const requests = [], timers = fakeTimers(t);
   const transport = createTransport({}, {
     location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
     fetch(url, options) {
@@ -22,11 +21,10 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
       }));
     },
   });
-  const hosts = [{ name: 'alpha', sandbox: 'east' }, { name: 'beta', sandbox: 'west' }];
-  const dispose = mount(root, {
-    selection, hosts, ...hostLookups(() => hosts),
-    transport,
-  });
+  const services = createServices(transport), selection = services.selection;
+  services.hosts = [{ name: 'alpha', sandbox: 'east' }, { name: 'beta', sandbox: 'west' }];
+  const following = liveSubscriptions(selection);
+  const dispose = mount(root, services);
   const row = { sandbox: 'east', address: '203.0.113.1:443', transport: 'tcp', connections: 2, requests: 3, packets: 0, first: 1, last: 4 };
   const snapshot = { revision: 1, dropped: 0, lost: 0, pending: [], lookups: [], destinations: [
     { ...row, outcome: 'served', by: '<world.test>' },
@@ -89,6 +87,7 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
   assert.match(root.textContent, /disconnected.*may be incomplete/);
   next = [...timers.values()][0].callback; timers.clear(); next(); await settle();
   dispose();
+  assert.equal(following(), 0);
   transport.close();
   requests[5].resolve(snapshot);
   await settle();
@@ -100,17 +99,15 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
 test('containment escapes override completeness only in their scope', async (t) => {
   fakeTimers(t);
   const document = createDocument(), root = document.createElement('section');
-  const selection = createSelection();
   let update, opened, stopped = false;
   const row = { sandbox: 'east', name: 'example.test', address: '203.0.113.10:443', transport: 'tcp', outcome: 'forwarded', by: 'https://example.test', requests: 1, connections: 1, packets: 0, first: .4, last: .4 };
-  const hosts = [{ name: 'alpha', sandbox: 'east' }, { name: 'beta', sandbox: 'west' }];
-  const dispose = mount(root, {
-    selection, hosts, ...hostLookups(() => hosts),
-    transport: { get: async () => ({ revision: 1, destinations: [row, { ...row, outcome: 'no_route', requests: 0, connections: 0, packets: 1, last: .400001 }], pending: [], lookups: [], dropped: 0, lost: 0 }) },
-    containmentState: '/api/state/containment',
-    state(path, callback) { assert.equal(path, '/api/state/containment'); update = callback; return () => { stopped = true; }; },
-    showPanel(kind) { opened = kind; },
-  });
+  const services = createServices({ get: async () => ({ revision: 1, destinations: [row, { ...row, outcome: 'no_route', requests: 0, connections: 0, packets: 1, last: .400001 }], pending: [], lookups: [], dropped: 0, lost: 0 }) });
+  const selection = services.selection;
+  services.hosts = [{ name: 'alpha', sandbox: 'east' }, { name: 'beta', sandbox: 'west' }];
+  services.containmentState = '/api/state/containment';
+  services.state = (path, callback) => { assert.equal(path, '/api/state/containment'); update = callback; return () => { stopped = true; }; };
+  services.showPanel = (kind) => { opened = kind; };
+  const dispose = mount(root, services);
   await settle();
   assert.doesNotMatch(root.textContent, /Everything else stayed/);
   update({ value: { probes: [{ guest: 'east', outcome: 'not_contained' }] } });
@@ -140,10 +137,9 @@ test('after the run stopped, a failed read says so and stops asking', async (t) 
   const document = createDocument(), root = document.createElement('section');
   document.body.append(root);
   const timers = fakeTimers(t);
-  const dispose = mount(root, {
-    selection: createSelection(), hosts: [], ...hostLookups(() => []), stopped: () => true,
-    transport: { get: async () => { throw new TypeError('Failed to fetch'); } },
-  });
+  const services = createServices({ get: async () => { throw new TypeError('Failed to fetch'); } });
+  services.run.set('stopped');
+  const dispose = mount(root, services);
   await settle();
   assert.equal(root.querySelector('.egress-summary').querySelector('p').textContent, 'The run has stopped, so destinations can no longer be loaded.');
   assert.doesNotMatch(root.textContent, /Failed to fetch/);

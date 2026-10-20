@@ -41,7 +41,7 @@ export function mount(root, services, options) {
   const cleanup = [];
   const buttons = [];
   let revision, busy = false;
-  const when = () => (services.runTime ? ` at ${fmtDuration(services.runTime())}` : '');
+  const when = () => ` at ${fmtDuration(services.runTime())}`;
   function say(line, value) {
     reply.replaceChildren();
     el('p', { text: line }, reply);

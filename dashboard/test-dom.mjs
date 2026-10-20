@@ -113,3 +113,16 @@ export function fakeTimers(t) {
   t.mock.method(globalThis, 'clearTimeout', (id) => { timers.delete(id); });
   return timers;
 }
+
+// Counts the live subscriptions to `store`, such as the graph model or the
+// selection, by wrapping its `subscribe`. A panel outlived by a store must
+// let go of it when disposed: returns a function that gives the count.
+export function liveSubscriptions(store) {
+  const live = new Set(), subscribe = store.subscribe;
+  store.subscribe = (...args) => {
+    const token = {}, off = subscribe(...args);
+    live.add(token);
+    return () => { live.delete(token); off(); };
+  };
+  return () => live.size;
+}

@@ -34,6 +34,13 @@ rows keep their place and focus. `services.moment(element)` applies the shared
 story moment style. `services.runTime()` is the run's clock in seconds.
 `services.stopped()` is true once the header says Stopped; a load that fails
 then should say the run has stopped rather than report the failed request.
+`services.showPanel(kind)` opens an inspector panel, by kind or by id.
+`services.showPackets({local, peer})` opens the packet list for one address
+pair, which `services.packetPair` holds. `services.isMoment(event)` says
+whether the world marked an event as a story moment, and
+`services.onMoment(listener)` calls back when it marks another.
+`createServices` in `page.mjs` builds every one of these members, so a
+component uses them without checking that they exist.
 
 A world panel's content is padded and scrolls when it is taller than its
 place. Its own pieces can use the page's classes: `eyebrow` (add `accent` for

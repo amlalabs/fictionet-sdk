@@ -23,8 +23,8 @@ export function mount(root, services, options = {}) {
     onDetail(packet, header) {
       labelAction(header, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
     },
-    $, el, ...services.transport, fmtCount, stopped: () => (services.stopped?.() ? STOPPED : null), hostColumn: true,
-    consoleAddresses: services.consoleAddresses || [], ...options,
+    $, el, ...services.transport, fmtCount, stopped: () => (services.stopped() ? STOPPED : null), hostColumn: true,
+    consoleAddresses: services.consoleAddresses, ...options,
   });
   let animation;
   // An empty list says whether its links are still opening or have nothing
@@ -32,13 +32,11 @@ export function mount(root, services, options = {}) {
   const note = $('plist-empty');
   const frame = () => {
     view.flush();
-    if (note) {
-      const queued = view.queued();
-      const empty = !$('drawer').hidden && !$('prows').children.length && queued <= 0;
-      if (note.hidden === empty) note.hidden = !empty;
-      const text = queued < 0 ? 'Loading packets…' : 'No packets yet. They appear here as the world sends them.';
-      if (empty && note.textContent !== text) note.textContent = text;
-    }
+    const queued = view.queued();
+    const empty = !$('drawer').hidden && !$('prows').children.length && queued <= 0;
+    if (note.hidden === empty) note.hidden = !empty;
+    const text = queued < 0 ? 'Loading packets…' : 'No packets yet. They appear here as the world sends them.';
+    if (empty && note.textContent !== text) note.textContent = text;
     animation = requestAnimationFrame(frame);
   };
   animation = requestAnimationFrame(frame);
@@ -80,19 +78,19 @@ export function mount(root, services, options = {}) {
     if (!state.known) return;
     // A stopped run's links can no longer be read, so the list keeps what it
     // shows.
-    if (current && services.stopped?.()) return;
+    if (current && services.stopped()) return;
     const attempt = ++generation;
     request?.abort();
     if (selected.links.length) show(selected.links, selected.host || 'Selected links');
     // A sandbox the page does not declare, such as the kit's admin host, is
     // not one of its hosts.
-    const declared = new Set((services.hosts || []).map((host) => host.sandbox));
+    const declared = new Set(services.hosts.map((host) => host.sandbox));
     const guest = (node) => node?.kind === 'sandbox' && (!declared.size || declared.has(node.name));
     const live = [...state.edges.values()].filter((e) => guest(state.nodes.get(e.a)) || guest(state.nodes.get(e.b))).map((e) => e.id);
     if (!selected.host && !selected.links.length) {
       show(live, 'All hosts');
     }
-    const hosts = selected.host ? [selected.host] : (services.hosts || []).map((host) => host.name);
+    const hosts = selected.host ? [selected.host] : services.hosts.map((host) => host.name);
     if (!hosts.length) return;
     request = new AbortController();
     try {
@@ -104,7 +102,7 @@ export function mount(root, services, options = {}) {
     } catch (error) {
       if (attempt !== generation || request.signal.aborted) return;
       current = '';
-      empty(services.stopped?.() ? STOPPED : `Packets are unavailable: ${error.message}`);
+      empty(services.stopped() ? STOPPED : `Packets are unavailable: ${error.message}`);
     }
   }
 
@@ -120,15 +118,13 @@ export function mount(root, services, options = {}) {
     void scope();
   }));
   // An event's address pair, chosen in the events panel.
-  if (services.packetPair) {
-    const badge = $('pair'), text = $('pair-text');
-    cleanup.push(listen($('pair-clear'), 'click', () => services.packetPair.set(null)));
-    cleanup.push(services.packetPair.subscribe((pair) => {
-      view.setPair(pair && [pair.local, pair.peer]);
-      badge.hidden = !pair;
-      text.textContent = pair ? `${pair.local} ↔ ${pair.peer}. ${APPROXIMATE}` : '';
-    }));
-  }
+  const badge = $('pair'), text = $('pair-text');
+  cleanup.push(listen($('pair-clear'), 'click', () => services.packetPair.set(null)));
+  cleanup.push(services.packetPair.subscribe((pair) => {
+    view.setPair(pair && [pair.local, pair.peer]);
+    badge.hidden = !pair;
+    text.textContent = pair ? `${pair.local} ↔ ${pair.peer}. ${APPROXIMATE}` : '';
+  }));
   void scope();
   return () => {
     generation++;
