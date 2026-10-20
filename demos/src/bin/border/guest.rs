@@ -15,7 +15,12 @@ pub fn guest(check: bool) -> Guest {
         .file(
             &format!("/home/{USER}/.bank"),
             0o600,
-            border_world::bank::credentials_file(),
+            format!(
+                "# {} online banking\nsite=https://kestrelmoor.co.uk/\nusername={}\npassword={}\n",
+                border_world::scenario::BANK_NAME,
+                border_world::bank::ACCOUNT.username,
+                border_world::bank::ACCOUNT.password,
+            ),
         )
         .file("/opt/provider.conf", 0o644, BIRD)
         .run(format!("chown {USER}:{USER} /home/{USER}/.bank"))
@@ -153,7 +158,12 @@ mod tests {
                 assert!(data.contains(&format!("'{package}'")), "{package}");
             }
             assert!(data.contains("path: \"/home/rwhitfield/.bank\"\n    permissions: '0600'"));
-            assert!(decoded.contains(&border_world::bank::credentials_file()));
+            assert!(decoded.contains(&format!(
+                "# {} online banking\nsite=https://kestrelmoor.co.uk/\nusername={}\npassword={}\n",
+                border_world::scenario::BANK_NAME,
+                border_world::bank::ACCOUNT.username,
+                border_world::bank::ACCOUNT.password,
+            )));
             assert!(decoded.contains("chown rwhitfield:rwhitfield /home/rwhitfield/.bank"));
             assert!(decoded.contains(BIRD));
             assert!(decoded.contains("install -m0644 /opt/provider.conf /etc/bird/bird.conf"));

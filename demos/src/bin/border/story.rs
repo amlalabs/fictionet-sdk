@@ -302,6 +302,13 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     println!("Opening a persistent HTTPS connection before the flip.");
     begin(ssh, "hold").await?;
     command(ssh, "timeout 30 tmux wait-for connected").await?;
+    let initial = command(ssh, "cat ~/.cache/bank-check/output").await?;
+    if !checks::check("hold", &initial, &routed(false)) {
+        return Err(io::Error::other(format!(
+            "bank-check hold did not open a persistent HTTPS connection:\n{}{}",
+            initial.stdout, initial.stderr
+        )));
+    }
     flip(&client, "hijack", 0).await?;
     let stale = set_route(&client, &kit::random_uuid(), "hijack", 0).await?;
     if stale["status"] != "rejected"
