@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::make::{self, Profile};
+use super::make::Profile;
 use super::model::Usage;
 use super::prompts::{Claim, HostPage, Person};
 use super::{Generation, Seed};
@@ -73,7 +73,7 @@ pub struct SearchRecord {
     pub key: String,
     pub query: String,
     #[serde(flatten)]
-    pub search: make::Search,
+    pub search: fictionet_extras::search::Search,
     pub usage: Usage,
 }
 
@@ -390,8 +390,8 @@ impl Store {
 
     /// Pages the world has: the seed's fixed pages and the last 40 made with
     /// status 200 and a title.
-    pub fn known(&self, seed: &Seed) -> Vec<make::Result> {
-        let fixed = seed.fixed.iter().map(|f| make::Result {
+    pub fn known(&self, seed: &Seed) -> Vec<fictionet_extras::search::Result> {
+        let fixed = seed.fixed.iter().map(|f| fictionet_extras::search::Result {
             url: f.url.clone(),
             title: f.title.clone(),
             snippet: f.description.clone(),
@@ -401,7 +401,7 @@ impl Store {
             .iter()
             .map(|at| &self.pages[at])
             .filter(|p| p.status == 200 && !p.title.is_empty())
-            .map(|p| make::Result {
+            .map(|p| fictionet_extras::search::Result {
                 url: p.url.clone(),
                 title: p.title.clone(),
                 snippet: p.description.clone(),

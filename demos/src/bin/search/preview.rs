@@ -7,7 +7,6 @@
 use adaptive_web_world::{
     World,
     pages::{self, Seed},
-    route::Engine,
     search::{Failure, Outcome, Searches},
 };
 use example_common::log::Log;
@@ -31,6 +30,7 @@ use fictionet_demo::{
     },
     search::{self as page, Topics},
 };
+use fictionet_extras::search::Engine;
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{Containment, Host, HostState, HostStatus, Labels, StateLimits, StateTopic},

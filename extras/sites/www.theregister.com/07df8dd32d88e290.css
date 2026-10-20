@@ -1,0 +1,26 @@
+
+                    header#nav, header.pageHeader { font-family: "Roboto"; font-weight: normal; font-style: normal; text-transform: none; letter-spacing: normal; color: #000000; }
+                    .pageHeader .search .search-container input[type=text]::placeholder { font-family: "Roboto"; font-weight: normal; font-style: normal; text-transform: none; letter-spacing: normal; }
+                    .bodytext { font-family: "Roboto"; font-weight: normal; font-style: normal; font-size: 1.125rem; text-transform: none; letter-spacing: normal; }
+                    .articleHeader .headline { font-family: "Roboto"; font-weight: 700; font-style: normal; font-size: 2.75rem; text-transform: none; letter-spacing: normal; }
+                    article.column .content .headline { font-family: "Roboto"; font-weight: 700; font-style: normal; font-size: 1.5rem; text-transform: none; letter-spacing: normal; }
+                    .byline .name { font-family: "Roboto Mono"; font-weight: normal; font-style: normal; font-size: 0.8125rem; text-transform: none; letter-spacing: normal; color: #000000; }
+                    .articleHeader .subtitle { font-family: "Roboto"; font-weight: normal; font-style: normal; text-transform: none; letter-spacing: normal; }
+                    article.column .content .subtitle { font-family: "Roboto"; font-weight: normal; font-style: normal; text-transform: none; letter-spacing: normal; }
+                    article .bodytext figure .caption { font-family: "Roboto Condensed"; font-weight: normal; font-style: normal; text-transform: none; letter-spacing: normal; }
+                    article .meta .dates { font-family: "Roboto Mono"; font-weight: normal; font-style: normal; font-size: 0.75rem; text-transform: none; letter-spacing: normal; }
+                    article .meta .dates .dateLabel { font-family: "Roboto Mono"; font-weight: normal; font-style: normal; font-size: 0.75rem; text-transform: none; letter-spacing: normal; }
+                    .articleFooter .tags a { font-family: "Roboto Mono"; font-weight: normal; font-style: normal; text-transform: uppercase; letter-spacing: normal; }
+                    body { font-family: "Roboto"; font-weight: normal; font-style: normal; line-height: 1.6; text-transform: none; letter-spacing: normal; }
+                    .topBarMenu ul li a, topBarMenu ul li span, .pageHeader .hamburger .hamburger-container .topBarMenu ul li { font-family: "Roboto"; font-weight: normal; font-style: normal; font-size: 1.25rem; text-transform: none; letter-spacing: normal; }
+                    .customMenu1 ul li a, .customMenu1 ul li span, .pageHeader .hamburger .hamburger-container .customMenu1 ul li a, .pageHeader .hamburger .hamburger-container .customMenu1 ul li span { font-family: "Roboto"; font-weight: normal; font-style: normal; font-size: 1.125rem; text-transform: none; letter-spacing: normal; }
+                    .articleHeader .kicker { font-family: "Roboto"; font-weight: normal; font-style: normal; font-size: 1rem; text-transform: uppercase; letter-spacing: normal; }
+                    article.column .content .kicker { font-family: "Roboto"; font-weight: normal; font-style: normal; font-size: 1rem; text-transform: uppercase; letter-spacing: normal; }
+                    footer.page { font-family: "Roboto"; font-weight: normal; font-style: normal; font-size: 0.75rem; text-transform: none; letter-spacing: normal; text-decoration: none; hyphens: auto; }
+                    .bodytext>p a, .bodytext>ul a, .bodytext>ol a, .bodytext>h2 a, .bodytext>h3 a, .bodytext>h4 a { font-family: "Roboto"; font-weight: normal; font-style: normal; font-size: 1.125rem; text-transform: none; letter-spacing: normal; color: #333333; text-decoration: underline; hyphens: auto; }
+                    .toplist ul li .text h4 { font-family: "Roboto"; font-weight: 700; font-style: normal; font-size: 1.125rem; line-height: 1.5; text-transform: none; letter-spacing: normal; hyphens: auto; }
+                    .articleHeader .lab-article-section { font-family: "Roboto"; font-weight: normal; font-style: normal; font-size: 0.9375rem; text-transform: uppercase; letter-spacing: normal; hyphens: auto; }
+                    .font-Roboto { font-family: "Roboto" !important; }
+                    .font-Roboto.font-weight-bold { font-weight: 700 !important; }
+                    .font-RobotoMono { font-family: "Roboto Mono" !important; }
+                    .font-RobotoMono.font-weight-bold { font-weight: 700 !important; }

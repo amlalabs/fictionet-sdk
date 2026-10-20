@@ -1,0 +1,16 @@
+[package]
+name = "fictionet-extras"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description = "Optional web layouts and reusable service components for Fictionet worlds."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+include_dir = "0.7"
+kuchiki = "0.8"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+time = "0.3"
+url = "2"

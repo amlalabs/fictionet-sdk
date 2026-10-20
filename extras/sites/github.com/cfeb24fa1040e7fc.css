@@ -1,0 +1,1 @@
+@keyframes toggle-color{0%{background-color:#0000}50%{color:#4c4a42;background-color:#fff9ea;border-color:#dfd8c2}to{background-color:#0000}}.details-collapse.open .collapse{height:auto;display:block;overflow:visible}:root{--pr-toolbar-sticky-header-height:max(var(--observed-header-height,60px), 60px)}

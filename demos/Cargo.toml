@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 arc-swap = "1.9.3"
+fictionet-extras = { path = "../extras" }
 artifactory-world = { path = "../examples/artifactory/world" }
 border-world = { path = "../examples/border/world" }
 adaptive-web-world = { path = "../examples/adaptive-web/world" }

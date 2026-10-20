@@ -92,7 +92,7 @@ fn on_disk(
 
 /// The result links and titles of a Google results page.
 fn results(body: &[u8]) -> Vec<(String, String)> {
-    render::google_results(std::str::from_utf8(body).unwrap())
+    fictionet_extras::search::links(std::str::from_utf8(body).unwrap())
 }
 
 async fn get(pages: &Arc<Pages>, cx: &Cx, url: &str) -> Response {
@@ -1333,7 +1333,7 @@ fn search_styles_are_static_with_either_generator() {
                     .await;
                 assert_eq!(css.status, 200);
                 assert_eq!(css.content_type, "text/css; charset=utf-8");
-                assert_eq!(css.body, render::SEARCH_CSS.as_bytes());
+                assert_eq!(css.body, fictionet_extras::search::CSS.as_bytes());
                 assert_eq!(css.logged()["kind"], "asset");
                 assert!(pages.store().page(host, "/search.css?v=1").is_none());
             }
@@ -2256,4 +2256,98 @@ fn anthropic_answers_keep_tokens_and_where_they_stopped() {
         (&body["system"], &body["max_tokens"]),
         (&json!("system"), &json!(100))
     );
+}
+
+#[test]
+fn captured_model_pages_use_the_container_without_a_stylesheet_call() {
+    let fake = Fake::new(|_, body| {
+        let prompt = body["messages"][1]["content"].as_str().unwrap();
+        assert!(prompt.contains("div class=\"body\" role=\"main\""));
+        assert!(!prompt.contains("SITE_CSS:"));
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Paths\nBODY:\n<h1>Paths</h1><p>Read directories with pathlib.</p>",
+            Some(0.001),
+        )
+    });
+    let pages = Arc::new(Pages::open(
+        seed(),
+        Store::memory(),
+        Some(Maker::Model(openrouter(fake.clone()))),
+        0,
+    ));
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let response = get(
+            &pages,
+            &cx,
+            "https://docs.python.org/3/library/pathlib.html",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let html = std::str::from_utf8(&response.body).unwrap();
+        assert!(html.contains("Read directories with pathlib."));
+        let stylesheet = {
+            let dom = kuchiki::traits::TendrilSink::one(kuchiki::parse_html(), html);
+            dom.select_first("link[rel=stylesheet]")
+                .unwrap()
+                .attributes
+                .borrow()
+                .get("href")
+                .unwrap()
+                .to_owned()
+        };
+        for path in [
+            stylesheet.as_str(),
+            "/_assets/missing.css",
+            "/_assets/../page.html",
+        ] {
+            let asset = pages
+                .handle(&cx, "GET", "docs.python.org", path, None)
+                .await;
+            assert_eq!(asset.status, if path == stylesheet { 200 } else { 404 });
+            assert!(matches!(asset.meta, Meta::Asset));
+        }
+        assert_eq!(fake.users().len(), 1);
+        Ok(())
+    });
+}
+
+#[test]
+fn captured_stub_pages_and_assets_are_available_with_generation_off() {
+    let pages = halvard();
+    lab(move |cx| async move {
+        let response = get(&pages, &cx, "https://en.wikipedia.org/wiki/Directories").await;
+        assert_eq!(response.status, 200);
+        let html = std::str::from_utf8(&response.body).unwrap();
+        assert!(html.contains("mw-body"));
+        assert!(html.contains("/_assets/"));
+        pages
+            .apply(
+                &cx,
+                Command::SetGeneration {
+                    generate: false,
+                    expected_revision: pages.generation().revision,
+                },
+            )
+            .unwrap();
+        let stylesheet = {
+            let dom = kuchiki::traits::TendrilSink::one(kuchiki::parse_html(), html);
+            dom.select_first("link[rel=stylesheet]")
+                .unwrap()
+                .attributes
+                .borrow()
+                .get("href")
+                .unwrap()
+                .to_owned()
+        };
+        let asset = pages
+            .handle(&cx, "GET", "en.wikipedia.org", &stylesheet, None)
+            .await;
+        assert_eq!(asset.status, 200);
+        assert!(asset.content_type.starts_with("text/css"));
+        let cached = get(&pages, &cx, "https://en.wikipedia.org/wiki/Directories").await;
+        assert_eq!(cached.body, response.body);
+        Ok(())
+    });
 }

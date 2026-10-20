@@ -255,3 +255,23 @@ async fn page_declares_the_workspace_and_serves_its_modules() {
         assert!(!reply.body.is_empty());
     }
 }
+
+#[test]
+fn search_javascript() {
+    let output = std::process::Command::new("node")
+        .args(["--test", "src/search/search.test.mjs"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("node is not installed");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{text}");
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("# fail 0") || text.contains("fail 0"),
+        "{text}"
+    );
+}

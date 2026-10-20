@@ -1,0 +1,98 @@
+@keyframes firework {
+  0% {
+    width: 1.5vmin;
+    opacity: 20;
+  }
+
+  100% {
+    width: 12vmin;
+    opacity: 0;
+  }
+}
+
+@keyframes rw-gp-animate-circle {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes rw-gp-expand-collapse {
+  0% {
+    transform: scale(1);
+  }
+  70% {
+    transform: scale(1.2);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+div[data-rewards-widget].medallion {
+  --rw-medal-color: #174ae4;
+  --rw-medal-color-glow: #1e90ff;
+  --rw-font-color: #333333;
+  --rw-red-dot-color: #c80000;
+  --rw-red-dot-diameter: 7px;
+  display: inline-block;
+  cursor: pointer;
+  position: relative;
+}
+
+div[data-rewards-widget].medallion:not(.copilotSearch) > div {
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  height: 100%;
+  padding: 0 4px;
+}
+
+div[data-rewards-widget].medallion:not(.copilotSearch) > div > * {
+  padding: 0 4px;
+  display: flex;
+}
+
+div[data-rewards-widget].medallion:not(.copilotSearch) .points-container {
+  color: var(--rw-color, var(--rw-font-color));
+  font-family: var(--rw-font-family);
+  font-feature-settings: 'tnum';
+  font-variant-numeric: tabular-nums;
+  display: inline-block;
+  text-align: right;
+}
+
+div[data-rewards-widget].medallion:not(.copilotSearch) div.medal {
+  position: relative;
+}
+
+@keyframes rw-medal-ripple {
+  0% {
+    box-shadow: 0 0 0 0 rgba(78, 131, 246, 0), 0 0 0 2px rgba(78, 131, 246, 1);
+    opacity: 1;
+  }
+
+  20% {
+    box-shadow: 0 0 0 2px rgba(78, 131, 246, 0.5), 0 0 0 2px rgba(78, 131, 246, 0.8);
+    opacity: 1;
+  }
+
+  50% {
+    box-shadow: 0 0 0 6px rgba(78, 131, 246, 0.3), 0 0 0 2px rgba(78, 131, 246, 0.5);
+    opacity: 0.8;
+  }
+
+  80% {
+    box-shadow: 0 0 0 8px rgba(78, 131, 246, 0.15), 0 0 0 2px rgba(78, 131, 246, 0.2);
+    opacity: 0.3;
+  }
+
+  100% {
+    box-shadow: 0 0 0 12px rgba(78, 131, 246, 0), 0 0 0 2px rgba(78, 131, 246, 0);
+    opacity: 0;
+  }
+}
+
+div[data-rewards-widget].medallion svg.medal-newlevel-circled {
+  width: 32px;
+  height: 32px;
+}

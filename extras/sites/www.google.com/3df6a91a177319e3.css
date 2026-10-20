@@ -1,0 +1,1 @@
+@keyframes pulse-animation {0%{opacity:1}50%{animation-timing-function:cubic-bezier(0,0,1,1);opacity:0.5}100%{opacity:1}}

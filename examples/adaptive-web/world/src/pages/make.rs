@@ -2,6 +2,7 @@
 //! page content, with no model.
 
 use super::{Seed, prompts::expected_type, seed::parse_date, text::*};
+use fictionet_extras::search::{Ad, Result, Search};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -70,41 +71,6 @@ const FILLER_SITES: [(&str, &str, &str); 12] = [
     ("www.linkedin.com", "pulse/{slug}", "{Phrase} | LinkedIn"),
 ];
 
-/// One generated search result.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Result {
-    /// Destination URL.
-    pub url: String,
-    /// Link title.
-    pub title: String,
-    /// Preview text shown below the title.
-    pub snippet: String,
-    /// Display date with an English month abbreviation.
-    #[serde(default)]
-    pub date: String,
-}
-/// A sponsored search result.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Ad {
-    /// Destination URL.
-    pub url: String,
-    /// Advertisement heading.
-    pub title: String,
-    /// Advertisement body text.
-    pub text: String,
-}
-/// Content shared by the search engine layouts.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Search {
-    /// Results in ranking order.
-    pub results: Vec<Result>,
-    /// Related search phrases.
-    pub related: Vec<String>,
-    /// Suggested follow-up questions.
-    pub questions: Vec<String>,
-    /// Sponsored results.
-    pub ads: Vec<Ad>,
-}
 /// Site branding and layout settings shared by its pages.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {

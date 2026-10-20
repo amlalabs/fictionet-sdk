@@ -42,11 +42,12 @@ pub use meta::Meta;
 pub use seed::Seed;
 
 use crate::files::FileLock;
-use crate::route::{Engine, Route, query_key, route};
+use crate::route::{Route, query_key, route};
 use crate::search::{Cache, Reason};
 use example_common::names;
 use fictionet::Cx;
 use fictionet::events::Fields;
+use fictionet_extras::search::{self, Engine};
 use meta::{Asked, Listing, Shown};
 use model::{Failure, Ledger, Model, Provider, Usage};
 use prompts::{Claim, HostPage, Person};
@@ -503,6 +504,13 @@ impl Pages {
     }
 
     async fn answer(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, route: Route) -> Response {
+        let path = target.split('?').next().unwrap_or(target);
+        if path.starts_with("/_assets/") {
+            return match fictionet_extras::sites::asset(host, path) {
+                Some((mime, bytes)) => Response::new(200, mime, bytes, vec![], Meta::Asset),
+                None => Response::new(404, "text/plain", "Not found", vec![], Meta::Asset),
+            };
+        }
         match route {
             Route::Redirect { location, status } => {
                 let body = format!(
@@ -515,13 +523,10 @@ impl Pages {
                 Response::new(status, "text/html; charset=utf-8", body, headers, meta)
             }
             Route::SearchHome { engine } => Response::html(
-                match engine {
-                    Engine::Google => render::google_home(),
-                    _ => render::duckduckgo_home(),
-                },
+                fictionet_extras::search::home(engine),
                 Meta::SearchHome,
                 200,
-                render::engine_server(engine),
+                fictionet_extras::search::engine_server(engine),
             ),
             Route::Search {
                 engine,
@@ -678,9 +683,9 @@ impl Pages {
                 Err(stop) => return stop.response(Asked::Search),
             },
         };
-        let empty = make::Search::default();
+        let empty = fictionet_extras::search::Search::default();
         let search = record.as_ref().map_or(&empty, |r| &r.search);
-        let body = render::search(engine, query, search, start);
+        let body = search::render(engine, query, search, start);
         let listing = Listing {
             engine,
             search: query.into(),
@@ -691,7 +696,12 @@ impl Pages {
             usage: record.map(|r| r.usage),
         };
         let meta = Meta::Search(Box::new(listing));
-        Response::html(body, meta, 200, render::engine_server(engine))
+        Response::html(
+            body,
+            meta,
+            200,
+            fictionet_extras::search::engine_server(engine),
+        )
     }
 
     async fn make_search(&self, cx: &Cx, key: &str, query: &str) -> Result<SearchRecord, Stop> {
@@ -714,7 +724,7 @@ impl Pages {
             )
             .await?;
         let mut search = made.fields;
-        let mut results: Vec<make::Result> = Vec::new();
+        let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
             let (host, target) = text::target_of(&r.url);
             let known_match = known.iter().find(|k| k.url == r.url);
@@ -902,7 +912,7 @@ impl Pages {
         let store = self.store();
         let profile = store.site(host);
         Response::html(
-            render::not_found(host, profile, target, &self.seed.date[..4]),
+            render::not_found(host, profile, target, &self.seed.date),
             Meta::Missing,
             404,
             render::server_of(profile),
@@ -1016,7 +1026,9 @@ impl Pages {
                 },
                 |text| {
                     let page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
-                    if ask.profile.is_none() && page.site.as_ref().is_none_or(|p| p.css.is_empty())
+                    if ask.profile.is_none()
+                        && fictionet_extras::sites::lookup(host, target).is_none()
+                        && page.site.as_ref().is_none_or(|p| p.css.is_empty())
                     {
                         return Err(prompts::Unreadable("the first page needs SITE_CSS".into()));
                     }
@@ -1033,7 +1045,7 @@ impl Pages {
         {
             page.title = title.into();
         }
-        let year = &self.seed.date[..4];
+        let today = &self.seed.date;
         let profile = match ask.profile {
             Some(profile) => profile,
             None => {
@@ -1050,9 +1062,9 @@ impl Pages {
         let body = if !html {
             page.body.clone()
         } else if page.status == 404 && ask.mentions.is_empty() {
-            render::not_found(host, Some(&profile), target, year)
+            render::not_found(host, Some(&profile), target, today)
         } else {
-            render::page(host, &profile, &page, year)
+            render::page_at(host, target, &profile, &page, today)
         };
         let tells = text::tells(&if html {
             text::text_of(&page.body)
@@ -1116,7 +1128,10 @@ fn static_asset(path: &str) -> Option<Response> {
     let (ctype, body): (&str, &[u8]) = if path == "/robots.txt" {
         ("text/plain; charset=utf-8", b"User-agent: *\nAllow: /\n")
     } else if path == "/search.css" {
-        ("text/css; charset=utf-8", render::SEARCH_CSS.as_bytes())
+        (
+            "text/css; charset=utf-8",
+            fictionet_extras::search::CSS.as_bytes(),
+        )
     } else {
         let (base, ext) = path.rsplit_once('.')?;
         if ext.contains('/') || base.is_empty() {

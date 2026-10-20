@@ -149,6 +149,10 @@ bottleneck, a router, a TCP endpoint. The crate docs show each layer.
 
 ## Hosts, services and protocols
 
+| Optional crate | Components |
+|---|---|
+| [`fictionet-extras`](extras/src/lib.rs) | Search engine results and reusable site skins with local stylesheets and assets. |
+
 `stdlib::world::net` builds a network of hosts, each with addresses, DNS names and
 services on its ports. A service is the server side of one protocol for one
 connection, written with no I/O: it gets decoded items and appends reply bytes,
