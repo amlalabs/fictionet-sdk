@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use fakewiki_world::tamper::Reply;
 use fictionet_demo::kit::{
-    Run,
+    GuestHandle, Run,
     client::{Capability, PageClient, Response},
     rfb, shot,
 };
@@ -154,6 +154,25 @@ impl StateStream {
     }
 }
 
+/// The events after `after` (at most one page) and the reply around them.
+async fn events(client: &PageClient, after: u64) -> io::Result<(Vec<Value>, Value)> {
+    let mut value = get(client, &format!("/api/events?after={after}")).await?;
+    let Value::Array(events) = value["events"].take() else {
+        return Err(io::Error::other("events API has no events"));
+    };
+    Ok((events, value))
+}
+
+/// The cursor past a page of events. A page holds at most 1,000 events, so
+/// `last` (the newest event of the run) would skip the rest of the history.
+fn cursor(events: &[Value], value: &Value) -> io::Result<u64> {
+    events
+        .last()
+        .map_or(&value["last"], |event| &event["seq"])
+        .as_u64()
+        .ok_or_else(|| io::Error::other("events API has no cursor"))
+}
+
 async fn event(
     client: &PageClient,
     missing: &str,
@@ -164,43 +183,231 @@ async fn event(
         let mut poll = tokio::time::interval(Duration::from_millis(100));
         loop {
             poll.tick().await;
-            let value = get(client, &format!("/api/events?after={after}")).await?;
-            let events = value["events"]
-                .as_array()
-                .ok_or_else(|| io::Error::other("events API has no events"))?;
+            let (events, value) = events(client, after).await?;
             if events.iter().any(&matches) {
                 return Ok(());
             }
-            after = value["last"]
-                .as_u64()
-                .ok_or_else(|| io::Error::other("events API has no cursor"))?;
+            after = cursor(&events, &value)?;
         }
     })
     .await
     .map_err(|_| io::Error::other(missing))?
 }
 
+fn article(event: &Value) -> bool {
+    event["source"] == "http"
+        && event["kind"] == "request"
+        && event["sandbox"]["name"] == HOST
+        && event["fields"]["host"] == WIKI
+        && event["fields"]["path"] == ARTICLE
+}
+
+/// A complete 200 GET of the article, as one version at one revision.
+fn complete_read(event: &Value, served: &str, revision: u64) -> bool {
+    let fields = &event["fields"];
+    article(event)
+        && fields["served"] == served
+        && fields["tamper_revision"] == revision
+        && fields["method"] == "GET"
+        && fields["status"] == 200
+        && fields["complete"] == true
+}
+
 pub(super) async fn read(client: &PageClient, served: &str, revision: u64) -> io::Result<()> {
     event(
         client,
         &format!("scripted reader did not receive {served} article at revision {revision}"),
-        |event| {
-            let fields = &event["fields"];
-            event["source"] == "http"
-                && event["kind"] == "request"
-                && event["sandbox"]["name"] == HOST
-                && fields["host"] == WIKI
-                && fields["path"] == ARTICLE
-                && fields["served"] == served
-                && fields["tamper_revision"] == revision
-                && fields["status"] == 200
-                && fields["complete"] == true
-        },
+        |event| complete_read(event, served, revision),
     )
     .await
 }
 
+/// Follows the events after the switch to revision 1 for the second read.
+#[derive(Default)]
+pub(super) struct Reload {
+    switched: bool,
+    pub requests: usize,
+}
+
+impl Reload {
+    /// True once a complete tampered read at revision 1 arrives. An article
+    /// request after the switch that was served the real page, or served at
+    /// revision 0, is an error.
+    pub fn observe(&mut self, events: &[Value]) -> io::Result<bool> {
+        let mut received = false;
+        for event in events {
+            if event["source"] == "fakewiki"
+                && event["kind"] == "tampering"
+                && event["fields"]["revision"] == 1
+                && event["fields"]["on"] == true
+            {
+                self.switched = true;
+            }
+            if !self.switched || !article(event) {
+                continue;
+            }
+            self.requests += 1;
+            let fields = &event["fields"];
+            require(
+                fields["served"] != "real" && fields["tamper_revision"] != 0,
+                &format!("article after the switch used the old state: {event}"),
+            )?;
+            received |= complete_read(event, "tampered", 1);
+        }
+        Ok(received)
+    }
+}
+
+/// Runs xdotool as the scripted reader on the guest's display.
+async fn xdotool(guest: &GuestHandle, args: &str) -> io::Result<String> {
+    let command = format!("env DISPLAY=:1 xdotool {args}");
+    let output = tokio::time::timeout(Duration::from_secs(30), guest.ssh().run(&command))
+        .await
+        .map_err(|_| io::Error::other(format!("scripted reader timed out: {command}")))??;
+    require(
+        output.code == 0,
+        &format!(
+            "scripted reader {command:?}: exit {}; {}",
+            output.code, output.stderr
+        ),
+    )?;
+    Ok(output.stdout)
+}
+
+/// Waits until Firefox's window shows the article's title, so the first
+/// load has finished, and returns the window's id.
+async fn article_window(guest: &GuestHandle) -> io::Result<u64> {
+    let windows = xdotool(
+        guest,
+        "search --sync --onlyvisible --name '^Stream ripping - Wikipedia.*Firefox'",
+    )
+    .await?;
+    windows
+        .lines()
+        .next()
+        .ok_or_else(|| io::Error::other("Firefox article window not found"))?
+        .trim()
+        .parse()
+        .map_err(io::Error::other)
+}
+
+async fn reload(guest: &GuestHandle, window: u64) -> io::Result<()> {
+    println!("Scripted reader: reload Firefox window {window} (ctrl+F5)");
+    xdotool(
+        guest,
+        &format!("windowactivate --sync {window} key --window {window} --clearmodifiers ctrl+F5"),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Reloads the article and waits for the tampered read. When no article
+/// request at all arrives within 15 s, it names the active window and
+/// reloads once more.
+async fn second_read(
+    client: &PageClient,
+    guest: &GuestHandle,
+    window: u64,
+    mut after: u64,
+) -> io::Result<()> {
+    let mut observed = Reload::default();
+    let mut retried = false;
+    let started = tokio::time::Instant::now();
+    let wait = async {
+        reload(guest, window).await?;
+        let mut poll = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            poll.tick().await;
+            let (events, value) = events(client, after).await?;
+            if observed.observe(&events)? {
+                return Ok(());
+            }
+            after = cursor(&events, &value)?;
+            if !retried && observed.requests == 0 && started.elapsed() >= Duration::from_secs(15) {
+                retried = true;
+                let active = xdotool(guest, "getactivewindow getwindowname").await;
+                println!(
+                    "Scripted reader: no article request within 15 s; active window: {active:?}"
+                );
+                println!("Scripted reader: retrying the reload once");
+                reload(guest, window).await?;
+            }
+        }
+    };
+    let result = tokio::time::timeout(Duration::from_secs(60), wait).await;
+    result.map_err(|_| {
+        io::Error::other(format!(
+            "scripted reader did not receive tampered article at revision 1 \
+             ({} article requests after the switch; reload retried: {retried})",
+            observed.requests
+        ))
+    })?
+}
+
+/// Runs the checks. On a failure it prints the article's requests and saves
+/// the guest's screen before it returns the error.
 pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
+    let mut switch = None;
+    let result = checks(run, output, &mut switch).await;
+    if let Err(error) = &result {
+        eprintln!("Gate failed: {error}");
+        let requests = article_requests(run, switch);
+        match tokio::time::timeout(Duration::from_secs(10), requests).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("Article requests unavailable: {error}"),
+            Err(_) => eprintln!("Article requests unavailable: timed out"),
+        }
+        let path = output.join("failure-desktop.png");
+        let capture = async {
+            std::fs::create_dir_all(output)?;
+            rfb::capture_page(run.page_url(), HOST, &path).await
+        };
+        match tokio::time::timeout(Duration::from_secs(30), capture).await {
+            Ok(Ok(_)) => eprintln!("Guest screen at the failure: {}", path.display()),
+            Ok(Err(error)) => eprintln!("Guest screen unavailable: {error}"),
+            Err(_) => eprintln!("Guest screen unavailable: timed out"),
+        }
+    }
+    result
+}
+
+/// Prints the article's requests since the switch, or since the start
+/// when the gate failed before it.
+async fn article_requests(run: &Run, switch: Option<u64>) -> io::Result<()> {
+    let client = PageClient::from_url(run.page_url())?;
+    let since = if switch.is_some() {
+        "the switch"
+    } else {
+        "the start"
+    };
+    eprintln!("Article requests since {since}:");
+    let (mut after, mut count) = (switch.unwrap_or(0), 0);
+    let dropped = loop {
+        let (events, value) = events(&client, after).await?;
+        for event in events.iter().filter(|event| article(event)) {
+            count += 1;
+            let fields = &event["fields"];
+            eprintln!(
+                "  at {} s: {} served {} at revision {}, status {}, complete {}",
+                event["at"],
+                fields["method"],
+                fields["served"],
+                fields["tamper_revision"],
+                fields["status"],
+                fields["complete"],
+            );
+        }
+        let next = cursor(&events, &value)?;
+        if next == after {
+            break value["dropped"].clone();
+        }
+        after = next;
+    };
+    eprintln!("{count} article requests; events lost from the history: {dropped}");
+    Ok(())
+}
+
+async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Result<()> {
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
     let guest = run.guest(HOST);
@@ -245,9 +452,14 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
     println!("[pass] page security: token required, missing and reused tickets refused");
     println!("[pass] first read: real, revision 0");
 
+    let window = article_window(guest).await?;
+    println!("Scripted reader: the article's title is in Firefox window {window}");
+
     let mut stream = StateStream::open(run.page_url()).await?;
     let initial = stream.state("tamper", 0).await?;
     require(initial["value"]["on"] == false, "tampering must start off")?;
+    let before = get(&client, "/api/events?after=0").await?["last"].as_u64();
+    *switch = Some(before.ok_or_else(|| io::Error::other("events API has no cursor"))?);
     require(
         matches!(
             command(&client, "switch-on", true, 0).await?,
@@ -270,14 +482,7 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
         "[pass] switch: applied revision 1, stale revision rejected with HTTP 409 and world event, GET and stream agree"
     );
 
-    let reload = tokio::time::timeout(Duration::from_secs(30), guest.ssh().run(
-        "env DISPLAY=:1 xdotool search --sync --onlyvisible --class firefox windowactivate --sync key --clearmodifiers ctrl+F5"
-    )).await.map_err(|_| io::Error::other("scripted Firefox reload timed out"))??;
-    require(
-        reload.code == 0,
-        &format!("scripted Firefox reload failed: {}", reload.stderr),
-    )?;
-    read(&client, "tampered", 1).await?;
+    second_read(&client, guest, window, switch.unwrap_or(0)).await?;
     let diff = get(&client, "/api/state/diff").await?;
     require(
         diff["status"]["too_large"] == false && diff["value"]["revision"] == 1,

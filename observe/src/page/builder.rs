@@ -432,9 +432,13 @@ pub(super) async fn projection(
         None,
     );
     let mut value: serde_json::Value = serde_json::from_slice(&values[0].bytes)?;
+    let last = value["last"].clone();
     let Some(events) = value["events"].as_array_mut() else {
         return http::respond(conn, 404, "application/json", &values[0].bytes).await;
     };
+    // A page holds at most 1,000 events, so the cursor stops at the last one
+    // examined; `last` would skip the rest of a longer history.
+    let next = events.last().map_or(last, |e| e["seq"].clone());
     let sandbox = filter
         .host
         .as_ref()
@@ -455,7 +459,7 @@ pub(super) async fn projection(
     });
     let reply = serde_json::json!({
         "rows": value["events"],
-        "next": value["last"],
+        "next": next,
         "dropped": value["dropped"],
     });
     http::json(conn, 200, &reply).await

@@ -73,18 +73,32 @@ the desktop paints.
 `cargo xtask demo fakewiki` runs an in-process [FakeWiki](../examples/fakewiki)
 world and an Ubuntu 24.04 desktop on the shared microVM kit. A scripted Firefox
 reader loads the Wikipedia article, then reloads after the page turns tampering
-on. The standard page shows served versions, traffic and containment. The gate
-checks both reads and saves guest and page screenshots before shutdown.
+on. The gate checks both reads and saves guest and page screenshots before
+shutdown.
 
-It needs KVM and Chromium. Reviewer measurements pending: first-run download
-size, first-run time and cached-run time.
+The page puts an article panel beside the guest's screen. It has the Tamper
+switch, the true and the false claim, and the real and tampered article side
+by side with the changed sentences marked. It marks the version the world
+serves now and the version Firefox last received, from the world's facts about
+each request, and keeps a strip of this run's reads. The inspector has the
+standard panels and a Reads table.
+
+It needs KVM and Chromium. Measured on a 24-core machine: the pinned files are
+about 650 MB, shared with the desktop demo. The first run also fetches about
+78 MB of Ubuntu packages through the world's mirror into
+`downloads/cloudimage/apt-cache/`. With the files downloaded and the binary
+built, the desktop was up with the article read 67 s after boot on an empty
+package cache, and 52 s after boot with a warm cache. A whole run with a warm
+cache took 54 s.
 
 For page design without a VM, run `cargo run --locked -p fictionet-demo --example fakewiki_page`.
 It uses the same page and world with a placeholder screen. The first stdout
 line is its loopback URL. Press Enter to make the in-world scripted client
-read the article, use the page's Tamper switch, then press Enter again.
-EOF stops the example. Its markers name the scripted client; the VM demo
-names Firefox (scripted). Article component tests run with
+read the article, use the page's Tamper switch, then press Enter again. Type
+`drop` to close the placeholder screen's connections. EOF stops the example.
+Its markers name the scripted client; the VM demo names Firefox (scripted).
+The design screenshots of every panel and state come from this example; the
+gate's screenshots come from the VM. Article component tests run with
 `node --test demos/src/bin/fakewiki/article.test.mjs`.
 
 ## VM scripts

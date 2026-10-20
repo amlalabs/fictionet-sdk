@@ -4,16 +4,21 @@ use fictionet_observe::page::{BoxFuture, Console, Duplex, Pty};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-pub struct Screen;
+#[derive(Clone)]
+pub struct Screen(pub tokio::sync::watch::Sender<()>);
 impl Console for Screen {
     fn terminal(&self, _: u16, _: u16) -> Option<BoxFuture<'static, io::Result<Box<dyn Pty>>>> {
         None
     }
     fn screen(&self) -> Option<BoxFuture<'static, io::Result<Box<dyn Duplex>>>> {
-        Some(Box::pin(async {
+        let mut drops = self.0.subscribe();
+        Some(Box::pin(async move {
             let (client, server) = tokio::io::duplex(64 << 10);
             tokio::spawn(async move {
-                let _ = screen(server).await;
+                tokio::select! {
+                    _ = screen(server) => {},
+                    _ = drops.changed() => {},
+                }
             });
             Ok(Box::new(client) as Box<dyn Duplex>)
         }))
