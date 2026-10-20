@@ -529,17 +529,27 @@ fn worst_case_snapshot_fits() {
         seed,
         generator: Generator {
             kind: GeneratorKind::Model(Provider::OpenRouter),
-            model: t,
+            model: t.clone(),
             prefetch: n,
             generate: false,
             generation_revision: n,
             generation_at_ms: n,
+            canned: false,
         },
         queries: vec![q; MAX_QUERIES],
         results: vec![list; MAX_RESULTS],
         pages: vec![p; MAX_PAGES],
         sites: vec![site; MAX_SITES],
         refused: vec![refused; MAX_REFUSED],
+        planted: vec![
+            Plant {
+                kind: t.clone(),
+                text: t.clone(),
+                url: t.clone(),
+                at_ms: n,
+            };
+            MAX_PLANTED
+        ],
         omitted: Omitted {
             queries: n,
             results: n,
@@ -547,6 +557,7 @@ fn worst_case_snapshot_fits() {
             pages: n,
             sites: n,
             refused: n,
+            planted: n,
             seed_facts: n,
             seed_sites: n,
         },

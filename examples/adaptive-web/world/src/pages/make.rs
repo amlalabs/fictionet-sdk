@@ -14,63 +14,126 @@ const STOP: &[&str] = &[
     "who", "why", "with", "you", "our", "we", "this", "that", "was", "will", "about", "online",
     "news", "com", "www", "https", "http",
 ];
-const CLUTTER: [&str; 8] = [
-    "Comments on this page are moderated. Please keep discussion on topic and respectful.",
-    "Updated with a correction to the second paragraph after publication.",
-    "This article is part of our weekly roundup. Last week's roundup covered cloud price changes and a new browser release.",
-    "Our team reviews hundreds of products a year. We may earn a commission from links on this page.",
-    "Sign up to our newsletter for a short summary every Tuesday morning.",
-    "Elsewhere this week: a major airline's booking site was down for three hours, and two retailers changed their returns policies.",
-    "Reader question of the week: is it worth upgrading a five-year-old laptop? Our answer is in the archive.",
-    "Photo: file image. Some details in this story were first reported by a partner publication.",
-];
-const FILLER_SITES: [(&str, &str, &str); 12] = [
-    ("en.wikipedia.org", "wiki/{Title}", "{Phrase} - Wikipedia"),
+/// Sites a search lists when no page or scenario site matches its words:
+/// host, path, title and snippet. The snippets read as text cut from those
+/// pages.
+const FILLER_SITES: [(&str, &str, &str, &str); 12] = [
+    (
+        "en.wikipedia.org",
+        "wiki/{Title}",
+        "{Phrase} - Wikipedia",
+        "{Phrase} may refer to: {W0}, a term used in several fields; a list of articles with similar titles ...",
+    ),
     (
         "www.reddit.com",
         "r/{w0}/comments/{slug}/",
         "{Phrase} : r/{w0}",
+        "{n} votes, {m} comments. Has anyone run into {phrase} lately? Asking before I change anything on our side ...",
     ),
     (
         "www.theregister.com",
         "2026/{mm}/{dd}/{slug}/",
         "{Phrase} • The Register",
+        "{Phrase}: what we know so far, and what the vendors told us when we asked this week ...",
     ),
     (
         "stackoverflow.com",
         "questions/tagged/{w0}",
         "Newest '{w0}' questions - Stack Overflow",
+        "Questions tagged [{w0}]. Ask Question. {n} questions. Newest, Active, Bountied, Unanswered. Sorted by ...",
     ),
     (
         "medium.com",
         "@{w0}-notes/{slug}",
         "{Phrase} | by {W0} Notes | Medium",
+        "{k} min read. A few notes on {phrase}: what I tried first, what broke, and what finally worked for us ...",
     ),
     (
         "www.techradar.com",
         "news/{slug}",
         "{Phrase}: what you need to know | TechRadar",
+        "Everything you need to know about {phrase}, plus our pick of the alternatives if you want to switch ...",
     ),
-    ("github.com", "topics/{w0}", "{w0} · GitHub Topics · GitHub"),
+    (
+        "github.com",
+        "topics/{w0}",
+        "{w0} · GitHub Topics · GitHub",
+        "{n} public repositories match this topic. Language: All. Sort: Most stars. Here are {k} ...",
+    ),
     (
         "www.bbc.co.uk",
         "news/technology/{slug}",
         "{Phrase} - BBC News",
+        "Security researchers say people should check their settings after reports about {phrase} ...",
     ),
     (
         "www.youtube.com",
         "results?search_query={plus}",
         "{Phrase} - YouTube",
+        "{Phrase} explained in {k} minutes. {n}K views. Chapters: overview, setup, common mistakes ...",
     ),
-    ("www.quora.com", "{Dash}", "{Phrase}? - Quora"),
+    (
+        "www.quora.com",
+        "{Dash}",
+        "{Phrase}? - Quora",
+        "Answer (1 of {k}): It depends on what you mean by {phrase}. In my experience the first thing to check is ...",
+    ),
     (
         "news.ycombinator.com",
         "from?site={w0}.com",
         "{Phrase} | Hacker News",
+        "{n} points by {user} {k} hours ago | {m} comments. Surprised no one has mentioned the obvious workaround ...",
     ),
-    ("www.linkedin.com", "pulse/{slug}", "{Phrase} | LinkedIn"),
+    (
+        "www.linkedin.com",
+        "pulse/{slug}",
+        "{Phrase} | LinkedIn",
+        "{Phrase}: three things our team learned the hard way, and the one setting I now change on day one ...",
+    ),
 ];
-
+/// Bylines on articles the offline generator makes.
+const AUTHORS: [&str; 16] = [
+    "Priya Raman",
+    "Tomasz Wierzbicki",
+    "Aoife Gallagher",
+    "Kwame Mensah",
+    "Lucía Ortega",
+    "Henrik Lindqvist",
+    "Mei Tanaka",
+    "Oluwaseun Adeyemi",
+    "Dmitri Volkov",
+    "Fatima Benali",
+    "Rhys Pritchard",
+    "Ingrid Solberg",
+    "Mateus Carvalho",
+    "Yusuf Demir",
+    "Chloé Marchand",
+    "Arjun Mehta",
+];
+/// Forum and Q&A user names.
+const USERS: [&str; 12] = [
+    "netadmin_dk",
+    "ferrous_wheel",
+    "kb_ops",
+    "sysop42",
+    "lenkaP",
+    "grumpy_firewall",
+    "jbrandt",
+    "mikko_v",
+    "routerroot",
+    "tamsin.h",
+    "oldschool_ccna",
+    "pfeiffer_it",
+];
+/// Replies that add little, as many forum replies do.
+const REPLIES: [&str; 6] = [
+    "Following. Same question here.",
+    "Did you check the vendor's release notes first? That usually answers it.",
+    "We saw something similar last month, a reboot after the update sorted it.",
+    "Not sure this is the right subforum for it, but bumping anyway.",
+    "Can you post your version and model? Hard to say otherwise.",
+    "Thanks, this helped. Marking as solved on our end.",
+];
 /// Site branding and layout settings shared by its pages.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
@@ -135,17 +198,80 @@ fn facts_for(seed: &Seed, text: &str) -> Vec<String> {
         .cloned()
         .collect()
 }
+/// A stable number for `text`, to vary dates, counts and names by URL.
+fn hash(text: &str) -> usize {
+    text.bytes()
+        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize))
+}
 fn day(seed: &Seed, back: usize) -> time::Date {
     parse_date(&seed.date).unwrap() - time::Duration::days(back as i64)
 }
-fn long_date(d: time::Date) -> String {
-    let month = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ][d.month() as usize - 1];
-    format!("{} {month} {}", d.day(), d.year())
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+/// A date as result lists and bylines show it: `Oct 3, 2026`.
+pub fn short_date(d: time::Date) -> String {
+    format!(
+        "{} {}, {}",
+        MONTHS[d.month() as usize - 1],
+        d.day(),
+        d.year()
+    )
+}
+/// A page's `YYYY-MM-DD` date as a result list shows it, or empty.
+pub fn result_date(date: &str) -> String {
+    parse_date(date).map(short_date).unwrap_or_default()
+}
+/// A date on or before the world's date, from 0 to `within` days back,
+/// that stays the same for the same `key`.
+fn date_for(seed: &Seed, key: &str, within: usize) -> time::Date {
+    day(seed, hash(key) % (within + 1))
 }
 
-/// Makes results from matching known pages, seed sites and filler sites.
+/// The known pages that share words with `query`, the most shared words
+/// first; ties keep their order.
+pub fn rank<'a>(known: &'a [Result], query: &str) -> Vec<&'a Result> {
+    let mut asked = words(query);
+    asked.sort();
+    asked.dedup();
+    let mut scored: Vec<(usize, &Result)> = known
+        .iter()
+        .map(|k| {
+            let have = words(&format!("{} {} {}", k.title, k.url, k.snippet));
+            (asked.iter().filter(|w| have.contains(w)).count(), k)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.into_iter().map(|(_, k)| k).collect()
+}
+
+/// Text cut from a page as a snippet shows it: at most about 160
+/// characters, ending at a word with "...". Some start part way through.
+pub fn excerpt(text: &str, key: &str) -> String {
+    let text = normalize_space(text);
+    let words: Vec<&str> = text.split(' ').collect();
+    let from = if words.len() > 18 && hash(key).is_multiple_of(3) {
+        words.len() / 4
+    } else {
+        0
+    };
+    let mut out = String::new();
+    for word in &words[from..] {
+        if out.len() + word.len() > 160 {
+            out.push_str(" ...");
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if from > 0 { format!("... {out}") } else { out }
+}
+
+/// Makes results from matching known pages, scenario sites and filler
+/// sites, in that order.
 pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
     let mut ws = words(query);
     if ws.is_empty() {
@@ -158,7 +284,9 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
         phrase
     };
     let slug = ws.iter().take(6).cloned().collect::<Vec<_>>().join("-");
-    let d = day(seed, 3);
+    let d = date_for(seed, &slug, 20);
+    let number =
+        |salt: &str, below: usize| (hash(&format!("{slug}{salt}")) % below + 2).to_string();
     let fill = [
         (
             "Title",
@@ -169,6 +297,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
                 .join("_"),
         ),
         ("Phrase", upper_first(&phrase)),
+        ("phrase", phrase.clone()),
         ("w0", ws[0].clone()),
         ("W0", capitalize(&ws[0])),
         ("slug", slug.clone()),
@@ -183,6 +312,10 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
                 .collect::<Vec<_>>()
                 .join("-"),
         ),
+        ("n", number("n", 400)),
+        ("m", number("m", 90)),
+        ("k", number("k", 9)),
+        ("user", USERS[hash(&slug) % USERS.len()].into()),
     ];
     let format = |template: &str| {
         // Substitute only the template's fields, never braces in a query.
@@ -198,9 +331,8 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
     };
     let facts = facts_for(seed, query);
     let mut results: Vec<Result> = Vec::new();
-    let mut add = |url: String, title: String, snippet: String| {
+    let mut add = |url: String, title: String, snippet: String, date: String| {
         if results.len() < 10 && !results.iter().any(|r| r.url == url) {
-            let date = long_date(day(seed, results.len() * 2 + 1));
             results.push(Result {
                 url,
                 title,
@@ -209,43 +341,56 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             });
         }
     };
-    for k in known {
-        if shares_words(&format!("{} {}", k.title, k.url), query) {
-            add(
-                k.url.clone(),
-                k.title.clone(),
-                if k.snippet.is_empty() {
-                    k.title.clone()
-                } else {
-                    k.snippet.clone()
-                },
-            );
-        }
+    for k in rank(known, query) {
+        let snippet = if k.snippet.is_empty() {
+            &k.title
+        } else {
+            &k.snippet
+        };
+        let date = if k.date.is_empty() {
+            short_date(date_for(seed, &k.url, 30))
+        } else {
+            k.date.clone()
+        };
+        add(
+            k.url.clone(),
+            k.title.clone(),
+            excerpt(snippet, &k.url),
+            date,
+        );
     }
     for site in &seed.sites {
         if shares_words(&format!("{} {}", site.host, site.about), query) {
+            let url = format!("https://{}/{slug}", site.host);
+            let text = facts.first().unwrap_or(&site.about);
             add(
-                format!("https://{}/{slug}", site.host),
+                url.clone(),
                 format!(
                     "{} | {}",
                     upper_first(&phrase),
                     site.host.strip_prefix("www.").unwrap_or(&site.host)
                 ),
-                facts.first().unwrap_or(&site.about).clone(),
+                excerpt(text, &url),
+                short_date(date_for(seed, &url, 30)),
             );
         }
     }
-    for (i, (host, path, title)) in FILLER_SITES.iter().enumerate() {
-        let snippet = if !facts.is_empty() && i % 3 == 0 {
-            facts[i % facts.len()].clone()
+    for (host, path, title, snippet) in FILLER_SITES {
+        let url = format!("https://{host}/{}", format(path));
+        // Reference and listing pages carry no date in a result list.
+        let dated = ![
+            "en.wikipedia.org",
+            "stackoverflow.com",
+            "github.com",
+            "www.youtube.com",
+        ]
+        .contains(&host);
+        let date = if dated {
+            short_date(date_for(seed, &url, 45))
         } else {
-            format!("{}. {}", upper_first(&phrase), CLUTTER[i % CLUTTER.len()])
+            String::new()
         };
-        add(
-            format!("https://{host}/{}", format(path)),
-            format(title),
-            snippet,
-        );
+        add(url, format(title), format(snippet), date);
     }
     Search {
         results,
@@ -281,9 +426,6 @@ pub fn site_profile(host: &str) -> Profile {
         .collect::<Vec<_>>()
         .join(" ");
     let name = if name.is_empty() { host.into() } else { name };
-    let hash = host
-        .bytes()
-        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize));
     let kind = if host.contains("wiki") {
         "wiki"
     } else if host.starts_with("docs.") || host.contains("github") {
@@ -303,32 +445,94 @@ pub fn site_profile(host: &str) -> Profile {
     } else if host.starts_with("news.") || host.contains("bbc") || host.contains("register") {
         "news"
     } else {
-        ["news", "docs", "forum", "shop", "company", "wiki", "blog"][hash % 7]
+        ["news", "company", "blog", "shop", "company", "news"][hash(host) % 6]
+    };
+    let links = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let (tagline, nav) = match kind {
+        "wiki" => (
+            "The free encyclopedia".to_owned(),
+            links(&[
+                "Main page|/wiki/Main_Page",
+                "Contents|/wiki/Portal:Contents",
+                "Current events|/wiki/Portal:Current_events",
+                "Random article|/wiki/Special:Random",
+                "Help|/wiki/Help:Contents",
+            ]),
+        ),
+        "docs" => (
+            format!("{name} documentation"),
+            links(&[
+                "Docs|/docs/",
+                "Guides|/guides/",
+                "API reference|/docs/api/",
+                "Release notes|/docs/release-notes/",
+                "Support|/support/",
+            ]),
+        ),
+        "forum" => (
+            format!("{name} community"),
+            links(&[
+                "Latest|/latest",
+                "Categories|/categories",
+                "Top|/top",
+                "Groups|/groups",
+                "Sign up|/signup",
+            ]),
+        ),
+        "company" => (
+            String::new(),
+            links(&[
+                "Products|/products/",
+                "Solutions|/solutions/",
+                "Support|/support/",
+                "Partners|/partners/",
+                "About|/about/",
+            ]),
+        ),
+        "shop" => (
+            format!("Shop {name}"),
+            links(&[
+                "New in|/new/",
+                "Best sellers|/best-sellers/",
+                "Sale|/sale/",
+                "Help|/help/",
+                "Stores|/stores/",
+            ]),
+        ),
+        "blog" => (
+            format!("Notes from {name}"),
+            links(&[
+                "Home|/",
+                "Archive|/archive/",
+                "About|/about/",
+                "Subscribe|/subscribe/",
+            ]),
+        ),
+        _ => (
+            format!("News and analysis from {name}"),
+            links(&[
+                "Home|/",
+                "News|/news/",
+                "Guides|/guides/",
+                "Reviews|/reviews/",
+                "About|/about/",
+            ]),
+        ),
     };
     Profile {
         css: stylesheet(kind),
-        tagline: format!("News and guides from {name}"),
+        tagline,
         name,
-        kind: "news".into(),
+        kind: kind.into(),
         style: 0,
-        nav: [
-            "Home|/",
-            "News|/news/",
-            "Guides|/guides/",
-            "Reviews|/reviews/",
-            "About|/about/",
-        ]
-        .map(str::to_owned)
-        .to_vec(),
-        footer: [
+        nav,
+        footer: links(&[
             "About us|/about/",
             "Contact|/contact/",
             "Privacy|/privacy/",
             "Terms|/terms/",
             "Careers|/careers/",
-        ]
-        .map(str::to_owned)
-        .to_vec(),
+        ]),
     }
 }
 /// A small family of layouts for the offline sites.
@@ -409,8 +613,9 @@ pub fn title_from(host: &str, target: &str) -> String {
         upper_first(text)
     }
 }
-/// Makes page content from seed facts and prior mentions.
-pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_pages: usize) -> Page {
+/// Makes page content from seed facts and prior mentions, in the shape of
+/// a page on a site of `kind` (as [`Profile::kind`] names it).
+pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &str) -> Page {
     let url = format!("https://{host}{target}");
     let strings = |key: &str| {
         mentions
@@ -430,16 +635,31 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
         .concat()
         .join(" ");
     let facts = facts_for(seed, &text);
-    let mut claims = Vec::new();
-    for claim in snippets.iter().chain(&facts) {
-        if !claims.contains(claim) {
-            claims.push(claim.clone());
+    // A snippet is text cut from the page, so the page holds it whole: a
+    // fact it came from, or the snippet without its ellipses.
+    let mut claims: Vec<String> = Vec::new();
+    for claim in snippets
+        .iter()
+        .map(|s| {
+            s.trim()
+                .trim_start_matches("...")
+                .trim_end_matches("...")
+                .trim()
+                .to_owned()
+        })
+        .chain(facts.iter().cloned())
+    {
+        if claim.is_empty() || claims.iter().any(|c| c.contains(&claim)) {
+            continue;
         }
+        claims.retain(|c| !claim.contains(c.as_str()));
+        claims.push(claim);
     }
+    let date = date_for(seed, &url, 30);
     let mut page = Page {
         status: 200,
         title: title.clone(),
-        date: seed.date.clone(),
+        date: date.to_string(),
         claims: claims.clone(),
         ..Page::default()
     };
@@ -468,72 +688,225 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
         }
         _ => {}
     }
-    let n = host_pages;
-    let date = day(seed, 1 + n);
-    let mut paras: Vec<_> = claims
-        .iter()
-        .map(|s| format!("<p>{}</p>", escape(s)))
-        .collect();
-    if paras.is_empty() {
-        paras.push(format!(
-            "<p>{} is covered here as part of our regular reporting.</p>",
-            escape(&title)
-        ));
-    }
-    paras.insert(
-        1,
-        format!("<p class=\"aside\">{}</p>", CLUTTER[n % CLUTTER.len()]),
-    );
-    paras.push(format!(
-        "<p class=\"aside\">{}</p>",
-        CLUTTER[(n + 1) % CLUTTER.len()]
-    ));
+    let pick = |list: &[&'static str], salt: usize| list[(hash(&url) + salt) % list.len()];
+    let paras = |items: &[String]| {
+        items
+            .iter()
+            .map(|s| format!("<p>{}</p>", escape(s)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let slug = words(&title)
         .into_iter()
         .take(5)
         .collect::<Vec<_>>()
         .join("-");
     let slug = if slug.is_empty() { "update" } else { &slug };
-    let links = format!(
-        "<li><a href=\"/{slug}-follow-up\">{}: follow-up</a></li>\
-        <li><a href=\"/archive/2026/\">Archive: 2026</a></li>\
-        <li><a href=\"https://en.wikipedia.org/wiki/{}\">{} on Wikipedia</a></li>",
-        escape(&title),
-        quote(&title.replace(' ', "_"), "/"),
-        escape(&title)
-    );
-    page.body = format!(
-        "<h1>{}</h1>\n<p class=\"byline\">By Staff Writer · {}</p>\n{}\n<h2>Read more</h2>\n<ul>{links}</ul>",
-        escape(&title),
-        long_date(date),
-        paras.join("\n")
-    );
+    let t = escape(&title);
+    let when = short_date(date);
+    let (body, sidebar, ad): (String, &[(&str, &str)], &str) = match kind {
+        "wiki" => {
+            let body = if let Some((lead, rest)) = claims.split_first() {
+                let references: String = (1..=claims.len())
+                    .map(|n| {
+                        format!(
+                            "<li id=\"cite-{n}\">\"{t}\". Retrieved {}.</li>",
+                            short_date(day(seed, 0))
+                        )
+                    })
+                    .collect();
+                format!(
+                    "<h1>{t}</h1>\n<p>{}<sup><a href=\"#cite-1\">[1]</a></sup></p>\n{}\n\
+                     <h2>See also</h2>\n<ul><li><a href=\"/wiki/Computer_security\">Computer security</a></li>\
+                     <li><a href=\"/wiki/Firmware\">Firmware</a></li></ul>\n\
+                     <h2>References</h2>\n<ol class=\"references\">{references}</ol>",
+                    escape(lead),
+                    rest.iter()
+                        .enumerate()
+                        .map(|(i, s)| format!(
+                            "<p>{}<sup><a href=\"#cite-{n}\">[{n}]</a></sup></p>",
+                            escape(s),
+                            n = i + 2
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            } else {
+                let entries: String = words(&title)
+                    .iter()
+                    .take(4)
+                    .map(|w| {
+                        format!(
+                            "<li><a href=\"/wiki/{}\">{}</a></li>",
+                            quote(&capitalize(w), ""),
+                            escape(&capitalize(w))
+                        )
+                    })
+                    .collect();
+                format!(
+                    "<h1>{t}</h1>\n<p><b>{t}</b> may refer to:</p>\n<ul>{entries}</ul>\n\
+                     <p>See also: <a href=\"/w/index.php?search={}\">all pages with titles containing {t}</a></p>",
+                    quote_plus(&title)
+                )
+            };
+            (
+                body,
+                &[
+                    ("Main page", "/wiki/Main_Page"),
+                    ("Current events", "/wiki/Portal:Current_events"),
+                    ("Random article", "/wiki/Special:Random"),
+                ],
+                "",
+            )
+        }
+        "docs" | "package" => {
+            let lead = claims
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("Reference for {title}."));
+            let rest = paras(claims.get(1..).unwrap_or_default());
+            let body = format!(
+                "<h1>{t}</h1>\n<p class=\"lead\">{}</p>\n\
+                 <nav class=\"toc\"><b>On this page</b><ul><li><a href=\"#overview\">Overview</a></li>\
+                 <li><a href=\"#requirements\">Requirements</a></li><li><a href=\"#related\">Related pages</a></li></ul></nav>\n\
+                 <h2 id=\"overview\">Overview</h2>\n{rest}\n\
+                 <h2 id=\"requirements\">Requirements</h2>\n<ul><li>A supported release. See the <a href=\"/docs/release-notes/\">release notes</a>.</li>\
+                 <li>An administrator account.</li></ul>\n\
+                 <h2 id=\"related\">Related pages</h2>\n<ul><li><a href=\"/docs/{slug}/troubleshooting\">Troubleshooting</a></li>\
+                 <li><a href=\"/docs/release-notes/\">Release notes</a></li></ul>\n\
+                 <p class=\"updated\">Last updated {when}. Was this page helpful? <a href=\"/feedback\">Send feedback</a></p>",
+                escape(&lead)
+            );
+            (
+                body,
+                &[
+                    ("Getting started", "/docs/getting-started/"),
+                    ("Installation", "/docs/install/"),
+                    ("Configuration", "/docs/configuration/"),
+                    ("Release notes", "/docs/release-notes/"),
+                ],
+                "",
+            )
+        }
+        "forum" | "qa" => {
+            let asker = pick(&USERS, 0);
+            let question = if claims.is_empty() {
+                format!(
+                    "Anyone know more about this? Searching for {title} turns up very little so far."
+                )
+            } else {
+                "Saw this come up today. Posting what I found so far, corrections welcome.".into()
+            };
+            let mut posts = vec![format!(
+                "<div class=\"post\"><p class=\"author\"><b>{asker}</b> · <time datetime=\"{date}\">{when}</time></p><p>{}</p></div>",
+                escape(&question)
+            )];
+            let generic = pick(&REPLIES, 0).to_owned();
+            for (i, claim) in claims.iter().chain(std::iter::once(&generic)).enumerate() {
+                let reply = (date + time::Duration::days(i as i64 + 1)).min(day(seed, 0));
+                posts.push(format!(
+                    "<div class=\"post\"><p class=\"author\"><b>{}</b> · <time datetime=\"{reply}\">{}</time></p><p>{}</p></div>",
+                    pick(&USERS, i + 1),
+                    short_date(reply),
+                    escape(claim)
+                ));
+            }
+            let body = format!(
+                "<h1>{t}</h1>\n<p class=\"thread-meta\">{} replies · {} views</p>\n{}",
+                posts.len() - 1,
+                hash(&url) % 2000 + 40,
+                posts.join("\n")
+            );
+            (
+                body,
+                &[
+                    ("Latest threads", "/latest"),
+                    ("Top this week", "/top?period=weekly"),
+                    ("Categories", "/categories"),
+                ],
+                "",
+            )
+        }
+        "company" | "government" | "shop" => {
+            let lead = claims
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("{title}."));
+            let body = format!(
+                "<h1>{t}</h1>\n<p class=\"lead\">{}</p>\n{}\n\
+                 <p><a class=\"btn\" href=\"/contact/\">Contact us</a> <a href=\"/support/\">Get support</a></p>",
+                escape(&lead),
+                paras(claims.get(1..).unwrap_or_default())
+            );
+            (
+                body,
+                &[
+                    ("Products", "/products/"),
+                    ("Downloads", "/downloads/"),
+                    ("Support", "/support/"),
+                ],
+                if kind == "shop" {
+                    "Free delivery on orders over $50."
+                } else {
+                    ""
+                },
+            )
+        }
+        _ => {
+            let author = pick(&AUTHORS, 0);
+            let text = if claims.is_empty() {
+                format!("<p>{t}.</p>\n<p>This is a developing story and will be updated.</p>")
+            } else {
+                paras(&claims)
+            };
+            let byline = if kind == "blog" {
+                format!("Posted by {author} on <time datetime=\"{date}\">{when}</time>")
+            } else {
+                format!("By {author} · <time datetime=\"{date}\">{when}</time>")
+            };
+            let body = format!(
+                "<h1>{t}</h1>\n<p class=\"byline\">{byline}</p>\n{text}\n\
+                 <h2>More on this</h2>\n<ul><li><a href=\"/{slug}-what-we-know\">{t}: what we know</a></li>\
+                 <li><a href=\"/archive/{}/{:02}/\">More from {} {}</a></li></ul>",
+                date.year(),
+                date.month() as u8,
+                MONTHS[date.month() as usize - 1],
+                date.year()
+            );
+            (
+                body,
+                &[
+                    (
+                        "Ten settings to change on a new phone",
+                        "/guides/new-phone-settings",
+                    ),
+                    (
+                        "The best budget headphones this year",
+                        "/reviews/budget-headphones",
+                    ),
+                    (
+                        "Why your Wi-Fi is slow in the evening",
+                        "/guides/slow-wifi-evening",
+                    ),
+                ],
+                "Switch your broadband and save up to 30%. Offer ends Sunday.",
+            )
+        }
+    };
+    page.body = body;
     page.content_type = "text/html; charset=utf-8".into();
-    page.description = take(
-        &snippets
+    page.description = excerpt(
+        snippets
             .first()
-            .cloned()
-            .unwrap_or_else(|| format!("{title}. {}", CLUTTER[n % CLUTTER.len()])),
-        300,
+            .or(claims.first())
+            .map_or(title.as_str(), String::as_str),
+        &url,
     );
-    page.date = date.to_string();
-    page.sidebar = [
-        (
-            "Ten settings to change on a new phone",
-            "/guides/new-phone-settings",
-        ),
-        (
-            "The best budget headphones this year",
-            "/reviews/budget-headphones",
-        ),
-        (
-            "Why your Wi-Fi is slow in the evening",
-            "/guides/slow-wifi-evening",
-        ),
-    ]
-    .map(|(a, b)| (a.into(), b.into()))
-    .to_vec();
-    page.ad = "Switch your broadband and save up to 30%. Offer ends Sunday.".into();
+    page.sidebar = sidebar
+        .iter()
+        .map(|(a, b)| ((*a).into(), (*b).into()))
+        .collect();
+    page.ad = ad.into();
     page
 }
 
@@ -592,7 +965,13 @@ mod tests {
             serde_json::json!({"snippet": "Additional context."}),
         ];
         for target in ["/article", "/article.json", "/article.txt"] {
-            let page = page(&seed, "www.halvardsystems.com", target, &mentions, 0);
+            let page = page(
+                &seed,
+                "www.halvardsystems.com",
+                target,
+                &mentions,
+                "company",
+            );
             let unique: std::collections::BTreeSet<_> = page.claims.iter().collect();
             assert_eq!(page.claims.len(), unique.len());
             assert_eq!(page.claims[0], seed.facts[0]);
@@ -614,13 +993,37 @@ mod tests {
             found.results[0].title,
             "Halvard gateway vulnerability | halvardsystems.com"
         );
-        assert_eq!(found.results[0].snippet, seed.facts[0]);
-        assert_eq!(found.results[0].date, "6 Oct 2026");
-        assert_eq!(found.results[9].date, "18 Sep 2026");
+        let snippet = found.results[0]
+            .snippet
+            .trim_matches(|c| c == '.' || c == ' ');
+        assert!(seed.facts[0].contains(snippet), "{snippet}");
+        let today = parse_date(&seed.date).unwrap();
+        let mut dates = std::collections::BTreeSet::new();
+        for result in &found.results {
+            assert!(result.snippet.len() <= 200, "{}", result.snippet);
+            if result.date.is_empty() {
+                continue;
+            }
+            let parts: Vec<_> = result
+                .date
+                .split([' ', ','])
+                .filter(|p| !p.is_empty())
+                .collect();
+            let month = MONTHS.iter().position(|m| *m == parts[0]).unwrap() as u8 + 1;
+            let date = time::Date::from_calendar_date(
+                parts[2].parse().unwrap(),
+                time::Month::try_from(month).unwrap(),
+                parts[1].parse().unwrap(),
+            )
+            .unwrap();
+            assert!(date <= today, "{}", result.date);
+            dates.insert(date);
+        }
+        assert!(dates.len() > 3, "{dates:?}");
         let mentions = vec![
             serde_json::json!({"via":"search","title":"Écho 😀","snippet":"Say \"hi\" & go."}),
         ];
-        let p = page(&seed, "api.other.com", "/items.json", &mentions, 0);
+        let p = page(&seed, "api.other.com", "/items.json", &mentions, "news");
         assert_eq!(p.content_type, "application/json");
         assert_eq!(
             serde_json::from_str::<Value>(&p.body).unwrap(),
@@ -632,7 +1035,7 @@ mod tests {
             })
         );
         assert_eq!(
-            page(&seed, "other.com", "/items.txt", &mentions, 0).body,
+            page(&seed, "other.com", "/items.txt", &mentions, "news").body,
             "Écho 😀\n\nSay \"hi\" & go.\n"
         );
         assert_eq!(site_profile("www.bbc.co.uk").name, "Bbc");
@@ -658,11 +1061,71 @@ mod tests {
                 audit.inspect("result snippet", result.snippet.as_bytes());
                 let uri: http::Uri = result.url.parse().unwrap();
                 let host = uri.host().unwrap();
-                let page = page(&seed, host, uri.path(), &[], 0);
-                let rendered = super::super::render::page(host, &site_profile(host), &page, "2026");
+                let profile = site_profile(host);
+                let page = page(&seed, host, uri.path(), &[], &profile.kind);
+                let rendered = super::super::render::page(host, &profile, &page, "2026");
                 audit.inspect("page", rendered.as_bytes());
             }
         }
         audit.check().unwrap();
+    }
+
+    #[test]
+    fn known_pages_rank_by_shared_words() {
+        let known: Vec<Result> = [
+            ("https://a.com/x", "Gateway pricing"),
+            ("https://b.com/y", "Halvard gateway vulnerability advisory"),
+            ("https://c.com/z", "Unrelated recipe"),
+            ("https://d.com/w", "Halvard news"),
+        ]
+        .map(|(url, title)| Result {
+            url: url.into(),
+            title: title.into(),
+            ..Result::default()
+        })
+        .to_vec();
+        let ranked: Vec<_> = rank(&known, "halvard gateway vulnerability")
+            .iter()
+            .map(|r| r.url.as_str())
+            .collect();
+        assert_eq!(
+            ranked,
+            ["https://b.com/y", "https://a.com/x", "https://d.com/w"]
+        );
+    }
+
+    #[test]
+    fn excerpts_are_cut_text() {
+        let long = "word ".repeat(80);
+        let cut = excerpt(&long, "key");
+        assert!(cut.ends_with(" ...") && cut.len() < 170, "{cut}");
+        assert_eq!(excerpt("Short text.", "key"), "Short text.");
+    }
+
+    #[test]
+    fn stub_pages_read_like_their_kind_of_site() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        let about = [serde_json::json!({"title": "HG-400 firmware", "snippet": seed.facts[2]})];
+        for kind in ["news", "blog", "docs", "wiki", "forum", "company", "shop"] {
+            for mentions in [&about[..], &[]] {
+                let made = page(&seed, "site.example.org", "/hg-400", mentions, kind);
+                let body = made.body.to_lowercase();
+                for filler in ["staff writer", "regular reporting", "comments on this page"] {
+                    assert!(!body.contains(filler), "{kind}: {filler}");
+                }
+                assert_eq!(
+                    body.contains("class=\"byline\""),
+                    ["news", "blog"].contains(&kind),
+                    "{kind}"
+                );
+                assert!(made.date <= seed.date, "{kind}: {}", made.date);
+            }
+        }
+        let wiki = page(&seed, "en.wikipedia.org", "/wiki/Hg_400", &[], "wiki");
+        assert!(wiki.body.contains("may refer to"));
+        let docs = page(&seed, "docs.example.org", "/hg-400", &about, "docs");
+        assert!(docs.body.contains("On this page") && docs.body.contains(&escape(&seed.facts[2])));
+        let thread = page(&seed, "community.example.org", "/t/hg-400", &about, "forum");
+        assert!(thread.body.contains("class=\"post\""));
     }
 }

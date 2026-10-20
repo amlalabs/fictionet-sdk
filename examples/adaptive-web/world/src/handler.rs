@@ -126,10 +126,13 @@ impl Handler {
                     .field("key", query_key(search, *start))
             });
         }
-        let answer = self
-            .pages
-            .handle_route(&self.fcx, &target.host, path, action)
-            .await;
+        let answer = if parts.method == http::Method::POST && action == Route::Page {
+            self.pages.form(&target.host, path)
+        } else {
+            self.pages
+                .handle_route(&self.fcx, &target.host, path, action)
+                .await
+        };
         if let Some(q) = &mut query {
             match &answer.meta {
                 Meta::Error { error, .. } => q.fail("error", Some(error), answer.serve_ms),

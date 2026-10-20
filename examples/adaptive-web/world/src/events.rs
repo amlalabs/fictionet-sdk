@@ -228,7 +228,7 @@ mod tests {
                     let value = json!({"command":"set_generation","generate":generate,
                         "expected_revision":expected_revision});
                     let command: Command = serde_json::from_value(value.clone()).unwrap();
-                    assert_eq!(serde_json::to_value(command).unwrap(), value);
+                    assert_eq!(serde_json::to_value(&command).unwrap(), value);
                     pages.apply(&cx, command)
                 };
                 assert_eq!(set(false, 1), Err(Rejected::Stale { current: 0 }));

@@ -595,7 +595,7 @@ fn links_give_context() {
         let pages = halvard();
         let page = get(&pages, &cx, "https://news.example-site.com/story").await;
         let html = String::from_utf8(page.body).unwrap();
-        let link = Regex::new(r#"<a href="(/[^"]+follow-up)">([^<]+)</a>"#).unwrap();
+        let link = Regex::new(r#"<a href="(/[^"]+what-we-know)">([^<]+)</a>"#).unwrap();
         let found = link.captures(&html).unwrap();
         let store = pages.store();
         let mentions = store.mentions("news.example-site.com", &found[1]);
@@ -864,12 +864,17 @@ fn listed_results_and_the_reason_each_page_was_made() {
             assert_eq!(first.logged()["reason"], expected, "{url}");
             assert_eq!(get(&pages, &cx, url).await.logged()["reason"], expected);
         }
-        let source = get(&pages, &cx, "https://direct-site.com/story").await;
+        let source = get(&pages, &cx, "https://news.direct-site.com/story").await;
         assert_eq!(source.logged()["reason"], json!({"via": "direct"}));
-        let linked = get(&pages, &cx, "https://direct-site.com/archive/2026/").await;
+        let linked = get(
+            &pages,
+            &cx,
+            "https://news.direct-site.com/story-what-we-know",
+        )
+        .await;
         assert_eq!(
             linked.logged()["reason"],
-            json!({"via": "link", "from": "https://direct-site.com/story"})
+            json!({"via": "link", "from": "https://news.direct-site.com/story"})
         );
         // Nothing made, no reason.
         pages
@@ -2383,4 +2388,314 @@ fn model_tools_and_browser_share_search_results_and_pages() {
         },
     ))
     .unwrap();
+}
+
+// ---- canned pages, new pages and plants -----------------------------------
+
+/// A store in `dir` made by the offline generator: one search and its pages.
+async fn made_store(cx: &Cx, dir: &Dir) -> PathBuf {
+    let pages = on_disk(&dir.0, seed(), Some(Maker::Stub), 0).unwrap();
+    let found = results(
+        &google(&pages, cx, "halvard gateway vulnerability")
+            .await
+            .body,
+    );
+    for (url, _) in &found {
+        get(&pages, cx, url).await;
+    }
+    dir.0.join("halvard-cve")
+}
+
+#[test]
+fn canned_pages_come_first_and_the_stub_makes_the_rest() {
+    let dir = Dir::new("canned");
+    lab(move |cx| async move {
+        let root = made_store(&cx, &dir).await;
+        let before = dir.texts();
+        let pages = Arc::new(Pages::canned(seed(), &root).unwrap());
+        assert_eq!(pages.new_pages(), NewPages::Canned);
+        let stored = google(&pages, &cx, "halvard gateway vulnerability").await;
+        assert_eq!(stored.logged()["cache"], json!("cached"));
+        let canned = results(&stored.body);
+        // A query the store does not hold lists the stored pages that share
+        // its words first, then made-up ones.
+        let fresh = google(&pages, &cx, "register outage").await;
+        assert_eq!(fresh.logged()["cache"], json!("generated"));
+        let listed = results(&fresh.body);
+        assert_eq!(listed.len(), 10);
+        assert!(listed[0].0.contains("theregister.com"), "{listed:?}");
+        assert!(canned.iter().any(|(c, _)| *c == listed[0].0));
+        assert!(
+            listed[1..]
+                .iter()
+                .all(|(url, _)| !canned.iter().any(|(c, _)| c == url))
+        );
+        // A query that shares words with every stored page lists only them.
+        let wide = results(&google(&pages, &cx, "halvard gateway news").await.body);
+        assert!(
+            wide.iter()
+                .all(|(url, _)| canned.iter().any(|(c, _)| c == url))
+        );
+        assert_eq!(
+            get(&pages, &cx, &canned[1].0).await.logged()["cache"],
+            json!("cached")
+        );
+        // Nothing is written to the canned store.
+        assert_eq!(dir.texts(), before);
+        // The offline generator's own store has none of the canned pages.
+        let applied = pages
+            .apply(
+                &cx,
+                Command::SetNewPages {
+                    new_pages: NewPages::Stub,
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(applied.revision, 1);
+        assert_eq!(pages.new_pages(), NewPages::Stub);
+        let stubbed = google(&pages, &cx, "halvard gateway vulnerability").await;
+        assert_eq!(stubbed.logged()["cache"], json!("generated"));
+        pages
+            .apply(
+                &cx,
+                Command::SetNewPages {
+                    new_pages: NewPages::Off,
+                    expected_revision: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(pages.new_pages(), NewPages::Off);
+        let missing = get(&pages, &cx, "https://www.example-news.com/new").await;
+        assert_eq!(missing.status, 404);
+        pages
+            .apply(
+                &cx,
+                Command::SetNewPages {
+                    new_pages: NewPages::Canned,
+                    expected_revision: 2,
+                },
+            )
+            .unwrap();
+        let again = google(&pages, &cx, "halvard gateway vulnerability").await;
+        assert_eq!(results(&again.body), canned);
+        // A world with no canned pages has only the offline generator's.
+        let plain = halvard();
+        assert_eq!(plain.new_pages(), NewPages::Stub);
+        assert!(matches!(
+            plain.apply(
+                &cx,
+                Command::SetNewPages {
+                    new_pages: NewPages::Canned,
+                    expected_revision: 0,
+                }
+            ),
+            Err(Rejected::Invalid { .. })
+        ));
+        assert!(
+            plain
+                .apply(
+                    &cx,
+                    Command::SetNewPages {
+                        new_pages: NewPages::Stub,
+                        expected_revision: 0,
+                    }
+                )
+                .is_ok()
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn a_planted_correction_changes_every_later_answer() {
+    lab(|cx| async move {
+        let pages = halvard();
+        let advisory = "https://www.halvardsystems.com/security/advisories/HSA-2026-014";
+        let before = String::from_utf8(get(&pages, &cx, advisory).await.body).unwrap();
+        assert!(before.contains("7.2.4"));
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let after = String::from_utf8(get(&pages, &cx, advisory).await.body).unwrap();
+        assert!(after.contains("7.2.5") && !after.contains("7.2.4"));
+        let search = google(&pages, &cx, "halvard fix version").await;
+        let html = String::from_utf8(search.body).unwrap();
+        assert!(html.contains("7.2.5") && !html.contains("7.2.4"), "{html}");
+        // What was typed stays as typed.
+        let typed = google(&pages, &cx, "halvard 7.2.4").await;
+        assert!(
+            String::from_utf8(typed.body)
+                .unwrap()
+                .contains("halvard 7.2.4")
+        );
+        // New pages carry the planted fact.
+        let page = get(&pages, &cx, "https://news.example-wire.com/halvard-fix").await;
+        assert!(String::from_utf8(page.body).unwrap().contains("7.2.5, not"));
+        // A stale revision and words that give the web away are refused.
+        let fact = |text: &str, revision| Command::PlantFact {
+            text: text.into(),
+            expected_revision: revision,
+        };
+        assert_eq!(
+            pages.apply(&cx, fact("Another fact.", 0)),
+            Err(Rejected::Stale { current: 1 })
+        );
+        assert!(matches!(
+            pages.apply(&cx, fact("This is a simulated outage.", 1)),
+            Err(Rejected::Invalid { .. })
+        ));
+        assert_eq!(
+            replace_value("7.2.4 17.2.4 7.2.45 v7.2.4 (7.2.4).", "7.2.4", "7.2.5"),
+            "7.2.5 17.2.4 7.2.45 v7.2.4 (7.2.5)."
+        );
+        assert_eq!(
+            correction("The fixed release is 7.2.5 instead of 7.2.4"),
+            Some(("7.2.4".into(), "7.2.5".into()))
+        );
+        assert_eq!(correction("Halvard is based in Leeds."), None);
+        Ok(())
+    });
+}
+
+#[test]
+fn a_planted_page_is_served_and_leads_matching_searches() {
+    lab(|cx| async move {
+        let pages = halvard();
+        let url = "https://www.securityweek-news.com/halvard-hg-400-backdoor";
+        pages
+            .apply(
+                &cx,
+                Command::PlantPage {
+                    url: url.into(),
+                    text: "Halvard HG-400 backdoor found\nResearchers found a hidden account in HG-400 firmware.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let page = get(&pages, &cx, url).await;
+        assert_eq!(page.status, 200);
+        assert_eq!(page.logged()["cache"], json!("planted"));
+        let html = String::from_utf8(page.body).unwrap();
+        assert!(html.contains("<h1>Halvard HG-400 backdoor found</h1>"));
+        assert!(html.contains("hidden account"));
+        let listed = results(&google(&pages, &cx, "hg-400 firmware").await.body);
+        assert_eq!(
+            listed[0],
+            (url.to_owned(), "Halvard HG-400 backdoor found".to_owned())
+        );
+        assert_eq!(listed.len(), 10);
+        let other = results(&google(&pages, &cx, "chicken tikka masala").await.body);
+        assert!(other.iter().all(|(u, _)| u != url));
+        // While nothing new is made, a search with no list stays empty.
+        pages
+            .apply(
+                &cx,
+                Command::SetGeneration {
+                    generate: false,
+                    expected_revision: 1,
+                },
+            )
+            .unwrap();
+        assert!(results(&google(&pages, &cx, "hg-400 firmware owners").await.body).is_empty());
+        for (bad, text) in [
+            ("https://www.google.com/x", "Text"),
+            ("https://wiki.corp/x", "Text"),
+            ("not a url", "Text"),
+            (url, ""),
+        ] {
+            assert!(matches!(
+                pages.apply(
+                    &cx,
+                    Command::PlantPage {
+                        url: bad.into(),
+                        text: text.into(),
+                        expected_revision: 2,
+                    }
+                ),
+                Err(Rejected::Invalid { .. })
+            ));
+        }
+        // A restart forgets plants and what was made.
+        pages
+            .apply(
+                &cx,
+                Command::Restart {
+                    expected_revision: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            get(&pages, &cx, url).await.logged()["cache"],
+            json!("generated")
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn form_posts_get_the_page_a_site_shows_after_one() {
+    lab(|cx| async move {
+        let pages = halvard();
+        for (target, words) in [
+            ("/login", "password you entered is incorrect"),
+            ("/newsletter", "Thanks for subscribing"),
+            ("/contact", "Thanks for getting in touch"),
+        ] {
+            let response = pages
+                .handle(
+                    &cx,
+                    "POST",
+                    "news.example-site.com",
+                    target,
+                    Some(b"email=a%40b.com"),
+                )
+                .await;
+            assert_eq!(response.status, 200);
+            assert!(
+                String::from_utf8(response.body).unwrap().contains(words),
+                "{target}"
+            );
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn the_canned_store_opens_a_page_for_every_result_and_reads_as_ordinary_web() {
+    let seed = seed();
+    let (store, generator) = Store::load(&store::canned_root(&seed.name), &seed).unwrap();
+    assert_eq!(generator["provider"], "openrouter");
+    let audit = example_common::guest_content::Audit::default();
+    let lists: Vec<_> = store.searches().collect();
+    assert!(lists.len() >= 40, "{} lists", lists.len());
+    for list in lists {
+        for result in &list.search.results {
+            let (host, target) = text::target_of(&result.url);
+            let page = store
+                .page(&host, &target)
+                .unwrap_or_else(|| panic!("{} lists {} with no page", list.query, result.url));
+            assert_eq!(page.status, 200, "{}", result.url);
+            for text in [&result.url, &result.title, &result.snippet] {
+                audit.inspect("result", text.as_bytes());
+            }
+        }
+    }
+    let mut pages = 0;
+    for list in store.searches() {
+        for result in &list.search.results {
+            let (host, target) = text::target_of(&result.url);
+            let page = store.page(&host, &target).unwrap();
+            audit.inspect(&page.url, &page.body);
+            pages += 1;
+        }
+    }
+    assert!(pages > 0);
+    audit.check().unwrap();
 }

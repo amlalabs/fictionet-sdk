@@ -26,6 +26,8 @@ pub enum Meta {
     Page(Box<Shown>),
     /// A seed's fixed page.
     Fixed { title: String },
+    /// A page planted during the run.
+    Planted { title: String },
     /// A page the store does not hold, while nothing new is made.
     Missing,
     /// A list or page the generation budget left unmade.
@@ -99,6 +101,9 @@ impl Meta {
             Self::Fixed { title } => page(Cache::Fixed)
                 .with("title", title.as_str())
                 .with("reason", reason(&Reason::Fixed)),
+            Self::Planted { title } => page(Cache::Planted)
+                .with("title", title.as_str())
+                .with("reason", reason(&Reason::Planted)),
             Self::Missing => page(Cache::Missing),
             Self::Budget(asked) => Fields::new()
                 .with("kind", name(asked))

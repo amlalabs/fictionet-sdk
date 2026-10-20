@@ -23,6 +23,8 @@ pub const MAX_SITES: usize = 128;
 pub const MAX_REFUSED: usize = 64;
 /// Facts and site hosts retained in each seed list.
 pub const MAX_SEED_ITEMS: usize = 32;
+/// Most recent planted facts and pages retained.
+pub const MAX_PLANTED: usize = 16;
 /// Maximum compact snapshot JSON size: 3,942,835 bytes at these limits.
 /// Each string byte can need six JSON bytes. Numbers use twenty digits.
 /// Fixed costs include field names, punctuation and the longest enum values.
@@ -41,6 +43,10 @@ pub const MAX_SNAPSHOT_BYTES: usize = {
         // Site and refusal rows, including a comma per row.
         + MAX_SITES * (79 + 2 * string)
         + MAX_REFUSED * (53 + 2 * string)
+        // Planted rows with a comma each but the last, the list's name and
+        // brackets, the canned flag and the omitted count.
+        + MAX_PLANTED * (60 + 3 * string)
+        + 58
 };
 
 fn bounded(text: &str) -> String {
@@ -91,6 +97,10 @@ pub struct Generator {
     pub generation_revision: u64,
     /// Run time of the last generation change, in milliseconds.
     pub generation_at_ms: u64,
+    /// Whether the canned pages answer, rather than the offline
+    /// generator's own (see [`NewPages`](crate::pages::NewPages)).
+    #[serde(default)]
+    pub canned: bool,
 }
 impl Default for Generator {
     fn default() -> Self {
@@ -101,6 +111,7 @@ impl Default for Generator {
             generate: true,
             generation_revision: 0,
             generation_at_ms: 0,
+            canned: false,
         }
     }
 }
@@ -116,6 +127,8 @@ pub enum Cache {
     Cached,
     /// Supplied as a fixed page.
     Fixed,
+    /// A page planted during the run.
+    Planted,
     /// Absent from storage during replay.
     Missing,
     /// Blocked by the generation budget.
@@ -225,6 +238,8 @@ pub enum Reason {
     Direct,
     /// The page was supplied by the seed.
     Fixed,
+    /// The page was planted during the run.
+    Planted,
     /// No known creation reason was supplied.
     #[default]
     #[serde(other)]
@@ -251,6 +266,8 @@ pub enum Made {
     Stored,
     /// Supplied as a fixed page.
     Fixed,
+    /// A page planted during the run.
+    Planted,
     /// Absent from storage during replay.
     Missing,
     /// Blocked by the generation budget.
@@ -263,7 +280,7 @@ impl Made {
     fn supplied(self) -> bool {
         matches!(
             self,
-            Self::Stubbed | Self::WrittenLive | Self::Stored | Self::Fixed
+            Self::Stubbed | Self::WrittenLive | Self::Stored | Self::Fixed | Self::Planted
         )
     }
 }
@@ -273,6 +290,7 @@ fn made(cache: Cache, model: &str) -> Made {
         Cache::Generated | Cache::Prefetched => Made::WrittenLive,
         Cache::Cached => Made::Stored,
         Cache::Fixed => Made::Fixed,
+        Cache::Planted => Made::Planted,
         Cache::Missing => Made::Missing,
         Cache::Budget => Made::NotMade,
         Cache::Unknown => Made::Unknown,
@@ -348,6 +366,18 @@ pub struct Refused {
     /// Run time of the refusal, in milliseconds.
     pub at_ms: u64,
 }
+/// A fact or page planted during the run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plant {
+    /// `fact` or `page`.
+    pub kind: String,
+    /// The fact, or the page's title.
+    pub text: String,
+    /// The page's URL; empty for a fact.
+    pub url: String,
+    /// Run time of the planting, in milliseconds.
+    pub at_ms: u64,
+}
 /// Counts of rows dropped to keep the snapshot bounded.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Omitted {
@@ -358,6 +388,8 @@ pub struct Omitted {
     pub pages: u64,
     pub sites: u64,
     pub refused: u64,
+    #[serde(default)]
+    pub planted: u64,
     pub seed_facts: u64,
     pub seed_sites: u64,
 }
@@ -375,6 +407,9 @@ pub struct Snapshot {
     pub pages: Vec<Page>,
     pub sites: Vec<Site>,
     pub refused: Vec<Refused>,
+    /// Facts and pages planted during the run, oldest first.
+    #[serde(default)]
+    pub planted: Vec<Plant>,
     pub omitted: Omitted,
 }
 
@@ -425,6 +460,7 @@ impl Searches {
                 model: pages.model(),
                 prefetch: pages.prefetch() as u64,
                 generate: pages.generation().generate,
+                canned: pages.new_pages() == crate::pages::NewPages::Canned,
                 ..Generator::default()
             },
         )
@@ -454,7 +490,13 @@ impl Observer for Searches {
             (m.source, m.kind),
             (
                 "adaptive",
-                "site" | "refused" | "query" | "query_failed" | "generation"
+                "site"
+                    | "refused"
+                    | "query"
+                    | "query_failed"
+                    | "generation"
+                    | "planted"
+                    | "restarted"
             ) | ("http", "request")
         )
     }
@@ -496,6 +538,32 @@ impl Snapshot {
                 self.generator.generate = generate;
                 self.generator.generation_revision = revision;
                 self.generator.generation_at_ms = ms;
+                if let Some(canned) = parse(e, "canned") {
+                    self.generator.canned = canned;
+                }
+                true
+            }
+            ("adaptive", "planted") => {
+                let row = Plant {
+                    kind: text(e, "plant"),
+                    text: text(e, "text"),
+                    url: text(e, "url"),
+                    at_ms: ms,
+                };
+                recent(
+                    &mut self.planted,
+                    row,
+                    MAX_PLANTED,
+                    &mut self.omitted.planted,
+                );
+                true
+            }
+            ("adaptive", "restarted") => {
+                self.queries.clear();
+                self.results.clear();
+                self.pages.clear();
+                self.refused.clear();
+                self.planted.clear();
                 true
             }
             ("adaptive", "query") => {

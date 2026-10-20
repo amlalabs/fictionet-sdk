@@ -13,7 +13,8 @@ const MAX_EXPANDED: usize = 2 << 30;
 const MAX_DEPTH: usize = 8;
 const MAX_ERRORS: usize = 32;
 
-const NAMES: &[&str] = &[
+/// Project and scenario names no guest content may contain.
+pub const NAMES: &[&str] = &[
     "fictionet",
     "amlalabs",
     "fakewiki",
@@ -28,7 +29,8 @@ const NAMES: &[&str] = &[
     "altered_one",
     "altered_all",
 ];
-const WORDS: &[&str] = &[
+/// Words no first-party guest content may use.
+pub const WORDS: &[&str] = &[
     "eval",
     "evals",
     "evaluation",

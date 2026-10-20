@@ -52,9 +52,11 @@ pub struct Search {
     /// Sponsored results.
     pub ads: Vec<Ad>,
 }
-/// Stylesheet for the built-in layouts and sponsored blocks.
+/// Stylesheet for the built-in layouts and sponsored blocks. Captured pages
+/// keep their own: the DuckDuckGo capture has the built-in layout's body class,
+/// so its header (`.header--html`) keeps it out of scope.
 pub const CSS: &str = r#"
-@scope (html:has(> body.google, > body.bing, > body.body--html), .uEierd, .b_ad) {
+@scope (html:has(> body.google), html:has(> body.bing), html:has(> body.body--html):not(:has(.header--html)), .uEierd, .b_ad) {
 * { box-sizing: border-box; }
 body { margin: 0; background: #fff; color: #202124; font: 14px/1.55 Arial, sans-serif; }
 a { color: #1a0dab; text-decoration: none; }
