@@ -113,15 +113,6 @@ impl Banners {
     pub(crate) fn all(&self) -> Vec<Banner> {
         self.kept.values().cloned().collect()
     }
-
-    /// Banners kept after `revision`, sorted by host then port.
-    pub(crate) fn since(&self, revision: u64) -> Vec<Banner> {
-        self.kept
-            .values()
-            .filter(|b| b.revision > revision)
-            .cloned()
-            .collect()
-    }
 }
 
 /// Reads a banner from a first data segment: its first line, or an HTTP
@@ -251,8 +242,6 @@ mod tests {
         assert_eq!(banners.all(), std::slice::from_ref(&first));
         assert_eq!(first.text, "SSH-2.0-first");
         assert_eq!((first.at_ms, first.revision), (10, 3));
-        assert!(banners.since(3).is_empty());
-        assert_eq!(banners.since(2), [first]);
     }
 
     #[test]

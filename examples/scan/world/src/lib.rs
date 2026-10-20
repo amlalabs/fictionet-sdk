@@ -14,7 +14,7 @@
 //!
 //! To run in-process, build [`office`] and add hosts or routes if needed.
 //! Call [`start`] with the world's attachments. Keep the [`Ports`] handle
-//! for snapshots and changes since a revision. See [`ports`] for probe facts
+//! for snapshots of the port map. See [`ports`] for probe facts
 //! and [`banners`] for the first data each open port sends.
 //!
 //! ```
@@ -48,7 +48,7 @@
 pub mod banners;
 pub mod ports;
 pub use banners::Banner;
-pub use ports::{Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Ports, Protocol};
+pub use ports::{Machine, MachineKind, PortMap, PortRow, PortState, Ports, Protocol};
 
 use std::convert::Infallible;
 use std::net::Ipv4Addr;

@@ -335,18 +335,18 @@ pub fn all_answered(map: &PortMap) -> bool {
 /// Starts the world task that publishes the topics and marks the moment.
 pub fn publish(cx: &Cx, ports: Ports, topics: Topics, progress: Progress) {
     cx.spawn(move |cx| async move {
-        let mut published: Option<(u64, u64, u64)> = None;
+        let mut published: Option<PortMap> = None;
         let mut version = 0;
         let mut discovered = false;
         loop {
-            let latest = ports.changes_since(u64::MAX);
-            let marks = (latest.revision, latest.untracked, latest.untracked_banners);
-            if published != Some(marks) {
+            if published
+                .as_ref()
+                .is_none_or(|map| ports.changed_since(map))
+            {
                 let map = ports.snapshot();
                 // A refused publication sets the topic's too_large status,
                 // which the panels show; the previous map stays.
                 let _ = topics.ports.publish(cx.now(), &map);
-                published = Some((map.revision, map.untracked, map.untracked_banners));
                 if !discovered && all_answered(&map) {
                     discovered = true;
                     let hosts: Vec<Value> = map
@@ -362,6 +362,7 @@ pub fn publish(cx: &Cx, ports: Ports, topics: Topics, progress: Progress) {
                             .field("at_ms", at_ms)
                     });
                 }
+                published = Some(map);
             }
             if let Some((next, story, reports)) = progress.changed(version) {
                 let _ = topics.story.publish(cx.now(), &story);

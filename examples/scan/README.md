@@ -100,10 +100,11 @@ keeps them in its budget for repeatable facts, so they never evict the
 run's other events.
 
 `start()` returns a shared `Ports` handle. `snapshot()` returns the office
-labels and sorted rows. `changes_since(revision)` returns the latest version
-of each row changed since that revision. Every tracked probe and state change
-advances the map revision. Both projections include the last change time and the
-untracked count. Their `MAX_JSON_BYTES` constants bound compact JSON output.
+labels and sorted rows. Every tracked probe and state change advances the map
+revision. The map includes the last change time and the untracked count, and
+`PortMap::MAX_JSON_BYTES` bounds its compact JSON output. `changed_since(map)`
+says whether a copy is out of date, so a publisher copies the map only after
+it changed.
 
 The map holds at most 16,384 rows and never evicts them. Further probes for
 new keys increment `untracked`; existing rows still update. The first such
@@ -117,7 +118,7 @@ an HTTP status line, the banner is the status line and the `Server` header's
 value. Bytes outside printable ASCII show as `\xHH`, and a backslash as `\\`.
 A `scan.banner` fact marks each new banner, with its host, port, text, server
 value, time and revision. A new banner advances the map revision. A later
-connection never replaces a kept banner. Snapshots and changes list banners
+connection never replaces a kept banner. Snapshots list banners
 sorted by host, then port. The map keeps at most 1,024 banners and never
 evicts one; further banners only increment `untracked_banners`.
 

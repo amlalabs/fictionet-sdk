@@ -12,8 +12,8 @@ use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RunOptions, Seed};
 use fictionet_observe::{Limits, Memory};
 use scan_world::ports::MAX_ROWS;
 use scan_world::{
-    Banner, Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Protocol, SCANNER,
-    SERVER, SERVER_ADDR, office, start,
+    Machine, MachineKind, PortMap, PortRow, PortState, Protocol, SCANNER, SERVER, SERVER_ADDR,
+    office, start,
 };
 
 const SCANNER_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 9, 2);
@@ -56,7 +56,7 @@ fn datagram(host: Ipv4Addr, port: u16) -> Packet {
 }
 
 #[test]
-fn echo_discovery_updates_snapshots_deltas_and_facts() {
+fn echo_discovery_updates_snapshots_and_facts() {
     let memory = Arc::new(Memory::default());
     let history = memory.clone();
     fictionet::block_on(fictionet::lab(
@@ -90,11 +90,9 @@ fn echo_discovery_updates_snapshots_deltas_and_facts() {
                     assert_eq!(payload[1], 1);
                 }
                 let map = ports.snapshot();
-                let delta = ports.changes_since(prior);
                 assert_eq!(map.revision, prior + 2);
                 assert_eq!(map.rows.len(), i + 1);
-                assert_eq!(delta.rows, [map.rows[i].clone()]);
-                let row = &delta.rows[0];
+                let row = &map.rows[i];
                 assert_eq!(
                     (row.host, row.protocol, row.port, row.state, row.probes),
                     (host, Protocol::Icmp, 0, state, 1)
@@ -232,18 +230,6 @@ fn scan_snapshot_deltas_and_facts_follow_the_packets() {
                 .into(),
             };
             assert_eq!(ports.snapshot(), expected);
-            assert_eq!(
-                ports.changes_since(intermediate),
-                PortChanges {
-                    from_revision: 8,
-                    revision: 14,
-                    at_ms: 90,
-                    untracked: 0,
-                    untracked_banners: 0,
-                    rows: [1, 2, 4, 6].map(|i| expected.rows[i].clone()).into(),
-                    banners: vec![],
-                }
-            );
             let facts = history.checked_of("scan", "port").unwrap();
             let expected_facts = [
                 ("10.0.0.10", 22, "tcp", "unanswered", None),
@@ -422,9 +408,6 @@ fn banners_from_real_connections_are_kept_once_with_facts() {
                 assert_eq!(event.u64("revision"), Some(banner.revision));
                 assert_eq!(event.level, Level::Info);
             }
-            let first: &Banner = &map.banners[0];
-            let changes = ports.changes_since(first.revision - 1);
-            assert!(changes.banners.contains(first));
             fcx.cancel();
             Ok(())
         },
