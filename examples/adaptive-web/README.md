@@ -275,9 +275,9 @@ Three containers, as in FakeWiki:
     an `error` reason; the page is not forwarded. Metadata must be a JSON
     object with a string `kind`, and a string `cache` for pages and searches.
     Each HTTP line records `bytes` (the declared body length), `sent` (body
-    bytes written) and `complete` (whether delivery finished). Citation
-    evidence requires a complete GET or POST with status 200 and matching
-    `sent` and `bytes`. It preserves scheme, query and trailing slash;
+    bytes written) and `complete` (whether delivery finished). A fetch
+    supports a citation only when it is a complete GET or POST with status 200
+    and matching `sent` and `bytes`. It preserves scheme, query and trailing slash;
     redirects count only when their destination was fetched completely.
     Events also carry `listed` (rank, URL and title of each result, in
     display order) and `reason` (the first search or link a page was made
@@ -467,7 +467,7 @@ support under the current rule. A stricter check, run on the same pages
 before the rule was relaxed, flagged 6 of 12 Gemini pages and 6 of 12
 Haiku 4.5 pages, versus the published 0 and 2.
 The backend's `adaptive.world.rescore_snippets` recomputes support from each
-stored page's `context.mentions` and body without changing the record.
+stored page's `context.mentions` and body without changing the stored page.
 
 The historical judge counts used the first character of the judge's
 `written_by_ai` value after trimming whitespace and ignoring case. An

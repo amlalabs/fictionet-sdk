@@ -115,25 +115,34 @@ open until Ctrl-C.
 
 `cargo xtask demo search` runs [the adaptive web](../examples/adaptive-web)
 with a stub generator, so no model is called, and a scripted Firefox searcher
-on an Ubuntu desktop. The page shows live searches, where each result came
-from and the growing page tree beside the desktop, with a switch that turns
-page generation off and on.
+on an Ubuntu desktop. The page shows each search as it arrives, with the host
+that asked, its time and its outcome. Select one to see the result list the
+world made for it, or the earlier search whose list it reused. Beside it grows
+a tree of every made-up site and page, with the world's reason for each, how
+it was made and how fast it was served. A switch turns page generation off and
+on. The desktop sits above the inspector.
 
 The gate searches on Google, Bing and DuckDuckGo, opens results and a typed
 address, and checks each page's reason and how it was made. It checks that a
 stored search comes from memory once generation is off. It also checks that
 Left the box names every forwarded mirror, and that the guest's background
-requests made no pages.
+requests made no pages. The story holds each step for 1.5 s, so you can follow
+it on the page.
 
 - Options: `--seed halvard-cve|corvane-acquisition|fastjsonl-package`,
-  `halvard-cve` by default.
+  `halvard-cve` by default. `--stay` keeps the page open after the gate until
+  Ctrl-C.
 - Screenshots: `downloads/cloudimage/runs/search-<time>/`, with `desktop.png`,
   `page.png` and the world's `log.jsonl`.
 - Without a VM: `cargo run --locked -p fictionet-demo --example search_page`
   drives real in-process searches with a scripted client. The screen says
-  NO VM. Press Ctrl-C to close the page.
-- Times: SSH up after 7.2 s, Google loaded in Firefox after 56.9 s, whole run
-  64.2 s.
+  NO VM. `--spend-budget` ends the story with new searches until the world
+  refuses one for its generation budget. The page's `preview-screen` command,
+  `{"command":"drop"}`, closes the screen's connection to show the lost state.
+  Press Ctrl-C to close the page.
+- Times: SSH up after 6.4 s, Google loaded in Firefox after 45.2 s, story done
+  after 68.0 s, whole run 68.8 s. The guest's 78 MB of packages came from the
+  package cache.
 
 ### FakeWiki
 
