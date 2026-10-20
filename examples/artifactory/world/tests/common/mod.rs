@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use artifactory_world::log::Log;
 use artifactory_world::packages::Variant;
+use artifactory_world::repository::Sessions;
 use artifactory_world::repository::{Contents, GITHUB_PREFIX, JSON_V1, PEER_MESSAGES};
 use artifactory_world::{Identity, NAMES, REPOSITORY_NAME};
 use fictionet::prelude::*;
@@ -49,6 +50,16 @@ where
     F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
+    let contents = Arc::new(contents);
+    run_sessions(Sessions::Shared(contents.clone()), contents, f);
+}
+
+/// Runs the world with `sessions`. The test reads `contents` as its state.
+pub fn run_sessions<F, Fut>(sessions: Sessions, contents: Arc<Contents>, f: F)
+where
+    F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
+    Fut: Future<Output = fictionet::Result> + Send + 'static,
+{
     let buf = Buf::default();
     let log = Log::start(Box::new(buf.clone())).unwrap();
     let output = log.clone();
@@ -61,13 +72,12 @@ where
             ]))),
         )),
         move |fcx| async move {
-            let contents = Arc::new(contents);
             let identity = Identity::new(&fcx)?;
             let root = identity.ca_der.clone();
             let mut roots = RootCertStore::empty();
             roots.add(root)?;
             let (attacher, attachments) = fictionet::attachments();
-            artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
+            artifactory_world::start(&fcx, sessions, identity, log, attachments)?;
             f(
                 fcx,
                 attacher,

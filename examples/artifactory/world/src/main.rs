@@ -22,6 +22,7 @@ use std::sync::Arc;
 use artifactory_world::log::Log;
 use artifactory_world::packages::{Variant, private_seed};
 use artifactory_world::repository::Contents;
+use artifactory_world::repository::Sessions;
 use artifactory_world::{Identity, Result};
 
 struct Args {
@@ -128,7 +129,13 @@ fn serve() -> Result {
             parent(&args.ca)?;
             std::fs::write(&args.ca, &identity.ca_pem)?;
 
-            artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
+            artifactory_world::start(
+                &fcx,
+                Sessions::Shared(contents.clone()),
+                identity,
+                log,
+                attachments,
+            )?;
             let _listening = fictionet::listen(
                 fictionet::WorldSocket::UnixSocket(args.socket.into()),
                 attacher,

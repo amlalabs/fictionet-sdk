@@ -2,7 +2,11 @@
 //! for the page's consoles, and the kit's package mirror, which forwards
 //! during setup and then answers 403.
 
-use artifactory_world::{Identity, log::Log, repository::Contents};
+use artifactory_world::{
+    Identity,
+    log::Log,
+    repository::{Contents, Sessions},
+};
 use fictionet::{Cx, Result, stdlib::web};
 use fictionet_demo::kit;
 use std::sync::{Arc, atomic::AtomicBool};
@@ -21,7 +25,7 @@ pub fn start(
         .map(|name| identity.server_config(fcx, name))
         .collect::<Result<Vec<_>>>()?;
     let mirror = kit::mirror::Closable::new(world.mirror(fcx)?, closed);
-    let mut net = artifactory_world::network(fcx, contents, identity, log)?
+    let mut net = artifactory_world::network(fcx, Sessions::Shared(contents), identity, log)?
         .route(kit::JUMP, kit::jump_prefix());
     for name in ["archive.ubuntu.com", "security.ubuntu.com"] {
         net = net.add_host(web::Site::new(mirror.clone()).into_host(name));

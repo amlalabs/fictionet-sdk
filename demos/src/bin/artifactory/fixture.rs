@@ -8,7 +8,12 @@ use super::{
     facts::{Facts, Publisher},
     story,
 };
-use artifactory_world::{Identity, NAMES, log::Log, packages::Variant, repository::Contents};
+use artifactory_world::{
+    Identity, NAMES,
+    log::Log,
+    packages::Variant,
+    repository::{Contents, Sessions},
+};
 use fictionet::{
     Cx, RunOptions, Seed,
     events::Fanout,
@@ -110,7 +115,13 @@ async fn run(
     let result = fictionet::run(options, move |cx| async move {
         let identity = Identity::new(&cx)?;
         let (attacher, attachments) = fictionet::attachments();
-        artifactory_world::start(&cx, contents.clone(), identity, log, attachments)?;
+        artifactory_world::start(
+            &cx,
+            Sessions::Shared(contents.clone()),
+            identity,
+            log,
+            attachments,
+        )?;
         let machine =
             sandbox::machine(&cx, attacher.attach("fixture")?, Ipv4Addr::new(10, 0, 0, 2));
         let mut client = Client {
