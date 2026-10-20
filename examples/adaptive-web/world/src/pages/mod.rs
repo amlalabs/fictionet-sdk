@@ -21,6 +21,7 @@
 //! snippets known when a page is made are checked for textual support in
 //! it. Choosing a result's title and making the page it names share one
 //! lock per URL, so a search and a request for the page publish one title.
+//! Worlds sharing a store share these locks too (see [`store`]).
 //!
 //! [`Generator::Stub`] makes everything offline and deterministically;
 //! [`Generator::Model`] asks a model. Without a generator nothing new is
@@ -202,21 +203,83 @@ const UNAVAILABLE: &[u8] = b"<html><head><title>503 Service Temporarily Unavaila
 <body><center><h1>503 Service Temporarily Unavailable</h1></center><hr><center>nginx</center>\
 </body></html>";
 
-/// One async lock per key, made on first use. A URL's lock covers choosing
-/// its title and making its page; a query's lock covers making its list.
-#[derive(Default)]
-struct Locks(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+/// One lock per key, made on first use. A URL's lock covers choosing its
+/// title and making its page; a query's lock covers making its list. Within
+/// the world it is an async lock; for a store kept in a directory it is
+/// also a file in the store's `locks/`, which other worlds on the store
+/// take too.
+struct Locks {
+    local: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    dir: Option<std::path::PathBuf>,
+}
+
+/// A key's lock, held until dropped.
+struct KeyLock {
+    _local: tokio::sync::OwnedMutexGuard<()>,
+    file: Option<std::fs::File>,
+}
+
+impl Drop for KeyLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+    }
+}
 
 impl Locks {
-    async fn lock(&self, key: String) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = self
-            .0
+    async fn lock(&self, cx: &Cx, key: String) -> std::io::Result<KeyLock> {
+        let local = self
+            .local
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
+            .entry(key.clone())
             .or_default()
             .clone();
-        lock.lock_owned().await
+        let local = local.lock_owned().await;
+        let Some(dir) = &self.dir else {
+            return Ok(KeyLock {
+                _local: local,
+                file: None,
+            });
+        };
+        std::fs::create_dir_all(dir)?;
+        // Keys that share a file name only wait for each other.
+        let name: String = key
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(200)
+            .collect();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(name))?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if cx
+                        .sleep(std::time::Duration::from_millis(50))
+                        .await
+                        .is_err()
+                    {
+                        return Err(std::io::Error::other("the world stopped"));
+                    }
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+        }
+        Ok(KeyLock {
+            _local: local,
+            file: Some(file),
+        })
     }
 }
 
@@ -286,12 +349,16 @@ impl Pages {
         prefetch: usize,
     ) -> Self {
         store.generation.generate = generator.is_some();
+        let locks = Locks {
+            local: Mutex::default(),
+            dir: store.root().map(|root| root.join("locks")),
+        };
         Self {
             seed,
             generator,
             prefetch,
             store: Mutex::new(store),
-            locks: Locks::default(),
+            locks,
         }
     }
 
@@ -325,8 +392,12 @@ impl Pages {
         self.prefetch
     }
 
+    /// The store, with what other worlds on it have added. If that cannot be
+    /// read, the world goes on with what it has, and its next write fails.
     fn store(&self) -> MutexGuard<'_, Store> {
-        self.store.lock().unwrap_or_else(|e| e.into_inner())
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = store.catch_up();
+        store
     }
 
     fn generating(&self) -> bool {
@@ -435,7 +506,7 @@ impl Pages {
             } => self.search(cx, engine, &query, start).await,
             Route::Page => {
                 if let Some(fixed) = self.seed.fixed_for(host, target) {
-                    return self.fixed(fixed).await;
+                    return self.fixed(cx, fixed).await;
                 }
                 if let Some(asset) = static_asset(target.split('?').next().unwrap()) {
                     return asset;
@@ -519,7 +590,11 @@ impl Pages {
     /// The people the world names, made the first time a list or page
     /// needs them.
     async fn cast(&self, cx: &Cx) -> Result<Vec<Person>, Stop> {
-        let _lock = self.locks.lock("cast".into()).await;
+        let _lock = self
+            .locks
+            .lock(cx, "cast".into())
+            .await
+            .map_err(Stop::store)?;
         if let Some(cast) = self.store().cast() {
             return Ok(cast.people.clone());
         }
@@ -552,7 +627,10 @@ impl Pages {
         start: u64,
     ) -> Response {
         let key = query_key(query, start);
-        let _lock = self.locks.lock(format!("search {key}")).await;
+        let _lock = match self.locks.lock(cx, format!("search {key}")).await {
+            Ok(lock) => lock,
+            Err(error) => return Stop::store(error).response("search"),
+        };
         let stored = self.store().search(&key).cloned();
         let (record, cache) = match stored {
             Some(record) => (Some(record), "cached"),
@@ -624,7 +702,11 @@ impl Pages {
                 "snippet": r.snippet,
                 "date": r.date,
             });
-            let _page = self.locks.lock(page_key(&host, &target)).await;
+            let _page = self
+                .locks
+                .lock(cx, page_key(&host, &target))
+                .await
+                .map_err(Stop::store)?;
             let mention = self
                 .store()
                 .reserve_mention(&self.seed, &host, &target, mention)
@@ -676,9 +758,12 @@ impl Pages {
         }
     }
 
-    async fn fixed(&self, fixed: &seed::Fixed) -> Response {
+    async fn fixed(&self, cx: &Cx, fixed: &seed::Fixed) -> Response {
         let (host, target) = (fixed.host.as_str(), fixed.target.as_str());
-        let lock = self.locks.lock(page_key(host, target)).await;
+        let lock = match self.locks.lock(cx, page_key(host, target)).await {
+            Ok(lock) => lock,
+            Err(error) => return Stop::store(error).response("page"),
+        };
         let stored = self.store().page(host, target).cloned();
         let (record, made) = match stored {
             Some(record) => (record, false),
@@ -738,7 +823,10 @@ impl Pages {
     }
 
     async fn page(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, prefetch: bool) -> Response {
-        let lock = self.locks.lock(page_key(host, target)).await;
+        let lock = match self.locks.lock(cx, page_key(host, target)).await {
+            Ok(lock) => lock,
+            Err(error) => return Stop::store(error).response("page"),
+        };
         let stored = self.store().page(host, target).cloned();
         let (record, mut cache) = match stored {
             Some(record) => (record, "cached"),

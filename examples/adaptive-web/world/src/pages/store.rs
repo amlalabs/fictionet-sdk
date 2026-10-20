@@ -10,16 +10,21 @@
 //! world.jsonl        everything made, one object per line, in order
 //! generations.jsonl  every model attempt, stub call and prefetch error
 //! addresses.jsonl    every pool address given out (see `Addresses`)
-//! store.lock         held by the world using the store
+//! store.lock         held while a world checks or writes the store
+//! locks/             one lock file per page, result list and the cast
 //! ```
 //!
-//! One world uses a store at a time. A store answers only for the seed it
-//! was made with and, to make more, for the same generator: provider,
-//! model and reasoning setting. Anything else fails with how to start over.
+//! Several worlds can use one store at once. A world writes only while it
+//! holds `store.lock`, after reading what the others wrote. Making a page,
+//! a result list or the cast holds that item's file in `locks/`, so the
+//! first world to ask makes it and the others wait and read it. A store
+//! answers only for the seed it was made with and, to make more, for the
+//! same generator: provider, model and reasoning setting. Anything else
+//! fails with how to start over.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -29,6 +34,7 @@ use super::make::{self, Profile};
 use super::model::Usage;
 use super::prompts::{Claim, HostPage, Person};
 use super::{Generation, Seed};
+use crate::FileLock;
 
 /// The format of `store.json` and `world.jsonl`.
 const VERSION: u64 = 1;
@@ -131,9 +137,14 @@ mod body {
 
 struct Files {
     root: PathBuf,
+    /// `world.jsonl`, read from `read` on and appended to.
     world: File,
+    /// The bytes and lines of `world.jsonl` applied so far.
+    read: u64,
+    lines: usize,
     generations: File,
-    _lock: File,
+    /// `store.lock`.
+    lock: File,
 }
 
 /// The world's store. See the [module](self).
@@ -204,16 +215,7 @@ impl Store {
             .write(true)
             .open(root.join("store.lock"))
             .map_err(fail)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(format!(
-                    "store {} is in use by another world",
-                    root.display()
-                ));
-            }
-            Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
-        }
+        let held = FileLock::take(&lock).map_err(fail)?;
         let identity_path = root.join("store.json");
         let declared = seed.declaration();
         let made_by = match std::fs::read(&identity_path) {
@@ -255,37 +257,86 @@ impl Store {
                 identity["generator"].clone()
             }
         };
-        let mut store = Self::memory();
-        let world_path = root.join("world.jsonl");
-        match File::open(&world_path) {
-            Ok(file) => {
-                for (index, line) in io::BufReader::new(file).lines().enumerate() {
-                    let bad = |why: String| {
-                        format!("{}: line {}: {why}", world_path.display(), index + 1)
-                    };
-                    let line = line.map_err(|e| bad(e.to_string()))?;
-                    let entry: Entry =
-                        serde_json::from_str(&line).map_err(|e| bad(e.to_string()))?;
-                    store.apply(entry);
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(fail(e)),
-        }
         let append = |name: &str| {
             OpenOptions::new()
                 .create(true)
+                .read(true)
                 .append(true)
                 .open(root.join(name))
                 .map_err(fail)
         };
+        let mut store = Self::memory();
         store.files = Some(Files {
             root: root.to_owned(),
             world: append("world.jsonl")?,
+            read: 0,
+            lines: 0,
             generations: append("generations.jsonl")?,
-            _lock: lock,
+            lock,
         });
+        store.read_on(true).map_err(|e| e.to_string())?;
+        drop(held);
         Ok((store, made_by))
+    }
+
+    /// Applies what other worlds have written to `world.jsonl` since this
+    /// world last read it. Without `store.lock` a line still being written
+    /// waits for the next read. While it is held (`held`), every line is
+    /// finished, and one without its newline is an error. Nothing is
+    /// applied if a line is not an entry.
+    fn read_on(&mut self, held: bool) -> io::Result<()> {
+        let Some(files) = &mut self.files else {
+            return Ok(());
+        };
+        let mut text = Vec::new();
+        files.world.seek(SeekFrom::Start(files.read))?;
+        files.world.read_to_end(&mut text)?;
+        let path = files.root.join("world.jsonl");
+        let bad = |line: usize, why: String| {
+            let why = format!("{}: line {line}: {why}", path.display());
+            io::Error::new(io::ErrorKind::InvalidData, why)
+        };
+        let complete = text
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |end| end + 1);
+        let entries = text[..complete]
+            .split_inclusive(|&b| b == b'\n')
+            .enumerate()
+            .map(|(i, line)| {
+                serde_json::from_slice::<Entry>(line)
+                    .map_err(|e| bad(files.lines + 1 + i, e.to_string()))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if held && complete < text.len() {
+            let line = files.lines + 1 + entries.len();
+            return Err(bad(line, "the line is unfinished".into()));
+        }
+        files.read += complete as u64;
+        files.lines += entries.len();
+        for entry in entries {
+            self.apply(entry);
+        }
+        Ok(())
+    }
+
+    /// Reads what other worlds have added to the store since this world
+    /// last did. Writes read it too, so a failure here also fails the
+    /// next write.
+    pub fn catch_up(&mut self) -> io::Result<()> {
+        self.read_on(false)
+    }
+
+    /// Takes `store.lock` and reads what other worlds wrote, so a check made
+    /// next sees the whole store until the lock drops. `None` for a store
+    /// kept in memory.
+    fn hold(&mut self) -> io::Result<Option<FileLock>> {
+        let Some(files) = &self.files else {
+            return Ok(None);
+        };
+        let held = FileLock::take(&files.lock)?;
+        self.read_on(true)?;
+        Ok(Some(held))
     }
 
     /// The directory the store is kept in, if any.
@@ -322,12 +373,14 @@ impl Store {
     }
 
     /// Writes `entry` to the store's file, then applies it. Nothing is
-    /// applied if the write fails.
+    /// applied if the write fails. The caller holds `store.lock`.
     fn record(&mut self, entry: Entry) -> io::Result<()> {
         if let Some(files) = &mut self.files {
             let mut line = serde_json::to_vec(&entry).map_err(io::Error::other)?;
             line.push(b'\n');
             files.world.write_all(&line)?;
+            files.read += line.len() as u64;
+            files.lines += 1;
         }
         self.apply(entry);
         Ok(())
@@ -335,6 +388,7 @@ impl Store {
 
     /// Appends a row to `generations.jsonl`, for a store with a directory.
     pub fn log_generation(&mut self, row: &Value) -> io::Result<()> {
+        let _held = self.hold()?;
         if let Some(files) = &mut self.files {
             let mut line = serde_json::to_vec(row).map_err(io::Error::other)?;
             line.push(b'\n');
@@ -348,6 +402,7 @@ impl Store {
     }
 
     pub fn insert_page(&mut self, page: PageRecord) -> io::Result<()> {
+        let _held = self.hold()?;
         self.record(Entry::Page(page))
     }
 
@@ -403,6 +458,11 @@ impl Store {
 
     /// Records a mention of a URL, unless it is already recorded.
     pub fn add_mention(&mut self, host: &str, target: &str, mention: Value) -> io::Result<()> {
+        let _held = self.hold()?;
+        self.mention_held(host, target, mention)
+    }
+
+    fn mention_held(&mut self, host: &str, target: &str, mention: Value) -> io::Result<()> {
         if self.mentions(host, target).contains(&mention) {
             return Ok(());
         }
@@ -424,6 +484,7 @@ impl Store {
         target: &str,
         mut mention: Value,
     ) -> io::Result<Value> {
+        let _held = self.hold()?;
         let page = self
             .page(host, target)
             .filter(|p| !p.title.is_empty())
@@ -446,7 +507,7 @@ impl Store {
         {
             mention["title"] = title.into();
         }
-        self.add_mention(host, target, mention.clone())?;
+        self.mention_held(host, target, mention.clone())?;
         Ok(mention)
     }
 
@@ -457,6 +518,7 @@ impl Store {
     /// The host's layout: the first one recorded for it. A new one gets
     /// `style`, the number of hosts that had a layout before it.
     pub fn site_once(&mut self, host: &str, mut profile: Profile) -> io::Result<Profile> {
+        let _held = self.hold()?;
         if let Some(profile) = self.site(host) {
             return Ok(profile.clone());
         }
@@ -473,6 +535,7 @@ impl Store {
     }
 
     pub fn insert_search(&mut self, search: SearchRecord) -> io::Result<()> {
+        let _held = self.hold()?;
         self.record(Entry::Search(search))
     }
 
@@ -481,6 +544,7 @@ impl Store {
     }
 
     pub fn set_cast(&mut self, cast: CastRecord) -> io::Result<()> {
+        let _held = self.hold()?;
         self.record(Entry::Cast(cast))
     }
 }

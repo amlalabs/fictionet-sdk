@@ -787,16 +787,83 @@ fn replay_serves_the_store_and_nothing_new() {
     });
 }
 
+/// Gets `url` from every world at once.
+async fn at_once(cx: &Cx, worlds: &[Arc<Pages>], url: &str) -> Vec<Response> {
+    let replies: Vec<_> = worlds
+        .iter()
+        .map(|world| {
+            let (world, url) = (world.clone(), url.to_owned());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cx.spawn(move |cx| async move {
+                let _ = tx.send(get(&world, &cx, &url).await);
+                Ok(())
+            });
+            rx
+        })
+        .collect();
+    let mut out = Vec::new();
+    for reply in replies {
+        out.push(reply.await.unwrap());
+    }
+    out
+}
+
+/// Worlds sharing a store, each with its own model API: the first to ask
+/// for a list or a page makes it, and the others wait and read it. Every
+/// world serves the same bytes, and the page has the title its result
+/// showed.
 #[test]
-fn one_world_uses_a_store_at_a_time() {
-    let dir = Dir::new("in-use");
-    let first = on_disk(&dir.0, seed(), Some(Generator::Stub), 0).unwrap();
-    let error = on_disk(&dir.0, seed(), Some(Generator::Stub), 0)
-        .err()
-        .unwrap();
-    assert!(error.contains("is in use by another world"), "{error}");
-    drop(first);
-    on_disk(&dir.0, seed(), None, 0).unwrap();
+fn worlds_sharing_a_store_make_each_list_and_page_once() {
+    let dir = Dir::new("shared");
+    let fakes: Vec<_> = (0..3).map(|_| fake_openrouter(Arc::default())).collect();
+    let worlds: Vec<_> = fakes
+        .iter()
+        .map(|fake| {
+            let model = openrouter(fake.clone());
+            on_disk(&dir.0, seed(), Some(Generator::Model(model)), 0).unwrap()
+        })
+        .collect();
+    lab(move |cx| async move {
+        let lists = at_once(&cx, &worlds, "https://www.google.com/search?q=halvard+flaw").await;
+        assert!(
+            lists
+                .iter()
+                .all(|r| r.status == 200 && r.body == lists[0].body)
+        );
+        let (url, title) = results(&lists[0].body).remove(0);
+        let pages = at_once(&cx, &worlds, &url).await;
+        assert!(
+            pages
+                .iter()
+                .all(|r| r.status == 200 && r.body == pages[0].body)
+        );
+        assert_eq!(pages[0].meta["title"], json!(title));
+        let made =
+            |cache: &str, rs: &[Response]| rs.iter().filter(|r| r.meta["cache"] == cache).count();
+        assert_eq!((made("generated", &lists), made("cached", &lists)), (1, 2));
+        assert_eq!((made("generated", &pages), made("cached", &pages)), (1, 2));
+        let asked: Vec<String> = fakes.iter().flat_map(|fake| fake.users()).collect();
+        for prompt in [
+            "List the people",
+            "Someone searched for",
+            "Write the page at",
+        ] {
+            let count = asked.iter().filter(|user| user.contains(prompt)).count();
+            assert_eq!(count, 1, "{prompt}");
+        }
+        Ok(())
+    });
+    let world = std::fs::read_to_string(dir.0.join("halvard-cve/world.jsonl")).unwrap();
+    let kinds: Vec<String> = world
+        .lines()
+        .map(|line| {
+            let entry: Value = serde_json::from_str(line).unwrap();
+            entry.as_object().unwrap().keys().next().unwrap().clone()
+        })
+        .collect();
+    for kind in ["cast", "search", "page"] {
+        assert_eq!(kinds.iter().filter(|k| *k == kind).count(), 1, "{kind}");
+    }
 }
 
 #[test]

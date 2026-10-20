@@ -113,7 +113,7 @@ Settings, all from the environment:
 | `ADAPTIVE_WEB_NETWORK` | the world container's network: `none` for stub/replay; `bridge` for model APIs; overrides the automatic choice |
 | `ADAPTIVE_WEB_PREFETCH` | how many pages behind each new result list to make ahead of time (default 3 with a model) |
 | `ADAPTIVE_WEB_REASONING` | reasoning effort sent to OpenRouter, for models that think before writing (`none`, `minimal`, ...) |
-| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; default: a fresh container store per run under Inspect, the Compose project's named `store` volume under `docker compose` (kept until `docker compose down --volumes`), and `examples/adaptive-web/store` in `cargo xtask eval adaptive-web --live`. One world uses a store at a time: a second world on the same seed's store does not start |
+| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; default: a fresh container store per run under Inspect, the Compose project's named `store` volume under `docker compose` (kept until `docker compose down --volumes`), and `examples/adaptive-web/store` in `cargo xtask eval adaptive-web --live`. Every sample of the seed, in this run and later ones, shares the store, so an eval with several epochs makes each page once |
 | `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY` | the provider's key. It is sent in the API request's header and nowhere else: never logged, stored or put in an error message. |
 
 Only the world container gets a network, and only in live mode. The
@@ -168,8 +168,9 @@ has said.
 
 * **A URL always returns the same bytes.** A page or result list is made
   once and stored. Every later request, from any client, gets the stored
-  copy. Making a page holds its URL's lock, so when two requests ask for a
-  new URL at once, the first makes it and the second waits and reads it.
+  copy. Making a page holds its URL's lock, so when two requests, or two
+  worlds sharing a store, ask for a new URL at once, the first makes it and
+  the second waits and reads it.
   Fixed pages follow the same rule. Their bytes, status, content type and
   headers are captured on first use, from the file as the world read it at
   startup. Editing or deleting a fixed source file does not change that
@@ -194,8 +195,8 @@ has said.
   Google, DuckDuckGo and Bing share one result list per query.
   Choosing a title and recording its mention happen under the same URL
   lock as page creation. Concurrent queries and direct page requests use
-  the first reserved title. A search waits for an in-progress page to
-  finish before using its metadata.
+  the first reserved title, even across worlds sharing a store. A search
+  waits for an in-progress page to finish before using its metadata.
 * **Links carry context.** The first 80 link candidates on a page are
   considered, before any filtering. Relative URLs are resolved first. Only
   http(s) links with a host are kept; search hosts and targets whose page is
@@ -239,8 +240,8 @@ Three containers, as in FakeWiki:
     addresses for its own hosts. Every other host gets the next free address
     from 104.21.0.0/16 and 172.67.0.0/16, where many ordinary sites live. A
     host keeps its address for the run, and the address is appended to the
-    store's `addresses.jsonl`, so a later run on the same store gives it
-    the same one. A run fails without `finalized` if `addresses.jsonl` is
+    store's `addresses.jsonl`, so a later run, or another world, on the same
+    store gives it the same one. A run fails without `finalized` if `addresses.jsonl` is
     unreadable, corrupt or cannot be appended.
   * **Certificates.** A host's certificate is made at its first TLS
     handshake, signed by the seeded CA the world makes at startup,
@@ -348,8 +349,15 @@ world.jsonl           everything made, in order: pages (body, title, claims, mod
                       mentions, the hosts' layouts and the cast
 generations.jsonl     model attempts, stub calls and prefetch error diagnostics
 addresses.jsonl       every pool address given out
-store.lock            held by the world that uses the store
+store.lock            held while a world checks or writes the store
+locks/                one file per page, result list and the cast, held while
+                      a world makes it
 ```
+
+Several worlds can use one store at once, such as the epochs of an eval
+run. A world reads what the others wrote before it checks or writes, and
+the first world to ask for a page, a result list or the cast makes it while
+the others wait.
 
 A body that is not UTF-8, such as a binary fixed page, is kept as
 `{"base64": ...}`.
@@ -589,7 +597,7 @@ of another kind of store. To rebuild, choose a new empty
 world directly, choose a new `ADAPTIVE_WEB_STORE`. Keep the old store and its
 judgments for audit. Rebuilding creates a new snapshot; it does not recover
 historical responses or validate published realism scores. Replay requires
-a store a generator made. One world uses a store at a time.
+a store a generator made.
 
 ```bash
 export ADAPTIVE_WEB_STORE_DIR=$PWD/store
