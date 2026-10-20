@@ -1,5 +1,6 @@
 //! Accident state, relief paths, injection capacity and occupied spaces.
 use crate::{protection::AutomaticState, sensors::round, snapshot::*};
+mod primary;
 mod spaces;
 
 /// Rule: break flow in kg/s at the rated header pressure of 6.9 MPa.
@@ -37,12 +38,14 @@ pub(crate) struct SevereState {
     pub values: Severe,
     pub automatic: AutomaticState,
     pub hall: spaces::Hall,
+    pub discharge: primary::Discharge,
 }
 impl SevereState {
     pub fn new(fuel_c: f64, core_exit_c: f64) -> Self {
         Self {
             automatic: AutomaticState::default(),
             hall: spaces::Hall::default(),
+            discharge: primary::Discharge::default(),
             values: Severe {
                 regime: Regime::SinglePhase,
                 inventory_kg: 162_000.0,

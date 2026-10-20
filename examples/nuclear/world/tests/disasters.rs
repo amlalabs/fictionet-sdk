@@ -9,6 +9,167 @@ fn fault(plant: &mut Plant, change: FaultChange) {
         .unwrap();
 }
 
+fn stage_time(label: &str, actual: u64, target: u64, tolerance: u64) {
+    println!("{label}: {actual} ms; target {target} ms within {tolerance} ms");
+    assert!(
+        actual.abs_diff(target) <= tolerance,
+        "{label}: {actual} ms; target {target} ms within {tolerance} ms"
+    );
+}
+
+#[test]
+fn loss_of_feed_boils_without_reaching_the_model_limit() {
+    let mut config = Scenario::Normal.config();
+    config.automatic_protection = false;
+    for (slot, pump) in config.schedule.iter_mut().zip(Loop::ALL) {
+        *slot = Some(ScheduledFault {
+            at_ms: 0,
+            change: FaultChange::Inject(Fault::Process(ProcessFault::FeedPumpTrip { pump })),
+        });
+    }
+    let mut plant = Plant::new(config);
+    let mut boiling = None;
+    for at in (50..=300_000).step_by(50) {
+        plant.advance(at);
+        let snap = plant.snapshot();
+        assert!(!snap.model_limit, "model limit at {at} ms");
+        if boiling.is_none()
+            && let Some(time) = snap.stages[Stage::Boiling.index()]
+        {
+            stage_time("Loss of feed boiling", time, 105_000, 6_000);
+            boiling = Some(time);
+        }
+    }
+    assert!(boiling.is_some());
+}
+
+fn primary_until_uncovered(
+    scenario: Scenario,
+    boiling_target: u64,
+    boiling_tolerance: u64,
+    safety_target: Option<u64>,
+    uncovered_target: Option<u64>,
+) {
+    let mut plant = Plant::new(scenario.config());
+    let mut boiling = None;
+    let mut safety = None;
+    let mut inventory_min = 162_000.0_f64;
+    let mut inventory_max = 0.0_f64;
+    let mut pressure_min = f64::INFINITY;
+    let mut pressure_max = 0.0_f64;
+    for at in (50..=6 * 3_600_000).step_by(50) {
+        plant.advance(at);
+        let snap = plant.snapshot();
+        let severe = &snap.severe;
+        assert!(!snap.model_limit, "{scenario:?}: model limit at {at} ms");
+        assert!(
+            (0.0..=162_000.0).contains(&severe.inventory_kg),
+            "{scenario:?}: inventory {} kg at {at} ms",
+            severe.inventory_kg
+        );
+        inventory_min = inventory_min.min(severe.inventory_kg);
+        inventory_max = inventory_max.max(severe.inventory_kg);
+        if boiling.is_none()
+            && let Some(time) = snap.stages[Stage::Boiling.index()]
+        {
+            stage_time(
+                &format!("{scenario:?} boiling"),
+                time,
+                boiling_target,
+                boiling_tolerance,
+            );
+            boiling = Some(time);
+        }
+        if safety.is_none() && severe.relief.safety_valve_flow_kg_s > 0.0 {
+            safety = Some(at);
+            if let Some(target) = safety_target {
+                stage_time(
+                    &format!("{scenario:?} safety valves"),
+                    at,
+                    target,
+                    target / 10,
+                );
+            }
+        }
+        if scenario == Scenario::StuckOpenRelief {
+            assert!(!snap.reported_status.pressurizer_relief_open);
+            if (20 * 60_000..=70 * 60_000).contains(&at) {
+                let pressure = snap.truth.primary.pressure_mpa;
+                assert!((6.5..=7.5).contains(&pressure), "{pressure} MPa at {at} ms");
+                pressure_min = pressure_min.min(pressure);
+                pressure_max = pressure_max.max(pressure);
+            }
+            if (15 * 60_000..=74 * 60_000).contains(&at) {
+                assert_eq!(severe.pressurizer_water_kg, 24_000.0, "at {at} ms");
+                assert!(severe.relief.flow_kg_s > 0.0);
+                assert!(snap.truth.primary.relief_open);
+            }
+        }
+        if let Some(time) = snap.stages[Stage::CoreUncovered.index()] {
+            assert!(boiling.is_some());
+            if let Some(target) = uncovered_target {
+                stage_time(
+                    &format!("{scenario:?} core uncovered"),
+                    time,
+                    target,
+                    target / 10,
+                );
+            } else {
+                println!("{scenario:?} core uncovered: {time} ms");
+            }
+            if safety_target.is_some() {
+                assert!(safety.is_some());
+            }
+            println!(
+                "{scenario:?} inventory: {inventory_min} to {inventory_max} kg; bounds 0 to 162000 kg"
+            );
+            if scenario == Scenario::StuckOpenRelief {
+                println!(
+                    "Stuck relief pressure: {pressure_min} to {pressure_max} MPa; bounds 6.5 to 7.5 MPa"
+                );
+                println!(
+                    "Pressurizer: 24000 kg from 15 to 74 min; reported relief closed throughout"
+                );
+            }
+            return;
+        }
+    }
+    panic!("{scenario:?}: core did not uncover within six hours");
+}
+
+#[test]
+fn stuck_relief_drains_the_vessel_behind_a_closed_light_and_full_pressurizer() {
+    primary_until_uncovered(
+        Scenario::StuckOpenRelief,
+        426_000,
+        43_000,
+        None,
+        Some(4_464_000),
+    );
+}
+
+#[test]
+fn unattended_loop_boils_and_lifts_safety_valves_before_uncovering() {
+    primary_until_uncovered(
+        Scenario::LoopBUnattended,
+        52_800,
+        6_000,
+        Some(3_066_000),
+        Some(5_802_000),
+    );
+}
+
+#[test]
+fn blackout_boils_and_lifts_safety_valves_before_uncovering() {
+    primary_until_uncovered(
+        Scenario::StationBlackout,
+        713_500,
+        71_350,
+        Some(4_164_000),
+        None,
+    );
+}
+
 #[test]
 fn steam_break_fills_the_hall_at_the_design_time() {
     let mut plant = Plant::new(Scenario::SteamLineBreak.config());
