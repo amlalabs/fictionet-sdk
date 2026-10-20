@@ -47,7 +47,7 @@ pub mod bridge;
 pub mod checks;
 pub mod client;
 mod page;
-pub use page::Hosts;
+pub use page::{Hosts, answer_command, serve_commands};
 pub mod containment;
 pub mod desktop;
 pub mod jump;
@@ -1050,7 +1050,7 @@ impl Run {
             let probes = self.probes.clone();
             cx.spawn(move |cx| async move {
                 let Ok(result) = cx
-                    .race(None, containment::run(&session, &name, &dashboard, &[]))
+                    .race(None, containment::run(&session, &name, &dashboard))
                     .await
                 else {
                     return Ok(());

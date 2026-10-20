@@ -3,7 +3,9 @@
 use border_world::routing::{Applied, Rejection, RouteState, Routing, SetRoute};
 use border_world::scenario::{Scenario, Task, Variant, parse_prefix};
 use fictionet::Cx;
-use fictionet_observe::page::{Action, CommandLimits, CommandPort, Page, StateLimits, StateTopic};
+use fictionet_observe::page::{
+    Action, CommandLimits, CommandPort, Page, Rejected, StateLimits, StateTopic,
+};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -79,47 +81,42 @@ impl Control {
         Ok(())
     }
 
+    /// Applies a route command and publishes the new route, or says why the
+    /// page rejects it.
     pub fn apply(
         &self,
         cx: &Cx,
         routing: &Routing,
-        command: fictionet_observe::page::Command<SetRoute, Applied>,
-    ) -> fictionet::Result {
-        match routing.apply(cx, command.command.clone()) {
+        route: &SetRoute,
+    ) -> fictionet::Result<Result<Applied, Rejected>> {
+        let rejected = match routing.apply(cx, route.clone()) {
             Ok(applied) => {
                 self.publish(cx.now(), &routing.state())?;
-                command.reply(cx, applied);
+                return Ok(Ok(applied));
             }
-            Err(rejected) => command.reject(
-                cx,
-                match rejected.reason {
-                    Rejection::StaleRevision => fictionet_observe::page::Rejected::StaleRevision {
-                        current: rejected.revision,
+            Err(rejected) => rejected,
+        };
+        Ok(Err(match rejected.reason {
+            Rejection::StaleRevision => Rejected::StaleRevision {
+                current: rejected.revision,
+            },
+            Rejection::AlreadyInMode => Rejected::Invalid {
+                message: format!(
+                    "the route is already {} (revision {})",
+                    match rejected.mode {
+                        Variant::Legitimate => "Normal",
+                        Variant::Hijack => "Hijacked",
                     },
-                    Rejection::AlreadyInMode => fictionet_observe::page::Rejected::Invalid {
-                        message: format!(
-                            "the route is already {} (revision {})",
-                            match rejected.mode {
-                                Variant::Legitimate => "Normal",
-                                Variant::Hijack => "Hijacked",
-                            },
-                            rejected.revision
-                        ),
-                    },
-                },
-            ),
-        }
-        Ok(())
+                    rejected.revision
+                ),
+            },
+        }))
     }
 
     pub async fn serve(self, cx: Cx, routing: Routing) -> fictionet::Result {
-        while let Some(command) = cx
-            .race(None, self.port.recv())
-            .await
-            .map_err(|_| fictionet::Cancelled)?
-        {
-            self.apply(&cx, &routing, command)?;
-        }
-        Ok(())
+        fictionet_demo::kit::serve_commands(&cx, &self.port, |route| {
+            self.apply(&cx, &routing, route)
+        })
+        .await
     }
 }

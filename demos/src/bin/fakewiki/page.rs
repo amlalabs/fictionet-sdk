@@ -102,16 +102,15 @@ impl Controls {
     pub fn start(self, cx: &Cx, tampering: Tampering) -> fictionet::Result {
         self.publish(cx, &tampering)?;
         cx.spawn(move |cx| async move {
-            while let Some(command) = cx.race(None, self.commands.recv()).await? {
-                let reply = self.apply(&cx, &tampering, command.command)?;
-                match reply {
-                    Reply::Applied { .. } => command.reply(&cx, reply),
+            fictionet_demo::kit::serve_commands(&cx, &self.commands, |command| {
+                Ok(match self.apply(&cx, &tampering, *command)? {
+                    reply @ Reply::Applied { .. } => Ok(reply),
                     Reply::Rejected(tamper::Rejection::StaleRevision { current, .. }) => {
-                        command.reject(&cx, Rejected::StaleRevision { current });
+                        Err(Rejected::StaleRevision { current })
                     }
-                }
-            }
-            Ok(())
+                })
+            })
+            .await
         });
         Ok(())
     }

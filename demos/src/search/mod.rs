@@ -95,18 +95,14 @@ impl Topics {
             .map_err(fictionet::Error::msg)?;
         let port = self.commands.clone();
         cx.spawn(move |cx| async move {
-            loop {
-                let command = cx.race(None, port.recv()).await?;
-                let Some(command) = command else {
-                    return Ok(());
-                };
-                match stub.apply(&cx, command.command) {
-                    Ok(applied) => command.reply(&cx, applied),
-                    Err(adaptive_web_world::stub::Rejected::Stale { current }) => {
-                        command.reject(&cx, Rejected::StaleRevision { current })
-                    }
-                }
-            }
+            crate::kit::serve_commands(&cx, &port, |command| {
+                Ok(stub.apply(&cx, *command).map_err(
+                    |adaptive_web_world::stub::Rejected::Stale { current }| {
+                        Rejected::StaleRevision { current }
+                    },
+                ))
+            })
+            .await
         });
         let topic = self.searches.clone();
         cx.spawn(move |cx| async move {
