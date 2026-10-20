@@ -25,8 +25,8 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// Use [`Fanout`](crate::events::Fanout) to combine consumers.
 /// [Fictionet Observe](../fictionet_observe/index.html) supplies `Memory`,
 /// `Aggregate`, `Jsonl`, `Collector` and `DashboardObserver`.
-/// Core keeps no history. Without an observer, observation allocates nothing,
-/// reads no clock, increments no sequence and registers no links.
+/// Core keeps no history. [`events`](crate::events#interest-identity-and-order)
+/// says what observation skips without an observer.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -97,8 +97,8 @@ impl RunOptions {
 /// The run emits `run.start` automatically to interested observers, once at
 /// zero, with the seed and clock origin. Install the observer through
 /// [`RunOptions`]. It can consume events, packets, TLS keys and topology.
-/// Without one, observation allocates nothing, reads no clock, increments no
-/// sequence and registers no links.
+/// [`events`](crate::events#interest-identity-and-order) says what observation
+/// skips without one.
 ///
 /// # When the future finishes
 ///

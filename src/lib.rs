@@ -26,12 +26,13 @@
 //!
 //! Core produces four typed streams: events, packets, TLS keys and topology.
 //! The integrator installs one observer in [`RunOptions`]. [`events`] defines
-//! the contract. [Fictionet Observe](../fictionet_observe/index.html) consumes
+//! the contract, including
+//! [what observation skips without an observer](events#interest-identity-and-order).
+//! [Fictionet Observe](../fictionet_observe/index.html) consumes
 //! these streams: `Memory` and `Aggregate` for grading, `Jsonl` for files,
 //! `Collector` for bounded collection, and `DashboardObserver` for clients.
-//! With no observer, observation allocates nothing, reads no clock, increments
-//! no sequence and registers no links. `run.start` emits the seed to
-//! interested observers. Core retains no observation history.
+//! `run.start` emits the seed to interested observers. Core retains no
+//! observation history.
 //!
 //! # How a sandbox connects to a world
 //!

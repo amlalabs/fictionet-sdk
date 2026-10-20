@@ -73,8 +73,8 @@
 //!    Use [`Fanout`](crate::events::Fanout) to combine consumers from
 //!    [Fictionet Observe](../../../fictionet_observe/index.html).
 //!    `run` and `lab` emit `run.start` once at zero when interested.
-//!    Without an observer, observation allocates nothing, reads no clock,
-//!    increments no sequence and registers no links. Every task the world starts
+//!    [`events`](crate::events#interest-identity-and-order) says what
+//!    observation skips without an observer. Every task the world starts
 //!    with [`Cx::spawn`](crate::Cx::spawn), and every stdlib task, is polled
 //!    inside this same future.
 //! 4. **[`block_on`](crate::block_on)** polls the future on the current
