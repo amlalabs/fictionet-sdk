@@ -202,7 +202,7 @@ mod tests {
         super::super::story::observed(&client, false).await.unwrap();
         let tls: serde_json::Value = client.get_json("/api/state/tls").await.unwrap();
         assert_eq!(tls["value"]["lost"], 0);
-        let sessions = tls["value"]["sessions"].as_array().unwrap();
+        let sessions = tls["value"]["sessions"]["rows"].as_array().unwrap();
         assert_eq!(sessions.len(), 7, "{sessions:?}");
         for session in sessions {
             assert_eq!(session["gaps"], 0);

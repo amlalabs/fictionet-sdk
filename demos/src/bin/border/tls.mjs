@@ -19,9 +19,9 @@ export function mount(root, services, options) {
   function render() {
     if (!capture) return;
     const {value, status: state} = capture;
-    status.textContent = `${plural(value.sessions.length, 'retained session')} · older sessions dropped: ${value.dropped} · packets lost: ${value.lost}${state?.too_large ? ' · publication exceeded its limit' : ''}`;
+    status.textContent = `${plural(value.sessions.rows.length, 'retained session')} · older sessions dropped: ${value.sessions.dropped} · packets lost: ${value.lost}${state?.too_large ? ' · publication exceeded its limit' : ''}`;
     // A session keeps its element, so one the viewer closed stays closed.
-    reconcile(rows, value.sessions.toReversed(), (s) => JSON.stringify([s.at_ms, s.sandbox, s.client, s.server]), () => {
+    reconcile(rows, value.sessions.rows.toReversed(), (s) => JSON.stringify([s.at_ms, s.sandbox, s.client, s.server]), () => {
       const node = el('details', { class: 'border-inspector-session' }, null);
       node.open = true;
       return { node, shown: '' };
