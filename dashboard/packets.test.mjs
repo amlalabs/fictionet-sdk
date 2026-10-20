@@ -175,7 +175,9 @@ test('merged subscriber gaps follow earlier packets still held for ordering', (t
   const h = setup(t, ['a', 'b']);
   h.send(1, { link: 'b', t: 2, skipped: 0 });
   h.send(1, { link: 'a', t: 1, skipped: 0 });
-  h.view.flush(); // Both rows are still within the merge hold window.
+  // Link b has passed link a's row, so it goes in; link b's row waits for link a.
+  h.view.flush();
+  assert.deepEqual(h.rows().map((r) => `${r.dataset.link}:${r.dataset.seq}`), ['a:1']);
   h.source.emit('packet_gap', { link: 'b', after: 1, next: 5, missed: 3 });
   assert.equal($('sampled').textContent, 'Subscriber: 3 rows missed');
   h.send(5, { link: 'b', t: 3, skipped: 0 });
@@ -357,6 +359,28 @@ test('repeated reconnects replace single-link rows and sampling totals before re
   assert.equal($('sampled').hidden, true);
 });
 
+test('a late tab shows the merged history still kept at once, in time order, with its loss', (t) => {
+  const h = setup(t, ['a', 'b']);
+  // The history of both links arrives in one burst; no time passes.
+  h.send(5, { link: 'a', t: 1, evicted: 100, skipped: 0 });
+  h.send(6, { link: 'a', t: 3, skipped: 0 });
+  h.send(7, { link: 'a', t: 5, skipped: 0 });
+  h.send(2, { link: 'b', t: 2, evicted: 50, skipped: 0 });
+  h.send(3, { link: 'b', t: 4, skipped: 0 });
+  h.send(4, { link: 'b', t: 6, skipped: 0 });
+  h.view.flush();
+  assert.deepEqual(h.rows().map((r) => `${r.dataset.link}:${r.dataset.seq}`), ['a:5', 'b:2', 'a:6', 'b:3', 'a:7']);
+  assert.equal($('sampled').textContent, 'Capture: 150 copies evicted');
+  // Link a has not reached link b's last row, which waits for it a moment.
+  h.flush();
+  assert.deepEqual(h.rows().map((r) => r.dataset.seq), ['5', '2', '6', '3', '7', '4']);
+  // A link that ended holds nothing back.
+  h.source.emit('link_end', { link: 'a', reason: 'the link closed' });
+  h.send(5, { link: 'b', t: 9, skipped: 0 });
+  h.view.flush();
+  assert.equal(h.rows().at(-1).dataset.seq, '5');
+});
+
 test('merged replay restarts display numbering and discards packets held for ordering', async (t) => {
   const h = setup(t, ['a', 'b']);
   for (let reconnect = 0; reconnect < 3; reconnect++) {
@@ -523,6 +547,14 @@ test('merged host rows keep display numbers and link identities in detail and la
   assert.equal($('drawer').classList.contains('merged-hosts'), false);
 });
 
+
+test('address cells carry their full address, for a narrow list that cuts them', (t) => {
+  const h = setup(t);
+  h.send(1, { src: '185.15.59.224:443', dst: '10.0.0.2:60483' });
+  h.flush();
+  const cells = h.rows()[0].children;
+  assert.deepEqual([cells[3], cells[4]].map((cell) => cell.getAttribute('title')), ['185.15.59.224:443', '10.0.0.2:60483']);
+});
 
 test('host columns fit the declared names and stay fixed as packets arrive', (t) => {
   const h = setup(t);

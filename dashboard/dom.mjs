@@ -21,6 +21,24 @@ export function scoped(root) {
   };
 }
 
+// Updates a list in place by key, so live rows neither jump nor lose focus.
+// `retained` maps each key to an entry whose `node` is a child of `parent`,
+// and `parent` holds only those nodes. New items get `create(item)`; every
+// item then gets `update(entry, item, fresh)`. Entries for items no longer
+// wanted are removed, and a node moves only when its place changes.
+export function reconcile(parent, items, key, create, update, retained) {
+  const wanted = new Set(items.map(key));
+  for (const [id, entry] of retained) if (!wanted.has(id)) { entry.node.remove(); retained.delete(id); }
+  items.forEach((item, index) => {
+    const id = key(item);
+    let entry = retained.get(id);
+    const fresh = !entry;
+    if (!entry) { entry = create(item); retained.set(id, entry); }
+    update(entry, item, fresh);
+    if (parent.children[index] !== entry.node) parent.insertBefore(entry.node, parent.children[index] || null);
+  });
+}
+
 export function listen(target, name, callback, options) {
   target.addEventListener(name, callback, options);
   return () => target.removeEventListener(name, callback, options);

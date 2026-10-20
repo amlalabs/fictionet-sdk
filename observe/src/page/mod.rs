@@ -57,7 +57,8 @@
 //! [crate's packet data](crate#packet-values). `world_error` carries `{error}`
 //! and terminates a refused stream. `end` carries `{reason}` and is terminal.
 //! There are at most 32 active SSE streams, shared with state streams;
-//! capacity returns 503 before starting a subscription.
+//! capacity returns 503 before starting a subscription. A stream ends as soon
+//! as its client closes the connection, which frees its place.
 //! [`Server::shutdown`] stops accepting connections and drains available stream
 //! data, including `ended` when the run has ended, before the terminal `end`.
 //! State streams also end with `end`; the server reason is `the page server stopped`.
@@ -176,7 +177,9 @@
 //! `screen` or `terminal`; console panels also have `host`.
 //! `workspace(title)` places that custom panel in the workspace and moves
 //! the consoles to the inspector. Add `workspace_consoles()` to keep their
-//! tiles beside the custom panel. `command(name, port)` registers a mailbox
+//! tiles beside the custom panel. `inspector_first(title)` puts that
+//! inspector panel first and opens the inspector on it; `/api/page` gives its
+//! id as `inspector_first`, which is null without the call. `command(name, port)` registers a mailbox
 //! at `/api/command/<name>` without a control panel. Names, columns, actions, paths and
 //! composition conflicts are checked before the listener binds.
 //!
@@ -429,6 +432,8 @@ pub struct PageDescription {
     pub panels: Vec<PanelDescription>,
     /// Named event projections shown in the top bar.
     pub moments: Vec<MomentDescription>,
+    /// The inspector panel shown first and opened first, or null for Packets.
+    pub inspector_first: Option<String>,
 }
 
 /// A named moment marked by world events.
@@ -456,6 +461,7 @@ pub struct Page {
     labels: Option<Labels>,
     workspace: Option<String>,
     workspace_consoles: bool,
+    inspector_first: Option<String>,
     modules: Vec<(String, String)>,
     assets: Vec<(String, String, Vec<u8>)>,
     filters: Vec<(String, EventFilter)>,
@@ -478,6 +484,7 @@ impl Page {
             labels: None,
             workspace: None,
             workspace_consoles: false,
+            inspector_first: None,
             modules: vec![],
             assets: vec![],
             filters: vec![],
@@ -831,6 +838,7 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
                     hosts: shared.page.hosts.iter().map(Host::description).collect(),
                     panels: shared.page.panels.clone(),
                     moments: shared.page.moments.clone(),
+                    inspector_first: shared.page.inspector_first.clone(),
                 },
             )
             .await

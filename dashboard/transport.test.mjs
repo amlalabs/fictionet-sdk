@@ -266,6 +266,30 @@ test('HTTP refusal reasons reach the watch and packet stream without retry', asy
   }
 });
 
+test('a busy page server is tried again, not taken as a refusal', async (t) => {
+  const h = transport(t);
+  const errors = [], refusals = [], snapshots = [];
+  h.respond(Response.json({ error: 'too many streams' }, { status: 503 }));
+  const source = h.stateStream({ leases: undefined, 'host-alpha': 4 });
+  source.addEventListener('error', (e) => errors.push(JSON.parse(e.data)));
+  source.addEventListener('world_error', (e) => refusals.push(JSON.parse(e.data)));
+  source.addEventListener('snapshot', (e) => snapshots.push(JSON.parse(e.data)));
+  await settle();
+  assert.deepEqual(refusals, []);
+  assert.deepEqual(errors, [{ error: 'The page server is busy (too many streams). Reconnecting.' }]);
+  assert.deepEqual(h.delays, [1000]);
+  h.retry();
+  await settle();
+  h.sources[0].emit('snapshot', { topic: 'leases', revision: 1, value: {} });
+  await settle();
+  assert.deepEqual(snapshots.map((snapshot) => snapshot.topic), ['leases']);
+  assert.equal(h.requests.length, 2);
+  for (const request of h.requests) assert.equal(new URL(request.url).searchParams.get('after'), 'host-alpha:4');
+  source.close();
+  await settle();
+  assert.equal(h.timers.size, 0);
+});
+
 test('packet reconnect sends authorization and resets history before replay', async (t) => {
   const h = transport(t);
   const seen = [];

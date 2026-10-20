@@ -5,7 +5,7 @@ import { createInteraction } from '../interaction.mjs';
 import { createLayout } from '../layout.mjs';
 import { createState } from '../state.mjs';
 import { createTables } from '../tables.mjs';
-import { fmtDuration, fmtBytes, fmtCount, fmtRate } from '../format.mjs';
+import { fmtDuration, fmtBytes, fmtCount, fmtRate, plural } from '../format.mjs';
 
 export function mount(root, services, options = {}) {
   const { $, el } = scoped(root);
@@ -23,7 +23,6 @@ export function mount(root, services, options = {}) {
 
   const graph = createState({ view, setStatus, loadLayout: (nodes) => loadLayout(nodes), pulse: (n) => pulse(n) });
   const { state, runTime } = graph;
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   const shortFile = (f) => (f ? f.split('/').pop() : '');
   const where = (n) => (n.file ? `${shortFile(n.file)}:${n.line}` : '');
   const nodeLabel = (n) => (n ? n.name : '?');

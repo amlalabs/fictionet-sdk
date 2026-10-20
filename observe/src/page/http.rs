@@ -192,6 +192,22 @@ pub(super) async fn read_request(
     .map_err(io::Error::other)?
 }
 
+/// Resolves when a stream's client closes its connection. The client sends
+/// nothing after its request, so any further bytes also end the stream.
+/// Without this, a closed stream would hold its place until a write failed.
+pub(super) async fn hangup(conn: &TcpStream) {
+    let mut byte = [0; 1];
+    loop {
+        if conn.readable().await.is_err() {
+            return;
+        }
+        match conn.try_read(&mut byte) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            _ => return,
+        }
+    }
+}
+
 pub(super) async fn write(conn: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
     tokio::time::timeout(IO_TIMEOUT, conn.write_all(bytes))
         .await

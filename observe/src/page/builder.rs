@@ -163,6 +163,17 @@ impl Page {
         self.workspace_consoles = true;
         self
     }
+    /// Puts the named inspector panel first and opens the inspector on it, so
+    /// a demo's own panel is what a viewer sees before Packets.
+    pub fn inspector_first(mut self, title: impl Into<String>) -> Self {
+        let title = title.into();
+        if self.inspector_first.replace(title.clone()).is_some() {
+            self.errors.push(format!(
+                "inspector_first({title:?}) called twice; choose one panel"
+            ));
+        }
+        self
+    }
 
     /// Injects elapsed monotonic time for ticket expiration and lease timestamps.
     pub fn clock(mut self, clock: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
@@ -294,6 +305,19 @@ impl Page {
                 }
             }
             self.panels[selected].area = Area::Workspace;
+        }
+        if let Some(title) = &mut self.inspector_first {
+            let panel = self
+                .panels
+                .iter()
+                .find(|p| &p.title == title && p.area == Area::Inspector)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "inspector_first({title:?}) names no inspector panel; give the title of a declared panel that is not in the workspace"
+                    ))
+                })?;
+            // From here on it holds the panel id that /api/page reports.
+            *title = panel.id.clone();
         }
         let mut paths = std::collections::BTreeSet::new();
         for (path, kind, _) in &self.assets {
