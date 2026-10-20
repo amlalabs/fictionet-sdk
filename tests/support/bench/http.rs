@@ -1,14 +1,13 @@
 mod observer;
 
 use super::World;
-use example_common::hyper_io::{Exec, Io};
 use bytes::Bytes;
-use fictionet::relay;
+use example_common::hyper_io::{Exec, Io};
 use fictionet::stdlib::protocols::dns::op::{MessageType, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
 use fictionet::stdlib::world::sandbox::{self, Machine, TlsClient};
 use fictionet::stdlib::{network::Connection, services::tls, web};
-use fictionet::{Attacher, Cx, WorldSocket, listen};
+use fictionet::{Attacher, Cx};
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use observer::ObserverStatus;
@@ -169,13 +168,16 @@ fn certs(
 /// requests on it, one at a time.
 fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
     let (attacher, attachments) = fictionet::attachments();
-    // The observer reaches the world through a real world socket, as the
+    // The observer reaches the world through an observation socket, as the
     // dashboard does.
     let path = socket_path("sites");
-    let listening = case
+    let dashboard = case
         .watch
         .enabled()
-        .then(|| listen(WorldSocket::UnixSocket(path.clone()), attacher.clone()).unwrap());
+        .then(|| fictionet_observe::DashboardObserver::new(Default::default()));
+    let listening = dashboard
+        .as_ref()
+        .map(|dashboard| fictionet_observe::serve(dashboard.handle(), &path).unwrap());
     let stop = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(Mutex::new(ObserverStatus::Waiting));
     let measuring = Arc::new(AtomicBool::new(false));
@@ -186,19 +188,32 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
     let stop_after = stop.clone();
     let wait_for = ready.clone();
     let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
-    if case.watch.enabled() {
-        options = options.event_history(Arc::new(fictionet::events::Memory::default()));
-    }
     struct Hook;
     impl fictionet::events::Observer for Hook {
         fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        let fictionet::events::Interest::Event(_, _) = interest else { return false; }; true }
+            let fictionet::events::Interest::Event(_, _) = interest else {
+                return false;
+            };
+            true
+        }
         fn observe(&self, _: fictionet::events::Stamp, _: fictionet::events::Observation<'_>) {}
     }
-    let writer = case.writer.then(|| Arc::new(fictionet_observe::Jsonl::new(std::io::sink(), fictionet::events::Limits::default()).unwrap()));
+    let writer = case.writer.then(|| {
+        Arc::new(
+            fictionet_observe::Jsonl::new(std::io::sink(), fictionet_observe::Limits::default())
+                .unwrap(),
+        )
+    });
     let mut destinations: Vec<Arc<dyn fictionet::events::Observer>> = Vec::new();
-    if let Some(writer) = &writer { destinations.push(writer.clone()); }
-    if case.hooks { destinations.push(Arc::new(Hook)); }
+    if let Some(dashboard) = &dashboard {
+        destinations.push(dashboard.observer());
+    }
+    if let Some(writer) = &writer {
+        destinations.push(writer.clone());
+    }
+    if case.hooks {
+        destinations.push(Arc::new(Hook));
+    }
     if !destinations.is_empty() {
         options = options.observer(Arc::new(fictionet::events::Fanout::new(destinations)));
     }
@@ -233,9 +248,7 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
         if case.watch.enabled() {
             *watching.lock().unwrap() = Some(std::thread::spawn(move || {
                 let result = (|| {
-                    let mut client =
-                        relay::observer::Client::connect(watch_path.to_str().unwrap(), "bench")
-                            .map_err(std::io::Error::other)?;
+                    let mut client = fictionet_observe::Client::connect(&watch_path)?;
                     client.set_timeout(Some(Duration::from_millis(100)))?;
                     observer::watch_world(
                         &mut client,
@@ -347,11 +360,12 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
     let future = std::mem::replace(&mut world.future, Box::pin(async { Ok(()) }));
     world.future = Box::pin(async move {
         let result = future.await;
-        if let Some(writer) = writer { writer.finish()?; }
+        if let Some(writer) = writer {
+            writer.finish()?;
+        }
         result
     });
     world
-
 }
 
 // A hyper client over a `Connection`.

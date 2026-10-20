@@ -485,6 +485,7 @@ fn pages_match_the_backend() {
         std::env::set_var("FAKEWIKI_VARIANT", "altered_all");
     }
     let args = Args {
+        observation: None,
         socket: String::new(),
         ca_dir: PathBuf::new(),
         backend: here.join("backend"),

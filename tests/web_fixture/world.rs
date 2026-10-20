@@ -1,7 +1,8 @@
 //! The quick-start world with bulk transfers and a real upstream for tests.
 //!
-//! `web_fixture <socket> <ca path>` serves the world. `--upstream <port>`
-//! instead runs a real HTTP server on the host's network for the proxy.
+//! `web_fixture <socket> <ca path> [observation.sock]` serves the world.
+//! `--upstream <port>` instead runs a real HTTP server on the host's network
+//! for the proxy.
 
 use std::io::{Read, Write};
 
@@ -19,7 +20,7 @@ fn main() -> Result {
         let port = args.get(2).map(|p| p.parse()).transpose()?.unwrap_or(80);
         return upstream(port);
     }
-    web_world::run(world)
+    web_world::run(&args, world)
 }
 
 fn world(

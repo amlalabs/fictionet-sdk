@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The dashboard demo, run inside the VM by cargo xtask demo dashboard. The web world
 # and its sandbox from cargo xtask demo web, with `fictionet dashboard` showing them
-# live in your browser, and `fictionet observe` reading the same API from
-# a shell.
+# live in your browser. `fictionet observe` reads the same API from a shell.
+# Both commands connect to the world's private observation socket.
 # needs: sdk
 . "$(dirname "$0")/lib.sh"
 . "$(dirname "$0")/web_setup.sh"
@@ -20,17 +20,18 @@ cleanup
 
 step "Start the world, and attach a sandbox to it"
 note "The same web_world example and network namespace as cargo xtask demo web."
-start_web
+start_web /run/fictionet/observation.sock
 attach_web
 
 step "Start the dashboard"
-note "fictionet dashboard connects to the world's socket as an observer: the world needs no"
-note "flag of its own. In the VM it listens on port 7878, which cargo xtask vm forwards to"
+note "web_world serves its collector on the third path with fictionet_observe::serve."
+note "fictionet dashboard connects through --observation unix:/run/fictionet/observation.sock."
+note "In the VM it listens on port 7878, which cargo xtask vm forwards to"
 note "127.0.0.1:$host_port on your machine, and nowhere else."
 umask 077
 token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 printf '%s\n' "$token" > /run/fictionet/dashboard-token
-fictionet dashboard --token-file /run/fictionet/dashboard-token --world unix:/run/fictionet/world.sock --listen 0.0.0.0:7878 >/run/dashboard.log 2>&1 &
+fictionet dashboard --token-file /run/fictionet/dashboard-token --observation unix:/run/fictionet/observation.sock --listen 0.0.0.0:7878 >/run/dashboard.log 2>&1 &
 dash_pid=$!
 for _ in $(seq 50); do grep -q serving /run/dashboard.log && break; sleep 0.1; done
 sed 's/^/    /' /run/dashboard.log
@@ -59,13 +60,13 @@ if ! kill -0 "$traffic_pid" 2>/dev/null; then
 fi
 
 step "The same API from a shell: fictionet observe"
-vm "fictionet observe --world unix:/run/fictionet/world.sock world"
-vm "fictionet observe --world unix:/run/fictionet/world.sock graph | jq -c '{tasks: [.nodes[] | select(.kind != \"sandbox\")] | length, sandboxes: [.nodes[] | select(.kind == \"sandbox\") | .name], links: (.edges | length)}'"
-note "The world keeps a log of events, such as web_world's dns.query and http.request, whether"
-note "or not anyone watches. The watch request replays every event the world kept from the start,"
-note "then follows new events as they happen. Here are the first four:"
+vm "fictionet observe --observation unix:/run/fictionet/observation.sock world"
+vm "fictionet observe --observation unix:/run/fictionet/observation.sock graph | jq -c '{tasks: [.nodes[] | select(.kind != \"sandbox\")] | length, sandboxes: [.nodes[] | select(.kind == \"sandbox\") | .name], links: (.edges | length)}'"
+note "web_world installs a collector that retains events before clients connect."
+note "watch 0 replays its retained events, then follows events as they arrive."
+note "Retention is bounded. Here are the first four:"
 vm "s=0
-timeout 4 fictionet observe --world unix:/run/fictionet/world.sock watch 0 >/run/watch.jsonl || s=\$?
+timeout 4 fictionet observe --observation unix:/run/fictionet/observation.sock watch 0 >/run/watch.jsonl || s=\$?
 [[ \$s -eq 0 || \$s -eq 124 ]] || exit \"\$s\"
 jq -es 'map(select(.event == \"event\" and .data.source == \"http\")) | length > 0' /run/watch.jsonl >/dev/null
 jq -c 'select(.event == \"event\") | .data | {source, kind, summary}' /run/watch.jsonl | sed -n 1,4p"

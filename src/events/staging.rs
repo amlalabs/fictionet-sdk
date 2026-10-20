@@ -3,6 +3,9 @@
 //! A task can change the topology while it holds its own locks, such as a
 //! network starting a machine under its state lock. The run stages what a
 //! poll produces and delivers it, in order, once the poll returns.
+//! Interest is checked before staging. Count and byte limits bound each batch.
+//! A full batch reports topology loss with `LossReason::Staging`, without a
+//! sequence range. Callbacks run after the staging borrow is released.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -12,7 +15,7 @@ use super::{Dispatch, Loss, LossReason, Stream, TopologyRef};
 /// Topology records one poll may stage. A world's first poll can build
 /// thousands of tasks, groups and links.
 const MAX_ITEMS: usize = 1 << 16;
-/// Bytes of names and labels one poll may stage.
+/// Bytes charged for topology values and their owned data in one poll.
 const MAX_BYTES: usize = 16 << 20;
 
 type Delivery = Box<dyn FnOnce(&Dispatch)>;

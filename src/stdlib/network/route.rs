@@ -249,7 +249,7 @@ pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
         handle: Arc::new(sender),
     };
     fcx.spawn_as(
-        || "router".into(),
+        || "router",
         move |fcx| async move {
             let mut ports = Ports::new(Vec::new());
             // Which port each prefix goes out on.
@@ -655,7 +655,7 @@ where
         handle: Arc::new(LanHandle { subnet, sender }),
     };
     fcx.spawn_as(
-        || "lan".into(),
+        || "lan",
         move |fcx| async move {
             let mut ports = Ports::new(Vec::new());
             let mut members = Members::new(enrich);
@@ -1069,7 +1069,7 @@ mod tests {
     /// says so, and the sender hears "time exceeded".
     #[test]
     fn a_routing_loop_ends_when_the_ttl_runs_out() {
-        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
             |fcx| async move {
@@ -1123,7 +1123,7 @@ mod tests {
                 assert_eq!(answer.0[7], 63);
 
                 let drops: Vec<String> = evidence
-                    .checked_of("router", "drop").unwrap()
+                    .of("router", "drop")
                     .into_iter()
                     .map(|e| e.summary)
                     .collect();
@@ -1332,7 +1332,7 @@ mod tests {
     /// each with its reason, in the installed observer.
     #[test]
     fn drops_and_member_changes_are_recorded() {
-        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
             |fcx| async move {
@@ -1342,7 +1342,6 @@ mod tests {
                 let (b_lan, _b) = fictionet::pair();
                 lan.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
                 lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
-                assert!(!fcx.observed());
                 a.send(v4([192, 168, 56, 10], [192, 168, 56, 12]));
                 a.send(v4([192, 168, 56, 10], [10, 0, 0, 1]));
                 a.send(v4([192, 168, 56, 10], [192, 168, 56, 10]));
@@ -1355,7 +1354,7 @@ mod tests {
                 fcx.sleep(Duration::from_millis(20)).await?;
 
                 let events: Vec<(&str, String)> = evidence
-                    .checked_all().unwrap()
+                    .all()
                     .into_iter()
                     .filter(|e| e.source == "lan")
                     .map(|e| (e.kind, e.summary))
@@ -1424,6 +1423,32 @@ mod tests {
                     "the LAN has stopped"
                 );
                 assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// A router delivers a removed route to the installed observer.
+    #[test]
+    fn routers_record_routes_they_remove() {
+        let evidence = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            |fcx| async move {
+                let (a, b) = fictionet::pair();
+                let (c, d) = fictionet::pair();
+                let router = fictionet::stdlib::network::route::router(
+                    &fcx,
+                    vec![("10.0.0.0/24".parse().unwrap(), a)],
+                );
+                router.add("10.0.1.0/24".parse().unwrap(), c);
+                drop(b);
+                fcx.sleep(Duration::from_millis(10)).await?;
+                let removed = evidence.of("router", "route_removed");
+                assert_eq!(removed.len(), 1);
+                assert_eq!(removed[0].str("prefix"), Some("10.0.0.0/24"));
+                drop(d);
                 Ok(())
             },
         ))

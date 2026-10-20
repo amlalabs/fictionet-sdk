@@ -464,7 +464,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
 /// does. Before, it dropped the work and took an upgrade for a close.
 #[test]
 fn the_harness_runs_deferred_work_and_reports_upgrades() {
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(evidence_h.clone());
     let got = h.push(b"one\nlater\ntwo\n");
     assert_eq!(

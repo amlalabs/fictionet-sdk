@@ -14,6 +14,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
 COPY cli cli
+COPY observe observe
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches

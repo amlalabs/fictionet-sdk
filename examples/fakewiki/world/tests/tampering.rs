@@ -97,7 +97,7 @@ async fn switch(fcx: Cx, tampering: Tampering, content: Content) -> fictionet::R
     Err(fictionet::Error::msg("done"))
 }
 
-fn check_events(memory: &fictionet::events::Memory) {
+fn check_events(memory: &fictionet_observe::Memory) {
     let events = memory.checked_all().unwrap();
     let requests: Vec<_> = events
         .iter()
@@ -157,7 +157,7 @@ fn check_events(memory: &fictionet::events::Memory) {
 
 #[test]
 fn sandbox_sees_runtime_switches_in_a_lab() {
-    let memory = Arc::new(fictionet::events::Memory::default());
+    let memory = Arc::new(fictionet_observe::Memory::default());
     let result = fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(memory.clone()),
         |fcx| async move {
@@ -206,7 +206,7 @@ fn sandbox_sees_runtime_switches_through_python() {
         .unwrap();
     let startup: serde_json::Value = serde_json::from_str(&startup).unwrap();
     assert_eq!(startup["variant"], "altered_all");
-    let memory = Arc::new(fictionet::events::Memory::default());
+    let memory = Arc::new(fictionet_observe::Memory::default());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

@@ -44,6 +44,9 @@ use upstream::Client as ProxyClient;
 /// real site as a plain `GET`. A world that wants WebSockets serves them
 /// itself, with a handler on the site (see [`httpd`'s upgrades](fictionet::stdlib::web::httpd)).
 /// If the real site cannot be reached, the agent gets `502 Bad Gateway`.
+/// Every request it sends upstream, answered or not, has a `forwarded`
+/// field in its `http.request` event: the origin it went to, such as
+/// `https://github.com`.
 /// Returns an error in a lab before constructing a client.
 pub fn proxy(fcx: &Cx) -> Result<Proxy, Error> {
     fcx.require_real_io()?;
@@ -139,11 +142,13 @@ async fn send_upstream(
     } else {
         format!("{}:{}", target.host, target.port)
     };
+    let origin = format!("{}://{}", target.scheme, authority);
     dispatch(
         client,
         request,
-        |path| Ok(format!("{}://{}{}", target.scheme, authority, path).parse()?),
+        |path| Ok(format!("{origin}{path}").parse()?),
         Host::Replace(&authority),
+        &origin,
         Some(&target.host),
     )
     .await
@@ -158,13 +163,16 @@ enum Host<'a> {
 }
 
 /// Sends one request upstream. `destination` makes the upstream URI from
-/// the request's path and query. A failed request becomes a
-/// [`httpd::BadGateway`], prefixed with `error_context` when there is one.
+/// the request's path and query. A failed request is answered `502 Bad
+/// Gateway`, prefixed with `error_context` when there is one. Before sending, the
+/// request records a `forwarded` event field naming `origin`, so the
+/// request's event says it left the world.
 async fn dispatch(
     client: Arc<ProxyClient>,
     request: Request<Body>,
     destination: impl FnOnce(&str) -> Result<http::Uri, Error>,
     host: Host<'_>,
+    origin: &str,
     error_context: Option<&str>,
 ) -> Result<Response<Body>, Error> {
     let (mut parts, body) = request.into_parts();
@@ -176,21 +184,25 @@ async fn dispatch(
             .unwrap_or("/"),
     )?;
     parts.version = http::Version::HTTP_11;
-    parts.extensions = http::Extensions::new();
+    if let Some(fields) = parts.extensions.get::<httpd::RequestFields>() {
+        fields.record_fields(fictionet::events::Fields::new().with("forwarded", origin));
+    }
+    parts.extensions.clear();
     strip_hop_by_hop(&mut parts.headers);
     if let Host::Replace(authority) = host {
         parts.headers.insert(http::header::HOST, authority.parse()?);
     }
-    let mut response = client
-        .request(Request::from_parts(parts, body))
-        .await
-        .map_err(|e| {
-            httpd::BadGateway(match error_context {
-                Some(context) => format!("{context}: {e}"),
-                None => e.to_string(),
-            })
-        })?;
+    let request = Request::from_parts(parts, body);
+    let mut response = client.request(request).await.map_err(|error| {
+        httpd::BadGateway(match error_context {
+            Some(context) => format!("{context}: {error}"),
+            None => error.to_string(),
+        })
+    })?;
     strip_hop_by_hop(response.headers_mut());
+    response
+        .extensions_mut()
+        .insert(fictionet::events::Fields::new().with("forwarded", origin));
     Ok(response)
 }
 
@@ -202,7 +214,8 @@ async fn dispatch(
 /// The origin does not depend on [`Target`], so default-host requests can
 /// be forwarded here even when their routing is [`Routing::Fallback`].
 /// This handler requires real host I/O and works with any executor.
-/// It uses the same HTTP/1.1 transport and limits as [`proxy`].
+/// It uses the same HTTP/1.1 transport and limits as [`proxy`], and its
+/// requests' events carry the same `forwarded` field.
 /// Returns an error in a lab before constructing a client, and for an
 /// upstream without such a scheme or without an authority.
 pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
@@ -252,18 +265,23 @@ impl tower_service::Service<Request<Body>> for Forward {
         let client = self.client.clone();
         let scheme = self.scheme.clone();
         let authority = self.authority.clone();
-        Box::pin(dispatch(
-            client,
-            request,
-            move |path| {
-                Ok(http::Uri::builder()
-                    .scheme(scheme)
-                    .authority(authority)
-                    .path_and_query(path)
-                    .build()?)
-            },
-            Host::Preserve,
-            None,
-        ))
+        Box::pin(async move {
+            let origin = format!("{scheme}://{authority}");
+            dispatch(
+                client,
+                request,
+                move |path| {
+                    Ok(http::Uri::builder()
+                        .scheme(scheme)
+                        .authority(authority)
+                        .path_and_query(path)
+                        .build()?)
+                },
+                Host::Preserve,
+                &origin,
+                None,
+            )
+            .await
+        })
     }
 }

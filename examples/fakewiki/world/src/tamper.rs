@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn command_events_describe_each_outcome() {
-        let memory = Arc::new(fictionet::events::Memory::default());
+        let memory = Arc::new(fictionet_observe::Memory::default());
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(memory.clone()),
             |fcx| async move {

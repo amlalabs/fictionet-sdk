@@ -325,6 +325,8 @@
 //!
 //! `examples/scan` is a five-host subnet that `nmap` scans from a sandbox:
 //! four simulated machines and one real container, wired with a router and
-//! [grouped](crate::Cx#groups) for the dashboard. Its
+//! [grouped](crate::Cx#groups) for topology observers. The companion's
+//! `DashboardObserver` collects that topology for the dashboard. See
+//! [Fictionet Observe](../../../fictionet_observe/index.html) for setup. The scan
 //! [README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/scan/README.md)
 //! runs it under Docker Compose and shows the scan.

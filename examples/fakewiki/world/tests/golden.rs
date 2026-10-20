@@ -134,6 +134,7 @@ fn the_log_is_the_recorded_one() {
         std::env::set_var("FAKEWIKI_VARIANT", "altered_one");
     }
     let args = Args {
+        observation: None,
         socket: String::new(),
         ca_dir: state_dir.join("ca"),
         backend: here.join("backend"),
@@ -255,13 +256,12 @@ fn run_script(
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let drain = log.clone();
-        let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
-            .aggregate_events()
-            .event_history(Arc::new(fictionet::events::Memory::default()))
-            .observer(Arc::new(fakewiki_world::events::LogObserver {
+        let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
+            fictionet_observe::Aggregate::new(Arc::new(fakewiki_world::events::LogObserver {
                 log: log.clone(),
                 hosts: hosts.clone(),
-            }));
+            })),
+        ));
         let world = move |fcx: Cx| async move {
             let variant = Tampering::from(Variant::AlteredOne);
             let content = match port {

@@ -1,7 +1,18 @@
-// A sandbox on a slow link: `stdlib::network::bottleneck` in front of `web::Sites`,
-// with a count of the packets its queues drop.
-//
-//     cargo run --example bottleneck_sites -- /run/fictionet/world.sock
+//! A sandbox on a slow link: `stdlib::network::bottleneck` in front of `web::Sites`,
+//! with a count of the packets its queues drop.
+//!
+//! ```text
+//! cargo run --example bottleneck_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
+//! ```
+//!
+//! The optional second argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,31 +45,37 @@ fn count(fcx: &fictionet::Cx, inner: impl fictionet::Interface, counts: Counts) 
 }
 
 fn main() -> fictionet::Result {
-    let path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
         .unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
+    let _observation = if let Some(path) = args.next() {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        options = options.observer(std::sync::Arc::new(fictionet_observe::Aggregate::new(
+            dashboard.observer(),
+        )));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");
 
-    fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
-        |fcx| async move {
-            let app =
-                axum::Router::new()
-                    .route("/4mb", get(|| async { vec![b'x'; 4 << 20] }))
-                    .route(
-                        "/upload",
-                        post(|body: axum::body::Bytes| async move {
-                            format!("got {} bytes\n", body.len())
-                        }),
-                    )
-                    // The agent sends this body, so keep a limit on it.
-                    .layer(DefaultBodyLimit::max(8 << 20));
+    fictionet::block_on(fictionet::run(options, |fcx| async move {
+        let app = axum::Router::new()
+            .route("/4mb", get(|| async { vec![b'x'; 4 << 20] }))
+            .route(
+                "/upload",
+                post(
+                    |body: axum::body::Bytes| async move { format!("got {} bytes\n", body.len()) },
+                ),
+            )
+            // The agent sends this body, so keep a limit on it.
+            .layer(DefaultBodyLimit::max(8 << 20));
 
-            let slow = attachments.map(&fcx, |fcx, sandbox| {
+        let slow = attachments.map(&fcx, |fcx, sandbox| {
             // Count packets on both sides of the bottleneck. A packet
             // that went in on one side and never came out of the other
             // was dropped by the queue.
@@ -99,12 +116,11 @@ fn main() -> fictionet::Result {
             link
         });
 
-            web::Sites::new(move |host: &str| match host {
-                "example.test" => Some(web::Site::new(app.clone())),
-                _ => None,
-            })
-            .start(&fcx, slow)?;
-            Ok(())
-        },
-    ))
+        web::Sites::new(move |host: &str| match host {
+            "example.test" => Some(web::Site::new(app.clone())),
+            _ => None,
+        })
+        .start(&fcx, slow)?;
+        Ok(())
+    }))
 }

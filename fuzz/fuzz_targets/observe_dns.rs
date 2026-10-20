@@ -1,5 +1,5 @@
 #![no_main]
-use fictionet::observe::protocols::Dns;
+use fictionet_observe::protocols::Dns;
 use fictionet::stdlib::test_support::contract::check_decode;
 use libfuzzer_sys::fuzz_target;
 

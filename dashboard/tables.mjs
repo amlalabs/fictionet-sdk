@@ -1,12 +1,12 @@
+import { renderEvents } from './components/events.mjs';
 // The Fictionet dashboard's tables: tooltip contents, the header's counts,
 // the breadcrumb, and the side panel's sections, lists and event rows.
 // app.mjs passes in the state and view, formatting, the graph's rates and
 // helpers, and the selection, focus and packet steps the rows link to,
 // and calls `refresh` once a frame.
 
-import { $, el } from './dom.mjs';
 
-export function createTables({ state, view, runTime, fmtDuration, fmtBytes, fmtCount, fmtRate, plural, where, nodeLabel, tone, drawnSource, liveRate, dRate, dCounts, dBytesRate, ends, dEdgesOf, groupChain, parentOf, isOpen, select, toggleGroup, applySearch, focusNode, focusGroup, openPackets, openLinks }) {
+export function createTables({ $, el, state, view, runTime, fmtDuration, fmtBytes, fmtCount, fmtRate, plural, where, nodeLabel, tone, drawnSource, liveRate, dRate, dCounts, dBytesRate, ends, dEdgesOf, groupChain, parentOf, isOpen, select, toggleGroup, applySearch, focusNode, focusGroup, openPackets, openLinks }) {
   // ---------------------------------------------------------------------------
   // Tooltip contents
 
@@ -183,39 +183,7 @@ export function createTables({ state, view, runTime, fmtDuration, fmtBytes, fmtC
   }
 
   function eventsList(parent, events) {
-    if (!events.length) {
-      el('p', { class: 'quiet', text: 'Nothing recorded yet. Services record what they see, bottlenecks and LANs the packets they drop, routers the routes they lose, and world code its own events.' }, parent);
-      return;
-    }
-    const ul = el('ul', { class: 'rows' }, parent);
-    for (const n of events.slice(-60).reverse()) {
-      const li = el('li', { class: 'event-row' }, ul);
-      el('time', { text: `${n.at.toFixed(1)}s` }, li);
-      const node = state.nodes.get(n.node) || drawnSource(n);
-      const head = el('span', {}, li);
-      el('span', { class: `kind ${tone(n)}`, text: `${n.source}.${n.kind}` }, head);
-      if (n.task || node) {
-        head.append(' from ');
-        const b = el('button', { class: 'link', type: 'button', text: n.task || node.name }, head);
-        b.title = n.file ? `${n.file}:${n.line}` : '';
-        b.addEventListener('click', () => {
-          if (state.nodes.get(n.node)) focusNode(n.node);
-          else select({ kind: 'ended', id: n.node, event: n });
-        });
-      }
-      el('span', { class: 'text', text: n.summary || eventText(n.fields) }, li);
-    }
-  }
-
-  /// An event's fields as `key value` pairs, or as JSON when they are not
-  /// an object.
-  function eventText(data) {
-    if (data && typeof data === 'object' && !Array.isArray(data)) {
-      return Object.entries(data)
-        .map(([k, v]) => `${k} ${typeof v === 'object' ? JSON.stringify(v) : v}`)
-        .join(', ');
-    }
-    return JSON.stringify(data);
+    renderEvents(parent, events, { el, state, drawnSource, tone, focusNode, select });
   }
 
   /// What group `gid` holds directly: groups, then tasks and sandboxes by
@@ -474,7 +442,7 @@ export function createTables({ state, view, runTime, fmtDuration, fmtBytes, fmtC
     // The side panel is rebuilt when something changed, and once a second
     // for its rates, unless the viewer is pointing at it or typing in it.
     const side = $('side');
-    const busy = side.matches(':hover') || side.contains(document.activeElement);
+    const busy = side.matches(':hover') || side.contains(side.ownerDocument.activeElement);
     if (state.sideDirty || (now - lastSide > 1000 && !busy)) {
       lastSide = now;
       renderSide();

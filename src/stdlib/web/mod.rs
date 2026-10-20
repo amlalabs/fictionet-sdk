@@ -480,13 +480,15 @@
 //!   `handler`, `error`, `redirect`, `misdirected`, `no_host` or
 //!   `cancelled`), its status, and how much of the body was sent, also
 //!   when the client gave up before the answer
-//!   ([`fictionet::stdlib::web::httpd`] lists the fields);
+//!   ([`fictionet::stdlib::web::httpd`] lists the fields); a request that
+//!   `web::proxy` or `web::forward` sent on to the real site also has
+//!   `forwarded`, the origin it went to;
 //! - `http.error`: every connection on port 80 or 443 that ended in an HTTP
 //!   error (`cause`: `protocol`, `timeout` or `transport`);
 //! - `net.blocked`: the packets `Sites` itself drops or refuses, with
 //!   `why` (see [`BlockedWhy`](fictionet::stdlib::world::net::BlockedWhy)),
 //!   `protocol`, `src`, `dst`, `dst_port` and `count`. These are
-//!   repeatable facts: an optional [`Aggregate`](fictionet::events::Aggregate)
+//!   repeatable facts: an optional `fictionet_observe::Aggregate`
 //!   counts a scan or flood within bounded run-time windows.
 //!
 //! Every event names the sandbox it came from; events about a connection
@@ -500,25 +502,25 @@
 //!
 #![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
 //!
-//! The integrator installs observers before running the world. With no observer,
-//! services skip event construction. [`Memory`](fictionet::events::Memory) keeps
-//! a bounded history for grading. Native `fictionet_observe::Jsonl` writes files
-//! and needs an explicit `finish` outside the run. Custom observers must return promptly without calling back
-//! into the world. A grader can install memory and optional repeat aggregation:
+//! Install the observer in `RunOptions` before running the world. With no
+//! observer, services skip event construction. The companion's `Memory` and
+//! `Aggregate` retain events for grading; `Jsonl` exports files. See
+//! [Fictionet Observe](../../../fictionet_observe/index.html) for consumption.
+//! A grader can install bounded memory and repeat aggregation:
 //!
 //! ```
 //! use std::sync::Arc;
 //! use fictionet::{RunOptions, Seed, block_on, lab};
-//! use fictionet::events::{Aggregate, Memory};
-//! let evidence = Arc::new(Memory::default());
+//! use fictionet_observe::{Aggregate, Memory};
+//! let grader = Arc::new(Memory::default());
 //! let options = RunOptions::new(Seed::from_u64(7))
-//!     .observer(Arc::new(Aggregate::new(evidence.clone())));
+//!     .observer(Arc::new(Aggregate::new(grader.clone())));
 //! block_on(lab(options, |fcx| async move {
 //!     // Start the sites and simulated clients here.
 //!     fcx.emit("shop", "order", |event| event.field("item", "pump"));
 //!     Ok(())
 //! }))?;
-//! let events = evidence.checked_all()?;
+//! let events = grader.checked_all()?;
 //! assert!(events.iter().any(|event| event.is("shop", "order")));
 //! # Ok::<(), fictionet::Error>(())
 //! ```
