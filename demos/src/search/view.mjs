@@ -4,64 +4,57 @@ import { engine, ms, made, siteReason, cache, outcome, counts, resultView, tree,
 const OMITTED = { queries: 'searches', results: 'result lists', listed: 'results cut from long lists', pages: 'pages', sites: 'sites', refused: 'refused names', seed_facts: 'seed facts', seed_sites: 'seed sites' };
 
 export function mount(root, services, options) {
-  const { reconcile } = services.dom, { fmtRunMs: time } = services.format;
-  const doc = root.ownerDocument;
+  const { reconcile, listen } = services.dom, { fmtRunMs: time } = services.format;
   root.classList.add('search-content');
-  const el = (tag, text, parent, cls) => {
-    const node = doc.createElement(tag);
-    if (text != null) node.textContent = text;
-    if (cls) node.setAttribute('class', cls);
-    parent?.appendChild(node);
-    return node;
-  };
-  const link = el('link', null, root);
+  const { el } = services.dom.scoped(root);
+  const link = el('link', {}, root);
   link.setAttribute('rel', 'stylesheet'); link.setAttribute('href', '/assets/search/style.css');
-  const box = el('div', null, root, 'search-panel');
-  const intro = el('header', null, box, 'search-intro');
-  el('p', 'Every page here is made up by the world for this run.', intro, 'search-premise');
-  const context = el('div', null, intro, 'search-context');
-  const seed = el('p', 'Waiting for the world’s seed…', context, 'search-seed');
-  const question = el('p', '', context, 'search-question');
-  const disclosure = el('details', null, context);
-  el('summary', 'Question, facts & forwarding policy', disclosure);
-  const fullQuestion = el('p', '', disclosure);
-  const facts = el('p', '', disclosure);
-  const policy = el('div', 'Waiting for forwarding policy…', disclosure);
-  const controls = el('section', null, intro, 'search-generator');
-  el('span', 'stub generator (no model)', controls, 'eyebrow');
-  const toggle = el('button', null, controls, 'switch search-toggle');
+  const box = el('div', { class: 'search-panel' }, root);
+  const intro = el('header', { class: 'search-intro' }, box);
+  el('p', { class: 'search-premise', text: 'Every page here is made up by the world for this run.' }, intro);
+  const context = el('div', { class: 'search-context' }, intro);
+  const seed = el('p', { class: 'search-seed', text: 'Waiting for the world’s seed…' }, context);
+  const question = el('p', { class: 'search-question' }, context);
+  const disclosure = el('details', {}, context);
+  el('summary', { text: 'Question, facts & forwarding policy' }, disclosure);
+  const fullQuestion = el('p', {}, disclosure);
+  const facts = el('p', {}, disclosure);
+  const policy = el('div', { text: 'Waiting for forwarding policy…' }, disclosure);
+  const controls = el('section', { class: 'search-generator' }, intro);
+  el('span', { class: 'eyebrow', text: 'stub generator (no model)' }, controls);
+  const toggle = el('button', { class: 'switch search-toggle' }, controls);
   toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-checked', 'false');
-  const track = el('span', null, toggle, 'switch-track'); track.setAttribute('aria-hidden', 'true');
-  el('span', null, track, 'switch-knob');
-  const toggleLabel = el('span', 'Waiting for generation state…', toggle);
-  const revision = el('small', '', controls);
-  const commandStatus = el('p', '', controls, 'search-command'); commandStatus.setAttribute('role', 'status');
-  const error = el('p', '', box, 'search-error'); error.setAttribute('role', 'status');
-  const meters = el('div', null, box, 'search-counts');
+  const track = el('span', { class: 'switch-track' }, toggle); track.setAttribute('aria-hidden', 'true');
+  el('span', { class: 'switch-knob' }, track);
+  const toggleLabel = el('span', { text: 'Waiting for generation state…' }, toggle);
+  const revision = el('small', {}, controls);
+  const commandStatus = el('p', { class: 'search-command' }, controls); commandStatus.setAttribute('role', 'status');
+  const error = el('p', { class: 'search-error' }, box); error.setAttribute('role', 'status');
+  const meters = el('div', { class: 'search-counts' }, box);
   const countNodes = new Map();
-  const omitted = el('small', '', box, 'search-omitted');
-  const columns = el('div', null, box, 'search-columns');
-  const streamSection = el('section', null, columns, 'search-stream-section');
-  const streamHead = el('header', null, streamSection, 'search-section-head');
-  el('h3', 'Search stream', streamHead);
-  const source = el('p', 'Waiting for searcher…', streamHead, 'eyebrow');
-  const stream = el('div', null, streamSection, 'search-stream');
-  const empty = el('p', 'No searches yet. The web starts with a question.', streamSection, 'note search-empty');
-  const detail = el('section', null, columns, 'search-results');
-  const detailHead = el('header', null, detail, 'search-section-head');
-  const detailTitle = el('h3', 'Results the world made', detailHead);
-  const origin = el('p', 'The newest search’s result list appears here.', detailHead);
-  const resultList = el('ol', null, detail);
-  const treeSection = el('section', null, columns, 'search-tree-section');
-  const treeHead = el('header', null, treeSection, 'search-section-head');
-  el('h3', 'The made-up web', treeHead);
-  el('p', 'Searches → results → links', treeHead, 'eyebrow');
-  const treeList = el('div', null, treeSection, 'search-tree');
-  const treeEmpty = el('p', 'No pages yet. Pages appear here when the world is asked for them.', treeSection, 'note search-empty');
-  const sitesHead = el('h4', 'Sites with no page in the tree', treeSection, 'search-list-head');
-  const otherSites = el('div', null, treeSection, 'search-sites');
-  const refusedHead = el('h4', 'Names the world refused', treeSection, 'search-list-head');
-  const refused = el('div', null, treeSection, 'search-refused');
+  const omitted = el('small', { class: 'search-omitted' }, box);
+  const columns = el('div', { class: 'search-columns' }, box);
+  const streamSection = el('section', { class: 'search-stream-section' }, columns);
+  const streamHead = el('header', { class: 'search-section-head' }, streamSection);
+  el('h3', { text: 'Search stream' }, streamHead);
+  const source = el('p', { class: 'eyebrow', text: 'Waiting for searcher…' }, streamHead);
+  const stream = el('div', { class: 'search-stream' }, streamSection);
+  const empty = el('p', { class: 'note search-empty', text: 'No searches yet. The web starts with a question.' }, streamSection);
+  const detail = el('section', { class: 'search-results' }, columns);
+  const detailHead = el('header', { class: 'search-section-head' }, detail);
+  const detailTitle = el('h3', { text: 'Results the world made' }, detailHead);
+  const origin = el('p', { text: 'The newest search’s result list appears here.' }, detailHead);
+  const resultList = el('ol', {}, detail);
+  const treeSection = el('section', { class: 'search-tree-section' }, columns);
+  const treeHead = el('header', { class: 'search-section-head' }, treeSection);
+  el('h3', { text: 'The made-up web' }, treeHead);
+  el('p', { class: 'eyebrow', text: 'Searches → results → links' }, treeHead);
+  const treeList = el('div', { class: 'search-tree' }, treeSection);
+  const treeEmpty = el('p', { class: 'note search-empty', text: 'No pages yet. Pages appear here when the world is asked for them.' }, treeSection);
+  const sitesHead = el('h4', { class: 'search-list-head', text: 'Sites with no page in the tree' }, treeSection);
+  const otherSites = el('div', { class: 'search-sites' }, treeSection);
+  const refusedHead = el('h4', { class: 'search-list-head', text: 'Names the world refused' }, treeSection);
+  const refused = el('div', { class: 'search-refused' }, treeSection);
   sitesHead.hidden = refusedHead.hidden = true;
   const rows = new Map(), nodes = new Map(), results = new Map(), sites = new Map(), refusals = new Map();
   // Hosts on screen when the panel opened, and hosts that had their moment.
@@ -69,9 +62,8 @@ export function mount(root, services, options) {
   const controller = new AbortController();
   let snapshot, chosen, selectedPage, busy = false, waitingRevision, disposed = false, initialized = false;
   const cleanup = [];
-  const listen = (node, name, fn) => { node.addEventListener(name, fn); cleanup.push(() => node.removeEventListener(name, fn)); };
   const set = (node, value) => { if (node.textContent !== String(value)) node.textContent = value; };
-  const line = (parent, cls) => el('span', '', parent, cls);
+  const line = (parent, cls) => el('span', { class: cls }, parent);
   const stateButton = () => {
     const g = snapshot?.generator;
     // A reply describes one revision; once the switch moves past it, it is history.
@@ -105,7 +97,7 @@ export function mount(root, services, options) {
     render();
     nodes.get(`page:${url}`)?.node.scrollIntoView({ block: 'nearest' });
   }
-  listen(toggle, 'click', async () => {
+  cleanup.push(listen(toggle, 'click', async () => {
     if (toggle.disabled || disposed) return;
     const g = snapshot.generator;
     busy = true; stateButton(); set(commandStatus, 'Waiting for the world…');
@@ -125,12 +117,12 @@ export function mount(root, services, options) {
         set(commandStatus, `The switch changed elsewhere. Current revision ${rejection.current}. No retry was sent.`);
       } else set(commandStatus, e.body?.status === 'timeout' ? 'No reply yet. The command may still apply; read the state before trying again.' : `Command failed: ${e.message}`);
     } finally { if (!disposed) { busy = false; stateButton(); } }
-  });
+  }));
   // One delegated listener per list also covers rows added by later snapshots.
-  const delegate = (parent, action) => listen(parent, 'click', (event) => {
+  const delegate = (parent, action) => cleanup.push(listen(parent, 'click', (event) => {
     let target = event.target;
     while (target && target !== parent) { if (target.dataset?.identity) { action(target.dataset.identity); return; } target = target.parentElement; }
-  });
+  }));
   delegate(stream, (id) => {
     chosen = Number(id); selectedPage = null;
     const q = snapshot?.queries.find((q) => q.id === chosen);
@@ -139,7 +131,7 @@ export function mount(root, services, options) {
   delegate(treeList, (url) => openPage(url));
   delegate(resultList, (url) => openPage(url));
   const card = (cls, parentTag = 'button') => {
-    const node = el(parentTag, null, null, cls);
+    const node = el(parentTag, { class: cls }, null);
     if (parentTag === 'button') node.type = 'button';
     return { node, top: line(node, 'search-row-top'), title: line(node, 'search-row-title'), path: line(node, 'search-row-path'), note: line(node, 'search-row-note') };
   };
@@ -152,15 +144,15 @@ export function mount(root, services, options) {
     stateButton();
     for (const [label, value] of Object.entries(counts(s))) {
       if (!countNodes.has(label)) {
-        const cell = el('div', null, meters);
-        countNodes.set(label, el('b', '', cell)); el('span', label, cell);
+        const cell = el('div', {}, meters);
+        countNodes.set(label, el('b', {}, cell)); el('span', { text: label }, cell);
       }
       set(countNodes.get(label), value);
     }
     const lost = Object.values(s.omitted).reduce((a, b) => a + b, 0);
     set(omitted, lost ? `No longer held here: ${Object.entries(s.omitted).filter(([, n]) => n).map(([k, n]) => `${n} ${OMITTED[k] || k.replaceAll('_', ' ')}`).join(', ')}. The counts describe what is held.` : '');
     empty.hidden = s.queries.length > 0;
-    reconcile(stream, [...s.queries].reverse(), (q) => q.id, () => { const entry = card('search-row'); entry.badge = el('span', '', entry.top, 'pill outline'); entry.meta = el('span', '', entry.top); return entry; }, (entry, q, fresh) => {
+    reconcile(stream, [...s.queries].reverse(), (q) => q.id, () => { const entry = card('search-row'); entry.badge = el('span', { class: 'pill outline' }, entry.top); entry.meta = el('span', {}, entry.top); return entry; }, (entry, q, fresh) => {
       entry.node.dataset.identity = String(q.id);
       entry.node.setAttribute('aria-pressed', String(chosen === q.id));
       set(entry.badge, engine(q.engine));
@@ -180,8 +172,8 @@ export function mount(root, services, options) {
       const following = chosen == null ? `Newest search${q.results > 0 ? ' with results' : ''}; select one to keep it here. ` : '';
       const view = resultView(s, q); set(origin, `${following}${view.origin}`);
       reconcile(resultList, view.rows, (r) => `${q.key}:${r.rank}:${r.url}`, () => {
-        const node = el('li', null, null);
-        return { node, title: line(node, 'search-row-title'), host: line(node, 'search-url'), url: line(node, 'search-path'), note: line(node, 'search-row-note'), open: el('button', '', node, 'search-open') };
+        const node = el('li', {}, null);
+        return { node, title: line(node, 'search-row-title'), host: line(node, 'search-url'), url: line(node, 'search-path'), note: line(node, 'search-row-note'), open: el('button', { class: 'search-open' }, node) };
       }, (entry, r) => {
         set(entry.title, `${r.rank}. ${r.title}`); set(entry.host, r.host); set(entry.url, r.url);
         set(entry.note, r.site ? `${r.site.address} · ${siteReason(r.site.reason)}` : 'No address assignment observed yet');
@@ -232,11 +224,11 @@ export function mount(root, services, options) {
     if (disposed || !value) return;
     set(source, value.searcher);
     policy.replaceChildren();
-    el('p', `Made up: ${value.made_up}`, policy);
-    el('p', 'Forwarded to the real internet for setup:', policy);
-    const list = el('ul', null, policy);
-    value.forwarded.forEach((row) => el('li', `${row.host} — ${row.why}`, list));
-    el('p', `Refused: ${value.refused}`, policy);
+    el('p', { text: `Made up: ${value.made_up}` }, policy);
+    el('p', { text: 'Forwarded to the real internet for setup:' }, policy);
+    const list = el('ul', {}, policy);
+    value.forwarded.forEach((row) => el('li', { text: `${row.host} — ${row.why}` }, list));
+    el('p', { text: `Refused: ${value.refused}` }, policy);
   }, (e) => { if (!disposed) set(policy, `Policy unavailable: ${e.message}`); }));
   cleanup.push(services.state(options.state, ({ value }) => {
     if (disposed || !value) return;

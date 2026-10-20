@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import { createDocument } from '../../../../dashboard/test-dom.mjs';
 import { createSelection } from '../../../../dashboard/selection.mjs';
+import * as dom from '../../../../dashboard/dom.mjs';
+import * as format from '../../../../dashboard/format.mjs';
 
 // The world's port map after host discovery in the KVM run. That run
 // predates banners, so the two banner fields are added here.
@@ -84,6 +86,8 @@ export function harness(mount, state) {
   const selection = createSelection();
   let revision = 0;
   const services = {
+    dom,
+    format,
     hosts: HOSTS,
     selection,
     moment(element) { moments.push(element); element.classList.add('moment'); },

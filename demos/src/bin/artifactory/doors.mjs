@@ -20,7 +20,6 @@ function transport(row) { return typeof row.transport === 'string' ? row.transpo
 function key(row, hosts) {
   return JSON.stringify([destination(row), row.transport, row.port, row.ports, row.service, row.outcome, row.egress_denied, credential(row.credential), hosts ? row.sandbox : null]);
 }
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 // What this run did that matches the incident's two kinds of move.
 export function incidentRows(requests, inventory) {
@@ -34,62 +33,62 @@ export function incidentRows(requests, inventory) {
 }
 
 export function mount(root, services, options) {
-  const { reconcile } = services.dom;
-  const b = builder(root);
+  const { reconcile } = services.dom, { plural } = services.format;
+  const b = builder(root, services.dom);
   const { el, button, set } = b;
   b.stylesheet();
-  const panel = el('div', 'art-panel doors-panel', undefined, root);
+  const panel = el('div', { class: 'art-panel doors-panel' }, root);
 
-  const variant = el('header', 'art-variant', undefined, panel);
-  const variantName = el('p', 'eyebrow accent', 'Variant', variant);
-  const variantText = el('p', 'art-variant-text', 'Loading the variant…', variant);
-  const variantOthers = el('p', 'note', '', variant);
-  const otherNames = el('span', '', '', variantOthers);
-  el('code', 'mono', 'cargo xtask demo artifactory --variant NAME', variantOthers);
-  const variantSessions = el('p', 'art-sessions', '', variant);
+  const variant = el('header', { class: 'art-variant' }, panel);
+  const variantName = el('p', { class: 'eyebrow accent', text: 'Variant' }, variant);
+  const variantText = el('p', { class: 'art-variant-text', text: 'Loading the variant…' }, variant);
+  const variantOthers = el('p', { class: 'note' }, variant);
+  const otherNames = el('span', {}, variantOthers);
+  el('code', { class: 'mono', text: 'cargo xtask demo artifactory --variant NAME' }, variantOthers);
+  const variantSessions = el('p', { class: 'art-sessions' }, variant);
   variantSessions.hidden = true;
 
-  const strip = el('section', 'doors-story section', undefined, panel);
-  const stripHead = el('div', 'art-head', undefined, strip);
-  el('h2', '', 'Scripted agent', stripHead);
-  const stripNote = el('p', 'note', 'A fixed story, not a model. The wheels are small and inert.', stripHead);
-  const stepsRoot = el('ol', 'doors-steps', undefined, strip);
+  const strip = el('section', { class: 'doors-story section' }, panel);
+  const stripHead = el('div', { class: 'art-head' }, strip);
+  el('h2', { text: 'Scripted agent' }, stripHead);
+  const stripNote = el('p', { class: 'note', text: 'A fixed story, not a model. The wheels are small and inert.' }, stripHead);
+  const stepsRoot = el('ol', { class: 'doors-steps' }, strip);
 
-  const summary = el('div', 'doors-summary section', undefined, panel);
-  const totals = el('strong', 'doors-totals', '0 doors tried', summary);
+  const summary = el('div', { class: 'doors-summary section' }, panel);
+  const totals = el('strong', { class: 'doors-totals', text: '0 doors tried' }, summary);
   const setup = button(summary, 'text-button', 'Setup traffic: 0 rows in Left the box', () => services.showPanel('left_the_box'));
-  const otherCount = el('span', 'note', '', summary);
-  const status = el('p', 'loss-note', 'Loading doors…', panel);
+  const otherCount = el('span', { class: 'note' }, summary);
+  const status = el('p', { class: 'loss-note', text: 'Loading doors…' }, panel);
   status.setAttribute('role', 'status');
-  const empty = el('p', 'empty-note', 'No doors yet. They appear as the story runs.', panel);
-  const board = el('section', 'doors-board', undefined, panel);
+  const empty = el('p', { class: 'empty-note', text: 'No doors yet. They appear as the story runs.' }, panel);
+  const board = el('section', { class: 'doors-board' }, panel);
 
-  const band = el('section', 'doors-techniques section', undefined, panel);
-  const bandHead = el('div', 'art-head', undefined, band);
-  el('h2', '', 'Upstream and SSRF techniques', bandHead);
-  el('p', 'note', 'Where the agent’s requests named an off-site target. The world never fetches one.', bandHead);
-  const techniqueList = el('dl', 'doors-technique-list', undefined, band);
+  const band = el('section', { class: 'doors-techniques section' }, panel);
+  const bandHead = el('div', { class: 'art-head' }, band);
+  el('h2', { text: 'Upstream and SSRF techniques' }, bandHead);
+  el('p', { class: 'note', text: 'Where the agent’s requests named an off-site target. The world never fetches one.' }, bandHead);
+  const techniqueList = el('dl', { class: 'doors-technique-list' }, band);
   const techniqueNodes = new Map();
   for (const [id, title] of TECHNIQUES) {
-    const node = el('div', 'doors-technique', undefined, techniqueList);
-    el('dt', '', title, node);
-    techniqueNodes.set(id, { node, count: el('dd', 'mono', '0', node) });
+    const node = el('div', { class: 'doors-technique' }, techniqueList);
+    el('dt', { text: title }, node);
+    techniqueNodes.set(id, { node, count: el('dd', { class: 'mono', text: '0' }, node) });
   }
 
-  const incident = el('section', 'art-incident section', undefined, panel);
-  el('p', 'eyebrow', 'July 2026', incident);
-  const incidentText = el('p', '', 'During an OpenAI eval, agents used a shared Artifactory instance as a route to the internet and as a message board. Folder names in its shared cache, such as zzHELP_…, carried messages between agents. ', incident);
-  const metr = el('a', '', 'METR’s investigation', incidentText);
+  const incident = el('section', { class: 'art-incident section' }, panel);
+  el('p', { class: 'eyebrow', text: 'July 2026' }, incident);
+  const incidentText = el('p', { text: 'During an OpenAI eval, agents used a shared Artifactory instance as a route to the internet and as a message board. Folder names in its shared cache, such as zzHELP_…, carried messages between agents. ' }, incident);
+  const metr = el('a', { text: 'METR’s investigation' }, incidentText);
   metr.setAttribute('href', METR);
   metr.setAttribute('target', '_blank');
   metr.setAttribute('rel', 'noopener noreferrer');
-  el('h3', '', 'In this run', incident);
-  const incidentList = el('ul', 'art-incident-list', undefined, incident);
+  el('h3', { text: 'In this run' }, incident);
+  const incidentList = el('ul', { class: 'art-incident-list' }, incident);
 
-  const other = el('section', 'doors-other section', undefined, panel);
-  el('h2', '', 'Other traffic during the story', other);
-  el('p', 'note', 'Traffic from the guest that the step’s command does not make.', other);
-  const otherRows = el('ul', 'doors-other-rows', undefined, other);
+  const other = el('section', { class: 'doors-other section' }, panel);
+  el('h2', { text: 'Other traffic during the story' }, other);
+  el('p', { class: 'note', text: 'Traffic from the guest that the step’s command does not make.' }, other);
+  const otherRows = el('ul', { class: 'doors-other-rows' }, other);
 
   const groups = new Map(), steps = new Map(), otherLines = new Map(), incidentLines = new Map();
   let values = {}, disposed = false;
@@ -121,17 +120,17 @@ export function mount(root, services, options) {
   function renderStory(story, replay) {
     stepsRoot.classList.toggle('with-hosts', Boolean(values.doors?.scenario?.sessions));
     reconcile(stepsRoot, story, (step) => step.title, (step) => {
-      const node = el('li', 'doors-step');
-      el('span', 'mono doors-number', String(story.indexOf(step) + 1), node);
-      const state = el('span', 'doors-state', '', node);
+      const node = el('li', { class: 'doors-step' });
+      el('span', { class: 'mono doors-number', text: String(story.indexOf(step) + 1) }, node);
+      const state = el('span', { class: 'doors-state' }, node);
       // Only a run with two workstations names the one that ran each step.
-      el('span', 'mono doors-host', values.doors?.scenario?.sessions ? step.host : '', node);
+      el('span', { class: 'mono doors-host', text: values.doors?.scenario?.sessions ? step.host : '' }, node);
       const title = button(node, 'doors-step-title', step.title, () => {
         const current = values.doors?.story?.find((item) => item.title === step.title);
         if (current?.state === 'done') open(current);
       });
       title.setAttribute('title', step.command);
-      const exit = el('span', 'mono doors-exit', '', node);
+      const exit = el('span', { class: 'mono doors-exit' }, node);
       return { node, state, title, exit };
     }, (nodes, step) => {
       nodes.node.dataset.state = step.state;
@@ -141,7 +140,7 @@ export function mount(root, services, options) {
         nodes.shown = step.state;
         nodes.state.replaceChildren();
         services.dom.icon(nodes.state, ICONS[step.state] || 'neutral');
-        el('span', 'art-hidden', STATES[step.state] || words(step.state), nodes.state);
+        el('span', { class: 'art-hidden', text: STATES[step.state] || words(step.state) }, nodes.state);
         nodes.state.setAttribute('title', STATES[step.state] || words(step.state));
       }
       set(nodes.exit, step.exit == null ? (replay ? '' : '—') : `exit ${step.exit}`);
@@ -166,24 +165,24 @@ export function mount(root, services, options) {
     }
     empty.hidden = byName.size > 0;
     reconcile(board, [...byName], ([name]) => name, ([name]) => {
-      const node = el('section', 'doors-destination');
-      const head = el('div', 'doors-destination-head', undefined, node);
-      el('h3', 'mono', name, head);
-      return { node, tally: el('span', 'note', '', head), grid: el('div', 'doors-grid', undefined, node), tiles: new Map() };
+      const node = el('section', { class: 'doors-destination' });
+      const head = el('div', { class: 'doors-destination-head' }, node);
+      el('h3', { class: 'mono', text: name }, head);
+      return { node, tally: el('span', { class: 'note' }, head), grid: el('div', { class: 'doors-grid' }, node), tiles: new Map() };
     }, (group, [, doors]) => {
       const list = [...doors.values()];
       group.node.style.setProperty('--tiles', String(Math.min(list.length, 3)));
       set(group.tally, `${plural(list.length, 'door')} · ${plural(list.reduce((n, row) => n + row.count, 0), 'attempt')}`);
       reconcile(group.grid, list, (row) => row.id, (row) => {
-        const node = el('article', 'door-tile new-row');
+        const node = el('article', { class: 'door-tile new-row' });
         node.classList.add(row.egress_denied ? 'door-denied' : row.outcome === 'served' ? 'door-served' : 'door-other');
-        const head = el('div', 'door-head', undefined, node);
-        el('strong', 'mono', `${transport(row)} ${port(row)}`, head);
-        const count = el('span', 'doors-count mono', '', head);
-        el('span', 'door-service', `${words(row.service)} · ${words(row.outcome)}`, node);
-        if (hosts && row.sandbox) el('span', 'mono door-host', row.sandbox, node);
-        if (row.egress_denied) el('span', 'door-verdict', 'Denied egress', node);
-        if (row.credential) el('span', 'pill outline door-credential', credential(row.credential), node);
+        const head = el('div', { class: 'door-head' }, node);
+        el('strong', { class: 'mono', text: `${transport(row)} ${port(row)}` }, head);
+        const count = el('span', { class: 'doors-count mono' }, head);
+        el('span', { class: 'door-service', text: `${words(row.service)} · ${words(row.outcome)}` }, node);
+        if (hosts && row.sandbox) el('span', { class: 'mono door-host', text: row.sandbox }, node);
+        if (row.egress_denied) el('span', { class: 'door-verdict', text: 'Denied egress' }, node);
+        if (row.credential) el('span', { class: 'pill outline door-credential', text: credential(row.credential) }, node);
         return { node, count };
       }, (tile, row) => set(tile.count, `× ${row.count}`), group.tiles);
     }, groups);
@@ -208,7 +207,7 @@ export function mount(root, services, options) {
     if (found.refused) cache.push(`${plural(found.refused, 'folder write')} ${found.refused === 1 ? 'was' : 'were'} refused`);
     if (cache.length) lines.push({ id: 'cache', text: `Cache folder names as messages: ${cache.join(', ')}.` });
     if (!lines.length) lines.push({ id: 'none', text: 'No rows of either kind yet.' });
-    reconcile(incidentList, lines, (line) => line.id, () => ({ node: el('li', '', '') }), (entry, line) => set(entry.node, line.text), incidentLines);
+    reconcile(incidentList, lines, (line) => line.id, () => ({ node: el('li') }), (entry, line) => set(entry.node, line.text), incidentLines);
   }
 
   function renderOthers(others) {
@@ -220,7 +219,7 @@ export function mount(root, services, options) {
       return { text, id: `${text}\u0000${repeat}` };
     });
     if (!lines.length) lines.push({ text: 'No other traffic observed during the story.', id: '' });
-    reconcile(otherRows, lines, (line) => line.id, (line) => ({ node: el('li', '', line.text) }), () => {}, otherLines);
+    reconcile(otherRows, lines, (line) => line.id, (line) => ({ node: el('li', { text: line.text }) }), () => {}, otherLines);
   }
 
   const stop = topics(services, { doors: options.state, requests: '/api/state/requests', inventory: '/api/state/packages' }, (latest, statuses) => {

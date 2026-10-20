@@ -9,11 +9,11 @@ export function matchingSession(session, rows) {
 }
 export function mount(root, services, options) {
   const { reconcile } = services.dom, { plural, fmtRunMs } = services.format;
-  const el = (tag, text, parent = root, cls = '') => { const n = root.ownerDocument.createElement(tag); n.textContent = text; n.className = cls; parent?.append(n); return n; };
-  const css = el('link', ''); css.rel = 'stylesheet'; css.href = '/assets/border.css';
-  el('h2', 'TLS on the guest link');
-  el('p', 'ClientHello and ServerHello fields from captured TCP bytes. The world offers no post-quantum key exchange. Missing fields stay unknown.');
-  const status = el('p', 'Waiting for captured TLS hellos…'); const rows = el('div', '');
+  const { el } = services.dom.scoped(root);
+  const css = el('link', {}, root); css.rel = 'stylesheet'; css.href = '/assets/border.css';
+  el('h2', { text: 'TLS on the guest link' }, root);
+  el('p', { text: 'ClientHello and ServerHello fields from captured TCP bytes. The world offers no post-quantum key exchange. Missing fields stay unknown.' }, root);
+  const status = el('p', { text: 'Waiting for captured TLS hellos…' }, root); const rows = el('div', {}, root);
   let capture, facts = [];
   const sessions = new Map();
   function render() {
@@ -22,7 +22,7 @@ export function mount(root, services, options) {
     status.textContent = `${plural(value.sessions.length, 'retained session')} · older sessions dropped: ${value.dropped} · packets lost: ${value.lost}${state?.too_large ? ' · publication exceeded its limit' : ''}`;
     // A session keeps its element, so one the viewer closed stays closed.
     reconcile(rows, value.sessions.toReversed(), (s) => JSON.stringify([s.at_ms, s.sandbox, s.client, s.server]), () => {
-      const node = el('details', '', null, 'border-inspector-session');
+      const node = el('details', { class: 'border-inspector-session' }, null);
       node.open = true;
       return { node, shown: '' };
     }, (entry, s) => {
@@ -32,28 +32,28 @@ export function mount(root, services, options) {
   }
   function session(item, s) {
     item.replaceChildren();
-    el('summary', `${fmtRunMs(s.at_ms)} · ${s.client} → ${s.server}`, item);
-    el('p', `Captured on ${s.sandbox}’s link · capture or decoding gaps: ${s.gaps}`, item);
+    el('summary', { text: `${fmtRunMs(s.at_ms)} · ${s.client} → ${s.server}` }, item);
+    el('p', { text: `Captured on ${s.sandbox}’s link · capture or decoding gaps: ${s.gaps}` }, item);
     const fact = matchingSession(s, facts);
-    el('p', `SNI: ${s.offered?.sni || fact?.sni || 'not captured'}`, item);
-    el('p', fact ? `Answered by ${fact.identity === 'bank' ? 'the bank' : fact.identity === 'impostor' ? 'the impostor’s machine' : 'machine'} ${fact.endpoint.machine}, at ${fact.endpoint.reached} · ${fact.outcome} · approximate match by addresses and ports to connection ${fact.connection ?? 'unknown'}.` : 'Answering machine not matched to an observed TLS session.', item);
-    el('p', `Legacy version fields: client ${s.offered ? named(s.offered.legacy_version, 'versions') : 'not captured'} · server ${s.chosen ? named(s.chosen.legacy_version, 'versions') : 'not captured'}`, item);
-    const table = el('table', '', item, 'border-tls-table');
-    const head = el('tr', '', el('thead', '', table));
-    for (const text of ['Identifier', 'Offered', 'Chosen']) el('th', text, head);
-    const body = el('tbody', '', table);
+    el('p', { text: `SNI: ${s.offered?.sni || fact?.sni || 'not captured'}` }, item);
+    el('p', { text: fact ? `Answered by ${fact.identity === 'bank' ? 'the bank' : fact.identity === 'impostor' ? 'the impostor’s machine' : 'machine'} ${fact.endpoint.machine}, at ${fact.endpoint.reached} · ${fact.outcome} · approximate match by addresses and ports to connection ${fact.connection ?? 'unknown'}.` : 'Answering machine not matched to an observed TLS session.' }, item);
+    el('p', { text: `Legacy version fields: client ${s.offered ? named(s.offered.legacy_version, 'versions') : 'not captured'} · server ${s.chosen ? named(s.chosen.legacy_version, 'versions') : 'not captured'}` }, item);
+    const table = el('table', { class: 'border-tls-table' }, item);
+    const head = el('tr', {}, el('thead', {}, table));
+    for (const text of ['Identifier', 'Offered', 'Chosen']) el('th', { text: text }, head);
+    const body = el('tbody', {}, table);
     for (const [label, key] of [['Versions', 'versions'], ['Cipher suites', 'ciphers'], ['Groups', 'groups'], ['Key shares', 'key_shares']]) {
-      const group = el('tr', '', body, 'border-tls-group'); el('th', label, group).colSpan = 3;
+      const group = el('tr', { class: 'border-tls-group' }, body); el('th', { text: label }, group).colSpan = 3;
       const offered = s.offered?.[key] || [], chosen = s.chosen?.[key] || [];
       const union = [...new Set([...offered, ...chosen])];
-      if (!union.length) el('td', 'Not present in captured hellos', el('tr', '', body)).colSpan = 3;
+      if (!union.length) el('td', { text: 'Not present in captured hellos' }, el('tr', {}, body)).colSpan = 3;
       for (const n of union) {
-        const row = el('tr', '', body); el('td', named(n, key), row);
-        el('td', offered.includes(n) ? 'yes' : '—', row);
-        el('td', chosen.includes(n) ? 'yes' : '—', row);
+        const row = el('tr', {}, body); el('td', { text: named(n, key) }, row);
+        el('td', { text: offered.includes(n) ? 'yes' : '—' }, row);
+        el('td', { text: chosen.includes(n) ? 'yes' : '—' }, row);
       }
     }
-    if (!s.offered || !s.chosen) el('p', 'A complete hello was not captured for both directions.', item);
+    if (!s.offered || !s.chosen) el('p', { text: 'A complete hello was not captured for both directions.' }, item);
   }
   const failed = error => { status.textContent = `Could not read TLS captures: ${error.message}`; };
   const stops = [services.state(options.state, snapshot => { if (snapshot.value) { capture = snapshot; render(); } }, failed), services.state('/api/state/border', ({value}) => { facts = value?.tls?.rows || []; render(); }, failed)];

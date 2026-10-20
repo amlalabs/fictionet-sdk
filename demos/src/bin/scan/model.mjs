@@ -9,21 +9,9 @@ export const OFFICE = '/api/state/office';
 // Port row states as the world's tap names them, and "idle" for no probe.
 export const STATES = ['open', 'closed', 'unreachable', 'unanswered', 'idle'];
 
-// An element with text set as text, never markup.
-export function element(document, tag, className, text, parent) {
-  const node = document.createElement(tag);
-  if (className) node.setAttribute('class', className);
-  if (text !== undefined) node.textContent = String(text);
-  parent?.appendChild(node);
-  return node;
-}
-
-// Loads the panels' stylesheet inside a panel root.
-export function stylesheet(document, root) {
-  const link = element(document, 'link', '', undefined, root);
-  link.setAttribute('rel', 'stylesheet');
-  link.setAttribute('href', '/assets/scan/scan.css');
-  return link;
+// Loads the panels' stylesheet inside a panel root, with the page's `el`.
+export function stylesheet(el, root) {
+  return el('link', { rel: 'stylesheet', href: '/assets/scan/scan.css' }, root);
 }
 
 const answered = (state) => state === 'open' || state === 'closed';

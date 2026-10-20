@@ -1,40 +1,39 @@
 // The Services panel: one row per open port, with the banner the world's
 // tap saw on the wire beside nmap's name, product and version, and nmap's
 // OS guess for each host. Everything from nmap is labeled "nmap says".
-import { element, stylesheet, hosts, services as nmapNames, osGuess, version, banners as wireBanners, count, server, OFFICE, PORTS } from './model.mjs';
+import { stylesheet, hosts, services as nmapNames, osGuess, version, banners as wireBanners, count, server, OFFICE, PORTS } from './model.mjs';
 
 export function mount(root, services, options) {
-  const document = root.ownerDocument;
-  const el = (tag, className, text, parent) => element(document, tag, className, text, parent);
-  stylesheet(document, root);
-  const panel = el('div', 'scan-panel services-panel', undefined, root);
-  el('p', 'scan-muted services-intro', 'A banner is the first data an open port sent to the scanner, as the world saw it on the wire. Service names, versions and OS guesses are what nmap says.', panel);
-  const notes = el('p', 'loss-note', '', panel);
+  const { el } = services.dom.scoped(root);
+  stylesheet(el, root);
+  const panel = el('div', { class: 'scan-panel services-panel' }, root);
+  el('p', { class: 'scan-muted services-intro', text: 'A banner is the first data an open port sent to the scanner, as the world saw it on the wire. Service names, versions and OS guesses are what nmap says.' }, panel);
+  const notes = el('p', { class: 'loss-note' }, panel);
   notes.setAttribute('role', 'status');
-  const empty = el('p', 'empty-note', 'No host has answered yet. Each open port gets a row as nmap finds it.', panel);
-  const table = el('table', 'data-table services-table', undefined, panel);
-  const head = el('thead', '', undefined, table);
-  const groupRow = el('tr', 'services-group-row', undefined, head);
-  el('th', '', '', groupRow).setAttribute('colspan', '2');
-  const nmapHead = el('th', 'nmap-says', 'nmap says', groupRow);
+  const empty = el('p', { class: 'empty-note', text: 'No host has answered yet. Each open port gets a row as nmap finds it.' }, panel);
+  const table = el('table', { class: 'data-table services-table' }, panel);
+  const head = el('thead', {}, table);
+  const groupRow = el('tr', { class: 'services-group-row' }, head);
+  el('th', {}, groupRow).setAttribute('colspan', '2');
+  const nmapHead = el('th', { class: 'nmap-says', text: 'nmap says' }, groupRow);
   nmapHead.setAttribute('colspan', '3');
   nmapHead.setAttribute('scope', 'colgroup');
-  const labels = el('tr', '', undefined, head);
-  for (const label of ['Port', 'Banner on the wire', 'Service', 'Product', 'Version']) el('th', '', label, labels).setAttribute('scope', 'col');
+  const labels = el('tr', {}, head);
+  for (const label of ['Port', 'Banner on the wire', 'Service', 'Product', 'Version']) el('th', { text: label }, labels).setAttribute('scope', 'col');
   let map = null, reports = null, mapStatus = null, reportStatus = null, replay = false, drawn = '';
   const seen = new Set();
 
   function osLine(parent, addr) {
     const guess = osGuess(reports, addr);
-    const line = el('span', 'services-os', undefined, parent);
+    const line = el('span', { class: 'services-os' }, parent);
     if (!guess) {
-      el('span', 'scan-muted', 'OS detection has not run yet', line);
+      el('span', { class: 'scan-muted', text: 'OS detection has not run yet' }, line);
       return;
     }
-    el('span', 'nmap-says', guess.none ? 'nmap made no match' : 'nmap says', line);
+    el('span', { class: 'nmap-says', text: guess.none ? 'nmap made no match' : 'nmap says' }, line);
     if (guess.none) return;
-    el('b', 'services-os-name', ` ${guess.name}`, line);
-    el('span', 'scan-muted', ` · ${guess.accuracy}%${guess.more ? ` · ${count(guess.more, 'other guess', 'other guesses')}` : ''}`, line);
+    el('b', { class: 'services-os-name', text: ` ${guess.name}` }, line);
+    el('span', { class: 'scan-muted', text: ` · ${guess.accuracy}%${guess.more ? ` · ${count(guess.more, 'other guess', 'other guesses')}` : ''}` }, line);
   }
 
   function draw() {
@@ -62,41 +61,41 @@ export function mount(root, services, options) {
     drawn = shown;
     for (const body of table.querySelectorAll('tbody')) body.remove();
     for (const machine of machines) {
-      const body = el('tbody', 'services-host', undefined, table);
-      const top = el('tr', 'services-host-row', undefined, body);
-      const cell = el('th', '', undefined, top);
+      const body = el('tbody', { class: 'services-host' }, table);
+      const top = el('tr', { class: 'services-host-row' }, body);
+      const cell = el('th', {}, top);
       cell.setAttribute('colspan', '5');
       cell.setAttribute('scope', 'rowgroup');
-      const title = el('span', 'ports-title', undefined, cell);
-      el('b', '', machine.name, title);
-      el('span', 'office-addr', machine.addr, title);
-      el('span', machine.kind === 'real' ? 'scan-badge' : 'scan-muted', machine.kind === 'real' ? server(replay) : machine.kind === 'simulated' ? 'Simulated by the world' : 'Not one of the world\'s machines', title);
+      const title = el('span', { class: 'ports-title' }, cell);
+      el('b', { text: machine.name }, title);
+      el('span', { class: 'office-addr', text: machine.addr }, title);
+      el('span', { class: machine.kind === 'real' ? 'scan-badge' : 'scan-muted', text: machine.kind === 'real' ? server(replay) : machine.kind === 'simulated' ? 'Simulated by the world' : 'Not one of the world\'s machines' }, title);
       osLine(cell, machine.addr);
       const ports = [...open.get(machine.addr)].sort((a, b) => a - b);
       if (!ports.length) {
-        const none = el('tr', '', undefined, body);
-        el('td', 'scan-muted', 'No open port seen yet.', none).setAttribute('colspan', '5');
+        const none = el('tr', {}, body);
+        el('td', { class: 'scan-muted', text: 'No open port seen yet.' }, none).setAttribute('colspan', '5');
         continue;
       }
       for (const port of ports) {
         const key = `${machine.addr}:${port}`;
-        const tr = el('tr', '', undefined, body);
+        const tr = el('tr', {}, body);
         if (!seen.has(key)) {
           seen.add(key);
           tr.classList.add('new-row');
         }
-        el('td', 'numeric services-port', `${port}/tcp`, tr);
+        el('td', { class: 'numeric services-port', text: `${port}/tcp` }, tr);
         const banner = kept.get(key);
-        const wire = el('td', 'services-banner', undefined, tr);
+        const wire = el('td', { class: 'services-banner' }, tr);
         if (banner) {
-          el('span', 'services-banner-text', banner.text, wire);
-          if (banner.server) el('span', 'services-banner-server', `Server: ${banner.server}`, wire);
+          el('span', { class: 'services-banner-text', text: banner.text }, wire);
+          if (banner.server) el('span', { class: 'services-banner-server', text: `Server: ${banner.server}` }, wire);
         } else {
-          el('span', 'scan-muted', 'none seen yet', wire);
+          el('span', { class: 'scan-muted', text: 'none seen yet' }, wire);
         }
         const named = names.get(key);
         for (const value of [named?.service, named?.product, named && version(named)]) {
-          el('td', 'services-nmap', value || '—', tr).setAttribute('title', 'nmap says');
+          el('td', { class: 'services-nmap', text: value || '—' }, tr).setAttribute('title', 'nmap says');
         }
       }
     }
