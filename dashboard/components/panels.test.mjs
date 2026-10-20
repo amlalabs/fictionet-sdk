@@ -186,6 +186,20 @@ test('after the run stopped, event tables and custom panels say so instead of a 
   await settle();
   assert.equal(panel.root.textContent, 'Could not open Plant: the run has stopped, so the panel can no longer be loaded');
   stop();
+  const rows = fixture();
+  rows.services.stopped = () => true;
+  const close = table(rows.root, rows.services, { state: '/api/state/rows', columns: [{ label: 'Name', pointer: '/name' }] });
+  rows.fail(new Error('The run has stopped, so its state can no longer be loaded'));
+  assert.equal(rows.root.querySelector('.loss-note').textContent, 'The run has stopped, so these rows can no longer be loaded.');
+  close();
+});
+
+test('a table that cannot load its state while the run goes says why', () => {
+  const h = fixture();
+  const close = table(h.root, h.services, { state: '/api/state/rows', columns: [{ label: 'Name', pointer: '/name' }] });
+  h.fail(new Error('no such state topic: "rows"'));
+  assert.equal(h.root.querySelector('.loss-note').textContent, 'Could not load rows: no such state topic: "rows"');
+  close();
 });
 
 test('custom panels dispose a late mount and reject foreign module paths', async () => {

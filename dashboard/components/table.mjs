@@ -87,6 +87,8 @@ export function mount(root, services, options) {
     const value = snapshot.value;
     render(body, Array.isArray(value) ? value : value === null ? [] : [value], options.columns);
     status.textContent = snapshot.status?.too_large ? 'This state exceeded its size limit. The last complete rows are shown.' : '';
-  }, (error) => { status.textContent = `Could not load rows: ${error.message}`; });
+  }, (error) => {
+    status.textContent = services.stopped?.() ? 'The run has stopped, so these rows can no longer be loaded.' : `Could not load rows: ${error.message}`;
+  });
   return () => { stop(); root.replaceChildren(); };
 }
