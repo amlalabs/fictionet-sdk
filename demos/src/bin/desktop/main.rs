@@ -68,6 +68,7 @@ fn main() -> ExitCode {
 
 async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
     let total = Instant::now();
+    let (logins, store) = world::Logins::load().map_err(boxed)?;
     let loaded = Arc::new(AtomicBool::new(false));
     let agents = StateTopic::<Vec<Value>>::new(StateLimits::default());
     let table = agents.clone();
@@ -125,7 +126,7 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
         }))
         .world(move |fcx, world| async move {
             let _ = world_clock.send(fcx.clone());
-            world::start(fcx, world, SITE.into(), commands).await
+            world::start(fcx, world, SITE.into(), commands, logins, store).await
         });
     // Screenshots survive the run (the run dir does not).
     let shots = downloads.join("shots");
@@ -156,7 +157,7 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
             install\n",
         kit::jump::JUMP_ADDR
     );
-    let result = run_checks(&run, &loaded, &shots, &agents, &cx)
+    let result = run_checks(&run, &loaded, &shots, &agents, &cx, logins)
         .await
         .map(|checks| (ssh_ready_ms, checks));
     if result.is_err() {
@@ -213,6 +214,7 @@ async fn run_checks(
     shots: &Path,
     agents: &StateTopic<Vec<Value>>,
     cx: &fictionet::Cx,
+    logins: world::Logins,
 ) -> Result<Checks, Error> {
     let workstation = run.guest(HOSTNAME);
     let session = workstation.ssh();
@@ -222,7 +224,7 @@ async fn run_checks(
     trust_checks(session, loaded, &mut failures).await?;
     agent_checks(session, agents, cx, &mut failures).await?;
     let screenshots = screen_checks(run, shots, &mut failures).await?;
-    let agents_install = agent_tls_checks(session, run.page_url(), &mut failures).await?;
+    let agents_install = agent_tls_checks(session, run.page_url(), &mut failures, logins).await?;
     failures.extend(run.containment().await.err());
     let peak_rss_mib = workstation.vm().peak_rss_mib().unwrap_or(0);
     if !failures.is_empty() {
@@ -531,6 +533,7 @@ async fn agent_tls_checks(
     session: &ssh::Session,
     page_url: &str,
     failures: &mut Vec<std::io::Error>,
+    logins: world::Logins,
 ) -> Result<String, Error> {
     let task = guest_cmd(
         session,
@@ -606,7 +609,7 @@ async fn agent_tls_checks(
         .err(),
     );
     codex_checks(session, &page, failures).await?;
-    stop_checks(session, &page, failures).await?;
+    stop_checks(session, &page, failures, logins).await?;
     let agents = guest_cmd(
         session,
         "sudo grep -h '^coding agents:' /var/log/cloud-init-output.log || echo 'coding agents: \
@@ -674,6 +677,13 @@ async fn codex_checks(
                         ))))
         })
         .await?;
+    failures.extend(
+        check(
+            "Codex refreshes its model catalog without an error",
+            !codex.stdout.contains("failed to refresh available models"),
+        )
+        .err(),
+    );
     let output = codex.stdout.to_lowercase();
     failures.extend(
         check(
@@ -741,6 +751,7 @@ async fn stop_checks(
     session: &ssh::Session,
     page: &PageClient,
     failures: &mut Vec<std::io::Error>,
+    logins: world::Logins,
 ) -> Result<(), Error> {
     page.command("model", "pause-for-stop-check", json!("pause"))
         .await?;
@@ -772,30 +783,48 @@ async fn stop_checks(
             .is_some_and(|path| path.ends_with("/messages") || path.ends_with("/responses"));
     }
     failures.extend(check("paused calls never reach a provider", !forwarded).err());
-    // A world with a subscription login stops with that plan's limit instead.
-    if !Path::new(".ax/credentials.redb").exists() {
-        failures.extend(
-            check(
-                "Claude Code shows Anthropic's workspace spend limit",
-                claude.code != 0
-                    && claude
-                        .stdout
-                        .contains("You have reached your specified workspace API usage limits"),
-            )
-            .err(),
-        );
-        failures.extend(
-            check(
-                "Codex shows OpenAI's quota error",
-                codex.code != 0
-                    && codex
-                        .stdout
-                        .contains("Quota exceeded. Check your plan and billing details."),
-            )
-            .err(),
-        );
+    for ((name, result, message), provider) in [
+        (
+            "Claude Code shows its limit error",
+            &claude,
+            logins.stop_messages()[0],
+        ),
+        (
+            "Codex shows its limit error",
+            &codex,
+            logins.stop_messages()[1],
+        ),
+    ]
+    .into_iter()
+    .zip(logins.provider_hosts())
+    {
+        if let Some(message) = message {
+            let refused = page
+                .find_event(&mut start.clone(), |event| {
+                    Ok(budget_refusal(event, provider))
+                })
+                .await?;
+            failures.extend(
+                check(
+                    name,
+                    stopped(result.code, &result.stdout, message) && refused.is_some(),
+                )
+                .err(),
+            );
+        }
     }
     Ok(())
+}
+
+fn stopped(code: i32, output: &str, message: &str) -> bool {
+    code != 0 && output.contains(message)
+}
+
+fn budget_refusal(event: &Value, provider: &str) -> bool {
+    event["source"] == "model"
+        && event["kind"] == "refused"
+        && event["fields"]["provider"] == provider
+        && event["fields"]["reason"] == "budget"
 }
 
 async fn probe(

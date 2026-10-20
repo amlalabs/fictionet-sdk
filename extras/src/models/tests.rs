@@ -343,3 +343,204 @@ fn cached_input_counts_once_toward_budget() {
         }
     }
 }
+
+async fn catalog_request(cx: &Cx, site: Model, request: Request<Body>) -> Response<Bytes> {
+    use fictionet::stdlib::network::{ConnectionExt, ip, tcp};
+    use fictionet::stdlib::world::net;
+    use std::net::{Ipv4Addr, SocketAddr};
+    let (attacher, attachments) = fictionet::attachments();
+    net::Net::new()
+        .host("catalog", |host| {
+            host.at(Ipv4Addr::new(198, 18, 0, 1))
+                .dns_name("chatgpt.com")
+                .port_server(80, httpd::Server::new(site))
+        })
+        .start(cx, attachments)
+        .unwrap();
+    let end = attacher.attach("client").unwrap();
+    let (t, _u, _i, _o) = ip::split_protocols(cx, end);
+    let mut conn = tcp::endpoint(cx, t, Ipv4Addr::new(10, 0, 0, 2).into())
+        .connect(cx, SocketAddr::from(([198, 18, 0, 1], 80)))
+        .await
+        .unwrap();
+    let mut wire = format!(
+        "{} {} HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\n",
+        request.method(),
+        request.uri()
+    );
+    for (name, value) in request.headers() {
+        wire.push_str(&format!("{name}: {}\r\n", value.to_str().unwrap()));
+    }
+    wire.push_str("Content-Length: 0\r\n\r\n");
+    conn.write_all(cx, wire.as_bytes()).await.unwrap();
+    let mut decoder = fictionet::stdlib::protocols::http1::Responses::new();
+    decoder.expect_method(request.method().as_str()).unwrap();
+    let mut stream = fictionet::stdlib::codec::Stream::new(decoder);
+    let decoded = loop {
+        if let Some(response) = stream.next() {
+            break response.unwrap();
+        }
+        let mut buf = [0; 4096];
+        let n = conn.read(cx, &mut buf).await.unwrap();
+        assert_ne!(n, 0, "catalog connection ended before its response");
+        assert_eq!(stream.push(&buf[..n]), n);
+    };
+    let mut response = Response::builder().status(decoded.head.status);
+    for header in decoded.head.headers {
+        response = response.header(header.name, header.value);
+    }
+    response.body(Bytes::from(decoded.body)).unwrap()
+}
+
+#[test]
+fn codex_catalog_answer_checks_credentials_and_passes_a_pause() {
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(31)),
+        |cx| async move {
+            let model = Model::at(
+                &cx,
+                Provider::OpenAi,
+                Credential::api_key(&cx, Secret::new("OPENAI_API_KEY", "sk-private".into())?),
+                "http://127.0.0.1:1".parse()?,
+            )?
+            .budget(Budget::new().calls(0));
+            model.pause(true);
+            let catalog = Bytes::from_static(br#"{"models":[]}"#);
+            let site = model.codex_catalog("http://127.0.0.1:1".parse()?, Some(catalog.clone()))?;
+            let request = |method, path, bearer: &str| {
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", bearer)
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let bearer = model.credential.wire(Provider::OpenAi, false);
+            let response = catalog_request(
+                &cx,
+                site.clone(),
+                request(
+                    "GET",
+                    "/backend-api/codex/models?client_version=0.163.0",
+                    &bearer,
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            assert_eq!(response.into_body(), catalog);
+            assert_eq!(
+                catalog_request(
+                    &cx,
+                    site.clone(),
+                    request("GET", "/backend-api/codex/models", "Bearer wrong")
+                )
+                .await
+                .status(),
+                401
+            );
+            for (method, path) in [
+                ("POST", "/backend-api/codex/responses"),
+                ("GET", "/backend-api/wham/usage"),
+                ("POST", "/backend-api/codex/models"),
+            ] {
+                assert_eq!(
+                    catalog_request(&cx, site.clone(), request(method, path, &bearer))
+                        .await
+                        .status(),
+                    404
+                );
+            }
+            assert_eq!(model.ledger.lock().unwrap().calls, 0);
+            cx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn codex_catalog_forward_swaps_key_and_preserves_response() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap().to_lowercase();
+        assert!(
+            head.starts_with("get /backend-api/codex/models?client_version=0.163.0 http/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("authorization: bearer sk-private\r\n"));
+        assert!(head.contains("if-none-match: old-catalog\r\n"));
+        assert!(!head.contains("guest-cookie"));
+        let body = r#"{"models":[],"message":"sk-private"}"#;
+        write!(socket, "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nETag: catalog-version\r\nX-Message: sk-private\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(32)),
+        |cx| async move {
+            let model = Model::at(
+                &cx,
+                Provider::OpenAi,
+                Credential::api_key(&cx, Secret::new("OPENAI_API_KEY", "sk-private".into())?),
+                "http://127.0.0.1:1".parse()?,
+            )?
+            .budget(Budget::new().calls(0));
+            model.pause(true);
+            let site = model.codex_catalog(format!("http://{address}").parse()?, None)?;
+            let request = |bearer: String| {
+                Request::get("/backend-api/codex/models?client_version=0.163.0")
+                    .header("authorization", bearer)
+                    .header("if-none-match", "old-catalog")
+                    .header("cookie", "guest-cookie")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            assert_eq!(
+                catalog_request(&cx, site.clone(), request("Bearer wrong".into()))
+                    .await
+                    .status(),
+                401
+            );
+            let model_call = Request::post("/backend-api/codex/responses")
+                .header(
+                    "authorization",
+                    model.credential.wire(Provider::OpenAi, false),
+                )
+                .body(Body::empty())?;
+            assert_eq!(
+                catalog_request(&cx, site.clone(), model_call)
+                    .await
+                    .status(),
+                404
+            );
+            let response = catalog_request(
+                &cx,
+                site,
+                request(model.credential.wire(Provider::OpenAi, false)),
+            )
+            .await;
+            assert_eq!(response.status(), 202);
+            assert_eq!(response.headers()["etag"], "catalog-version");
+            assert_eq!(response.headers()["x-message"], "<OPENAI_API_KEY>");
+            let body = response.into_body();
+            let decoded: Value = serde_json::from_slice(&body)?;
+            assert_eq!(decoded["message"], "<OPENAI_API_KEY>");
+            assert_eq!(model.ledger.lock().unwrap().calls, 0);
+            cx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+    upstream.join().unwrap();
+}

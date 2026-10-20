@@ -63,11 +63,147 @@ pub enum Command {
     Budget(models::Budget),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Login {
+    Subscription,
+    ApiKey,
+    OpenRouter,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Logins {
+    pub claude: Login,
+    pub codex: Login,
+}
+
+impl Logins {
+    pub fn choose(
+        store: Option<&models::oauth::Store>,
+        has_key: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
+        let choose = |login, key| -> Result<Login> {
+            let subscribed = store
+                .map(|store| store.has_login(login))
+                .transpose()?
+                .unwrap_or(false);
+            Ok(if subscribed {
+                Login::Subscription
+            } else if has_key(key) {
+                Login::ApiKey
+            } else if has_key("OPENROUTER_API_KEY") {
+                Login::OpenRouter
+            } else {
+                Login::None
+            })
+        };
+        Ok(Self {
+            claude: choose(models::oauth::Login::Claude, "ANTHROPIC_API_KEY")?,
+            codex: choose(models::oauth::Login::Codex, "OPENAI_API_KEY")?,
+        })
+    }
+
+    pub fn load() -> Result<(Self, Option<Arc<models::oauth::Store>>)> {
+        let path = std::path::Path::new(".ax/credentials.redb");
+        let store = if path.exists() {
+            Some(models::oauth::Store::open(path)?)
+        } else {
+            None
+        };
+        let logins = Self::choose(store.as_deref(), |key| std::env::var_os(key).is_some())?;
+        Ok((logins, store))
+    }
+
+    pub fn stop_messages(self) -> [Option<&'static str>; 2] {
+        [
+            match self.claude {
+                // @anthropic-ai/claude-code-linux-x64 2.1.292, package/claude:
+                // embedded JavaScript mwe.five_hour, _Dn and Ck format this prefix.
+                Login::Subscription => Some("You've hit your session limit"),
+                Login::ApiKey | Login::OpenRouter => {
+                    Some("You have reached your specified workspace API usage limits")
+                }
+                Login::None => None,
+            },
+            match self.codex {
+                // github.com/openai/codex, rust-v0.163.0:
+                // codex-rs/protocol/src/error.rs, UsageLimitReachedError::fmt.
+                Login::Subscription => Some("You’ve hit your usage limit."),
+                Login::ApiKey | Login::OpenRouter => {
+                    Some("Quota exceeded. Check your plan and billing details.")
+                }
+                Login::None => None,
+            },
+        ]
+    }
+
+    pub fn provider_hosts(self) -> [&'static str; 2] {
+        [
+            "api.anthropic.com",
+            if self.codex == Login::Subscription {
+                "chatgpt.com"
+            } else {
+                "api.openai.com"
+            },
+        ]
+    }
+}
+
+fn chatgpt_model(
+    codex: &models::Model,
+    subscription: bool,
+    catalog: Option<bytes::Bytes>,
+) -> Result<models::Model> {
+    if subscription {
+        Ok(codex.clone())
+    } else {
+        codex.codex_catalog("https://chatgpt.com".parse()?, catalog)
+    }
+}
+
+async fn bundled_catalog(cx: &Cx) -> Result<bytes::Bytes> {
+    use http_body_util::BodyExt;
+    use tower_service::Service;
+    let version = super::guest::CODEX_VERSION;
+    let mut forward = web::forward(
+        cx,
+        "https://raw.githubusercontent.com".parse()?,
+        Arc::new(fictionet_host::Client::new()),
+    )?;
+    let request = http::Request::get(format!(
+        "/openai/codex/rust-v{version}/codex-rs/models-manager/models.json"
+    ))
+    .header("host", "raw.githubusercontent.com")
+    .body(web::Body::empty())?;
+    let fetch = async {
+        let response = forward.call(request).await?;
+        if !response.status().is_success() {
+            return Err(fictionet::Error::msg(format!(
+                "GitHub returned {}",
+                response.status()
+            )));
+        }
+        let body = response.into_body().collect().await?.to_bytes();
+        let decoded: serde_json::Value = serde_json::from_slice(&body)?;
+        if !decoded["models"].is_array() {
+            return Err(fictionet::Error::msg("catalog has no models array"));
+        }
+        Ok(body)
+    };
+    fetch.await.map_err(|error: fictionet::Error| {
+        fictionet::Error::msg(format!(
+            "Could not load Codex {version} bundled model catalog from GitHub: {error}"
+        ))
+    })
+}
+
 pub async fn start(
     fcx: Cx,
     mut world: kit::World,
     site: String,
     commands: CommandPort<Command, bool>,
+    logins: Logins,
+    store: Option<Arc<models::oauth::Store>>,
 ) -> Result {
     let now_unix = world.now_unix();
     let now_sys = SystemTime::UNIX_EPOCH + Duration::from_secs(now_unix as u64);
@@ -90,19 +226,11 @@ pub async fn start(
     let handler = adaptive_web_world::handler::Handler::new(&fcx, pages.clone());
     let codex_pages = pages.clone();
     let model_cfg = z.server_config(&fcx, &["api.anthropic.com"], now_sys)?;
-    let store = std::path::Path::new(".ax/credentials.redb");
-    let store = if store.exists() {
-        Some(models::oauth::Store::open(store)?)
-    } else {
-        None
-    };
-    let oauth = if let Some(store) = store.as_ref()
-        && store.has_login(models::oauth::Login::Claude)?
-    {
+    let oauth = if logins.claude == Login::Subscription {
         Some(models::oauth::OAuth::new(
             &fcx,
             models::oauth::Login::Claude,
-            store.clone(),
+            store.as_ref().expect("selected subscription store").clone(),
         )?)
     } else {
         None
@@ -112,9 +240,9 @@ pub async fn start(
         let model = models::Model::oauth(&fcx, oauth.clone()).await?;
         world.seed_home_files(oauth.guest_files()?)?;
         (Some(model), "claude-haiku-4-5-20251001")
-    } else if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+    } else if logins.claude == Login::ApiKey {
         (Some(models::anthropic(&fcx)?), "claude-haiku-4-5-20251001")
-    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+    } else if logins.claude == Login::OpenRouter {
         (
             Some(models::anthropic_via_openrouter(&fcx)?),
             "anthropic/claude-haiku-4.5",
@@ -137,13 +265,11 @@ pub async fn start(
     }
     // Codex: a ChatGPT login from the store, or an API key, set up in the
     // guest the way `codex login` leaves a laptop.
-    let codex_oauth = if let Some(store) = store.as_ref()
-        && store.has_login(models::oauth::Login::Codex)?
-    {
+    let codex_oauth = if logins.codex == Login::Subscription {
         Some(models::oauth::OAuth::new(
             &fcx,
             models::oauth::Login::Codex,
-            store.clone(),
+            store.as_ref().expect("selected subscription store").clone(),
         )?)
     } else {
         None
@@ -155,9 +281,9 @@ pub async fn start(
         let model = models::Model::oauth(&fcx, oauth.clone()).await?;
         world.seed_home_files(oauth.guest_files()?)?;
         (Some(model), "gpt-5.4")
-    } else if std::env::var_os("OPENAI_API_KEY").is_some() {
+    } else if logins.codex == Login::ApiKey {
         (Some(models::openai(&fcx)?), "gpt-5.4-mini")
-    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+    } else if logins.codex == Login::OpenRouter {
         (
             Some(models::openai_via_openrouter(&fcx)?),
             "openai/gpt-5.4-mini",
@@ -185,6 +311,15 @@ pub async fn start(
             ),
         )])?;
     }
+    let catalog = if logins.codex == Login::OpenRouter {
+        Some(bundled_catalog(&fcx).await?)
+    } else {
+        None
+    };
+    let chatgpt = codex
+        .as_ref()
+        .map(|model| chatgpt_model(model, codex_oauth.is_some(), catalog))
+        .transpose()?;
     let controlled: Vec<_> = model.clone().into_iter().chain(codex.clone()).collect();
     fcx.spawn(move |cx| async move {
         kit::serve_commands(&cx, &commands, |command| {
@@ -228,21 +363,13 @@ pub async fn start(
         "api.anthropic.com" => model
             .clone()
             .map(|model| web::Site::handler(model).tls(model_cfg.clone())),
-        // Codex's model site is chatgpt.com with a ChatGPT login and
-        // api.openai.com with a key. The other name does not resolve, so
-        // Codex's account and catalog requests fail as on a network that
-        // blocks it, instead of reaching a generated page.
-        "api.openai.com" | "chatgpt.com" => codex
+        "api.openai.com" => codex
             .clone()
-            .filter(|_| (host == "chatgpt.com") == codex_oauth.is_some())
-            .map(|model| {
-                let tls = if host == "chatgpt.com" {
-                    &chatgpt_cfg
-                } else {
-                    &codex_api_cfg
-                };
-                web::Site::handler(model).tls(tls.clone())
-            }),
+            .filter(|_| codex_oauth.is_none())
+            .map(|model| web::Site::handler(model).tls(codex_api_cfg.clone())),
+        "chatgpt.com" => chatgpt
+            .clone()
+            .map(|model| web::Site::handler(model).tls(chatgpt_cfg.clone())),
         "auth.openai.com" => codex_oauth
             .clone()
             .map(|oauth| web::Site::new(oauth).tls(codex_token_cfg.clone())),
@@ -271,6 +398,157 @@ pub async fn start(
 mod tests {
     use super::*;
     use fictionet::events::{Fields, Stream};
+
+    fn login_store() -> (std::path::PathBuf, Arc<models::oauth::Store>) {
+        let mut random = [0; 8];
+        fictionet::random_bytes(&mut random).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "desktop-logins-{}.redb",
+            u64::from_le_bytes(random)
+        ));
+        let store = models::oauth::Store::open(&path).unwrap();
+        (path, store)
+    }
+
+    #[test]
+    fn login_choices_and_stop_messages_follow_each_agent() {
+        let (path, store) = login_store();
+        let keys = |key: &str| matches!(key, "ANTHROPIC_API_KEY" | "OPENAI_API_KEY");
+        let api = Logins::choose(Some(&store), keys).unwrap();
+        assert_eq!(
+            api,
+            Logins {
+                claude: Login::ApiKey,
+                codex: Login::ApiKey
+            }
+        );
+        assert_eq!(
+            api.stop_messages(),
+            [
+                Some("You have reached your specified workspace API usage limits"),
+                Some("Quota exceeded. Check your plan and billing details."),
+            ]
+        );
+        for login in [models::oauth::Login::Claude, models::oauth::Login::Codex] {
+            store
+                .put(
+                    login,
+                    models::oauth::Tokens::new(
+                        models::Secret::new("access", "access".into()).unwrap(),
+                        models::Secret::new("refresh", "refresh".into()).unwrap(),
+                        u64::MAX,
+                    ),
+                )
+                .unwrap();
+            let selected = Logins::choose(Some(&store), keys).unwrap();
+            assert_eq!(selected.claude, Login::Subscription);
+            assert_eq!(
+                selected.stop_messages()[0],
+                Some("You've hit your session limit")
+            );
+            if login == models::oauth::Login::Claude {
+                assert_eq!(selected.codex, Login::ApiKey);
+                assert_eq!(selected.stop_messages()[1], api.stop_messages()[1]);
+            } else {
+                assert_eq!(selected.codex, Login::Subscription);
+                assert_eq!(
+                    selected.stop_messages()[1],
+                    Some("You’ve hit your usage limit.")
+                );
+            }
+        }
+        assert_eq!(
+            Logins::choose(None, |_| false).unwrap().stop_messages(),
+            [None, None]
+        );
+        let router = Logins::choose(None, |key| key == "OPENROUTER_API_KEY").unwrap();
+        assert_eq!(
+            router,
+            Logins {
+                claude: Login::OpenRouter,
+                codex: Login::OpenRouter
+            }
+        );
+        assert_eq!(router.stop_messages(), api.stop_messages());
+        assert_eq!(
+            api.provider_hosts(),
+            ["api.anthropic.com", "api.openai.com"]
+        );
+        assert_eq!(
+            Logins::choose(Some(&store), keys).unwrap().provider_hosts(),
+            ["api.anthropic.com", "chatgpt.com"]
+        );
+        for logins in [api, router, Logins::choose(Some(&store), keys).unwrap()] {
+            for message in logins.stop_messages().into_iter().flatten() {
+                assert!(super::super::stopped(1, message, message));
+                assert!(!super::super::stopped(0, message, message));
+                assert!(!super::super::stopped(124, "connection failed", message));
+            }
+            for provider in logins.provider_hosts() {
+                let event = serde_json::json!({"source":"model", "kind":"refused", "fields":{"provider":provider,"reason":"budget"}});
+                assert!(super::super::budget_refusal(&event, provider));
+                assert!(!super::super::budget_refusal(&event, "unrelated.example"));
+                for (field, value) in [("reason", "credential"), ("reason", "handshake")] {
+                    let mut wrong = event.clone();
+                    wrong["fields"][field] = value.into();
+                    assert!(!super::super::budget_refusal(&wrong, provider));
+                }
+                let mut call = event;
+                call["kind"] = "call".into();
+                assert!(!super::super::budget_refusal(&call, provider));
+            }
+        }
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn api_key_chatgpt_site_serves_the_model_catalog() {
+        use http_body_util::BodyExt;
+        use web::httpd::{Handler, Reply};
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(4)),
+            |cx| async move {
+                let credential = models::Credential::api_key(
+                    &cx,
+                    models::Secret::new("OPENAI_API_KEY", "sk-host-key".into())?,
+                );
+                let bearer = format!("Bearer {}", credential.placeholder());
+                let model = models::Model::at(
+                    &cx,
+                    models::Provider::OpenAi,
+                    credential,
+                    "http://127.0.0.1:1".parse()?,
+                )?;
+                let catalog = bytes::Bytes::from_static(br#"{"models":[]}"#);
+                let site = chatgpt_model(&model, false, Some(catalog))
+                    .expect("chatgpt.com must resolve for API-key catalog reads");
+                let conn = fictionet::events::ConnInfo::default();
+                let mut exchange = web::httpd::Exchange::new(cx.now(), &cx, &conn);
+                let reply = site.call(
+                    http::Request::get("/backend-api/codex/models?client_version=0.163.0")
+                        .header("authorization", bearer)
+                        .body(web::Body::empty())?,
+                    &mut exchange,
+                );
+                let response = match reply {
+                    Reply::Now(response) => response,
+                    Reply::Later(work) => work(cx).await?,
+                    Reply::Handoff(_) => panic!("catalog read upgraded"),
+                };
+                assert_eq!(response.status(), 200);
+                #[derive(Deserialize)]
+                struct Catalog {
+                    models: Vec<serde_json::Value>,
+                }
+                let body = response.into_body().collect().await?.to_bytes();
+                let decoded: Catalog = serde_json::from_slice(&body)?;
+                assert!(decoded.models.is_empty());
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn only_a_complete_firefox_page_read_marks_the_site_loaded() {
