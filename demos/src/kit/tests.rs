@@ -93,6 +93,9 @@ fn user_data_installs_packages_files_and_steps() {
     assert!(data.contains(&base64::encode(b"echo ready\n")));
     assert!(data.contains("bash /opt/start.sh"));
     assert!(data.find("update-ca-certificates").unwrap() < data.find("'curl'").unwrap());
+    assert!(data.find("update-ca-certificates").unwrap() < data.find("apt-get update").unwrap());
+    assert_eq!(data.matches("apt-get update").count(), 1);
+    assert_eq!(data.matches("apt-get install").count(), 1);
     assert!(data.contains("/etc/profile.d/trust.sh"));
     assert!(data.contains("/etc/systemd/system.conf.d/trust.conf"));
     let trust = "NODE_USE_SYSTEM_CA=1 REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \

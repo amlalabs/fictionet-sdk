@@ -80,7 +80,7 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
             "--hide-scrollbars",
             "--window-size=1440,900",
             "--remote-debugging-pipe",
-            "about:blank",
+            url,
         ])
         .arg(format!("--user-data-dir={}", profile.display()))
         .stdin(Stdio::null())
@@ -110,12 +110,8 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
         {
             Some(target) => string_field(target, "targetId")?,
             None => {
-                let target = reader.call(
-                    &to_write,
-                    None,
-                    "Target.createTarget",
-                    json!({"url":"about:blank"}),
-                )?;
+                let target =
+                    reader.call(&to_write, None, "Target.createTarget", json!({"url":url}))?;
                 string_field(&target, "targetId")?
             }
         };
@@ -140,12 +136,6 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
         )?;
         reader.call(&to_write, Some(&session), "Runtime.enable", json!({}))?;
         reader.deadline = Some(Instant::now() + timeout);
-        reader.call(
-            &to_write,
-            Some(&session),
-            "Page.navigate",
-            json!({"url":url}),
-        )?;
         loop {
             let value = reader.call(
                 &to_write,

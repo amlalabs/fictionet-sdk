@@ -148,29 +148,24 @@ pub fn user_data(p: &Provision) -> String {
         }
     }
     out.push_str("runcmd:\n");
+    // The Ubuntu image already has the updater; trust the world before apt uses HTTPS.
     let mut commands = vec![
-        "apt-get update".to_string(),
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates"
-            .into(),
         "update-ca-certificates".into(),
         format!(
             "printf '%s\\n' {} >> /etc/environment",
             assignments.join(" ")
         ),
         "systemctl daemon-reexec".into(),
-    ];
-    if !g.packages.is_empty() {
-        commands.push("apt-get update".into());
-        commands.push(format!(
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {}",
+        "apt-get update".into(),
+        format!(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates {}",
             g.packages
                 .iter()
                 .map(|s| super::ssh::quote(s))
                 .collect::<Vec<_>>()
                 .join(" ")
-        ));
-    }
+        ),
+    ];
     commands.extend(g.steps.iter().cloned());
     // One shell stops provisioning on the first failed command.
     out.push_str(&format!(

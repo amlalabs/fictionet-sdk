@@ -229,6 +229,15 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         "boot to desktop with Google loaded: {} ms",
         run.boot_started().elapsed().as_millis()
     );
+    let timing = run
+        .guest(HOST)
+        .ssh()
+        .run(
+            "sudo cloud-init analyze show; sudo cat /var/log/apt/history.log; \
+             sudo journalctl -b -o short-monotonic --no-pager -u cloud-final -u vnc",
+        )
+        .await?;
+    println!("guest setup timing:\n{}", timing.stdout);
     checks::bearer_required(&client).await?;
     checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
 
@@ -406,6 +415,22 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     run.containment().await?;
     run.screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
         .await?;
+    run.page_shot(
+        &output.join("packets.png"),
+        r#"(() => {
+            const tab = document.querySelector('#tab-packets');
+            if (!tab) return false;
+            if (tab.getAttribute('aria-selected') !== 'true') tab.click();
+            const info = document.querySelector('.packet-info-text');
+            const list = document.querySelector('#plist');
+            const loss = document.querySelector('#sampled');
+            return info && info.getBoundingClientRect().width > 0
+                && list.getBoundingClientRect().height > 200
+                && loss.getBoundingClientRect().height < 100;
+        })()"#,
+        Duration::from_secs(30),
+    )
+    .await?;
     Ok(())
 }
 
