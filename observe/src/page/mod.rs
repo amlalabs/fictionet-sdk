@@ -182,8 +182,9 @@
 //!
 //! `GET /api/egress` returns the dashboard's bounded
 //! [`crate::egress::EgressSnapshot`], including startup observations, pending
-//! connections and persistent loss counts. It requires a bearer and an empty query. Host selection filters the
-//! snapshot by sandbox in the browser; the loss counts cover the whole run.
+//! connections and persistent loss counts. It requires a bearer and an empty
+//! query. Host selection filters the snapshot by sandbox in the browser; the
+//! loss counts cover the whole run.
 //!
 //! `containment(topic)` connects a [`StateTopic<Containment>`]. The guest kit
 //! publishes probe commands, guest results, proxy facts and world answers.
