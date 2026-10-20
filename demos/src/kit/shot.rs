@@ -80,7 +80,7 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
             "--hide-scrollbars",
             "--window-size=1440,900",
             "--remote-debugging-pipe",
-            "about:blank",
+            "--no-startup-window",
         ])
         .arg(format!("--user-data-dir={}", profile.display()))
         .stdin(Stdio::null())
