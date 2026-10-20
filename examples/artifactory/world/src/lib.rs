@@ -17,11 +17,15 @@
 //! [`packages`] builds the seeded wheels. [`repository`] serves the indexes,
 //! storage API and cache. [`ssrf`] extracts off-site request targets without
 //! fetching them. [`events`] defines the log format and [`log`] writes it.
+//! [`inventory`] is the revisioned package and cache snapshot a dashboard may
+//! show. [`facts`] projects request rows and door attempts from observer events.
 //! This module issues certificates and connects the sites to the packet network.
 
 #![warn(missing_docs)]
 
 pub mod events;
+pub mod facts;
+pub mod inventory;
 pub mod log;
 pub mod packages;
 pub mod repository;
@@ -62,15 +66,25 @@ pub struct Identity {
     pub ca_pem: String,
     /// The public CA certificate for clients in tests.
     pub ca_der: CertificateDer<'static>,
+    extra_names: Vec<String>,
     leaves: Vec<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
 }
 
 impl Identity {
     /// Issues a fresh CA and one certificate per site.
     pub fn new(fcx: &Cx) -> Result<Self> {
-        let ca = fictionet::stdlib::services::ca::Ca::new(fcx, "Artifactory World CA")?;
+        Self::with_names(fcx, &[])
+    }
+
+    /// Issues extra leaves from the same root before dropping the CA key.
+    pub fn with_names(fcx: &Cx, names: &[&str]) -> Result<Self> {
+        let ca = fictionet::stdlib::services::ca::Ca::new(fcx, "Northwind Internal CA")?;
         let mut leaves = Vec::new();
-        for (name, _) in NAMES {
+        for name in NAMES
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(names.iter().copied())
+        {
             let mut leaf = ca.issue(
                 fcx,
                 &[name],
@@ -87,7 +101,24 @@ impl Identity {
             ca_pem: ca.cert_pem(),
             ca_der: ca.cert_der(),
             leaves,
+            extra_names: names.iter().map(|name| (*name).to_owned()).collect(),
         })
+    }
+
+    /// Returns a server configuration for an extra name issued with this identity.
+    pub fn server_config(&self, fcx: &Cx, name: &str) -> Result<Arc<rustls::ServerConfig>> {
+        let index = self
+            .extra_names
+            .iter()
+            .position(|n| n == name)
+            .ok_or_else(|| fictionet::Error::msg(format!("no certificate for {name}")))?;
+        let (leaf, key) = &self.leaves[NAMES.len() + index];
+        Ok(Arc::new(
+            tls::config_builder(fcx, SystemTime::now())
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf.clone()], key.clone_key())?,
+        ))
     }
 }
 
@@ -99,9 +130,20 @@ pub fn start(
     log: Log,
     attachments: Attachments,
 ) -> Result {
+    network(fcx, contents, identity, log)?.start(fcx, attachments)
+}
+
+/// Builds the configured network so callers can add hosts and routes.
+pub fn network(
+    fcx: &Cx,
+    contents: Arc<Contents>,
+    identity: Identity,
+    log: Log,
+) -> Result<fictionet::stdlib::world::net::Net> {
     let configs = identity
         .leaves
         .into_iter()
+        .take(NAMES.len())
         .map(|(leaf, key)| {
             Ok(Arc::new(
                 tls::config_builder(fcx, SystemTime::now())
@@ -134,7 +176,7 @@ pub fn start(
     for (name, _) in NAMES {
         net = net.add_host(site_for(name).unwrap().into_host(name));
     }
-    net.start(fcx, attachments)
+    Ok(net)
 }
 #[cfg(test)]
 mod tests {

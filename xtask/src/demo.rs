@@ -26,12 +26,12 @@ pub fn run(args: &[String]) -> Result {
     if args == ["libraries"] {
         return libraries::assets();
     }
-    if let [name] = args
+    if let [name, rest @ ..] = args
         && binaries.contains(name)
     {
         microvm::assets()?;
         microvm::build(name)?;
-        return microvm::launch(name);
+        return microvm::launch(name, rest);
     }
     let usage = format!(
         "usage: cargo xtask demo [assets|libraries|{}]",

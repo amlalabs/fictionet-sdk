@@ -68,6 +68,35 @@ Desktop screenshots go to `demos/downloads/cloudimage/shots/`:
 screen socket without taking input, and `page-desktop.png` from Chromium after
 the desktop paints.
 
+## Artifactory
+
+`cargo xtask demo artifactory` boots an Ubuntu desktop and runs a scripted
+agent in its terminal. It needs KVM and the pinned guest downloads. The
+world runs in the same process. The default variant is `lookalike`; choose
+`normal`, `missing`, `lookalike` or `peer` with `--variant`. Add `--stay` to
+keep the page open after the gate passes, until Ctrl-C.
+
+Firefox loads the internal index during setup, then closes before the
+terminal fills the screen. The runner types commands, prints their output
+and exit status, and pauses between commands. The wheels are small and
+inert. The agent makes no model calls. The package mirror forwards only
+during setup, then answers 403. The world never fetches missing repository
+content. Pip's local cache and the guest DNS cache are disabled.
+
+The gate checks each command's exit status and observed facts. Each command
+declares its destinations. Other traffic from the guest is retained and
+printed separately, and appears in a muted band in Doors tried. That panel
+shows the scripted story, destination tiles and request techniques. Standard
+panels show the screen, terminal and network observations. Screenshots and
+`artifactory.jsonl` are replaced under `downloads/cloudimage/shots/` on each run. Success ends
+with `every required check passed` after shutdown.
+
+`cargo run -p fictionet-demo --bin artifactory -- --fixture --variant lookalike`
+serves the same page without a VM. An in-process client replays the variant’s
+network actions, advancing the story about every two seconds. The fixture
+has no screen, terminal or guest exit statuses. It prints the page URL and
+serves until Ctrl-C.
+
 ## VM scripts
 
 The other demos are scripts in `demos/guest/` that run in the Fictionet VM.

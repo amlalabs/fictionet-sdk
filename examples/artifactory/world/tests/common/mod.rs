@@ -30,6 +30,8 @@ pub struct Env {
     pub log: Buf,
     /// The packages and peer folders served by the world.
     pub contents: Arc<Contents>,
+    /// The raw observed events.
+    pub memory: Arc<fictionet_observe::Memory>,
 }
 
 /// Runs the world until the test client returns.
@@ -38,15 +40,28 @@ where
     F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
+    run_contents(Contents::new(variant, "", &[1; 32]).unwrap(), f);
+}
+
+/// Runs supplied contents so tests can install a change listener.
+pub fn run_contents<F, Fut>(contents: Contents, f: F)
+where
+    F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
+    Fut: Future<Output = fictionet::Result> + Send + 'static,
+{
     let buf = Buf::default();
     let log = Log::start(Box::new(buf.clone())).unwrap();
     let output = log.clone();
+    let memory = Arc::new(fictionet_observe::Memory::default());
     fictionet_test_support::harness::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
-            fictionet_observe::Aggregate::new(Arc::new(log.clone())),
+            fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
+                memory.clone(),
+                Arc::new(log.clone()),
+            ]))),
         )),
         move |fcx| async move {
-            let contents = Arc::new(Contents::new(variant, "", &[1; 32]).unwrap());
+            let contents = Arc::new(contents);
             let identity = Identity::new(&fcx)?;
             let root = identity.ca_der.clone();
             let mut roots = RootCertStore::empty();
@@ -60,6 +75,7 @@ where
                     roots: Arc::new(roots),
                     log: buf,
                     contents,
+                    memory,
                 },
             )
             .await

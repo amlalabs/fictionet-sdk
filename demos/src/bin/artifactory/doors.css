@@ -1,0 +1,33 @@
+.doors-panel { flex: 1; min-height: 0; overflow: auto; padding: 16px; color: var(--ink); font-size: 12px; }
+.doors-panel h2 { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
+.doors-panel p { margin: 0 0 8px; }
+.doors-story { padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+.doors-steps { list-style: none; padding: 0; margin: 0; }
+.doors-step { display: grid; grid-template-columns: 20px minmax(0, 1fr) 56px 48px 72px; align-items: center; column-gap: 8px; padding: 4px 8px; border-left: 2px solid transparent; }
+.doors-step[data-state='running'] { border-left-color: var(--ink); background: var(--sunken); }
+.doors-step-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doors-number, .doors-exit { color: var(--muted); font-size: 11px; }
+.doors-step-links { display: flex; gap: 8px; color: var(--muted); }
+.doors-step-links button { font-size: 11px; }
+.doors-step:not([data-state='done']) .doors-step-links { visibility: hidden; }
+.doors-summary { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; padding: 16px 0; font-variant-numeric: tabular-nums; }
+.doors-summary > span:first-child { font-weight: 600; }
+.doors-panel .loss-note { margin: 0 0 8px; }
+.doors-destination { margin-bottom: 16px; }
+.doors-destination h3 { font-size: 12px; margin: 0 0 8px; overflow-wrap: anywhere; }
+.doors-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(184px, 1fr)); gap: 8px; }
+.door-tile { display: flex; flex-direction: column; gap: 4px; min-height: 88px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--raised); }
+.door-head { display: flex; justify-content: space-between; gap: 8px; }
+.door-head strong { font-size: 12px; }
+.doors-count { display: inline-block; min-width: 7ch; text-align: right; font-variant-numeric: tabular-nums; }
+.door-service { color: var(--muted); }
+.door-outcome { text-transform: capitalize; }
+.door-denied { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
+.door-denied .door-service { color: inherit; }
+.door-credential { align-self: start; max-width: 100%; height: auto; min-height: 18px; white-space: normal; overflow-wrap: anywhere; }
+.doors-techniques, .doors-other { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }
+.doors-technique { display: flex; justify-content: space-between; padding: 4px 0; }
+.doors-other li { overflow-wrap: anywhere; font-size: 11px; }
+.door-tile.new-row { animation: door-arrives 600ms ease-out; }
+@keyframes door-arrives { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .door-tile.new-row { animation: none; } }

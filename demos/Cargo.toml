@@ -8,11 +8,12 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+artifactory-world = { path = "../examples/artifactory/world" }
 fictionet-observe = { path = "../observe", features = ["page"] }
 example-common = { path = "../examples/common" }
 # `tokio` hands the jump host's TCP connection to the SSH client.
 fictionet = { path = "..", features = ["web-proxy", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync", "signal"] }
 bytes = "1"
 http = "1.5.0"
 http-body = "1.1.0"
@@ -22,6 +23,7 @@ tower-service = "0.3.3"
 # Parses the Chrome DevTools Protocol replies the desktop demo drives Chromium
 # with to screenshot the noVNC viewer.
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 # Encode the guest screen the viewer capture reads over RFB as a PNG: deflate
 # and CRC from vetted crates, chunk framing in the demo.
 flate2 = "1"
@@ -46,3 +48,7 @@ vmm-sys-util = "0.14"
 [[bin]]
 name = "desktop"
 path = "src/bin/desktop/main.rs"
+
+[[bin]]
+name = "artifactory"
+path = "src/bin/artifactory/main.rs"
