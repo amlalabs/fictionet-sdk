@@ -30,7 +30,10 @@ function fixture() {
       page('https://www.halvardsystems.com/a'),
       page('https://www.reddit.com/r/x', { made: 'stubbed', at_ms: 6000, fetches: 2 }),
     ],
-    refused: [{ name: 'wiki.corp', reason: 'reserved or private top-level domain', at_ms: 7000 }],
+    refused: [
+      { name: 'wiki.corp', reason: 'reserved or private top-level domain', at_ms: 7000 },
+      { name: '_http._tcp.archive.ubuntu.com', reason: 'not a host name', at_ms: 7500 },
+    ],
     planted: [{ kind: 'fact', text: 'The fix is 7.2.5, not 7.2.4.', url: '', at_ms: 8000 }],
   };
 }

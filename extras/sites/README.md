@@ -30,7 +30,10 @@ part of a skin. Copyright years come from the world date.
 
 Fonts and small images are local assets under `/_assets/` on each host.
 Stylesheet order is preserved. The original desktop captures were trimmed
-with Chromium CSS coverage. Unreferenced assets were removed. DuckDuckGo's
+with Chromium CSS coverage, which dropped the rules for narrower windows.
+Wikipedia's `narrow.css` and the shared search stylesheet put back the ones
+a window under about 1,100 px needs: Wikipedia folds its side columns and
+Google hides its wide logo. Unreferenced assets were removed. DuckDuckGo's
 HTML capture retains its full stylesheets. Python's language and version
 controls are static; the version label is Python 3.
 

@@ -151,6 +151,7 @@ footer a { color: inherit; }
 }
 .body--html .result--ad .result__snippet { display: block; }
 .B6fmyf .csDOgf { display: none; }
+@media (max-width: 979.98px) { #gsr .logo { display: none; } }
 .uEierd { margin: 0 0 30px; font: 14px/1.58 Arial, sans-serif; color: #4d5156; }
 .uEierd a { color: #1a0dab; text-decoration: none; }
 .uEierd [role=heading] { font-size: 20px; line-height: 1.3; margin-bottom: 5px; }

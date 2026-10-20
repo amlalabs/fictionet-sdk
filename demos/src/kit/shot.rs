@@ -199,6 +199,100 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
     })
 }
 
+/// A Chromium app window on a page, opened over the DevTools pipe so the
+/// page's address and token never appear on a command line. The window
+/// closes when this is dropped.
+pub struct AppWindow {
+    child: std::process::Child,
+    commands: OwnedFd,
+    _replies: OwnedFd,
+    _profile: super::util::RunDir,
+}
+
+impl AppWindow {
+    /// Opens `url` in a new Chromium app window with its own profile.
+    pub fn open(url: &str) -> io::Result<Self> {
+        let profile = super::util::RunDir::new(&std::env::temp_dir(), "app")?;
+        let (to_read, to_write) = pipe().ok_or_else(std::io::Error::last_os_error)?;
+        let (from_read, from_write) = pipe().ok_or_else(std::io::Error::last_os_error)?;
+        let (child_cmd_fd, child_reply_fd) = (to_read.as_raw_fd(), from_write.as_raw_fd());
+        let mut command = Command::new("chromium");
+        command
+            .args([
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-sync",
+                "--password-store=basic",
+                "--use-mock-keychain",
+                "--window-size=1440,900",
+                "--remote-debugging-pipe",
+                "--app=about:blank",
+            ])
+            .arg(format!("--user-data-dir={}", profile.path().display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: dup2 is async-signal-safe; the fds are plain i32s copied
+        // into the closure before the fork.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(child_cmd_fd, 3) < 0 || libc::dup2(child_reply_fd, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        drop(to_read);
+        drop(from_write);
+        let mut reader = Reader::new(from_read.as_raw_fd());
+        let opened = (|| {
+            let targets = reader.call(&to_write, None, "Target.getTargets", json!({}))?;
+            let target = targets["targetInfos"]
+                .as_array()
+                .and_then(|targets| targets.iter().find(|target| target["type"] == "page"))
+                .ok_or_else(|| io::Error::other("Chromium opened no window"))?;
+            let attach = reader.call(
+                &to_write,
+                None,
+                "Target.attachToTarget",
+                json!({"targetId": string_field(target, "targetId")?, "flatten": true}),
+            )?;
+            let session = string_field(&attach, "sessionId")?;
+            reader.call(
+                &to_write,
+                Some(&session),
+                "Page.navigate",
+                json!({"url": url}),
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = opened {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(Self {
+            child,
+            commands: to_write,
+            _replies: from_read,
+            _profile: profile,
+        })
+    }
+}
+
+impl Drop for AppWindow {
+    fn drop(&mut self) {
+        let _ = write_all(&self.commands, b"{\"id\":0,\"method\":\"Browser.close\"}");
+        let closing = Instant::now() + CLOSE_TIMEOUT;
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < closing {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 struct Reader {
     fd: RawFd,
     buf: Vec<u8>,

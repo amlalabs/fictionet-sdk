@@ -191,31 +191,60 @@ async fn main() -> Result {
         .route(kit::JUMP, kit::jump_prefix())
         .start(&cx, world.into_attachments())
     });
-    let run = kit.boot(downloads).await?;
+    // The app stops cleanly on Ctrl-C at any point, booting included. The
+    // checks keep the terminal's default.
+    let mut interrupt = if check {
+        None
+    } else {
+        Some(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        )?)
+    };
+    let run = match &mut interrupt {
+        None => kit.boot(downloads).await?,
+        Some(interrupt) => tokio::select! {
+            run = kit.boot(downloads) => run?,
+            _ = interrupt.recv() => {
+                println!("Stopped while booting.");
+                return Ok(());
+            }
+        },
+    };
     println!(
         "boot to SSH-ready: {} ms",
         run.guest(guest::HOST).ssh_ready().as_millis()
     );
     let mut visited = BTreeSet::new();
-    let mut result = if check {
-        checks::run(&run, &scenario, &output, &mut visited).await
-    } else {
-        run.guest(guest::HOST)
-            .wait_desktop(std::time::Duration::from_secs(300))
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
-    };
-    if result.is_ok() {
-        println!(
-            "{}: {} ms",
-            if check { "story done" } else { "desktop up" },
-            run.boot_started().elapsed().as_millis()
-        );
-        if !check {
-            result = kit::checks::stay_open().await.map_err(Into::into);
+    let result = match &mut interrupt {
+        None => {
+            let result = checks::run(&run, &scenario, &output, &mut visited).await;
+            if result.is_ok() {
+                println!(
+                    "story done: {} ms",
+                    run.boot_started().elapsed().as_millis()
+                );
+            }
+            result
         }
-    }
+        Some(interrupt) => {
+            let desktop = run.guest(guest::HOST);
+            tokio::select! {
+                ready = desktop.wait_desktop(std::time::Duration::from_secs(300)) => match ready {
+                    Ok(_) => {
+                        println!(
+                            "desktop up: {} ms",
+                            run.boot_started().elapsed().as_millis()
+                        );
+                        println!("The page stays open until Ctrl-C.");
+                        interrupt.recv().await;
+                        Ok(())
+                    }
+                    Err(error) => Err(error.into()),
+                },
+                _ = interrupt.recv() => Ok(()),
+            }
+        }
+    };
     if result.is_err() {
         eprint!("{}", run.guest(guest::HOST).diagnostics().await);
     }

@@ -24,13 +24,17 @@ export function pageTag(p) {
   return first;
 }
 
+// Names a person might have typed: not the service lookups (`_http._tcp.…`)
+// the system makes on its own.
+const typed = (r) => !r.name.startsWith('_');
+
 // The newest rows first: searches, pages, refused names and plants.
 export function rows(s, limit = 6) {
   const path = (url) => { try { const u = new URL(url); return `${u.pathname}${u.search}`; } catch { return url; } };
   return [
     ...s.queries.map((q) => ({ at: q.at_ms, who: ENGINE_HOSTS[q.engine] || q.engine, what: q.search, tag: queryTag(s, q) })),
     ...s.pages.map((p) => ({ at: p.at_ms, who: p.host, what: path(p.url), tag: pageTag(p) })),
-    ...s.refused.map((r) => ({ at: r.at_ms, who: 'DNS', what: r.name, tag: 'refused' })),
+    ...s.refused.filter(typed).map((r) => ({ at: r.at_ms, who: 'DNS', what: r.name, tag: 'refused' })),
     ...(s.planted || []).map((p) => ({ at: p.at_ms, who: p.kind === 'page' ? hostOf(p.url) : 'fact', what: p.text, tag: 'planted' })),
   ].sort((a, b) => b.at - a.at).slice(0, limit);
 }
@@ -66,6 +70,6 @@ export function picture(s) {
     return { host, label: short(host), pages: opened.length, seed: seedHosts.has(host), tag: opened.length ? pageTag(opened.at(-1)) : 'listed' };
   });
   const planted = (s.planted || []).slice(-2).map((p) => ({ label: p.kind === 'page' ? short(hostOf(p.url)) : 'fact', text: p.text }));
-  const refused = s.refused.at(-1)?.name || null;
+  const refused = s.refused.filter(typed).at(-1)?.name || null;
   return { query: q?.search || null, engines, sites, more: Math.max(0, hosts.length - 6), planted, refused };
 }
