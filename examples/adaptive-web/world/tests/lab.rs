@@ -132,7 +132,7 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
             let fields: serde_json::Map<_, _> = e
                 .fields
                 .iter()
-                .map(|(k, v)| (k.to_owned(), adaptive_web_world::events::to_json(v)))
+                .map(|(k, v)| (k.to_owned(), example_common::events::js(Some(v))))
                 .collect();
             json!({"source":e.source,"kind":e.kind,"fields":fields})
         })

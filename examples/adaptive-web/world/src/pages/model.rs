@@ -34,29 +34,15 @@ const ATTEMPTS: u32 = 3;
 /// How long one HTTP attempt may take.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
-/// A model API.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A model API, named as `ADAPTIVE_WEB_GENERATOR` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Provider {
     Anthropic,
     OpenRouter,
 }
 
 impl Provider {
-    /// Reads `anthropic` or `openrouter`.
-    pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "anthropic" => Some(Self::Anthropic),
-            "openrouter" => Some(Self::OpenRouter),
-            _ => None,
-        }
-    }
-    /// The provider's name, as `ADAPTIVE_WEB_GENERATOR` gives it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenRouter => "openrouter",
-        }
-    }
     /// The variable that holds the provider's key.
     pub fn key_variable(self) -> &'static str {
         match self {
@@ -354,7 +340,7 @@ pub fn identity(provider: Provider, model: &str, reasoning: &str) -> Value {
     } else {
         model
     };
-    json!({"provider": provider.name(), "model": model, "reasoning": reasoning})
+    json!({"provider": provider, "model": model, "reasoning": reasoning})
 }
 
 /// A model and how to reach it.

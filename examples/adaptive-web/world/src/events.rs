@@ -17,6 +17,7 @@ use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
 use crate::handler::PAGE_FIELDS;
+use example_common::events::js;
 use example_common::log::Log;
 
 use example_common::headers;
@@ -58,25 +59,8 @@ impl fictionet::events::Observer for LogObserver {
     }
 }
 
-/// An event field's value as JSON.
-pub fn to_json(v: &J) -> Value {
-    match v {
-        J::Null => Value::Null,
-        J::Bool(b) => Value::Bool(*b),
-        J::Number(n) => serde_json::from_str(n.text()).unwrap_or(Value::Null),
-        J::String(s) => Value::String(s.clone()),
-        J::Array(items) => Value::Array(items.iter().map(to_json).collect()),
-        J::Object(members) => Value::Object(
-            members
-                .iter()
-                .map(|(k, v)| (k.clone(), to_json(v)))
-                .collect(),
-        ),
-    }
-}
-
 fn get(e: &Event, name: &str) -> Value {
-    e.get(name).map(to_json).unwrap_or(Value::Null)
+    js(e.get(name))
 }
 
 /// The log line for `e`, if it is one the log keeps.
@@ -92,7 +76,7 @@ fn line(e: &Event) -> Option<Value> {
                 json!({"type": "query_failed", "id": get(e, "query_id"), "why": get(e, "why")});
             for name in ["error", "serve_ms"] {
                 if let Some(value) = e.get(name) {
-                    line[name] = to_json(value);
+                    line[name] = js(Some(value));
                 }
             }
             Some(line)
@@ -105,14 +89,20 @@ fn line(e: &Event) -> Option<Value> {
             println!("detached {}", name.as_deref().unwrap_or(""));
             None
         }
-        ("adaptive", "site") => Some(
-            json!({"type": "site", "host": get(e, "host"), "addr": get(e, "addr"), "why": get(e, "why")}),
-        ),
+        ("adaptive", "site") => Some(json!({
+            "type": "site",
+            "host": get(e, "host"),
+            "addr": get(e, "addr"),
+            "why": get(e, "why"),
+        })),
         ("adaptive", "refused") => {
             Some(json!({"type": "refused", "host": get(e, "host"), "why": get(e, "why")}))
         }
         ("adaptive", "cert") => Some(json!({
-            "type": "cert", "host": get(e, "host"), "not_before": get(e, "not_before"), "not_after": get(e, "not_after"),
+            "type": "cert",
+            "host": get(e, "host"),
+            "not_before": get(e, "not_before"),
+            "not_after": get(e, "not_after"),
         })),
         ("dns", "query") => Some(json!({
             "type": "dns",
@@ -170,7 +160,7 @@ fn http(e: &Event) -> Value {
     line.insert("complete".into(), get(e, "complete"));
     for name in PAGE_FIELDS {
         if let Some(v) = e.get(name) {
-            line.insert(name.into(), to_json(v));
+            line.insert(name.into(), js(Some(v)));
         }
     }
     if !line.contains_key("bytes") {

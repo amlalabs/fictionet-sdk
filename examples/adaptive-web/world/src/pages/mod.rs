@@ -39,6 +39,7 @@ pub mod text;
 pub use seed::Seed;
 
 use crate::route::{Engine, Route, query_key, route};
+use crate::search::GeneratorKind;
 use fictionet::Cx;
 use model::{Failure, Ledger, Model, Usage};
 use prompts::{Claim, HostPage, Person};
@@ -377,13 +378,15 @@ impl Pages {
         }
     }
 
-    /// What makes new pages: `stub`, `openrouter`, `anthropic`, or `replay`
-    /// when nothing new is made.
-    pub fn provider(&self) -> &str {
+    /// What makes new pages, or `Replay` when nothing new is made.
+    pub fn generator_kind(&self) -> GeneratorKind {
         match &self.generator {
-            Some(Generator::Stub) => "stub",
-            Some(Generator::Model(model)) => model.provider.name(),
-            None => "replay",
+            Some(Generator::Stub) => GeneratorKind::Stub,
+            Some(Generator::Model(model)) => match model.provider {
+                model::Provider::Anthropic => GeneratorKind::Anthropic,
+                model::Provider::OpenRouter => GeneratorKind::Openrouter,
+            },
+            None => GeneratorKind::Replay,
         }
     }
 
@@ -807,7 +810,12 @@ impl Pages {
             content_type: record.content_type,
             body: record.body,
             headers: record.headers,
-            meta: json!({"kind": "page", "cache": "fixed", "title": record.title, "reason": {"via": "fixed"}}),
+            meta: json!({
+                "kind": "page",
+                "cache": "fixed",
+                "title": record.title,
+                "reason": {"via": "fixed"},
+            }),
         }
     }
 

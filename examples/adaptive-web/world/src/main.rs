@@ -31,6 +31,7 @@ use adaptive_web_world::pages::{Generator, Pages, Seed};
 use adaptive_web_world::{Addresses, Ca, GATEWAY, serve, world_start};
 use example_common::args::{args, secs};
 use example_common::log::Log;
+use example_common::names;
 use serde_json::json;
 
 fn main() {
@@ -65,7 +66,7 @@ fn real_main() -> fictionet::Result {
         "" | "stub" => Kind::Stub,
         "replay" => Kind::Replay,
         other => {
-            let provider = Provider::parse(other).ok_or_else(|| {
+            let provider = names::parse::<Provider>(other).ok_or_else(|| {
                 fictionet::Error::msg(format!(
                     "ADAPTIVE_WEB_GENERATOR must be stub, openrouter, anthropic or replay, not {other:?}"
                 ))
@@ -111,8 +112,7 @@ fn real_main() -> fictionet::Result {
     let stores =
         std::env::var("ADAPTIVE_WEB_STORE").unwrap_or_else(|_| "/var/lib/adaptive-web".into());
     let root = Path::new(&stores).join(&seed.name);
-    let (store, made_by) =
-        Store::open(&root, &seed, identity.as_ref()).map_err(fictionet::Error::msg)?;
+    let (store, _) = Store::open(&root, &seed, identity.as_ref()).map_err(fictionet::Error::msg)?;
     let addresses = Arc::new(Addresses::new(
         seed.fixed_addresses(),
         Some(&root.join("addresses.jsonl")),
@@ -136,33 +136,7 @@ fn real_main() -> fictionet::Result {
         std::fs::create_dir_all(dir)?;
     }
     let socket = args.socket.clone();
-    let fixed: std::collections::BTreeMap<_, _> = seed
-        .fixed_addresses()
-        .into_iter()
-        .map(|(host, (addr, why))| (host, json!({"addr": addr.to_string(), "why": why})))
-        .collect();
-    let state = json!({
-        "seed": seed.name,
-        "date": seed.date,
-        "question": seed.question,
-        "generator": match kind {
-            Kind::Stub => "stub",
-            Kind::Model(provider, _) => provider.name(),
-            Kind::Replay => "replay",
-        },
-        "model": match kind {
-            Kind::Replay => json!("replay"),
-            _ => made_by["model"].clone(),
-        },
-        "prefetch": prefetch,
-        "store": root.canonicalize()?.display().to_string(),
-        "addresses": fixed,
-        "fixed": seed.fixed.iter().map(|f| f.url.clone()).collect::<Vec<_>>(),
-        "dns": GATEWAY.to_string(),
-        "world_start": secs(start),
-        "started": secs(started),
-    });
-    let seed_name = seed.name.clone();
+    let store_path = root.canonicalize()?.display().to_string();
     let state_path = args.state_dir.join("state.json");
     let ready = args.ready.clone();
 
@@ -185,6 +159,27 @@ fn real_main() -> fictionet::Result {
             Kind::Replay => None,
         };
         let pages = Arc::new(Pages::open(seed, store, generator, prefetch));
+        let seed = pages.seed();
+        let fixed: std::collections::BTreeMap<_, _> = seed
+            .fixed_addresses()
+            .into_iter()
+            .map(|(host, (addr, why))| (host, json!({"addr": addr.to_string(), "why": why})))
+            .collect();
+        let state = json!({
+            "seed": seed.name,
+            "date": seed.date,
+            "question": seed.question,
+            "generator": pages.generator_kind(),
+            "model": pages.model(),
+            "prefetch": pages.prefetch(),
+            "store": store_path,
+            "addresses": fixed,
+            "fixed": seed.fixed.iter().map(|f| f.url.clone()).collect::<Vec<_>>(),
+            "dns": GATEWAY.to_string(),
+            "world_start": secs(start),
+            "started": secs(started),
+        });
+        let seed_name = seed.name.clone();
         let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
         serve(&fcx, addresses, ca, pages, log, start, attachments)?;
         // The fixed addresses answer from the start, also for an agent

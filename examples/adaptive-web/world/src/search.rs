@@ -1,7 +1,7 @@
 //! Bounded search and page state for a run observer.
 
-use crate::events::to_json;
 use crate::route::Engine;
+use example_common::events::js;
 use fictionet::events::{Event, Interest, Observation, Observer, Stamp};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -37,7 +37,7 @@ fn text(e: &Event, key: &str) -> String {
     bounded(e.str(key).unwrap_or_default())
 }
 fn parse<T: serde::de::DeserializeOwned>(e: &Event, key: &str) -> Option<T> {
-    serde_json::from_value(to_json(e.get(key)?)).ok()
+    serde_json::from_value(js(Some(e.get(key)?))).ok()
 }
 
 /// The seed shown at the start of a run.
@@ -414,22 +414,14 @@ impl Searches {
     /// Starts with the card of an in-memory world with the offline
     /// generator ([`Pages::new`](crate::pages::Pages::new)).
     pub fn from_seed(seed: &crate::pages::Seed) -> Self {
-        Self::new(
-            SeedCard::of(seed),
-            Generator {
-                kind: GeneratorKind::Stub,
-                model: "stub".into(),
-                ..Generator::default()
-            },
-        )
+        Self::of(&crate::pages::Pages::new(seed.clone()))
     }
     /// Starts with the card of a world's pages: its seed and its generator.
     pub fn of(pages: &crate::pages::Pages) -> Self {
         Self::new(
             SeedCard::of(pages.seed()),
             Generator {
-                kind: serde_json::from_value(serde_json::json!(pages.provider()))
-                    .unwrap_or_default(),
+                kind: pages.generator_kind(),
                 model: pages.model().into(),
                 prefetch: pages.prefetch() as u64,
                 generate: pages.generation().generate,
@@ -607,7 +599,7 @@ impl Snapshot {
                                 .iter()
                                 .take(MAX_LISTED)
                                 .filter_map(|item| {
-                                    let value = to_json(item);
+                                    let value = js(Some(item));
                                     let url = value["url"].as_str()?;
                                     Some(Listed {
                                         rank: value["rank"].as_u64()?,
