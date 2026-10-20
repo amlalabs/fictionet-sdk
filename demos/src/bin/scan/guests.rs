@@ -1,4 +1,15 @@
-//! The workstation and office server.
+//! The two guests. Both boot Ubuntu's 24.04 cloud image unmodified and
+//! install their packages at boot through the world's mirror.
+//!
+//! The workstation is the scanner, with nmap. Its screen is Xvnc with
+//! openbox and one full-screen xterm. The xterm runs a small runner that
+//! reads one command at a time from a named pipe, types it out, runs it and
+//! writes back its exit status. The demo sends the story's nmap commands
+//! through that pipe over SSH.
+//!
+//! The office server runs nginx and OpenSSH at 10.0.0.50. Its login shell
+//! follows sshd's journal and nginx's access log, so the page's terminal
+//! shows nmap's probes reaching a real server.
 use fictionet::stdlib::network::ethernet::Family;
 use fictionet_demo::kit::{Guest, desktop::VNC_PORT};
 
@@ -20,19 +31,25 @@ pub fn server() -> Guest {
         .resources(1, 512)
         .card(Family::Serve(scan_world::SERVER_LEASE))
         .packages(&["nginx", "openssh-server"])
+        // The page's terminal can log in before cloud-init has installed
+        // nginx. tail -F waits for the access log to appear; its notes about
+        // the missing file go to /dev/null so the terminal shows only logs.
         .file(
             "/etc/profile.d/office-logs.sh",
             0o644,
             r#"if [ -n "$PS1" ]; then
     sudo journalctl -f -u ssh.service -u ssh.socket --no-pager &
     journal_pid=$!
-    sudo tail -n 20 -F /var/log/nginx/access.log &
+    sudo tail -n 20 -F /var/log/nginx/access.log 2>/dev/null &
     access_pid=$!
     trap 'kill "$journal_pid" "$access_pid" 2>/dev/null' EXIT
 fi
 "#,
         )
-        .run("systemctl enable --now nginx.service ssh.service")
+        // The cloud image socket-activates OpenSSH already, and the kit reaches
+        // the guest through it. Restarting ssh.service here would put systemd's
+        // left-over process warnings in the journal the terminal follows.
+        .run("systemctl enable --now nginx.service")
 }
 
 fn terminal_desktop(hostname: &str, user: &str) -> Guest {
@@ -63,7 +80,7 @@ mkdir -p "$HOME/notes"
 for fifo in "$HOME/notes/requests" "$HOME/notes/results"; do
     if [ ! -p "$fifo" ]; then mkfifo "$fifo"; fi
 done
-Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -nolisten tcp -geometry 640x480 -depth 24 &
+Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -nolisten tcp -geometry {GEOMETRY} -depth 24 &
 xpid=$!
 trap 'kill "$xpid"' EXIT
 # Wait for the X server before opening the terminal.
@@ -73,11 +90,21 @@ for ((attempt=0; attempt<150; attempt++)); do
 done
 xdpyinfo >/dev/null
 openbox &
-exec xterm -fa 'DejaVu Sans Mono' -fs 14 -fullscreen -bg '#101820' -fg '#e7edf4' \
+exec xterm -fa 'DejaVu Sans Mono' -fs {FONT_SIZE} -fullscreen -bg '#101820' -fg '#e7edf4' \
     -title 'Office work' -e /opt/assistant
 "#
     )
 }
+
+// The screen is wide and short because its tile is: with two hosts stacked
+// in the workspace, a tile's console measures 817x344 at 1440x900 and
+// 724x294 at 1280x800, about 2.4 times as wide as tall, so a screen of that
+// shape fills it. At 15 px, DejaVu Sans Mono's characters are 9 px wide, so
+// 960 px holds 106 columns and nmap's widest service line (82 characters)
+// fits on one line. The page scales the screen by 0.85 at 1440x900 and 0.74
+// at 1280x800, so the text shows at 11 to 13 px.
+const GEOMETRY: &str = "960x400";
+const FONT_SIZE: u8 = 15;
 
 fn service(user: &str) -> String {
     format!(
@@ -200,9 +227,28 @@ mod tests {
                 .any(|s| s.contains("timeout 300 bash") && s.contains("PIPESTATUS[0]"))
         );
         assert!(text.contains("enable --now vnc.service"));
+        assert!(
+            files
+                .iter()
+                .any(|s| s.contains("-geometry 960x400 ") && s.contains("-fs 15 "))
+        );
         let text = data(&office);
         assert!(text.contains("'nginx' 'openssh-server'"));
-        assert!(text.contains("enable --now nginx.service ssh.service"));
+        // The login shell follows the access log without printing tail's
+        // notes while nginx is not installed yet.
+        assert!(
+            text.lines()
+                .filter_map(|line| line.strip_prefix("    content: "))
+                .map(|s| String::from_utf8(b64_decode(s).unwrap()).unwrap())
+                .any(|s| s.contains("tail -n 20 -F /var/log/nginx/access.log 2>/dev/null &"))
+        );
+        // nginx is enabled; OpenSSH stays socket-activated as the image ships it.
+        let runcmd = text
+            .lines()
+            .find(|line| line.starts_with("  - [bash, -euc, "))
+            .unwrap();
+        assert!(runcmd.contains("systemctl enable --now nginx.service"));
+        assert!(!runcmd.contains("ssh.service") && !runcmd.contains("ssh.socket"));
         assert!(!text.contains("vnc"));
     }
 }

@@ -170,9 +170,13 @@ and that the panels have data.
 ### Scan
 
 `cargo xtask demo scan` boots two Ubuntu guests in an in-process office. A
-scripted agent on the workstation runs an nmap inventory of four simulated
-machines and a real Ubuntu server with nginx and OpenSSH. The page pins both
-guests beside the shared panels.
+script, not a model, types three nmap steps into the workstation's terminal:
+host discovery, a SYN scan of ports 1 to 1,024 with service detection, and OS
+detection. Four office machines are simulated. The fifth is the second guest,
+a real Ubuntu server with nginx and OpenSSH. The page shows both guests, the
+office subnet lighting up as hosts answer, each host's 1,024 ports, and the
+banners seen on the wire beside what nmap says, with the shared panels. See
+[the scan example](../examples/scan/README.md#the-in-process-demo).
 
 The gate checks each nmap report against the ports the world served, and the
 page's access controls and terminal.

@@ -15,7 +15,11 @@
 //! A `scan.port` fact marks a new row or a state change. It includes the
 //! previous state, probe count, first and last probe times, and revision.
 //! The previous state is null for a new row. Times are whole milliseconds
-//! since the run began.
+//! since the run began. A port scan makes thousands of these facts, so each
+//! is a repeatable fact: the host, protocol, state and previous state
+//! identify it, and the port, times, probe count and revision are its
+//! detail. An event store with a separate budget for repeatable facts, such
+//! as `fictionet_observe::Memory`, keeps them from evicting other events.
 //!
 //! [`Ports::snapshot`] copies the five office labels and all rows, sorted
 //! by address, protocol, then port. [`Ports::changes_since`] copies the latest
@@ -26,17 +30,24 @@
 //! Rows stay for the run, up to [`MAX_ROWS`] (16,384). At capacity, probes for
 //! new keys increment `untracked`; existing rows still update. The first
 //! untracked probe emits one `scan.full` fact with `max_rows`.
+//!
+//! The tap also keeps the first data each open port sent to the scanner, as
+//! described in [`crate::banners`]. A `scan.banner` fact marks each new one,
+//! with its host, port, text, server value, time and revision. A new banner
+//! advances the revision too. Both views list banners sorted by host, then
+//! port, and include the `untracked_banners` count.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use fictionet::events::{Level, opt};
+use fictionet::events::{Fields, Level, opt};
 use fictionet::stdlib::network::{Direction, ip};
 use fictionet::sync::Mutex;
 use fictionet::{Cx, Packet};
 use serde::{Deserialize, Serialize};
 
+use crate::banners::{Banner, Banners, MAX_BANNERS, Offer};
 use crate::{MACHINES, OFFICE};
 
 /// Maximum number of distinct host, protocol and port rows in a run.
@@ -181,17 +192,22 @@ pub struct PortMap {
     pub max_rows: usize,
     /// Probes for new keys that could not fit in the map.
     pub untracked: u64,
+    /// Banners that could not fit in the map.
+    pub untracked_banners: u64,
     /// The five office machines, including those with no probes.
     pub machines: Vec<Machine>,
     /// All tracked rows, sorted by address, protocol, then port.
     pub rows: Vec<PortRow>,
+    /// Every kept banner, sorted by host, then port.
+    pub banners: Vec<Banner>,
 }
 
 impl PortMap {
     /// Compact JSON bound for snapshots produced by [`Ports`].
     pub const MAX_JSON_BYTES: usize =
-        r#"{"revision":18446744073709551615,"at_ms":18446744073709551615,"max_rows":,"untracked":18446744073709551615,"machines":,"rows":[]}"#.len()
-        + (MAX_ROWS.ilog10() as usize + 1) + machines_json_bytes() + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1);
+        r#"{"revision":18446744073709551615,"at_ms":18446744073709551615,"max_rows":,"untracked":18446744073709551615,"untracked_banners":18446744073709551615,"machines":,"rows":[],"banners":[]}"#.len()
+        + (MAX_ROWS.ilog10() as usize + 1) + machines_json_bytes() + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
+        + MAX_BANNERS * (Banner::MAX_JSON_BYTES + 1);
 }
 
 /// Latest versions of rows changed after a revision, sorted as a snapshot.
@@ -206,15 +222,20 @@ pub struct PortChanges {
     pub at_ms: u64,
     /// Probes for new keys that could not fit in the map.
     pub untracked: u64,
+    /// Banners that could not fit in the map.
+    pub untracked_banners: u64,
     /// Changed rows at their latest versions, sorted by address, protocol, then port.
     pub rows: Vec<PortRow>,
+    /// Banners kept after `from_revision`, sorted by host, then port.
+    pub banners: Vec<Banner>,
 }
 
 impl PortChanges {
     /// Compact JSON bound for deltas produced by [`Ports`].
     pub const MAX_JSON_BYTES: usize =
-        r#"{"from_revision":18446744073709551615,"revision":18446744073709551615,"at_ms":18446744073709551615,"untracked":18446744073709551615,"rows":[]}"#.len()
-        + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1);
+        r#"{"from_revision":18446744073709551615,"revision":18446744073709551615,"at_ms":18446744073709551615,"untracked":18446744073709551615,"untracked_banners":18446744073709551615,"rows":[],"banners":[]}"#.len()
+        + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
+        + MAX_BANNERS * (Banner::MAX_JSON_BYTES + 1);
 }
 
 /// A shared view of the scanner's probes, readable outside the world.
@@ -237,6 +258,13 @@ impl Ports {
         self.0.lock().changes_since(revision)
     }
 
+    /// Copies the complete map and the changes since `revision` under one
+    /// lock, so the changes lead exactly to that snapshot.
+    pub fn snapshot_with_changes(&self, revision: u64) -> (PortMap, PortChanges) {
+        let tracker = self.0.lock();
+        (tracker.snapshot(), tracker.changes_since(revision))
+    }
+
     pub(crate) fn tap(&self, fcx: &Cx, direction: Direction, packet: &Packet) -> bool {
         let signal = self.0.lock().packet(
             direction,
@@ -254,17 +282,35 @@ impl Ports {
                         row.state.as_str()
                     ))
                     .field("host", row.host.to_string())
-                    .field("port", u32::from(row.port))
                     .field("protocol", row.protocol.as_str())
                     .field("state", row.state.as_str())
                     .field("previous", opt(previous.map(PortState::as_str)))
-                    .field("first_probe_ms", row.first_probe_ms)
-                    .field("last_probe_ms", row.last_probe_ms)
-                    .field("probes", row.probes)
-                    .field("revision", row.revision)
+                    .repeat(
+                        Fields::new()
+                            .with("port", u32::from(row.port))
+                            .with("first_probe_ms", row.first_probe_ms)
+                            .with("last_probe_ms", row.last_probe_ms)
+                            .with("probes", row.probes)
+                            .with("revision", row.revision),
+                    )
             }),
             Signal::Full => fcx.emit("scan", "full", |e| {
                 e.level(Level::Notice).field("max_rows", MAX_ROWS as u64)
+            }),
+            Signal::Banner(banner) => fcx.emit("scan", "banner", |e| {
+                e.level(Level::Info)
+                    .summary(format_args!(
+                        "{}:{}/tcp {}",
+                        banner.host,
+                        banner.port,
+                        banner.server.as_deref().unwrap_or(&banner.text)
+                    ))
+                    .field("host", banner.host.to_string())
+                    .field("port", u32::from(banner.port))
+                    .field("text", banner.text.as_str())
+                    .field("server", opt(banner.server.as_deref()))
+                    .field("at_ms", banner.at_ms)
+                    .field("revision", banner.revision)
             }),
             Signal::None => {}
         }
@@ -278,6 +324,8 @@ struct Tracked {
     source: IpAddr,
     source_port: u16,
     sequence: u32,
+    /// The sequence number of the SYN-ACK that answered the latest TCP probe.
+    answer_sequence: Option<u32>,
 }
 
 struct Tracker {
@@ -286,6 +334,7 @@ struct Tracker {
     revision: u64,
     at_ms: u64,
     untracked: u64,
+    banners: Banners,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -293,16 +342,22 @@ enum Signal {
     None,
     Port(PortRow, Option<PortState>),
     Full,
+    Banner(Banner),
 }
 
 impl Tracker {
     fn new(max_rows: usize) -> Self {
+        Self::with_banners(max_rows, MAX_BANNERS)
+    }
+
+    fn with_banners(max_rows: usize, max_banners: usize) -> Self {
         Self {
             rows: BTreeMap::new(),
             max_rows,
             revision: 0,
             at_ms: 0,
             untracked: 0,
+            banners: Banners::new(max_banners),
         }
     }
 
@@ -312,8 +367,10 @@ impl Tracker {
             at_ms: self.at_ms,
             max_rows: self.max_rows,
             untracked: self.untracked,
+            untracked_banners: self.banners.untracked,
             machines: machines(),
             rows: self.rows.values().map(|t| t.row.clone()).collect(),
+            banners: self.banners.all(),
         }
     }
 
@@ -323,12 +380,14 @@ impl Tracker {
             revision: self.revision,
             at_ms: self.at_ms,
             untracked: self.untracked,
+            untracked_banners: self.banners.untracked,
             rows: self
                 .rows
                 .values()
                 .filter(|t| t.row.revision > revision)
                 .map(|t| t.row.clone())
                 .collect(),
+            banners: self.banners.since(revision),
         }
     }
 
@@ -383,6 +442,7 @@ impl Tracker {
         let Some(protocol) = protocol(h.protocol) else {
             return Signal::None;
         };
+        let mut data: &[u8] = &[];
         let flags = match protocol {
             Protocol::Tcp => {
                 if transport.len() < 20 {
@@ -392,6 +452,7 @@ impl Tracker {
                 if len < 20 || len > transport.len() {
                     return Signal::None;
                 }
+                data = &transport[len..];
                 transport[13]
             }
             Protocol::Udp => {
@@ -448,7 +509,9 @@ impl Tracker {
                     source: h.src,
                     source_port: 0,
                     sequence: 0,
+                    answer_sequence: None,
                 });
+                tracked.answer_sequence = None;
                 tracked.row.last_probe_ms = at_ms;
                 tracked.row.probes += 1;
                 tracked.row.revision = self.revision;
@@ -485,6 +548,10 @@ impl Tracker {
                     }
                     Protocol::Udp => PortState::Open,
                     Protocol::Tcp => {
+                        // ACK set, SYN and RST clear, with data: maybe a first data segment.
+                        if flags & 0x16 == 0x10 && !data.is_empty() {
+                            return self.banner(key, dword(transport, 4), data, at_ms);
+                        }
                         if flags & 0x10 == 0 || dword(transport, 8) != row.sequence.wrapping_add(1)
                         {
                             return Signal::None;
@@ -492,6 +559,8 @@ impl Tracker {
                         if flags & 4 != 0 {
                             PortState::Closed
                         } else if flags & 2 != 0 {
+                            let sequence = dword(transport, 4);
+                            self.rows.get_mut(&key).unwrap().answer_sequence = Some(sequence);
                             PortState::Open
                         } else {
                             return Signal::None;
@@ -500,6 +569,28 @@ impl Tracker {
                 };
                 self.answer(key, state, at_ms)
             }
+        }
+    }
+
+    /// Keeps a banner from the first data segment of an open port's latest
+    /// connection: the segment whose sequence number follows the SYN-ACK.
+    fn banner(&mut self, key: Key, sequence: u32, data: &[u8], at_ms: u64) -> Signal {
+        let tracked = &self.rows[&key];
+        if tracked.row.state != PortState::Open
+            || tracked.answer_sequence.map(|s| s.wrapping_add(1)) != Some(sequence)
+        {
+            return Signal::None;
+        }
+        match self
+            .banners
+            .offer(key.0, key.2, data, at_ms, self.revision + 1)
+        {
+            Offer::Kept(banner) => {
+                self.revision += 1;
+                self.at_ms = at_ms;
+                Signal::Banner(banner)
+            }
+            Offer::Known | Offer::Full => Signal::None,
         }
     }
 
@@ -668,7 +759,9 @@ mod tests {
                 revision: 3,
                 at_ms: 22,
                 untracked: 0,
+                untracked_banners: 0,
                 rows: vec![row],
+                banners: vec![],
             }
         );
         assert_eq!(
@@ -795,8 +888,10 @@ mod tests {
             at_ms: u64::MAX,
             max_rows: MAX_ROWS,
             untracked: u64::MAX,
+            untracked_banners: u64::MAX,
             machines: machines(),
             rows: vec![row; MAX_ROWS],
+            banners: vec![longest_banner(); MAX_BANNERS],
         };
         roundtrip(&map, PortMap::MAX_JSON_BYTES);
         let changes = PortChanges {
@@ -804,13 +899,174 @@ mod tests {
             revision: u64::MAX,
             at_ms: u64::MAX,
             untracked: u64::MAX,
+            untracked_banners: u64::MAX,
             rows: map.rows,
+            banners: map.banners,
         };
         roundtrip(&changes, PortChanges::MAX_JSON_BYTES);
+        // The bound counts a comma after the last row and the last banner.
         assert_eq!(
-            serde_json::to_vec(&changes).unwrap().len() + 1,
+            serde_json::to_vec(&changes).unwrap().len() + 2,
             PortChanges::MAX_JSON_BYTES
         );
+    }
+
+    fn longest_banner() -> Banner {
+        Banner {
+            host: Ipv4Addr::BROADCAST,
+            port: u16::MAX,
+            text: "\"".repeat(crate::banners::MAX_TEXT_BYTES),
+            server: Some("\"".repeat(crate::banners::MAX_TEXT_BYTES)),
+            at_ms: u64::MAX,
+            revision: u64::MAX,
+        }
+    }
+
+    fn segment(port: u16, client: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut t = vec![0; 20];
+        t[..2].copy_from_slice(&port.to_be_bytes());
+        t[2..4].copy_from_slice(&client.to_be_bytes());
+        t[4..8].copy_from_slice(&seq.to_be_bytes());
+        t[8..12].copy_from_slice(&101u32.to_be_bytes());
+        t[12] = 0x50;
+        t[13] = flags;
+        t.extend_from_slice(payload);
+        let sum = ip::transport_checksum(HOST.into(), SCANNER.into(), 6, &t);
+        t[16..18].copy_from_slice(&sum.to_be_bytes());
+        ip::packet(HOST.into(), SCANNER.into(), 6, &t).0
+    }
+
+    /// Probes `port` and answers with a SYN-ACK whose sequence number is 7.
+    fn opened(t: &mut Tracker, port: u16, client: u16) {
+        t.packet(FromInner, &syn(port, client, 100), 10);
+        t.packet(ToInner, &segment(port, client, 7, 0x12, b""), 11);
+    }
+
+    const SSH: &[u8] = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20\r\n";
+
+    #[test]
+    fn the_first_data_segment_after_the_syn_ack_is_the_banner() {
+        let mut t = Tracker::new(10);
+        opened(&mut t, 22, 4000);
+        assert_eq!(t.revision, 2);
+        // A segment later in the stream is not the first data segment.
+        assert_eq!(
+            t.packet(ToInner, &segment(22, 4000, 9, 0x18, SSH), 12),
+            Signal::None
+        );
+        let banner = Banner {
+            host: HOST,
+            port: 22,
+            text: "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20".into(),
+            server: None,
+            at_ms: 13,
+            revision: 3,
+        };
+        assert_eq!(
+            t.packet(ToInner, &segment(22, 4000, 8, 0x18, SSH), 13),
+            Signal::Banner(banner.clone())
+        );
+        assert_eq!((t.revision, t.at_ms), (3, 13));
+        assert_eq!(t.snapshot().banners, std::slice::from_ref(&banner));
+        assert_eq!(t.changes_since(2).banners, std::slice::from_ref(&banner));
+        assert!(t.changes_since(2).rows.is_empty());
+        assert!(t.changes_since(3).banners.is_empty());
+        assert_eq!(
+            t.packet(ToInner, &segment(22, 4000, 8, 0x19, SSH), 14),
+            Signal::None
+        );
+        assert_eq!(t.revision, 3);
+    }
+
+    #[test]
+    fn an_http_banner_keeps_the_status_line_and_server_value() {
+        let mut t = Tracker::new(10);
+        opened(&mut t, 80, 4000);
+        let response =
+            b"HTTP/1.1 200 OK\r\nServer: nginx/1.24.0 (Ubuntu)\r\nDate: today\r\n\r\n<html>";
+        let Signal::Banner(banner) = t.packet(ToInner, &segment(80, 4000, 8, 0x18, response), 12)
+        else {
+            panic!("expected a banner");
+        };
+        assert_eq!(banner.text, "HTTP/1.1 200 OK");
+        assert_eq!(banner.server.as_deref(), Some("nginx/1.24.0 (Ubuntu)"));
+    }
+
+    #[test]
+    fn data_from_closed_unanswered_or_other_connections_is_ignored() {
+        let mut t = Tracker::new(10);
+        t.packet(FromInner, &syn(23, 4000, 100), 10);
+        t.packet(FromInner, &syn(25, 4001, 100), 10);
+        t.packet(ToInner, &segment(25, 4001, 7, 0x14, b""), 11);
+        assert_eq!(t.snapshot().rows[1].state, Closed);
+        let before = t.revision;
+        for packet in [
+            segment(23, 4000, 8, 0x18, SSH),
+            segment(25, 4001, 8, 0x18, SSH),
+        ] {
+            assert_eq!(t.packet(ToInner, &packet, 12), Signal::None);
+        }
+        opened(&mut t, 22, 4002);
+        let before_data = t.revision;
+        for packet in [
+            // To another client port, with SYN set, with RST set, and with no data.
+            segment(22, 4003, 8, 0x18, SSH),
+            segment(22, 4002, 8, 0x02, SSH),
+            segment(22, 4002, 8, 0x04, SSH),
+            segment(22, 4002, 8, 0x18, b""),
+        ] {
+            assert_eq!(t.packet(ToInner, &packet, 12), Signal::None);
+        }
+        assert_eq!(t.revision, before_data);
+        assert!(before_data > before);
+        assert!(t.snapshot().banners.is_empty());
+    }
+
+    #[test]
+    fn a_second_connection_does_not_replace_the_banner() {
+        let mut t = Tracker::new(10);
+        opened(&mut t, 22, 4000);
+        t.packet(
+            ToInner,
+            &segment(22, 4000, 8, 0x18, b"SSH-2.0-first\r\n"),
+            12,
+        );
+        opened(&mut t, 22, 4001);
+        let revision = t.revision;
+        assert_eq!(
+            t.packet(
+                ToInner,
+                &segment(22, 4001, 8, 0x18, b"SSH-2.0-second\r\n"),
+                13
+            ),
+            Signal::None
+        );
+        assert_eq!(t.revision, revision);
+        assert_eq!(t.snapshot().banners[0].text, "SSH-2.0-first");
+        assert_eq!(t.snapshot().banners[0].at_ms, 12);
+    }
+
+    #[test]
+    fn banners_past_the_bound_are_counted_and_never_evict() {
+        let mut t = Tracker::with_banners(10, 1);
+        opened(&mut t, 22, 4000);
+        opened(&mut t, 80, 4001);
+        t.packet(ToInner, &segment(22, 4000, 8, 0x18, SSH), 12);
+        let revision = t.revision;
+        assert_eq!(
+            t.packet(
+                ToInner,
+                &segment(80, 4001, 8, 0x18, b"HTTP/1.1 200 OK\r\n"),
+                13
+            ),
+            Signal::None
+        );
+        assert_eq!(t.revision, revision);
+        let map = t.snapshot();
+        assert_eq!(map.untracked_banners, 1);
+        assert_eq!(map.banners.len(), 1);
+        assert_eq!(map.banners[0].port, 22);
+        assert_eq!(t.changes_since(0).untracked_banners, 1);
     }
 
     fn state(t: &Tracker, expected: PortState, probes: u64, revision: u64) {
@@ -988,7 +1244,9 @@ mod tests {
                 revision: 4,
                 at_ms: 24,
                 untracked: 2,
-                rows: vec![after.rows[0].clone()]
+                untracked_banners: 0,
+                rows: vec![after.rows[0].clone()],
+                banners: vec![],
             }
         );
         assert_eq!(t.changes_since(0).rows, after.rows);
@@ -1098,8 +1356,10 @@ mod tests {
             at_ms: u64::MAX,
             max_rows: MAX_ROWS,
             untracked: u64::MAX,
+            untracked_banners: u64::MAX,
             machines: machines(),
             rows: vec![row; MAX_ROWS],
+            banners: vec![longest_banner(); MAX_BANNERS],
         };
         roundtrip(&map, PortMap::MAX_JSON_BYTES);
         let changes = PortChanges {
@@ -1107,7 +1367,9 @@ mod tests {
             revision: u64::MAX,
             at_ms: u64::MAX,
             untracked: u64::MAX,
+            untracked_banners: u64::MAX,
             rows: map.rows,
+            banners: map.banners,
         };
         roundtrip(&changes, PortChanges::MAX_JSON_BYTES);
         for protocol in [Protocol::Tcp, Protocol::Udp] {

@@ -5,10 +5,10 @@ This example is a small office subnet for a port scanner. The agent runs
 are simulated machines that the world builds from Fictionet's stdlib. The
 fifth is a real server, attached to the world as a sandbox of its own and
 routed into the same subnet. Compose runs it as a container with nginx
-and OpenSSH. An in-process demo can attach a VM at the same address. From the
-scanner's side there is no difference between them: every host answers
-pings, every closed port answers a SYN with a RST, and every open port
-answers nmap's service probes.
+and OpenSSH. [The in-process demo](#the-in-process-demo) runs it as a VM at
+the same address. From the scanner's side there is no difference between
+them: every host answers pings, every closed port answers a SYN with a RST,
+and every open port answers nmap's service probes.
 
 ## What is in the world
 
@@ -92,7 +92,12 @@ office, stale replies and noninitial fragments do not update the map.
 A row starts `unanswered`. Repeated probes keep the last answered state.
 `scan.port` facts report new rows and state changes, with the previous state,
 probe count, first and last probe times, and revision. A new row's previous
-state is null. Times are whole milliseconds since the run began.
+state is null. Times are whole milliseconds since the run began. A port scan
+makes thousands of these facts, so each is a repeatable fact
+(`Event::repeat`): the host, protocol, state and previous state identify it,
+and the port, times, probe count and revision are its detail. A dashboard
+keeps them in its budget for repeatable facts, so they never evict the
+run's other events.
 
 `start()` returns a shared `Ports` handle. `snapshot()` returns the office
 labels and sorted rows. `changes_since(revision)` returns the latest version
@@ -103,6 +108,18 @@ untracked count. Their `MAX_JSON_BYTES` constants bound compact JSON output.
 The map holds at most 16,384 rows and never evicts them. Further probes for
 new keys increment `untracked`; existing rows still update. The first such
 probe emits one `scan.full` fact with `max_rows`.
+
+The tap also keeps a banner for each open TCP port: the first data the host
+sent to the scanner. It reads only the first data segment of a connection,
+the one that follows the SYN-ACK, and never reassembles a stream. The banner
+is that segment's first line, at most 160 bytes. When the data starts with
+an HTTP status line, the banner is the status line and the `Server` header's
+value. Bytes outside printable ASCII show as `\xHH`, and a backslash as `\\`.
+A `scan.banner` fact marks each new banner, with its host, port, text, server
+value, time and revision. A new banner advances the map revision. A later
+connection never replaces a kept banner. Snapshots and changes list banners
+sorted by host, then port. The map keeps at most 1,024 banners and never
+evicts one; further banners only increment `untracked_banners`.
 
 ## Running it
 
@@ -221,6 +238,51 @@ Closing "simulated hosts" hides the router and its internal links.
 The links to the two sandboxes stay visible.
 
 Stop it all and remove its volume with `docker compose down -v`.
+
+## The in-process demo
+
+`cargo xtask demo scan` runs the same world in one process with two Ubuntu
+24.04 microVMs from the shared kit (see [the demos](../../demos/README.md)).
+It needs KVM and Chromium. The Compose stack above is a separate way to run
+the world.
+
+- The workstation is the scanner. It runs nmap, and a script types three
+  nmap steps into its terminal: host discovery, a SYN scan of ports 1 to
+  1,024 with service detection, and OS detection. The agent is scripted; no
+  model runs.
+- The office server is the real host at 10.0.0.50, with nginx and OpenSSH.
+  Its terminal follows nginx's access log and sshd's journal.
+
+The page shows both VMs in the workspace and three panels of its own:
+
+- **Office**: the story's steps, then the scanner and the office subnet as
+  256 cells. A cell lights when the port map shows a probe to its address.
+  A card appears for each machine whose address answered. When all five
+  have answered, the demo emits one `scan.discovered` fact, and the page's
+  header shows that moment.
+- **Ports**: each answering host's 1,024 ports, filled in from the port map,
+  and a view of only the ports open on any host.
+- **Services**: one row per open port, with the banner the tap saw on the
+  wire beside nmap's service, product and version, and nmap's OS guess for
+  each host.
+
+The standard Packets, Events, Map, Left the box, Containment, and Labels
+and export panels are there too.
+
+The port map and banners come from the tap (see Port facts above). nmap's
+names and OS guesses come from its XML output, which the demo reads after
+each step, and the page labels them "nmap says". The gate reads all three
+through the page's API.
+
+The command prints each step's command and nmap's findings, then the page
+checks, and ends with `every required check passed`. nmap's XML reports, the
+port map after each step and the screenshots go to
+`demos/downloads/cloudimage/shots/`.
+
+`cargo run -p fictionet-demo --example scan_page` serves the same page
+without VMs, to work on it: an in-world scanner sends the story's probes, a
+stand-in answers at 10.0.0.50, and nmap's reports are the ones recorded in a
+KVM run.
 
 ## Recording the dashboard
 

@@ -14,7 +14,8 @@
 //!
 //! To run in-process, build [`office`] and add hosts or routes if needed.
 //! Call [`start`] with the world's attachments. Keep the [`Ports`] handle
-//! for snapshots and changes since a revision. See [`ports`] for probe facts.
+//! for snapshots and changes since a revision. See [`ports`] for probe facts
+//! and [`banners`] for the first data each open port sends.
 //!
 //! ```
 //! use fictionet::{RunOptions, Seed};
@@ -44,7 +45,9 @@
 //! [`fictionet::stdlib::network::ethernet::Family::FromWorld`] and the
 //! [`SCANNER`] attachment. The Net's DHCP leases it an address in [`SCANNER_SUBNET`].
 
+pub mod banners;
 pub mod ports;
+pub use banners::Banner;
 pub use ports::{Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Ports, Protocol};
 
 use std::convert::Infallible;
@@ -190,7 +193,7 @@ pub fn office() -> Net {
                     httpd::Http1::new(Page { server, title })
                 }),
                 Kind::Ssh => host.tcp(port, Arc::new(()), || Ssh),
-                _ => host.tcp(port, Arc::new(()), move || Banner(kind)),
+                _ => host.tcp(port, Arc::new(()), move || Greeting(kind)),
             };
         }
         net = net.add_host(host);
@@ -266,9 +269,9 @@ impl httpd::Handler for Page {
     }
 }
 
-struct Banner(Kind);
+struct Greeting(Kind);
 
-impl Service for Banner {
+impl Service for Greeting {
     type Decoder = Collect<Vec<u8>, true>;
     type State = ();
     type Error = Infallible;

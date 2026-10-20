@@ -81,54 +81,6 @@ async fn field_presence_includes_null_values_and_excludes_other_events() {
     assert_eq!(rows[1]["fields"]["selected"], serde_json::Value::Null);
 }
 
-#[tokio::test]
-async fn event_table_cursors_reach_rows_past_one_page() {
-    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
-    fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(dashboard.observer()),
-        |cx| async move {
-            for _ in 0..1500 {
-                cx.emit("fixture", "noise", |event| event);
-            }
-            cx.emit("fixture", "request", |event| event);
-            for _ in 0..1500 {
-                cx.emit("fixture", "noise", |event| event);
-            }
-            Ok(())
-        },
-    )
-    .await
-    .unwrap();
-    let server = Page::new("Paging", dashboard.handle())
-        .event_table(
-            "Requests",
-            EventFilter {
-                source: Some("fixture".into()),
-                kind: Some("request".into()),
-                ..EventFilter::default()
-            },
-            vec![],
-        )
-        .bind_loopback(0)
-        .await
-        .unwrap();
-    let (mut after, mut rows, mut pages) = (0, vec![], 0);
-    loop {
-        let path = format!("/api/event-table/requests?after={after}");
-        let page = json_body(&request(&server, "GET", &path, &bearer(&server), "").await);
-        rows.extend(page["rows"].as_array().unwrap().iter().cloned());
-        let next = page["next"].as_u64().unwrap();
-        if next == after {
-            break;
-        }
-        assert!(next > after);
-        (after, pages) = (next, pages + 1);
-    }
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["kind"], "request");
-    assert!(pages > 1);
-}
-
 fn address(server: &Server) -> &str {
     server
         .url()
@@ -1969,6 +1921,81 @@ async fn moments_validate_titles_ids_and_host_filters_before_binding() {
             io::ErrorKind::InvalidInput
         );
     }
+}
+
+#[tokio::test]
+async fn a_late_event_table_read_finds_a_moment_past_the_first_thousand_events() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let observer = dashboard.observer();
+    let server = Page::new("Late reader", dashboard.handle())
+        .moment(
+            "Found",
+            EventFilter {
+                source: Some("fixture".into()),
+                kind: Some("found".into()),
+                ..EventFilter::default()
+            },
+        )
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    std::thread::spawn(move || {
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(3)).observer(observer),
+            |cx| async move {
+                for n in 0..2500u64 {
+                    cx.emit("fixture", "noise", |e| e.field("n", n));
+                }
+                cx.emit("fixture", "found", |e| e.field("n", 2500u64));
+                for n in 0..1500u64 {
+                    cx.emit("fixture", "noise", |e| e.field("n", n));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap()
+    })
+    .join()
+    .unwrap();
+    let all = json_body(&request(&server, "GET", "/api/events?max=1", &bearer(&server), "").await);
+    let last = all["last"].as_u64().unwrap();
+    let rows = json_body(
+        &request(
+            &server,
+            "GET",
+            "/api/event-table/found",
+            &bearer(&server),
+            "",
+        )
+        .await,
+    );
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(rows["rows"][0]["fields"]["n"], 2500);
+    assert_eq!(rows["next"], last);
+    let seq = rows["rows"][0]["seq"].as_u64().unwrap();
+    let before = json_body(
+        &request(
+            &server,
+            "GET",
+            &format!("/api/event-table/found?after={}", seq - 1),
+            &bearer(&server),
+            "",
+        )
+        .await,
+    );
+    assert_eq!(before["rows"], rows["rows"]);
+    let after = json_body(
+        &request(
+            &server,
+            "GET",
+            &format!("/api/event-table/found?after={seq}"),
+            &bearer(&server),
+            "",
+        )
+        .await,
+    );
+    assert_eq!(after["rows"], serde_json::json!([]));
+    assert_eq!(after["next"], last);
 }
 
 #[tokio::test]

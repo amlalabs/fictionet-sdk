@@ -1,5 +1,8 @@
-//! The scripted office inventory and its checks.
-use crate::{Error, guests, nmap};
+//! Runs the scripted office inventory in the workstation's terminal, checks
+//! each nmap report against the world's port map, and records the story's
+//! progress and nmap's reports for the page.
+use crate::script::{self, STEPS};
+use crate::{Error, guests, nmap, page};
 use fictionet_demo::kit::{self, base64, ssh::quote};
 use scan_world::{PortMap, PortState, Protocol};
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,37 +10,12 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// The last octets of the five office machines.
 pub const HOSTS: [u8; 5] = [10, 11, 12, 13, 50];
+/// Each machine's open TCP ports, in the order of `HOSTS`.
 const OPEN: [&[u16]; 5] = [&[22, 80], &[25, 110, 143], &[21, 22], &[80, 631], &[22, 80]];
 
-pub struct Step {
-    pub title: &'static str,
-    pub options: &'static str,
-    pub target: &'static str,
-    pub expected_exit: i32,
-}
-pub const STEPS: [Step; 3] = [
-    Step {
-        title: "Host discovery",
-        options: "-sn -n",
-        target: "10.0.0.0/24",
-        expected_exit: 0,
-    },
-    Step {
-        title: "SYN scan with service detection",
-        options: "-sS -sV --version-light -n -p 1-1024 --max-rate 300",
-        target: "10.0.0.0/24",
-        expected_exit: 0,
-    },
-    Step {
-        title: "OS detection",
-        options: "-O --osscan-guess -n --max-os-tries 1",
-        target: "10.0.0.10,11,12,13,50",
-        expected_exit: 0,
-    },
-];
-
-fn addr(last: u8) -> Ipv4Addr {
+pub fn addr(last: u8) -> Ipv4Addr {
     Ipv4Addr::new(10, 0, 0, last)
 }
 
@@ -168,30 +146,47 @@ pub fn check(index: usize, exit: i32, report: &nmap::Report, map: &PortMap) -> R
             }
         }
     }
-    if index == 2
-        && up.iter().any(|h| {
-            h.os.matches
+    if index == 2 {
+        for host in &up {
+            let Some(os) = &host.os else {
+                return Err(format!(
+                    "{}: nmap ran no OS detection",
+                    host.ipv4().unwrap()
+                ));
+            };
+            if os
+                .matches
                 .iter()
                 .any(|m| m.accuracy > 100 || m.name.is_empty())
-        })
-    {
-        return Err("nmap returned an invalid OS match".into());
+            {
+                return Err("nmap returned an invalid OS match".into());
+            }
+        }
     }
     Ok(())
 }
 
-pub async fn run(run: &kit::Run, ports: &scan_world::Ports, out: &Path) -> Result<Duration, Error> {
+pub async fn run(
+    run: &kit::Run,
+    ports: &scan_world::Ports,
+    out: &Path,
+    progress: &page::Progress,
+) -> Result<Duration, Error> {
     let start = Instant::now();
     let guest = run.guest(guests::WORKSTATION);
     for (index, step) in STEPS.iter().enumerate() {
         println!("{}: {}", index + 1, step.title);
-        let file = format!("notes/office-{}.xml", index + 1);
-        let command = format!("sudo nmap {} -oX {file} {}", step.options, step.target);
+        let file = script::report_file(index);
+        let command = script::command(index);
         println!("scripted agent: {command}");
+        progress.start(index);
         let send = format!(
             "printf '%s' {} | base64 -d > ~/notes/requests; cat ~/notes/results",
             quote(&base64(format!("{command}\n").as_bytes()))
         );
+        // The step's exit status and nmap's report, as far as the step got.
+        let mut exit = None;
+        let mut report = None;
         let result = async {
             let output = tokio::time::timeout(
                 Duration::from_secs(330),
@@ -201,9 +196,12 @@ pub async fn run(run: &kit::Run, ports: &scan_world::Ports, out: &Path) -> Resul
             if output.code != 0 {
                 return Err(format!("runner transport: {}", output.stderr).into());
             }
-            let exit: i32 = output.stdout.trim().parse()?;
-            if exit != step.expected_exit {
-                return Err(format!("exit status {exit}, expected {}", step.expected_exit).into());
+            let status: i32 = output.stdout.trim().parse()?;
+            exit = Some(status);
+            if status != step.expected_exit {
+                return Err(
+                    format!("exit status {status}, expected {}", step.expected_exit).into(),
+                );
             }
             let xml = tokio::time::timeout(
                 Duration::from_secs(30),
@@ -221,12 +219,14 @@ pub async fn run(run: &kit::Run, ports: &scan_world::Ports, out: &Path) -> Resul
                 out.join(format!("office-{}-ports.json", index + 1)),
                 serde_json::to_vec_pretty(&snapshot)?,
             )?;
-            let report = nmap::parse(&xml.stdout)?;
-            check(index, exit, &report, &snapshot).map_err(|e| -> Error { e.into() })?;
-            print_report(index, &report);
+            let parsed = nmap::parse(&xml.stdout)?;
+            report = Some(page::StepReport::new(step.title, &parsed));
+            check(index, status, &parsed, &snapshot).map_err(|e| -> Error { e.into() })?;
+            print_report(index, &parsed);
             Ok::<(), Error>(())
         }
         .await;
+        progress.finish(index, exit, report, result.is_ok());
         if let Err(error) = result {
             let output = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -249,6 +249,21 @@ pub async fn run(run: &kit::Run, ports: &scan_world::Ports, out: &Path) -> Resul
     Ok(start.elapsed())
 }
 
+/// nmap's best OS guess for a host with its accuracy and how many other
+/// guesses nmap gave, or "no match".
+fn os_guess(host: &nmap::Host) -> String {
+    match host.os.as_ref().map(|os| os.matches.as_slice()) {
+        Some([best, rest @ ..]) => {
+            let more = match rest.len() {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
+            format!("{} ({}%){more}", best.name, best.accuracy)
+        }
+        _ => "no match".into(),
+    }
+}
+
 fn print_report(index: usize, report: &nmap::Report) {
     for host in report.hosts.iter().filter(|h| h.status.state == "up") {
         let ip = host.ipv4().unwrap();
@@ -267,15 +282,7 @@ fn print_report(index: usize, report: &nmap::Report) {
                     );
                 }
             }
-            _ => {
-                if host.os.matches.is_empty() {
-                    println!("nmap OS: {ip}: no match");
-                } else {
-                    for guess in &host.os.matches {
-                        println!("nmap OS: {ip}: {} ({}%)", guess.name, guess.accuracy);
-                    }
-                }
-            }
+            _ => println!("nmap OS: {ip}: {}", os_guess(host)),
         }
     }
 }
@@ -283,10 +290,13 @@ fn print_report(index: usize, report: &nmap::Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nmap::tests::{DISCOVERY, OS, SERVICES};
+    use crate::nmap::tests::{DISCOVERY, OS, SERVICES, os_without_match};
+    use crate::page::tests::recorded_discovery;
 
+    /// A port map with a row for each of the first 1,024 TCP ports on every
+    /// host, open where the recorded SYN scan found them open.
     fn map() -> PortMap {
-        let mut map: PortMap = serde_json::from_str(r#"{"revision":10240,"at_ms":1000,"max_rows":16384,"untracked":0,"machines":[],"rows":[]}"#).unwrap();
+        let mut map: PortMap = serde_json::from_str(r#"{"revision":10240,"at_ms":1000,"max_rows":16384,"untracked":0,"untracked_banners":0,"machines":[],"rows":[],"banners":[]}"#).unwrap();
         for host in nmap::parse(SERVICES).unwrap().hosts {
             for port in 1..=1024 {
                 let open = host
@@ -315,31 +325,21 @@ mod tests {
 
     #[test]
     fn recorded_discovery_requires_an_answer_for_each_host() {
-        let report = nmap::parse(include_str!("discovery.xml")).unwrap();
-        let mut map = map();
-        map.rows = HOSTS
-            .map(|last| scan_world::PortRow {
-                host: addr(last),
-                port: 0,
-                protocol: Protocol::Icmp,
-                state: PortState::Open,
-                first_probe_ms: 10,
-                last_probe_ms: 10,
-                probes: 1,
-                revision: 2,
-            })
-            .into();
+        let report = nmap::parse(DISCOVERY).unwrap();
+        let map = recorded_discovery();
         check(0, 0, &report, &map).unwrap();
-        for i in 0..map.rows.len() {
+        for last in HOSTS {
             let mut missing = map.clone();
-            missing.rows.remove(i);
+            missing.rows.retain(|r| r.host != addr(last));
             assert_eq!(
                 check(0, 0, &report, &missing),
-                Err(format!("{} has no answered port probe", map.rows[i].host))
+                Err(format!("{} has no answered port probe", addr(last)))
             );
             for state in [PortState::Unanswered, PortState::Unreachable] {
                 let mut unanswered = map.clone();
-                unanswered.rows[i].state = state;
+                for row in unanswered.rows.iter_mut().filter(|r| r.host == addr(last)) {
+                    row.state = state;
+                }
                 assert!(check(0, 0, &report, &unanswered).is_err());
             }
         }
@@ -350,6 +350,33 @@ mod tests {
         for (index, xml) in [DISCOVERY, SERVICES, OS].into_iter().enumerate() {
             check(index, 0, &nmap::parse(xml).unwrap(), &map()).unwrap();
         }
+        check(
+            2,
+            0,
+            &nmap::parse(&os_without_match("10.0.0.50")).unwrap(),
+            &map(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn os_guesses_print_the_best_and_a_count() {
+        let report = nmap::parse(&os_without_match("10.0.0.13")).unwrap();
+        let printed: Vec<_> = report.hosts.iter().map(os_guess).collect();
+        assert_eq!(
+            printed,
+            [
+                "OpenWrt 0.9 - 7.09 (Linux 2.4.30 - 2.4.34) (91%) and 9 more",
+                "OpenWrt Kamikaze 7.09 (Linux 2.6.22) (92%) and 9 more",
+                "OpenWrt Kamikaze 7.09 (Linux 2.6.22) (92%) and 9 more",
+                "no match",
+                "Linux 5.0 - 5.5 (100%)",
+            ]
+        );
+        assert_eq!(
+            os_guess(&nmap::parse(DISCOVERY).unwrap().hosts[0]),
+            "no match"
+        );
     }
 
     #[test]
@@ -377,7 +404,7 @@ mod tests {
             ("Apache httpd", "unknown"),
             ("CUPS", "unknown"),
             ("state=\"closed\"", "state=\"filtered\""),
-            ("reason=\"resets\"", "reason=\"no-responses\""),
+            ("reason=\"reset\"", "reason=\"no-response\""),
             ("count=\"1022\"", "count=\"1021\""),
         ] {
             assert!(
@@ -414,20 +441,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_os_accuracy_without_requiring_a_guess() {
+    fn rejects_invalid_os_accuracy_and_missing_detection_without_requiring_a_guess() {
         assert!(
             check(
                 2,
                 0,
-                &nmap::parse(&OS.replace("accuracy=\"96\"", "accuracy=\"101\"")).unwrap(),
+                &nmap::parse(&OS.replace("accuracy=\"100\"", "accuracy=\"101\"")).unwrap(),
                 &map()
             )
             .is_err()
         );
         let mut report = nmap::parse(OS).unwrap();
         for host in &mut report.hosts {
-            host.os.matches.clear();
+            host.os.as_mut().unwrap().matches.clear();
         }
         check(2, 0, &report, &map()).unwrap();
+        report.hosts[3].os = None;
+        assert_eq!(
+            check(2, 0, &report, &map()),
+            Err("10.0.0.13: nmap ran no OS detection".into())
+        );
     }
 }
