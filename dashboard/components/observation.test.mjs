@@ -479,3 +479,32 @@ test('selected startup links acquire their host name without changing the select
   stop();
   h.clean();
 });
+
+test('the map rings the item an event came from and draws the graph again when reopened', (t) => {
+  for (const [name, value] of [['getTotalLength', () => 100], ['getPointAtLength', () => ({ x: 0, y: 0 })]]) {
+    if (Element.prototype[name]) continue;
+    Element.prototype[name] = value;
+    t.after(() => { delete Element.prototype[name]; });
+  }
+  const h = fixture(t);
+  h.services.reducedMotion = { matches: false };
+  let dispose = map(h.root, h.services);
+  h.watches[0].emit('snapshot', {
+    ...h.snapshot,
+    nodes: [...h.snapshot.nodes, { id: 't1', kind: 'task', name: 'filter', parent: null }],
+    edges: [{ id: 'e1', a: 's1', b: 't1' }],
+    counters: { e1: [1, 40, 1, 40] },
+  });
+  h.frame();
+  h.watches[0].emit('event', { seq: 1, at: 1, source: 'http', kind: 'request', node: 't1', fields: {} });
+  assert.equal(h.root.querySelector('#labels').querySelectorAll('rect.pulse').length, 1);
+  const drawn = h.root.querySelector('#nodes').children.length;
+  assert.ok(drawn >= 2);
+  dispose();
+  // The graph model outlives the map: a map opened again draws what it holds.
+  dispose = map(h.root, h.services);
+  h.frame();
+  assert.equal(h.root.querySelector('#nodes').children.length, drawn);
+  dispose();
+  h.clean();
+});
