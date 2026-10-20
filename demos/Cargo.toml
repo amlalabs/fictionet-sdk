@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+scan-world = { path = "../examples/scan/world" }
+quick-xml = { version = "0.38", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
 fictionet-observe = { path = "../observe", features = ["page"] }
 example-common = { path = "../examples/common" }
 # `tokio` hands the jump host's TCP connection to the SSH client.
@@ -46,3 +49,7 @@ vmm-sys-util = "0.14"
 [[bin]]
 name = "desktop"
 path = "src/bin/desktop/main.rs"
+
+[[bin]]
+name = "scan"
+path = "src/bin/scan/main.rs"

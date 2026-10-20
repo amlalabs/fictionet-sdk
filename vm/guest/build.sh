@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Builds Fictionet's binaries inside the VM, from the copy of the working
 # tree at /src, as static musl executables. cargo xtask vm runs it; so can you,
-# with `cargo xtask vm build [sdk] [border] [fakewiki] [adaptive-web] [scan]`.
+# with `cargo xtask vm build [sdk] [border] [fakewiki] [adaptive-web]`.
 #
 #   sdk       fictionet and every example in the crate's Cargo.toml: web_world,
 #             the web_fixture test world and the rest
-#   scan      scan-world, the world of examples/scan
 #   border    border-world, the world of examples/border
 #   fakewiki, adaptive-web
 #             fakewiki-world and adaptive-web-world, those examples' worlds
@@ -46,7 +45,7 @@ for what in "${@:-sdk}"; do
             done
             install -m 0755 "$out/fictionet" "$out/examples/web_world" "$out/examples/web_fixture" "$pre/out/"
             ;;
-        border | fakewiki | adaptive-web | scan)
+        border | fakewiki | adaptive-web)
             echo "Building $what-world"
             build -p "$what-world" --bin "$what-world"
             put "$out/$what-world"

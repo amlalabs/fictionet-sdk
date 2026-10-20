@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<!-- Representative nmap XML for parser and story tests. -->
+<nmaprun scanner="nmap" version="7.94SVN">
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.10" addrtype="ipv4"/>
+</host>
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.11" addrtype="ipv4"/>
+</host>
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.12" addrtype="ipv4"/>
+</host>
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.13" addrtype="ipv4"/>
+</host>
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.50" addrtype="ipv4"/>
+</host>
+<runstats><finished exit="success"/><hosts up="5" down="251" total="256"/></runstats></nmaprun>

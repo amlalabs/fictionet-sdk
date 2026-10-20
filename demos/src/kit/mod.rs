@@ -100,6 +100,7 @@ struct File {
 #[derive(Clone)]
 pub struct Guest {
     hostname: String,
+    attachment: String,
     user: String,
     vcpus: u8,
     memory_mib: u32,
@@ -119,6 +120,7 @@ impl Guest {
     pub fn ubuntu(hostname: &str, user: &str) -> Self {
         Self {
             hostname: hostname.into(),
+            attachment: hostname.into(),
             user: user.into(),
             vcpus: 2,
             memory_mib: 2048,
@@ -130,6 +132,11 @@ impl Guest {
             steps: Vec::new(),
             desktop: None,
         }
+    }
+    /// Sets the host-side attachment name independently of the guest hostname.
+    pub fn attachment(mut self, name: &str) -> Self {
+        self.attachment = name.into();
+        self
     }
     /// Sets the vCPU count and memory in MiB, defaulting to 2 and 2048.
     pub fn resources(mut self, vcpus: u8, memory_mib: u32) -> Self {
@@ -186,7 +193,11 @@ impl Guest {
                 )));
             }
         }
-        if self.hostname == JUMP || self.vcpus == 0 || self.memory_mib == 0 {
+        if self.attachment.is_empty()
+            || self.attachment == JUMP
+            || self.vcpus == 0
+            || self.memory_mib == 0
+        {
             return Err(io::Error::other("guest name or resources are invalid"));
         }
         for value in [&self.manufacturer, &self.product] {
@@ -291,7 +302,7 @@ impl Kit {
 }
 
 impl<W> Kit<W> {
-    /// Adds a guest whose hostname also names its world attachment.
+    /// Adds a guest with its world attachment.
     pub fn guest(mut self, guest: Guest) -> Self {
         self.guests.push(guest);
         self
@@ -371,7 +382,7 @@ pub struct GuestHandle {
 }
 
 impl GuestHandle {
-    /// Returns the guest hostname and world attachment name.
+    /// Returns the guest hostname.
     pub fn name(&self) -> &str {
         &self.guest.hostname
     }
@@ -618,10 +629,11 @@ impl<W> Kit<W> {
             return Err(io::Error::other("declare at least one guest"));
         }
         let mut names = std::collections::HashSet::new();
+        let mut attachments = std::collections::HashSet::new();
         for guest in &self.guests {
             guest.validate()?;
-            if !names.insert(&guest.hostname) {
-                return Err(io::Error::other("duplicate guest hostname"));
+            if !names.insert(&guest.hostname) || !attachments.insert(&guest.attachment) {
+                return Err(io::Error::other("duplicate guest hostname or attachment"));
             }
         }
         let mut run = Run {
@@ -648,7 +660,9 @@ impl<W> Kit<W> {
         };
         for (index, guest) in self.guests.drain(..).enumerate() {
             let resources = Resources::new(run.path(), &guest, index)?;
-            let link = attacher.attach(&guest.hostname).map_err(io::Error::other)?;
+            let link = attacher
+                .attach(&guest.attachment)
+                .map_err(io::Error::other)?;
             let (tx, frames) = tokio::sync::mpsc::unbounded_channel();
             let queue = net::RxQueue::new()?;
             prepared.backends.push((tx, queue.clone()));
@@ -660,7 +674,7 @@ impl<W> Kit<W> {
             });
             let (tx, addr) = watch::channel(guest.initial_addr());
             prepared.observers.push(Arc::new(Lease {
-                name: guest.hostname.clone(),
+                name: guest.attachment.clone(),
                 addr: tx,
             }));
             let console = page::GuestConsole::new(&guest);
@@ -941,7 +955,7 @@ impl Run {
             .console
             .connected(&cx, session.clone(), guest.addr().unwrap(), self.boot);
         if let Some(dashboard) = self.dashboard.clone() {
-            let name = guest.name().to_string();
+            let name = guest.guest.attachment.clone();
             let topic = self.containment.clone();
             let probes = self.probes.clone();
             cx.spawn(move |cx| async move {

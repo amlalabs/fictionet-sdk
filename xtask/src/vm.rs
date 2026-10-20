@@ -636,7 +636,7 @@ pub fn run(args: &[String]) -> Result {
         }
         [help] if matches!(help.as_str(), "--help" | "-h") => {
             println!(
-                "cargo xtask vm [--fetch | nested [--fetch] | prepare | up | down | clean | status | sync | build [sdk|border|fakewiki|adaptive-web|scan] | test <name> | ssh [command]]"
+                "cargo xtask vm [--fetch | nested [--fetch] | prepare | up | down | clean | status | sync | build [sdk|border|fakewiki|adaptive-web] | test <name> | ssh [command]]"
             );
             return Ok(());
         }
