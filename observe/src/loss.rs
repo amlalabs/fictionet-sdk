@@ -57,6 +57,27 @@ impl LossStatus {
         self.unknown_events || self.kinds.contains(&(source, kind))
     }
 
+    pub(crate) fn omissions(&self, stream: Stream, class: usize) -> u64 {
+        self.streams
+            .iter()
+            .filter(|loss| {
+                loss.stream == stream
+                    && loss.class.is_none_or(|index| index == class)
+                    && loss.reason != LossReason::Truncation
+            })
+            .map(|loss| loss.count)
+            .chain(
+                self.untracked
+                    .iter()
+                    .filter(|loss| {
+                        loss.class.is_none_or(|index| index == class)
+                            && loss.reason != LossReason::Truncation
+                    })
+                    .map(|loss| loss.count),
+            )
+            .fold(0, u64::saturating_add)
+    }
+
     pub(crate) fn add(&mut self, limit: usize, loss: Loss) {
         self.insert(
             limit,
@@ -168,7 +189,6 @@ impl LossStatus {
     }
 }
 
-#[cfg(feature = "decode")]
 pub(crate) fn stream_name(stream: Stream) -> String {
     match stream {
         Stream::Events => "events".into(),

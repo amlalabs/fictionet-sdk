@@ -721,6 +721,7 @@ fn an_oversized_copy_reports_overflow_and_preserves_retained_copies() {
             let batch = collector.packets(link, 2, 10);
             assert_eq!(evictions(&batch), 1);
             assert_eq!(batch.packets[0].stamp.seq, 3);
+            assert_eq!(batch.packets[0].omissions, 2);
             assert_eq!(
                 count(&collector, Stream::Packets(link), LossReason::Overflow),
                 1
@@ -1650,4 +1651,367 @@ fn every_loss_has_a_stream_a_class_and_a_reason() {
     assert_eq!(staged.reason, LossReason::Staging);
     assert_eq!(staged.count, 2);
     assert_eq!(staged.event, None);
+}
+
+fn pcap_blocks(file: &[u8]) -> Vec<(u32, &[u8])> {
+    use fictionet::stdlib::codec::le32;
+    let mut blocks = Vec::new();
+    let mut offset = 0;
+    while offset < file.len() {
+        let length = le32(file, offset + 4).unwrap() as usize;
+        assert_eq!(length % 4, 0);
+        assert_eq!(le32(file, offset + length - 4).unwrap() as usize, length);
+        blocks.push((
+            le32(file, offset).unwrap(),
+            &file[offset + 8..offset + length - 4],
+        ));
+        offset += length;
+    }
+    assert_eq!(offset, file.len());
+    blocks
+}
+
+fn pcap_file(export: &mut crate::export::Export) -> Vec<u8> {
+    let mut file = Vec::new();
+    loop {
+        let (bytes, last) = export.next_chunk();
+        file.extend(bytes);
+        if last {
+            return file;
+        }
+    }
+}
+
+#[test]
+fn a_download_of_an_unwatched_link_comes_from_the_ring() {
+    with_link(
+        Options {
+            policy: policy([Class::new("packets").count(4)]),
+            ..Options::default()
+        },
+        |collector, link| {
+            packet(&collector, link, 1, Instant::ZERO, &[0x45; 20]);
+            let mut export = collector.export(&crate::export::Selection {
+                streams: vec![Stream::Packets(link)],
+                ..Default::default()
+            });
+            let file = pcap_file(&mut export);
+            let blocks = pcap_blocks(&file);
+            assert_eq!(
+                blocks.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+                [0x0a0d0d0a, 1, 6]
+            );
+            assert_eq!(&blocks[2].1[20..40], &[0x45; 20]);
+            assert!(!collector.demand.load()[&link].enabled());
+        },
+    );
+}
+
+#[test]
+fn a_long_capture_downloads_in_pieces_that_join_into_pcapng() {
+    use fictionet::stdlib::codec::le32;
+    let collector = Arc::new(Collector::new(policy([Class::new("packets")
+        .count(4096)
+        .bytes(8 << 20)])));
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)).observer(collector.clone()),
+        |cx| async move {
+            let (a, _b) = fictionet::pair();
+            let _a = cx.tap("test", a);
+            cx.yield_now().await?;
+            let link = *collector.topology().links.keys().next().unwrap();
+            cx.tls_key_log(None).unwrap().log(
+                "CLIENT_TRAFFIC_SECRET_0",
+                &7u64.to_be_bytes(),
+                &[0xab; 32],
+            );
+            let mut data = vec![0; 1200];
+            data[0] = 0x45;
+            data[2..4].copy_from_slice(&1200u16.to_be_bytes());
+            data[9] = 17;
+            for seq in 1..=300 {
+                packet(&collector, link, seq, Instant::ZERO, &data);
+            }
+            let mut export = collector.export(&crate::export::Selection {
+                streams: vec![Stream::Packets(link), Stream::Keys],
+                ..Default::default()
+            });
+            let (first, last) = export.next_chunk();
+            assert!(!last);
+            assert!(first.len() < 2 * (1 << 18));
+            let mut file = first;
+            file.extend(pcap_file(&mut export));
+            let blocks = pcap_blocks(&file);
+            assert_eq!(
+                blocks
+                    .iter()
+                    .take(3)
+                    .map(|(kind, _)| *kind)
+                    .collect::<Vec<_>>(),
+                [0x0a0d0d0a, 1, 0x0a]
+            );
+            let packets: Vec<_> = blocks.iter().filter(|(kind, _)| *kind == 6).collect();
+            assert_eq!(packets.len(), 300);
+            for (_, block) in packets {
+                assert_eq!(le32(block, 12).unwrap(), 1200);
+                assert_eq!(le32(block, 16).unwrap(), 1200);
+                assert_eq!(&block[20..1220], &data);
+            }
+            let keylog = collector.keylog();
+            let key_block = blocks[2].1;
+            let length = le32(key_block, 4).unwrap() as usize;
+            assert_eq!(&key_block[8..8 + length], keylog.as_bytes());
+            assert!(keylog.starts_with("CLIENT_TRAFFIC_SECRET_0 0000000000000007"));
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[cfg(feature = "page")]
+#[test]
+fn jsonl_and_pcapng_share_a_selection() {
+    use fictionet::events::{Event, Sandbox};
+    use fictionet::stdlib::codec::le32;
+    struct ByConnection([Class; 2]);
+    impl Policy for ByConnection {
+        fn classes(&self) -> &[Class] {
+            &self.0
+        }
+        fn admit(&self, interest: Interest<'_>) -> Admit {
+            match interest {
+                Interest::Event(_, conn) => Admit::Class(usize::from(conn.id != Some(1))),
+                Interest::Packet(packet) => {
+                    Admit::Class(usize::from(packet.bytes.last() != Some(&1)))
+                }
+                Interest::TlsKey(key) => Admit::Class(usize::from(
+                    key.connection.and_then(|conn| conn.id) != Some(1),
+                )),
+                Interest::Topology(_) => Admit::Build,
+            }
+        }
+        fn sort(&self, _: &Observation<'_>) -> Option<usize> {
+            panic!("already classified")
+        }
+    }
+    let collector = Arc::new(Collector::new(Arc::new(ByConnection([
+        Class::new("agent").snap(28),
+        Class::new("bulk"),
+    ]))));
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)).observer(collector.clone()),
+        |cx| async move {
+            let (a, _b) = fictionet::pair();
+            let (c, _d) = fictionet::pair();
+            let (_a, _c) = (cx.tap("alpha", a), cx.tap("beta", c));
+            cx.yield_now().await?;
+            let links: Vec<_> = collector.topology().links.keys().copied().collect();
+            for seq in 1..=6 {
+                let mut event = Event::new("http", "request");
+                event.conn.id = Some(if seq % 2 == 1 { 1 } else { 2 });
+                event.conn.sandbox = Some(Sandbox {
+                    id: 1,
+                    name: if seq <= 4 {
+                        "alpha".into()
+                    } else {
+                        "beta".into()
+                    },
+                    addr: None,
+                    addr_v6: None,
+                });
+                collector.observe(
+                    Stamp {
+                        stream: Stream::Events,
+                        seq,
+                        at: Instant::ZERO,
+                    },
+                    Observation::Event(&event),
+                );
+                cx.tls_key_log(Some(&event.conn)).unwrap().log(
+                    "CLIENT_RANDOM",
+                    &[seq as u8],
+                    &[seq as u8],
+                );
+                for (link, host) in links.iter().zip(["alpha", "beta"]) {
+                    let mut data = vec![0; 40];
+                    data[0] = 0x45;
+                    data[2..4].copy_from_slice(&40u16.to_be_bytes());
+                    data[39] = event.conn.id.unwrap() as u8;
+                    collector.observe(
+                        Stamp {
+                            stream: Stream::Packets(*link),
+                            seq,
+                            at: Instant::ZERO,
+                        },
+                        Observation::Packet(PacketRef {
+                            link: *link,
+                            tap: host,
+                            sandbox: Some(host),
+                            side: Side::A,
+                            len: data.len(),
+                            link_type: LinkType::Ip,
+                            bytes: &data,
+                        }),
+                    );
+                }
+            }
+            let mut merged = collector.export(&crate::export::Selection {
+                streams: vec![Stream::Packets(links[1]), Stream::Packets(links[0])],
+                ..Default::default()
+            });
+            let merged_file = pcap_file(&mut merged);
+            let merged_blocks = pcap_blocks(&merged_file);
+            assert_eq!(
+                merged_blocks
+                    .iter()
+                    .filter(|(kind, _)| *kind == 0x0a0d0d0a)
+                    .count(),
+                2
+            );
+            let comments: Vec<_> = merged_blocks
+                .iter()
+                .filter(|(kind, _)| *kind == 6)
+                .map(|(_, block)| packet_comment(block))
+                .collect();
+            assert_eq!(comments.len(), 12);
+            for (rows, host) in comments.chunks(6).zip(["beta", "alpha"]) {
+                for (index, comment) in rows.iter().enumerate() {
+                    assert_eq!(comment["seq"], index + 1);
+                    assert_eq!(comment["class"], index % 2);
+                    assert_eq!(comment["source"], host);
+                }
+            }
+            let mut export = collector.export(&crate::export::Selection {
+                streams: vec![
+                    Stream::Events,
+                    Stream::Packets(links[0]),
+                    Stream::Packets(links[1]),
+                    Stream::Keys,
+                ],
+                classes: Some(vec![0]),
+                sandbox: Some("alpha".into()),
+                after: 1,
+                through: Some(4),
+                ..Default::default()
+            });
+            let lines: Vec<serde_json::Value> = export
+                .jsonl()
+                .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+                .collect();
+            let events: Vec<_> = lines
+                .iter()
+                .filter(|line| line.get("seq").is_some())
+                .collect();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["seq"], 3);
+            assert_eq!(events[0]["class"], 0);
+            assert_eq!(events[0]["sandbox"]["name"], "alpha");
+            assert_eq!(export.keylog(), "CLIENT_RANDOM 03 03\n");
+            let file = pcap_file(&mut export);
+            let blocks = pcap_blocks(&file);
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|(kind, _)| *kind == 0x0a0d0d0a)
+                    .count(),
+                1
+            );
+            let packets: Vec<_> = blocks.iter().filter(|(kind, _)| *kind == 6).collect();
+            assert_eq!(packets.len(), 1);
+            assert_eq!(le32(packets[0].1, 12).unwrap(), 28);
+            assert_eq!(le32(packets[0].1, 16).unwrap(), 40);
+            let comment = packet_comment(packets[0].1);
+            assert_eq!(comment["seq"], 3);
+            assert_eq!(comment["class"], 0);
+            assert_eq!(comment["source"], "alpha");
+            assert!(lines.iter().any(|line| line["type"] == "loss"
+                && line["class"] == 0
+                && line["reason"] == "truncation"));
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[cfg(feature = "page")]
+fn packet_comment(block: &[u8]) -> serde_json::Value {
+    use fictionet::stdlib::codec::{le16, le32};
+    let at = 20 + (le32(block, 12).unwrap() as usize).div_ceil(4) * 4;
+    assert_eq!(le16(block, at).unwrap(), 1);
+    let length = le16(block, at + 2).unwrap() as usize;
+    serde_json::from_slice(&block[at + 4..at + 4 + length]).unwrap()
+}
+
+#[cfg(feature = "page")]
+#[test]
+fn a_flow_label_is_a_pcapng_comment() {
+    with_link(
+        Options {
+            policy: policy([Class::new("packets")]),
+            ..Options::default()
+        },
+        |collector, link| {
+            let data = work_packet([192, 0, 2, 1], 0, b"hello").0;
+            let header = fictionet::stdlib::network::ip::Header::parse_truncated(&data).unwrap();
+            let payload = header.payload(&data);
+            let src =
+                std::net::SocketAddr::new(header.src, u16::from_be_bytes([payload[0], payload[1]]))
+                    .to_string();
+            let dst =
+                std::net::SocketAddr::new(header.dst, header.dst_port(&data).unwrap()).to_string();
+            packet(&collector, link, 1, Instant::ZERO, &data);
+            let labels = vec![
+                crate::page::Label {
+                    id: 1,
+                    target: crate::page::LabelTarget::Flow {
+                        link: link.to_string(),
+                        a: dst,
+                        b: src,
+                    },
+                    text: "agent request".into(),
+                    at: 0.0,
+                },
+                crate::page::Label {
+                    id: 2,
+                    target: crate::page::LabelTarget::Flow {
+                        link: link.to_string(),
+                        a: "other".into(),
+                        b: "flow".into(),
+                    },
+                    text: "unrelated".into(),
+                    at: 0.0,
+                },
+            ];
+            let mut export = collector.export(&crate::export::Selection {
+                streams: vec![Stream::Packets(link)],
+                labels,
+                ..Default::default()
+            });
+            let file = pcap_file(&mut export);
+            let blocks = pcap_blocks(&file);
+            let comment = packet_comment(blocks.iter().find(|(kind, _)| *kind == 6).unwrap().1);
+            assert_eq!(comment["labels"], serde_json::json!(["agent request"]));
+            assert_eq!(comment["source"], "test");
+            assert_eq!(comment["kind"], "packets");
+        },
+    );
+}
+
+#[test]
+fn core_packet_loss_breaks_the_next_copy_continuity() {
+    with_link(
+        Options {
+            policy: policy([Class::new("packets")]),
+            ..Options::default()
+        },
+        |collector, link| {
+            packet(&collector, link, 1, Instant::ZERO, &[0x45; 20]);
+            collector.lost(Loss::staged(Stream::Packets(link), 1));
+            packet(&collector, link, 2, Instant::ZERO, &[0x45; 20]);
+            let copies = collector.packets(link, 0, 10).packets;
+            assert_eq!(copies[0].omissions, 0);
+            assert_eq!(copies[1].omissions, 1);
+            assert_eq!(collector.losses().streams[0].class, None);
+        },
+    );
 }

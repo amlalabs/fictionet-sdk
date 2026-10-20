@@ -59,6 +59,8 @@ pub struct PacketCopy {
     pub bytes: Arc<[u8]>,
     /// Packets sampled out in this class since its preceding copy.
     pub skipped: u64,
+    /// Ledger omissions through this copy, used to break decoder continuity.
+    pub(crate) omissions: u64,
 }
 
 /// Captures merged by the core's per-link sequence.
@@ -260,6 +262,7 @@ impl Captures {
             link_type: packet.link_type,
             bytes: packet.bytes[..len].into(),
             skipped: std::mem::take(&mut ring.skipped),
+            omissions: losses.omissions(stamp.stream, index),
         };
         ring.push(copy);
         self.bytes += len;

@@ -1,11 +1,11 @@
 //! Link watches: one link's captured copies, decoded in order and kept for
-//! the packet list, the detail pane and the capture download.
+//! the packet list and the detail pane.
 //!
 //! Readers decode. A watch decodes when a session pumps it, on that
 //! session's thread, never in an observer callback. Locks are taken in this
 //! order: the watch set, then one watch, then the collector.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +14,6 @@ use fictionet::events::{LinkId, Side};
 use fictionet::sync::Mutex;
 
 use crate::dashboard::Shared;
-use crate::decode::pcap;
 use crate::json::{self, Object};
 use crate::{Bounds, CaptureDemand, Collector, Dissector, KeyLine, Registry};
 
@@ -28,8 +27,6 @@ pub(crate) const ROW_BYTES: usize = 32 << 20;
 const PUMP_BATCH: usize = 1024;
 /// How long a watch's rows are kept after its last subscriber leaves.
 pub(crate) const LINGER: Duration = Duration::from_secs(60);
-/// The size of each piece of a capture download.
-const EXPORT_CHUNK: usize = 1 << 18;
 
 /// A decoded packet.
 struct Row {
@@ -37,12 +34,6 @@ struct Row {
     seq: u64,
     /// Decode order across all watches, for the aggregate budget.
     order: u64,
-    /// When it crossed, in microseconds since the Unix epoch, or since
-    /// the run started in a lab.
-    micros: u64,
-    /// Its length on the link.
-    len: usize,
-    data: Arc<[u8]>,
     /// The packet list's line, as JSON.
     summary: String,
     /// The detail pane, as JSON.
@@ -51,7 +42,7 @@ struct Row {
 
 impl Row {
     fn bytes(&self) -> usize {
-        self.data.len() + self.summary.len() + self.detail.len()
+        self.summary.len() + self.detail.len()
     }
 }
 
@@ -71,6 +62,7 @@ struct Inner {
     /// Copies evicted before the next decoded row.
     evicted: BTreeMap<usize, u64>,
     positions: BTreeMap<usize, u64>,
+    omissions: BTreeMap<usize, u64>,
     next_row: u64,
     dissectors: BTreeMap<usize, Dissector>,
     registry: Registry,
@@ -96,26 +88,6 @@ fn key_size(key: &KeyLine) -> usize {
     size_of::<KeyLine>() + key.label.len() + key.client_random.len() + key.secret.len()
 }
 
-/// A capture download in progress. It holds the rows it was made from,
-/// without copying their bytes, and writes the file one piece at a time.
-pub(crate) struct Export {
-    header: Option<Vec<u8>>,
-    rows: VecDeque<(u64, usize, Arc<[u8]>)>,
-}
-
-impl Export {
-    /// The next piece of the file, and whether it is the last.
-    pub(crate) fn next_chunk(&mut self) -> (Vec<u8>, bool) {
-        let mut out = self.header.take().unwrap_or_default();
-        while out.len() < EXPORT_CHUNK
-            && let Some((micros, len, data)) = self.rows.pop_front()
-        {
-            pcap::packet(&mut out, micros, len, &data);
-        }
-        (out, self.rows.is_empty())
-    }
-}
-
 impl LinkWatch {
     fn new(id: LinkId, link: String, registry: Registry) -> Self {
         Self {
@@ -126,6 +98,7 @@ impl LinkWatch {
                 cursor: 0,
                 evicted: BTreeMap::new(),
                 positions: BTreeMap::new(),
+                omissions: BTreeMap::new(),
                 next_row: 1,
                 dissectors: BTreeMap::new(),
                 registry,
@@ -220,7 +193,6 @@ impl LinkWatch {
     pub(crate) fn pump(&self, shared: &Shared) -> bool {
         let collector = &shared.collector;
         let watches = &shared.watches;
-        let wall = shared.wall().map_or(0, |d| d.as_micros() as u64);
         let mut inner = self.inner.lock();
         let mut done = 0;
         let mut drained = inner.gone;
@@ -260,7 +232,11 @@ impl LinkWatch {
                     .dissectors
                     .entry(copy.class)
                     .or_insert_with(|| Dissector::with_registry(inner.registry.clone()));
-                if copy.skipped > 0 {
+                let previous = inner
+                    .omissions
+                    .insert(copy.class, copy.omissions)
+                    .unwrap_or(0);
+                if copy.omissions > previous {
                     dissector.lost();
                 }
                 let mut decoded = dissector.decode(&copy.bytes, keys);
@@ -301,9 +277,6 @@ impl LinkWatch {
                 let row = Row {
                     seq,
                     order: watches.order.fetch_add(1, Ordering::Relaxed),
-                    micros: wall.saturating_add(at.as_micros() as u64),
-                    len: copy.original_len,
-                    data: copy.bytes,
                     summary,
                     detail,
                 };
@@ -350,38 +323,6 @@ impl LinkWatch {
             .get(at)
             .filter(|r| r.seq == seq)
             .map(|r| r.detail.clone())
-    }
-
-    /// Every kept row as a pcapng download, with this watch's cached TLS
-    /// keys and the collector's current keys, each line once.
-    pub(crate) fn export(&self, collector: &Collector) -> Export {
-        let (rows, mut keys) = {
-            let inner = self.inner.lock();
-            let rows: VecDeque<_> = inner
-                .rows
-                .iter()
-                .map(|r| (r.micros, r.len, r.data.clone()))
-                .collect();
-            (rows, inner.keys.iter().cloned().collect::<Vec<_>>())
-        };
-        keys.extend(collector.keys().iter().map(KeyLine::from));
-        let mut seen = BTreeSet::new();
-        let mut keylog = String::new();
-        for key in keys.iter().filter(|k| {
-            seen.insert((
-                k.label.as_str(),
-                k.client_random.as_slice(),
-                k.secret.as_slice(),
-            ))
-        }) {
-            crate::keys::push_keylog_line(&mut keylog, &key.label, &key.client_random, &key.secret);
-        }
-        let mut header = Vec::new();
-        pcap::start(&mut header, keylog.as_bytes());
-        Export {
-            header: Some(header),
-            rows,
-        }
     }
 
     #[cfg(test)]

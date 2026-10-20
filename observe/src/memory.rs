@@ -381,6 +381,31 @@ impl Memory {
         }
     }
 
+    pub(crate) fn selected(
+        &self,
+        selection: &crate::export::Selection,
+    ) -> Vec<(usize, Arc<Event>)> {
+        let state = self.state.lock();
+        let mut events: Vec<_> = state
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(class, _)| selection.class(*class))
+            .flat_map(|(class, ring)| {
+                ring.events
+                    .iter()
+                    .filter(|event| {
+                        selection.sequence(event.seq)
+                            && selection
+                                .host(event.conn.sandbox.as_ref().map(|sandbox| &*sandbox.name))
+                    })
+                    .map(move |event| (class, event.clone()))
+            })
+            .collect();
+        events.sort_by_key(|(_, event)| event.seq);
+        events
+    }
+
     pub(crate) fn largest(&self) -> Option<(usize, usize)> {
         self.state
             .lock()

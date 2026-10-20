@@ -10,7 +10,6 @@ mod app;
 mod conversation;
 /// Copyable HTTP/2 and gRPC presentation.
 pub mod http2;
-pub(crate) mod pcap;
 mod present;
 /// Copyable capture decoders and presenters for the built-in protocols.
 pub mod protocols;

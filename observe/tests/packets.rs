@@ -352,9 +352,11 @@ fn watch_capacity_errors_preserve_shared_streams_and_cancel_frees_admission() {
     let forgotten = second
         .call(&format!(r#"{{"op":"pcap","link":"e{}"}}"#, edges[0]))
         .unwrap();
+    assert!(forgotten.binary && forgotten.end);
+    assert_eq!(&forgotten.bytes[..4], &[0x0a, 0x0d, 0x0d, 0x0a]);
     assert_eq!(
-        text(&forgotten),
-        r#"{"error":"nothing is watching that link"}"#
+        fictionet::stdlib::codec::le32(&forgotten.bytes, 28).unwrap(),
+        1
     );
     let done = attacher.attach("done").unwrap();
     world.join().unwrap().unwrap();

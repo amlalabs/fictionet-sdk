@@ -38,8 +38,8 @@
 //! [crate's observation interface](crate). In particular, `events` accepts
 //! `after` and `max`; packet operations accept `link`, `packets` accepts
 //! `after`, and `packet` requires `seq`. Open a `packets` stream for a link
-//! before requesting its `packet` details or `pcap` export: those operations
-//! use the observer's existing decoded watch. Ordinary observer refusals return
+//! before requesting its `packet` details. `pcap` exports retained copies
+//! directly from the collector, without a watch. Ordinary observer refusals return
 //! HTTP 404 with `{error}`. Unknown routes also return 404.
 //!
 //! `keylog` downloads text with an attachment filename; `pcap` downloads
@@ -198,17 +198,17 @@
 //! and revision. Without this builder call, the panel offers exports and
 //! explains that labeling has not been enabled.
 //!
-//! `GET /api/export/events` streams JSONL in pages of at most 128 events,
+//! `GET /api/export/events` streams a JSONL snapshot of retained events,
 //! ending at the last sequence held when the download began. `host=<name>`
 //! scopes events to that page host; omit it for the whole run. The first
 //! line describes the scope, end sequence and label snapshot. Event lines
 //! carry their event and connection labels. `type: loss` lines report lost
 //! event counts for the run, including for a host-scoped export. Truncated
-//! event markers remain in the event data. A loss during export is reported
-//! on the next bounded page; sequence gaps alone are not treated as loss.
+//! event markers remain in the event data. Loss totals come from the same
+//! snapshot; sequence gaps alone are not treated as loss.
 //! `GET /api/export/packets` accepts the same scope and streams the captured
 //! guest links as pcapng sections, with retained TLS keys. Capture limits
-//! and the 32-link download bound apply. Both exports require the bearer;
+//! apply. Both exports require the bearer;
 //! browser download links contain only local blob URLs.
 //!
 //! Each host is `{name,sandbox,status,screen,terminal}`. `status` is

@@ -125,20 +125,20 @@ async fn merged_download(
     handle: &DashboardHandle,
     links: &[String],
 ) -> io::Result<()> {
-    // Prepare every bounded capture before sending a header. Each session
-    // holds packet references and emits one chunk at a time, in section order.
-    let mut captures = Vec::new();
+    let collector = &handle.0.collector;
+    let mut streams = Vec::new();
     let mut failures = Vec::new();
     for link in links {
-        let mut session = handle.session();
-        let query = [("link".into(), link.clone())];
-        let values = session.request(1, &observe_request("pcap", &query), Instant::now(), wall());
-        for value in &values {
-            if let Some(Envelope::Error(error)) = value.envelope() {
-                failures.push(serde_json::json!({"link": link, "error": error}));
-            }
+        match link
+            .strip_prefix('e')
+            .unwrap_or(link)
+            .parse::<u64>()
+            .ok()
+            .and_then(|number| collector.find_link(number))
+        {
+            Some(id) => streams.push(fictionet::events::Stream::Packets(id)),
+            None => failures.push(serde_json::json!({"link": link, "error": "no such link"})),
         }
-        captures.push((session, values));
     }
     if !failures.is_empty() {
         let names = failures
@@ -162,20 +162,17 @@ async fn merged_download(
         "Content-Disposition: attachment; filename=\"fictionet-links.pcapng\"\r\n",
     )
     .await?;
-    for (mut session, mut values) in captures {
-        loop {
-            let mut done = false;
-            for value in values {
-                if !value.binary {
-                    return Err(io::Error::other("the capture did not return binary data"));
-                }
-                http::write(conn, &value.bytes).await?;
-                done |= value.end;
-            }
-            if done {
-                break;
-            }
-            values = poll(&mut session).await;
+    streams.push(fictionet::events::Stream::Keys);
+    let mut export = collector.export(&crate::export::Selection {
+        streams,
+        wall: handle.0.wall(),
+        ..Default::default()
+    });
+    loop {
+        let (bytes, last) = export.next_chunk();
+        http::write(conn, &bytes).await?;
+        if last {
+            break;
         }
     }
     Ok(())

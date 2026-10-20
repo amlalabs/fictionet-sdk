@@ -249,11 +249,8 @@ fn quiet_capture_keeps_keys_after_the_collector_ring_rotates() {
         assert_eq!(current.lines().count(), bounds.count);
         assert!(!current.contains(&original));
         let exported = exported_keys(&download(&mut session, 2, links[0], now));
-        assert!(
-            exported.starts_with(&original),
-            "the retained key is missing"
-        );
-        assert_eq!(exported, format!("{original}{current}"));
+        assert_eq!(watch.cached_keys(), 1);
+        assert_eq!(exported, current);
 
         // Traffic resumes: the watch's bounded cache also forgets the old key.
         ends[0].send(ip());
@@ -343,17 +340,29 @@ fn a_subscription_does_not_keep_its_run_or_link_alive() {
         ends[0].send(ip());
         subscription.watch().pump(&handle.0);
         drop(ends);
-        *save.lock() = Some((subscription, Arc::downgrade(&handle.0), expected, id));
+        let export = handle.0.collector.export(&crate::export::Selection {
+            streams: vec![
+                fictionet::events::Stream::Packets(id),
+                fictionet::events::Stream::Keys,
+            ],
+            ..Default::default()
+        });
+        *save.lock() = Some((
+            subscription,
+            Arc::downgrade(&handle.0),
+            expected,
+            id,
+            export,
+        ));
         Ok(())
     });
     assert!(dashboard.handle().0.collector.ended().is_some());
-    let (subscription, weak, expected, id) = saved.lock().take().unwrap();
+    let (subscription, weak, expected, id, mut export) = saved.lock().take().unwrap();
     assert!(!dashboard.handle().0.collector.live(id));
     drop(dashboard);
     assert!(weak.upgrade().is_none());
     let watch = subscription.watch().clone();
     assert_eq!(watch.rows_after(0, 10).1.len(), 1);
-    let mut export = watch.export(&Collector::default());
     let (file, end) = export.next_chunk();
     assert!(end);
     assert_eq!(exported_keys(&file), expected);
@@ -409,15 +418,14 @@ fn watch_capacity_shares_watches_and_refuses_new_links_while_all_are_active() {
             [links[1]],
             "admission forgets idle history"
         );
-        assert_eq!(
-            text(&call(
-                &mut second,
-                11,
-                &format!(r#"{{"op":"pcap","link":"e{}"}}"#, links[0]),
-                now
-            )),
-            r#"{"error":"nothing is watching that link"}"#
+        let file = call(
+            &mut second,
+            11,
+            &format!(r#"{{"op":"pcap","link":"e{}"}}"#, links[0]),
+            now,
         );
+        assert!(file.binary);
+        assert_eq!(&file.bytes[..4], &[0x0a, 0x0d, 0x0d, 0x0a]);
         Ok(())
     });
 }
@@ -834,64 +842,4 @@ fn a_capture_of_a_detached_sandbox_stays_readable() {
     assert!(text(&detail).starts_with(r#"{"seq":3,"#));
     let file = download(&mut session, 3, link, now);
     assert_eq!(&file[..4], &[0x0a, 0x0d, 0x0d, 0x0a]);
-}
-
-#[test]
-fn a_long_capture_downloads_in_pieces_that_join_into_pcapng() {
-    with_dashboard(startup(Options::default()), |cx, handle| async move {
-        let (mut ends, links) = links(&cx, &handle, 1).await;
-        log_key(&cx, &key(7));
-        let mut packet = vec![0u8; 1200];
-        packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&1200u16.to_be_bytes());
-        packet[9] = 17;
-        for _ in 0..6 {
-            for _ in 0..50 {
-                ends[0].send(Packet(packet.clone()));
-            }
-            // Past the sampling window, so every packet is captured.
-            cx.sleep(Duration::from_millis(100)).await?;
-        }
-        let now = Instant::now();
-        let mut session = handle.session();
-        call(&mut session, 1, &packets(links[0], 0), now);
-        let mut rows = 0;
-        loop {
-            let values = session.poll(now, None);
-            if values.is_empty() {
-                break;
-            }
-            rows += values.len();
-        }
-        assert_eq!(rows, 300);
-        let first = call(
-            &mut session,
-            2,
-            &format!(r#"{{"op":"pcap","link":"e{}"}}"#, links[0]),
-            now,
-        );
-        assert!(first.binary && !first.end);
-        assert!(first.bytes.len() < 2 * EXPORT_CHUNK);
-        let file = download(&mut session, 3, links[0], now);
-        assert!(file.starts_with(&first.bytes));
-        let mut kinds = Vec::new();
-        let mut i = 0;
-        while i < file.len() {
-            let len = le32(&file, i + 4).unwrap() as usize;
-            assert_eq!(le32(&file, i + len - 4).unwrap() as usize, len);
-            let kind = le32(&file, i).unwrap();
-            if kind == 6 {
-                assert_eq!(le32(&file, i + 20).unwrap(), 1200);
-                assert_eq!(le32(&file, i + 24).unwrap(), 1200);
-                assert_eq!(&file[i + 28..i + 28 + 1200], &packet[..]);
-            }
-            kinds.push(kind);
-            i += len;
-        }
-        assert_eq!(i, file.len());
-        assert_eq!(kinds[..3], [0x0a0d_0d0a, 1, 0x0a]);
-        assert_eq!(kinds.iter().filter(|k| **k == 6).count(), 300);
-        assert!(exported_keys(&file).starts_with("CLIENT_TRAFFIC_SECRET_0 0000000000000007"));
-        Ok(())
-    });
 }

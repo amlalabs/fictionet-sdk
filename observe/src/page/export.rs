@@ -1,9 +1,9 @@
 use std::io;
 
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::net::TcpStream;
 
-use super::{Label, LabelTarget, Shared, http, observation};
+use super::{Shared, http};
 
 pub(super) async fn route(
     conn: &mut TcpStream,
@@ -20,93 +20,65 @@ pub(super) async fn route(
             None => return http::error(conn, 404, "no such host").await,
         },
     };
-    if req.path.ends_with("/packets") {
-        let links: Vec<_> = shared
-            .page
-            .dashboard
-            .0
-            .collector
-            .sandbox_links(host.map(|host| host.sandbox.as_str()))
+    let collector = &shared.page.dashboard.0.collector;
+    let packets = req.path.ends_with("/packets");
+    let sandbox = host.map(|host| host.sandbox.clone());
+    let streams = if packets {
+        let mut streams: Vec<_> = collector
+            .sandbox_links(sandbox.as_deref())
             .into_iter()
-            .map(|id| id.to_string())
+            .map(fictionet::events::Stream::Packets)
             .collect();
-        if links.is_empty() {
+        if streams.is_empty() {
             return http::error(conn, 404, "this scope has no captured links").await;
         }
-        return observation::route(conn, shared, "pcap", &[("link".into(), links.join(","))]).await;
-    }
+        streams.push(fictionet::events::Stream::Keys);
+        streams
+    } else {
+        vec![fictionet::events::Stream::Events]
+    };
     let labels = shared
         .page
         .labels
         .as_ref()
         .map_or_else(Vec::new, |labels| labels.snapshot());
-    let end = shared.page.dashboard.0.collector.events().last();
+    let mut export = collector.export(&crate::export::Selection {
+        streams,
+        sandbox,
+        labels: labels.clone(),
+        wall: shared.page.dashboard.0.wall(),
+        ..Default::default()
+    });
     http::headers(
         conn,
         200,
-        "application/x-ndjson",
-        "Content-Disposition: attachment; filename=\"fictionet-events.jsonl\"\r\n",
+        if packets {
+            "application/vnd.tcpdump.pcap"
+        } else {
+            "application/x-ndjson"
+        },
+        if packets {
+            "Content-Disposition: attachment; filename=\"fictionet-links.pcapng\"\r\n"
+        } else {
+            "Content-Disposition: attachment; filename=\"fictionet-events.jsonl\"\r\n"
+        },
     )
     .await?;
-    line(conn, &json!({"type":"export", "through":end, "host":host.map(|host| &host.name), "labels": labels})).await?;
-    let mut after = 0;
-    let mut lost = 0;
-    loop {
-        let batch: Value =
-            serde_json::from_str(&crate::view::events(&shared.page.dashboard, after, 128))
-                .map_err(io::Error::other)?;
-        let dropped = batch["lost"].as_u64().unwrap_or(0);
-        if dropped > lost {
-            line(conn, &json!({"type":"loss", "stream":"events", "count":dropped - lost, "scope":"run", "through":end})).await?;
-            lost = dropped;
-        }
-        let events = batch["events"]
-            .as_array()
-            .ok_or_else(|| io::Error::other("invalid event batch"))?;
-        if events.is_empty() {
-            break;
-        }
-        for event in events {
-            let seq = event["seq"]
-                .as_u64()
-                .ok_or_else(|| io::Error::other("event has no sequence"))?;
-            if seq > end {
-                return Ok(());
+    if packets {
+        loop {
+            let (bytes, last) = export.next_chunk();
+            http::write(conn, &bytes).await?;
+            if last {
+                break;
             }
-            after = seq;
-            if host.is_some_and(|host| {
-                event["sandbox"]["name"].as_str() != Some(host.sandbox.as_str())
-            }) {
-                continue;
-            }
-            line(conn, &labeled(event.clone(), &labels)).await?;
         }
-        if after >= end {
-            break;
+    } else {
+        let mut header = serde_json::to_vec(&json!({"type":"export", "through":export.through(), "host":host.map(|host| &host.name), "labels":labels})).map_err(io::Error::other)?;
+        header.push(b'\n');
+        http::write(conn, &header).await?;
+        for line in export.jsonl() {
+            http::write(conn, line.map_err(io::Error::other)?.as_bytes()).await?;
         }
     }
     Ok(())
-}
-
-pub(super) fn labeled(mut event: Value, labels: &[Label]) -> Value {
-    let attached: Vec<_> = labels
-        .iter()
-        .filter(|label| match &label.target {
-            LabelTarget::Event { seq } => event["seq"].as_u64() == Some(*seq),
-            LabelTarget::Connection { id, local, peer } => {
-                event["conn"].as_u64() == Some(*id)
-                    && event["local"].as_str() == Some(local)
-                    && event["peer"].as_str() == Some(peer)
-            }
-            LabelTarget::Flow { .. } => false,
-        })
-        .collect();
-    event["labels"] = serde_json::to_value(attached).expect("labels are JSON");
-    event
-}
-
-async fn line(conn: &mut TcpStream, value: &Value) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-    http::write(conn, &bytes).await
 }

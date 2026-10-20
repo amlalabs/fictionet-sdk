@@ -232,37 +232,115 @@ mod tests {
     fn label_inputs_are_bounded_recorded_and_joined_to_exports() {
         let events = Arc::new(crate::Memory::default());
         let saved = events.clone();
-        fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)).observer(events), move |cx| async move {
-            let labels = Labels::default();
-            let command = LabelCommand::Add { target: LabelTarget::Event { seq: 7 }, text: "download".into() };
-            assert_eq!(labels.apply_change(&cx, &command).unwrap(), 1);
-            let joined = super::super::export::labeled(serde_json::json!({"seq":7}), &labels.snapshot());
-            assert_eq!(joined["labels"][0]["text"], "download");
-            assert!(super::super::export::labeled(serde_json::json!({"seq":8}), &labels.snapshot())["labels"].as_array().unwrap().is_empty());
-            let connection = LabelTarget::Connection { id: 3, local: "192.0.2.1:80".into(), peer: "10.0.2.15:40000".into() };
-            labels.apply_change(&cx, &LabelCommand::Add { target: connection, text: "request".into() }).unwrap();
-            let joined = super::super::export::labeled(serde_json::json!({"seq":8,"conn":3,"local":"192.0.2.1:80","peer":"10.0.2.15:40000"}), &labels.snapshot());
-            assert_eq!(joined["labels"][0]["text"], "request");
-            let flow = LabelTarget::Flow { link: "e1".into(), a: "b".into(), b: "a".into() };
-            labels.apply_change(&cx, &LabelCommand::Add { target: flow, text: "flow".into() }).unwrap();
-            assert_eq!(labels.snapshot()[2].target, LabelTarget::Flow { link: "e1".into(), a: "a".into(), b: "b".into() });
-            for text in ["", "\n", &"x".repeat(81)] {
-                assert!(labels.apply_change(&cx, &LabelCommand::Add { target: LabelTarget::Event { seq: 7 }, text: text.into() }).is_err());
-            }
-            assert!(labels.apply_change(&cx, &LabelCommand::Add { target: LabelTarget::Event { seq: 0 }, text: "invalid".into() }).is_err());
-            for _ in 3..256 { labels.apply_change(&cx, &command).unwrap(); }
-            assert_eq!(labels.snapshot().len(), 256);
-            assert!(labels.apply_change(&cx, &command).is_err());
-            labels.apply_change(&cx, &LabelCommand::Remove { id: 1 }).unwrap();
-            assert!(labels.apply_change(&cx, &LabelCommand::Remove { id: 1 }).is_err());
-            assert_eq!(labels.snapshot().len(), 255);
-            labels.apply_change(&cx, &command).unwrap();
-            assert_eq!(labels.snapshot().last().unwrap().id, 257);
-            let changes = saved.checked_of("page", "label").unwrap();
-            assert_eq!(changes.len(), 258);
-            assert_eq!(changes[0].u64("id"), Some(1));
-            assert_eq!(changes.last().unwrap().u64("revision"), Some(258));
-            Ok(())
-        })).unwrap();
+        fictionet::block_on(fictionet::lab(
+            RunOptions::new(Seed::from_u64(1)).observer(events),
+            move |cx| async move {
+                let labels = Labels::default();
+                let command = LabelCommand::Add {
+                    target: LabelTarget::Event { seq: 7 },
+                    text: "download".into(),
+                };
+                assert_eq!(labels.apply_change(&cx, &command).unwrap(), 1);
+                let mut event = fictionet::events::Event::new("test", "item");
+                event.seq = 7;
+                assert_eq!(
+                    crate::export::event_labels(&event, &labels.snapshot())[0].text,
+                    "download"
+                );
+                event.seq = 8;
+                assert!(crate::export::event_labels(&event, &labels.snapshot()).is_empty());
+                let connection = LabelTarget::Connection {
+                    id: 3,
+                    local: "192.0.2.1:80".into(),
+                    peer: "10.0.2.15:40000".into(),
+                };
+                labels
+                    .apply_change(
+                        &cx,
+                        &LabelCommand::Add {
+                            target: connection,
+                            text: "request".into(),
+                        },
+                    )
+                    .unwrap();
+                event.conn = fictionet::events::ConnInfo::new(
+                    3,
+                    "192.0.2.1:80".parse().unwrap(),
+                    "10.0.2.15:40000".parse().unwrap(),
+                );
+                assert_eq!(
+                    crate::export::event_labels(&event, &labels.snapshot())[0].text,
+                    "request"
+                );
+                let flow = LabelTarget::Flow {
+                    link: "e1".into(),
+                    a: "b".into(),
+                    b: "a".into(),
+                };
+                labels
+                    .apply_change(
+                        &cx,
+                        &LabelCommand::Add {
+                            target: flow,
+                            text: "flow".into(),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    labels.snapshot()[2].target,
+                    LabelTarget::Flow {
+                        link: "e1".into(),
+                        a: "a".into(),
+                        b: "b".into()
+                    }
+                );
+                for text in ["", "\n", &"x".repeat(81)] {
+                    assert!(
+                        labels
+                            .apply_change(
+                                &cx,
+                                &LabelCommand::Add {
+                                    target: LabelTarget::Event { seq: 7 },
+                                    text: text.into()
+                                }
+                            )
+                            .is_err()
+                    );
+                }
+                assert!(
+                    labels
+                        .apply_change(
+                            &cx,
+                            &LabelCommand::Add {
+                                target: LabelTarget::Event { seq: 0 },
+                                text: "invalid".into()
+                            }
+                        )
+                        .is_err()
+                );
+                for _ in 3..256 {
+                    labels.apply_change(&cx, &command).unwrap();
+                }
+                assert_eq!(labels.snapshot().len(), 256);
+                assert!(labels.apply_change(&cx, &command).is_err());
+                labels
+                    .apply_change(&cx, &LabelCommand::Remove { id: 1 })
+                    .unwrap();
+                assert!(
+                    labels
+                        .apply_change(&cx, &LabelCommand::Remove { id: 1 })
+                        .is_err()
+                );
+                assert_eq!(labels.snapshot().len(), 255);
+                labels.apply_change(&cx, &command).unwrap();
+                assert_eq!(labels.snapshot().last().unwrap().id, 257);
+                let changes = saved.checked_of("page", "label").unwrap();
+                assert_eq!(changes.len(), 258);
+                assert_eq!(changes[0].u64("id"), Some(1));
+                assert_eq!(changes.last().unwrap().u64("revision"), Some(258));
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 }

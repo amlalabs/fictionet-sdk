@@ -348,8 +348,7 @@
 //! packets remain. A decoder that already derived keys can continue while its
 //! connection state survives. Retained decoded details keep their plaintext.
 //!
-//! A pcapng download includes deduplicated keys from the watch cache and the
-//! collector. Wireshark can use them without a separate key file. The `keylog`
+//! A pcapng download includes deduplicated keys from the collector rings. Wireshark can use them without a separate key file. The `keylog`
 //! operation returns only the collector's retained keys as SSLKEYLOGFILE text.
 //! Key debug output hides secrets.
 //!
@@ -462,14 +461,14 @@
 //! Zero watch capacity refuses a watch for another link.
 //!
 //! Each watch retains at most 4,096 decoded rows and 32 MiB. Rows charge packet
-//! bytes, summary JSON and detail JSON. [`DashboardOptions::watch_bytes`] adds
+//! summary JSON and detail JSON. [`DashboardOptions::watch_bytes`] adds
 //! a 256 MiB aggregate row budget. Pressure forgets idle watches first,
 //! longest idle first, then evicts the oldest decoded rows across watches.
 //! Idle history lasts up to one minute by the caller's supplied time; pressure
 //! can evict it sooner. Losing a watch loses its row numbers and details.
 //! Watching that link again starts row numbers at 1 and decodes kept copies.
-//! `packet` and `pcap` return `{"error":"nothing is watching that link"}`
-//! when no watch remains. Removed links can still be watched while their
+//! `packet` returns `{"error":"nothing is watching that link"}`
+//! when no watch remains. `pcap` reads retained copies without a watch. Removed links can still be watched while their
 //! captures remain.
 //!
 //! These are retention and admission budgets, not a process-memory bound.
@@ -542,13 +541,13 @@
 //! | `link` | `link`, such as `"e13"` | One edge with `counters`. |
 //! | `packets` | `link`; `after`, a decoded row number, default 0 | `link`, then `packet` and `gap` events. |
 //! | `packet` | `link`, `seq` | One kept row's layers and buffers. |
-//! | `pcap` | `link` | Binary pcapng of that watch's kept rows and keys. |
+//! | `pcap` | `link` | Binary pcapng of the collector's retained copies and keys. |
 //! | `keylog` | None | Binary SSLKEYLOGFILE text from the collector. |
 //! | `cancel` | `id`, a subscription's request ID | That stream ends; this request gets `{"ok":true}`. |
 //!
 //! Link arguments accept an `e`-prefixed string, a numeric string or a number.
-//! The CLI accepts request names or a literal JSON object. `packet` and `pcap`
-//! need a kept watch: send `packets` first. `cancel` targets a subscription,
+//! The CLI accepts request names or a literal JSON object. `packet`
+//! needs a kept watch: send `packets` first. `pcap` does not. `cancel` targets a subscription,
 //! not a capture download. An absent subscription returns `no such subscription`.
 //! Malformed JSON, missing `op`, duplicate active request IDs and unknown
 //! operations also return explicit errors. A missing row returns
@@ -676,7 +675,7 @@
 //! A subscriber whose cursor predates retained rows receives a gap first:
 //!
 //! ```json
-//! {"event":"gap","data":{"after":7,"next":12,"missed":4}}
+//! {"event":"gap","data":{"stream":"packets:13","class":null,"after":7,"next":12,"missed":4}}
 //! ```
 //!
 //! Here rows 8 through 11 are missing. `next` is the first retained row, or
@@ -727,9 +726,12 @@ extern crate self as fictionet_observe;
 mod aggregate;
 mod capture;
 pub mod egress;
+/// Exports retained observations through one selection.
+pub mod export;
 mod keys;
 mod loss;
 mod memory;
+mod pcap;
 mod policy;
 mod ring;
 pub use policy::{Admit, Class, Policy, When};

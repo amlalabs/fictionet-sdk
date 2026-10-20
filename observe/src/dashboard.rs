@@ -6,8 +6,9 @@ use fictionet::sync::Mutex;
 use fictionet::time::Instant as RunTime;
 
 use crate::egress::{Egress, EgressLimits, EgressSnapshot};
+use crate::export::{Export, Selection};
 use crate::json::{self, Object, Scalar};
-use crate::watch::{Export, Subscription as Hold, Watches};
+use crate::watch::{Subscription as Hold, Watches};
 use crate::{Collector, Options, Registry, Value, view};
 
 /// How often a graph subscription sends what changed.
@@ -374,10 +375,16 @@ impl Session {
                         }
                         None => error("nothing is watching that link"),
                     },
-                    _ => match shared.watches.existing(number, now) {
-                        Some(watch) => {
-                            watch.pump(shared);
-                            let mut export = watch.export(&shared.collector);
+                    _ => match shared.collector.find_link(number) {
+                        Some(link) => {
+                            let mut export = shared.collector.export(&Selection {
+                                streams: vec![
+                                    fictionet::events::Stream::Packets(link),
+                                    fictionet::events::Stream::Keys,
+                                ],
+                                wall: shared.wall(),
+                                ..Selection::default()
+                            });
                             let (bytes, last) = export.next_chunk();
                             if !last {
                                 self.downloads.push(Download {
@@ -393,7 +400,7 @@ impl Session {
                                 end: last,
                             }];
                         }
-                        None => error("nothing is watching that link"),
+                        None => error("no such link"),
                     },
                 }
             }

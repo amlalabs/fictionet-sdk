@@ -49,7 +49,13 @@ pub(crate) fn start(out: &mut Vec<u8>, keylog: &[u8]) {
 
 /// Appends one packet with its time in microseconds since the Unix epoch.
 /// `original` is its length on the link; `data` may be shorter.
-pub(crate) fn packet(out: &mut Vec<u8>, micros: u64, original: usize, data: &[u8]) {
+pub(crate) fn packet(
+    out: &mut Vec<u8>,
+    micros: u64,
+    original: usize,
+    data: &[u8],
+    comment: Option<&str>,
+) {
     let mut epb = Vec::with_capacity(20 + data.len());
     epb.extend_from_slice(&0u32.to_le_bytes());
     epb.extend_from_slice(&((micros >> 32) as u32).to_le_bytes());
@@ -57,6 +63,21 @@ pub(crate) fn packet(out: &mut Vec<u8>, micros: u64, original: usize, data: &[u8
     epb.extend_from_slice(&(data.len() as u32).to_le_bytes());
     epb.extend_from_slice(&(original.max(data.len()) as u32).to_le_bytes());
     epb.extend_from_slice(data);
+    if let Some(mut comment) = comment {
+        epb.resize(20 + data.len().div_ceil(4) * 4, 0);
+        while !comment.is_empty() {
+            let mut len = comment.len().min(u16::MAX as usize);
+            while !comment.is_char_boundary(len) {
+                len -= 1;
+            }
+            epb.extend_from_slice(&1u16.to_le_bytes());
+            epb.extend_from_slice(&(len as u16).to_le_bytes());
+            epb.extend_from_slice(&comment.as_bytes()[..len]);
+            epb.resize(epb.len().div_ceil(4) * 4, 0);
+            comment = &comment[len..];
+        }
+        epb.extend_from_slice(&[0; 4]);
+    }
     block(out, 6, &epb);
 }
 
@@ -76,7 +97,7 @@ mod tests {
         let keys = b"CLIENT_RANDOM aa bbbb\n";
         let mut file = Vec::new();
         start(&mut file, keys);
-        super::packet(&mut file, micros, 40, &packet);
+        super::packet(&mut file, micros, 40, &packet, None);
         let mut kinds = Vec::new();
         let mut i = 0;
         while i < file.len() {
