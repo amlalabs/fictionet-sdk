@@ -54,6 +54,7 @@
 //! | [`snapshot`] | Bounded projection for a future state topic |
 //! | [`driver`] | Shared handle that owns the plant behind a mutex |
 //! | [`plc`] | Modbus/TCP service of one controller over the shared plant |
+//! | [`facts`] | Plant facts for the Fictionet event log |
 //! | [`network`] | Operations and control networks, with the controllers on port 502 |
 //!
 //! Loops are loop A and loop B, in that array order.
@@ -105,6 +106,7 @@
 
 pub mod command;
 pub mod driver;
+pub mod facts;
 pub mod faults;
 pub mod kinetics;
 pub mod network;

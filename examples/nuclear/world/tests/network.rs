@@ -56,7 +56,7 @@ fn a_sandbox_reads_rcs1_and_a_closed_port_refuses() {
         RunOptions::new(Seed::from_u64(1)),
         |fcx| async move {
             let driver = Driver::new(Config::default());
-            driver.advance_to(2_000);
+            driver.advance_to(&(), 2_000);
             let (attacher, attachments) = fictionet::attachments();
             network::start(&fcx, &driver, attachments)?;
             let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
@@ -98,7 +98,7 @@ fn each_controller_serves_its_own_map_and_a_write_reaches_the_shared_plant() {
         RunOptions::new(Seed::from_u64(2)),
         |fcx| async move {
             let driver = Driver::new(Config::default());
-            driver.advance_to(2_000);
+            driver.advance_to(&(), 2_000);
             let (attacher, attachments) = fictionet::attachments();
             network::start(&fcx, &driver, attachments)?;
             let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);

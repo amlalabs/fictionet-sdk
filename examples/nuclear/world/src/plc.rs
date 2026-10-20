@@ -16,6 +16,12 @@
 //! Switching a momentary coil (trip, reset, acknowledge) off decodes to no
 //! command. Such a coil already reads as off, so the write is accepted and
 //! changes nothing.
+//!
+//! The event log records each accepted command as `plant.action`, with the
+//! source of the connection: `hmi` from [`facts::HMI_ADDRESS`], otherwise
+//! `modbus`. A refused write records one `plant.rejected`. Trips and the first
+//! action after a fault start are recorded when the write makes them. Facts of
+//! a write are delivered only when the whole write is accepted.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -27,6 +33,7 @@ use fictionet::sync::Mutex;
 
 use crate::Plant;
 use crate::command::{Command, Rejection};
+use crate::facts::{self, Held, Sink, Source};
 use crate::registers::{self, Plc};
 
 /// One plant, shared by the connections of every controller.
@@ -53,7 +60,8 @@ impl serve::Service for PlcService {
         state: &Shared,
         driver: &mut serve::Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
-        let pdu = self.answer(&frame, state);
+        let source = facts::source_of(driver.conn());
+        let pdu = self.answer(&frame, state, source, &*driver);
         frame
             .reply(pdu)
             .write(driver.reply())
@@ -63,8 +71,9 @@ impl serve::Service for PlcService {
 }
 
 impl PlcService {
-    /// The reply PDU for one request frame.
-    fn answer(&self, frame: &Frame, plant: &Shared) -> Vec<u8> {
+    /// The reply PDU for one request frame. `source` names the sender of any
+    /// write, and `sink` receives the facts the write makes.
+    fn answer(&self, frame: &Frame, plant: &Shared, source: Source, sink: &impl Sink) -> Vec<u8> {
         let function = frame.function().unwrap_or(0);
         let request = match Request::parse(&frame.pdu) {
             Ok(request) => request,
@@ -94,6 +103,8 @@ impl PlcService {
                     commands,
                     function,
                     Response::WriteSingleCoil { address, value },
+                    source,
+                    sink,
                 )
             }
             Request::WriteMultipleCoils { address, values } => {
@@ -104,6 +115,8 @@ impl PlcService {
                     commands,
                     function,
                     Response::WriteMultiple { address, quantity },
+                    source,
+                    sink,
                 )
             }
             Request::WriteSingleRegister { address, value } => {
@@ -113,6 +126,8 @@ impl PlcService {
                     commands,
                     function,
                     Response::WriteSingleRegister { address, value },
+                    source,
+                    sink,
                 )
             }
             Request::WriteMultipleRegisters { address, values } => {
@@ -123,6 +138,8 @@ impl PlcService {
                     commands,
                     function,
                     Response::WriteMultiple { address, quantity },
+                    source,
+                    sink,
                 )
             }
             Request::Other { .. } => Exception::IllegalFunction.to_pdu(function),
@@ -185,29 +202,60 @@ fn write_reply(
     commands: Option<Vec<Command>>,
     function: u8,
     echo: Response,
+    source: Source,
+    sink: &impl Sink,
 ) -> Vec<u8> {
     let Some(commands) = commands else {
         return Exception::IllegalDataAddress.to_pdu(function);
     };
-    match apply_commands(plant, &commands) {
+    match apply_commands(plant, &commands, source, sink) {
         Ok(()) => reply_pdu(echo, function),
-        Err(exception) => exception.to_pdu(function),
+        Err(refusal) => {
+            facts::rejected(sink, refusal.command, source, refusal.reason, refusal.at_ms);
+            exception_for(refusal.reason).to_pdu(function)
+        }
     }
+}
+
+/// The command a write refused, why, and the plant time of the refusal.
+struct Refusal {
+    command: Command,
+    reason: Rejection,
+    at_ms: u64,
 }
 
 /// Applies `commands` to the shared plant, in order, as one step. They run on a
 /// copy under the plant's lock, and the copy replaces the plant only when every
-/// command is accepted. A rejection returns its exception and leaves the plant
-/// as it was.
-fn apply_commands(plant: &Shared, commands: &[Command]) -> Result<(), Exception> {
-    let mut guard = plant.lock();
-    let mut trial = (*guard).clone();
-    for &command in commands {
-        trial
-            .apply(command)
-            .map_err(|rejected| exception_for(rejected.reason))?;
+/// command is accepted. A refusal leaves the plant as it was and reports the
+/// command that failed. Facts of the accepted commands are delivered to `sink`
+/// after the plant's lock is released, and a refused write delivers none.
+fn apply_commands(
+    plant: &Shared,
+    commands: &[Command],
+    source: Source,
+    sink: &impl Sink,
+) -> Result<(), Refusal> {
+    let held = Held::new(sink);
+    {
+        let mut guard = plant.lock();
+        let mut trial = (*guard).clone();
+        let mut before = trial.snapshot();
+        for &command in commands {
+            if let Err(rejected) = trial.apply(command) {
+                return Err(Refusal {
+                    command,
+                    reason: rejected.reason,
+                    at_ms: before.at_ms,
+                });
+            }
+            let after = trial.snapshot();
+            facts::action(&held, command, source, &after);
+            facts::changes(&held, &before, &after);
+            before = after;
+        }
+        *guard = trial;
     }
-    *guard = trial;
+    held.release();
     Ok(())
 }
 
@@ -238,6 +286,12 @@ fn reply_pdu(response: Response, function: u8) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::Config;
+    use crate::command::{FaultCommand, Loop};
+    use crate::faults::{Fault, FaultChange, SensorFault};
+    use crate::sensors::Sensor;
+    use fictionet::events::ConnInfo;
+    use fictionet::stdlib::services::serve::Harness;
+    use fictionet_observe::Memory;
     use std::error::Error;
 
     const TRANSACTION: u16 = 7;
@@ -252,6 +306,22 @@ mod tests {
             PlcService { plc },
             plant.clone(),
         )
+    }
+
+    /// A connection from `peer`, as the event log sees it.
+    fn from(peer: &str) -> ConnInfo {
+        ConnInfo::new(
+            1,
+            "10.40.0.2:502".parse().expect("the local address parses"),
+            peer.parse().expect("the peer address parses"),
+        )
+    }
+
+    /// A harness whose connection comes from `peer`, with its facts kept in `memory`.
+    fn observed(plc: Plc, plant: &Shared, peer: &str, memory: &Arc<Memory>) -> Harness<PlcService> {
+        harness(plc, plant)
+            .with_conn(from(peer))
+            .observer(memory.clone())
     }
 
     /// Sends one request frame through the harness and reads back the reply.
@@ -662,5 +732,167 @@ mod tests {
                 "{reason:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_write_from_the_hmi_address_logs_its_action_as_hmi() -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let memory = Arc::new(Memory::default());
+        let mut h = observed(Plc::Rps1, &plant, "10.40.0.20:51000", &memory);
+        exchange(
+            &mut h,
+            &Request::WriteSingleRegister {
+                address: 0,
+                value: 480,
+            },
+        )?;
+        let actions = memory.checked_of("plant", "action")?;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].str("source"), Some("hmi"));
+        assert_eq!(actions[0].str("command"), Some("rod_demand"));
+        assert_eq!(actions[0].u64("operator_actions"), Some(1));
+        assert_eq!(actions[0].u64("revision"), Some(0));
+        assert_eq!(actions[0].u64("at_ms"), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_from_another_address_logs_its_action_as_modbus() -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let memory = Arc::new(Memory::default());
+        let mut h = observed(Plc::Rps1, &plant, "10.40.0.30:51000", &memory);
+        exchange(
+            &mut h,
+            &Request::WriteSingleRegister {
+                address: 0,
+                value: 480,
+            },
+        )?;
+        let actions = memory.checked_of("plant", "action")?;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].str("source"), Some("modbus"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_write_logs_its_rejection_and_no_action() -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let memory = Arc::new(Memory::default());
+        let mut h = observed(Plc::Bop1, &plant, "10.40.0.20:51000", &memory);
+        exchange(
+            &mut h,
+            &Request::WriteSingleRegister {
+                address: 0,
+                value: 500,
+            },
+        )?;
+        assert!(memory.checked_of("plant", "action")?.is_empty());
+        let refused = memory.checked_of("plant", "rejected")?;
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].str("command"), Some("valve_demand"));
+        assert_eq!(refused[0].str("source"), Some("hmi"));
+        assert_eq!(refused[0].str("reason"), Some("wrong_mode"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_partly_refused_write_logs_no_action_for_its_accepted_commands()
+    -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let memory = Arc::new(Memory::default());
+        let mut h = observed(Plc::Bop1, &plant, "10.40.0.20:51000", &memory);
+        exchange(
+            &mut h,
+            &Request::WriteSingleCoil {
+                address: 4,
+                value: false,
+            },
+        )?;
+        // Valve A is accepted in manual, then valve B in automatic is refused:
+        // the write applies nothing, so only the rejection is logged.
+        exchange(
+            &mut h,
+            &Request::WriteMultipleRegisters {
+                address: 0,
+                values: vec![300, 400],
+            },
+        )?;
+        let actions = memory.checked_of("plant", "action")?;
+        assert_eq!(actions.len(), 1, "only the mode change was accepted");
+        assert_eq!(actions[0].str("command"), Some("controller"));
+        let refused = memory.checked_of("plant", "rejected")?;
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].u64("at_ms"), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn the_first_command_after_a_fault_start_logs_one_first_action_per_fault()
+    -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let memory = Arc::new(Memory::default());
+        let inject = |sensor, revision| FaultCommand {
+            change: FaultChange::Inject(Fault::Sensor {
+                sensor,
+                kind: SensorFault::Stuck { value: 3250 },
+            }),
+            expected_revision: revision,
+        };
+        plant
+            .lock()
+            .apply_fault(inject(Sensor::HotLeg(Loop::A), 0))
+            .expect("the first fault is accepted");
+        plant.lock().advance(2_000);
+
+        let mut h = observed(Plc::Rps1, &plant, "10.40.0.20:51000", &memory);
+        for value in [480, 400] {
+            exchange(&mut h, &Request::WriteSingleRegister { address: 0, value })?;
+        }
+        let firsts = memory.checked_of("plant", "first_action")?;
+        assert_eq!(firsts.len(), 1, "a second command does not log again");
+        assert_eq!(firsts[0].u64("first_action_after_fault_ms"), Some(2_000));
+        assert_eq!(firsts[0].u64("at_ms"), Some(2_000));
+
+        // A second fault start at 2500 ms arms the next first action. The write
+        // at 2750 ms is 250 ms after it, and that logs once more.
+        plant.lock().advance(2_500);
+        plant
+            .lock()
+            .apply_fault(inject(Sensor::ColdLeg(Loop::A), 1))
+            .expect("the second fault is accepted");
+        plant.lock().advance(2_750);
+        exchange(
+            &mut h,
+            &Request::WriteSingleRegister {
+                address: 0,
+                value: 420,
+            },
+        )?;
+        let firsts = memory.checked_of("plant", "first_action")?;
+        assert_eq!(firsts.len(), 2);
+        assert_eq!(firsts[1].u64("first_action_after_fault_ms"), Some(250));
+        assert_eq!(firsts[1].u64("at_ms"), Some(2_750));
+        Ok(())
+    }
+
+    #[test]
+    fn a_manual_trip_coil_logs_a_manual_trip() -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let memory = Arc::new(Memory::default());
+        let mut h = observed(Plc::Rps1, &plant, "10.40.0.20:51000", &memory);
+        exchange(
+            &mut h,
+            &Request::WriteSingleCoil {
+                address: 0,
+                value: true,
+            },
+        )?;
+        let trips = memory.checked_of("plant", "trip")?;
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0].str("cause"), Some("manual"));
+        assert_eq!(trips[0].u64("tripped_ms"), Some(0));
+        let actions = memory.checked_of("plant", "action")?;
+        assert_eq!(actions[0].str("command"), Some("manual_trip"));
+        Ok(())
     }
 }
