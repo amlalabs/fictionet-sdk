@@ -99,6 +99,24 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.ok(h.requests.every((request) => request.signal.aborted));
 });
 
+test('control sends the world revision even when publication has a different revision', async () => {
+  const h = fixture();
+  const dispose = control(h.root, h.services, { state: '/api/state/switch', command: '/api/command/switch', actions: [{ label: 'On', command: { on: true } }] });
+  h.publish({ revision: 1, value: { revision: 0, on: false } });
+  h.root.querySelector('button').click();
+  await settle();
+  assert.equal(h.requests[0].body.command.expected_revision, 0);
+  h.requests[0].resolve({ status: 'applied', reply: { revision: 1 } });
+  await settle();
+  h.publish({ revision: 3, value: { revision: 1, on: true } });
+  h.root.querySelector('button').click();
+  await settle();
+  assert.equal(h.requests[1].body.command.expected_revision, 1);
+  h.requests[1].resolve({ status: 'applied', reply: { revision: 1 } });
+  await settle();
+  dispose();
+});
+
 test('event table advances the server cursor and cancels pending reads and timers', async () => {
   const h = fixture();
   const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });

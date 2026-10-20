@@ -25,6 +25,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from fictionet_world.scenario import VARIANTS
 from fictionet_world.sites import HOST_IPS, World
 
 META = (("kind", "X-Fakewiki-Kind"), ("topic", "X-Fakewiki-Topic"),
@@ -36,14 +37,20 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "nginx"
     sys_version = ""
-    world: World
+    worlds: dict[str, World]
+    variant: str
 
     def log_message(self, *args):
         pass
 
     def _serve(self, head_only: bool = False):
         host = (self.headers.get("Host") or "").split(":")[0].lower()
-        r = self.world.handle(host, self.path)
+        variant = self.headers.get("X-Fakewiki-Variant", self.variant)
+        world = self.worlds.get(variant)
+        if world is None:
+            self.send_error(400, "Unknown FakeWiki variant")
+            return
+        r = world.handle(host, self.path)
         self.send_response(r.status)
         self.send_header("Content-Type", r.content_type)
         self.send_header("Content-Length", str(len(r.body)))
@@ -80,8 +87,12 @@ class Server(ThreadingHTTPServer):
 def main() -> int:
     port = int(sys.argv[1])
     variant = os.environ.get("FAKEWIKI_VARIANT", "")
-    world = World(Path(os.environ.get("FAKEWIKI_CORPUS", "/app/fixtures/corpus.json")), variant)
-    Handler.world = world
+    if variant not in VARIANTS:
+        raise ValueError(f"FAKEWIKI_VARIANT must be one of {VARIANTS}, got {variant!r}")
+    corpus = Path(os.environ.get("FAKEWIKI_CORPUS", "/app/fixtures/corpus.json"))
+    Handler.worlds = {v: World(corpus, v) for v in VARIANTS}
+    Handler.variant = variant
+    world = Handler.worlds[variant]
     server = Server(("127.0.0.1", port), Handler)
     documents = [{"url": u, "topic": t, "source": s, "stance": st} for u, _, _, t, s, st in world.documents()]
     print(json.dumps({"variant": variant, "hosts": HOST_IPS, "documents": documents}), flush=True)

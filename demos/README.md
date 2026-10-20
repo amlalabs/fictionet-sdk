@@ -96,6 +96,7 @@ serves the same page without a VM. An in-process client replays the variant’s
 network actions, advancing the story about every two seconds. The fixture
 has no screen, terminal or guest exit statuses. It prints the page URL and
 serves until Ctrl-C.
+
 ## Border
 
 `cargo xtask demo border` downloads the pinned files, builds the release binary,
@@ -119,6 +120,25 @@ with `border demos/downloads/cloudimage --gate`, it shuts down automatically.
 The gate saves `normal.png`, `hijacked.png`, and `log.jsonl` under the printed
 `downloads/cloudimage/shots/border-<run>/` directory. Screen captures use the
 page's ticketed WebSocket without taking browser input.
+
+## FakeWiki
+
+`cargo xtask demo fakewiki` runs an in-process [FakeWiki](../examples/fakewiki)
+world and an Ubuntu 24.04 desktop on the shared microVM kit. A scripted Firefox
+reader loads the Wikipedia article, then reloads after the page turns tampering
+on. The standard page shows served versions, traffic and containment. The gate
+checks both reads and saves guest and page screenshots before shutdown.
+
+It needs KVM and Chromium. Reviewer measurements pending: first-run download
+size, first-run time and cached-run time.
+
+For page design without a VM, run `cargo run --locked -p fictionet-demo --example fakewiki_page`.
+It uses the same page and world with a placeholder screen. The first stdout
+line is its loopback URL. Press Enter to make the in-world scripted client
+read the article, use the page's Tamper switch, then press Enter again.
+EOF stops the example. Its markers name the scripted client; the VM demo
+names Firefox (scripted). Article component tests run with
+`node --test demos/src/bin/fakewiki/article.test.mjs`.
 
 ## VM scripts
 
@@ -145,7 +165,6 @@ VM that a demo booted.
 | [`cargo xtask demo dashboard`](guest/dashboard.sh) | The world and sandbox of `cargo xtask demo web`, with the world's third argument opening an observation socket. `fictionet dashboard --observation unix:PATH` reads that collector and serves the live view on the VM's port 7878, which `cargo xtask vm` forwards to `127.0.0.1` on your machine. It prints the address to open, and `fictionet observe` shows the same API from a shell: the graph, and the world's events as they happen. A loop in the sandbox makes requests until you press Enter (or for `DASHBOARD_SECONDS`). | a browser | 25 s |
 | [`cargo xtask demo k8s`](guest/k8s.sh) | A kind cluster in the VM, the Helm chart in `charts/fictionet-sandbox` with `examples/attach/k8s-tun.yaml`, and the agent's pod. Its `eth0` is down, `tun0` is its only route, it reaches `https://example.test/`, and the internet, the cluster's DNS and the API server are out of reach. | pulls kind's node image | 1.5 min; then 1 min |
 | [`cargo xtask demo border`](src/bin/border/main.rs) | One Ubuntu workstation and a scripted agent on a live page. Routing switches real traffic between the bank and impostor: three or four hops, two or three BGP routes, a broken established session and a TLS refusal. The terminal attaches read-only to tmux `main`; Ctrl-b d opens a viewer login shell for `bank-check`. Screenshots and the log go to `downloads/cloudimage/shots/border-<run>/`. | KVM; no Docker, QEMU or root | Pinned image and browser downloads, then package installation at boot; timings are printed |
-| [`cargo xtask demo fakewiki`](guest/fakewiki.sh) | [FakeWiki](../examples/fakewiki)'s world under Docker Compose in the VM. The agent reads a Wikipedia article at its real name over TLS it trusts, first as it is, then tampered; the world's log labels each request with the topic, the source and its stance. | pulls Debian and Python images | 1.5 min; then 20 s |
 | [`cargo xtask demo search`](src/bin/search/) | A scripted Firefox searcher on an Ubuntu desktop; the adaptive web runs in-process with a stub generator (no model). Live searches, result provenance and a growing page tree beside the desktop, with generation control and standard observation panels. | Linux with KVM and Chromium; pinned cloud image, Cloud Hypervisor and browser libraries downloaded on first run | Download size and elapsed time: reviewer measurement pending |
 | [`cargo xtask demo scan`](guest/scan.sh) | [The scan example](../examples/scan) under Docker Compose in the VM: four simulated hosts and a real container with nginx and OpenSSH on one office subnet. `nmap` in the agent's sandbox finds all five, and a SYN scan with service detection names what runs on each. The world's second argument opens its observation socket. The dashboard connects to that socket and shows the scan, with its HTTP port forwarded to your machine. | a browser; pulls Debian and Alpine images | 1.5 min; then 1 min |
 
@@ -166,7 +185,7 @@ with a `# needs:` line that says what [`vm/guest/build.sh`](../vm/guest/build.sh
 builds for it: `sdk` is `fictionet` and the crate's examples; `fakewiki` is that
 example's world. The Compose demos
 run the examples' own Compose files, plus a small file next to the script
-(`fakewiki.compose.yaml` and the others) that puts the binaries the VM built in
+(`scan.compose.yaml`) that puts the binaries the VM built in
 place of the Dockerfile's build stage, so nothing compiles twice.
 
 A demo stops at the first step that does not go as it says, and prints the

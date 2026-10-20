@@ -1,7 +1,7 @@
 // mount(root, services, options) returns dispose. Commands are sent once per input.
 // A control's actions post the world's own command type. With a linked state
-// topic, the panel shows that state and sends its revision with each command,
-// so the world can refuse a command made against an old state.
+// topic, the panel sends the value's revision, or the envelope revision when
+// absent, so the world can refuse a command made against an old state.
 import { scoped, listen } from '../dom.mjs';
 import { fmtDuration } from '../format.mjs';
 

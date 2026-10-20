@@ -11,6 +11,7 @@ publish = false
 artifactory-world = { path = "../examples/artifactory/world" }
 border-world = { path = "../examples/border/world" }
 adaptive-web-world = { path = "../examples/adaptive-web/world" }
+fakewiki-world = { path = "../examples/fakewiki/world" }
 fictionet-observe = { path = "../observe", features = ["page"] }
 example-common = { path = "../examples/common" }
 # `tokio` hands the jump host's TCP connection to the SSH client.
@@ -63,3 +64,11 @@ path = "src/bin/border/main.rs"
 [[bin]]
 name = "search"
 path = "src/bin/search/main.rs"
+
+[[bin]]
+name = "fakewiki"
+path = "src/bin/fakewiki/main.rs"
+
+[[example]]
+name = "fakewiki_page"
+path = "src/bin/fakewiki/example.rs"
