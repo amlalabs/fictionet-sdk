@@ -319,6 +319,40 @@ test('the page holds at most three long-lived streams across every panel, and no
   assert.equal(themeClosed, true);
 });
 
+test('after the run stops, a moment read that fails says nothing and stops asking', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  let reads = 0, failing = false;
+  const transport = {
+    get: async (path) => {
+      if (path === '/api/page') return DESCRIPTION;
+      if (path === '/api/event-table/paused') {
+        reads++;
+        if (failing) throw new TypeError('Failed to fetch');
+        return { rows: [], next: 0, dropped: 0 };
+      }
+      return path.startsWith('/api/host/') ? { links: [] } : { rows: [], next: 0, dropped: 0 };
+    },
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  };
+  const stop = await mount(h.root, transport, { subscribe: () => () => {}, dispose() {} });
+  await settle();
+  const watch = h.streams.find((source) => source.tag === 'watch');
+  watch.emit('ended', { t: 5 });
+  failing = true;
+  const poll = async () => { const pending = [...h.timers.values()]; h.timers.clear(); pending.forEach((callback) => callback()); await settle(); };
+  const before = reads;
+  await poll();
+  assert.equal(reads, before + 1);
+  assert.equal(h.root.querySelector('#moment-status').textContent, '');
+  await poll();
+  assert.equal(reads, before + 1, 'a stopped page stops asking for moments');
+  stop();
+});
+
 test('a refused page description shows one not signed in card', async (t) => {
   const h = harness(t);
   const { mount } = await import('./page.mjs');

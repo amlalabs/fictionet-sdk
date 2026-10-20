@@ -446,6 +446,8 @@ export async function mount(root, transport, theme) {
           $('moment-banner').hidden = false;
         }
       } catch (error) {
+        // A stopped run's page server is gone; the moments already shown stay.
+        if (services.stopped()) return;
         if (!disposed) $('moment-status').textContent = `Could not read moments: ${error.message}`;
       }
     }
