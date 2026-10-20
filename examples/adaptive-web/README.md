@@ -29,28 +29,14 @@ they do outside.
 ## Live demo
 
 Run `cargo xtask demo search` on Linux with KVM. One executable boots an
-official Ubuntu 24.04 desktop through Cloud Hypervisor and runs the adaptive
-web in-process with its stub generator (no model). A scripted searcher drives
-Firefox across Google, Bing and DuckDuckGo; the loopback page has the desktop,
-standard observation panels, search events and generation control. Search results
-and opened web pages are made up for this run. Only package installation hosts are forwarded.
-
-The page streams each search with the host that asked, its time and its
-outcome. A selected search shows the result list the world made for it, or
-the earlier search whose list it reused. A tree grows with every made-up site
-and page, the world's reason for each, how it was made and how fast it was
-served. The run saves the guest's screen and the page as it ends. Screenshots
-of the page's other states, such as a failed search or a lost screen, come
-from the preview without a VM, `cargo xtask demo search preview`, described
-in [demos/README.md](../../demos/README.md).
-
-The default seed is `halvard-cve`. Select another embedded seed with
-`cargo xtask demo search --seed corvane-acquisition` or
-`cargo xtask demo search --seed fastjsonl-package`. The run prints each
-check, measurements and capture paths, then shuts the guest down. With
-`--stay`, a passing run keeps the guest and the page up until Ctrl-C.
-Captures and the log are written directly to the printed persistent output
-directory, `demos/downloads/cloudimage/runs/search-<unix seconds>/`.
+official Ubuntu 24.04 desktop through Cloud Hypervisor, with Firefox and Claude
+Code, and runs the adaptive web in-process. It serves the canned pages in
+`stores/halvard-cve/`, made ahead of time with
+`cargo xtask demo search bake` from `seeds/halvard-cve.queries`; the stub makes
+whatever the store lacks, so no page costs a model call. The page opens in
+Chromium and stays up until Ctrl-C. `cargo xtask demo search check` runs the
+scripted story and its checks instead. See
+[demos/README.md](../../demos/README.md).
 
 ## Quick start
 

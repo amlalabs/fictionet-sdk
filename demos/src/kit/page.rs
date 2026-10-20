@@ -351,6 +351,40 @@ pub struct PageAccess {
 impl PageAccess {
     /// Prints the public address and a separate action to open the authenticated page.
     pub fn new(url: &str) -> io::Result<Self> {
+        let access = Self::bootstrap(url)?;
+        access.print_open();
+        Ok(access)
+    }
+
+    /// Opens the authenticated page in a Chromium app window, or prints how
+    /// to open it where there is no display to open it on.
+    pub fn open(url: &str) -> io::Result<Self> {
+        let access = Self::bootstrap(url)?;
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            access.print_open();
+            return Ok(access);
+        }
+        let launched = std::process::Command::new("chromium")
+            .args(["--password-store=basic", "--use-mock-keychain"])
+            .arg(format!("--app=file://{}", access.path().display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match launched {
+            Ok(mut chromium) => {
+                // Reap it whenever it exits; the run does not wait for it.
+                std::thread::spawn(move || chromium.wait());
+            }
+            Err(error) => {
+                println!("Chromium did not start: {error}");
+                access.print_open();
+            }
+        }
+        Ok(access)
+    }
+
+    fn bootstrap(url: &str) -> io::Result<Self> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         super::client::PageClient::from_url(url)?;
@@ -367,11 +401,18 @@ impl PageAccess {
             url.replace('&', "&amp;")
         )?;
         println!("Page: {}", url.split('#').next().unwrap());
+        Ok(Self { _dir: dir })
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self._dir.path().join("open.html")
+    }
+
+    fn print_open(&self) {
         println!(
             "Open: cargo xtask demo open {}",
-            super::ssh::quote(&path.display().to_string())
+            super::ssh::quote(&self.path().display().to_string())
         );
-        Ok(Self { _dir: dir })
     }
 }
 

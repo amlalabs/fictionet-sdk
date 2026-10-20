@@ -1,14 +1,35 @@
 // mount(root, services, options) -> dispose; shared services are described in README.md.
 // A shell on the host through xterm.js. Output is acknowledged after xterm
 // has written it, so the page server stops reading when the browser lags.
+// With options.interactive the text starts large and options.controls gets
+// A− and A+ buttons; the size is kept for the next visit.
 import { mountConsole } from './console.mjs';
+import { scoped, listen } from '../dom.mjs';
+
+const SIZE_KEY = 'fictionet-terminal-size';
 
 export function mount(root, services, options) {
   const css = root.ownerDocument.createElement('link');
   css.rel = 'stylesheet';
   css.href = '/vendor/xterm/css/xterm.css';
   root.append(css);
-  let active, focus = options.focus;
+  let active, focus = options.focus, fontSize = 13;
+  const sizing = [];
+  if (options.interactive) {
+    fontSize = 18;
+    try { const saved = Number(localStorage.getItem(SIZE_KEY)); if (saved >= 10 && saved <= 36) fontSize = saved; } catch { /* The size still lasts for this page. */ }
+    if (options.controls) {
+      const { el } = scoped(root);
+      for (const [text, label, step] of [['A−', 'Smaller text', -2], ['A+', 'Larger text', 2]]) {
+        const button = el('button', { type: 'button', class: 'text-size', text, 'aria-label': label }, options.controls);
+        sizing.push(listen(button, 'click', () => {
+          fontSize = Math.max(10, Math.min(36, fontSize + step));
+          try { localStorage.setItem(SIZE_KEY, String(fontSize)); } catch { /* Storage may be disabled. */ }
+          if (active?.terminal) { active.terminal.options.fontSize = fontSize; active.resize?.(); }
+        }));
+      }
+    }
+  }
   const theme = (display) => {
     const computed = getComputedStyle(display);
     return { background: computed.backgroundColor, foreground: computed.color, cursor: computed.color };
@@ -29,7 +50,7 @@ export function mount(root, services, options) {
       entry.socket = socket;
       const [{ Terminal }, { FitAddon }] = panel.library;
       const font = getComputedStyle(panel.display).fontFamily;
-      const terminal = entry.terminal = new Terminal({ scrollback: 5000, theme: theme(panel.display), allowProposedApi: false, fontSize: 13, ...(font ? { fontFamily: font } : {}) });
+      const terminal = entry.terminal = new Terminal({ scrollback: 5000, theme: theme(panel.display), allowProposedApi: false, fontSize, ...(font ? { fontFamily: font } : {}) });
       const fit = new FitAddon();
       terminal.loadAddon(fit);
       terminal.open(panel.display);
@@ -39,6 +60,7 @@ export function mount(root, services, options) {
         fit.fit();
         send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }));
       };
+      entry.resize = resize;
       const opened = () => {
         panel.hide();
         resize();
@@ -95,5 +117,7 @@ export function mount(root, services, options) {
   return () => {
     if (!dispose()) return;
     offTheme();
+    sizing.forEach((off) => off());
+    if (options.interactive) options.controls?.replaceChildren();
   };
 }

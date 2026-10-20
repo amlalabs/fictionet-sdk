@@ -2,7 +2,10 @@
 // A host's screen through noVNC, watching by default. "Take over" asks for the
 // host's input lease; services.input says who holds it, for every viewer.
 // options.controls, when given, is where the take over button and the owner
-// go (a tile header); otherwise they sit above the screen.
+// go (a tile header); otherwise they sit above the screen. With
+// options.interactive the viewer takes input as soon as the screen connects,
+// unless another viewer holds it, and the guest's display follows the size
+// of the panel while this viewer holds input.
 import { scoped } from '../dom.mjs';
 import { mountConsole } from './console.mjs';
 
@@ -17,10 +20,13 @@ export function mount(root, services, options) {
   function ownership() {
     const was = mine;
     mine = Boolean(active?.connected && input.mine);
-    if (active?.rfb) active.rfb.viewOnly = !mine;
-    claim.hidden = !active?.connected;
+    if (active?.rfb) {
+      active.rfb.viewOnly = !mine;
+      if (options.interactive) active.rfb.resizeSession = mine;
+    }
+    claim.hidden = !active?.connected || Boolean(options.interactive && (!input.holder || mine));
     claim.textContent = mine ? 'Release' : 'Take over';
-    owner.textContent = input.text;
+    owner.textContent = options.interactive && mine ? '' : input.text;
     owner.dataset.owner = input.owner;
     if (was && !mine && input.holder && active?.connected) {
       // Input is already off: the lease moved to another viewer.
@@ -57,6 +63,7 @@ export function mount(root, services, options) {
         panel.hide();
         services.input.session(options.host, entry.session);
         ownership();
+        if (options.interactive && !input.holder) void takeover(false);
       };
       const disconnected = () => {
         entry.disconnected = true;
@@ -96,14 +103,14 @@ export function mount(root, services, options) {
     load: () => services.importModule('/vendor/novnc/core/rfb.js').catch(() => { throw new Error('noVNC'); }),
   });
   if (!options.controls) root.insertBefore(controls, root.firstChild);
-  async function takeover() {
+  async function takeover(take = true) {
     const current = active;
     if (!current?.connected) return;
     claim.disabled = true;
     try {
       const release = input.holder === current.session;
       const reply = await services.transport[release ? 'delete' : 'post']('/api/lease', {
-        host: options.host, session: current.session, ...(release ? {} : { take: true }),
+        host: options.host, session: current.session, ...(release ? {} : { take: take !== false }),
       }, current.controller.signal);
       // The lease topic owns input permission, including a takeover during this reply.
       if (active !== current) return;
@@ -115,13 +122,14 @@ export function mount(root, services, options) {
       claim.disabled = false;
     }
   }
-  claim.addEventListener('click', takeover);
+  const click = () => takeover();
+  claim.addEventListener('click', click);
   const offInput = services.input.subscribe(options.host, (value) => { input = value; ownership(); });
   return () => {
     if (!dispose()) return;
     offInput();
     clearTimeout(notice);
-    claim.removeEventListener('click', takeover);
+    claim.removeEventListener('click', click);
     controls.replaceChildren();
   };
 }

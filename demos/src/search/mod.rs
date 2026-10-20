@@ -8,13 +8,16 @@ use adaptive_web_world::{
     search::{self, Searches},
 };
 use fictionet::Cx;
+use fictionet_extras::models;
 use fictionet_observe::page::Host;
 use fictionet_observe::{
     DashboardHandle,
     page::{CommandLimits, CommandPort, Page, Rejected, StateLimits, StateTopic},
 };
-use serde::Serialize;
 
+/// The names the world forwards to the real internet, and why: the guest's
+/// packages and Claude Code, installed at boot. Claude Code's model calls
+/// go out through the model site, when there is one.
 pub const FORWARDED: &[(&str, &str)] = &[
     ("archive.ubuntu.com", "Ubuntu packages installed at boot"),
     (
@@ -22,26 +25,15 @@ pub const FORWARDED: &[(&str, &str)] = &[
         "Ubuntu security packages installed at boot",
     ),
     ("packages.mozilla.org", "Firefox installed at boot"),
+    (
+        crate::kit::desktop::CLAUDE_HOST,
+        "Claude Code installed at boot",
+    ),
 ];
-
-#[derive(Serialize)]
-pub struct Policy {
-    searcher: &'static str,
-    forwarded: Vec<Forwarded>,
-    made_up: &'static str,
-    refused: &'static str,
-}
-
-#[derive(Serialize)]
-struct Forwarded {
-    host: &'static str,
-    why: &'static str,
-}
 
 #[derive(Clone)]
 pub struct Topics {
     pub searches: StateTopic<search::Snapshot>,
-    pub policy: StateTopic<Policy>,
     pub commands: CommandPort<Command, Applied>,
 }
 
@@ -51,16 +43,14 @@ impl Topics {
             searches: StateTopic::new(StateLimits {
                 max_bytes: search::MAX_SNAPSHOT_BYTES,
             }),
-            policy: StateTopic::new(StateLimits::default()),
             commands: CommandPort::new(CommandLimits::default()),
         }
     }
 
     pub fn page(&self, dashboard: DashboardHandle, host: Host) -> Page {
-        Page::new("Mediated search", dashboard)
+        Page::new("Search", dashboard)
             .host(host)
             .standard_panels()
-            .state("policy", self.policy.clone())
             .command("generation", self.commands.clone())
             .custom("Search", include_str!("search.mjs"), self.searches.clone())
             .asset(
@@ -79,27 +69,23 @@ impl Topics {
                 include_bytes!("style.css").to_vec(),
             )
             .workspace("Search")
-            .workspace_consoles()
+            .app()
     }
 
-    pub fn start(
-        &self,
-        cx: &Cx,
-        searches: Arc<Searches>,
-        pages: Arc<Pages>,
-        searcher: &'static str,
-    ) -> fictionet::Result {
-        self.policy
-            .publish(cx.now(), &policy(searcher))
-            .map_err(fictionet::Error::msg)?;
+    pub fn start(&self, cx: &Cx, searches: Arc<Searches>, pages: Arc<Pages>) -> fictionet::Result {
         let port = self.commands.clone();
         cx.spawn(move |cx| async move {
             crate::kit::serve_commands(&cx, &port, |command| {
-                Ok(pages.apply(&cx, *command).map_err(
-                    |adaptive_web_world::pages::Rejected::Stale { current }| {
-                        Rejected::StaleRevision { current }
-                    },
-                ))
+                Ok(pages
+                    .apply(&cx, command.clone())
+                    .map_err(|rejected| match rejected {
+                        adaptive_web_world::pages::Rejected::Stale { current } => {
+                            Rejected::StaleRevision { current }
+                        }
+                        adaptive_web_world::pages::Rejected::Invalid { message } => {
+                            Rejected::Invalid { message }
+                        }
+                    }))
             })
             .await
         });
@@ -112,18 +98,6 @@ impl Topics {
             }
         });
         Ok(())
-    }
-}
-
-pub fn policy(searcher: &'static str) -> Policy {
-    Policy {
-        searcher,
-        forwarded: FORWARDED
-            .iter()
-            .map(|&(host, why)| Forwarded { host, why })
-            .collect(),
-        made_up: "Every other name that could be on the internet gets a site made up by the world, at an address it picks.",
-        refused: "Single-label names and reserved or private top-level domains get no address.",
     }
 }
 
@@ -151,19 +125,30 @@ impl Default for Topics {
 }
 
 /// The world's network for the guest run and the preview: the adaptive web,
-/// with the names in [`FORWARDED`] served from the kit's package mirror.
+/// with the names in [`FORWARDED`] served from the kit's package mirror and,
+/// given one, Claude Code's model site at `api.anthropic.com`. Every HTTPS
+/// name has a certificate from the world's CA.
 pub fn network(
     world: &adaptive_web_world::World,
     cx: &Cx,
     log: Arc<example_common::log::Log>,
     mirror: crate::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,
+    model: Option<models::Model>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
-    let tls = world.ca.config(cx, crate::kit::desktop::HOSTS[0])?.0;
+    use fictionet::stdlib::web::Site;
+    let mozilla = world.ca.config(cx, crate::kit::desktop::HOSTS[0])?.0;
+    let claude = world.ca.config(cx, crate::kit::desktop::CLAUDE_HOST)?.0;
+    let api = world.ca.config(cx, models::Provider::Anthropic.host())?.0;
     Ok(world.net(cx, log, move |host| {
+        if host == models::Provider::Anthropic.host() {
+            return model.clone().map(|model| Site::new(model).tls(api.clone()));
+        }
         FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
-            let site = fictionet::stdlib::web::Site::new(mirror.clone());
+            let site = Site::new(mirror.clone());
             if crate::kit::desktop::HOSTS.contains(&host) {
-                site.tls(tls.clone())
+                site.tls(mozilla.clone())
+            } else if host == crate::kit::desktop::CLAUDE_HOST {
+                site.tls(claude.clone())
             } else {
                 site
             }

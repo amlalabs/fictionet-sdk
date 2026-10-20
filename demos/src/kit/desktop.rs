@@ -215,6 +215,56 @@ pub fn terminal(hostname: &str, user: &str, title: &str, size: (u16, u16), font_
     .run("systemctl daemon-reload && systemctl enable --now vnc.service")
 }
 
+/// Claude Code's native build, on Anthropic's stable channel. The guest
+/// fetches the zstd file as Anthropic's installer does, and checks it and
+/// the binary it unpacks to against two pinned sha256s, copied from the
+/// release's `manifest.zst.json` and `manifest.json`.
+pub const CLAUDE_VERSION: &str = "2.1.292";
+const CLAUDE_ZST_SHA256: &str = "28509427a53a5c15bd94d022d39013cc4b867a8e6305497f48162dcf91576326";
+const CLAUDE_SHA256: &str = "a967e7b1d8b4e47ee421d5433027880347952b0c0857abf880e2c942a4ec93b3";
+/// Where the guest downloads Claude Code. Serve it through World::mirror,
+/// with TLS from the CA passed to World::trust.
+pub const CLAUDE_HOST: &str = "downloads.claude.ai";
+/// Claude Code's settings for every user: no updates and no traffic beyond
+/// its model calls.
+pub const CLAUDE_SETTINGS: &str =
+    "{\"env\":{\"DISABLE_UPDATES\":\"1\",\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\":\"1\"}}\n";
+
+/// Shell lines that download Claude Code into `$work`, check it against
+/// its pinned sha256s and install it as /usr/local/bin/claude. `sha256sum
+/// -c` stops a script run with `set -e` on a mismatch.
+pub fn install_claude() -> String {
+    format!(
+        "curl -fsSLo \"$work/claude.zst\" \
+           https://{CLAUDE_HOST}/claude-code-releases/{CLAUDE_VERSION}/linux-x64/claude.zst\n\
+         echo \"{CLAUDE_ZST_SHA256}  $work/claude.zst\" | sha256sum -c -\n\
+         zstd -dq \"$work/claude.zst\" -o \"$work/claude\"\n\
+         echo \"{CLAUDE_SHA256}  $work/claude\" | sha256sum -c -\n\
+         install -m0755 \"$work/claude\" /usr/local/bin/claude\n"
+    )
+}
+
+/// Adds Claude Code, pinned and checked, with its managed settings.
+pub fn claude_code(guest: Guest) -> Guest {
+    let script = format!(
+        "#!/bin/bash\n\
+         set -euo pipefail\n\
+         work=$(mktemp -d)\n\
+         {}\
+         rm -rf \"$work\"\n",
+        install_claude()
+    );
+    guest
+        .packages(&["zstd"])
+        .file(
+            "/etc/claude-code/managed-settings.json",
+            0o644,
+            CLAUDE_SETTINGS,
+        )
+        .file("/opt/install-claude.sh", 0o755, script)
+        .run("bash /opt/install-claude.sh")
+}
+
 /// An Ubuntu guest with Xfce on Xvnc at 1280x800 and Mozilla's Firefox at
 /// start_url. Panics if the URL is not neutral HTTP or HTTPS or contains
 /// shell quoting or expansion characters. Desktop setup precedes
@@ -283,6 +333,8 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
          sleep 2\n\
          mkdir -p \"$HOME/.mozilla/firefox\"\n\
          firefox --no-remote '{start_url}' >/tmp/firefox.log 2>&1 &\n\
+         # Maximized, Firefox follows the screen when the viewer resizes it.\n\
+         for _ in $(seq 1 300); do wmctrl -x -r firefox -b add,maximized_vert,maximized_horz 2>/dev/null && break; sleep 0.2; done\n\
          wait\n"
     );
     xvnc(
@@ -304,6 +356,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         "fonts-liberation",
         "adwaita-icon-theme",
         "scrot",
+        "wmctrl",
     ])
     .file(
         "/etc/apt/keyrings/packages.mozilla.org.asc",

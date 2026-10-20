@@ -174,7 +174,9 @@
 //! tiles beside the custom panel. `inspector_first(title)` puts that
 //! inspector panel first and opens the inspector on it, with the page's other
 //! own panels after it; `/api/page` gives its id as `inspector_first`, which
-//! is null without the call.
+//! is null without the call. `app()` shows the page as an app: the first
+//! host's Screen and Terminal as tabs beside the workspace panel, a World
+//! menu the panel fills, and no inspector; `/api/page` gives `app: true`.
 //! `command(name, port)` registers a mailbox
 //! at `/api/command/<name>` without a control panel. Names, columns, actions, paths and
 //! composition conflicts are checked before the listener binds.
@@ -442,6 +444,10 @@ pub struct PageDescription {
     pub moments: Vec<MomentDescription>,
     /// The inspector panel shown first and opened first, or null for Packets.
     pub inspector_first: Option<String>,
+    /// The page is an app: the first host's screen and terminal beside the
+    /// workspace panel, with no inspector (see [`Page::app`]).
+    #[serde(default)]
+    pub app: bool,
 }
 
 /// A named moment marked by world events.
@@ -470,6 +476,7 @@ pub struct Page {
     workspace: Option<String>,
     workspace_consoles: bool,
     inspector_first: Option<String>,
+    app: bool,
     modules: Vec<(String, String)>,
     assets: Vec<(String, String, Vec<u8>)>,
     filters: Vec<(String, EventFilter)>,
@@ -493,6 +500,7 @@ impl Page {
             workspace: None,
             workspace_consoles: false,
             inspector_first: None,
+            app: false,
             modules: vec![],
             assets: vec![],
             filters: vec![],
@@ -803,6 +811,7 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
                     panels: shared.page.panels.clone(),
                     moments: shared.page.moments.clone(),
                     inspector_first: shared.page.inspector_first.clone(),
+                    app: shared.page.app,
                 },
             )
             .await

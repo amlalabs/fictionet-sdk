@@ -447,6 +447,85 @@ function moments(root, services, page, panels, signal) {
   return () => { stopped = true; clearTimeout(timer); stopBanner(); };
 }
 
+// The app: a header with the demo's name, its World menu and whether the
+// run is live; the agent's Screen and Terminal on the left; and the page's
+// own world panel on the right. The world panel puts its controls in
+// `services.worldMenu`. Returns dispose.
+export function appShell(root, services, page) {
+  const { el } = scoped(root);
+  const document = root.ownerDocument;
+  root.replaceChildren();
+  root.classList.add('demo-app');
+  const header = el('header', { class: 'app-top' }, root);
+  const brand = el('div', { class: 'app-brand' }, header);
+  el('span', { class: 'app-mark', 'aria-hidden': 'true' }, brand);
+  el('span', { text: 'Fictionet' }, brand);
+  el('span', { class: 'app-sep', 'aria-hidden': 'true' }, brand);
+  el('b', { text: page.title }, brand);
+  const right = el('div', { class: 'app-right' }, header);
+  const menu = el('div', { class: 'app-menu' }, right);
+  const toggle = el('button', { type: 'button', class: 'app-menu-button', 'aria-expanded': 'false', 'aria-controls': 'world-menu', text: 'World' }, menu);
+  el('i', { 'aria-hidden': 'true', text: '▾' }, toggle);
+  const pop = el('div', { id: 'world-menu', class: 'app-pop', role: 'group', 'aria-label': 'World' }, menu);
+  pop.hidden = true;
+  services.worldMenu = pop;
+  const live = el('span', { class: 'app-live', role: 'status', 'data-live': 'false', text: 'Connecting' }, right);
+  const body = el('main', { class: 'app-body' }, root);
+  const agent = el('section', { class: 'app-agent', 'aria-label': 'Agent' }, body);
+  const bar = el('div', { class: 'app-tabs', role: 'tablist', 'aria-label': 'Agent' }, agent);
+  const controls = el('div', { class: 'app-controls' });
+  const stage = el('div', { class: 'app-stage', role: 'tabpanel' }, agent);
+  const world = el('section', { class: 'app-world', 'aria-label': 'World' }, body);
+  const host = page.hosts[0];
+  const kinds = ['screen', 'terminal'].filter((kind) => host?.[kind]);
+  const cleanup = [];
+  let selected = kinds[0], stopConsole = () => {};
+  const tabs = new Map();
+  function open(focus = false) {
+    stopConsole();
+    stopConsole = () => {};
+    stage.replaceChildren();
+    controls.replaceChildren();
+    for (const [kind, tab] of tabs) tab.setAttribute('aria-selected', String(kind === selected));
+    stage.dataset.kind = selected || '';
+    if (!selected || document.hidden) return;
+    const options = page.panels.find((item) => item.kind === selected && item.host === host.name) || { kind: selected, host: host.name, title: host.name };
+    stopConsole = panel(services, page, stage, { ...options, focus, interactive: true }, controls);
+  }
+  for (const kind of kinds) {
+    const tab = el('button', { type: 'button', role: 'tab', 'aria-selected': 'false', text: kind === 'screen' ? 'Screen' : 'Terminal' }, bar);
+    tabs.set(kind, tab);
+    cleanup.push(listen(tab, 'click', () => { if (selected !== kind) { selected = kind; open(kind === 'terminal'); } }));
+  }
+  bar.append(controls);
+  open();
+  const own = page.panels.find((item) => item.area === 'workspace' && item.kind === 'custom');
+  if (own) cleanup.push(panel(services, page, world, own));
+  const close = () => { pop.hidden = true; toggle.setAttribute('aria-expanded', 'false'); };
+  cleanup.push(listen(toggle, 'click', () => {
+    pop.hidden = !pop.hidden;
+    toggle.setAttribute('aria-expanded', String(!pop.hidden));
+  }));
+  cleanup.push(listen(document, 'keydown', (event) => { if (event.key === 'Escape' && !pop.hidden) { close(); toggle.focus(); } }));
+  cleanup.push(listen(document, 'pointerdown', (event) => { if (!menu.contains(event.target)) close(); }));
+  const status = (text, on) => { live.textContent = text; live.dataset.live = String(on); };
+  cleanup.push(services.graph.subscribe((name, value) => {
+    if (name === 'waiting') status('Waiting for the world', false);
+    if (name === 'snapshot') { services.run.set(value.ended ? 'stopped' : 'running'); status(value.ended ? 'Stopped' : 'Live', !value.ended); }
+    if (name === 'ended' || name === 'end') { services.run.set('stopped'); status('Stopped', false); }
+    if (name === 'error' && !services.stopped()) status('Reconnecting', false);
+    if (name === 'open' && !services.stopped()) { services.run.set('running'); status('Live', true); }
+    if (name === 'world_error') { services.run.set('stopped'); status(value.error, false); }
+  }));
+  // A hidden tab keeps no console open.
+  cleanup.push(listen(document, 'visibilitychange', () => { if (document.hidden) { stopConsole(); stopConsole = () => {}; } else open(); }));
+  return () => {
+    stopConsole();
+    cleanup.reverse().forEach((off) => off());
+    root.classList.remove('demo-app');
+  };
+}
+
 // `importModule`, when given, replaces how the page loads modules (see
 // createServices).
 export async function mount(root, transport, theme, importModule) {
@@ -485,6 +564,10 @@ export async function mount(root, transport, theme, importModule) {
   services.labelCommand = page.panels.find((item) => item.kind === 'labels')?.command;
   services.containmentState = page.panels.find((item) => item.kind === 'containment')?.state;
   document.title = `${page.title} · Fictionet`;
+  if (page.app) {
+    cleanup.push(appShell(root, services, page));
+    return stop;
+  }
   $('page-title').textContent = page.title;
 
   const area = workspace(root, services, page);
