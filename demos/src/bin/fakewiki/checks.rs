@@ -336,25 +336,21 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
         ),
     )?;
     stale_command(&client, "stale-switch", true, 0, 1).await?;
-    let state = client.get_json("/api/state/tamper").await?;
+    let state: Value = client.state("tamper").await?;
     let streamed = stream
         .next("tamper", |s| s["value"]["revision"] == 1)
         .await?;
     check(
         "GET and the stream agree that tampering is on",
-        state["value"] == streamed["value"] && state["value"]["on"] == true,
+        state == streamed["value"] && state["on"] == true,
     )?;
     println!(
         "[pass] switch: applied revision 1, stale revision rejected with HTTP 409 and world event, GET and stream agree"
     );
 
     second_read(&client, guest, window, switch.unwrap_or(0)).await?;
-    let diff = client.get_json("/api/state/diff").await?;
-    check(
-        "the diff has revision 1 within its bound",
-        diff["status"]["too_large"] == false && diff["value"]["revision"] == 1,
-    )?;
-    let diff: fakewiki_world::pages::diff::Diff = serde_json::from_value(diff["value"].clone())?;
+    let diff: fakewiki_world::pages::diff::Diff = client.state("diff").await?;
+    check("the diff has revision 1", diff.revision == 1)?;
     check(
         "the diff marks the article tampered",
         diff.topics

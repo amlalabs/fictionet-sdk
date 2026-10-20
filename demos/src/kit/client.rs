@@ -158,8 +158,8 @@ impl PageClient {
     }
 
     /// Reads the state topic `name` as a browser does and returns its value.
-    /// A status but 200, a publication over the topic's bound or a topic with
-    /// nothing published yet is an error.
+    /// Any status other than 200 is an error. So is a publication over the
+    /// topic's bound, or a topic with nothing published yet.
     pub async fn state<T: serde::de::DeserializeOwned>(&self, name: &str) -> io::Result<T> {
         let path = format!("/api/state/{name}");
         let reply = self.request("GET", &path, None, true).await?;

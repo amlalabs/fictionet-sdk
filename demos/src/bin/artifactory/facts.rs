@@ -1219,12 +1219,10 @@ pub(super) mod tests {
         client: &fictionet_demo::kit::client::PageClient,
         name: &str,
     ) -> serde_json::Value {
-        let response = client
-            .request("GET", &format!("/api/state/{name}"), None, true)
+        client
+            .get_json(&format!("/api/state/{name}"))
             .await
-            .unwrap();
-        assert_eq!(response.status, 200);
-        serde_json::from_slice(&response.body).unwrap()
+            .unwrap()
     }
 
     #[tokio::test]

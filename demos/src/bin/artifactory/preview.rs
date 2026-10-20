@@ -840,11 +840,7 @@ mod tests {
         .unwrap();
         let client = fictionet_demo::kit::client::PageClient::from_url(page.url()).unwrap();
         client.bootstrap().await.unwrap();
-        let reply = client
-            .request("GET", "/api/state/requests", None, true)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let value: serde_json::Value = client.get_json("/api/state/requests").await.unwrap();
         assert_eq!(value["status"]["too_large"], false);
         let rows = value["value"]["rows"].as_array().unwrap();
         assert_eq!(rows.len(), super::super::facts::PAGE_ROWS);

@@ -1,6 +1,8 @@
 //! The scripted terminal story and the page's own command client.
 
 use super::{checks, guest::HOSTNAME};
+use border_world::routing::RouteState;
+use border_world::scenario::Variant;
 use fictionet_demo::kit::{
     self, Run,
     client::{Capability, PageClient},
@@ -93,10 +95,6 @@ async fn flip(client: &PageClient, mode: &str, revision: u64) -> io::Result<()> 
     Ok(())
 }
 
-async fn border_state(client: &PageClient) -> io::Result<Value> {
-    Ok(client.get_json("/api/state/border").await?["value"].take())
-}
-
 fn aborted_after(view: &Value, after: u64) -> bool {
     view["tls"]["rows"].as_array().is_some_and(|rows| {
         rows.iter().any(|row| {
@@ -138,7 +136,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
     let client = PageClient::from_url(run.page_url())?;
     let mut titles = Vec::new();
     let result = tokio::time::timeout(Duration::from_secs(60), async {
-        let before = border_state(&client).await?;
+        let before: Value = client.state("border").await?;
         let after = before["tls"]["rows"].as_array().into_iter().flatten()
             .filter_map(|row| row["event"].as_u64()).max().unwrap_or(0);
         let mut cursor = client.last_event().await?;
@@ -159,7 +157,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
             let bank = current.contains("Kestrelmoor");
             if !current.is_empty() && bank != hijacked
                 && (hijacked || served)
-                && (!hijacked || aborted_after(&border_state(&client).await?, after)) {
+                && (!hijacked || aborted_after(&client.state("border").await?, after)) {
                 println!("Firefox final title: {current:?}");
                 if hijacked {
                     println!("Browser TLS: the impostor answered and the guest aborted with an alert.");
@@ -272,8 +270,8 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
         )));
     }
     println!("Repeated command: rejected stale_revision; revision remains 1.");
-    let state = client.get_json("/api/state/routing").await?;
-    if state["value"]["revision"] != 1 || state["value"]["mode"] != "hijack" {
+    let state: RouteState = client.state("routing").await?;
+    if state.revision != 1 || state.mode != Variant::Hijack {
         return Err(io::Error::other(
             "the rejected command changed the route state",
         ));

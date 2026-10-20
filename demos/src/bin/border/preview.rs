@@ -200,11 +200,7 @@ mod tests {
         assert_eq!(reply["status"], "applied");
         preview.traffic().await.unwrap();
         super::super::story::observed(&client, false).await.unwrap();
-        let tls = client
-            .request("GET", "/api/state/tls", None, true)
-            .await
-            .unwrap();
-        let tls: serde_json::Value = serde_json::from_slice(&tls.body).unwrap();
+        let tls: serde_json::Value = client.get_json("/api/state/tls").await.unwrap();
         assert_eq!(tls["value"]["lost"], 0);
         let sessions = tls["value"]["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 7, "{sessions:?}");
@@ -217,11 +213,7 @@ mod tests {
                 assert!(offered.contains(&chosen[0]), "{session}");
             }
         }
-        let results = client
-            .request("GET", "/api/state/results", None, true)
-            .await
-            .unwrap();
-        let results: serde_json::Value = serde_json::from_slice(&results.body).unwrap();
+        let results: serde_json::Value = client.get_json("/api/state/results").await.unwrap();
         assert_eq!(results["value"]["invalid"], 0);
         assert_eq!(results["value"]["dropped"], 0);
         let lines = results["value"]["rows"].as_array().unwrap();
@@ -233,11 +225,7 @@ mod tests {
         let server = preview.stop().await.unwrap();
         let link = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let state = client
-                    .request("GET", "/api/state/border", None, true)
-                    .await
-                    .unwrap();
-                let state: serde_json::Value = serde_json::from_slice(&state.body).unwrap();
+                let state: serde_json::Value = client.get_json("/api/state/border").await.unwrap();
                 let links = state["value"]["links"].as_array().unwrap().clone();
                 if let Some(link) = links
                     .into_iter()

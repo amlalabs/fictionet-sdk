@@ -5,9 +5,7 @@ use crate::Error;
 use crate::page::{self, Reports, StepState, Story};
 use crate::story::{HOSTS, addr};
 use fictionet_demo::kit::client::PageClient;
-use fictionet_observe::page::Snapshot;
 use scan_world::{PortMap, PortState, Protocol, SERVER_ADDR};
-use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 
@@ -21,38 +19,14 @@ pub struct Topics {
 /// Reads the page's topics and the moment's events through its API.
 pub async fn read(client: &PageClient) -> Result<(Topics, serde_json::Value), Error> {
     let topics = Topics {
-        ports: topic(client, page::PORTS).await?,
-        reports: topic(client, page::SERVICES).await?,
-        story: topic(client, page::OFFICE).await?,
+        ports: client.state(&page::PORTS.to_ascii_lowercase()).await?,
+        reports: client.state(&page::SERVICES.to_ascii_lowercase()).await?,
+        story: client.state(&page::OFFICE.to_ascii_lowercase()).await?,
     };
-    let reply = client
-        .request(
-            "GET",
-            "/api/event-table/all-five-hosts-answered",
-            None,
-            true,
-        )
+    let moment = client
+        .get_json("/api/event-table/all-five-hosts-answered")
         .await?;
-    if reply.status != 200 {
-        return Err(format!("moment events: {}", reply.status_line).into());
-    }
-    Ok((topics, serde_json::from_slice(&reply.body)?))
-}
-
-/// Reads one state topic by its panel title.
-async fn topic<T: DeserializeOwned>(client: &PageClient, title: &str) -> Result<T, Error> {
-    let path = format!("/api/state/{}", title.to_ascii_lowercase());
-    let reply = client.request("GET", &path, None, true).await?;
-    if reply.status != 200 {
-        return Err(format!("{path}: {}", reply.status_line).into());
-    }
-    let snapshot: Snapshot<T> = serde_json::from_slice(&reply.body)?;
-    if snapshot.status.too_large {
-        return Err(format!("{path}: a publication exceeded its size limit").into());
-    }
-    snapshot
-        .value
-        .ok_or_else(|| format!("{path}: nothing published yet").into())
+    Ok((topics, moment))
 }
 
 /// Checks what the page shows after the story. Returns a one-line summary.

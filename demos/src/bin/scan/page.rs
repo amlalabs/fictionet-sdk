@@ -618,11 +618,7 @@ pub mod tests {
             client.bootstrap().await.unwrap();
             let get = |path: &'static str| {
                 let client = &client;
-                async move {
-                    let reply = client.request("GET", path, None, true).await.unwrap();
-                    assert_eq!(reply.status, 200, "{path}");
-                    serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap()
-                }
+                async move { client.get_json(path).await.unwrap() }
             };
             for index in 0..3 {
                 let reached = tokio::task::block_in_place(|| steps.recv().unwrap());

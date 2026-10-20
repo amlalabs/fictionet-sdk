@@ -609,12 +609,7 @@ async fn desktop_readiness_does_not_require_a_page() {
 #[tokio::test]
 async fn page_wires_containment_and_labels() {
     let mut fixture = PageFixture::new().await;
-    let response = fixture
-        .client
-        .request("GET", "/api/page", None, true)
-        .await
-        .unwrap();
-    let description: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let description = fixture.client.get_json("/api/page").await.unwrap();
     let panels = description["panels"].as_array().unwrap();
     let containment = panels.iter().find(|p| p["id"] == "containment").unwrap();
     assert_eq!(containment["state"], "/api/state/containment");
@@ -1050,12 +1045,7 @@ async fn attachment_names_are_independent_of_guest_identity() {
     .unwrap();
     let client = client::PageClient::from_url(run.page_url()).unwrap();
     client.bootstrap().await.unwrap();
-    let response = client
-        .request("GET", "/api/page", None, true)
-        .await
-        .unwrap();
-    assert_eq!(response.status, 200);
-    let description: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let description: serde_json::Value = client.get_json("/api/page").await.unwrap();
     assert_eq!(description["hosts"][0]["sandbox"], "client-link");
     assert_eq!(description["hosts"][1]["sandbox"], "storage-link");
     assert_eq!(description["hosts"][0]["pinned"], true);

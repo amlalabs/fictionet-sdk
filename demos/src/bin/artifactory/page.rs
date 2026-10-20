@@ -160,35 +160,16 @@ pub fn lookalike_wheel(inventory: &Inventory) -> Option<&str> {
     }
 }
 
-async fn topic<T: serde::de::DeserializeOwned>(client: &PageClient, name: &str) -> io::Result<T> {
-    let reply = client
-        .request("GET", &format!("/api/state/{name}"), None, true)
-        .await?;
-    if reply.status != 200 {
-        return Err(io::Error::other(format!(
-            "page topic {name}: {}",
-            reply.status_line
-        )));
-    }
-    let mut value: serde_json::Value = serde_json::from_slice(&reply.body)?;
-    if value["status"]["too_large"] != false {
-        return Err(io::Error::other(format!(
-            "page topic {name} exceeded its byte bound"
-        )));
-    }
-    Ok(serde_json::from_value(value["value"].take())?)
-}
-
 /// Reads the page's topics with the run's bearer and Origin, as a browser
 /// does, and checks that they show every step's facts.
 pub async fn check(url: &str, variant: Variant, sessions: Option<Mode>) -> io::Result<String> {
     let client = PageClient::from_url(url)?;
     client.bootstrap().await?;
-    let inventory: Inventory = topic(&client, "packages").await?;
-    let requests: Rows<RequestRow> = topic(&client, "requests").await?;
-    let doors: Doors = topic(&client, "doors-tried").await?;
+    let inventory: Inventory = client.state("packages").await?;
+    let requests: Rows<RequestRow> = client.state("requests").await?;
+    let doors: Doors = client.state("doors-tried").await?;
     let colleague: Option<Inventory> = match sessions {
-        Some(Mode::Separate) => Some(topic(&client, COLLEAGUE_STATE).await?),
+        Some(Mode::Separate) => Some(client.state(COLLEAGUE_STATE).await?),
         _ => None,
     };
     verify(
