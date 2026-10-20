@@ -344,6 +344,35 @@ async fn second_read(
     })?
 }
 
+/// Captures the guest's screen until two captures in a row match, for at
+/// most 15 s. Firefox animates its tab while it loads, so a settled screen
+/// shows the page it received rather than the one it is replacing. Returns
+/// the last capture and how many captures it took, or None if the screen
+/// was still changing.
+async fn settled_screen(run: &Run, out: &Path) -> io::Result<(rfb::Capture, Option<usize>)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (mut previous, mut captures) = (None, 0);
+    let mut poll = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        poll.tick().await;
+        captures += 1;
+        let capture = tokio::time::timeout(
+            Duration::from_secs(30),
+            rfb::capture_page(run.page_url(), HOST, out),
+        )
+        .await
+        .map_err(|_| io::Error::other("guest screen capture timed out"))??;
+        let pixels = std::fs::read(&capture.png)?;
+        if previous.as_ref() == Some(&pixels) {
+            return Ok((capture, Some(captures)));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok((capture, None));
+        }
+        previous = Some(pixels);
+    }
+}
+
 /// Runs the checks. On a failure it prints the article's requests and saves
 /// the guest's screen before it returns the error.
 pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
@@ -516,17 +545,21 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
     println!("[pass] panels: Reads, Left the box, containment and map have data");
     std::fs::create_dir_all(output)?;
     let screen = output.join("desktop.png");
-    let capture = tokio::time::timeout(
-        Duration::from_secs(30),
-        rfb::capture_page(run.page_url(), HOST, &screen),
-    )
-    .await
-    .map_err(|_| io::Error::other("guest screen capture timed out"))??;
+    let (capture, settled) = settled_screen(run, &screen).await?;
     require(
         capture.width == 1280 && capture.height == 800 && capture.colors >= 16,
         "guest screen is blank or has unexpected dimensions",
     )?;
-    println!("guest screenshot: {}", screen.display());
+    match settled {
+        Some(captures) => println!(
+            "guest screenshot: {} (the screen settled after {captures} captures)",
+            screen.display()
+        ),
+        None => println!(
+            "guest screenshot: {} (the screen was still changing after 15 s)",
+            screen.display()
+        ),
+    }
     let page = output.join("page.png");
     let url = run.page_url().to_owned();
     let screenshot = page.clone();
