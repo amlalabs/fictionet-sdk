@@ -721,6 +721,29 @@ impl Run {
 }
 
 impl Run {
+    /// Waits until `host` shows its desktop and every guest has finished
+    /// setting up. The package mirror stops forwarding setup traffic when
+    /// this returns, ready or not, or when it is dropped unfinished.
+    async fn app_ready(&self, host: &str) -> io::Result<()> {
+        struct CloseSetup<'a>(&'a mirror::Setup);
+        impl Drop for CloseSetup<'_> {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _close = CloseSetup(&self.setup);
+        let desktop = self
+            .guest(host)
+            .wait_desktop(Duration::from_secs(300))
+            .await?;
+        println!("desktop up: {} ms", desktop.as_millis());
+        for guest in &self.guests {
+            let setup = guest.wait_cloud_init(Duration::from_secs(300)).await?;
+            println!("{} ready: {} ms", guest.name(), setup.as_millis());
+        }
+        Ok(())
+    }
+
     fn stop_status(&self) {
         if let Some(cx) = self.fcx.lock().unwrap().as_ref() {
             for guest in &self.guests {
@@ -935,6 +958,48 @@ where
                 Err(error)
             }
         }
+    }
+}
+
+impl<W, F> Kit<W>
+where
+    W: FnOnce(Cx, World) -> F + Send + 'static,
+    F: Future<Output = fictionet::Result> + Send + 'static,
+{
+    /// Runs the kit as an app someone drives by hand: opens the page,
+    /// boots, says when the guest `host` has its desktop and has finished
+    /// setting up, and stays up until Ctrl-C, which also stops a boot. It
+    /// shuts the run down before it returns.
+    pub async fn run_app(self, downloads: impl AsRef<Path>, host: &str) -> io::Result<()> {
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let run = tokio::select! {
+            run = self.open_page().boot(downloads) => run?,
+            _ = interrupt.recv() => {
+                println!("Stopped while booting.");
+                return Ok(());
+            }
+        };
+        println!(
+            "boot to SSH-ready: {} ms",
+            run.guest(host).ssh_ready().as_millis()
+        );
+        let result = tokio::select! {
+            ready = run.app_ready(host) => match ready {
+                Ok(()) => {
+                    println!("The page stays open until Ctrl-C.");
+                    interrupt.recv().await;
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            _ = interrupt.recv() => Ok(()),
+        };
+        if result.is_err() {
+            eprint!("{}", run.guest(host).diagnostics().await);
+        }
+        let shutdown = run.shutdown().await;
+        result.and(shutdown)
     }
 }
 
