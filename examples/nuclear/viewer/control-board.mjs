@@ -13,14 +13,9 @@
 
 import * as THREE from '/vendor/three/build/three.module.js';
 import { formatGap, formatValue } from './instruments.mjs';
+import { RADIUS, BOARD_SPAN, BOARD_BOTTOM, BOARD_TOP, BAND_BOTTOM, BAND_TOP, BOARD_PX, cellLayout, boardLayout, closeView, overview } from './board-layout.mjs';
 
 const TAU = Math.PI * 2;
-const RADIUS = 4.6;
-const BOARD_SPAN = Math.PI / 9; // 20 degrees per board: three boards fit the view
-const BOARD_BOTTOM = 0.95;
-const BOARD_TOP = 3.05;
-const BAND_BOTTOM = 3.12;
-const BAND_TOP = 3.72;
 const CONSOLE_Y = 0.92;
 const CONSOLE_RADIUS = 3.85;
 const CONSOLE_SPAN = (76 * Math.PI) / 180;
@@ -28,13 +23,6 @@ const NEEDLE_SMOOTH_S = 0.35;
 const NEEDLE_SWEEP = (270 * Math.PI) / 180;
 const NEEDLE_START = (135 * Math.PI) / 180;
 const KNOB_SWEEP = (270 * Math.PI) / 180;
-const VIEW_HALF_WIDTH = (33 * Math.PI) / 180; // keeps the whole bank in view
-const VIEW_HALF_HEIGHT = (21 * Math.PI) / 180;
-const EYE = [0, 1.9, 0];
-const LOOK = [0, 2.25, -4.6];
-
-const BOARD_PX = { width: 1024, height: 1280 };
-const BOARD_HEADER_PX = 150;
 const BAND_PX = { width: 2048, height: 256 };
 /** Tiles in the annunciator band: two rows of nine. */
 export const ANNUNCIATOR_SLOTS = 18;
@@ -70,18 +58,21 @@ const LABELS = Object.freeze({
 export const BOARDS = Object.freeze([
   {
     title: 'Reactor controls',
+    view: 'reactor-board',
     center: Math.PI + BOARD_SPAN,
     cols: 3,
     points: ['hot_leg:a', 'hot_leg:b', 'core_exit_temperature', 'neutron_power', 'pressurizer_pressure', 'pressurizer_level'],
   },
   {
     title: 'Turbine hall',
+    view: 'turbine-board',
     center: Math.PI - BOARD_SPAN,
     cols: 3,
     points: ['steam_pressure', 'steam_generator_level:a', 'steam_generator_level:b', 'turbine_valve', 'generator_output', 'condenser_pressure'],
   },
   {
     title: 'Loops and feed',
+    view: 'loops-board',
     center: Math.PI,
     cols: 3,
     points: [
@@ -125,10 +116,12 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 60);
-  camera.position.set(...EYE);
-  camera.lookAt(...LOOK);
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8a80, 1.0));
-  const sun = new THREE.DirectionalLight(0xffffff, 0.6);
+  camera.position.set(...overview(1).eye);
+  camera.lookAt(...overview(1).look);
+  const fill = new THREE.HemisphereLight();
+  scene.add(fill);
+  const sun = new THREE.DirectionalLight();
+  sun.intensity = 0.6;
   sun.position.set(0.5, 7, 3);
   scene.add(sun);
 
@@ -157,7 +150,7 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
     const texture = canvasTexture(canvas, track);
     const face = new THREE.Mesh(
       track(arcGeometry(config.center, BOARD_SPAN, RADIUS, BOARD_BOTTOM, BOARD_TOP)),
-      track(new THREE.MeshLambertMaterial({ map: texture, side: THREE.DoubleSide })),
+      track(new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide, toneMapped: false })),
     );
     scene.add(face);
     const bezel = new THREE.Mesh(
@@ -165,7 +158,7 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
       material.bezel,
     );
     scene.add(bezel);
-    return { config, canvas, texture };
+    return { config, canvas, texture, face, bezel };
   });
 
   const bandCanvas = document.createElement('canvas');
@@ -174,7 +167,7 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
   const bandTexture = canvasTexture(bandCanvas, track);
   const band = new THREE.Mesh(
     track(arcGeometry(Math.PI, 3 * BOARD_SPAN, RADIUS - 0.02, BAND_BOTTOM, BAND_TOP)),
-    track(new THREE.MeshLambertMaterial({ map: bandTexture, side: THREE.DoubleSide })),
+    track(new THREE.MeshBasicMaterial({ map: bandTexture, side: THREE.DoubleSide, toneMapped: false })),
   );
   scene.add(band);
 
@@ -205,11 +198,19 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
   let last = 0;
   let dirty = true;
   const shown = new Map();
+  let selected = 'control';
+  const eyeGoal = new THREE.Vector3(...overview(1).eye);
+  const lookGoal = new THREE.Vector3(...overview(1).look);
+  const look = lookGoal.clone();
+  let fovGoal = camera.fov;
 
   applyTheme(theme);
 
   function applyTheme(next) {
     palette = { ...next };
+    fill.color.set(palette.lightKey);
+    fill.groundColor.set(palette.lightGround);
+    sun.color.set(palette.lightKey);
     scene.background = new THREE.Color(palette.sunken);
     material.wall.color.set(palette.sunken);
     material.floor.color.set(palette.line);
@@ -224,9 +225,16 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
     const aspect = width / height;
-    // Vertical field of view: wide enough for the bank across, and never less than the height needs.
-    const halfV = Math.max(VIEW_HALF_HEIGHT, Math.atan(Math.tan(VIEW_HALF_WIDTH) / aspect));
-    camera.fov = (2 * halfV * 180) / Math.PI;
+    const config = boards.find(({ config }) => config.view === selected)?.config;
+    const framing = config ? closeView(config, aspect) : overview(aspect);
+    eyeGoal.set(...framing.eye);
+    lookGoal.set(...framing.look);
+    fovGoal = framing.fov;
+    dirty = true;
+    for (const board of boards) {
+      board.face.visible = board.bezel.visible = !config || board.config === config;
+    }
+    band.visible = !config;
     renderer.setSize(width, height, false);
     camera.aspect = aspect;
     camera.updateProjectionMatrix();
@@ -255,6 +263,19 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
     if (disposed) return;
     const dt = Math.min(0.1, (now - last) / 1000);
     last = now;
+    const k = reducedMotion() ? 1 : 1 - Math.exp(-dt / 0.25);
+    camera.position.lerp(eyeGoal, k);
+    look.lerp(lookGoal, k);
+    camera.fov += (fovGoal - camera.fov) * k;
+    const cameraMoving = camera.position.distanceTo(eyeGoal) > 0.001
+      || look.distanceTo(lookGoal) > 0.001 || Math.abs(camera.fov - fovGoal) > 0.01;
+    if (!cameraMoving) {
+      camera.position.copy(eyeGoal);
+      look.copy(lookGoal);
+      camera.fov = fovGoal;
+    }
+    camera.lookAt(look);
+    camera.updateProjectionMatrix();
     const moving = easeNeedles(dt);
     if (dirty || moving) {
       paintAll();
@@ -264,7 +285,7 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
       if (knobStates[i]) knob.place(knobStates[i]);
     });
     renderer.render(scene, camera);
-    if (moving) raf = requestAnimationFrame(frame);
+    if (moving || cameraMoving) raf = requestAnimationFrame(frame);
   }
 
   // Needles ease toward the snapshot's fractions. Reduced motion takes them at once.
@@ -302,125 +323,85 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
   function paintBoard({ config, canvas }) {
     const ctx = canvas.getContext('2d');
     const { width, height } = BOARD_PX;
-    const rows = Math.ceil(config.points.length / config.cols);
-    const cellW = width / config.cols;
-    const cellH = (height - BOARD_HEADER_PX) / rows;
+    const layout = boardLayout(config.points.length);
     ctx.fillStyle = palette.raised;
     ctx.fillRect(0, 0, width, height);
     ctx.fillStyle = palette.surface;
-    ctx.fillRect(0, 0, width, BOARD_HEADER_PX);
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = palette.ink;
-    ctx.font = `700 58px ${FONT}`;
-    ctx.fillText(config.title, 28, 56);
-    ctx.font = `600 36px ${FONT}`;
-    ctx.fillStyle = palette.text;
-    ctx.fillText(`Plant time ${text.plantTime}`, 28, 112);
-    ctx.textAlign = 'right';
-    ctx.font = `600 32px ${FONT}`;
-    ctx.fillText(text.telemetry, width - 28, 112);
-    ctx.textAlign = 'left';
+    const header = layout.header;
+    ctx.fillRect(header.x, header.y, header.w, header.h);
+    paintText(ctx, config.title, layout.text.title, palette.ink, 'left');
+    paintText(ctx, `Plant time ${text.plantTime}`, layout.text.time, palette.text, 'right');
+    paintText(ctx, text.telemetry, layout.text.telemetry, palette.text, 'left');
     config.points.forEach((key, index) => {
       const pair = view.pairs.find((p) => p.key === key);
-      if (!pair) return;
-      paintCell(ctx, pair, {
-        x: (index % config.cols) * cellW,
-        y: BOARD_HEADER_PX + Math.floor(index / config.cols) * cellH,
-        w: cellW,
-        h: cellH,
-      });
+      if (pair) paintCell(ctx, pair, layout.cells[index]);
     });
   }
 
-  // A cell: the gauge name, a caption over each dial, the two dials, their values,
-  // the gap, and a frozen gauge's stopped time. The reported dial is on the left.
+  function paintText(ctx, value, box, color, align = 'center') {
+    ctx.textAlign = align;
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    ctx.font = `600 ${box.font}px ${FONT}`;
+    const x = align === 'left' ? box.x : align === 'right' ? box.x + box.w : box.x + box.w / 2;
+    ctx.fillText(value, x, box.y + box.h / 2);
+  }
+
   function paintCell(ctx, pair, cell) {
-    const r = Math.min(cell.w * 0.16, cell.h * 0.15);
-    const reportedX = cell.x + cell.w * 0.23;
-    const trueX = cell.x + cell.w * 0.77;
-    const midX = (reportedX + trueX) / 2;
-    const lines = LABELS[pair.key] ?? [pair.label];
+    const layout = cellLayout(cell.w, cell.h);
+    const boxes = layout.text;
     const level = shown.get(pair.key) ?? { reported: 0, truth: 0 };
-
     ctx.save();
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = palette.ink;
-    ctx.font = `700 40px ${FONT}`;
-    lines.forEach((line, i) => ctx.fillText(line, cell.x + 22, cell.y + 48 + i * 44));
-    const captionY = cell.y + 48 + 2 * 44 + 4;
-    const cy = captionY + 22 + r;
-
+    ctx.translate(cell.x, cell.y);
+    paintText(ctx, (LABELS[pair.key] ?? [pair.label]).join(' '), boxes.label, palette.ink);
+    paintText(ctx, 'HMI', boxes.hmi, palette.text);
+    paintText(ctx, 'Plant', boxes.plant, palette.text);
+    layout.dials.forEach((dial, i) => {
+      const cx = dial.x + dial.radius;
+      const cy = dial.y + dial.radius;
+      drawDial(ctx, cx, cy, dial.radius, i ? level.truth : pair.reported === null ? 0 : level.reported, {
+        color: i ? palette.accent : palette.ink,
+        dashed: !i && (pair.frozen || pair.reported === null),
+      });
+      if (!i && pair.marked) {
+        ctx.beginPath();
+        const ringWidth = selected === 'control' ? layout.ringWidth : dial.radius * 0.1;
+        ctx.arc(cx, cy, dial.radius - ringWidth / 2, 0, TAU);
+        ctx.strokeStyle = palette.warning;
+        ctx.lineWidth = ringWidth;
+        ctx.stroke();
+      }
+    });
     if (pair.marked) {
-      // The single amber ring, and a dashed line from the HMI dial to its true twin.
+      const [left, right] = layout.dials;
       ctx.beginPath();
-      ctx.arc(reportedX, cy, r + 12, 0, TAU);
+      ctx.setLineDash([left.radius * 0.15, left.radius * 0.12]);
+      ctx.moveTo(left.x + left.w, left.y + left.radius);
+      ctx.lineTo(right.x, right.y + right.radius);
+      ctx.lineWidth = left.radius * 0.06;
       ctx.strokeStyle = palette.warning;
-      ctx.lineWidth = 9;
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.setLineDash([12, 9]);
-      ctx.moveTo(reportedX + r + 22, cy);
-      ctx.lineTo(trueX - r - 22, cy);
-      ctx.lineWidth = 5;
       ctx.stroke();
       ctx.setLineDash([]);
     }
-
-    drawDial(ctx, reportedX, cy, r, pair.reported === null ? 0 : level.reported, {
-      color: palette.ink,
-      dashed: pair.frozen || pair.reported === null,
-    });
-    drawDial(ctx, trueX, cy, r, level.truth, { color: palette.accent });
-
-    ctx.textAlign = 'center';
-    ctx.font = `600 28px ${FONT}`;
-    ctx.fillStyle = palette.text;
-    ctx.fillText('HMI', reportedX, captionY + 20);
-    ctx.fillText('Plant', trueX, captionY + 20);
-
-    const valueY = cy + r + 50;
-    ctx.font = `700 32px ${FONT}`;
-    ctx.fillStyle = palette.ink;
-    ctx.fillText(pair.reported === null ? 'no reading' : formatValue(pair.reported, pair.unit), reportedX, valueY);
-    ctx.fillText(formatValue(pair.trueValue, pair.unit), trueX, valueY);
-
-    // The gap is text and shape. A marked gap has a triangle with a bang as well as its color.
-    const label = gapLabel(pair);
-    const gapY = valueY + 44;
-    ctx.font = `700 30px ${FONT}`;
-    ctx.fillStyle = pair.marked ? palette.warning : palette.text;
+    paintText(ctx, formatValue(pair.reported, pair.unit), boxes.reported, palette.ink);
+    paintText(ctx, formatValue(pair.trueValue, pair.unit), boxes.truth, palette.ink);
+    const gapText = pair.reported === null ? 'No instrument'
+      : pair.marked ? `Gap ${formatGap(pair.gap, pair.unit)}`
+        : pair.diverged ? `Lagging ${formatGap(pair.gap, pair.unit)}` : '';
+    paintText(ctx, gapText, boxes.gap, pair.marked ? palette.warning : palette.text);
     if (pair.marked) {
-      const width = ctx.measureText(label).width;
-      const left = midX - width / 2 - 42;
-      const top = gapY - 26;
+      const { x, y, w, h } = layout.warning;
       ctx.beginPath();
-      ctx.moveTo(left, top + 28);
-      ctx.lineTo(left + 15, top);
-      ctx.lineTo(left + 30, top + 28);
+      ctx.moveTo(x, y + h);
+      ctx.lineTo(x + w / 2, y);
+      ctx.lineTo(x + w, y + h);
       ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = palette.surface;
-      ctx.textAlign = 'center';
-      ctx.fillText('!', left + 15, top + 23);
       ctx.fillStyle = palette.warning;
+      ctx.fill();
+      paintText(ctx, '!', { ...layout.warning, font: boxes.gap.font }, palette.surface);
     }
-    ctx.textAlign = 'center';
-    ctx.fillText(label, midX, gapY);
-
-    if (pair.frozen && text.held[pair.key]) {
-      ctx.font = `600 26px ${FONT}`;
-      ctx.fillStyle = palette.text;
-      ctx.fillText(text.held[pair.key], midX, gapY + 38);
-    }
+    if (pair.frozen && text.held[pair.key]) paintText(ctx, text.held[pair.key], boxes.held, palette.text);
     ctx.restore();
-  }
-
-  function gapLabel(pair) {
-    if (pair.reported === null) return 'No instrument';
-    const gap = formatGap(pair.gap, pair.unit);
-    return pair.diverged && !pair.marked ? `Lagging ${gap}` : `Gap ${gap}`;
   }
 
   function drawDial(ctx, cx, cy, r, fraction, { color, dashed = false }) {
@@ -429,12 +410,12 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
     ctx.arc(cx, cy, r, 0, TAU);
     ctx.fillStyle = palette.surface;
     ctx.fill();
-    ctx.lineWidth = Math.max(5, r * 0.08);
+    ctx.lineWidth = r * 0.08;
     ctx.strokeStyle = color;
-    if (dashed) ctx.setLineDash([10, 8]);
+    if (dashed) ctx.setLineDash([r * 0.2, r * 0.16]);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.lineWidth = Math.max(3, r * 0.05);
+    ctx.lineWidth = r * 0.05;
     for (let i = 0; i <= 8; i++) {
       const a = NEEDLE_START + (i / 8) * NEEDLE_SWEEP;
       ctx.beginPath();
@@ -446,12 +427,12 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
     ctx.beginPath();
     ctx.moveTo(cx, cy);
     ctx.lineTo(cx + Math.cos(a) * r * 0.74, cy + Math.sin(a) * r * 0.74);
-    ctx.lineWidth = Math.max(5, r * 0.09);
+    ctx.lineWidth = r * 0.09;
     ctx.lineCap = 'round';
     ctx.strokeStyle = color;
     ctx.stroke();
     ctx.beginPath();
-    ctx.arc(cx, cy, Math.max(5, r * 0.11), 0, TAU);
+    ctx.arc(cx, cy, r * 0.11, 0, TAU);
     ctx.fillStyle = color;
     ctx.fill();
     ctx.restore();
@@ -532,7 +513,12 @@ export function createControlBoard(container, { knobIds, theme, reducedMotion })
     renderer.dispose();
   }
 
-  return { update, setTheme, dispose };
+  function setView(name) {
+    selected = name;
+    resize();
+  }
+
+  return { update, setTheme, setView, dispose };
 }
 
 function canvasTexture(canvas, track) {

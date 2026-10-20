@@ -94,6 +94,7 @@ function dialSlot(rack, slot) {
 const DIAL_POSE = DIALS.map(({ rack, slot }) => dialSlot(rack, slot));
 
 const TOKEN = {
+  lightKey: '--light-key',
   surface: '--surface',
   raised: '--surface-raised',
   sunken: '--surface-sunken',
@@ -108,29 +109,13 @@ const TOKEN = {
   hotCoolant: '--coolant-hot',
 };
 
-// Used only when the page does not define the tokens.
-const FALLBACK = {
-  surface: '#f7f6f0',
-  raised: '#fbfaf6',
-  sunken: '#e9eddf',
-  ink: '#263e35',
-  steel: '#acb5a8',
-  metal: '#8a9482',
-  line: '#d2d8c8',
-  steam: '#fbfaf6',
-  accent: '#df5835',
-  warning: '#8f5a00',
-  coldCoolant: '#2f6fa3',
-  hotCoolant: '#a8322a',
-};
-
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
 function readColors(el) {
   const style = getComputedStyle(el);
   const out = {};
   for (const [name, token] of Object.entries(TOKEN)) {
-    out[name] = style.getPropertyValue(token).trim() || FALLBACK[name];
+    out[name] = style.getPropertyValue(token).trim();
   }
   return out;
 }
@@ -402,8 +387,10 @@ export function createPlantScene(container) {
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 200);
-  scene.add(new THREE.HemisphereLight(0xffffff, 0xffffff, 1.0));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+  const fill = new THREE.HemisphereLight();
+  scene.add(fill);
+  const sun = new THREE.DirectionalLight();
+  sun.intensity = 1.5;
   sun.position.set(-6, 14, 18);
   scene.add(sun);
 
@@ -440,6 +427,9 @@ export function createPlantScene(container) {
   });
 
   function applyColors() {
+    fill.color.set(colors.lightKey);
+    fill.groundColor.set(colors.lightKey);
+    sun.color.set(colors.lightKey);
     mat.shell.color.set(colors.raised);
     mat.containment.color.set(colors.line);
     mat.metal.color.set(colors.metal);

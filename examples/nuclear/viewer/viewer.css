@@ -1,3 +1,8 @@
+/* Painted board contrast, light / dark:
+ * ink on raised: 11.03 / 12.73; text on raised: 5.33 / 7.82;
+ * text on surface: 5.14 / 8.49; warning on raised: 5.54 / 8.88;
+ * surface on warning: 5.34 / 9.65. Unlit canvas faces preserve these ratios.
+ */
 /*
  * Nuclear plant viewer: the 3D scene beside a text panel of the same readings.
  *
@@ -9,6 +14,11 @@
 
 :root {
   color-scheme: light;
+  --light-key: #ffffff;
+  --light-ground: #8a8a80;
+  --shadow-inset: rgba(0, 0, 0, 0.18);
+  --shadow-soft: rgba(0, 0, 0, 0.12);
+  --shadow-deep: rgba(0, 0, 0, 0.25);
   --surface: #f7f6f0;
   --surface-raised: #fbfaf6;
   --surface-sunken: #e9eddf;

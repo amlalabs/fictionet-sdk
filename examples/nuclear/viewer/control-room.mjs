@@ -6,7 +6,7 @@
 // through services.transport to the control port named in the options.
 //
 // The panel has four parts: a status line and annunciator tiles across the top,
-// a viewport with three vantage points (the control room boards in 3D, and the
+// a viewport with fixed vantage points (the control room boards in 3D, and the
 // reactor building and turbine hall from plant-scene.mjs), the knobs, and the
 // readings as text. Knobs are real controls with keyboard support; their
 // motion comes from knobs.mjs and their values come from the plant.
@@ -48,6 +48,8 @@ import {
 const TURBINE_VALVE_VALUES = Object.freeze([0, 250, 500, 750, 1000]);
 const ANNUNCIATOR_SLOTS = 18;
 const PALETTE_TOKENS = Object.freeze({
+  lightKey: '--light-key',
+  lightGround: '--light-ground',
   surface: '--surface',
   raised: '--surface-raised',
   sunken: '--surface-sunken',
@@ -59,19 +61,6 @@ const PALETTE_TOKENS = Object.freeze({
   accent: '--accent',
   warning: '--warning',
 });
-const PALETTE_FALLBACK = Object.freeze({
-  surface: '#f7f6f0',
-  raised: '#fbfaf6',
-  sunken: '#e9eddf',
-  line: '#dedfd4',
-  ink: '#263e35',
-  text: '#5f6c59',
-  steel: '#acb5a8',
-  metal: '#8a9482',
-  accent: '#df5835',
-  warning: '#8f5a00',
-});
-
 const LOAD_FAILURE = 'Run `cargo xtask demo libraries`, then rebuild.';
 
 /** Knobs in the order they appear on the page and the console. */
@@ -329,6 +318,9 @@ export function mount(root, services, options = {}) {
 
   const vantageButtons = [
     ['control', 'Control room'],
+    ['reactor-board', 'Reactor board'],
+    ['loops-board', 'Loops board'],
+    ['turbine-board', 'Turbine board'],
     ['reactor', 'Reactor building'],
     ['turbine', 'Turbine hall'],
   ].map(([name, label]) => h('button', { type: 'button', class: 'cr-vantage', 'data-view': name, 'aria-pressed': name === 'control' ? 'true' : 'false', text: label }));
@@ -366,7 +358,9 @@ export function mount(root, services, options = {}) {
 
   const readingsHost = h('div', { class: 'cr-readings' });
   root.append(
-    h('section', { class: 'cr-panel' }, status, facts, annunciators, viewport, controls, readingsHost),
+    h('section', { class: 'cr-panel' },
+      h('div', { class: 'cr-overview', lang: 'en-US' }, status, facts, annunciators, viewport),
+      controls, readingsHost),
   );
 
   // Knobs are built once. Their DOM follows the model every tick.
@@ -390,6 +384,8 @@ export function mount(root, services, options = {}) {
     if (plantView) {
       if (plantScene) plantScene.setView(name);
       else pendingView = name;
+    } else {
+      board?.setView(name);
     }
   }
   for (const button of vantageButtons) {
@@ -773,6 +769,7 @@ export function mount(root, services, options = {}) {
       paintReadout(knob);
     }
     readings?.update(value);
+    plantScene?.update(value);
     refreshBoard();
     requestTick();
   }
@@ -802,7 +799,10 @@ export function mount(root, services, options = {}) {
       }
       item.dataset.state = tile.state;
       item.removeAttribute('aria-hidden');
-      item.replaceChildren(h('span', { class: 'cr-tile-name', text: tile.label }), h('span', { class: 'cr-tile-state', text: tile.stateText }));
+      item.replaceChildren(
+        h('span', { class: 'cr-tile-name', text: tile.label.replace(/Pressurizer/g, 'Pressur\u00adizer').replace(/Subcooling/g, 'Sub\u00adcooling').replace(/Condenser/g, 'Con\u00addenser').replace(/temperature/g, 'tempera\u00adture') }),
+        h('span', { class: 'cr-tile-state', text: tile.stateText.replace('Equipment', 'Equip\u00adment').replace('Acknowledged', 'Acknow\u00adledged') }),
+      );
     });
   }
 
@@ -864,6 +864,7 @@ export function mount(root, services, options = {}) {
         theme: palette(),
         reducedMotion,
       });
+      board.setView(viewName === 'reactor' || viewName === 'turbine' ? 'control' : viewName);
       refreshBoard();
     },
     (error) => {
@@ -877,7 +878,10 @@ export function mount(root, services, options = {}) {
       plantScene = createPlantScene(plantStage);
       if (pendingView) plantScene.setView(pendingView);
       readings = createReadingsPanel(readingsHost);
-      if (latest) readings.update(latest.value);
+      if (latest) {
+        readings.update(latest.value);
+        plantScene.update(latest.value);
+      }
     },
     (error) => {
       if (disposed) return;
@@ -927,7 +931,7 @@ function readPalette(root) {
   const style = getComputedStyle(root);
   const out = {};
   for (const [name, token] of Object.entries(PALETTE_TOKENS)) {
-    out[name] = style.getPropertyValue(token).trim() || PALETTE_FALLBACK[name];
+    out[name] = style.getPropertyValue(token).trim();
   }
   return out;
 }
