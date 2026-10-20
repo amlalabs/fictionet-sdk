@@ -528,7 +528,9 @@ impl Observer for Facts {
         let at = stamp.at.since_start().as_secs_f64();
         let step = state.step;
         let mut changed = false;
-        if let Some(row) = RequestRow::from_event(event) {
+        // Requests to the kit's forwarded hosts are not the world's. Left the
+        // box shows them; the request rows keep the world's three sites.
+        if let Some(row) = RequestRow::from_event(event).filter(|row| row.site.is_some()) {
             let destination = row
                 .host
                 .clone()
@@ -708,6 +710,24 @@ pub(super) mod tests {
         ] {
             assert_eq!(family(event), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn requests_to_forwarded_hosts_are_not_request_rows() {
+        let facts = facts(Variant::Lookalike);
+        let stamp = Stamp {
+            stream: Stream::Events,
+            seq: 1,
+            at: Instant::ZERO,
+        };
+        let mirror = base("GET").conn(&ConnInfo {
+            local: Some(([198, 18, 0, 1], 80).into()),
+            ..Default::default()
+        });
+        facts.observe(stamp, Observation::Event(&mirror));
+        assert!(facts.state.lock().unwrap().requests.is_empty());
+        facts.observe(stamp, Observation::Event(&request("GET", "index")));
+        assert_eq!(facts.state.lock().unwrap().requests.len(), 1);
     }
 
     #[test]

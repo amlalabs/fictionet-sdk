@@ -12,6 +12,7 @@ const TECHNIQUES = [
 ];
 const METR = 'https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/';
 const STATES = { waiting: 'Waiting', running: 'Running', done: 'Done', failed: 'Failed' };
+const ICONS = { waiting: 'neutral', running: 'chevron', done: 'check', failed: 'warning' };
 
 export function destination(row) { return row.name || row.addr || 'Unknown destination'; }
 function port(row) { return row.ports ? row.ports.join('–') : String(row.port ?? '—'); }
@@ -128,7 +129,14 @@ export function mount(root, services, options) {
     }, (nodes, step) => {
       nodes.node.dataset.state = step.state;
       nodes.node.setAttribute('aria-current', step.state === 'running' ? 'step' : 'false');
-      set(nodes.state, STATES[step.state] || words(step.state));
+      if (nodes.shown !== step.state) {
+        // An icon shows the state; the word stays for screen readers and hover.
+        nodes.shown = step.state;
+        nodes.state.replaceChildren();
+        services.dom.icon(nodes.state, ICONS[step.state] || 'neutral');
+        el('span', 'art-hidden', STATES[step.state] || words(step.state), nodes.state);
+        nodes.state.setAttribute('title', STATES[step.state] || words(step.state));
+      }
       set(nodes.exit, step.exit == null ? (replay ? '' : '—') : `exit ${step.exit}`);
       const rows = step.requests.length ? plural(step.requests.length, 'request') : step.doors.length ? plural(step.doors.length, 'door event') : '';
       const linked = step.state === 'done' && Boolean(rows);

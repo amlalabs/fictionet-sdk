@@ -18,10 +18,12 @@
 .art-panel { container-type: inline-size; }
 .doors-steps { margin: 0; padding: 0; list-style: none; columns: 1; column-gap: 16px; }
 @container (min-width: 560px) { .doors-steps { columns: 2; } }
-.doors-step { display: grid; grid-template-columns: 20px 56px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 24px; padding: 0 8px 0 6px; border-left: 2px solid transparent; break-inside: avoid; font-size: 12px; }
+.art-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.doors-step { display: grid; grid-template-columns: 20px 16px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 24px; padding: 0 8px 0 6px; border-left: 2px solid transparent; break-inside: avoid; font-size: 12px; }
 .doors-step[data-state='running'] { border-left-color: var(--accent); background: var(--sunken); }
 .doors-number { color: var(--muted); text-align: right; }
-.doors-state { color: var(--muted); font-size: 11px; }
+.doors-state { display: inline-flex; color: var(--muted); }
+.doors-state svg { width: 14px; height: 14px; }
 .doors-step[data-state='running'] .doors-state { color: var(--accent-text); font-weight: 600; }
 .doors-step[data-state='done'] .doors-state { color: var(--success); }
 .doors-step[data-state='failed'] .doors-state { color: var(--warning); font-weight: 600; }

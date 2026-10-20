@@ -110,6 +110,8 @@ test('the strip shows every state and opens a finished step’s rows', () => {
   const lines = f.root.querySelectorAll('.doors-step');
   assert.deepEqual(lines.map((node) => node.dataset.state), ['waiting', 'running', 'done', 'done', 'failed', 'done']);
   assert.deepEqual(lines.map((node) => node.getAttribute('aria-current')), ['false', 'step', 'false', 'false', 'false', 'false']);
+  assert.deepEqual(lines.map((node) => node.querySelector('.doors-state').textContent), ['Waiting', 'Running', 'Done', 'Done', 'Failed', 'Done']);
+  assert.ok(lines.every((node) => node.querySelector('.doors-state').querySelector('svg')));
   assert.deepEqual(lines.map((node) => node.querySelector('.doors-exit').textContent), ['—', '—', 'exit 0', 'exit 0', 'exit 1', 'exit 0']);
   assert.deepEqual(lines.map((node) => node.querySelector('button').disabled), [true, true, false, false, true, true]);
   assert.equal(f.root.querySelector('done'), null);
@@ -126,6 +128,7 @@ test('the strip shows every state and opens a finished step’s rows', () => {
   f.doors({ story: story.map((item, i) => (i === 1 ? { ...item, state: 'done', exit: 0 } : item)) });
   assert.deepEqual(f.root.querySelectorAll('.doors-step'), lines);
   assert.equal(line.dataset.state, 'done');
+  assert.equal(line.querySelector('.doors-state').textContent, 'Done');
   assert.equal(line.querySelector('.doors-exit').textContent, 'exit 0');
   f.dispose();
 });
