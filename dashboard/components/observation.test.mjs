@@ -229,6 +229,30 @@ test('packets says when its links have nothing captured yet', (t) => {
   h.clean();
 });
 
+test('a late tab opens one packet stream once the graph is known and shows its loss before its rows', async (t) => {
+  const h = fixture(t);
+  const dispose = packets(h.root, h.services);
+  await settle();
+  h.frame();
+  const note = h.root.querySelector('#plist-empty');
+  assert.equal(h.streams.length, 0, 'no packet stream before the graph');
+  assert.equal(note.hidden, false);
+  assert.equal(note.textContent, 'Loading packets…');
+  const edges = [{ id: 'e2', a: 's1', b: 't1' }, { id: 'e3', a: 's1', b: 't2' }];
+  h.watches[0].emit('snapshot', { ...h.snapshot, edges, counters: { e2: [2, 0, 0, 0], e3: [1, 0, 0, 0] } });
+  await settle();
+  assert.deepEqual(h.streams.map((stream) => stream.links), ['e2,e3'], 'one stream, opened once');
+  // Link e3 has sent nothing yet, so e2's first row waits a moment. Its loss
+  // shows at once, and the list does not claim there are no packets.
+  h.streams[0].emit('packet', { seq: 9, link: 'e2', t: 4, side: 0, len: 28, skipped: 0, evicted: 7, src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', info: 'Echo', tags: [] });
+  h.frame();
+  assert.equal(h.root.querySelector('#prows').children.length, 0);
+  assert.equal(h.root.querySelector('#sampled').textContent, 'Capture: 7 copies evicted');
+  assert.equal(note.hidden, true);
+  dispose();
+  h.clean();
+});
+
 test('the map keeps its own selection instead of applying it back to itself', (t) => {
   // Drawn links move packets along their paths; the fake DOM has no geometry.
   for (const [name, value] of [['getTotalLength', () => 100], ['getPointAtLength', () => ({ x: 0, y: 0 })]]) {

@@ -20,7 +20,8 @@ export function createPackets({
   const prows = $('prows');
   const plist = $('plist');
   // What the drawer watches: { links: [{ id, flip }], source, paused, held,
-  // queue, lastTime, skipped, evicted, missed, rows }. A packet's side is turned to the drawn edge's:
+  // queue, lastTime, done, skipped, evicted, missed, rows }; done holds links that
+  // ended. A packet's side is turned to the drawn edge's:
   // 0 from its first end, 1 from its second.
   let packets = null, labels = [];
   let unread = 0;
@@ -87,14 +88,14 @@ export function createPackets({
       invalidateSelection();
       // A new subscription replays retained history, possibly with restarted
       // sequence numbers. Replace its state before accepting any replay.
-      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
+      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
       prows.replaceChildren();
       addGap('Packet history reloaded after reconnect.');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
       clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
     });
-    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
+    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
     onStream('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
@@ -120,13 +121,16 @@ export function createPackets({
         gap: `Packets ${gap.after + 1}–${gap.next - 1} of link ${link} are no longer kept (${fmtCount(gap.missed)} rows missed).`,
       });
     });
-    onStream('link_end', () => {
-      if (packets?.source === source) packets.open--;
+    onStream('link_end', (ev) => {
+      if (packets?.source !== source) return;
+      packets.open--;
+      packets.done.add(JSON.parse(ev.data).link);
     });
     onStream('link_error', (ev) => {
       if (packets?.source !== source) return;
       const { link, error } = JSON.parse(ev.data);
       packets.open--;
+      packets.done.add(link);
       packets.failed = true;
       addGap(`Link ${link}: ${error}`);
     });
@@ -239,11 +243,16 @@ export function createPackets({
     let batch = packets.queue;
     packets.queue = [];
     if (packets.many) {
-      // Merged links send their packets in turns, a little apart: hold each
-      // packet for a moment, and add them in time order.
+      // Merged links send their packets in turns, a little apart, and rows go
+      // in time order. A packet goes in once every open link has sent one at
+      // or after its time, since nothing earlier can follow; a link that has
+      // sent nothing yet holds packets back for a moment. A tab opened late
+      // so shows the history still kept at once.
       const now = performance.now();
       batch.sort((a, b) => a.t - b.t);
-      const ready = batch.findIndex((p) => now - p.came < MERGE_HOLD_MS);
+      const open = [...packets.flips.keys()].filter((link) => !packets.done.has(link));
+      const reached = Math.min(...open.map((link) => packets.lastTime.get(link) ?? -Infinity));
+      const ready = batch.findIndex((p) => p.t > reached && now - p.came < MERGE_HOLD_MS);
       if (ready !== -1) {
         // Everything later than the first packet still held waits with it.
         packets.queue = batch.slice(ready);
@@ -514,5 +523,7 @@ export function createPackets({
     cleanup.splice(0).forEach((remove) => remove());
     prows.replaceChildren();
     clearDetail('Select a packet to see its layers.');
-  }, open: openPackets, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels };
+  }, open: openPackets, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels,
+  /// Packets received but not shown yet, or -1 while no stream is open.
+  queued: () => (packets ? packets.queue.length + packets.held.length : -1) };
 }

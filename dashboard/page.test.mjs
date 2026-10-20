@@ -491,6 +491,26 @@ test('the stopped page stays stopped without an Events reconnect banner after th
   stop();
 });
 
+test('a tab opened late shows the run time as soon as the snapshot comes', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const transport = {
+    get: async (path) => (path === '/api/page' ? { ...DESCRIPTION, moments: [], panels: [DESCRIPTION.panels[2]] } : { links: [] }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  };
+  const stop = await mount(h.root, transport, { subscribe: () => () => {}, dispose() {} });
+  await settle();
+  assert.equal(h.root.querySelector('#run-clock').textContent, '0s');
+  // No clock timer runs here: the snapshot alone must set the clock.
+  h.streams.find((source) => source.tag === 'watch').emit('snapshot', { t: 63.4, started: 0, ended: false, hosts: [], groups: [], nodes: [], edges: [], counters: {}, events: [] });
+  assert.equal(h.root.querySelector('#page-status').textContent, 'Running');
+  assert.equal(h.root.querySelector('#run-clock').textContent, '1m 3s');
+  stop();
+});
+
 test('declared pins open both hosts without a click', async (t) => {
   const h = harness(t);
   const { mount } = await import('./page.mjs');

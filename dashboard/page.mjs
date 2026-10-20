@@ -396,9 +396,11 @@ export async function mount(root, transport, theme) {
   if (tabs.length) activate(tabs[0]);
   else $('inspector-content').replaceChildren(el('p', { class: 'empty-note', text: 'This demo declares no inspector panels.' }));
 
-  // The run status and clock, from the shared watch.
+  // The run status and clock, from the shared watch. A tab opened late shows
+  // the run time as soon as the snapshot comes, not at the next tick.
   const clock = services.clock;
-  const status = (state, text) => { $('run-status').dataset.state = state; $('page-status').textContent = text; };
+  const tick = () => { $('run-clock').textContent = format.fmtDuration(services.runTime()); };
+  const status = (state, text) => { $('run-status').dataset.state = state; $('page-status').textContent = text; tick(); };
   watch = services.watch();
   const on = (name, callback) => cleanup.push(listen(watch, name, (event) => callback(event.data ? JSON.parse(event.data) : null)));
   on('waiting', () => status('connecting', 'Waiting for the world'));
@@ -409,7 +411,6 @@ export async function mount(root, transport, theme) {
   on('error', () => { if (!clock.ended) status('connecting', 'Reconnecting'); });
   on('open', () => { if ($('run-status').dataset.state === 'connecting' && !clock.ended) status('running', 'Running'); });
   on('world_error', (value) => status('stopped', value.error));
-  const tick = () => { $('run-clock').textContent = format.fmtDuration(services.runTime()); };
   tick();
   clockTimer = setInterval(tick, 1000);
 
