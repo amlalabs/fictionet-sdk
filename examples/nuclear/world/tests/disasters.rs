@@ -2,7 +2,9 @@ use nuclear_world::{
     Config, Plant,
     command::*,
     faults::*,
+    registers::{self, Plc},
     scenarios::Scenario,
+    sensors::Sensor,
     snapshot::{PlantSnapshot, Regime},
     stages::{FailureCause, Stage},
 };
@@ -403,6 +405,35 @@ fn accepted_commands_alone_update_last_command() {
         FaultChange::Inject(Fault::Process(ProcessFault::ReliefStuckOpen)),
     );
     assert_eq!(plant.snapshot().last_command, Some(last));
+}
+
+#[test]
+fn narrow_core_exit_reads_the_hot_steam_and_pegs_at_its_top() {
+    let narrow = Sensor::CoreExitTemperature;
+    let mut plant = Plant::new(Scenario::LoopBUnattended.config());
+    let mut superheated = 0;
+    for at in (1_000..=139 * 60_000).step_by(1_000) {
+        plant.advance(at);
+        let snap = plant.snapshot();
+        let reading = snap.readings[narrow.index()].reading.value;
+        let register = registers::input_registers(Plc::Rps1, &snap)[2];
+        assert_eq!(f64::from(register), (reading * 10.0).round(), "at {at} ms");
+        let saturation = snap.truth.reactor.core_exit_c;
+        let steam = snap.severe.core_exit_steam_c;
+        // The thermocouple follows the steam, not the saturation temperature.
+        if steam > saturation + 100.0 && steam < 590.0 {
+            superheated += 1;
+            assert!(
+                reading > saturation + 50.0,
+                "core exit reads {reading} C at {at} ms, steam {steam} C, saturation {saturation} C"
+            );
+        }
+        if at >= 107 * 60_000 {
+            assert_eq!(reading, 600.0, "narrow range at {at} ms");
+            assert_eq!(register, 6000, "rps1 input register 2 at {at} ms");
+        }
+    }
+    assert!(superheated > 0);
 }
 
 fn core_to_breach(scenario: Scenario, targets_minutes: [f64; 6]) {

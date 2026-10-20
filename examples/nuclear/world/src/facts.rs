@@ -40,7 +40,7 @@ use crate::faults::{Fault, FaultChange, FaultTarget, ProcessFault};
 use crate::protection::TripCause;
 use crate::scenarios::Scenario;
 use crate::sensors::{Sensor, Unit};
-use crate::snapshot::{PlantSnapshot, Truth};
+use crate::snapshot::PlantSnapshot;
 use crate::stages::{FailureCause, Stage};
 
 /// The source name of every plant fact.
@@ -629,9 +629,10 @@ fn loop_name(l: Loop) -> &'static str {
     }
 }
 
-/// The true value of a sensor's point, read from the snapshot's truth. This
-/// matches the plant's own sensor source.
-pub(crate) fn true_value_of(truth: &Truth, sensor: Sensor) -> f64 {
+/// The true value of a sensor's point, read from the snapshot. This matches
+/// the plant's own sensor source.
+pub(crate) fn true_value_of(snapshot: &PlantSnapshot, sensor: Sensor) -> f64 {
+    let truth = &snapshot.truth;
     let reactor = &truth.reactor;
     let primary = &truth.primary;
     let secondary = &truth.secondary;
@@ -651,7 +652,7 @@ pub(crate) fn true_value_of(truth: &Truth, sensor: Sensor) -> f64 {
         Sensor::TurbineValve => secondary.turbine_valve_percent,
         Sensor::GeneratorOutput => secondary.generator_mw,
         Sensor::CondenserPressure => secondary.condenser_pressure_kpa,
-        Sensor::CoreExitTemperature => reactor.core_exit_c,
+        Sensor::CoreExitTemperature => snapshot.severe.core_exit_steam_c,
     }
 }
 
@@ -688,6 +689,14 @@ mod tests {
 
     fn snapshot() -> PlantSnapshot {
         Plant::new(Config::default()).snapshot()
+    }
+
+    #[test]
+    fn core_exit_truth_is_the_steam_the_thermocouples_sit_in() {
+        let mut snap = snapshot();
+        snap.severe.core_exit_steam_c = 1_200.0;
+        assert_ne!(snap.truth.reactor.core_exit_c, 1_200.0);
+        assert_eq!(true_value_of(&snap, Sensor::CoreExitTemperature), 1_200.0);
     }
 
     #[test]

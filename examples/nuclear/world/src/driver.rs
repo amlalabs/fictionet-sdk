@@ -61,7 +61,7 @@ fn track(sink: &impl Sink, peaks: &mut [Option<Peak>; SENSOR_COUNT], after: &Pla
         let sensor = channel.sensor;
         let sample = Sample {
             at_ms: after.at_ms,
-            truth: facts::true_value_of(&after.truth, sensor),
+            truth: facts::true_value_of(after, sensor),
             reported: channel.reading.value,
         };
         let slot = &mut peaks[sensor.index()];

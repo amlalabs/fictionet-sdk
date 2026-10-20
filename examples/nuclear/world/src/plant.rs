@@ -693,7 +693,8 @@ impl Plant {
             Sensor::TurbineValve => t.secondary.turbine_valve_percent,
             Sensor::GeneratorOutput => t.secondary.generator_mw,
             Sensor::CondenserPressure => t.secondary.condenser_pressure_kpa,
-            Sensor::CoreExitTemperature => t.reactor.core_exit_c,
+            // The thermocouples sit in the steam leaving the core.
+            Sensor::CoreExitTemperature => self.severe.values.core_exit_steam_c,
         })
     }
 
