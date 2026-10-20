@@ -103,7 +103,7 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     let task = if task.is_empty() {
         Task::Read
     } else {
-        Task::parse(&task).ok_or_else(|| {
+        parse::<Task>(&task).ok_or_else(|| {
             fictionet::Error::msg(format!(
                 "BORDER_TASK must be read, login or pay, not {task:?}"
             ))
@@ -150,7 +150,7 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
         std::fs::write(&args.ready, &variant)?;
         println!(
             "border world up: variant={variant} task={}",
-            scenario.task.as_str()
+            name(&scenario.task)
         );
         // The network serves every sandbox from here on. The listener lives
         // as long as the world.

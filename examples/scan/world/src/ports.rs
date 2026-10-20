@@ -65,17 +65,6 @@ pub enum Protocol {
     Icmp,
 }
 
-impl Protocol {
-    /// Returns the protocol name used in facts and JSON.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Udp => "udp",
-            Self::Icmp => "icmp",
-        }
-    }
-}
-
 /// The latest answered probe's result, or no answer yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,15 +79,11 @@ pub enum PortState {
     Unreachable,
 }
 
-impl PortState {
-    /// Returns the state name used in facts and JSON.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unanswered => "unanswered",
-            Self::Open => "open",
-            Self::Closed => "closed",
-            Self::Unreachable => "unreachable",
-        }
+/// The name serde writes for a unit variant, as facts carry it too.
+fn name(value: impl Serialize) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        other => unreachable!("a unit variant serializes as its name, not {other:?}"),
     }
 }
 
@@ -289,13 +274,13 @@ impl Tap {
                         "{}:{}/{} {}",
                         row.host,
                         row.port,
-                        row.protocol.as_str(),
-                        row.state.as_str()
+                        name(row.protocol),
+                        name(row.state)
                     ))
                     .field("host", row.host.to_string())
-                    .field("protocol", row.protocol.as_str())
-                    .field("state", row.state.as_str())
-                    .field("previous", opt(previous.map(PortState::as_str)))
+                    .field("protocol", name(row.protocol))
+                    .field("state", name(row.state))
+                    .field("previous", opt(previous.map(name)))
                     .repeat(
                         Fields::new()
                             .with("port", u32::from(row.port))
@@ -892,7 +877,6 @@ mod tests {
             PortRow::MAX_JSON_BYTES
         );
         assert_eq!(serde_json::to_string(&Protocol::Icmp).unwrap(), "\"icmp\"");
-        assert_eq!(Protocol::Icmp.as_str(), "icmp");
         roundtrip(&row, PortRow::MAX_JSON_BYTES);
         let map = PortMap {
             revision: u64::MAX,
@@ -1383,18 +1367,6 @@ mod tests {
             banners: map.banners,
         };
         roundtrip(&changes, PortChanges::MAX_JSON_BYTES);
-        for protocol in [Protocol::Tcp, Protocol::Udp] {
-            assert_eq!(
-                serde_json::to_string(&protocol).unwrap(),
-                format!("\"{}\"", protocol.as_str())
-            );
-        }
-        for state in [Unanswered, Open, Closed, Unreachable] {
-            assert_eq!(
-                serde_json::to_string(&state).unwrap(),
-                format!("\"{}\"", state.as_str())
-            );
-        }
         let empty = Tap::new();
         roundtrip(&empty.snapshot(), PortMap::MAX_JSON_BYTES);
         roundtrip(&empty.changes_since(0), PortChanges::MAX_JSON_BYTES);

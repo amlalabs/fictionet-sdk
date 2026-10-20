@@ -261,7 +261,7 @@ pub fn state(scenario: &Scenario) -> Value {
     let identity = projection.bank_identity;
     json!({
         "variant": scenario.variant,
-        "task": scenario.task.as_str(),
+        "task": scenario.task,
         "hijacked": scenario.hijacked(),
         "bank_name": BANK_DOMAIN,
         "bank_names": BANK_NAMES,
