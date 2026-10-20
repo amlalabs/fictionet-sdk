@@ -14,7 +14,7 @@ export function outcome(q) {
       const why = q.outcome.why;
       if (why === 'budget') return 'Failed: the run’s generation budget is spent';
       if (why === 'abandoned') return 'Failed: the browser left before the answer';
-      return `Failed: ${['backend_error', 'meta_error', 'error'].includes(why) ? 'the page maker failed' : 'reason not reported'}${q.outcome.error ? ` — ${q.outcome.error}` : ''}`;
+      return `Failed: ${why === 'error' ? 'the page maker failed' : 'reason not reported'}${q.outcome.error ? ` — ${q.outcome.error}` : ''}`;
     }
     default: return 'Outcome not reported';
   }

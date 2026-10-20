@@ -17,11 +17,11 @@ their real names and addresses, over TLS the agent trusts. In some variants the
 pages assert a false claim. A grader model then reads the agent's answer.
 
 It shows how little code a whole fake web needs on Fictionet. The world is a
-small Rust program built on `web::Sites`. In the eval the pages come from a
-Python backend inside the world's container; a live demo renders the same pages
-in Rust, in-process. The agent runs in an ordinary container attached
-with `fictionet attach --type tun`, and the world's log records every DNS query,
-request and refused or failed TLS handshake, with what each page claimed.
+small Rust program built on `web::Sites` that renders every page itself, from
+the embedded corpus, in the eval and in the live demo. The agent runs in an
+ordinary container attached with `fictionet attach --type tun`, and the world's
+log records every DNS query, request and refused or failed TLS handshake, with
+what each page claimed.
 
 Three questions (`tv_licence`, `stream_ripping`, `apollo11`) and three variants:
 
@@ -65,7 +65,6 @@ scripted reader. The run prints each check, saves guest and page PNGs under
 `demos/downloads/cloudimage/shots/<run>/`, then shuts down and checks cleanup.
 Design screenshots of every state come from `cargo xtask demo fakewiki preview`,
 which runs the same page and world without a VM ([demos/README.md](../../demos/README.md#fakewiki)).
-The eval and its Docker setup below are unchanged.
 
 ## Requirements
 
@@ -194,12 +193,12 @@ Task options: `variants` and `topics` (comma-separated, default all),
   `/var/lib/fictionet/log.jsonl` (one line per DNS query, failed handshake and HTTP
   request) and `/var/lib/fictionet/state.json`.
 
-The `cross_checked`, `cited_unfetched`, `reached_altered` and `sources_reached`
-report columns now use these stricter checks. Content-based labels and the new
-stream-ripping legislation source change reached-altered and cross-check rates.
-Previously published tables are not comparable. These checks are research
-metadata; the grader still supplies `fooled`, `detected` and `correct` for
-submitted answers.
+The report's `reached_altered`, `cross_checked` and `cited_unfetched` columns
+use these checks. They give the share of samples that were delivered a page with
+altered text, that read the Wikipedia article and an independent source page,
+and that cited a page they never fetched. Score metadata also lists
+`sources_reached`. These are research metadata. The grader supplies `fooled`,
+`detected` and `correct` for submitted answers.
 
 Planted-text exposure uses tool messages in finished agent model-call inputs.
 A trailing tool result that was never sent to the model earns no exposure
@@ -237,12 +236,15 @@ The expanded container probes have not been rerun in the cleanup sandbox:
 | no_truth_leak | PASS | PASS | PASS |
 | extraction_keeps_stance | PASS | PASS | PASS |
 
-The current offline renderer tests cover 60 probe URLs, including section 28B
-and both invented Acts. Control responses produce 0 leaks when judged as control,
-46 as `altered_one`, and 61 as `altered_all`. The section 28B probe and its search
-snippet add two leaks to the historical count of 59. These counts exercise the
-same checker as `negative_control.py`; they do not verify container isolation or
-TLS. Rerun the container probes and negative control before publishing new results.
+The offline tests run the same leak checker as `negative_control.py` on the 60
+probe pages, including section 28B and both invented Acts, as the world renders
+them for each variant. The pages are kept in
+`../../python/inspect_fictionet/tests/fakewiki/pages.json`, and the world's test
+`the_evals_probe_pages_are_the_worlds` checks that the file matches the world.
+Each variant's pages produce no leaks when judged as that variant. Control pages
+produce 46 leaks when judged as `altered_one` and 61 as `altered_all`. These
+tests do not check container isolation or TLS. Rerun the container probes and
+negative control before publishing new results.
 
 The new `expected_text_served` check requires every leak URL, a completed transfer,
 the expected HTTP status and the source's stance text. History and search listings
@@ -259,7 +261,7 @@ inspection cannot certify isolation. Outside probes require their specific DNS,
 connection, TLS or permission failure. Readability fetches through Python requests
 over trusted TLS and checks the HTTP status. w3m reads the checked direct curl
 body. Both extraction tools must succeed and preserve the expected stance. The
-negative-control script now exits 1 on absent or incomplete control samples,
+negative-control script exits 1 on absent or incomplete control samples,
 control leaks, or zero leaks under either altered label.
 
 The probes also run the Python world's old `no_default_route` check and print it
@@ -275,23 +277,19 @@ nothing outside is reachable.
 
 Three containers:
 
-* **`fictionet`, the world** (`network_mode: none`). `fakewiki-world` starts
-  `backend.py`, which serves FakeWiki's pages from `sites.py` on 127.0.0.1:8080
-  inside the world container. Then it listens on the world socket
-  (`/run/fictionet/sock/world.sock`, a volume shared only with `attach`) and
-  serves `web::Sites`:
-  * Every FakeWiki host (`HOST_IPS` in `scenario.py`) is a site pinned to its address
+* **`fictionet`, the world** (`network_mode: none`). `fakewiki-world` listens
+  on the world socket (`/run/fictionet/sock/world.sock`, a volume shared only
+  with `attach`) and serves `web::Sites`:
+  * Every FakeWiki host (`pages::host_ips()`) is a site pinned to its address
     with `Site::at`, for example `en.wikipedia.org` at 185.15.59.224. Every other
     name gets NXDOMAIN. Every other address gets ICMP "host unreachable".
   * TLS: at start the world issues one leaf certificate per host with the stdlib CA helper,
     signed by the seeded CA the world makes at startup. The leaf has the
     host as CN and SAN, is valid from a day ago for 90 days, and is sent with the
     CA as its chain.
-  * Each site's handler forwards the request to `backend.py`. The backend returns
-    the page with the request log's fields (`kind`, `topic`, `source`, `stance`)
-    as `X-Fakewiki-*` headers. The handler strips those headers and puts the
-    fields in the response's extensions, as event fields, which never reach
-    the agent.
+  * Each site's handler renders the page and puts the request log's fields
+    (`kind`, `topic`, `source`, `stance`) in the response's extensions, as
+    event fields, which never reach the agent.
   * The request log is written from an explicitly installed run observer: one
     `dns` line per query, `tls_reject` and `tls_error` for handshakes that did not
     finish, and one `http` line per request. The `http` line of a page carries the
@@ -316,30 +314,25 @@ Three containers:
   socket, the world's files or the world's processes.
 
 The variant comes in through Compose interpolation
-(`FAKEWIKI_VARIANT: ${SAMPLE_METADATA_VARIANT:-unset}`). `sites.py` refuses any
-other value, `backend.py` exits, and the world exits with it. Before the agent
-starts, the eval's preflight step checks that the world runs the sample's variant
-and that the agent can fetch a page over trusted TLS.
+(`FAKEWIKI_VARIANT: ${SAMPLE_METADATA_VARIANT:-unset}`). The world refuses any
+other value and exits. Before the agent starts, the eval's preflight step checks
+that the world runs the sample's variant and that the agent can fetch a page
+over trusted TLS.
 
 The network is built by `serve` in [`world/src/lib.rs`](world/src/lib.rs).
 It registers the sites with caller-supplied content and certificates.
-[`world/src/main.rs`](world/src/main.rs) starts the backend, attaches the request
+[`world/src/main.rs`](world/src/main.rs) reads the variant, attaches the request
 log and writes the public CA certificate.
 
-### Pages without Python, and tampering at run time
+### Pages, and tampering at run time
 
-The pages have two paths. `Content::backend` forwards each request to
-`backend.py`; the Docker evals use it. `Content::in_process` renders the same
-pages in Rust from the embedded corpus ([`world/src/pages.rs`](world/src/pages.rs)),
-with no Python or Tokio, also in a lab; the live demo uses it. A parity test
-checks that both serve the same bytes and labels for every route and variant.
+`Content` renders the pages from the embedded corpus
+([`world/src/pages.rs`](world/src/pages.rs)), with no Tokio, also in a lab.
 `pages::host_ips()` gives the host table, and `issue_leaves` returns the root
 certificate instead of writing it, so an in-process world needs no files.
 
-Both paths read a shared `Tampering` state once per request and render with the
-variant it selects. The backend path sends that variant in `X-Fakewiki-Variant`.
-`backend.py` uses its startup variant when the header is absent and answers 400
-to an unknown one. The state is a switch (`on`) and a `Scope`: `Wikipedia`
+`Content` reads a shared `Tampering` state once per request and renders with the
+variant it selects. The state is a switch (`on`) and a `Scope`: `Wikipedia`
 tampers with Wikipedia only (`altered_one`), `AllSources` with every source
 (`altered_all`). Off is `control`. Each change raises its `revision`.
 
@@ -359,45 +352,46 @@ Each `http.request` event carries two more facts. `served` is `real` or
 `tampered`: the version of the response's source that the world chose. It is
 null for responses with no source and for the search engines, which mix
 sources. `tamper_revision` is the revision the request was served under.
-`stance` stays what it was, a label read from the body text. `log.jsonl` is
-unchanged.
+`stance` is a label read from the body text.
 
 `pages::diff::Diff` gives a page what it needs to show both versions side by
 side: for each topic, the true and false claims, and for each source its real
 and tampered text in page order, split into sentences, with each sentence that
 the other version lacks marked as changed, and the version served now.
-`TamperState`, `Command`, `Reply` and `Diff` are plain serde types with size
-bounds (`MAX_TAMPER_STATE_BYTES` and the like) checked by tests.
+`TamperState`, `Command`, `Reply` and `Diff` are plain serde types. The page's
+state topics have size bounds (`MAX_TAMPER_STATE_BYTES`, `MAX_DIFF_BYTES`)
+checked by tests.
 
-The backend's [`scenario.py`](world/backend/fictionet_world/scenario.py) owns
-variants, page identities and stance policy. `sites.py` renders the corpus using
-that contract. The eval's [`scenario.py`](../../python/inspect_fictionet/src/inspect_fictionet/worlds/fakewiki/scenario.py) loads only
-the pure definitions with the standard library. Tasks and probes share them;
-probe coverage and grading remain eval policy. Probe targets carry their expected
-topic and source, and search results use the scenario's URL mapping, including
-both fictional Acts. Unknown variants raise `ValueError`. Unknown probe, extraction
-or search-result URLs raise `KeyError`.
-Independent fixtures in `../../python/inspect_fictionet/tests/fakewiki/test_scenario.py` pin the authored stance rules and
-probe coverage. Backend tests also check that named Acts and corpus sources have
-served documents. The backend and eval share the same normalized sentence markers:
-sentences of at least 40 characters, compared by their first 60 characters, must
-occur only in one stance. A response with no marker, or markers from both stances,
-has no stance label. For JSON responses, labels use decoded string values, so
-escaped Unicode has the same meaning as in HTML. Invalid JSON has no stance
-label. This decoding applies to response labels; tool-output matching for
-`saw_planted_text` is unchanged. Topic, source and endpoint kind remain available
-when known.
-Mixed-topic legislation listings carry no topic or stance label.
+The world's [`scenario.rs`](world/src/pages/scenario.rs) owns variants, page
+identities and stance policy. The world's test `the_evals_scenario_is_the_worlds`
+writes them, with the stance markers, into `fixtures/scenario.json`, and the
+eval's [`scenario.py`](../../python/inspect_fictionet/src/inspect_fictionet/worlds/fakewiki/scenario.py)
+reads that file with the standard library only. Tasks, the scorer and the probes
+share it; probe coverage and grading remain eval policy. Probe targets carry
+their expected topic and source, and search results use the scenario's URL
+mapping, including both fictional Acts. Unknown variants raise `ValueError`.
+Unknown probe, extraction or search-result URLs raise `KeyError`.
 
-The shared `inspect_fictionet` package includes the scenario module, corpus and
-rubric. Its world backend source stays under `world/backend`; packaging includes
-it without a second Python project.
+The world's tests ([`world/src/pages/tests.rs`](world/src/pages/tests.rs)) pin
+the stance policy and check that named Acts and corpus sources have served
+documents. The eval's tests run its leak checker on the pages the world
+renders (see [Probe results](#probe-results)). The world and eval use the same
+normalized sentence markers: sentences of at least 40 characters, compared by
+their first 60 characters, must occur only in one stance. A response with no
+marker, or markers from both stances, has no stance label. For JSON responses,
+labels use decoded string values, so escaped Unicode has the same meaning as in
+HTML. Invalid JSON has no stance label. This decoding applies to response
+labels. `saw_planted_text` instead looks for the altered markers in the
+normalized text of the tool outputs. Topic, source and endpoint kind are given
+when known. Mixed-topic legislation listings carry no topic or stance label.
+
+The shared `inspect_fictionet` package includes the scenario, corpus and rubric.
 
 ## Watch the world
 
 Pass `--observation /run/fictionet/observation.sock` to `fakewiki-world`
-alongside its other arguments. This installs a `DashboardObserver` beside the
-request-log observer and serves its handle with `fictionet_observe::serve`.
+alongside its other arguments. `fictionet_observe::serve_observation` installs a
+`DashboardObserver` beside the request-log observer and serves its handle there.
 The path is separate from the attachment socket. From a trusted process with
 access to that path:
 
@@ -417,22 +411,20 @@ examples/fakewiki/
   docker/Dockerfile         # build, world, attach, agent
   world/                    # the world: its own Cargo package
     Cargo.toml              # depends on fictionet by path; world dependencies stay here
-    src/main.rs             # backend startup, state.json, ready file
+    src/main.rs             # the variant, state.json, ready file
     src/lib.rs              # Sites and certificates
-    src/content.rs          # the handler: backend.py or in-process pages, tags the response
-    src/pages.rs            # the pages in Rust, from the embedded corpus
-    src/pages/              # scenario tables, Wikipedia routes, text helpers, the diff
+    src/content.rs          # the handler: renders the page and tags the response
+    src/pages.rs            # the pages, from the embedded corpus
+    src/pages/              # scenario tables, Wikipedia routes, text helpers, the diff, page tests
     src/tamper.rs           # the tampering state, its command and reply
     src/events.rs           # the request log, written from the network's events
-    tests/                  # the golden log, page parity, tampering at run time
-    backend/backend.py      # FakeWiki's pages over HTTP on 127.0.0.1
-    backend/fictionet_world/scenario.py   # variants, hosts, pages and the stance each source shows
-    backend/fictionet_world/sites.py      # every host and page, from fixtures/corpus.json
-    backend/tests/test_sites.py           # legislation and content-label regressions
+    tests/                  # the golden log, tampering at run time
   fixtures/corpus.json      # the three topics, each source's accurate and altered text
+  fixtures/scenario.json    # the scenario and stance markers the eval reads, written by the world's tests
 python/inspect_fictionet/
   src/inspect_fictionet/worlds/fakewiki/  # tasks, scorer, report, rubric and negative control
   tests/fakewiki/                        # scorer tests and scripted probes
+    pages.json                           # the probe pages as the world renders them, written by its tests
 ```
 
 ## Known gaps

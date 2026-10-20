@@ -1,10 +1,10 @@
 # The adaptive web on Fictionet under Docker Compose, which cargo xtask demo
 # adaptive-web runs in the VM.
 #
-#   world     - the world: web::Sites in Rust for any name, and the Python
-#               backend that makes and keeps pages, on its own 127.0.0.1.
-#               Offline (the default) it has no network at all. Live, it
-#               needs a network to reach the model API, and only it has one.
+#   world     - the world: web::Sites in Rust for any name, which makes and
+#               keeps the pages. Offline (the default) it has no network at
+#               all. Live, it needs a network to reach the model API, and
+#               only it has one.
 #   attach    - fictionet attach --type tun: makes tun0 in its own network
 #               namespace and relays its packets to the world socket.
 #   default   - the agent. It joins attach's network namespace, so its only
@@ -18,7 +18,7 @@
 #   ADAPTIVE_WEB_NETWORK      the world's network: none (default), or bridge
 #                             for openrouter and anthropic
 #   ADAPTIVE_WEB_MODEL, ADAPTIVE_WEB_PREFETCH, ADAPTIVE_WEB_REASONING
-#                             see world/backend/backend.py
+#                             see world/src/main.rs
 #   ADAPTIVE_WEB_STORE_DIR    an absolute host directory to keep pages in
 #                             across runs; by default a volume per run
 #   OPENROUTER_API_KEY, ANTHROPIC_API_KEY

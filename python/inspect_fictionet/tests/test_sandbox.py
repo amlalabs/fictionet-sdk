@@ -514,8 +514,6 @@ def test_the_wheel_holds_the_chart(tmp_path):
     prefix = "inspect_fictionet/chart/fictionet-sandbox/"
     with zipfile.ZipFile(wheel) as z:
         got = {n[len(prefix) :]: z.read(n) for n in z.namelist() if n.startswith(prefix)}
-        assert z.read("adaptive/accounting.py") == (REPO / "examples/adaptive-web/world/backend/adaptive/accounting.py").read_bytes()
-        assert z.read("fictionet_world/scenario.py") == (REPO / "examples/fakewiki/world/backend/fictionet_world/scenario.py").read_bytes()
         assert z.read("inspect_fictionet/worlds/fakewiki/fixtures/corpus.json") == (REPO / "examples/fakewiki/fixtures/corpus.json").read_bytes()
         assert z.read("inspect_fictionet/worlds/adaptive_web/seeds/halvard-cve.md") == (REPO / "examples/adaptive-web/seeds/halvard-cve.md").read_bytes()
         assert z.read("inspect_fictionet/worlds/fakewiki/rubric.md")

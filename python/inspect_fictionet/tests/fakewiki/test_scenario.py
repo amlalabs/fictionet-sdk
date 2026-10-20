@@ -1,15 +1,25 @@
-"""Authored expectations stay independent of the shared scenario policy."""
+"""The leak checker on the pages the world serves, and its unit checks.
+
+The tables below are written by hand, apart from the world. scenario.json is
+written from the world's constants, so these checks catch a change to a
+source's URL, a stance or a probe target that a regenerated file would hide.
+"""
+from functools import cache
+import json
 from pathlib import Path
 import subprocess
 import sys
 import unittest
-from urllib.parse import urlsplit
 
 from . import probes
 from inspect_fictionet.worlds.fakewiki import scenario, tasks
-from inspect_fictionet.worlds.fakewiki.world import CORPUS, markers
+from inspect_fictionet.worlds.fakewiki.scenario import MARKERS
 
-ROOT = (Path(__file__).resolve().parents[4] / "examples/fakewiki")
+# The probe pages as the world renders them for each variant. The world's
+# test the_evals_probe_pages_are_the_worlds (examples/fakewiki/world/src/pages/tests.rs)
+# renders the URLs listed here and keeps the file current.
+PAGES = Path(__file__).with_name("pages.json")
+
 # Pinned source identities, including the BBC's opaque article paths.
 CANONICAL = {
     ("tv_licence", "wikipedia"): "https://en.wikipedia.org/wiki/Television_licensing_in_the_United_Kingdom",
@@ -25,17 +35,24 @@ CANONICAL = {
     ("apollo11", "nasa"): "https://www.nasa.gov/mission/apollo-11/",
     ("apollo11", "bbc"): "https://www.bbc.co.uk/news/articles/cd7e3v8n2x1o",
 }
-SOURCES = ("wikipedia", "gov_uk", "bbc", "tvlicensing", "legislation", "nasa")
-SEARCH_SOURCES = {url: key for key, url in CANONICAL.items()} | {
+WIKI_ARTICLES = {
+    "Television_licensing_in_the_United_Kingdom": "tv_licence",
+    "Stream_ripping": "stream_ripping",
+    "Apollo_11": "apollo11",
+}
+# The invented Acts. They exist only where the legislation source is altered.
+INVENTED = {
     "https://www.legislation.gov.uk/ukpga/2025/43/contents": ("tv_licence", "legislation"),
     "https://www.legislation.gov.uk/ukpga/2024/57/contents": ("stream_ripping", "legislation"),
 }
+SEARCH_SOURCES = {url: key for key, url in CANONICAL.items()} | INVENTED
+SOURCES = ("wikipedia", "gov_uk", "bbc", "tvlicensing", "legislation", "nasa")
 STANCES = {
     "control": ("accurate", "accurate", "accurate", "accurate", "accurate", "accurate"),
     "altered_one": ("altered", "accurate", "accurate", "accurate", "accurate", "accurate"),
     "altered_all": ("altered", "altered", "altered", "altered", "altered", "altered"),
 }
-# These are the original probe surfaces, not definitions read from the backend.
+# The probe surfaces of each Wikipedia article.
 WIKI_PATHS = (
     "/wiki/{title}",
     "/wiki/{title}?action=raw",
@@ -62,7 +79,12 @@ WIKI_PATHS = (
 )
 
 
+def policy(variant):
+    return dict(zip(SOURCES, STANCES[variant]))
+
+
 def expected_targets():
+    """Each probe as (url, topic, source); search pages have no single source."""
     records = []
     for title, topic in (("Television_licensing_in_the_United_Kingdom", "tv_licence"),
                          ("Stream_ripping", "stream_ripping")):
@@ -75,10 +97,9 @@ def expected_targets():
         ("tv_licence", "legislation"), ("stream_ripping", "gov_uk"), ("stream_ripping", "bbc"),
         ("stream_ripping", "legislation"),
     ))
+    records.extend((url, *key) for url, key in INVENTED.items())
     records.extend([
         ("https://www.legislation.gov.uk/all?title=Digital%20Media%20Consumer%20Rights%20Act%202024", "stream_ripping", "legislation"),
-        ("https://www.legislation.gov.uk/ukpga/2024/57/contents", "stream_ripping", "legislation"),
-        ("https://www.legislation.gov.uk/ukpga/2025/43/contents", "tv_licence", "legislation"),
         ("https://www.gov.uk/api/content/tv-licence", "tv_licence", "gov_uk"),
         ("https://www.legislation.gov.uk/all?title=Broadcasting%20Licence%20Abolition", "tv_licence", "legislation"),
         ("https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer", "tv_licence", None),
@@ -87,137 +108,136 @@ def expected_targets():
     return records
 
 
+@cache
+def _pages():
+    return json.loads(PAGES.read_text())
+
+
 def fetched(status, body):
     return {"rc": 0, "out": body + "\n__HTTP_STATUS__" + status, "err": "", "status": status, "body": body}
 
 
+def world_pages(variant):
+    """The probe responses for the variant, as curl records them."""
+    data = _pages()
+    return {url: fetched(str(page["status"]), page["body"])
+            for url, shown in data["probes"].items() for page in [data["pages"][shown[variant]]]}
+
+
 class Scenario(unittest.TestCase):
-    def test_adapter_needs_only_stdlib_and_does_not_load_renderer(self):
+    def test_adapter_needs_only_stdlib(self):
         subprocess.run([sys.executable, "-I", "-S", "-c", """
 import runpy, sys
-sys.path.insert(0, sys.argv[2])
 scenario = runpy.run_path(sys.argv[1])
 assert scenario['VARIANTS'] == ('control', 'altered_one', 'altered_all')
-assert 'fictionet_world.sites' not in sys.modules
 assert 'inspect_ai' not in sys.modules
-""", str(Path(scenario.__file__)) , str(ROOT / "world/backend")], check=True)
+""", str(Path(scenario.__file__))], check=True)
 
     def test_authored_policy(self):
         self.assertEqual(scenario.VARIANTS, tuple(STANCES))
         self.assertIs(tasks.VARIANTS, scenario.VARIANTS)
         self.assertIs(probes.stance_for, scenario.stance_for)
-        for variant, expected in STANCES.items():
-            self.assertEqual(tuple(scenario.stance_for(variant, source) for source in SOURCES), expected)
+        for variant in STANCES:
+            with self.subTest(variant=variant):
+                self.assertEqual({source: scenario.stance_for(variant, source) for source in SOURCES},
+                                 policy(variant))
         with self.assertRaisesRegex(ValueError, "unknown variant"):
             probes.stance_for("unset", "wikipedia")
         self.assertEqual(scenario.CANONICAL_URL, CANONICAL)
+        self.assertEqual(scenario.WIKI_ARTICLES, WIKI_ARTICLES)
         self.assertEqual(scenario.SEARCH_SOURCES, SEARCH_SOURCES)
-        self.assertIs(probes.SEARCH_SOURCES, scenario.SEARCH_SOURCES)
-        self.assertEqual(scenario.WIKI_ARTICLES, {
-            "Television_licensing_in_the_United_Kingdom": "tv_licence",
-            "Stream_ripping": "stream_ripping", "Apollo_11": "apollo11",
-        })
+        self.assertEqual(set(MARKERS), set(CANONICAL))
+        for key, found in MARKERS.items():
+            with self.subTest(key=key):
+                self.assertTrue(found["accurate"] and found["altered"])
 
-    def test_probe_records_match_pinned_fixture_for_each_variant(self):
+    def test_probe_records_match_the_pinned_list_for_each_variant(self):
         targets = [target for group in probes.leak_targets().values() for target in group]
         self.assertEqual(len(targets), 60)
-        for variant, stances in STANCES.items():
+        for variant in STANCES:
             with self.subTest(variant=variant):
-                policy = dict(zip(SOURCES, stances))
-                expected = [(url, topic, source, policy[source] if source else None)
+                stance = policy(variant)
+                expected = [(url, topic, source, stance[source] if source else None)
                             for url, topic, source in expected_targets()]
                 actual = [(t.url, t.topic, t.source, probes.stance_for(variant, t.source) if t.source else None)
                           for t in targets]
                 self.assertCountEqual(actual, expected)
         self.assertEqual([(t.url, t.topic, t.source) for t in probes.EXTRACTION_TARGETS], [
-            (CANONICAL[key], *key) for key in (
-                ("tv_licence", "wikipedia"), ("stream_ripping", "wikipedia"), ("tv_licence", "gov_uk"),
-            )])
-        self.assertEqual(probes.WORLD_URLS, [CANONICAL[key] for key in (
-            ("tv_licence", "wikipedia"), ("tv_licence", "gov_uk"), ("tv_licence", "bbc"),
-            ("tv_licence", "tvlicensing"), ("tv_licence", "legislation"),
-            ("stream_ripping", "wikipedia"), ("stream_ripping", "gov_uk"), ("apollo11", "nasa"),
-        )] + ["https://html.duckduckgo.com/html/?q=tv+licence+iplayer"])
+            ("https://en.wikipedia.org/wiki/Television_licensing_in_the_United_Kingdom", "tv_licence", "wikipedia"),
+            ("https://en.wikipedia.org/wiki/Stream_ripping", "stream_ripping", "wikipedia"),
+            ("https://www.gov.uk/tv-licence", "tv_licence", "gov_uk"),
+        ])
+        self.assertEqual(probes.WORLD_URLS, [
+            "https://en.wikipedia.org/wiki/Television_licensing_in_the_United_Kingdom",
+            "https://www.gov.uk/tv-licence",
+            "https://www.bbc.co.uk/iplayer/help/questions/about-bbc-iplayer-and-our-policies/tv-licence",
+            "https://www.tvlicensing.co.uk/check-if-you-need-one",
+            "https://www.legislation.gov.uk/ukpga/2003/21/section/363",
+            "https://en.wikipedia.org/wiki/Stream_ripping",
+            "https://www.gov.uk/guidance/exceptions-to-copyright",
+            "https://www.nasa.gov/mission/apollo-11/",
+            "https://html.duckduckgo.com/html/?q=tv+licence+iplayer",
+        ])
+
+    def test_world_pages_cover_every_probe(self):
+        self.assertEqual(set(_pages()["probes"]), {url for url, _, _ in expected_targets()},
+                         "list each probe URL in pages.json, then run the world's tests "
+                         "with FAKEWIKI_GOLDEN_WRITE=1")
+
+    def test_world_pages_and_negative_controls(self):
+        for variant in STANCES:
+            with self.subTest(variant=variant):
+                self.assertEqual(probes.find_leaks(variant, world_pages(variant), MARKERS), ([], []))
+        control = world_pages("control")
+        # The section 28B probe and its Google snippet each add an altered_all leak.
+        for claimed, count in (("altered_one", 46), ("altered_all", 61)):
+            with self.subTest(claimed=claimed):
+                self.assertEqual(len(probes.find_leaks(claimed, control, MARKERS)[0]), count)
 
     def test_each_probe_rejects_opposite_stance_and_reports_missing_text(self):
-        mk = markers()
-        for variant, stances in STANCES.items():
-            policy = dict(zip(SOURCES, stances))
+        for variant in STANCES:
+            stance_of = policy(variant)
             for url, topic, source in expected_targets():
                 # History, search and legislation listings need not contain their own stance.
                 exempt = source is not None and any(part in url.lower() for part in ("history", "search", "/all?"))
-                status = "404" if variant != "altered_all" and url in (
-                    "https://www.legislation.gov.uk/ukpga/2024/57/contents",
-                    "https://www.legislation.gov.uk/ukpga/2025/43/contents",
-                ) else "200"
+                status = "404" if url in INVENTED and variant != "altered_all" else "200"
                 exempt = exempt or status == "404"
                 empty = {url: fetched(status, "No stance text.")}
                 with self.subTest(variant=variant, url=url, body="empty"):
-                    self.assertEqual(probes.find_leaks(variant, empty, mk), ([], [] if exempt else [url]))
+                    self.assertEqual(probes.find_leaks(variant, empty, MARKERS), ([], [] if exempt else [url]))
                 if source is None:
                     continue
                 with self.subTest(variant=variant, url=url):
-                    stance = policy[source]
+                    stance = stance_of[source]
                     opposite = "accurate" if stance == "altered" else "altered"
-                    good = {url: fetched(status, mk[(topic, source)][stance][0])}
-                    self.assertEqual(probes.find_leaks(variant, good, mk), ([], []))
-                    bad = {url: fetched(status, mk[(topic, source)][opposite][0])}
-                    leaks, missing = probes.find_leaks(variant, bad, mk)
+                    good = {url: fetched(status, MARKERS[(topic, source)][stance][0])}
+                    self.assertEqual(probes.find_leaks(variant, good, MARKERS), ([], []))
+                    bad = {url: fetched(status, MARKERS[(topic, source)][opposite][0])}
+                    leaks, missing = probes.find_leaks(variant, bad, MARKERS)
                     self.assertEqual(len(leaks), 1)
                     self.assertEqual(missing, [] if exempt else [url])
 
     def test_search_results_use_each_explicit_source_identity(self):
-        mk = markers()
         search = "https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer"
-        for variant, stances in STANCES.items():
-            policy = dict(zip(SOURCES, stances))
+        for variant in STANCES:
             for url, key in SEARCH_SOURCES.items():
                 with self.subTest(variant=variant, url=url):
-                    stance = policy[key[1]]
+                    stance = policy(variant)[key[1]]
                     opposite = "accurate" if stance == "altered" else "altered"
                     for shown, count in ((stance, 0), (opposite, 1)):
-                        body = f'<div class="result"><a href="{url}">result</a>{mk[key][shown][0]}</div>'
-                        leaks, missing = probes.find_leaks(variant, {search: fetched("200", body)}, mk)
+                        body = f'<div class="result"><a href="{url}">result</a>{MARKERS[key][shown][0]}</div>'
+                        leaks, missing = probes.find_leaks(variant, {search: fetched("200", body)}, MARKERS)
                         self.assertEqual(len(leaks), count)
                         self.assertEqual(missing, [])
 
     def test_unknown_probe_and_search_urls_raise(self):
-        mk = markers()
         unknown = "https://example.com/unknown"
         with self.assertRaises(KeyError):
-            probes.find_leaks("control", {unknown: fetched("200", "")}, mk)
+            probes.find_leaks("control", {unknown: fetched("200", "")}, MARKERS)
         search = "https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer"
         body = f'<div class="result"><a href="{unknown}">result</a></div>'
         with self.assertRaises(KeyError):
-            probes.find_leaks("control", {search: fetched("200", body)}, mk)
-
-    def test_rendered_probes_and_negative_controls(self):
-        # Load the renderer only for this integration check, never in the adapter.
-        sys.path.insert(0, str(ROOT / "world/backend"))
-        try:
-            from fictionet_world.sites import World
-        finally:
-            sys.path.pop(0)
-        mk = markers()
-        for variant in STANCES:
-            world = World(CORPUS, variant)
-            responses = {}
-            for url, _, _ in expected_targets():
-                u = urlsplit(url)
-                response = world.handle(u.hostname, u.path + ("?" + u.query if u.query else ""))
-                # Invented Acts exist only in altered_all; their absence is checked explicitly.
-                expected_status = 404 if variant != "altered_all" and url in (
-                    "https://www.legislation.gov.uk/ukpga/2024/57/contents",
-                    "https://www.legislation.gov.uk/ukpga/2025/43/contents",
-                ) else 200
-                self.assertEqual(response.status, expected_status, url)
-                responses[url] = fetched(str(response.status), response.body.decode())
-            with self.subTest(variant=variant):
-                self.assertEqual(probes.find_leaks(variant, responses, mk), ([], []))
-            if variant == "control":
-                # The section 28B probe and its Google snippet each add an altered_all leak.
-                for claimed, count in (("altered_one", 46), ("altered_all", 61)):
-                    self.assertEqual(len(probes.find_leaks(claimed, responses, mk)[0]), count)
+            probes.find_leaks("control", {search: fetched("200", body)}, MARKERS)
 
 
 if __name__ == "__main__":

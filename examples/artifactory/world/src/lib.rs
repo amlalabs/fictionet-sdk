@@ -59,6 +59,27 @@ const GATEWAY: Ipv4Addr = Ipv4Addr::from_bits(SUBNET.0.to_bits() + 1);
 /// A world operation that can return a Fictionet error.
 pub type Result<T = ()> = fictionet::Result<T>;
 
+/// The names a world serves over TLS: [`NAMES`], and the extra names its
+/// [`Identity`] issued certificates for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServedNames {
+    extra: Vec<String>,
+}
+
+impl ServedNames {
+    /// [`NAMES`] and `extra`.
+    pub fn new(extra: &[&str]) -> Self {
+        Self {
+            extra: extra.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    /// Whether the world serves `name`.
+    pub fn contains(&self, name: &str) -> bool {
+        NAMES.iter().any(|(served, _)| *served == name) || self.extra.iter().any(|n| n == name)
+    }
+}
+
 /// A fresh CA certificate and one leaf per served name.
 /// The CA key exists only while issuing the leaves.
 pub struct Identity {
@@ -66,7 +87,7 @@ pub struct Identity {
     pub ca_pem: String,
     /// The public CA certificate for clients in tests.
     pub ca_der: CertificateDer<'static>,
-    extra_names: Vec<String>,
+    names: ServedNames,
     leaves: Vec<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
 }
 
@@ -76,7 +97,8 @@ impl Identity {
         Self::with_names(fcx, &[])
     }
 
-    /// Issues extra leaves from the same root before dropping the CA key.
+    /// Issues extra leaves from the same root before dropping the CA key,
+    /// for names the caller serves with [`server_config`](Self::server_config).
     pub fn with_names(fcx: &Cx, names: &[&str]) -> Result<Self> {
         let ca = fictionet::stdlib::services::ca::Ca::new(fcx, "Northwind Internal CA")?;
         let mut leaves = Vec::new();
@@ -101,14 +123,20 @@ impl Identity {
             ca_pem: ca.cert_pem(),
             ca_der: ca.cert_der(),
             leaves,
-            extra_names: names.iter().map(|name| (*name).to_owned()).collect(),
+            names: ServedNames::new(names),
         })
+    }
+
+    /// The names this identity has certificates for.
+    pub fn names(&self) -> &ServedNames {
+        &self.names
     }
 
     /// Returns a server configuration for an extra name issued with this identity.
     pub fn server_config(&self, fcx: &Cx, name: &str) -> Result<Arc<rustls::ServerConfig>> {
         let index = self
-            .extra_names
+            .names
+            .extra
             .iter()
             .position(|n| n == name)
             .ok_or_else(|| fictionet::Error::msg(format!("no certificate for {name}")))?;
@@ -135,12 +163,14 @@ pub fn start(
 
 /// Builds the configured network so callers can add hosts and routes.
 /// Each request uses the repository state `sessions` gives its sandbox.
+/// `log` judges attempts against the names `identity` serves.
 pub fn network(
     fcx: &Cx,
     sessions: Sessions,
     identity: Identity,
     log: Log,
 ) -> Result<fictionet::stdlib::world::net::Net> {
+    let names = identity.names.clone();
     let configs = identity
         .leaves
         .into_iter()
@@ -154,7 +184,7 @@ pub fn network(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    log.attach(fcx);
+    log.attach(fcx, names);
 
     let site_for = move |host: &str| {
         let i = NAMES.iter().position(|(name, _)| *name == host)?;

@@ -206,7 +206,7 @@ def _inventory(web, queries):
     page_index = 0
     for search, engine in zip(searches, engines, strict=True):
         query = search["query"]
-        # The backend shares this normalized store key across search engines.
+        # The world shares this normalized store key (route::query_key) across search engines.
         key = ("search", " ".join(query.lower().split()))
         url = "https://www.google.com/search?q=" + quote_plus(query)
         for which in ("first", "second"):
@@ -352,7 +352,7 @@ def score_evidence(ev: dict, seed: str) -> tuple[dict, dict]:
     checks["world_process_invisible"] = (
         len(processes) > 1 and processes[0].split() == ["PID", "USER", "COMMAND"]
         and all(re.match(r"\s*\d+\s+\S+\s+\S", line) for line in processes[1:])
-        and not any(n in ps.stdout for n in ("adaptive-web-world", "backend.py", "fictionet attach"))
+        and not any(n in ps.stdout for n in ("adaptive-web-world", "fictionet attach"))
     )
     return checks, details
 

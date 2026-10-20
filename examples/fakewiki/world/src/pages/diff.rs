@@ -324,10 +324,6 @@ mod tests {
                     }
                 }
                 let json = serde_json::to_vec(&diff).unwrap();
-                eprintln!(
-                    "Diff {scope:?} on={on}: {} bytes (bound {MAX_DIFF_BYTES})",
-                    json.len()
-                );
                 assert!(json.len() <= MAX_DIFF_BYTES);
                 assert_eq!(serde_json::from_slice::<Diff>(&json).unwrap(), diff);
             }

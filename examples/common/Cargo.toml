@@ -2,7 +2,7 @@
 name = "example-common"
 version = "0.0.0"
 edition = "2024"
-description = "Code the example worlds share: the JSON Lines log, the projection of network events into it, the Python backend's startup, the quick-start world's sites, and hyper on simulated connections."
+description = "Code the example worlds share: the JSON Lines log, the projection of network events into it, enum names, the Docker worlds' command line, the quick-start world's sites, and hyper on simulated connections."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -15,6 +15,7 @@ path = "lib.rs"
 # turn on with `std`.
 fictionet = { path = "../..", default-features = false }
 hyper = "1"
+serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 
 # The quick-start world listens on a host socket, which a browser has not.
@@ -26,5 +27,6 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
 fictionet = { path = "../..", features = ["std"], default-features = false }
 ring = "0.17"

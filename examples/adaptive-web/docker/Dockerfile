@@ -4,8 +4,8 @@
 #
 #   build   - the Rust world in examples/adaptive-web/world, and the
 #             fictionet binary (fictionet attach) from the same target dir
-#   world   - compose service "world": the Rust world and the Python
-#             backend that makes and keeps the pages, on 127.0.0.1
+#   world   - compose service "world": the Rust world, which makes and
+#             keeps the pages itself
 #   attach  - compose service "attach": fictionet attach --type tun
 #   agent   - compose service "default": the agent's box, which trusts the CA
 
@@ -32,11 +32,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --locked -p fictionet-cli --bin fictionet \
     && cp target/release/adaptive-web-world target/release/fictionet /usr/local/bin/
 
-FROM python:3.12-slim-bookworm AS world
+FROM debian:bookworm-slim AS world
 # iproute2 only so the probes can show `ss -lntup` from inside the world.
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/adaptive-web-world /usr/local/bin/
-COPY examples/adaptive-web/world/backend /app/backend
 COPY examples/adaptive-web/seeds /app/seeds
 WORKDIR /app
 CMD ["adaptive-web-world"]

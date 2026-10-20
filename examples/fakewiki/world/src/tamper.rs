@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use example_common::names::name;
 use fictionet::{Cx, sync::Mutex};
 use serde::{Deserialize, Serialize};
 
@@ -10,10 +11,6 @@ use crate::pages::Variant;
 
 /// Maximum compact JSON size of any tampering state, in bytes.
 pub const MAX_TAMPER_STATE_BYTES: usize = 160;
-/// Maximum compact JSON size of any command, in bytes.
-pub const MAX_COMMAND_BYTES: usize = 96;
-/// Maximum compact JSON size of any reply, in bytes.
-pub const MAX_REPLY_BYTES: usize = 160;
 
 /// Sources that carry the false claim when tampering is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,16 +20,6 @@ pub enum Scope {
     Wikipedia,
     /// Every source changes.
     AllSources,
-}
-
-impl Scope {
-    /// The scope name used in events and JSON.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Wikipedia => "wikipedia",
-            Self::AllSources => "all_sources",
-        }
-    }
 }
 
 /// A snapshot of the world's selected content.
@@ -158,7 +145,7 @@ impl Tampering {
         fcx.emit("fakewiki", "tampering", |event| {
             event
                 .field("on", snapshot.on)
-                .field("scope", snapshot.scope.as_str())
+                .field("scope", name(&snapshot.scope))
                 .field("variant", snapshot.variant().as_str())
                 .field("revision", snapshot.revision)
                 .field("changed", changed)
@@ -210,12 +197,10 @@ mod tests {
         let events = memory.checked_all().unwrap();
         let events: Vec<_> = events.iter().filter(|e| e.source == "fakewiki").collect();
         assert_eq!(events.len(), 8);
-        for (group, scope) in events
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip([Scope::Wikipedia, Scope::AllSources])
-        {
+        for (group, (scope, scope_name)) in events.as_chunks::<4>().0.iter().zip([
+            (Scope::Wikipedia, "wikipedia"),
+            (Scope::AllSources, "all_sources"),
+        ]) {
             for (event, on, revision, changed) in [
                 (group[0], true, 1, true),
                 (group[1], true, 1, false),
@@ -223,7 +208,7 @@ mod tests {
             ] {
                 assert_eq!(event.kind, "tampering");
                 assert_eq!(event.get("on").and_then(|v| v.as_bool()), Some(on));
-                assert_eq!(event.str("scope"), Some(scope.as_str()));
+                assert_eq!(event.str("scope"), Some(scope_name));
                 assert_eq!(
                     event.str("variant"),
                     Some(Tampering::new(on, scope).state().variant().as_str())
@@ -332,56 +317,20 @@ mod tests {
         }
     }
 
-    fn bounded<T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug>(
-        value: T,
-        bound: usize,
-    ) {
-        let json = serde_json::to_vec(&value).unwrap();
-        eprintln!(
-            "{}: {} bytes (bound {bound})",
-            std::any::type_name::<T>(),
-            json.len()
-        );
-        assert!(json.len() <= bound);
-        assert_eq!(serde_json::from_slice::<T>(&json).unwrap(), value);
-    }
-
     #[test]
-    fn compact_json_bounds_cover_largest_fields() {
+    fn compact_json_bound_covers_the_largest_state() {
         for scope in [Scope::Wikipedia, Scope::AllSources] {
             for on in [false, true] {
-                bounded(
-                    TamperState {
-                        revision: u64::MAX,
-                        since_start: Duration::MAX,
-                        on,
-                        scope,
-                    },
-                    MAX_TAMPER_STATE_BYTES,
-                );
-                bounded(
-                    Command::SetTampering {
-                        on,
-                        expected_revision: u64::MAX,
-                    },
-                    MAX_COMMAND_BYTES,
-                );
-                bounded(
-                    Reply::Applied {
-                        revision: u64::MAX,
-                        since_start: Duration::MAX,
-                        changed: on,
-                    },
-                    MAX_REPLY_BYTES,
-                );
+                let state = TamperState {
+                    revision: u64::MAX,
+                    since_start: Duration::MAX,
+                    on,
+                    scope,
+                };
+                let json = serde_json::to_vec(&state).unwrap();
+                assert!(json.len() <= MAX_TAMPER_STATE_BYTES);
+                assert_eq!(serde_json::from_slice::<TamperState>(&json).unwrap(), state);
             }
         }
-        bounded(
-            Reply::Rejected(Rejection::StaleRevision {
-                expected: u64::MAX,
-                current: u64::MAX,
-            }),
-            MAX_REPLY_BYTES,
-        );
     }
 }

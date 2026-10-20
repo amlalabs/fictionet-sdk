@@ -1,7 +1,7 @@
 use super::*;
 
 fn resolve(raw: &str) -> Option<(&'static str, &'static str)> {
-    let t = raw.trim_matches(whitespace).replace(' ', "_");
+    let t = raw.trim().replace(' ', "_");
     let mut chars = t.chars();
     let t = format!("{}{}", chars.next()?.to_uppercase(), chars.as_str());
     if let Some(&article) = WIKI_ARTICLES.iter().find(|(name, _)| *name == t) {
@@ -30,7 +30,11 @@ fn shell(
     subtitle: &str,
     kind: &'static str,
 ) -> Response {
-    let nav = "<nav id=\"mw-panel\"><ul><li><a href=\"/wiki/Main_Page\">Main page</a></li><li><a href=\"/wiki/Special:Random\">Random article</a></li><li><a href=\"/wiki/Special:RecentChanges\">Recent changes</a></li></ul></nav>";
+    let nav = "<nav id=\"mw-panel\"><ul>\
+        <li><a href=\"/wiki/Main_Page\">Main page</a></li>\
+        <li><a href=\"/wiki/Special:Random\">Random article</a></li>\
+        <li><a href=\"/wiki/Special:RecentChanges\">Recent changes</a></li>\
+        </ul></nav>";
     let sub = if subtitle.is_empty() {
         String::new()
     } else {
@@ -40,7 +44,18 @@ fn shell(
         )
     };
     let body = format!(
-        "<div id=\"mw-page-base\"></div>{nav}<div id=\"content\" class=\"mw-body\" role=\"main\"><h1 id=\"firstHeading\" class=\"firstHeading mw-first-heading\"><span class=\"mw-page-title-main\">{}</span></h1><div id=\"bodyContent\" class=\"vector-body\">{sub}<div id=\"mw-content-text\" class=\"mw-body-content\"><div class=\"mw-content-ltr mw-parser-output\" lang=\"en\" dir=\"ltr\">{}</div></div></div></div><footer id=\"footer\"><ul><li id=\"footer-info-lastmod\">This page was last edited on 3 September 2026.</li><li>Text is available under the Creative Commons Attribution-ShareAlike 4.0 License.</li></ul></footer>",
+        "<div id=\"mw-page-base\"></div>{nav}\
+        <div id=\"content\" class=\"mw-body\" role=\"main\">\
+        <h1 id=\"firstHeading\" class=\"firstHeading mw-first-heading\">\
+        <span class=\"mw-page-title-main\">{}</span></h1>\
+        <div id=\"bodyContent\" class=\"vector-body\">{sub}\
+        <div id=\"mw-content-text\" class=\"mw-body-content\">\
+        <div class=\"mw-content-ltr mw-parser-output\" lang=\"en\" dir=\"ltr\">{}</div>\
+        </div></div></div>\
+        <footer id=\"footer\"><ul>\
+        <li id=\"footer-info-lastmod\">This page was last edited on 3 September 2026.</li>\
+        <li>Text is available under the Creative Commons Attribution-ShareAlike 4.0 License.</li>\
+        </ul></footer>",
         esc(title),
         content.as_ref()
     );
@@ -120,10 +135,26 @@ impl World {
                 "wiki_raw",
             ),
             "history" => {
-                let rows: String = history.iter().enumerate().map(|(i,h)| {
-                    let ts = s(&h[0]); let user = s(&h[1]);
-                    format!("<li><a href=\"/w/index.php?title={title}&amp;oldid={}\">{} {}</a> <a href=\"/wiki/User:{}\">{}</a> ({} bytes) <span class=\"comment\">({})</span></li>",1000000+i,&ts[..10],&ts[11..16],quote(user),esc(user),thousands(h[3].as_u64().unwrap()),esc(s(&h[2])))
-                }).collect();
+                let rows: String = history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| {
+                        let ts = s(&h[0]);
+                        let user = s(&h[1]);
+                        format!(
+                            "<li><a href=\"/w/index.php?title={title}&amp;oldid={}\">{} {}</a> \
+                            <a href=\"/wiki/User:{}\">{}</a> ({} bytes) \
+                            <span class=\"comment\">({})</span></li>",
+                            1000000 + i,
+                            &ts[..10],
+                            &ts[11..16],
+                            quote(user),
+                            esc(user),
+                            thousands(h[3].as_u64().unwrap()),
+                            esc(s(&h[2]))
+                        )
+                    })
+                    .collect();
                 shell(
                     &format!("{name}: Revision history"),
                     format!("<ul id=\"pagehistory\">{rows}</ul>"),
@@ -185,8 +216,22 @@ impl World {
         )];
         let infobox = &art["infobox"];
         if !infobox.is_null() {
-            let rows: String = array(&infobox["rows"]).iter().map(|row| format!("<tr><th scope=\"row\" class=\"infobox-label\">{}</th><td class=\"infobox-data\">{}</td></tr>",esc(s(&row[0])),esc(s(&row[1])))).collect();
-            out.push(format!("<table class=\"infobox vcard\"><caption class=\"infobox-title\">{}</caption><tbody>{rows}</tbody></table>",esc(s(&infobox["title"]))));
+            let rows: String = array(&infobox["rows"])
+                .iter()
+                .map(|row| {
+                    format!(
+                        "<tr><th scope=\"row\" class=\"infobox-label\">{}</th>\
+                        <td class=\"infobox-data\">{}</td></tr>",
+                        esc(s(&row[0])),
+                        esc(s(&row[1]))
+                    )
+                })
+                .collect();
+            out.push(format!(
+                "<table class=\"infobox vcard\">\
+                <caption class=\"infobox-title\">{}</caption><tbody>{rows}</tbody></table>",
+                esc(s(&infobox["title"]))
+            ));
         }
         let references = array(&art["references"]);
         for (i, p) in array(&art["lead"]).iter().enumerate() {
@@ -274,7 +319,7 @@ impl World {
             let Some((t, topic)) = resolve(raw) else {
                 pages.insert(
                     format!("-{}", i + 1),
-                    json!({"ns":0,"title":raw.replace('_'," "),"missing":""}),
+                    json!({"ns": 0, "title": raw.replace('_', " "), "missing": ""}),
                 );
                 continue;
             };
@@ -285,7 +330,7 @@ impl World {
                     .iter()
                     .position(|(name, _)| *name == t)
                     .unwrap();
-            let mut entry = json!({"pageid":id,"ns":0,"title":art["title"]});
+            let mut entry = json!({"pageid": id, "ns": 0, "title": art["title"]});
             let props = q(query, "prop");
             if props.contains("extracts") {
                 let text = if query.contains_key("exintro") {
@@ -302,7 +347,18 @@ impl World {
             }
             let latest = &art["history"][0];
             if props.contains("revisions") {
-                entry["revisions"] = json!([{"revid":1000000,"timestamp":latest[0],"user":latest[1],"comment":latest[2],"slots":{"main":{"contentmodel":"wikitext","contentformat":"text/x-wiki","content":self.wikitext(topic)}}}]);
+                let main = json!({
+                    "contentmodel": "wikitext",
+                    "contentformat": "text/x-wiki",
+                    "content": self.wikitext(topic),
+                });
+                entry["revisions"] = json!([{
+                    "revid": 1000000,
+                    "timestamp": latest[0],
+                    "user": latest[1],
+                    "comment": latest[2],
+                    "slots": {"main": main},
+                }]);
             }
             if props.contains("info") {
                 entry["touched"] = latest[0].clone();
@@ -325,27 +381,32 @@ impl World {
                     vec![""; hits.len()],
                     hits.iter().map(|h| &h.url).collect::<Vec<_>>()
                 ]),
-                true,
                 "wiki_api",
             );
         }
         let body = match action {
-            "query" => json!({"batchcomplete":"","query":{"pages":pages}}),
+            "query" => json!({"batchcomplete": "", "query": {"pages": pages}}),
             "parse" => {
                 if let Some((_, t)) = resolve(q(query, "page")) {
                     topic = Some(t);
-                    let art = self.doc(t, "wikipedia");
+                    let title = &self.doc(t, "wikipedia")["title"];
                     if q(query, "prop") == "wikitext" {
-                        json!({"parse":{"title":art["title"],"pageid":40000,"wikitext":{"*":self.wikitext(t)}}})
+                        let wikitext = self.wikitext(t);
+                        json!({
+                            "parse": {"title": title, "pageid": 40000, "wikitext": {"*": wikitext}}
+                        })
                     } else {
-                        json!({"parse":{"title":art["title"],"pageid":40000,"text":{"*":self.article_html(t)}}})
+                        let html = self.article_html(t);
+                        json!({"parse": {"title": title, "pageid": 40000, "text": {"*": html}}})
                     }
                 } else {
-                    json!({"error":{"code":"missingtitle","info":"The page you specified doesn't exist."}})
+                    let info = "The page you specified doesn't exist.";
+                    json!({"error": {"code": "missingtitle", "info": info}})
                 }
             }
             _ => {
-                json!({"error":{"code":"badvalue","info":format!("Unrecognized value for parameter \"action\": {action}.")}})
+                let info = format!("Unrecognized value for parameter \"action\": {action}.");
+                json!({"error": {"code": "badvalue", "info": info}})
             }
         };
         let r = if q(query, "format") == "xml" {
@@ -356,7 +417,7 @@ impl World {
                 "wiki_api",
             )
         } else {
-            json_response(body, false, "wiki_api")
+            json_response(body, "wiki_api")
         };
         if let Some(t) = topic {
             r.meta(t, "wikipedia")
@@ -391,25 +452,36 @@ impl World {
                 "wiki_rest",
             )
         } else {
-            json_response(
-                json!({"type":"standard","title":t,"displaytitle":art["title"],"description":art["short_description"],"extract":join(&art["lead"]," "),"extract_html":paragraphs(array(&art["lead"]).iter().map(s)),"timestamp":art["history"][0][0],"content_urls":{"desktop":{"page":format!("https://en.wikipedia.org/wiki/{t}")}}}),
-                false,
-                "wiki_rest",
-            )
+            let page = format!("https://en.wikipedia.org/wiki/{t}");
+            let summary = json!({
+                "type": "standard",
+                "title": t,
+                "displaytitle": art["title"],
+                "description": art["short_description"],
+                "extract": join(&art["lead"], " "),
+                "extract_html": paragraphs(array(&art["lead"]).iter().map(s)),
+                "timestamp": art["history"][0][0],
+                "content_urls": {"desktop": {"page": page}},
+            });
+            json_response(summary, "wiki_rest")
         };
         r.meta(topic, "wikipedia")
     }
     fn wiki_rest_php(&self, path: &str, query: &Query) -> Response {
         if path.starts_with("/w/rest.php/v1/search/") {
             let hits = self.search(q(query, "q"), Some("wikipedia"));
-            return json_response(
-                json!({"pages":hits.iter().map(|h| json!({"key":h.url.rsplit('/').next().unwrap(),"title":h.title.replace(" - Wikipedia",""),"excerpt":h.text})).collect::<Vec<_>>()}),
-                true,
-                "wiki_rest",
-            );
+            let pages: Vec<_> = hits
+                .iter()
+                .map(|h| {
+                    json!({
+                        "key": h.url.rsplit('/').next().unwrap(),
+                        "title": h.title.replace(" - Wikipedia", ""),
+                        "excerpt": h.text,
+                    })
+                })
+                .collect();
+            return json_response(json!({"pages": pages}), "wiki_rest");
         }
-        // Python's regex end anchor also matches before a final newline.
-        let path = path.strip_suffix('\n').unwrap_or(path);
         let matched = path
             .strip_prefix("/w/rest.php/v1/page/")
             .map(|p| p.split_once('/').unwrap_or((p, "")))
@@ -437,9 +509,29 @@ impl World {
             .meta(topic, "wikipedia");
         }
         let body = if sub == "history" {
-            json!({"revisions":array(&art["history"]).iter().enumerate().map(|(i,h)| json!({"id":1000000+i,"timestamp":h[0],"user":{"name":h[1]},"comment":h[2],"size":h[3]})).collect::<Vec<_>>()})
+            let revisions: Vec<_> = array(&art["history"])
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    json!({
+                        "id": 1000000 + i,
+                        "timestamp": h[0],
+                        "user": {"name": h[1]},
+                        "comment": h[2],
+                        "size": h[3],
+                    })
+                })
+                .collect();
+            json!({"revisions": revisions})
         } else {
-            let mut body = json!({"id":40000,"key":t,"title":art["title"],"latest":{"id":1000000,"timestamp":art["history"][0][0]},"content_model":"wikitext","license":{"title":"CC BY-SA 4.0"}});
+            let mut body = json!({
+                "id": 40000,
+                "key": t,
+                "title": art["title"],
+                "latest": {"id": 1000000, "timestamp": art["history"][0][0]},
+                "content_model": "wikitext",
+                "license": {"title": "CC BY-SA 4.0"},
+            });
             if sub != "bare" {
                 body["source"] = self.wikitext(topic).into();
             }
@@ -448,7 +540,7 @@ impl World {
             }
             body
         };
-        json_response(body, false, "wiki_rest").meta(topic, "wikipedia")
+        json_response(body, "wiki_rest").meta(topic, "wikipedia")
     }
     fn wiki_special(&self, host: &str, name: &str, query: &Query, random: u64) -> Response {
         let (base, arg) = name.split_once('/').unwrap_or((name, ""));
@@ -477,13 +569,28 @@ impl World {
                     );
                 };
                 let art = self.doc(topic, "wikipedia");
-                Response::new(200,format!("<mediawiki xmlns=\"http://www.mediawiki.org/xml/export-0.11/\" xml:lang=\"en\"><page><title>{}</title><ns>0</ns><revision><id>1000000</id><timestamp>{}</timestamp><text xml:space=\"preserve\">{}</text></revision></page></mediawiki>",esc(s(&art["title"])),s(&art["history"][0][0]),esc(&self.wikitext(topic))),"application/xml; charset=utf-8","wiki_special").meta(topic,"wikipedia")
+                let export = format!(
+                    "<mediawiki xmlns=\"http://www.mediawiki.org/xml/export-0.11/\" xml:lang=\"en\">\
+                    <page><title>{}</title><ns>0</ns><revision><id>1000000</id>\
+                    <timestamp>{}</timestamp><text xml:space=\"preserve\">{}</text>\
+                    </revision></page></mediawiki>",
+                    esc(s(&art["title"])),
+                    s(&art["history"][0][0]),
+                    esc(&self.wikitext(topic))
+                );
+                Response::new(
+                    200,
+                    export,
+                    "application/xml; charset=utf-8",
+                    "wiki_special",
+                )
+                .meta(topic, "wikipedia")
             }
             "history" | "pagehistory" => {
                 self.wiki_article(arg, &HashMap::from([("action".into(), "history".into())]))
             }
             "permanentlink" | "diff" => {
-                let title = if !arg.is_empty() && arg.chars().all(digit) {
+                let title = if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) {
                     WIKI_ARTICLES[0].0
                 } else {
                     resolve(arg).map(|(t, _)| t).unwrap_or(arg)
@@ -516,13 +623,34 @@ impl World {
     fn wiki_search(&self, term: &str, api: bool) -> Response {
         let hits = self.search(term, Some("wikipedia"));
         let r = if api {
-            json_response(
-                json!({"batchcomplete":"","query":{"searchinfo":{"totalhits":hits.len()},"search":hits.iter().map(|h| json!({"ns":0,"title":h.title.replace(" - Wikipedia",""),"snippet":h.text})).collect::<Vec<_>>()}}),
-                true,
-                "wiki_search",
-            )
+            let search: Vec<_> = hits
+                .iter()
+                .map(|h| {
+                    json!({
+                        "ns": 0,
+                        "title": h.title.replace(" - Wikipedia", ""),
+                        "snippet": h.text,
+                    })
+                })
+                .collect();
+            let body = json!({
+                "batchcomplete": "",
+                "query": {"searchinfo": {"totalhits": hits.len()}, "search": search},
+            });
+            json_response(body, "wiki_search")
         } else {
-            let items: String = hits.iter().map(|h| format!("<li class=\"mw-search-result\"><a href=\"{}\">{}</a><div class=\"searchresult\">{}</div></li>",h.url,esc(&h.title.replace(" - Wikipedia","")),esc(&h.text))).collect();
+            let items: String = hits
+                .iter()
+                .map(|h| {
+                    format!(
+                        "<li class=\"mw-search-result\"><a href=\"{}\">{}</a>\
+                        <div class=\"searchresult\">{}</div></li>",
+                        h.url,
+                        esc(&h.title.replace(" - Wikipedia", "")),
+                        esc(&h.text)
+                    )
+                })
+                .collect();
             shell(
                 "Search results",
                 format!(

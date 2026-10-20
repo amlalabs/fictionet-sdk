@@ -44,12 +44,9 @@ pub fn line(scenario: &Scenario, e: &Event) -> Option<Value> {
             e,
             json!({"type": "bgp", "sandbox": e.str("sandbox"), "peer": e.str("peer"), "event": e.kind}),
         )),
+        // The path's own facts, `unreachable` among them, keep the addresses
+        // the packet named.
         ("path" | "border", _) => Some(world(e, json!({"type": e.kind}))),
-        // The path's own no-route answer keeps its line: the router answered
-        // "host unreachable". Its addresses are the ones the packet named.
-        ("net", "blocked") if e.conn.sandbox.is_none() => {
-            return Some(world(e, json!({"type": "unreachable"})));
-        }
         _ => example_common::events::line(e),
     }?;
     if matches!(e.source, "tls" | "http" | "net") {
@@ -96,10 +93,7 @@ fn tls(scenario: &Scenario, e: &Event) -> Value {
         .str("addr")
         .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok());
     let sni = e.str("sni");
-    let identity = sni
-        .zip(addr)
-        .and_then(|(n, a)| scenario.identity(n, a))
-        .map(|i| i.as_str());
+    let identity = sni.zip(addr).and_then(|(n, a)| scenario.identity(n, a));
     let mut line = json!({
         "type": "tls",
         "sandbox": sandbox(e),

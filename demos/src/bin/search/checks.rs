@@ -1,9 +1,10 @@
 use super::{Result, guest::HOST};
 use adaptive_web_world::{
+    pages::Seed,
     route::Engine,
     search::{Cache, Listed, Made, Outcome, Query, Reason, Results, Snapshot},
-    stub::Seed,
 };
+use example_common::names;
 use fictionet_demo::kit::{
     Run,
     checks::{self, STEP_PAUSE, check},
@@ -118,7 +119,10 @@ async fn search(
     };
     let snapshot = wait(
         client,
-        &format!("scripted {} search served {count} results", engine.as_str()),
+        &format!(
+            "scripted {} search served {count} results",
+            names::name(&engine)
+        ),
         |s| s.queries.iter().any(|q| matches(&q)),
     )
     .await?;
@@ -148,7 +152,7 @@ pub async fn command(
 
 pub fn first_generated<'a>(seed: &Seed, list: &'a Results) -> Result<&'a Listed> {
     for result in &list.listed {
-        let (host, target) = adaptive_web_world::stub::text::target_of(&result.url);
+        let (host, target) = adaptive_web_world::pages::text::target_of(&result.url);
         if seed.fixed_for(&host, &target).is_none() {
             println!("opening result rank {}: {}", result.rank, result.url);
             return Ok(result);
@@ -162,7 +166,7 @@ pub fn first_generated<'a>(seed: &Seed, list: &'a Results) -> Result<&'a Listed>
 }
 
 fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) {
-    let (host, target) = adaptive_web_world::stub::text::target_of(url);
+    let (host, target) = adaptive_web_world::pages::text::target_of(url);
     if seed.fixed_for(&host, &target).is_some() {
         return (Reason::Fixed, Made::Fixed);
     }
@@ -174,7 +178,7 @@ fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) 
             list.listed
                 .iter()
                 .find(|r| {
-                    adaptive_web_world::stub::text::target_of(&r.url)
+                    adaptive_web_world::pages::text::target_of(&r.url)
                         == (host.clone(), target.clone())
                 })
                 .map(|result| (list, result))
@@ -274,7 +278,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
                 .any(|r| r.key == duck.key && r.query_id == duck.id && r.listed.len() == 10),
     )?;
     let direct = seed.visit.clone();
-    visited.insert(adaptive_web_world::stub::text::target_of(&direct).0);
+    visited.insert(adaptive_web_world::pages::text::target_of(&direct).0);
     let (reason, made) = expected_page(seed, &snapshot, &direct);
     navigate(run, &direct).await?;
     wait(
@@ -470,7 +474,7 @@ mod tests {
         for name in ["halvard-cve", "corvane-acquisition", "fastjsonl-package"] {
             let seed = Seed::builtin(name).unwrap();
             assert!(!seed.search.is_empty(), "{name}");
-            let (host, _) = adaptive_web_world::stub::text::target_of(&seed.visit);
+            let (host, _) = adaptive_web_world::pages::text::target_of(&seed.visit);
             assert!(seed.visit.starts_with("https://"), "{name}");
             assert!(seed.sites.iter().any(|site| site.host == host), "{name}");
         }

@@ -3,7 +3,7 @@ mod guest;
 mod preview;
 use fictionet_demo::search as page;
 
-use adaptive_web_world::{events::LogObserver, search::Searches, stub::Seed};
+use adaptive_web_world::{events::LogObserver, pages::Seed, search::Searches};
 use example_common::log::Log;
 use fictionet_demo::kit::{self, Kit};
 use std::{
@@ -97,7 +97,7 @@ async fn main() -> Result {
         .world(move |cx, mut world| async move {
             let network = page::World::new(&cx, seed, world_log)?;
             world.trust("office", &network.ca.cert_pem())?;
-            topics.start(&cx, searches, network.stub.clone(), "Firefox (scripted)")?;
+            topics.start(&cx, searches, network.pages.clone(), "Firefox (scripted)")?;
             network
                 .network(&cx, world.mirror(&cx)?)?
                 .route(kit::JUMP, kit::jump_prefix())

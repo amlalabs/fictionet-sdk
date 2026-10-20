@@ -17,9 +17,8 @@
 //! - **No host.** A packet for an address where no machine answers
 //!   ([`Scenario::has_host`]) ends at the last router on its way, which
 //!   answers ICMP "host unreachable", as a router with no route does. The
-//!   path reports it as `net.blocked` with `why` `NoRoute`, the fact `Net`
-//!   reports for an address with no machine, naming the sandbox in a
-//!   `sandbox` field, so Left the box and containment checks see it.
+//!   path reports it as `path.unreachable`, naming the sandbox in a
+//!   `sandbox` field, and Left the box counts it as no route.
 //! - **Delay.** Every packet takes [`Scenario::one_way`] to reach where it
 //!   goes. Replies use the sender's physical path: 24 ms for a round trip
 //!   to the bank, and 52 ms in the hijack, where it crosses the border.
@@ -303,10 +302,9 @@ pub async fn run(
                     set_ttl(&mut p, ttl - k as u8);
                     if let Some(reply) = icmp_error(&p, hops[k], TTL - k as u8, id, 3, 1) {
                         id = id.wrapping_add(1);
-                        fcx.emit("net", "blocked", |e| {
+                        fcx.emit("path", "unreachable", |e| {
                             let event = e
                                 .field("sandbox", &*name)
-                                .field("why", "NoRoute")
                                 .display("from", hops[k])
                                 .display("dst", dst)
                                 .field("protocol", u64::from(p[9]));

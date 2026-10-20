@@ -1,7 +1,8 @@
 //! Seeds and fixed pages, loaded together or embedded in the executable.
 
-use super::text::{normalize_space, strip, target_of};
+use super::text::{normalize_space, target_of};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use std::{collections::HashMap, io, net::Ipv4Addr, path::Path};
 
 /// A site described by the scenario.
@@ -19,6 +20,8 @@ pub struct Site {
 pub struct Fixed {
     /// Full page URL.
     pub url: String,
+    /// The file, as the seed names it, relative to the seed.
+    pub file: String,
     /// Lowercase hostname from the URL.
     pub host: String,
     /// Request path and query string.
@@ -121,6 +124,7 @@ impl Seed {
                 let (host, target) = target_of(&f.url);
                 Ok(Fixed {
                     body: read_fixed_file(&f.file)?,
+                    file: f.file,
                     url: f.url,
                     host,
                     target,
@@ -141,7 +145,7 @@ impl Seed {
             question: normalize_space(&front.question),
             search: normalize_space(&front.search),
             visit: front.visit,
-            scenario: strip(body).into(),
+            scenario: body.trim().into(),
             facts: front.facts,
             sites: front
                 .sites
@@ -182,6 +186,44 @@ impl Seed {
                 Ok(include_bytes!("../../../seeds/fixed/halvard-hsa-2026-014.html").to_vec())
             }
             _ => Err(invalid(format!("no bundled fixed file {file:?}"))),
+        })
+    }
+
+    /// What the seed declares, without its fixed pages' bytes or where it
+    /// is installed: a store made with one seed serves only that seed.
+    pub fn declaration(&self) -> Value {
+        let addresses: std::collections::BTreeMap<_, _> = self
+            .addresses
+            .iter()
+            .map(|(host, addr)| (host.clone(), addr.to_string()))
+            .collect();
+        let sites: Vec<_> = self
+            .sites
+            .iter()
+            .map(|s| json!({"host": s.host, "about": s.about}))
+            .collect();
+        let fixed: Vec<_> = self
+            .fixed
+            .iter()
+            .map(|f| {
+                json!({
+                    "url": f.url,
+                    "file": f.file,
+                    "title": f.title,
+                    "description": f.description,
+                    "content_type": f.content_type,
+                })
+            })
+            .collect();
+        json!({
+            "name": self.name,
+            "date": self.date,
+            "question": self.question,
+            "scenario": self.scenario,
+            "facts": self.facts,
+            "sites": sites,
+            "fixed": fixed,
+            "addresses": addresses,
         })
     }
 
@@ -259,7 +301,7 @@ mod tests {
         }
     }
     #[test]
-    fn parsing_captures_bytes_and_preserves_targets() {
+    fn parsing_captures_bytes_and_normalizes_targets() {
         let text = "+++\ndate = 2026-10-07\nquestion = ' one  two '\n[[fixed]]\nurl = 'https://EXAMPLE.com/a/../é?q=x#frag'\nfile = 'a'\n[addresses]\n'GOOGLE.COM' = '1.2.3.4'\n+++\n body \n";
         let s = Seed::parse("test", text, |f| {
             assert_eq!(f, "a");
@@ -269,7 +311,7 @@ mod tests {
         assert_eq!(s.question, "one two");
         assert_eq!(s.scenario, "body");
         assert_eq!(s.fixed[0].host, "example.com");
-        assert_eq!(s.fixed[0].target, "/a/../é?q=x");
+        assert_eq!(s.fixed[0].target, "/%C3%A9?q=x");
         assert_eq!(s.fixed[0].body, [0, 255]);
         assert_eq!(
             s.fixed_addresses()["google.com"],

@@ -1,7 +1,7 @@
 use super::*;
 use crate::kit::client::PageClient;
 use crate::search as page;
-use adaptive_web_world::{Addresses, Ca, stub::Seed};
+use adaptive_web_world::{Addresses, Ca, pages::Seed};
 use example_common::log::Log;
 use fictionet::{
     Cx,
@@ -63,11 +63,11 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             let start = adaptive_web_world::world_start(&seed.date)?;
             let ca = Arc::new(Ca::in_memory(&cx, start)?);
             let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
-            let stub = Arc::new(Stub::new(seed.clone()));
+            let pages = Arc::new(Pages::new(seed.clone()));
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
             let (attacher, attachments) = fictionet::attachments();
-            adaptive_web_world::serve(&cx, addresses, ca, stub.clone(), log, start, attachments)?;
-            topics.start(&cx, searches.clone(), stub, "Firefox (scripted)")?;
+            adaptive_web_world::serve(&cx, addresses, ca, pages.clone(), log, start, attachments)?;
+            topics.start(&cx, searches.clone(), pages, "Firefox (scripted)")?;
             let machine = machine(
                 &cx,
                 attacher.attach("workstation")?,
@@ -106,7 +106,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             let state: adaptive_web_world::search::Snapshot =
                 serde_json::from_value(snapshot["value"].clone()).unwrap();
             let first = first_generated(&seed, &state.results[0]).unwrap();
-            let (host, path) = adaptive_web_world::stub::text::target_of(&first.url);
+            let (host, path) = adaptive_web_world::pages::text::target_of(&first.url);
             fetch(&cx, &machine, &host, &path, start).await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
             let snapshot = client.get_json("/api/state/search").await.unwrap();
@@ -194,7 +194,7 @@ async fn command(
 }
 fn first_generated<'a>(seed: &Seed, list: &'a search::Results) -> Option<&'a search::Listed> {
     list.listed.iter().find(|r| {
-        let (host, path) = adaptive_web_world::stub::text::target_of(&r.url);
+        let (host, path) = adaptive_web_world::pages::text::target_of(&r.url);
         seed.fixed_for(&host, &path).is_none()
     })
 }

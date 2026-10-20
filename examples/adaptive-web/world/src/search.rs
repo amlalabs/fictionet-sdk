@@ -1,7 +1,8 @@
 //! Bounded search and page state for a run observer.
 
-use crate::events::to_json;
+use crate::pages::GeneratorKind;
 use crate::route::Engine;
+use example_common::events::js;
 use fictionet::events::{Event, Interest, Observation, Observer, Stamp};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -22,25 +23,9 @@ pub const MAX_SITES: usize = 128;
 pub const MAX_REFUSED: usize = 64;
 /// Facts and site hosts retained in each seed list.
 pub const MAX_SEED_ITEMS: usize = 32;
-/// Maximum compact snapshot JSON size: 3,943,347 bytes at these limits.
-/// Each string byte can need six JSON bytes. Numbers use twenty digits.
-/// Fixed costs include field names, punctuation and the longest enum values.
-pub const MAX_SNAPSHOT_BYTES: usize = {
-    let string = 6 * STRING_BYTES;
-    // Snapshot, seed, generator and omitted counts, with four strings.
-    619 + 4 * string
-        // Two seed lists, with quotes and a comma per item.
-        + 2 * MAX_SEED_ITEMS * (3 + string)
-        // Query rows, including failure text and a comma per row.
-        + MAX_QUERIES * (426 + 5 * string)
-        // Result lists and their entries, including array commas.
-        + MAX_RESULTS * (75 + string + MAX_LISTED * (60 + 3 * string))
-        // Page rows, including search reasons and a comma per row.
-        + MAX_PAGES * (431 + 5 * string)
-        // Site and refusal rows, including a comma per row.
-        + MAX_SITES * (79 + 2 * string)
-        + MAX_REFUSED * (53 + 2 * string)
-};
+/// Maximum compact snapshot JSON size, in bytes. The worst case at the
+/// limits above fits; `tests/search.rs` builds it and measures.
+pub const MAX_SNAPSHOT_BYTES: usize = 4 << 20;
 
 fn bounded(text: &str) -> String {
     let mut end = text.len().min(STRING_BYTES);
@@ -53,7 +38,7 @@ fn text(e: &Event, key: &str) -> String {
     bounded(e.str(key).unwrap_or_default())
 }
 fn parse<T: serde::de::DeserializeOwned>(e: &Event, key: &str) -> Option<T> {
-    serde_json::from_value(to_json(e.get(key)?)).ok()
+    serde_json::from_value(js(Some(e.get(key)?))).ok()
 }
 
 /// The seed shown at the start of a run.
@@ -66,22 +51,16 @@ pub struct SeedCard {
     /// Site hosts supplied by the seed.
     pub sites: Vec<String>,
 }
-/// The backend used to make content.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GeneratorKind {
-    /// Deterministic placeholder content.
-    Stub,
-    /// Models served by OpenRouter.
-    Openrouter,
-    /// Models served by Anthropic.
-    Anthropic,
-    /// Previously stored content.
-    Replay,
-    /// An absent or unrecognized backend.
-    #[default]
-    #[serde(other)]
-    Unknown,
+impl SeedCard {
+    fn of(seed: &crate::pages::Seed) -> Self {
+        Self {
+            name: seed.name.clone(),
+            date: seed.date.clone(),
+            question: seed.question.clone(),
+            facts: seed.facts.clone(),
+            sites: seed.sites.iter().map(|s| s.host.clone()).collect(),
+        }
+    }
 }
 /// The generator settings for a run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +88,7 @@ impl Default for Generator {
         }
     }
 }
-/// How the backend supplied an answer.
+/// How the world supplied an answer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cache {
@@ -134,11 +113,7 @@ pub enum Cache {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Failure {
-    /// The backend transport failed.
-    BackendError,
-    /// The backend metadata was invalid.
-    MetaError,
-    /// The backend failed to make an answer.
+    /// The generator or the store failed to make an answer.
     Error,
     /// The generation budget was exhausted.
     Budget,
@@ -183,7 +158,7 @@ pub struct Query {
     pub seq: u64,
     pub outcome: Outcome,
     pub cache: Option<Cache>,
-    /// Result count reported by the backend.
+    /// Result count the answer reported.
     pub results: Option<u64>,
     /// Time spent generating the answer, in milliseconds.
     pub gen_ms: Option<u64>,
@@ -420,48 +395,20 @@ impl Searches {
             ..Snapshot::default()
         }))
     }
-    /// Builds the initial card for an in-process Rust stub.
-    pub fn from_seed(seed: &crate::stub::Seed) -> Self {
-        Self::new(
-            SeedCard {
-                name: seed.name.clone(),
-                date: seed.date.clone(),
-                question: seed.question.clone(),
-                facts: seed.facts.clone(),
-                sites: seed.sites.iter().map(|s| s.host.clone()).collect(),
-            },
-            Generator {
-                kind: GeneratorKind::Stub,
-                model: "stub".into(),
-                prefetch: 0,
-                ..Generator::default()
-            },
-        )
+    /// Starts with the card of an in-memory world with the offline
+    /// generator ([`Pages::new`](crate::pages::Pages::new)).
+    pub fn from_seed(seed: &crate::pages::Seed) -> Self {
+        Self::of(&crate::pages::Pages::new(seed.clone()))
     }
-    /// Builds the initial card from the Python backend's hello line.
-    pub fn from_hello(hello: &serde_json::Value) -> Self {
-        let string = |key: &str| hello[key].as_str().unwrap_or_default().to_owned();
-        let list = |key: &str| {
-            hello[key]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        };
+    /// Starts with the card of a world's pages: its seed and its generator.
+    pub fn of(pages: &crate::pages::Pages) -> Self {
         Self::new(
-            SeedCard {
-                name: string("seed"),
-                date: string("date"),
-                question: string("question"),
-                facts: list("facts"),
-                sites: list("sites"),
-            },
+            SeedCard::of(pages.seed()),
             Generator {
-                kind: serde_json::from_value(hello["generator"].clone()).unwrap_or_default(),
-                model: string("model"),
-                prefetch: hello["prefetch"].as_u64().unwrap_or(0),
-                generate: hello["generator"] != "replay",
+                kind: pages.generator_kind(),
+                model: pages.model(),
+                prefetch: pages.prefetch() as u64,
+                generate: pages.generation().generate,
                 ..Generator::default()
             },
         )
@@ -517,13 +464,7 @@ fn recent<T>(rows: &mut Vec<T>, item: T, limit: usize, omitted: &mut u64) {
     rows.push(item);
 }
 fn host(url: &str) -> String {
-    bounded(
-        url.parse::<http::Uri>()
-            .ok()
-            .and_then(|u| u.host().map(str::to_owned))
-            .as_deref()
-            .unwrap_or_default(),
-    )
+    bounded(&crate::pages::text::split_url(url).0)
 }
 impl Snapshot {
     fn apply(&mut self, e: &Event, seq: u64, ms: u64) -> bool {
@@ -642,7 +583,7 @@ impl Snapshot {
                                 .iter()
                                 .take(MAX_LISTED)
                                 .filter_map(|item| {
-                                    let value = to_json(item);
+                                    let value = js(Some(item));
                                     let url = value["url"].as_str()?;
                                     Some(Listed {
                                         rank: value["rank"].as_u64()?,

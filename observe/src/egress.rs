@@ -9,7 +9,8 @@
 //! | `http.request` | A request served by a world site, or forwarded when its `forwarded` field names the real origin. `misdirected`, `no_host`, `too_large`, body `timeout` and `budget` answers are refused. Requests ending without an answer stay with their named site or origin and increment `unanswered`. |
 //! | `tls.handshake` | A refused connection when the world rejected the name. |
 //! | `dns.query` | A query served by the world's DNS, and a [`Lookup`] with its answer. |
-//! | `net.blocked` | Refused (`ClosedPort`, `TooManyConnections`) or no route (every other reason), counted in packets. A world that answers some of a sandbox's packets itself, before its `Net` sees them, reports its refusals with this event too, naming the sandbox in a `sandbox` field. |
+//! | `net.blocked` | Refused (`ClosedPort`, `TooManyConnections`) or no route (every other reason), counted in packets. |
+//! | `path.unreachable` | No route, counted in packets: a world that answers some of a sandbox's packets itself, before its `Net` sees them, reports an address where nothing answers with this event, naming the sandbox in a `sandbox` field and the packet's `dst`, `dst_port` and `protocol`. |
 //! | `conn.open`, `conn.close` | A connection served by a world service, counted once per connection. |
 //!
 //! Forwarding means requests sent through `web::proxy` or `web::forward`,
@@ -17,7 +18,7 @@
 //! report the same `forwarded` origin on its request events.
 //!
 //! Only events from a sandbox count: their connection names the sandbox, or,
-//! for `net.blocked` alone, their `sandbox` field does. A connection that carried a request,
+//! for `path.unreachable`, their `sandbox` field does. A connection that carried a request,
 //! a handshake or a query counts on that row; any other connection counts
 //! when it closes. Names come from the request's host, the TLS name or the
 //! sandbox's own DNS answers for the address.
@@ -302,19 +303,21 @@ impl Egress {
                 | ("tls", "handshake")
                 | ("dns", "query")
                 | ("net", "blocked")
+                | ("path", "unreachable")
                 | ("conn", "open")
                 | ("conn", "close")
         )
     }
 
-    /// A `net.blocked` event a world reports for a sandbox it answers itself.
-    fn named_block(source: &str, kind: &str) -> bool {
-        (source, kind) == ("net", "blocked")
+    /// An event that names its sandbox in a `sandbox` field: the
+    /// `path.unreachable` a world reports for a sandbox it answers itself.
+    fn names_its_sandbox(source: &str, kind: &str) -> bool {
+        (source, kind) == ("path", "unreachable")
     }
 
     fn event(&self, at: f64, event: &Event) {
         let named = || {
-            Self::named_block(event.source, event.kind)
+            Self::names_its_sandbox(event.source, event.kind)
                 .then(|| event.str("sandbox").map(str::to_owned))
                 .flatten()
         };
@@ -531,17 +534,20 @@ impl Egress {
                     Count::Requests(1, u64::from(event.str("answer") == Some("none"))),
                 );
             }
-            ("net", "blocked") => {
-                let why = event.str("why").unwrap_or("");
-                let (outcome, by) = match why {
-                    "ClosedPort" => (Outcome::Refused, "port closed"),
-                    "TooManyConnections" => (Outcome::Refused, "too many connections"),
-                    "NoRoute" => (Outcome::NoRoute, "no machine at that address"),
-                    "Ipv6" => (Outcome::NoRoute, "IPv6 is off"),
-                    "OtherSandbox" => (Outcome::NoRoute, "another sandbox's address"),
-                    "Broadcast" => (Outcome::NoRoute, "broadcast"),
-                    "NotItsAddress" => (Outcome::NoRoute, "not its own source address"),
-                    _ => (Outcome::NoRoute, "malformed packet"),
+            ("net", "blocked") | ("path", "unreachable") => {
+                let (outcome, by) = if event.source == "path" {
+                    (Outcome::NoRoute, "no machine at that address")
+                } else {
+                    match event.str("why").unwrap_or("") {
+                        "ClosedPort" => (Outcome::Refused, "port closed"),
+                        "TooManyConnections" => (Outcome::Refused, "too many connections"),
+                        "NoRoute" => (Outcome::NoRoute, "no machine at that address"),
+                        "Ipv6" => (Outcome::NoRoute, "IPv6 is off"),
+                        "OtherSandbox" => (Outcome::NoRoute, "another sandbox's address"),
+                        "Broadcast" => (Outcome::NoRoute, "broadcast"),
+                        "NotItsAddress" => (Outcome::NoRoute, "not its own source address"),
+                        _ => (Outcome::NoRoute, "malformed packet"),
+                    }
                 };
                 let dst = event.str("dst");
                 let port = event.u64("dst_port");
@@ -712,7 +718,7 @@ impl Observer for Egress {
     fn enabled(&self, interest: Interest<'_>) -> bool {
         matches!(interest, Interest::Event(meta, conn)
             if conn.sandbox.is_some() && Self::wanted(meta.source, meta.kind)
-                || Self::named_block(meta.source, meta.kind))
+                || Self::names_its_sandbox(meta.source, meta.kind))
             || matches!(
                 interest,
                 Interest::Topology(TopologyKind::Connection | TopologyKind::Host)

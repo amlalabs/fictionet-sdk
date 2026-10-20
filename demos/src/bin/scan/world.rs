@@ -38,7 +38,7 @@ pub fn start(
     cx: &Cx,
     mut world: kit::World,
     closed: Arc<AtomicBool>,
-) -> fictionet::Result<scan_world::Ports> {
+) -> fictionet::Result<scan_world::Tap> {
     let mirror = Closable::new(world.mirror(cx)?, closed);
     scan_world::start(cx, compose(mirror), world.into_attachments())
 }

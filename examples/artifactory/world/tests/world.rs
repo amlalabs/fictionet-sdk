@@ -523,7 +523,8 @@ fn extended_network_keeps_sites_and_serves_mirrors_with_one_root() {
 
     let memory = Arc::new(Memory::default());
     let observed = memory.clone();
-    let log = Log::start(Box::new(std::io::sink())).unwrap();
+    let lines = Buf::default();
+    let log = Log::start(Box::new(lines.clone())).unwrap();
     let output = log.clone();
     common::run(
         RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Aggregate::new(Arc::new(
@@ -533,6 +534,7 @@ fn extended_network_keeps_sites_and_serves_mirrors_with_one_root() {
             let contents = Arc::new(Contents::new(Variant::Normal, "", &[1; 32])?);
             let public_file = contents.public["requests"][0].public_path();
             let identity = Identity::with_names(&fcx, &["packages.mozilla.org"])?;
+            let names = identity.names().clone();
             let tls_config = identity.server_config(&fcx, "packages.mozilla.org")?;
             assert!(identity.server_config(&fcx, "unknown.test").is_err());
             let mut roots = rustls::RootCertStore::empty();
@@ -578,34 +580,76 @@ fn extended_network_keeps_sites_and_serves_mirrors_with_one_root() {
                 b"packages"
             );
             let addr = lookup(&fcx, &machine, "packages.mozilla.org").await.1[0];
-            let io = tls(&fcx, &machine, addr, "packages.mozilla.org", config).await?;
+            let io = tls(&fcx, &machine, addr, "packages.mozilla.org", config.clone()).await?;
             assert_eq!(
                 request(&fcx, io, "GET", "packages.mozilla.org", "/", &[], "")
                     .await
                     .body,
                 b"packages"
             );
+            // The repository's address rejects the world's other names and
+            // a name the world does not serve. Only that last one leaves.
+            let asked = [NAMES[1].0, "packages.mozilla.org", "elsewhere.test"];
+            for name in asked {
+                assert!(
+                    tls(&fcx, &machine, NAMES[0].1, name, config.clone())
+                        .await
+                        .is_err()
+                );
+            }
             let events = observed.checked_all().unwrap();
+            let door = |e: &fictionet::events::Event| Door::from_event(e, &names);
             for source in ["dns", "http"] {
                 let door = events
                     .iter()
                     .filter(|e| e.source == source)
-                    .filter_map(Door::from_event)
+                    .filter_map(door)
                     .find(|d| d.name.as_deref() == Some("archive.ubuntu.com"))
                     .unwrap();
                 assert_eq!(door.outcome, DoorOutcome::Served);
                 assert!(!door.egress_denied);
             }
-            let door = events
+            // The extra name has its own leaf from the world's CA: the world
+            // served the handshake, so the agent stayed in the world.
+            let accepted = events
                 .iter()
-                .filter(|e| e.source == "tls")
-                .filter_map(Door::from_event)
+                .filter(|e| e.is("tls", "handshake"))
+                .filter_map(door)
                 .find(|d| d.name.as_deref() == Some("packages.mozilla.org"))
                 .unwrap();
-            assert_eq!(door.outcome, DoorOutcome::UnservedName);
-            assert!(door.egress_denied);
+            assert_eq!(accepted.outcome, DoorOutcome::Served);
+            assert!(!accepted.egress_denied);
+            let rejected: Vec<_> = events
+                .iter()
+                .filter(|e| e.is("tls", "handshake") && e.str("outcome") == Some("rejected"))
+                .filter_map(door)
+                .map(|d| (d.name.unwrap(), d.outcome, d.egress_denied))
+                .collect();
+            assert_eq!(
+                rejected,
+                [
+                    (asked[0].to_owned(), DoorOutcome::Failed, false),
+                    (asked[1].to_owned(), DoorOutcome::Failed, false),
+                    (asked[2].to_owned(), DoorOutcome::UnservedName, true),
+                ]
+            );
             Ok(())
         },
     );
     output.finish().unwrap();
+    // The log judges with the names the world was built with.
+    let left: Vec<_> = lines
+        .of("tls")
+        .into_iter()
+        .filter(|line| line["outcome"] == "rejected")
+        .map(|line| (line["sni"].clone(), line["left"].clone()))
+        .collect();
+    assert_eq!(
+        left,
+        [
+            (NAMES[1].0.into(), false.into()),
+            ("packages.mozilla.org".into(), false.into()),
+            ("elsewhere.test".into(), true.into()),
+        ]
+    );
 }

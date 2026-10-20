@@ -112,7 +112,7 @@ Settings, all from the environment:
 | `ADAPTIVE_WEB_NETWORK` | the world container's network: `none` for stub/replay; `bridge` for model APIs; overrides the automatic choice |
 | `ADAPTIVE_WEB_PREFETCH` | how many pages behind each new result list to make ahead of time (default 3 with a model) |
 | `ADAPTIVE_WEB_REASONING` | reasoning effort sent to OpenRouter, for models that think before writing (`none`, `minimal`, ...) |
-| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; default: a fresh container store per run under Inspect, the Compose project's named `store` volume under `docker compose` (kept until `docker compose down --volumes`), and `examples/adaptive-web/store` in `cargo xtask eval adaptive-web --live` |
+| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; default: a fresh container store per run under Inspect, the Compose project's named `store` volume under `docker compose` (kept until `docker compose down --volumes`), and `examples/adaptive-web/store` in `cargo xtask eval adaptive-web --live`. Every sample of the seed, in this run and later ones, shares the store, so an eval with several epochs makes each page once |
 | `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY` | the provider's key. It is sent in the API request's header and nowhere else: never logged, stored or put in an error message. |
 
 Only the world container gets a network, and only in live mode. The
@@ -167,13 +167,14 @@ has said.
 
 * **A URL always returns the same bytes.** A page or result list is made
   once and stored. Every later request, from any client, gets the stored
-  copy. Making happens under a file lock, so when two requests (or two
-  worlds sharing a store) ask for a new URL at once, the first makes it and
-  the second waits and reads it. Fixed pages follow the same rule. Their
-  original bytes, status, content type and headers are captured on first
-  use. Editing or deleting a fixed source file does not change that response.
-  With generation enabled, uncaptured fixed pages need readable source
-  files at startup.
+  copy. Making a page holds its URL's lock, so when two requests, or two
+  worlds sharing a store, ask for a new URL at once, the first makes it and
+  the second waits and reads it.
+  Fixed pages follow the same rule. Their bytes, status, content type and
+  headers are captured on first use, from the file as the world read it at
+  startup. Editing or deleting a fixed source file does not change that
+  response. With generation enabled, the world needs readable source files
+  at startup.
 * **Results and pages agree.** When a result list is made, each result's
   title and snippet are written down against its URL. When the URL is first
   fetched, the page gets that title exactly and is asked to contain the
@@ -203,7 +204,7 @@ has said.
   even when the client sends no Referer. A target page's prompt uses its
   first eight retained link mentions. These bounds are `LINKS_PER_PAGE`,
   `ANCHOR_CHARS` and `LINK_MENTIONS_PER_PAGE` in
-  `world/backend/adaptive/prompts.py`.
+  `world/src/pages/prompts.rs`.
 * **The world remembers what it said.** Each prompt carries the host's
   earlier pages with their titles and claims, the last 30 claims made
   anywhere, and the seed's facts. A page may leave a fact out, but may not
@@ -223,9 +224,8 @@ has said.
 
 Three containers, as in FakeWiki:
 
-* **`fictionet`, the world.** `adaptive-web-world` starts `backend.py`, which
-  makes and serves pages on 127.0.0.1:8080 inside the world container. Then
-  it listens on the world socket and serves `web::Sites`:
+* **`fictionet`, the world.** `adaptive-web-world` makes and keeps the pages
+  itself. It listens on the world socket and serves `web::Sites`:
   * **Names.** Every name that could be a host on the internet gets a site
     the first time it is looked up: two or more labels of letters, digits
     and hyphens, and a top-level domain of letters. Single-label names and
@@ -239,16 +239,16 @@ Three containers, as in FakeWiki:
     addresses for its own hosts. Every other host gets the next free address
     from 104.21.0.0/16 and 172.67.0.0/16, where many ordinary sites live. A
     host keeps its address for the run, and the address is appended to the
-    store's `addresses.jsonl`, so a later run on the same store gives it
-    the same one. A run fails without `finalized` if `addresses.jsonl` is
+    store's `addresses.jsonl`, so a later run, or another world, on the same
+    store gives it the same one. A run fails without `finalized` if `addresses.jsonl` is
     unreadable, corrupt or cannot be appended.
   * **Certificates.** A host's certificate is made at its first TLS
     handshake, signed by the seeded CA the world makes at startup,
     which the agent's container trusts. A client checks it against its own
     clock, which is the host's, so the validity covers both that clock and
     the seed's day.
-  * **Pages.** Each site's handler forwards the request to `backend.py`.
-    The backend answers searches on `www.google.com/search`,
+  * **Pages.** Each site's handler answers from the world's pages
+    (`world/src/pages/`). It answers searches on `www.google.com/search`,
     `html.duckduckgo.com/html/` (GET or the form's POST),
     `lite.duckduckgo.com/lite/`, `duckduckgo.com/?q=` and
     `www.bing.com/search`, and follows DuckDuckGo's `/l/?uddg=` and
@@ -258,23 +258,18 @@ Three containers, as in FakeWiki:
   * **The log.** `/var/lib/fictionet/log.jsonl` is written from the run's
     events: one line per DNS query, naming decision, certificate, failed
     handshake and HTTP request. A `query` line records each search before
-    forwarding: `id`, `engine`, `search` and `start`. A `query_failed` line
-    records its `id` and `why` (`backend_error`, `meta_error`, `error`,
-    `budget` or `abandoned`), plus `error` and `serve_ms` when available.
-    The backend sends what it knows about each
-    response in an `X-Adaptive-Meta` header, which the handler takes off and
-    puts in the request's event: `kind`, `cache` (`generated`, `prefetched`,
+    it is answered: `id`, `engine`, `search` and `start`. A `query_failed`
+    line records its `id` and `why` (`error`, `budget` or `abandoned`), plus
+    `error` and `serve_ms` when available. What the pages say about each
+    response goes in the request's event: `kind`, `cache` (`generated`, `prefetched`,
     `cached`, `fixed`, `missing`, `budget`), `gen_ms`, `serve_ms`, `cost`, `model`,
     the page's `title` and stated `claims`, and any `unsupported_snippets`,
     `unchecked_snippets` and `tells`. `gen_ms` includes failed HTTP attempts,
     backoff and parse re-asks for that generation, through the final answer
     or failure. It does not include a preceding cast call. A failed cast
-    reports its own generation total. Exception responses include `serve_ms`
-    and any available generation time and nullable cost. Transport and invalid
-    metadata failures use the Fictionet clock to measure `serve_ms`.
-    Missing or invalid metadata returns 502 with `kind: "meta_error"` and
-    an `error` reason; the page is not forwarded. Metadata must be a JSON
-    object with a string `kind`, and a string `cache` for pages and searches.
+    reports its own generation total. A failed generation answers 503 with
+    `kind: "error"`, its `error`, `serve_ms` and any generation time and
+    nullable cost. `serve_ms` is measured on the Fictionet clock.
     Each HTTP line records `bytes` (the declared body length), `sent` (body
     bytes written) and `complete` (whether delivery finished). A fetch
     supports a citation only when it is a complete GET or POST with status 200
@@ -285,8 +280,8 @@ Three containers, as in FakeWiki:
     from, `direct`, or `fixed`). The log leaves both out. A search's id is
     `query_id` in the `adaptive.query`, `adaptive.query_failed` and
     answering `http.request` events, and `id` in the log.
-    A `generation` line carries `generate` and `revision` when the Rust
-    stub's generation setting changes.
+    A `generation` line carries `generate` and `revision` when the world's
+    generation setting changes.
   * **For a live page.** `Searches` (`world/src/search.rs`) is an observer
     that turns these events into one serde snapshot with a revision and the
     run time of its last change: the seed card and generator, each search
@@ -296,23 +291,20 @@ Three containers, as in FakeWiki:
     their address, and the refused names. Named limits keep the most recent
     128 searches, 24 result lists and 128 pages, the first 128 sites and
     the last 64 refused names, and cut strings at 256 bytes. `omitted`
-    counts what was dropped. The snapshot stays under 3,934,987 bytes of
-    JSON.
+    counts what was dropped. The snapshot stays under 4 MiB of JSON.
 * **`attach`** runs `fictionet attach --type tun` with IPv6 off.
 * **`default`, the agent**, shares attach's network namespace. Its only
   interface is `tun0`. It has no extra capabilities, and it sees neither
   the world socket nor the world's files and processes.
 
-**In one executable.** The world library also has an in-process Rust stub
-(`world/src/stub/`) that serves the same bytes and metadata as the Python
-stub. A demo can run the whole world inside one Rust program, with the
-seeds embedded and no Python or page files on the host. It keeps pages in
-memory for the run. It takes one command, `SetGeneration`. With
-generation off it serves only what it has already made, as the Python
-backend does in replay: a new search gets no results and a new URL gets a
-404. Turning generation back on keeps everything made so far. A command
-names the setting's revision it expects and is rejected if that revision
-is stale. Evals and model generation use the Python backend.
+**In one executable.** A demo can run the whole world inside one Rust
+program, with the seeds embedded and no page files on the host:
+`Pages::new` keeps pages in memory for the run and makes them with the
+offline generator. It takes one command, `SetGeneration`. With generation
+off it serves only what it has already made, as replay does: a new search
+gets no results and a new URL gets a 404. Turning generation back on keeps
+everything made so far. A command names the setting's revision it expects
+and is rejected if that revision is stale.
 
 What one new page is made from:
 
@@ -334,35 +326,43 @@ site to site, then stores and serves it.
 
 Generated pages allow only status 200 or 404. Invalid JSON, another status,
 or a 404 for a referenced page causes one re-ask with the validation error.
-If the second answer is still invalid, the backend serves 503 and stores
+If the second answer is still invalid, the world serves 503 and stores
 no page. Rendering preserves the accepted status, and the generation log
 keeps the raw answer.
 
-The backend is split by job: `seed.py` reads seeds, `llm.py` calls the model
-APIs, `prompts.py` says what is asked and reads the answers, `generate.py`
-and `stub.py` are the two generators, `world.py` routes requests and holds
-the consistency rules, `store.py` keeps the files, `render.py` lays out
-pages and result lists, and `tells.py` finds what gives generated text away.
+The pages (`world/src/pages/`) are split by job: `seed.rs` reads seeds,
+`model.rs` calls the model APIs over the SDK's HTTP client, `prompts.rs`
+says what is asked and reads the answers, `make.rs` is the offline
+generator, `mod.rs` routes requests and holds the consistency rules,
+`store.rs` keeps what was made, `render.rs` lays out pages and result
+lists, and `text.rs` checks snippets and finds what gives generated text
+away.
 
-The store, under `/var/lib/adaptive-web/<seed>/`, is plain files named after
-the URLs, so a person can find a page by its URL:
+The store, under `/var/lib/adaptive-web/<seed>/`, is plain JSON, one line
+per thing made, so a person can find a page by searching for its URL:
 
 ```
-pages/www.halvardsystems.com/support/@page.json       a page: body, title, claims, model, time, cost, context
-pages/www.halvardsystems.com/support/@mentions.json   the results and links that pointed at it
-pages/www.halvardsystems.com/@site.json               the host's name, kind, navigation and footer
-searches/halvard%20gateway%20vulnerability/@search.json
-@cast.json            the people pages name
-@store.json           format version, seed fingerprint and generator configuration
-claims.jsonl          every claim, with the page that made it
+store.json            format version, the seed's declaration and the generator
+world.jsonl           everything made, in order: pages (body, title, claims, model,
+                      time, cost, the mentions they were made from), result lists,
+                      mentions, the hosts' layouts and the cast
 generations.jsonl     model attempts, stub calls and prefetch error diagnostics
 addresses.jsonl       every pool address given out
+store.lock            held while a world checks or writes these files
+locks/                one file per page, result list and the cast, held while
+                      a world makes it
 ```
 
-Fixed page records use `body_base64` to preserve binary bytes as well as text.
+Several worlds can use one store at once, such as the epochs of an eval
+run. A world reads what the others wrote before it checks or writes, and
+the first world to ask for a page, a result list or the cast makes it while
+the others wait.
+
+A body that is not UTF-8, such as a binary fixed page, is kept as
+`{"base64": ...}`.
 
 Model attempts use `record: "attempt"`. Each row has one-based `ask` and
-`attempt` indices, monotonic `started` and `ended` seconds, call duration
+`attempt` indices, `started` and `ended` seconds on the run's clock, call duration
 `ms`, and the actual `backoff_ms` spent after it. Outcomes are `ok`,
 `http <code>`, `transport`, or `unreadable`. Rejected answers keep their raw
 text and reported usage. Exhausted retries and on-demand failures are
@@ -380,34 +380,24 @@ two). `call_ms` is the accepted answer's call time alone, or null on failure.
 `cost_known` is the reported subtotal and `cost_unknown` counts attempts
 without a reported cost. `cost`, `input_tokens` and `output_tokens` are
 null if any included value is unknown. Attempt rows keep individual costs;
-their terminal `generation` object holds totals. The backend accounting functions use
-these totals for generation statistics and count every attempt's cost once.
-They print a known subtotal, the number of unknown cost records, and a null
-recorded total if any cost is unknown. Cost means cover only fully known
-generation totals, with their denominator and unknown count shown. Token
-medians also state their measured denominator. Legacy rows are labelled:
-missing attempts and costs cannot be reconstructed from them. Their reported
-costs contribute to the known subtotal, but their generation cost and token
-totals remain unknown. Any legacy row makes the recorded cost total null.
+their terminal `generation` object holds totals.
 
 ## Speed and cost
 
 Time per run is often what limits an eval's size, so the world records it
 twice: `gen_ms`, elapsed time from the first HTTP attempt through reading
 the final answer, including backoff and re-asks, and `serve_ms`, how long
-the backend took to answer. This includes exceptions; transport failures
-measure time waiting for the backend. It does not measure delivery of the
-body to the agent. The demo's score counts every HTTP event as `requests`,
+the world took to answer, failures included. It does not measure delivery
+of the body to the agent. The demo's score counts every HTTP event as `requests`,
 with `timed`, `untimed` and `failed` counts. Serving p50 and p95 cover `timed`
 requests, including timed failures. `failed` counts status 500 and above or
 an error kind; it does not classify every client error as a server failure.
 Generation percentiles cover the `generated` measured totals carried by
 HTTP responses, including failed generations. `generation_untimed` and
 `generation_failed` show the other counts in that population. The score
-does not include casts or prefetches absent from HTTP responses; the store
-reports include them. The accounting functions report timed, untimed and failed generation
-counts, and p50/p95 over timed generations. Each attempt's `ms` remains its
-individual HTTP call duration, excluding backoff.
+does not include casts or prefetches absent from HTTP responses;
+`generations.jsonl` records them. Each attempt's `ms` remains its individual
+HTTP call duration, excluding backoff.
 
 Four fast models, each making the result lists for the seeds' six queries
 and the twelve or so pages behind their first results, one at a time with no
@@ -432,7 +422,7 @@ the answers came back empty.
 
 Prefetch hides most of the rest. In the agent runs below, a page the world
 had made ahead of time was served in 0.1 to 0.3 s, and the median recorded
-backend wait was 1.6 s to 3.9 s among timed successful requests. These
+serving time was 1.6 s to 3.9 s among timed successful requests. These
 historical figures omit exception and transport failures. A warm demo run,
 three seeds in parallel, took 38 s to 81 s; this excludes image building and
 dependency setup.
@@ -467,8 +457,6 @@ matched, and finding half the pieces was enough. These counts do not measure
 support under the current rule. A stricter check, run on the same pages
 before the rule was relaxed, flagged 6 of 12 Gemini pages and 6 of 12
 Haiku 4.5 pages, versus the published 0 and 2.
-The backend's `adaptive.world.rescore_snippets` recomputes support from each
-stored page's `context.mentions` and body without changing the stored page.
 
 The historical judge counts used the first character of the judge's
 `written_by_ai` value after trimming whitespace and ignoring case. An
@@ -580,25 +568,25 @@ is a fresh world that serves the stored pages. It needs no network and no key.
 This includes fixed URLs: replay serves their retained bytes, without
 opening the source files. An unfetched fixed URL is still missing.
 
-The store checks a versioned identity at startup. The seed fingerprint
-covers the parsed date, question, scenario, facts, sites, addresses and
-fixed-page declarations, including titles, content types and relative file
-names. It excludes the installation directory and fixed file bytes. Those
-bytes belong to the response captured on first use. Give the seed an explicit
-date when retaining a run; the default date changes each day.
+The store checks its identity at startup: its format version and the seed's
+declaration, as `store.json` keeps them. The declaration covers the parsed
+date, question, scenario, facts, sites, addresses and fixed-page
+declarations, including titles, content types and relative file names. It
+excludes the installation directory and fixed file bytes. Those bytes belong
+to the response captured on first use. Give the seed an explicit date when
+retaining a run; the default date changes each day.
 
 Continuing generation also requires the same provider, model and reasoning
 setting. Replay uses the retained generator identity and needs no provider
 credentials. Prefetch and generation limits can change between runs.
 
-An incompatible or unversioned store is rejected. Old fixed records kept
-only metadata, so they cannot prove what bytes were served. They are never
-silently filled from today's source files. To rebuild, choose a new empty
-`ADAPTIVE_WEB_STORE_DIR` and run with a generator such as `stub`. Direct
-backend users choose a new `ADAPTIVE_WEB_STORE` instead. Keep the old store
-and its judgments for audit. Rebuilding creates a new snapshot; it does not
-recover historical responses or validate published realism scores. Replay
-requires a store initialized by a generator.
+An incompatible store is rejected, and so is a directory that holds files
+of another kind of store. To rebuild, choose a new empty
+`ADAPTIVE_WEB_STORE_DIR` and run with a generator such as `stub`; running the
+world directly, choose a new `ADAPTIVE_WEB_STORE`. Keep the old store and its
+judgments for audit. Rebuilding creates a new snapshot; it does not recover
+historical responses or validate published realism scores. Replay requires
+a store a generator made.
 
 ```bash
 export ADAPTIVE_WEB_STORE_DIR=$PWD/store
@@ -649,29 +637,25 @@ or `missing` cache states fail the inventory check.
 
 ## Tests
 
-* `cargo test --locked --manifest-path examples/adaptive-web/world/Cargo.toml` runs the world end to end
-  with the Python stub and with the Rust stub, and compares both logs with
-  the same recorded one (`tests/golden/`). It also checks that every result
+* `cargo test --locked -p adaptive-web-world` runs the world end to end
+  with the offline generator on a fresh store, and compares its log with
+  the recorded one (`tests/golden/`). It also checks that every result
   resolves to a page with its title, that URLs return the same bytes, and
   that responses and certificates are dated from the seed's day.
-  `tests/parity.rs` sends the same requests to a fresh Python stub and the
-  Rust stub for each seed and compares status, headers, bodies and
-  metadata, including the generation budget. `tests/lab.rs` runs the Rust
-  stub world twice in a lab run, with no real I/O, and checks that the
-  events and the search projection are the same. Other tests check that
-  missing or malformed backend metadata returns 502 and records
-  `meta_error`, and each reason a search can fail.
+  `tests/lab.rs` runs the world twice in a lab run, with no real I/O, and
+  checks that the events and the search projection are the same, and that
+  the generation budget ends in `query_failed`. The pages' own tests
+  (`src/pages/tests.rs`) check the consistency rules, a search and a page
+  racing for one URL's title, the store across restarts and replay, its
+  identity checks, reading model answers, the ledger of every model
+  attempt, and the model generator against a scripted model API,
+  including that the key is never stored or included in an error.
+  `tests/model.rs` runs the model client over HTTP on 127.0.0.1. A key
+  with characters outside printable ASCII (0x21-0x7E) is rejected at
+  startup, before any request.
 * `uv run --project python/inspect_fictionet --locked pytest python/inspect_fictionet/tests/adaptive_web`
   checks citation identity, complete delivery, checked preflights and probe
   diagnostics, request multiplicity and cache sequences. It needs no Docker.
-* From `examples/adaptive-web/world/backend`,
-  `uv run --project ../../../../python/inspect_fictionet --locked python -m pytest tests` runs the
-  backend's tests: the consistency rules, the make-once store across
-  threads and processes, replay, reading model answers, the tells, and the
-  model generator against a fake OpenRouter on 127.0.0.1, including that
-  the key is never stored or included in an error. A key with characters
-  outside printable ASCII (0x21-0x7E) is rejected at startup, before any
-  request, with exit status 2.
 
 ## Layout
 
@@ -682,20 +666,17 @@ examples/adaptive-web/
   seeds/                    # the seeds, and fixed/ pages they serve
   world/                    # the world: its own Cargo package
     src/lib.rs              # names, addresses, dates, certificates, Sites
-    src/backend.rs          # shared handler for Python and Rust page sources
-    src/stub/               # embedded seeds, in-memory store, generator, layouts, text helpers
+    src/handler.rs          # every site's handler: routing, search facts, event fields
+    src/pages/              # seeds, store, generators, model calls, prompts, layouts, checks
     src/route.rs            # search routing and query keys
     src/search.rs           # bounded search and page projection
     src/events.rs           # the log, written from the network's events
-    src/main.rs             # start-up, state.json, the ready file
-    tests/golden.rs         # both sources against tests/golden/ and projection assertions
-    tests/parity.rs         # byte and metadata parity with the Python stub
-    tests/lab.rs            # Rust-only world and budget failures without real I/O
-    backend/backend.py      # the HTTP server on 127.0.0.1
-    backend/adaptive/       # seed, llm, prompts, generate, stub, world, store, render, tells, ca
-    backend/tests/          # the backend's tests
+    src/main.rs             # start-up from the environment, state.json, the ready file
+    tests/golden.rs         # the world against tests/golden/ and projection assertions
+    tests/lab.rs            # the world and its budget without real I/O
+    tests/model.rs          # the model client over HTTP
 python/inspect_fictionet/
-  src/inspect_fictionet/worlds/adaptive_web/  # task, scorer and realism judge
+  src/inspect_fictionet/worlds/adaptive_web/  # task, scorer, timing populations and realism judge
   tests/adaptive_web/                        # scorer tests and scripted probes
 ```
 
@@ -703,10 +684,11 @@ python/inspect_fictionet/
 
 * **The agent waits while a new page is made**, 3 to 4 s with the default
   model, unless it was made ahead of time. Clients with short timeouts can
-  give up first; the page is still stored for the next request. Each backend
-  run allows 200 new generator calls, including searches, pages, prefetches
+  give up first; the page is still stored for the next request. Each world
+  run allows 200 new generations, including searches, pages, prefetches
   and the cast. Failed calls use the budget too. Further generation returns
-  HTTP 503; cached and fixed pages remain available. Retained stores are
+  nginx's plain 503 page, and the log line says `budget`. Cached and fixed
+  pages remain available. Retained stores are
   intended for short demos.
 * **A judge that knows to look can usually tell.** In the realism runs the
   judge found the made page in 66% to 86% of pairs, depending on the model.

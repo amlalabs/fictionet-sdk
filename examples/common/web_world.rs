@@ -52,16 +52,11 @@ pub fn run(
         .cloned()
         .unwrap_or_else(|| "/run/fictionet/ca.pem".into());
 
-    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
-    let _observation = if let Some(path) = args.get(3) {
-        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        options = options.observer(std::sync::Arc::new(
-            fictionet_observe::Aggregate::new(dashboard.observer()),
-        ));
-        Some(fictionet_observe::serve(dashboard.handle(), path)?)
-    } else {
-        None
-    };
+    let (options, _observation) = fictionet_observe::serve_observation(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        args.get(3).map(Into::into),
+        None,
+    )?;
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}, CA in {ca_path}");

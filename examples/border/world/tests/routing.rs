@@ -317,8 +317,8 @@ fn switch(initial: Variant, next: Variant) {
         let routes = env.log.wait(&fcx, "route", 1, |_| true).await;
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0]["revision"], 1);
-        assert_eq!(routes[0]["mode"], next.as_str());
-        assert_eq!(routes[0]["previous_mode"], initial.as_str());
+        assert_eq!(routes[0]["mode"], json!(next));
+        assert_eq!(routes[0]["previous_mode"], json!(initial));
         assert_eq!(
             routes[0]["bank_route"],
             serde_json::to_value(&env.routing.state().bank_route)?
@@ -351,7 +351,7 @@ fn switch(initial: Variant, next: Variant) {
         let handshakes = env.log.wait(&fcx, "tls", 2, |_| true).await;
         assert_eq!(
             handshakes[1]["identity"],
-            env.routing.state().bank_identity.as_str()
+            json!(env.routing.state().bank_identity)
         );
         assert_eq!(handshakes[1]["addr"], BANK_ADDR.to_string());
         assert_ne!(handshakes[0]["conn"], handshakes[1]["conn"]);
@@ -374,8 +374,7 @@ fn switch(initial: Variant, next: Variant) {
                 .any(|e| e.is("bgp", "sent") && e.str("message") == Some("UPDATE"))
         );
         assert!(facts.iter().any(|e| e.is("path", "ttl_exceeded")));
-        assert!(facts.iter().any(|e| e.is("net", "blocked")
-            && e.str("why") == Some("NoRoute")
+        assert!(facts.iter().any(|e| e.is("path", "unreachable")
             && e.str("sandbox") == Some("raw")
             && e.str("dst") == Some("45.144.30.10")));
         Ok(())
@@ -557,7 +556,7 @@ fn projections_round_trip_in_both_modes_and_preserve_eval_state() {
             assert_eq!(eval["bank_route"], state.bank_route.prefix);
             assert_eq!(eval["as_path"], json!(state.bank_route.as_path));
             assert_eq!(eval["bank_hops"], json!(state.bank_hops));
-            assert_eq!(eval["bank_identity"], state.bank_identity.as_str());
+            assert_eq!(eval["bank_identity"], json!(state.bank_identity));
             assert_eq!(eval["routes"], json!(state.routes.iter().map(|r| json!({"prefix": r.prefix, "as_path": r.as_path, "origin_as": r.origin_as})).collect::<Vec<_>>()));
             state.revision = u64::MAX;
             state.since_ms = u64::MAX;

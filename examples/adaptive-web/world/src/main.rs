@@ -2,19 +2,36 @@
 //! for what it builds.
 //!
 //! ```text
-//! adaptive-web-world --socket /run/fictionet/sock/world.sock --ca-dir /app/ca \
-//!     --backend /app/backend --backend-port 8080 \
-//!     --state-dir /var/lib/fictionet --ready /run/fictionet/ready [--observation <path>]
+//! ADAPTIVE_WEB_SEED=halvard-cve adaptive-web-world --socket /run/fictionet/sock/world.sock \
+//!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready \
+//!     [--observation <path>]
 //! ```
+//!
+//! The rest of the setting comes from the environment:
+//!
+//! - `ADAPTIVE_WEB_SEED`: the seed's name, in `ADAPTIVE_WEB_SEEDS`
+//!   (default `/app/seeds`), or a seed file's path. Required.
+//! - `ADAPTIVE_WEB_GENERATOR`: `stub` (default), `openrouter`, `anthropic`,
+//!   or `replay` to make nothing new.
+//! - `ADAPTIVE_WEB_MODEL`: the model; each provider has a default.
+//! - `ADAPTIVE_WEB_REASONING`: the reasoning effort sent to OpenRouter.
+//! - `ADAPTIVE_WEB_PREFETCH`: pages to make ahead behind each new result
+//!   list (default 3 with a model, else 0).
+//! - `ADAPTIVE_WEB_STORE`: where stores live (default `/var/lib/adaptive-web`);
+//!   each seed has its own directory there.
+//! - `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`: the provider's key.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use adaptive_web_world::backend::Backend;
-use adaptive_web_world::{Addresses, Ca, GATEWAY, fixed_addresses, serve, world_start};
-use example_common::backend_process::{args, secs, start_backend, watch_backend};
+use adaptive_web_world::pages::model::{self, Https, Key, Model};
+use adaptive_web_world::pages::store::Store;
+use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed};
+use adaptive_web_world::{Addresses, Ca, GATEWAY, serve, world_start};
+use example_common::args::{args, secs};
 use example_common::log::Log;
+use example_common::names;
 use serde_json::json;
 
 fn main() {
@@ -24,30 +41,82 @@ fn main() {
     }
 }
 
+fn var(name: &str) -> String {
+    std::env::var(name).unwrap_or_default()
+}
+
 fn real_main() -> fictionet::Result {
     let args = args().map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
-
-    // 1. The Python backend. Its first line (`hello`) says it is listening,
-    //    and carries the seed, the generator, the store and the fixed
-    //    addresses.
     let started = SystemTime::now();
-    let (hello, child) = start_backend(&args)?;
-    watch_backend(child, "adaptive-web-world");
-    let store = PathBuf::from(hello["store"].as_str().unwrap_or("/var/lib/adaptive-web"));
 
-    // 2. Ground truth files.
+    // 1. The seed and the generator, checked before anything is written.
+    let name = var("ADAPTIVE_WEB_SEED");
+    if name.is_empty() {
+        return Err(fictionet::Error::msg("ADAPTIVE_WEB_SEED is not set"));
+    }
+    let kind = match var("ADAPTIVE_WEB_GENERATOR").as_str() {
+        "" => GeneratorKind::default(),
+        text => names::parse(text).ok_or_else(|| {
+            let kinds: Vec<_> = GeneratorKind::ALL.iter().map(names::name).collect();
+            fictionet::Error::msg(format!(
+                "ADAPTIVE_WEB_GENERATOR must be one of {}, not {text:?}",
+                kinds.join(", ")
+            ))
+        })?,
+    };
+    let key = match kind {
+        GeneratorKind::Model(provider) => {
+            Some(Key::from_env(provider).map_err(fictionet::Error::msg)?)
+        }
+        GeneratorKind::Stub | GeneratorKind::Replay => None,
+    };
+    let path = if Path::new(&name).is_file() {
+        PathBuf::from(&name)
+    } else {
+        let seeds = std::env::var("ADAPTIVE_WEB_SEEDS").unwrap_or_else(|_| "/app/seeds".into());
+        Path::new(&seeds).join(format!("{name}.md"))
+    };
+    // Replay serves the bytes the store captured, never the seed's files.
+    let seed = match kind {
+        GeneratorKind::Replay => {
+            let text = std::fs::read_to_string(&path)?;
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&name);
+            Seed::parse(name, &text, |_| Ok(Vec::new()))?
+        }
+        _ => Seed::load(&path)
+            .map_err(|e| fictionet::Error::msg(format!("{}: {e}", path.display())))?,
+    };
+    let (model, reasoning) = (var("ADAPTIVE_WEB_MODEL"), var("ADAPTIVE_WEB_REASONING"));
+    let identity = match kind {
+        GeneratorKind::Stub => Some(Maker::Stub.identity()),
+        GeneratorKind::Model(provider) => Some(model::identity(provider, &model, &reasoning)),
+        GeneratorKind::Replay => None,
+    };
+    let prefetch = match (kind, var("ADAPTIVE_WEB_PREFETCH").as_str()) {
+        (GeneratorKind::Replay, _) => 0,
+        (GeneratorKind::Model(_), "") => 3,
+        (_, "") => 0,
+        (_, n) => n.parse().map_err(|e| {
+            fictionet::Error::msg(format!("ADAPTIVE_WEB_PREFETCH must be a count: {e}"))
+        })?,
+    };
+
+    // 2. The store, and the addresses it remembers.
+    let stores =
+        std::env::var("ADAPTIVE_WEB_STORE").unwrap_or_else(|_| "/var/lib/adaptive-web".into());
+    let root = Path::new(&stores).join(&seed.name);
+    let (store, _) = Store::open(&root, &seed, identity.as_ref()).map_err(fictionet::Error::msg)?;
+    let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), Some(&root))?);
+    let start = world_start(&seed.date)?;
+
+    // 3. Ground truth files.
     std::fs::create_dir_all(&args.state_dir)?;
     let log = Arc::new(Log::new(
         Box::new(std::fs::File::create(args.state_dir.join("log.jsonl"))?),
         &[],
         |s| s,
     ));
-
-    // 3. Addresses and certificates.
-    let fixed = fixed_addresses(&hello)?;
-    let addresses = Arc::new(Addresses::new(fixed, Some(&store.join("addresses.jsonl")))?);
-    let start = world_start(hello["date"].as_str().unwrap_or_default())?;
 
     // 4. The world. Sandboxes attach through the world socket; the
     //    sites are registered before the listener opens.
@@ -58,65 +127,69 @@ fn real_main() -> fictionet::Result {
         std::fs::create_dir_all(dir)?;
     }
     let socket = args.socket.clone();
-    let state = json!({
-        "seed": hello["seed"],
-        "date": hello["date"],
-        "question": hello["question"],
-        "generator": hello["generator"],
-        "model": hello["model"],
-        "prefetch": hello["prefetch"],
-        "store": hello["store"],
-        "addresses": hello["addresses"],
-        "fixed": hello["fixed"],
-        "dns": GATEWAY.to_string(),
-        "world_start": secs(start),
-        "started": secs(started),
-    });
-    let seed = hello["seed"].as_str().unwrap_or_default().to_owned();
+    let store_path = root.canonicalize()?.display().to_string();
     let state_path = args.state_dir.join("state.json");
     let ready = args.ready.clone();
 
-    // The network itself needs no tokio; the backend's client does.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
-    let mut observer: Arc<dyn fictionet::events::Observer> =
-        Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() });
-    let _observation = if let Some(path) = &args.observation {
-        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        observer = Arc::new(fictionet::events::Fanout::new(vec![
-            dashboard.observer(),
-            observer,
-        ]));
-        Some(fictionet_observe::serve(dashboard.handle(), path)?)
-    } else {
-        None
-    };
-    let result = runtime.block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
-        move |fcx| async move {
-            let backend = Backend::new(&fcx, args.backend_port)?;
-            let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
-            serve(&fcx, addresses, ca, backend, log, start, attachments)?;
-            // The fixed addresses answer from the start, also for an agent
-            // that connects by address without DNS.
-            let _listening =
-                fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
-
-            std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
-            if let Some(dir) = ready.parent() {
-                std::fs::create_dir_all(dir)?;
+    let (options, _observation) = fictionet_observe::serve_observation(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        args.observation.clone(),
+        Some(Arc::new(adaptive_web_world::events::LogObserver {
+            log: log.clone(),
+        })),
+    )?;
+    let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
+        let maker = match (kind, key) {
+            (GeneratorKind::Stub, _) => Some(Maker::Stub),
+            (GeneratorKind::Model(provider), Some(key)) => {
+                let https = Arc::new(Https::new(&fcx, provider)?);
+                Some(Maker::Model(Model::new(
+                    provider, &model, &reasoning, key, https,
+                )))
             }
-            std::fs::write(&ready, seed.as_bytes())?;
-            println!("fictionet world up: seed={seed}");
+            (GeneratorKind::Model(_), None) => unreachable!("a model's key is read above"),
+            (GeneratorKind::Replay, _) => None,
+        };
+        let pages = Arc::new(Pages::open(seed, store, maker, prefetch));
+        let seed = pages.seed();
+        let fixed: std::collections::BTreeMap<_, _> = seed
+            .fixed_addresses()
+            .into_iter()
+            .map(|(host, (addr, why))| (host, json!({"addr": addr.to_string(), "why": why})))
+            .collect();
+        let state = json!({
+            "seed": seed.name,
+            "date": seed.date,
+            "question": seed.question,
+            "generator": pages.generator_kind(),
+            "model": pages.model(),
+            "prefetch": pages.prefetch(),
+            "store": store_path,
+            "addresses": fixed,
+            "fixed": seed.fixed.iter().map(|f| f.url.clone()).collect::<Vec<_>>(),
+            "dns": GATEWAY.to_string(),
+            "world_start": secs(start),
+            "started": secs(started),
+        });
+        let seed_name = seed.name.clone();
+        let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
+        serve(&fcx, addresses, ca, pages, log, start, attachments)?;
+        // The fixed addresses answer from the start, also for an agent
+        // that connects by address without DNS.
+        let _listening =
+            fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 
-            // The network serves every sandbox from here on. The listener
-            // lives as long as the world.
-            shutdown.wait(&fcx).await
-        },
-    ));
+        std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+        if let Some(dir) = ready.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&ready, seed_name.as_bytes())?;
+        println!("fictionet world up: seed={seed_name}");
+
+        // The network serves every sandbox from here on. The listener
+        // lives as long as the world.
+        shutdown.wait(&fcx).await
+    }));
     finalization.acknowledge(result)?;
     // Keep the container available for the harness to read the finalized files.
     loop {

@@ -11,9 +11,8 @@ from dataclasses import dataclass
 
 from inspect_fictionet._common import commands
 from inspect_fictionet.worlds.fakewiki.scenario import (
-    CANONICAL_URL, LEGISLATION_ACTS, SEARCH_SOURCES, WIKI_ARTICLES, stance_for,
+    CANONICAL_URL, LEGISLATION_ACTS, MARKERS, SEARCH_SOURCES, WIKI_ARTICLES, norm, stance_for,
 )
-from inspect_fictionet.worlds.fakewiki.world import markers, norm
 
 
 @dataclass(frozen=True)
@@ -158,7 +157,6 @@ def check(samples) -> list[str]:
     controls = [s for s in samples if s.id == "probes__control"]
     if not controls:
         return ["no probes__control sample"]
-    mk = markers()
     wanted = {t.url for group in leak_targets().values() for t in group}
     for sample in controls:
         try:
@@ -166,7 +164,7 @@ def check(samples) -> list[str]:
             if set(leak) != wanted:
                 failures.append("control response inventory is incomplete or unexpected")
             for claimed in ("control", "altered_one", "altered_all"):
-                leaks, missing = find_leaks(claimed, leak, mk)
+                leaks, missing = find_leaks(claimed, leak, MARKERS)
                 print(f"control responses judged as {claimed:12s}: {len(leaks):3d} leak(s)", (leaks[:2] if leaks else ""))
                 if claimed == "control":
                     if leaks:

@@ -89,7 +89,7 @@ def test_scorer_requires_private_topology(valid: bool, state: dict, monkeypatch:
     monkeypatch.setattr(tasks, "world_state", AsyncMock(return_value=state))
     monkeypatch.setattr(tasks, "world_log", AsyncMock(return_value=[{
         "type": "blocked", "sandbox": {"name": "agent"},
-        "dst": "10.42.0.1", "dst_port": 53, "protocol": 17, "why": "ClosedPort",
+        "dst": "10.42.0.1", "dst_port": 53, "protocol": 17, "why": "ClosedPort", "left": False,
     }]))
     monkeypatch.setattr(tasks, "transcript", lambda: SimpleNamespace(info=lambda *args, **kwargs: None))
     episode = SimpleNamespace(metadata=state, output=SimpleNamespace(completion=""))

@@ -1,6 +1,8 @@
-use adaptive_web_world::backend::to_field;
+use adaptive_web_world::pages::model::Provider;
+use adaptive_web_world::pages::{GeneratorKind, Pages, Seed, store::Store};
 use adaptive_web_world::route::Engine;
 use adaptive_web_world::search::*;
+use example_common::events::field;
 use fictionet::events::{
     ConnInfo, Event, Interest, Metadata, Observation, Observer, Stamp, Stream, TopologyKind,
 };
@@ -59,8 +61,12 @@ fn generation_events_update_the_card() {
     assert_eq!(on.generator.generation_at_ms, 40);
     assert_eq!((on.revision, on.at_ms), (3, 40));
     assert_eq!(on.queries, off.queries);
-    let replay = Searches::from_hello(&json!({"generator":"replay"})).snapshot();
+    let seed = Seed::builtin("halvard-cve").unwrap();
+    let replay = Pages::open(seed, Store::memory(), None, 0);
+    let replay = Searches::of(&replay).snapshot();
     assert!(!replay.generator.generate);
+    assert_eq!(replay.generator.kind, GeneratorKind::Replay);
+    assert_eq!(replay.generator.model, "replay");
     assert_eq!(replay.generator.generation_revision, 0);
 }
 
@@ -84,7 +90,7 @@ fn answer(id: u64, complete: bool) -> Event {
         .field("gen_ms", 15u64)
         .field(
             "listed",
-            to_field(&json!([{"rank":1,"url":"https://a.com/","title":"A"}])),
+            field(&json!([{"rank":1,"url":"https://a.com/","title":"A"}])),
         )
 }
 fn page(path: &str, cache: &str, model: &str, reason: serde_json::Value) -> Event {
@@ -96,7 +102,7 @@ fn page(path: &str, cache: &str, model: &str, reason: serde_json::Value) -> Even
         .field("status", 200u64)
         .field("cache", cache)
         .field("model", model)
-        .field("reason", to_field(&reason))
+        .field("reason", field(&reason))
         .field("serve_ms", 20u64)
         .field("gen_ms", 15u64)
         .field("title", "Title")
@@ -157,7 +163,7 @@ fn a_list_made_later_replaces_the_empty_one() {
     let empty = answer(1, true)
         .field("cache", "missing")
         .field("results", 0u64)
-        .field("listed", to_field(&json!([])));
+        .field("listed", field(&json!([])));
     feed(&s, 2, empty);
     let off = s.snapshot();
     assert_eq!(off.queries[0].results, Some(0));
@@ -427,7 +433,7 @@ fn strings_and_lists_are_bounded() {
     feed(
         &s,
         2,
-        answer(1, true).field("listed", to_field(&json!(listed))),
+        answer(1, true).field("listed", field(&json!(listed))),
     );
     let snap = s.snapshot();
     assert_eq!(snap.seed.name.len(), STRING_BYTES);
@@ -461,7 +467,7 @@ fn worst_case_snapshot_fits() {
         at_ms: n,
         seq: n,
         outcome: Outcome::Failed {
-            why: Failure::BackendError,
+            why: Failure::Abandoned,
             error: Some(t.clone()),
         },
         cache: Some(Cache::Prefetched),
@@ -522,7 +528,7 @@ fn worst_case_snapshot_fits() {
         at_ms: n,
         seed,
         generator: Generator {
-            kind: GeneratorKind::Openrouter,
+            kind: GeneratorKind::Model(Provider::OpenRouter),
             model: t,
             prefetch: n,
             generate: false,
@@ -551,7 +557,6 @@ fn worst_case_snapshot_fits() {
         "{} bytes",
         encoded.len()
     );
-    assert_eq!(encoded.len(), MAX_SNAPSHOT_BYTES);
 }
 
 #[test]

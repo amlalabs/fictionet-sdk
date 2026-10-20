@@ -13,21 +13,24 @@
 //! counted lines pass through without further folding. Open folds are bounded
 //! and flushed early if full.
 
-use crate::events;
+use crate::{ServedNames, events};
 use fictionet::{Cx, events::Event};
 use serde_json::{Value, json};
 use std::io::Write;
+use std::sync::{Arc, OnceLock};
 const FOLDED: &[&str] = &["blocked"];
 #[derive(Clone)]
 /// A handle for the world's JSON Lines log.
 pub struct Log {
     inner: example_common::log::Log,
+    names: Arc<OnceLock<ServedNames>>,
 }
 impl Log {
     /// Prepares the output. Call `attach` before writing.
     pub fn start(out: Box<dyn Write + Send>) -> std::io::Result<Self> {
         Ok(Self {
             inner: example_common::log::Log::new(out, FOLDED, transform),
+            names: Arc::default(),
         })
     }
     /// Prepares the trusted harness's shutdown request and acknowledgement.
@@ -37,9 +40,11 @@ impl Log {
     ) -> std::io::Result<example_common::log::Finalization> {
         self.inner.finalization(directory)
     }
-    /// Attaches the output to the run's lifetime.
-    pub fn attach(&self, fcx: &Cx) {
+    /// Attaches the output to the run's lifetime. Lines judge whether an
+    /// attempt left the repository against the world's `names`.
+    pub fn attach(&self, fcx: &Cx, names: ServedNames) {
         self.inner.attach(fcx);
+        self.names.set(names).expect("log attached once");
     }
     /// Drains the log after the run and reports output errors.
     pub fn finish(&self) -> std::io::Result<()> {
@@ -47,7 +52,8 @@ impl Log {
     }
     /// Converts a network event to a log line when it is relevant.
     pub fn entry(&self, entry: &Event) {
-        if let Some(line) = events::line(entry) {
+        let names = self.names.get().expect("log attached to a run");
+        if let Some(line) = events::line(entry, names) {
             self.line(line);
         }
     }
@@ -132,7 +138,7 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(aggregate),
             |cx| async move {
-                log.attach(&cx);
+                log.attach(&cx, ServedNames::default());
                 let open = Arc::new(AtomicUsize::new(0));
                 for (id, port) in [53, 80, 53, 53, 80, 80].into_iter().enumerate() {
                     let conn = ConnInfo::new(
@@ -169,7 +175,7 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             |cx| {
-                log.attach(&cx);
+                log.attach(&cx, ServedNames::default());
                 fictionet::events::Observer::lost(
                     &log,
                     fictionet::events::Loss {

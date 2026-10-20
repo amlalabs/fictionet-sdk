@@ -1,9 +1,10 @@
-//! The entire Rust stub world runs without Python, sockets or files.
+//! The whole world, with its offline generator, runs in a lab: no sockets
+//! or files.
 use adaptive_web_world::{
-    Addresses, Ca, Pages,
+    Addresses, Ca,
+    pages::{Pages, Seed, render::google_results, text::target_of},
     search::Searches,
     serve,
-    stub::{Seed, Stub, text::target_of},
 };
 use fictionet::{
     Cx,
@@ -49,19 +50,14 @@ async fn fetch(cx: &Cx, m: &Machine, host: &str, path: &str, start: SystemTime) 
         http1::Request::parse(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
             .unwrap();
     let response = sandbox::request(cx, &mut conn, &request).await.unwrap();
-    assert!(
-        !response
-            .head
-            .headers
-            .iter()
-            .any(|h| h.name.eq_ignore_ascii_case("x-adaptive-meta"))
-    );
     (response.head.status, response.body)
 }
 fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
     let events = Arc::new(Memory::default());
     let seed = Seed::builtin("halvard-cve").unwrap();
-    let searches = Arc::new(Searches::from_seed(&seed));
+    let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None).unwrap());
+    let pages = Arc::new(Pages::new(seed));
+    let searches = Arc::new(Searches::of(&pages));
     let log = Arc::new(example_common::log::Log::new(
         Box::new(std::io::sink()),
         &[],
@@ -82,33 +78,19 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
                     .midnight()
                     .assume_utc(),
             );
-            let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
             let ca = Arc::new(Ca::in_memory(&cx, start)?);
-            let stub = Arc::new(Stub::new(seed));
             if exhaust {
+                // The cast and 199 pages spend the 200 generations.
                 for n in 0..199 {
-                    assert_eq!(
-                        stub.handle(&cx, "GET", "budget.io", &format!("/{n}.txt"), None)
-                            .status,
-                        200
-                    );
+                    let target = format!("/{n}.txt");
+                    let page = pages.handle(&cx, "GET", "budget.io", &target, None);
+                    assert_eq!(page.await.status, 200);
                 }
-                assert_eq!(
-                    stub.handle(&cx, "GET", "budget.io", "/last.txt", None)
-                        .status,
-                    503
-                );
+                let last = pages.handle(&cx, "GET", "budget.io", "/last.txt", None);
+                assert_eq!(last.await.status, 503);
             }
             let (attacher, attachments) = fictionet::attachments();
-            serve(
-                &cx,
-                addresses,
-                ca,
-                Pages::Stub(stub),
-                log,
-                start,
-                attachments,
-            )?;
+            serve(&cx, addresses, ca, pages, log, start, attachments)?;
             let m = machine(&cx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
             let (status, body) = fetch(
                 &cx,
@@ -119,18 +101,16 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
             )
             .await;
             if exhaust {
+                // A busy server's plain page; the log says why.
                 assert_eq!(status, 503);
-                assert_eq!(body, b"Generation budget exhausted");
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                assert!(body.contains("<h1>503 Service Temporarily Unavailable</h1>"));
+                assert!(!body.to_lowercase().contains("generat"));
             } else {
                 assert_eq!(status, 200);
-                let html = std::str::from_utf8(&body).unwrap();
-                let urls: Vec<_> = html
-                    .split(r#"<div class="yuRUbf"><a href=""#)
-                    .skip(1)
-                    .map(|p| adaptive_web_world::stub::text::unescape(p.split('"').next().unwrap()))
-                    .collect();
-                assert_eq!(urls.len(), 10);
-                for url in urls {
+                let results = google_results(std::str::from_utf8(&body).unwrap());
+                assert_eq!(results.len(), 10);
+                for (url, _) in results {
                     let (host, target) = target_of(&url);
                     let (status, first) = fetch(&cx, &m, &host, &target, start).await;
                     assert_eq!(status, 200);
@@ -155,7 +135,7 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
             let fields: serde_json::Map<_, _> = e
                 .fields
                 .iter()
-                .map(|(k, v)| (k.to_owned(), adaptive_web_world::events::to_json(v)))
+                .map(|(k, v)| (k.to_owned(), example_common::events::js(Some(v))))
                 .collect();
             json!({"source":e.source,"kind":e.kind,"fields":fields})
         })
@@ -224,7 +204,7 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
                 &cx,
                 addresses,
                 ca,
-                Arc::new(Stub::new(seed)),
+                Arc::new(Pages::new(seed)),
                 log,
                 start,
                 move |name| {

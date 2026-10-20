@@ -1,7 +1,9 @@
-//! Deterministic search results, site profiles and page content.
+//! The offline generator: deterministic search results, site profiles and
+//! page content, with no model.
 
-use super::{Seed, seed::parse_date, text::*};
+use super::{Seed, prompts::expected_type, seed::parse_date, text::*};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::OnceLock;
 
@@ -69,7 +71,7 @@ const FILLER_SITES: [(&str, &str, &str); 12] = [
 ];
 
 /// One generated search result.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Result {
     /// Destination URL.
     pub url: String,
@@ -78,10 +80,11 @@ pub struct Result {
     /// Preview text shown below the title.
     pub snippet: String,
     /// Display date with an English month abbreviation.
+    #[serde(default)]
     pub date: String,
 }
 /// A sponsored search result.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Ad {
     /// Destination URL.
     pub url: String,
@@ -91,7 +94,7 @@ pub struct Ad {
     pub text: String,
 }
 /// Content shared by the search engine layouts.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Search {
     /// Results in ranking order.
     pub results: Vec<Result>,
@@ -103,7 +106,7 @@ pub struct Search {
     pub ads: Vec<Ad>,
 }
 /// Site branding and layout settings shared by its pages.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     /// Display name derived from the hostname.
     pub name: String,
@@ -139,6 +142,8 @@ pub struct Page {
     pub sidebar: Vec<(String, String)>,
     /// Advertisement text.
     pub ad: String,
+    /// How the generator describes the site, for a host's first page.
+    pub site: Option<Profile>,
 }
 
 /// Extracts lowercase search words, excluding common stop words.
@@ -346,37 +351,11 @@ pub fn title_from(host: &str, target: &str) -> String {
         .split(&last)
         .collect::<Vec<_>>()
         .join(" ");
-    let text = strip(&text);
+    let text = text.trim();
     if text.is_empty() {
         site_profile(host).name
     } else {
         upper_first(text)
-    }
-}
-/// Infers a non-HTML media type from the host and path.
-pub fn expected_type(url: &str) -> Option<&'static str> {
-    let (host, path, _) = split_url(url);
-    let path = path.to_lowercase();
-    if path.ends_with(".json")
-        || path.ends_with("/json")
-        || host.starts_with("api.")
-        || path.starts_with("/api/")
-    {
-        Some("application/json")
-    } else if [".xml", ".rss", "/feed", "/feed/"]
-        .iter()
-        .any(|ext| path.ends_with(ext))
-    {
-        Some("application/xml")
-    } else if [
-        ".txt", ".md", ".py", ".toml", ".cfg", ".yaml", ".yml", ".sh",
-    ]
-    .iter()
-    .any(|ext| path.ends_with(ext))
-    {
-        Some("text/plain")
-    } else {
-        None
     }
 }
 /// Makes page content from seed facts and prior mentions.
@@ -411,9 +390,13 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
     match expected_type(&url) {
         Some("application/json") => {
             page.content_type = "application/json".into();
-            page.body = json_pretty(
-                &serde_json::json!({"url":url,"title":title,"updated":seed.date,"items":claims}),
-            );
+            let body = serde_json::json!({
+                "url": url,
+                "title": title,
+                "updated": seed.date,
+                "items": claims,
+            });
+            page.body = serde_json::to_string_pretty(&body).expect("a JSON value");
             return page;
         }
         Some("text/plain") => {
@@ -457,7 +440,9 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
         .join("-");
     let slug = if slug.is_empty() { "update" } else { &slug };
     let links = format!(
-        "<li><a href=\"/{slug}-follow-up\">{}: follow-up</a></li><li><a href=\"/archive/2026/\">Archive: 2026</a></li><li><a href=\"https://en.wikipedia.org/wiki/{}\">{} on Wikipedia</a></li>",
+        "<li><a href=\"/{slug}-follow-up\">{}: follow-up</a></li>\
+        <li><a href=\"/archive/2026/\">Archive: 2026</a></li>\
+        <li><a href=\"https://en.wikipedia.org/wiki/{}\">{} on Wikipedia</a></li>",
         escape(&title),
         quote(&title.replace(' ', "_"), "/"),
         escape(&title)
@@ -501,7 +486,7 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], host_page
 mod tests {
     use super::*;
     #[test]
-    fn results_and_pages_follow_the_python_stub() {
+    fn results_and_pages() {
         let seed = Seed::builtin("halvard-cve").unwrap();
         let found = search(&seed, "halvard gateway vulnerability", &[]);
         assert_eq!(found.results.len(), 10);
@@ -520,9 +505,15 @@ mod tests {
             serde_json::json!({"via":"search","title":"Écho 😀","snippet":"Say \"hi\" & go."}),
         ];
         let p = page(&seed, "api.other.com", "/items.json", &mentions, 0);
+        assert_eq!(p.content_type, "application/json");
         assert_eq!(
-            p.body,
-            "{\n  \"url\": \"https://api.other.com/items.json\",\n  \"title\": \"\\u00c9cho \\ud83d\\ude00\",\n  \"updated\": \"2026-10-07\",\n  \"items\": [\n    \"Say \\\"hi\\\" & go.\"\n  ]\n}"
+            serde_json::from_str::<Value>(&p.body).unwrap(),
+            serde_json::json!({
+                "url": "https://api.other.com/items.json",
+                "title": "Écho 😀",
+                "updated": "2026-10-07",
+                "items": ["Say \"hi\" & go."],
+            })
         );
         assert_eq!(
             page(&seed, "other.com", "/items.txt", &mentions, 0).body,

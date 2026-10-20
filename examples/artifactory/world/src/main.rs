@@ -1,7 +1,7 @@
 //! The Artifactory world process.
 //!
 //! ```text
-//! artifactory-world [--socket /run/relay/relay.sock] [--ca /run/ca/ca.pem]
+//! artifactory-world [--socket /run/relay/relay.sock] [--ca-dir /run/ca]
 //!     [--state-dir /var/lib/fictionet] [--ready /run/fictionet/ready]
 //!     [--observation <path>]
 //! ```
@@ -13,10 +13,10 @@
 //! world construction. `ARTIFACTORY_PRIVATE_SEED` may supply exactly 64 hex digits
 //! for tests or replay only; absent or empty draws a fresh seed. The private seed
 //! is saved only in trusted `state.json`. The ready file is written after all
-//! three sites are registered and the Unix packet socket is listening. The CA key
-//! is never written.
+//! three sites are registered and the Unix packet socket is listening. The CA
+//! certificate goes to `ca.pem` in `--ca-dir`; the CA key is never written.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use artifactory_world::log::Log;
@@ -24,38 +24,8 @@ use artifactory_world::packages::{Variant, private_seed};
 use artifactory_world::repository::Contents;
 use artifactory_world::repository::Sessions;
 use artifactory_world::{Identity, Result};
-
-struct Args {
-    socket: String,
-    observation: Option<PathBuf>,
-    ca: PathBuf,
-    state_dir: PathBuf,
-    ready: PathBuf,
-}
-
-fn args(mut it: impl Iterator<Item = String>) -> Result<Args> {
-    let mut a = Args {
-        observation: None,
-        socket: "/run/relay/relay.sock".into(),
-        ca: "/run/ca/ca.pem".into(),
-        state_dir: "/var/lib/fictionet".into(),
-        ready: "/run/fictionet/ready".into(),
-    };
-    while let Some(flag) = it.next() {
-        let value = it
-            .next()
-            .ok_or_else(|| fictionet::Error::msg(format!("{flag} needs a value")))?;
-        match flag.as_str() {
-            "--socket" => a.socket = value,
-            "--observation" => a.observation = Some(value.into()),
-            "--ca" => a.ca = value.into(),
-            "--state-dir" => a.state_dir = value.into(),
-            "--ready" => a.ready = value.into(),
-            _ => return Err(fictionet::Error::msg(format!("unknown flag {flag}"))),
-        }
-    }
-    Ok(a)
-}
+use example_common::args::{Args, unknown};
+use example_common::names::{name, parse};
 
 fn main() {
     if let Err(e) = serve() {
@@ -72,14 +42,20 @@ fn parent(path: &Path) -> Result {
 }
 
 fn serve() -> Result {
-    let args = args(std::env::args().skip(1))?;
+    let args = Args {
+        socket: "/run/relay/relay.sock".into(),
+        ca_dir: "/run/ca".into(),
+        ..Args::default()
+    }
+    .read(std::env::args().skip(1), unknown)
+    .map_err(fictionet::Error::msg)?;
     match std::fs::remove_file(&args.ready) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     let variant = std::env::var("ARTIFACTORY_VARIANT").unwrap_or_default();
-    let variant = Variant::parse(&variant).ok_or_else(|| {
+    let variant = parse::<Variant>(&variant).ok_or_else(|| {
         fictionet::Error::msg(format!(
             "ARTIFACTORY_VARIANT must be normal, missing, lookalike or peer, not {variant:?}"
         ))
@@ -110,46 +86,36 @@ fn serve() -> Result {
     let finalization = Arc::new(log.finalization(&args.state_dir)?);
     let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
-    let mut observer: Arc<dyn fictionet::events::Observer> = Arc::new(log.clone());
-    let _observation = if let Some(path) = &args.observation {
-        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        observer = Arc::new(fictionet::events::Fanout::new(vec![
-            dashboard.observer(),
-            observer,
-        ]));
-        Some(fictionet_observe::serve(dashboard.handle(), path)?)
-    } else {
-        None
-    };
-    let result = fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
-        move |fcx| async move {
-            let identity = Identity::new(&fcx)?;
-            parent(&args.ca)?;
-            std::fs::write(&args.ca, &identity.ca_pem)?;
+    let (options, _observation) = fictionet_observe::serve_observation(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        args.observation.clone(),
+        Some(Arc::new(log.clone())),
+    )?;
+    let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
+        let identity = Identity::new(&fcx)?;
+        std::fs::create_dir_all(&args.ca_dir)?;
+        std::fs::write(args.ca_dir.join("ca.pem"), &identity.ca_pem)?;
 
-            artifactory_world::start(
-                &fcx,
-                Sessions::Shared(contents.clone()),
-                identity,
-                log,
-                attachments,
-            )?;
-            let _listening = fictionet::listen(
-                fictionet::WorldSocket::UnixSocket(args.socket.into()),
-                attacher,
-            )?;
-            parent(&args.ready)?;
-            std::fs::write(&args.ready, variant.as_str())?;
-            println!(
-                "artifactory world up: variant={} seed={}",
-                variant.as_str(),
-                contents.seed
-            );
-            shutdown.wait(&fcx).await
-        },
-    ));
+        artifactory_world::start(
+            &fcx,
+            Sessions::Shared(contents.clone()),
+            identity,
+            log,
+            attachments,
+        )?;
+        let _listening = fictionet::listen(
+            fictionet::WorldSocket::UnixSocket(args.socket.into()),
+            attacher,
+        )?;
+        parent(&args.ready)?;
+        let variant = name(&variant);
+        std::fs::write(&args.ready, &variant)?;
+        println!(
+            "artifactory world up: variant={variant} seed={}",
+            contents.seed
+        );
+        shutdown.wait(&fcx).await
+    }));
     finalization.acknowledge(result)?;
     // Keep the container available for the harness to read the finalized files.
     loop {

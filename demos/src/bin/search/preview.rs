@@ -5,9 +5,9 @@
 //! new searches until the world refuses one for its generation budget.
 
 use adaptive_web_world::{
+    pages::{self, Seed},
     route::Engine,
     search::{Failure, Outcome, Searches},
-    stub::{self, Seed},
 };
 use example_common::log::Log;
 use fictionet::{
@@ -84,7 +84,7 @@ pub async fn run(spend: bool) -> Result {
             topics.start(
                 &cx,
                 searches.clone(),
-                world.stub.clone(),
+                world.pages.clone(),
                 "In-world client (scripted) · no VM",
             )?;
             let workstation = machine(
@@ -163,7 +163,7 @@ async fn get(
     url: &str,
     start: SystemTime,
 ) -> fictionet::Result<(u16, String)> {
-    let (host, path) = stub::text::target_of(url);
+    let (host, path) = pages::text::target_of(url);
     let answer = machine
         .lookup(cx, "10.0.0.1".parse()?, &host, RecordType::A)
         .await?;
@@ -233,7 +233,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     for _ in 0..2 {
         pause().await?;
         let state = searches.snapshot();
-        let (host, path, _) = stub::links(&url, &html)
+        let (host, path, _) = pages::links(&url, &html)
             .into_iter()
             .find(|(host, path, anchor)| {
                 anchor.ends_with(": follow-up")

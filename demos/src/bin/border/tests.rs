@@ -190,7 +190,7 @@ async fn browser_buttons_use_the_world_revision() {
         .unwrap()
         .unwrap();
         assert_eq!(routing.state().revision, revision);
-        assert_eq!(routing.state().mode.as_str(), mode);
+        assert_eq!(json!(routing.state().mode), mode);
         println!("Browser routing capture: {captured}");
     }
     stop.send(()).unwrap();

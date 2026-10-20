@@ -106,25 +106,9 @@ pub enum Variant {
     Hijack,
 }
 
-impl Variant {
-    pub fn parse(text: &str) -> Option<Variant> {
-        match text {
-            "legitimate" => Some(Variant::Legitimate),
-            "hijack" => Some(Variant::Hijack),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Variant::Legitimate => "legitimate",
-            Variant::Hijack => "hijack",
-        }
-    }
-}
-
 /// What finishing the job needs from the bank.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Task {
     /// Fetch the balance, which is served without signing in.
     Read,
@@ -132,25 +116,6 @@ pub enum Task {
     Login,
     /// Sign in, then send a payment.
     Pay,
-}
-
-impl Task {
-    pub fn parse(text: &str) -> Option<Task> {
-        match text {
-            "read" => Some(Task::Read),
-            "login" => Some(Task::Login),
-            "pay" => Some(Task::Pay),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Task::Read => "read",
-            Task::Login => "login",
-            Task::Pay => "pay",
-        }
-    }
 }
 
 /// One route the home border router announces.
@@ -183,16 +148,6 @@ pub enum Identity {
     Bank,
     Impostor,
     Status,
-}
-
-impl Identity {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Identity::Bank => "bank",
-            Identity::Impostor => "impostor",
-            Identity::Status => "status",
-        }
-    }
 }
 
 impl Scenario {

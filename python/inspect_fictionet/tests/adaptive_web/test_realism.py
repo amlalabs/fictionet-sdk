@@ -24,7 +24,7 @@ class FakeClient:
     def complete(self, system, user, max_tokens):
         self.calls.append((system, user, max_tokens))
         text, cost = next(self.answers)
-        return realism.llm.Completion(text, "fake", 10, 10, cost, 0)
+        return realism.Completion(text, cost)
 
 
 class RealismTests(unittest.TestCase):
@@ -104,21 +104,23 @@ class RealismTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bench, real = Path(tmp) / "bench", Path(tmp) / "real"
             made = bench / "generator" / "seed"
-            (made / "searches" / "query").mkdir(parents=True)
-            (made / "pages" / "host").mkdir(parents=True)
+            made.mkdir(parents=True)
             (real / "seed").mkdir(parents=True)
             results = [{"url": "url", "title": "title", "snippet": "snippet"}]
-            (made / "searches" / "query" / "@search.json").write_text(
-                json.dumps({"query": "query", "results": results}))
+            fixed = {"url": "fixed", "body": "fixed", "fixed": True}
+            (made / "world.jsonl").write_text("\n".join(json.dumps(entry) for entry in (
+                {"search": {"query": "query", "results": results}},
+                {"mention": {"host": "host", "target": "/", "mention": {}}},
+                {"page": fixed},
+                {"page": {"url": "url", "body": "made", "fixed": False}},
+            )) + "\n")
             (real / "seed" / "results-0.json").write_text(json.dumps({"results": results}))
-            (made / "pages" / "host" / "@page.json").write_text(
-                json.dumps({"url": "url", "body": "made", "model": "generator", "created": 1}))
             (real / "seed" / "page-0.json").write_text(json.dumps({"text": "real"}))
             (real / "manifest.json").write_text(json.dumps({"seed": {
                 "queries": [evidence("search-url", len(realism.results_text(results)))],
                 "pages": [evidence("page-url", len("real"))]}}))
             client = FakeClient([('{"written_by_ai": "B"}', 0.25)] + [("invalid", 0.25)] * 9)
-            with patch.object(realism.llm, "client", return_value=client), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(realism, "Judge", return_value=client), contextlib.redirect_stdout(io.StringIO()):
                 realism.judge(bench, real, "fake/judge")
             verdicts = json.loads((bench / "generator" / "judgments.json").read_text())
             self.assertEqual(len(verdicts), 4)
@@ -172,12 +174,12 @@ class CollectionTests(unittest.TestCase):
 
     def judge(self):
         bench = self.root / "bench"
-        made = bench / "generator" / "seed" / "pages" / "host"
+        made = bench / "generator" / "seed"
         made.mkdir(parents=True)
-        (made / "@page.json").write_text(json.dumps(
-            {"url": "made-url", "body": "made", "model": "generator", "created": 1}))
+        (made / "world.jsonl").write_text(json.dumps(
+            {"page": {"url": "made-url", "body": "made", "fixed": False}}) + "\n")
         client = FakeClient([('{"written_by_ai": "A"}', 0.25)] * 2)
-        with patch.object(realism.llm, "client", return_value=client):
+        with patch.object(realism, "Judge", return_value=client):
             realism.judge(bench, self.real, "fake/judge")
         return client
 
@@ -335,7 +337,7 @@ class CollectionTests(unittest.TestCase):
                      {**valid, "search": {**valid, "curl_exit_code": False}}):
             with self.subTest(page=page):
                 (self.real / "manifest.json").write_text(json.dumps({"seed": {"queries": [], "pages": [page]}}))
-                with patch.object(realism.llm, "client") as client:
+                with patch.object(realism, "Judge") as client:
                     with self.assertRaisesRegex(SystemExit, "Invalid real corpus"):
                         realism.judge(self.root, self.real, "fake/judge")
                     client.assert_not_called()
@@ -346,7 +348,7 @@ class CollectionTests(unittest.TestCase):
         for content in ("{", "[]", "{}", json.dumps(manifest)):
             with self.subTest(content=content):
                 (self.real / "manifest.json").write_text(content)
-                with patch.object(realism.llm, "client") as client:
+                with patch.object(realism, "Judge") as client:
                     with self.assertRaisesRegex(SystemExit, "Invalid real corpus"):
                         realism.judge(self.root, self.real, "fake/judge")
                     client.assert_not_called()

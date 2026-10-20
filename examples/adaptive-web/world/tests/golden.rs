@@ -2,18 +2,15 @@
 //! fixed script of agent actions, compared line for line with
 //! `tests/golden/halvard-cve.jsonl`.
 //!
-//! The script runs with both the Python backend and the in-process Rust
-//! stub, each with a fresh store and a CA
-//! made for the test. The script searches, follows results, asks for the
-//! same URLs twice, and looks up names the world turns down. Besides the
-//! log, it checks what Kai's evals need: the same URL returns the same
-//! bytes, every result link resolves and answers 200, and each page's
-//! title is the title its search result showed.
+//! The world runs the offline generator on a fresh store, with a CA made
+//! for the test. The script searches, follows results, asks for the same
+//! URLs twice, and looks up names the world turns down. Besides the log, it
+//! checks what the evals need: the same URL returns the same bytes, every
+//! result link resolves and answers 200, and each page's title is the title
+//! its search result showed.
 //!
 //! `ts`, `gen_ms`, `serve_ms` and the certificates' dates change from run to
 //! run and are left out. The lines are compared as sorted sets.
-//! `gen_ms` includes HTTP failures, backoff and parse re-asks; this offline
-//! fixture has one stub call per generation and no HTTP attempts.
 //! `ADAPTIVE_WEB_GOLDEN_WRITE=1 cargo test --test golden` records the file
 //! again.
 
@@ -22,14 +19,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use adaptive_web_world::backend::Backend;
-use adaptive_web_world::{Addresses, Ca, fixed_addresses, serve, world_start};
+use adaptive_web_world::pages::render::google_results;
+use adaptive_web_world::pages::text::{escape, target_of};
+use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed, store::Store};
+use adaptive_web_world::{Addresses, Ca, serve, world_start};
 use bytes::Bytes;
-mod common;
-use adaptive_web_world::{
-    Pages,
-    stub::{Seed, Stub},
-};
 use example_common::log::Log;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
@@ -103,105 +97,23 @@ async fn fetch(fcx: &Cx, m: &Machine, host: &str, path: &str) -> (u16, Bytes) {
     get(fcx, stream, host, path).await
 }
 
-/// The result links and titles of a Google results page.
-fn results(page: &str) -> Vec<(String, String)> {
-    page.split(r#"<div class="yuRUbf"><a href=""#)
-        .skip(1)
-        .map(|chunk| {
-            let url = chunk.split('"').next().unwrap().replace("&amp;", "&");
-            let title = chunk
-                .split("<h3>")
-                .nth(1)
-                .unwrap()
-                .split("</h3>")
-                .next()
-                .unwrap()
-                .to_owned();
-            (url, title)
-        })
-        .collect()
-}
-
-fn split_url(url: &str) -> (String, String) {
-    let rest = url.strip_prefix("https://").unwrap();
-    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    (
-        host.to_owned(),
-        if path.is_empty() {
-            "/".to_owned()
-        } else {
-            path.to_owned()
-        },
-    )
-}
-
-/// The example's seeds, copied to `base` with the world's date set to
-/// `date`, a day other than today, to check that the world's clock follows
-/// the seed.
-fn seeds_dated(base: &std::path::Path, date: &str) -> PathBuf {
-    let from = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seeds");
-    let to = base.join("seeds");
-    std::fs::create_dir_all(to.join("fixed")).unwrap();
-    for entry in std::fs::read_dir(from.join("fixed")).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), to.join("fixed").join(entry.file_name())).unwrap();
-    }
-    let seed = std::fs::read_to_string(from.join("halvard-cve.md")).unwrap();
-    let seed = seed.replace("date = \"2026-10-07\"", &format!("date = \"{date}\""));
-    assert!(seed.contains(date), "the seed's date line changed");
-    std::fs::write(to.join("halvard-cve.md"), seed).unwrap();
-    to
-}
-
 #[test]
 fn the_log_is_the_recorded_one() {
-    golden(false);
-}
-
-#[test]
-fn the_rust_stub_log_is_the_recorded_one() {
-    golden(true);
-}
-
-fn golden(use_stub: bool) {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let base = std::env::temp_dir().join(format!(
-        "adaptive-web-golden-{use_stub}-{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("adaptive-web-golden-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
+    // A day other than today, to check that the world's clock follows the seed.
     let mut seed = Seed::builtin("halvard-cve").unwrap();
     seed.date = "2026-09-30".into();
-    let child = if use_stub {
-        None
-    } else {
-        Some(common::Python::start(
-            "halvard-cve",
-            &seeds_dated(&base, &seed.date),
-            &base.join("store"),
-            "stub",
-        ))
-    };
-    let port = child.as_ref().map_or(0, |p| p.port);
-    let fixed = child.as_ref().map_or_else(
-        || seed.fixed_addresses(),
-        |p| fixed_addresses(&p.hello).unwrap(),
-    );
-    let fixed_pages: Vec<String> = child.as_ref().map_or_else(
-        || seed.fixed.iter().map(|f| f.url.clone()).collect(),
-        |p| serde_json::from_value(p.hello["fixed"].clone()).unwrap(),
-    );
-    let store = child
-        .as_ref()
-        .map(|p| PathBuf::from(p.hello["store"].as_str().unwrap()).join("addresses.jsonl"));
-    let addresses = Arc::new(Addresses::new(fixed, store.as_deref()).unwrap());
+    let fixed_pages: Vec<String> = seed.fixed.iter().map(|f| f.url.clone()).collect();
+    let root = base.join("store").join(&seed.name);
+    let (store, _) = Store::open(&root, &seed, Some(&Maker::Stub.identity())).unwrap();
+    let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), Some(&root)).unwrap());
     let start = world_start(&seed.date).unwrap();
     let ca_dir = base.join("ca");
-    let searches = Arc::new(child.as_ref().map_or_else(
-        || adaptive_web_world::search::Searches::from_seed(&seed),
-        |p| adaptive_web_world::search::Searches::from_hello(&p.hello),
-    ));
+    let pages = Arc::new(Pages::open(seed, store, Some(Maker::Stub), 0));
+    let searches = Arc::new(adaptive_web_world::search::Searches::of(&pages));
     let log_path = base.join("log.jsonl");
     let log = Arc::new(Log::new(
         Box::new(std::fs::File::create(&log_path).unwrap()),
@@ -221,22 +133,14 @@ fn golden(use_stub: bool) {
             .iter()
             .any(|h| h == "www.halvardsystems.com")
     );
-    assert_eq!(
-        initial.generator.kind,
-        adaptive_web_world::search::GeneratorKind::Stub
-    );
+    assert_eq!(initial.generator.kind, GeneratorKind::Stub);
     assert_eq!(initial.generator.model, "stub");
     assert_eq!(initial.generator.prefetch, 0);
     let projection = searches.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
         let drain = log.clone();
-        let result = rt.block_on(fictionet::run(
+        let result = fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
                 fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
                     Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() }),
@@ -246,11 +150,6 @@ fn golden(use_stub: bool) {
             move |fcx| async move {
                 let ca = Arc::new(Ca::new(&fcx, &ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();
-                let pages = if use_stub {
-                    Pages::Stub(Arc::new(Stub::new(seed)))
-                } else {
-                    Pages::Backend(Backend::new(&fcx, port)?)
-                };
                 serve(&fcx, addresses, ca, pages, log, start, attachments)?;
 
                 let end = attacher.attach("agent").unwrap();
@@ -273,7 +172,7 @@ fn golden(use_stub: bool) {
                 )
                 .await;
                 assert_eq!(status, 200);
-                let found = results(std::str::from_utf8(&page).unwrap());
+                let found = google_results(std::str::from_utf8(&page).unwrap());
                 assert_eq!(found.len(), 10, "ten results");
                 // Responses are dated on the seed's day.
                 let addr = lookup(&fcx, &m, "www.google.com").await.unwrap();
@@ -285,7 +184,7 @@ fn golden(use_stub: bool) {
                 let (_, date, _) = request(&fcx, conn, "www.google.com", "/").await;
                 assert!(date.contains("30 Sep 2026"), "Date: {date}");
                 for (rank, (url, title)) in found.iter().enumerate() {
-                    let (host, path) = split_url(url);
+                    let (host, path) = target_of(url);
                     let (status, first) = fetch(&fcx, &m, &host, &path).await;
                     assert_eq!(status, 200, "{url}");
                     let snapshot = projection.snapshot();
@@ -335,7 +234,7 @@ fn golden(use_stub: bool) {
                     assert_eq!(first, again, "{url} changed between two requests");
                     let text = String::from_utf8_lossy(&first);
                     assert!(
-                        text.contains(&format!("<title>{title}</title>")),
+                        text.contains(&format!("<title>{}</title>", escape(title))),
                         "{url} is not titled {title:?}"
                     );
                 }
@@ -348,7 +247,7 @@ fn golden(use_stub: bool) {
                 )
                 .await;
                 assert_eq!(status, 200);
-                assert!(String::from_utf8_lossy(&ddg).contains(&found[1].1));
+                assert!(String::from_utf8_lossy(&ddg).contains(&escape(&found[1].1)));
                 // A name nothing pointed at.
                 let (status, _) = fetch(&fcx, &m, "totally-new-site.io", "/pricing").await;
                 assert_eq!(status, 200);
@@ -378,14 +277,7 @@ fn golden(use_stub: bool) {
                 for (rank, listed) in snapshot.results[0].listed.iter().enumerate() {
                     assert_eq!(listed.rank, rank as u64 + 1);
                     assert_eq!(listed.url, found[rank].0);
-                    let rendered = listed
-                        .title
-                        .replace('&', "&amp;")
-                        .replace('<', "&lt;")
-                        .replace('>', "&gt;")
-                        .replace('"', "&quot;")
-                        .replace('\'', "&#x27;");
-                    assert_eq!(rendered, found[rank].1);
+                    assert_eq!(listed.title, found[rank].1);
                 }
                 assert_eq!(
                     snapshot
@@ -424,9 +316,9 @@ fn golden(use_stub: bool) {
         drain.finish().unwrap();
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
-    let result = rx.recv_timeout(Duration::from_secs(90));
-    drop(child);
-    let result = result.expect("the test timed out");
+    let result = rx
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the test timed out");
     assert_eq!(result.as_deref(), Some("done"));
 
     let text = std::fs::read_to_string(&log_path).unwrap();

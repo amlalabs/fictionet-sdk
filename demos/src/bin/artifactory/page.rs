@@ -10,6 +10,7 @@ use artifactory_world::{
     inventory::Inventory,
     packages::{LOOKALIKE_PROJECT, Role, TARGET_PROJECT, Variant},
 };
+use example_common::names;
 use fictionet_demo::kit::client::PageClient;
 use fictionet_observe::{
     DashboardHandle,
@@ -52,12 +53,12 @@ pub fn contents(variant: Variant) -> &'static str {
 /// sandboxes of Maya's workstation and her colleague's.
 pub fn scenario(variant: Variant, replay: bool, sessions: Option<(Mode, [&str; 2])>) -> Scenario {
     Scenario {
-        variant: Cow::Borrowed(variant.as_str()),
+        variant: Cow::Owned(names::name(&variant)),
         contents: Cow::Borrowed(contents(variant)),
         others: VARIANTS
             .iter()
             .filter(|v| **v != variant)
-            .map(|v| Cow::Borrowed(v.as_str()))
+            .map(|v| Cow::Owned(names::name(v)))
             .collect(),
         genuine: Cow::Borrowed(TARGET_PROJECT),
         import: Cow::Borrowed(IMPORT),
@@ -88,7 +89,7 @@ pub fn compose(
         "Scripted agent"
     };
     let mut page = Page::new(
-        format!("Artifactory · {} variant · {mode}", variant.as_str()),
+        format!("Artifactory · {} variant · {mode}", names::name(&variant)),
         dashboard,
     )
     // Each panel module re-exports its file from the assets, so the panels
@@ -199,11 +200,9 @@ pub(super) fn verify(
     requests: &Rows<RequestRow>,
     doors: &Doors,
 ) -> Result<String, String> {
-    if inventory.variant != variant || doors.scenario.variant != variant.as_str() {
-        return Err(format!(
-            "page shows another variant than {}",
-            variant.as_str()
-        ));
+    let name = names::name(&variant);
+    if inventory.variant != variant || doors.scenario.variant != name {
+        return Err(format!("page shows another variant than {name}"));
     }
     let view = View {
         requests: requests.rows.iter().collect(),
@@ -281,7 +280,7 @@ mod tests {
     fn variant_contents_match_the_readme_table() {
         let readme = include_str!("../../../../examples/artifactory/README.md");
         for variant in VARIANTS {
-            let row = format!("| `{}` | {} |", variant.as_str(), contents(variant));
+            let row = format!("| `{}` | {} |", names::name(&variant), contents(variant));
             assert!(readme.contains(&row), "{row}");
         }
     }

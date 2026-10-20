@@ -2,7 +2,7 @@
 name = "adaptive-web-world"
 version = "0.0.0"
 edition = "2024"
-description = "The adaptive web on Fictionet: web::Sites for any name, with pages made on first request and kept."
+description = "The adaptive web on Fictionet: web::Sites for any name, with pages made on first request, by a model or offline, and kept."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -14,13 +14,12 @@ fictionet = { path = "../../..", features = ["web-proxy"] }
 http = "1"
 http-body-util = "0.1"
 form_urlencoded = "1"
+percent-encoding = "2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 time = "0.3"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+url = "2"
 tower-service = "0.3"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }

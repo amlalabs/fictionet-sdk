@@ -15,7 +15,7 @@ HN pages also record their search response. Failed downloads are reported
 and make `real` exit nonzero after writing the manifest. A run that keeps
 nothing also exits nonzero. Missing curl leaves no manifest.
 
-`judge` pairs stored generated pages and result lists with those real pages, of the same kind
+`judge` pairs generated pages and result lists with those real pages, of the same kind
 (a result list with a result list, a page with a page), and shows each pair
 to JUDGE_MODEL, which should be a model other than the generator. The judge
 is told that one of the two is real and one was written by a model, and
@@ -27,19 +27,21 @@ Invalid output is retried up to three attempts and then excluded from the
 rate. A group with no valid judgments has no rate. All raw answers and
 attempt costs are saved next to the bench's pages for audit.
 The judge requires a manifest and reads only the entries marked kept.
+BENCH_DIR holds a directory per generator, each holding the world's stores:
+a directory per seed with its `world.jsonl`.
 """
 from __future__ import annotations
 
 import base64
 import html
 import json
+import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlsplit
-
-from adaptive import llm  # noqa: E402
 
 # Real topics of the same kind as each seed's: a VPN vulnerability, a
 # biotech acquisition, a JSON library. Result lists come from Bing for the
@@ -240,6 +242,47 @@ def total_cost(records: list[dict]) -> float | None:
     return None if any(r["cost"] is None for r in records) else sum(r["cost"] for r in records)
 
 
+@dataclass
+class Completion:
+    """One answer and what it cost, when the API reports it."""
+    text: str
+    cost: float | None
+
+
+class Judge:
+    """A judge model on OpenRouter, through the OpenAI client, with low reasoning effort."""
+
+    def __init__(self, model: str):
+        from openai import OpenAI
+
+        key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not key:
+            raise SystemExit("OPENROUTER_API_KEY is not set")
+        self.model = model
+        self.client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key)
+
+    def complete(self, system: str, user: str, max_tokens: int) -> Completion:
+        answer = self.client.chat.completions.create(
+            model=self.model, max_tokens=max_tokens, temperature=1.0,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            extra_body={"usage": {"include": True}, "reasoning": {"effort": "low"}},
+        )
+        cost = (answer.usage.model_extra or {}).get("cost") if answer.usage else None
+        return Completion(answer.choices[0].message.content or "", cost)
+
+
+def made_samples(store: Path) -> tuple[list[dict], list[dict]]:
+    """The result lists and the generated pages in a store's `world.jsonl`, in the order made."""
+    lists, pages = [], []
+    for line in (store / "world.jsonl").read_text().splitlines():
+        entry = json.loads(line)
+        if "search" in entry:
+            lists.append(entry["search"])
+        elif "page" in entry and not entry["page"]["fixed"] and isinstance(entry["page"]["body"], str):
+            pages.append(entry["page"])
+    return lists, pages
+
+
 def judge_pair(client, kind: str, made_text: str, real_text: str, what: str, made_first: bool) -> dict:
     """Judge one ordering, retaining every attempt and scoring only a valid choice."""
     a, b = (made_text, real_text) if made_first else (real_text, made_text)
@@ -316,8 +359,7 @@ def real_samples(real_dir: Path) -> dict:
 
 def judge(bench: Path, real_dir: Path, judge_model: str) -> None:
     corpus = real_samples(real_dir)
-    client = llm.client("openrouter", judge_model)
-    client.reasoning = "low"
+    client = Judge(judge_model)
     summary = {}
     for model_dir in sorted(p for p in bench.iterdir() if p.is_dir()):
         pairs = []
@@ -326,10 +368,7 @@ def judge(bench: Path, real_dir: Path, judge_model: str) -> None:
                 raise SystemExit(f"Seed {seed_dir.name!r} is missing from {real_dir / 'manifest.json'}")
             real_lists = corpus[seed_dir.name]["queries"]
             real_pages = corpus[seed_dir.name]["pages"]
-            made_lists = [json.loads(p.read_text()) for p in sorted(seed_dir.glob("searches/*/@search.json"))]
-            made_pages = [json.loads(p.read_text()) for p in sorted(seed_dir.glob("pages/**/@page.json"))
-                          if json.loads(p.read_text()).get("model") not in (None, "fixed")]
-            made_pages.sort(key=lambda r: r["created"])
+            made_lists, made_pages = made_samples(seed_dir)
             for made, real_list in zip(made_lists, real_lists):
                 if real_list["results"]:
                     pairs.append(("search result list", results_text(made["results"])[:CHARS],

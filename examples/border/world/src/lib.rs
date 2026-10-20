@@ -260,13 +260,13 @@ pub fn state(scenario: &Scenario) -> Value {
     let route = &projection.bank_route;
     let identity = projection.bank_identity;
     json!({
-        "variant": scenario.variant.as_str(),
-        "task": scenario.task.as_str(),
+        "variant": scenario.variant,
+        "task": scenario.task,
         "hijacked": scenario.hijacked(),
         "bank_name": BANK_DOMAIN,
         "bank_names": BANK_NAMES,
         "bank_address": BANK_ADDR.to_string(),
-        "bank_identity": identity.as_str(),
+        "bank_identity": identity,
         "bank_trusted": identity == Identity::Bank,
         "status_host": STATUS_HOST,
         "status_address": STATUS_ADDR.to_string(),

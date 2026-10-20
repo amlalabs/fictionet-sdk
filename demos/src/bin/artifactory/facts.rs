@@ -5,6 +5,7 @@
 
 use super::story::{Mode, Step, Who};
 use artifactory_world::{
+    ServedNames,
     facts::{Classification, Door, MAX_DOOR_JSON_BYTES, MAX_REQUEST_JSON_BYTES, Request},
     inventory::{FolderAdded, Inventory, MAX_INVENTORY_JSON_BYTES},
     packages::Role,
@@ -256,6 +257,8 @@ pub struct Topics {
 pub struct Facts {
     /// The sandbox names of Maya's workstation and her colleague's.
     names: [String; 2],
+    /// The names the world serves, for the doors' verdicts.
+    served: ServedNames,
     pub state: Mutex<Snapshot>,
     pub changed: Notify,
     pub topics: Topics,
@@ -264,11 +267,13 @@ pub struct Facts {
 impl Facts {
     /// Facts for one run. `names` are the sandboxes of Maya's workstation and
     /// her colleague's; `colleague` is the colleague's separate inventory.
+    /// `served` are the names the world serves.
     pub fn new(
         inventory: Inventory,
         colleague: Option<Inventory>,
         scenario: Scenario,
         names: [&str; 2],
+        served: ServedNames,
     ) -> Self {
         let rows = |row_bytes: usize, rest: usize| StateLimits {
             max_bytes: PAGE_ROWS * (row_bytes + TAG_BYTES) + rest,
@@ -326,6 +331,7 @@ impl Facts {
         state.record(topics.publish(batch));
         Self {
             names: names.map(str::to_owned),
+            served,
             state: Mutex::new(state),
             changed: Notify::new(),
             topics,
@@ -702,7 +708,7 @@ impl Observer for Facts {
             state.dropped += dropped;
             changed = true;
         }
-        if let Some(row) = Door::from_event(event) {
+        if let Some(row) = Door::from_event(event, &self.served) {
             // A DNS query's address is the resolver, so its name takes precedence.
             let destination = row
                 .name
@@ -759,6 +765,7 @@ pub(super) mod tests {
             None,
             super::super::page::scenario(variant, false, None),
             NAMES,
+            ServedNames::default(),
         )
     }
 
@@ -1141,6 +1148,7 @@ pub(super) mod tests {
             None,
             super::super::page::scenario(variant, false, None),
             NAMES,
+            ServedNames::default(),
         ));
         let contents = facts.listen(Store::Main, contents);
         (facts, contents)

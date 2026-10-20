@@ -649,6 +649,7 @@ mod tests {
     use super::super::guest;
     use super::*;
     use artifactory_world::{
+        ServedNames,
         facts::Door,
         inventory::{Entry, EntryKind, FolderAdded},
     };
@@ -770,7 +771,7 @@ mod tests {
             step: Cow::Borrowed("action"),
             at: 0.0,
             traffic: Traffic::Agent,
-            row: Door::from_event(&event).unwrap(),
+            row: Door::from_event(&event, &ServedNames::default()).unwrap(),
         });
         scopes(&check, &state);
         for bad in [
@@ -784,7 +785,7 @@ mod tests {
                 step: Cow::Borrowed("action"),
                 at: 0.0,
                 traffic: Traffic::Agent,
-                row: Door::from_event(&bad).unwrap(),
+                row: Door::from_event(&bad, &ServedNames::default()).unwrap(),
             });
             assert!(!holds(&check, &state, "action"));
         }

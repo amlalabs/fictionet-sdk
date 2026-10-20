@@ -5,7 +5,7 @@ use std::task::Poll;
 
 use fictionet::events::Level;
 use fictionet::prelude::*;
-use fictionet::stdlib::network::ports::{Event, Ports as Links};
+use fictionet::stdlib::network::ports::{Event, Ports};
 use fictionet::stdlib::network::{ip, tcp, udp};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RunOptions, Seed};
@@ -65,12 +65,12 @@ fn echo_discovery_updates_snapshots_and_facts() {
             let (attacher, attachments) = fictionet::attachments();
             let ports = start(&fcx, office(), attachments)?;
             let mut scanner = attacher.attach(SCANNER)?;
-            for (i, (last, state)) in [
-                (10, PortState::Open),
-                (11, PortState::Open),
-                (12, PortState::Open),
-                (13, PortState::Open),
-                (14, PortState::Unreachable),
+            for (i, (last, state, state_name)) in [
+                (10, PortState::Open, "open"),
+                (11, PortState::Open, "open"),
+                (12, PortState::Open, "open"),
+                (13, PortState::Open, "open"),
+                (14, PortState::Unreachable, "unreachable"),
             ]
             .into_iter()
             .enumerate()
@@ -102,7 +102,7 @@ fn echo_discovery_updates_snapshots_and_facts() {
                 assert_eq!(facts.len(), (i + 1) * 2);
                 for (event, expected, previous) in [
                     (&facts[i * 2], "unanswered", None),
-                    (&facts[i * 2 + 1], state.as_str(), Some("unanswered")),
+                    (&facts[i * 2 + 1], state_name, Some("unanswered")),
                 ] {
                     assert_eq!(event.str("host"), Some(host.to_string().as_str()));
                     assert_eq!(event.str("protocol"), Some("icmp"));
@@ -123,7 +123,7 @@ fn server(fcx: &Cx, sandbox: End) -> (tcp::Endpoint, tcp::Listener, End) {
     let (stack, stack_link) = fictionet::pair();
     let (inject, inject_link) = fictionet::pair();
     fcx.spawn(move |fcx| async move {
-        let mut links = Links::new(vec![sandbox, stack_link, inject_link]);
+        let mut links = Ports::new(vec![sandbox, stack_link, inject_link]);
         loop {
             match links.next(&fcx, None, |_| Poll::Pending).await? {
                 Event::Packet(0, packet) => links.send(1, packet),

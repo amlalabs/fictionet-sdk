@@ -32,11 +32,9 @@ class RequestMetadata(unittest.TestCase):
                     ]))
 
     def test_errors_fail_even_with_cache(self):
-        for kind in ("error", "meta_error", "backend_error"):
-            with self.subTest(kind=kind):
-                self.assertFalse(request_metadata_complete([
-                    {"answer": "handler", "kind": kind, "cache": "cached"},
-                ]))
+        self.assertFalse(request_metadata_complete([
+            {"answer": "handler", "kind": "error", "cache": "cached"},
+        ]))
 
     def test_valid_metadata_and_world_redirect(self):
         self.assertTrue(request_metadata_complete([

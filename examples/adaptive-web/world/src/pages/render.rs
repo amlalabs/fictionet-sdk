@@ -2,16 +2,16 @@
 
 use super::{
     make::{Page, Profile, Search},
-    text::{escape as e, normalize_space, quote, quote_plus, split_url, strip},
+    text::{escape as e, normalize_space, quote, quote_plus, split_url, unescape},
 };
 use crate::route::Engine;
 
-/// Formats a URL as a host and up to three path segments.
+/// Formats a URL as a host and up to three decoded path segments.
 pub fn display_url(url: &str) -> String {
     let (mut host, path, _) = split_url(url);
     for part in path.split('/').filter(|p| !p.is_empty()).take(3) {
         host.push_str(" › ");
-        host.push_str(part);
+        host.push_str(&percent_encoding::percent_decode_str(part).decode_utf8_lossy());
     }
     host
 }
@@ -75,7 +75,17 @@ pub fn google(query: &str, record: &Search, start: u64) -> String {
     )];
     if start == 0 {
         for ad in record.ads.iter().take(2) {
-            out.push(format!(r#"<div class="uEierd"><span class="U3A9Ac">Sponsored</span><a href="{}"><div role="heading">{}</div><span>{}</span></a><div class="MUxGbd">{}</div></div>"#, e(&ad.url),e(&ad.title),e(&display_url(&ad.url)),e(&ad.text)));
+            out.push(format!(
+                concat!(
+                    r#"<div class="uEierd"><span class="U3A9Ac">Sponsored</span>"#,
+                    r#"<a href="{url}"><div role="heading">{title}</div><span>{shown}</span></a>"#,
+                    r#"<div class="MUxGbd">{text}</div></div>"#,
+                ),
+                url = e(&ad.url),
+                title = e(&ad.title),
+                shown = e(&display_url(&ad.url)),
+                text = e(&ad.text),
+            ));
         }
     }
     for r in &record.results {
@@ -84,7 +94,18 @@ pub fn google(query: &str, record: &Search, start: u64) -> String {
         } else {
             format!(r#"<span class="LEwnzc">{} — </span>"#, e(&r.date))
         };
-        out.push(format!(r#"<div class="g"><div class="yuRUbf"><a href="{}"><h3>{}</h3><br><cite>{}</cite></a></div><div class="VwiC3b">{date}<span>{}</span></div></div>"#,e(&r.url),e(&r.title),e(&display_url(&r.url)),e(&r.snippet)));
+        out.push(format!(
+            concat!(
+                r#"<div class="g"><div class="yuRUbf"><a href="{url}"><h3>{title}</h3><br>"#,
+                r#"<cite>{shown}</cite></a></div>"#,
+                r#"<div class="VwiC3b">{date}<span>{snippet}</span></div></div>"#,
+            ),
+            url = e(&r.url),
+            title = e(&r.title),
+            shown = e(&display_url(&r.url)),
+            date = date,
+            snippet = e(&r.snippet),
+        ));
     }
     if !record.questions.is_empty() {
         out.push(r#"<div class="related-question-pair"><h2>People also ask</h2>"#.into());
@@ -110,6 +131,17 @@ pub fn google(query: &str, record: &Search, start: u64) -> String {
 <footer><span>United Kingdom</span> · <a href="https://support.google.com/websearch">Help</a> · <a href="https://www.google.com/tools/feedback">Send feedback</a> · <a href="https://policies.google.com/privacy">Privacy</a> · <a href="https://policies.google.com/terms">Terms</a></footer></body></html>"#));
     out.join("\n")
 }
+/// The links and titles of the results a [`google`] page lists, unescaped.
+pub fn google_results(page: &str) -> Vec<(String, String)> {
+    page.split(r#"<div class="yuRUbf"><a href=""#)
+        .skip(1)
+        .filter_map(|chunk| {
+            let (url, rest) = chunk.split_once('"')?;
+            let title = rest.split_once("<h3>")?.1.split_once("</h3>")?.0;
+            Some((unescape(url), unescape(title)))
+        })
+        .collect()
+}
 /// Returns the Google search form.
 pub fn google_home() -> &'static str {
     r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><title>Google</title></head>
@@ -133,7 +165,20 @@ pub fn duckduckgo(query: &str, record: &Search) -> String {
     )];
     for ad in record.ads.iter().take(1) {
         let link = e(&ddg_link(&ad.url));
-        out.push(format!(r#"<div class="result results_links results_links_deep result--ad"><div class="links_main links_deep result__body"><h2 class="result__title"><a rel="nofollow" class="result__a" href="{link}">{}</a></h2><a class="result__url" href="{link}">{}</a><a class="result__snippet" href="{link}">{}</a><div class="badge--ad">Ad</div></div></div>"#,e(&ad.title),e(&split_url(&ad.url).0),e(&ad.text)));
+        out.push(format!(
+            concat!(
+                r#"<div class="result results_links results_links_deep result--ad">"#,
+                r#"<div class="links_main links_deep result__body"><h2 class="result__title">"#,
+                r#"<a rel="nofollow" class="result__a" href="{link}">{title}</a></h2>"#,
+                r#"<a class="result__url" href="{link}">{host}</a>"#,
+                r#"<a class="result__snippet" href="{link}">{text}</a>"#,
+                r#"<div class="badge--ad">Ad</div></div></div>"#,
+            ),
+            link = link,
+            title = e(&ad.title),
+            host = e(&split_url(&ad.url).0),
+            text = e(&ad.text),
+        ));
     }
     for r in &record.results {
         let link = e(&ddg_link(&r.url));
@@ -143,7 +188,26 @@ pub fn duckduckgo(query: &str, record: &Search) -> String {
         } else {
             format!(r#"<span class="result__timestamp">{}</span>"#, e(&r.date))
         };
-        out.push(format!(r#"<div class="result results_links results_links_deep web-result"><div class="links_main links_deep result__body"><h2 class="result__title"><a rel="nofollow" class="result__a" href="{link}">{}</a></h2><div class="result__extras"><div class="result__extras__url"><span class="result__icon"><a rel="nofollow" href="{link}"><img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/{host}.ico" name="i15" /></a></span><a class="result__url" href="{link}">{}</a>{date}</div></div><a class="result__snippet" href="{link}">{}</a><div class="clear"></div></div></div>"#,e(&r.title),e(&display_url(&r.url).replace(" › ","/")),e(&r.snippet)));
+        out.push(format!(
+            concat!(
+                r#"<div class="result results_links results_links_deep web-result">"#,
+                r#"<div class="links_main links_deep result__body"><h2 class="result__title">"#,
+                r#"<a rel="nofollow" class="result__a" href="{link}">{title}</a></h2>"#,
+                r#"<div class="result__extras"><div class="result__extras__url">"#,
+                r#"<span class="result__icon"><a rel="nofollow" href="{link}">"#,
+                r#"<img class="result__icon__img" width="16" height="16" alt="" "#,
+                r#"src="//external-content.duckduckgo.com/ip3/{host}.ico" name="i15" /></a></span>"#,
+                r#"<a class="result__url" href="{link}">{shown}</a>{date}</div></div>"#,
+                r#"<a class="result__snippet" href="{link}">{snippet}</a>"#,
+                r#"<div class="clear"></div></div></div>"#,
+            ),
+            link = link,
+            title = e(&r.title),
+            host = host,
+            shown = e(&display_url(&r.url).replace(" › ", "/")),
+            date = date,
+            snippet = e(&r.snippet),
+        ));
     }
     out.push(format!(r#"<div class="nav-link"><form action="/html/" method="post"><input type="submit" class="btn btn--alt" value="Next" /><input type="hidden" name="q" value="{q}" /><input type="hidden" name="s" value="10" /><input type="hidden" name="dc" value="11" /></form></div>
 </div></div><div class="feedback-btn"><a rel="nofollow" href="//duckduckgo.com/feedback.html">Feedback</a></div></body></html>"#));
@@ -179,7 +243,16 @@ pub fn bing(query: &str, record: &Search) -> String {
         } else {
             format!(r#"<span class="news_dt">{}</span> · "#, e(&r.date))
         };
-        out.push(format!(r#"<li class="b_algo"><h2><a href="{}">{}</a></h2><div class="b_caption"><cite>{}</cite><p>{date}{}</p></div></li>"#,e(&r.url),e(&r.title),e(&r.url),e(&r.snippet)));
+        out.push(format!(
+            concat!(
+                r#"<li class="b_algo"><h2><a href="{url}">{title}</a></h2>"#,
+                r#"<div class="b_caption"><cite>{url}</cite><p>{date}{snippet}</p></div></li>"#,
+            ),
+            url = e(&r.url),
+            title = e(&r.title),
+            date = date,
+            snippet = e(&r.snippet),
+        ));
     }
     out.push(r#"</ol><div id="b_context"><h2>Related searches</h2><ul>"#.into());
     for rel in record.related.iter().take(8) {
@@ -196,7 +269,7 @@ fn nav(items: &[String], class: &str) -> String {
     let mut out = format!(r#"<ul class="{class}">"#);
     for item in items {
         let (label, href) = item.split_once('|').unwrap_or((item, ""));
-        let href = strip(href);
+        let href = href.trim();
         let href = if href.is_empty() {
             format!(
                 "/{}",
@@ -208,7 +281,7 @@ fn nav(items: &[String], class: &str) -> String {
         out.push_str(&format!(
             r#"<li><a href="{}">{}</a></li>"#,
             e(&href),
-            e(strip(label))
+            e(label.trim())
         ));
     }
     out + "</ul>"
@@ -394,7 +467,7 @@ pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str
 mod tests {
     use super::*;
     #[test]
-    fn python_counts_and_urls() {
+    fn counts_and_urls() {
         assert_eq!(result_count("one two"), "12,083,890");
         assert_eq!(result_count("é 😀"), "12,078,810");
         assert_eq!(

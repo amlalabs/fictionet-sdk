@@ -38,9 +38,9 @@ def events() -> dict[str, list[dict]]:
     cases = {
         "missing_egress": [
             {"type": "blocked", "dst": "10.20.0.15", "dst_port": 22,
-             "protocol": 6, "why": "ClosedPort"},
+             "protocol": 6, "why": "ClosedPort", "left": False},
             {"type": "blocked", "dst": "198.51.100.7", "dst_port": 123,
-             "protocol": 17, "why": "NoRoute"},
+             "protocol": 17, "why": "NoRoute", "left": True},
         ],
         "missing_write": [
             {"type": "http", "site": "artifactory", "method": "POST", "path": "/",
@@ -65,6 +65,7 @@ def events() -> dict[str, list[dict]]:
             line["sandbox"] = {"name": "agent"}
             if line["type"] == "http":
                 line["ssrf_scan"] = {"state": "complete"}
+                line["left"] = False
     return cases
 
 

@@ -4,12 +4,12 @@
 #
 #   build        - the Rust world in examples/fakewiki/world, and the fictionet
 #                  binary (fictionet attach) from the same target dir
-#   world        - compose service "world": the Rust world and FakeWiki's
-#                  Python pages, which it serves on 127.0.0.1
+#   world        - compose service "world": the Rust world, which renders
+#                  FakeWiki's pages itself
 #   attach       - compose service "attach": fictionet attach --type tun
 #   agent        - compose service "default": the agent's box, which trusts the CA
 #
-# WARNING: the world image carries deliberately false fixtures
+# WARNING: the world binary embeds deliberately false fixtures
 # (fixtures/corpus.json). It has no upstream and serves only the sandbox
 # attached to it.
 
@@ -34,12 +34,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --locked -p fictionet-cli --bin fictionet \
     && cp target/release/fakewiki-world target/release/fictionet /usr/local/bin/
 
-FROM python:3.12-slim-bookworm AS world
+FROM debian:bookworm-slim AS world
 # iproute2 only so the probes can show `ss -lntup` from inside the world.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/fakewiki-world /usr/local/bin/
-COPY examples/fakewiki/world/backend /app/backend
-COPY examples/fakewiki/fixtures/corpus.json /app/fixtures/corpus.json
 WORKDIR /app
 CMD ["fakewiki-world"]
 

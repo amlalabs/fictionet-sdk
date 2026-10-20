@@ -59,7 +59,7 @@ pub fn network(
         );
     }
     let hosts: HashMap<String, Ipv4Addr> = pages::host_ips();
-    let mut net = sites(cx, &hosts, leaves, Content::in_process(tampering))?;
+    let mut net = sites(cx, &hosts, leaves, Content::new(tampering))?;
     for host in mirrors {
         net = net.add_host(host);
     }

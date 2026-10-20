@@ -21,11 +21,11 @@
 //! detail. An event store with a separate budget for repeatable facts, such
 //! as `fictionet_observe::Memory`, keeps them from evicting other events.
 //!
-//! [`Ports::snapshot`] copies the five office labels and all rows, sorted
+//! [`Tap::snapshot`] copies the five office labels and all rows, sorted
 //! by address, protocol, then port. Each tracked probe or state change
 //! advances the revision. The map includes the last row change time and the
 //! `untracked` count. [`PortMap::MAX_JSON_BYTES`] bounds its compact JSON.
-//! [`Ports::changed_since`] says whether a copy is out of date.
+//! [`Tap::changed_since`] says whether a copy is out of date.
 //!
 //! Rows stay for the run, up to [`MAX_ROWS`] (16,384). At capacity, probes for
 //! new keys increment `untracked`; existing rows still update. The first
@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
+use example_common::names::name;
 use fictionet::events::{Fields, Level, opt};
 use fictionet::stdlib::network::{Direction, ip};
 use fictionet::sync::Mutex;
@@ -65,17 +66,6 @@ pub enum Protocol {
     Icmp,
 }
 
-impl Protocol {
-    /// Returns the protocol name used in facts and JSON.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Udp => "udp",
-            Self::Icmp => "icmp",
-        }
-    }
-}
-
 /// The latest answered probe's result, or no answer yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,18 +78,6 @@ pub enum PortState {
     Closed,
     /// A matching ICMP unreachable arrived, with any code for an echo probe.
     Unreachable,
-}
-
-impl PortState {
-    /// Returns the state name used in facts and JSON.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unanswered => "unanswered",
-            Self::Open => "open",
-            Self::Closed => "closed",
-            Self::Unreachable => "unreachable",
-        }
-    }
 }
 
 /// One port's probes and latest answered state.
@@ -203,18 +181,25 @@ pub struct PortMap {
 }
 
 impl PortMap {
-    /// Compact JSON bound for snapshots produced by [`Ports`].
-    pub const MAX_JSON_BYTES: usize =
-        r#"{"revision":18446744073709551615,"at_ms":18446744073709551615,"max_rows":,"untracked":18446744073709551615,"untracked_banners":18446744073709551615,"machines":,"rows":[],"banners":[]}"#.len()
-        + (MAX_ROWS.ilog10() as usize + 1) + machines_json_bytes() + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
+    /// Compact JSON bound for snapshots produced by [`Tap`].
+    pub const MAX_JSON_BYTES: usize = concat!(
+        r#"{"revision":18446744073709551615,"at_ms":18446744073709551615,"#,
+        r#""max_rows":,"untracked":18446744073709551615,"#,
+        r#""untracked_banners":18446744073709551615,"#,
+        r#""machines":,"rows":[],"banners":[]}"#,
+    )
+    .len()
+        + (MAX_ROWS.ilog10() as usize + 1)
+        + machines_json_bytes()
+        + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
         + MAX_BANNERS * (Banner::MAX_JSON_BYTES + 1);
 }
 
 /// A shared view of the scanner's probes, readable outside the world.
 #[derive(Clone)]
-pub struct Ports(Arc<Mutex<Tracker>>);
+pub struct Tap(Arc<Mutex<Tracker>>);
 
-impl Ports {
+impl Tap {
     pub(crate) fn new() -> Self {
         Self(Arc::new(Mutex::new(Tracker::new(MAX_ROWS))))
     }
@@ -246,13 +231,13 @@ impl Ports {
                         "{}:{}/{} {}",
                         row.host,
                         row.port,
-                        row.protocol.as_str(),
-                        row.state.as_str()
+                        name(&row.protocol),
+                        name(&row.state)
                     ))
                     .field("host", row.host.to_string())
-                    .field("protocol", row.protocol.as_str())
-                    .field("state", row.state.as_str())
-                    .field("previous", opt(previous.map(PortState::as_str)))
+                    .field("protocol", name(&row.protocol))
+                    .field("state", name(&row.state))
+                    .field("previous", opt(previous.map(|state| name(&state))))
                     .repeat(
                         Fields::new()
                             .with("port", u32::from(row.port))
@@ -821,7 +806,6 @@ mod tests {
             PortRow::MAX_JSON_BYTES
         );
         assert_eq!(serde_json::to_string(&Protocol::Icmp).unwrap(), "\"icmp\"");
-        assert_eq!(Protocol::Icmp.as_str(), "icmp");
         roundtrip(&row, PortRow::MAX_JSON_BYTES);
         let map = PortMap {
             revision: u64::MAX,
@@ -1165,7 +1149,7 @@ mod tests {
 
     #[test]
     fn a_copy_is_out_of_date_after_a_tracked_or_untracked_probe() {
-        let ports = Ports(Arc::new(Mutex::new(Tracker::new(1))));
+        let ports = Tap(Arc::new(Mutex::new(Tracker::new(1))));
         let empty = ports.snapshot();
         assert!(!ports.changed_since(&empty));
         ports.0.lock().packet(FromInner, &syn(80, 4000, 1), 10);
@@ -1286,19 +1270,7 @@ mod tests {
             banners: vec![longest_banner(); MAX_BANNERS],
         };
         roundtrip(&map, PortMap::MAX_JSON_BYTES);
-        for protocol in [Protocol::Tcp, Protocol::Udp] {
-            assert_eq!(
-                serde_json::to_string(&protocol).unwrap(),
-                format!("\"{}\"", protocol.as_str())
-            );
-        }
-        for state in [Unanswered, Open, Closed, Unreachable] {
-            assert_eq!(
-                serde_json::to_string(&state).unwrap(),
-                format!("\"{}\"", state.as_str())
-            );
-        }
-        let empty = Ports::new();
+        let empty = Tap::new();
         roundtrip(&empty.snapshot(), PortMap::MAX_JSON_BYTES);
     }
 }

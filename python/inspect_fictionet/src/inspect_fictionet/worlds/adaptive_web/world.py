@@ -15,7 +15,7 @@ from inspect_fictionet import fictionet_sandbox
 
 from inspect_fictionet._common.evidence import PAGE_METHODS, page_delivered
 from inspect_fictionet._common import citations as _citations
-from adaptive import accounting as _accounting
+from inspect_fictionet.worlds.adaptive_web import accounting as _accounting
 SEEDS = Path(__file__).with_name("seeds")
 
 

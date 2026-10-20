@@ -13,6 +13,7 @@ dependencies = [
  "form_urlencoded",
  "http",
  "http-body-util",
+ "percent-encoding",
  "regex",
  "serde",
  "serde_json",
@@ -20,6 +21,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower-service",
+ "url",
 ]
 
 [[package]]
@@ -781,6 +783,7 @@ dependencies = [
  "hyper",
  "ring",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -789,19 +792,15 @@ dependencies = [
 name = "fakewiki-world"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "example-common",
  "fictionet",
  "fictionet-observe",
  "form_urlencoded",
  "http",
  "http-body-util",
- "icu_properties",
  "percent-encoding",
  "serde",
  "serde_json",
- "tokio",
- "tower-service",
 ]
 
 [[package]]
@@ -2397,6 +2396,7 @@ dependencies = [
 name = "scan-world"
 version = "0.0.0"
 dependencies = [
+ "example-common",
  "fictionet",
  "fictionet-observe",
  "http",

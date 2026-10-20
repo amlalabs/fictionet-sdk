@@ -3,6 +3,8 @@
 pub mod diff;
 
 mod scenario;
+#[cfg(test)]
+mod tests;
 mod text;
 mod wiki;
 
@@ -38,14 +40,6 @@ impl Version {
         source
             .filter(|source| *source != "search")
             .map(|source| Self::for_source(variant, source))
-    }
-
-    /// The name used in request facts and JSON.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Real => "real",
-            Self::Tampered => "tampered",
-        }
     }
 }
 
@@ -101,7 +95,7 @@ impl Response {
     }
 }
 
-/// An indexable document, in the same order as the backend's index.
+/// An indexable document, in search index order.
 #[derive(Debug)]
 pub struct Document {
     /// The canonical document URL.
@@ -157,38 +151,35 @@ fn corpus() -> &'static Corpus {
     })
 }
 
-/// Lists all documents for a variant without starting a backend.
+/// Lists all documents for a variant.
 pub fn documents(variant: Variant) -> Vec<Document> {
     World { variant }.documents()
 }
 
-/// Renders GET, HEAD or POST. Other methods return an unlabeled 501.
-/// `random` selects the article for Special:Random.
+/// Renders GET, HEAD or POST for `host`, the lowercase name the request
+/// was routed by. Other methods return an unlabeled 501. `random` selects
+/// the article for Special:Random.
 pub fn handle(
     host: &str,
-    raw_path_and_query: &str,
-    method: &str,
+    uri: &http::Uri,
+    method: &http::Method,
     variant: Variant,
     random: u64,
 ) -> Response {
-    if !matches!(method, "GET" | "HEAD" | "POST") {
+    use http::Method;
+    if !matches!(*method, Method::GET | Method::HEAD | Method::POST) {
         let mut r = Response::new(
             501,
             "Unsupported method.\n",
-            "text/html;charset=utf-8",
+            "text/html; charset=utf-8",
             "other",
         );
         r.cache_control = None;
         return r;
     }
-    let raw = if raw_path_and_query.starts_with("//") {
-        format!("/{}", raw_path_and_query.trim_start_matches('/'))
-    } else {
-        raw_path_and_query.into()
-    };
-    let mut response = World { variant }.route(host, &raw, random);
+    let mut response = World { variant }.route(host, uri, random);
     label(&mut response);
-    if method == "HEAD" {
+    if method == Method::HEAD {
         response.body.clear();
     }
     response
@@ -312,38 +303,15 @@ impl World {
         }
         docs
     }
-    fn route(&self, host: &str, raw: &str, random: u64) -> Response {
-        let host = host.to_lowercase();
-        let host = host.split(':').next().unwrap().trim_end_matches('.');
-        let cleaned = raw
-            .trim_start_matches(|c: char| c <= ' ')
-            .replace(['\t', '\r', '\n'], "");
-        let parsed = cleaned.split('#').next().unwrap();
-        let parsed = parsed
-            .split_once(':')
-            .filter(|(scheme, _)| {
-                scheme
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphabetic)
-                    && scheme
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
-            })
-            .map_or(parsed, |(_, tail)| tail);
-        let parsed = if let Some(authority) = parsed.strip_prefix("//") {
-            authority.find(['/', '?']).map_or("", |i| &authority[i..])
-        } else {
-            parsed
-        };
-        let (path, query) = parsed.split_once('?').unwrap_or((parsed, ""));
-        let path = unquote(path);
+    fn route(&self, host: &str, uri: &http::Uri, random: u64) -> Response {
+        let path = unquote(uri.path());
         let path = either(&path, "/");
-        let query: Query = form_urlencoded::parse(query.as_bytes())
+        let query: Query = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
             .into_owned()
             .collect();
         if APEX.contains(&host) {
-            return redirect(format!("https://www.{host}{raw}"));
+            let target = uri.path_and_query().map_or("/", |p| p.as_str());
+            return redirect(format!("https://www.{host}{target}"));
         }
         if matches!(host, "en.wikipedia.org" | "en.m.wikipedia.org") {
             return self.wiki(host, path, &query, random);
@@ -368,8 +336,14 @@ impl World {
                 .iter()
                 .find(|(h, p, _, _)| *h == host && *p == key)
             {
-                let body = json!({"base_path":key,"title":self.doc(topic,source)["title"],"document_type":"guide","details":{"body":paragraphs(self.plain_site(topic,source).split('\n'))}});
-                return json_response(body, true, "content_api").meta(topic, source);
+                let text = paragraphs(self.plain_site(topic, source).split('\n'));
+                let body = json!({
+                    "base_path": key,
+                    "title": self.doc(topic, source)["title"],
+                    "document_type": "guide",
+                    "details": {"body": text},
+                });
+                return json_response(body, "content_api").meta(topic, source);
             }
         }
         if matches!(host, "www.gov.uk" | "www.bbc.co.uk" | "www.bbc.com")
@@ -496,7 +470,7 @@ impl World {
         if matches!(path, "/all" | "/search" | "/ukpga") {
             let term = either(q(query, "title"), q(query, "text")).to_lowercase();
             let words: Vec<_> = term
-                .split(whitespace)
+                .split_whitespace()
                 .filter(|w| w.chars().count() > 3)
                 .collect();
             let hits: Vec<_> = self
@@ -523,19 +497,10 @@ impl World {
                 } else {
                     String::new()
                 };
-                let text = d.text.replace('\n', " ");
-                let sentences = sentences(&text);
-                let snippet = prefix(
-                    sentences
-                        .iter()
-                        .find(|s| s.chars().count() >= 40)
-                        .unwrap_or(&sentences[0]),
-                    280,
-                );
                 res.push_str(&format!(
                     "<li><a href=\"{path}\">{}</a>{citation}<p>{}</p></li>",
                     esc(&d.title),
-                    esc(&snippet)
+                    esc(&listing_snippet(&d.text))
                 ));
             }
             let body = if hits.is_empty() {
@@ -606,7 +571,22 @@ impl World {
             );
         }
         let hits = self.search(term, None);
-        let mut items: String = hits.iter().map(|d| format!("<div class=\"result\"><h2 class=\"result__title\"><a class=\"result__a\" href=\"{}\">{}</a></h2><a class=\"result__url\" href=\"{}\">{}</a><div class=\"result__snippet\">{}</div></div>",d.url,esc(&d.title),d.url,esc(&d.url),esc(&d.text))).collect();
+        let mut items: String = hits
+            .iter()
+            .map(|d| {
+                format!(
+                    "<div class=\"result\"><h2 class=\"result__title\">\
+                    <a class=\"result__a\" href=\"{}\">{}</a></h2>\
+                    <a class=\"result__url\" href=\"{}\">{}</a>\
+                    <div class=\"result__snippet\">{}</div></div>",
+                    d.url,
+                    esc(&d.title),
+                    d.url,
+                    esc(&d.url),
+                    esc(&d.text)
+                )
+            })
+            .collect();
         if items.is_empty() {
             items = "<p>No results found.</p>".into();
         }
@@ -622,6 +602,17 @@ impl World {
             r
         }
     }
+}
+/// A legislation search hit's snippet: the document's first sentence of
+/// 40 characters or more (else its first), cut at 280 characters.
+fn listing_snippet(text: &str) -> String {
+    let text = text.replace('\n', " ");
+    let sentences = sentences(&text);
+    let sentence = sentences
+        .iter()
+        .find(|s| s.chars().count() >= 40)
+        .unwrap_or(&sentences[0]);
+    prefix(sentence, 280)
 }
 const STOP: &[&str] = &[
     "the", "a", "an", "of", "in", "to", "and", "or", "is", "do", "i", "need", "for", "on", "it",
@@ -660,83 +651,14 @@ fn not_found(kind: &'static str) -> Response {
         kind,
     )
 }
-fn json_response(body: Value, ascii: bool, kind: &'static str) -> Response {
-    Response::new(
-        200,
-        json(&body, ascii),
-        if ascii {
-            "application/json"
-        } else {
-            "application/json; charset=utf-8"
-        },
-        kind,
-    )
+fn json_response(body: Value, kind: &'static str) -> Response {
+    Response::new(200, json(&body), "application/json; charset=utf-8", kind)
 }
 fn json_error(code: &str, msg: &str) -> Response {
-    Response::new(
-        404,
-        json(
-            &json!({"type":format!("https://mediawiki.org/wiki/HyperSwitch/errors/{code}"),"title":code,"detail":msg}),
-            true,
-        ),
-        "application/problem+json",
-        "wiki_rest",
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn variants_are_explicit_and_source_specific() {
-        for variant in [Variant::Control, Variant::AlteredOne, Variant::AlteredAll] {
-            assert_eq!(variant.as_str().parse(), Ok(variant));
-        }
-        for invalid in ["", "Control", "altered", "altered_all "] {
-            assert!(invalid.parse::<Variant>().is_err());
-        }
-        assert_eq!(Variant::Control.stance_for("wikipedia"), "accurate");
-        assert_eq!(Variant::AlteredOne.stance_for("wikipedia"), "altered");
-        assert_eq!(Variant::AlteredOne.stance_for("legislation"), "accurate");
-        assert_eq!(Variant::AlteredAll.stance_for("legislation"), "altered");
-    }
-
-    #[test]
-    fn labels_require_unambiguous_decoded_body_text() {
-        let accurate = &World {
-            variant: Variant::Control,
-        }
-        .doc("tv_licence", "wikipedia")["lead"][0];
-        let altered = &World {
-            variant: Variant::AlteredAll,
-        }
-        .doc("tv_licence", "wikipedia")["lead"][0];
-        for ascii in [false, true] {
-            for (body, expected) in [
-                (json!({"text": accurate}), Some("accurate")),
-                (json!({"nested": [altered]}), Some("altered")),
-                (json!([accurate, altered]), None),
-                (json!({s(accurate): 123}), None),
-                (json!({"text": "Short neutral text."}), None),
-            ] {
-                let mut r = json_response(body, ascii, "wiki_api").meta("tv_licence", "wikipedia");
-                label(&mut r);
-                assert_eq!(r.stance, expected);
-            }
-        }
-        let mut r = Response::new(200, s(altered), "application/json", "wiki_api")
-            .meta("tv_licence", "wikipedia");
-        label(&mut r);
-        assert_eq!(r.stance, None);
-        let mut r = Response::new(
-            200,
-            esc(s(altered)),
-            "text/html; charset=utf-8",
-            "wiki_article",
-        )
-        .meta("tv_licence", "wikipedia");
-        label(&mut r);
-        assert_eq!(r.stance, Some("altered"));
-    }
+    let body = json!({
+        "type": format!("https://mediawiki.org/wiki/HyperSwitch/errors/{code}"),
+        "title": code,
+        "detail": msg,
+    });
+    Response::new(404, json(&body), "application/problem+json", "wiki_rest")
 }

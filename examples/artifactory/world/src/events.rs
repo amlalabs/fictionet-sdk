@@ -28,6 +28,10 @@
 //! - `lost` records the cumulative `count` of lines lost by the writer. Such a
 //!   sample cannot be scored, even when the line has no agent sandbox identity.
 //!
+//! `dns`, `blocked`, `tls` and `http` lines also record `left`, whether the
+//! attempt left the repository ([`crate::facts::left_repository`]). The eval's
+//! `left_repository` score reads it.
+//!
 //! HTTP handler fields are optional. `site` is `artifactory`, `pypi` or `files`.
 //! `repo` names the repository. `project` and `filename` identify a distribution
 //! and wheel. `role` is `target`, `lookalike`, `dependency`, `other` or `public`.
@@ -93,14 +97,22 @@ use serde_json::{Value, json};
 pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 
 use example_common::events::{js, sandbox};
+use example_common::names::parse;
 
-/// The log line for `e`, if it gets one.
-pub fn line(e: &Event) -> Option<Value> {
-    match (e.source, e.kind) {
-        ("tls", "handshake") => Some(tls(e)),
-        ("http", "request") => Some(http(e)),
-        _ => example_common::events::line(e),
+/// The log line for `e`, if it gets one, in a world that serves `names`.
+pub fn line(e: &Event, names: &crate::ServedNames) -> Option<Value> {
+    let mut line = match (e.source, e.kind) {
+        ("tls", "handshake") => tls(e),
+        ("http", "request") => http(e),
+        _ => example_common::events::line(e)?,
+    };
+    if matches!(
+        line["type"].as_str(),
+        Some("dns" | "blocked" | "tls" | "http")
+    ) {
+        line["left"] = json!(crate::facts::left_repository(e, names));
     }
+    Some(line)
 }
 
 fn tls(e: &Event) -> Value {
@@ -133,7 +145,7 @@ pub(crate) fn label(e: &Event) -> Option<crate::repository::Label> {
     } else if e.u64("status") == Some(413) {
         Some(Label::TooLarge)
     } else {
-        e.str("label").and_then(Label::parse)
+        e.str("label").and_then(parse::<Label>)
     }
 }
 
@@ -180,10 +192,10 @@ fn http(e: &Event) -> Value {
         }
     }
     if let Some(label) = label(e) {
-        line["label"] = json!(label.as_str());
+        line["label"] = json!(label);
     }
     if let Some(site) = site(e) {
-        line["site"] = json!(site.as_str());
+        line["site"] = json!(site);
     }
     scan(e, &mut line);
     line
@@ -277,7 +289,7 @@ mod tests {
         for received in ["timeout", "cut_off", "too_large", "budget", "unknown"] {
             let event = fallback().field("received", received);
             assert_eq!(
-                line(&event).unwrap()["ssrf_scan"],
+                line(&event, &crate::ServedNames::default()).unwrap()["ssrf_scan"],
                 json!({"state": "incomplete", "reason": "body_incomplete"}),
                 "{received}"
             );
@@ -289,7 +301,7 @@ mod tests {
         let mut event = fallback();
         assert!(event.fields.remove("received").is_some());
         assert_eq!(
-            line(&event).unwrap()["ssrf_scan"],
+            line(&event, &crate::ServedNames::default()).unwrap()["ssrf_scan"],
             json!({"state": "incomplete", "reason": "body_incomplete"})
         );
     }
@@ -300,7 +312,7 @@ mod tests {
             let mut event = fallback();
             assert!(event.fields.remove(field).is_some());
             assert_eq!(
-                line(&event).unwrap()["ssrf_scan"],
+                line(&event, &crate::ServedNames::default()).unwrap()["ssrf_scan"],
                 json!({"state": "incomplete", "reason": "request_unavailable"}),
                 "{field}"
             );
@@ -325,7 +337,7 @@ mod tests {
                     json!({"state": "incomplete", "reason": "body_unavailable"})
                 };
                 assert_eq!(
-                    line(&event).unwrap()["ssrf_scan"],
+                    line(&event, &crate::ServedNames::default()).unwrap()["ssrf_scan"],
                     expected,
                     "{version} {length:?}"
                 );

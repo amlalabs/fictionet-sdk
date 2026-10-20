@@ -162,7 +162,7 @@ fn sandbox_sees_runtime_switches_in_a_lab() {
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(memory.clone()),
         |fcx| async move {
             let tampering = Tampering::new(false, Scope::Wikipedia);
-            let content = Content::in_process(tampering.clone());
+            let content = Content::new(tampering.clone());
             switch(fcx, tampering, content).await
         },
     ));
@@ -170,67 +170,7 @@ fn sandbox_sees_runtime_switches_in_a_lab() {
     check_events(&memory);
 }
 
-struct Backend(std::process::Child);
-
-impl Drop for Backend {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-#[test]
-fn sandbox_sees_runtime_switches_through_python() {
-    use std::io::BufRead;
-    use std::process::{Command as Process, Stdio};
-
-    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut backend = Backend(
-        Process::new("python3")
-            .arg(here.join("backend/backend.py"))
-            .arg(port.to_string())
-            .env("FAKEWIKI_CORPUS", here.join("../fixtures/corpus.json"))
-            .env("FAKEWIKI_VARIANT", "altered_all")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let mut startup = String::new();
-    std::io::BufReader::new(backend.0.stdout.take().unwrap())
-        .read_line(&mut startup)
-        .unwrap();
-    let startup: serde_json::Value = serde_json::from_str(&startup).unwrap();
-    assert_eq!(startup["variant"], "altered_all");
-    let memory = Arc::new(fictionet_observe::Memory::default());
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime
-        .block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
-            move |fcx| async move { request_facts(&fcx, Some(port)).await },
-        ))
-        .unwrap();
-    let result = runtime.block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(memory.clone()),
-        move |fcx| async move {
-            let tampering = Tampering::new(false, Scope::Wikipedia);
-            let content = Content::backend(&fcx, port, tampering.clone())?;
-            switch(fcx, tampering, content).await
-        },
-    ));
-    assert_eq!(result.unwrap_err().to_string(), "done");
-    check_events(&memory);
-}
-
-async fn request_facts(fcx: &Cx, port: Option<u16>) -> fictionet::Result {
+async fn request_facts(fcx: &Cx) -> fictionet::Result {
     use fakewiki_world::pages::Variant;
     use fictionet::events::{ConnInfo, Fields};
     use fictionet::stdlib::web::{
@@ -244,10 +184,7 @@ async fn request_facts(fcx: &Cx, port: Option<u16>) -> fictionet::Result {
     let mut exchange = httpd::Exchange::new(fcx.now(), &entropy, &conn);
     for scope in [Scope::Wikipedia, Scope::AllSources] {
         let tampering = Tampering::new(true, scope);
-        let content = match port {
-            Some(port) => Content::backend(fcx, port, tampering.clone())?,
-            None => Content::in_process(tampering.clone()),
-        };
+        let content = Content::new(tampering.clone());
         let hosts = VirtualHosts::new();
         for host in [WIKI, GOV, "www.legislation.gov.uk", "duckduckgo.com"] {
             hosts.insert(host, VHost::new(content.clone()));
@@ -322,10 +259,8 @@ async fn request_facts(fcx: &Cx, port: Option<u16>) -> fictionet::Result {
                     .uri(format!("https://{host}{path}"))
                     .extension(httpd::EventInterest(true))
                     .body(Body::empty())?;
-                let response = match hosts.call(request, &mut exchange) {
-                    httpd::Reply::Now(response) => response,
-                    httpd::Reply::Later(work) => work(fcx.clone()).await?,
-                    httpd::Reply::Handoff(_) => panic!("content must handle the request"),
+                let httpd::Reply::Now(response) = hosts.call(request, &mut exchange) else {
+                    panic!("the embedded pages answer at once");
                 };
                 let fields = response.extensions().get::<Fields>().unwrap();
                 let served = fields.get("served").unwrap();
@@ -360,10 +295,8 @@ async fn request_facts(fcx: &Cx, port: Option<u16>) -> fictionet::Result {
                 ..
             }
         ));
-        let response = match pending {
-            httpd::Reply::Now(response) => response,
-            httpd::Reply::Later(work) => work(fcx.clone()).await?,
-            httpd::Reply::Handoff(_) => panic!("content must handle the request"),
+        let httpd::Reply::Now(response) = pending else {
+            panic!("the embedded pages answer at once");
         };
         let fields = response.extensions().get::<Fields>().unwrap();
         assert_eq!(
@@ -385,7 +318,7 @@ async fn request_facts(fcx: &Cx, port: Option<u16>) -> fictionet::Result {
 fn embedded_request_facts_use_the_selected_document() {
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
-        |fcx| async move { request_facts(&fcx, None).await },
+        |fcx| async move { request_facts(&fcx).await },
     ))
     .unwrap();
 }

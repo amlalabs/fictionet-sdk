@@ -2,7 +2,7 @@
 //! does: one line per DNS query, decision about a name, certificate,
 //! failed TLS handshake and HTTP request.
 //!
-//! The handler ([`backend`](crate::backend)) puts what the backend said
+//! The handler ([`handler`](crate::handler)) puts what the pages said
 //! about a page (generated or cached, the model, the time it took, its
 //! claims) in its response's extensions. The `http.request` event brings
 //! them back here, so one `http` line holds both what the agent asked for
@@ -16,7 +16,7 @@ use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
-use crate::backend::PAGE_FIELDS;
+use example_common::events::js;
 use example_common::log::Log;
 
 use example_common::headers;
@@ -58,25 +58,34 @@ impl fictionet::events::Observer for LogObserver {
     }
 }
 
-/// An event field's value as JSON.
-pub fn to_json(v: &J) -> Value {
-    match v {
-        J::Null => Value::Null,
-        J::Bool(b) => Value::Bool(*b),
-        J::Number(n) => serde_json::from_str(n.text()).unwrap_or(Value::Null),
-        J::String(s) => Value::String(s.clone()),
-        J::Array(items) => Value::Array(items.iter().map(to_json).collect()),
-        J::Object(members) => Value::Object(
-            members
-                .iter()
-                .map(|(k, v)| (k.clone(), to_json(v)))
-                .collect(),
-        ),
-    }
-}
+/// Page fields an `http` line keeps, in this order. None is a name
+/// `http.request` uses itself. There, `query` is the URL query, so search
+/// text is `search`. The search projection also reads `listed` and
+/// `reason`, which the line leaves out.
+const PAGE_FIELDS: [&str; 19] = [
+    "kind",
+    "cache",
+    "engine",
+    "search",
+    "results",
+    "title",
+    "model",
+    "gen_ms",
+    "cost",
+    "serve_ms",
+    "prefetched",
+    "claims",
+    "mentions",
+    "unsupported_snippets",
+    "unchecked_snippets",
+    "tells",
+    "location",
+    "error",
+    "bytes",
+];
 
 fn get(e: &Event, name: &str) -> Value {
-    e.get(name).map(to_json).unwrap_or(Value::Null)
+    js(e.get(name))
 }
 
 /// The log line for `e`, if it is one the log keeps.
@@ -92,7 +101,7 @@ fn line(e: &Event) -> Option<Value> {
                 json!({"type": "query_failed", "id": get(e, "query_id"), "why": get(e, "why")});
             for name in ["error", "serve_ms"] {
                 if let Some(value) = e.get(name) {
-                    line[name] = to_json(value);
+                    line[name] = js(Some(value));
                 }
             }
             Some(line)
@@ -105,14 +114,20 @@ fn line(e: &Event) -> Option<Value> {
             println!("detached {}", name.as_deref().unwrap_or(""));
             None
         }
-        ("adaptive", "site") => Some(
-            json!({"type": "site", "host": get(e, "host"), "addr": get(e, "addr"), "why": get(e, "why")}),
-        ),
+        ("adaptive", "site") => Some(json!({
+            "type": "site",
+            "host": get(e, "host"),
+            "addr": get(e, "addr"),
+            "why": get(e, "why"),
+        })),
         ("adaptive", "refused") => {
             Some(json!({"type": "refused", "host": get(e, "host"), "why": get(e, "why")}))
         }
         ("adaptive", "cert") => Some(json!({
-            "type": "cert", "host": get(e, "host"), "not_before": get(e, "not_before"), "not_after": get(e, "not_after"),
+            "type": "cert",
+            "host": get(e, "host"),
+            "not_before": get(e, "not_before"),
+            "not_after": get(e, "not_after"),
         })),
         ("dns", "query") => Some(json!({
             "type": "dns",
@@ -170,7 +185,7 @@ fn http(e: &Event) -> Value {
     line.insert("complete".into(), get(e, "complete"));
     for name in PAGE_FIELDS {
         if let Some(v) = e.get(name) {
-            line.insert(name.into(), to_json(v));
+            line.insert(name.into(), js(Some(v)));
         }
     }
     if !line.contains_key("bytes") {
@@ -185,13 +200,13 @@ mod tests {
 
     #[test]
     fn generation_commands_emit_only_changes() {
+        use crate::pages::{Applied, Command, Generation, Pages, Rejected, Seed};
         use crate::search::Searches;
-        use crate::stub::{Applied, Command, Generation, Rejected, Seed, Stub};
         use fictionet::events::Fanout;
         use fictionet_observe::Memory;
 
-        let seed = Seed::builtin("halvard-cve").unwrap();
-        let searches = Arc::new(Searches::from_seed(&seed));
+        let pages = Pages::new(Seed::builtin("halvard-cve").unwrap());
+        let searches = Arc::new(Searches::of(&pages));
         let memory = Arc::new(Memory::default());
         let initial = searches.snapshot();
         assert!(initial.generator.generate);
@@ -202,9 +217,8 @@ mod tests {
                 Fanout::new(vec![memory.clone(), searches.clone()]),
             )),
             |cx| async move {
-                let stub = Stub::new(seed);
                 assert_eq!(
-                    stub.generation(),
+                    pages.generation(),
                     Generation {
                         generate: true,
                         revision: 0
@@ -215,11 +229,11 @@ mod tests {
                         "expected_revision":expected_revision});
                     let command: Command = serde_json::from_value(value.clone()).unwrap();
                     assert_eq!(serde_json::to_value(command).unwrap(), value);
-                    stub.apply(&cx, command)
+                    pages.apply(&cx, command)
                 };
                 assert_eq!(set(false, 1), Err(Rejected::Stale { current: 0 }));
                 assert_eq!(
-                    stub.generation(),
+                    pages.generation(),
                     Generation {
                         generate: true,
                         revision: 0
@@ -248,7 +262,7 @@ mod tests {
                 assert_eq!(set(true, 0), Err(Rejected::Stale { current: 1 }));
                 assert_eq!(set(false, 0), Err(Rejected::Stale { current: 1 }));
                 assert_eq!(
-                    stub.generation(),
+                    pages.generation(),
                     Generation {
                         generate: false,
                         revision: 1
@@ -303,13 +317,7 @@ mod tests {
             line(&query),
             Some(json!({"type":"query","id":3,"engine":"google","search":"a","start":10}))
         );
-        for why in [
-            "backend_error",
-            "meta_error",
-            "error",
-            "budget",
-            "abandoned",
-        ] {
+        for why in ["error", "budget", "abandoned"] {
             let failed = Event::new("adaptive", "query_failed")
                 .field("query_id", 3u64)
                 .field("why", why);

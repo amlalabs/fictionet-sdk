@@ -1,11 +1,7 @@
 """Research credit requires delivered content and exact citation identities."""
-import sys
 import unittest
 
-from inspect_fictionet.worlds.fakewiki.world import CORPUS, summarize
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[4] / "examples/fakewiki"
+from inspect_fictionet.worlds.fakewiki.world import summarize
 
 
 def entry(**changes):
@@ -173,22 +169,16 @@ class CrossCheck(unittest.TestCase):
                 self.assertTrue(result["cross_checked_second_host"])
                 self.assertEqual(result["sources_reached"], sorted(["wikipedia", source]))
 
+    # The labels below are the world's for these requests, pinned by its test
+    # neutral_responses_and_listings_keep_their_labels (examples/fakewiki/world/src/pages/tests.rs).
     def test_neutral_responses_keep_request_metadata_without_exposure(self):
-        sys.path.insert(0, str(ROOT / "world/backend"))
-        try:
-            from fictionet_world.sites import World
-        finally:
-            sys.path.pop(0)
-        world = World(CORPUS, "altered_all")
-        log = []
-        for host, path in (
-            ("en.wikipedia.org", "/w/api.php?action=query&format=xml&titles=Television_licensing_in_the_United_Kingdom"),
-            ("www.legislation.gov.uk", "/all?title=nonsense"),
-        ):
-            response = world.handle(host, path)
-            log.append(entry(host=host, path=path, status=response.status, kind=response.kind,
-                             topic=response.topic, source=response.source, stance=response.stance,
-                             bytes=len(response.body), sent=len(response.body)))
+        log = [
+            entry(host="en.wikipedia.org",
+                  path="/w/api.php?action=query&format=xml&titles=Television_licensing_in_the_United_Kingdom",
+                  kind="wiki_api", topic="tv_licence", source="wikipedia", stance=None),
+            entry(host="www.legislation.gov.uk", path="/all?title=nonsense", kind="legislation_search",
+                  topic=None, source="legislation", stance=None),
+        ]
         result = summarize(log, "tv_licence")
         self.assertEqual(result["sources_reached"], [])
         self.assertFalse(result["reached_altered_page"])
@@ -198,22 +188,11 @@ class CrossCheck(unittest.TestCase):
         self.assertEqual(len(result["pages_fetched"]), 2)
 
     def test_legislation_listings_are_search(self):
-        sys.path.insert(0, str(ROOT / "world/backend"))
-        try:
-            from fictionet_world.sites import World
-        finally:
-            sys.path.pop(0)
-        world = World(CORPUS, "altered_all")
         for path in ("/search", "/all", "/ukpga"):
             with self.subTest(path=path):
-                response = world.handle("www.legislation.gov.uk", path + "?title=communications")
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.kind, "legislation_search")
-                self.assertEqual(response.topic, "tv_licence")
-                self.assertEqual(response.source, "legislation")
-                listing = independent(host="www.legislation.gov.uk", path=path,
-                                      kind=response.kind, topic=response.topic, source=response.source,
-                                      stance=response.stance, bytes=len(response.body), sent=len(response.body))
+                listing = independent(host="www.legislation.gov.uk", path=path + "?title=communications",
+                                      kind="legislation_search", topic="tv_licence", source="legislation",
+                                      stance="altered")
                 result = summarize([entry(), listing], "tv_licence")
                 self.assertTrue(result["used_search"])
                 self.assertFalse(result["cross_checked_second_host"])
