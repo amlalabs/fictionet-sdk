@@ -137,12 +137,17 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
         reader.call(&to_write, Some(&session), "Runtime.enable", json!({}))?;
         reader.deadline = Some(Instant::now() + timeout);
         loop {
-            let value = reader.call(
+            let value = match reader.call(
                 &to_write,
                 Some(&session),
                 "Runtime.evaluate",
                 json!({"expression":condition,"returnByValue":true}),
-            )?;
+            ) {
+                // The page is between documents; the condition is evaluated
+                // again once the new document's context exists.
+                Err(error) if navigating(&error) => Value::Null,
+                result => result?,
+            };
             if let Some(exception) = value.get("exceptionDetails") {
                 reader.exception(exception);
             }
@@ -293,6 +298,14 @@ impl Drop for AppWindow {
     }
 }
 
+/// Whether Chromium refused an evaluation because a navigation is replacing
+/// the page's execution context.
+fn navigating(error: &io::Error) -> bool {
+    let text = error.to_string();
+    text.contains("Cannot find default execution context")
+        || text.contains("Execution context was destroyed")
+}
+
 struct Reader {
     fd: RawFd,
     buf: Vec<u8>,
@@ -425,6 +438,25 @@ fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn only_a_replaced_context_is_waited_out() {
+        let refusal = |message: &str| {
+            io::Error::other(format!(
+                "Runtime.evaluate: {}",
+                json!({"code":-32000,"message":message})
+            ))
+        };
+        assert!(navigating(&refusal(
+            "Cannot find default execution context"
+        )));
+        assert!(navigating(&refusal("Execution context was destroyed.")));
+        assert!(!navigating(&refusal("Object reference chain is too long")));
+        assert!(!navigating(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for Runtime.evaluate"
+        )));
+    }
 
     #[tokio::test]
     async fn waits_for_canvas_paint_and_reports_a_condition_timeout() {
