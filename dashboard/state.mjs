@@ -1,6 +1,9 @@
-// Graph state, the run clock, and incoming snapshot and event application.
-// The caller passes group views and status, layout, and pulse effects.
-export function createState({ view, setStatus, loadLayout, pulse }) {
+// The page's graph: tasks, sandboxes, hosts, groups and links with their
+// counters, recent events, loss status and the run clock, kept from the
+// watch stream. The map keeps its layout and drawing on the same objects.
+import { listen } from './dom.mjs';
+
+export function createState() {
   const state = {
     nodes: new Map(), // id -> task or sandbox, as the world sent it
     edges: new Map(), // id -> link
@@ -12,17 +15,21 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
     startedMs: 0,
     ended: false,
     connected: false,
+    // Whether a snapshot has arrived, so the graph is known.
+    known: false,
+    // The watch's loss status: `{ incomplete, losses, ... }`.
+    status: null,
     selected: null, // { kind: 'node' | 'group' | 'edge' | 'ended', id }
     search: '',
     view: { x: 0, y: 0, k: 1 },
     userMoved: false,
     layoutDirty: true,
     sideDirty: true,
-    // What the viewer chose, kept per world: groups opened or closed by
-    // hand (by group key), and nodes dragged to a place (by node key).
+    // What the viewer chose on the map until the next snapshot: groups
+    // opened or closed by hand (by group key), and nodes dragged to a place
+    // (by node key).
     expanded: new Map(),
     pins: new Map(),
-    worldKey: '',
   };
 
   const runTime = () => state.serverT + (state.ended ? 0 : (performance.now() - state.serverAt) / 1000);
@@ -43,7 +50,11 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
     state.startedMs = s.started;
     state.ended = s.ended;
     state.connected = true;
-    setStatus(s.ended ? 'ended' : 'running', s.ended ? 'World stopped' : 'Running');
+    state.known = true;
+    state.status = s.status || null;
+    // A new graph forgets the places and open groups chosen for the last one.
+    state.pins.clear();
+    state.expanded.clear();
     for (const g of s.groups || []) upsertGroup(g);
     for (const n of s.nodes) upsertNode(n);
     for (const e of s.edges) upsertEdge(e);
@@ -55,8 +66,7 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
       }
     }
     for (const n of s.events) addEvent(n);
-    loadLayout(s.nodes);
-    // Fit once the layout is made, dragged places included.
+    // Fit once the layout is made.
     state.userMoved = false;
     state.sideDirty = true;
   }
@@ -79,9 +89,6 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
 
   function removeGroup(id) {
     state.groups.delete(id);
-    const gv = view.gviews.get(id);
-    if (gv?.g) gv.g.remove();
-    view.gviews.delete(id);
     if (state.selected?.kind === 'group' && state.selected.id === id) state.selected = null;
     state.layoutDirty = true;
     state.sideDirty = true;
@@ -155,7 +162,6 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
 
   function addEvent(n) {
     state.events.push(n);
-    pulse(n);
     if (state.events.length > 500) state.events.shift();
     if (n.kind === 'drop' && n.node) {
       const node = state.nodes.get(n.node);
@@ -174,48 +180,59 @@ export function createState({ view, setStatus, loadLayout, pulse }) {
   return { state, runTime, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent };
 }
 
-// Bind one watch to a graph state. The owner closes it when its view leaves.
-export function watchState(source, { state, setStatus, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent }) {
+// Bind one watch to a graph state, until the returned function is called.
+export function watchState(source, { state, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent }) {
   const cleanup = [];
   const on = (name, callback) => {
     source.addEventListener(name, callback);
     cleanup.push(() => source.removeEventListener(name, callback));
   };
-    on('waiting', () => {
-      state.connected = true;
-      setStatus('waiting', 'Waiting for a world');
-    });
-    on('snapshot', (e) => snapshot(JSON.parse(e.data)));
-    on('host', (e) => upsertHost?.(JSON.parse(e.data)));
-    on('host_end', (e) => removeHost?.(JSON.parse(e.data).id));
-    on('group', (e) => upsertGroup(JSON.parse(e.data)));
-    on('group_end', (e) => removeGroup(JSON.parse(e.data).id));
-    on('node', (e) => upsertNode(JSON.parse(e.data)));
-    on('node_end', (e) => removeNode(JSON.parse(e.data).id));
-    on('edge', (e) => upsertEdge(JSON.parse(e.data)));
-    on('edge_end', (e) => removeEdge(JSON.parse(e.data).id));
-    on('counters', (e) => counters(JSON.parse(e.data)));
-    on('event', (e) => addEvent(JSON.parse(e.data)));
-    on('ended', (e) => {
-      tick(JSON.parse(e.data).t);
-      state.ended = true;
-      setStatus('ended', 'World stopped');
-      state.sideDirty = true;
-    });
-    on('end', () => {
-      source.close();
-      if (!state.ended) setStatus('ended', 'The world closed');
-      state.ended = true;
-    });
-    on('world_error', (e) => {
-      state.ended = true;
-      setStatus('ended', JSON.parse(e.data).error);
-    });
-    on('error', () => {
-      if (!state.ended) setStatus('connecting', 'Reconnecting');
-    });
+  on('waiting', () => { state.connected = true; });
+  on('snapshot', (e) => snapshot(JSON.parse(e.data)));
+  on('host', (e) => upsertHost(JSON.parse(e.data)));
+  on('host_end', (e) => removeHost(JSON.parse(e.data).id));
+  on('group', (e) => upsertGroup(JSON.parse(e.data)));
+  on('group_end', (e) => removeGroup(JSON.parse(e.data).id));
+  on('node', (e) => upsertNode(JSON.parse(e.data)));
+  on('node_end', (e) => removeNode(JSON.parse(e.data).id));
+  on('edge', (e) => upsertEdge(JSON.parse(e.data)));
+  on('edge_end', (e) => removeEdge(JSON.parse(e.data).id));
+  on('counters', (e) => counters(JSON.parse(e.data)));
+  on('event', (e) => addEvent(JSON.parse(e.data)));
+  on('ended', (e) => {
+    tick(JSON.parse(e.data).t);
+    state.ended = true;
+    state.sideDirty = true;
+  });
+  on('end', () => {
+    source.close();
+    state.ended = true;
+  });
+  on('status', (e) => { state.status = JSON.parse(e.data).status; });
+  on('world_error', () => { state.ended = true; });
   return () => {
     cleanup.forEach((remove) => remove());
     source.close();
+  };
+}
+
+// The watch events the model passes on to its subscribers.
+const EVENTS = ['waiting', 'snapshot', 'host', 'host_end', 'group', 'group_end', 'node', 'node_end', 'edge', 'edge_end', 'counters', 'status', 'event', 'ended', 'end', 'world_error', 'error', 'open'];
+
+/// The page's one graph, bound to `source`, a watch. `subscribe(listener)`
+/// calls `listener(name, data)` for each watch event once the graph holds it,
+/// and returns an unsubscribe function.
+export function createModel(source) {
+  const graph = createState();
+  const listeners = new Set();
+  const unbind = watchState(source, graph);
+  const removers = EVENTS.map((name) => listen(source, name, (event) => {
+    const data = event.data ? JSON.parse(event.data) : null;
+    for (const listener of [...listeners]) listener(name, data);
+  }));
+  return {
+    ...graph,
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    dispose() { listeners.clear(); removers.forEach((remove) => remove()); unbind(); },
   };
 }

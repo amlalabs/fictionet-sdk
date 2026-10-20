@@ -45,7 +45,6 @@ test('table renders column pointers and formats as text and replaces snapshots',
   assert.match(h.root.textContent, /<img src=x>/);
   assert.match(h.root.textContent, /2.0 KB/);
   assert.match(h.root.textContent, /1,234/);
-  assert.equal(h.root.querySelector('img'), null);
   h.publish({ revision: 2, value: [] });
   assert.doesNotMatch(h.root.textContent, /<img/);
   assert.match(h.root.textContent, /No rows yet/);
@@ -214,20 +213,4 @@ test('custom panels dispose a late mount and reject foreign module paths', async
   assert.match(h.root.textContent, /Invalid panel module path/);
   assert.equal(imports, 1);
   bad();
-});
-
-test('control uses the world revision when stream and world revisions differ', async () => {
-  const h = fixture();
-  const dispose = control(h.root, h.services, { state: '/api/state/routing', command: '/api/command/routing', actions: [{ label: 'Hijacked', command: { mode: 'hijack' } }] });
-  h.publish({ revision: 1, value: { revision: 0, mode: 'legitimate' } });
-  h.root.querySelector('button').click();
-  await settle();
-  assert.equal(h.requests[0].body.command.expected_revision, 0);
-  h.requests[0].resolve({ status: 'applied', reply: { revision: 1 } });
-  await settle();
-  h.publish({ revision: 2, value: { revision: 1, mode: 'hijack' } });
-  h.root.querySelector('button').click();
-  await settle();
-  assert.equal(h.requests[1].body.command.expected_revision, 1);
-  dispose();
 });

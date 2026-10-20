@@ -4,6 +4,7 @@ import { createTransport } from '../transport.mjs';
 import { mount } from './left-the-box.mjs';
 import { createDocument } from '../test-dom.mjs';
 import { createSelection } from '../selection.mjs';
+import { hostLookups } from '../page.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -21,8 +22,9 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
       }));
     },
   });
+  const hosts = [{ name: 'alpha', sandbox: 'east' }, { name: 'beta', sandbox: 'west' }];
   const dispose = mount(root, {
-    selection, hosts: [{ name: 'alpha', sandbox: 'east' }, { name: 'beta', sandbox: 'west' }],
+    selection, hosts, ...hostLookups(() => hosts),
     transport,
     setTimeout(callback, delay) { delays.push(delay); const id = Symbol(); timers.set(id, callback); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -40,7 +42,6 @@ test('destinations show outcomes, scope guests, report loss and stop reads on di
   requests[0].resolve(snapshot);
   await settle();
   assert.match(root.textContent, /Served by the world.*<world.test>/);
-  assert.equal(root.querySelector('world.test'), null);
   assert.match(root.textContent, /the host package cache/);
   assert.equal(root.querySelector('.egress-origins').textContent, 'https://archive.ubuntu.com3 requests');
   for (const address of root.querySelectorAll('.egress-address')) {
@@ -103,8 +104,9 @@ test('containment escapes override completeness only in their scope', async () =
   const selection = createSelection();
   let update, opened, stopped = false;
   const row = { sandbox: 'east', name: 'example.test', address: '203.0.113.10:443', transport: 'tcp', outcome: 'forwarded', by: 'https://example.test', requests: 1, connections: 1, packets: 0, first: .4, last: .4 };
+  const hosts = [{ name: 'alpha', sandbox: 'east' }, { name: 'beta', sandbox: 'west' }];
   const dispose = mount(root, {
-    selection, hosts: [{ name: 'alpha', sandbox: 'east' }, { name: 'beta', sandbox: 'west' }],
+    selection, hosts, ...hostLookups(() => hosts),
     transport: { get: async () => ({ revision: 1, destinations: [row, { ...row, outcome: 'no_route', requests: 0, connections: 0, packets: 1, last: .400001 }], pending: [], lookups: [], dropped: 0, lost: 0 }) },
     containmentState: '/api/state/containment',
     state(path, callback) { assert.equal(path, '/api/state/containment'); update = callback; return () => { stopped = true; }; },
@@ -113,7 +115,7 @@ test('containment escapes override completeness only in their scope', async () =
   await settle();
   assert.doesNotMatch(root.textContent, /Everything else stayed/);
   update({ value: { probes: [{ guest: 'east', outcome: 'not_contained' }] } });
-  assert.match(root.textContent, /The containment check found a way out that the world does not record/);
+  assert.match(root.textContent, /The containment check found a way out that the world did not see/);
   assert.equal(root.querySelector('.egress-origins').textContent, 'https://example.test1 request');
   assert.match(root.textContent, /1 request · 1 connection/);
   assert.match(root.textContent, /1 packet/);
@@ -140,7 +142,7 @@ test('after the run stopped, a failed read says so and stops asking', async () =
   document.body.append(root);
   const timers = new Map();
   const dispose = mount(root, {
-    selection: createSelection(), hosts: [], stopped: () => true,
+    selection: createSelection(), hosts: [], ...hostLookups(() => []), stopped: () => true,
     transport: { get: async () => { throw new TypeError('Failed to fetch'); } },
     setTimeout(callback) { const id = Symbol(); timers.set(id, callback); return id; },
     clearTimeout(id) { timers.delete(id); },

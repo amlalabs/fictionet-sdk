@@ -12,7 +12,7 @@ const humanize = (key) => {
 const text = (value) => (value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value));
 
 /// A value as a key and value list: one row per field of an object.
-export function keyValues(parent, el, value) {
+function keyValues(parent, el, value) {
   const dl = el('dl', { class: 'kv' }, parent);
   const entries = value !== null && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value) : [['Value', value]];
   for (const [key, item] of entries) {

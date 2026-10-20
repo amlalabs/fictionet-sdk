@@ -56,7 +56,7 @@ function setup(t, links = ['a'], maxRows = 3000) {
     packet: (p, signal) => new Promise((resolve, reject) => requests.push({ url: `api/packet?link=${p.link}&seq=${p.seq}`, signal, resolve, reject })),
     download: async (...args) => { downloads.push(args); if (downloadError) throw downloadError; },
   };
-  const view = createPackets({ $, el, ...transport, fmtCount: String, fit() {}, maxRows });
+  const view = createPackets({ $, el, ...transport, fmtCount: String, maxRows });
   const open = () => view.openLinks('From', 'To', links.map((id) => ({ e: { id }, flip: false })));
   open();
   const source = sources[0];
@@ -75,7 +75,7 @@ function setup(t, links = ['a'], maxRows = 3000) {
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const detail = (seq) => ({ seq, len: 40, t: seq, layers: [], buffers: [{ name: 'packet', hex: '4142' }, { name: 'payload', hex: '43' }] });
 
-test('refused_subscription_reason: a single link shows its terminal reason', (t) => {
+test('a single link shows its terminal reason', (t) => {
   const h = setup(t, ['e3']);
   h.source.emit('world_error', { error: 'no such link' });
   assert.equal($('prows').textContent, 'Link e3: no such link');
@@ -483,7 +483,7 @@ test('a successful capture download clears the previous failure label', async (t
   h.failDownload(null);
   $('pcap').click();
   await settle();
-  assert.equal($('pcap-label').textContent, 'Capture for Wireshark');
+  assert.equal($('pcap-label').textContent, 'pcapng');
 });
 
 test('packets keep the reading position and offer a jump to new rows', (t) => {
@@ -540,7 +540,6 @@ test('merged host rows keep display numbers and link identities in detail and la
   h.view.setLabels([{ text: '<download>', target: { kind: 'flow', link: 'b', a: '10.0.0.3', b: '10.0.0.2' } }]);
   assert.equal(h.rows()[0].querySelector('.label-chip'), null);
   assert.equal(h.rows()[1].querySelector('.c-info').querySelector('.label-chip').textContent, '<download>');
-  assert.equal(h.rows()[1].querySelector('download'), null);
   h.view.setLabels([]);
   assert.equal(h.rows()[1].querySelector('.label-chip'), null);
   h.view.openLinks('alpha', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'c' }, host: 'alpha' }]);

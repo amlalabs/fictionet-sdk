@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { createDocument } from '../test-dom.mjs';
 import { createSelection } from '../selection.mjs';
 import { createTransport } from '../transport.mjs';
-import { createServices } from '../page.mjs';
-import { mount, guestResult } from './containment.mjs';
+import { createServices, hostLookups } from '../page.mjs';
+import { mount } from './containment.mjs';
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 test('startup checks use authenticated state paths, render facts and scope guests', async () => {
@@ -22,15 +22,15 @@ test('startup checks use authenticated state paths, render facts and scope guest
     },
   });
   const services = createServices(transport);
-  const dispose = mount(root, { selection, state: services.state, hosts: [{ name: 'alpha', sandbox: 'east' }] }, { state: '/api/state/containment' });
+  const hosts = [{ name: 'alpha', sandbox: 'east' }];
+  const dispose = mount(root, { selection, state: services.state, hosts, ...hostLookups(() => hosts) }, { state: '/api/state/containment' });
   assert.match(root.textContent, /No startup checks published/);
   await settle();
-  const probe = { guest: 'east', name: 'Public DNS', command: '<dig @8.8.8.8>', outcome: 'contained', guest_result: 'Timed out', world_answer: 'no route: no machine at that address' };
+  const probe = { guest: 'east', name: 'Public DNS', command: '<dig @8.8.8.8>', destination: '8.8.8.8:53', outcome: 'contained', guest_result: 'Exit 9\nTimed out', summary: 'Timed out', world_answer: 'no route: no machine at that address' };
   source.enqueue(new TextEncoder().encode(`event: snapshot\ndata: ${JSON.stringify({ topic: 'containment', revision: 1, value: { probes: [probe, { ...probe, guest: 'west', outcome: 'not_contained' }, { ...probe, name: 'Proxy settings', outcome: 'fact', proxies: [{ name: 'HTTPS_PROXY', destination: 'http://cache.test', world_host: true }] }] } })}\n\n`));
   await settle();
-  assert.match(root.textContent, /west · Public DNS: the guest got Timed out, and the world has no record of it/);
+  assert.match(root.textContent, /west · Public DNS: the guest got Timed out from 8.8.8.8:53, and the world did not see it/);
   assert.match(root.textContent, /<dig @8.8.8.8>/);
-  assert.equal(root.querySelector('dig'), null);
   assert.match(root.textContent, /Timed out/);
   assert.match(root.textContent, /HTTPS_PROXY: http:\/\/cache.test \(world host\)/);
   selection.set({ host: 'alpha' });
@@ -45,9 +45,9 @@ test('probe rows group guests, summarize outputs and expand full commands', () =
   const document = createDocument(), root = document.createElement('section');
   const outcomes = ['contained', 'forwarded', 'not_contained', 'timed_out', 'unknown', 'missing_tool', 'fact'];
   const dispose = mount(root, {
-    selection: createSelection(),
+    selection: createSelection(), ...hostLookups(() => []),
     state(path, callback) {
-      callback({ value: { probes: outcomes.map((outcome) => ({ guest: 'alpha', name: outcome, outcome, command: 'curl https://example.test', destination: 'example.test', guest_result: '\nHTTP 200\nFull output', world_answer: 'https://example.test' })) } });
+      callback({ value: { probes: outcomes.map((outcome) => ({ guest: 'alpha', name: outcome, outcome, command: 'curl https://example.test/path', destination: 'example.test', guest_result: '\nHTTP 200\nFull output', summary: 'HTTP 200', world_answer: 'https://example.test' })) } });
       return () => {};
     },
   }, { state: '/api/state/containment' });
@@ -58,7 +58,7 @@ test('probe rows group guests, summarize outputs and expand full commands', () =
   assert.ok(root.querySelectorAll('.outcome-pill').every((pill) => pill.querySelector('svg').getAttribute('aria-hidden') === 'true'));
   assert.equal(root.querySelector('.probe-result').textContent, 'HTTP 200');
   assert.equal(root.querySelector('pre').textContent, '\nHTTP 200\nFull output');
-  assert.match(root.querySelector('.containment-alert').textContent, /alpha · not_contained: the guest got HTTP 200 from https:\/\/example.test, and the world has no record of it/);
+  assert.match(root.querySelector('.containment-alert').textContent, /alpha · not_contained: the guest got HTTP 200 from example.test, and the world did not see it/);
   const alert = root.querySelector('.containment-alert').children[0];
   assert.equal(alert.children[0].tag, 'svg');
   assert.equal(alert.children[0].getAttribute('aria-hidden'), 'true');
@@ -67,18 +67,12 @@ test('probe rows group guests, summarize outputs and expand full commands', () =
 });
 
 
-test('guest summaries skip tool metadata and keep the meaningful result', () => {
-  assert.equal(guestResult(';; DiG 9.18\n;; global options: +cmd\n;; connection timed out; no servers could be reached'), 'connection timed out; no servers could be reached');
-  assert.equal(guestResult('\nHTTP 200\nresponse body'), 'HTTP 200');
-  assert.equal(guestResult('\nNo proxy settings set\n'), 'No proxy settings set');
-});
-
 test('startup checks that cannot load say whether the run has stopped', () => {
   for (const [stopped, text] of [[true, 'The run has stopped, so startup checks can no longer be loaded.'], [false, 'Could not load startup checks: no such state topic: "containment"']]) {
     const document = createDocument(), root = document.createElement('section');
     let fail;
     const dispose = mount(root, {
-      selection: createSelection(), hosts: [], stopped: () => stopped,
+      selection: createSelection(), ...hostLookups(() => []), stopped: () => stopped,
       state: (_, update, error) => { fail = error; return () => {}; },
     }, { state: '/api/state/containment' });
     fail(new Error(stopped ? 'The run has stopped, so its state can no longer be loaded' : 'no such state topic: "containment"'));

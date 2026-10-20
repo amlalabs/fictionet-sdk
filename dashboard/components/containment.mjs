@@ -1,13 +1,9 @@
+// mount(root, services, options) returns dispose. The startup checks the
+// guest kit published: each probe's command, what the guest got (its
+// summary, from the kit), and what the world saw.
 import { scoped, icon } from '../dom.mjs';
 
 const labels = { contained: 'Contained', forwarded: 'Forwarded by the world', not_contained: 'Not contained', unknown: 'Not determined', missing_tool: 'Tool unavailable', timed_out: 'Timed out', fact: 'Configuration' };
-
-export function guestResult(output = '') {
-  const lines = output.split('\n').map((line) => line.trim()).filter(Boolean);
-  const result = lines.find((line) => /^(HTTP(?:\/\S+)? \d{3}|curl:)|timed out|no servers could be reached/.test(line))
-    || lines.find((line) => !line.startsWith(';') && !line.startsWith('%'));
-  return result?.replace(/^;+\s*/, '') || 'No output';
-}
 
 export function mount(root, services, options) {
   const { el } = scoped(root);
@@ -16,23 +12,22 @@ export function mount(root, services, options) {
   let snapshot, selected;
   function draw() {
     if (!snapshot) return;
-    const guest = services.hosts?.find((host) => host.name === selected)?.sandbox || selected;
+    const guest = services.sandboxOf(selected);
     const rows = (snapshot.value?.probes || []).filter((row) => !guest || row.guest === guest);
     const escaped = rows.filter((row) => row.outcome === 'not_contained');
     status.classList.toggle('containment-alert', escaped.length > 0);
     status.replaceChildren();
     for (const row of escaped) {
-      const destination = row.command.match(/https?:\/\/[^\s'";]+/)?.[0] || row.destination;
       const alert = el('div', {}, status);
       icon(alert, 'warning');
-      el('span', { text: `${row.guest} · ${row.name}: the guest got ${guestResult(row.guest_result)}${destination ? ` from ${destination}` : ''}, and the world has no record of it.` }, alert);
+      el('span', { text: `${row.guest} · ${row.name}: the guest got ${row.summary}${row.destination ? ` from ${row.destination}` : ''}, and the world did not see it.` }, alert);
     }
     if (!escaped.length) status.textContent = snapshot.status?.too_large ? 'Startup checks exceeded the state size limit. Results may be incomplete.'
       : rows.length ? 'Startup checks compare guest results with the world’s observations.' : 'No startup checks published yet.';
     body.replaceChildren();
     const guests = [...new Set(rows.map((row) => row.guest))];
     for (const name of guests) {
-      if (!guest) el('h3', { class: 'containment-guest', text: services.hosts?.find((host) => host.sandbox === name)?.name || name }, body);
+      if (!guest) el('h3', { class: 'containment-guest', text: services.hostOf(name) || name }, body);
       for (const row of rows.filter((row) => row.guest === name)) {
         const details = el('details', { class: `containment-probe ${row.outcome === 'not_contained' ? 'not-contained' : ''}` }, body);
         const summary = el('summary', {}, details);
@@ -41,7 +36,7 @@ export function mount(root, services, options) {
         icon(name, 'chevron');
         name.append(row.name);
         el('code', { class: 'probe-command', text: row.command, title: row.command }, title);
-        el('span', { class: 'probe-result', text: guestResult(row.guest_result) }, summary);
+        el('span', { class: 'probe-result', text: row.summary }, summary);
         el('span', { class: 'probe-world', text: row.world_answer }, summary);
         const pill = el('span', { class: `outcome-pill ${row.outcome}` }, summary);
         icon(pill, row.outcome === 'contained' ? 'check' : row.outcome === 'not_contained' ? 'warning' : 'neutral');

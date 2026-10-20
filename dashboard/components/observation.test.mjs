@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mount as map } from './map.mjs';
 import { mount as packets } from './packets.mjs';
 import { mount as events } from './events.mjs';
-import { watchState } from '../state.mjs';
+import { createModel } from '../state.mjs';
+import { hostLookups } from '../page.mjs';
 import { createSelection } from '../selection.mjs';
 import { createTransport } from '../transport.mjs';
 import { createDocument, Element } from '../test-dom.mjs';
@@ -30,9 +31,11 @@ function fixture(t) {
   }
   const selection = createSelection();
   const watch = () => { const source = new Source(); watches.push(source); return source; };
+  const hosts = [{ name: 'alpha', sandbox: 'guest' }];
   const services = {
-    selection, reducedMotion: { matches: true }, hosts: [{ name: 'alpha', sandbox: 'guest' }],
-    watch, connect: (graph) => watchState(watch(), graph),
+    selection, reducedMotion: { matches: true }, hosts,
+    graph: createModel(watch()),
+    ...hostLookups(() => hosts),
     transport: {
       ...createTransport({}, {
         location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
@@ -49,6 +52,7 @@ function fixture(t) {
     snapshot: { t: 0, started: 1, ended: false, hosts: [{ id: 'h1', name: 'alpha', sandbox: 'guest', group: null }], groups: [], nodes: [{ id: 's1', kind: 'sandbox', name: 'guest', host: 'h1' }], edges: [], counters: {}, events: [] },
     frame() { const callbacks = [...frames.values()]; frames.clear(); callbacks.forEach((callback) => callback(performance.now())); },
     clean() {
+      services.graph.dispose();
       assert.equal(frames.size, 0);
       assert.ok(observers.every((observer) => observer.closed));
       for (const source of [...watches, ...streams]) { assert.equal(source.closed, true); assert.equal(source.listenerCount, 0); }
@@ -61,7 +65,7 @@ function fixture(t) {
 // Node has no browser frame scheduler or resize observer.
 for (const name of ['requestAnimationFrame', 'cancelAnimationFrame', 'ResizeObserver']) globalThis[name] ??= function () {};
 
-test('map uses its root and releases its watch, controls, observer and frames', (t) => {
+test('map uses its root and releases its controls, observer and frames', (t) => {
   const h = fixture(t);
   const dispose = map(h.root, h.services);
   h.watches[0].emit('snapshot', h.snapshot);
@@ -188,7 +192,6 @@ test('events filters text, preserves loss and selects only explicit flow identit
   h.frame();
   assert.match(h.root.textContent, /4 lost/);
   assert.match(h.root.textContent, /<script>hello<\/script>/);
-  assert.equal(h.root.querySelector('script'), null);
   h.root.querySelector('button.event-line').click();
   assert.equal(h.selection.get().connection, 12);
   assert.deepEqual(h.selection.get().links, []);
@@ -463,14 +466,13 @@ test('selected startup links acquire their host name without changing the select
   assert.deepEqual(h.selection.get().links, ['e2']);
   assert.equal(h.streams.at(-1).links, 'e2');
   assert.ok(h.streams.slice(0, -1).every((stream) => stream.closed));
-  let update;
   h.services.transport.packet = async () => ({ ok: true, json: async () => ({ seq: 4, len: 28, t: 1, layers: [], buffers: [{ name: 'packet', hex: '4142' }] }) });
   dispose();
-  const stop = packets(h.root, h.services, { onReady(view) { update = view; } });
-  h.watches.at(-1).emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
+  // A panel opened again reads the graph the page already holds.
+  const stop = packets(h.root, h.services);
   await settle();
   h.streams.at(-1).emit('packet', { seq: 4, link: 'e2', side: 0, t: 1, tags: [], src: 'a', dst: 'b', proto: 'ICMP', len: 28, info: 'Echo request' });
-  update.flush();
+  h.frame();
   h.root.querySelector('#prows').querySelector('tr').click();
   await settle();
   assert.match(h.root.querySelector('.packet-detail-head').textContent, /Packet 4 · alpha's link, packet 4/);

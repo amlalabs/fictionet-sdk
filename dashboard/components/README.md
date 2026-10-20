@@ -11,9 +11,16 @@ and one packet stream. Components never open their own watch or state stream;
 they subscribe through `services`. Everything else is a short request.
 
 `services.transport` owns same-origin authenticated requests and console sockets.
-`services.watch()` returns a source with the page's one watch stream: the latest
+`services.graph` is the page's one graph model on its watch stream (see
+`state.mjs`): `graph.state` holds the nodes, links, hosts, groups, the latest
+500 events and the loss status, and `graph.subscribe(listener)` calls
+`listener(name, data)` for each watch event once the model holds it.
+`services.watch()` returns a source with the watch stream itself: the latest
 snapshot and the changes since, then live events. Close it when done.
-`services.connect(graph)` binds that watch to a graph state (see `state.mjs`).
+`services.hosts` lists the page's hosts; `services.hostOf(sandbox)` names the
+host of a sandbox, or null, and `services.sandboxOf(host)` the sandbox of a
+host. `services.input.subscribe(host, listener)` says who holds a host's
+input, as `{holder, mine, owner, text}`.
 `services.state(path, onSnapshot, onError)` subscribes to a state topic and
 returns an unsubscribe function; snapshots have `{revision, at, value, status}`.
 A topic stays on the stream after its panel closes, so switching

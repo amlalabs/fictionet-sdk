@@ -2,23 +2,25 @@
 // The Rust test `dashboard_js` runs these when node is installed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createTransport } from './transport.mjs';
+import { createTransport, SIGN_IN } from './transport.mjs';
+import { watchState } from './state.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-function transport(t, { fragment = '', token = 'secret', bootstrap = 204, onLogout } = {}) {
+function transport(t, { fragment = '', token = 'secret', bootstrap = 204 } = {}) {
   const requests = [], sources = [], calls = [], downloads = [], revoked = [], sockets = [];
   const timers = new Map(), stored = new Map(token ? [['fictionet_token', token]] : []);
   const window = new EventTarget(), anchors = new Set(), delays = [];
   const state = { connected: false, ended: false, sideDirty: false };
   const location = { href: `http://127.0.0.1:7878/${fragment}` };
-  const reducers = { state, onLogout };
-  for (const name of ['setStatus', 'tick', 'snapshot', 'upsertGroup', 'removeGroup', 'upsertNode', 'removeNode', 'upsertEdge', 'removeEdge', 'counters', 'addEvent']) {
+  // A graph that records what the watch applies to it.
+  const reducers = { state };
+  for (const name of ['tick', 'snapshot', 'upsertHost', 'removeHost', 'upsertGroup', 'removeGroup', 'upsertNode', 'removeNode', 'upsertEdge', 'removeEdge', 'counters', 'addEvent']) {
     reducers[name] = (...args) => calls.push([name, ...args]);
   }
   const storage = { getItem: (key) => stored.get(key), setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) };
   let nextResponse;
-  const api = createTransport(reducers, {
+  const api = createTransport({ setStatus: (...args) => calls.push(['setStatus', ...args]) }, {
     location, storage, window,
     WebSocket: class extends EventTarget {
       constructor(url) { super(); this.url = url; this.closed = false; sockets.push(this); }
@@ -72,6 +74,8 @@ function transport(t, { fragment = '', token = 'secret', bootstrap = 204, onLogo
   t.after(api.close);
   return {
     ...api, state, requests, sources, calls, timers, stored, location, downloads, revoked, anchors, delays, sockets,
+    // The page's watch, applied to the recording graph; returns the source.
+    connect() { const source = api.watch(); watchState(source, reducers); return source; },
     navigate(fragment) { location.href = `http://127.0.0.1:7878/${fragment}`; window.dispatchEvent(new Event('hashchange')); },
     respond(response) { nextResponse = response; },
     retry() { const [id, fn] = timers.entries().next().value; timers.delete(id); fn(); },
@@ -97,6 +101,7 @@ test('missing, invalid or used bootstrap cannot open an API stream', async (t) =
     assert.equal(h.sources.length, 0);
     assert.equal(h.stored.size, 0);
     assert.equal(h.timers.size, 0);
+    assert.deepEqual(h.calls.at(-1), ['setStatus', 'ended', `Not signed in. ${SIGN_IN}`]);
     await assert.rejects(h.packet({ link: 'e1', seq: 1 }));
   }
 });
@@ -125,19 +130,15 @@ test('fragment navigation clears the URL immediately and keeps the matching sess
   assert.deepEqual(h.calls, []);
 });
 
-test('fragment navigation can sign in an unsigned tab and resume its watch', async (t) => {
+test('fragment navigation signs in an unsigned tab', async (t) => {
   const h = transport(t, { token: null });
-  h.connect();
   await settle();
-  assert.deepEqual(h.calls.at(-1), ['setStatus', 'ended', 'Not signed in. Open the dashboard bootstrap URL to sign in. If it was already used, restart the dashboard first.']);
+  await assert.rejects(h.packet({ link: 'e1', seq: 1 }));
   h.navigate('#token=secret');
   assert.equal(h.location.href, 'http://127.0.0.1:7878/');
-  await settle();
+  await h.packet({ link: 'e1', seq: 1 });
   assert.equal(h.stored.get('fictionet_token'), 'secret');
-  assert.equal(h.sources.length, 1);
-  h.sources[0].emit('waiting');
-  await settle();
-  assert.deepEqual(h.calls.at(-1), ['setStatus', 'waiting', 'Waiting for a world']);
+  assert.equal(h.requests.at(-1).headers.Authorization, 'Bearer secret');
 });
 
 test('fragment navigation rejects a used bootstrap that differs from the stored token', async (t) => {
@@ -152,7 +153,7 @@ test('fragment navigation rejects a used bootstrap that differs from the stored 
   assert.equal(h.timers.size, 0);
 });
 
-test('connect parses split UTF-8, CRLF, comments and multiline data and routes named events', async (t) => {
+test('the watch parses split UTF-8, CRLF, comments and multiline data and routes named events', async (t) => {
   const h = transport(t);
   h.connect();
   await settle();
@@ -175,13 +176,12 @@ test('connect parses split UTF-8, CRLF, comments and multiline data and routes n
   for (const byte of new TextEncoder().encode(wire)) source.bytes(new Uint8Array([byte]));
   await settle();
   assert.equal(h.state.connected, true);
-  assert.deepEqual(h.calls[0], ['setStatus', 'waiting', 'Waiting for a world']);
-  assert.deepEqual(h.calls.slice(1, -1), events.map(([name, data, reducer]) => [reducer, name.endsWith('_end') ? data.id : data]));
+  assert.deepEqual(h.calls.slice(0, -1), events.map(([name, data, reducer]) => [reducer, name.endsWith('_end') ? data.id : data]));
   assert.deepEqual(h.calls.at(-1), ['upsertGroup', { id: 'g2', name: 'café' }]);
   source.emit('ended', { t: 3 });
   source.emit('end');
   await settle();
-  assert.deepEqual(h.calls.slice(-2), [['tick', 3], ['setStatus', 'ended', 'World stopped']]);
+  assert.deepEqual(h.calls.at(-1), ['tick', 3]);
   assert.equal(h.state.ended, true);
   assert.equal(h.state.sideDirty, true);
   assert.equal(source.cancelled, true);
@@ -199,10 +199,11 @@ test('end closes the watch without retrying', async (t) => {
   assert.equal(h.timers.size, 0);
 });
 
-test('terminal_refusal_no_retry: the watch shows the reason even after ended', async (t) => {
+test('a watch refusal is terminal and keeps its reason, even after ended', async (t) => {
   for (const ended of [false, true]) {
-    const h = transport(t);
-    h.connect();
+    const h = transport(t), reasons = [];
+    const source = h.connect();
+    source.addEventListener('world_error', (event) => reasons.push(JSON.parse(event.data).error));
     await settle();
     if (ended) h.sources[0].emit('ended', { t: 3 });
     h.sources[0].emit('world_error', { error: 'the world closed during a reply value' });
@@ -210,7 +211,7 @@ test('terminal_refusal_no_retry: the watch shows the reason even after ended', a
     await settle();
     assert.equal(h.timers.size, 0);
     assert.equal(h.state.ended, true);
-    assert.deepEqual(h.calls.at(-1), ['setStatus', 'ended', 'the world closed during a reply value']);
+    assert.deepEqual(reasons, ['the world closed during a reply value']);
   }
 });
 
@@ -253,9 +254,10 @@ test('HTTP refusal reasons reach the watch and packet stream without retry', asy
   for (const status of [400, 502]) {
     const h = transport(t);
     h.respond(Response.json({ error: 'this world has too many watched links' }, { status }));
-    h.connect();
+    const reasons = [];
+    h.connect().addEventListener('world_error', (event) => reasons.push(JSON.parse(event.data).error));
     await settle();
-    assert.deepEqual(h.calls.at(-1), ['setStatus', 'ended', 'this world has too many watched links']);
+    assert.deepEqual(reasons, ['this world has too many watched links']);
     assert.equal(h.state.ended, true);
     const seen = [];
     h.respond(Response.json({ error: 'no such link' }, { status }));
@@ -319,12 +321,12 @@ test('packet reconnect sends authorization and resets history before replay', as
 });
 
 test('watch reconnects with bearer; authorization rejection signs out without retry', async (t) => {
-  const h = transport(t);
-  h.connect();
+  const h = transport(t), errors = [];
+  h.connect().addEventListener('error', (event) => errors.push(JSON.parse(event.data).error));
   await settle();
   h.sources[0].end();
   await settle();
-  assert.deepEqual(h.calls.at(-1), ['setStatus', 'connecting', 'Reconnecting']);
+  assert.deepEqual(errors, ['Connection dropped. Reconnecting.']);
   h.respond(new Response(null, { status: 401 }));
   h.retry();
   await settle();
@@ -333,25 +335,22 @@ test('watch reconnects with bearer; authorization rejection signs out without re
   assert.equal(h.timers.size, 0);
 });
 
-test('authorization failure closes the packet view before signing in again', async (t) => {
+test('authorization failure closes every stream until the tab signs in again', async (t) => {
   for (const status of [401, 403]) {
-    let packetView;
-    const h = transport(t, { onLogout: () => { packetView.close(); packetView = null; } });
+    const h = transport(t);
     h.connect();
-    packetView = h.packetStream('e1');
+    h.packetStream('e1');
     await settle();
     h.respond(new Response(null, { status }));
     await assert.rejects(h.packet({ link: 'e1', seq: 1 }));
-    assert.equal(packetView, null);
     assert.ok(h.sources.every((source) => source.cancelled));
     assert.equal(h.stored.size, 0);
     h.navigate('#token=new-secret');
     await settle();
-    assert.equal(h.sources.length, 3);
-    assert.equal(packetView, null);
-    packetView = h.packetStream('e1');
+    assert.equal(h.sources.length, 2, 'signing in again opens nothing by itself');
+    h.packetStream('e1');
     await settle();
-    assert.equal(h.sources.length, 4);
+    assert.equal(h.sources.length, 3);
     assert.equal(h.requests.at(-1).headers.Authorization, 'Bearer new-secret');
     assert.equal(h.sources.at(-1).cancelled, false);
   }

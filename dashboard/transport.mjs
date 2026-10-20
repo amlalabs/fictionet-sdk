@@ -1,9 +1,11 @@
-import { watchState } from './state.mjs';
+/// How a viewer signs in.
+export const SIGN_IN = 'Open the URL the demo printed in its terminal.';
+const SIGNED_OUT = `Not signed in. ${SIGN_IN}`;
 
 // One owner for origin-scoped authorization, requests, streams and downloads.
-export function createTransport({ state, setStatus = () => {}, onLogout = () => {}, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent }, {
+// `setStatus('ended', message)` hears when the page signs out.
+export function createTransport({ setStatus = () => {} } = {}, {
   fetch = globalThis.fetch, location = globalThis.location, history = globalThis.history, window = globalThis.window,
-  signedOutMessage = 'Not signed in. Open the dashboard bootstrap URL to sign in. If it was already used, restart the dashboard first.',
   WebSocket = globalThis.WebSocket,
   storage, document = globalThis.document, URL = globalThis.URL,
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout,
@@ -16,12 +18,8 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
   const downloads = new Map();
   let bootstrap = 0;
   let token;
-  let events;
-  let stopWatch;
-  let watching = false;
 
   function stop() {
-    stopWatch?.();
     lifetime.abort();
     for (const source of streams) source.close();
     for (const socket of sockets) socket.close();
@@ -42,9 +40,7 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
   function logout() {
     stop();
     try { storage?.removeItem(key); } catch { /* Storage may be disabled. */ }
-    if (state) state.connected = false;
-    onLogout();
-    setStatus('ended', signedOutMessage);
+    setStatus('ended', SIGNED_OUT);
   }
 
   // Endpoints are fixed; values are query parameters, never destinations.
@@ -115,10 +111,8 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
   function hashchange() {
     const fragment = takeFragment();
     if (!fragment.has('token')) return;
-    const reconnect = lifetime.signal.aborted;
-    if (reconnect) lifetime = new AbortController();
+    if (lifetime.signal.aborted) lifetime = new AbortController();
     ready = authorize(fragment);
-    if (reconnect && watching) connect();
   }
   window?.addEventListener('hashchange', hashchange);
 
@@ -128,7 +122,7 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
     const response = await send(op, params, signal, token, method, body);
     if (response.status === 401 || response.status === 403) {
       logout();
-      throw new Error(signedOutMessage);
+      throw new Error(SIGNED_OUT);
     }
     return response;
   }
@@ -219,20 +213,6 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
     return source;
   }
 
-  function connect(observer) {
-    watching = true;
-    if (observer) ({ state, setStatus, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent } = observer);
-    stopWatch?.();
-    events = stream('watch', {});
-    const source = events;
-    const unbind = watchState(source, { state, setStatus, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent });
-    stopWatch = () => {
-      unbind();
-      if (events === source) events = null;
-    };
-    return () => { watching = false; stopWatch?.(); };
-  }
-
   function packetStream(list, reconnected = () => {}) {
     const source = stream('packets', { link: list });
     let opened = false;
@@ -314,5 +294,5 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
     return { socket, session: result.session };
   }
 
-  return { get, post, delete: remove, stateStream, socket, watch: () => stream('watch', {}), connect, packetStream, packet, download, logout, close };
+  return { get, post, delete: remove, stateStream, socket, watch: () => stream('watch', {}), packetStream, packet, download, logout, close };
 }

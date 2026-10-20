@@ -14,6 +14,7 @@ const exec = promisify(execFile);
 async function checkPacketLayout() {
   const { mount } = await import('./components/packets.mjs');
   const { createSelection } = await import('./selection.mjs');
+  const { hostLookups } = await import('./page.mjs');
   const check = (value, message) => { if (!value) throw new Error(message); };
   const css = document.createElement('link');
   css.rel = 'stylesheet'; css.href = '/page.css';
@@ -27,13 +28,23 @@ async function checkPacketLayout() {
     emit(type, data) { this.dispatchEvent(new MessageEvent(type, { data: JSON.stringify(data) })); }
     close() {}
   }
-  const source = new Source(), watch = new Source();
-  let view;
+  const source = new Source();
+  // The graph holds one sandbox per host, each with one link: link `a` for
+  // the first host, `b` for the second. The list shows every host's links.
+  const listeners = new Set();
+  const graph = { state: { known: true, nodes: new Map(), edges: new Map() }, subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); } };
+  let hosts = [];
+  const scenario = (names) => {
+    hosts = names.map((name) => ({ name, sandbox: name }));
+    graph.state.nodes = new Map([['t1', { id: 't1', kind: 'task' }], ...names.map((name) => [`s-${name}`, { id: `s-${name}`, kind: 'sandbox', name }])]);
+    graph.state.edges = new Map(names.map((name, index) => ['ab'[index], { id: 'ab'[index], a: `s-${name}`, b: 't1', c: [0, 0, 0, 0] }]));
+    listeners.forEach((listener) => listener('snapshot'));
+  };
   const dispose = mount(root, {
-    selection: createSelection(), watch: () => watch,
-    transport: { packetStream: () => source },
-  }, { onReady(value) { view = value; } });
-  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'b' }, host: 'beta' }]);
+    selection: createSelection(), graph, get hosts() { return hosts; }, ...hostLookups(() => hosts),
+    transport: { packetStream: () => source, get: async () => ({ links: [] }) },
+  });
+  scenario(['alpha', 'beta']);
   const send = (seq, src, dst, t = seq / 1000) => source.emit('packet', {
     link: 'a', seq, src, dst, proto: 'ICMP', info: 'Echo (ping) reply id=0x1234',
     t, side: 0, len: 28, tags: [],
@@ -103,7 +114,7 @@ async function checkPacketLayout() {
   const last = [...root.querySelectorAll('#prows tr:not(.gap)')].at(-1);
   check(last.querySelector('.c-src').textContent === src && last.querySelector('.c-dst').textContent === dst, 'long address changed');
   for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
-  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'workstation1' }, { e: { id: 'b' }, host: 'jump' }]);
+  scenario(['workstation1', 'jump']);
   for (const width of [530, 600]) {
     root.style.width = width + 'px';
     const rows = root.querySelectorAll('#prows tr').length;
@@ -119,7 +130,7 @@ async function checkPacketLayout() {
     check($('#plist').scrollWidth <= $('#plist').clientWidth, 'host column overflows');
   }
   // A single host's list has no Host column and keeps Protocol to 560 px.
-  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }]);
+  scenario(['alpha']);
   send(6, '10.0.0.2', '10.0.0.3');
   while (!root.querySelector('#prows tr:not(.gap)')) await frame();
   check(!root.querySelector('.packet-panel').classList.contains('merged-hosts'), 'one host shows a Host column');
@@ -144,11 +155,13 @@ async function checkContainmentLayout() {
   document.body.append(root);
   const outcomes = ['contained', 'not_contained', 'unknown', 'missing_tool', 'timed_out', 'fact'];
   const probes = outcomes.map((outcome) => ({
-    guest: 'east', name: 'Public DNS', command: 'dig @8.8.8.8 example.com', guest_result: 'connection timed out; no servers could be reached',
-    world_answer: 'no route: no machine at that address', outcome,
+    guest: 'east', name: 'Public DNS', command: 'dig @8.8.8.8 example.com', destination: '8.8.8.8:53', guest_result: 'connection timed out; no servers could be reached',
+    summary: 'connection timed out; no servers could be reached', world_answer: 'no route: no machine at that address', outcome,
   }));
+  const hosts = [{ name: 'east', sandbox: 'east' }];
+  const { hostLookups } = await import('./page.mjs');
   const dispose = mount(root, {
-    selection: createSelection(), hosts: [{ name: 'east', sandbox: 'east' }],
+    selection: createSelection(), hosts, ...hostLookups(() => hosts),
     state: (_, update) => { update({ value: { probes } }); return () => {}; },
   }, { state: 'containment' });
   // The inspector is about 530 px wide at 1280 and 457 px in a shared workspace at 1440.
@@ -164,6 +177,79 @@ async function checkContainmentLayout() {
     }
   }
   dispose(); root.remove(); css.remove();
+}
+
+// World data reaches the page as text: markup in it never becomes elements
+// or runs, in any panel.
+async function checkTextStaysText() {
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  const panels = {
+    events: await import('./components/events.mjs'),
+    table: await import('./components/table.mjs'),
+    containment: await import('./components/containment.mjs'),
+    leftTheBox: await import('./components/left-the-box.mjs'),
+    labels: await import('./components/labels.mjs'),
+    packets: await import('./components/packets.mjs'),
+    map: await import('./components/map.mjs'),
+  };
+  const { createSelection } = await import('./selection.mjs');
+  const { createState } = await import('./state.mjs');
+  const { hostLookups } = await import('./page.mjs');
+  const markup = '<img src=x onerror="window.injected=true"><fictionet-injected>tag</fictionet-injected>';
+  const graph = createState();
+  graph.snapshot({
+    t: 1, started: 0, ended: false, status: null,
+    nodes: [{ id: 's1', kind: 'sandbox', name: 'alpha' }, { id: 't1', kind: 'task', name: markup, file: markup, line: 1 }],
+    edges: [{ id: 'e1', a: 's1', b: 't1', label: markup }], counters: { e1: [1, 40, 0, 0] },
+    events: [{ seq: 1, at: 1, source: 'http', kind: 'request', summary: markup, fields: { host: markup }, sandbox: { name: 'alpha' }, task: markup, node: 't1' }],
+  });
+  const hosts = [{ name: 'alpha', sandbox: 'alpha' }];
+  const values = {
+    '/api/state/rows': [{ name: markup }],
+    '/api/state/containment': { probes: [{ guest: 'alpha', name: markup, command: markup, destination: markup, outcome: 'not_contained', guest_result: markup, summary: markup, world_answer: markup, proxies: [{ name: markup, destination: markup, world_host: false }] }] },
+    '/api/state/labels': [{ id: 1, text: markup, target: { kind: 'event', seq: 1 }, at: 1 }],
+  };
+  class Source extends EventTarget {
+    emit(type, data) { this.dispatchEvent(new MessageEvent(type, { data: JSON.stringify(data) })); }
+    close() {}
+  }
+  const source = new Source();
+  const services = {
+    selection: createSelection(), graph: { ...graph, subscribe: () => () => {} }, hosts, ...hostLookups(() => hosts),
+    state: (path, update) => { update({ revision: 1, value: values[path], status: {} }); return () => {}; },
+    labelState: '/api/state/labels', labelCommand: '/api/command/labels', containmentState: '/api/state/containment',
+    transport: {
+      get: async (path) => (path === '/api/egress'
+        ? { revision: 1, dropped: 0, lost: 0, pending: [], lookups: [{ sandbox: 'alpha', name: markup, answer: markup, count: 1, first: 1, last: 1 }], destinations: [{ sandbox: 'alpha', name: markup, address: markup, transport: 'tcp', outcome: 'forwarded', by: markup, requests: 1, connections: 1, packets: 0, unanswered: 0, first: 1, last: 1 }] }
+        : { links: [] }),
+      packetStream: () => source,
+    },
+  };
+  const options = {
+    events: {}, map: {}, packets: {}, leftTheBox: {},
+    table: { state: '/api/state/rows', columns: [{ label: markup, pointer: '/name', format: 'text' }] },
+    containment: { state: '/api/state/containment' },
+    labels: { state: '/api/state/labels', command: '/api/command/labels' },
+  };
+  const disposals = [];
+  const roots = [];
+  for (const [name, { mount }] of Object.entries(panels)) {
+    const root = document.createElement('section');
+    root.style.cssText = 'width:600px;height:400px;display:flex;flex-direction:column';
+    document.body.append(root);
+    roots.push(root);
+    disposals.push(mount(root, services, options[name]));
+  }
+  source.emit('packet', { link: 'e1', seq: 1, t: 1, side: 0, len: 40, tags: [], src: markup, dst: markup, proto: markup, info: markup });
+  // Select the event so its fields open below its line.
+  services.selection.set({ event: graph.state.events[0] });
+  for (let i = 0; i < 10; i++) await new Promise(requestAnimationFrame);
+  const text = roots.map((root) => root.textContent).join('');
+  check(text.split('<fictionet-injected>').length > 8, 'the markup is not shown as text in every panel');
+  for (const root of roots) check(!root.querySelector('img, fictionet-injected'), 'markup became an element');
+  check(!window.injected, 'markup ran');
+  disposals.forEach((dispose) => dispose());
+  roots.forEach((root) => root.remove());
 }
 
 test('browser bootstrap, reconnect and downloads keep credentials away from another port', async (t) => {
@@ -252,6 +338,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
           try {
             await (${checkPacketLayout.toString()})();
             await (${checkContainmentLayout.toString()})();
+            await (${checkTextStaysText.toString()})();
             await fetch('/layout-result', { method: 'POST', body: 'PASS' });
           } catch (error) {
             await fetch('/layout-result', { method: 'POST', body: error.message });
@@ -341,7 +428,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     assert.fail(`Chromium exited before reporting a result (code ${outcome.code}, signal ${outcome.signal})\n${diagnostics}`);
   }
   if (outcome.timeout) assert.fail(`Chromium did not report a result within 30 s\n${diagnostics}`);
-  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width; containment labels stay on one line', () => {
+  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width; containment labels stay on one line; world data stays text', () => {
     assert.equal(layoutReport, 'PASS');
   });
   assert.match(outcome.report, /^PASS: isolated$/);

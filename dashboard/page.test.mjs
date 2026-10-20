@@ -645,3 +645,26 @@ test('declared pins open both hosts without a click', async (t) => {
   stop();
   assert.equal(h.budget.open, 0);
 });
+
+test('each host chip says who holds its input, from the leases topic', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const transport = {
+    get: async (path) => (path === '/api/page' ? { ...DESCRIPTION, moments: [] } : path.startsWith('/api/host/') ? { links: [] } : { rows: [], next: 0, dropped: 0 }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  };
+  const stop = await mount(h.root, transport, { subscribe: () => () => {}, dispose() {} });
+  await settle();
+  const state = h.streams.findLast((source) => source.tag === 'state' && !source.closed);
+  assert.ok('leases' in state.args);
+  const owners = h.root.querySelectorAll('span.host-owner');
+  assert.deepEqual(owners.map((owner) => owner.dataset.owner), ['none', 'none']);
+  state.emit('snapshot', { topic: 'leases', revision: 1, value: { alpha: { holder: 'another session' }, beta: { holder: null } } });
+  assert.deepEqual(owners.map((owner) => [owner.textContent, owner.dataset.owner]), [['Another viewer has control', 'other'], ['', 'none']]);
+  state.emit('world_error', { error: 'no such state topic: "leases"' });
+  assert.equal(owners[1].textContent, 'Input control unavailable: no such state topic: "leases"');
+  stop();
+});

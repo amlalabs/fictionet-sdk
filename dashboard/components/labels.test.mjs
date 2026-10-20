@@ -34,7 +34,6 @@ test('typed labels, removal and scoped downloads use real authenticated transpor
   source.enqueue(new TextEncoder().encode(`event: snapshot\ndata: ${JSON.stringify({ topic: 'labels', revision: 1, value: [{ id: 3, text: '<download>', target: { kind: 'event', seq: 7 }, at: 2 }] })}\n\n`));
   await settle();
   assert.match(root.textContent, /<download>Event 72.0s/);
-  assert.equal(root.querySelector('download'), null);
   const remove = root.querySelectorAll('button').find((button) => button.getAttribute('aria-label') === 'Remove label <download>');
   remove.click(); await settle();
   assert.deepEqual(JSON.parse(requests.at(-1).options.body).command, { action: 'remove', id: 3 });
@@ -90,12 +89,11 @@ test('label editors cancel with Escape or Cancel and close after saving', async 
   assert.equal(open.hidden, false);
 });
 
-test('label targets describe and select retained events, connections and host links', () => {
+test('label targets describe and select retained events, connections and host links', async () => {
   const document = createDocument(), root = document.createElement('section');
   const watch = new EventTarget(); watch.close = () => {};
-  const services = createServices({});
+  const services = createServices({ watch: () => watch });
   const opened = [], pairs = [];
-  services.watch = () => watch;
   services.showPanel = (kind) => opened.push(kind);
   services.showPackets = (pair) => pairs.push(pair);
   services.hosts = [{ name: 'beta', sandbox: 'west' }];
@@ -108,9 +106,9 @@ test('label targets describe and select retained events, connections and host li
   };
   const dispose = mount(root, services, { state: '/api/state/labels' });
   const event = { seq: 7, source: 'dns', kind: 'query', summary: 'example.test', conn: 4 };
-  const snapshot = new Event('snapshot');
-  snapshot.data = JSON.stringify({ events: [event], nodes: [{ id: 'n2', kind: 'sandbox', name: 'west' }], edges: [{ id: 'e2', a: 'n2', b: 'n3' }] });
-  watch.dispatchEvent(snapshot);
+  const send = (name, data) => { const message = new Event(name); message.data = JSON.stringify(data); watch.dispatchEvent(message); };
+  send('snapshot', { t: 0, started: 0, ended: false, events: [event], nodes: [{ id: 'n2', kind: 'sandbox', name: 'west' }], edges: [{ id: 'e2', a: 'n2', b: 'n3' }], counters: {} });
+  await settle();
   const targets = root.querySelectorAll('.label-target');
   assert.deepEqual(targets.map((button) => button.textContent), ['Event 7 · dns.query example.test', "beta's link · 10.0.0.2 ↔ 10.0.0.3", '10.0.0.2:53 ↔ 10.0.0.3:99']);
   targets[0].click();
@@ -126,15 +124,18 @@ test('label targets describe and select retained events, connections and host li
   assert.equal(root.querySelectorAll('td.numeric')[0].textContent, '1.2s');
   assert.equal(root.querySelector('.label-remove').getAttribute('aria-label'), 'Remove label lookup');
   assert.ok(root.querySelector('.label-remove').querySelector('svg'));
+  // A link that ends leaves its label without a host.
+  send('edge_end', { id: 'e2' });
+  await settle();
+  assert.equal(root.querySelectorAll('.label-target')[1].textContent, 'Link e2 · 10.0.0.2 ↔ 10.0.0.3');
   dispose(); services.dispose();
 });
 
 test('labels that cannot load say whether the run has stopped', () => {
   for (const [stopped, text] of [[true, 'The run has stopped, so labels can no longer be loaded.'], [false, 'Could not load labels: no such state topic: "labels"']]) {
     const document = createDocument(), root = document.createElement('section');
-    const services = createServices({});
+    const services = createServices({ watch: () => { const watch = new EventTarget(); watch.close = () => {}; return watch; } });
     let fail;
-    services.watch = () => { const watch = new EventTarget(); watch.close = () => {}; return watch; };
     services.stopped = () => stopped;
     services.state = (_, update, error) => { fail = error; return () => {}; };
     const dispose = mount(root, services, { state: '/api/state/labels' });

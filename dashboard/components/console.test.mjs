@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mount as screen } from './screen.mjs';
 import { mount as terminal } from './terminal.mjs';
+import { createInputOwners } from './console.mjs';
 import { createDocument, Element } from '../test-dom.mjs';
 import { createTransport } from '../transport.mjs';
 
@@ -64,6 +65,7 @@ function fixture() {
       async socket(capability, host) { const socket = new Socket(); sockets.push(socket); requests.push({ capability, host }); return { socket, session: 'ours' }; },
     },
   };
+  services.input = createInputOwners(services.state);
   return {
     root, services, subscriptions, timers, sockets, requests, rfbs, terminals, observers, themes,
     screenOptions: { host: 'alpha', load: async () => ({ default: RFB }) },
@@ -140,8 +142,9 @@ test('terminal focuses once on request and never on a later status change or rec
 });
 
 test('screen stays unavailable while booting, watches by default and follows the live lease', async () => {
-  const h = fixture(), ownership = [];
-  const dispose = screen(h.root, h.services, { ...h.screenOptions, onOwnership: (text) => ownership.push(text) });
+  const h = fixture();
+  const dispose = screen(h.root, h.services, h.screenOptions);
+  const owner = h.root.querySelector('span.console-owner');
   await settle();
   assert.equal(h.sockets.length, 0);
   assert.match(h.root.textContent, /alpha is booting/);
@@ -165,10 +168,11 @@ test('screen stays unavailable while booting, watches by default and follows the
   h.lease('ours');
   assert.equal(rfb.viewOnly, false);
   assert.equal(claim.textContent, 'Release');
-  assert.equal(ownership.at(-1), 'You have control');
+  assert.equal(owner.textContent, 'You have control');
+  assert.equal(owner.dataset.owner, 'mine');
   h.lease('another');
   assert.equal(rfb.viewOnly, true);
-  assert.equal(ownership.at(-1), 'Another viewer has control');
+  assert.equal(owner.dataset.owner, 'other');
   assert.match(h.root.textContent, /Another viewer took control/);
   const notice = [...h.timers.values()].find((timer) => timer.delay === 4000);
   assert.ok(notice, 'the lost-control notice clears itself');

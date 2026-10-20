@@ -34,7 +34,7 @@ export function mount(root, services) {
   let timer, snapshot, containment, containmentFailed = false, selected, failed = false;
   function draw() {
     if (!snapshot) return;
-    const sandbox = services.hosts?.find((host) => host.name === selected)?.sandbox || selected;
+    const sandbox = services.sandboxOf(selected);
     const visible = (row) => !sandbox || row.sandbox === sandbox;
     const rows = snapshot.destinations.filter(visible);
     const origins = new Map();
@@ -57,7 +57,7 @@ export function mount(root, services) {
     const count = (outcome) => rows.filter((row) => row.outcome === outcome).reduce((n, row) => n + attempts(row), 0);
     stayed.replaceChildren();
     if (escaped) {
-      stayed.append('The containment check found a way out that the world does not record. ');
+      stayed.append('The containment check found a way out that the world did not see. ');
       const button = el('button', { class: 'text-button', type: 'button', text: 'Open Containment' }, stayed);
       button.addEventListener('click', () => services.showPanel?.('containment'));
       stayed.append(' ');
@@ -80,7 +80,7 @@ export function mount(root, services) {
       for (const row of group) {
         const tr = el('tr', {}, tbody);
         const destination = el('td', { class: 'egress-destination' }, tr);
-        if (!sandbox) el('span', { class: 'pill', text: services.hosts?.find((host) => host.sandbox === row.sandbox)?.name || row.sandbox }, destination);
+        if (!sandbox) el('span', { class: 'pill', text: services.hostOf(row.sandbox) || row.sandbox }, destination);
         if (row.name) el('div', { class: 'egress-name', text: row.name }, destination);
         el('div', { class: 'mono egress-muted', text: `${row.address} ${row.transport}` }, destination);
         const by = el('td', { class: 'egress-answer' }, tr);

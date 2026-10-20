@@ -1,4 +1,4 @@
-import { scoped, icon, listen } from '../dom.mjs';
+import { scoped, icon } from '../dom.mjs';
 import { fmtRunTime } from '../format.mjs';
 
 export function labelAction(parent, services, target, title = 'Label', onClose = () => {}) {
@@ -62,25 +62,21 @@ export function mount(root, services, options) {
   }
   const heading = el('h3', { class: 'labels-heading', text: 'Labels (0)' }, root);
   const body = el('div', { class: 'table-scroll labels-table' }, root);
-  let events = [], nodes = [], edges = [], snapshot;
-  const cleanup = [];
-  const watch = services.watch?.();
-  if (watch) {
-    const on = (name, callback) => cleanup.push(listen(watch, name, (event) => callback(JSON.parse(event.data))));
-    on('snapshot', (value) => { events = value.events || []; nodes = value.nodes || []; edges = value.edges || []; draw(); });
-    on('event', (event) => { events = [...events, event].slice(-500); draw(); });
-    on('node', (node) => { nodes = [...nodes.filter((item) => item.id !== node.id), node]; draw(); });
-    on('edge', (edge) => { edges = [...edges.filter((item) => item.id !== edge.id), edge]; draw(); });
-  }
+  const { state } = services.graph;
+  let snapshot;
+  // A label names its target from the graph: redraw as the graph changes.
+  const stopGraph = services.graph.subscribe((name) => {
+    if (['snapshot', 'event', 'node', 'node_end', 'edge', 'edge_end'].includes(name)) draw();
+  });
   function targetText(target) {
     if (target.kind === 'event') {
-      const event = events.find((event) => event.seq === target.seq);
+      const event = state.events.find((event) => event.seq === target.seq);
       return `Event ${target.seq}${event ? ` · ${event.source}.${event.kind} ${event.summary || ''}` : ''}`;
     }
     if (target.kind === 'connection') return `${target.local} ↔ ${target.peer}`;
-    const edge = edges.find((edge) => edge.id === target.link);
-    const node = edge && nodes.find((node) => (node.id === edge.a || node.id === edge.b) && node.kind === 'sandbox');
-    const host = services.hosts?.find((host) => host.sandbox === node?.name)?.name || node?.name;
+    const edge = state.edges.get(target.link);
+    const node = edge && [state.nodes.get(edge.a), state.nodes.get(edge.b)].find((node) => node?.kind === 'sandbox');
+    const host = services.hostOf(node?.name) || node?.name;
     return `${host ? `${host}'s link` : `Link ${target.link}`} · ${target.a} ↔ ${target.b}`;
   }
   function selectTarget(target) {
@@ -88,7 +84,7 @@ export function mount(root, services, options) {
       services.selection.set({ host: null, links: [target.link], event: null, connection: null });
       services.showPackets?.({ local: target.a, peer: target.b });
     } else {
-      const event = events.find((event) => target.kind === 'event' ? event.seq === target.seq : event.conn === target.id);
+      const event = state.events.find((event) => target.kind === 'event' ? event.seq === target.seq : event.conn === target.id);
       services.selection.set({ host: null, links: [], event: target.kind === 'event' ? event || { seq: target.seq } : null, connection: target.kind === 'connection' ? target.id : event?.conn ?? null, request: null });
       services.showPanel?.('events');
     }
@@ -127,5 +123,5 @@ export function mount(root, services, options) {
     }
     if (!snapshot.value?.length) el('p', { class: 'empty-note', text: 'Select an event, connection or packet flow and choose Label.' }, body);
   }
-  return () => { stopState(); stopSelection(); cleanup.forEach((stop) => stop()); watch?.close(); root.replaceChildren(); };
+  return () => { stopState(); stopSelection(); stopGraph(); root.replaceChildren(); };
 }
