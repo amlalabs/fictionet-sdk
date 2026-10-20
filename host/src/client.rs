@@ -24,7 +24,7 @@ use http::{Method, Request, Response};
 use http_body::{Body as _, Frame, SizeHint};
 
 use fictionet::Error;
-use fictionet::stdlib::codec::{Fail, Stream, Wire};
+use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire};
 use fictionet::stdlib::{protocols::http1, web::httpd::Body};
 use fictionet::sync::Mutex;
 
@@ -383,7 +383,7 @@ fn expects_content(method: &Method) -> bool {
     )
 }
 
-fn response_stream(method: &Method) -> Result<Stream<http1::ResponseEvents>, Error> {
+fn response_stream(method: &Method) -> Result<Stream<ResponseDecoder>, Error> {
     let mut decoder = http1::ResponseEvents::with_limits(http1::Limits {
         header_line: HEAD,
         head: HEAD,
@@ -391,7 +391,39 @@ fn response_stream(method: &Method) -> Result<Stream<http1::ResponseEvents>, Err
     });
     decoder.skip_chunk_extras();
     decoder.expect_method(method.as_str())?;
-    Ok(Stream::new(decoder))
+    Ok(Stream::new(ResponseDecoder {
+        inner: decoder,
+        close: false,
+    }))
+}
+
+/// Streams close-delimited bytes without waiting for a full decoder block.
+struct ResponseDecoder {
+    inner: http1::ResponseEvents,
+    close: bool,
+}
+
+impl Decode for ResponseDecoder {
+    type Item = Event;
+    type Error = http1::Error;
+    const NAME: &'static str = <http1::ResponseEvents as Decode>::NAME;
+
+    fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    fn held(&self) -> usize {
+        self.inner.held()
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, Self::Error> {
+        if self.close && !input.is_empty() {
+            let n = input.len().min(http1::Limits::default().body_chunk);
+            return Ok(Step::Item(http1::Event::Body(input[..n].to_vec()), n));
+        }
+        // The core still validates heads and framed bodies and ends at EOF.
+        self.inner.decode(input, eof)
+    }
 }
 
 /// One request and its response on one connection.
@@ -413,7 +445,7 @@ struct Exchange<'a> {
     complete: bool,
     /// Why the upstream stopped taking the request.
     refused: Option<io::Error>,
-    stream: Stream<http1::ResponseEvents>,
+    stream: Stream<ResponseDecoder>,
     pending: Option<Result<Event, Error>>,
     final_head: bool,
     reuse: bool,
@@ -450,6 +482,17 @@ impl Exchange<'_> {
                     http1::Event::Head(head) if head.status < 200 => continue,
                     http1::Event::Head(head) => {
                         self.final_head = true;
+                        self.stream.decoder().close = self.job.method != Method::HEAD
+                            && !matches!(head.status, 204 | 304)
+                            && !(self.job.method == Method::CONNECT
+                                && (200..300).contains(&head.status))
+                            && !head.headers.iter().any(|h| {
+                                h.name.eq_ignore_ascii_case("content-length")
+                                    || (h.name.eq_ignore_ascii_case("transfer-encoding")
+                                        && h.value.split(|b| *b == b',').any(|coding| {
+                                            coding.trim_ascii().eq_ignore_ascii_case(b"chunked")
+                                        }))
+                            });
                         self.reuse = self.job.method != Method::CONNECT
                             && head.keep_alive()?
                             && (self.job.method == Method::HEAD

@@ -2324,3 +2324,150 @@ fn jsonl_skips_unserializable_events_and_reports_their_kind() {
         lines
     );
 }
+
+#[test]
+fn full_key_ring_does_not_scan_capture_bytes() {
+    for (keys, bytes) in [(8, 1024), (64, 8192)] {
+        with_link(
+            Options {
+                policy: policy([
+                    Class::new("keys").count(keys),
+                    Class::new("packets").count(2),
+                ]),
+                ..Options::default()
+            },
+            move |collector, link| {
+                packet(&collector, link, 1, Instant::ZERO, &vec![0; bytes]);
+                block_on(lab(
+                    RunOptions::new(Seed::from_u64(1)).observer(collector.clone()),
+                    |cx| async move {
+                        let logger = cx.tls_key_log(None).unwrap();
+                        for seq in 1..=keys {
+                            logger.log("CLIENT_RANDOM", &[seq as u8; 32], &[2; 48]);
+                        }
+                        collector
+                            .state
+                            .lock()
+                            .captures
+                            .compared_windows
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        logger.log("CLIENT_RANDOM", &[255; 32], &[2; 48]);
+                        let state = collector.state.lock();
+                        assert_eq!(state.keys.rings[&2].items.len(), keys);
+                        let work = state
+                            .captures
+                            .compared_windows
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        assert_eq!(work, 0, "key insertion compared {work} capture windows");
+                        Ok(())
+                    },
+                ))
+                .unwrap();
+            },
+        );
+    }
+}
+
+#[test]
+fn captured_client_hello_pins_key_until_last_copy_leaves() {
+    with_link(
+        Options {
+            policy: policy([Class::new("keys").count(2), Class::new("packets").count(2)]),
+            ..Options::default()
+        },
+        |collector, link| {
+            let mut hello = vec![22, 3, 3, 0, 45, 1, 0, 0, 41, 3, 3];
+            hello.extend_from_slice(&[1; 32]);
+            hello.extend_from_slice(&[0, 0, 2, 0x13, 1, 1, 0]);
+            packet(&collector, link, 1, Instant::ZERO, &hello);
+            packet(&collector, link, 2, Instant::ZERO, &hello);
+            let packet_class = collector.packets(link, 0, 1).packets[0].class;
+            block_on(lab(
+                RunOptions::new(Seed::from_u64(1)).observer(collector.clone()),
+                move |cx| async move {
+                    let logger = cx.tls_key_log(None).unwrap();
+                    for random in [1, 2, 3] {
+                        logger.log("CLIENT_RANDOM", &[random; 32], &[2; 48]);
+                    }
+                    let randoms = || {
+                        collector
+                            .keys()
+                            .iter()
+                            .map(|key| key.client_random[0])
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(randoms(), [1, 3]);
+                    assert_eq!(count(&collector, Stream::Keys, LossReason::Eviction), 1);
+                    packet(&collector, link, 3, Instant::ZERO, &[0; 64]);
+                    assert!(collector.state.lock().captures.has_random(&[1; 32]));
+                    {
+                        let mut state = collector.state.lock();
+                        let mut losses = collector.events.losses.lock();
+                        state.captures.evict(
+                            link,
+                            packet_class,
+                            &mut losses,
+                            collector.options.loss_streams,
+                        );
+                        assert!(!state.captures.has_random(&[1; 32]));
+                    }
+                    logger.log("CLIENT_RANDOM", &[4; 32], &[2; 48]);
+                    assert_eq!(randoms(), [3, 4]);
+                    assert_eq!(count(&collector, Stream::Keys, LossReason::Eviction), 2);
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        },
+    );
+}
+
+#[test]
+fn pinned_keys_respect_count_and_byte_bounds_and_report_losses() {
+    for bounds in [
+        Bounds {
+            count: 1,
+            bytes: 8192,
+        },
+        Bounds {
+            count: 20,
+            bytes: size_of::<Key>() + 13 + 32 + 48,
+        },
+    ] {
+        with_link(
+            Options {
+                policy: policy([
+                    Class::new("keys").count(bounds.count).bytes(bounds.bytes),
+                    Class::new("packets").count(2),
+                ]),
+                ..Options::default()
+            },
+            |collector, link| {
+                let mut hello = vec![1, 0, 0, 41, 3, 3];
+                hello.extend_from_slice(&[1; 32]);
+                hello.extend_from_slice(&[1, 0, 0, 41, 3, 3]);
+                hello.extend_from_slice(&[3; 32]);
+                packet(&collector, link, 1, Instant::ZERO, &hello);
+                block_on(lab(
+                    RunOptions::new(Seed::from_u64(1)).observer(collector.clone()),
+                    move |cx| async move {
+                        let logger = cx.tls_key_log(None).unwrap();
+                        logger.log("CLIENT_RANDOM", &[1; 32], &[2; 48]);
+                        logger.log("CLIENT_RANDOM", &[2; 32], &[2; 48]);
+                        assert_eq!(collector.keys().len(), 1);
+                        assert_eq!(collector.keys()[0].client_random, [1; 32]);
+                        assert_eq!(count(&collector, Stream::Keys, LossReason::Overflow), 1);
+                        assert_eq!(count(&collector, Stream::Keys, LossReason::Eviction), 0);
+                        logger.log("CLIENT_RANDOM", &[3; 32], &[2; 48]);
+                        assert_eq!(collector.keys().len(), 1);
+                        assert_eq!(collector.keys()[0].client_random, [3; 32]);
+                        assert_eq!(count(&collector, Stream::Keys, LossReason::Overflow), 1);
+                        assert_eq!(count(&collector, Stream::Keys, LossReason::Eviction), 1);
+                        Ok(())
+                    },
+                ))
+                .unwrap();
+            },
+        );
+    }
+}

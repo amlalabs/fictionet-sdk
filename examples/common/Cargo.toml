@@ -27,7 +27,7 @@ zstd = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 percent-encoding = "2"
-quick-xml = "0.38"
+quick-xml = { version = "0.38", features = ["escape-html"] }
 
 fictionet-observe = { path = "../../observe", features = ["native"] }
 axum = { version = "0.8", default-features = false }
