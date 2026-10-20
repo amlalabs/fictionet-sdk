@@ -75,6 +75,8 @@ pub struct HostStatus {
 /// One host in the page description.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostDescription {
+    /// Whether this host starts pinned in the workspace.
+    pub pinned: bool,
     /// Host name used by console routes.
     pub name: String,
     /// Sandbox name in the dashboard topology.
@@ -89,6 +91,7 @@ pub struct HostDescription {
 
 /// One machine in a page composition.
 pub struct Host {
+    pinned: bool,
     pub(super) name: String,
     pub(super) sandbox: String,
     pub(super) console: Option<Arc<dyn Console>>,
@@ -102,6 +105,7 @@ impl Host {
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         Self {
+            pinned: false,
             sandbox: name.clone(),
             name,
             console: None,
@@ -109,6 +113,11 @@ impl Host {
             screen: false,
             terminal: false,
         }
+    }
+    /// Pins this host in the initial tiled workspace.
+    pub fn pinned(mut self) -> Self {
+        self.pinned = true;
+        self
     }
     /// Maps this host to a world sandbox.
     pub fn sandbox(mut self, name: impl Into<String>) -> Self {
@@ -127,6 +136,7 @@ impl Host {
     }
     pub(super) fn description(&self) -> HostDescription {
         HostDescription {
+            pinned: self.pinned,
             name: self.name.clone(),
             sandbox: self.sandbox.clone(),
             status: format!("/api/state/host-{}", self.name),

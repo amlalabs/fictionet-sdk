@@ -4,7 +4,7 @@
 # with `cargo xtask vm build [sdk] [border] [fakewiki] [adaptive-web]`.
 #
 #   sdk       fictionet and every example in the crate's Cargo.toml: web_world,
-#             scan, the web_fixture test world and the rest
+#             the web_fixture test world and the rest
 #   border    border-world, the world of examples/border
 #   fakewiki, adaptive-web
 #             fakewiki-world and adaptive-web-world, those examples' worlds

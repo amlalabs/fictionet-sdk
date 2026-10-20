@@ -166,7 +166,7 @@ VM that a demo booted.
 | [`cargo xtask demo k8s`](guest/k8s.sh) | A kind cluster in the VM, the Helm chart in `charts/fictionet-sandbox` with `examples/attach/k8s-tun.yaml`, and the agent's pod. Its `eth0` is down, `tun0` is its only route, it reaches `https://example.test/`, and the internet, the cluster's DNS and the API server are out of reach. | pulls kind's node image | 1.5 min; then 1 min |
 | [`cargo xtask demo border`](src/bin/border/main.rs) | One Ubuntu workstation and a scripted agent on a live page. Routing switches real traffic between the bank and impostor: three or four hops, two or three BGP routes, a broken established session and a TLS refusal. The terminal attaches read-only to tmux `main`; Ctrl-b d opens a viewer login shell for `bank-check`. Screenshots and the log go to `downloads/cloudimage/shots/border-<run>/`. | KVM; no Docker, QEMU or root | Pinned image and browser downloads, then package installation at boot; timings are printed |
 | [`cargo xtask demo search`](src/bin/search/) | A scripted Firefox searcher on an Ubuntu desktop; the adaptive web runs in-process with a stub generator (no model). Live searches, result provenance and a growing page tree beside the desktop, with generation control and standard observation panels. | Linux with KVM and Chromium; pinned cloud image, Cloud Hypervisor and browser libraries downloaded on first run | Download size and elapsed time: reviewer measurement pending |
-| [`cargo xtask demo scan`](guest/scan.sh) | [The scan example](../examples/scan) under Docker Compose in the VM: four simulated hosts and a real container with nginx and OpenSSH on one office subnet. `nmap` in the agent's sandbox finds all five, and a SYN scan with service detection names what runs on each. The world's second argument opens its observation socket. The dashboard connects to that socket and shows the scan, with its HTTP port forwarded to your machine. | a browser; pulls Debian and Alpine images | 1.5 min; then 1 min |
+| [`cargo xtask demo scan`](src/bin/scan/main.rs) | Two Ubuntu microVMs and an in-process office: a scripted nmap inventory of four simulated machines and a real nginx and OpenSSH server. The loopback page shows both guests and the shared panels. | KVM and Chromium; Ubuntu packages at boot | not measured |
 
 The times are from a 24-core machine with other work running, with the VM's
 default 4 vCPUs and 5 GB. "First run" is the whole command on a machine that
@@ -208,7 +208,7 @@ by hand with `docker compose`. The evals and the VM are also test suites:
 [`examples/attach`](../examples/attach) has the Compose and Kubernetes recipes
 for `fictionet attach` on your own machine or cluster, and
 [`examples/hosted`](../examples/hosted) runs the Compose setup inside a Daytona
-or E2B sandbox. `cargo xtask scan` records the scan demo's dashboard as a video.
+or E2B sandbox. `cargo xtask scan` records the scan example's dashboard as a video.
 [Fictionet Observe](../observe/README.md) covers the collector, browser sign-in
 and capture limits. The dashboard and `fictionet observe` use the observation
 socket served by `fictionet_observe::serve`; attachments use the world socket.
@@ -250,14 +250,14 @@ See the [kit API](src/kit/mod.rs) and the desktop's
 ### Adding a VM script
 
 Start from [`examples/scan`](../examples/scan), the smallest Docker example with
-an agent container: the world in one file, a Dockerfile with one stage per
-container, and a Compose file.
+an agent container: a world library and socket executable, a Dockerfile with
+one stage per container, and a Compose file.
 
-1. Copy `examples/scan` to `examples/<name>`, and add the world to the crate's
-   `Cargo.toml` as an example, next to `scan`'s entry: `name = "<name>"`,
-   `path = "examples/<name>/main.rs"`. Write your world in `main.rs`;
-   `cargo run --example <name> -- /tmp/world.sock` runs it on its own.
-2. In `docker/Dockerfile`, build and copy your example instead of `scan` (its
+1. Copy `examples/scan` to `examples/<name>` and rename the package and binary
+   in `world/Cargo.toml` to `<name>-world`. The workspace includes it already.
+   Write your world in `world/src/lib.rs`;
+   `cargo run -p <name>-world -- /tmp/world.sock` runs it on its own.
+2. In `docker/Dockerfile`, build and copy your world instead of `scan-world` (its
    `build` and `fictionet` stages name it), and give the agent's stage the
    tools your agent uses instead of nmap. Drop the `container` stage if your
    world has no real host.
@@ -267,8 +267,8 @@ container, and a Compose file.
 4. Run it from the repository root with your machine's Docker, as the scan
    README does: `docker compose -f examples/<name>/compose.yaml up -d --build --wait`,
    then `exec` into the agent's service, and `down -v` at the end.
-5. For `cargo xtask demo <name>`, copy `demos/guest/scan.sh` to
-   `demos/guest/<name>.sh` and `scan.compose.yaml` to `<name>.compose.yaml`,
+5. For `cargo xtask demo <name>`, copy `demos/guest/border.sh` to
+   `demos/guest/<name>.sh` and `border.compose.yaml` to `<name>.compose.yaml`,
    and change the Compose file, the project name and the steps. Keep the
    `# needs: sdk` line: the VM builds every example. `cargo xtask demo` finds
    the script by its name. Add a row to the table above.

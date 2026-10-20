@@ -933,8 +933,10 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "libc",
+ "quick-xml",
  "russh",
  "rustls",
+ "scan-world",
  "serde",
  "serde_json",
  "tokio",
@@ -2051,6 +2053,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2420,6 +2432,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scan-world"
+version = "0.0.0"
+dependencies = [
+ "fictionet",
+ "fictionet-observe",
+ "http",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

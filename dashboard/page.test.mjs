@@ -440,3 +440,26 @@ test('the stopped page stays stopped without an Events reconnect banner after th
   assert.equal(requests, 1);
   stop();
 });
+
+test('declared pins open both hosts without a click', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = { ...DESCRIPTION, hosts: DESCRIPTION.hosts.map((host) => ({ ...host, pinned: true })) };
+  const transport = {
+    get: async (path) => (path === '/api/page' ? description : path.startsWith('/api/host/') ? { links: [] } : { rows: [], next: 0, dropped: 0 }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  };
+  const stop = await mount(h.root, transport, { subscribe: (listener) => { listener('light'); return () => {}; }, dispose() {} });
+  await settle();
+  assert.equal(h.root.querySelectorAll('section.workspace-tile').length, 2);
+  const pins = h.root.querySelectorAll('button.pin');
+  assert.ok(pins.every((pin) => pin.getAttribute('aria-pressed') === 'true'));
+  pins[1].click();
+  assert.equal(h.root.querySelectorAll('section.workspace-tile').length, 1);
+  assert.equal(h.root.querySelector('section.workspace-tile').getAttribute('aria-label'), 'alpha');
+  stop();
+  assert.equal(h.budget.open, 0);
+});

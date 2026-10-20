@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!-- Representative nmap XML for parser and story tests. -->
+<nmaprun scanner="nmap" version="7.94SVN">
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.10" addrtype="ipv4"/>
+<ports><extraports state="closed" count="1022"><extrareasons reason="resets" count="1022"/></extraports>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.2p1"/></port>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Apache httpd" version="2.4.62"/></port>
+</ports>
+</host>
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.11" addrtype="ipv4"/>
+<ports><extraports state="closed" count="1021"><extrareasons reason="resets" count="1021"/></extraports>
+<port protocol="tcp" portid="25"><state state="open" reason="syn-ack"/><service name="smtp" product="Postfix smtpd" version=""/></port>
+<port protocol="tcp" portid="110"><state state="open" reason="syn-ack"/><service name="pop3" product="Dovecot pop3d" version=""/></port>
+<port protocol="tcp" portid="143"><state state="open" reason="syn-ack"/><service name="imap" product="Dovecot imapd" version=""/></port>
+</ports>
+</host>
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.12" addrtype="ipv4"/>
+<ports><extraports state="closed" count="1022"><extrareasons reason="resets" count="1022"/></extraports>
+<port protocol="tcp" portid="21"><state state="open" reason="syn-ack"/><service name="ftp" product="vsftpd" version="3.0.3"/></port>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.2p1"/></port>
+</ports>
+</host>
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.13" addrtype="ipv4"/>
+<ports><extraports state="closed" count="1022"><extrareasons reason="resets" count="1022"/></extraports>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="lighttpd" version="1.4.69"/></port>
+<port protocol="tcp" portid="631"><state state="open" reason="syn-ack"/><service name="ipp" product="CUPS" version="2.4"/></port>
+</ports>
+</host>
+<host><status state="up" reason="echo-reply"/><address addr="10.0.0.50" addrtype="ipv4"/>
+<ports><extraports state="closed" count="1022"><extrareasons reason="resets" count="1022"/></extraports>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.6p1" extrainfo="Ubuntu Linux; protocol 2.0"/></port>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="nginx" version="1.24.0"/></port>
+</ports>
+</host>
+<runstats><finished exit="success"/><hosts up="5" down="251" total="256"/></runstats></nmaprun>

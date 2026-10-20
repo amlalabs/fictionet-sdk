@@ -927,3 +927,69 @@ fn home_files_are_written_after_user_creation() {
         }
     }
 }
+
+#[tokio::test]
+async fn attachment_names_are_independent_of_guest_identity() {
+    let mut kit = Kit::new("storage")
+        .guest(
+            Guest::ubuntu("laptop", "alex")
+                .attachment("client-link")
+                .resources(3, 1536),
+        )
+        .guest(
+            Guest::ubuntu("storage", "sam")
+                .attachment("storage-link")
+                .resources(2, 768)
+                .card(Family::Serve(fictionet::stdlib::network::ethernet::Lease {
+                    addr: fictionet::stdlib::network::ethernet::Cidr {
+                        addr: Ipv4Addr::new(192, 0, 2, 20),
+                        prefix: 24,
+                    },
+                    gateway: Some(Ipv4Addr::new(192, 0, 2, 1)),
+                    dns: Some(Ipv4Addr::new(192, 0, 2, 53)),
+                })),
+        );
+    let (mut run, mut prepared) = kit.prepare().unwrap();
+    assert_eq!(run.guests[0].name(), "laptop");
+    assert_eq!(run.guests[1].name(), "storage");
+    assert_eq!(run.guests[0].guest.attachment, "client-link");
+    assert_eq!(run.guests[1].guest.attachment, "storage-link");
+    assert_eq!(run.guests[0].resources.mac, [2, 0, 0, 0, 0, 2]);
+    assert_eq!(run.guests[1].resources.mac, [2, 0, 0, 0, 0, 3]);
+    assert_eq!(
+        (run.guests[0].guest.vcpus, run.guests[0].guest.memory_mib),
+        (3, 1536)
+    );
+    assert_eq!(
+        (run.guests[1].guest.vcpus, run.guests[1].guest.memory_mib),
+        (2, 768)
+    );
+    assert!(matches!(prepared.bridges[0].family, Family::FromWorld));
+    assert_eq!(run.guests[1].addr(), Some(Ipv4Addr::new(192, 0, 2, 20)));
+    assert!(matches!(prepared.bridges[1].family, Family::Serve(_)));
+    run.bind_page(
+        "storage",
+        Box::new(|dashboard, hosts| {
+            Page::new("Example", dashboard)
+                .host(hosts.take("laptop").pinned())
+                .host(hosts.take("storage").pinned())
+                .standard_panels()
+        }),
+        &mut prepared,
+    )
+    .await
+    .unwrap();
+    let client = client::PageClient::from_url(run.page_url()).unwrap();
+    client.bootstrap().await.unwrap();
+    let response = client
+        .request("GET", "/api/page", None, true)
+        .await
+        .unwrap();
+    assert_eq!(response.status, 200);
+    let description: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(description["hosts"][0]["sandbox"], "client-link");
+    assert_eq!(description["hosts"][1]["sandbox"], "storage-link");
+    assert_eq!(description["hosts"][0]["pinned"], true);
+    assert_eq!(description["hosts"][1]["pinned"], true);
+    run.shutdown().await.unwrap();
+}

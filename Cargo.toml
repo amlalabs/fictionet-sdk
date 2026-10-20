@@ -118,12 +118,6 @@ required-features = ["web-proxy", "tokio"]
 test = true
 
 [[example]]
-name = "scan"
-path = "examples/scan/main.rs"
-test = true
-required-features = ["std"]
-
-[[example]]
 name = "custom_protocol"
 path = "examples/custom_protocol/main.rs"
 test = true

@@ -164,6 +164,7 @@ export async function mount(root, transport, theme) {
   $('workbench').classList.toggle('shared-workbench', Boolean(sharedWorkspace));
   cleanup.push(divider($('divider'), $('workbench'), page.title, sharedWorkspace ? 68 : DEFAULT_SPLIT));
   for (const host of page.hosts) {
+    if (host.pinned && !customWorkspace) pinned.add(host.name);
     const group = el('div', { class: 'host-group' }, bar);
     const chip = el('button', { type: 'button', class: 'host-chip', 'aria-pressed': 'false' }, group);
     const dot = el('i', { class: 'readiness', 'data-state': 'booting', 'aria-hidden': 'true' }, chip);
@@ -172,7 +173,7 @@ export async function mount(root, transport, theme) {
     const ready = el('span', { class: 'pill', text: 'Booting' }, chip);
     const marks = el('span', { class: 'console-marks' }, chip);
     const owner = el('span', { class: 'host-owner' }, chip);
-    const pin = el('button', { type: 'button', class: 'pin', 'aria-label': `Pin ${host.name} to the workspace`, title: 'Pin to the workspace', 'aria-pressed': 'false' }, group);
+    const pin = el('button', { type: 'button', class: 'pin', 'aria-label': `${pinned.has(host.name) ? 'Unpin' : 'Pin'} ${host.name} ${pinned.has(host.name) ? 'from' : 'to'} the workspace`, title: 'Pin to the workspace', 'aria-pressed': String(pinned.has(host.name)) }, group);
     icon(el, pin, 'pin');
     pin.hidden = Boolean(customWorkspace && !sharedWorkspace);
     chips.set(host.name, { chip, pin, owner });
