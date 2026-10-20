@@ -68,7 +68,7 @@ pub trait Transport: Send + Sync {
 /// The provider's API over HTTPS, through [`web::forward`].
 pub struct Https {
     forward: web::Forward,
-    path: &'static str,
+    path: String,
     authority: String,
     provider: Provider,
 }
@@ -76,9 +76,10 @@ pub struct Https {
 impl Https {
     /// A client for the provider's API. Needs real I/O.
     pub fn new(fcx: &Cx, provider: Provider) -> fictionet::Result<Self> {
-        Self::at(
+        Self::with_provider(
             fcx,
             format!("https://{}", provider.host()).parse()?,
+            provider,
             match provider {
                 Provider::Anthropic => "/v1/messages",
                 Provider::OpenRouter => "/api/v1/chat/completions",
@@ -87,25 +88,39 @@ impl Https {
                 Provider::Gemini => {
                     return Err(Error::msg("Gemini clients must name a model path"));
                 }
-            },
+            }
+            .into(),
         )
     }
     /// A client that posts to `path` at `origin`, such as a test server.
-    pub fn at(fcx: &Cx, origin: http::Uri, path: &'static str) -> fictionet::Result<Self> {
+    /// Returns an error if no provider serves the path.
+    pub fn at(fcx: &Cx, origin: http::Uri, path: impl Into<String>) -> fictionet::Result<Self> {
+        let path = path.into();
+        let provider = [
+            Provider::Anthropic,
+            Provider::OpenAi,
+            Provider::ChatGpt,
+            Provider::OpenRouter,
+            Provider::Gemini,
+        ]
+        .into_iter()
+        .find(|provider| provider.allows(&path))
+        .ok_or_else(|| Error::msg(format!("No model provider serves path {path}")))?;
+        Self::with_provider(fcx, origin, provider, path)
+    }
+
+    fn with_provider(
+        fcx: &Cx,
+        origin: http::Uri,
+        provider: Provider,
+        path: String,
+    ) -> fictionet::Result<Self> {
         Ok(Self {
             authority: origin
                 .authority()
                 .ok_or_else(|| Error::msg("Model origin needs an authority"))?
                 .to_string(),
-            provider: if path.starts_with("/api/") {
-                Provider::OpenRouter
-            } else if path.contains("messages") {
-                Provider::Anthropic
-            } else if path.starts_with("/backend-api/") {
-                Provider::ChatGpt
-            } else {
-                Provider::OpenAi
-            },
+            provider,
             forward: web::forward(
                 fcx,
                 origin,
@@ -124,7 +139,7 @@ impl Transport for Https {
         body: Vec<u8>,
     ) -> Post<'a> {
         Box::pin(async move {
-            let mut request = http::Request::post(self.path);
+            let mut request = http::Request::post(self.path.as_str());
             for (name, value) in headers {
                 request = request.header(name, value);
             }
@@ -171,5 +186,108 @@ impl Transport for Https {
                 .to_bytes();
             Ok((status, body.to_vec()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_gemini_posts_key_path_and_returns_response() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(
+                request
+                    .starts_with("POST /v1beta/models/gemini-flash:generateContent HTTP/1.1\r\n")
+            );
+            assert!(request.contains("\r\nx-goog-api-key: AIza-test-private\r\n"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            let mut body = [0; 2];
+            socket.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"{}");
+            socket.write_all(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"result\":\"ok\"}").unwrap();
+        });
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(31)),
+            |cx| async move {
+                let client = Https::at(
+                    &cx,
+                    format!("http://{address}").parse()?,
+                    format!("/v1beta/models/{}:generateContent", "gemini-flash"),
+                )?;
+                let key = Key::new("GEMINI_API_KEY", Some("AIza-test-private".into()))
+                    .map_err(Error::msg)?;
+                let (status, body) = client
+                    .post(&cx, vec![key.header(Provider::Gemini)], b"{}".to_vec())
+                    .await
+                    .map_err(Error::msg)?;
+                assert_eq!(status, 201);
+                assert_eq!(body, br#"{"result":"ok"}"#);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        upstream.join().unwrap();
+    }
+
+    #[test]
+    fn https_rejects_unserved_path() {
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(32)),
+            |cx| async move {
+                let result = Https::at(&cx, "http://127.0.0.1:1".parse()?, "/v1/files");
+                let error = result.err().expect("unserved path must fail");
+                assert!(error.to_string().contains("/v1/files"));
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn https_selects_provider_for_each_endpoint() {
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(33)),
+            |cx| async move {
+                for (provider, path) in [
+                    (Provider::OpenRouter, "/api/v1/messages"),
+                    (Provider::OpenRouter, "/api/v1/responses"),
+                    (Provider::OpenRouter, "/api/v1/chat/completions"),
+                    (Provider::Anthropic, "/v1/messages"),
+                    (Provider::Anthropic, "/v1/messages/count_tokens"),
+                    (Provider::OpenAi, "/v1/responses"),
+                    (Provider::OpenAi, "/v1/chat/completions"),
+                    (Provider::ChatGpt, "/backend-api/codex/responses"),
+                    (
+                        Provider::Gemini,
+                        "/v1beta/models/gemini-flash:generateContent",
+                    ),
+                    (
+                        Provider::Gemini,
+                        "/v1beta/models/gemini-flash:streamGenerateContent",
+                    ),
+                ] {
+                    let client = Https::at(&cx, "http://127.0.0.1:1".parse()?, path)?;
+                    assert_eq!(client.provider, provider, "{path}");
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 }
