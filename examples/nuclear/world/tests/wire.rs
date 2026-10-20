@@ -1,4 +1,6 @@
-use nuclear_world::{Config, Plant, command::*, faults::*, protection::*, sensors::*, snapshot::*};
+use nuclear_world::{
+    Config, Plant, command::*, faults::*, protection::*, sensors::*, snapshot::*, stages::*,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 
@@ -75,6 +77,7 @@ fn command_reply_and_fault_bounds_cover_variants_and_integer_extremes() {
             Pump::MainFeed(l),
             Pump::AuxiliaryFeed,
             Pump::CirculatingWater,
+            Pump::SafetyInjection,
         ] {
             bounded(pump, Pump::MAX_JSON_BYTES);
             for running in [false, true] {
@@ -118,6 +121,12 @@ fn command_reply_and_fault_bounds_cover_variants_and_integer_extremes() {
         Command::ManualTrip,
         Command::ResetTrip,
         Command::Heaters { on: false },
+        Command::Relief { open: false },
+        Command::Relief { open: true },
+        Command::ReliefBlock { closed: false },
+        Command::ReliefBlock { closed: true },
+        Command::SteamIsolation { closed: false },
+        Command::SteamIsolation { closed: true },
         Command::Heaters { on: true },
         Command::AcknowledgeAlarms,
     ] {
@@ -334,6 +343,61 @@ fn snapshot_bound_with_every_alarm_fault_and_maximum_numeric_width() {
             _ => {}
         }
     }
+    s.severe.breach_pressure_mpa = Some(-f64::MAX);
+    s.severe.containment.failure = Some(FailureCause::HydrogenBurn);
+    let mut severe = serde_json::to_value(&s.severe).unwrap();
+    widen(&mut severe);
+    s.severe = serde_json::from_value(severe).unwrap();
+    let mut stylized = serde_json::to_value(&s.stylized).unwrap();
+    widen(&mut stylized);
+    s.stylized = serde_json::from_value(stylized).unwrap();
+    s.stages = [Some(u64::MAX); 12];
+    s.end = Some(End {
+        stage: Stage::ControlRoomUninhabitable,
+        at_ms: u64::MAX,
+    });
+    s.last_command = Some(LastCommand {
+        command: Command::Controller {
+            controller: Controller::PressurizerPressure,
+            mode: Mode::Automatic,
+        },
+        at_ms: u64::MAX,
+    });
+    bounded(s.severe.relief.clone(), Relief::MAX_JSON_BYTES);
+    bounded(s.severe.relief_tank.clone(), ReliefTank::MAX_JSON_BYTES);
+    bounded(
+        s.severe.safety_injection.clone(),
+        SafetyInjection::MAX_JSON_BYTES,
+    );
+    bounded(s.severe.containment.clone(), Containment::MAX_JSON_BYTES);
+    bounded(s.severe.cavity.clone(), Cavity::MAX_JSON_BYTES);
+    bounded(s.severe.turbine_hall.clone(), TurbineHall::MAX_JSON_BYTES);
+    bounded(s.severe.clone(), Severe::MAX_JSON_BYTES);
+    bounded(s.stylized.clone(), Stylized::MAX_JSON_BYTES);
+    bounded(s.last_command.unwrap(), LastCommand::MAX_JSON_BYTES);
+    bounded(
+        StageLog {
+            times: s.stages,
+            end: s.end,
+        },
+        StageLog::MAX_JSON_BYTES,
+    );
+    for stage in Stage::ALL {
+        bounded(stage, Stage::MAX_JSON_BYTES);
+        bounded(
+            End {
+                stage,
+                at_ms: u64::MAX,
+            },
+            End::MAX_JSON_BYTES,
+        );
+    }
+    for cause in [FailureCause::HydrogenBurn, FailureCause::Overpressure] {
+        bounded(cause, FailureCause::MAX_JSON_BYTES);
+    }
+    for regime in [Regime::SinglePhase, Regime::TwoPhase, Regime::Breached] {
+        bounded(regime, Regime::MAX_JSON_BYTES);
+    }
     widen(&mut truth);
     s.truth = serde_json::from_value(truth).unwrap();
     bounded(s.truth.reactor.clone(), Reactor::MAX_JSON_BYTES);
@@ -350,6 +414,12 @@ fn snapshot_bound_with_every_alarm_fault_and_maximum_numeric_width() {
     bounded(s.reported_status, ReportedStatus::MAX_JSON_BYTES);
     bounded(s.telemetry, Telemetry::MAX_JSON_BYTES);
     bounded(s.faults.clone(), Faults::MAX_JSON_BYTES);
+    // Deserialization permits the longest variant in every slot.
+    s.faults
+        .process
+        .fill(Some(ProcessFault::CoolantPumpTrip { pump: Loop::A }));
+    s.faults.telemetry_quiet = false;
+    bounded(s.faults.clone(), Faults::MAX_JSON_BYTES);
     bounded(s, PlantSnapshot::MAX_JSON_BYTES);
 }
 
@@ -361,4 +431,63 @@ fn telemetry_heartbeat_wraps_at_sixteen_bits() {
     assert_eq!(p.snapshot().telemetry.heartbeat, u16::MAX);
     p.advance((remaining + 1) * SAMPLE_MS);
     assert_eq!(p.snapshot().telemetry.heartbeat, 0);
+}
+
+#[test]
+fn new_command_wire_forms_and_fault_slot_order() {
+    for (text, expected) in [
+        (
+            r#"{"pump":{"pump":"safety_injection","running":true}}"#,
+            Command::Pump {
+                pump: Pump::SafetyInjection,
+                running: true,
+            },
+        ),
+        (
+            r#"{"relief":{"open":true}}"#,
+            Command::Relief { open: true },
+        ),
+        (
+            r#"{"relief_block":{"closed":true}}"#,
+            Command::ReliefBlock { closed: true },
+        ),
+        (
+            r#"{"steam_isolation":{"closed":true}}"#,
+            Command::SteamIsolation { closed: true },
+        ),
+    ] {
+        assert_eq!(serde_json::from_str::<Command>(text).unwrap(), expected);
+        assert_eq!(serde_json::to_string(&expected).unwrap(), text);
+    }
+    assert_eq!(
+        serde_json::from_str::<FaultChange>(r#"{"inject":{"process":"station_blackout"}}"#)
+            .unwrap(),
+        FaultChange::Inject(Fault::Process(ProcessFault::StationBlackout))
+    );
+    assert_eq!(
+        ProcessFault::ALL,
+        [
+            ProcessFault::FeedPumpTrip { pump: Loop::A },
+            ProcessFault::FeedPumpTrip { pump: Loop::B },
+            ProcessFault::CoolantPumpTrip { pump: Loop::A },
+            ProcessFault::CoolantPumpTrip { pump: Loop::B },
+            ProcessFault::FeedValveStuck { line: Loop::A },
+            ProcessFault::FeedValveStuck { line: Loop::B },
+            ProcessFault::CondenserCoolingLoss,
+            ProcessFault::ReliefStuckOpen,
+            ProcessFault::SafetyInjectionFailure,
+            ProcessFault::SteamLineBreak,
+            ProcessFault::StationBlackout,
+        ]
+    );
+    let mut plant = Plant::new(Config::default());
+    for (i, process) in ProcessFault::ALL.into_iter().enumerate() {
+        plant
+            .apply_fault(FaultCommand {
+                expected_revision: plant.snapshot().revision,
+                change: FaultChange::Inject(Fault::Process(process)),
+            })
+            .unwrap();
+        assert_eq!(plant.snapshot().faults.process[i], Some(process));
+    }
 }

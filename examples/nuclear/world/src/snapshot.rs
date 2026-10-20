@@ -4,10 +4,11 @@
 //! 0.1 pcm and heat transfer 0.1 MW. Every float needs at most 25 JSON bytes.
 //! The bound includes all slots, longest enum variants and 20-digit counters.
 use crate::{
-    command::Mode,
+    command::{Command, Mode},
     faults::Faults,
     protection::{ALARM_COUNT, AlarmEntry, Trip},
     sensors::{Channel, SENSOR_COUNT, Telemetry},
+    stages::{End, FailureCause},
 };
 use serde::{Deserialize, Serialize};
 
@@ -148,7 +149,138 @@ pub struct PlantSnapshot {
     pub telemetry: Telemetry,
     pub alarms: [Option<AlarmEntry>; ALARM_COUNT],
     pub faults: Faults,
+    pub severe: Severe,
+    pub stylized: Stylized,
+    pub stages: [Option<u64>; 12],
+    pub end: Option<End>,
+    pub last_command: Option<LastCommand>,
 }
 impl PlantSnapshot {
-    pub const MAX_JSON_BYTES: usize = 8795;
+    pub const MAX_JSON_BYTES: usize = 11263;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Regime {
+    SinglePhase,
+    TwoPhase,
+    Breached,
+}
+impl Regime {
+    pub const MAX_JSON_BYTES: usize = 14;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Relief {
+    pub demanded_open: bool,
+    pub flow_kg_s: f64,
+    pub safety_valve_flow_kg_s: f64,
+    pub block_closed: bool,
+    pub tailpipe_c: f64,
+}
+impl Relief {
+    pub const MAX_JSON_BYTES: usize = 172;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReliefTank {
+    pub pressure_kpa: f64,
+    pub disk_ruptured: bool,
+}
+impl ReliefTank {
+    pub const MAX_JSON_BYTES: usize = 64;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SafetyInjection {
+    pub signal: bool,
+    pub running: bool,
+    pub flow_kg_s: f64,
+}
+impl SafetyInjection {
+    pub const MAX_JSON_BYTES: usize = 70;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Containment {
+    pub pressure_kpa: f64,
+    pub temperature_c: f64,
+    pub steam_percent: f64,
+    pub hydrogen_percent: f64,
+    pub hydrogen_kg: f64,
+    pub burn_excess_kpa: f64,
+    pub direct_heating_kpa: f64,
+    pub fan_coolers_running: bool,
+    pub failure: Option<FailureCause>,
+}
+impl Containment {
+    pub const MAX_JSON_BYTES: usize = 356;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cavity {
+    pub melt_t: f64,
+    pub ablation_m: f64,
+}
+impl Cavity {
+    pub const MAX_JSON_BYTES: usize = 75;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TurbineHall {
+    pub steam_kg_m3: f64,
+    pub temperature_c: f64,
+}
+impl TurbineHall {
+    pub const MAX_JSON_BYTES: usize = 83;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Severe {
+    pub regime: Regime,
+    pub inventory_kg: f64,
+    pub pressurizer_water_kg: f64,
+    pub vessel_water_kg: f64,
+    pub vessel_level_percent: f64,
+    pub uncovered_percent: f64,
+    pub hot_fuel_c: f64,
+    pub core_exit_steam_c: f64,
+    pub zirconium_oxidized_percent: f64,
+    pub hydrogen_generated_kg: f64,
+    pub hydrogen_in_primary_kg: f64,
+    pub melted_percent: f64,
+    pub lower_plenum_melt_t: f64,
+    pub lower_head_c: f64,
+    pub breach_pressure_mpa: Option<f64>,
+    pub void_percent: f64,
+    pub relief: Relief,
+    pub relief_tank: ReliefTank,
+    pub safety_injection: SafetyInjection,
+    pub steam_isolation_closed: bool,
+    pub steam_break_kg_s: f64,
+    pub containment: Containment,
+    pub cavity: Cavity,
+    pub turbine_hall: TurbineHall,
+}
+impl Severe {
+    pub const MAX_JSON_BYTES: usize = 1698;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stylized {
+    pub control_room_steam: f64,
+    pub release_fraction: f64,
+    pub containment_dose_sv_h: f64,
+}
+impl Stylized {
+    pub const MAX_JSON_BYTES: usize = 143;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastCommand {
+    pub command: Command,
+    pub at_ms: u64,
+}
+impl LastCommand {
+    pub const MAX_JSON_BYTES: usize = 112;
 }

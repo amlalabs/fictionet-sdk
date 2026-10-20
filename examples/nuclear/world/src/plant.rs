@@ -58,7 +58,9 @@ use crate::{
     kinetics::Kinetics,
     protection::*,
     sensors::{self, Channel, Instruments, SENSOR_COUNT, Sensor},
+    severe::{self, SevereState},
     snapshot::*,
+    stages::{Stage, StageLog},
     steam,
 };
 
@@ -129,6 +131,9 @@ pub struct Plant {
     last_fault_start_ms: Option<u64>,
     first_action_after_fault_ms: Option<u64>,
     state: Truth,
+    severe: SevereState,
+    stages: StageLog,
+    last_command: Option<LastCommand>,
     kinetics: Kinetics,
     instruments: Instruments,
     faults: Faults,
@@ -138,6 +143,8 @@ pub struct Plant {
     dump_demand: f64,
     spray_demand: f64,
     heater_demand: bool,
+    auxiliary_auto_inhibited: bool,
+    heater_auto_inhibited: bool,
     initial_average: f64,
     initial_fuel: f64,
     rated_steam: f64,
@@ -225,6 +232,9 @@ impl Plant {
             last_fault_start_ms: None,
             first_action_after_fault_ms: None,
             state,
+            severe: SevereState::new(fuel, hot),
+            stages: StageLog::default(),
+            last_command: None,
             kinetics: Kinetics::new(power),
             faults: Faults::default(),
             alarms: [AlarmState::Normal; ALARM_COUNT],
@@ -233,6 +243,8 @@ impl Plant {
             dump_demand: 0.0,
             spray_demand: 0.0,
             heater_demand: false,
+            auxiliary_auto_inhibited: false,
+            heater_auto_inhibited: false,
             initial_average: 0.0,
             initial_fuel: fuel,
             rated_steam,
@@ -304,17 +316,32 @@ impl Plant {
         }
     }
 
+    fn mark(&mut self, stage: Stage) {
+        self.stages.mark(stage, self.at_ms);
+    }
+
     fn step(&mut self) {
+        let blackout = self.faults.has(ProcessFault::StationBlackout);
         for l in Loop::ALL {
             let i = l.index();
-            if self.faults.has(ProcessFault::FeedPumpTrip { pump: l }) {
+            if blackout || self.faults.has(ProcessFault::FeedPumpTrip { pump: l }) {
                 self.state.secondary.feed_pumps_running[i] = false;
             }
-            if self.faults.has(ProcessFault::CoolantPumpTrip { pump: l }) {
+            if blackout || self.faults.has(ProcessFault::CoolantPumpTrip { pump: l }) {
                 self.state.primary.loops[i].pump_running = false;
             }
         }
+        if blackout {
+            self.state.secondary.auxiliary_feed_running = false;
+            self.state.secondary.circulating_water_running = false;
+            self.heater_demand = false;
+            self.auxiliary_auto_inhibited = true;
+            self.heater_auto_inhibited = true;
+        }
+        self.severe.values.containment.fan_coolers_running = !blackout;
         if self.config.automatic_protection
+            && !self.auxiliary_auto_inhibited
+            && !blackout
             && (!self.state.secondary.feed_pumps_running.iter().any(|p| *p)
                 || self
                     .state
@@ -325,9 +352,40 @@ impl Plant {
         {
             self.state.secondary.auxiliary_feed_running = true;
         }
+        let actions = automatic_actions(
+            self.severe.automatic,
+            AutomaticInputs {
+                enabled: self.config.automatic_protection,
+                primary_mpa: self.state.primary.pressure_mpa,
+                header_mpa: self.state.secondary.steam_pressure_mpa,
+                injection_failed: self.faults.has(ProcessFault::SafetyInjectionFailure),
+                blackout,
+                injection_signal: self.severe.values.safety_injection.signal,
+                injection_running: self.severe.values.safety_injection.running,
+                isolation_closed: self.severe.values.steam_isolation_closed,
+            },
+        );
+        self.severe.automatic = actions.state;
+        self.severe.values.safety_injection.signal = actions.injection_signal;
+        self.severe.values.safety_injection.running = actions.injection_running;
+        self.severe.values.steam_isolation_closed = actions.isolation_closed;
         self.controls();
+        if self.heater_auto_inhibited {
+            self.state.primary.heaters_on = false;
+            self.state.primary.heater_fraction = 0.0;
+        }
         self.reactor();
         self.heat_and_mass();
+        self.severe.values.hot_fuel_c = self.state.reactor.fuel_temperature_c;
+        self.severe.values.core_exit_steam_c = self.state.reactor.core_exit_c;
+        if self
+            .severe
+            .hall
+            .step(self.severe.values.steam_break_kg_s, DT)
+        {
+            self.mark(Stage::TurbineHallSteam);
+        }
+        self.severe.values.turbine_hall = self.severe.hall.snapshot();
         if self.state.secondary.condenser_pressure_kpa > LOW_VACUUM_KPA {
             self.state.secondary.turbine_tripped = true;
             self.state.secondary.steam_dump_percent = 0.0;
@@ -508,8 +566,20 @@ impl Plant {
             2.0 * self.rated_steam * s.turbine_valve_percent / 100.0 * s.steam_pressure_mpa / 6.9;
         let dump_flow =
             2.0 * self.rated_steam * s.steam_dump_percent / 100.0 * s.steam_pressure_mpa / 6.9;
+        let (turbine_flow, dump_flow) = if self.severe.values.steam_isolation_closed {
+            (0.0, 0.0)
+        } else {
+            (turbine_flow, dump_flow)
+        };
+        let break_flow = severe::break_flow(
+            s.steam_pressure_mpa,
+            self.faults.has(ProcessFault::SteamLineBreak),
+            self.severe.values.steam_isolation_closed,
+        );
+        self.severe.values.steam_break_kg_s = break_flow;
         s.generator_mw = turbine_flow * 600.0 / (2.0 * self.rated_steam);
-        s.steam_pressure_mpa += DT * (steam_made - turbine_flow - dump_flow) / HEADER_CAPACITY;
+        s.steam_pressure_mpa +=
+            DT * (steam_made - turbine_flow - dump_flow - break_flow) / HEADER_CAPACITY;
         s.steam_relief_open = s.steam_pressure_mpa > 8.5;
         self.model_limit |= s.steam_pressure_mpa < 0.1;
         s.steam_pressure_mpa = s.steam_pressure_mpa.clamp(0.1, 8.5);
@@ -657,10 +727,135 @@ impl Plant {
                 }
             }),
             faults: self.faults.clone(),
+            severe: self.severe.snapshot(),
+            stylized: Stylized {
+                control_room_steam: 0.0,
+                release_fraction: 0.0,
+                containment_dose_sv_h: 0.001,
+            },
+            stages: self.stages.times,
+            end: self.stages.end,
+            last_command: self.last_command,
         }
     }
 }
 
 fn approach(value: f64, demand: f64, distance: f64) -> f64 {
     value + (demand - value).clamp(-distance, distance)
+}
+
+#[cfg(test)]
+mod equipment_tests {
+    use super::*;
+
+    #[test]
+    fn injection_signal_survives_failure_and_operator_stop_rearms_at_pressure() {
+        let mut plant = Plant::new(Config::default());
+        plant
+            .change_fault(FaultChange::Inject(Fault::Process(
+                ProcessFault::SafetyInjectionFailure,
+            )))
+            .unwrap();
+        plant.state.primary.pressure_mpa = 11.0;
+        plant.advance(50);
+        assert!(plant.severe.values.safety_injection.signal);
+        assert!(!plant.severe.values.safety_injection.running);
+        plant
+            .change_fault(FaultChange::Clear(FaultTarget::Process(
+                ProcessFault::SafetyInjectionFailure,
+            )))
+            .unwrap();
+        plant.advance(100);
+        assert!(plant.severe.values.safety_injection.running);
+        plant
+            .apply(Command::Pump {
+                pump: Pump::SafetyInjection,
+                running: false,
+            })
+            .unwrap();
+        plant.advance(150);
+        assert!(!plant.severe.values.safety_injection.signal);
+        assert!(!plant.severe.values.safety_injection.running);
+        plant.state.primary.pressure_mpa = 12.0;
+        plant.advance(200);
+        assert!(!plant.severe.values.safety_injection.signal);
+        plant.state.primary.pressure_mpa = 11.0;
+        plant.advance(250);
+        assert!(plant.severe.values.safety_injection.signal);
+        assert!(plant.severe.values.safety_injection.running);
+    }
+
+    #[test]
+    fn isolation_uses_unrounded_true_pressure_and_allows_operator_reopening() {
+        let mut plant = Plant::new(Config::default());
+        plant.state.secondary.steam_pressure_mpa = 4.5001;
+        plant.advance(50);
+        assert!(!plant.severe.values.steam_isolation_closed);
+        plant.state.secondary.steam_pressure_mpa = 4.4999;
+        plant.advance(100);
+        assert!(plant.severe.values.steam_isolation_closed);
+        plant
+            .apply(Command::SteamIsolation { closed: false })
+            .unwrap();
+        plant.state.secondary.steam_pressure_mpa = 4.0;
+        plant.advance(150);
+        assert!(!plant.severe.values.steam_isolation_closed);
+        plant.state.secondary.steam_pressure_mpa = 4.5;
+        plant.advance(200);
+        assert!(!plant.severe.values.steam_isolation_closed);
+        plant.state.secondary.steam_pressure_mpa = 4.0;
+        plant.advance(250);
+        assert!(plant.severe.values.steam_isolation_closed);
+    }
+
+    #[test]
+    fn injection_returns_after_blackout_with_a_latched_signal() {
+        let mut plant = Plant::new(Config::default());
+        plant.state.primary.pressure_mpa = 11.0;
+        plant
+            .change_fault(FaultChange::Inject(Fault::Process(
+                ProcessFault::StationBlackout,
+            )))
+            .unwrap();
+        plant.advance(50);
+        assert!(plant.severe.values.safety_injection.signal);
+        assert!(!plant.severe.values.safety_injection.running);
+        plant
+            .change_fault(FaultChange::Clear(FaultTarget::Process(
+                ProcessFault::StationBlackout,
+            )))
+            .unwrap();
+        plant.advance(100);
+        assert!(plant.severe.values.safety_injection.running);
+        assert!(!plant.state.secondary.auxiliary_feed_running);
+        assert!(!plant.state.primary.heaters_on);
+    }
+
+    #[test]
+    fn isolation_removes_dump_heat_from_the_condenser() {
+        let mut plant = Plant::new(Config {
+            automatic_protection: false,
+            ..Config::default()
+        });
+        plant
+            .apply(Command::Controller {
+                controller: Controller::SteamDump,
+                mode: Mode::Manual,
+            })
+            .unwrap();
+        plant
+            .apply(Command::ValveDemand {
+                valve: Valve::SteamDump,
+                permille: 1000,
+            })
+            .unwrap();
+        plant
+            .apply(Command::SteamIsolation { closed: true })
+            .unwrap();
+        plant.advance(50);
+        assert_eq!(plant.state.secondary.steam_dump_percent, 100.0);
+        assert_eq!(plant.state.secondary.generator_mw, 0.0);
+        let expected = 5.0 - DT * 300.0 * (5.0 - 1.0) / CONDENSER_CAPACITY;
+        assert!((plant.state.secondary.condenser_pressure_kpa - expected).abs() < 1e-12);
+    }
 }

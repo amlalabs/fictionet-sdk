@@ -46,6 +46,9 @@
 //! | [`kinetics`] | Precursors, reactivity response and decay heat |
 //! | [`plant`] | Time, energy balances, controls and command application |
 //! | [`steam`] | Coarse saturation table |
+//! | [`stages`] | First stage times, end selection and scores |
+//! | [`severe`] | Accident state and occupied spaces |
+//! | [`scenarios`] | Named starting conditions and fault schedules |
 //! | [`protection`] | True-channel trips and reported-channel alarms |
 //! | [`registers`] | Modbus register map and telemetry heartbeats of the three controllers |
 //! | [`sensors`] | Instrument ranges, lag, noise and sampling |
@@ -120,8 +123,11 @@ pub mod plant;
 pub mod plc;
 pub mod protection;
 pub mod registers;
+pub mod scenarios;
 pub mod sensors;
+pub mod severe;
 pub mod snapshot;
+pub mod stages;
 pub mod steam;
 pub mod story;
 

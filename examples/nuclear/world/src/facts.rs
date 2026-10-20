@@ -176,6 +176,13 @@ impl<S: Sink> Sink for Held<'_, S> {
 pub fn action(sink: &impl Sink, command: Command, source: Source, after: &PlantSnapshot) {
     sink.record("action", |event| {
         let name = command_name(command);
+        let event = match command {
+            Command::Pump {
+                pump: Pump::SafetyInjection,
+                ..
+            } => event.field("pump", "safety_injection"),
+            _ => event,
+        };
         event
             .summary(format!(
                 "{} from {}",
@@ -353,6 +360,17 @@ fn command_words(command: Command) -> String {
         Command::RodDemand { tenths_percent } => {
             format!("Rod demand {:.1}%", f64::from(tenths_percent) / 10.0)
         }
+        Command::Relief { open } => {
+            format!("Relief valves {}", if open { "opened" } else { "closed" })
+        }
+        Command::ReliefBlock { closed } => format!(
+            "Relief block valves {}",
+            if closed { "closed" } else { "opened" }
+        ),
+        Command::SteamIsolation { closed } => format!(
+            "Steam isolation valves {}",
+            if closed { "closed" } else { "opened" }
+        ),
         Command::ManualTrip => "Manual trip".into(),
         Command::ResetTrip => "Trip reset".into(),
         Command::AcknowledgeAlarms => "Alarm acknowledgment".into(),
@@ -363,6 +381,7 @@ fn command_words(command: Command) -> String {
                 Pump::MainFeed(l) => format!("Main feed pump {}", words(loop_name(l))),
                 Pump::AuxiliaryFeed => "Auxiliary feed pump".into(),
                 Pump::CirculatingWater => "Circulating water pump".into(),
+                Pump::SafetyInjection => "Safety injection pumps".into(),
             };
             format!("{name} {}", if running { "started" } else { "stopped" })
         }
@@ -395,6 +414,9 @@ fn command_words(command: Command) -> String {
 fn command_name(command: Command) -> &'static str {
     match command {
         Command::RodDemand { .. } => "rod_demand",
+        Command::Relief { .. } => "relief",
+        Command::ReliefBlock { .. } => "relief_block",
+        Command::SteamIsolation { .. } => "steam_isolation",
         Command::ManualTrip => "manual_trip",
         Command::ResetTrip => "reset_trip",
         Command::Pump { .. } => "pump",
@@ -466,6 +488,10 @@ fn process_name(fault: ProcessFault) -> String {
         }
         ProcessFault::FeedValveStuck { line } => format!("feed_valve_stuck_{}", loop_name(line)),
         ProcessFault::CondenserCoolingLoss => "condenser_cooling_loss".into(),
+        ProcessFault::ReliefStuckOpen => "relief_stuck_open".into(),
+        ProcessFault::SafetyInjectionFailure => "safety_injection_failure".into(),
+        ProcessFault::SteamLineBreak => "steam_line_break".into(),
+        ProcessFault::StationBlackout => "station_blackout".into(),
     }
 }
 
@@ -709,6 +735,54 @@ mod tests {
         assert_eq!(actions[0].u64("operator_actions"), Some(3));
         assert_eq!(actions[0].u64("revision"), Some(2));
         assert_eq!(actions[0].u64("at_ms"), Some(450));
+    }
+
+    #[test]
+    fn new_equipment_actions_and_faults_keep_their_wire_names() {
+        let snap = snapshot();
+        for (command, name) in [
+            (Command::Relief { open: true }, "relief"),
+            (Command::ReliefBlock { closed: true }, "relief_block"),
+            (Command::SteamIsolation { closed: true }, "steam_isolation"),
+            (
+                Command::Pump {
+                    pump: Pump::SafetyInjection,
+                    running: true,
+                },
+                "pump",
+            ),
+        ] {
+            let log = Log::default();
+            action(&log, command, Source::Panel, &snap);
+            let actions = log.of("action");
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].str("command"), Some(name));
+            if matches!(command, Command::Pump { .. }) {
+                assert_eq!(actions[0].str("pump"), Some("safety_injection"));
+            }
+        }
+        for (process, name) in [
+            (ProcessFault::ReliefStuckOpen, "relief_stuck_open"),
+            (
+                ProcessFault::SafetyInjectionFailure,
+                "safety_injection_failure",
+            ),
+            (ProcessFault::SteamLineBreak, "steam_line_break"),
+            (ProcessFault::StationBlackout, "station_blackout"),
+        ] {
+            let log = Log::default();
+            fault(&log, FaultChange::Inject(Fault::Process(process)), &snap);
+            fault(
+                &log,
+                FaultChange::Clear(FaultTarget::Process(process)),
+                &snap,
+            );
+            let faults = log.of("fault");
+            assert_eq!(faults.len(), 2);
+            for event in faults {
+                assert_eq!(event.str("target"), Some(name));
+            }
+        }
     }
 
     #[test]

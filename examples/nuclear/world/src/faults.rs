@@ -16,10 +16,14 @@ pub enum ProcessFault {
     CoolantPumpTrip { pump: Loop },
     FeedValveStuck { line: Loop },
     CondenserCoolingLoss,
+    ReliefStuckOpen,
+    SafetyInjectionFailure,
+    SteamLineBreak,
+    StationBlackout,
 }
 impl ProcessFault {
     pub const MAX_JSON_BYTES: usize = 34;
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::FeedPumpTrip { pump: Loop::A },
         Self::FeedPumpTrip { pump: Loop::B },
         Self::CoolantPumpTrip { pump: Loop::A },
@@ -27,6 +31,10 @@ impl ProcessFault {
         Self::FeedValveStuck { line: Loop::A },
         Self::FeedValveStuck { line: Loop::B },
         Self::CondenserCoolingLoss,
+        Self::ReliefStuckOpen,
+        Self::SafetyInjectionFailure,
+        Self::SteamLineBreak,
+        Self::StationBlackout,
     ];
     pub(crate) fn index(self) -> usize {
         match self {
@@ -34,6 +42,10 @@ impl ProcessFault {
             Self::CoolantPumpTrip { pump } => 2 + pump.index(),
             Self::FeedValveStuck { line } => 4 + line.index(),
             Self::CondenserCoolingLoss => 6,
+            Self::ReliefStuckOpen => 7,
+            Self::SafetyInjectionFailure => 8,
+            Self::SteamLineBreak => 9,
+            Self::StationBlackout => 10,
         }
     }
 }
@@ -87,21 +99,23 @@ impl ScheduledFault {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Faults {
-    pub process: [Option<ProcessFault>; 7],
+    pub process: [Option<ProcessFault>; 11],
     pub sensors: [Option<SensorFault>; SENSOR_COUNT],
     pub telemetry_quiet: bool,
 }
 impl Default for Faults {
     fn default() -> Self {
         Self {
-            process: [None; 7],
+            process: [None; 11],
             sensors: [None; SENSOR_COUNT],
             telemetry_quiet: false,
         }
     }
 }
 impl Faults {
-    pub const MAX_JSON_BYTES: usize = 888;
+    pub const MAX_JSON_BYTES: usize = 49
+        + 11 * (ProcessFault::MAX_JSON_BYTES + 1)
+        + SENSOR_COUNT * (SensorFault::MAX_JSON_BYTES + 1);
     pub(crate) fn has(&self, fault: ProcessFault) -> bool {
         self.process[fault.index()].is_some()
     }
