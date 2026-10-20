@@ -192,8 +192,9 @@ struct Assigned {
 }
 
 impl Inner {
-    /// Applies what this and other worlds have appended to the record since
-    /// it was last read. The caller holds `store.lock`.
+    /// Applies what this and other worlds have appended to
+    /// `addresses.jsonl` since it was last read. The caller holds
+    /// `store.lock`.
     fn read_on(&mut self) -> io::Result<()> {
         let Some(record) = &mut self.record else {
             return Ok(());
@@ -730,8 +731,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The store's lock is held while the record is read, so every line in
-    /// it is finished. One without its newline was cut short.
+    /// The store's lock is held while `addresses.jsonl` is read, so every
+    /// line in it is finished. One without its newline was cut short.
     #[test]
     fn a_record_without_its_newline_is_corrupt() {
         let dir = test_dir("record-without-newline");
