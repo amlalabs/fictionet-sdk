@@ -76,8 +76,14 @@ Other attachment names pass through unchanged.
 ## Port facts
 
 The scanner's tap watches IPv4 packets and passes them through unchanged.
-A probe is an office-bound TCP SYN with ACK, RST and FIN clear, or a UDP
-packet. A matching TCP SYN-ACK or UDP reply means `open`. A matching TCP
+A probe is an office-bound TCP SYN with ACK, RST and FIN clear, a UDP
+packet, or an ICMP echo request (type 8, code 0). Each host has at most one
+echo row, with protocol `icmp` and port 0. A matching echo reply marks it
+`open`: the host answered. Echo replies must match the latest request's
+identifier and sequence number. Any ICMP destination unreachable quoting
+that request marks the echo row `unreachable`.
+
+A matching TCP SYN-ACK or UDP reply means `open`. A matching TCP
 RST-ACK or ICMP port-unreachable means `closed`. Other ICMP destination
 unreachable codes mean `unreachable`. Each reply must match the latest
 probe's source port and, for TCP, its sequence number. Traffic outside the

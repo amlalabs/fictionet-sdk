@@ -1,11 +1,15 @@
 //! The tap watches IPv4 packets on the scanner's link and changes nothing.
-//! A probe is a TCP SYN with ACK, RST and FIN clear, or a UDP packet, sent
-//! to the office subnet. An answer must match the latest probe's addresses
-//! and ports. TCP answers must also match its sequence number.
+//! A probe is a TCP SYN with ACK, RST and FIN clear, a UDP packet, or an
+//! ICMP echo request (type 8, code 0), sent to the office subnet. An echo row
+//! uses protocol `icmp` and port 0. An answer must match the latest probe's
+//! addresses and ports. TCP answers must also match its sequence number;
+//! echo answers must match its identifier and sequence number.
 //!
-//! A row starts `unanswered`. A TCP SYN-ACK or UDP reply means `open`.
+//! A row starts `unanswered`. A TCP SYN-ACK, UDP reply or echo reply means
+//! `open`. For an echo row, this means the host answered.
 //! A TCP RST-ACK or ICMP port-unreachable means `closed`. Other ICMP
-//! destination unreachable codes mean `unreachable`. Repeated probes keep
+//! destination unreachable codes, and any code quoting an echo request,
+//! mean `unreachable`. Repeated probes keep
 //! the last answered state. Stale replies and noninitial fragments are ignored.
 //!
 //! A `scan.port` fact marks a new row or a state change. It includes the
@@ -38,7 +42,7 @@ use crate::{MACHINES, OFFICE};
 /// Maximum number of distinct host, protocol and port rows in a run.
 pub const MAX_ROWS: usize = 16_384;
 
-/// The transport used by a probe. TCP sorts before UDP.
+/// The protocol used by a probe. Sorts TCP, UDP, then ICMP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
@@ -46,6 +50,8 @@ pub enum Protocol {
     Tcp,
     /// A UDP probe.
     Udp,
+    /// An ICMP echo probe.
+    Icmp,
 }
 
 impl Protocol {
@@ -54,6 +60,7 @@ impl Protocol {
         match self {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
+            Self::Icmp => "icmp",
         }
     }
 }
@@ -64,11 +71,11 @@ impl Protocol {
 pub enum PortState {
     /// No matching answer has arrived.
     Unanswered,
-    /// A matching TCP SYN-ACK or UDP reply arrived.
+    /// A matching TCP SYN-ACK, UDP reply or ICMP echo reply arrived.
     Open,
     /// A matching TCP RST-ACK or ICMP port-unreachable arrived.
     Closed,
-    /// A matching ICMP destination unreachable with another code arrived.
+    /// A matching ICMP unreachable arrived, with any code for an echo probe.
     Unreachable,
 }
 
@@ -89,9 +96,9 @@ impl PortState {
 pub struct PortRow {
     /// The probed host's IPv4 address.
     pub host: Ipv4Addr,
-    /// The probed destination port.
+    /// The probed destination port, or zero for an ICMP echo.
     pub port: u16,
-    /// The probe's transport protocol.
+    /// The probe's protocol.
     pub protocol: Protocol,
     /// The latest answered state, or no answer yet.
     pub state: PortState,
@@ -108,7 +115,7 @@ pub struct PortRow {
 impl PortRow {
     /// Maximum compact JSON size, with the largest address, port and counters.
     pub const MAX_JSON_BYTES: usize = concat!(
-        r#"{"host":"255.255.255.255","port":65535,"protocol":"tcp","state":"unreachable","first_probe_ms":"#,
+        r#"{"host":"255.255.255.255","port":65535,"protocol":"icmp","state":"unreachable","first_probe_ms":"#,
         "18446744073709551615",
         r#","last_probe_ms":"#,
         "18446744073709551615",
@@ -330,10 +337,10 @@ impl Tracker {
             return Signal::None;
         };
         let transport = h.payload(bytes);
-        if direction == Direction::ToInner && h.protocol == 1 {
-            if transport.len() < 8 || transport[0] != 3 {
-                return Signal::None;
-            }
+        if transport.len() < 8 {
+            return Signal::None;
+        }
+        if direction == Direction::ToInner && h.protocol == 1 && transport[0] == 3 {
             let quoted = &transport[8..];
             let Some(q) = header(quoted, true) else {
                 return Signal::None;
@@ -348,20 +355,24 @@ impl Tracker {
             if t.len() < 8 {
                 return Signal::None;
             }
-            let key = (host, protocol, word(t, 2));
+            let echo = protocol == Protocol::Icmp;
+            if echo && t[..2] != [8, 0] {
+                return Signal::None;
+            }
+            let key = (host, protocol, if echo { 0 } else { word(t, 2) });
             let Some(row) = self.rows.get(&key) else {
                 return Signal::None;
             };
             if row.source != q.src
                 || h.dst != row.source
-                || row.source_port != word(t, 0)
-                || (protocol == Protocol::Tcp && row.sequence != dword(t, 4))
+                || (!echo && row.source_port != word(t, 0))
+                || (protocol != Protocol::Udp && row.sequence != dword(t, 4))
             {
                 return Signal::None;
             }
             return self.answer(
                 key,
-                if transport[1] == 3 {
+                if transport[1] == 3 && !echo {
                     PortState::Closed
                 } else {
                     PortState::Unreachable
@@ -384,16 +395,25 @@ impl Tracker {
                 transport[13]
             }
             Protocol::Udp => {
-                if transport.len() < 8 {
-                    return Signal::None;
-                }
                 let len = usize::from(word(transport, 4));
                 if len < 8 || (len > transport.len() && h.fragment.is_none()) {
                     return Signal::None;
                 }
                 0
             }
+            Protocol::Icmp => {
+                let kind = if direction == Direction::FromInner {
+                    8
+                } else {
+                    0
+                };
+                if transport[..2] != [kind, 0] {
+                    return Signal::None;
+                }
+                0
+            }
         };
+        let echo = protocol == Protocol::Icmp;
         match direction {
             Direction::FromInner => {
                 if !OFFICE.contains(h.dst) || (protocol == Protocol::Tcp && flags & 0x17 != 0x02) {
@@ -402,7 +422,7 @@ impl Tracker {
                 let IpAddr::V4(host) = h.dst else {
                     return Signal::None;
                 };
-                let key = (host, protocol, word(transport, 2));
+                let key = (host, protocol, if echo { 0 } else { word(transport, 2) });
                 let created = !self.rows.contains_key(&key);
                 if created && self.rows.len() == self.max_rows {
                     self.untracked += 1;
@@ -433,8 +453,8 @@ impl Tracker {
                 tracked.row.probes += 1;
                 tracked.row.revision = self.revision;
                 tracked.source = h.src;
-                tracked.source_port = word(transport, 0);
-                tracked.sequence = if protocol == Protocol::Tcp {
+                tracked.source_port = if echo { 0 } else { word(transport, 0) };
+                tracked.sequence = if protocol != Protocol::Udp {
                     dword(transport, 4)
                 } else {
                     0
@@ -449,14 +469,20 @@ impl Tracker {
                 let IpAddr::V4(host) = h.src else {
                     return Signal::None;
                 };
-                let key = (host, protocol, word(transport, 0));
+                let key = (host, protocol, if echo { 0 } else { word(transport, 0) });
                 let Some(row) = self.rows.get(&key) else {
                     return Signal::None;
                 };
-                if h.dst != row.source || word(transport, 2) != row.source_port {
+                if h.dst != row.source || (!echo && word(transport, 2) != row.source_port) {
                     return Signal::None;
                 }
                 let state = match protocol {
+                    Protocol::Icmp => {
+                        if dword(transport, 4) != row.sequence {
+                            return Signal::None;
+                        }
+                        PortState::Open
+                    }
                     Protocol::Udp => PortState::Open,
                     Protocol::Tcp => {
                         if flags & 0x10 == 0 || dword(transport, 8) != row.sequence.wrapping_add(1)
@@ -493,6 +519,7 @@ impl Tracker {
 
 fn protocol(number: u8) -> Option<Protocol> {
     match number {
+        1 => Some(Protocol::Icmp),
         6 => Some(Protocol::Tcp),
         17 => Some(Protocol::Udp),
         _ => None,
@@ -575,6 +602,215 @@ mod tests {
         let sum = ip::checksum(&t);
         t[2..4].copy_from_slice(&sum.to_be_bytes());
         ip::packet(Ipv4Addr::new(10, 0, 9, 1).into(), SCANNER.into(), 1, &t).0
+    }
+
+    fn echo(src: Ipv4Addr, dst: Ipv4Addr, kind: u8, code: u8, id: u16, seq: u16) -> Vec<u8> {
+        let mut t = vec![kind, code, 0, 0];
+        t.extend_from_slice(&id.to_be_bytes());
+        t.extend_from_slice(&seq.to_be_bytes());
+        let sum = ip::checksum(&t);
+        t[2..4].copy_from_slice(&sum.to_be_bytes());
+        ip::packet(src.into(), dst.into(), 1, &t).0
+    }
+
+    #[test]
+    fn echo_answers_match_the_latest_identifier_sequence_and_addresses() {
+        let mut t = Tracker::new(10);
+        assert!(matches!(
+            t.packet(FromInner, &echo(SCANNER, HOST, 8, 0, 123, 1), 10),
+            Signal::Port(
+                PortRow {
+                    protocol: Protocol::Icmp,
+                    port: 0,
+                    state: Unanswered,
+                    ..
+                },
+                None
+            )
+        ));
+        assert_eq!(
+            t.packet(FromInner, &echo(SCANNER, HOST, 8, 0, 124, 2), 20),
+            Signal::None
+        );
+        let before = t.snapshot();
+        for (src, dst, id, seq) in [
+            (HOST, SCANNER, 123, 2),
+            (HOST, SCANNER, 124, 1),
+            (HOST, SCANNER, 123, 1),
+            (Ipv4Addr::new(10, 0, 0, 11), SCANNER, 124, 2),
+            (HOST, Ipv4Addr::new(10, 0, 9, 3), 124, 2),
+        ] {
+            assert_eq!(
+                t.packet(ToInner, &echo(src, dst, 0, 0, id, seq), 21),
+                Signal::None
+            );
+            assert_eq!(t.snapshot(), before);
+        }
+        assert!(matches!(
+            t.packet(ToInner, &echo(HOST, SCANNER, 0, 0, 124, 2), 22),
+            Signal::Port(PortRow { state: Open, .. }, Some(Unanswered))
+        ));
+        let row = PortRow {
+            host: HOST,
+            port: 0,
+            protocol: Protocol::Icmp,
+            state: Open,
+            first_probe_ms: 10,
+            last_probe_ms: 20,
+            probes: 2,
+            revision: 3,
+        };
+        assert_eq!(t.snapshot().rows, std::slice::from_ref(&row));
+        assert_eq!(
+            t.changes_since(2),
+            PortChanges {
+                from_revision: 2,
+                revision: 3,
+                at_ms: 22,
+                untracked: 0,
+                rows: vec![row],
+            }
+        );
+        assert_eq!(
+            t.packet(ToInner, &echo(HOST, SCANNER, 0, 0, 124, 2), 23),
+            Signal::None
+        );
+        assert_eq!(
+            t.packet(FromInner, &echo(SCANNER, HOST, 8, 0, 125, 3), 24),
+            Signal::None
+        );
+        assert_eq!(t.snapshot().rows[0].state, Open);
+        assert_eq!(t.snapshot().rows[0].probes, 3);
+        assert_eq!(t.revision, 4);
+    }
+
+    #[test]
+    fn echo_unreachable_matches_the_quoted_request_for_every_code() {
+        let absent = Ipv4Addr::new(10, 0, 0, 14);
+        for code in 0..=u8::MAX {
+            let mut t = Tracker::new(10);
+            let probe = echo(SCANNER, absent, 8, 0, 124, 2);
+            t.packet(FromInner, &probe, 10);
+            let before = t.snapshot();
+            for quote in [
+                echo(SCANNER, absent, 8, 0, 123, 2),
+                echo(SCANNER, absent, 8, 0, 124, 1),
+                echo(SCANNER, HOST, 8, 0, 124, 2),
+                echo(Ipv4Addr::new(10, 0, 9, 3), absent, 8, 0, 124, 2),
+                echo(SCANNER, absent, 0, 0, 124, 2),
+                echo(SCANNER, absent, 8, 1, 124, 2),
+            ] {
+                assert_eq!(
+                    t.packet(ToInner, &unreachable(&quote, code), 11),
+                    Signal::None
+                );
+                assert_eq!(t.snapshot(), before);
+            }
+            assert!(matches!(
+                t.packet(ToInner, &unreachable(&probe, code), 12),
+                Signal::Port(
+                    PortRow {
+                        state: Unreachable,
+                        ..
+                    },
+                    Some(Unanswered)
+                )
+            ));
+            assert_eq!(t.snapshot().rows[0].host, absent);
+            assert_eq!(t.revision, 2);
+        }
+    }
+
+    #[test]
+    fn unsolicited_echo_replies_and_other_echo_traffic_are_ignored() {
+        let mut t = Tracker::new(10);
+        assert_eq!(
+            t.packet(ToInner, &echo(HOST, SCANNER, 0, 0, 123, 1), 1),
+            Signal::None
+        );
+        for (dst, kind, code) in [
+            (Ipv4Addr::new(10, 0, 9, 1), 8, 0),
+            (Ipv4Addr::new(10, 0, 1, 0), 8, 0),
+            (HOST, 0, 0),
+            (HOST, 8, 1),
+            (HOST, 13, 0),
+        ] {
+            assert_eq!(
+                t.packet(FromInner, &echo(SCANNER, dst, kind, code, 123, 1), 1),
+                Signal::None
+            );
+        }
+        assert_eq!(t.revision, 0);
+        assert!(t.snapshot().rows.is_empty());
+    }
+
+    #[test]
+    fn echo_rows_share_the_bound_and_sort_after_udp() {
+        let mut t = Tracker::new(3);
+        let probe = echo(SCANNER, HOST, 8, 0, 123, 1);
+        t.packet(FromInner, &probe, 1);
+        t.packet(FromInner, &udp(SCANNER, HOST, (4000, 53)), 2);
+        t.packet(FromInner, &syn(80, 4000, 1), 3);
+        assert_eq!(
+            t.snapshot()
+                .rows
+                .iter()
+                .map(|r| r.protocol)
+                .collect::<Vec<_>>(),
+            [Protocol::Tcp, Protocol::Udp, Protocol::Icmp]
+        );
+        let extra = echo(SCANNER, Ipv4Addr::new(10, 0, 0, 11), 8, 0, 123, 1);
+        assert_eq!(t.packet(FromInner, &extra, 4), Signal::Full);
+        assert_eq!(t.packet(FromInner, &extra, 5), Signal::None);
+        assert_eq!(t.packet(FromInner, &probe, 6), Signal::None);
+        t.packet(ToInner, &echo(HOST, SCANNER, 0, 0, 123, 1), 7);
+        assert_eq!(t.snapshot().rows.len(), 3);
+        assert_eq!(t.snapshot().rows[2].state, Open);
+        assert_eq!(t.snapshot().rows[2].probes, 2);
+        assert_eq!(t.untracked, 2);
+        assert_eq!(t.revision, 5);
+    }
+
+    #[test]
+    fn longest_protocol_fits_the_exact_json_row_bound() {
+        let row = PortRow {
+            host: Ipv4Addr::BROADCAST,
+            port: u16::MAX,
+            protocol: Protocol::Icmp,
+            state: Unreachable,
+            first_probe_ms: u64::MAX,
+            last_probe_ms: u64::MAX,
+            probes: u64::MAX,
+            revision: u64::MAX,
+        };
+        assert_eq!(
+            serde_json::to_vec(&row).unwrap().len(),
+            PortRow::MAX_JSON_BYTES
+        );
+        assert_eq!(serde_json::to_string(&Protocol::Icmp).unwrap(), "\"icmp\"");
+        assert_eq!(Protocol::Icmp.as_str(), "icmp");
+        roundtrip(&row, PortRow::MAX_JSON_BYTES);
+        let map = PortMap {
+            revision: u64::MAX,
+            at_ms: u64::MAX,
+            max_rows: MAX_ROWS,
+            untracked: u64::MAX,
+            machines: machines(),
+            rows: vec![row; MAX_ROWS],
+        };
+        roundtrip(&map, PortMap::MAX_JSON_BYTES);
+        let changes = PortChanges {
+            from_revision: u64::MAX,
+            revision: u64::MAX,
+            at_ms: u64::MAX,
+            untracked: u64::MAX,
+            rows: map.rows,
+        };
+        roundtrip(&changes, PortChanges::MAX_JSON_BYTES);
+        assert_eq!(
+            serde_json::to_vec(&changes).unwrap().len() + 1,
+            PortChanges::MAX_JSON_BYTES
+        );
     }
 
     fn state(t: &Tracker, expected: PortState, probes: u64, revision: u64) {

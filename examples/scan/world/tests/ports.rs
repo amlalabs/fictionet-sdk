@@ -7,7 +7,7 @@ use fictionet::events::Level;
 use fictionet::stdlib::network::ports::{Event, Ports as Links};
 use fictionet::stdlib::network::{ip, tcp, udp};
 use fictionet::time::ms;
-use fictionet::{Cx, End, Interface, Packet, RunOptions, Seed};
+use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RunOptions, Seed};
 use fictionet_observe::Memory;
 use scan_world::ports::MAX_ROWS;
 use scan_world::{
@@ -52,6 +52,71 @@ fn datagram(host: Ipv4Addr, port: u16) -> Packet {
     )
     .unwrap();
     ip::packet(SCANNER_ADDR.into(), host.into(), 17, &t)
+}
+
+#[test]
+fn echo_discovery_updates_snapshots_deltas_and_facts() {
+    let memory = Arc::new(Memory::default());
+    let history = memory.clone();
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(42)).observer(memory),
+        move |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            let ports = start(&fcx, office(), attachments)?;
+            let mut scanner = attacher.attach(SCANNER)?;
+            for (i, (last, state)) in [
+                (10, PortState::Open),
+                (11, PortState::Open),
+                (12, PortState::Open),
+                (13, PortState::Open),
+                (14, PortState::Unreachable),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let host = Ipv4Addr::new(10, 0, 0, last);
+                let mut echo = [8, 0, 0, 0, 0x51, 0x52, 0, 1];
+                let sum = ip::checksum(&echo);
+                echo[2..4].copy_from_slice(&sum.to_be_bytes());
+                let prior = ports.snapshot().revision;
+                scanner.send(ip::packet(SCANNER_ADDR.into(), host.into(), 1, &echo));
+                let reply = scanner.recv(&fcx).await?;
+                let header = ip::Header::parse(&reply.0).unwrap();
+                assert_eq!(header.protocol, 1);
+                let payload = header.payload(&reply.0);
+                assert_eq!(payload[0], if last == 14 { 3 } else { 0 });
+                if last == 14 {
+                    assert_eq!(payload[1], 1);
+                }
+                let map = ports.snapshot();
+                let delta = ports.changes_since(prior);
+                assert_eq!(map.revision, prior + 2);
+                assert_eq!(map.rows.len(), i + 1);
+                assert_eq!(delta.rows, [map.rows[i].clone()]);
+                let row = &delta.rows[0];
+                assert_eq!(
+                    (row.host, row.protocol, row.port, row.state, row.probes),
+                    (host, Protocol::Icmp, 0, state, 1)
+                );
+                assert_eq!(row.revision, map.revision);
+                let facts = history.checked_of("scan", "port").unwrap();
+                assert_eq!(facts.len(), (i + 1) * 2);
+                for (event, expected, previous) in [
+                    (&facts[i * 2], "unanswered", None),
+                    (&facts[i * 2 + 1], state.as_str(), Some("unanswered")),
+                ] {
+                    assert_eq!(event.str("host"), Some(host.to_string().as_str()));
+                    assert_eq!(event.str("protocol"), Some("icmp"));
+                    assert_eq!(event.u64("port"), Some(0));
+                    assert_eq!(event.str("state"), Some(expected));
+                    assert_eq!(event.str("previous"), previous);
+                }
+            }
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
 }
 
 /// The injection end lets the server send an unsolicited packet too.

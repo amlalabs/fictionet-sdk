@@ -314,6 +314,38 @@ mod tests {
     }
 
     #[test]
+    fn recorded_discovery_requires_an_answer_for_each_host() {
+        let report = nmap::parse(include_str!("discovery.xml")).unwrap();
+        let mut map = map();
+        map.rows = HOSTS
+            .map(|last| scan_world::PortRow {
+                host: addr(last),
+                port: 0,
+                protocol: Protocol::Icmp,
+                state: PortState::Open,
+                first_probe_ms: 10,
+                last_probe_ms: 10,
+                probes: 1,
+                revision: 2,
+            })
+            .into();
+        check(0, 0, &report, &map).unwrap();
+        for i in 0..map.rows.len() {
+            let mut missing = map.clone();
+            missing.rows.remove(i);
+            assert_eq!(
+                check(0, 0, &report, &missing),
+                Err(format!("{} has no answered port probe", map.rows[i].host))
+            );
+            for state in [PortState::Unanswered, PortState::Unreachable] {
+                let mut unanswered = map.clone();
+                unanswered.rows[i].state = state;
+                assert!(check(0, 0, &report, &unanswered).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn accepts_all_three_steps_and_no_os_match() {
         for (index, xml) in [DISCOVERY, SERVICES, OS].into_iter().enumerate() {
             check(index, 0, &nmap::parse(xml).unwrap(), &map()).unwrap();
