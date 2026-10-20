@@ -9,6 +9,7 @@ import { fmtCount } from '../format.mjs';
 // What the pair filter tells the viewer: an event names addresses and ports,
 // and packets are matched by them, never by time.
 export const APPROXIMATE = 'Approximate: matched by address and port, not by connection.';
+const STOPPED = 'The run has stopped, so its packets can no longer be loaded.';
 
 export function mount(root, services, options = {}) {
   const { $, el } = scoped(root);
@@ -17,25 +18,29 @@ export function mount(root, services, options = {}) {
     onDetail(packet, header) {
       labelAction(header, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
     },
-    $, el, ...services.transport, fmtCount, fit() {}, ...options,
+    $, el, ...services.transport, fmtCount, fit() {}, stopped: () => (services.stopped?.() ? STOPPED : null), hostColumn: true, ...options,
     placeholder: options.placeholder || (() => 'Select a packet to see its layers.'),
     ...(options.drawer ? {} : { pcapLabel: 'pcapng' }),
   });
   options.onReady?.(view);
   let animation;
-  // A list with links open but nothing captured yet says so.
+  // An empty list says whether its links are still opening or have nothing
+  // captured yet. Packets already received are about to be shown.
   const note = $('plist-empty');
   const frame = () => {
     view.flush();
     if (note) {
-      const empty = !$('drawer').hidden && !$('prows').children.length;
+      const queued = view.queued();
+      const empty = !$('drawer').hidden && !$('prows').children.length && queued <= 0;
       if (note.hidden === empty) note.hidden = !empty;
+      const text = queued < 0 ? 'Loading packets…' : 'No packets yet. They appear here as the world sends them.';
+      if (empty && note.textContent !== text) note.textContent = text;
     }
     animation = requestAnimationFrame(frame);
   };
   animation = requestAnimationFrame(frame);
   const cleanup = [];
-  let watch, request, generation = 0, current = '';
+  let watch, request, generation = 0, current = '', graph = false;
   let nodes = new Map(), edges = new Map(), owners = new Map();
   let selected = services.selection?.get() || { host: null, links: [] };
 
@@ -46,7 +51,7 @@ export function mount(root, services, options = {}) {
     $('drawer-title').title = 'Packets';
     $('drawer-title').setAttribute('aria-label', 'Packets');
     $('prows').replaceChildren();
-    el('td', { colspan: 8, text }, el('tr', { class: 'gap' }, $('prows')));
+    el('td', { colspan: 9, text }, el('tr', { class: 'gap' }, $('prows')));
   }
   function show(links, label) {
     const members = links.map((id) => edges.get(id) || { id, c: [0, 0, 0, 0] })
@@ -66,6 +71,9 @@ export function mount(root, services, options = {}) {
     view.openLinks(label, 'network', membersWithHosts, '', members.length);
   }
   async function scope() {
+    // Opening before the graph is known would open the stream again once it
+    // is, since each link's host and direction come from the graph.
+    if (!graph) return;
     const attempt = ++generation;
     request?.abort();
     if (selected.links.length) show(selected.links, selected.host || 'Selected links');
@@ -85,7 +93,7 @@ export function mount(root, services, options = {}) {
     } catch (error) {
       if (attempt !== generation || request.signal.aborted) return;
       current = '';
-      empty(`Packets are unavailable: ${error.message}`);
+      empty(services.stopped?.() ? STOPPED : `Packets are unavailable: ${error.message}`);
     }
   }
 
@@ -96,6 +104,7 @@ export function mount(root, services, options = {}) {
     watch = services.watch();
     const on = (name, callback) => cleanup.push(listen(watch, name, (event) => callback(JSON.parse(event.data))));
     on('snapshot', (snapshot) => {
+      graph = true;
       nodes = new Map(snapshot.nodes.map((node) => [node.id, node]));
       edges = new Map(snapshot.edges.map((edge) => [edge.id, { ...edge, c: snapshot.counters[edge.id] }]));
       void scope();

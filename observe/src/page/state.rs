@@ -293,13 +293,18 @@ pub(super) async fn stream(
         if closing {
             return observation::end(conn).await;
         }
-        tokio::select! {
+        let ping = tokio::select! {
             biased;
-            () = async { let _ = stopping.wait_for(|stopped| *stopped).await; } => closing = true,
-            () = changed.notified() => {}
-            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                http::write(conn, b": ping\n\n").await?;
+            () = async { let _ = stopping.wait_for(|stopped| *stopped).await; } => {
+                closing = true;
+                false
             }
+            () = http::hangup(conn) => return Ok(()),
+            () = changed.notified() => false,
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => true,
+        };
+        if ping {
+            http::write(conn, b": ping\n\n").await?;
         }
     }
 }

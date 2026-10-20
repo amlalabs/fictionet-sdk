@@ -44,11 +44,13 @@ export function mount(root, services, options) {
     old?.terminal?.dispose();
     display.replaceChildren();
   }
+  const CLOSED = 'The terminal closed when the run stopped.';
   function disconnected(reason) {
     focus = false;
     stop();
     if (disposed || !available) return;
-    show(reason ? `Disconnected: ${reason}.` : 'Disconnected.', true);
+    if (services.stopped?.()) show(CLOSED);
+    else show(reason ? `Disconnected: ${reason}.` : 'Disconnected.', true);
   }
   async function connect() {
     if (disposed || !available || !constructors) return;
@@ -134,7 +136,7 @@ export function mount(root, services, options) {
   }).catch((error) => {
     if (disposed) return;
     missing = true;
-    show(`${error.message} is not in this build. Run \`cargo xtask demo libraries\`, then rebuild.`);
+    show(services.stopped?.() ? CLOSED : `${error.message} is not in this build. Run \`cargo xtask demo libraries\`, then rebuild.`);
   });
   return () => {
     if (disposed) return;

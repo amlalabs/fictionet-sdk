@@ -56,6 +56,38 @@ test('table renders column pointers and formats as text and replaces snapshots',
   assert.equal(h.root.children.length, 0);
 });
 
+test('tables update rows in place and build again only rows whose text changed', async () => {
+  const h = fixture();
+  const dispose = table(h.root, h.services, { state: '/api/state/rows', columns: [{ label: 'Host', pointer: '/host' }, { label: 'Packets', pointer: '/packets', format: 'number' }] });
+  h.publish({ revision: 1, value: [{ host: 'alpha', packets: 1 }, { host: 'beta', packets: 1 }] });
+  const [alpha, beta] = h.root.querySelectorAll('tr').slice(1);
+  alpha.classList.remove('new-row');
+  beta.classList.remove('new-row');
+  h.publish({ revision: 2, value: [{ host: 'alpha', packets: 1 }, { host: 'gamma', packets: 0 }, { host: 'beta', packets: 2 }] });
+  const rows = h.root.querySelectorAll('tr').slice(1);
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0], alpha);
+  assert.equal(alpha.classList.contains('new-row'), false);
+  assert.deepEqual(rows.map((row) => row.textContent), ['alpha1', 'gamma0', 'beta2']);
+  assert.ok(rows.slice(1).every((row) => row.classList.contains('new-row')));
+  dispose();
+  // Event tables name rows by event, so a row read again keeps its element.
+  const log = fixture();
+  const stop = eventTable(log.root, log.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
+  await settle();
+  log.requests[0].resolve({ rows: [{ seq: 4, summary: 'first' }], next: 5, dropped: 0 });
+  await settle();
+  const first = log.root.querySelector('tbody').children[0];
+  const next = [...log.timers.values()][0]; log.timers.clear(); next();
+  await settle();
+  log.requests[1].resolve({ rows: [{ seq: 5, summary: 'second' }], next: 6, dropped: 0 });
+  await settle();
+  const body = log.root.querySelector('tbody').children;
+  assert.deepEqual(body.map((row) => row.textContent), ['first', 'second']);
+  assert.equal(body[0], first);
+  stop();
+});
+
 test('control sends the linked revision once and shows replies, rejections and timeouts', async () => {
   const h = fixture();
   const dispose = control(h.root, h.services, { state: '/api/state/traffic', command: '/api/command/traffic', actions: [{ label: '<Pause>', command: { running: false } }] });
@@ -134,6 +166,26 @@ test('event table advances the server cursor and cancels pending reads and timer
   assert.equal(h.requests[1].signal.aborted, true);
   assert.equal(h.timers.size, 0);
   assert.equal(h.root.children.length, 0);
+});
+
+test('after the run stopped, event tables and custom panels say so instead of a fetch error', async () => {
+  const h = fixture();
+  h.services.stopped = () => true;
+  const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
+  await settle();
+  h.requests[0].reject(new TypeError('Failed to fetch'));
+  await settle();
+  assert.match(h.root.textContent, /The run has stopped, so these events can no longer be loaded\./);
+  assert.doesNotMatch(h.root.textContent, /Failed to fetch/);
+  assert.equal(h.timers.size, 0, 'no further reads');
+  dispose();
+  const panel = fixture();
+  panel.services.stopped = () => true;
+  panel.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
+  const stop = custom(panel.root, panel.services, { title: 'Plant', module: '/panels/plant.mjs', state: '/api/state/plant' });
+  await settle();
+  assert.equal(panel.root.textContent, 'Could not open Plant: the run has stopped, so the panel can no longer be loaded');
+  stop();
 });
 
 test('custom panels dispose a late mount and reject foreign module paths', async () => {

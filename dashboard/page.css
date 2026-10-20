@@ -445,42 +445,14 @@
   container-type: inline-size;
 }
 .tab-strip {
-  position: relative;
   flex: none;
   border-bottom: 1px solid var(--line);
 }
-.tab-strip::before,
-.tab-strip::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  z-index: 1;
-  width: 40px;
-  opacity: 0;
-  pointer-events: none;
-}
-.tab-strip::before {
-  left: 0;
-  background: linear-gradient(to right, var(--paper), transparent);
-}
-.tab-strip::after {
-  right: 0;
-  background: linear-gradient(to left, var(--paper), transparent);
-}
-.tab-strip[data-left='true']::before,
-.tab-strip[data-right='true']::after {
-  opacity: 1;
-}
+/* Every tab stays in view: the strip wraps to a second row when it must. */
 #tabs {
   display: flex;
-  gap: 0;
+  flex-wrap: wrap;
   padding: 0 8px;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-#tabs::-webkit-scrollbar {
-  display: none;
 }
 #tabs [role='tab'] {
   flex: none;
@@ -530,6 +502,100 @@
 }
 
 /* Shared panel parts. */
+.eyebrow {
+  margin: 0;
+  color: var(--muted);
+  font: 10px/1.6 var(--mono);
+  letter-spacing: 0.06em;
+}
+.eyebrow.accent {
+  color: var(--accent-text);
+}
+.note {
+  color: var(--muted);
+  font-size: 12px;
+}
+.section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.pill.outline {
+  border: 1px solid var(--line-strong);
+  background: none;
+  color: var(--ink);
+}
+.pill.marked {
+  background: var(--hex-mark);
+  color: var(--on-selection);
+}
+/* A two-state switch: a button with role switch holding a .switch-track,
+   which holds a .switch-knob, then its label. */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font-weight: 600;
+  text-align: left;
+}
+.switch-track {
+  position: relative;
+  flex: none;
+  width: 32px;
+  height: 18px;
+  border: 1px solid var(--control);
+  border-radius: 999px;
+  background: var(--sunken);
+}
+.switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--ink);
+  transition: left 120ms ease-out;
+}
+.switch[aria-checked='true'] .switch-track {
+  border-color: var(--accent-text);
+  background: var(--accent-text);
+}
+.switch[aria-checked='true'] .switch-knob {
+  left: 16px;
+  background: var(--paper);
+}
+.switch:disabled {
+  cursor: progress;
+}
+@media (prefers-reduced-motion: reduce) {
+  .switch-knob {
+    transition: none;
+  }
+}
+@media (forced-colors: active) {
+  .switch-track {
+    forced-color-adjust: none;
+    border-color: ButtonText;
+    background: Canvas;
+  }
+  .switch-knob {
+    forced-color-adjust: none;
+    background: ButtonText;
+  }
+  .switch[aria-checked='true'] .switch-track {
+    border-color: Highlight;
+    background: Highlight;
+  }
+  .switch[aria-checked='true'] .switch-knob {
+    background: HighlightText;
+  }
+}
 .panel-tools {
   display: flex;
   flex: none;
@@ -763,9 +829,12 @@ tr.moment td:first-child {
 .packet-panel col.c-no { width: 5ch; }
 .packet-panel col.c-time { width: var(--packet-time, calc(6ch + 16px)); }
 .packet-panel col.c-dir { width: 24px; }
-.packet-panel .c-host { display: none; }
-.packet-panel.merged-hosts .c-host { display: table-cell; color: var(--muted); }
-.packet-panel.merged-hosts col.c-host { display: table-column; width: var(--packet-host, calc(12ch + 16px)); }
+/* A hidden column keeps its place at zero width, so every row, gap rows
+   included, spans the same nine columns. */
+.packet-panel col.c-host { width: 0; }
+.packet-panel .plist .c-host { color: var(--muted); }
+.packet-panel:not(.merged-hosts) .plist .c-host { padding: 0; visibility: hidden; }
+.packet-panel.merged-hosts col.c-host { width: var(--packet-host, calc(12ch + 16px)); }
 .packet-panel col.c-src { width: var(--packet-src, 15ch); }
 .packet-panel col.c-dst { width: var(--packet-dst, 15ch); }
 .packet-panel col.c-proto { width: var(--packet-proto, 6ch); }
@@ -779,11 +848,24 @@ tr.moment td:first-child {
   text-overflow: clip;
 }
 @container (width < 600px) {
-  .packet-panel .c-len, .packet-panel .c-no { display: none; }
+  .packet-panel col.c-len, .packet-panel col.c-no { width: 0; }
+  .packet-panel .plist .c-len, .packet-panel .plist .c-no { padding: 0; visibility: hidden; }
 }
 @container (width < 560px) {
-  .packet-panel .c-proto { display: none; }
+  .packet-panel col.c-proto { width: 0; }
+  .packet-panel .plist .c-proto { padding: 0; visibility: hidden; }
   .packet-panel .packet-info-protocol { display: inline; font-weight: 600; }
+}
+/* In a narrow inspector the addresses give way so Info keeps room; a cut
+   address shows in full on hover and in the packet's layers. */
+@container (width < 480px) {
+  .packet-panel col.c-src { width: min(var(--packet-src, 15ch), 24%); }
+  .packet-panel col.c-dst { width: min(var(--packet-dst, 15ch), 24%); }
+  .packet-panel .plist td.c-src,
+  .packet-panel .plist td.c-dst {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 .packet-panel .detail {
   display: block;
@@ -861,14 +943,17 @@ tr.moment td:first-child {
 }
 
 /* Custom panels. */
+/* A world panel's own content: padded, and scrolling when it is taller than
+   its place. Panels that lay out their own scrolling areas set padding 0
+   and fill the height. */
 .custom-content {
   display: flex;
   flex: 1;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  padding: 12px;
-  overflow: hidden;
+  padding: 16px;
+  overflow: auto;
 }
 .custom-caption {
   flex: none;
@@ -1073,8 +1158,8 @@ body.licenses {
 .probe-world { color: var(--muted); }
 .probe-full { padding-top: 16px; }
 .probe-full code, .probe-full pre { font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
-.outcome-pill { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-self: start; border-radius: 4px; padding: 3px 5px; background: var(--raised); color: var(--muted); font-size: 11px; }
-.outcome-pill svg { flex: none; }
+.outcome-pill { display: inline-grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; column-gap: 4px; justify-self: start; border-radius: 4px; padding: 3px 5px; background: var(--raised); color: var(--muted); font-size: 11px; }
+.outcome-pill .mono { grid-column: 2; overflow-wrap: anywhere; }
 .outcome-pill.contained { color: var(--success); }
 .outcome-pill.not_contained { color: var(--on-ink); background: var(--danger); }
 .containment-alert { color: var(--ink); padding: 0 8px; border-left: 3px solid var(--danger); line-height: 1.6; }

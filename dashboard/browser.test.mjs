@@ -50,14 +50,20 @@ async function checkPacketLayout() {
     check(text.left >= bounds.left && text.right <= bounds.right - 7, 'text exceeds its column: ' + cell.textContent);
     check(getComputedStyle(cell).textOverflow !== 'ellipsis', 'text can ellipsize: ' + cell.textContent);
   };
+  // A gap row spans every column; the header must still fill the table.
+  source.emit('error', { error: 'Connection dropped. Reconnecting.' });
+  while (!root.querySelector('#prows tr.gap')) await frame();
+  // A hidden column keeps its place at zero width and shows nothing.
+  const hidden = (cell) => getComputedStyle(cell).visibility === 'hidden' && cell.getBoundingClientRect().width < 1;
   for (const width of [530, 559, 559.5, 560, 599, 599.5, 600, 800, 530]) {
     root.style.width = width + 'px';
     await frame();
-    for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
+    for (const cell of root.querySelectorAll('#prows tr:not(.gap) td.c-src, #prows tr:not(.gap) td.c-dst, #prows tr:not(.gap) td.c-time')) whole(cell);
     check($('td.c-time').textContent === '11.0039' && $('#prows tr:nth-child(2) .c-time').textContent === '1000.0039', 'Time changed');
-    check((getComputedStyle($('td.c-proto')).display === 'none') === (width < 560), 'Protocol breakpoint');
-    for (const column of ['c-no', 'c-len']) check((getComputedStyle($('td.' + column)).display === 'none') === (width < 600), column + ' breakpoint');
-    check(getComputedStyle($('td.c-time')).display !== 'none', 'Time hidden');
+    check(hidden($('td.c-proto')) === (width < 560), 'Protocol breakpoint');
+    for (const column of ['c-no', 'c-len']) check(hidden($('td.' + column)) === (width < 600), column + ' breakpoint');
+    check(!hidden($('td.c-time')), 'Time hidden');
+    check(Math.abs($('th.c-info').getBoundingClientRect().right - $('#plist table').getBoundingClientRect().right) < 1, 'columns do not fill the table');
     const prefix = $('.packet-info-protocol');
     check((getComputedStyle(prefix).display !== 'none') === (width < 560), 'protocol prefix visibility');
     if (width < 560) {
@@ -67,6 +73,14 @@ async function checkPacketLayout() {
     check($('#pfilter').getBoundingClientRect().width >= 160, 'filter too narrow');
     check($('#plist').scrollWidth <= $('#plist').clientWidth, 'IPv4 table overflows');
   }
+  // Below 480 px the addresses give way so Info keeps room; each address
+  // stays whole in its title.
+  root.style.width = '420px';
+  await frame();
+  check($('th.c-info').getBoundingClientRect().width >= 60, 'Info has no room in a narrow list: ' + $('th.c-info').getBoundingClientRect().width);
+  for (const cell of root.querySelectorAll('#prows tr:not(.gap) td.c-src, #prows tr:not(.gap) td.c-dst')) check(cell.title === cell.textContent, 'address without its full title: ' + cell.textContent);
+  root.style.width = '530px';
+  await frame();
   const title = $('#drawer-title');
   check(title.title === title.textContent && title.getAttribute('aria-label') === title.textContent, 'incomplete title accessibility');
   $('#jump-packets').hidden = false;
@@ -78,8 +92,8 @@ async function checkPacketLayout() {
   const src = '[2001:db8:1234:5678:90ab:cdef:1234:5678]:65535';
   const dst = '192.168.100.200:65535';
   send(3, src, dst, 1001.0039);
-  while (root.querySelectorAll('#prows tr').length < 3) await frame();
-  const last = $('#prows').lastElementChild;
+  while (root.querySelectorAll('#prows tr:not(.gap)').length < 3) await frame();
+  const last = [...root.querySelectorAll('#prows tr:not(.gap)')].at(-1);
   check(last.querySelector('.c-src').textContent === src && last.querySelector('.c-dst').textContent === dst, 'long address changed');
   for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
   view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'workstation1' }, { e: { id: 'b' }, host: 'jump' }]);

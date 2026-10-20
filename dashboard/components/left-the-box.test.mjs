@@ -134,3 +134,20 @@ test('containment escapes override completeness only in their scope', async () =
   dispose();
   assert.equal(stopped, true);
 });
+
+test('after the run stopped, a failed read says so and stops asking', async () => {
+  const document = createDocument(), root = document.createElement('section');
+  document.body.append(root);
+  const timers = new Map();
+  const dispose = mount(root, {
+    selection: createSelection(), hosts: [], stopped: () => true,
+    transport: { get: async () => { throw new TypeError('Failed to fetch'); } },
+    setTimeout(callback) { const id = Symbol(); timers.set(id, callback); return id; },
+    clearTimeout(id) { timers.delete(id); },
+  });
+  await settle();
+  assert.equal(root.querySelector('.egress-summary').querySelector('p').textContent, 'The run has stopped, so destinations can no longer be loaded.');
+  assert.doesNotMatch(root.textContent, /Failed to fetch/);
+  assert.equal(timers.size, 0);
+  dispose();
+});

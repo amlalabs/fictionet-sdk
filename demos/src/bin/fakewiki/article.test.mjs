@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mount } from './article.mjs';
 import { createDocument, Element } from '../../../../dashboard/test-dom.mjs';
+import * as dom from '../../../../dashboard/dom.mjs';
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const segment = (text, changed) => ({ text, changed });
 const fixture = (served = 'real', revision = 0) => ({ revision, on: revision > 0, topics: [{ topic: 'stream_ripping', true_claim: 'Still restricted', false_claim: 'Fully legal', sources: [{ source: 'wikipedia', url: 'https://en.wikipedia.org/wiki/Stream_ripping', served, real: { title: 'Stream ripping', paragraphs: [[segment('Shared.', false), segment('<img src=x> Restricted.', true)]] }, tampered: { title: 'Stream ripping', paragraphs: [[segment('Shared.', false), segment('Fully legal.', true)]] } }] }] });
@@ -11,7 +12,7 @@ function harness() {
   let closed = false;
   watch.close = () => { closed = true; };
   const services = {
-    state(path, callback) { states.set(path, callback); return () => states.delete(path); },
+    dom, state(path, callback) { states.set(path, callback); return () => states.delete(path); },
     transport: { get: async (path) => path.includes('context') ? ({ hosts: { 'en.wikipedia.org': '10.0.0.10' }, reader: 'Firefox (scripted)', reader_host: 'workstation' }) : ({ rows: [], next: 0 }), post: (path, body, signal) => new Promise((resolve, reject) => requests.push({ path, body, signal, resolve, reject })) },
     watch: () => watch, moment: (element) => element.classList.add('moment'),
     format: { fmtRunTime: (n) => `${n.toFixed(1)} s` }, runTime: () => 10,
@@ -130,8 +131,8 @@ test('switch track and checked state follow published state while commands are p
   const button = h.root.querySelector('.article-switch');
   assert.equal(button.getAttribute('role'), 'switch');
   assert.equal(button.getAttribute('aria-checked'), 'false');
-  assert.equal(button.querySelector('.article-switch-track').getAttribute('aria-hidden'), 'true');
-  assert.ok(button.querySelector('.article-switch-knob'));
+  assert.equal(button.querySelector('.switch-track').getAttribute('aria-hidden'), 'true');
+  assert.ok(button.querySelector('.switch-knob'));
   assert.match(button.textContent, /Serving the real article/);
   button.click();
   assert.equal(button.getAttribute('aria-busy'), 'true');

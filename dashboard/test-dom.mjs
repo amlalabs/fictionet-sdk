@@ -53,7 +53,19 @@ export class Element extends EventTarget {
   focus() { this.ownerDocument.activeElement = this; }
   scrollIntoView() {}
   get firstChild() { return this.children[0]; }
-  remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); }
+  // As in a browser, inserting a node that has a parent moves it.
+  insertBefore(child, before) {
+    if (child.parent) child.remove();
+    const index = before ? this.children.indexOf(before) : this.children.length;
+    this.children.splice(index, 0, child);
+    child.parent = this;
+    return child;
+  }
+  remove() {
+    if (!this.parent) return;
+    this.parent.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = null;
+  }
   append(...children) { children.forEach((child) => this.appendChild(child)); }
   replaceChildren(...children) {
     this.children = [];

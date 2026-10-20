@@ -1,23 +1,10 @@
-import { engine, ms, time, made, siteReason, cache, outcome, counts, resultView, tree, rootNote } from './model.mjs';
-
-// Keep keyed elements in place unless their order or parent actually changes.
-export function reconcile(parent, items, key, create, update, retained) {
-  const wanted = new Set(items.map(key));
-  for (const [id, entry] of retained) if (!wanted.has(id)) { entry.node.remove(); retained.delete(id); }
-  items.forEach((item, index) => {
-    const id = key(item);
-    let entry = retained.get(id);
-    const fresh = !entry;
-    if (!entry) { entry = create(item); retained.set(id, entry); }
-    update(entry, item, fresh);
-    if (parent.children[index] !== entry.node) parent.insertBefore(entry.node, parent.children[index] || null);
-  });
-}
+import { engine, ms, made, siteReason, cache, outcome, counts, resultView, tree, rootNote } from './model.mjs';
 
 // Names for the snapshot's omitted counts.
 const OMITTED = { queries: 'searches', results: 'result lists', listed: 'results cut from long lists', pages: 'pages', sites: 'sites', refused: 'refused names', seed_facts: 'seed facts', seed_sites: 'seed sites' };
 
 export function mount(root, services, options) {
+  const { reconcile } = services.dom, { fmtRunMs: time } = services.format;
   const doc = root.ownerDocument;
   root.classList.add('search-content');
   const el = (tag, text, parent, cls) => {
@@ -41,9 +28,12 @@ export function mount(root, services, options) {
   const facts = el('p', '', disclosure);
   const policy = el('div', 'Waiting for forwarding policy…', disclosure);
   const controls = el('section', null, intro, 'search-generator');
-  el('span', 'stub generator (no model)', controls, 'search-eyebrow');
-  const toggle = el('button', 'Waiting for generation state…', controls, 'search-toggle');
+  el('span', 'stub generator (no model)', controls, 'eyebrow');
+  const toggle = el('button', null, controls, 'switch search-toggle');
   toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-checked', 'false');
+  const track = el('span', null, toggle, 'switch-track'); track.setAttribute('aria-hidden', 'true');
+  el('span', null, track, 'switch-knob');
+  const toggleLabel = el('span', 'Waiting for generation state…', toggle);
   const revision = el('small', '', controls);
   const commandStatus = el('p', '', controls, 'search-command'); commandStatus.setAttribute('role', 'status');
   const error = el('p', '', box, 'search-error'); error.setAttribute('role', 'status');
@@ -54,9 +44,9 @@ export function mount(root, services, options) {
   const streamSection = el('section', null, columns, 'search-stream-section');
   const streamHead = el('header', null, streamSection, 'search-section-head');
   el('h3', 'Search stream', streamHead);
-  const source = el('p', 'Waiting for searcher…', streamHead, 'search-eyebrow');
+  const source = el('p', 'Waiting for searcher…', streamHead, 'eyebrow');
   const stream = el('div', null, streamSection, 'search-stream');
-  const empty = el('p', 'No searches yet. The web starts with a question.', streamSection, 'search-empty');
+  const empty = el('p', 'No searches yet. The web starts with a question.', streamSection, 'note search-empty');
   const detail = el('section', null, columns, 'search-results');
   const detailHead = el('header', null, detail, 'search-section-head');
   const detailTitle = el('h3', 'Results the world made', detailHead);
@@ -65,9 +55,9 @@ export function mount(root, services, options) {
   const treeSection = el('section', null, columns, 'search-tree-section');
   const treeHead = el('header', null, treeSection, 'search-section-head');
   el('h3', 'The made-up web', treeHead);
-  el('p', 'Searches → results → links', treeHead, 'search-eyebrow');
+  el('p', 'Searches → results → links', treeHead, 'eyebrow');
   const treeList = el('div', null, treeSection, 'search-tree');
-  const treeEmpty = el('p', 'No pages yet. Pages appear here when the world is asked for them.', treeSection, 'search-empty');
+  const treeEmpty = el('p', 'No pages yet. Pages appear here when the world is asked for them.', treeSection, 'note search-empty');
   const sitesHead = el('h4', 'Sites with no page fetched', treeSection, 'search-list-head');
   const otherSites = el('div', null, treeSection, 'search-sites');
   const refusedHead = el('h4', 'Names the world refused', treeSection, 'search-list-head');
@@ -89,7 +79,7 @@ export function mount(root, services, options) {
     toggle.setAttribute('aria-busy', String(busy));
     toggle.setAttribute('aria-checked', String(!!g?.generate));
     toggle.dataset.known = String(!!g);
-    set(toggle, busy ? 'Waiting for the world…' : g ? (g.generate ? 'Making new pages' : 'Serving only what exists') : 'Waiting for generation state…');
+    set(toggleLabel, busy ? 'Waiting for the world…' : g ? (g.generate ? 'Making new pages' : 'Serving only what exists') : 'Waiting for generation state…');
     if (g) set(revision, `Revision ${g.generation_revision} · changed at ${time(g.generation_at_ms)}`);
   };
   // Resolve real event identities; sequence numbers are never treated as request IDs.
@@ -169,7 +159,7 @@ export function mount(root, services, options) {
     const lost = Object.values(s.omitted).reduce((a, b) => a + b, 0);
     set(omitted, lost ? `No longer held here: ${Object.entries(s.omitted).filter(([, n]) => n).map(([k, n]) => `${n} ${OMITTED[k] || k.replaceAll('_', ' ')}`).join(', ')}. The counts describe what is held.` : '');
     empty.hidden = s.queries.length > 0;
-    reconcile(stream, [...s.queries].reverse(), (q) => q.id, () => { const entry = card('search-row'); entry.badge = el('span', '', entry.top, 'search-engine'); entry.meta = el('span', '', entry.top); return entry; }, (entry, q, fresh) => {
+    reconcile(stream, [...s.queries].reverse(), (q) => q.id, () => { const entry = card('search-row'); entry.badge = el('span', '', entry.top, 'pill outline'); entry.meta = el('span', '', entry.top); return entry; }, (entry, q, fresh) => {
       entry.node.dataset.identity = String(q.id);
       entry.node.setAttribute('aria-pressed', String(chosen === q.id));
       set(entry.badge, engine(q.engine));

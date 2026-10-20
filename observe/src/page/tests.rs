@@ -2324,6 +2324,122 @@ async fn open_events(server: &Server, path: &str) -> (TcpStream, Vec<u8>) {
     (conn, wire)
 }
 
+/// Opens a stream and returns its HTTP status line.
+async fn stream_status(server: &Server, path: &str) -> (TcpStream, String) {
+    let mut conn = TcpStream::connect(address(server)).await.unwrap();
+    conn.write_all(
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\n{}\r\n",
+            address(server),
+            bearer(server)
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n") {
+        head.push(conn.read_u8().await.unwrap());
+    }
+    (conn, String::from_utf8(head).unwrap())
+}
+
+#[tokio::test]
+async fn inspector_first_opens_the_inspector_on_a_named_panel() {
+    let topic = StateTopic::<Vec<u8>>::new(StateLimits::default());
+    let page = || {
+        Page::new(
+            "First",
+            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        )
+        .standard_panels()
+        .custom(
+            "Doors tried",
+            "export function mount() { return () => {}; }",
+            topic.clone(),
+        )
+    };
+    let server = page()
+        .inspector_first("Doors tried")
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let description = request(&server, "GET", "/api/page", &bearer(&server), "").await;
+    status(&description, 200);
+    assert_eq!(json_body(&description)["inspector_first"], "doors-tried");
+    let plain = page().bind_loopback(0).await.unwrap();
+    let description = request(&plain, "GET", "/api/page", &bearer(&plain), "").await;
+    assert_eq!(
+        json_body(&description)["inspector_first"],
+        serde_json::Value::Null
+    );
+    for invalid in [
+        page().inspector_first("Missing"),
+        page()
+            .workspace("Doors tried")
+            .inspector_first("Doors tried"),
+        page()
+            .inspector_first("Doors tried")
+            .inspector_first("Events"),
+    ] {
+        let error = invalid.bind_loopback(0).await.err().unwrap();
+        assert!(error.to_string().contains("inspector_first"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn a_closed_stream_frees_its_place_without_waiting_for_a_heartbeat() {
+    let topic = StateTopic::new(StateLimits::default());
+    topic
+        .publish(fictionet::time::Instant::ZERO, &vec![1])
+        .unwrap();
+    let server = Page::new(
+        "Streams",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .table("Numbers", topic, vec![])
+    .bind_loopback(0)
+    .await
+    .unwrap();
+    // A tab that switches panels closes streams and opens new ones at once.
+    // Each round fills all 32 places, then closes them. The heartbeat comes
+    // every five seconds, so the next round must not wait for it.
+    for round in 0..3 {
+        let filled = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let mut open = Vec::new();
+                for n in 0..32 {
+                    let path = if n % 2 == 0 {
+                        "/api/states/stream?topics=numbers"
+                    } else {
+                        "/api/watch"
+                    };
+                    let (conn, line) = stream_status(&server, path).await;
+                    if !line.starts_with("HTTP/1.1 200 ") {
+                        break;
+                    }
+                    open.push(conn);
+                }
+                if open.len() == 32 {
+                    return open;
+                }
+                drop(open);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let Ok(open) = filled else {
+            panic!("round {round}: closed streams kept their places");
+        };
+        let (_, refused) = stream_status(&server, "/api/watch").await;
+        assert!(
+            refused.starts_with("HTTP/1.1 503 "),
+            "round {round}: {refused}"
+        );
+        drop(open);
+    }
+}
+
 #[tokio::test]
 async fn shutdown_drains_run_and_state_events_and_closes_consoles() {
     let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());

@@ -30,15 +30,9 @@ test('commands settle on a reply and refusals do not retry', () => {
   assert.match(switchState({ status: 'timeout' }).text, /may still apply/);
 });
 
-import { count } from './border.mjs';
 import { named, matchingSession } from './tls.mjs';
 import { summarize, describe } from './results.mjs';
 
-test('counts agree with singular and plural nouns', () => {
-  assert.equal(count(1, 'moment'), '1 moment');
-  assert.equal(count(0, 'moment'), '0 moments');
-  assert.equal(count(2, 'moment'), '2 moments');
-});
 test('TLS identifiers keep their hex and name the offered suites', () => {
   for (const n of [0x1301, 0x1302, 0x1303, 0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8, 0xff]) assert.match(named(n, 'ciphers'), /^TLS_.*\(0x[0-9a-f]{4}\)$/);
   assert.equal(named(0xff, 'ciphers'), 'TLS_EMPTY_RENEGOTIATION_INFO_SCSV (0x00ff)');
