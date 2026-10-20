@@ -21,11 +21,9 @@ export function mount(root, services, options) {
   const head = el('div', { class: 'art-head' }, panel);
   el('h2', { text: 'Requests to the world’s sites' }, head);
   el('p', { class: 'note', text: 'Every HTTP request the world answered or refused, oldest first. Select one to follow its connection.' }, head);
-  const legend = el('ul', { class: 'requests-legend' }, panel);
-  legend.setAttribute('aria-label', 'Classification colors');
+  const legend = el('ul', { class: 'requests-legend', 'aria-label': 'Classification colors' }, panel);
   for (const [family, label] of FAMILIES) el('span', { class: `pill family-${family}`, text: label }, el('li', {}, legend));
-  const status = el('p', { class: 'loss-note', text: 'Loading requests…' }, panel);
-  status.setAttribute('role', 'status');
+  const status = el('p', { class: 'loss-note', text: 'Loading requests…', role: 'status' }, panel);
   const scroll = el('div', { class: 'requests-scroll' }, panel);
   const table = el('table', { class: 'data-table requests-table' }, scroll);
   const tr = el('tr', {}, el('thead', {}, table));

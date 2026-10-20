@@ -5,18 +5,16 @@ export function mount(root, services, options = {}) {
   root.classList.add('article-container');
   const cleanup = [], dynamic = [];
   const controller = new AbortController();
-  const sheet = el('link', {}, root);
-  sheet.setAttribute('rel', 'stylesheet'); sheet.setAttribute('href', '/assets/article.css');
+  el('link', { rel: 'stylesheet', href: '/assets/article.css' }, root);
   const panel = el('div', { class: 'article-panel' }, root);
   const switchRow = el('div', { class: 'article-switch-row' }, panel);
   const toggle = el('button', { class: 'switch article-switch' }, switchRow);
-  const track = el('span', { class: 'switch-track' }, toggle);
-  track.setAttribute('aria-hidden', 'true');
+  const track = el('span', { class: 'switch-track', 'aria-hidden': 'true' }, toggle);
   el('span', { class: 'switch-knob' }, track);
   const switchLabel = el('span', { class: 'article-switch-label', text: 'Waiting for state…' }, toggle);
   toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-label', 'Tamper');
   const revision = el('p', { class: 'article-meta' }, switchRow);
-  const reply = el('p', { class: 'article-reply' }, panel); reply.setAttribute('role', 'status');
+  const reply = el('p', { class: 'article-reply', role: 'status' }, panel);
   const address = el('div', { class: 'article-address' }, panel);
   const where = el('div', { class: 'article-where' }, address);
   const url = el('div', { class: 'article-url', text: 'Waiting for the article…' }, where);
@@ -25,21 +23,17 @@ export function mount(root, services, options = {}) {
   address.hidden = true;
   const pickers = el('div', { class: 'article-pickers' }, panel);
   pickers.hidden = true;
-  const topics = el('div', { class: 'article-topics segmented' }, pickers);
-  topics.setAttribute('role', 'group'); topics.setAttribute('aria-label', 'Topic');
-  const chips = el('div', { class: 'article-chips' }, pickers);
-  chips.setAttribute('role', 'group'); chips.setAttribute('aria-label', 'Source');
+  const topics = el('div', { class: 'article-topics segmented', role: 'group', 'aria-label': 'Topic' }, pickers);
+  const chips = el('div', { class: 'article-chips', role: 'group', 'aria-label': 'Source' }, pickers);
   const body = el('div', { class: 'article-body' }, panel);
-  const loading = el('div', { class: 'article-loading' }, body);
-  loading.setAttribute('role', 'status');
+  const loading = el('div', { class: 'article-loading', role: 'status' }, body);
   el('strong', { text: 'Waiting for the article versions' }, loading);
   el('p', { text: 'The world has not published the article yet. The real and tampered versions appear here when it does.' }, loading);
-  const history = el('div', { class: 'article-history' }, panel);
-  history.setAttribute('role', 'group'); history.setAttribute('aria-label', 'Reads and switch changes in this run');
+  const history = el('div', { class: 'article-history', role: 'group', 'aria-label': 'Reads and switch changes in this run' }, panel);
   history.hidden = true;
-  const loss = el('p', { class: 'article-meta article-loss' }, panel); loss.setAttribute('role', 'status');
+  const loss = el('p', { class: 'article-meta article-loss', role: 'status' }, panel);
   // New reads are announced once here; the visible marker moves between renders.
-  const announce = el('p', { class: 'article-announce' }, panel); announce.setAttribute('aria-live', 'polite');
+  const announce = el('p', { class: 'article-announce', 'aria-live': 'polite' }, panel);
   const readMarker = el('div', { class: 'article-read' }, undefined);
   let markedRead = -1;
   let state, diff, hosts = {}, readerHost, reader = 'Reader (scripted)', topicName, sourceName, pinned = false, busy = false, disposed = false;
@@ -143,9 +137,7 @@ export function mount(root, services, options = {}) {
     const note = !last ? 'This source has not been read in this run.' : mismatch ? `${readerName} has not read this page since the switch changed.` : 'The last read matches this revision.';
     const callout = el('p', { class: `article-read-note${mismatch ? ' moment' : ''}` }, body);
     el('span', mismatch ? { class: 'kind', text: note } : { text: note }, callout);
-    const text = el('div', { class: 'article-text' }, body);
-    text.setAttribute('data-focus', 'article-text');
-    text.setAttribute('tabindex', '0'); text.setAttribute('aria-label', 'Both article versions, scroll together');
+    const text = el('div', { class: 'article-text', 'data-focus': 'article-text', tabindex: '0', 'aria-label': 'Both article versions, scroll together' }, body);
     for (let index = 0; index < Math.max(source.real.paragraphs.length, source.tampered.paragraphs.length); index++) {
       const row = el('div', { class: 'article-paragraphs' }, text);
       for (const kind of ['real', 'tampered']) {

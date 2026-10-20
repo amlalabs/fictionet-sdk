@@ -60,21 +60,21 @@ export function certificateField(key, value) {
 }
 
 export function mount(root, services, options) {
-  const { reconcile } = services.dom, { plural, fmtRunMs: time } = services.format;
+  const { reconcile, listen } = services.dom, { plural, fmtRunMs: time } = services.format;
   const { el } = services.dom.scoped(root);
-  const css = el('link', {}, root); css.rel = 'stylesheet'; css.href = '/assets/border.css';
+  el('link', { rel: 'stylesheet', href: '/assets/border.css' }, root);
   root.classList.add('border-panel');
   const header = el('header', { class: 'border-heading' }, root);
   el('p', { class: 'eyebrow accent', text: 'KESTRELMOOR BANK · LIVE ROUTING' }, header);
   el('h1', { text: 'Kestrelmoor Bank, live routing' }, header);
   el('p', { class: 'border-deck', text: 'Hijacked makes Transpeak announce a more specific route to the bank’s network, so the guest’s packets for 84.21.44.10 reach an impostor.' }, header);
   const switchBox = el('section', { class: 'border-switch' }, root);
-  const actions = el('div', { class: 'border-toggle' }, switchBox); actions.setAttribute('aria-label', 'Route mode');
+  const actions = el('div', { class: 'border-toggle', 'aria-label': 'Route mode' }, switchBox);
   const stateLine = el('p', { class: 'mono', text: 'Waiting for routing state…' }, switchBox);
-  const reply = el('p', { class: 'border-reply' }, switchBox); reply.setAttribute('role', 'status');
+  const reply = el('p', { class: 'border-reply', role: 'status' }, switchBox);
   el('p', { class: 'note', text: 'Routing commands do not claim browser input or pause the scripted agent.' }, switchBox);
-  const error = el('p', { class: 'loss-note' }, root); error.setAttribute('role', 'status');
-  const alert = el('section', { class: 'border-alert' }, root); alert.setAttribute('aria-live', 'polite'); alert.hidden = true;
+  const error = el('p', { class: 'loss-note', role: 'status' }, root);
+  const alert = el('section', { class: 'border-alert', 'aria-live': 'polite' }, root); alert.hidden = true;
   const pathBox = el('section', { class: 'section' }, root);
   el('h2', { text: 'Where the packets go' }, pathBox);
   const pathNote = el('p', { class: 'note' }, pathBox);
@@ -93,10 +93,12 @@ export function mount(root, services, options) {
   el('p', { text: 'Sign in → read balance → inspect certificate, traceroute and BGP → hold HTTPS open → flip route → inspect the failure → sign in with verification disabled → restore.' }, agent);
   el('p', { class: 'note', text: 'In the VM, the Terminal tab watches tmux session main. Ctrl-b d opens your login shell. Taking input does not pause the script.' }, agent);
   let route, view, pending = false, disposed = false, dismissed = 0, certValue, pathValue;
+  // The controller cancels a command still in flight when the panel closes.
   const controller = new AbortController();
+  const cleanup = [];
   const buttons = ['Normal', 'Hijacked'].map((label, index) => {
     const button = el('button', { text: label }, actions); button.type = 'button'; button.disabled = true;
-    button.addEventListener('click', async () => {
+    cleanup.push(listen(button, 'click', async () => {
       if (pending || !route || disposed) return;
       pending = true; reply.textContent = switchState().text; updateSwitch();
       let result;
@@ -104,7 +106,7 @@ export function mount(root, services, options) {
       catch (e) { result = e.body || { error: e.message }; }
       if (disposed) return;
       const state = switchState(result); pending = state.busy; reply.textContent = state.text; updateSwitch();
-    }, { signal: controller.signal });
+    }));
     return button;
   });
   function updateSwitch() {
@@ -190,7 +192,7 @@ export function mount(root, services, options) {
     error.textContent = dropped ? `Limited history: observations lost: ${view.lost}, fields truncated: ${view.truncated}; older rows dropped: BGP ${view.bgp.dropped}, TLS ${view.tls.dropped}, moments ${view.moments.dropped}.` : '';
   }
   const failed = e => { error.textContent = `Could not read state: ${e.message}`; };
-  const cleanup = [services.state('/api/state/routing', s => { route = s.value; render(); }, failed), services.state(options.state, s => { view = s.value; render(); if (s.status?.too_large) error.textContent = 'The projection exceeded its byte limit; this snapshot may be stale.'; }, failed)];
+  cleanup.push(services.state('/api/state/routing', s => { route = s.value; render(); }, failed), services.state(options.state, s => { view = s.value; render(); if (s.status?.too_large) error.textContent = 'The projection exceeded its byte limit; this snapshot may be stale.'; }, failed));
   const timer = setInterval(updateSwitch, 1000);
   return () => { disposed = true; controller.abort(); clearInterval(timer); cleanup.forEach(stop => stop()); root.replaceChildren(); root.classList.remove('border-panel'); };
 }

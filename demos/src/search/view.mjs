@@ -7,8 +7,7 @@ export function mount(root, services, options) {
   const { reconcile, listen } = services.dom, { fmtRunMs: time } = services.format;
   root.classList.add('search-content');
   const { el } = services.dom.scoped(root);
-  const link = el('link', {}, root);
-  link.setAttribute('rel', 'stylesheet'); link.setAttribute('href', '/assets/search/style.css');
+  el('link', { rel: 'stylesheet', href: '/assets/search/style.css' }, root);
   const box = el('div', { class: 'search-panel' }, root);
   const intro = el('header', { class: 'search-intro' }, box);
   el('p', { class: 'search-premise', text: 'Every page here is made up by the world for this run.' }, intro);
@@ -24,12 +23,12 @@ export function mount(root, services, options) {
   el('span', { class: 'eyebrow', text: 'stub generator (no model)' }, controls);
   const toggle = el('button', { class: 'switch search-toggle' }, controls);
   toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-checked', 'false');
-  const track = el('span', { class: 'switch-track' }, toggle); track.setAttribute('aria-hidden', 'true');
+  const track = el('span', { class: 'switch-track', 'aria-hidden': 'true' }, toggle);
   el('span', { class: 'switch-knob' }, track);
   const toggleLabel = el('span', { text: 'Waiting for generation state…' }, toggle);
   const revision = el('small', {}, controls);
-  const commandStatus = el('p', { class: 'search-command' }, controls); commandStatus.setAttribute('role', 'status');
-  const error = el('p', { class: 'search-error' }, box); error.setAttribute('role', 'status');
+  const commandStatus = el('p', { class: 'search-command', role: 'status' }, controls);
+  const error = el('p', { class: 'search-error', role: 'status' }, box);
   const meters = el('div', { class: 'search-counts' }, box);
   const countNodes = new Map();
   const omitted = el('small', { class: 'search-omitted' }, box);

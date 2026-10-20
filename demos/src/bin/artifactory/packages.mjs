@@ -45,8 +45,7 @@ export function mount(root, services, options) {
   const head = el('div', { class: 'art-head' }, panel);
   el('h2', { text: 'Packages on the simulated server' }, head);
   const revision = el('p', { class: 'note', text: 'Loading the inventory…' }, head);
-  const status = el('p', { class: 'loss-note' }, panel);
-  status.setAttribute('role', 'status');
+  const status = el('p', { class: 'loss-note', role: 'status' }, panel);
 
   const lookalike = el('section', { class: 'packages-lookalike' }, panel);
   lookalike.hidden = true;

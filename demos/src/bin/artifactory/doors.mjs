@@ -58,8 +58,7 @@ export function mount(root, services, options) {
   const totals = el('strong', { class: 'doors-totals', text: '0 doors tried' }, summary);
   const setup = button(summary, 'text-button', 'Setup traffic: 0 rows in Left the box', () => services.showPanel('left_the_box'));
   const otherCount = el('span', { class: 'note' }, summary);
-  const status = el('p', { class: 'loss-note', text: 'Loading doors…' }, panel);
-  status.setAttribute('role', 'status');
+  const status = el('p', { class: 'loss-note', text: 'Loading doors…', role: 'status' }, panel);
   const empty = el('p', { class: 'empty-note', text: 'No doors yet. They appear as the story runs.' }, panel);
   const board = el('section', { class: 'doors-board' }, panel);
 

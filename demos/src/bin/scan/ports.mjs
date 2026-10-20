@@ -19,21 +19,17 @@ export function mount(root, services, options) {
   stylesheet(el, root);
   const panel = el('div', { class: 'scan-panel ports-panel' }, root);
   const bar = el('div', { class: 'ports-bar' }, panel);
-  const views = el('div', { class: 'segmented' }, bar);
-  views.setAttribute('role', 'group');
-  views.setAttribute('aria-label', 'Ports view');
+  const views = el('div', { class: 'segmented', role: 'group', 'aria-label': 'Ports view' }, bar);
   const allButton = el('button', { text: 'All 1,024 ports' }, views);
   const openButton = el('button', { text: 'Open on any host' }, views);
   for (const button of [allButton, openButton]) button.setAttribute('type', 'button');
-  const legend = el('ul', { class: 'scan-legend' }, bar);
-  legend.setAttribute('aria-label', 'Port states');
+  const legend = el('ul', { class: 'scan-legend', 'aria-label': 'Port states' }, bar);
   for (const [state, label] of LEGEND) {
     const item = el('li', {}, legend);
     el('span', { class: 'port-cell' }, item).dataset.state = state;
     el('span', { text: label }, item);
   }
-  const notes = el('p', { class: 'loss-note' }, panel);
-  notes.setAttribute('role', 'status');
+  const notes = el('p', { class: 'loss-note', role: 'status' }, panel);
   const empty = el('p', { class: 'empty-note', text: 'No host has answered yet. Each host gets a row of its 1,024 ports when it answers.' }, panel);
   const heat = el('div', { class: 'ports-heat' }, panel);
   const compare = el('div', { class: 'ports-compare' }, panel);
@@ -70,8 +66,7 @@ export function mount(root, services, options) {
       figures[state] = { value: el('b', { text: '0' }, item), name: el('span', {}, item), item };
     }
     const openList = el('p', { class: 'ports-open' }, label);
-    const grid = el('div', { class: 'ports-grid' }, row);
-    grid.setAttribute('role', 'img');
+    const grid = el('div', { class: 'ports-grid', role: 'img' }, row);
     const cells = [null];
     for (let port = 1; port <= 1024; port++) {
       const cell = el('span', { class: 'port-cell' }, grid);
@@ -128,8 +123,7 @@ export function mount(root, services, options) {
     const words = { idle: 'not probed', unanswered: 'no answer yet' };
     for (const machine of machines) {
       const tr = el('tr', {}, body);
-      const th = el('th', {}, tr);
-      th.setAttribute('scope', 'row');
+      const th = el('th', { scope: 'row' }, tr);
       el('b', { text: machine.name }, th);
       el('span', { class: 'office-addr', text: machine.addr }, th);
       for (const port of columns) {

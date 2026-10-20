@@ -22,8 +22,7 @@ export function mount(root, services, options) {
   const panel = el('div', { class: 'scan-panel office-panel' }, root);
 
   // The story strip.
-  const strip = el('section', { class: 'scan-story' }, panel);
-  strip.setAttribute('aria-label', 'Scripted agent');
+  const strip = el('section', { class: 'scan-story', 'aria-label': 'Scripted agent' }, panel);
   const head = el('div', { class: 'scan-story-head' }, strip);
   el('h2', { class: 'scan-eyebrow', text: 'Scripted agent' }, head);
   const about = el('span', { class: 'scan-muted' }, head);
@@ -31,8 +30,7 @@ export function mount(root, services, options) {
   const command = el('p', { class: 'scan-command' }, strip);
   const commandLabel = el('span', { class: 'scan-command-label' }, command);
   const commandText = el('code', {}, command);
-  const storyNote = el('p', { class: 'loss-note' }, strip);
-  storyNote.setAttribute('role', 'status');
+  const storyNote = el('p', { class: 'loss-note', role: 'status' }, strip);
 
   // The counts and any limits.
   const totals = el('p', { class: 'office-summary' }, panel);
@@ -45,13 +43,11 @@ export function mount(root, services, options) {
   const probed = figure('addresses probed');
   const answering = figure('hosts answering');
   const open = figure('open ports');
-  const notes = el('p', { class: 'loss-note' }, panel);
-  notes.setAttribute('role', 'status');
+  const notes = el('p', { class: 'loss-note', role: 'status' }, panel);
 
   // The scanner and the hosts that answered.
   const map = el('div', { class: 'office-map' }, panel);
-  const left = el('section', { class: 'office-found' }, map);
-  left.setAttribute('aria-label', 'Scanner and hosts');
+  const left = el('section', { class: 'office-found', 'aria-label': 'Scanner and hosts' }, map);
   const found = el('h3', { class: 'office-found-title', text: 'No host has answered yet' }, left);
   const scanner = el('div', { class: 'office-card office-scanner' }, left);
   const scannerHost = services.hosts?.find((host) => host.sandbox === 'scanner');
@@ -73,11 +69,9 @@ export function mount(root, services, options) {
   const list = el('ol', { class: 'office-hosts' }, left);
 
   // The subnet: 256 cells, 16 to a row.
-  const subnet = el('section', { class: 'office-subnet' }, map);
-  subnet.setAttribute('aria-label', 'Office subnet 10.0.0.0/24');
+  const subnet = el('section', { class: 'office-subnet', 'aria-label': 'Office subnet 10.0.0.0/24' }, map);
   el('h3', { class: 'scan-eyebrow', text: 'Office subnet · 10.0.0.0/24' }, subnet);
-  const grid = el('div', { class: 'office-grid' }, subnet);
-  grid.setAttribute('role', 'img');
+  const grid = el('div', { class: 'office-grid', role: 'img' }, subnet);
   const cells = [];
   for (let row = 0; row < 16; row++) {
     el('span', { class: 'office-row', text: `.${row * 16}` }, grid).setAttribute('aria-hidden', 'true');
@@ -89,8 +83,7 @@ export function mount(root, services, options) {
       cells.push(cell);
     }
   }
-  const legend = el('ul', { class: 'scan-legend' }, subnet);
-  legend.setAttribute('aria-label', 'Cell states');
+  const legend = el('ul', { class: 'scan-legend', 'aria-label': 'Cell states' }, subnet);
   for (const state of ['host', 'empty', 'waiting', 'idle']) {
     const item = el('li', {}, legend);
     el('span', { class: 'office-cell' }, item).dataset.state = state;

@@ -9,16 +9,13 @@ export function mount(root, services, options) {
   stylesheet(el, root);
   const panel = el('div', { class: 'scan-panel services-panel' }, root);
   el('p', { class: 'scan-muted services-intro', text: 'A banner is the first data an open port sent to the scanner, as the world saw it on the wire. Service names, versions and OS guesses are what nmap says.' }, panel);
-  const notes = el('p', { class: 'loss-note' }, panel);
-  notes.setAttribute('role', 'status');
+  const notes = el('p', { class: 'loss-note', role: 'status' }, panel);
   const empty = el('p', { class: 'empty-note', text: 'No host has answered yet. Each open port gets a row as nmap finds it.' }, panel);
   const table = el('table', { class: 'data-table services-table' }, panel);
   const head = el('thead', {}, table);
   const groupRow = el('tr', { class: 'services-group-row' }, head);
   el('th', {}, groupRow).setAttribute('colspan', '2');
-  const nmapHead = el('th', { class: 'nmap-says', text: 'nmap says' }, groupRow);
-  nmapHead.setAttribute('colspan', '3');
-  nmapHead.setAttribute('scope', 'colgroup');
+  const nmapHead = el('th', { class: 'nmap-says', text: 'nmap says', colspan: '3', scope: 'colgroup' }, groupRow);
   const labels = el('tr', {}, head);
   for (const label of ['Port', 'Banner on the wire', 'Service', 'Product', 'Version']) el('th', { text: label }, labels).setAttribute('scope', 'col');
   let map = null, reports = null, mapStatus = null, reportStatus = null, replay = false, drawn = '';
@@ -64,9 +61,7 @@ export function mount(root, services, options) {
     for (const machine of machines) {
       const body = el('tbody', { class: 'services-host' }, table);
       const top = el('tr', { class: 'services-host-row' }, body);
-      const cell = el('th', {}, top);
-      cell.setAttribute('colspan', '5');
-      cell.setAttribute('scope', 'rowgroup');
+      const cell = el('th', { colspan: '5', scope: 'rowgroup' }, top);
       const title = el('span', { class: 'ports-title' }, cell);
       el('b', { text: machine.name }, title);
       el('span', { class: 'office-addr', text: machine.addr }, title);

@@ -10,7 +10,7 @@ export function matchingSession(session, rows) {
 export function mount(root, services, options) {
   const { reconcile } = services.dom, { plural, fmtRunMs } = services.format;
   const { el } = services.dom.scoped(root);
-  const css = el('link', {}, root); css.rel = 'stylesheet'; css.href = '/assets/border.css';
+  el('link', { rel: 'stylesheet', href: '/assets/border.css' }, root);
   el('h2', { text: 'TLS on the guest link' }, root);
   el('p', { text: 'ClientHello and ServerHello fields from captured TCP bytes. The world offers no post-quantum key exchange. Missing fields stay unknown.' }, root);
   const status = el('p', { text: 'Waiting for captured TLS hellos…' }, root); const rows = el('div', {}, root);
@@ -40,7 +40,7 @@ export function mount(root, services, options) {
     el('p', { text: `Legacy version fields: client ${s.offered ? named(s.offered.legacy_version, 'versions') : 'not captured'} · server ${s.chosen ? named(s.chosen.legacy_version, 'versions') : 'not captured'}` }, item);
     const table = el('table', { class: 'border-tls-table' }, item);
     const head = el('tr', {}, el('thead', {}, table));
-    for (const text of ['Identifier', 'Offered', 'Chosen']) el('th', { text: text }, head);
+    for (const text of ['Identifier', 'Offered', 'Chosen']) el('th', { text }, head);
     const body = el('tbody', {}, table);
     for (const [label, key] of [['Versions', 'versions'], ['Cipher suites', 'ciphers'], ['Groups', 'groups'], ['Key shares', 'key_shares']]) {
       const group = el('tr', { class: 'border-tls-group' }, body); el('th', { text: label }, group).colSpan = 3;

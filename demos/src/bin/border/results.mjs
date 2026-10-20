@@ -23,11 +23,11 @@ export function describe(line) {
 export function mount(root, services, options) {
   const { reconcile } = services.dom, { plural, fmtRunMs } = services.format;
   const { el } = services.dom.scoped(root);
-  const css = el('link', {}, root); css.rel = 'stylesheet'; css.href = '/assets/border.css';
+  el('link', { rel: 'stylesheet', href: '/assets/border.css' }, root);
   el('h2', { text: 'From the world’s log' }, root);
   el('p', { text: 'The world’s log for this run. Counts cover the retained lines below.' }, root);
   const status = el('p', { text: 'Waiting for log lines…' }, root);
-  const summary = el('div', {}, root); summary.className = 'border-inspector-summary';
+  const summary = el('div', { class: 'border-inspector-summary' }, root);
   const changes = el('div', {}, root); const rows = el('div', {}, root);
   el('h3', { text: 'In time order' }, rows);
   const list = el('div', {}, rows);
@@ -38,7 +38,7 @@ export function mount(root, services, options) {
     if (!value) return;
     status.textContent = `${plural(value.rows.length, 'retained line')} · dropped: ${value.dropped} · unreadable: ${value.invalid}${state?.too_large ? ' · publication exceeded its limit' : ''}`;
     const result = summarize(value.rows); summary.replaceChildren(); changes.replaceChildren();
-    for (const text of [`Bank: ${plural(result.bank, 'TLS session')}`, `Impostor: ${plural(result.impostor, 'TLS session')}`, `Client aborted: ${plural(result.aborted, 'TLS session')}`, `Impostor answered: ${plural(result.requests, 'request')}`, `Password reached impostor: ${result.passwords ? 'yes' : 'no'} (${result.passwords})`, `Payment reached impostor: ${result.payments ? 'yes' : 'no'} (${result.payments})`]) el('p', { text: text }, summary);
+    for (const text of [`Bank: ${plural(result.bank, 'TLS session')}`, `Impostor: ${plural(result.impostor, 'TLS session')}`, `Client aborted: ${plural(result.aborted, 'TLS session')}`, `Impostor answered: ${plural(result.requests, 'request')}`, `Password reached impostor: ${result.passwords ? 'yes' : 'no'} (${result.passwords})`, `Payment reached impostor: ${result.payments ? 'yes' : 'no'} (${result.payments})`]) el('p', { text }, summary);
     el('h3', { text: 'Route changes and rejections' }, changes);
     if (!result.routes.length) el('p', { text: 'No route changes or rejections logged.' }, changes);
     result.routes.forEach(line => el('p', { text: describe(line) }, changes));
@@ -48,9 +48,9 @@ export function mount(root, services, options) {
     const seen = new Map();
     const items = value.rows.map(line => { const text = JSON.stringify(line); const repeat = seen.get(text) || 0; seen.set(text, repeat + 1); return { line, id: `${text}\u0000${repeat}` }; });
     reconcile(list, items, item => item.id, ({ line }) => {
-      const node = el('details', {}, null); node.className = 'border-inspector-session';
+      const node = el('details', { class: 'border-inspector-session' }, null);
       const head = el('summary', {}, node);
-      const dl = el('dl', {}, node); dl.className = 'kv';
+      const dl = el('dl', { class: 'kv' }, node);
       for (const [key, value] of Object.entries(line)) { el('dt', { text: words(key) }, dl); el('dd', { text: typeof value === 'object' ? JSON.stringify(value) : words(value) }, dl); }
       return { node, head };
     }, (entry, { line }) => { entry.head.textContent = `${when(line)} · ${describe(line)}`; }, lines);
