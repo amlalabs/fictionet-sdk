@@ -47,6 +47,7 @@
 //! | [`plant`] | Time, energy balances, controls and command application |
 //! | [`steam`] | Coarse saturation table |
 //! | [`protection`] | True-channel trips and reported-channel alarms |
+//! | [`registers`] | Modbus register map of the three controllers |
 //! | [`sensors`] | Instrument ranges, lag, noise and sampling |
 //! | [`faults`] | Fixed fault slots and schedules |
 //! | [`command`] | Integer commands and replies |
@@ -107,6 +108,7 @@ pub mod faults;
 pub mod kinetics;
 pub mod plant;
 pub mod protection;
+pub mod registers;
 pub mod sensors;
 pub mod snapshot;
 pub mod steam;
