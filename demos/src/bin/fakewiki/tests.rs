@@ -240,3 +240,40 @@ fn lab_reads_follow_commands_and_unknown_addresses_are_unreachable() {
     ));
     assert_eq!(result.unwrap_err().to_string(), "finished");
 }
+
+#[test]
+fn reload_requires_a_complete_get_after_the_switch() {
+    use serde_json::json;
+    let switch =
+        json!({"source":"fakewiki", "kind":"tampering", "fields":{"on":true,"revision":1}});
+    let read = json!({"source":"http", "kind":"request", "sandbox":{"name":HOST}, "fields":{
+        "host":WIKI,"path":ARTICLE,"method":"GET","served":"tampered","tamper_revision":1,"status":200,"complete":true
+    }});
+    let mut reload = gate::Reload::default();
+    assert!(!reload.observe(std::slice::from_ref(&read)).unwrap());
+    assert_eq!(reload.requests, 0);
+    assert!(!reload.observe(std::slice::from_ref(&switch)).unwrap());
+    for (field, value) in [
+        ("method", json!("HEAD")),
+        ("status", json!(304)),
+        ("complete", json!(false)),
+        ("tamper_revision", json!(2)),
+        ("served", json!(null)),
+    ] {
+        let mut incomplete = read.clone();
+        incomplete["fields"][field] = value;
+        assert!(!reload.observe(&[incomplete]).unwrap(), "{field}");
+    }
+    assert_eq!(reload.requests, 5);
+    let mut other = read.clone();
+    other["sandbox"]["name"] = json!("other");
+    assert!(!reload.observe(&[other]).unwrap());
+    assert_eq!(reload.requests, 5);
+    assert!(reload.observe(std::slice::from_ref(&read)).unwrap());
+    for (field, value) in [("served", json!("real")), ("tamper_revision", json!(0))] {
+        let mut old = read.clone();
+        old["fields"][field] = value;
+        let error = reload.observe(&[read.clone(), old.clone()]).unwrap_err();
+        assert!(error.to_string().contains(&old.to_string()));
+    }
+}

@@ -149,8 +149,11 @@ it on the page.
 `cargo xtask demo fakewiki` runs the [FakeWiki](../examples/fakewiki) world
 with a scripted Firefox reader on an Ubuntu desktop. The reader loads a
 Wikipedia article, and reloads it after the page turns tampering on. The page
-shows which version each read was served and how the article changed, beside
-the traffic and containment.
+puts an article panel beside the guest's screen: the Tamper switch, the true
+and the false claim, and the real and tampered article side by side with the
+changed sentences marked. It marks the version the world serves now and the
+version Firefox last received, from the world's facts about each request, and
+keeps a strip of this run's reads. The inspector adds a Reads table.
 
 The gate checks both reads, the switch's revisions, a stale switch command,
 and that the panels have data.
@@ -160,8 +163,8 @@ and that the panels have data.
 - Without a VM: `cargo run --locked -p fictionet-demo --example fakewiki_page`
   serves the same page and world. The screen says NO VM. The first line it
   prints is the page URL. Press Enter to have the in-world scripted client read
-  the article, use the page's tamper switch, and press Enter again. End of
-  input stops it.
+  the article, use the page's tamper switch, and press Enter again. Type
+  `drop` to close the screen's connections. End of input stops it.
 - Times: SSH up after 7.1 s, article read after 45.1 s, whole run 46.6 s.
 
 ### Scan

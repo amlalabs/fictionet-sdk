@@ -16,7 +16,7 @@ use fictionet::{RunOptions, Seed};
 use fictionet_demo::kit;
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
-    page::{Host, HostState, HostStatus, Page, StateLimits, StateTopic},
+    page::{Containment, Host, HostState, HostStatus, Labels, Page, StateLimits, StateTopic},
 };
 
 const HOST: &str = "workstation";
@@ -28,24 +28,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let controls = page::Controls::new("in-world client (scripted)");
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
     let status = StateTopic::<HostStatus>::new(StateLimits::default());
+    let screen = kit::preview::Console::new();
+    let labels = Labels::default();
     let server = controls
         .page(
-            Page::new("FakeWiki · no VM · placeholder screen", dashboard.handle()).host(
-                Host::new(HOST)
-                    .console(kit::preview::Console::new())
-                    .status(status.clone()),
-            ),
+            Page::new("FakeWiki · no VM · placeholder screen", dashboard.handle())
+                .containment(StateTopic::<Containment>::new(StateLimits::default()))
+                .labels(labels.clone())
+                .host(
+                    Host::new(HOST)
+                        .console(screen.clone())
+                        .status(status.clone()),
+                ),
         )
         .bind_loopback(0)
         .await?;
     println!("{}", server.url());
     eprintln!(
-        "No VM or Firefox is running. Press Enter for each scripted article read; EOF stops the example."
+        "No VM or Firefox is running. Press Enter for each scripted article read; type drop to close screen connections; EOF stops the example."
     );
     let (sender, mut lines) = tokio::sync::mpsc::channel(1);
     std::thread::spawn(move || {
         for line in std::io::stdin().lines() {
-            if line.is_err() || sender.blocking_send(()).is_err() {
+            let Ok(line) = line else { break };
+            if sender.blocking_send(line).is_err() {
                 break;
             }
         }
@@ -53,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = fictionet::run(
         RunOptions::new(Seed::from_u64(1)).observer(dashboard.observer()),
         |cx| async move {
+            cx.spawn(move |cx| async move { Ok(labels.run(&cx).await?) });
             status.publish(
                 cx.now(),
                 &HostStatus {
@@ -72,7 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .start(&cx, attachments)?;
             controls.start(&cx, tampering.clone())?;
             let machine = sandbox::machine(&cx, attacher.attach(HOST)?, Ipv4Addr::new(10, 0, 0, 2));
-            while cx.race(None, lines.recv()).await?.is_some() {
+            while let Some(line) = cx.race(None, lines.recv()).await? {
+                if line == "drop" {
+                    screen.drop_connections();
+                    eprintln!("Placeholder screen connections closed");
+                    continue;
+                }
+                if !line.is_empty() {
+                    eprintln!("Use an empty line to read, or drop to close screen connections");
+                    continue;
+                }
                 let mut tls = machine
                     .tls(
                         &cx,

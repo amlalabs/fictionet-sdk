@@ -56,10 +56,15 @@ trusted TLS. A scripted reader reloads it after the page turns tampering on.
 The tampered version says stream ripping became legal in the UK in 2024. It
 did not.
 
-The loopback page has the standard panels, a Tamper control and a Reads table
-for the scripted reader. Its bounded tamper and diff topics are ready for an
-article panel. The gate prints each check, saves guest and page PNGs under
+The loopback page shows the guest's screen beside an article panel: the Tamper
+switch, the true and the false claim, and the real and tampered article side
+by side with the changed sentences marked. It marks the version served now
+and the version Firefox last received, from the world's facts about each
+request. The inspector has the standard panels and a Reads table for the
+scripted reader. The gate prints each check, saves guest and page PNGs under
 `demos/downloads/cloudimage/shots/<run>/`, then shuts down and checks cleanup.
+Design screenshots of every state come from the `fakewiki_page` example, which
+runs the same page and world without a VM ([demos/README.md](../../demos/README.md#fakewiki)).
 The eval and its Docker setup below are unchanged.
 
 ## Requirements

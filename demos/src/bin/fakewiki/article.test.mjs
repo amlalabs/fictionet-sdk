@@ -37,11 +37,11 @@ test('article columns mark changed text and keep observed reads separate from se
   h.emit('event', read(1, 'real', 0));
   h.publish('tampered', 1);
   assert.match(h.root.querySelectorAll('.article-head').find((node) => node.classList.contains('tampered')).textContent, /Served now/);
-  assert.match(h.root.querySelectorAll('.article-head').find((node) => node.classList.contains('real')).textContent, /Read by Firefox \(scripted\).*r0/);
+  assert.match(h.root.querySelectorAll('.article-head').find((node) => node.classList.contains('real')).textContent, /Read by Firefox \(scripted\)Revision 0/);
   assert.match(h.root.textContent, /has not read this page since/);
   h.emit('event', read(2, 'tampered', 1)); h.emit('event', read(2, 'tampered', 1));
   assert.match(h.root.textContent, /2 reads: 1 real, 1 tampered/);
-  assert.match(h.root.querySelectorAll('.article-head').find((node) => node.classList.contains('tampered')).textContent, /Read by Firefox \(scripted\).*r1/);
+  assert.match(h.root.querySelectorAll('.article-head').find((node) => node.classList.contains('tampered')).textContent, /Read by Firefox \(scripted\)Revision 1/);
   h.root.querySelector('button.real').click();
   assert.equal(h.selections[0].event.seq, 1);
   assert.equal(h.selections[0].connection, 'connection');
@@ -154,7 +154,10 @@ test('read badges mark new observations once and revision mismatches become call
   h.emit('event', read(1, 'real', 0));
   assert.equal(moments.length, 1);
   assert.match(h.root.textContent, /1 read: 1 real, 0 tampered/);
-  assert.equal(h.root.querySelector('.article-read').textContent, '✓ Read by Firefox (scripted) · r0 · 1.0 s');
+  assert.equal(h.root.querySelector('.article-read-name').textContent, '✓ Read by Firefox (scripted)');
+  assert.equal(h.root.querySelector('.article-read-detail').textContent, 'Revision 0 · at 1.0 s');
+  assert.equal(h.root.querySelector('.article-announce').textContent, 'Firefox (scripted) read the real version at revision 0.');
+  assert.match(h.root.querySelector('.article-head.real').textContent, /^RealServed nowTrue claim Still restricted/);
   assert.equal(h.root.querySelector('.article-read-note').classList.contains('moment'), false);
   h.publish('tampered', 1);
   assert.equal(moments.length, 1);
@@ -176,7 +179,7 @@ test('reader identity comes from context even when reads arrive before it', () =
   h.publish();
   h.states.get('/api/state/article')({ value: { hosts: { 'en.wikipedia.org': '10.0.0.10' }, reader: 'Browser (scripted)', reader_host: 'reader-machine' } });
   assert.match(h.root.textContent, /1 read: 1 real, 0 tampered/);
-  assert.match(h.root.querySelector('.article-read').textContent, /Read by Browser \(scripted\).*r0/);
+  assert.match(h.root.querySelector('.article-read').textContent, /Read by Browser \(scripted\)Revision 0/);
   h.dispose();
 });
 
@@ -195,25 +198,27 @@ test('topic segments and source chips expose selection and delivery meaning', ()
   assert.equal(topics.children.length, 3);
   assert.deepEqual(topics.children.map((button) => button.textContent), ['Stream ripping', 'Television licensing in the United Kingdom', 'Apollo 11']);
   assert.ok(topics.children.every((button) => button.getAttribute('title') === button.textContent));
-  assert.ok(h.root.querySelector('.article-topic-row').querySelector('.text-button'));
+  assert.equal(h.root.querySelector('.article-address').querySelector('.text-button').textContent, 'Following reads');
   assert.equal(h.root.querySelector('.article-history').querySelector('.text-button'), null);
   topics.children[1].click();
   assert.equal(h.root.querySelector('.article-topics').children[1].getAttribute('aria-pressed'), 'true');
   const chip = h.root.querySelector('.article-chips').children[1];
   assert.equal(chip.querySelector('.article-source-host').textContent, 'en.wikipedia.org');
   assert.equal(chip.getAttribute('aria-label'), 'en.wikipedia.org · real · unread');
-  assert.equal(chip.querySelector('.article-source-state').textContent, 'Real');
+  assert.equal(chip.querySelector('.article-source-state'), null);
   assert.equal(chip.querySelector('.article-source-read'), null);
   h.emit('event', { ...read(1, 'real', 0), fields: { ...read(1, 'real', 0).fields, topic: 'another_topic' } });
   const readChip = h.root.querySelector('.article-chips').children[1];
-  assert.equal(readChip.querySelector('.article-source-state').textContent, 'Real');
-  assert.equal(readChip.querySelector('.article-source-read').textContent, '✓ read');
+  assert.equal(readChip.querySelector('.article-source-state'), null);
+  assert.equal(readChip.querySelector('.article-source-read').textContent, '✓');
   assert.equal(readChip.getAttribute('aria-label'), 'en.wikipedia.org · real · read');
   diff.topics[1].sources[1].served = 'tampered';
   h.states.get('/api/state/diff')({ value: diff });
-  const tag = h.root.querySelector('.article-chips').children[1].querySelector('.article-source-state');
+  const tampered = h.root.querySelector('.article-chips').children[1];
+  const tag = tampered.querySelector('.article-source-state');
   assert.equal(tag.textContent, 'Tampered');
   assert.ok(tag.classList.contains('tampered'));
+  assert.equal(tampered.getAttribute('aria-label'), 'en.wikipedia.org · tampered · read');
   h.dispose();
 });
 
@@ -224,5 +229,36 @@ test('callout sentences capitalize the supplied reader name', () => {
   h.states.get('/api/state/diff')({ value: fixture('tampered', 1) });
   assert.equal(h.root.querySelector('.article-read-note').textContent, 'In-world client has not read this page since the switch changed.');
   assert.match(h.root.querySelector('.article-read').textContent, /Read by in-world client \(scripted\)/);
+  h.dispose();
+});
+
+test('crowded marks keep their order and spacing, and captions keep exact times', () => {
+  const h = harness(); h.publish();
+  h.services.runTime = () => 52;
+  h.emit('event', { ...read(1, 'real', 0), at: 50.1 });
+  h.emit('event', { seq: 2, at: 50.5, source: 'fakewiki', kind: 'tampering', fields: { on: true, revision: 1, changed: true } });
+  h.emit('event', { ...read(3, 'tampered', 1), at: 51.0 });
+  const ticks = h.root.querySelector('.article-axis').children;
+  assert.deepEqual(ticks.map((tick) => tick.getAttribute('aria-label')), [
+    'Read of the real version, revision 0, at 50.1 s',
+    'Switch on, revision 1, at 50.5 s',
+    'Read of the tampered version, revision 1, at 51.0 s',
+  ]);
+  const positions = ticks.map((tick) => Number(/\* ([0-9.]+) \+/.exec(tick.style.left)[1]));
+  for (let index = 1; index < positions.length; index++) assert.ok(positions[index] - positions[index - 1] >= 14 / 120 - 1e-4, `${positions}`);
+  assert.ok(positions.every((position) => position >= 0 && position <= 1));
+  h.dispose();
+});
+
+test('the panel waits for the world before it shows pickers or history', () => {
+  const h = harness();
+  assert.match(h.root.querySelector('.article-loading').textContent, /Waiting for the article versions/);
+  assert.equal(h.root.querySelector('.article-pickers').hidden, true);
+  assert.equal(h.root.querySelector('.article-history').hidden, true);
+  assert.equal(h.root.querySelector('.article-switch').disabled, true);
+  h.publish();
+  assert.equal(h.root.querySelector('.article-loading'), null);
+  assert.equal(h.root.querySelector('.article-pickers').hidden, false);
+  assert.equal(h.root.querySelector('.article-history').hidden, false);
   h.dispose();
 });

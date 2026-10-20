@@ -81,6 +81,54 @@ async fn field_presence_includes_null_values_and_excludes_other_events() {
     assert_eq!(rows[1]["fields"]["selected"], serde_json::Value::Null);
 }
 
+#[tokio::test]
+async fn event_table_cursors_reach_rows_past_one_page() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(dashboard.observer()),
+        |cx| async move {
+            for _ in 0..1500 {
+                cx.emit("fixture", "noise", |event| event);
+            }
+            cx.emit("fixture", "request", |event| event);
+            for _ in 0..1500 {
+                cx.emit("fixture", "noise", |event| event);
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let server = Page::new("Paging", dashboard.handle())
+        .event_table(
+            "Requests",
+            EventFilter {
+                source: Some("fixture".into()),
+                kind: Some("request".into()),
+                ..EventFilter::default()
+            },
+            vec![],
+        )
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let (mut after, mut rows, mut pages) = (0, vec![], 0);
+    loop {
+        let path = format!("/api/event-table/requests?after={after}");
+        let page = json_body(&request(&server, "GET", &path, &bearer(&server), "").await);
+        rows.extend(page["rows"].as_array().unwrap().iter().cloned());
+        let next = page["next"].as_u64().unwrap();
+        if next == after {
+            break;
+        }
+        assert!(next > after);
+        (after, pages) = (next, pages + 1);
+    }
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], "request");
+    assert!(pages > 1);
+}
+
 fn address(server: &Server) -> &str {
     server
         .url()

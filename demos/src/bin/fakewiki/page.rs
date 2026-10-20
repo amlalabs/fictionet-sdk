@@ -64,11 +64,10 @@ impl Controls {
                 },
                 vec![
                     Column::new("Time", "/at").format(Format::Time),
-                    Column::new("Host", "/fields/host"),
-                    Column::new("Path", "/fields/path"),
-                    Column::new("Source", "/fields/source"),
                     Column::new("Served", "/fields/served"),
                     Column::new("Revision", "/fields/tamper_revision").format(Format::Number),
+                    Column::new("Host", "/fields/host"),
+                    Column::new("Path", "/fields/path"),
                 ],
             )
     }
