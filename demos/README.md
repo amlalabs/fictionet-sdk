@@ -13,6 +13,8 @@ binary each, with the world in the same process. Four are scripts in
 `cargo xtask demo assets` downloads the files the microVM demos need, without
 booting anything. `cargo xtask demo libraries` downloads only the pinned
 browser libraries, into `observe/downloads/vendor/` at the repository root.
+Options for a demo go after its name, as in
+`cargo xtask demo search --seed corvane-acquisition`.
 
 ## The microVM demos
 
@@ -30,11 +32,19 @@ the first run on a machine also fetches about 280 MB of Ubuntu packages and
 later runs reuse them.
 
 Each run prints its page URL before the guests boot. It then runs the
-demo's story and its checks, saves screenshots, powers the guests off, and
-checks that no Cloud Hypervisor process or run directory is left. A passing
-run ends with `every required check passed`. A failing run prints the guests'
-cloud-init report, log tails and console tail. The page screenshots need
-Chromium on your machine.
+demo's story and its checks. Every demo checks that no containment probe was
+forwarded or answered from outside the world. The run saves screenshots,
+powers the guests off, and checks that no Cloud Hypervisor process or run
+directory is left. A passing run ends with `every required check passed`. A
+failing run prints the guests' cloud-init report, log tails and console tail.
+The page screenshots need Chromium on your machine.
+
+Five demos also run without a VM: `cargo xtask demo <name> preview` serves
+the same page with an in-world client in place of the guests, and needs only
+the browser libraries. A screen on its page says NO VM. Every preview reads its
+standard input the same way. Press Enter to run the in-world client again,
+where the demo has one, or type `drop` to close the screen's connections.
+The end of input or Ctrl-C stops it.
 
 The times below are from one run of each demo on a 24-core machine with other
 work running, the pinned files downloaded, the package cache filled and one
@@ -50,10 +60,10 @@ the checks have run both version commands. No model API is forwarded, so the
 agents run no task.
 
 The checks cover the guest's address and devices, the trust store, Firefox, the
-agents' own TLS clients, and the page's access controls. It types a command in
-the page terminal and moves the pointer with and without the screen lease.
+agents' own TLS clients, and the page's access controls. They type a command
+in the page terminal and move the pointer with and without the screen lease.
 
-- Options: a Unix socket path after `--`. With it,
+- Options: a Unix socket path. With it,
   `fictionet observe --observation unix:PATH watch` follows the same
   dashboard from another terminal.
 - Screenshots: `downloads/cloudimage/shots/`, with `guest-desktop.png` from
@@ -77,7 +87,7 @@ shows the simulated server's inventory with the lookalike flagged, and
 Requests lists every request with its classification.
 
 The checks cover each command's exit status and the facts the world observed,
-then reads the same facts from the page's API as a browser does. Each command
+then read the same facts from the page's API as a browser does. Each command
 declares its destinations. Other traffic from the guest is kept, printed
 apart, and shown in a muted band in Doors tried.
 
@@ -91,11 +101,12 @@ apart, and shown in a muted band in Doors tried.
 - Screenshots: `downloads/cloudimage/shots/artifactory-screen.png` and
   `artifactory-page.png`, with the world's log in `artifactory.jsonl`, each
   replaced on every run.
-- Without a VM: `cargo run -p fictionet-demo --bin artifactory -- --fixture
-  --variant lookalike` serves the same page. An in-process client replays the
-  variant's requests and door probes, about one step every two seconds. The
-  screen says NO VM, and there are no guest exit statuses. `--extra-reads N`
-  adds N index reads after the story, enough to fill the page's row bound.
+- Without a VM: `cargo xtask demo artifactory preview` serves the same page,
+  labeled a replay fixture. An in-process client replays the variant's
+  requests and door probes, about one step every two seconds, so there are no
+  guest exit statuses. It takes `--variant` and `--sessions` too, and
+  `--extra-reads N` adds N index reads after the story, enough to fill the
+  page's row bound.
 - Times: for `lookalike`, SSH up after 7.0 s, story 64.4 s, whole run
   114.2 s. Earlier runs of the other variants, before the demos were merged,
   took 4.9 s and 63.4 s for the story and the whole run of `normal`, 70.6 s
@@ -126,10 +137,9 @@ open until Ctrl-C.
   row match, so Firefox has finished loading. `page-hijacked.png` is the page
   in Chromium at the hijack, once the route, the four-hop traceroute and the
   credential alert show.
-- Without a VM: `cargo run -p fictionet-demo --bin border -- page` serves the
-  page with an in-process scripted client and real world traffic. Change the
-  route on the page, then press Enter to run sign-in, balance and traceroute on
-  it.
+- Without a VM: `cargo xtask demo border preview` serves the page with an
+  in-process scripted client and real world traffic. Change the route on the
+  page, then press Enter to run sign-in, balance and traceroute on it.
 - Times: SSH up after 6.8 s, desktop after 49.1 s, story done after 61.0 s,
   whole run 61.8 s.
 
@@ -144,11 +154,12 @@ a tree of every made-up site and page, with the world's reason for each, how
 it was made and how fast it was served. A switch turns page generation off and
 on. The desktop sits above the inspector.
 
-The checks search on Google, Bing and DuckDuckGo, opens results and a typed
-address, and checks each page's reason and how it was made. It checks that a
-stored search comes from memory once generation is off. It also checks that
-Left the box names every forwarded mirror, and that the guest's background
-requests made no pages. The story holds each step for 1.5 s, so you can follow
+The checks search on Google, Bing and DuckDuckGo, open results and a typed
+address, and check each page's reason and how it was made. The seed names the
+words to search for and the address to type. The checks confirm that a stored
+search comes from memory once generation is off, that Left the box names
+every forwarded mirror, and that the guest's background requests made no
+pages. The story holds each step for 1.5 s, so you can follow
 it on the page.
 
 - Options: `--seed halvard-cve|corvane-acquisition|fastjsonl-package`,
@@ -156,13 +167,12 @@ it on the page.
   Ctrl-C.
 - Screenshots: `downloads/cloudimage/runs/search-<time>/`, with `desktop.png`,
   `page.png` and the world's `log.jsonl`.
-- Without a VM: `cargo run --locked -p fictionet-demo --example search_page`
-  drives real in-process searches with a scripted client. The screen says
-  NO VM. `--spend-budget` ends the story with new searches until the world
-  refuses one for its generation budget. The page's `preview-screen` command,
-  `{"command":"drop"}`, closes the screen's connection to show the lost state.
-  Press Ctrl-C to close the page. The preview holds the package cache while it
-  runs, so a VM run started beside it fetches its packages without the cache.
+- Without a VM: `cargo xtask demo search preview` drives real in-process
+  searches with a scripted client. The story runs once. `--spend-budget` ends
+  it with new searches until the world refuses one for its generation budget.
+  Type `drop` to show the lost screen. The preview holds the package cache
+  while it runs, so a VM run started beside it fetches its packages without
+  the cache.
 - Times: SSH up after 7.5 s, Google loaded in Firefox after 45.3 s, story done
   after 65.3 s, whole run 66.0 s.
 
@@ -182,11 +192,10 @@ and that the panels have data.
 
 - Screenshots: `desktop.png` and `page.png` in a new directory under
   `downloads/cloudimage/shots/` for each run.
-- Without a VM: `cargo run --locked -p fictionet-demo --example fakewiki_page`
-  serves the same page and world. The screen says NO VM. The first line it
-  prints is the page URL. Press Enter to have the in-world scripted client read
-  the article, use the page's tamper switch, and press Enter again. Type
-  `drop` to close the screen's connections. End of input stops it.
+- Without a VM: `cargo xtask demo fakewiki preview` serves the same page and
+  world. The first line it prints is the page URL. Press Enter to have the
+  in-world scripted client read the article, use the page's tamper switch, and
+  press Enter again.
 - Times: SSH up after 7.2 s, article read after 47.6 s, whole run 52.2 s.
 
 ### Scan
@@ -205,11 +214,12 @@ page's access controls and terminal.
 
 - Screenshots: `downloads/cloudimage/shots/`, with `viewer-scan.png`,
   `page-scan.png`, and each step's nmap report and the world's ports beside it.
-- Without a VM: `cargo run --locked -p fictionet-demo --example scan_page`
-  serves the same page. An in-world scanner sends the story's probes, a
-  stand-in answers at 10.0.0.50 with the banners the real server sent, and
-  nmap's reports are the ones recorded in a KVM run. Enter or the end of input
-  stops it.
+- Without a VM: `cargo xtask demo scan preview` serves the same page,
+  labeled a replay. An in-world scanner sends the story's probes, a stand-in
+  answers at 10.0.0.50 with the banners the real server sent, and nmap's
+  reports are the ones recorded in a KVM run, so no step has an exit status.
+  `--bound` keeps probing new ports until the port map is full, and
+  `--no-os-match ADDR` removes nmap's OS matches for one host.
 - Times: both guests SSH up after 7.5 s, boot 31.2 s, story 51.1 s, whole run
   84.1 s.
 
@@ -283,26 +293,39 @@ The checks use the same few calls in every demo, all in
 - `GuestHandle::wait_cloud_init` waits for the guest's setup and fails with
   cloud-init's report.
 - `Run::screenshots` saves a guest's screen through the page and the page from
-  Chromium. `Run::screen` saves only the screen, and `Run::settled_screen`
-  keeps a capture once two in a row match, so a page the guest is loading has
-  finished. `Run::page_shot` saves the page once a condition holds in it.
+  Chromium. `Run::settled_screen` keeps a screen capture once two in a row
+  match, so a page the guest is loading has finished, and `Run::screen`
+  saves one capture. `Run::page_shot` saves the page once a condition holds
+  in it.
+- `Run::containment` waits for every guest's containment probes on the page
+  and fails if one was forwarded or answered from outside the world.
+- `Run::shutdown` powers the guests off and fails unless no Cloud Hypervisor
+  process or run directory is left.
 - `kit::checks::check` prints `[pass]` or `[FAIL]` with the check's name.
 - `kit::checks::bearer_required`, `single_use_ticket` and `terminal_runs_on`
   check the page's access controls and its terminal.
 - `GuestHandle::diagnostics` collects the guest's side of a failed run.
-- `PageClient` reads the page's API as a signed-in browser does, posts
-  commands, waits for a state or an event, pages through events with
-  `find_event`, and reads the state stream with `state_stream`.
+- `PageClient` reads the page's API as a signed-in browser does, reads one
+  state topic with `state`, posts commands, waits for a state or an event,
+  pages through events with `find_event`, and reads the state stream with
+  `state_stream`.
 - `kit::checks::STEP_PAUSE` holds each story step for 1.5 s, so a person
   watching can follow it. No check may depend on it.
 - `kit::checks::stay_open` keeps the page open until Ctrl-C.
 - `kit::preview::Console` is a screen that says NO VM, for a page without a
-  guest.
+  guest, and `kit::preview::Input` reads a preview's standard input.
 
 `kit::desktop::browser` declares an Ubuntu desktop with Mozilla's Firefox,
 quieted through enterprise policies so it makes no requests a page did not ask
-for. See the [kit API](src/kit/mod.rs) and the desktop's
-[guest](src/bin/desktop/guest.rs) and [world](src/bin/desktop/world.rs).
+for. `kit::desktop::terminal` declares one full-screen terminal that types and
+runs each command `GuestHandle::type_command` sends.
+`Guest::typed_commands` adds that program to any guest, as Artifactory's
+browser desktop does. `Guest::validate` refuses a guest whose names, files,
+packages or commands contain one of the words in `kit::FORBIDDEN`, such as
+eval or world, and `Guest::forbid` adds a demo's own words. A demo's page
+without a VM is its `preview` subcommand. See the [kit API](src/kit/mod.rs)
+and the desktop's [guest](src/bin/desktop/guest.rs) and
+[world](src/bin/desktop/world.rs).
 
 ## VM scripts
 
@@ -332,10 +355,8 @@ VM that a demo booted.
 The times are from a 24-core machine with other work running, with the VM's
 default 4 vCPUs and 5 GB. "First run" is the whole command on a machine that
 has run `cargo xtask demo web` once, so the VM image and the SDK build are
-there. "Then" is a later run of the same demo. The first runs went in the
-table's order. Docker's images and build cache, cargo's build output and uv's
-cache stay on the VM's cache disk, so only the first run of each demo pays for
-them.
+there. "Then" is a later run of the same demo, which reuses the build output on the
+VM's cache disk.
 
 ### How the scripts work
 
@@ -351,30 +372,8 @@ or a signal is a failure, not a refusal. The expected curl statuses come from
 its [exit-code documentation](https://curl.se/docs/manpage.html#exit-codes)
 and the world's DNS, TLS and routing behavior.
 
-### Adding a VM script
-
-Start from [`examples/scan`](../examples/scan), the smallest Docker example with
-an agent container: a world library and socket executable, a Dockerfile with
-one stage per container, and a Compose file.
-
-1. Copy `examples/scan` to `examples/<name>` and rename the package and binary
-   in `world/Cargo.toml` to `<name>-world`. The workspace includes it already.
-   Write your world in `world/src/lib.rs`.
-   `cargo run -p <name>-world -- /tmp/world.sock` runs it on its own.
-2. In `docker/Dockerfile`, build and copy your world instead of `scan-world` (its
-   `build` and `fictionet` stages name it), and give the agent's stage the
-   tools your agent uses instead of nmap. Drop the `container` stage if your
-   world has no real host.
-3. In `compose.yaml`, set `name` and the image tags to your name, the world's
-   `command` to your binary, and the agent's address, name and sandbox. Drop
-   `container` and `container-attach` with the stage.
-4. Run it from the repository root with your machine's Docker, as the scan
-   README does: `docker compose -f examples/<name>/compose.yaml up -d --build --wait`,
-   then `exec` into the agent's service, and `down -v` at the end.
-5. For `cargo xtask demo <name>`, copy `demos/guest/web.sh` to
-   `demos/guest/<name>.sh` and change the steps. Keep the `# needs: sdk` line:
-   the VM builds every example. `cargo xtask demo` finds the script by its
-   name. Add a row to the table above.
+A new demo is a microVM demo on the kit; see
+[Making a demo of your own](#making-a-demo-of-your-own).
 
 ## The evals, and the recipes
 
@@ -390,6 +389,3 @@ by hand with `docker compose`. The evals and the VM are also test suites:
 for `fictionet attach` on your own machine or cluster, and
 [`examples/hosted`](../examples/hosted) runs the Compose setup inside a Daytona
 or E2B sandbox. `cargo xtask scan` records the scan example's dashboard as a video.
-[Fictionet Observe](../observe/README.md) covers the collector, browser sign-in
-and capture limits. The dashboard and `fictionet observe` use the observation
-socket served by `fictionet_observe::serve`. Attachments use the world socket.
