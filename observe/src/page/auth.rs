@@ -8,10 +8,8 @@ pub(super) struct Auth {
 
 impl Auth {
     pub fn new() -> io::Result<Self> {
-        let mut bytes = [0; 32];
-        getrandom::fill(&mut bytes).map_err(io::Error::other)?;
         Ok(Self {
-            token: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            token: super::random_hex()?,
         })
     }
 

@@ -228,35 +228,23 @@ mod tests {
         &source[start..end]
     }
 
+    /// Whether a `/vendor/` path is a member of a library that
+    /// `cargo xtask demo libraries` pins in `observe/libraries.json`.
     fn pinned(path: &str) -> bool {
         let Some(path) = path.strip_prefix("/vendor/") else {
             return false;
         };
-        let pins = include_str!("../../../xtask/src/demo/libraries.rs");
-        pins.split("Library {").skip(2).any(|pin| {
-            let name = pin
-                .split_once("name: \"")
-                .unwrap()
-                .1
-                .split('"')
-                .next()
-                .unwrap();
-            let Some(member) = path.strip_prefix(&format!("{name}/")) else {
+        let pins: serde_json::Value =
+            serde_json::from_str(include_str!("../../libraries.json")).unwrap();
+        pins.as_array().unwrap().iter().any(|pin| {
+            let Some(member) = path.strip_prefix(&format!("{}/", pin["name"].as_str().unwrap()))
+            else {
                 return false;
             };
-            let members = pin
-                .split_once("members: &")
-                .unwrap()
-                .1
-                .split_once(']')
-                .unwrap()
-                .0;
-            let members: Vec<String> =
-                serde_json::from_str(&format!("{}]", members.trim_end().trim_end_matches(',')))
-                    .unwrap();
-            members
-                .iter()
-                .any(|item| member == item || member.starts_with(&format!("{item}/")))
+            pin["members"].as_array().unwrap().iter().any(|item| {
+                let item = item.as_str().unwrap();
+                member == item || member.starts_with(&format!("{item}/"))
+            })
         })
     }
 

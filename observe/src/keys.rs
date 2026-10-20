@@ -98,14 +98,25 @@ impl Keys {
 pub fn keylog(keys: &[Key]) -> String {
     let mut output = String::new();
     for key in keys {
-        output.push_str(&key.label);
-        for bytes in [&key.client_random, &key.secret] {
-            output.push(' ');
-            for byte in bytes {
-                write!(output, "{byte:02x}").expect("string write");
-            }
-        }
-        output.push('\n');
+        push_keylog_line(&mut output, &key.label, &key.client_random, &key.secret);
     }
     output
+}
+
+/// Appends one SSLKEYLOGFILE line: the label, then the client random and
+/// the secret in lowercase hex.
+pub(crate) fn push_keylog_line(
+    output: &mut String,
+    label: &str,
+    client_random: &[u8],
+    secret: &[u8],
+) {
+    output.push_str(label);
+    for bytes in [client_random, secret] {
+        output.push(' ');
+        for byte in bytes {
+            write!(output, "{byte:02x}").expect("string write");
+        }
+    }
+    output.push('\n');
 }

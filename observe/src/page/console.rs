@@ -85,12 +85,6 @@ impl Sessions {
     }
 }
 
-fn random() -> io::Result<String> {
-    let mut bytes = [0; 32];
-    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TicketRequest {
@@ -116,8 +110,8 @@ pub(super) async fn ticket(
     } {
         return http::error(conn, 404, "host does not offer that console").await;
     }
-    let ticket = random()?;
-    let session = random()?;
+    let ticket = super::random_hex()?;
+    let session = super::random_hex()?;
     let now = (shared.page.clock)();
     let added = {
         let mut inner = shared.consoles.inner.lock();

@@ -1,6 +1,4 @@
 use std::io;
-use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
@@ -22,20 +20,48 @@ pub struct EventFilter {
     pub host: Option<String>,
 }
 
-fn invalid(message: impl Into<String>) -> io::Error {
+pub(super) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+/// Whether `name` is one to 128 ASCII letters, digits, `-` or `_`: the rule
+/// for host, state and command names, which appear in URL paths.
+pub(super) fn valid_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// The Containment panel, over the `containment` state topic.
+fn containment_panel() -> PanelDescription {
+    PanelDescription::inspector(
+        "containment",
+        "Containment",
+        PanelContent::Containment {
+            state: "/api/state/containment".into(),
+        },
+    )
+}
+
+/// The Labels and export panel. With labeling enabled it links the
+/// `labels` state topic and command mailbox.
+pub(super) fn labels_panel(enabled: bool) -> PanelDescription {
+    PanelDescription::inspector(
+        "labels",
+        "Labels and export",
+        PanelContent::Labels {
+            state: enabled.then(|| "/api/state/labels".into()),
+            command: enabled.then(|| "/api/command/labels".into()),
+        },
+    )
 }
 
 impl Page {
     /// Registers bounded state without adding a panel.
     pub fn state<T: Serialize>(mut self, name: impl Into<String>, topic: StateTopic<T>) -> Self {
         let name = name.into();
-        if name.is_empty()
-            || name.len() > 128
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-        {
+        if !valid_name(&name) {
             self.errors.push(
                 "state needs a name of at most 128 ASCII letters, digits, hyphens or underscores"
                     .into(),
@@ -50,7 +76,8 @@ impl Page {
         self.hosts.push(host);
         self
     }
-    /// Adds consoles, Packets, Events, Map and Left the box at bind.
+    /// Adds consoles, Packets, Events, Map, Left the box, Containment, and
+    /// Labels and export at bind.
     pub fn standard_panels(mut self) -> Self {
         if self.standard {
             self.errors
@@ -59,27 +86,10 @@ impl Page {
         self.standard = true;
         self
     }
-    /// Adds the bounded projection of guest destinations and world answers.
-    pub fn left_the_box(mut self) -> Self {
-        self.panels.push(PanelDescription {
-            id: "left-the-box".into(),
-            title: "Left the box".into(),
-            area: Area::Inspector,
-            content: PanelContent::LeftTheBox,
-        });
-        self
-    }
     /// Adds startup containment results published by the world or guest kit.
     pub fn containment(mut self, topic: StateTopic<super::Containment>) -> Self {
         self.topics.push(("containment".into(), topic.topic));
-        self.panels.push(PanelDescription {
-            id: "containment".into(),
-            title: "Containment".into(),
-            area: Area::Inspector,
-            content: PanelContent::Containment {
-                state: "/api/state/containment".into(),
-            },
-        });
+        self.panels.push(containment_panel());
         self
     }
     /// Adds a server-filtered event table over the dashboard session.
@@ -92,15 +102,14 @@ impl Page {
         let title = title.into();
         let id = panel::slug(&title);
         self.filters.push((id.clone(), filter));
-        self.panels.push(PanelDescription {
-            id: id.clone(),
+        self.panels.push(PanelDescription::inspector(
+            id.clone(),
             title,
-            area: Area::Inspector,
-            content: PanelContent::EventTable {
+            PanelContent::EventTable {
                 events: format!("/api/event-table/{id}"),
                 columns,
             },
-        });
+        ));
         self
     }
     /// Names a story moment by the world events that mark it.
@@ -126,15 +135,14 @@ impl Page {
         let id = panel::slug(&title);
         self.topics.push((id.clone(), topic.topic));
         self.modules.push((id.clone(), module_source.into()));
-        self.panels.push(PanelDescription {
-            id: id.clone(),
+        self.panels.push(PanelDescription::inspector(
+            id.clone(),
             title,
-            area: Area::Inspector,
-            content: PanelContent::Custom {
+            PanelContent::Custom {
                 module: format!("/panels/{id}.mjs"),
                 state: format!("/api/state/{id}"),
             },
-        });
+        ));
         self
     }
     /// Embeds a file at /assets/path. Paths and media types are validated at bind.
@@ -187,23 +195,21 @@ impl Page {
     }
 
     /// Injects elapsed monotonic time for ticket expiration and lease timestamps.
-    pub fn clock(mut self, clock: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
-        self.clock = Arc::new(clock);
+    #[cfg(test)]
+    pub(super) fn clock(
+        mut self,
+        clock: impl Fn() -> std::time::Duration + Send + Sync + 'static,
+    ) -> Self {
+        self.clock = std::sync::Arc::new(clock);
         self
     }
 
     pub(super) fn prepare(&mut self) -> io::Result<()> {
         let mut names = std::collections::BTreeSet::new();
         for host in &mut self.hosts {
-            if host.name.is_empty()
-                || !host
-                    .name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-                || !names.insert(host.name.clone())
-            {
+            if !valid_name(&host.name) || !names.insert(host.name.clone()) {
                 return Err(invalid(format!(
-                    "host({:?}) is invalid or duplicated; use a unique name with ASCII letters, digits, - or _",
+                    "host({:?}) is invalid or duplicated; use a unique name of at most 128 ASCII letters, digits, - or _",
                     host.name
                 )));
             }
@@ -258,25 +264,10 @@ impl Page {
                 "containment".into(),
                 StateTopic::<super::Containment>::new(super::StateLimits::default()).topic,
             ));
-            self.panels.push(PanelDescription {
-                id: "containment".into(),
-                title: "Containment".into(),
-                area: Area::Inspector,
-                content: PanelContent::Containment {
-                    state: "/api/state/containment".into(),
-                },
-            });
+            self.panels.push(containment_panel());
         }
         if self.standard && self.labels.is_none() {
-            self.panels.push(PanelDescription {
-                id: "labels".into(),
-                title: "Labels and export".into(),
-                area: Area::Inspector,
-                content: PanelContent::Labels {
-                    state: None,
-                    command: None,
-                },
-            });
+            self.panels.push(labels_panel(false));
         }
         if self.standard {
             for (title, content) in [
@@ -285,12 +276,11 @@ impl Page {
                 ("Map", PanelContent::Map),
                 ("Left the box", PanelContent::LeftTheBox),
             ] {
-                self.panels.push(PanelDescription {
-                    id: panel::slug(title),
-                    title: title.into(),
+                self.panels.push(PanelDescription::inspector(
+                    panel::slug(title),
+                    title,
                     content,
-                    area: Area::Inspector,
-                });
+                ));
             }
         }
         if let Some(title) = &self.workspace {

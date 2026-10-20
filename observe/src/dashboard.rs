@@ -172,10 +172,6 @@ impl DashboardHandle {
     pub fn egress(&self) -> EgressSnapshot {
         self.0.egress.snapshot()
     }
-    /// Increases whenever [`DashboardHandle::egress`] would change.
-    pub fn egress_revision(&self) -> u64 {
-        self.0.egress.revision()
-    }
     pub(crate) fn begun(&self) -> bool {
         self.0.clock.lock().begun || self.0.collector.ended().is_some()
     }

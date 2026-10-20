@@ -28,7 +28,7 @@ impl Default for Limits {
     }
 }
 
-/// Evidence was lost; the sample cannot be graded from this observer.
+/// Events were lost; the sample cannot be graded from this observer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Incomplete {
     /// Number of evicted or rejected events.
@@ -37,13 +37,13 @@ pub struct Incomplete {
 
 impl std::fmt::Display for Incomplete {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "incomplete evidence: {} events lost", self.dropped)
+        write!(f, "incomplete history: {} events lost", self.dropped)
     }
 }
 
 impl std::error::Error for Incomplete {}
 
-/// Bounded synchronous evidence, owned by the integrator.
+/// Bounded synchronous event history, owned by the integrator.
 ///
 /// The default reserves separate budgets for ordinary events and network noise
 /// marked with [`Event::repeat`]. Oldest events in each budget are evicted first.
@@ -117,7 +117,7 @@ impl Default for Memory {
 }
 
 impl Memory {
-    /// Creates empty evidence with one shared budget for all raw facts.
+    /// Creates an empty history with one shared budget for all raw facts.
     /// Use [`Self::with_noise_limits`] to keep network floods from evicting
     /// ordinary events, as the default does.
     pub fn new(limits: Limits) -> Self {
@@ -137,12 +137,12 @@ impl Memory {
         }
     }
 
-    /// Reads matching evidence only if no event has been lost.
+    /// Reads matching retained events only if no event has been lost.
     pub fn checked_of(&self, source: &str, kind: &str) -> Result<Vec<Event>, Incomplete> {
         self.checked(|event| event.is(source, kind))
     }
 
-    /// Reads all retained evidence only if no event has been lost.
+    /// Reads all retained events only if no event has been lost.
     pub fn checked_all(&self) -> Result<Vec<Event>, Incomplete> {
         self.checked(|_| true)
     }
@@ -161,7 +161,7 @@ impl Memory {
             .collect())
     }
 
-    /// Waits for matching complete evidence, bounded by the run's clock.
+    /// Waits for matching events in a complete history, bounded by the run's clock.
     /// Inspects only events after `after`, once each, using a pure predicate.
     /// Returns the matches so far at the deadline. Cancellation and retention
     /// loss are errors. At most thirty-two waits may be outstanding.
@@ -182,7 +182,7 @@ impl Memory {
             let mut state = self.state.lock();
             state.waiters.retain(|wait| wait.strong_count() != 0);
             if state.waiters.len() == 32 {
-                return Err(fictionet::Error::msg("too many evidence waits"));
+                return Err(fictionet::Error::msg("too many event waits"));
             }
             state.waiters.push(Arc::downgrade(&wake));
         }
@@ -479,7 +479,7 @@ mod tests {
                         .await
                         .unwrap_err()
                         .to_string(),
-                    "too many evidence waits"
+                    "too many event waits"
                 );
                 drop(waits);
                 cx.emit("test", "ready", |event| event);
@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_events_are_rejected_without_evicting_retained_evidence() {
+    fn oversized_events_are_rejected_without_evicting_retained_events() {
         let memory = Memory::new(Limits::new(4, 2048));
         memory.observe(
             Stamp {
@@ -670,7 +670,7 @@ mod tests {
         assert_eq!(memory.checked_of("shop", "order").unwrap_err().dropped, 3);
     }
 
-    /// A bounded observer reports incomplete evidence when a flood exceeds
+    /// A bounded observer reports an incomplete history when a flood exceeds
     /// its retention budget; the bottleneck still reports every raw drop.
     #[test]
     fn a_flooded_bottleneck_reports_raw_drops_and_retention_loss() {

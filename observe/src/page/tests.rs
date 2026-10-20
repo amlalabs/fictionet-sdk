@@ -2000,49 +2000,42 @@ async fn a_late_event_table_read_finds_a_moment_past_the_first_thousand_events()
 
 #[tokio::test]
 async fn left_the_box_is_declared_and_requires_a_bearer() {
-    for standard in [false, true] {
-        let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
-        let page = Page::new("Destinations", dashboard.handle());
-        let server = if standard {
-            page.standard_panels()
-        } else {
-            page.left_the_box()
-        }
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let server = Page::new("Destinations", dashboard.handle())
+        .standard_panels()
         .bind_loopback(0)
         .await
         .unwrap();
-        let description =
-            json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
-        assert!(
-            description["panels"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|panel| panel["kind"] == "left_the_box")
-        );
-        status(&request(&server, "GET", "/api/egress", "", "").await, 401);
-        let response = request(&server, "GET", "/api/egress", &bearer(&server), "").await;
-        status(&response, 200);
-        let snapshot = json_body(&response);
-        assert_eq!(snapshot["destinations"], serde_json::json!([]));
-        assert_eq!(snapshot["dropped"], 0);
-        assert_eq!(snapshot["lost"], 0);
-        status(
-            &request(
-                &server,
-                "GET",
-                "/api/egress?token=wrong",
-                &bearer(&server),
-                "",
-            )
-            .await,
-            400,
-        );
-        status(
-            &request(&server, "GET", "/components/left-the-box.mjs", "", "").await,
-            200,
-        );
-    }
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    assert!(
+        description["panels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|panel| panel["kind"] == "left_the_box")
+    );
+    status(&request(&server, "GET", "/api/egress", "", "").await, 401);
+    let response = request(&server, "GET", "/api/egress", &bearer(&server), "").await;
+    status(&response, 200);
+    let snapshot = json_body(&response);
+    assert_eq!(snapshot["destinations"], serde_json::json!([]));
+    assert_eq!(snapshot["dropped"], 0);
+    assert_eq!(snapshot["lost"], 0);
+    status(
+        &request(
+            &server,
+            "GET",
+            "/api/egress?token=wrong",
+            &bearer(&server),
+            "",
+        )
+        .await,
+        400,
+    );
+    status(
+        &request(&server, "GET", "/components/left-the-box.mjs", "", "").await,
+        200,
+    );
 }
 
 #[tokio::test]

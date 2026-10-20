@@ -218,15 +218,7 @@ impl Page {
         self.commands
             .push(("labels".into(), Box::new(labels.commands.clone())));
         self.labels = Some(labels);
-        self.panels.push(super::PanelDescription {
-            id: "labels".into(),
-            title: "Labels and export".into(),
-            area: super::Area::Inspector,
-            content: super::PanelContent::Labels {
-                state: Some("/api/state/labels".into()),
-                command: Some("/api/command/labels".into()),
-            },
-        });
+        self.panels.push(super::builder::labels_panel(true));
         self
     }
 }

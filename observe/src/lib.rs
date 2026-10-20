@@ -792,7 +792,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use fictionet::events::{
-    Counts, Interest, LinkId, Loss, LossReason, Observation, Observer, Stamp, Stream, TopologyRef,
+    Interest, LinkId, Loss, LossReason, Observation, Observer, Stamp, Stream, TopologyRef,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -903,10 +903,6 @@ impl Collector {
     /// A revisioned, bounded snapshot of current entities.
     pub fn topology(&self) -> Topology {
         self.state.lock().topology.clone()
-    }
-    /// Live absolute counters for every retained link.
-    pub fn counters(&self) -> BTreeMap<LinkId, [Counts; 2]> {
-        self.topology().counters()
     }
     /// Retained copies after a copy cursor and the number evicted before them.
     pub fn packets(&self, link: LinkId, after: u64, max: usize) -> PacketBatch {
