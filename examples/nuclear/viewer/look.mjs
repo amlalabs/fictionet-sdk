@@ -29,15 +29,22 @@ export function applyMaterialPalette(material, palette) {
 
 export function createDisplayMaterial(THREE, palette, texture) {
   const material = createMaterial(THREE, palette, 'lamp', 'lightKey', {
-    map: texture, emissiveMap: texture, emissiveIntensity: 1, toneMapped: false,
-    roughness: 1, metalness: 0, envMapIntensity: 0,
+    map: texture,
+    emissiveMap: texture,
+    emissiveIntensity: 1,
+    toneMapped: false,
+    roughness: 1,
+    metalness: 0,
+    envMapIntensity: 0,
   });
   // Neutral multipliers preserve the canvas palette without reflected light.
   material.color.setScalar(0);
   material.emissive.setScalar(1);
-  material.onBeforeCompile = shader => {
-    shader.fragmentShader = shader.fragmentShader.replace('#include <opaque_fragment>',
-      'outgoingLight = totalEmissiveRadiance;\n#include <opaque_fragment>');
+  material.onBeforeCompile = (shader) => {
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <opaque_fragment>',
+      'outgoingLight = totalEmissiveRadiance;\n#include <opaque_fragment>',
+    );
   };
   return material;
 }
@@ -76,16 +83,32 @@ export function createEnvironment(THREE, renderer, palette) {
   const panel = new THREE.PlaneGeometry(1, 1);
   const walls = new THREE.MeshBasicMaterial({ color: palette.lightGround, side: THREE.BackSide });
   const glow = createMaterial(THREE, palette, 'lamp', 'lightKey', {
-    emissive: palette.lightKey, emissiveIntensity: 5, side: THREE.DoubleSide,
+    emissive: palette.lightKey,
+    emissiveIntensity: 5,
+    side: THREE.DoubleSide,
   });
   room.add(new THREE.Mesh(box, walls));
   for (const [position, rotation, scale] of [
-    [[-2.5, 2.9, 0], [Math.PI / 2, 0, 0], [1.5, 4, 1]],
-    [[2.5, 2.9, 0], [Math.PI / 2, 0, 0], [1.5, 4, 1]],
-    [[0, 1, -4.9], [0, 0, 0], [4, 1.5, 1]],
+    [
+      [-2.5, 2.9, 0],
+      [Math.PI / 2, 0, 0],
+      [1.5, 4, 1],
+    ],
+    [
+      [2.5, 2.9, 0],
+      [Math.PI / 2, 0, 0],
+      [1.5, 4, 1],
+    ],
+    [
+      [0, 1, -4.9],
+      [0, 0, 0],
+      [4, 1.5, 1],
+    ],
   ]) {
     const mesh = new THREE.Mesh(panel, glow);
-    mesh.position.set(...position); mesh.rotation.set(...rotation); mesh.scale.set(...scale);
+    mesh.position.set(...position);
+    mesh.rotation.set(...rotation);
+    mesh.scale.set(...scale);
     room.add(mesh);
   }
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -93,7 +116,11 @@ export function createEnvironment(THREE, renderer, palette) {
     return pmrem.fromScene(room, 0.04, 0.1, 30, { size: 128 });
   } finally {
     pmrem.dispose();
-    box.dispose(); panel.dispose(); walls.dispose(); glow.dispose(); room.clear();
+    box.dispose();
+    panel.dispose();
+    walls.dispose();
+    glow.dispose();
+    room.clear();
   }
 }
 
@@ -106,7 +133,12 @@ export function createLighting(THREE, scene, palette, plant = false) {
   key.shadow.mapSize.set(1024, 1024);
   const extent = plant ? 19 : 8;
   Object.assign(key.shadow.camera, {
-    left: -extent, right: extent, top: extent, bottom: -extent, near: 0.1, far: plant ? 65 : 22,
+    left: -extent,
+    right: extent,
+    top: extent,
+    bottom: -extent,
+    near: 0.1,
+    far: plant ? 65 : 22,
   });
   key.shadow.camera.updateProjectionMatrix();
   key.shadow.normalBias = 0.025;
@@ -120,7 +152,8 @@ export function createLighting(THREE, scene, palette, plant = false) {
       key.color.set(next[plant ? 'plantKey' : 'lightKey']);
     },
     dispose() {
-      key.dispose(); fill.dispose();
+      key.dispose();
+      fill.dispose();
       scene.remove(key, fill, key.target);
     },
   };
@@ -129,10 +162,11 @@ export function createLighting(THREE, scene, palette, plant = false) {
 // Scalar irradiance modulates the palette; it introduces no new surface colors.
 export function roomLightAt(point, normal) {
   let pool = 0;
-  for (const x of CEILING_LIGHTS.xs) for (const z of CEILING_LIGHTS.zs) {
-    const distance = (point.x - x) ** 2 + (point.z - z) ** 2;
-    pool = Math.max(pool, Math.exp(-distance / 2.2));
-  }
+  for (const x of CEILING_LIGHTS.xs)
+    for (const z of CEILING_LIGHTS.zs) {
+      const distance = (point.x - x) ** 2 + (point.z - z) ** 2;
+      pool = Math.max(pool, Math.exp(-distance / 2.2));
+    }
   let light = 0.62 + 0.38 * pool;
   const wallGap = Math.min(ROOM.width / 2 - Math.abs(point.x), ROOM.depth / 2 - Math.abs(point.z));
   light *= 0.76 + 0.24 * Math.min(1, Math.max(0, wallGap) / 0.65);

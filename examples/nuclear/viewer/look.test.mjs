@@ -1,8 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from '../../../observe/downloads/vendor/three/build/three.module.js';
-import { MATERIAL_ROLES, materialSpec, indicatorSpec, setIndicator, createRenderer, createMaterial,
-  createDisplayMaterial, applyMaterialPalette, roomLightAt } from './look.mjs';
+import {
+  MATERIAL_ROLES,
+  materialSpec,
+  indicatorSpec,
+  setIndicator,
+  createRenderer,
+  createMaterial,
+  createDisplayMaterial,
+  applyMaterialPalette,
+  roomLightAt,
+} from './look.mjs';
 import { windowState, DESKS, BOARDS, boardPoint, CEILING_LIGHTS } from './board-layout.mjs';
 
 test('surface roles separate painted steel, brushed metal, glass, rubber and concrete', () => {
@@ -33,7 +42,12 @@ test('material specs require a palette color and leave the palette and roles int
 });
 
 const palette = Object.freeze({ lampGlow: '#ffbe50', lampOff: '#222b27' });
-const color = () => ({ value: null, set(value) { this.value = value; } });
+const color = () => ({
+  value: null,
+  set(value) {
+    this.value = value;
+  },
+});
 
 test('emission follows the window decision through flashing, acknowledgement and clearing', () => {
   const material = { color: color(), emissive: color(), emissiveIntensity: 0 };
@@ -59,9 +73,15 @@ test('emission follows the window decision through flashing, acknowledgement and
 
 test('material creation and theme updates use the requested role and token', () => {
   class Material {
-    constructor(spec) { this.spec = spec; this.userData = {}; this.color = color(); }
+    constructor(spec) {
+      this.spec = spec;
+      this.userData = {};
+      this.color = color();
+    }
   }
-  const material = createMaterial({ MeshStandardMaterial: Material }, palette, 'lamp', 'lampOff', { depthWrite: false });
+  const material = createMaterial({ MeshStandardMaterial: Material }, palette, 'lamp', 'lampOff', {
+    depthWrite: false,
+  });
   assert.equal(material.spec.roughness, MATERIAL_ROLES.lamp.roughness);
   assert.equal(material.spec.color, palette.lampOff);
   assert.equal(material.spec.depthWrite, false);
@@ -73,9 +93,16 @@ test('material creation and theme updates use the requested role and token', () 
 test('the renderer factory creates one context with filmic output and shadow accounting', () => {
   let count = 0;
   const THREE = {
-    ACESFilmicToneMapping: Symbol(), SRGBColorSpace: Symbol(), PCFSoftShadowMap: Symbol(),
+    ACESFilmicToneMapping: Symbol(),
+    SRGBColorSpace: Symbol(),
+    PCFSoftShadowMap: Symbol(),
     WebGLRenderer: class {
-      constructor(options) { count++; this.options = options; this.shadowMap = {}; this.info = {}; }
+      constructor(options) {
+        count++;
+        this.options = options;
+        this.shadowMap = {};
+        this.info = {};
+      }
     },
   };
   const renderer = createRenderer(THREE);

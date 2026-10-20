@@ -250,17 +250,49 @@ export const plant = Object.freeze({
 });
 
 /** Sensor order follows Sensor::ALL. Resolutions are engineering units per count. */
-export const FAULT_SENSORS = Object.freeze([
-  ...POINTS,
-  { key: 'shutdown_rod_position', label: 'Shutdown rod position', unit: '%', truth: t => t.reactor.shutdown_rod_percent_inserted },
-].map((point, index) => {
-  const tags = ['NI-41', 'ZT-401', 'TE-411A', 'TE-411B', 'TE-412A', 'TE-412B',
-    'PT-455', 'LT-459', 'FT-414A', 'FT-414B', 'LT-421A', 'LT-421B', 'PT-431',
-    'FT-432A', 'FT-432B', 'FT-433A', 'FT-433B', 'ZT-441', 'JT-451', 'PT-452', 'TE-413', 'ZT-402'];
-  const [name, loop] = point.key.split(':');
-  return Object.freeze({ ...point, sensor: loop ? { [name]: loop } : name,
-    tag: tags[index], resolution: point.unit === 'MPa' ? 0.01 : HOT_LEG_RESOLUTION_C });
-}));
+export const FAULT_SENSORS = Object.freeze(
+  [
+    ...POINTS,
+    {
+      key: 'shutdown_rod_position',
+      label: 'Shutdown rod position',
+      unit: '%',
+      truth: (t) => t.reactor.shutdown_rod_percent_inserted,
+    },
+  ].map((point, index) => {
+    const tags = [
+      'NI-41',
+      'ZT-401',
+      'TE-411A',
+      'TE-411B',
+      'TE-412A',
+      'TE-412B',
+      'PT-455',
+      'LT-459',
+      'FT-414A',
+      'FT-414B',
+      'LT-421A',
+      'LT-421B',
+      'PT-431',
+      'FT-432A',
+      'FT-432B',
+      'FT-433A',
+      'FT-433B',
+      'ZT-441',
+      'JT-451',
+      'PT-452',
+      'TE-413',
+      'ZT-402',
+    ];
+    const [name, loop] = point.key.split(':');
+    return Object.freeze({
+      ...point,
+      sensor: loop ? { [name]: loop } : name,
+      tag: tags[index],
+      resolution: point.unit === 'MPa' ? 0.01 : HOT_LEG_RESOLUTION_C,
+    });
+  }),
+);
 
 export function sensorCount(point, value) {
   if (!Number.isFinite(value)) throw new RangeError('Enter a finite value.');
@@ -268,7 +300,9 @@ export function sensorCount(point, value) {
   const rounded = Math.sign(scaled) * Math.floor(Math.abs(scaled) + 0.5 + Number.EPSILON * Math.abs(scaled));
   const count = clamp(rounded, -32768, 32767);
   if (count !== rounded) {
-    throw new RangeError(`Value exceeds the signed count range. Nearest limit is ${count * point.resolution} ${point.unit}.`);
+    throw new RangeError(
+      `Value exceeds the signed count range. Nearest limit is ${count * point.resolution} ${point.unit}.`,
+    );
   }
   return count === 0 ? 0 : count;
 }
@@ -279,12 +313,14 @@ export function sensorFault(snapshot, point, kind, value) {
     return { change: fault.sensor(point.sensor, { bias: { delta: sensorCount(point, value) } }), note: '' };
   }
   if (kind !== 'stuck') throw new RangeError('Choose a sensor fault kind.');
-  const channel = snapshot.readings.find(entry => tagKey(entry.sensor) === point.key);
+  const channel = snapshot.readings.find((entry) => tagKey(entry.sensor) === point.key);
   const reported = channel?.reading?.value;
   const fallback = reported === null || reported === undefined;
   const reading = fallback ? point.truth(snapshot.truth) : reported;
-  return { change: fault.sensor(point.sensor, { stuck: { value: sensorCount(point, reading) } }),
-    note: fallback ? 'No reported reading. Used the true value.' : 'Used the current reported reading.' };
+  return {
+    change: fault.sensor(point.sensor, { stuck: { value: sensorCount(point, reading) } }),
+    note: fallback ? 'No reported reading. Used the true value.' : 'Used the current reported reading.',
+  };
 }
 
 export function activeFaults(snapshot) {
@@ -308,8 +344,11 @@ export function activeFaults(snapshot) {
       const sign = kind.bias.delta >= 0 ? '+' : '';
       text = `bias ${sign}${(kind.bias.delta * point.resolution).toFixed(decimals)} ${point.unit}`;
     }
-    entries.push({ key: `sensor:${point.key}`, label: `${point.label}: ${text}`,
-      change: fault.clear({ sensor: point.sensor }) });
+    entries.push({
+      key: `sensor:${point.key}`,
+      label: `${point.label}: ${text}`,
+      change: fault.clear({ sensor: point.sensor }),
+    });
   });
   if (snapshot.faults.telemetry_quiet) {
     entries.push({ key: 'telemetry', label: 'Telemetry: quiet', change: fault.telemetryQuiet(false) });
@@ -320,7 +359,7 @@ export function activeFaults(snapshot) {
 /** Fault changes in the world's serde forms, for a switch thrown on or off. */
 export const fault = Object.freeze({
   sensor: (sensor, kind) => ({ inject: { sensor: { sensor, kind } } }),
-  clear: target => ({ clear: target }),
+  clear: (target) => ({ clear: target }),
   feedPumpTrip: (loop, on) => {
     const process = { process: { feed_pump_trip: { pump: loop } } };
     return on ? { inject: process } : { clear: process };
@@ -342,7 +381,11 @@ export const fault = Object.freeze({
   stuckHotLeg: (loop, count, on) => {
     const sensor = { sensor: { hot_leg: loop } };
     return on
-      ? { inject: { sensor: { sensor: { hot_leg: loop }, kind: { stuck: { value: wholeIn(count, -32768, 32767, 'count') } } } } }
+      ? {
+          inject: {
+            sensor: { sensor: { hot_leg: loop }, kind: { stuck: { value: wholeIn(count, -32768, 32767, 'count') } } },
+          },
+        }
       : { clear: sensor };
   },
   clearAll: () => 'clear_all',
@@ -350,7 +393,10 @@ export const fault = Object.freeze({
 
 /** The count a hot leg sensor reads at a temperature in degrees C. */
 export function hotLegCount(celsius) {
-  return sensorCount(FAULT_SENSORS.find(point => point.key === 'hot_leg:a'), celsius);
+  return sensorCount(
+    FAULT_SENSORS.find((point) => point.key === 'hot_leg:a'),
+    celsius,
+  );
 }
 
 /**
@@ -382,7 +428,7 @@ const REFUSALS = Object.freeze({
 
 function refused(rejection) {
   const reason = rejection?.reason;
-  const detail = reason === 'invalid' ? rejection.message : REFUSALS[reason] ?? String(reason ?? 'unknown reason');
+  const detail = reason === 'invalid' ? rejection.message : (REFUSALS[reason] ?? String(reason ?? 'unknown reason'));
   return { state: 'refused', text: `Refused: ${detail}.` };
 }
 
@@ -410,7 +456,12 @@ export function outcomeOf(reply) {
  * shows. The transport rejects a reply that is not 2xx, and its body is the
  * command reply. Nothing here touches the DOM.
  */
-export async function postCommand(transport, path, command, { requestId = globalThis.crypto.randomUUID(), signal } = {}) {
+export async function postCommand(
+  transport,
+  path,
+  command,
+  { requestId = globalThis.crypto.randomUUID(), signal } = {},
+) {
   const body = commandRequest(command, requestId);
   try {
     return outcomeOf(await transport.post(path, body, signal));
