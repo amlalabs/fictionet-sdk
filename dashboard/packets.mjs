@@ -1,8 +1,7 @@
 // The packet list: its stream, queue, selection, detail and hex view.
 // components/packets.mjs passes in DOM helpers, the transport's packet calls,
 // labels and orientation.
-import { labelChips, flowMatches } from './components/labels.mjs';
-import { listen } from './dom.mjs';
+import { listen, scoped } from './dom.mjs';
 
 // What the detail pane says until a packet is selected.
 const PICK = 'Select a packet to see its layers.';
@@ -536,4 +535,16 @@ export function createPackets({
   }, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels,
   /// Packets received but not shown yet, or -1 while no stream is open.
   queued: () => (packets ? packets.queue.length + packets.held.length : -1) };
+}
+
+// Whether a flow label's target names this packet's link and addresses,
+// either way round.
+export function flowMatches(target, packet) {
+  return target.kind === 'flow' && target.link === packet.link && ((target.a === packet.src && target.b === packet.dst) || (target.b === packet.src && target.a === packet.dst));
+}
+
+// The labels as chips under `parent`.
+export function labelChips(parent, labels) {
+  const { el } = scoped(parent);
+  for (const label of labels) el('span', { class: 'pill label-chip', text: label.text }, parent);
 }

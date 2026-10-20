@@ -1,46 +1,11 @@
 // mount(root, services, options) returns dispose. Services provide the graph
 // model, selection and host names.
-import { labelAction, labelChips } from './labels.mjs';
+import { labelAction } from './labels.mjs';
+import { labelChips } from '../packets.mjs';
+import { eventText } from '../tables.mjs';
 import { scoped, listen, reconcile } from '../dom.mjs';
 import { fmtRunTime } from '../format.mjs';
 import { APPROXIMATE } from './packets.mjs';
-
-// The map's side panel list of recent events.
-export function renderEvents(parent, events, { el, state, drawnSource, tone, focusNode, select }) {
-  if (!events.length) {
-    el('p', { class: 'quiet', text: 'No events yet. They appear here as the world runs.' }, parent);
-    return;
-  }
-  const ul = el('ul', { class: 'rows' }, parent);
-  for (const n of events.slice(-60).reverse()) {
-    const li = el('li', { class: 'event-row' }, ul);
-    el('time', { text: fmtRunTime(n.at) }, li);
-    const node = state.nodes.get(n.node) || drawnSource(n);
-    const head = el('span', {}, li);
-    el('span', { class: `kind ${tone(n)}`, text: `${n.source}.${n.kind}` }, head);
-    if (n.task || node) {
-      head.append(' from ');
-      const b = el('button', { class: 'link', type: 'button', text: n.task || node.name }, head);
-      b.title = n.file ? `${n.file}:${n.line}` : '';
-      b.addEventListener('click', () => {
-        if (state.nodes.get(n.node)) focusNode(n.node);
-        else select({ kind: 'ended', id: n.node, event: n });
-      });
-    }
-    el('span', { class: 'text', text: n.summary || eventText(n.fields) }, li);
-  }
-}
-
-/// An event's fields as `key value` pairs, or as JSON when they are not
-/// an object.
-function eventText(data) {
-  if (data && typeof data === 'object' && !Array.isArray(data)) {
-    return Object.entries(data)
-      .map(([k, v]) => `${k} ${typeof v === 'object' ? JSON.stringify(v) : v}`)
-      .join(', ');
-  }
-  return JSON.stringify(data);
-}
 
 const LIMIT = 500;
 

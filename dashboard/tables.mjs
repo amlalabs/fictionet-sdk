@@ -1,9 +1,9 @@
-import { renderEvents } from './components/events.mjs';
 // The map's tables: tooltip contents, the empty notice, the breadcrumb, and
 // the side panel's sections, lists and event rows. components/map.mjs passes
 // in the state and view, formatting, the graph's rates and helpers, and the
 // selection, focus and packet steps the rows link to, and calls `refresh`
 // once a frame.
+import { fmtRunTime } from './format.mjs';
 
 export function createTables({ $, el, state, view, runTime, fmtDuration, fmtBytes, fmtCount, fmtRate, plural, where, nodeLabel, tone, drawnSource, liveRate, dRate, dCounts, dBytesRate, ends, dEdgesOf, groupChain, parentOf, isOpen, select, toggleGroup, applySearch, focusNode, focusGroup, openPackets, openLinks }) {
   // ---------------------------------------------------------------------------
@@ -446,4 +446,41 @@ export function createTables({ $, el, state, view, runTime, fmtDuration, fmtByte
   }
 
   return { nodeTip, groupTip, edgeTip, renderSide, refresh };
+}
+
+// The map's side panel list of recent events.
+export function renderEvents(parent, events, { el, state, drawnSource, tone, focusNode, select }) {
+  if (!events.length) {
+    el('p', { class: 'quiet', text: 'No events yet. They appear here as the world runs.' }, parent);
+    return;
+  }
+  const ul = el('ul', { class: 'rows' }, parent);
+  for (const n of events.slice(-60).reverse()) {
+    const li = el('li', { class: 'event-row' }, ul);
+    el('time', { text: fmtRunTime(n.at) }, li);
+    const node = state.nodes.get(n.node) || drawnSource(n);
+    const head = el('span', {}, li);
+    el('span', { class: `kind ${tone(n)}`, text: `${n.source}.${n.kind}` }, head);
+    if (n.task || node) {
+      head.append(' from ');
+      const b = el('button', { class: 'link', type: 'button', text: n.task || node.name }, head);
+      b.title = n.file ? `${n.file}:${n.line}` : '';
+      b.addEventListener('click', () => {
+        if (state.nodes.get(n.node)) focusNode(n.node);
+        else select({ kind: 'ended', id: n.node, event: n });
+      });
+    }
+    el('span', { class: 'text', text: n.summary || eventText(n.fields) }, li);
+  }
+}
+
+/// An event's fields as `key value` pairs, or as JSON when they are not
+/// an object.
+export function eventText(data) {
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    return Object.entries(data)
+      .map(([k, v]) => `${k} ${typeof v === 'object' ? JSON.stringify(v) : v}`)
+      .join(', ');
+  }
+  return JSON.stringify(data);
 }

@@ -191,7 +191,7 @@ async function checkTextStaysText() {
   const markup = '<img src=x onerror="window.injected=true"><fictionet-injected>tag</fictionet-injected>';
   const values = {
     '/api/state/rows': [{ name: markup }],
-    '/api/state/containment': { probes: [{ guest: 'alpha', name: markup, command: markup, destination: markup, outcome: 'not_contained', guest_result: markup, summary: markup, world_answer: markup, proxies: [{ name: markup, destination: markup, world_host: false }] }] },
+    '/api/state/containment': { probes: [{ guest: 'alpha', name: markup, command: markup, destination: markup, outcome: 'not_contained', guest_result: markup, summary: markup, world_answer: markup, proxies: [{ name: markup, destination: markup }] }] },
     '/api/state/labels': [{ id: 1, text: markup, target: { kind: 'event', seq: 1 }, at: 1 }],
   };
   class Source extends EventTarget {

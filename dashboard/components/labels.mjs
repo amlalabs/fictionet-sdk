@@ -29,15 +29,6 @@ export function labelAction(parent, services, target, title = 'Label', onClose =
   });
 }
 
-export function flowMatches(target, packet) {
-  return target.kind === 'flow' && target.link === packet.link && ((target.a === packet.src && target.b === packet.dst) || (target.b === packet.src && target.a === packet.dst));
-}
-
-export function labelChips(parent, labels) {
-  const { el } = scoped(parent);
-  for (const label of labels) el('span', { class: 'pill label-chip', text: label.text }, parent);
-}
-
 export function mount(root, services, options) {
   const { el } = scoped(root);
   el('h3', { class: 'labels-heading', text: 'Export' }, root);
