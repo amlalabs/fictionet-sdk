@@ -71,7 +71,7 @@ pub(super) async fn route(
         let Ok(_permit) = shared.streams.try_acquire() else {
             return http::error(conn, 503, "too many streams").await;
         };
-        return stream(conn, &shared.page.dashboard, op, query, merged).await;
+        return stream(conn, shared, op, query, merged).await;
     }
     let mut session = shared.page.dashboard.session();
     if let Some(links) = merged {
@@ -192,12 +192,14 @@ pub(super) async fn event(conn: &mut TcpStream, name: &str, data: &str) -> io::R
 
 async fn stream(
     conn: &mut TcpStream,
-    handle: &DashboardHandle,
+    shared: &super::Shared,
     op: &str,
     query: &[(String, String)],
     links: Option<Vec<String>>,
 ) -> io::Result<()> {
-    let mut session = handle.session();
+    let mut stopping = shared.stopping.clone();
+    let mut closing = false;
+    let mut session = shared.page.dashboard.session();
     let mut open = BTreeMap::new();
     let merged = links.is_some();
     let mut values = Vec::new();
@@ -274,7 +276,18 @@ async fn stream(
         }
         let next = session.next_poll().unwrap_or_else(Instant::now);
         let heartbeat = written + Duration::from_secs(5);
-        tokio::time::sleep_until(next.min(heartbeat).into()).await;
+        if !closing {
+            tokio::select! {
+                biased;
+                () = async { let _ = stopping.wait_for(|stopped| *stopped).await; } => {
+                    closing = true;
+                    session.drain_pending(Instant::now());
+                }
+                () = tokio::time::sleep_until(next.min(heartbeat).into()) => {}
+            }
+        } else if next > Instant::now() {
+            return end(conn).await;
+        }
         // A comment detects disconnects even when the world has no changes.
         if Instant::now() >= heartbeat {
             http::write(conn, b": ping\n\n").await?;
@@ -295,4 +308,8 @@ async fn stream(
         .await?;
     }
     Ok(())
+}
+
+pub(super) async fn end(conn: &mut TcpStream) -> io::Result<()> {
+    event(conn, "end", r#"{"reason":"the page server stopped"}"#).await
 }

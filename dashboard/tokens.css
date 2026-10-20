@@ -2,6 +2,7 @@
 :root {
   --paper: light-dark(#f7f6f0, #141915);
   --raised: light-dark(#fbfaf6, #1b211c);
+  --badge: light-dark(#e9eddf, #3b493c);
   --sunken: light-dark(#e9eddf, #1d241e);
   --sunken-hover: light-dark(#e2e8d8, #232b24);
   --ink: light-dark(#263e35, #e2e4d6);

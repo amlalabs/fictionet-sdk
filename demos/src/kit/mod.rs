@@ -528,7 +528,9 @@ impl Run {
         {
             failure = Some(error);
         }
-        self.page.take();
+        if let Some(page) = self.page.take() {
+            page.shutdown(Duration::from_secs(2)).await;
+        }
         failure.map_or(Ok(()), Err)
     }
 }

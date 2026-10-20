@@ -10,6 +10,87 @@ use std::sync::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn request_waits_for_success_after_window_adjustments() {
+    for request in ["pty-req", "shell"] {
+        let messages = [
+            russh::ChannelMsg::WindowAdjusted { new_size: 1024 },
+            russh::ChannelMsg::WindowAdjusted { new_size: 2048 },
+            russh::ChannelMsg::Success,
+        ];
+        let replies: Vec<_> = messages
+            .into_iter()
+            .map(|message| request_reply(Some(message), request).unwrap())
+            .collect();
+        assert_eq!(replies, [false, false, true]);
+    }
+}
+
+#[test]
+fn refusal_names_the_request() {
+    for request in ["pty-req", "shell"] {
+        let error = request_reply(Some(russh::ChannelMsg::Failure), request).unwrap_err();
+        assert_eq!(error.to_string(), format!("the guest refused {request}"));
+    }
+}
+
+#[test]
+fn channel_ending_before_the_reply_is_an_error() {
+    let error = request_reply(None, "shell").unwrap_err();
+    assert_eq!(error.to_string(), "waiting for shell reply: channel ended");
+}
+
+#[test]
+fn other_messages_before_the_reply_are_errors() {
+    use russh::ChannelMsg;
+    let messages = [
+        (
+            ChannelMsg::Data {
+                data: CryptoVec::from_slice(b"prompt"),
+            },
+            "Data",
+        ),
+        (
+            ChannelMsg::ExtendedData {
+                data: CryptoVec::from_slice(b"error"),
+                ext: 1,
+            },
+            "ExtendedData",
+        ),
+        (ChannelMsg::Eof, "Eof"),
+        (ChannelMsg::Close, "Close"),
+        (
+            ChannelMsg::XonXoff {
+                client_can_do: true,
+            },
+            "XonXoff",
+        ),
+        (ChannelMsg::ExitStatus { exit_status: 1 }, "ExitStatus"),
+        (
+            ChannelMsg::ExitSignal {
+                signal_name: russh::Sig::TERM,
+                core_dumped: false,
+                error_message: String::new(),
+                lang_tag: String::new(),
+            },
+            "ExitSignal",
+        ),
+        (
+            ChannelMsg::OpenFailure(russh::ChannelOpenFailure::AdministrativelyProhibited),
+            "OpenFailure",
+        ),
+    ];
+    for (message, name) in messages {
+        let error = request_reply(Some(message), "shell").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("waiting for shell reply: unexpected {name}")),
+            "{error}"
+        );
+    }
+}
+
 struct Server {
     events: mpsc::UnboundedSender<String>,
     ready: Arc<AtomicBool>,
