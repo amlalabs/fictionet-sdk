@@ -1,4 +1,4 @@
-// The Fictionet dashboard's graph view: what is drawn for the state
+// The map's graph view: what is drawn for the state
 // (`derive`), the SVG of each drawn item, edge and open group's frame, the
 // rings that mark events, and the packets that move along the edges.
 // components/map.mjs passes in the state and view, the layout's edge paths and

@@ -229,8 +229,8 @@
 //!
 //! A world is its own program (see [`running`](crate::guide::running)). The
 //! `fictionet` binary attaches sandboxes and observes worlds, with the
-//! commands `attach`, `ready`, `wait-blocked`, `observe` and `dashboard`,
-//! but does not run one. Observation commands use `--observation unix:PATH`
+//! commands `attach`, `ready`, `wait-blocked` and `observe`, but does not
+//! run one. Observation commands use `--observation unix:PATH`
 //! to reach a `DashboardObserver` served by
 //! [Fictionet Observe](../../../fictionet_observe/index.html).
 //! A proposed `fictionet --world` command starts a world written in Rust or

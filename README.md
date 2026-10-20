@@ -166,8 +166,9 @@ The companion crate owns consumption and retention: `Memory` for grading,
 watching a world. Graders check that retained events are complete. A world
 shows its own page with `fictionet_observe::page::Page`. Serve the dashboard
 handle with `fictionet_observe::serve` on a private observation socket, and
-`fictionet observe --observation unix:PATH` reads it from a shell. See [Fictionet Observe](observe/README.md) for setup
-and limits, and [services](docs/services.md) for a small world.
+`fictionet observe --observation unix:PATH` reads it from a shell. See
+[Fictionet Observe](observe/README.md) for setup and limits, and
+[services](docs/services.md) for a small world.
 
 Protocol codecs also work in unit tests and fuzz targets. The companion's
 `decode` feature supplies presenters that use those codecs for captured traffic.

@@ -551,7 +551,7 @@ button.link:hover {
   margin: 0;
 }
 
-/* The packet drawer. */
+/* The packet list. */
 .packet-info-protocol {
   display: none;
 }

@@ -1,4 +1,4 @@
-// Layout of the Fictionet dashboard's graph: the size and place of each
+// Layout of the page's map: the size and place of each
 // drawn item, the frames of open groups, and the path of each drawn edge.
 // No drawing: components/map.mjs passes in the state and view, text measurement, and
 // the `derive` and `fit` steps that `layout` runs before and after placing,

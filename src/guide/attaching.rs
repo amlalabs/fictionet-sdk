@@ -408,12 +408,13 @@
 //! containers of a pod share one network namespace, so attach makes `tun0`
 //! in the agent's namespace without `--netns`. The agent can also reach
 //! every listener on the pod's loopback. Nothing secret may listen there,
-//! including the dashboard; 127.0.0.1 does not isolate it from the agent.
-//! Keep dashboard tokens and the observation socket outside the agent
-//! container. Authenticate other loopback services; the pod's NetworkPolicy
-//! does not separate its containers. The attachment socket carries sandbox
-//! traffic. [Fictionet Observe](../../../fictionet_observe/index.html) describes
-//! serving the dashboard on its own observation socket.
+//! including a world's page. 127.0.0.1 does not isolate it from the agent.
+//! Keep the page's address, which holds its token, and the observation
+//! socket outside the agent container. Authenticate other loopback services.
+//! The pod's NetworkPolicy does not separate its containers. The attachment
+//! socket carries sandbox traffic.
+//! [Fictionet Observe](../../../fictionet_observe/index.html) describes how a
+//! world serves its own page and its observation socket.
 //!
 //! - **The agent's container** is the first entry in `containers`, so
 //!   Inspect runs its commands there. Every capability is dropped,

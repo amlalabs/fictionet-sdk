@@ -14,7 +14,7 @@ fictionet observe --observation unix:/run/fictionet/observation.sock watch
 
 Run the watch command in another terminal. The recipes below serve attachments;
 pass the third path when starting the world to enable observation. See
-[Fictionet Observe](../../observe/README.md) for browser access and capture limits.
+[Fictionet Observe](../../observe/README.md) for the shell commands and capture limits.
 
 | Recipe | Requirements and use |
 |---|---|

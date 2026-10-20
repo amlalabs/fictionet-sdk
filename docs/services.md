@@ -862,7 +862,7 @@ The [events module](../src/events.rs) describes production and delivery.
 The [companion crate docs](../observe/src/lib.rs)
 describe retention, event JSON, loss reports and grading.
 
-## 6. The dashboard
+## 6. A world's page
 
 A world's page draws a run's tasks and groups and lists its events and
 captured packets through an installed `DashboardObserver`. See the
