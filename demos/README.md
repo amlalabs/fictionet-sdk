@@ -180,9 +180,9 @@ plants a fact or a page, and restarts the run.
 - Pages come from the canned store in `examples/adaptive-web/stores/halvard-cve/`.
   A search it does not hold lists the canned pages that share its words first;
   the stub makes the rest. Nothing calls a model for pages.
-- Claude Code's own calls are the only billed ones. They use `ANTHROPIC_API_KEY`,
-  else `OPENROUTER_API_KEY` with `anthropic/claude-sonnet-5.5`, at most 60 per
-  run. Its WebSearch and WebFetch are answered by the same pages. With no key,
+- Claude Code's own calls are the only billed ones: Claude Sonnet 5.5 through
+  `ANTHROPIC_API_KEY`, else `OPENROUTER_API_KEY` (as
+  `anthropic/claude-sonnet-5.5`), at most 60 per run. Its WebSearch and WebFetch are answered by the same pages. With no key,
   typed searches work and Claude Code asks you to sign in.
 - `cargo xtask demo search check` runs the scripted story and its checks, with
   screenshots in `downloads/cloudimage/runs/search-<time>/`.

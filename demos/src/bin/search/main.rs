@@ -73,16 +73,18 @@ fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
     }
 }
 
-/// Claude Code's model site and the model it runs, from the host's key:
-/// `ANTHROPIC_API_KEY`, else `OPENROUTER_API_KEY`. None without either.
-fn claude_model(cx: &fictionet::Cx) -> fictionet::Result<Option<(models::Model, &'static str)>> {
+/// The model Claude Code runs. OpenRouter serves it under the same name as
+/// Anthropic does (as `anthropic/claude-sonnet-5.5`), and with the name it
+/// knows, Claude Code shapes its requests for this model.
+const CLAUDE_MODEL: &str = "claude-sonnet-5-5";
+
+/// Claude Code's model site, from the host's key: `ANTHROPIC_API_KEY`, else
+/// `OPENROUTER_API_KEY`. None without either.
+fn claude_model(cx: &fictionet::Cx) -> fictionet::Result<Option<models::Model>> {
     if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
-        Ok(Some((models::anthropic(cx)?, "claude-sonnet-5-5")))
+        Ok(Some(models::anthropic(cx)?))
     } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
-        Ok(Some((
-            models::anthropic_via_openrouter(cx)?,
-            "anthropic/claude-sonnet-5.5",
-        )))
+        Ok(Some(models::anthropic_via_openrouter(cx)?))
     } else {
         Ok(None)
     }
@@ -91,13 +93,7 @@ fn claude_model(cx: &fictionet::Cx) -> fictionet::Result<Option<(models::Model, 
 /// Claude Code's settings and state for the guest user: the model, and the
 /// first-run questions already answered for the key it is given.
 fn claude_files(model: &str, key: &str) -> Vec<(&'static str, String)> {
-    let mut settings = serde_json::json!({ "model": model });
-    if let Some(small) = model.strip_suffix("claude-sonnet-5.5") {
-        // Through OpenRouter, Claude Code's smaller model needs its name there too.
-        settings["env"] = serde_json::json!({
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": format!("{small}claude-haiku-4.5"),
-        });
-    }
+    let settings = serde_json::json!({ "model": model });
     let tail: String = key
         .chars()
         .rev()
@@ -165,31 +161,24 @@ async fn main() -> Result {
         world.trust("office", &web.ca.cert_pem())?;
         // The checks run with no key, so the guest has no model to call.
         let model = if check { None } else { claude_model(&cx)? };
-        let model = model.map(|(model, name)| {
-            let model = model
+        let model = model.map(|model| {
+            model
                 .search(pages.clone())
-                .budget(models::Budget::new().calls(CLAUDE_CALLS));
-            (model, name)
+                .budget(models::Budget::new().calls(CLAUDE_CALLS))
         });
-        if let Some((model, name)) = &model {
+        if let Some(model) = &model {
             let env = model.guest_env();
             let key = env
                 .first()
                 .map(|(_, value)| value.clone())
                 .unwrap_or_default();
             world.seed_env(env)?;
-            world.seed_home_files(claude_files(name, &key))?;
+            world.seed_home_files(claude_files(CLAUDE_MODEL, &key))?;
         }
         topics.start(&cx, searches, pages)?;
-        page::network(
-            &web,
-            &cx,
-            world_log,
-            world.mirror(&cx)?,
-            model.map(|(model, _)| model),
-        )?
-        .route(kit::JUMP, kit::jump_prefix())
-        .start(&cx, world.into_attachments())
+        page::network(&web, &cx, world_log, world.mirror(&cx)?, model)?
+            .route(kit::JUMP, kit::jump_prefix())
+            .start(&cx, world.into_attachments())
     });
     // The app stops cleanly on Ctrl-C at any point, booting included. The
     // checks keep the terminal's default.
@@ -311,21 +300,14 @@ mod tests {
     #[test]
     fn claude_code_starts_signed_in_with_the_placeholder_key() {
         let key = format!("sk-ant-api03-{}", "b".repeat(96));
-        let files = claude_files("anthropic/claude-sonnet-5.5", &key);
+        let files = claude_files(super::CLAUDE_MODEL, &key);
         let settings: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
-        assert_eq!(settings["model"], "anthropic/claude-sonnet-5.5");
-        assert_eq!(
-            settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
-            "anthropic/claude-haiku-4.5"
-        );
+        assert_eq!(settings["model"], "claude-sonnet-5-5");
         let state: serde_json::Value = serde_json::from_str(&files[1].1).unwrap();
         assert_eq!(
             state["customApiKeyResponses"]["approved"][0],
             "b".repeat(20)
         );
         assert_eq!(state["hasCompletedOnboarding"], true);
-        let direct = claude_files("claude-sonnet-5-5", &key);
-        let settings: serde_json::Value = serde_json::from_str(&direct[0].1).unwrap();
-        assert!(settings.get("env").is_none());
     }
 }
