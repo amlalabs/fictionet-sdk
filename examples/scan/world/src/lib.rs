@@ -13,7 +13,7 @@
 //! The two guests have their own groups: "real server" and "scanner".
 //!
 //! To run in-process, build [`office`] and add hosts or routes if needed.
-//! Call [`start`] with the world's attachments. Keep the [`Ports`] handle
+//! Call [`start`] with the world's attachments. Keep the [`Tap`] handle
 //! for snapshots and changes since a revision. See [`ports`] for probe facts
 //! and [`banners`] for the first data each open port sends.
 //!
@@ -37,18 +37,12 @@
 //! # Ok::<(), fictionet::Error>(())
 //! ```
 //!
-//! The server's card takes [`SERVER_LEASE`]:
-//! `Link::new(Family::Serve(SERVER_LEASE), Family::Off, mtu)`.
-//! Use [`fictionet::stdlib::network::ethernet::Link`] and
-//! [`fictionet::stdlib::network::ethernet::Family`]. Bridge its frames
-//! through the card to the [`SERVER`] attachment. The scanner's card uses
-//! [`fictionet::stdlib::network::ethernet::Family::FromWorld`] and the
-//! [`SCANNER`] attachment. The Net's DHCP leases it an address in [`SCANNER_SUBNET`].
+//! [`SERVER_LEASE`] says how a server VM and a scanner VM attach.
 
 pub mod banners;
 pub mod ports;
 pub use banners::Banner;
-pub use ports::{Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Ports, Protocol};
+pub use ports::{Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Protocol, Tap};
 
 use std::convert::Infallible;
 use std::net::Ipv4Addr;
@@ -165,11 +159,17 @@ pub const SCANNER_SUBNET: Prefix = Prefix {
 };
 /// The real server's fixed address.
 pub const SERVER_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 50);
-/// The server VM's network configuration.
+/// The server VM's network configuration: 10.0.0.50/24, gateway 10.0.0.1
+/// and DNS 10.0.9.1.
 ///
-/// Give its card `Link::new(Family::Serve(SERVER_LEASE), Family::Off, mtu)`
-/// and bridge its frames to the `SERVER` attachment. The scanner's card uses
-/// `Family::FromWorld`, so the Net leases it an address in `SCANNER_SUBNET`.
+/// Give the server's card
+/// `Link::new(Family::Serve(SERVER_LEASE), Family::Off, mtu)`, with
+/// [`Link`](fictionet::stdlib::network::ethernet::Link) and
+/// [`Family`](fictionet::stdlib::network::ethernet::Family), and bridge its
+/// frames through the card to the [`SERVER`] attachment. The scanner's card
+/// uses [`Family::FromWorld`](fictionet::stdlib::network::ethernet::Family::FromWorld)
+/// and the [`SCANNER`] attachment. The Net's DHCP leases it an address in
+/// [`SCANNER_SUBNET`].
 pub const SERVER_LEASE: Lease<Ipv4Addr> = Lease {
     addr: Cidr {
         addr: SERVER_ADDR,
@@ -209,9 +209,9 @@ pub fn office() -> Net {
 
 /// Starts an office with delays and a passive probe tap on the scanner.
 /// Other attachments pass through, including an integrator's jump host.
-pub fn start(fcx: &Cx, net: Net, attachments: Attachments) -> Result<Ports> {
-    let ports = Ports::new();
-    let tap = ports.clone();
+pub fn start(fcx: &Cx, net: Net, attachments: Attachments) -> Result<Tap> {
+    let tap = Tap::new();
+    let scanner_tap = tap.clone();
     // Each sandbox goes through a short delay started in its own group, so
     // the group holds the task that reads the sandbox, and the sandbox with
     // it.
@@ -224,7 +224,7 @@ pub fn start(fcx: &Cx, net: Net, attachments: Attachments) -> Result<Ports> {
             )),
             SCANNER => {
                 let group = fcx.group("scanner");
-                let tap = tap.clone();
+                let tap = scanner_tap.clone();
                 Box::new(fictionet::stdlib::network::delay(
                     &group,
                     ms(2),
@@ -239,7 +239,7 @@ pub fn start(fcx: &Cx, net: Net, attachments: Attachments) -> Result<Ports> {
         }
     });
     net.start(fcx, delayed)?;
-    Ok(ports)
+    Ok(tap)
 }
 
 /// Runs the default office for the socket executable.

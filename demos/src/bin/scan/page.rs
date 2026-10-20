@@ -12,7 +12,7 @@ use crate::{nmap, script};
 use fictionet::Cx;
 use fictionet::stdlib::protocols::json::Value;
 use fictionet_observe::page::{EventFilter, Page, StateLimits, StateTopic};
-use scan_world::{PortMap, PortState, Ports};
+use scan_world::{PortMap, PortState, Tap};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -337,7 +337,7 @@ pub fn all_answered(map: &PortMap) -> bool {
 }
 
 /// Starts the world task that publishes the topics and marks the moment.
-pub fn publish(cx: &Cx, ports: Ports, topics: Topics, progress: Progress) {
+pub fn publish(cx: &Cx, ports: Tap, topics: Topics, progress: Progress) {
     cx.spawn(move |cx| async move {
         let mut published: Option<(u64, u64, u64)> = None;
         let mut version = 0;

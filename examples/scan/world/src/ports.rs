@@ -21,8 +21,8 @@
 //! detail. An event store with a separate budget for repeatable facts, such
 //! as `fictionet_observe::Memory`, keeps them from evicting other events.
 //!
-//! [`Ports::snapshot`] copies the five office labels and all rows, sorted
-//! by address, protocol, then port. [`Ports::changes_since`] copies the latest
+//! [`Tap::snapshot`] copies the five office labels and all rows, sorted
+//! by address, protocol, then port. [`Tap::changes_since`] copies the latest
 //! version of each row changed after a revision. Each tracked probe or state
 //! change advances the revision. Both views include the last row change time
 //! and `untracked` count. Their `MAX_JSON_BYTES` constants bound compact JSON.
@@ -203,10 +203,17 @@ pub struct PortMap {
 }
 
 impl PortMap {
-    /// Compact JSON bound for snapshots produced by [`Ports`].
-    pub const MAX_JSON_BYTES: usize =
-        r#"{"revision":18446744073709551615,"at_ms":18446744073709551615,"max_rows":,"untracked":18446744073709551615,"untracked_banners":18446744073709551615,"machines":,"rows":[],"banners":[]}"#.len()
-        + (MAX_ROWS.ilog10() as usize + 1) + machines_json_bytes() + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
+    /// Compact JSON bound for snapshots produced by [`Tap`].
+    pub const MAX_JSON_BYTES: usize = concat!(
+        r#"{"revision":18446744073709551615,"at_ms":18446744073709551615,"#,
+        r#""max_rows":,"untracked":18446744073709551615,"#,
+        r#""untracked_banners":18446744073709551615,"#,
+        r#""machines":,"rows":[],"banners":[]}"#,
+    )
+    .len()
+        + (MAX_ROWS.ilog10() as usize + 1)
+        + machines_json_bytes()
+        + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
         + MAX_BANNERS * (Banner::MAX_JSON_BYTES + 1);
 }
 
@@ -231,18 +238,22 @@ pub struct PortChanges {
 }
 
 impl PortChanges {
-    /// Compact JSON bound for deltas produced by [`Ports`].
-    pub const MAX_JSON_BYTES: usize =
-        r#"{"from_revision":18446744073709551615,"revision":18446744073709551615,"at_ms":18446744073709551615,"untracked":18446744073709551615,"untracked_banners":18446744073709551615,"rows":[],"banners":[]}"#.len()
+    /// Compact JSON bound for deltas produced by [`Tap`].
+    pub const MAX_JSON_BYTES: usize = concat!(
+        r#"{"from_revision":18446744073709551615,"revision":18446744073709551615,"#,
+        r#""at_ms":18446744073709551615,"untracked":18446744073709551615,"#,
+        r#""untracked_banners":18446744073709551615,"rows":[],"banners":[]}"#,
+    )
+    .len()
         + MAX_ROWS * (PortRow::MAX_JSON_BYTES + 1)
         + MAX_BANNERS * (Banner::MAX_JSON_BYTES + 1);
 }
 
 /// A shared view of the scanner's probes, readable outside the world.
 #[derive(Clone)]
-pub struct Ports(Arc<Mutex<Tracker>>);
+pub struct Tap(Arc<Mutex<Tracker>>);
 
-impl Ports {
+impl Tap {
     pub(crate) fn new() -> Self {
         Self(Arc::new(Mutex::new(Tracker::new(MAX_ROWS))))
     }
@@ -1384,7 +1395,7 @@ mod tests {
                 format!("\"{}\"", state.as_str())
             );
         }
-        let empty = Ports::new();
+        let empty = Tap::new();
         roundtrip(&empty.snapshot(), PortMap::MAX_JSON_BYTES);
         roundtrip(&empty.changes_since(0), PortChanges::MAX_JSON_BYTES);
     }

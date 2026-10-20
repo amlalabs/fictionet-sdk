@@ -5,7 +5,7 @@ use std::task::Poll;
 
 use fictionet::events::Level;
 use fictionet::prelude::*;
-use fictionet::stdlib::network::ports::{Event, Ports as Links};
+use fictionet::stdlib::network::ports::{Event, Ports};
 use fictionet::stdlib::network::{ip, tcp, udp};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RunOptions, Seed};
@@ -125,7 +125,7 @@ fn server(fcx: &Cx, sandbox: End) -> (tcp::Endpoint, tcp::Listener, End) {
     let (stack, stack_link) = fictionet::pair();
     let (inject, inject_link) = fictionet::pair();
     fcx.spawn(move |fcx| async move {
-        let mut links = Links::new(vec![sandbox, stack_link, inject_link]);
+        let mut links = Ports::new(vec![sandbox, stack_link, inject_link]);
         loop {
             match links.next(&fcx, None, |_| Poll::Pending).await? {
                 Event::Packet(0, packet) => links.send(1, packet),

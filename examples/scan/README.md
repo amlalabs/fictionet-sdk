@@ -61,13 +61,8 @@ The golden report is in `world/tests/golden.txt`.
 ## Attaching a real server
 
 The attachment is named `server`, whether it comes from the Compose container
-or a VM. A server VM uses a card made with
-`Link::new(Family::Serve(SERVER_LEASE), Family::Off, mtu)`. Bridge its Ethernet
-frames through that card to the `SERVER` attachment. `SERVER_LEASE` gives it
-10.0.0.50/24, gateway 10.0.0.1 and DNS 10.0.9.1.
-
-The scanner attaches as `scanner`. A scanner VM's card uses `Family::FromWorld`.
-The world's DHCP leases it an address in `SCANNER_SUBNET` (10.0.9.0/24).
+or a VM. The scanner attaches as `scanner`. `SERVER_LEASE` in
+[world/src/lib.rs](world/src/lib.rs) describes the network card each VM uses.
 An integrator can add hosts with `.host(...)` or `.resolve(...)`, and trusted
 routes with `.route(...)`, to `office()` before calling `start()`. This lets a
 server reach an apt mirror and lets an admin jump host reach the server.
@@ -99,7 +94,7 @@ and the port, times, probe count and revision are its detail. A dashboard
 keeps them in its budget for repeatable facts, so they never evict the
 run's other events.
 
-`start()` returns a shared `Ports` handle. `snapshot()` returns the office
+`start()` returns a shared `Tap` handle. `snapshot()` returns the office
 labels and sorted rows. `changes_since(revision)` returns the latest version
 of each row changed since that revision. Every tracked probe and state change
 advances the map revision. Both projections include the last change time and the
@@ -124,7 +119,7 @@ evicts one; further banners only increment `untracked_banners`.
 ## Running it
 
 The world's optional second argument opens the observation socket with
-`fictionet_observe::serve`. For a local run, use separate terminals:
+`fictionet_observe::serve_observation`. For a local run, use separate terminals:
 
 ```sh
 cargo run -p scan-world -- /run/fictionet/world.sock /run/fictionet/observation.sock

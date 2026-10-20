@@ -168,7 +168,7 @@ pub fn check(index: usize, exit: i32, report: &nmap::Report, map: &PortMap) -> R
 
 pub async fn run(
     run: &kit::Run,
-    ports: &scan_world::Ports,
+    ports: &scan_world::Tap,
     out: &Path,
     progress: &page::Progress,
 ) -> Result<Duration, Error> {
