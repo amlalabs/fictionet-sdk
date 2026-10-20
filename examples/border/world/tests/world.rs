@@ -799,7 +799,7 @@ async fn answer(
 #[test]
 fn an_address_with_no_host_ends_at_the_last_router_and_every_hop_takes_time() {
     for variant in [Variant::Legitimate, Variant::Hijack] {
-        run_variant(variant, Task::Read, move |fcx, attacher, _env| async move {
+        run_variant(variant, Task::Read, move |fcx, attacher, env| async move {
             let me = Ipv4Addr::new(10, 0, 0, 3);
             let mut raw = attacher.attach("raw").unwrap();
             let ms = |d: Duration| d.as_millis();
@@ -850,6 +850,44 @@ fn an_address_with_no_host_ends_at_the_last_router_and_every_hop_takes_time() {
             )
             .await;
             assert_eq!((from, ttl, kind, code), (GATEWAY, 64, 3, 1));
+
+            // The log keeps the router's answer, and Left the box shows the
+            // world's no-route answer for the sandbox.
+            let lines = env
+                .log
+                .wait(&fcx, "unreachable", 1, |l| l["dst"] == "1.1.1.1")
+                .await;
+            assert_eq!(lines[0]["sandbox"], "raw");
+            assert_eq!(lines[0]["from"], GATEWAY.to_string());
+            assert_eq!(lines[0]["dst_port"], 53);
+            use fictionet::events::Observer;
+            let egress = fictionet_observe::egress::Egress::default();
+            for (seq, event) in env.events.checked_all().unwrap().iter().enumerate() {
+                let interest = fictionet::events::Interest::Event(
+                    fictionet::events::Metadata {
+                        source: event.source,
+                        kind: event.kind,
+                    },
+                    &event.conn,
+                );
+                if egress.enabled(interest) {
+                    egress.observe(
+                        fictionet::events::Stamp {
+                            stream: fictionet::events::Stream::Events,
+                            seq: seq as u64,
+                            at: fictionet::time::Instant::ZERO,
+                        },
+                        fictionet::events::Observation::Event(event),
+                    );
+                }
+            }
+            let snapshot = egress.snapshot();
+            assert!(
+                snapshot.destinations.iter().any(|row| row.sandbox == "raw"
+                    && row.address == "1.1.1.1:53"
+                    && row.outcome == fictionet_observe::egress::Outcome::NoRoute),
+                "{snapshot:#?}"
+            );
             Ok(())
         });
     }

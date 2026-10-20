@@ -1,5 +1,14 @@
 //! Read-only startup probes over the guest's admin SSH session.
 //! No probe installs packages or writes files on the guest.
+//!
+//! A network probe is contained when Left the box shows the world's own
+//! answer to it, added while the probe ran: a world site or service served
+//! it, the world refused it, the world had no route for it, or the world's
+//! DNS had no such name. Worlds built on `Net` report all of these. A world
+//! that answers some packets itself before they reach its `Net` reports its
+//! refusals as `net.blocked` too, naming the sandbox in a `sandbox` field,
+//! as Border's path does for addresses with no machine. A guest with no
+//! route for the IPv6 probe's address is contained for IPv6.
 
 use std::time::Duration;
 
@@ -25,9 +34,14 @@ pub struct Probe {
 enum Kind {
     Dns,
     Http,
+    /// An HTTP probe that first asks the guest for a route to its address.
+    Ipv6,
     Routes,
     Proxy,
 }
+
+/// What the IPv6 probe prints when the guest has no route to its address.
+const NO_IPV6_ROUTE: &str = "No IPv6 route";
 
 /// Commands suitable for an unmodified Ubuntu cloud image. Missing tools are
 /// reported as results; they are never installed by a probe.
@@ -55,10 +69,10 @@ pub const PROBES: &[Probe] = &[
     },
     Probe {
         name: "Public IPv6",
-        command: "curl --noproxy '*' --max-time 5 -6 -sS -o /dev/null -w 'HTTP %{http_code}\\n' 'https://[2606:4700:4700::1111]'",
+        command: "ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1 || echo 'No IPv6 route'; curl --noproxy '*' --max-time 5 -6 -sS -o /dev/null -w 'HTTP %{http_code}\\n' 'https://[2606:4700:4700::1111]'",
         destination: "[2606:4700:4700::1111]:443",
         timeout: Duration::from_secs(10),
-        kind: Kind::Http,
+        kind: Kind::Ipv6,
     },
     Probe {
         name: "Direct public site",
@@ -169,8 +183,10 @@ fn matches(probe: &Probe, row: &Destination) -> bool {
 
 /// Parses a recorded guest output against before and after projection snapshots.
 /// A successful guest response requires a matching answered request, not merely
-/// a connection or an old row. Loss prevents a missing observation from proving
-/// that a probe escaped.
+/// a connection or an old row. A TLS handshake the guest aborted because it did
+/// not trust the certificate (curl's exit 60) is answered by the world's refusal
+/// of a new connection. Loss prevents a missing observation from proving that a
+/// probe escaped.
 pub fn parse(
     probe: &Probe,
     guest: &str,
@@ -212,18 +228,21 @@ pub fn parse(
         }
         return result;
     }
+    let http_answer = output.stdout.lines().any(|line| {
+        line.strip_prefix("HTTP ").is_some_and(|code| {
+            code.parse::<u16>()
+                .is_ok_and(|code| (100..600).contains(&code))
+        })
+    });
+    // Curl's exit 60: a server showed a certificate the guest does not trust.
+    let tls_answer = output.code == 60 && !http_answer;
     let answered = match probe.kind {
         Kind::Dns => text.contains("status:") && text.contains("SERVER:"),
-        Kind::Http => {
-            output.stdout.lines().any(|line| {
-                line.strip_prefix("HTTP ").is_some_and(|code| {
-                    code.parse::<u16>()
-                        .is_ok_and(|code| (100..600).contains(&code))
-                })
-            }) || output.code == 60
-        }
+        Kind::Http | Kind::Ipv6 => http_answer || tls_answer,
         _ => false,
     };
+    let no_route =
+        matches!(probe.kind, Kind::Ipv6) && output.stdout.lines().any(|line| line == NO_IPV6_ROUTE);
     let rows: Vec<_> = after
         .destinations
         .iter()
@@ -236,15 +255,17 @@ pub fn parse(
             let unanswered = row
                 .unanswered
                 .saturating_sub(old.map_or(0, |old| old.unanswered));
-            let changed = requests > 0
-                || row.connections > old.map_or(0, |old| old.connections)
-                || row.packets > old.map_or(0, |old| old.packets);
-            changed.then_some((row, requests.saturating_sub(unanswered)))
+            let connections = row
+                .connections
+                .saturating_sub(old.map_or(0, |old| old.connections));
+            let changed =
+                requests > 0 || connections > 0 || row.packets > old.map_or(0, |old| old.packets);
+            changed.then_some((row, requests.saturating_sub(unanswered), connections))
         })
         .collect();
     result.world_answer = rows
         .iter()
-        .map(|(row, _)| match row.outcome {
+        .map(|(row, _, _)| match row.outcome {
             Outcome::Forwarded => format!("forwarded by the world to {}", row.by),
             Outcome::Served => format!("answered by {}", row.by),
             Outcome::Refused => format!("refused: {}", row.by),
@@ -273,15 +294,16 @@ pub fn parse(
     if dns_refused && rows.is_empty() {
         result.world_answer = "the world's DNS refused the name".into();
     }
-    let accounted = rows.iter().any(|(row, answers)| {
+    let accounted = rows.iter().any(|(row, answers, connections)| {
         matches!(
             row.outcome,
             Outcome::Served | Outcome::Forwarded | Outcome::Refused
         ) && *answers > 0
+            || tls_answer && row.outcome == Outcome::Refused && *connections > 0
     });
     let forwarded = rows
         .iter()
-        .any(|(row, _)| row.outcome == Outcome::Forwarded);
+        .any(|(row, _, _)| row.outcome == Outcome::Forwarded);
     result.outcome = if answered && !accounted {
         if after.complete() {
             ProbeOutcome::NotContained
@@ -290,13 +312,16 @@ pub fn parse(
         }
     } else if forwarded {
         ProbeOutcome::Forwarded
-    } else if !rows.is_empty() || dns_refused {
+    } else if !rows.is_empty() || dns_refused || no_route {
         ProbeOutcome::Contained
     } else if output.code == 124 || output.code == 28 || text.contains("timed out") {
         ProbeOutcome::TimedOut
     } else {
         ProbeOutcome::Unknown
     };
+    if no_route && rows.is_empty() && result.outcome == ProbeOutcome::Contained {
+        result.world_answer = "no route: the guest has no IPv6 route".into();
+    }
     if result.world_answer.is_empty() {
         result.world_answer = if after.complete() {
             "No matching world observation"
@@ -394,6 +419,9 @@ mod tests {
             "refused" => Event::new("http", "request")
                 .field("host", probe.destination)
                 .field("answer", "misdirected"),
+            "tls_alert" => Event::new("tls", "handshake")
+                .field("sni", probe.destination)
+                .field("outcome", "alert"),
             "refusal_response" => Event::new("http", "request")
                 .field("host", probe.destination)
                 .field("answer", "misdirected")
@@ -433,7 +461,7 @@ mod tests {
     fn each_network_probe_compares_guest_answers_with_new_world_observations() {
         for probe in PROBES
             .iter()
-            .filter(|probe| matches!(probe.kind, Kind::Dns | Kind::Http))
+            .filter(|probe| matches!(probe.kind, Kind::Dns | Kind::Http | Kind::Ipv6))
         {
             let empty = EgressSnapshot::default();
             let successful = output(
@@ -500,7 +528,7 @@ mod tests {
         let empty = EgressSnapshot::default();
         for probe in PROBES
             .iter()
-            .filter(|probe| matches!(probe.kind, Kind::Http))
+            .filter(|probe| matches!(probe.kind, Kind::Http | Kind::Ipv6))
         {
             let refused = observation(probe, "refusal_response");
             let result = parse(
@@ -514,6 +542,93 @@ mod tests {
             assert_eq!(result.outcome, ProbeOutcome::Contained);
             assert!(result.world_answer.starts_with("refused:"));
         }
+    }
+
+    #[test]
+    fn a_tls_refusal_on_a_new_connection_answers_an_untrusted_certificate() {
+        let empty = EgressSnapshot::default();
+        let untrusted = output(
+            60,
+            "HTTP 000\ncurl: (60) SSL certificate problem: unable to get local issuer certificate\n",
+        );
+        for probe in PROBES
+            .iter()
+            .filter(|probe| matches!(probe.kind, Kind::Http | Kind::Ipv6))
+        {
+            let alert = observation(probe, "tls_alert");
+            let result = parse(probe, "workstation", &untrusted, &empty, &alert, &[]);
+            assert_eq!(result.outcome, ProbeOutcome::Contained, "{}", probe.name);
+            assert_eq!(result.world_answer, "refused: TLS handshake alert");
+            assert_eq!(
+                parse(probe, "workstation", &untrusted, &alert, &alert, &[]).outcome,
+                ProbeOutcome::NotContained,
+                "an old refusal cannot explain a new handshake"
+            );
+            assert_eq!(
+                parse(
+                    probe,
+                    "workstation",
+                    &output(0, "HTTP 200\n"),
+                    &empty,
+                    &alert,
+                    &[]
+                )
+                .outcome,
+                ProbeOutcome::NotContained,
+                "a TLS refusal cannot explain an HTTP answer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_guest_without_an_ipv6_route_is_contained_for_ipv6() {
+        let probe = PROBES
+            .iter()
+            .find(|probe| matches!(probe.kind, Kind::Ipv6))
+            .unwrap();
+        assert!(
+            probe
+                .command
+                .starts_with("ip -6 route get 2606:4700:4700::1111 ")
+        );
+        let empty = EgressSnapshot::default();
+        let failed = "HTTP 000\ncurl: (7) Couldn't connect to server\n";
+        let result = parse(
+            probe,
+            "workstation",
+            &output(7, &format!("{NO_IPV6_ROUTE}\n{failed}")),
+            &empty,
+            &empty,
+            &[],
+        );
+        assert_eq!(result.outcome, ProbeOutcome::Contained);
+        assert_eq!(result.world_answer, "no route: the guest has no IPv6 route");
+        assert_eq!(
+            parse(
+                probe,
+                "workstation",
+                &output(7, failed),
+                &empty,
+                &empty,
+                &[]
+            )
+            .outcome,
+            ProbeOutcome::Unknown,
+            "with a route, only the world's observation decides"
+        );
+        assert_eq!(
+            parse(
+                probe,
+                "workstation",
+                &output(0, &format!("{NO_IPV6_ROUTE}\nHTTP 200\n")),
+                &empty,
+                &empty,
+                &[],
+            )
+            .outcome,
+            ProbeOutcome::NotContained,
+            "an answer the world did not give is not contained"
+        );
     }
 
     #[test]
@@ -537,7 +652,7 @@ mod tests {
         }
         for probe in PROBES
             .iter()
-            .filter(|probe| matches!(probe.kind, Kind::Dns | Kind::Http))
+            .filter(|probe| matches!(probe.kind, Kind::Dns | Kind::Http | Kind::Ipv6))
         {
             let result = parse(
                 probe,

@@ -147,8 +147,9 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
 
 /// Locked preferences that keep Firefox from making requests no page asked
 /// for, in the form the enterprise `Preferences` policy takes. Release
-/// Firefox ignores `services.settings.server`, so the remote settings host
-/// resolves to the guest's own loopback instead.
+/// Firefox ignores `services.settings.server`, and the policy cannot set
+/// `app.normandy.enabled`, so the remote settings and studies hosts resolve
+/// to the guest's own loopback instead.
 fn quiet_preferences() -> serde_json::Value {
     let preferences: &[(&str, serde_json::Value)] = &[
         ("browser.preonboarding.enabled", false.into()),
@@ -256,9 +257,10 @@ fn quiet_preferences() -> serde_json::Value {
         ("browser.region.update.enabled", false.into()),
         // Lookups go to the guest's own resolver, never over HTTPS.
         ("network.trr.mode", 5.into()),
+        // Remote settings and studies fetch from these hosts at startup.
         (
             "network.dns.localDomains",
-            "firefox.settings.services.mozilla.com".into(),
+            "firefox.settings.services.mozilla.com,normandy.cdn.mozilla.net".into(),
         ),
     ];
     preferences
@@ -353,10 +355,13 @@ mod tests {
             policy["Preferences"]["browser.preonboarding.enabled"]["Value"],
             false
         );
-        // Release Firefox ignores services.settings.server, so the remote
-        // settings host resolves to the guest's loopback, and stays so.
+        // Release Firefox ignores services.settings.server, and the policy
+        // cannot turn studies off, so their hosts resolve to the loopback.
         let local = &policy["Preferences"]["network.dns.localDomains"];
-        assert_eq!(local["Value"], "firefox.settings.services.mozilla.com");
+        assert_eq!(
+            local["Value"],
+            "firefox.settings.services.mozilla.com,normandy.cdn.mozilla.net"
+        );
         assert_eq!(local["Status"], "locked");
         for (name, value) in [
             ("browser.search.suggest.enabled", serde_json::json!(false)),

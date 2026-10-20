@@ -16,7 +16,10 @@
 //!   routers send at most [`TIME_EXCEEDED_PER_SECOND`] of these a second.
 //! - **No host.** A packet for an address where no machine answers
 //!   ([`Scenario::has_host`]) ends at the last router on its way, which
-//!   answers ICMP "host unreachable", as a router with no route does.
+//!   answers ICMP "host unreachable", as a router with no route does. The
+//!   path reports it as `net.blocked` with `why` `NoRoute`, the fact `Net`
+//!   reports for an address with no machine, naming the sandbox in a
+//!   `sandbox` field, so Left the box and containment checks see it.
 //! - **Delay.** Every packet takes [`Scenario::one_way`] to reach where it
 //!   goes. Replies use the sender's physical path: 24 ms for a round trip
 //!   to the bank, and 52 ms in the hijack, where it crosses the border.
@@ -300,11 +303,17 @@ pub async fn run(
                     set_ttl(&mut p, ttl - k as u8);
                     if let Some(reply) = icmp_error(&p, hops[k], TTL - k as u8, id, 3, 1) {
                         id = id.wrapping_add(1);
-                        fcx.emit("path", "unreachable", |e| {
-                            e.field("sandbox", &*name)
+                        fcx.emit("net", "blocked", |e| {
+                            let event = e
+                                .field("sandbox", &*name)
+                                .field("why", "NoRoute")
                                 .display("from", hops[k])
                                 .display("dst", dst)
-                                .field("protocol", u64::from(p[9]))
+                                .field("protocol", u64::from(p[9]));
+                            match dst_port(&p) {
+                                Some(port) => event.field("dst_port", u64::from(port)),
+                                None => event,
+                            }
                         });
                         on_the_way.hold(now + scenario.one_way(hops[k]) * 2, To::Sandbox, reply);
                     }
@@ -401,6 +410,15 @@ fn header_len(p: &[u8]) -> Option<usize> {
     }
     let ihl = usize::from(p[0] & 0x0f) * 4;
     (ihl >= 20 && p.len() >= ihl).then_some(ihl)
+}
+
+/// The destination port of a TCP or UDP packet `p`.
+fn dst_port(p: &[u8]) -> Option<u16> {
+    let ihl = header_len(p)?;
+    matches!(p[9], 6 | 17)
+        .then(|| p.get(ihl + 2..ihl + 4))
+        .flatten()
+        .map(|port| u16::from_be_bytes([port[0], port[1]]))
 }
 
 fn v4_dst(p: &[u8]) -> Option<Ipv4Addr> {

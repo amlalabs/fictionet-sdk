@@ -177,7 +177,9 @@ fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) 
     (reason, Made::Stubbed)
 }
 
-pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<String>> {
+/// Runs the story. `visited` collects the hosts the searcher opened as it
+/// goes, so the background check can run after a failed story too.
+pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<String>) -> Result {
     run.guest(HOST)
         .wait_desktop(Duration::from_secs(300))
         .await?;
@@ -242,11 +244,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
         "fastjsonl-package" => "fastjsonl package",
         _ => return Err("unknown embedded seed".into()),
     };
-    let mut visited = BTreeSet::from([
-        "www.google.com".to_string(),
-        "www.bing.com".into(),
-        "html.duckduckgo.com".into(),
-    ]);
+    visited.extend(["www.google.com", "www.bing.com", "html.duckduckgo.com"].map(String::from));
     let (snapshot, google) = search(run, &client, Engine::Google, words, 0, 10).await?;
     let list = snapshot
         .results
@@ -432,7 +430,19 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
     )?;
     run.screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
         .await?;
-    Ok(visited)
+    Ok(())
+}
+
+/// Runs the background check whatever the story's result, so a failed run
+/// still shows the unvisited hosts and their traffic. The story's error
+/// comes first.
+pub fn finish(story: Result, log: &Path, visited: &BTreeSet<String>) -> Result {
+    let background = background(log, visited);
+    match (story, background) {
+        (Err(story), Err(background)) => Err(format!("{story}; {background}").into()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 // Read the drained log so startup traffic cannot fall out of a bounded view.
@@ -486,6 +496,34 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_story_still_runs_the_background_check() {
+        let dir = std::env::temp_dir().join(format!(
+            "search-finish-{}",
+            fictionet_demo::kit::random_uuid()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"http\",\"host\":\"settings.example.com\",\"cache\":\"generated\"}\n",
+        )
+        .unwrap();
+        let visited = BTreeSet::new();
+        let error = finish(Err("the story failed".into()), &log, &visited)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "the story failed; required check failed: background hosts generated no pages"
+        );
+        std::fs::write(&log, "").unwrap();
+        let error = finish(Err("the story failed".into()), &log, &visited).unwrap_err();
+        assert_eq!(error.to_string(), "the story failed");
+        finish(Ok(()), &log, &visited).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn background_generation_fails_even_without_a_retained_site() {

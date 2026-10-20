@@ -6,6 +6,7 @@ use adaptive_web_world::{events::LogObserver, search::Searches, stub::Seed};
 use example_common::log::Log;
 use fictionet_demo::kit::{self, Kit};
 use std::{
+    collections::BTreeSet,
     fs::File,
     path::PathBuf,
     sync::Arc,
@@ -71,23 +72,25 @@ async fn main() -> Result {
         "boot to SSH-ready: {} ms",
         run.guest(guest::HOST).ssh_ready().as_millis()
     );
-    let result = gate::run(&run, &scenario, &output).await;
+    let mut visited = BTreeSet::new();
+    let result = gate::run(&run, &scenario, &output, &mut visited).await;
     if result.is_err() {
         eprint!("{}", run.guest(guest::HOST).diagnostics().await);
     }
     let shutdown = run.shutdown().await;
     let finish = log.finish();
-    kit::gate::check(
+    let clean = kit::gate::check(
         "shutdown removes the VMM and run directory",
         shutdown.is_ok()
             && !path.exists()
             && pid.is_none_or(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
-    )?;
-    shutdown?;
+    );
     println!("whole run: {} ms", total.elapsed().as_millis());
-    let visited = result?;
     finish?;
-    gate::background(&output.join("log.jsonl"), &visited)?;
+    let result = result
+        .and(clean.map_err(Into::into))
+        .and(shutdown.map_err(Into::into));
+    gate::finish(result, &output.join("log.jsonl"), &visited)?;
     println!("every required check passed");
     Ok(())
 }

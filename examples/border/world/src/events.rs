@@ -45,6 +45,11 @@ pub fn line(scenario: &Scenario, e: &Event) -> Option<Value> {
             json!({"type": "bgp", "sandbox": e.str("sandbox"), "peer": e.str("peer"), "event": e.kind}),
         )),
         ("path" | "border", _) => Some(world(e, json!({"type": e.kind}))),
+        // The path's own no-route answer keeps its line: the router answered
+        // "host unreachable". Its addresses are the ones the packet named.
+        ("net", "blocked") if e.conn.sandbox.is_none() => {
+            return Some(world(e, json!({"type": "unreachable"})));
+        }
         _ => example_common::events::line(e),
     }?;
     if matches!(e.source, "tls" | "http" | "net") {

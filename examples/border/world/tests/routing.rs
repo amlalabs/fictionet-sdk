@@ -374,7 +374,10 @@ fn switch(initial: Variant, next: Variant) {
                 .any(|e| e.is("bgp", "sent") && e.str("message") == Some("UPDATE"))
         );
         assert!(facts.iter().any(|e| e.is("path", "ttl_exceeded")));
-        assert!(facts.iter().any(|e| e.is("path", "unreachable")));
+        assert!(facts.iter().any(|e| e.is("net", "blocked")
+            && e.str("why") == Some("NoRoute")
+            && e.str("sandbox") == Some("raw")
+            && e.str("dst") == Some("45.144.30.10")));
         Ok(())
     });
 }
