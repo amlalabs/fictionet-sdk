@@ -53,6 +53,9 @@ pub struct ProbeResult {
     pub outcome: ProbeOutcome,
     /// Guest output, exit status, deadline or missing-tool reason.
     pub guest_result: String,
+    /// One line of the guest result that says what the guest got, such as
+    /// `HTTP 200` or `connection timed out; no servers could be reached`.
+    pub summary: String,
     /// World answer, derived from the destination projection after the probe.
     pub world_answer: String,
     /// Proxy settings, empty when none were set or this was not a proxy probe.

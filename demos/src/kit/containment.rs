@@ -154,6 +154,7 @@ fn result(probe: &Probe, guest: &str, outcome: ProbeOutcome, guest_result: Strin
         command: probe.command.into(),
         destination: probe.destination.into(),
         outcome,
+        summary: summary(&guest_result),
         guest_result,
         world_answer: "No matching world observation".into(),
         proxies: vec![],
@@ -181,6 +182,43 @@ fn matches(probe: &Probe, row: &Destination) -> bool {
             })
 }
 
+/// The line of guest output that says what the guest got: an HTTP status,
+/// curl's error or a timeout, else the first line that is not tool metadata.
+fn summary(output: &str) -> String {
+    let lines = || {
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    // `HTTP 200`, as the probes print it, or `HTTP/1.1 200 OK`.
+    let status = |line: &str| {
+        let Some(rest) = line.strip_prefix("HTTP") else {
+            return false;
+        };
+        let code = match rest.strip_prefix('/') {
+            Some(version) => version
+                .split_once(' ')
+                .filter(|(version, _)| !version.is_empty())
+                .map(|(_, code)| code),
+            None => rest.strip_prefix(' '),
+        };
+        code.is_some_and(|code| code.bytes().take(3).filter(u8::is_ascii_digit).count() == 3)
+    };
+    let telling = |line: &&str| {
+        status(line)
+            || line.starts_with("curl:")
+            || line.contains("timed out")
+            || line.contains("no servers could be reached")
+    };
+    let line = lines()
+        .find(telling)
+        .or_else(|| lines().find(|line| !line.starts_with(';') && !line.starts_with('%')))
+        .map(|line| line.trim_start_matches(';').trim_start())
+        .unwrap_or_default();
+    if line.is_empty() { "No output" } else { line }.into()
+}
+
 /// Parses a recorded guest output against before and after projection snapshots.
 /// A successful guest response requires a matching answered request, not merely
 /// a connection or an old row. A TLS handshake the guest aborted because it did
@@ -188,6 +226,19 @@ fn matches(probe: &Probe, row: &Destination) -> bool {
 /// of a new connection. Loss prevents a missing observation from proving that a
 /// probe escaped.
 pub fn parse(
+    probe: &Probe,
+    guest: &str,
+    output: &Output,
+    before: &EgressSnapshot,
+    after: &EgressSnapshot,
+    world_hosts: &[&str],
+) -> ProbeResult {
+    let mut result = judge(probe, guest, output, before, after, world_hosts);
+    result.summary = summary(&result.guest_result);
+    result
+}
+
+fn judge(
     probe: &Probe,
     guest: &str,
     output: &Output,
@@ -629,6 +680,31 @@ mod tests {
             ProbeOutcome::NotContained,
             "an answer the world did not give is not contained"
         );
+    }
+
+    #[test]
+    fn summaries_keep_the_line_that_says_what_the_guest_got() {
+        for (output, line) in [
+            (
+                ";; DiG 9.18\n;; global options: +cmd\n;; connection timed out; no servers could be reached",
+                "connection timed out; no servers could be reached",
+            ),
+            ("Exit 0\nHTTP 200\nresponse body", "HTTP 200"),
+            (
+                "HTTP/1.1 301 Moved Permanently\n",
+                "HTTP/1.1 301 Moved Permanently",
+            ),
+            (
+                "Exit 7\ncurl: (7) Failed to connect",
+                "curl: (7) Failed to connect",
+            ),
+            ("\nNo proxy settings set\n", "No proxy settings set"),
+            ("% Total\nExit 6", "Exit 6"),
+            ("", "No output"),
+            (";;\n", "No output"),
+        ] {
+            assert_eq!(summary(output), line, "{output:?}");
+        }
     }
 
     #[test]

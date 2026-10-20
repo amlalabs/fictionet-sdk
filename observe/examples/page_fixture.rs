@@ -718,6 +718,7 @@ fn recorded_containment() -> fictionet_observe::page::Containment {
                     command: command.into(),
                     destination: destination.into(),
                     outcome,
+                    summary: guest_result.into(),
                     guest_result: guest_result.into(),
                     world_answer: world_answer.into(),
                     proxies: vec![],
