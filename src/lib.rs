@@ -317,10 +317,10 @@
 //! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
 //! from `setTimeout`. In a page, hand [`run`] to the event loop with
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
-//! timers. Native HTTP/2 reset expiry uses the world clock. Opt-in axum
-//! upgrades still use hyper, whose internal clock is unavailable on this
-//! target. `examples/wasm_world` runs DNS, HTTP/1.1, HTTP/2
-//! and HTTPS through a world in Node.js.
+//! timers. The native HTTP/2 server times its deadlines on the world clock.
+//! Opt-in axum upgrades still use hyper, whose internal clock is unavailable
+//! on this target. `examples/wasm_world` runs DNS, HTTP/1.1, HTTP/2 and HTTPS
+//! through a world in Node.js.
 
 #![warn(missing_docs)]
 #![cfg_attr(

@@ -357,7 +357,8 @@
 //! fixed certificates and the [`tls`](crate::stdlib::services::tls) provider, whose
 //! key exchange and signatures draw from the run's seed.
 //!
-//! Native HTTP/2 reset expiry follows the run's clock. Opt-in axum upgrades
+//! The native HTTP/2 server times its deadlines on the run's clock,
+//! including how long it ignores a stream it reset. Opt-in axum upgrades
 //! use hyper; its internal time does not follow lab time. See
 //! [`httpd`](crate::stdlib::web::httpd) for the server's runtime boundaries.
 //!

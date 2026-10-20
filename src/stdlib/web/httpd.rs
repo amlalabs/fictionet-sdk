@@ -77,10 +77,12 @@
 //! connection's [`Budget`]. A head that does not fit is refused before its
 //! handler runs, with `answer: budget` and no status. A body that exceeds its
 //! allowance receives `503`. Transport storage belongs to its transport.
-//! Body deadlines, SETTINGS acknowledgment deadlines and reset-stream expiry
-//! all use the driver's world clock. Stream flow control, reset limits and
-//! bounded header assembly apply independently of the runtime. PING and GOAWAY
-//! are handled by the service; graceful shutdown drains admitted streams.
+//! After the HTTP/2 server resets a stream, it ignores that stream's late
+//! HEADERS and DATA for one second. That second, body deadlines and SETTINGS
+//! acknowledgment deadlines are all timed on the driver's world clock.
+//! Stream flow control, reset limits and bounded header assembly apply
+//! independently of the runtime. PING and GOAWAY are handled by the service;
+//! graceful shutdown drains admitted streams.
 //!
 //! ```
 //! use bytes::Bytes;
