@@ -224,10 +224,11 @@ fn page_key(host: &str, target: &str) -> String {
     format!("page {host}{target}")
 }
 
-/// Returns host, target and anchor of the first [`LINKS_PER_PAGE`]
-/// (prompts::LINKS_PER_PAGE) links on a page, resolved against its URL, in
-/// source order: http(s) links with a host that is not a search engine,
-/// with anchor text, cut at [`ANCHOR_CHARS`](prompts::ANCHOR_CHARS).
+/// Returns host, target and anchor of the first
+/// [`LINKS_PER_PAGE`](prompts::LINKS_PER_PAGE) links on a page, resolved
+/// against its URL, in source order: http(s) links with a host that is not
+/// a search engine, with anchor text, cut at
+/// [`ANCHOR_CHARS`](prompts::ANCHOR_CHARS).
 pub fn links(url: &str, markup: &str) -> Vec<(String, String, String)> {
     static LINK: OnceLock<Regex> = OnceLock::new();
     let link = LINK.get_or_init(|| {
