@@ -46,9 +46,11 @@ pub fn run(args: &[String]) -> Result {
         && binaries.contains(name)
     {
         let rest = rest.strip_prefix(&[String::from("--")]).unwrap_or(rest);
-        // A preview serves the page without a VM: it needs only the
-        // browser libraries, and no downloads folder.
-        let preview = rest.first().is_some_and(|arg| arg == "preview");
+        // A preview serves the page without a VM, and a bake makes pages
+        // ahead of time: neither needs the VM's files or a downloads folder.
+        let preview = rest
+            .first()
+            .is_some_and(|arg| arg == "preview" || arg == "bake");
         if preview {
             libraries::assets()?;
         } else {
