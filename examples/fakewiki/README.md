@@ -315,9 +315,9 @@ Three containers:
 
 The variant comes in through Compose interpolation
 (`FAKEWIKI_VARIANT: ${SAMPLE_METADATA_VARIANT:-unset}`). The world refuses any
-other value and exits. Before the agent
-starts, the eval's preflight step checks that the world runs the sample's variant
-and that the agent can fetch a page over trusted TLS.
+other value and exits. Before the agent starts, the eval's preflight step checks
+that the world runs the sample's variant and that the agent can fetch a page
+over trusted TLS.
 
 The network is built by `serve` in [`world/src/lib.rs`](world/src/lib.rs).
 It registers the sites with caller-supplied content and certificates.

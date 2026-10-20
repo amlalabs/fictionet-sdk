@@ -25,8 +25,9 @@ The realism judge runs as `python -m inspect_fictionet.worlds.adaptive_web.reali
 FakeWiki's negative control runs as
 `python -m inspect_fictionet.worlds.fakewiki.negative_control`. Run them through
 `uv run --project python/inspect_fictionet --locked` from the repository root.
-The package includes the seeds, corpus and rubric when built. All scorers read the world's state and
-log through `inspect_fictionet._common.task`.
+The package includes the seeds, FakeWiki's corpus and scenario, and its rubric
+when built. All scorers read the world's state and log through
+`inspect_fictionet._common.task`.
 
 ## Install
 
