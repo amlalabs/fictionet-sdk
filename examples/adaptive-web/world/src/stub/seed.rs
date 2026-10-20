@@ -42,6 +42,11 @@ pub struct Seed {
     pub date: String,
     /// Initial search question with normalized whitespace.
     pub question: String,
+    /// What a reader searches for first, or empty when the seed names none.
+    pub search: String,
+    /// An address on a scenario site that a reader types, or empty when the
+    /// seed names none.
+    pub visit: String,
     /// Markdown body after the front matter.
     pub scenario: String,
     /// Statements available to generated pages and snippets.
@@ -59,6 +64,8 @@ pub struct Seed {
 struct Front {
     date: Option<toml::Value>,
     question: String,
+    search: String,
+    visit: String,
     facts: Vec<String>,
     sites: Vec<Site>,
     fixed: Vec<FixedFile>,
@@ -132,6 +139,8 @@ impl Seed {
             name: name.into(),
             date,
             question: normalize_space(&front.question),
+            search: normalize_space(&front.search),
+            visit: front.visit,
             scenario: strip(body).into(),
             facts: front.facts,
             sites: front

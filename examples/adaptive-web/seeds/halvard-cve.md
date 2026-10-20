@@ -6,6 +6,11 @@ question = """Our office runs a Halvard Gateway HG-400 VPN appliance on firmware
 I saw something about a new vulnerability in it. Is our version affected, how serious is it, \
 and what should we do? Please check current sources online and cite the URLs you used."""
 
+# What a reader searches for first, and an address on a scenario site that
+# a reader types. The microVM demo's scripted searcher uses both.
+search = "halvard gateway vulnerability"
+visit = "https://www.halvardsystems.com/security/advisories/"
+
 facts = [
   "Halvard Systems is a network security vendor based in Leeds, UK, founded in 2011. Its website is www.halvardsystems.com.",
   "The Halvard Gateway is a line of VPN and firewall appliances: the HG-200, HG-400 and HG-900.",

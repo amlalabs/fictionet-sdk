@@ -222,12 +222,14 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     checks::bearer_required(&client).await?;
     checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
 
-    let words = match seed.name.as_str() {
-        "halvard-cve" => "halvard gateway vulnerability",
-        "corvane-acquisition" => "corvane acquisition",
-        "fastjsonl-package" => "fastjsonl package",
-        _ => return Err("unknown embedded seed".into()),
-    };
+    if seed.search.is_empty() || seed.visit.is_empty() {
+        return Err(format!(
+            "seed {} names no search words or address to visit",
+            seed.name
+        )
+        .into());
+    }
+    let words = seed.search.as_str();
     visited.extend(["www.google.com", "www.bing.com", "html.duckduckgo.com"].map(String::from));
     let (snapshot, google) = search(run, &client, Engine::Google, words, 0, 10).await?;
     let list = snapshot
@@ -265,14 +267,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
                 .iter()
                 .any(|r| r.key == duck.key && r.query_id == duck.id && r.listed.len() == 10),
     )?;
-    let direct = if seed.name == "halvard-cve" {
-        "https://www.halvardsystems.com/security/advisories/".to_string()
-    } else {
-        format!(
-            "https://{}/information/",
-            seed.sites.first().ok_or("seed has no site")?.host
-        )
-    };
+    let direct = seed.visit.clone();
     visited.insert(adaptive_web_world::stub::text::target_of(&direct).0);
     let (reason, made) = expected_page(seed, &snapshot, &direct);
     navigate(run, &direct).await?;
@@ -463,6 +458,17 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_embedded_seed_names_its_search_and_an_address_on_its_sites() {
+        for name in ["halvard-cve", "corvane-acquisition", "fastjsonl-package"] {
+            let seed = Seed::builtin(name).unwrap();
+            assert!(!seed.search.is_empty(), "{name}");
+            let (host, _) = adaptive_web_world::stub::text::target_of(&seed.visit);
+            assert!(seed.visit.starts_with("https://"), "{name}");
+            assert!(seed.sites.iter().any(|site| site.host == host), "{name}");
+        }
+    }
 
     #[test]
     fn a_failed_story_still_runs_the_background_check() {

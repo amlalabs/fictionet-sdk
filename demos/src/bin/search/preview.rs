@@ -39,6 +39,7 @@ use super::Result;
 pub async fn run(spend: bool) -> Result {
     let mut input = kit::preview::Input::stdin()?;
     let seed = Seed::builtin("halvard-cve")?;
+    let script = seed.clone();
     let searches = Arc::new(Searches::from_seed(&seed));
     let topics = Topics::new();
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
@@ -101,9 +102,16 @@ pub async fn run(spend: bool) -> Result {
             });
             cx.spawn(move |cx| async move {
                 let result = async {
-                    story(&cx, &client, &world, &searches, &page_client).await?;
+                    let client = Client {
+                        cx: &cx,
+                        machine: &client,
+                        world: &world,
+                        searches: &searches,
+                        page: &page_client,
+                    };
+                    story(&client, &script).await?;
                     if spend {
-                        spend_budget(&cx, &client, &world, &searches, &page_client).await?;
+                        spend_budget(&client, &script).await?;
                     }
                     Ok::<_, fictionet::Error>(())
                 }
@@ -189,23 +197,35 @@ async fn get(
     ))
 }
 
-async fn story(
-    cx: &Cx,
-    client: &Machine,
-    world: &World,
-    searches: &Searches,
-    page: &PageClient,
-) -> fictionet::Result {
+/// The scripted client in the world, and the page it reports to.
+struct Client<'a> {
+    cx: &'a Cx,
+    machine: &'a Machine,
+    world: &'a World,
+    searches: &'a Searches,
+    page: &'a PageClient,
+}
+
+/// A search engine address for `words`.
+fn search(engine: &str, words: &str) -> String {
+    format!("{engine}{}", words.replace(' ', "+"))
+}
+const GOOGLE: &str = "https://www.google.com/search?q=";
+
+/// The seed's searches and pages, in the order a reader would make them.
+async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
+    let Client {
+        cx,
+        machine: client,
+        world,
+        searches,
+        page,
+    } = *client;
+    let words = seed.search.as_str();
     let pause = || cx.sleep(Duration::from_secs(3));
     // Give viewers a chance to see the empty world before the first request.
     cx.sleep(Duration::from_secs(8)).await?;
-    fetch(
-        cx,
-        client,
-        "https://www.google.com/search?q=halvard+gateway+vulnerability",
-        world.start,
-    )
-    .await?;
+    fetch(cx, client, &search(GOOGLE, words), world.start).await?;
     pause().await?;
     let state = searches.snapshot();
     let first = state
@@ -235,12 +255,15 @@ async fn story(
         url = format!("https://{host}{path}");
         html = fetch(cx, client, &url, world.start).await?;
     }
-    for url in [
-        "https://www.bing.com/search?q=halvard+gateway+vulnerability",
-        "https://html.duckduckgo.com/html/?q=halvard+gateway+vulnerability+details",
-        "https://www.halvardsystems.com/security/advisories/",
-        "https://www.halvardsystems.com/security/advisories/HSA-2026-014",
-    ] {
+    let opened = [
+        search("https://www.bing.com/search?q=", words),
+        search(
+            "https://html.duckduckgo.com/html/?q=",
+            &format!("{words} details"),
+        ),
+        seed.visit.clone(),
+    ];
+    for url in opened.iter().chain(seed.fixed.iter().map(|f| &f.url)) {
         pause().await?;
         fetch(cx, client, url, world.start).await?;
     }
@@ -251,21 +274,10 @@ async fn story(
     println!("Scripted client asked for wiki.corp");
     pause().await?;
     generation(page, searches, false).await?;
-    fetch(
-        cx,
-        client,
-        "https://www.google.com/search?q=halvard+gateway+vulnerability+new+question",
-        world.start,
-    )
-    .await?;
+    let new = format!("{words} new question");
+    fetch(cx, client, &search(GOOGLE, &new), world.start).await?;
     pause().await?;
-    fetch(
-        cx,
-        client,
-        "https://www.google.com/search?q=halvard+gateway+vulnerability",
-        world.start,
-    )
-    .await?;
+    fetch(cx, client, &search(GOOGLE, words), world.start).await?;
     Ok(())
 }
 
@@ -295,23 +307,24 @@ async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> f
 }
 
 /// Makes new searches until the world refuses one for its generation budget.
-async fn spend_budget(
-    cx: &Cx,
-    client: &Machine,
-    world: &World,
-    searches: &Searches,
-    page: &PageClient,
-) -> fictionet::Result {
+async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
+    let Client {
+        cx,
+        machine: client,
+        world,
+        searches,
+        page,
+    } = *client;
     cx.sleep(Duration::from_secs(3)).await?;
     generation(page, searches, true).await?;
     println!("Spending the generation budget with new searches");
     // Every search with a new key takes one generation call. The bound is far
     // above the stub's budget, so it only stops a story that cannot fail.
     for n in 1..=1_000 {
-        let url = format!("https://www.google.com/search?q=halvard+gateway+question+{n}");
-        let (status, _) = get(cx, client, &url, world.start).await?;
+        let words = format!("{} question {n}", seed.search);
+        let (status, _) = get(cx, client, &search(GOOGLE, &words), world.start).await?;
         let failed = searches.snapshot().queries.iter().any(|q| {
-            q.search == format!("halvard gateway question {n}")
+            q.search == words
                 && matches!(
                     q.outcome,
                     Outcome::Failed {

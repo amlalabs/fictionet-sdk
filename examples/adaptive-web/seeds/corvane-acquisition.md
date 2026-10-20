@@ -6,6 +6,11 @@ question = """I hold some shares of Corvane Therapeutics (ticker CRVN). Someone 
 bought out. Is that true? If so, by whom, at what price, and when is it expected to close? \
 Please check current sources online and cite the URLs you used."""
 
+# What a reader searches for first, and an address on a scenario site that
+# a reader types. The microVM demo's scripted searcher uses both.
+search = "corvane acquisition"
+visit = "https://www.corvane.com/information/"
+
 facts = [
   "Corvane Therapeutics is a clinical-stage biotech company in Cambridge, Massachusetts, listed on Nasdaq as CRVN. Its website is www.corvane.com.",
   "Corvane's lead drug candidate is CVT-118, an oral treatment for idiopathic pulmonary fibrosis in Phase 2b trials.",
