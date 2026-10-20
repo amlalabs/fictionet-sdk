@@ -37,7 +37,8 @@ cloud-init report, log tails and console tail. The page screenshots need
 Chromium on your machine.
 
 The times below are from one run of each gate on a 24-core machine with other
-work running, with the pinned files downloaded and the package cache filled.
+work running, the pinned files downloaded, the package cache filled and one
+page tab open. All six ran one after another on the same build.
 
 ### Desktop
 
@@ -58,8 +59,8 @@ the page terminal and moves the pointer with and without the screen lease.
 - Screenshots: `downloads/cloudimage/shots/`, with `guest-desktop.png` from
   the guest, `viewer-desktop.png` through the page's screen socket, and
   `page-desktop.png` from Chromium.
-- Times: SSH up after 6.9 s, desktop after 56.6 s, cloud-init done after
-  62.2 s. This run started with an empty package cache.
+- Times: SSH up after 7.1 s, desktop after 44.7 s, cloud-init done after
+  47.7 s, whole run 58.2 s. One 88 MB file was not in the package cache.
 
 ### Artifactory
 
@@ -95,10 +96,11 @@ apart, and shown in a muted band in Doors tried.
   variant's requests and door probes, about one step every two seconds. The
   screen says NO VM, and there are no guest exit statuses. `--extra-reads N`
   adds N index reads after the story, enough to fill the page's row bound.
-- Times: SSH up after about 7 s in every run. The story and the whole run
-  took 64.2 s and 116.9 s for `lookalike`, 4.9 s and 63.4 s for `normal`,
-  70.6 s and 128.0 s for `missing`, 23.4 s and 74.1 s for `peer`, and
-  29.2 s and 79.8 s for `peer` with `--sessions shared`.
+- Times: for `lookalike`, SSH up after 7.0 s, story 64.4 s, whole run
+  114.2 s. Earlier runs of the other variants, before the demos were merged,
+  took 4.9 s and 63.4 s for the story and the whole run of `normal`, 70.6 s
+  and 128.0 s for `missing`, 23.4 s and 74.1 s for `peer`, and 29.2 s and
+  79.8 s for `peer` with `--sessions shared`.
 
 ### Border
 
@@ -128,8 +130,8 @@ open until Ctrl-C.
   page with an in-process scripted client and real world traffic. Change the
   route on the page, then press Enter to run sign-in, balance and traceroute on
   it.
-- Times: SSH up after 7.4 s, desktop after 44.6 s, story done after 53.0 s,
-  whole run 58.8 s.
+- Times: SSH up after 6.8 s, desktop after 49.1 s, story done after 61.0 s,
+  whole run 61.8 s.
 
 ### Search
 
@@ -159,10 +161,10 @@ it on the page.
   NO VM. `--spend-budget` ends the story with new searches until the world
   refuses one for its generation budget. The page's `preview-screen` command,
   `{"command":"drop"}`, closes the screen's connection to show the lost state.
-  Press Ctrl-C to close the page.
-- Times: SSH up after 6.4 s, Google loaded in Firefox after 45.2 s, story done
-  after 68.0 s, whole run 68.8 s. The guest's 78 MB of packages came from the
-  package cache.
+  Press Ctrl-C to close the page. The preview holds the package cache while it
+  runs, so a gate started beside it fetches its packages without the cache.
+- Times: SSH up after 7.5 s, Google loaded in Firefox after 45.3 s, story done
+  after 65.3 s, whole run 66.0 s.
 
 ### FakeWiki
 
@@ -185,7 +187,7 @@ and that the panels have data.
   prints is the page URL. Press Enter to have the in-world scripted client read
   the article, use the page's tamper switch, and press Enter again. Type
   `drop` to close the screen's connections. End of input stops it.
-- Times: SSH up after 7.1 s, article read after 45.1 s, whole run 46.6 s.
+- Times: SSH up after 7.2 s, article read after 47.6 s, whole run 52.2 s.
 
 ### Scan
 
@@ -203,7 +205,13 @@ page's access controls and terminal.
 
 - Screenshots: `downloads/cloudimage/shots/`, with `viewer-scan.png`,
   `page-scan.png`, and each step's nmap report and the world's ports beside it.
-- Times: boot 35.6 s, story 51.4 s, whole run 88.4 s.
+- Without a VM: `cargo run --locked -p fictionet-demo --example scan_page`
+  serves the same page. An in-world scanner sends the story's probes, a
+  stand-in answers at 10.0.0.50 with the banners the real server sent, and
+  nmap's reports are the ones recorded in a KVM run. Enter or the end of input
+  stops it.
+- Times: both guests SSH up after 7.5 s, boot 31.2 s, story 51.1 s, whole run
+  84.1 s.
 
 ## The page
 
@@ -218,8 +226,16 @@ The page binds to loopback. Data and commands need its per-run bearer token,
 with exact Host and Origin checks. Consoles use short-lived, single-use
 WebSocket tickets from the authenticated API, and screen input needs the
 host's input lease. Taking control claims browser input only. It does not
-pause an agent. The pinned noVNC and xterm.js files are embedded from
-`observe/downloads/vendor/`.
+pause an agent. A host takes four screen sessions and four terminal sessions
+at once. A gate's own captures use one or two, so with several page tabs open
+a gate's page shot can be refused a session and fail. The pinned noVNC and
+xterm.js files are embedded from `observe/downloads/vendor/`.
+
+The page's consoles and the gate reach each guest over SSH from the kit's
+jump host, so that traffic crosses the guest's link too. The packet list hides
+packets to and from the jump host's address, counts them, and shows them on
+request. The list for all hosts covers the declared hosts' links. A packet
+list keeps its rows when the run stops.
 
 The containment panel shows each startup probe and the world's answer to it.
 A probe is contained when Left the box shows the world's own answer: a world
@@ -267,11 +283,18 @@ A gate uses the same few calls in every demo, all in
 - `GuestHandle::wait_cloud_init` waits for the guest's setup and fails with
   cloud-init's report.
 - `Run::screenshots` saves a guest's screen through the page and the page from
-  Chromium. `Run::screen` saves only the screen.
+  Chromium. `Run::screen` saves only the screen, and `Run::settled_screen`
+  keeps a capture once two in a row match, so a page the guest is loading has
+  finished. `Run::page_shot` saves the page once a condition holds in it.
 - `kit::gate::check` prints `[pass]` or `[FAIL]` with the check's name.
+- `kit::gate::bearer_required`, `single_use_ticket` and `terminal_runs_on`
+  check the page's access controls and its terminal.
 - `GuestHandle::diagnostics` collects the guest's side of a failed run.
 - `PageClient` reads the page's API as a signed-in browser does, posts
-  commands, and waits for a state or an event.
+  commands, waits for a state or an event, pages through events with
+  `find_event`, and reads the state stream with `state_stream`.
+- `kit::gate::STEP_PAUSE` holds each story step for 1.5 s, so a person
+  watching can follow it. No check may depend on it.
 - `kit::gate::stay_open` keeps the page open until Ctrl-C.
 - `kit::preview::Console` is a screen that says NO VM, for a page without a
   guest.
