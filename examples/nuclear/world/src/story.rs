@@ -25,6 +25,11 @@
 //! console. [`clock`] moves the plant with the run clock, and it is the only
 //! place the plant advances in the viewer.
 
+use crate::pace::Pace;
+use fictionet::sync::Mutex;
+use std::future::{Future, poll_fn};
+use std::task::Poll;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -50,13 +55,13 @@ pub const OPERATOR: Ipv4Addr = Ipv4Addr::new(10, 40, 0, 50);
 
 const OPERATOR_NAME: &str = "operator";
 
-/// Plant time between plant clock ticks.
+/// Run time between plant clock ticks.
 const TICK: Duration = Duration::from_millis(50);
 
-/// Plant time between the story's looks at the plant.
+/// Run time between the story's looks at the plant.
 const POLL: Duration = Duration::from_millis(250);
 
-/// Plant time between published snapshots.
+/// Run time between published snapshots.
 pub const PUBLISH_MS: u64 = 100;
 
 /// Plant time the full power check waits for.
@@ -178,22 +183,38 @@ pub fn start_network(fcx: &Cx, driver: &Driver) -> Result<Machine, Error> {
 }
 
 /// Moves the plant with the run clock. Each tick advances the driver to the
-/// run's elapsed time, so plant time is run time. `publish` sees a snapshot
-/// each [`PUBLISH_MS`] of plant time. The task ends without error when the run
+/// pace target. `publish` sees at most one snapshot
+/// each [`PUBLISH_MS`] of run time. The task ends without error when the run
 /// is cancelled.
 pub async fn clock(
     fcx: &Cx,
     driver: &Driver,
+    pace: &Mutex<Pace>,
     mut publish: impl FnMut(&PlantSnapshot) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut published = None;
+    let mut previous = None;
     loop {
-        driver.advance_to(fcx, plant_ms(fcx));
-        let snapshot = driver.snapshot();
-        let slot = snapshot.at_ms / PUBLISH_MS;
-        if published != Some(slot) {
+        let run_ms = run_ms(fcx);
+        let snapshot = {
+            let mut pace = pace.lock();
+            let generation = driver.generation();
+            let at_ms = driver.snapshot().at_ms;
+            let had_end = previous.is_some_and(|(last_generation, last_ms, ended)| {
+                generation == last_generation && at_ms >= last_ms && ended
+            });
+            driver.advance_to(fcx, pace.target(run_ms));
+            let snapshot = driver.snapshot();
+            if snapshot.end.is_some() && !had_end {
+                pace.set_speed(run_ms, snapshot.at_ms, 0)
+                    .expect("pause is valid");
+            }
+            previous = Some((generation, snapshot.at_ms, snapshot.end.is_some()));
+            snapshot
+        };
+        if published.is_none_or(|at| run_ms.saturating_sub(at) >= PUBLISH_MS) {
             publish(&snapshot)?;
-            published = Some(slot);
+            published = Some(run_ms);
         }
         if fcx.sleep(TICK).await.is_err() {
             return Ok(());
@@ -201,14 +222,33 @@ pub async fn clock(
     }
 }
 
-/// The plant time of the run clock, in ms.
-pub fn plant_ms(fcx: &Cx) -> u64 {
+/// The elapsed run time, in ms.
+pub fn run_ms(fcx: &Cx) -> u64 {
     u64::try_from(fcx.now().since_start().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Runs the six steps against `driver`, through the HMI on `operator`. `say`
 /// receives the lines for each step, labeled with the plant time.
+/// Returns `None` when a reset stops the story before its next poll.
 pub async fn run(
+    fcx: &Cx,
+    driver: &Driver,
+    operator: &Machine,
+    say: impl FnMut(Line),
+) -> Result<Option<Report>, Error> {
+    let generation = driver.generation();
+    let mut story = std::pin::pin!(steps(fcx, driver, operator, say));
+    poll_fn(|cx| {
+        if driver.generation() != generation {
+            Poll::Ready(Ok(None))
+        } else {
+            story.as_mut().poll(cx).map(|result| result.map(Some))
+        }
+    })
+    .await
+}
+
+async fn steps(
     fcx: &Cx,
     driver: &Driver,
     operator: &Machine,
@@ -220,6 +260,7 @@ pub async fn run(
     // 1. Full power.
     let initial_view = until_hmi(
         fcx,
+        driver,
         operator,
         FULL_POWER_CHECK_MS,
         "the initial HMI readings",
@@ -338,6 +379,7 @@ pub async fn run(
     // the core exit channel, which still reads true.
     let alarm_view = until_hmi(
         fcx,
+        driver,
         operator,
         fault_at + ALARM_LIMIT_MS,
         "the subcooling margin alarm",
@@ -390,6 +432,7 @@ pub async fn run(
     // pressure and core exit temperature. Trip before saturation.
     let trip_view = until_hmi(
         fcx,
+        driver,
         operator,
         alarmed.at_ms + TRIP_LIMIT_MS,
         "the operator's trip condition",
@@ -770,6 +813,7 @@ async fn wait_for(fcx: &Cx, driver: &Driver, at_ms: u64) -> Result<PlantSnapshot
 /// `what` names the event in the failure.
 async fn until_hmi(
     fcx: &Cx,
+    driver: &Driver,
     operator: &Machine,
     limit_ms: u64,
     what: &str,
@@ -780,7 +824,7 @@ async fn until_hmi(
         if done(&view)? {
             return Ok(view);
         }
-        if plant_ms(fcx) >= limit_ms {
+        if driver.snapshot().at_ms >= limit_ms {
             return Err(Error::msg(format!(
                 "{what} did not happen by {limit_ms} ms"
             )));

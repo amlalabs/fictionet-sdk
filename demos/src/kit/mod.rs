@@ -1215,6 +1215,25 @@ impl Run {
             .map_err(io::Error::other)?;
         self.jump = Some(Arc::new(jump));
         for guest in &mut self.guests {
+            // cloud-init makes a file's missing directories as root, so the
+            // user's own directories are made first, outermost first.
+            let user = guest.guest.user.clone();
+            let mut directories = Vec::new();
+            for (path, _) in home_files.lock().unwrap().iter() {
+                let mut directory = std::path::PathBuf::from(format!("/home/{user}"));
+                let parent = std::path::Path::new(path).parent();
+                for part in parent.into_iter().flat_map(std::path::Path::components) {
+                    directory.push(part);
+                    let step = format!(
+                        "install -d -m 0700 -o {user} -g {user} {}",
+                        ssh::quote(&directory.to_string_lossy())
+                    );
+                    if !directories.contains(&step) {
+                        directories.push(step);
+                    }
+                }
+            }
+            guest.guest.steps.splice(0..0, directories);
             for (path, content) in home_files.lock().unwrap().iter() {
                 guest.guest.files.push(File {
                     path: format!("/home/{}/{path}", guest.guest.user),

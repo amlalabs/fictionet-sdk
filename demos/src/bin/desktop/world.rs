@@ -88,6 +88,7 @@ pub async fn start(
     )?);
     let pages = Arc::new(adaptive_web_world::pages::Pages::new(seed));
     let handler = adaptive_web_world::handler::Handler::new(&fcx, pages.clone());
+    let codex_pages = pages.clone();
     let model_cfg = z.server_config(&fcx, &["api.anthropic.com"], now_sys)?;
     let store = std::path::Path::new(".ax/credentials.redb");
     let store = if store.exists() {
@@ -134,19 +135,71 @@ pub async fn start(
             serde_json::json!({"model":name}).to_string(),
         )])?;
     }
-    let controlled = model.clone();
+    // Codex: a ChatGPT login from the store, or an API key, set up in the
+    // guest the way `codex login` leaves a laptop.
+    let codex_oauth = if let Some(store) = store.as_ref()
+        && store.has_login(models::oauth::Login::Codex)?
+    {
+        Some(models::oauth::OAuth::new(
+            &fcx,
+            models::oauth::Login::Codex,
+            store.clone(),
+        )?)
+    } else {
+        None
+    };
+    let codex_api_cfg = z.server_config(&fcx, &["api.openai.com"], now_sys)?;
+    let chatgpt_cfg = z.server_config(&fcx, &["chatgpt.com"], now_sys)?;
+    let codex_token_cfg = z.server_config(&fcx, &[models::oauth::Login::Codex.host()], now_sys)?;
+    let (codex, codex_name) = if let Some(oauth) = &codex_oauth {
+        let model = models::Model::oauth(&fcx, oauth.clone()).await?;
+        world.seed_home_files(oauth.guest_files()?)?;
+        (Some(model), "gpt-5.4")
+    } else if std::env::var_os("OPENAI_API_KEY").is_some() {
+        (Some(models::openai(&fcx)?), "gpt-5.4-mini")
+    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        (
+            Some(models::openai_via_openrouter(&fcx)?),
+            "openai/gpt-5.4-mini",
+        )
+    } else {
+        (None, "gpt-5.4-mini")
+    };
+    let codex = codex.map(|model| {
+        model
+            .search(codex_pages)
+            .budget(models::Budget::new().calls(8))
+    });
+    if let Some(codex) = &codex {
+        let env = codex.guest_env();
+        if let Some((_, key)) = env.first() {
+            let login = serde_json::json!({"auth_mode": "apikey", "OPENAI_API_KEY": key});
+            world.seed_home_files([(".codex/auth.json", serde_json::to_string_pretty(&login)?)])?;
+        }
+        world.seed_env(env)?;
+        world.seed_home_files([(
+            ".codex/config.toml",
+            format!(
+                "model = {codex_name:?}\nmodel_reasoning_effort = \"low\"\n\
+                 web_search = \"live\"\ncli_auth_credentials_store = \"file\"\n"
+            ),
+        )])?;
+    }
+    let controlled: Vec<_> = model.clone().into_iter().chain(codex.clone()).collect();
     fcx.spawn(move |cx| async move {
         kit::serve_commands(&cx, &commands, |command| {
-            let Some(model) = &controlled else {
+            if controlled.is_empty() {
                 return Ok(Err(Rejected::Invalid {
                     message: "No model credential is configured".into(),
                 }));
-            };
-            match command {
-                Command::Pause => model.pause(true),
-                Command::Resume => model.pause(false),
-                Command::Budget(budget) => model.set_budget(*budget),
-                Command::Calls(limit) => model.set_budget(models::Budget::new().calls(*limit)),
+            }
+            for model in &controlled {
+                match command {
+                    Command::Pause => model.pause(true),
+                    Command::Resume => model.pause(false),
+                    Command::Budget(budget) => model.set_budget(*budget),
+                    Command::Calls(limit) => model.set_budget(models::Budget::new().calls(*limit)),
+                }
             }
             Ok(Ok(true))
         })
@@ -175,6 +228,24 @@ pub async fn start(
         "api.anthropic.com" => model
             .clone()
             .map(|model| web::Site::new(model).tls(model_cfg.clone())),
+        // Codex's model site is chatgpt.com with a ChatGPT login and
+        // api.openai.com with a key. The other name does not resolve, so
+        // Codex's account and catalog requests fail as on a network that
+        // blocks it, instead of reaching a generated page.
+        "api.openai.com" | "chatgpt.com" => codex
+            .clone()
+            .filter(|_| (host == "chatgpt.com") == codex_oauth.is_some())
+            .map(|model| {
+                let tls = if host == "chatgpt.com" {
+                    &chatgpt_cfg
+                } else {
+                    &codex_api_cfg
+                };
+                web::Site::new(model).tls(tls.clone())
+            }),
+        "auth.openai.com" => codex_oauth
+            .clone()
+            .map(|oauth| web::Site::new(oauth).tls(codex_token_cfg.clone())),
         "platform.claude.com" => oauth
             .clone()
             .map(|oauth| web::Site::new(oauth).tls(token_cfg.clone())),

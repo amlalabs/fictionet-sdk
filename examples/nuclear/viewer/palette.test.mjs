@@ -45,7 +45,11 @@ test('lamp states and window borders have graphic contrast in every theme', () =
     const colors = Object.fromEntries(
       [...block.matchAll(/--([\w-]+):\s*#([\da-f]+);/g)].map(([, name, hex]) => [name, luminance(hex)]),
     );
-    for (const [a, b] of [['lamp-glow', 'lamp-off'], ['ink', 'steel'], ['warning', 'steel']]) {
+    for (const [a, b] of [
+      ['lamp-glow', 'lamp-off'],
+      ['ink', 'steel'],
+      ['warning', 'steel'],
+    ]) {
       const contrast = (Math.max(colors[a], colors[b]) + 0.05) / (Math.min(colors[a], colors[b]) + 0.05);
       assert.ok(contrast >= 3, `${a} against ${b}: ${contrast}`);
     }
@@ -59,7 +63,9 @@ test('view colors are ready only when every required token has a value', () => {
   assert.equal(paletteReady({}), false);
   const base = css.match(/:root\s*\{([^}]+)\}/)[1];
   for (const [block] of palettes) {
-    const tokens = Object.fromEntries([...(base + block).matchAll(/(--[\w-]+):\s*(#[\da-f]+);/g)].map(([, name, color]) => [name, color]));
+    const tokens = Object.fromEntries(
+      [...(base + block).matchAll(/(--[\w-]+):\s*(#[\da-f]+);/g)].map(([, name, color]) => [name, color]),
+    );
     const values = Object.fromEntries(Object.entries(PALETTE_TOKENS).map(([name, token]) => [name, tokens[token]]));
     assert.equal(paletteReady(values), true);
     for (const name of Object.keys(PALETTE_TOKENS)) {
@@ -75,7 +81,9 @@ test('view colors are ready only when every required token has a value', () => {
 
 test('forced colors preserve meter text and warning contrast with system colors', () => {
   const block = css.match(/@media \(forced-colors: active\)\s*\{\s*:root, :root\[data-theme\]\s*\{([^}]+)\}/)[1];
-  const colors = Object.fromEntries([...block.matchAll(/--([\w-]+):\s*(\w+);/g)].map(([, name, color]) => [name, color]));
+  const colors = Object.fromEntries(
+    [...block.matchAll(/--([\w-]+):\s*(\w+);/g)].map(([, name, color]) => [name, color]),
+  );
   for (const name of ['surface', 'surface-raised', 'surface-sunken', 'steel']) assert.equal(colors[name], 'Canvas');
   for (const name of ['ink', 'text', 'warning', 'line', 'line-strong']) assert.equal(colors[name], 'CanvasText');
   assert.notEqual(colors.rubber, colors['lamp-legend']);
@@ -97,14 +105,30 @@ test('vantage buttons stay below a wide canvas in one fitted row with visible fo
   assert.match(styles, /@media\s*\(forced-colors:\s*active\)/);
 });
 
-
-test('all ten vantage labels fit the smaller measured canvas with full accessible names', t => {
+test('all ten vantage labels fit the smaller measured canvas with full accessible names', (t) => {
   const source = readFileSync(new URL('./control-room.mjs', import.meta.url), 'utf8');
   const styles = readFileSync(new URL('./control-room.css', import.meta.url), 'utf8');
   const sourceRow = source.slice(source.indexOf('  const vantageButtons = ['), source.indexOf('  const controlStage'));
   const labels = [...sourceRow.matchAll(/\['([^']+)', '([^']+)', ([^\n]+)\],/g)];
-  assert.deepEqual(labels.map(match => match[2]), ['Room', 'RPS', 'RCS', 'Loops', 'SG / feed', 'Turbine', 'CCTV', 'Door', 'Containment', 'Turbine hall']);
-  assert.deepEqual(labels.map(match => match[1]), ['control-room', 'rps-board', 'rcs-board', 'loops-board', 'feed-board', 'turbine-board', 'cctv', 'door', 'reactor', 'turbine']);
+  assert.deepEqual(
+    labels.map((match) => match[2]),
+    ['Room', 'RPS', 'RCS', 'Loops', 'SG / feed', 'Turbine', 'CCTV', 'Door', 'Containment', 'Turbine hall'],
+  );
+  assert.deepEqual(
+    labels.map((match) => match[1]),
+    [
+      'control-room',
+      'rps-board',
+      'rcs-board',
+      'loops-board',
+      'feed-board',
+      'turbine-board',
+      'cctv',
+      'door',
+      'reactor',
+      'turbine',
+    ],
+  );
   assert.match(sourceRow, /'aria-label': accessible/);
   for (const match of labels.slice(0, 8)) assert.match(match[3], /STANDING_SPOTS/);
   const row = styles.match(/\.cr-vantages\s*\{([^}]+)\}/)[1];
@@ -114,8 +138,10 @@ test('all ten vantage labels fit the smaller measured canvas with full accessibl
   const border = Number(button.match(/border:\s*(\d+)px/)[1]);
   const gap = Number(row.match(/gap:\s*(\d+)px/)[1]);
   const outer = Number(row.match(/padding:\s*(\d+)px/)[1]);
-  const width = labels.reduce((sum, match) => sum + match[2].length * font * 0.65 + 2 * (padding + border), 0)
-    + (labels.length - 1) * gap + 2 * outer;
+  const width =
+    labels.reduce((sum, match) => sum + match[2].length * font * 0.65 + 2 * (padding + border), 0) +
+    (labels.length - 1) * gap +
+    2 * outer;
   assert.ok(width <= 692, `${width} px`);
   t.diagnostic(`Estimated chip row ${width.toFixed(1)} px of 692 px.`);
 });

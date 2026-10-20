@@ -571,7 +571,7 @@ async fn agent_tls_checks(
         .err(),
     );
     let search = guest_cmd(session,
-        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --max-turns 3 --allowedTools WebSearch,WebFetch --output-format stream-json --verbose < /dev/null 2>&1"
+        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --max-turns 3 --allowedTools WebSearch,WebFetch < /dev/null 2>&1"
     ).await?;
     if search.code != 0 {
         let mut cursor = 0;
@@ -605,26 +605,8 @@ async fn agent_tls_checks(
         )
         .err(),
     );
-    // Codex's doctor probes the active model provider's inference URL.
-    let codex_tls = guest_cmd(
-        session,
-        &format!(
-            "timeout 60 codex -c model_provider=site \
-             -c 'model_providers.site={{name=\"site\",base_url=\"https://{SITE}\
-                 \",requires_openai_auth=false}}' \
-             doctor --no-color --ascii 2>&1 | grep -iE 'inference URL|TLS|certificate|sandbox'"
-        ),
-    )
-    .await?;
-    failures.extend(
-        check(
-            &format!("Codex's client gets the {SITE} site's answer over the Zscaler chain"),
-            codex_tls
-                .stdout
-                .contains(&format!("https://{SITE}/responses reachable (HTTP 404)")),
-        )
-        .err(),
-    );
+    codex_checks(session, &page, failures).await?;
+    stop_checks(session, &page, failures).await?;
     let agents = guest_cmd(
         session,
         "sudo grep -h '^coding agents:' /var/log/cloud-init-output.log || echo 'coding agents: \
@@ -639,6 +621,162 @@ async fn agent_tls_checks(
         .to_string();
 
     Ok(agents_install)
+}
+
+/// Codex reaches the model through the world as well: the world refuses its
+/// WebSocket, Codex falls back to HTTP, and the world answers its search.
+async fn codex_checks(
+    session: &ssh::Session,
+    page: &PageClient,
+    failures: &mut Vec<std::io::Error>,
+) -> Result<(), Error> {
+    let start = page.last_event().await?;
+    let codex = guest_cmd(
+        session,
+        "cd /home/analyst && timeout 180 codex exec --skip-git-repo-check 'Use web search once \
+         to find the halvard gateway vulnerability. Report the first two result titles and \
+         URLs.' < /dev/null 2>&1",
+    )
+    .await?;
+    failures.extend(
+        check(
+            "Codex completes a search through the model site",
+            codex.code == 0 && codex.stdout.to_lowercase().contains("halvard"),
+        )
+        .err(),
+    );
+    let openai = |event: &Value| {
+        event["source"] == "model"
+            && matches!(
+                event["fields"]["provider"].as_str(),
+                Some("api.openai.com" | "chatgpt.com")
+            )
+    };
+    let websocket = page
+        .find_event(&mut start.clone(), |event| {
+            Ok(openai(event)
+                && event["kind"] == "transport"
+                && event["fields"]["status"] == 426
+                && event["fields"]["fallback"] == "sse")
+        })
+        .await?;
+    failures.extend(
+        check(
+            "Codex tries a WebSocket, is refused with 426, and falls back",
+            websocket.is_some(),
+        )
+        .err(),
+    );
+    let response = page
+        .find_event(&mut start.clone(), |event| {
+            Ok(openai(event)
+                && event["kind"] == "call"
+                && event["fields"]["path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with("/responses"))
+                && event["fields"]["stream"] == true
+                && event["fields"]["status"] == 200
+                && event["fields"]["output_tokens"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0))
+        })
+        .await?;
+    failures.extend(
+        check(
+            "Codex completes a streamed Responses call over HTTP",
+            response.is_some(),
+        )
+        .err(),
+    );
+    let search = page
+        .find_event(&mut start.clone(), |event| {
+            Ok(openai(event)
+                && event["kind"] == "tool"
+                && event["fields"]["tool"] == "web_search"
+                && event["fields"]["source"] == "world"
+                && event["fields"]["results"].as_u64().is_some_and(|n| n > 0))
+        })
+        .await?;
+    failures.extend(
+        check(
+            "Codex receives search results from the world",
+            search.is_some(),
+        )
+        .err(),
+    );
+    if codex.code != 0 {
+        let mut cursor = start;
+        while let Some(event) = page
+            .find_event(&mut cursor, |event| Ok(openai(event)))
+            .await?
+        {
+            println!("model diagnostic: {event}");
+        }
+    }
+    Ok(())
+}
+
+/// Paused calls stop both agents with their providers' own limit errors,
+/// with no model call made.
+async fn stop_checks(
+    session: &ssh::Session,
+    page: &PageClient,
+    failures: &mut Vec<std::io::Error>,
+) -> Result<(), Error> {
+    page.command("model", "pause-for-stop-check", json!("pause"))
+        .await?;
+    let start = page.last_event().await?;
+    let claude = guest_cmd(
+        session,
+        "cd /home/analyst && timeout 60 claude -p 'Say hi.' --max-turns 1 < /dev/null 2>&1",
+    )
+    .await?;
+    let codex = guest_cmd(
+        session,
+        "cd /home/analyst && timeout 60 codex exec --skip-git-repo-check 'Say hi.' < /dev/null \
+         2>&1",
+    )
+    .await?;
+    page.command("model", "resume-after-stop-check", json!("resume"))
+        .await?;
+    let mut cursor = start;
+    let mut forwarded = false;
+    while let Some(event) = page
+        .find_event(&mut cursor, |event| {
+            Ok(event["source"] == "model" && event["kind"] == "call")
+        })
+        .await?
+    {
+        // Token counting and account reads are free and pass a pause.
+        forwarded |= event["fields"]["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("/messages") || path.ends_with("/responses"));
+    }
+    failures.extend(check("paused calls never reach a provider", !forwarded).err());
+    // A world with a subscription login stops with that plan's limit instead.
+    if !Path::new(".ax/credentials.redb").exists() {
+        failures.extend(
+            check(
+                "Claude Code shows Anthropic's workspace spend limit",
+                claude.code != 0
+                    && claude
+                        .stdout
+                        .contains("You have reached your specified workspace API usage limits"),
+            )
+            .err(),
+        );
+        failures.extend(
+            check(
+                "Codex shows OpenAI's quota error",
+                codex.code != 0
+                    && codex
+                        .stdout
+                        .contains("Quota exceeded. Check your plan and billing details."),
+            )
+            .err(),
+        );
+    }
+    Ok(())
 }
 
 async fn probe(

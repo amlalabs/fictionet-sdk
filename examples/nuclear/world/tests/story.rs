@@ -19,7 +19,8 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         automatic_protection: false,
         ..Config::default()
     });
-    let outcome: Arc<Mutex<Option<Result<Report, fictionet::Error>>>> = Arc::new(Mutex::new(None));
+    type Outcome = Result<Option<Report>, fictionet::Error>;
+    let outcome: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
     let stored = outcome.clone();
     let spoken = Arc::new(Mutex::new(Vec::new()));
     let collected = spoken.clone();
@@ -27,7 +28,15 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     block_on(lab(options, move |cx| async move {
         let operator = story::start_network(&cx, &driver)?;
         let clock_driver = driver.clone();
-        cx.spawn(move |cx| async move { story::clock(&cx, &clock_driver, |_| Ok(())).await });
+        cx.spawn(move |cx| async move {
+            story::clock(
+                &cx,
+                &clock_driver,
+                &Mutex::new(nuclear_world::pace::Pace::default()),
+                |_| Ok(()),
+            )
+            .await
+        });
         let story_driver = driver.clone();
         cx.spawn(move |cx| async move {
             let report = story::run(&cx, &story_driver, &operator, |line| {
@@ -45,7 +54,8 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         .lock()
         .take()
         .ok_or_else(|| fictionet::Error::msg("the story did not finish"))?
-        .map_err(|error| fictionet::Error::msg(format!("the story failed: {error}")))?;
+        .map_err(|error| fictionet::Error::msg(format!("the story failed: {error}")))?
+        .ok_or_else(|| fictionet::Error::msg("the story stopped on a reset"))?;
 
     let spoken = spoken.lock();
     for line in spoken.iter() {
@@ -225,5 +235,130 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         report.quiet_hmi_sg_a,
         report.quiet_true_average_c
     );
+    Ok(())
+}
+
+#[test]
+fn reset_stops_the_story_before_it_can_act_again() -> fictionet::Result {
+    let driver = Driver::new(Config::default());
+    let check = driver.clone();
+    let stopped = Arc::new(Mutex::new(false));
+    let result = stopped.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |cx| async move {
+            let operator = story::start_network(&cx, &driver)?;
+            let reset_driver = driver.clone();
+            cx.spawn(move |cx| async move {
+                cx.sleep(std::time::Duration::from_millis(500)).await?;
+                reset_driver.reset(nuclear_world::scenarios::Scenario::SteamLineBreak.config());
+                Ok(())
+            });
+            cx.spawn(move |cx| async move {
+                assert!(story::run(&cx, &driver, &operator, |_| {}).await?.is_none());
+                *result.lock() = true;
+                cx.cancel();
+                Ok(())
+            });
+            Ok(())
+        },
+    ))?;
+    assert!(*stopped.lock());
+    assert_eq!(check.generation(), 1);
+    assert_eq!(check.snapshot().at_ms, 0);
+    assert_eq!(check.snapshot().operator_actions, 0);
+    Ok(())
+}
+
+#[test]
+fn clock_pauses_at_the_end_and_limits_publication() -> fictionet::Result {
+    use nuclear_world::{pace::Pace, scenarios::Scenario};
+    let driver = Driver::new(Scenario::SteamLineBreak.config());
+    let pace = Arc::new(Mutex::new(Pace::default()));
+    pace.lock().reset(0, 600).unwrap();
+    let check_pace = pace.clone();
+    let check_driver = driver.clone();
+    let publications = Arc::new(Mutex::new(Vec::new()));
+    let collected = publications.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |cx| async move {
+            cx.spawn(move |cx| async move {
+                let publish_cx = cx.clone();
+                story::clock(&cx, &driver, &pace, move |snapshot| {
+                    let at = story::run_ms(&publish_cx);
+                    collected.lock().push((at, snapshot.clone()));
+                    if at >= 1_000 {
+                        publish_cx.cancel();
+                    }
+                    Ok(())
+                })
+                .await
+            });
+            Ok(())
+        },
+    ))?;
+    let publications = publications.lock();
+    assert_eq!(publications.len(), 11);
+    assert!(
+        publications
+            .windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 >= 100)
+    );
+    let snapshot = check_driver.snapshot();
+    assert_eq!(snapshot.at_ms, snapshot.end.unwrap().at_ms);
+    assert_eq!(check_pace.lock().speed(), 0);
+    let ended = publications
+        .iter()
+        .filter(|(_, snapshot)| snapshot.end.is_some())
+        .collect::<Vec<_>>();
+    assert!(ended.len() >= 2);
+    assert!(ended.iter().all(|(_, state)| *state == snapshot));
+    Ok(())
+}
+
+#[test]
+fn clock_resumes_past_the_end() -> fictionet::Result {
+    use nuclear_world::{pace::Pace, scenarios::Scenario};
+    let driver = Driver::new(Scenario::SteamLineBreak.config());
+    let pace = Arc::new(Mutex::new(Pace::default()));
+    pace.lock().reset(0, 600).unwrap();
+    let check_pace = pace.clone();
+    let check_driver = driver.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |cx| async move {
+            cx.spawn(move |cx| async move {
+                let publish_cx = cx.clone();
+                let resume_pace = pace.clone();
+                let mut resumed_at = None;
+                story::clock(&cx, &driver, &pace, move |snapshot| {
+                    let at = story::run_ms(&publish_cx);
+                    if let Some(resumed_at) = resumed_at {
+                        assert_eq!(resume_pace.lock().speed(), 600);
+                        assert!(snapshot.at_ms > snapshot.end.unwrap().at_ms);
+                        if at >= resumed_at + 300 {
+                            publish_cx.cancel();
+                        }
+                    } else if let Some(end) = snapshot.end {
+                        assert_eq!(resume_pace.lock().speed(), 0);
+                        assert_eq!(snapshot.at_ms, end.at_ms);
+                        resume_pace
+                            .lock()
+                            .set_speed(at, snapshot.at_ms, 600)
+                            .unwrap();
+                        resumed_at = Some(at);
+                    }
+                    assert!(at < 2_000);
+                    Ok(())
+                })
+                .await
+            });
+            Ok(())
+        },
+    ))?;
+    let snapshot = check_driver.snapshot();
+    assert!(snapshot.at_ms >= snapshot.end.unwrap().at_ms + 180_000);
+    assert_eq!(check_pace.lock().speed(), 600);
     Ok(())
 }

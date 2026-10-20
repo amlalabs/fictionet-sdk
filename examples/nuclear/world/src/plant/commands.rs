@@ -18,6 +18,10 @@ impl Plant {
     pub fn apply(&mut self, command: Command) -> Result<Applied, Rejected> {
         self.operator_command(command)
             .map_err(|reason| self.reject(reason))?;
+        self.last_command = Some(LastCommand {
+            command,
+            at_ms: self.at_ms,
+        });
         self.operator_actions = self.operator_actions.saturating_add(1);
         if self.first_action_after_fault_ms.is_none() {
             self.first_action_after_fault_ms = self.last_fault_start_ms.map(|at| self.at_ms - at);
@@ -62,9 +66,13 @@ impl Plant {
                 let fault = match pump {
                     Pump::Coolant(l) => Some(ProcessFault::CoolantPumpTrip { pump: l }),
                     Pump::MainFeed(l) => Some(ProcessFault::FeedPumpTrip { pump: l }),
+                    Pump::SafetyInjection => Some(ProcessFault::SafetyInjectionFailure),
                     _ => None,
                 };
-                if running && fault.is_some_and(|f| self.faults.has(f)) {
+                if running
+                    && (self.faults.has(ProcessFault::StationBlackout)
+                        || fault.is_some_and(|f| self.faults.has(f)))
+                {
                     return Err(Rejection::Faulted);
                 }
                 match pump {
@@ -72,7 +80,19 @@ impl Plant {
                     Pump::MainFeed(l) => {
                         self.state.secondary.feed_pumps_running[l.index()] = running
                     }
-                    Pump::AuxiliaryFeed => self.state.secondary.auxiliary_feed_running = running,
+                    Pump::SafetyInjection => {
+                        self.severe.values.safety_injection.running = running;
+                        if !running {
+                            self.severe.values.safety_injection.signal = false;
+                            self.severe.automatic.reset_injection();
+                        }
+                    }
+                    Pump::AuxiliaryFeed => {
+                        self.state.secondary.auxiliary_feed_running = running;
+                        if running {
+                            self.auxiliary_auto_inhibited = false;
+                        }
+                    }
                     Pump::CirculatingWater => {
                         self.state.secondary.circulating_water_running = running
                     }
@@ -129,11 +149,25 @@ impl Plant {
                     self.state.controllers.steam_dump = mode;
                 }
             },
+            Command::Relief { open } => self.severe.values.relief.demanded_open = open,
+            Command::ReliefBlock { closed } => self.severe.values.relief.block_closed = closed,
+            Command::SteamIsolation { closed } => {
+                self.severe.values.steam_isolation_closed = closed;
+                if !closed {
+                    self.severe.automatic.reset_isolation();
+                }
+            }
             Command::Heaters { on } => {
+                if on && self.faults.has(ProcessFault::StationBlackout) {
+                    return Err(Rejection::Faulted);
+                }
                 if self.state.controllers.pressurizer_pressure == Mode::Automatic {
                     return Err(Rejection::WrongMode);
                 }
                 self.heater_demand = on;
+                if on {
+                    self.heater_auto_inhibited = false;
+                }
             }
             Command::AcknowledgeAlarms => {
                 for alarm in &mut self.alarms {

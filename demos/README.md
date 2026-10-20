@@ -69,9 +69,17 @@ the checks have run both version commands. The Anthropic model API is forwarded 
 receives only a placeholder key. WebSearch and WebFetch use the same adaptive pages
 and search results as the browser. The checks run a real WebSearch for Halvard
 Gateway advisories and require a world search event. The World menu pauses calls
-or changes the default limit of twelve calls.
+or changes the default limits of twelve calls for Claude Code and eight for Codex.
 
-A dedicated Claude login installed with `models::oauth::Store::put` in
+Codex reaches the OpenAI Responses API the same way, using `OPENAI_API_KEY` or
+OpenRouter’s Responses endpoint with `OPENROUTER_API_KEY`. The guest is set up as
+`codex login --with-api-key` leaves it, with a placeholder key. Codex tries a
+WebSocket first; the world refuses it with `426`, and Codex falls back to HTTP
+streaming. The world answers Codex’s web search, page opens and page finds from
+the same pages. The checks run one Codex search, then pause calls and require
+each agent to show its provider’s own limit error.
+
+A dedicated Claude or ChatGPT login installed with `models::oauth::Store::put` in
 `.ax/credentials.redb` takes precedence over API keys. The world owns refresh and
 seeds only placeholders in the guest, with private file permissions. The desktop
 does not read the host’s Claude Code or Codex login files.

@@ -55,3 +55,81 @@ pub(super) fn allowed(tool: &Value, url: &str) -> bool {
             .as_array()
             .is_none_or(|ds| ds.iter().any(matches))
 }
+/// Elements that end a line of text, as a browser lays them out.
+const BLOCKS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "br",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "td",
+    "th",
+    "tr",
+    "ul",
+];
+/// A page's readable text: HTML without scripts and styles, or plain text.
+/// Blank lines and indentation are dropped. Other media types have none.
+pub(super) fn text(page: &Page) -> Option<String> {
+    let text = if page.media_type == "text/html" {
+        use kuchiki::iter::NodeEdge;
+        use kuchiki::traits::TendrilSink;
+        let doc = kuchiki::parse_html().one(String::from_utf8_lossy(&page.body).into_owned());
+        if let Ok(nodes) = doc.select("head,script,style,noscript,template") {
+            for node in nodes.collect::<Vec<_>>() {
+                node.as_node().detach();
+            }
+        }
+        let block = |node: &kuchiki::NodeRef| {
+            node.as_element()
+                .is_some_and(|e| BLOCKS.contains(&&*e.name.local))
+        };
+        let mut text = String::new();
+        for edge in doc.traverse() {
+            match edge {
+                NodeEdge::Start(node) | NodeEdge::End(node) if block(&node) => text.push('\n'),
+                NodeEdge::Start(node) => {
+                    if let Some(chunk) = node.as_text() {
+                        text.push_str(&chunk.borrow());
+                    }
+                }
+                NodeEdge::End(_) => {}
+            }
+        }
+        text
+    } else if page.media_type.starts_with("text/") {
+        String::from_utf8_lossy(&page.body).into_owned()
+    } else {
+        return None;
+    };
+    Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}

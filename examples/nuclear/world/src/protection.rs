@@ -261,3 +261,158 @@ mod tests {
         assert_eq!(p.cause(), None);
     }
 }
+
+/// Tracks threshold crossings so an operator can undo an automatic action.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AutomaticState {
+    injection_low: bool,
+    isolation_low: bool,
+}
+
+impl AutomaticState {
+    pub fn reset_injection(&mut self) {
+        self.injection_low = true;
+    }
+    pub fn reset_isolation(&mut self) {
+        self.isolation_low = true;
+    }
+}
+
+pub(crate) struct AutomaticInputs {
+    pub enabled: bool,
+    pub primary_mpa: f64,
+    pub header_mpa: f64,
+    pub injection_failed: bool,
+    pub blackout: bool,
+    pub injection_signal: bool,
+    pub injection_running: bool,
+    pub isolation_closed: bool,
+}
+pub(crate) struct AutomaticActions {
+    pub state: AutomaticState,
+    pub injection_signal: bool,
+    pub injection_running: bool,
+    pub isolation_closed: bool,
+}
+
+/// True pressure thresholds and equipment availability determine each action.
+pub(crate) fn automatic_actions(state: AutomaticState, input: AutomaticInputs) -> AutomaticActions {
+    let injection_low = input.primary_mpa < 12.0;
+    let isolation_low = input.header_mpa < 4.5;
+    let signal = input.injection_signal || (input.enabled && injection_low && !state.injection_low);
+    AutomaticActions {
+        state: AutomaticState {
+            injection_low,
+            isolation_low,
+        },
+        injection_signal: signal,
+        injection_running: (input.injection_running || (input.enabled && signal))
+            && !input.injection_failed
+            && !input.blackout,
+        isolation_closed: input.isolation_closed
+            || (input.enabled && isolation_low && !state.isolation_low),
+    }
+}
+
+#[cfg(test)]
+mod automatic_tests {
+    use super::*;
+    fn input() -> AutomaticInputs {
+        AutomaticInputs {
+            enabled: true,
+            primary_mpa: 11.9,
+            header_mpa: 4.4,
+            injection_failed: false,
+            blackout: false,
+            injection_signal: false,
+            injection_running: false,
+            isolation_closed: false,
+        }
+    }
+    #[test]
+    fn low_true_pressures_start_injection_and_close_isolation() {
+        let actions = automatic_actions(AutomaticState::default(), input());
+        assert!(actions.injection_signal && actions.injection_running && actions.isolation_closed);
+    }
+    #[test]
+    fn thresholds_do_not_trigger_at_equality() {
+        let actions = automatic_actions(
+            AutomaticState::default(),
+            AutomaticInputs {
+                primary_mpa: 12.0,
+                header_mpa: 4.5,
+                ..input()
+            },
+        );
+        assert!(
+            !actions.injection_signal && !actions.injection_running && !actions.isolation_closed
+        );
+    }
+    #[test]
+    fn protection_off_takes_no_automatic_action() {
+        let actions = automatic_actions(
+            AutomaticState::default(),
+            AutomaticInputs {
+                enabled: false,
+                ..input()
+            },
+        );
+        assert!(
+            !actions.injection_signal && !actions.injection_running && !actions.isolation_closed
+        );
+    }
+    #[test]
+    fn failed_injection_latches_and_returns_after_repair() {
+        let failed = automatic_actions(
+            AutomaticState::default(),
+            AutomaticInputs {
+                injection_failed: true,
+                ..input()
+            },
+        );
+        assert!(failed.injection_signal);
+        assert!(!failed.injection_running);
+        let repaired = automatic_actions(
+            failed.state,
+            AutomaticInputs {
+                primary_mpa: 13.0,
+                injection_signal: failed.injection_signal,
+                ..input()
+            },
+        );
+        assert!(repaired.injection_running);
+    }
+    #[test]
+    fn blackout_stops_injection_but_not_isolation() {
+        let actions = automatic_actions(
+            AutomaticState::default(),
+            AutomaticInputs {
+                blackout: true,
+                injection_running: true,
+                ..input()
+            },
+        );
+        assert!(actions.injection_signal && actions.isolation_closed);
+        assert!(!actions.injection_running);
+    }
+    #[test]
+    fn operator_overrides_wait_for_a_new_pressure_crossing() {
+        let first = automatic_actions(AutomaticState::default(), input());
+        let overridden = automatic_actions(first.state, input());
+        assert!(
+            !overridden.injection_signal
+                && !overridden.injection_running
+                && !overridden.isolation_closed
+        );
+        let reset = automatic_actions(
+            overridden.state,
+            AutomaticInputs {
+                primary_mpa: 12.0,
+                header_mpa: 4.5,
+                ..input()
+            },
+        );
+        let again = automatic_actions(reset.state, input());
+        assert!(again.injection_signal && again.injection_running && again.isolation_closed);
+    }
+}

@@ -2,8 +2,31 @@ import { FAULT_SENSORS } from './knobs.mjs';
 
 export const SCREEN_LAYOUTS = Object.freeze(['primary', 'secondary', 'alarms-primary', 'alarms-secondary']);
 
-const PRIMARY = ['neutron_power', 'rod_position', 'core_exit_temperature', 'pressurizer_pressure', 'pressurizer_level', 'hot_leg:a', 'hot_leg:b', 'cold_leg:a', 'cold_leg:b', 'coolant_flow:a', 'coolant_flow:b'];
-const SECONDARY = ['steam_generator_level:a', 'steam_generator_level:b', 'steam_pressure', 'steam_flow:a', 'steam_flow:b', 'feed_flow:a', 'feed_flow:b', 'turbine_valve', 'generator_output', 'condenser_pressure'];
+const PRIMARY = [
+  'neutron_power',
+  'rod_position',
+  'core_exit_temperature',
+  'pressurizer_pressure',
+  'pressurizer_level',
+  'hot_leg:a',
+  'hot_leg:b',
+  'cold_leg:a',
+  'cold_leg:b',
+  'coolant_flow:a',
+  'coolant_flow:b',
+];
+const SECONDARY = [
+  'steam_generator_level:a',
+  'steam_generator_level:b',
+  'steam_pressure',
+  'steam_flow:a',
+  'steam_flow:b',
+  'feed_flow:a',
+  'feed_flow:b',
+  'turbine_valve',
+  'generator_output',
+  'condenser_pressure',
+];
 
 // The HMI combines loop alarms into one tile. Keep its tile order.
 const ALARMS = [
@@ -35,9 +58,9 @@ function valueText(pair) {
 
 function alarmTiles(view) {
   return ALARMS.map(([label, ...keys]) => {
-    const states = keys.map(key => view?.alarms?.find(alarm => alarm.key === key)?.state ?? 'normal');
+    const states = keys.map((key) => view?.alarms?.find((alarm) => alarm.key === key)?.state ?? 'normal');
     let state = 'Unavailable';
-    if (view?.alarms && states.every(state => state === 'normal')) state = 'Normal';
+    if (view?.alarms && states.every((state) => state === 'normal')) state = 'Normal';
     if (states.includes('acknowledged')) state = 'Acknowledged';
     if (states.includes('active')) state = 'Active';
     return { label, state };
@@ -57,18 +80,29 @@ function contents(view, layout) {
   }
   const rs = view?.reportedStatus ?? {};
   const keys = layout === 'primary' ? PRIMARY : SECONDARY;
-  const readings = keys.map(key => {
-    const pair = view?.pairs?.find(pair => pair.key === key);
-    return { tag: FAULT_SENSORS.find(sensor => sensor.key === key).tag, value: valueText(pair) };
+  const readings = keys.map((key) => {
+    const pair = view?.pairs?.find((pair) => pair.key === key);
+    return { tag: FAULT_SENSORS.find((sensor) => sensor.key === key).tag, value: valueText(pair) };
   });
   let status;
   if (layout === 'primary') {
-    status = [rs.reactorTripped, rs.pressurizerHeatersOn, rs.pressurizerReliefOpen, ...[0, 1].map(i => rs.coolantPumpsRunning?.[i])];
+    status = [
+      rs.reactorTripped,
+      rs.pressurizerHeatersOn,
+      rs.pressurizerReliefOpen,
+      ...[0, 1].map((i) => rs.coolantPumpsRunning?.[i]),
+    ];
   } else {
-    status = [rs.turbineTripped, rs.steamReliefOpen, ...[0, 1].map(i => rs.feedPumpsRunning?.[i]), rs.auxiliaryFeedRunning, rs.circulatingWaterRunning];
+    status = [
+      rs.turbineTripped,
+      rs.steamReliefOpen,
+      ...[0, 1].map((i) => rs.feedPumpsRunning?.[i]),
+      rs.auxiliaryFeedRunning,
+      rs.circulatingWaterRunning,
+    ];
   }
-  const active = allAlarms.filter(alarm => alarm.state === 'Active').length;
-  const acknowledged = allAlarms.filter(alarm => alarm.state === 'Acknowledged').length;
+  const active = allAlarms.filter((alarm) => alarm.state === 'Active').length;
+  const acknowledged = allAlarms.filter((alarm) => alarm.state === 'Acknowledged').length;
   return { title: `HMI01 · ${layout.toUpperCase()} OVERVIEW`, link, readings, status, active, acknowledged };
 }
 
@@ -120,7 +154,17 @@ export function paintDeskScreen(ctx, { width = 1024, height = 512, view, palette
     ctx.stroke();
   };
   const valve = (x, y, abnormal) => {
-    path([[x - 12, y - 9], [x + 12, y + 9], [x + 12, y - 9], [x - 12, y + 9], [x - 12, y - 9]], abnormal === true ? p.warning : p.steel, true);
+    path(
+      [
+        [x - 12, y - 9],
+        [x + 12, y + 9],
+        [x + 12, y - 9],
+        [x - 12, y + 9],
+        [x - 12, y - 9],
+      ],
+      abnormal === true ? p.warning : p.steel,
+      true,
+    );
   };
   const stateText = (state, yes, no) => {
     if (state == null) return 'Unavailable';
@@ -128,7 +172,11 @@ export function paintDeskScreen(ctx, { width = 1024, height = 512, view, palette
   };
   const pump = (x, y, label, running, abnormal = running === false) => {
     circle(x, y, 18, abnormal ? p.warning : p.steel);
-    path([[x - 6, y - 8], [x + 9, y], [x - 6, y + 8]]);
+    path([
+      [x - 6, y - 8],
+      [x + 9, y],
+      [x - 6, y + 8],
+    ]);
     text(`${label} ${stateText(running, 'Running', 'Stopped')}`, x - 65, y + 24, 18, abnormal ? p.warning : p.ink);
   };
   const vessel = (x, y, label, tripped, tubes = false) => {
@@ -169,14 +217,40 @@ export function paintDeskScreen(ctx, { width = 1024, height = 512, view, palette
   } else {
     const s = data.status;
     if (layout === 'primary') {
-      path([[156, 132], [450, 132]]);
-      path([[516, 132], [900, 132]]);
-      path([[123, 176], [123, 200], [450, 200]]);
-      path([[933, 176], [933, 200], [516, 200]]);
-      path([[693, 150], [693, 166], [840, 166], [840, 132]]);
-      path([[726, 82], [800, 82]]);
+      path([
+        [156, 132],
+        [450, 132],
+      ]);
+      path([
+        [516, 132],
+        [900, 132],
+      ]);
+      path([
+        [123, 176],
+        [123, 200],
+        [450, 200],
+      ]);
+      path([
+        [933, 176],
+        [933, 200],
+        [516, 200],
+      ]);
+      path([
+        [693, 150],
+        [693, 166],
+        [840, 166],
+        [840, 132],
+      ]);
+      path([
+        [726, 82],
+        [800, 82],
+      ]);
       vessel(450, 114, 'Reactor', s[0]);
-      for (const x of [470, 482, 494]) path([[x, 124], [x, 174]]);
+      for (const x of [470, 482, 494])
+        path([
+          [x, 124],
+          [x, 174],
+        ]);
       text(stateText(s[0], 'Tripped', 'Clear'), 440, 208, 18, s[0] === true ? p.warning : p.ink);
       vessel(660, 64, 'Pressurizer');
       valve(770, 82, s[2]);
@@ -187,24 +261,59 @@ export function paintDeskScreen(ctx, { width = 1024, height = 512, view, palette
       pump(285, 200, 'RCP A', s[3]);
       pump(760, 200, 'RCP B', s[4]);
     } else {
-      path([[70, 152], [70, 84], [720, 84], [720, 194], [970, 194], [970, 228], [70, 228], [70, 180]]);
-      path([[250, 152], [250, 84]]);
-      path([[250, 180], [250, 228]]);
+      path([
+        [70, 152],
+        [70, 84],
+        [720, 84],
+        [720, 194],
+        [970, 194],
+        [970, 228],
+        [70, 228],
+        [70, 180],
+      ]);
+      path([
+        [250, 152],
+        [250, 84],
+      ]);
+      path([
+        [250, 180],
+        [250, 228],
+      ]);
       vessel(36, 128, 'SG A', false, true);
       vessel(216, 128, 'SG B', false, true);
       valve(380, 84, s[1]);
       valve(480, 84);
-      for (const [x, label] of [[540, 'HP'], [640, 'LP']]) {
-        path([[x, 72], [x + 65, 52], [x + 65, 116], [x, 96], [x, 72]], s[0] === true ? p.warning : p.steel, true);
+      for (const [x, label] of [
+        [540, 'HP'],
+        [640, 'LP'],
+      ]) {
+        path(
+          [
+            [x, 72],
+            [x + 65, 52],
+            [x + 65, 116],
+            [x, 96],
+            [x, 72],
+          ],
+          s[0] === true ? p.warning : p.steel,
+          true,
+        );
         text(label, x + 18, 72, 22);
       }
       text(`Turbine ${stateText(s[0], 'Tripped', 'Clear')}`, 530, 125, 18, s[0] === true ? p.warning : p.ink);
-      path([[705, 84], [804, 84]]);
+      path([
+        [705, 84],
+        [804, 84],
+      ]);
       circle(830, 84, 26);
       text('G', 820, 71, 26);
       text('Generator', 885, 72, 20);
       box(855, 154, 145, 58, p.steel);
-      for (const y of [166, 180, 194]) path([[862, y], [993, y]]);
+      for (const y of [166, 180, 194])
+        path([
+          [862, y],
+          [993, y],
+        ]);
       text('Condenser', 870, 130, 18);
       valve(135, 228);
       valve(315, 228);
@@ -221,7 +330,13 @@ export function paintDeskScreen(ctx, { width = 1024, height = 512, view, palette
       text(reading.value, x + 6, y + 34, 28);
     });
     box(16, 432, 992, 36, p.raised);
-    text(`Alarms: ${data.active} active · ${data.acknowledged} acknowledged`, 26, 437, 24, data.active > 0 ? p.warning : p.ink);
+    text(
+      `Alarms: ${data.active} active · ${data.acknowledged} acknowledged`,
+      26,
+      437,
+      24,
+      data.active > 0 ? p.warning : p.ink,
+    );
   }
   text(data.link, 16, 480, 26);
   ctx.restore();
