@@ -7,8 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fictionet::stdlib::network::ConnError;
 use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::network::{ConnError, ConnectionExt};
 use fictionet::stdlib::protocols::http1::{self, Header, RequestHead, Version};
 use fictionet::stdlib::world::sandbox::{self, Machine};
 use fictionet::sync::Mutex;
@@ -31,6 +31,14 @@ struct World {
 }
 
 fn start_world(fcx: &Cx, driver: &Driver) -> Result<World, Error> {
+    start_world_with_controllers(fcx, driver, hmi::controllers())
+}
+
+fn start_world_with_controllers(
+    fcx: &Cx,
+    driver: &Driver,
+    controllers: hmi::Controllers,
+) -> Result<World, Error> {
     let (attacher, attachments) = fictionet::attachments();
     let operator_route = Prefix {
         addr: IpAddr::V4(OPERATOR),
@@ -40,7 +48,7 @@ fn start_world(fcx: &Cx, driver: &Driver) -> Result<World, Error> {
         .route("operator", operator_route)
         .start(fcx, attachments)?;
     let hmi_machine = sandbox::machine(fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
-    let held = hmi::start(fcx, hmi_machine, hmi::controllers())?;
+    let held = hmi::start(fcx, hmi_machine, controllers)?;
     let operator = sandbox::machine(fcx, attacher.attach("operator")?, OPERATOR);
     Ok(World {
         attacher,
@@ -196,6 +204,48 @@ fn poll_holds_each_controller_block_and_plant_json_matches_the_snapshot() {
             let world = start_world(&fcx, &driver)?;
             let view = next_poll(&fcx, &world.operator, 0).await;
 
+            for reading in view["readings"].as_object().unwrap().values() {
+                assert!(!reading["tag"].as_str().unwrap().is_empty());
+            }
+            assert_eq!(
+                view["plant_time"],
+                hmi::plant_time(view["clock_ms"].as_u64().unwrap())
+            );
+            assert!(
+                view["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|link| link["error"].is_null())
+            );
+            let trend = send(
+                &fcx,
+                &world.operator,
+                &get("/api/trend?point=neutron_power&minutes=10"),
+            )
+            .await;
+            assert_eq!(trend.head.status, 200);
+            let trend = json_body(&trend);
+            assert_eq!(trend["point"], "neutron_power");
+            let samples = trend["samples"].as_array().unwrap();
+            assert!(!samples.is_empty());
+            assert_eq!(
+                samples.last().unwrap()["value"],
+                view["readings"]["neutron_power"]["value"]
+            );
+            assert!(samples[0]["clock_ms"].is_u64());
+            for query in ["", "&minutes=no", "&minutes=0", "&minutes=-1"] {
+                let reply = send(
+                    &fcx,
+                    &world.operator,
+                    &get(&format!("/api/trend?point=neutron_power{query}")),
+                )
+                .await;
+                assert_eq!(reply.head.status, 200);
+                assert!(!json_body(&reply)["samples"].as_array().unwrap().is_empty());
+            }
+            let missing = send(&fcx, &world.operator, &get("/api/trend?point=missing")).await;
+            assert_eq!(missing.head.status, 404);
             let snapshot = driver.snapshot();
             // The blocks the HMI holds are the controllers' own blocks.
             {
@@ -433,6 +483,14 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
                 next_poll(&fcx, &world.operator, before["polls"].as_u64().unwrap_or(0)).await;
             assert_eq!(stopped["status"]["coolant_pump_b"], json!(false));
             assert_eq!(alarm_state(&stopped, "coolant_pump_stopped"), "active");
+            let in_time = stopped["alarms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["id"] == "coolant_pump_stopped")
+                .unwrap()["in_ms"]
+                .clone();
+            assert_eq!(in_time, stopped["clock_ms"]);
 
             let ack = send(
                 &fcx,
@@ -450,6 +508,15 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
             assert_eq!(
                 alarm_state(&acknowledged, "coolant_pump_stopped"),
                 "acknowledged"
+            );
+            assert_eq!(
+                acknowledged["alarms"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|a| a["id"] == "coolant_pump_stopped")
+                    .unwrap()["in_ms"],
+                in_time
             );
             assert_eq!(
                 driver.snapshot().operator_actions,
@@ -559,6 +626,112 @@ fn telemetry_heartbeats_hold_across_polls_and_resume_after_clearing() {
                     .zip(&held_counts)
                     .all(|(a, b)| a > b)
             );
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn site_clock_follows_elapsed_time_across_civil_boundaries() {
+    assert_eq!(hmi::plant_time(0), "2026-03-14T08:00:00.000Z");
+    assert_eq!(hmi::plant_time(12_500), "2026-03-14T08:00:12.500Z");
+    assert_eq!(hmi::plant_time(16 * 3_600_000), "2026-03-15T00:00:00.000Z");
+    assert_eq!(hmi::plant_time(18 * 86_400_000), "2026-04-01T08:00:00.000Z");
+    assert_eq!(
+        hmi::plant_time(293 * 86_400_000),
+        "2027-01-01T08:00:00.000Z"
+    );
+    assert_eq!(
+        hmi::plant_time(717 * 86_400_000),
+        "2028-02-29T08:00:00.000Z"
+    );
+    assert_eq!(
+        hmi::plant_time(718 * 86_400_000),
+        "2028-03-01T08:00:00.000Z"
+    );
+}
+
+#[test]
+fn history_is_bounded_and_failed_reads_are_gaps() {
+    let mut held = Held::default();
+    held.blocks[0].online = true;
+    held.blocks[0].read_ms = Some(0);
+    held.blocks[0].input = vec![1000; 5];
+    for n in 0..hmi::HISTORY_CAPACITY + 7 {
+        held.clock_ms = Some(n as u64 * hmi::POLL_MS);
+        held.sample();
+    }
+    let samples = held.trend("neutron_power", 10).unwrap();
+    assert_eq!(samples.len(), hmi::HISTORY_CAPACITY);
+    assert_eq!(samples[0].clock_ms, 7 * hmi::POLL_MS);
+    assert_eq!(samples[0].value, Some(100.0));
+    let recent = held.trend("neutron_power", 1).unwrap();
+    assert_eq!(recent.len(), 241);
+    assert_eq!(recent[0].clock_ms, held.clock_ms.unwrap() - 60_000);
+    held.blocks[0].online = false;
+    held.clock_ms = held.clock_ms.map(|time| time + hmi::POLL_MS);
+    held.sample();
+    assert_eq!(
+        held.trend("neutron_power", 10)
+            .unwrap()
+            .last()
+            .unwrap()
+            .value,
+        None
+    );
+    assert!(held.trend("missing", 10).is_none());
+}
+
+#[test]
+fn failed_controller_links_serve_classified_reasons() {
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(10)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            let mut controllers = hmi::controllers();
+            controllers.rcs1.set_port(5999);
+            controllers.bop1 = SocketAddr::new(OPERATOR.into(), 5998);
+            controllers
+                .rps1
+                .set_ip(Ipv4Addr::new(192, 168, 95, 99).into());
+            let (attacher, attachments) = fictionet::attachments();
+            hmi::with_hmi(&driver)
+                .route(
+                    "operator",
+                    Prefix {
+                        addr: OPERATOR.into(),
+                        len: 32,
+                    },
+                )
+                .route(
+                    "disconnected-controller",
+                    Prefix {
+                        addr: controllers.rps1.ip(),
+                        len: 32,
+                    },
+                )
+                .start(&fcx, attachments)?;
+            let _disconnected = attacher.attach("disconnected-controller")?;
+            let machine = sandbox::machine(&fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
+            hmi::start(&fcx, machine, controllers)?;
+            let operator = sandbox::machine(&fcx, attacher.attach("operator")?, OPERATOR);
+            let mut listener = operator.tcp.listen(5998)?;
+            fcx.spawn(move |fcx| async move {
+                let mut conn = listener.accept(&fcx).await?;
+                let mut request = [0; 64];
+                conn.read(&fcx, &mut request).await?;
+                conn.write_all(&fcx, &[0, 1, 0, 1, 0, 2, 1, 3]).await?;
+                Ok(())
+            });
+            let view = next_poll(&fcx, &operator, 0).await;
+            assert_eq!(view["links"][0]["error"], "timeout");
+            assert_eq!(view["links"][1]["error"], "refused");
+            assert_eq!(view["links"][0]["online"], false);
+            assert_eq!(view["links"][1]["online"], false);
+            assert_eq!(view["links"][2]["error"], "bad reply");
+            assert_eq!(view["links"][2]["online"], false);
             fcx.cancel();
             Ok(())
         },

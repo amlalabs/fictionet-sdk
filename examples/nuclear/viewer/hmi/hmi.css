@@ -1,81 +1,81 @@
 /* Colors are tokens on :root. The control room palette is dark by default. */
 :root {
-  --bg: #0f1419;
-  --panel: #161d24;
-  --ink: #e6edf3;
-  --muted: #9aa7b4;
-  --line: #2f3a46;
-  --line-strong: #6b7a8a;
-  --equip: #1d2731;
-  --pipe: #5b6b7b;
-  --ok: #3fb950;
+  --bg: #202020;
+  --panel: #292929;
+  --ink: #eeeeee;
+  --muted: #bbbbbb;
+  --line: #555555;
+  --line-strong: #777777;
+  --equip: #333333;
+  --pipe: #999999;
+  --ok: #cccccc;
   --stale: #d4a72c;
-  --trend: #58a6ff;
-  --focus: #ffb454;
+  --trend: #cccccc;
+  --focus: #eeeeee;
   --alarm-bg: #4a1d1d;
   --alarm-ink: #ffd8d4;
   --alarm-line: #ff7b72;
   --ack-bg: #3a2f10;
   --ack-ink: #f2e2b0;
   --ack-line: #d4a72c;
-  --button-bg: #22303c;
-  --button-ink: #e6edf3;
+  --button-bg: #404040;
+  --button-ink: #eeeeee;
   --danger-bg: #8b1e1e;
-  --danger-ink: #ffffff;
+  --danger-ink: #dedede;
   color-scheme: dark;
 }
 
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
-    --bg: #f3f5f7;
-    --panel: #ffffff;
-    --ink: #14202b;
-    --muted: #4b5a68;
-    --line: #cdd5dd;
-    --line-strong: #6b7a8a;
-    --equip: #eef2f6;
-    --pipe: #7b8a99;
-    --ok: #1a7f37;
+    --bg: #c6c6c6;
+    --panel: #dedede;
+    --ink: #202020;
+    --muted: #444444;
+    --line: #999999;
+    --line-strong: #777777;
+    --equip: #d2d2d2;
+    --pipe: #666666;
+    --ok: #555555;
     --stale: #7a4d00;
-    --trend: #0b5cad;
-    --focus: #8a4b00;
+    --trend: #333333;
+    --focus: #202020;
     --alarm-bg: #fde7e4;
     --alarm-ink: #7a1b13;
     --alarm-line: #b3261e;
     --ack-bg: #fff4cf;
     --ack-ink: #5a4300;
     --ack-line: #9a6700;
-    --button-bg: #e8edf2;
-    --button-ink: #14202b;
+    --button-bg: #d2d2d2;
+    --button-ink: #202020;
     --danger-bg: #b3261e;
-    --danger-ink: #ffffff;
+    --danger-ink: #dedede;
     color-scheme: light;
   }
 }
 
 :root[data-theme="light"] {
-  --bg: #f3f5f7;
-  --panel: #ffffff;
-  --ink: #14202b;
-  --muted: #4b5a68;
-  --line: #cdd5dd;
-  --line-strong: #6b7a8a;
-  --equip: #eef2f6;
-  --pipe: #7b8a99;
-  --ok: #1a7f37;
+  --bg: #c6c6c6;
+  --panel: #dedede;
+  --ink: #202020;
+  --muted: #444444;
+  --line: #999999;
+  --line-strong: #777777;
+  --equip: #d2d2d2;
+  --pipe: #666666;
+  --ok: #555555;
   --stale: #7a4d00;
-  --trend: #0b5cad;
-  --focus: #8a4b00;
+  --trend: #333333;
+  --focus: #202020;
   --alarm-bg: #fde7e4;
   --alarm-ink: #7a1b13;
   --alarm-line: #b3261e;
   --ack-bg: #fff4cf;
   --ack-ink: #5a4300;
   --ack-line: #9a6700;
-  --button-bg: #e8edf2;
-  --button-ink: #14202b;
+  --button-bg: #d2d2d2;
+  --button-ink: #202020;
   --danger-bg: #b3261e;
-  --danger-ink: #ffffff;
+  --danger-ink: #dedede;
   color-scheme: light;
 }
 
@@ -93,7 +93,12 @@ body {
 }
 
 .top {
-  padding: 16px 16px 4px;
+  grid-area: header;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 32px;
+  justify-content: space-between;
+  align-items: baseline;
 }
 
 .top h1 {
@@ -113,6 +118,7 @@ body {
   padding: 12px 16px 24px;
   grid-template-columns: minmax(0, 1fr);
   grid-template-areas:
+    "header"
     "alarms"
     "mimic"
     "controls"
@@ -123,7 +129,7 @@ body {
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 2px;
   padding: 12px;
   min-width: 0;
 }
@@ -163,12 +169,16 @@ body {
 
 @media (min-width: 1000px) {
   .hmi {
-    grid-template-columns: 320px minmax(0, 1fr) 300px;
+    grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
     grid-template-areas:
-      "alarms alarms alarms"
-      "controls mimic trends"
-      "status status status";
+      "header header"
+      "alarms alarms"
+      "mimic mimic"
+      "controls trends"
+      "status status";
   }
+  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .controls > .panel-title, .controls > .message { grid-column: 1 / -1; }
 }
 
 /* Annunciators */
@@ -195,7 +205,7 @@ body {
   flex-direction: column;
   gap: 2px;
   padding: 8px 10px;
-  border-radius: 6px;
+  border-radius: 2px;
   border: 1px solid var(--line);
   border-left: 6px solid var(--line-strong);
   background: var(--equip);
@@ -234,7 +244,7 @@ body {
 .mimic svg {
   display: block;
   width: 100%;
-  min-width: 620px;
+  min-width: 1050px;
   height: auto;
 }
 
@@ -324,14 +334,14 @@ body {
   min-width: 32px;
   padding: 4px 10px;
   border: 1px solid var(--line-strong);
-  border-radius: 6px;
+  border-radius: 2px;
   background: var(--button-bg);
   color: var(--button-ink);
   font: inherit;
   cursor: pointer;
 }
 
-.control-button.danger {
+.control-button.armed {
   background: var(--danger-bg);
   color: var(--danger-ink);
   border-color: var(--danger-bg);
@@ -343,7 +353,7 @@ body {
   min-height: 32px;
   padding: 4px 6px;
   border: 1px solid var(--line-strong);
-  border-radius: 6px;
+  border-radius: 2px;
   background: var(--panel);
   color: var(--ink);
   font: inherit;
@@ -444,7 +454,7 @@ body {
   }
 
   .pump.running {
-    fill: Highlight;
+    fill: CanvasText;
   }
 
   .pipe,
@@ -452,3 +462,11 @@ body {
     stroke: CanvasText;
   }
 }
+
+.mimic text { font-family: ui-monospace, monospace; font-size: 13px; }
+.pump.abnormal { fill: var(--alarm-line); }
+.pump-state.abnormal { fill: var(--alarm-ink); }
+.pump-state.stale, .pump.stale { fill: var(--stale); }
+.site-clock { font-variant-numeric: tabular-nums; }
+.alarm-entries { margin: 12px 0 0; padding-left: 20px; }
+.trip-note { font-size: .9rem; margin: 6px 0; }

@@ -3,13 +3,13 @@
 // render(root, plant, history) fills five parts of the page from one reply of
 // /api/plant: the alarm strip, the mimic, the control column, the trend column
 // and the status bar. It makes no network calls. The page loop at the end of
-// this file polls /api/plant once a second, keeps the newest replies for the
-// trends, and sends controls as POST requests when an operator presses a button.
+// this file polls /api/plant and /api/trend once a second and sends controls
+// as POST requests when an operator presses a button.
 
 const PLANT_PATH = '/api/plant';
 const CONTROL_PATH = '/api/control/';
 const POLL_MS = 1000;
-const HISTORY_LIMIT = 120;
+
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 const STATE_WORDS = { normal: 'Normal', active: 'Active', acknowledged: 'Acknowledged' };
@@ -17,38 +17,49 @@ const LINK_IDS = ['rps1', 'rcs1', 'bop1'];
 
 // Equipment boxes of the mimic. Each lists the readings it shows, in order.
 const BOXES = [
-  { title: 'Pressurizer', x: 40, y: 20, w: 150, h: 112, fields: ['pressurizer_pressure', 'pressurizer_level', 'spray_valve'] },
-  { title: 'Reactor core', x: 40, y: 170, w: 150, h: 180, fields: ['neutron_power', 'rod_demand', 'core_exit_temperature'] },
-  { title: 'Steam generator A', x: 262, y: 30, w: 170, h: 150, fields: ['hot_leg_a', 'sg_level_a', 'steam_flow_a', 'feed_flow_a', 'feed_valve_a'] },
-  { title: 'Steam generator B', x: 262, y: 262, w: 170, h: 150, fields: ['hot_leg_b', 'sg_level_b', 'steam_flow_b', 'feed_flow_b', 'feed_valve_b'] },
-  { title: 'Turbine', x: 530, y: 30, w: 170, h: 110, fields: ['turbine_valve_position', 'generator_output'] },
-  { title: 'Steam dump', x: 530, y: 170, w: 170, h: 90, fields: ['steam_dump_valve'] },
-  { title: 'Condenser', x: 530, y: 300, w: 170, h: 90, fields: ['condenser_pressure'] },
+  { title: 'Reactor core', x: 20, y: 20, w: 340, h: 245, fields: ['neutron_power', 'rod_position', 'shutdown_rods', 'rod_demand', 'core_exit_temperature'], flags: ['reactor_tripped'] },
+  { title: 'Pressurizer', x: 20, y: 320, w: 340, h: 220, fields: ['pressurizer_pressure', 'pressurizer_level', 'spray_valve'], flags: ['heaters', 'pressurizer_relief'] },
+  { title: 'Loop A · Steam generator A', x: 400, y: 20, w: 340, h: 390, fields: ['hot_leg_a', 'cold_leg_a', 'coolant_flow_a', 'sg_level_a', 'steam_flow_a', 'feed_flow_a', 'feed_valve_a'], flags: ['coolant_pump_a', 'feed_pump_a'] },
+  { title: 'Loop B · Steam generator B', x: 400, y: 460, w: 340, h: 390, fields: ['hot_leg_b', 'cold_leg_b', 'coolant_flow_b', 'sg_level_b', 'steam_flow_b', 'feed_flow_b', 'feed_valve_b'], flags: ['coolant_pump_b', 'feed_pump_b'] },
+  { title: 'Turbine / Generator', x: 780, y: 20, w: 340, h: 220, fields: ['turbine_valve', 'turbine_valve_position', 'generator_output'], flags: ['turbine_tripped'] },
+  { title: 'Steam header', x: 780, y: 300, w: 340, h: 175, fields: ['steam_pressure', 'steam_dump_valve'], flags: ['steam_relief'] },
+  { title: 'Condenser / Feedwater', x: 780, y: 550, w: 340, h: 200, fields: ['condenser_pressure'], flags: ['circulating_water', 'auxiliary_feed'] },
 ];
 
-// Pipes as [x1, y1, x2, y2]. Hot legs leave the reactor; cold legs return to it.
+// Connections end at equipment edges. Text stays inside the equipment.
 const PIPES = [
-  [105, 132, 105, 170],
-  [190, 185, 262, 100],
-  [262, 160, 190, 240],
-  [190, 330, 262, 410],
-  [262, 320, 190, 290],
-  [432, 80, 530, 80],
-  [432, 290, 500, 290],
-  [500, 290, 500, 90],
-  [470, 230, 432, 150],
-  [470, 300, 432, 300],
+  [180, 265, 180, 320],
+  [360, 90, 400, 90], [360, 220, 400, 220],
+  [360, 150, 380, 150], [380, 150, 380, 670], [380, 670, 400, 670],
+  [360, 240, 370, 240], [370, 240, 370, 800], [370, 800, 400, 800],
+  [740, 100, 780, 100], [740, 520, 760, 520], [760, 520, 760, 140], [760, 140, 780, 140],
+  [950, 240, 950, 300], [950, 475, 950, 550],
+  [780, 650, 740, 650], [780, 610, 750, 610], [750, 610, 750, 370], [750, 370, 740, 370],
 ];
 
-// Pumps as circles on the pipes. `flag` is the status key of the pump.
-const PUMPS = [
-  { label: 'Coolant pump A', flag: 'coolant_pump_a', x: 236, y: 189 },
-  { label: 'Coolant pump B', flag: 'coolant_pump_b', x: 236, y: 309 },
-  { label: 'Feed pump A', flag: 'feed_pump_a', x: 470, y: 230 },
-  { label: 'Feed pump B', flag: 'feed_pump_b', x: 470, y: 300 },
-];
+const FLAGS = {
+  reactor_tripped: ['Reactor trip', 'Tripped', 'Clear', true, 'rps1'],
+  turbine_tripped: ['Turbine trip', 'Tripped', 'Clear', true, 'bop1'],
+  heaters: ['Pressurizer heaters', 'On', 'Off', null, 'rcs1'],
+  pressurizer_relief: ['Pressurizer relief', 'Open', 'Closed', true, 'rcs1'],
+  steam_relief: ['Steam relief', 'Open', 'Closed', true, 'bop1'],
+  coolant_pump_a: ['Coolant pump A', 'Running', 'Stopped', false, 'rcs1'],
+  coolant_pump_b: ['Coolant pump B', 'Running', 'Stopped', false, 'rcs1'],
+  feed_pump_a: ['Feed pump A', 'Running', 'Stopped', false, 'bop1'],
+  feed_pump_b: ['Feed pump B', 'Running', 'Stopped', false, 'bop1'],
+  auxiliary_feed: ['Auxiliary feed', 'Running', 'Stopped', false, 'bop1'],
+  circulating_water: ['Circulating water', 'Running', 'Stopped', false, 'bop1'],
+};
 
 const FIELD_LABELS = {
+  rod_position: 'Rod position',
+  shutdown_rods: 'Shutdown rods',
+  cold_leg_a: 'Cold leg',
+  cold_leg_b: 'Cold leg',
+  coolant_flow_a: 'Coolant flow',
+  coolant_flow_b: 'Coolant flow',
+  steam_pressure: 'Steam pressure',
+  turbine_valve: 'Valve position',
   pressurizer_pressure: 'Pressure',
   pressurizer_level: 'Level',
   spray_valve: 'Spray valve',
@@ -65,7 +76,7 @@ const FIELD_LABELS = {
   feed_flow_b: 'Feed flow',
   feed_valve_a: 'Feed valve',
   feed_valve_b: 'Feed valve',
-  turbine_valve_position: 'Turbine valve',
+  turbine_valve_position: 'Valve demand',
   generator_output: 'Output',
   steam_dump_valve: 'Steam dump valve',
   condenser_pressure: 'Pressure',
@@ -149,6 +160,7 @@ function partsFor(root) {
   const doc = root.ownerDocument ?? globalThis.document;
   found = {
     doc,
+    clock: make(doc, 'time', { class: 'site-clock' }),
     annunciators: buildAnnunciators(doc),
     mimic: buildMimic(doc),
     controls: buildControls(doc),
@@ -156,6 +168,10 @@ function partsFor(root) {
     status: buildStatus(doc),
   };
   root.textContent = '';
+  const header = make(doc, 'header', { class: 'top' });
+  header.appendChild(make(doc, 'h1', {}, 'ASHCOMBE UNIT 1 · PLANT OVERVIEW'));
+  header.appendChild(found.clock);
+  root.appendChild(header);
   root.appendChild(found.annunciators.section);
   root.appendChild(found.mimic.section);
   root.appendChild(found.controls.section);
@@ -174,10 +190,12 @@ export function showNotice(root, text) {
 
 /**
  * Fills the five parts of the page from one reply of /api/plant. `history`
- * holds earlier replies, oldest first, for the trends.
+ * accepts server histories by point, or earlier plant replies, oldest first.
  */
 export function render(root, plant, history = []) {
   const p = partsFor(root);
+  p.clock.textContent = plant.plant_time ?? 'Site time: awaiting first poll';
+  p.clock.setAttribute('datetime', plant.plant_time ?? '');
   updateAnnunciators(p.annunciators, plant.alarms ?? []);
   updateMimic(p.mimic, plant);
   p.controls.update(plant);
@@ -195,7 +213,9 @@ function buildAnnunciators(doc) {
   section.appendChild(heading);
   section.appendChild(summary);
   section.appendChild(list);
-  return { doc, section, summary, list, tiles: new Map() };
+  const entries = make(doc, 'ul', { class: 'alarm-entries', 'aria-label': 'Alarm time in' });
+  section.appendChild(entries);
+  return { doc, section, summary, list, entries, tiles: new Map() };
 }
 
 function updateAnnunciators(a, alarms) {
@@ -218,6 +238,13 @@ function updateAnnunciators(a, alarms) {
     if (alarm.state === 'active') active += 1;
   }
   a.summary.textContent = `${active} active`;
+  a.entries.textContent = '';
+  const current = alarms.filter((alarm) => alarm.state === 'active' || alarm.state === 'acknowledged');
+  for (const alarm of current) {
+    const time = alarm.in_ms == null ? 'Time unavailable' : `${Math.floor(alarm.in_ms / 60000)}:${((alarm.in_ms % 60000) / 1000).toFixed(1).padStart(4, '0')}`;
+    a.entries.appendChild(make(a.doc, 'li', {}, `${time} · ${alarm.label} · ${STATE_WORDS[alarm.state]}`));
+  }
+  if (!current.length) a.entries.appendChild(make(a.doc, 'li', {}, 'No active alarms.'));
 }
 
 // ---- Mimic -----------------------------------------------------------------
@@ -225,7 +252,7 @@ function updateAnnunciators(a, alarms) {
 function buildMimic(doc) {
   const section = make(doc, 'section', { class: 'panel mimic', 'aria-label': 'Plant mimic' });
   const picture = svg(doc, 'svg', {
-    viewBox: '0 0 720 440',
+    viewBox: '0 0 1140 870',
     role: 'img',
     'aria-label': 'Mimic of the primary and secondary circuits with live readings and pump state',
   });
@@ -233,24 +260,26 @@ function buildMimic(doc) {
     picture.appendChild(svg(doc, 'line', { x1, y1, x2, y2, class: 'pipe' }));
   }
   const readings = new Map();
+  const pumps = new Map();
   for (const box of BOXES) {
     picture.appendChild(svg(doc, 'rect', { x: box.x, y: box.y, width: box.w, height: box.h, rx: 6, class: 'equipment' }));
     picture.appendChild(svg(doc, 'text', { x: box.x + 10, y: box.y + 22, class: 'equipment-title' }, box.title));
     box.fields.forEach((id, i) => {
-      const text = svg(doc, 'text', { x: box.x + 10, y: box.y + 46 + i * 18, class: 'reading', 'data-reading': id });
+      const text = svg(doc, 'text', { x: box.x + 10, y: box.y + 54 + i * 30, class: 'reading', 'data-reading': id });
       picture.appendChild(text);
       readings.set(id, { text, label: FIELD_LABELS[id] ?? id });
     });
-  }
-  const pumps = new Map();
-  for (const pump of PUMPS) {
-    const circle = svg(doc, 'circle', { cx: pump.x, cy: pump.y, r: 16, class: 'pump', 'data-pump': pump.flag });
-    const name = svg(doc, 'text', { x: pump.x, y: pump.y + 34, class: 'pump-name', 'text-anchor': 'middle' }, pump.label);
-    const state = svg(doc, 'text', { x: pump.x, y: pump.y + 50, class: 'pump-state', 'text-anchor': 'middle' });
-    picture.appendChild(circle);
-    picture.appendChild(name);
-    picture.appendChild(state);
-    pumps.set(pump.flag, { circle, state });
+    box.flags.forEach((flag, i) => {
+      const y = box.y + 54 + (box.fields.length + i) * 30;
+      const [label] = FLAGS[flag];
+      const circle = svg(doc, 'circle', { cx: box.x + 17, cy: y - 5, r: 6, class: 'pump', 'data-pump': flag });
+      const name = svg(doc, 'text', { x: box.x + 32, y, class: 'pump-name' }, label);
+      const state = svg(doc, 'text', { x: box.x + 250, y, class: 'pump-state', 'data-status': flag });
+      picture.appendChild(circle);
+      picture.appendChild(name);
+      picture.appendChild(state);
+      pumps.set(flag, { circle, state });
+    });
   }
   section.appendChild(picture);
   return { section, readings, pumps };
@@ -259,14 +288,20 @@ function buildMimic(doc) {
 function updateMimic(m, plant) {
   for (const [id, entry] of m.readings) {
     const reading = plant.readings?.[id];
-    entry.text.textContent = `${entry.label}: ${formatValue(reading)}`;
+    entry.text.textContent = `${reading?.tag ?? "—"} ${entry.label}: ${formatValue(reading)}`;
     setFlag(entry.text, 'stale', reading?.stale === true);
   }
   for (const [flag, pump] of m.pumps) {
     const running = plant.status?.[flag];
     pump.circle.classList.remove('running', 'stopped', 'unknown');
     pump.circle.classList.add(running === true ? 'running' : running === false ? 'stopped' : 'unknown');
-    pump.state.textContent = running === true ? 'Running' : running === false ? 'Stopped' : 'No data';
+    const [, on, off, abnormal, controller] = FLAGS[flag];
+    const stale = plant.links?.some((link) => link.id === controller && !link.online);
+    pump.state.textContent = stale ? 'Stale' : running === true ? on : running === false ? off : 'No data';
+    setFlag(pump.state, 'abnormal', running != null && running === abnormal);
+    setFlag(pump.circle, 'abnormal', running != null && running === abnormal);
+    setFlag(pump.state, 'stale', stale || running == null);
+    setFlag(pump.circle, 'stale', stale || running == null);
   }
 }
 
@@ -283,7 +318,34 @@ function buildControls(doc) {
   const message = make(doc, 'p', { class: 'message', role: 'status' }, 'Ready.');
 
   const reactor = group(doc, 'Reactor');
-  reactor.add(button(doc, 'Trip reactor', 'danger', () => post('trip', {}, 'Trip reactor', message)));
+  let armedUntil = 0;
+  let armTimer;
+  const note = make(doc, 'p', { id: 'trip-note', role: 'status', class: 'trip-note' });
+  const resetArm = () => {
+    armedUntil = 0;
+    clearTimeout(armTimer);
+    trip.textContent = 'Trip reactor';
+    trip.setAttribute('aria-label', 'Trip reactor');
+    trip.classList.remove('armed');
+    note.textContent = '';
+  };
+  const trip = button(doc, 'Trip reactor', '', () => {
+    if (armedUntil > Date.now()) {
+      resetArm();
+      return post('trip', {}, 'Trip reactor', message);
+    }
+    resetArm();
+    armedUntil = Date.now() + 5000;
+    trip.textContent = 'Confirm trip';
+    trip.setAttribute('aria-label', 'Confirm trip');
+    trip.classList.add('armed');
+    note.textContent = 'Trip armed for 5 seconds. Press Confirm trip to trip the reactor.';
+    armTimer = setTimeout(resetArm, 5000);
+    return undefined;
+  });
+  trip.setAttribute('aria-describedby', 'trip-note');
+  reactor.add(trip);
+  reactor.add(note);
   reactor.add(button(doc, 'Reset trip', '', () => post('reset', {}, 'Reset trip', message)));
   reactor.add(button(doc, 'Acknowledge alarms', '', () => post('acknowledge', {}, 'Acknowledge alarms', message)));
   section.appendChild(reactor.node);
@@ -489,34 +551,49 @@ function buildTrends(doc) {
     const value = make(doc, 'span', { class: 'trend-value' });
     const picture = svg(doc, 'svg', { viewBox: '0 0 160 40', class: 'sparkline', role: 'img', 'aria-label': `${trend.label} history` });
     const line = svg(doc, 'polyline', { class: 'trend-line', points: '' });
+    const gaps = svg(doc, 'path', { class: 'trend-line', d: '' });
     picture.appendChild(line);
+    picture.appendChild(gaps);
     item.appendChild(label);
     item.appendChild(value);
     item.appendChild(picture);
     section.appendChild(item);
-    return { id: trend.id, value, line };
+    return { id: trend.id, value, line, gaps };
   });
   return { section, rows };
 }
 
-function sparkPoints(values) {
-  if (values.length < 2) return '';
+function sparkSegments(samples) {
+  const values = samples.map((sample) => sample.value).filter((value) => typeof value === 'number');
+  if (values.length < 2) return [];
   const low = Math.min(...values);
-  const high = Math.max(...values);
-  const span = high - low || 1;
-  const step = 160 / (values.length - 1);
-  return values
-    .map((value, i) => `${(i * step).toFixed(1)},${(36 - ((value - low) / span) * 32 + 2).toFixed(1)}`)
-    .join(' ');
+  const span = Math.max(...values) - low || 1;
+  const start = samples[0].clock_ms;
+  const duration = samples.at(-1).clock_ms - start;
+  const segments = [];
+  let segment = [];
+  for (const [i, sample] of samples.entries()) {
+    if (typeof sample.value !== 'number') {
+      if (segment.length > 1) segments.push(segment);
+      segment = [];
+      continue;
+    }
+    const x = duration > 0 ? (sample.clock_ms - start) / duration * 160 : i / (samples.length - 1) * 160;
+    segment.push(`${x.toFixed(1)},${(38 - (sample.value - low) / span * 32).toFixed(1)}`);
+  }
+  if (segment.length > 1) segments.push(segment);
+  return segments;
 }
 
 function updateTrends(t, plant, history) {
   for (const row of t.rows) {
     row.value.textContent = formatValue(plant.readings?.[row.id]);
-    const values = history
-      .map((sample) => sample.readings?.[row.id]?.value)
-      .filter((value) => typeof value === 'number');
-    row.line.setAttribute('points', sparkPoints(values));
+    const samples = Array.isArray(history)
+      ? history.map((sample) => ({ clock_ms: sample.clock_ms, value: sample.readings?.[row.id]?.value }))
+      : history[row.id]?.samples ?? [];
+    const segments = sparkSegments(samples);
+    row.line.setAttribute('points', segments[0]?.join(' ') ?? '');
+    row.gaps.setAttribute('d', segments.slice(1).map((segment) => `M${segment.join(' L')}`).join(' '));
   }
 }
 
@@ -540,13 +617,13 @@ function buildStatus(doc) {
 function fillStatus(s, plant) {
   s.clock.textContent = plant.clock_ms === null || plant.clock_ms === undefined
     ? 'Clock: waiting for the first poll'
-    : `Clock ${seconds(plant.clock_ms)}`;
+    : `Elapsed ${seconds(plant.clock_ms)}`;
   for (const link of plant.links ?? []) {
     const item = s.links.get(link.id);
     if (!item) continue;
     const last = link.read_ms === null || link.read_ms === undefined ? 'never read' : `last poll ${seconds(link.read_ms)}`;
     const heartbeat = link.heartbeat == null ? 'not yet read' : link.heartbeat;
-    item.textContent = `${link.id} ${link.online ? 'online' : 'offline'}, ${last}, heartbeat ${heartbeat}`;
+    item.textContent = `${link.id} ${link.online ? 'COMM OK' : `COMM FAIL: ${link.error ?? 'awaiting first poll'}`}, ${last}, heartbeat ${heartbeat}`;
     setFlag(item, 'offline', !link.online);
   }
 }
@@ -554,25 +631,30 @@ function fillStatus(s, plant) {
 // ---- Page loop -------------------------------------------------------------
 
 /**
- * Polls /api/plant every POLL_MS, renders each reply and keeps the newest
- * HISTORY_LIMIT replies for the trends.
+ * Polls the held plant values and the server history every POLL_MS.
  */
 export function start(root, interval = POLL_MS) {
-  const history = [];
+
   let busy = false;
   const tick = async () => {
     if (busy) return;
     busy = true;
+    let plantReceived = false;
     try {
       const response = await fetch(PLANT_PATH, { cache: 'no-store' });
       if (!response.ok) throw new Error(`status ${response.status}`);
       const plant = await response.json();
-      history.push(plant);
-      if (history.length > HISTORY_LIMIT) history.splice(0, history.length - HISTORY_LIMIT);
-      render(root, plant, history);
+      render(root, plant);
+      plantReceived = true;
+      const histories = await Promise.all(TRENDS.map(async ({ id }) => {
+        const reply = await fetch(`/api/trend?point=${id}&minutes=10`, { cache: 'no-store' });
+        if (!reply.ok) throw new Error('History unavailable');
+        return [id, await reply.json()];
+      }));
+      render(root, plant, Object.fromEntries(histories));
       showNotice(root, '');
     } catch {
-      showNotice(root, 'No data from the HMI. Retrying.');
+      showNotice(root, plantReceived ? 'Trend history unavailable. Retrying.' : 'No data from the HMI. Retrying.');
     } finally {
       busy = false;
     }

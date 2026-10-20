@@ -23,9 +23,7 @@
 //! a supervisory system does. The limits are the HMI's configuration. They are
 //! not read from the plant.
 //!
-//! Plant time is not in any register, so `clock_ms` is the run clock at the
-//! last poll cycle. A world that wants the screen to show plant time must
-//! add it to the register map first.
+//! Site time is the fixed site epoch plus the run clock at the last poll.
 //!
 //! Engineering values are the input-register count times its scale: 0.1 for
 //! most channels and 0.01 for the two pressures. Holding registers for rod and
@@ -39,7 +37,7 @@
 //! | rcs1 | 8 (30009) |
 //! | bop1 | 10 (30011) |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -56,7 +54,7 @@ use fictionet::stdlib::web::httpd::{self, Handler, HttpOptions, Router};
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::world::sandbox::Machine;
 use fictionet::sync::Mutex;
-use fictionet::{Cx, Error};
+use fictionet::{Cx, Error, RaceError};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +73,61 @@ pub const POLL_MS: u64 = 250;
 /// The path prefix of the control POSTs.
 pub const CONTROL_PREFIX: &str = "/api/control/";
 
+/// Site clock origin, in UTC civil fields.
+pub const SITE_EPOCH: (u64, u64, u64, u64) = (2026, 3, 14, 8);
+/// Ten minutes of samples at the poll interval.
+pub const HISTORY_CAPACITY: usize = 2400;
+
+/// Formats the site epoch plus elapsed milliseconds without a wall clock.
+pub fn plant_time(clock_ms: u64) -> String {
+    let (mut year, mut month, day, hour) = SITE_EPOCH;
+    let seconds = clock_ms / 1000 + hour * 3600;
+    let mut days = seconds / 86400 + day - 1;
+    year += (days / 146_097) * 400;
+    days %= 146_097;
+    loop {
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let length = match month {
+            2 => {
+                if leap {
+                    29
+                } else {
+                    28
+                }
+            }
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if days < length {
+            break;
+        }
+        days -= length;
+        month += 1;
+        if month == 13 {
+            month = 1;
+            year += 1;
+        }
+    }
+    let time = seconds % 86400;
+    format!(
+        "{year:04}-{month:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        days + 1,
+        time / 3600,
+        time / 60 % 60,
+        time % 60,
+        clock_ms % 1000
+    )
+}
+
+/// One polled value; null marks a failed read.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Sample {
+    pub clock_ms: u64,
+    pub value: Option<f64>,
+}
+
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const UNIT: u8 = 1;
 const PLCS: [Plc; 3] = [Plc::Rps1, Plc::Rcs1, Plc::Bop1];
 const INDEX_HTML: &str = include_str!("../../viewer/hmi/index.html");
@@ -188,6 +241,7 @@ pub struct Block {
 struct Latch {
     active: bool,
     acknowledged: bool,
+    in_ms: Option<u64>,
 }
 
 impl Latch {
@@ -202,7 +256,7 @@ impl Latch {
 
 /// Everything the poll task holds: the three blocks, the poll counters, and
 /// the alarm latches.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Held {
     /// One block per controller: rps1, rcs1, bop1.
     pub blocks: [Block; 3],
@@ -211,9 +265,47 @@ pub struct Held {
     /// Completed poll cycles.
     pub polls: u64,
     alarms: [Latch; ALARM_COUNT],
+    history: BTreeMap<&'static str, VecDeque<Sample>>,
 }
 
 impl Held {
+    /// Saves one poll and drops samples beyond the fixed capacity.
+    pub fn sample(&mut self) {
+        let Some(clock_ms) = self.clock_ms else {
+            return;
+        };
+        for point in POINTS {
+            let value = if block(self, point.plc).online {
+                point_value(self, point)
+            } else {
+                None
+            };
+            let samples = self.history.entry(point.id).or_default();
+            if samples.len() == HISTORY_CAPACITY {
+                samples.pop_front();
+            }
+            samples.push_back(Sample { clock_ms, value });
+        }
+    }
+
+    /// Returns a known point's samples within the requested time window.
+    pub fn trend(&self, point: &str, minutes: u64) -> Option<Vec<Sample>> {
+        POINTS.iter().find(|p| p.id == point)?;
+        let cutoff = self
+            .clock_ms
+            .unwrap_or(0)
+            .saturating_sub(minutes.saturating_mul(60_000));
+        Some(
+            self.history
+                .get(point)
+                .into_iter()
+                .flatten()
+                .filter(|sample| sample.clock_ms >= cutoff)
+                .cloned()
+                .collect(),
+        )
+    }
+
     /// Marks every active alarm as acknowledged.
     fn acknowledge(&mut self) {
         for latch in self.alarms.iter_mut().filter(|latch| latch.active) {
@@ -238,6 +330,7 @@ enum Scale {
 #[derive(Clone, Copy, Debug)]
 struct Point {
     id: &'static str,
+    tag: &'static str,
     plc: Plc,
     bank: Bank,
     index: usize,
@@ -247,6 +340,7 @@ struct Point {
 
 const fn input(
     id: &'static str,
+    tag: &'static str,
     plc: Plc,
     index: usize,
     scale: Scale,
@@ -254,6 +348,7 @@ const fn input(
 ) -> Point {
     Point {
         id,
+        tag,
         plc,
         bank: Bank::Input,
         index,
@@ -262,9 +357,16 @@ const fn input(
     }
 }
 
-const fn holding(id: &'static str, plc: Plc, index: usize, unit: &'static str) -> Point {
+const fn holding(
+    id: &'static str,
+    tag: &'static str,
+    plc: Plc,
+    index: usize,
+    unit: &'static str,
+) -> Point {
     Point {
         id,
+        tag,
         plc,
         bank: Bank::Holding,
         index,
@@ -274,40 +376,90 @@ const fn holding(id: &'static str, plc: Plc, index: usize, unit: &'static str) -
 }
 
 const POINTS: &[Point] = &[
-    input("neutron_power", Plc::Rps1, 0, Scale::Tenth, "%"),
-    input("rod_position", Plc::Rps1, 1, Scale::Tenth, "%"),
-    input("core_exit_temperature", Plc::Rps1, 2, Scale::Tenth, "C"),
-    input("shutdown_rods", Plc::Rps1, 3, Scale::Tenth, "%"),
-    holding("rod_demand", Plc::Rps1, 0, "%"),
-    input("hot_leg_a", Plc::Rcs1, 0, Scale::Tenth, "C"),
-    input("hot_leg_b", Plc::Rcs1, 1, Scale::Tenth, "C"),
-    input("cold_leg_a", Plc::Rcs1, 2, Scale::Tenth, "C"),
-    input("cold_leg_b", Plc::Rcs1, 3, Scale::Tenth, "C"),
+    input("neutron_power", "NI-41", Plc::Rps1, 0, Scale::Tenth, "%"),
+    input("rod_position", "ZT-401", Plc::Rps1, 1, Scale::Tenth, "%"),
+    input(
+        "core_exit_temperature",
+        "TE-413",
+        Plc::Rps1,
+        2,
+        Scale::Tenth,
+        "C",
+    ),
+    input("shutdown_rods", "ZT-402", Plc::Rps1, 3, Scale::Tenth, "%"),
+    holding("rod_demand", "ZIC-401", Plc::Rps1, 0, "%"),
+    input("hot_leg_a", "TE-411A", Plc::Rcs1, 0, Scale::Tenth, "C"),
+    input("hot_leg_b", "TE-411B", Plc::Rcs1, 1, Scale::Tenth, "C"),
+    input("cold_leg_a", "TE-412A", Plc::Rcs1, 2, Scale::Tenth, "C"),
+    input("cold_leg_b", "TE-412B", Plc::Rcs1, 3, Scale::Tenth, "C"),
     input(
         "pressurizer_pressure",
+        "PT-455",
         Plc::Rcs1,
         4,
         Scale::Hundredth,
         "MPa",
     ),
-    input("pressurizer_level", Plc::Rcs1, 5, Scale::Tenth, "%"),
-    input("coolant_flow_a", Plc::Rcs1, 6, Scale::Tenth, "%"),
-    input("coolant_flow_b", Plc::Rcs1, 7, Scale::Tenth, "%"),
-    holding("spray_valve", Plc::Rcs1, 0, "%"),
-    input("sg_level_a", Plc::Bop1, 0, Scale::Tenth, "%"),
-    input("sg_level_b", Plc::Bop1, 1, Scale::Tenth, "%"),
-    input("steam_pressure", Plc::Bop1, 2, Scale::Hundredth, "MPa"),
-    input("steam_flow_a", Plc::Bop1, 3, Scale::Tenth, "kg/s"),
-    input("steam_flow_b", Plc::Bop1, 4, Scale::Tenth, "kg/s"),
-    input("feed_flow_a", Plc::Bop1, 5, Scale::Tenth, "kg/s"),
-    input("feed_flow_b", Plc::Bop1, 6, Scale::Tenth, "kg/s"),
-    input("turbine_valve", Plc::Bop1, 7, Scale::Tenth, "%"),
-    input("generator_output", Plc::Bop1, 8, Scale::Tenth, "MW"),
-    input("condenser_pressure", Plc::Bop1, 9, Scale::Tenth, "kPa"),
-    holding("feed_valve_a", Plc::Bop1, 0, "%"),
-    holding("feed_valve_b", Plc::Bop1, 1, "%"),
-    holding("turbine_valve_position", Plc::Bop1, 2, "%"),
-    holding("steam_dump_valve", Plc::Bop1, 3, "%"),
+    input(
+        "pressurizer_level",
+        "LT-459",
+        Plc::Rcs1,
+        5,
+        Scale::Tenth,
+        "%",
+    ),
+    input("coolant_flow_a", "FT-414A", Plc::Rcs1, 6, Scale::Tenth, "%"),
+    input("coolant_flow_b", "FT-414B", Plc::Rcs1, 7, Scale::Tenth, "%"),
+    holding("spray_valve", "ZT-456", Plc::Rcs1, 0, "%"),
+    input("sg_level_a", "LT-421A", Plc::Bop1, 0, Scale::Tenth, "%"),
+    input("sg_level_b", "LT-421B", Plc::Bop1, 1, Scale::Tenth, "%"),
+    input(
+        "steam_pressure",
+        "PT-431",
+        Plc::Bop1,
+        2,
+        Scale::Hundredth,
+        "MPa",
+    ),
+    input(
+        "steam_flow_a",
+        "FT-432A",
+        Plc::Bop1,
+        3,
+        Scale::Tenth,
+        "kg/s",
+    ),
+    input(
+        "steam_flow_b",
+        "FT-432B",
+        Plc::Bop1,
+        4,
+        Scale::Tenth,
+        "kg/s",
+    ),
+    input("feed_flow_a", "FT-433A", Plc::Bop1, 5, Scale::Tenth, "kg/s"),
+    input("feed_flow_b", "FT-433B", Plc::Bop1, 6, Scale::Tenth, "kg/s"),
+    input("turbine_valve", "ZT-441", Plc::Bop1, 7, Scale::Tenth, "%"),
+    input(
+        "generator_output",
+        "JT-451",
+        Plc::Bop1,
+        8,
+        Scale::Tenth,
+        "MW",
+    ),
+    input(
+        "condenser_pressure",
+        "PT-452",
+        Plc::Bop1,
+        9,
+        Scale::Tenth,
+        "kPa",
+    ),
+    holding("feed_valve_a", "ZT-433A", Plc::Bop1, 0, "%"),
+    holding("feed_valve_b", "ZT-433B", Plc::Bop1, 1, "%"),
+    holding("turbine_valve_position", "ZIC-441", Plc::Bop1, 2, "%"),
+    holding("steam_dump_valve", "ZT-434", Plc::Bop1, 3, "%"),
 ];
 
 /// A discrete input, read as a yes or no.
@@ -655,6 +807,12 @@ fn update_alarms(held: &mut Held) {
     let known = Known::of(held);
     for (alarm, latch) in ALARMS.iter().zip(held.alarms.iter_mut()) {
         if let Some(active) = alarm.rule.decide(&known, latch.active) {
+            if active && !latch.active {
+                latch.in_ms = held.clock_ms;
+            }
+            if !active {
+                latch.in_ms = None;
+            }
             latch.active = active;
             if !active {
                 latch.acknowledged = false;
@@ -707,6 +865,7 @@ fn mode_value(held: &Held, plc: Plc, index: usize) -> Option<&'static str> {
 /// has failed.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Reading {
+    pub tag: &'static str,
     pub value: Option<f64>,
     pub unit: &'static str,
     pub stale: bool,
@@ -730,11 +889,13 @@ pub struct AlarmView {
     pub label: &'static str,
     /// `normal`, `active` or `acknowledged`.
     pub state: &'static str,
+    pub in_ms: Option<u64>,
 }
 
 /// What `/api/plant` returns.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct View {
+    pub plant_time: Option<String>,
     pub polls: u64,
     pub clock_ms: Option<u64>,
     pub links: Vec<Link>,
@@ -749,6 +910,7 @@ pub struct View {
 /// The HMI's view of the held blocks.
 pub fn view(held: &Held) -> View {
     View {
+        plant_time: held.clock_ms.map(plant_time),
         polls: held.polls,
         clock_ms: held.clock_ms,
         links: PLCS
@@ -772,6 +934,7 @@ pub fn view(held: &Held) -> View {
                 (
                     p.id,
                     Reading {
+                        tag: p.tag,
                         value: point_value(held, p),
                         unit: p.unit,
                         stale: !block(held, p.plc).online,
@@ -791,6 +954,7 @@ pub fn view(held: &Held) -> View {
                 id: alarm.id,
                 label: alarm.label,
                 state: latch.state(),
+                in_ms: latch.in_ms,
             })
             .collect(),
     }
@@ -802,11 +966,11 @@ enum Failure {
     /// The connection failed or was cancelled.
     Net(ConnError),
     /// A frame or PDU did not parse or could not be written.
-    Frame(modbus::Error),
+    Frame,
     /// The reply did not answer the request.
-    Reply(&'static str),
+    Reply,
     /// The controller answered with an exception.
-    Exception(Exception),
+    Exception,
     /// The controller closed the connection before it replied.
     Closed,
 }
@@ -814,13 +978,23 @@ enum Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Failure::Net(e) => write!(f, "connection: {e:?}"),
-            Failure::Frame(e) => write!(f, "frame: {e:?}"),
-            Failure::Reply(reason) => f.write_str(reason),
-            Failure::Exception(e) => write!(f, "the controller answered: {e}"),
-            Failure::Closed => f.write_str("the controller closed the connection"),
+            Failure::Net(e) => f.write_str(match e {
+                ConnError::TimedOut => "timeout",
+                ConnError::Broken => "bad reply",
+                _ => "refused",
+            }),
+            Failure::Frame | Failure::Reply | Failure::Exception => f.write_str("bad reply"),
+
+            Failure::Closed => f.write_str("refused"),
         }
     }
+}
+
+fn deadline_failure(error: RaceError) -> Failure {
+    Failure::Net(match error {
+        RaceError::Deadline => ConnError::TimedOut,
+        RaceError::Cancelled => ConnError::Cancelled,
+    })
 }
 
 /// One Modbus/TCP session to a controller.
@@ -831,7 +1005,11 @@ struct Session {
 
 impl Session {
     async fn open(fcx: &Cx, tcp: &tcp::Endpoint, to: SocketAddr) -> Result<Session, Failure> {
-        let conn = tcp.connect(fcx, to).await.map_err(Failure::Net)?;
+        let conn = fcx
+            .race(Some(fcx.now() + RESPONSE_TIMEOUT), tcp.connect(fcx, to))
+            .await
+            .map_err(deadline_failure)?
+            .map_err(Failure::Net)?;
         Ok(Session {
             conn,
             transaction: 0,
@@ -844,31 +1022,46 @@ impl Session {
         fcx: &Cx,
         request: &modbus::Request,
     ) -> Result<modbus::Response, Failure> {
+        fcx.race(
+            Some(fcx.now() + RESPONSE_TIMEOUT),
+            self.exchange(fcx, request),
+        )
+        .await
+        .map_err(deadline_failure)?
+    }
+
+    async fn exchange(
+        &mut self,
+        fcx: &Cx,
+        request: &modbus::Request,
+    ) -> Result<modbus::Response, Failure> {
         self.transaction = self.transaction.wrapping_add(1);
         let transaction = self.transaction;
-        let pdu = request.to_pdu().map_err(Failure::Frame)?;
+        let pdu = request.to_pdu().map_err(|_| Failure::Frame)?;
         let bytes = Frame {
             transaction,
             unit: UNIT,
             pdu,
         }
         .to_bytes()
-        .map_err(Failure::Frame)?;
+        .map_err(|_| Failure::Frame)?;
         self.conn
             .write_all(fcx, &bytes)
             .await
             .map_err(Failure::Net)?;
         let mut received = Vec::new();
         loop {
-            if let Some((frame, used)) = Frame::parse_prefix(&received).map_err(Failure::Frame)? {
+            if let Some((frame, used)) =
+                Frame::parse_prefix(&received).map_err(|_| Failure::Frame)?
+            {
                 received.drain(..used);
-                if frame.transaction != transaction {
-                    return Err(Failure::Reply("the reply names another transaction"));
+                if frame.transaction != transaction || frame.unit != UNIT {
+                    return Err(Failure::Reply);
                 }
                 let (function, response) =
-                    modbus::Response::parse(&frame.pdu).map_err(Failure::Frame)?;
+                    modbus::Response::parse(&frame.pdu).map_err(|_| Failure::Frame)?;
                 if function != request.function() {
-                    return Err(Failure::Reply("the reply names another function"));
+                    return Err(Failure::Reply);
                 }
                 return Ok(response);
             }
@@ -890,8 +1083,8 @@ async fn registers(
 ) -> Result<Vec<u16>, Failure> {
     match session.call(fcx, &request).await? {
         modbus::Response::Registers(values) if values.len() == usize::from(quantity) => Ok(values),
-        modbus::Response::Exception(e) => Err(Failure::Exception(e)),
-        _ => Err(Failure::Reply("the reply does not hold the registers read")),
+        modbus::Response::Exception(_) => Err(Failure::Exception),
+        _ => Err(Failure::Reply),
     }
 }
 
@@ -906,8 +1099,8 @@ async fn bits(
         modbus::Response::Bits(values) if values.len() >= usize::from(quantity) => {
             Ok(values[..usize::from(quantity)].to_vec())
         }
-        modbus::Response::Exception(e) => Err(Failure::Exception(e)),
-        _ => Err(Failure::Reply("the reply does not hold the bits read")),
+        modbus::Response::Exception(_) => Err(Failure::Exception),
+        _ => Err(Failure::Reply),
     }
 }
 
@@ -1015,6 +1208,7 @@ async fn poll(
             state.polls += 1;
             state.clock_ms = Some(clock);
             update_alarms(&mut state);
+            state.sample();
         }
         if fcx.sleep(Duration::from_millis(POLL_MS)).await.is_err() {
             break;
@@ -1067,6 +1261,7 @@ pub fn start(
 
 fn router(held: Arc<Mutex<Held>>, tcp: tcp::Endpoint, controllers: Controllers) -> Router {
     let plant = held.clone();
+    let history = held.clone();
     Router::new()
         .get("/", |_, _| {
             respond(
@@ -1091,6 +1286,28 @@ fn router(held: Arc<Mutex<Held>>, tcp: tcp::Endpoint, controllers: Controllers) 
         })
         .get("/api/plant", move |_, _| {
             json(StatusCode::OK, &view(&plant.lock()))
+        })
+        .get("/api/trend", move |_, request| {
+            let query: BTreeMap<_, _> = request
+                .uri()
+                .query()
+                .unwrap_or_default()
+                .split('&')
+                .filter_map(|part| part.split_once('='))
+                .collect();
+            let point = query.get("point").copied().unwrap_or_default();
+            let minutes = query
+                .get("minutes")
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(10);
+            match history.lock().trend(point, minutes) {
+                Some(samples) => json(
+                    StatusCode::OK,
+                    &serde_json::json!({ "point": point, "samples": samples }),
+                ),
+                None => refusal(StatusCode::NOT_FOUND, "unknown point", None),
+            }
         })
         .route_async(Some(Method::POST), "/api/control/*", move |fcx, request| {
             control(fcx, tcp.clone(), controllers, held.clone(), request)
