@@ -631,6 +631,9 @@ impl Model {
             }
         };
         if self.provider == Provider::Anthropic && self.engine.is_some() && splice::needed(&body) {
+            if path.ends_with("/count_tokens") {
+                return Box::pin(splice::count(self, parts, body)).await;
+            }
             return Box::pin(splice::serve(self, parts, body)).await;
         }
         if matches!(self.provider, Provider::OpenAi | Provider::ChatGpt)

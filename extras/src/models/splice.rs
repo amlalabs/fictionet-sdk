@@ -239,20 +239,12 @@ impl HttpBody for Channel {
     }
 }
 
-pub(super) async fn serve(
-    mut model: Model,
-    parts: http::request::Parts,
-    mut body: Value,
-) -> fictionet::Result<Response<Body>> {
-    let engine = model.engine.take().expect("engine checked");
-    if history(&mut body, &model.seal).is_err() {
-        return Ok(model.provider.error(
-            400,
-            "invalid_request_error",
-            "Invalid server tool history",
-        ));
-    }
-    let mut tools = std::collections::HashMap::new();
+type Tools = std::collections::HashMap<String, (&'static str, Value)>;
+
+/// Replaces the web tools with their function definitions. Returns each
+/// tool's kind and settings by name.
+fn definitions(body: &mut Value) -> Tools {
+    let mut tools = Tools::new();
     if let Some(entries) = body["tools"].as_array_mut() {
         for entry in entries {
             if let Some(kind) = kind(entry) {
@@ -262,6 +254,40 @@ pub(super) async fn serve(
             }
         }
     }
+    tools
+}
+
+fn invalid_history(model: &Model) -> Response<Body> {
+    model
+        .provider
+        .error(400, "invalid_request_error", "Invalid server tool history")
+}
+
+/// Counts the tokens of the request the splice would send: its history and
+/// web tools translated. The count comes back as the upstream wrote it.
+pub(super) async fn count(
+    mut model: Model,
+    parts: http::request::Parts,
+    mut body: Value,
+) -> fictionet::Result<Response<Body>> {
+    model.engine = None;
+    if history(&mut body, &model.seal).is_err() {
+        return Ok(invalid_history(&model));
+    }
+    definitions(&mut body);
+    upstream(&model, &parts, &body).await
+}
+
+pub(super) async fn serve(
+    mut model: Model,
+    parts: http::request::Parts,
+    mut body: Value,
+) -> fictionet::Result<Response<Body>> {
+    let engine = model.engine.take().expect("engine checked");
+    if history(&mut body, &model.seal).is_err() {
+        return Ok(invalid_history(&model));
+    }
+    let tools = definitions(&mut body);
     let stream = body["stream"] == true;
     let response = upstream(&model, &parts, &body).await?;
     if !response.status().is_success() {
@@ -321,7 +347,7 @@ struct Turn {
 async fn read(
     response: Response<Body>,
     model: &Model,
-    tools: &std::collections::HashMap<String, (&str, Value)>,
+    tools: &Tools,
     output: &mut Output,
 ) -> fictionet::Result<Turn> {
     let streaming = response
@@ -466,7 +492,7 @@ async fn read(
 fn visible(
     mut block: Value,
     model: &Model,
-    tools: &std::collections::HashMap<String, (&str, Value)>,
+    tools: &Tools,
     ids: &mut std::collections::HashMap<String, String>,
 ) -> Value {
     if block["type"] == "tool_use"
@@ -490,7 +516,7 @@ async fn run(
     engine: Arc<dyn Engine>,
     parts: http::request::Parts,
     mut body: Value,
-    tools: std::collections::HashMap<String, (&'static str, Value)>,
+    tools: Tools,
     mut response: Response<Body>,
     output: &mut Output,
 ) -> fictionet::Result<()> {

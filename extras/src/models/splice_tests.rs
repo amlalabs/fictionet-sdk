@@ -28,6 +28,10 @@ impl Engine for Pages {
     }
 }
 pub(super) fn receive(socket: &mut std::net::TcpStream) -> Value {
+    exchange(socket).1
+}
+/// The request head and JSON body.
+pub(super) fn exchange(socket: &mut std::net::TcpStream) -> (String, Value) {
     socket
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
@@ -46,7 +50,7 @@ pub(super) fn receive(socket: &mut std::net::TcpStream) -> Value {
         .unwrap();
     let mut body = vec![0; size];
     socket.read_exact(&mut body).unwrap();
-    serde_json::from_slice(&body).unwrap()
+    (headers, serde_json::from_slice(&body).unwrap())
 }
 fn response(socket: &mut std::net::TcpStream, content: Vec<Value>, stop: &str, stream: bool) {
     let mut message = json!({"type":"message","id":"msg_abc","role":"assistant","model":"claude","content":[],"usage":{"input_tokens":7,"output_tokens":2},"stop_reason":null,"stop_sequence":null});
@@ -216,4 +220,76 @@ fn domain_filters_match_host_boundaries() {
     assert!(!tools::allowed(&tool, "https://example.com.evil.com/page"));
     assert!(!tools::allowed(&tool, "https://private.example.com/page"));
     assert!(!tools::allowed(&tool, "https://user@example.com/page"));
+}
+
+#[test]
+fn token_counting_with_web_tools_and_history_returns_the_count() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let count = |socket: &mut std::net::TcpStream| {
+            let body = r#"{"input_tokens":42}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        };
+        let (mut socket, _) = listener.accept().unwrap();
+        let (head, first) = exchange(&mut socket);
+        assert!(
+            head.starts_with("POST /v1/messages/count_tokens "),
+            "{head}"
+        );
+        assert!(first["tools"][0].get("type").is_none(), "{first}");
+        assert_eq!(first["tools"][0]["name"], "web_search");
+        count(&mut socket);
+        let (mut socket, _) = listener.accept().unwrap();
+        receive(&mut socket);
+        let call = json!({"type":"tool_use","id":"toolu_original","name":"web_search","input":{"query":"page"}});
+        response(&mut socket, vec![call.clone()], "tool_use", false);
+        let (mut socket, _) = listener.accept().unwrap();
+        receive(&mut socket);
+        response(
+            &mut socket,
+            vec![json!({"type":"text","text":"The page text."})],
+            "end_turn",
+            false,
+        );
+        let (mut socket, _) = listener.accept().unwrap();
+        let (head, replay) = exchange(&mut socket);
+        assert!(
+            head.starts_with("POST /v1/messages/count_tokens "),
+            "{head}"
+        );
+        assert!(replay["tools"][0].get("type").is_none(), "{replay}");
+        assert_eq!(replay["messages"][1]["content"][0], call);
+        assert_eq!(
+            replay["messages"][2]["content"][0]["tool_use_id"],
+            "toolu_original"
+        );
+        count(&mut socket);
+    });
+    let pages = Arc::new(Pages(AtomicUsize::new(0)));
+    fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(10)), |cx| async move {
+        let credential = Credential::api_key(&cx, Secret::new("key", "sk-ant-api03-private".into())?);
+        let key = credential.placeholder().to_owned();
+        let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?
+            .search(pages)
+            .budget(Budget::new().calls(2));
+        let request = |path: &str, body: &Value| Request::post(path).header("x-api-key", &key).body(Body::from(body.to_string())).unwrap();
+        let tools = json!([{"type":"web_search_20250305","name":"web_search","max_uses":1}]);
+        let mut body = json!({"model":"claude","messages":[{"role":"user","content":"Search for page"}],"tools":tools});
+        let counted = model.clone().send(request("/v1/messages/count_tokens", &body)).await?;
+        assert_eq!(counted.status(), 200);
+        assert_eq!(counted.into_body().collect().await?.to_bytes(), r#"{"input_tokens":42}"#);
+        body["max_tokens"] = json!(100);
+        let answer = collected(model.clone().send(request("/v1/messages", &body)).await?, false).await;
+        assert_eq!(answer["content"][0]["type"], "server_tool_use");
+        body.as_object_mut().unwrap().remove("max_tokens");
+        body["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","content":answer["content"]}), json!({"role":"user","content":"Continue"})]);
+        // Both calls are spent; counting stays free.
+        let counted = model.clone().send(request("/v1/messages/count_tokens", &body)).await?;
+        assert_eq!(counted.status(), 200);
+        assert_eq!(counted.into_body().collect().await?.to_bytes(), r#"{"input_tokens":42}"#);
+        assert_eq!(model.ledger.lock().unwrap().calls, 2);
+        Ok(())
+    })).unwrap();
+    server.join().unwrap();
 }
