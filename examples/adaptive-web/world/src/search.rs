@@ -22,13 +22,13 @@ pub const MAX_SITES: usize = 128;
 pub const MAX_REFUSED: usize = 64;
 /// Facts and site hosts retained in each seed list.
 pub const MAX_SEED_ITEMS: usize = 32;
-/// Maximum compact snapshot JSON size: 3,934,987 bytes at these limits.
+/// Maximum compact snapshot JSON size: 3,943,347 bytes at these limits.
 /// Each string byte can need six JSON bytes. Numbers use twenty digits.
 /// Fixed costs include field names, punctuation and the longest enum values.
 pub const MAX_SNAPSHOT_BYTES: usize = {
     let string = 6 * STRING_BYTES;
     // Snapshot, seed, generator and omitted counts, with four strings.
-    579 + 4 * string
+    619 + 4 * string
         // Two seed lists, with quotes and a comma per item.
         + 2 * MAX_SEED_ITEMS * (3 + string)
         // Query rows, including failure text and a comma per row.
@@ -36,7 +36,7 @@ pub const MAX_SNAPSHOT_BYTES: usize = {
         // Result lists and their entries, including array commas.
         + MAX_RESULTS * (75 + string + MAX_LISTED * (60 + 3 * string))
         // Page rows, including search reasons and a comma per row.
-        + MAX_PAGES * (366 + 5 * string)
+        + MAX_PAGES * (431 + 5 * string)
         // Site and refusal rows, including a comma per row.
         + MAX_SITES * (79 + 2 * string)
         + MAX_REFUSED * (53 + 2 * string)
@@ -94,6 +94,8 @@ pub struct Generator {
     pub generate: bool,
     /// Revision of the generation setting, independent of the snapshot.
     pub generation_revision: u64,
+    /// Run time of the last generation change, in milliseconds.
+    pub generation_at_ms: u64,
 }
 impl Default for Generator {
     fn default() -> Self {
@@ -103,6 +105,7 @@ impl Default for Generator {
             prefetch: 0,
             generate: true,
             generation_revision: 0,
+            generation_at_ms: 0,
         }
     }
 }
@@ -289,6 +292,10 @@ fn made(cache: Cache, model: &str) -> Made {
 /// refusal over the budget), the first fetch stands in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page {
+    /// Event sequence of the first fetch.
+    pub seq: u64,
+    /// Serving time of the first fetch, including a missing page.
+    pub first_serve_ms: Option<u64>,
     pub url: String,
     pub host: String,
     /// Run time of the first fetch, in milliseconds.
@@ -531,6 +538,7 @@ impl Snapshot {
                 }
                 self.generator.generate = generate;
                 self.generator.generation_revision = revision;
+                self.generator.generation_at_ms = ms;
                 true
             }
             ("adaptive", "query") => {
@@ -678,6 +686,8 @@ impl Snapshot {
                     let mut reason: Reason = parse(e, "reason").unwrap_or_default();
                     reason.bound();
                     let fetched = Page {
+                        seq,
+                        first_serve_ms: e.u64("serve_ms"),
                         url,
                         host: bounded(host_name),
                         at_ms: ms,
@@ -698,6 +708,8 @@ impl Snapshot {
                         let mut page = if !old.made.supplied() && made.supplied() {
                             // The fetch that made the page says why and how.
                             Page {
+                                seq: old.seq,
+                                first_serve_ms: old.first_serve_ms,
                                 at_ms: old.at_ms,
                                 fetches: old.fetches,
                                 ..fetched

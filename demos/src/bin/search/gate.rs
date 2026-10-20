@@ -48,7 +48,7 @@ async fn wait(
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         loop {
             tick.tick().await;
-            let value = get(client, "/api/state/search-state").await?;
+            let value = get(client, "/api/state/search").await?;
             if !value["value"].is_null() {
                 let snapshot: Snapshot = serde_json::from_value(value["value"].clone())?;
                 if predicate(&snapshot) {
@@ -78,6 +78,7 @@ async fn navigate(run: &Run, url: &str) -> Result {
     if output.code != 0 {
         return Err(format!("scripted Firefox navigation: {}", output.stderr).into());
     }
+    println!("Firefox (scripted) typed: {url}");
     Ok(())
 }
 
@@ -196,7 +197,7 @@ fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) 
     (reason, Made::Stubbed)
 }
 
-pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result {
+pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<String>> {
     run.guest(HOST)
         .wait_desktop(Duration::from_secs(300))
         .await?;
@@ -367,15 +368,31 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result {
         "generation restored at revision two",
         reply["status"] == "applied" && reply["reply"]["revision"] == 2,
     )?;
-    let snapshot = wait(&client, "topic shows generation restored", |s| {
+    wait(&client, "topic shows generation restored", |s| {
         s.generator.generate && s.generator.generation_revision == 2
     })
     .await?;
-    let rows = get(&client, "/api/event-table/searches").await?;
+    let description = get(&client, "/api/page").await?;
     check(
-        "Searches table has rows",
-        rows["rows"].as_array().is_some_and(|r| !r.is_empty()),
+        "Search panel is in the workspace",
+        description["panels"].as_array().is_some_and(|panels| {
+            panels.iter().any(|p| {
+                p["title"] == "Search" && p["kind"] == "custom" && p["area"] == "workspace"
+            })
+        }),
     )?;
+    for path in [
+        "/panels/search.mjs",
+        "/assets/search/model.mjs",
+        "/assets/search/view.mjs",
+        "/assets/search/style.css",
+    ] {
+        let response = client.request("GET", path, None, true).await?;
+        check(
+            &format!("search module served: {path}"),
+            response.status == 200,
+        )?;
+    }
     let egress = get(&client, "/api/egress").await?;
     let destinations = egress["destinations"]
         .as_array()
@@ -435,37 +452,6 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result {
             )
         }),
     )?;
-    let events = get(&client, "/api/events").await?;
-    for site in snapshot.sites.iter().filter(|s| !visited.contains(&s.host)) {
-        let asked = events["events"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|e| {
-                e["source"] == "http" && e["kind"] == "request" && e["fields"]["host"] == site.host
-            })
-            .collect::<Vec<_>>();
-        let first = asked.first();
-        let path = first
-            .and_then(|e| e["fields"]["path"].as_str())
-            .unwrap_or("none");
-        let user_agent = first
-            .and_then(|e| e["fields"]["headers"].as_array())
-            .and_then(|headers| {
-                headers.iter().find(|h| {
-                    h[0].as_str()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("user-agent"))
-                })
-            })
-            .and_then(|header| header[1].as_str())
-            .unwrap_or("none");
-        println!(
-            "unvisited made-up host: {}; reason: {:?}; requests: {}; first path: {path}; User-Agent: {user_agent}",
-            site.host,
-            site.reason,
-            asked.len()
-        );
-    }
     let desktop = output.join("desktop.png");
     rfb::capture_page(run.page_url(), HOST, &desktop).await?;
     println!("guest screen: {}", desktop.display());
@@ -482,5 +468,65 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result {
     })
     .await??;
     println!("page screen: {}", page.display());
-    Ok(())
+    Ok(visited)
+}
+
+// Read the drained log so startup traffic cannot fall out of a bounded view.
+pub fn background(path: &Path, visited: &BTreeSet<String>) -> Result {
+    background_lines(std::io::BufReader::new(std::fs::File::open(path)?), visited)
+}
+
+fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) -> Result {
+    let mut sites = BTreeMap::new();
+    let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut generated = Vec::new();
+    for line in input.lines() {
+        let event: Value = serde_json::from_str(&line?)?;
+        let Some(host) = event["host"]
+            .as_str()
+            .filter(|host| !visited.contains(*host))
+        else {
+            continue;
+        };
+        if event["type"] == "site" {
+            sites.insert(host.to_string(), event["why"].clone());
+        } else if event["type"] == "http" {
+            if event["cache"] == "generated" {
+                generated.push(format!(
+                    "{host}; User-Agent: {}",
+                    event["ua"].as_str().unwrap_or("none")
+                ));
+            }
+            requests.entry(host.to_string()).or_default().push(event);
+        }
+    }
+    for (host, why) in sites {
+        let asked = requests.get(&host).map(Vec::as_slice).unwrap_or_default();
+        let first = asked.first();
+        let path = first.and_then(|e| e["path"].as_str()).unwrap_or("none");
+        let user_agent = first.and_then(|e| e["ua"].as_str()).unwrap_or("none");
+        println!(
+            "unvisited made-up host: {host}; reason: {why}; requests: {}; first path: {path}; User-Agent: {user_agent}",
+            asked.len()
+        );
+    }
+    for message in &generated {
+        println!("[FAIL] background generated a page: {message}");
+    }
+    check("background hosts generated no pages", generated.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_generation_fails_even_without_a_retained_site() {
+        let visited = BTreeSet::from(["www.google.com".into()]);
+        let allowed = b"{\"type\":\"http\",\"host\":\"www.google.com\",\"cache\":\"generated\"}\n{\"type\":\"site\",\"host\":\"entropy.ubuntu.com\",\"why\":\"pool\"}\n";
+        background_lines(&allowed[..], &visited).unwrap();
+        let generated = b"{\"type\":\"http\",\"host\":\"settings.example.com\",\"cache\":\"generated\",\"ua\":\"Firefox/150\"}\n";
+        assert!(background_lines(&generated[..], &visited).is_err());
+        assert!(background_lines(&b"not json\n"[..], &visited).is_err());
+    }
 }

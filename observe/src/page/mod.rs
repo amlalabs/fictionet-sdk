@@ -446,6 +446,7 @@ pub struct Page {
     standard: bool,
     labels: Option<Labels>,
     workspace: Option<String>,
+    workspace_hosts: bool,
     modules: Vec<(String, String)>,
     assets: Vec<(String, String, Vec<u8>)>,
     filters: Vec<(String, EventFilter)>,
@@ -467,6 +468,7 @@ impl Page {
             standard: false,
             labels: None,
             workspace: None,
+            workspace_hosts: false,
             modules: vec![],
             assets: vec![],
             filters: vec![],
@@ -483,23 +485,13 @@ impl Page {
         self
     }
 
-    /// Selects a JSON pointer in the linked snapshot for command revisions.
-    pub fn control_revision(mut self, pointer: impl Into<String>) -> Self {
-        let pointer = pointer.into();
-        if !panel::valid_pointer(&pointer) {
-            self.errors
-                .push("control revision must be a JSON pointer".into());
-        }
-        if let Some(PanelDescription {
-            content: PanelContent::Control { revision, .. },
-            ..
-        }) = self.panels.last_mut()
-        {
-            *revision = Some(pointer);
-        } else {
-            self.errors
-                .push("control_revision must follow control".into());
-        }
+    /// Registers a typed command endpoint without adding a control panel.
+    pub fn command<C: serde::de::DeserializeOwned + Send + 'static, R: Serialize + 'static>(
+        mut self,
+        name: impl Into<String>,
+        port: CommandPort<C, R>,
+    ) -> Self {
+        self.commands.push((name.into(), Box::new(port)));
         self
     }
 
@@ -543,7 +535,6 @@ impl Page {
                 command: format!("/api/command/{id}"),
                 actions,
                 state: None,
-                revision: None,
             },
         });
         self
@@ -658,6 +649,21 @@ impl Page {
                     format!(
                         "state topic {id:?} conflicts with a host status or built-in topic; rename the panel or host"
                     ),
+                ));
+            }
+        }
+        let mut command_names = std::collections::BTreeSet::new();
+        for (name, _) in &self.commands {
+            if name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                || !command_names.insert(name)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command names must be unique and contain one to 128 ASCII letters, digits, - or _",
                 ));
             }
         }

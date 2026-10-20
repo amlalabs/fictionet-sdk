@@ -122,9 +122,6 @@ pub enum PanelContent {
         /// Optional authoritative topic. Copy its revision into the command's
         /// `expected_revision` field before posting; the world validates it.
         state: Option<String>,
-        /// JSON pointer into the state envelope; defaults to its revision.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        revision: Option<String>,
     },
 }
 

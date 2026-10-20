@@ -6,6 +6,9 @@ pub const START: &str = "https://www.google.com/";
 
 // Background requests would create pages and spend the generation budget.
 const PREFERENCES: &str = r#"// Office browser preferences.
+// Keep typed URLs as URLs after a default-engine search.
+lockPref("browser.urlbar.showSearchTerms.enabled", false);
+lockPref("browser.urlbar.showSearchTerms.featureGate", false);
 // Suggestions send a request for every address bar keystroke.
 lockPref("browser.search.suggest.enabled", false);
 lockPref("browser.urlbar.suggest.searches", false);
@@ -31,12 +34,10 @@ lockPref("datareporting.healthreport.uploadEnabled", false);
 lockPref("datareporting.policy.dataSubmissionEnabled", false);
 lockPref("app.shield.optoutstudies.enabled", false);
 lockPref("app.normandy.enabled", false);
-// New tab feeds, sponsored content and Pocket fetch unrelated pages.
-lockPref("extensions.pocket.enabled", false);
+// New tab feeds and sponsored content fetch unrelated pages.
 lockPref("browser.newtabpage.enabled", false);
 lockPref("browser.newtabpage.activity-stream.feeds.telemetry", false);
 lockPref("browser.newtabpage.activity-stream.telemetry", false);
-lockPref("browser.newtabpage.activity-stream.feeds.snippets", false);
 lockPref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
 lockPref("browser.newtabpage.activity-stream.showSponsored", false);
 lockPref("browser.newtabpage.activity-stream.showSponsoredTopSites", false);
@@ -56,7 +57,27 @@ lockPref("extensions.systemAddon.update.enabled", false);
 lockPref("extensions.systemAddon.update.url", "");
 lockPref("browser.discovery.enabled", false);
 lockPref("browser.search.update", false);
-lockPref("services.settings.server", "");
+// Translation models and recommendations fetch remote collections.
+lockPref("browser.translations.enable", false);
+lockPref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.addons", false);
+lockPref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.features", false);
+lockPref("browser.newtabpage.activity-stream.asrouter.providers.cfr", '{"id":"cfr","enabled":false}');
+lockPref("browser.newtabpage.activity-stream.asrouter.providers.message-groups", '{"id":"message-groups","enabled":false}');
+lockPref("browser.newtabpage.activity-stream.asrouter.providers.messaging-experiments", '{"id":"messaging-experiments","enabled":false}');
+lockPref("browser.newtabpage.activity-stream.asrouter.useRemoteL10n", false);
+lockPref("browser.contentblocking.report.monitor.enabled", false);
+lockPref("nimbus.rollouts.enabled", false);
+lockPref("services.settings.poll_interval", 2147483647);
+// Push keeps a background connection even when no page requests it.
+lockPref("dom.push.enabled", false);
+lockPref("dom.push.connection.enabled", false);
+// Media plugins download binaries and check for updates at startup.
+lockPref("media.gmp-manager.updateEnabled", false);
+lockPref("media.gmp-gmpopenh264.enabled", false);
+lockPref("media.gmp-gmpopenh264.autoupdate", false);
+lockPref("media.gmp-widevinecdm.enabled", false);
+lockPref("media.gmp-widevinecdm.autoupdate", false);
+lockPref("media.eme.enabled", false);
 // Region discovery also contacts a remote service during browser startup.
 lockPref("browser.region.network.url", "");
 lockPref("browser.region.update.enabled", false);
@@ -72,6 +93,17 @@ pub fn guest() -> Guest {
             "pref(\"general.config.filename\", \"office.cfg\");\npref(\"general.config.obscure_value\", 0);\n",
         )
         .file("/usr/lib/firefox/office.cfg", 0o644, PREFERENCES)
+        // The Pro apt hook contacts the contract service during package setup.
+        .file("/etc/apt/apt.conf.d/20apt-esm-hook.conf", 0o644, "")
+        // Pro apt news fetches a remote news feed during package setup.
+        .file("/etc/ubuntu-advantage/uaclient.conf", 0o644,
+            "ua_config:\n  apt_news: false\n")
+        // Release checks fetch the upgrade list even when no upgrade is wanted.
+        .file("/etc/update-manager/release-upgrades", 0o644,
+            "[DEFAULT]\nPrompt=never\n")
+        // The clock comes from the host; network time would request another name.
+        .file("/etc/systemd/timesyncd.conf", 0o644,
+            "[Time]\nNTP=\nFallbackNTP=\n")
         // Stop unattended apt work after cloud-init's explicit package setup.
         .file("/etc/apt/apt.conf.d/99periodic", 0o644,
             "APT::Periodic::Enable \"0\";\n")
@@ -79,6 +111,7 @@ pub fn guest() -> Guest {
         .file("/etc/default/motd-news", 0o644, "ENABLED=0\n");
     // Prevent later refresh starts when desktop setup reloads systemd.
     for unit in [
+        "systemd-timesyncd.service",
         "snapd.socket",
         "snapd.service",
         "snapd.seeded.service",

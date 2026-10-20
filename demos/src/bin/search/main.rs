@@ -1,18 +1,9 @@
 mod gate;
 mod guest;
-mod page;
+use fictionet_demo::search as page;
 
-#[cfg(test)]
-mod tests;
-
-use adaptive_web_world::{
-    Addresses, Ca,
-    events::LogObserver,
-    search::Searches,
-    stub::{Seed, Stub},
-};
+use adaptive_web_world::{events::LogObserver, search::Searches, stub::Seed};
 use example_common::log::Log;
-use fictionet::stdlib::web;
 use fictionet_demo::kit::{self, Kit};
 use std::{
     fs::File,
@@ -63,31 +54,15 @@ async fn main() -> Result {
         .guest(guest::guest())
         .observer(searches.clone())
         .observer(Arc::new(LogObserver { log: log.clone() }))
-        .page(move |dashboard, hosts| view.page(dashboard, hosts))
+        .page(move |dashboard, hosts| view.page(dashboard, hosts.take(guest::HOST)))
         .world(move |cx, mut world| async move {
-            let start = adaptive_web_world::world_start(&seed.date)?;
-            let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
-            let ca = Arc::new(Ca::in_memory(&cx, start)?);
-            world.trust("office", &ca.cert_pem())?;
-            let tls = ca.config(&cx, kit::desktop::HOSTS[0])?.0;
-            let mirror = world.mirror(&cx)?;
-            let stub = Arc::new(Stub::new(seed));
-            topics.start(&cx, searches, stub.clone())?;
-            adaptive_web_world::net(&cx, addresses, ca, stub, world_log, start, move |host| {
-                page::FORWARDED
-                    .iter()
-                    .any(|(name, _)| *name == host)
-                    .then(|| {
-                        let site = web::Site::new(mirror.clone());
-                        if kit::desktop::HOSTS.contains(&host) {
-                            site.tls(tls.clone())
-                        } else {
-                            site
-                        }
-                    })
-            })
-            .route(kit::JUMP, kit::jump_prefix())
-            .start(&cx, world.into_attachments())
+            let network = page::World::new(&cx, seed, world_log)?;
+            world.trust("office", &network.ca.cert_pem())?;
+            topics.start(&cx, searches, network.stub.clone(), "Firefox (scripted)")?;
+            network
+                .network(&cx, world.mirror(&cx)?)?
+                .route(kit::JUMP, kit::jump_prefix())
+                .start(&cx, world.into_attachments())
         });
     let run = kit.boot(downloads).await?;
     let path = run.path().to_path_buf();
@@ -107,8 +82,9 @@ async fn main() -> Result {
     )?;
     shutdown?;
     println!("whole run: {} ms", total.elapsed().as_millis());
-    result?;
+    let visited = result?;
     finish?;
+    gate::background(&output.join("log.jsonl"), &visited)?;
     println!("every required check passed");
     Ok(())
 }

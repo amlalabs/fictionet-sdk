@@ -41,6 +41,7 @@ fn generation_events_update_the_card() {
     let off = s.snapshot();
     assert!(!off.generator.generate);
     assert_eq!(off.generator.generation_revision, 1);
+    assert_eq!(off.generator.generation_at_ms, 20);
     assert_eq!((off.revision, off.at_ms), (2, 20));
     for event in [
         generation(false, 1),
@@ -55,6 +56,7 @@ fn generation_events_update_the_card() {
     let on = s.snapshot();
     assert!(on.generator.generate);
     assert_eq!(on.generator.generation_revision, 2);
+    assert_eq!(on.generator.generation_at_ms, 40);
     assert_eq!((on.revision, on.at_ms), (3, 40));
     assert_eq!(on.queries, off.queries);
     let replay = Searches::from_hello(&json!({"generator":"replay"})).snapshot();
@@ -274,6 +276,8 @@ fn page_creation_and_fetches() {
     assert_eq!(p.made, Made::Stubbed);
     assert_eq!(p.latest, Made::Stored);
     assert_eq!(p.cache, Cache::Generated);
+    assert_eq!(p.seq, 1);
+    assert_eq!(p.first_serve_ms, Some(20));
     assert_eq!(
         p.reason,
         Reason::Search {
@@ -311,6 +315,8 @@ fn a_page_made_after_a_404_takes_its_reason_from_the_fetch_that_made_it() {
     assert_eq!((p.made, p.latest), (Made::Stubbed, Made::Stubbed));
     assert_eq!(p.reason, Reason::Direct);
     assert_eq!(p.cache, Cache::Generated);
+    assert_eq!(p.seq, 1);
+    assert_eq!(p.first_serve_ms, Some(20));
     assert_eq!((p.title.as_str(), p.model.as_str()), ("Title", "stub"));
     assert_eq!((p.serve_ms, p.gen_ms), (Some(5), Some(15)));
     assert_eq!((p.at_ms, p.fetches, p.status), (10, 3, 200));
@@ -480,6 +486,8 @@ fn worst_case_snapshot_fits() {
         query_id: n,
     };
     let p = Page {
+        seq: n,
+        first_serve_ms: Some(n),
         url: t.clone(),
         host: t.clone(),
         at_ms: n,
@@ -519,6 +527,7 @@ fn worst_case_snapshot_fits() {
             prefetch: n,
             generate: false,
             generation_revision: n,
+            generation_at_ms: n,
         },
         queries: vec![q; MAX_QUERIES],
         results: vec![list; MAX_RESULTS],

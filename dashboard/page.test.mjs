@@ -334,3 +334,34 @@ test('a custom workspace panel replaces the console tiles and hides the pins', a
   stop();
   assert.equal(h.budget.open, 0);
 });
+
+test('a custom workspace can sit beside consoles while pins remain available', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = { ...DESCRIPTION, panels: [
+    { id: 'packets', title: 'Packets', area: 'inspector', kind: 'packets' },
+    { id: 'plant', title: 'Plant', area: 'workspace', kind: 'custom', module: '/panels/plant.mjs', state: '/api/state/rows' },
+    { id: 'alpha-screen', title: 'Screen', area: 'workspace', kind: 'screen', host: 'alpha' },
+  ] };
+  const stop = await mount(h.root, {
+    get: async (path) => path === '/api/page' ? description : { rows: [], next: 0, dropped: 0 },
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'), packetStream: (links) => h.stream('packets', links), close() {},
+  }, { subscribe: () => () => {}, dispose() {} });
+  await settle();
+  const workspace = h.root.querySelector('#workspace');
+  const custom = workspace.querySelector('section.custom-workspace');
+  assert.ok(custom);
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 1);
+  const pins = h.root.querySelectorAll('button.pin');
+  assert.ok(pins.every((pin) => !pin.hidden));
+  pins.forEach((pin) => pin.click());
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 2);
+  assert.equal(workspace.querySelector('section.custom-workspace'), custom);
+  pins[0].click();
+  assert.equal(workspace.querySelector('section.workspace-tile').getAttribute('aria-label'), 'beta');
+  assert.equal(h.root.querySelector('#divider').getAttribute('aria-valuenow'), '64');
+  stop();
+  assert.equal(h.budget.open, 0);
+  assert.equal(h.timers.size, 0);
+});

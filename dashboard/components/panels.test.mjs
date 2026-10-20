@@ -131,25 +131,3 @@ test('custom panels dispose a late mount and reject foreign module paths', async
   assert.equal(imports, 1);
   bad();
 });
-
-test('control reads the world revision inside the linked snapshot', async () => {
-  const h = fixture();
-  const dispose = control(h.root, h.services, {
-    state: '/api/state/settings', command: '/api/command/settings',
-    revision: '/value/generator/generation_revision',
-    actions: [{ label: 'Disable', command: { generate: false } }],
-  });
-  h.publish({ revision: 18, value: { generator: { generation_revision: 0 } } });
-  h.root.querySelector('button').click();
-  await settle();
-  assert.equal(h.requests[0].body.command.expected_revision, 0);
-  h.requests[0].resolve({ status: 'applied', reply: { revision: 1 } });
-  await settle();
-  h.publish({ revision: 24, value: { generator: { generation_revision: 1 } } });
-  h.root.querySelector('button').click();
-  await settle();
-  assert.equal(h.requests[1].body.command.expected_revision, 1);
-  h.requests[1].resolve({ status: 'applied', reply: { revision: 2 } });
-  await settle();
-  dispose();
-});
