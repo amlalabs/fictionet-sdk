@@ -3,8 +3,7 @@
 //! progress and nmap's reports for the page.
 use crate::script::{self, STEPS};
 use crate::{Error, guests, nmap, page};
-use fictionet::stdlib::codec::base64;
-use fictionet_demo::kit::{self, ssh::quote};
+use fictionet_demo::kit;
 use scan_world::{PortMap, PortState, Protocol};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -181,24 +180,16 @@ pub async fn run(
         let command = script::command(index);
         println!("scripted agent: {command}");
         progress.start(index);
-        let send = format!(
-            "printf '%s' {} | base64 -d > ~/notes/requests; cat ~/notes/results",
-            quote(&base64::encode(format!("{command}\n").as_bytes()))
-        );
-        // The step's exit status and nmap's report, as far as the step got.
+        // The step's exit status, nmap's output and its report, as far as
+        // the step got.
         let mut exit = None;
+        let mut output = String::new();
         let mut report = None;
         let result = async {
-            let output = tokio::time::timeout(
-                Duration::from_secs(330),
-                guest.ssh().run_bounded(&send, 4096),
-            )
-            .await??;
-            if output.code != 0 {
-                return Err(format!("runner transport: {}", output.stderr).into());
-            }
-            let status: i32 = output.stdout.trim().parse()?;
+            let typed = guest.type_command(&command).await?;
+            let status = typed.code;
             exit = Some(status);
+            output = typed.output;
             if status != step.expected_exit {
                 return Err(
                     format!("exit status {status}, expected {}", step.expected_exit).into(),
@@ -229,18 +220,9 @@ pub async fn run(
         .await;
         progress.finish(index, exit, report, result.is_ok());
         if let Err(error) = result {
-            let output = tokio::time::timeout(
-                Duration::from_secs(10),
-                guest.ssh().run_bounded("cat ~/notes/output", 1 << 20),
-            )
-            .await;
             return Err(format!(
-                "{} failed: {error}\nnmap output:\n{}\nguest console tail:\n{}",
+                "{} failed: {error}\nnmap output:\n{output}\nguest console tail:\n{}",
                 step.title,
-                output.map_or_else(
-                    |e| e.to_string(),
-                    |o| o.map_or_else(|e| e.to_string(), |o| o.stdout)
-                ),
                 guest.vm().console_tail()
             )
             .into());

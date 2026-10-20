@@ -2,17 +2,13 @@
 //! probes, the destinations it may reach, the exit status it must have, and
 //! the world facts its own rows must show. The guest has no model.
 
-use super::{
-    facts::{Facts, Traffic, View},
-    guest,
-};
+use super::facts::{Facts, Traffic, View};
 use artifactory_world::{
     facts::{Classification, CredentialScheme, DoorOutcome, OutcomeKind, Transport},
     inventory::Origin,
     packages::{Role, Variant},
     repository::Label,
 };
-use fictionet::stdlib::codec::base64;
 use fictionet_demo::kit;
 use std::time::{Duration, Instant};
 
@@ -545,33 +541,6 @@ pub fn steps(variant: Variant, sessions: Option<Mode>) -> Vec<Step> {
     steps
 }
 
-/// Types the step's command in Maya's terminal window and returns its exit.
-async fn type_command(guest: &kit::GuestHandle, step: &Step) -> std::io::Result<i32> {
-    let encoded = base64::encode(serde_json::to_string(&step.command)?.as_bytes());
-    let command = format!(
-        "printf %s {} | base64 -d > {}/commands && head -n1 {}/results",
-        kit::ssh::quote(&encoded),
-        guest::WORK,
-        guest::WORK
-    );
-    let out = tokio::time::timeout(Duration::from_secs(150), guest.ssh().run(&command))
-        .await
-        .map_err(|_| {
-            std::io::Error::other(format!("{}: runner exceeded 150 seconds", step.name))
-        })??;
-    if out.code != 0 {
-        return Err(std::io::Error::other(format!(
-            "{}: runner exit {}: {}",
-            step.name, out.code, out.stderr
-        )));
-    }
-    let value: serde_json::Value = serde_json::from_str(&out.stdout)?;
-    value["code"]
-        .as_i64()
-        .and_then(|n| i32::try_from(n).ok())
-        .ok_or_else(|| std::io::Error::other("runner omitted exit status"))
-}
-
 /// Runs each step on its workstation: Maya's steps in her terminal window,
 /// the colleague's over SSH. Waits for each step's facts before the next.
 pub async fn run(
@@ -589,7 +558,7 @@ pub async fn run(
             facts.phase(step.name, step.destinations, step.who);
             println!("story: {} [{}]", step.name, facts.name(step.who));
             let code = match step.who {
-                Who::Maya => type_command(maya, &step).await?,
+                Who::Maya => maya.type_command(&step.command).await?.code,
                 Who::Colleague => {
                     let guest = colleague.ok_or_else(|| {
                         std::io::Error::other(format!("{}: no colleague workstation", step.name))
@@ -675,6 +644,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::super::facts::{RequestRow, Snapshot, Tagged, View};
+    use super::super::guest;
     use super::*;
     use artifactory_world::{
         facts::Door,
