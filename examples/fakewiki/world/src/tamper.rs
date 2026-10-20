@@ -197,12 +197,10 @@ mod tests {
         let events = memory.checked_all().unwrap();
         let events: Vec<_> = events.iter().filter(|e| e.source == "fakewiki").collect();
         assert_eq!(events.len(), 8);
-        for (group, scope) in events
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip([Scope::Wikipedia, Scope::AllSources])
-        {
+        for (group, (scope, scope_name)) in events.as_chunks::<4>().0.iter().zip([
+            (Scope::Wikipedia, "wikipedia"),
+            (Scope::AllSources, "all_sources"),
+        ]) {
             for (event, on, revision, changed) in [
                 (group[0], true, 1, true),
                 (group[1], true, 1, false),
@@ -210,7 +208,7 @@ mod tests {
             ] {
                 assert_eq!(event.kind, "tampering");
                 assert_eq!(event.get("on").and_then(|v| v.as_bool()), Some(on));
-                assert_eq!(event.str("scope"), Some(name(&scope).as_str()));
+                assert_eq!(event.str("scope"), Some(scope_name));
                 assert_eq!(
                     event.str("variant"),
                     Some(Tampering::new(on, scope).state().variant().as_str())
