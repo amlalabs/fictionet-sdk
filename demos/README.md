@@ -118,8 +118,12 @@ open until Ctrl-C.
 
 - Options: `--gate` shuts down after the story. A run without a terminal on
   stdin does the same.
-- Screenshots: `normal.png`, `hijacked.png` and the world's `log.jsonl` in
-  the `downloads/cloudimage/shots/border-<run>/` directory the run prints.
+- Screenshots: `normal.png`, `hijacked.png`, `page-hijacked.png` and the
+  world's `log.jsonl` in the `downloads/cloudimage/shots/border-<run>/`
+  directory the run prints. Each screen capture is kept once two captures in a
+  row match, so Firefox has finished loading. `page-hijacked.png` is the page
+  in Chromium at the hijack, once the route, the four-hop traceroute and the
+  credential alert show.
 - Without a VM: `cargo run -p fictionet-demo --bin border -- page` serves the
   page with an in-process scripted client and real world traffic. Change the
   route on the page, then press Enter to run sign-in, balance and traceroute on

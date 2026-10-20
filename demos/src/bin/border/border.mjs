@@ -34,6 +34,20 @@ export function switchState(result) {
   if (r?.reason === 'stale_revision') return { busy: false, text: `Not applied: the route changed. Current revision ${r.current}. Check the state before trying again.` };
   return { busy: false, text: `Not applied: ${r?.message || result.error || 'the world is not taking commands right now.'}` };
 }
+// The guest link's last traceroute. A link that has closed keeps its last trace.
+// `time` formats run milliseconds.
+export function traceLines(link, diff, time) {
+  const closed = link?.ended_ms == null ? '' : `guest link closed at ${time(link.ended_ms)}`;
+  const trace = link?.trace;
+  if (!trace) return { heading: closed ? `No UDP traceroute was observed; the ${closed}.` : 'No UDP traceroute observed on this guest link yet.' };
+  return {
+    heading: ['Last observed traceroute', time(trace.started_ms), trace.complete ? '' : 'incomplete', closed].filter(Boolean).join(' · '),
+    hops: trace.hops.map(h => `${h.ttl} ${h.address}`).join(' → ') || (closed ? 'No replies arrived.' : 'Waiting for replies…'),
+    note: diff.beforeChange ? 'The last traceroute ran before the change.'
+      : diff.matches ? 'The observed path matches the current route.'
+      : `The observed path does not ${closed ? '' : 'yet '}match the complete configured path.`,
+  };
+}
 
 export function certificateField(key, value) {
   if (Array.isArray(value)) return value.join(', ');
@@ -110,8 +124,9 @@ export function mount(root, services, options) {
     updateSwitch();
     if (!route || !view?.config) return;
     const config = view.config;
-    const traced = view.traces.find(t => t.sandbox === config.guest);
-    const diff = pathDiff(route, traced?.trace, config.bank);
+    const guestLink = view.links.find(l => l.sandbox === config.guest);
+    const traced = guestLink?.trace;
+    const diff = pathDiff(route, traced, config.bank);
     pathNote.textContent = `Configured round trip: ${route.mode === 'hijack' ? config.hijacked_ms : config.normal_ms} ms. This is the world's delay, not a latency measurement.`;
     const pathSignature = JSON.stringify([route.mode, diff.configured]);
     if (pathSignature !== pathValue) {
@@ -128,12 +143,13 @@ export function mount(root, services, options) {
     });
     }
     traceBox.replaceChildren();
-    if (!traced) el('p', 'No UDP traceroute observed on this guest link yet.', traceBox, 'note');
+    const lines = traceLines(guestLink, diff, time);
+    if (!traced) el('p', lines.heading, traceBox, 'note');
     else {
-      el('p', `Last observed traceroute · ${time(traced.trace.started_ms)}${traced.trace.complete ? '' : ' · incomplete'}`, traceBox);
-      el('p', traced.trace.hops.map(h => `${h.ttl} ${h.address}`).join(' → ') || 'Waiting for replies…', traceBox, 'mono');
-      el('p', diff.beforeChange ? 'The last traceroute ran before the change.' : diff.matches ? 'The observed path matches the current route.' : 'The observed path does not yet match the complete configured path.', traceBox, 'note');
-      if (traced.trace.dropped) el('p', `Probes or hops dropped: ${traced.trace.dropped}.`, traceBox, 'loss-note');
+      el('p', lines.heading, traceBox);
+      el('p', lines.hops, traceBox, 'mono');
+      el('p', lines.note, traceBox, 'note');
+      if (traced.dropped) el('p', `Probes or hops dropped: ${traced.dropped}.`, traceBox, 'loss-note');
     }
     table(routes, ['Prefix', 'AS path', 'Origin'], route.routes.map(r => ({ cells: [r.prefix, r.as_path.join(' → '), `AS ${r.origin_as}`], mark: r.hijack })));
     explanation.textContent = longestPrefix(route.routes, config.bank);
