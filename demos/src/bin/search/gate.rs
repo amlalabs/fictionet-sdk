@@ -1,8 +1,8 @@
 use super::{Result, guest::HOST};
 use adaptive_web_world::{
+    pages::Seed,
     route::Engine,
     search::{Cache, Listed, Made, Outcome, Query, Reason, Results, Snapshot},
-    stub::Seed,
 };
 use fictionet_demo::kit::{
     Run,
@@ -150,7 +150,7 @@ pub async fn command(
 
 pub fn first_generated<'a>(seed: &Seed, list: &'a Results) -> Result<&'a Listed> {
     for result in &list.listed {
-        let (host, target) = adaptive_web_world::stub::text::target_of(&result.url);
+        let (host, target) = adaptive_web_world::pages::text::target_of(&result.url);
         if seed.fixed_for(&host, &target).is_none() {
             println!("opening result rank {}: {}", result.rank, result.url);
             return Ok(result);
@@ -164,7 +164,7 @@ pub fn first_generated<'a>(seed: &Seed, list: &'a Results) -> Result<&'a Listed>
 }
 
 fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) {
-    let (host, target) = adaptive_web_world::stub::text::target_of(url);
+    let (host, target) = adaptive_web_world::pages::text::target_of(url);
     if seed.fixed_for(&host, &target).is_some() {
         return (Reason::Fixed, Made::Fixed);
     }
@@ -176,7 +176,7 @@ fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) 
             list.listed
                 .iter()
                 .find(|r| {
-                    adaptive_web_world::stub::text::target_of(&r.url)
+                    adaptive_web_world::pages::text::target_of(&r.url)
                         == (host.clone(), target.clone())
                 })
                 .map(|result| (list, result))
@@ -286,7 +286,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
             seed.sites.first().ok_or("seed has no site")?.host
         )
     };
-    visited.insert(adaptive_web_world::stub::text::target_of(&direct).0);
+    visited.insert(adaptive_web_world::pages::text::target_of(&direct).0);
     let (reason, made) = expected_page(seed, &snapshot, &direct);
     navigate(run, &direct).await?;
     wait(

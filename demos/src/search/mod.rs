@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adaptive_web_world::{
+    pages::{Applied, Command, Pages},
     search::{self, Searches},
-    stub::{Applied, Command, Stub},
 };
 use fictionet::Cx;
 use fictionet_observe::page::Host;
@@ -87,7 +87,7 @@ impl Topics {
         &self,
         cx: &Cx,
         searches: Arc<Searches>,
-        stub: Arc<Stub>,
+        pages: Arc<Pages>,
         searcher: &'static str,
     ) -> fictionet::Result {
         self.policy
@@ -100,9 +100,9 @@ impl Topics {
                 let Some(command) = command else {
                     return Ok(());
                 };
-                match stub.apply(&cx, command.command) {
+                match pages.apply(&cx, command.command) {
                     Ok(applied) => command.reply(&cx, applied),
-                    Err(adaptive_web_world::stub::Rejected::Stale { current }) => {
+                    Err(adaptive_web_world::pages::Rejected::Stale { current }) => {
                         command.reject(&cx, Rejected::StaleRevision { current })
                     }
                 }
@@ -158,7 +158,7 @@ impl Default for Topics {
 /// The in-memory generator and network shared by the guest run and preview.
 pub struct World {
     pub ca: Arc<adaptive_web_world::Ca>,
-    pub stub: Arc<Stub>,
+    pub pages: Arc<Pages>,
     pub start: std::time::SystemTime,
     addresses: Arc<adaptive_web_world::Addresses>,
     log: Arc<example_common::log::Log>,
@@ -167,7 +167,7 @@ pub struct World {
 impl World {
     pub fn new(
         cx: &Cx,
-        seed: adaptive_web_world::stub::Seed,
+        seed: adaptive_web_world::pages::Seed,
         log: Arc<example_common::log::Log>,
     ) -> fictionet::Result<Self> {
         let start = adaptive_web_world::world_start(&seed.date)?;
@@ -177,7 +177,7 @@ impl World {
                 seed.fixed_addresses(),
                 None,
             )?),
-            stub: Arc::new(Stub::new(seed)),
+            pages: Arc::new(Pages::new(seed)),
             start,
             log,
         })
@@ -193,7 +193,7 @@ impl World {
             cx,
             self.addresses.clone(),
             self.ca.clone(),
-            self.stub.clone(),
+            self.pages.clone(),
             self.log.clone(),
             self.start,
             move |host| {

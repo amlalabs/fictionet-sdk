@@ -1,23 +1,11 @@
-//! Reproduces Python's string, HTML and URL behavior so the Rust and Python
-//! stubs return the same page bytes and metadata.
+//! String, HTML and URL helpers for the pages and their checks.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Tests whitespace with Python's additional control characters.
-pub fn whitespace(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
-}
-/// Trims Python whitespace from both ends.
-pub fn strip(s: &str) -> &str {
-    s.trim_matches(whitespace)
-}
-/// Joins runs of words with one space.
+/// Joins runs of whitespace with one space and trims both ends.
 pub fn normalize_space(s: &str) -> String {
-    s.split(whitespace)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 /// Takes at most `n` Unicode code points.
 pub fn take(s: &str, n: usize) -> String {
@@ -31,49 +19,13 @@ pub fn upper_first(s: &str) -> String {
         .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
         .unwrap_or_default()
 }
-/// Titlecases the first character and lowercases the rest, as Python does.
+/// Uppercases the first character and lowercases the rest.
 pub fn capitalize(s: &str) -> String {
-    let Some(first) = s.chars().next() else {
-        return String::new();
-    };
-    let title = match first {
-        'Ǆ' | 'ǅ' | 'ǆ' => "ǅ".into(),
-        'Ǉ' | 'ǈ' | 'ǉ' => "ǈ".into(),
-        'Ǌ' | 'ǋ' | 'ǌ' => "ǋ".into(),
-        'Ǳ' | 'ǲ' | 'ǳ' => "ǲ".into(),
-        '\u{1f80}'..='\u{1f87}' | '\u{1f90}'..='\u{1f97}' | '\u{1fa0}'..='\u{1fa7}' => {
-            char::from_u32(first as u32 + 8).unwrap().to_string()
-        }
-        '\u{1f88}'..='\u{1f8f}'
-        | '\u{1f98}'..='\u{1f9f}'
-        | '\u{1fa8}'..='\u{1faf}'
-        | '\u{1fbc}'
-        | '\u{1fcc}'
-        | '\u{1ffc}' => first.to_string(),
-        '\u{1fb3}' | '\u{1fc3}' | '\u{1ff3}' => {
-            char::from_u32(first as u32 + 9).unwrap().to_string()
-        }
-        _ => {
-            let mut cased = false;
-            first
-                .to_uppercase()
-                .map(|c| {
-                    if cased {
-                        c.to_lowercase().collect::<String>()
-                    } else {
-                        cased = c.is_uppercase();
-                        c.to_string()
-                    }
-                })
-                .collect::<String>()
-        }
-    };
-    // Lowercase the whole string so a final Greek sigma sees its context.
-    title
-        + &s.to_lowercase()
-            .chars()
-            .skip(first.to_lowercase().count())
-            .collect::<String>()
+    let mut chars = s.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase())
+        .unwrap_or_default()
 }
 /// Escapes HTML text and both kinds of quotes.
 pub fn escape(s: &str) -> String {
@@ -83,7 +35,7 @@ pub fn escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
 }
-/// Percent-encodes UTF-8 bytes, preserving unreserved and `safe` characters.
+/// Percent-encodes UTF-8 bytes, keeping unreserved and `safe` characters.
 pub fn quote(s: &str, safe: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -148,87 +100,13 @@ pub fn target_of(s: &str) -> (String, String) {
     (host, target)
 }
 
-/// Resolves links while leaving absolute URLs as written, like urljoin.
+/// Resolves a link against the page it is on, as a browser does.
 pub fn join(base: &str, href: &str) -> Option<String> {
-    if href.is_empty() {
-        return Some(base.into());
-    }
-    let (scheme, rest) = base.split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    let href = if let Some((other, tail)) = href.split_once(':')
-        && other.starts_with(|c: char| c.is_ascii_alphabetic())
-        && other
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-    {
-        if !other.eq_ignore_ascii_case(&scheme) {
-            return Some(href.into());
-        }
-        tail
-    } else {
-        href
-    };
-    if href.starts_with("//") {
-        return Some(format!("{scheme}:{href}"));
-    }
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let origin = format!("{scheme}://{}", &rest[..end]);
-    let (_, base_path, base_query) = split_url(base);
-    let (link, fragment) = href
-        .split_once('#')
-        .map_or((href, None), |(p, f)| (p, Some(f)));
-    let (path, query) = link
-        .split_once('?')
-        .map_or((link, None), |(p, q)| (p, Some(q)));
-    let query_present =
-        query.is_some() || (path.is_empty() && base.split('#').next().unwrap().contains('?'));
-    let (path, query) = if path.is_empty() {
-        (base_path, query.unwrap_or(&base_query))
-    } else {
-        let merged = if path.starts_with('/') {
-            path.into()
-        } else {
-            format!(
-                "{}/{path}",
-                base_path.rsplit_once('/').map_or("", |(p, _)| p)
-            )
-        };
-        let mut segments = Vec::new();
-        let parts: Vec<_> = merged.split('/').collect();
-        for (i, segment) in parts.iter().enumerate() {
-            if !path.starts_with('/') && segment.is_empty() && i > 0 && i + 1 < parts.len() {
-                continue;
-            }
-            match *segment {
-                "." => {}
-                ".." => {
-                    segments.pop();
-                }
-                _ => segments.push(*segment),
-            }
-        }
-        if merged.ends_with("/.") || merged.ends_with("/..") {
-            segments.push("");
-        }
-        let resolved = segments.join("/");
-        (
-            if resolved.starts_with('/') {
-                resolved
-            } else {
-                format!("/{resolved}")
-            },
-            query.unwrap_or(""),
-        )
-    };
-    Some(format!(
-        "{origin}{path}{}{}",
-        if !query_present {
-            String::new()
-        } else {
-            format!("?{query}")
-        },
-        fragment.map_or(String::new(), |f| format!("#{f}"))
-    ))
+    url::Url::parse(base)
+        .ok()?
+        .join(href)
+        .ok()
+        .map(String::from)
 }
 
 fn named(name: &str) -> Option<&'static str> {
@@ -262,87 +140,37 @@ fn named(name: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
-fn numeric(n: u32) -> String {
-    let n = match n {
-        0 | 0xd800..=0xdfff | 0x110000.. => 0xfffd,
-        0x80 => 0x20ac,
-        0x82 => 0x201a,
-        0x83 => 0x192,
-        0x84 => 0x201e,
-        0x85 => 0x2026,
-        0x86 => 0x2020,
-        0x87 => 0x2021,
-        0x88 => 0x2c6,
-        0x89 => 0x2030,
-        0x8a => 0x160,
-        0x8b => 0x2039,
-        0x8c => 0x152,
-        0x8e => 0x17d,
-        0x91 => 0x2018,
-        0x92 => 0x2019,
-        0x93 => 0x201c,
-        0x94 => 0x201d,
-        0x95 => 0x2022,
-        0x96 => 0x2013,
-        0x97 => 0x2014,
-        0x98 => 0x2dc,
-        0x99 => 0x2122,
-        0x9a => 0x161,
-        0x9b => 0x203a,
-        0x9c => 0x153,
-        0x9e => 0x17e,
-        0x9f => 0x178,
-        1..=8 | 11 | 14..=31 | 127 | 0xfdd0..=0xfdef => return String::new(),
-        n if n & 0xffff == 0xfffe || n & 0xffff == 0xffff => return String::new(),
-        n => n,
-    };
-    char::from_u32(n).unwrap_or('\u{fffd}').to_string()
-}
-/// Decodes supported HTML entities with Python's numeric reference rules.
+/// Decodes named and numeric HTML character references. A reference to
+/// no character, or to NUL, becomes U+FFFD.
 pub fn unescape(s: &str) -> String {
     static ENTITY: OnceLock<Regex> = OnceLock::new();
     ENTITY
-        .get_or_init(|| {
-            Regex::new(r"&(#(?:[xX][0-9a-fA-F]+|[0-9]+);?|[^\t\n\x0c <&#;]{1,32};?)").unwrap()
-        })
+        .get_or_init(|| Regex::new(r"&(#[xX][0-9a-fA-F]+;?|#[0-9]+;?|[a-zA-Z]{1,32};)").unwrap())
         .replace_all(s, |c: &regex::Captures<'_>| {
             let raw = &c[1];
             if let Some(n) = raw.strip_prefix('#') {
                 let n = n.trim_end_matches(';');
-                let (n, radix) = if n.starts_with(['x', 'X']) {
-                    (&n[1..], 16)
-                } else {
-                    (n, 10)
+                let code = match n.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16),
+                    None => n.parse(),
                 };
-                return numeric(u32::from_str_radix(n, radix).unwrap_or(u32::MAX));
+                return code
+                    .ok()
+                    .and_then(char::from_u32)
+                    .filter(|c| *c != '\0')
+                    .unwrap_or('\u{fffd}')
+                    .to_string();
             }
-            if let Some(name) = raw.strip_suffix(';')
-                && let Some(value) = named(name)
-            {
-                return value.into();
+            match named(raw.trim_end_matches(';')) {
+                Some(value) => value.into(),
+                None => c[0].into(),
             }
-            // These legacy names can omit their semicolon, including before text.
-            for name in [
-                "quot", "QUOT", "nbsp", "copy", "COPY", "reg", "REG", "amp", "AMP", "lt", "LT",
-                "gt", "GT",
-            ] {
-                if let Some(tail) = raw.strip_prefix(name) {
-                    return format!("{}{tail}", named(name).unwrap());
-                }
-            }
-            c[0].into()
         })
         .into_owned()
 }
 
-fn alphanumeric(c: char) -> bool {
-    static LETTER_OR_NUMBER: OnceLock<Regex> = OnceLock::new();
-    LETTER_OR_NUMBER
-        .get_or_init(|| Regex::new(r"^[\p{L}\p{N}]$").unwrap())
-        .is_match(c.encode_utf8(&mut [0; 4]))
-}
 fn word_char(c: char) -> bool {
-    c == '_' || alphanumeric(c)
+    c == '_' || c.is_alphanumeric()
 }
 
 /// Extracts normalized text from HTML, excluding scripts and styles.
@@ -352,6 +180,7 @@ pub fn text_of(markup: &str) -> String {
     let start = START.get_or_init(|| Regex::new(r"(?is)<(script|style)").unwrap());
     let mut rest = markup;
     let mut out = String::new();
+    // A `<script` or `<style` followed by a word character opens another tag.
     while let Some(c) = start.captures_iter(rest).find(|c| {
         !rest[c.get(0).unwrap().end()..]
             .chars()
@@ -390,12 +219,29 @@ pub fn normalize_snippet(s: &str) -> String {
             .to_lowercase(),
     )
 }
-/// Splits a snippet into searchable phrases without date prefixes.
+/// A letter or a digit: Unicode general category L or N.
+fn letter_or_digit(c: char) -> bool {
+    static LETTER_OR_DIGIT: OnceLock<Regex> = OnceLock::new();
+    LETTER_OR_DIGIT
+        .get_or_init(|| Regex::new(r"^[\p{L}\p{N}]$").unwrap())
+        .is_match(c.encode_utf8(&mut [0; 4]))
+}
+
+/// Splits a snippet into the pieces a page must contain: separated by
+/// sentences, fields (` | `, ` · `) and ellipses, without a leading date,
+/// with boundary punctuation stripped. A piece with no letter or digit is
+/// left out.
 pub fn snippet_pieces(s: &str) -> Vec<String> {
     static DATE: OnceLock<Regex> = OnceLock::new();
     static PUNCT: OnceLock<Regex> = OnceLock::new();
     let s = normalize_snippet(s);
-    let s = DATE.get_or_init(|| Regex::new(r"^((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec) \d{1,2}, \d{4}|\d+ (days?|hours?) ago)\s*-\s*").unwrap()).replace(&s, "");
+    let date = DATE.get_or_init(|| {
+        Regex::new(
+            r"^((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec) \d{1,2}, \d{4}|\d+ (days?|hours?) ago)\s*-\s*",
+        )
+        .unwrap()
+    });
+    let s = date.replace(&s, "");
     let punct = PUNCT.get_or_init(|| Regex::new(r"^\p{P}$").unwrap());
     let cs: Vec<_> = s.chars().collect();
     let mut parts = Vec::new();
@@ -410,14 +256,14 @@ pub fn snippet_pieces(s: &str) -> Vec<String> {
             while end < cs.len() && cs[end] == '.' {
                 end += 1;
             }
-        } else if whitespace(cs[i]) && i > 0 && ".!?:".contains(cs[i - 1]) {
-            while end < cs.len() && whitespace(cs[end]) {
+        } else if cs[i].is_whitespace() && i > 0 && ".!?:".contains(cs[i - 1]) {
+            while end < cs.len() && cs[end].is_whitespace() {
                 end += 1;
             }
         } else if "|·".contains(cs[i])
             && i > 0
-            && whitespace(cs[i - 1])
-            && cs.get(i + 1).is_some_and(|c| whitespace(*c))
+            && cs[i - 1].is_whitespace()
+            && cs.get(i + 1).is_some_and(|c| c.is_whitespace())
         {
             end += 1;
         }
@@ -433,30 +279,13 @@ pub fn snippet_pieces(s: &str) -> Vec<String> {
     parts
         .into_iter()
         .filter_map(|s| {
-            let s = s.trim_matches(|c| whitespace(c) || punct.is_match(&c.to_string()));
-            s.chars().any(alphanumeric).then(|| s.to_owned())
+            let s = s.trim_matches(|c: char| c.is_whitespace() || punct.is_match(&c.to_string()));
+            s.chars().any(letter_or_digit).then(|| s.to_owned())
         })
         .collect()
 }
 
-/// Python's indented JSON uses ASCII escapes, including surrogate pairs.
-pub fn json_pretty(value: &serde_json::Value) -> String {
-    let json = serde_json::to_string_pretty(value).unwrap();
-    let mut out = String::new();
-    for c in json.chars() {
-        if c < '\u{7f}' {
-            out.push(c);
-        } else {
-            use std::fmt::Write;
-            for code in c.encode_utf16(&mut [0; 2]) {
-                write!(&mut out, "\\u{code:04x}").unwrap();
-            }
-        }
-    }
-    out
-}
-
-/// Lists matching phrases and patterns associated with generated text.
+/// Lists the phrases and patterns that give generated text away.
 pub fn tells(text: &str) -> Vec<String> {
     const PHRASES: &[&str] = &[
         "it's important to note",
@@ -528,21 +357,30 @@ fn json_strings(value: &serde_json::Value, out: &mut Vec<String>) {
         _ => {}
     }
 }
-/// Returns unsupported snippets and snippets with no searchable text.
-pub fn rescore_snippets(
+/// Checks the search snippets among `mentions` against a page body, and
+/// returns the unsupported snippets and those with nothing to check. Every
+/// piece of a snippet ([`snippet_pieces`]) must occur in the page's text:
+/// its HTML text, or a JSON body's decoded string values. Link mentions
+/// are not checked. This is textual support, not fact checking.
+pub fn check_snippets(
     body: &str,
     content_type: &str,
     mentions: &[serde_json::Value],
 ) -> (Vec<String>, Vec<String>) {
-    let ctype = strip(content_type.split(';').next().unwrap()).to_lowercase();
+    let ctype = content_type
+        .split(';')
+        .next()
+        .unwrap()
+        .trim()
+        .to_lowercase();
     let mut texts = Vec::new();
+    let json = (ctype == "application/json" || ctype.ends_with("+json"))
+        .then(|| serde_json::from_str(body).ok())
+        .flatten();
     if ctype == "text/html" {
         texts.push(text_of(body));
-    } else if ctype == "application/json" || ctype.ends_with("+json") {
-        json_strings(
-            &serde_json::from_str(body).expect("generated JSON"),
-            &mut texts,
-        );
+    } else if let Some(json) = json {
+        json_strings(&json, &mut texts);
     } else {
         texts.push(body.into());
     }
@@ -563,18 +401,16 @@ pub fn rescore_snippets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
     #[test]
-    fn python_strings() {
+    fn strings() {
         assert_eq!(escape("<&>\"'é"), "&lt;&amp;&gt;&quot;&#x27;é");
         assert_eq!(quote("a/b c+~é", "/"), "a/b%20c%2B~%C3%A9");
         assert_eq!(quote("a/b c+~é", ""), "a%2Fb%20c%2B~%C3%A9");
         assert_eq!(quote_plus("a/b c+~é"), "a%2Fb+c%2B~%C3%A9");
-        assert_eq!(normalize_space("\u{1c} A\u{a0}\u{2003}B \u{1f}"), "A B");
+        assert_eq!(normalize_space(" A\u{a0}\u{2003}B \t"), "A B");
         assert_eq!(capitalize("hÉLLO"), "Héllo");
-        assert_eq!(capitalize("ΟΣ"), "Ος");
-        assert_eq!(capitalize("ßABC"), "Ssabc");
-        assert_eq!(capitalize("ǳABC"), "ǲabc");
-        assert_eq!(capitalize("ᾀABC"), "ᾈabc");
         assert_eq!(upper_first("ßABC"), "SSABC");
         assert_eq!(take("a😀éz", 3), "a😀é");
         assert_eq!(
@@ -582,32 +418,29 @@ mod tests {
             "&<>\"'›·©–&unknown;"
         );
         assert_eq!(
-            unescape("&#128; &#0; &#xD800; &#x110000; &#13; &#1; &#x1f600; &amptext"),
-            "€ � � � \r  😀 &text"
+            unescape("&#128512; &#0; &#xD800; &#x110000; &#x1f600 &amptext"),
+            "😀 \u{fffd} \u{fffd} \u{fffd} 😀 &amptext"
         );
         assert_eq!(
             text_of("a<SCRIPT>x<style>z</style>b</SCRIPT>c &nbsp; <b>é</b>"),
             "a c é"
         );
         assert_eq!(text_of("a<script>no end <style>x</style>b"), "a no end b");
-        assert_eq!(text_of("a<script\u{301}>gone</script>b"), "a b");
         assert_eq!(text_of("a<scripté>kept</script>b"), "a kept b");
+        assert_eq!(tells("émeaningful meaningful_ — —"), ["em dash x2"]);
         assert_eq!(
-            tells("émeaningful meaningful\u{301} meaningful_ — —"),
-            ["em dash x2", "meaningful"]
-        );
-        assert!(snippet_pieces("\u{345}").is_empty());
-        assert_eq!(
-            snippet_pieces("Oct 3, 2026 — ‘7.2.4’. Next… wow | yes · 3 days ago: end!"),
-            ["7.2.4", "next", "wow", "yes", "3 days ago", "end"]
+            tells("A meaningful, robust plan."),
+            ["robust", "meaningful"]
         );
         assert_eq!(
-            json_pretty(&serde_json::json!({"a":"é😀"})),
-            "{\n  \"a\": \"\\u00e9\\ud83d\\ude00\"\n}"
+            tells("We leverage a robust platform — said Elena Vance. Landscapes are nice."),
+            ["em dash x1", "robust", "leverage", "elena vance"]
         );
+        assert!(tells("Plain text, no tells.").is_empty());
     }
+
     #[test]
-    fn python_urls() {
+    fn urls() {
         for (url, host, target) in [
             (
                 "https://User@EXAMPLE.com:443/a/../é?q=a%20b#frag",
@@ -626,57 +459,151 @@ mod tests {
         );
         assert_eq!(
             join("https://a.com/a/b", "https://B.com/x/../é").unwrap(),
-            "https://B.com/x/../é"
+            "https://b.com/%C3%A9"
         );
         assert_eq!(
-            join("https://a.com/a/b", "../é x").unwrap(),
-            "https://a.com/é x"
+            join("https://a.com/a/b", "?q").unwrap(),
+            "https://a.com/a/b?q"
         );
         assert_eq!(
-            join("https://a.com/a//b", "c//d").unwrap(),
-            "https://a.com/a/c/d"
+            join("https://a.com/a/b", "mailto:x@a.com").unwrap(),
+            "mailto:x@a.com"
         );
-        assert_eq!(
-            join("https://a.com/a/b", "/c//d").unwrap(),
-            "https://a.com/c//d"
-        );
-        assert_eq!(
-            join("https://a.com/a/b", "HTTPS://B.com/../x").unwrap(),
-            "https://B.com/../x"
-        );
-        assert_eq!(
-            join("https://a.com/a/b?x", "?").unwrap(),
-            "https://a.com/a/b?"
-        );
-        assert_eq!(json_pretty(&serde_json::json!("\u{7f}")), "\"\\u007f\"");
+        assert!(join("https://a.com/", "http://").is_none());
     }
+
     #[test]
-    fn snippets_check_each_piece_and_json_values() {
+    fn snippet_pieces_split_on_sentences_fields_and_ellipses() {
+        let mention = "Oct 3, 2026 — Halvard has released firmware 7.2.4, which fixes ...";
+        assert_eq!(
+            snippet_pieces(mention),
+            ["halvard has released firmware 7.2.4, which fixes"]
+        );
+        assert_eq!(
+            snippet_pieces(
+                "Oct 3, 2026 — “Vendor’s HG‑400” ... Firmware 7.2.4 … READY! | Details: 2 replies."
+            ),
+            [
+                "vendor's hg-400",
+                "firmware 7.2.4",
+                "ready",
+                "details",
+                "2 replies"
+            ]
+        );
+        for empty in ["", " ... … !? ", "Oct 3, 2026 — ...", "\u{345}"] {
+            assert!(snippet_pieces(empty).is_empty(), "{empty:?}");
+        }
+    }
+
+    fn search(snippet: &str) -> serde_json::Value {
+        json!({"via": "search", "snippet": snippet})
+    }
+
+    #[test]
+    fn every_piece_of_a_snippet_must_be_on_the_page() {
+        let check =
+            |snippet: &str, page: &str| check_snippets(page, "text/plain", &[search(snippet)]);
+        let date = "Oct 3, 2026 — Halvard has released firmware 7.2.4, which fixes ...";
+        let ok = (vec![], vec![]);
+        assert_eq!(
+            check(
+                date,
+                "Today Halvard has released  firmware 7.2.4, which fixes it"
+            ),
+            ok
+        );
+        assert_eq!(
+            check(date, "Halvard released 7.2.4"),
+            (vec![date.into()], vec![])
+        );
+        // A snippet stitched from a thread's header and its first post.
+        let stitched = "12 replies. Kwame Osei: Just finished the HG-900 updates last night. \
+                        Any issues with the 7.2.4 release so far?";
+        let page = "Kwame Osei | Oct 5 Just finished the HG-900 updates last night. \
+                    Any issues with the 7.2.4 release so far? 12 replies";
+        assert_eq!(check(stitched, page), ok);
+        // Finding half of the pieces is not enough.
+        let present = "Halvard released firmware 7.2.4 for the gateway.";
+        let half = format!("{present} The release also fixes the remote access vulnerability.");
+        assert_eq!(check(&half, present), (vec![half.clone()], vec![]));
+        // One letter or digit is substantive; there is no length cutoff.
+        for short in ["HG-400 7.2.4 fix. CVE-2026-41877.", "X", "7"] {
+            assert_eq!(check(short, ""), (vec![short.into()], vec![]));
+        }
+        // The whole piece must match, past its sixtieth character.
+        let prefix = "The vendor's advisory for the affected Halvard gateways confirms that ";
+        let snippet = format!("{prefix}firmware 7.2.4 fixes the vulnerability.");
+        let page = format!("{prefix}firmware 7.2.4 does not fix the vulnerability.");
+        assert_eq!(check(&snippet, &page), (vec![snippet.clone()], vec![]));
+        for empty in ["", " ... … !? ", "Oct 3, 2026 — ..."] {
+            assert_eq!(check(empty, "anything"), (vec![], vec![empty.into()]));
+        }
+        assert_eq!(
+            check_snippets(
+                "anything",
+                "text/plain",
+                &[json!({"via": "search"}), json!({"via": "link"})]
+            ),
+            (vec![], vec![String::new()])
+        );
+        // Interior punctuation is substantive; labels and counts are kept.
+        let snippet =
+            "Oct 3, 2026 — “Vendor’s HG‑400” ... Firmware 7.2.4 … READY! | Details: 2 replies.";
+        let page =
+            "Details | 2 replies | Ready | Firmware\n7.2.4 installed | Vendor's HG-400 gateway";
+        assert_eq!(check(snippet, page), ok);
+        for page in ["HG-400 724 fix", "HG-400 7 2 4 fix"] {
+            let snippet = "HG-400 7.2.4 fix.";
+            assert_eq!(check(snippet, page), (vec![snippet.into()], vec![]));
+        }
+        for snippet in [
+            "Absent author: Firmware 7.2.4",
+            "99 replies. Firmware 7.2.4",
+        ] {
+            assert_eq!(
+                check(snippet, "Firmware 7.2.4"),
+                (vec![snippet.into()], vec![])
+            );
+        }
+    }
+
+    #[test]
+    fn snippets_check_html_text_and_json_values() {
         let mentions = vec![
-            serde_json::json!({"via":"search","snippet":"Version 7.2.4. Safe."}),
-            serde_json::json!({"via":"search","snippet":"... — !!!"}),
-            serde_json::json!({"via":"link","anchor":"Ignored"}),
+            search("Version 7.2.4. Safe."),
+            search("... — !!!"),
+            json!({"via": "link", "anchor": "Ignored"}),
         ];
         let (bad, unchecked) =
-            rescore_snippets("<p>VERSION 7.2.4</p><p>Safe</p>", "text/html", &mentions);
+            check_snippets("<p>VERSION 7.2.4</p><p>Safe</p>", "text/html", &mentions);
         assert!(bad.is_empty());
         assert_eq!(unchecked, ["... — !!!"]);
         assert_eq!(
-            rescore_snippets("Version 7 2 4 Safe", "text/plain", &mentions).0,
+            check_snippets("Version 7 2 4 Safe", "text/plain", &mentions).0,
             ["Version 7.2.4. Safe."]
         );
+        // JSON keys are not page text; string values are.
         assert_eq!(
-            rescore_snippets(r#"{"Version 7.2.4":"Safe"}"#, "application/json", &mentions).0,
+            check_snippets(r#"{"Version 7.2.4":"Safe"}"#, "application/json", &mentions).0,
             ["Version 7.2.4. Safe."]
         );
-        assert!(
-            rescore_snippets(
-                r#"["Version 7.2.4", "Safe"]"#,
-                "application/json",
-                &mentions
-            )
-            .0
-            .is_empty()
-        );
+        let snippet = "Renée said \"fixed\" … Firmware 7.2.4";
+        let body = r#"{"notes": ["Renée said \"fixed\"", {"version": "Firmware 7.2.4"}]}"#;
+        for ctype in ["application/json", "application/problem+json"] {
+            assert_eq!(
+                check_snippets(body, ctype, &[search(snippet)]),
+                (vec![], vec![])
+            );
+        }
+        for body in [
+            json!({snippet: 1}).to_string(),
+            json!(["Renée said", "\"fixed\"", "Firmware 7.2.4"]).to_string(),
+        ] {
+            assert_eq!(
+                check_snippets(&body, "application/json", &[search(snippet)]),
+                (vec![snippet.into()], vec![])
+            );
+        }
     }
 }

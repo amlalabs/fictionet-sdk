@@ -1,7 +1,7 @@
 """Reports include failures, distinguish attempts and generations, and keep unknown costs."""
 import unittest
 
-from adaptive.accounting import generation_report, cost_report
+from inspect_fictionet.worlds.adaptive_web.accounting import generation_report, cost_report
 
 
 class Accounting(unittest.TestCase):

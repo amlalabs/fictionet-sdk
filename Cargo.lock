@@ -20,6 +20,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower-service",
+ "url",
 ]
 
 [[package]]

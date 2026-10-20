@@ -1,8 +1,19 @@
-//! Request routing shared with the Python world.
+//! Request routing: searches, the engines' redirects, and pages.
 
+use crate::pages::text::normalize_space;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+
+/// The search engines' hosts. Links to them are not mentions of pages.
+pub const SEARCH_HOSTS: [&str; 7] = [
+    "www.google.com",
+    "google.com",
+    "html.duckduckgo.com",
+    "duckduckgo.com",
+    "lite.duckduckgo.com",
+    "www.bing.com",
+    "bing.com",
+];
 
 /// A supported search engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,67 +59,30 @@ pub enum Route {
     Page,
 }
 
-fn whitespace(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
-}
-
 /// Normalizes search text and adds offsets of ten or more to the shared key.
 pub fn query_key(query: &str, start: u64) -> String {
-    let mut key = query
-        .to_lowercase()
-        .split(whitespace)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let mut key = normalize_space(&query.to_lowercase());
     if start >= 10 {
         key.push_str(&format!(" (from {start})"));
     }
     key
 }
 
-// Python accepts decimal Unicode digits and underscores between digits.
-fn digit(c: char) -> Option<u64> {
-    if c.is_ascii_digit() {
-        return Some(u64::from(c as u32 - '0' as u32));
-    }
-    static DECIMAL: OnceLock<regex::Regex> = OnceLock::new();
-    let decimal = DECIMAL.get_or_init(|| regex::Regex::new(r"^\p{Nd}$").unwrap());
-    if !decimal.is_match(c.encode_utf8(&mut [0; 4])) {
-        return None;
-    }
-    let mut first = c as u32;
-    while let Some(prev) = char::from_u32(first - 1) {
-        if !decimal.is_match(prev.encode_utf8(&mut [0; 4])) {
-            break;
-        }
-        first -= 1;
-    }
-    Some(u64::from((c as u32 - first) % 10))
-}
-
-/// Offsets beyond the representation saturate at the largest offset.
+/// A result offset: decimal digits after an optional `+`, saturating at
+/// the largest offset. Anything else is zero.
 fn number(text: &str) -> u64 {
-    // Python int excludes the four extra string whitespace characters.
-    let text = text.trim_matches(char::is_whitespace);
-    let text = text.strip_prefix('+').unwrap_or(text);
-    let mut value = 0u64;
-    let mut previous_digit = false;
-    for c in text.chars() {
-        if c == '_' && previous_digit {
-            previous_digit = false;
-            continue;
-        }
-        let Some(digit) = digit(c) else {
-            return 0;
-        };
-        value = value.saturating_mul(10).saturating_add(digit);
-        previous_digit = true;
+    let text = text.trim();
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
     }
-    if previous_digit { value } else { 0 }
+    digits.bytes().fold(0u64, |value, b| {
+        value.saturating_mul(10).saturating_add(u64::from(b - b'0'))
+    })
 }
 
-/// Routes a host and request target like the Python backend.
-/// Pass form bytes only for a form URL encoded POST.
+/// Routes a host and request target. Pass form bytes only for a form URL
+/// encoded POST; its fields take the place of the query's.
 pub fn route(host: &str, target: &str, form: Option<&[u8]>) -> Route {
     let host = host.to_lowercase();
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -127,7 +101,7 @@ pub fn route(host: &str, target: &str, form: Option<&[u8]>) -> Route {
         args.extend(parse(String::from_utf8_lossy(body).as_bytes(), false));
     }
     let arg = |name: &str| args.get(name).map(String::as_str).unwrap_or("");
-    let q = arg("q").trim_matches(whitespace);
+    let q = arg("q").trim();
     let search = |engine, start| Route::Search {
         engine,
         query: q.to_owned(),
@@ -264,17 +238,16 @@ mod tests {
         for (offset, want) in [
             ("-4", 0),
             ("bad", 0),
-            ("1__0", 0),
-            ("10_", 0),
-            ("%2B1_0", 10),
+            ("1_0", 0),
+            ("%2B10", 10),
             ("+20+", 20),
-            ("١٢", 12),
-            ("%1C10", 0),
+            ("١٢", 0),
+            ("99999999999999999999999", u64::MAX),
         ] {
             assert_eq!(
                 route(
                     "www.google.com",
-                    &format!("/search?q=%1CHi%1F&start={offset}"),
+                    &format!("/search?q=+Hi%09&start={offset}"),
                     None
                 ),
                 Route::Search {
@@ -298,10 +271,7 @@ mod tests {
                 }
             );
         }
-        assert_eq!(
-            query_key("\u{1c}HI\u{1d}\u{2003}There\u{1f}", 9),
-            "hi there"
-        );
+        assert_eq!(query_key("\tHI\u{2003}There ", 9), "hi there");
         assert_eq!(query_key("Hi", 10), "hi (from 10)");
     }
 }

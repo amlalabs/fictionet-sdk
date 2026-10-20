@@ -1,0 +1,497 @@
+//! Everything the world has made: pages, result lists, the mentions that
+//! pointed at a URL before it existed, site layouts and the cast.
+//!
+//! A store lives in memory. With a directory it is also kept there, so a
+//! later world on the same directory starts from everything an earlier one
+//! made:
+//!
+//! ```text
+//! store.json         format version, the seed's declaration, the generator
+//! world.jsonl        everything made, one object per line, in order
+//! generations.jsonl  every model attempt, stub call and prefetch error
+//! addresses.jsonl    every pool address given out (see `Addresses`)
+//! store.lock         held by the world using the store
+//! ```
+//!
+//! One world uses a store at a time. A store answers only for the seed it
+//! was made with and, to make more, for the same generator: provider,
+//! model and reasoning setting. Anything else fails with how to start over.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use super::make::{self, Profile};
+use super::model::Usage;
+use super::prompts::{Claim, HostPage, Person};
+use super::{Generation, Seed};
+
+/// The format of `store.json` and `world.jsonl`.
+const VERSION: u64 = 1;
+
+/// A page as the world serves it, and what it was made from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PageRecord {
+    pub url: String,
+    pub host: String,
+    pub target: String,
+    pub status: u16,
+    pub content_type: String,
+    #[serde(with = "body")]
+    pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+    pub title: String,
+    pub description: String,
+    pub date: String,
+    pub claims: Vec<String>,
+    /// The mentions the page was made from, in their recorded order.
+    pub mentions: Vec<Value>,
+    pub tells: Vec<String>,
+    pub unsupported_snippets: Vec<String>,
+    pub unchecked_snippets: Vec<String>,
+    /// Made ahead of its first request.
+    pub prefetched: bool,
+    /// A fixed page from the seed, captured on first use.
+    pub fixed: bool,
+    /// What making it cost; none for a fixed page.
+    pub usage: Option<Usage>,
+}
+
+/// A result list, shared by every engine that shows the query.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchRecord {
+    pub key: String,
+    pub query: String,
+    #[serde(flatten)]
+    pub search: make::Search,
+    pub usage: Usage,
+}
+
+/// The people pages name.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CastRecord {
+    pub people: Vec<Person>,
+    pub usage: Usage,
+}
+
+/// One line of `world.jsonl`.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Entry {
+    Page(PageRecord),
+    Search(SearchRecord),
+    Mention {
+        host: String,
+        target: String,
+        mention: Value,
+    },
+    Site {
+        host: String,
+        profile: Profile,
+    },
+    Cast(CastRecord),
+}
+
+/// A page body: text when it is UTF-8, else `{"base64": ...}`.
+mod body {
+    use fictionet::stdlib::codec::base64;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Form {
+        Text(String),
+        Bytes { base64: String },
+    }
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Form::Text(text.into()),
+            Err(_) => Form::Bytes {
+                base64: base64::encode(bytes),
+            },
+        }
+        .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        match Form::deserialize(d)? {
+            Form::Text(text) => Ok(text.into_bytes()),
+            Form::Bytes { base64: text } => {
+                base64::decode(text.as_bytes(), base64::Padding::Required)
+                    .ok_or_else(|| serde::de::Error::custom("a body is not base64"))
+            }
+        }
+    }
+}
+
+struct Files {
+    root: PathBuf,
+    world: File,
+    generations: File,
+    _lock: File,
+}
+
+/// The world's store. See the [module](self).
+pub struct Store {
+    pages: HashMap<(String, String), PageRecord>,
+    /// Pages in the order they were made.
+    order: Vec<(String, String)>,
+    mentions: HashMap<(String, String), Vec<Value>>,
+    sites: Vec<(String, Profile)>,
+    searches: HashMap<String, SearchRecord>,
+    cast: Option<CastRecord>,
+    claims: Vec<Claim>,
+    files: Option<Files>,
+    /// The world's generation setting; not stored.
+    pub generation: Generation,
+    /// Generations this run has started; not stored.
+    pub made: usize,
+    /// Pages made ahead of time that no request has asked for yet.
+    pub unserved: std::collections::HashSet<(String, String)>,
+}
+
+fn key(host: &str, target: &str) -> (String, String) {
+    (host.to_owned(), target.to_owned())
+}
+
+/// Why a store cannot be used, and how to start over.
+fn incompatible(root: &Path, reason: &str) -> String {
+    format!(
+        "cannot reuse store {}: {reason}; rebuild in a fresh ADAPTIVE_WEB_STORE_DIR \
+        (ADAPTIVE_WEB_STORE for the world). Keep the old store for audit",
+        root.display()
+    )
+}
+
+impl Store {
+    /// A store kept in memory only.
+    pub fn memory() -> Self {
+        Self {
+            pages: HashMap::new(),
+            order: Vec::new(),
+            mentions: HashMap::new(),
+            sites: Vec::new(),
+            searches: HashMap::new(),
+            cast: None,
+            claims: Vec::new(),
+            files: None,
+            generation: Generation::default(),
+            made: 0,
+            unserved: Default::default(),
+        }
+    }
+
+    /// Opens the store at `root` for `seed`, creating it if it is empty.
+    /// `generator` is the identity of what will make new pages (see
+    /// [`Model::identity`](super::model::Model::identity)), or `None` to
+    /// serve only what the store holds. Returns the store and the identity
+    /// of the generator that made it.
+    pub fn open(
+        root: &Path,
+        seed: &Seed,
+        generator: Option<&Value>,
+    ) -> Result<(Self, Value), String> {
+        let fail = |e: io::Error| format!("{}: {e}", root.display());
+        std::fs::create_dir_all(root).map_err(fail)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join("store.lock"))
+            .map_err(fail)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "store {} is in use by another world",
+                    root.display()
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
+        }
+        let identity_path = root.join("store.json");
+        let declared = seed.declaration();
+        let made_by = match std::fs::read(&identity_path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let other = std::fs::read_dir(root)
+                    .map_err(fail)?
+                    .filter_map(|entry| entry.ok())
+                    .any(|entry| entry.file_name() != "store.lock");
+                if other {
+                    return Err(incompatible(
+                        root,
+                        "the directory holds files of no store of this version",
+                    ));
+                }
+                let Some(generator) = generator else {
+                    return Err(incompatible(root, "replay needs a store a generator made"));
+                };
+                let identity =
+                    json!({"version": VERSION, "seed": declared, "generator": generator});
+                write_new(&identity_path, &identity).map_err(fail)?;
+                generator.clone()
+            }
+            Err(e) => return Err(fail(e)),
+            Ok(text) => {
+                let identity: Value = serde_json::from_slice(&text)
+                    .map_err(|e| incompatible(root, &format!("store.json is not JSON: {e}")))?;
+                if identity["version"] != VERSION {
+                    return Err(incompatible(root, "unsupported store format version"));
+                }
+                if identity["seed"] != declared {
+                    return Err(incompatible(root, "the seed's declaration differs"));
+                }
+                if !identity["generator"].is_object() {
+                    return Err(incompatible(root, "it names no generator"));
+                }
+                if generator.is_some_and(|g| *g != identity["generator"]) {
+                    return Err(incompatible(root, "generator configuration mismatch"));
+                }
+                identity["generator"].clone()
+            }
+        };
+        let mut store = Self::memory();
+        let world_path = root.join("world.jsonl");
+        match File::open(&world_path) {
+            Ok(file) => {
+                for (index, line) in io::BufReader::new(file).lines().enumerate() {
+                    let bad = |why: String| {
+                        format!("{}: line {}: {why}", world_path.display(), index + 1)
+                    };
+                    let line = line.map_err(|e| bad(e.to_string()))?;
+                    let entry: Entry =
+                        serde_json::from_str(&line).map_err(|e| bad(e.to_string()))?;
+                    store.apply(entry);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(fail(e)),
+        }
+        let append = |name: &str| {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join(name))
+                .map_err(fail)
+        };
+        store.files = Some(Files {
+            root: root.to_owned(),
+            world: append("world.jsonl")?,
+            generations: append("generations.jsonl")?,
+            _lock: lock,
+        });
+        Ok((store, made_by))
+    }
+
+    /// The directory the store is kept in, if any.
+    pub fn root(&self) -> Option<&Path> {
+        self.files.as_ref().map(|f| f.root.as_path())
+    }
+
+    fn apply(&mut self, entry: Entry) {
+        match entry {
+            Entry::Page(page) => {
+                let at = key(&page.host, &page.target);
+                self.claims.extend(page.claims.iter().map(|claim| Claim {
+                    url: page.url.clone(),
+                    claim: claim.clone(),
+                }));
+                self.order.push(at.clone());
+                self.pages.insert(at, page);
+            }
+            Entry::Search(search) => {
+                self.searches.insert(search.key.clone(), search);
+            }
+            Entry::Mention {
+                host,
+                target,
+                mention,
+            } => self
+                .mentions
+                .entry((host, target))
+                .or_default()
+                .push(mention),
+            Entry::Site { host, profile } => self.sites.push((host, profile)),
+            Entry::Cast(cast) => self.cast = Some(cast),
+        }
+    }
+
+    /// Writes `entry` to the store's file, then applies it. Nothing is
+    /// applied if the write fails.
+    fn record(&mut self, entry: Entry) -> io::Result<()> {
+        if let Some(files) = &mut self.files {
+            let mut line = serde_json::to_vec(&entry).map_err(io::Error::other)?;
+            line.push(b'\n');
+            files.world.write_all(&line)?;
+        }
+        self.apply(entry);
+        Ok(())
+    }
+
+    /// Appends a row to `generations.jsonl`, for a store with a directory.
+    pub fn log_generation(&mut self, row: &Value) -> io::Result<()> {
+        if let Some(files) = &mut self.files {
+            let mut line = serde_json::to_vec(row).map_err(io::Error::other)?;
+            line.push(b'\n');
+            files.generations.write_all(&line)?;
+        }
+        Ok(())
+    }
+
+    pub fn page(&self, host: &str, target: &str) -> Option<&PageRecord> {
+        self.pages.get(&key(host, target))
+    }
+
+    pub fn insert_page(&mut self, page: PageRecord) -> io::Result<()> {
+        self.record(Entry::Page(page))
+    }
+
+    /// The host's pages, oldest first, as a page prompt shows them.
+    pub fn host_pages(&self, host: &str) -> Vec<HostPage> {
+        self.order
+            .iter()
+            .filter(|(h, _)| h == host)
+            .take(20)
+            .map(|at| {
+                let page = &self.pages[at];
+                HostPage {
+                    url: page.url.clone(),
+                    title: page.title.clone(),
+                    claims: page.claims.iter().take(6).cloned().collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Pages the world has: the seed's fixed pages and the last 40 made with
+    /// status 200 and a title.
+    pub fn known(&self, seed: &Seed) -> Vec<make::Result> {
+        let fixed = seed.fixed.iter().map(|f| make::Result {
+            url: f.url.clone(),
+            title: f.title.clone(),
+            snippet: f.description.clone(),
+            date: String::new(),
+        });
+        let made = self.order[self.order.len().saturating_sub(40)..]
+            .iter()
+            .map(|at| &self.pages[at])
+            .filter(|p| p.status == 200 && !p.title.is_empty())
+            .map(|p| make::Result {
+                url: p.url.clone(),
+                title: p.title.clone(),
+                snippet: p.description.clone(),
+                date: String::new(),
+            });
+        fixed.chain(made).collect()
+    }
+
+    /// The last `n` claims pages made, oldest first.
+    pub fn recent_claims(&self, n: usize) -> Vec<Claim> {
+        self.claims[self.claims.len().saturating_sub(n)..].to_vec()
+    }
+
+    pub fn mentions(&self, host: &str, target: &str) -> &[Value] {
+        self.mentions
+            .get(&key(host, target))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Records a mention of a URL, unless it is already recorded.
+    pub fn add_mention(&mut self, host: &str, target: &str, mention: Value) -> io::Result<()> {
+        if self.mentions(host, target).contains(&mention) {
+            return Ok(());
+        }
+        self.record(Entry::Mention {
+            host: host.into(),
+            target: target.into(),
+            mention,
+        })
+    }
+
+    /// Chooses a search result's title and snippet and records it as a
+    /// mention: a page that exists gives its title and description, then the
+    /// seed's declaration of a fixed page, then the first title a mention
+    /// showed. Returns the mention as recorded, so every engine shows it.
+    pub fn reserve_mention(
+        &mut self,
+        seed: &Seed,
+        host: &str,
+        target: &str,
+        mut mention: Value,
+    ) -> io::Result<Value> {
+        let page = self
+            .page(host, target)
+            .filter(|p| !p.title.is_empty())
+            .map(|p| (p.title.clone(), p.description.clone()));
+        let declared = seed
+            .fixed_for(host, target)
+            .map(|f| (f.title.clone(), f.description.clone()));
+        if let Some((title, description)) = page.or(declared) {
+            if !title.is_empty() {
+                mention["title"] = title.into();
+            }
+            if !description.is_empty() {
+                mention["snippet"] = description.into();
+            }
+        } else if let Some(title) = self
+            .mentions(host, target)
+            .iter()
+            .filter_map(|m| m["title"].as_str())
+            .find(|s| !s.is_empty())
+        {
+            mention["title"] = title.into();
+        }
+        self.add_mention(host, target, mention.clone())?;
+        Ok(mention)
+    }
+
+    pub fn site(&self, host: &str) -> Option<&Profile> {
+        self.sites.iter().find(|(h, _)| h == host).map(|(_, p)| p)
+    }
+
+    /// The host's layout: the first one recorded for it. A new one gets
+    /// `style`, the number of hosts that had a layout before it.
+    pub fn site_once(&mut self, host: &str, mut profile: Profile) -> io::Result<Profile> {
+        if let Some(profile) = self.site(host) {
+            return Ok(profile.clone());
+        }
+        profile.style = self.sites.len();
+        self.record(Entry::Site {
+            host: host.into(),
+            profile: profile.clone(),
+        })?;
+        Ok(profile)
+    }
+
+    pub fn search(&self, key: &str) -> Option<&SearchRecord> {
+        self.searches.get(key)
+    }
+
+    pub fn insert_search(&mut self, search: SearchRecord) -> io::Result<()> {
+        self.record(Entry::Search(search))
+    }
+
+    pub fn cast(&self) -> Option<&CastRecord> {
+        self.cast.as_ref()
+    }
+
+    pub fn set_cast(&mut self, cast: CastRecord) -> io::Result<()> {
+        self.record(Entry::Cast(cast))
+    }
+}
+
+/// Writes `value` to a new file at `path`, through a temporary file, so a
+/// reader never sees half of it.
+fn write_new(path: &Path, value: &Value) -> io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(value).map_err(io::Error::other)?,
+    )?;
+    std::fs::rename(tmp, path)
+}

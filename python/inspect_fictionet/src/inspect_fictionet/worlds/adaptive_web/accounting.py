@@ -1,4 +1,5 @@
-"""Shared populations for eval metadata and stored generation reports. No I/O."""
+"""Populations for eval metadata, and reports over a store's
+`generations.jsonl`. No I/O."""
 import math
 
 

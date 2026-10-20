@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use example_common::backend_process::{args, secs};
+use example_common::args::{args, secs};
 use example_common::log::Log;
 use fakewiki_world::content::Content;
 use fakewiki_world::pages::{self, Variant};

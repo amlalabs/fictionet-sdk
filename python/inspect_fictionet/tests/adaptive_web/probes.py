@@ -352,7 +352,7 @@ def score_evidence(ev: dict, seed: str) -> tuple[dict, dict]:
     checks["world_process_invisible"] = (
         len(processes) > 1 and processes[0].split() == ["PID", "USER", "COMMAND"]
         and all(re.match(r"\s*\d+\s+\S+\s+\S", line) for line in processes[1:])
-        and not any(n in ps.stdout for n in ("adaptive-web-world", "backend.py", "fictionet attach"))
+        and not any(n in ps.stdout for n in ("adaptive-web-world", "fictionet attach"))
     )
     return checks, details
 

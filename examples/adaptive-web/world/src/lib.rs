@@ -2,9 +2,8 @@
 //! a certificate, and every page is made the first time it is asked for.
 //!
 //! ```text
-//! adaptive-web-world --socket /run/fictionet/sock/world.sock --ca-dir /app/ca \
-//!     --backend /app/backend --backend-port 8080 \
-//!     --state-dir /var/lib/fictionet --ready /run/fictionet/ready
+//! ADAPTIVE_WEB_SEED=halvard-cve adaptive-web-world --socket /run/fictionet/sock/world.sock \
+//!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready
 //! ```
 //!
 //! - **Names** ([`admit`]): any name that could exist on the internet gets
@@ -22,26 +21,23 @@
 //! - **Dates** ([`world_start`]): the world's clock starts on the seed's
 //!   date, so every response's `Date` header is in the scenario, and each
 //!   certificate was issued shortly before it.
-//! - **Pages** ([`backend`]): sites use either the Python backend on
-//!   127.0.0.1 or the in-process [`stub`]. Python serves evals and model
-//!   generation; the Rust stub serves demos without host I/O. Fixed responses
-//!   retain their bytes and metadata on first use. Replay needs no fixed
-//!   source files and returns 404 for pages absent from the store. Stores
-//!   check the seed and generator identity; incompatible or legacy stores
-//!   require an explicit rebuild in a fresh directory.
+//! - **Pages** ([`pages`]): searches and pages, made by the offline
+//!   generator or a model, kept in a store, and checked for consistency
+//!   with what the world already said. [`handler`] answers every site from
+//!   them.
 //! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, the
 //!   ready file, and the store. The log is written from the run's events
 //!   ([`events`]).
 //!
 //! An in-process world can keep its addresses, pages and CA in memory.
-//! This example sends its log to standard output. Give the PEM root and
-//! attacher to the guest runner, then use commands to change generation.
+//! This example sends its log to standard output, and turns generation off
+//! once the network is up.
 //!
 //! ```no_run
 //! use std::sync::Arc;
 //! use adaptive_web_world::{Addresses, Ca, serve, world_start};
 //! use adaptive_web_world::{events::LogObserver, search::Searches};
-//! use adaptive_web_world::stub::{Command, Seed, Stub};
+//! use adaptive_web_world::pages::{Command, Pages, Seed};
 //! use example_common::log::Log;
 //! use fictionet::events::Fanout;
 //!
@@ -49,8 +45,8 @@
 //! let seed = Seed::builtin("halvard-cve")?;
 //! let start = world_start(&seed.date)?;
 //! let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
-//! let searches = Arc::new(Searches::from_seed(&seed));
-//! let stub = Arc::new(Stub::new(seed));
+//! let pages = Arc::new(Pages::new(seed));
+//! let searches = Arc::new(Searches::of(&pages));
 //! let log = Arc::new(Log::new(Box::new(std::io::stdout()), &[], |s| s));
 //! let observer = Arc::new(Fanout::new(vec![
 //!     searches.clone(),
@@ -63,11 +59,11 @@
 //!     let ca = Arc::new(Ca::in_memory(&cx, start)?);
 //!     let root_pem = ca.cert_pem();
 //!     let (attacher, attachments) = fictionet::attachments();
-//!     serve(&cx, addresses, ca, stub.clone(), log.clone(), start, attachments)?;
+//!     serve(&cx, addresses, ca, pages.clone(), log.clone(), start, attachments)?;
 //!     // Start a guest with root_pem and attacher here.
-//!     let applied = stub.apply(&cx, Command::SetGeneration {
+//!     let applied = pages.apply(&cx, Command::SetGeneration {
 //!         generate: false,
-//!         expected_revision: stub.generation().revision,
+//!         expected_revision: pages.generation().revision,
 //!     }).unwrap();
 //!     assert_eq!(applied.revision, 1);
 //!     cx.cancelled().await;
@@ -78,11 +74,11 @@
 //! # }
 //! ```
 
-pub mod backend;
 pub mod events;
+pub mod handler;
+pub mod pages;
 pub mod route;
 pub mod search;
-pub mod stub;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -97,10 +93,8 @@ use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use serde_json::{Value, json};
 
-#[cfg(test)]
-use crate::backend::Backend;
-pub use crate::backend::Pages;
 use example_common::log::Log;
+use pages::Pages;
 
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -160,9 +154,9 @@ pub fn admit(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Every host's address: fixed ones from the backend (search engines, the
-/// seed), ones recorded by an earlier run on the same store, then the next
-/// free one from the pools. Recorded history must be readable and consistent.
+/// Every host's address: fixed ones (search engines, the seed), ones
+/// recorded by an earlier run on the same store, then the next free one from
+/// the pools. Recorded history must be readable and consistent.
 /// New addresses are published only after their records have been written.
 pub struct Addresses {
     fixed: Vec<String>,
@@ -420,7 +414,7 @@ pub fn serve(
     fcx: &Cx,
     addresses: Arc<Addresses>,
     ca: Arc<Ca>,
-    pages: impl Into<Pages>,
+    pages: Arc<Pages>,
     log: Arc<Log>,
     start: SystemTime,
     attachments: fictionet::Attachments,
@@ -434,12 +428,12 @@ pub fn net(
     fcx: &Cx,
     addresses: Arc<Addresses>,
     ca: Arc<Ca>,
-    pages: impl Into<Pages>,
+    pages: Arc<Pages>,
     log: Arc<Log>,
     start: SystemTime,
     forward: impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static,
 ) -> fictionet::stdlib::world::net::Net {
-    let handler = pages.into().handler(fcx);
+    let handler = handler::Handler::new(fcx, pages);
     log.attach(fcx);
     let names = addresses.fixed.clone();
     let world = fcx.clone();
@@ -516,29 +510,6 @@ pub fn net(
         net = net.add_host(host);
     }
     net
-}
-
-/// The fixed addresses in the backend's first line.
-pub fn fixed_addresses(
-    backend: &Value,
-) -> fictionet::Result<HashMap<String, (Ipv4Addr, &'static str)>> {
-    let mut out = HashMap::new();
-    for (host, entry) in backend["addresses"]
-        .as_object()
-        .ok_or_else(|| fictionet::Error::msg("backend sent no addresses"))?
-    {
-        let addr: Ipv4Addr = entry["addr"]
-            .as_str()
-            .ok_or_else(|| fictionet::Error::msg("bad address"))?
-            .parse()?;
-        let why = if entry["why"] == "seed" {
-            "seed"
-        } else {
-            "search engine"
-        };
-        out.insert(host.clone(), (addr, why));
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -761,11 +732,12 @@ mod tests {
                     start,
                 });
                 let (attacher, attachments) = fictionet::attachments();
+                let seed = pages::Seed::builtin("halvard-cve")?;
                 serve(
                     &fcx,
                     addresses.clone(),
                     ca,
-                    Backend::new(&fcx, 8080)?,
+                    Arc::new(Pages::new(seed)),
                     output.clone(),
                     start,
                     attachments,

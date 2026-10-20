@@ -175,7 +175,7 @@ jobs:
           done
 
   python:
-    name: Python packages and world backends
+    name: Python packages
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -189,9 +189,6 @@ jobs:
           python/inspect_fictionet/tests
           examples/hosted/tests
           tests/k8s
-      - name: The adaptive web's backend
-        working-directory: examples/adaptive-web/world/backend
-        run: uv run --project "${{ github.workspace }}/python/inspect_fictionet" --locked --extra k8s --no-editable python -m pytest tests
 
   wasm:
     name: wasm32 (browser)

@@ -2,18 +2,15 @@
 //! fixed script of agent actions, compared line for line with
 //! `tests/golden/halvard-cve.jsonl`.
 //!
-//! The script runs with both the Python backend and the in-process Rust
-//! stub, each with a fresh store and a CA
-//! made for the test. The script searches, follows results, asks for the
-//! same URLs twice, and looks up names the world turns down. Besides the
-//! log, it checks what Kai's evals need: the same URL returns the same
-//! bytes, every result link resolves and answers 200, and each page's
-//! title is the title its search result showed.
+//! The world runs the offline generator on a fresh store, with a CA made
+//! for the test. The script searches, follows results, asks for the same
+//! URLs twice, and looks up names the world turns down. Besides the log, it
+//! checks what the evals need: the same URL returns the same bytes, every
+//! result link resolves and answers 200, and each page's title is the title
+//! its search result showed.
 //!
 //! `ts`, `gen_ms`, `serve_ms` and the certificates' dates change from run to
 //! run and are left out. The lines are compared as sorted sets.
-//! `gen_ms` includes HTTP failures, backoff and parse re-asks; this offline
-//! fixture has one stub call per generation and no HTTP attempts.
 //! `ADAPTIVE_WEB_GOLDEN_WRITE=1 cargo test --test golden` records the file
 //! again.
 
@@ -22,14 +19,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use adaptive_web_world::backend::Backend;
-use adaptive_web_world::{Addresses, Ca, fixed_addresses, serve, world_start};
+use adaptive_web_world::pages::{Generator, Pages, Seed, store::Store};
+use adaptive_web_world::{Addresses, Ca, serve, world_start};
 use bytes::Bytes;
-mod common;
-use adaptive_web_world::{
-    Pages,
-    stub::{Seed, Stub},
-};
 use example_common::log::Log;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
@@ -135,73 +127,25 @@ fn split_url(url: &str) -> (String, String) {
     )
 }
 
-/// The example's seeds, copied to `base` with the world's date set to
-/// `date`, a day other than today, to check that the world's clock follows
-/// the seed.
-fn seeds_dated(base: &std::path::Path, date: &str) -> PathBuf {
-    let from = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seeds");
-    let to = base.join("seeds");
-    std::fs::create_dir_all(to.join("fixed")).unwrap();
-    for entry in std::fs::read_dir(from.join("fixed")).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), to.join("fixed").join(entry.file_name())).unwrap();
-    }
-    let seed = std::fs::read_to_string(from.join("halvard-cve.md")).unwrap();
-    let seed = seed.replace("date = \"2026-10-07\"", &format!("date = \"{date}\""));
-    assert!(seed.contains(date), "the seed's date line changed");
-    std::fs::write(to.join("halvard-cve.md"), seed).unwrap();
-    to
-}
-
 #[test]
 fn the_log_is_the_recorded_one() {
-    golden(false);
-}
-
-#[test]
-fn the_rust_stub_log_is_the_recorded_one() {
-    golden(true);
-}
-
-fn golden(use_stub: bool) {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let base = std::env::temp_dir().join(format!(
-        "adaptive-web-golden-{use_stub}-{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("adaptive-web-golden-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
+    // A day other than today, to check that the world's clock follows the seed.
     let mut seed = Seed::builtin("halvard-cve").unwrap();
     seed.date = "2026-09-30".into();
-    let child = if use_stub {
-        None
-    } else {
-        Some(common::Python::start(
-            "halvard-cve",
-            &seeds_dated(&base, &seed.date),
-            &base.join("store"),
-            "stub",
-        ))
-    };
-    let port = child.as_ref().map_or(0, |p| p.port);
-    let fixed = child.as_ref().map_or_else(
-        || seed.fixed_addresses(),
-        |p| fixed_addresses(&p.hello).unwrap(),
+    let fixed_pages: Vec<String> = seed.fixed.iter().map(|f| f.url.clone()).collect();
+    let root = base.join("store").join(&seed.name);
+    let (store, _) = Store::open(&root, &seed, Some(&Generator::Stub.identity())).unwrap();
+    let addresses = Arc::new(
+        Addresses::new(seed.fixed_addresses(), Some(&root.join("addresses.jsonl"))).unwrap(),
     );
-    let fixed_pages: Vec<String> = child.as_ref().map_or_else(
-        || seed.fixed.iter().map(|f| f.url.clone()).collect(),
-        |p| serde_json::from_value(p.hello["fixed"].clone()).unwrap(),
-    );
-    let store = child
-        .as_ref()
-        .map(|p| PathBuf::from(p.hello["store"].as_str().unwrap()).join("addresses.jsonl"));
-    let addresses = Arc::new(Addresses::new(fixed, store.as_deref()).unwrap());
     let start = world_start(&seed.date).unwrap();
     let ca_dir = base.join("ca");
-    let searches = Arc::new(child.as_ref().map_or_else(
-        || adaptive_web_world::search::Searches::from_seed(&seed),
-        |p| adaptive_web_world::search::Searches::from_hello(&p.hello),
-    ));
+    let pages = Arc::new(Pages::open(seed, store, Some(Generator::Stub), 0));
+    let searches = Arc::new(adaptive_web_world::search::Searches::of(&pages));
     let log_path = base.join("log.jsonl");
     let log = Arc::new(Log::new(
         Box::new(std::fs::File::create(&log_path).unwrap()),
@@ -230,13 +174,8 @@ fn golden(use_stub: bool) {
     let projection = searches.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
         let drain = log.clone();
-        let result = rt.block_on(fictionet::run(
+        let result = fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
                 fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
                     Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() }),
@@ -246,11 +185,6 @@ fn golden(use_stub: bool) {
             move |fcx| async move {
                 let ca = Arc::new(Ca::new(&fcx, &ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();
-                let pages = if use_stub {
-                    Pages::Stub(Arc::new(Stub::new(seed)))
-                } else {
-                    Pages::Backend(Backend::new(&fcx, port)?)
-                };
                 serve(&fcx, addresses, ca, pages, log, start, attachments)?;
 
                 let end = attacher.attach("agent").unwrap();
@@ -424,9 +358,9 @@ fn golden(use_stub: bool) {
         drain.finish().unwrap();
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
-    let result = rx.recv_timeout(Duration::from_secs(90));
-    drop(child);
-    let result = result.expect("the test timed out");
+    let result = rx
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the test timed out");
     assert_eq!(result.as_deref(), Some("done"));
 
     let text = std::fs::read_to_string(&log_path).unwrap();

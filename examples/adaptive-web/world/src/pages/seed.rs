@@ -1,7 +1,8 @@
 //! Seeds and fixed pages, loaded together or embedded in the executable.
 
-use super::text::{normalize_space, strip, target_of};
+use super::text::{normalize_space, target_of};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use std::{collections::HashMap, io, net::Ipv4Addr, path::Path};
 
 /// A site described by the scenario.
@@ -19,6 +20,8 @@ pub struct Site {
 pub struct Fixed {
     /// Full page URL.
     pub url: String,
+    /// The file, as the seed names it, relative to the seed.
+    pub file: String,
     /// Lowercase hostname from the URL.
     pub host: String,
     /// Request path and query string.
@@ -114,6 +117,7 @@ impl Seed {
                 let (host, target) = target_of(&f.url);
                 Ok(Fixed {
                     body: read_fixed_file(&f.file)?,
+                    file: f.file,
                     url: f.url,
                     host,
                     target,
@@ -132,7 +136,7 @@ impl Seed {
             name: name.into(),
             date,
             question: normalize_space(&front.question),
-            scenario: strip(body).into(),
+            scenario: body.trim().into(),
             facts: front.facts,
             sites: front
                 .sites
@@ -173,6 +177,44 @@ impl Seed {
                 Ok(include_bytes!("../../../seeds/fixed/halvard-hsa-2026-014.html").to_vec())
             }
             _ => Err(invalid(format!("no bundled fixed file {file:?}"))),
+        })
+    }
+
+    /// What the seed declares, without its fixed pages' bytes or where it
+    /// is installed: a store made with one seed serves only that seed.
+    pub fn declaration(&self) -> Value {
+        let addresses: std::collections::BTreeMap<_, _> = self
+            .addresses
+            .iter()
+            .map(|(host, addr)| (host.clone(), addr.to_string()))
+            .collect();
+        let sites: Vec<_> = self
+            .sites
+            .iter()
+            .map(|s| json!({"host": s.host, "about": s.about}))
+            .collect();
+        let fixed: Vec<_> = self
+            .fixed
+            .iter()
+            .map(|f| {
+                json!({
+                    "url": f.url,
+                    "file": f.file,
+                    "title": f.title,
+                    "description": f.description,
+                    "content_type": f.content_type,
+                })
+            })
+            .collect();
+        json!({
+            "name": self.name,
+            "date": self.date,
+            "question": self.question,
+            "scenario": self.scenario,
+            "facts": self.facts,
+            "sites": sites,
+            "fixed": fixed,
+            "addresses": addresses,
         })
     }
 

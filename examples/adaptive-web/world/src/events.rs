@@ -2,7 +2,7 @@
 //! does: one line per DNS query, decision about a name, certificate,
 //! failed TLS handshake and HTTP request.
 //!
-//! The handler ([`backend`](crate::backend)) puts what the backend said
+//! The handler ([`handler`](crate::handler)) puts what the pages said
 //! about a page (generated or cached, the model, the time it took, its
 //! claims) in its response's extensions. The `http.request` event brings
 //! them back here, so one `http` line holds both what the agent asked for
@@ -16,7 +16,7 @@ use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
-use crate::backend::PAGE_FIELDS;
+use crate::handler::PAGE_FIELDS;
 use example_common::log::Log;
 
 use example_common::headers;
@@ -185,13 +185,13 @@ mod tests {
 
     #[test]
     fn generation_commands_emit_only_changes() {
+        use crate::pages::{Applied, Command, Generation, Pages, Rejected, Seed};
         use crate::search::Searches;
-        use crate::stub::{Applied, Command, Generation, Rejected, Seed, Stub};
         use fictionet::events::Fanout;
         use fictionet_observe::Memory;
 
-        let seed = Seed::builtin("halvard-cve").unwrap();
-        let searches = Arc::new(Searches::from_seed(&seed));
+        let pages = Pages::new(Seed::builtin("halvard-cve").unwrap());
+        let searches = Arc::new(Searches::of(&pages));
         let memory = Arc::new(Memory::default());
         let initial = searches.snapshot();
         assert!(initial.generator.generate);
@@ -202,9 +202,8 @@ mod tests {
                 Fanout::new(vec![memory.clone(), searches.clone()]),
             )),
             |cx| async move {
-                let stub = Stub::new(seed);
                 assert_eq!(
-                    stub.generation(),
+                    pages.generation(),
                     Generation {
                         generate: true,
                         revision: 0
@@ -215,11 +214,11 @@ mod tests {
                         "expected_revision":expected_revision});
                     let command: Command = serde_json::from_value(value.clone()).unwrap();
                     assert_eq!(serde_json::to_value(command).unwrap(), value);
-                    stub.apply(&cx, command)
+                    pages.apply(&cx, command)
                 };
                 assert_eq!(set(false, 1), Err(Rejected::Stale { current: 0 }));
                 assert_eq!(
-                    stub.generation(),
+                    pages.generation(),
                     Generation {
                         generate: true,
                         revision: 0
@@ -248,7 +247,7 @@ mod tests {
                 assert_eq!(set(true, 0), Err(Rejected::Stale { current: 1 }));
                 assert_eq!(set(false, 0), Err(Rejected::Stale { current: 1 }));
                 assert_eq!(
-                    stub.generation(),
+                    pages.generation(),
                     Generation {
                         generate: false,
                         revision: 1
@@ -303,13 +302,7 @@ mod tests {
             line(&query),
             Some(json!({"type":"query","id":3,"engine":"google","search":"a","start":10}))
         );
-        for why in [
-            "backend_error",
-            "meta_error",
-            "error",
-            "budget",
-            "abandoned",
-        ] {
+        for why in ["error", "budget", "abandoned"] {
             let failed = Event::new("adaptive", "query_failed")
                 .field("query_id", 3u64)
                 .field("why", why);

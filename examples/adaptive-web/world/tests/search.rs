@@ -1,4 +1,5 @@
-use adaptive_web_world::backend::to_field;
+use adaptive_web_world::handler::to_field;
+use adaptive_web_world::pages::{Pages, Seed, store::Store};
 use adaptive_web_world::route::Engine;
 use adaptive_web_world::search::*;
 use fictionet::events::{
@@ -59,8 +60,12 @@ fn generation_events_update_the_card() {
     assert_eq!(on.generator.generation_at_ms, 40);
     assert_eq!((on.revision, on.at_ms), (3, 40));
     assert_eq!(on.queries, off.queries);
-    let replay = Searches::from_hello(&json!({"generator":"replay"})).snapshot();
+    let seed = Seed::builtin("halvard-cve").unwrap();
+    let replay = Pages::open(seed, Store::memory(), None, 0);
+    let replay = Searches::of(&replay).snapshot();
     assert!(!replay.generator.generate);
+    assert_eq!(replay.generator.kind, GeneratorKind::Replay);
+    assert_eq!(replay.generator.model, "replay");
     assert_eq!(replay.generator.generation_revision, 0);
 }
 
@@ -461,7 +466,7 @@ fn worst_case_snapshot_fits() {
         at_ms: n,
         seq: n,
         outcome: Outcome::Failed {
-            why: Failure::BackendError,
+            why: Failure::Abandoned,
             error: Some(t.clone()),
         },
         cache: Some(Cache::Prefetched),
@@ -551,7 +556,6 @@ fn worst_case_snapshot_fits() {
         "{} bytes",
         encoded.len()
     );
-    assert_eq!(encoded.len(), MAX_SNAPSHOT_BYTES);
 }
 
 #[test]

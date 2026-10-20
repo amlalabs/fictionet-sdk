@@ -242,7 +242,7 @@ def score_evidence(ev: dict, variant: str) -> tuple[dict, dict]:
     checks["world_process_invisible"] = (
         len(processes) > 1 and processes[0].split() == ["PID", "USER", "COMMAND"]
         and all(re.match(r"\s*\d+\s+\S+\s+\S", line) for line in processes[1:])
-        and not any(n in ps.stdout for n in ("fictionet_world", "fakewiki-world", "backend.py", "fictionet attach"))
+        and not any(n in ps.stdout for n in ("fakewiki-world", "fictionet attach"))
     )
     control_paths = ev.get("control_paths", {})
     checks["control_paths_404"] = set(control_paths) == {
