@@ -28,10 +28,16 @@
 //! add it to the register map first.
 //!
 //! Engineering values are the input-register count times its scale: 0.1 for
-//! most channels, 0.01 for the two pressures, and `(count - 32768) * 0.1` for
-//! reactivity. Holding registers for rod and valve positions use 0.1 too.
+//! most channels and 0.01 for the two pressures. Holding registers for rod and
+//! valve positions use 0.1 too.
 //! Each link shows its unscaled telemetry heartbeat from the last good read.
 //! It stops when the feed freezes, while the HMI poll count keeps advancing.
+//!
+//! | Controller | Heartbeat address |
+//! | --- | --- |
+//! | rps1 | 4 (30005) |
+//! | rcs1 | 8 (30009) |
+//! | bop1 | 10 (30011) |
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -127,7 +133,7 @@ pub struct Layout {
 pub fn layout(plc: Plc) -> Layout {
     match plc {
         Plc::Rps1 => Layout {
-            input: 6,
+            input: 5,
             discrete: 2,
             coils: 3,
             holding: 1,
@@ -226,8 +232,6 @@ enum Bank {
 enum Scale {
     Tenth,
     Hundredth,
-    /// Reactivity in pcm, with the +32768 bias.
-    Reactivity,
 }
 
 /// One analog value the HMI shows: its register, scale and unit.
@@ -274,7 +278,6 @@ const POINTS: &[Point] = &[
     input("rod_position", Plc::Rps1, 1, Scale::Tenth, "%"),
     input("core_exit_temperature", Plc::Rps1, 2, Scale::Tenth, "C"),
     input("shutdown_rods", Plc::Rps1, 3, Scale::Tenth, "%"),
-    input("reactivity", Plc::Rps1, 4, Scale::Reactivity, "pcm"),
     holding("rod_demand", Plc::Rps1, 0, "%"),
     input("hot_leg_a", Plc::Rcs1, 0, Scale::Tenth, "C"),
     input("hot_leg_b", Plc::Rcs1, 1, Scale::Tenth, "C"),
@@ -681,7 +684,6 @@ fn point_value(held: &Held, point: &Point) -> Option<f64> {
     Some(tidy(match point.scale {
         Scale::Tenth => count * 0.1,
         Scale::Hundredth => count * 0.01,
-        Scale::Reactivity => (count - 32_768.0) * 0.1,
     }))
 }
 
@@ -1388,15 +1390,7 @@ mod tests {
         assert_eq!(view.readings["hot_leg_a"].value, Some(325.0));
         assert_eq!(view.readings["neutron_power"].value, Some(100.0));
         assert_eq!(view.readings["rod_demand"].value, Some(50.0));
-        assert_eq!(view.readings["reactivity"].value, Some(0.0));
         assert_eq!(view.readings["pressurizer_pressure"].unit, "MPa");
-    }
-
-    #[test]
-    fn reactivity_removes_the_bias() {
-        let mut held = ready();
-        held.blocks[slot(Plc::Rps1)].input[4] = 31_568;
-        assert_eq!(view(&held).readings["reactivity"].value, Some(-120.0));
     }
 
     #[test]

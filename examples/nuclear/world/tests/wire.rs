@@ -13,6 +13,21 @@ fn bounded<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: T, bound:
 }
 
 #[test]
+fn shutdown_rod_channel_is_appended_and_serializes() {
+    assert_eq!(SENSOR_COUNT, 22);
+    assert_eq!(Sensor::ShutdownRodPosition.index(), 21);
+    assert_eq!(Sensor::ALL[21], Sensor::ShutdownRodPosition);
+    for (index, sensor) in Sensor::ALL.into_iter().enumerate() {
+        assert_eq!(sensor.index(), index);
+    }
+    assert_eq!(
+        serde_json::to_string(&Sensor::ShutdownRodPosition).unwrap(),
+        r#""shutdown_rod_position""#
+    );
+    assert_eq!(Sensor::ShutdownRodPosition.spec().resolution, 0.1);
+}
+
+#[test]
 fn command_examples_and_unknown_fields() {
     let c: Command = serde_json::from_str(r#"{"rod_demand":{"tenths_percent":480}}"#).unwrap();
     assert_eq!(

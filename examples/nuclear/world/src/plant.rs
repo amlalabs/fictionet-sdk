@@ -553,6 +553,7 @@ impl Plant {
         Sensor::ALL.map(|s| match s {
             Sensor::NeutronPower => t.reactor.neutron_power_percent,
             Sensor::RodPosition => t.reactor.control_rod_percent,
+            Sensor::ShutdownRodPosition => t.reactor.shutdown_rod_percent_inserted,
             Sensor::HotLeg(l) => t.primary.loops[l.index()].hot_leg_c,
             Sensor::ColdLeg(l) => t.primary.loops[l.index()].cold_leg_c,
             Sensor::PressurizerPressure => t.primary.pressure_mpa,

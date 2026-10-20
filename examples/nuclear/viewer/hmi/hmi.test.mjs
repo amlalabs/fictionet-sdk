@@ -104,7 +104,6 @@ const SAMPLE = {
     rod_position: { value: 50.0, unit: '%', stale: false },
     core_exit_temperature: { value: 325.0, unit: 'C', stale: false },
     shutdown_rods: { value: 0.0, unit: '%', stale: false },
-    reactivity: { value: 0.0, unit: 'pcm', stale: false },
     rod_demand: { value: 50.0, unit: '%', stale: false },
     hot_leg_a: { value: 325.0, unit: 'C', stale: false },
     hot_leg_b: { value: 325.1, unit: 'C', stale: false },
@@ -199,7 +198,6 @@ test('the mimic shows live readings with their units', () => {
   assert.match(byReading(root, 'pressurizer_pressure').textContent, /15\.50 MPa/);
   assert.match(byReading(root, 'neutron_power').textContent, /100\.0 %/);
   assert.match(byReading(root, 'hot_leg_a').textContent, /325\.0 C/);
-  assert.match(byReading(root, 'reactivity').textContent, /0 pcm/);
 });
 
 test('the mimic shows each pump as running or stopped', () => {

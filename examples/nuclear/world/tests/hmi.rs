@@ -233,6 +233,18 @@ fn poll_holds_each_controller_block_and_plant_json_matches_the_snapshot() {
             // Engineering values agree with the plant's own readings, to one
             // instrument count.
             let reading = |sensor: Sensor| snapshot.readings[sensor.index()].reading.value;
+            assert!(view["readings"].get("reactivity").is_none());
+            assert_close(
+                value(&view, "shutdown_rods"),
+                reading(Sensor::ShutdownRodPosition),
+                0.05,
+                "shutdown rods",
+            );
+            assert_eq!(world.held.lock().blocks[0].input.len(), 5);
+            assert_eq!(
+                world.held.lock().blocks[0].input[4],
+                snapshot.telemetry.heartbeat
+            );
             assert_close(
                 value(&view, "pressurizer_pressure"),
                 reading(Sensor::PressurizerPressure),

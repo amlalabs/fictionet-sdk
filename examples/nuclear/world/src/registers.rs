@@ -10,8 +10,7 @@
 //!
 //! Every analog value is an unsigned 16-bit count: the engineering value divided
 //! by the instrument resolution, rounded half away from zero and clamped to
-//! 0..=65535. A hot leg at 325.0 C reads 3250. Reactivity is the exception. It is
-//! pcm divided by 0.1, plus a bias of 32768, so negative values stay non-negative.
+//! 0..=65535. A hot leg at 325.0 C reads 3250.
 //!
 //! Sensor-backed input registers read the reading, so a sensor fault shows in
 //! the register. Discrete inputs and equipment coils (pumps, heaters, auxiliary
@@ -25,7 +24,11 @@
 //!
 //! | Controller | Address | Name | Scale |
 //! | --- | --- | --- | --- |
-//! | rps1 | 5 (30006) | Telemetry heartbeat | 1 |
+//! | rps1 | 0 (30001) | Neutron power | 0.1 % |
+//! | rps1 | 1 (30002) | Control rod position | 0.1 % |
+//! | rps1 | 2 (30003) | Core exit temperature | 0.1 C |
+//! | rps1 | 3 (30004) | Shutdown rod position | 0.1 % |
+//! | rps1 | 4 (30005) | Telemetry heartbeat | 1 |
 //! | rcs1 | 8 (30009) | Telemetry heartbeat | 1 |
 //! | bop1 | 10 (30011) | Telemetry heartbeat | 1 |
 
@@ -49,24 +52,17 @@ pub enum Plc {
 enum Input {
     /// The reading of an instrument, at the instrument's resolution.
     Sensor(Sensor),
-    /// Shutdown rod insertion, tenths of a percent, from the true reactor state.
-    ShutdownRods,
-    /// Reactivity with the +32768 bias, from the true reactor state.
-    Reactivity,
     /// The telemetry sample count.
     Heartbeat,
 }
 
-const REACTIVITY_RESOLUTION_PCM: f64 = 0.1;
-const REACTIVITY_BIAS: f64 = 32_768.0;
 const ROD_RESOLUTION_PERCENT: f64 = 0.1;
 
-const RPS1_INPUTS: [Input; 6] = [
+const RPS1_INPUTS: [Input; 5] = [
     Input::Sensor(Sensor::NeutronPower),
     Input::Sensor(Sensor::RodPosition),
     Input::Sensor(Sensor::CoreExitTemperature),
-    Input::ShutdownRods,
-    Input::Reactivity,
+    Input::Sensor(Sensor::ShutdownRodPosition),
     Input::Heartbeat,
 ];
 
@@ -109,21 +105,12 @@ fn count(value: f64, resolution: f64) -> u16 {
     (value / resolution).round().clamp(0.0, 65_535.0) as u16
 }
 
-fn reactivity_count(pcm: f64) -> u16 {
-    ((pcm / REACTIVITY_RESOLUTION_PCM).round() + REACTIVITY_BIAS).clamp(0.0, 65_535.0) as u16
-}
-
 fn input_count(input: Input, s: &PlantSnapshot) -> u16 {
     match input {
         Input::Sensor(sensor) => count(
             s.readings[sensor.index()].reading.value,
             sensor.spec().resolution,
         ),
-        Input::ShutdownRods => count(
-            s.truth.reactor.shutdown_rod_percent_inserted,
-            ROD_RESOLUTION_PERCENT,
-        ),
-        Input::Reactivity => reactivity_count(s.truth.reactor.reactivity_pcm),
         Input::Heartbeat => s.telemetry.heartbeat,
     }
 }
@@ -263,7 +250,7 @@ mod tests {
     }
 
     fn assert_heartbeats(snapshot: &PlantSnapshot, expected: u16) {
-        for (plc, address) in [(Plc::Rps1, 5), (Plc::Rcs1, 8), (Plc::Bop1, 10)] {
+        for (plc, address) in [(Plc::Rps1, 4), (Plc::Rcs1, 8), (Plc::Bop1, 10)] {
             assert_eq!(input_registers(plc, snapshot)[address], expected);
             assert_eq!(expected, snapshot.telemetry.heartbeat);
         }
@@ -292,6 +279,10 @@ mod tests {
             before.truth.reactor.neutron_power_percent
         );
         assert_heartbeats(&after, before.telemetry.heartbeat);
+        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1] {
+            assert_eq!(input_registers(plc, &before), input_registers(plc, &after));
+            assert_eq!(discrete_inputs(plc, &before), discrete_inputs(plc, &after));
+        }
     }
 
     #[test]
@@ -310,15 +301,6 @@ mod tests {
         assert_eq!(count(2.5, 1.0), 3, "halves round away from zero");
         assert_eq!(count(-4.0, 0.1), 0, "negative values clamp to zero");
         assert_eq!(count(1.0e9, 0.1), 65_535, "large values clamp to the top");
-    }
-
-    #[test]
-    fn reactivity_is_biased_so_negative_pcm_stays_unsigned() {
-        assert_eq!(reactivity_count(0.0), 32_768);
-        assert_eq!(reactivity_count(-120.0), 31_568);
-        assert_eq!(reactivity_count(50.0), 33_268);
-        assert_eq!(reactivity_count(-1.0e6), 0);
-        assert_eq!(reactivity_count(1.0e6), 65_535);
     }
 
     #[test]
@@ -400,14 +382,18 @@ mod tests {
     }
 
     #[test]
-    fn rps1_block_reads_truth_for_rod_insertion_and_reactivity() {
+    fn rps1_block_reads_shutdown_rod_indication() {
         let mut s = full_power();
         s.truth.reactor.shutdown_rod_percent_inserted = 25.0;
-        s.truth.reactor.reactivity_pcm = -120.0;
+        s.readings[Sensor::ShutdownRodPosition.index()]
+            .reading
+            .value = 63.4;
         let regs = input_registers(Plc::Rps1, &s);
         assert_eq!(regs.len(), RPS1_INPUTS.len());
-        assert_eq!(regs[3], 250);
-        assert_eq!(regs[4], 31_568);
+        assert_eq!(regs[3], 634);
+        s.truth.reactor.shutdown_rod_percent_inserted = 100.0;
+        assert_eq!(input_registers(Plc::Rps1, &s)[3], 634);
+        assert_eq!(regs[4], s.telemetry.heartbeat);
     }
 
     #[test]

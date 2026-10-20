@@ -18,7 +18,7 @@ const LINK_IDS = ['rps1', 'rcs1', 'bop1'];
 // Equipment boxes of the mimic. Each lists the readings it shows, in order.
 const BOXES = [
   { title: 'Pressurizer', x: 40, y: 20, w: 150, h: 112, fields: ['pressurizer_pressure', 'pressurizer_level', 'spray_valve'] },
-  { title: 'Reactor core', x: 40, y: 170, w: 150, h: 180, fields: ['neutron_power', 'rod_demand', 'reactivity', 'core_exit_temperature'] },
+  { title: 'Reactor core', x: 40, y: 170, w: 150, h: 180, fields: ['neutron_power', 'rod_demand', 'core_exit_temperature'] },
   { title: 'Steam generator A', x: 262, y: 30, w: 170, h: 150, fields: ['hot_leg_a', 'sg_level_a', 'steam_flow_a', 'feed_flow_a', 'feed_valve_a'] },
   { title: 'Steam generator B', x: 262, y: 262, w: 170, h: 150, fields: ['hot_leg_b', 'sg_level_b', 'steam_flow_b', 'feed_flow_b', 'feed_valve_b'] },
   { title: 'Turbine', x: 530, y: 30, w: 170, h: 110, fields: ['turbine_valve_position', 'generator_output'] },
@@ -54,7 +54,6 @@ const FIELD_LABELS = {
   spray_valve: 'Spray valve',
   neutron_power: 'Power',
   rod_demand: 'Rod demand',
-  reactivity: 'Reactivity',
   core_exit_temperature: 'Core exit',
   hot_leg_a: 'Hot leg',
   hot_leg_b: 'Hot leg',

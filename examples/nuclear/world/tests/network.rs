@@ -110,6 +110,10 @@ fn each_controller_serves_its_own_map_and_a_write_reaches_the_shared_plant() {
                     .await
                     .expect("each controller accepts Modbus/TCP on port 502");
                 let expected = registers::input_registers(plc, &driver.snapshot());
+                if plc == Plc::Rps1 {
+                    assert_eq!(expected.len(), 5);
+                    assert_eq!(expected[4], driver.snapshot().telemetry.heartbeat);
+                }
                 let response = exchange(
                     &fcx,
                     &mut conn,

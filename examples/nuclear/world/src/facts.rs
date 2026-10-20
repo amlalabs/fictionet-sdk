@@ -18,7 +18,7 @@
 //!
 //! Limits: a write's facts are held by [`Held`] until the whole write is
 //! accepted. A refused write therefore logs only its rejection. A divergence
-//! sample has one line per active sensor fault, at most 21 lines, and at most
+//! sample has one line per active sensor fault, at most 22 lines, and at most
 //! one sample per [`advance`](crate::driver::Driver::advance_to) call. A
 //! sample is due when the plant time crosses a multiple of [`DIVERGENCE_MS`].
 //! The true value is the snapshot's truth at the snapshot's rounding (0.1 or
@@ -372,6 +372,7 @@ fn point_name(sensor: Sensor) -> String {
     match sensor {
         Sensor::NeutronPower => "neutron_power".into(),
         Sensor::RodPosition => "rod_position".into(),
+        Sensor::ShutdownRodPosition => "shutdown_rod_position".into(),
         Sensor::HotLeg(l) => format!("hot_leg_{}", loop_name(l)),
         Sensor::ColdLeg(l) => format!("cold_leg_{}", loop_name(l)),
         Sensor::PressurizerPressure => "pressurizer_pressure".into(),
@@ -404,6 +405,7 @@ fn true_value_of(truth: &Truth, sensor: Sensor) -> f64 {
     match sensor {
         Sensor::NeutronPower => reactor.neutron_power_percent,
         Sensor::RodPosition => reactor.control_rod_percent,
+        Sensor::ShutdownRodPosition => reactor.shutdown_rod_percent_inserted,
         Sensor::HotLeg(l) => primary.loops[l.index()].hot_leg_c,
         Sensor::ColdLeg(l) => primary.loops[l.index()].cold_leg_c,
         Sensor::PressurizerPressure => primary.pressure_mpa,

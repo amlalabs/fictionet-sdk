@@ -70,6 +70,39 @@ impl serve::Service for PlcService {
     }
 }
 
+fn device_identification(data: &[u8]) -> Vec<u8> {
+    if data.len() < 3 {
+        return Exception::IllegalDataValue.to_pdu(0x2B);
+    }
+    if data[0] != 0x0E {
+        return Exception::IllegalFunction.to_pdu(0x2B);
+    }
+    let objects: &[(u8, &str)] = &[
+        (0x00, "Ventham Controls"),
+        (0x01, "VC-2600"),
+        (0x02, "V4.07"),
+        (0x04, "VC-2600 Process Controller"),
+        (0x05, "VC-2640"),
+    ];
+    let code = data[1];
+    let start = objects.iter().position(|&(id, _)| id == data[2]);
+    let selected = match code {
+        1 => &objects[start.filter(|&i| i < 3).unwrap_or(0)..3],
+        2 | 3 => &objects[start.unwrap_or(0)..],
+        4 => match start {
+            Some(i) => &objects[i..=i],
+            None => return Exception::IllegalDataAddress.to_pdu(0x2B),
+        },
+        _ => return Exception::IllegalDataValue.to_pdu(0x2B),
+    };
+    let mut reply = vec![0x2B, 0x0E, code, 0x82, 0, 0, selected.len() as u8];
+    for &(id, value) in selected {
+        reply.extend([id, value.len() as u8]);
+        reply.extend_from_slice(value.as_bytes());
+    }
+    reply
+}
+
 impl PlcService {
     /// The reply PDU for one request frame. `source` names the sender of any
     /// write, and `sink` receives the facts the write makes.
@@ -142,6 +175,10 @@ impl PlcService {
                     sink,
                 )
             }
+            Request::Other {
+                function: 0x2B,
+                data,
+            } => device_identification(&data),
             Request::Other { .. } => Exception::IllegalFunction.to_pdu(function),
         }
     }
@@ -687,6 +724,89 @@ mod tests {
             exception_code(&coil),
             Some(Exception::IllegalDataAddress.code())
         );
+        Ok(())
+    }
+
+    fn identify(h: &mut Harness<PlcService>, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let bytes = Frame {
+            transaction: TRANSACTION,
+            unit: 1,
+            pdu: Request::Other {
+                function: 0x2B,
+                data: data.to_vec(),
+            }
+            .to_pdu()?,
+        }
+        .to_bytes()?;
+        let reply = h.push(&bytes)?;
+        let (frame, used) = Frame::parse_prefix(&reply)?.ok_or("incomplete reply")?;
+        assert_eq!(used, reply.len());
+        assert_eq!(frame.transaction, TRANSACTION);
+        assert_eq!(frame.unit, 1);
+        Ok(frame.pdu)
+    }
+
+    #[test]
+    fn device_identity_streams_and_individual_objects() -> Result<(), Box<dyn Error>> {
+        let expected = [
+            (0, "Ventham Controls"),
+            (1, "VC-2600"),
+            (2, "V4.07"),
+            (4, "VC-2600 Process Controller"),
+            (5, "VC-2640"),
+        ];
+        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1] {
+            let mut h = harness(plc, &plant());
+            for (code, start, indices) in [
+                (1, 0, vec![0, 1, 2]),
+                (2, 0, vec![0, 1, 2, 3, 4]),
+                (3, 0, vec![0, 1, 2, 3, 4]),
+                (1, 3, vec![0, 1, 2]),
+                (2, 3, vec![0, 1, 2, 3, 4]),
+                (3, 255, vec![0, 1, 2, 3, 4]),
+                (1, 1, vec![1, 2]),
+                (2, 4, vec![3, 4]),
+                (3, 5, vec![4]),
+                (4, 5, vec![4]),
+            ] {
+                let reply = identify(&mut h, &[0x0E, code, start])?;
+                assert_eq!(
+                    &reply[..7],
+                    &[0x2B, 0x0E, code, 0x82, 0, 0, indices.len() as u8]
+                );
+                let mut offset = 7;
+                for i in indices {
+                    let (id, value) = expected[i];
+                    assert_eq!(&reply[offset..offset + 2], &[id, value.len() as u8]);
+                    offset += 2;
+                    let actual = std::str::from_utf8(&reply[offset..offset + value.len()])?;
+                    assert_eq!(actual, value);
+                    for forbidden in ["sim", "emul", "virtual", "test", "model", "fictionet"] {
+                        assert!(!actual.to_ascii_lowercase().contains(forbidden));
+                    }
+                    offset += value.len();
+                }
+                assert_eq!(offset, reply.len());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn device_identity_rejects_invalid_requests() -> Result<(), Box<dyn Error>> {
+        for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1] {
+            let mut h = harness(plc, &plant());
+            for (data, exception) in [
+                (vec![0x0E, 4, 3], 2),
+                (vec![0x0E, 5, 0], 3),
+                (vec![0x0D, 1, 0], 1),
+                (vec![], 3),
+                (vec![0x0E], 3),
+                (vec![0x0E, 1], 3),
+            ] {
+                assert_eq!(identify(&mut h, &data)?, vec![0xAB, exception]);
+            }
+        }
         Ok(())
     }
 

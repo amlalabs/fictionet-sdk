@@ -101,7 +101,7 @@ impl Default for Faults {
     }
 }
 impl Faults {
-    pub const MAX_JSON_BYTES: usize = 861;
+    pub const MAX_JSON_BYTES: usize = 888;
     pub(crate) fn has(&self, fault: ProcessFault) -> bool {
         self.process[fault.index()].is_some()
     }
