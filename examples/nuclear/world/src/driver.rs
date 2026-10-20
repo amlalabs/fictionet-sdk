@@ -17,6 +17,7 @@ use fictionet::sync::Mutex;
 
 use crate::command::{Applied, Command, FaultCommand, Rejected};
 use crate::facts::{self, Sink};
+use crate::sensors::{SENSOR_COUNT, Sensor};
 use crate::snapshot::PlantSnapshot;
 use crate::{Config, Plant};
 
@@ -24,6 +25,68 @@ use crate::{Config, Plant};
 #[derive(Clone)]
 pub struct Driver {
     plant: Arc<Mutex<Plant>>,
+    divergence: Arc<Mutex<[Option<Peak>; SENSOR_COUNT]>>,
+}
+
+#[derive(Clone, Copy)]
+struct Sample {
+    at_ms: u64,
+    truth: f64,
+    reported: f64,
+}
+
+impl Sample {
+    fn gap(self) -> f64 {
+        (self.truth - self.reported).abs()
+    }
+
+    fn emit(self, sink: &impl Sink, sensor: Sensor, phase: &'static str) {
+        facts::divergence(sink, sensor, self.truth, self.reported, self.at_ms, phase);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Peak {
+    sample: Sample,
+    grown: bool,
+    emitted: bool,
+}
+
+fn track(sink: &impl Sink, peaks: &mut [Option<Peak>; SENSOR_COUNT], after: &PlantSnapshot) {
+    for channel in &after.readings {
+        let sensor = channel.sensor;
+        let sample = Sample {
+            at_ms: after.at_ms,
+            truth: facts::true_value_of(&after.truth, sensor),
+            reported: channel.reading.value,
+        };
+        let slot = &mut peaks[sensor.index()];
+        if channel.fault.is_some() {
+            if let Some(peak) = slot {
+                if !peak.emitted && sample.at_ms > peak.sample.at_ms {
+                    if sample.gap() > peak.sample.gap() {
+                        peak.sample = sample;
+                        peak.grown = true;
+                    } else if peak.grown {
+                        peak.sample.emit(sink, sensor, "peak");
+                        peak.emitted = true;
+                    }
+                }
+            } else {
+                sample.emit(sink, sensor, "start");
+                *slot = Some(Peak {
+                    sample,
+                    grown: false,
+                    emitted: false,
+                });
+            }
+        } else if let Some(peak) = slot.take() {
+            if !peak.emitted {
+                peak.sample.emit(sink, sensor, "peak");
+            }
+            sample.emit(sink, sensor, "clear");
+        }
+    }
 }
 
 impl Driver {
@@ -31,6 +94,7 @@ impl Driver {
     pub fn new(config: Config) -> Driver {
         Driver {
             plant: Arc::new(Mutex::new(Plant::new(config))),
+            divergence: Arc::new(Mutex::new([None; SENSOR_COUNT])),
         }
     }
 
@@ -40,15 +104,24 @@ impl Driver {
     }
 
     /// Advances the plant to the absolute time `to_ms`. Only whole 50 ms steps
-    /// run, and an earlier target does nothing. Delivers a trip the advance
-    /// latched, and, when the plant time crosses a divergence sample, one line
-    /// for each active sensor fault.
+    /// run, and an earlier target does nothing. Tracks each sensor fault at
+    /// each step and delivers its start, peak, and clear values.
     pub fn advance_to(&self, sink: &impl Sink, to_ms: u64) {
-        let (before, after, ()) = self.act(|plant| plant.advance(to_ms));
+        let held = facts::Held::new(sink);
+        let (before, after) = {
+            let mut plant = self.plant.lock();
+            let mut peaks = self.divergence.lock();
+            let before = plant.snapshot();
+            let mut after = before.clone();
+            while to_ms.saturating_sub(after.at_ms) >= crate::plant::STEP_MS {
+                plant.advance(after.at_ms + crate::plant::STEP_MS);
+                after = plant.snapshot();
+                track(&held, &mut peaks, &after);
+            }
+            (before, after)
+        };
         facts::changes(sink, &before, &after);
-        if facts::divergence_due(before.at_ms, after.at_ms) {
-            facts::divergence(sink, &after);
-        }
+        held.release();
     }
 
     /// Returns the plant's state at the current plant time.
@@ -60,7 +133,7 @@ impl Driver {
     /// or the first action that the command makes. It does not deliver the
     /// action itself, which the caller logs with its source.
     pub fn apply(&self, sink: &impl Sink, command: Command) -> Result<Applied, Rejected> {
-        let (before, after, result) = self.act(|plant| plant.apply(command));
+        let (before, after, result) = self.act(sink, |plant| plant.apply(command));
         if result.is_ok() {
             facts::changes(sink, &before, &after);
         }
@@ -73,20 +146,30 @@ impl Driver {
         sink: &impl Sink,
         command: FaultCommand,
     ) -> Result<Applied, Rejected> {
-        let (_, after, result) = self.act(|plant| plant.apply_fault(command));
+        let held = facts::Held::new(sink);
+        let (_, after, result) = self.act(&held, |plant| plant.apply_fault(command));
         if result.is_ok() {
             facts::fault(sink, command.change, &after);
         }
+        held.release();
         result
     }
 
     /// Runs `act` on the plant. Returns the snapshots before and after it, read
     /// under the same lock, and the result of `act`.
-    fn act<T>(&self, act: impl FnOnce(&mut Plant) -> T) -> (PlantSnapshot, PlantSnapshot, T) {
+    fn act<T>(
+        &self,
+        sink: &impl Sink,
+        act: impl FnOnce(&mut Plant) -> T,
+    ) -> (PlantSnapshot, PlantSnapshot, T) {
+        let held = facts::Held::new(sink);
         let mut plant = self.plant.lock();
         let before = plant.snapshot();
         let result = act(&mut plant);
         let after = plant.snapshot();
+        track(&held, &mut self.divergence.lock(), &after);
+        drop(plant);
+        held.release();
         (before, after, result)
     }
 }
@@ -252,6 +335,49 @@ mod tests {
     }
 
     #[test]
+    fn divergence_marks_the_first_peak_or_defers_it_until_clear() -> fictionet::Result {
+        for gaps in [[1.0, 2.0, 2.0, 4.0], [1.0, 2.0, 3.0, 4.0]] {
+            let memory = Arc::new(Memory::default());
+            let observed = memory.clone();
+            fictionet::block_on(fictionet::lab(options(&memory), move |cx| async move {
+                let mut peaks = [None; SENSOR_COUNT];
+                let mut snapshot = Plant::new(Config::default()).snapshot();
+                let sensor = Sensor::HotLeg(Loop::A);
+                snapshot.readings[sensor.index()].fault = Some(SensorFault::Stuck { value: 3000 });
+                snapshot.readings[sensor.index()].reading.value = 300.0;
+                for (step, gap) in gaps.into_iter().enumerate() {
+                    snapshot.at_ms = step as u64 * 50;
+                    snapshot.truth.primary.loops[0].hot_leg_c = 300.0 + gap;
+                    track(&cx, &mut peaks, &snapshot);
+                }
+                let before_clear = observed.checked_of("plant", "divergence")?;
+                assert_eq!(before_clear.len(), if gaps[2] == 2.0 { 2 } else { 1 });
+                snapshot.at_ms = 200;
+                snapshot.readings[sensor.index()].fault = None;
+                track(&cx, &mut peaks, &snapshot);
+                snapshot.at_ms = 250;
+                track(&cx, &mut peaks, &snapshot);
+                Ok(())
+            }))?;
+            let lines = memory.checked_of("plant", "divergence")?;
+            assert_eq!(lines.len(), 3);
+            assert_eq!(lines[0].str("phase"), Some("start"));
+            assert_eq!(lines[1].str("phase"), Some("peak"));
+            assert_eq!(lines[2].str("phase"), Some("clear"));
+            let (peak_time, peak_value) = if gaps[2] == 2.0 {
+                (50, 302.0)
+            } else {
+                (150, 304.0)
+            };
+            assert_eq!(lines[1].u64("at_ms"), Some(peak_time));
+            assert_eq!(lines[1].get("true_value"), Some(&float(peak_value)));
+            assert_eq!(lines[1].get("reported_value"), Some(&float(300.0)));
+            assert_eq!(lines[2].u64("at_ms"), Some(200));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn divergence_follows_a_sensor_fault_and_stops_when_it_clears() -> fictionet::Result {
         let memory = Arc::new(Memory::default());
         let driver = Driver::new(Config::default());
@@ -277,15 +403,22 @@ mod tests {
         }))?;
 
         let lines = memory.checked_of("plant", "divergence")?;
-        assert_eq!(
-            lines.len(),
-            1,
-            "one sample while the fault is active, none after"
-        );
+        assert_eq!(lines.len(), 3, "one start, peak, and clear, none after");
         assert_eq!(lines[0].str("point"), Some("hot_leg_a"));
-        assert_eq!(lines[0].get("reported_value"), Some(&float(300.0)));
-        assert_eq!(lines[0].u64("at_ms"), Some(3_000));
-        let true_value = lines[0]
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.str("phase"))
+                .collect::<Vec<_>>(),
+            [Some("start"), Some("peak"), Some("clear")]
+        );
+        assert_eq!(lines[0].u64("at_ms"), Some(1_000));
+        assert_eq!(lines[2].u64("at_ms"), Some(3_000));
+        assert_eq!(lines[2].str("time"), Some("0:03.0"));
+        assert_eq!(lines[1].get("reported_value"), Some(&float(300.0)));
+        assert!(lines[1].u64("at_ms").unwrap() >= 1_000);
+        assert!(lines[1].u64("at_ms").unwrap() <= 3_000);
+        let true_value = lines[1]
             .get("true_value")
             .and_then(|value| value.as_f64())
             .ok_or_else(|| fictionet::Error::msg("true_value is a number"))?;

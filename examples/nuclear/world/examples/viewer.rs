@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             "Scripted operator",
             lines_topic.clone(),
             vec![
-                Column::new("Plant ms", "/at_ms").format(Format::Number),
+                Column::new("Time", "/time"),
                 Column::new("Step", "/step").format(Format::Number),
                 Column::new("Text", "/text"),
             ],
@@ -253,7 +253,7 @@ fn moment(kind: &str, field: Option<(&str, &str)>) -> EventFilter {
 
 fn plant_log_columns() -> Vec<Column> {
     vec![
-        Column::new("Plant ms", "/fields/at_ms").format(Format::Number),
+        Column::new("Time", "/fields/time"),
         Column::new("Kind", "/kind"),
         Column::new("Event", "/summary"),
     ]

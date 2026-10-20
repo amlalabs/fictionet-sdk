@@ -1,7 +1,7 @@
 //! Plant facts for the Fictionet event log.
 //!
 //! Every fact is an event from source `plant`. Each fact has a fixed short
-//! list of fields, at most five, and every fact carries `at_ms`: the plant
+//! list of fields, and every fact carries `at_ms`: the plant
 //! time of the snapshot it was read from. Facts go to a [`Sink`]: a world's
 //! [`Cx`], or the driver of a Modbus connection. A sink builds a fact only
 //! when a destination wants that kind, so a run without an observer builds
@@ -18,9 +18,8 @@
 //!
 //! Limits: a write's facts are held by [`Held`] until the whole write is
 //! accepted. A refused write therefore logs only its rejection. A divergence
-//! sample has one line per active sensor fault, at most 22 lines, and at most
-//! one sample per [`advance`](crate::driver::Driver::advance_to) call. A
-//! sample is due when the plant time crosses a multiple of [`DIVERGENCE_MS`].
+//! sample marks the start, peak, or clear of a sensor fault. The driver tracks
+//! the peak at each plant step and emits at most three lines per fault.
 //! The true value is the snapshot's truth at the snapshot's rounding (0.1 or
 //! 0.01), not the plant's unrounded value. A reactor trip carries `tripped_ms`,
 //! the plant step that latched it. `at_ms` is when the change was seen: the
@@ -33,17 +32,24 @@ use fictionet::Cx;
 use fictionet::events::{ConnInfo, Event, Level, float};
 use fictionet::stdlib::services::serve;
 
-use crate::command::{Command, Loop, Rejection};
+use crate::command::{Command, Controller, Loop, Mode, Pump, Rejection, Valve};
 use crate::faults::{Fault, FaultChange, FaultTarget, ProcessFault};
 use crate::protection::TripCause;
-use crate::sensors::Sensor;
+use crate::sensors::{Sensor, Unit};
 use crate::snapshot::{PlantSnapshot, Truth};
 
 /// The source name of every plant fact.
 const SOURCE: &str = "plant";
 
-/// Plant time between divergence samples, in ms.
-pub const DIVERGENCE_MS: u64 = 1_000;
+/// Plant time formatted as minutes, seconds, and tenths.
+pub fn time(at_ms: u64) -> String {
+    format!(
+        "{}:{:02}.{}",
+        at_ms / 60_000,
+        at_ms / 1_000 % 60,
+        at_ms / 100 % 10
+    )
+}
 
 /// The HMI's address. A Modbus connection from it logs its commands as `hmi`.
 pub const HMI_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 40, 0, 20);
@@ -171,12 +177,17 @@ pub fn action(sink: &impl Sink, command: Command, source: Source, after: &PlantS
     sink.record("action", |event| {
         let name = command_name(command);
         event
-            .summary(format!("{name} from {}", source.as_str()))
+            .summary(format!(
+                "{} from {}",
+                command_words(command),
+                source_words(source)
+            ))
             .field("command", name)
             .field("source", source.as_str())
             .field("operator_actions", after.operator_actions)
             .field("revision", after.revision)
             .field("at_ms", after.at_ms)
+            .field("time", time(after.at_ms))
     });
 }
 
@@ -187,11 +198,17 @@ pub fn rejected(sink: &impl Sink, command: Command, source: Source, reason: Reje
         let reason = rejection_name(reason);
         event
             .level(Level::Notice)
-            .summary(format!("{name} from {} refused: {reason}", source.as_str()))
+            .summary(format!(
+                "{} from {} refused: {}",
+                command_words(command),
+                source_words(source),
+                words(reason)
+            ))
             .field("command", name)
             .field("source", source.as_str())
             .field("reason", reason)
             .field("at_ms", at_ms)
+            .field("time", time(at_ms))
     });
 }
 
@@ -200,13 +217,22 @@ pub fn fault(sink: &impl Sink, change: FaultChange, after: &PlantSnapshot) {
     sink.record("fault", |event| {
         let (kind, target) = change_parts(change);
         let summary = match &target {
-            Some(target) => format!("fault {kind}: {target}"),
-            None => format!("fault {kind}"),
+            Some(target) => format!(
+                "{} {}",
+                sentence(target),
+                if kind == "inject" {
+                    "injected"
+                } else {
+                    "cleared"
+                }
+            ),
+            None => "All faults cleared".into(),
         };
         let event = event
             .summary(summary)
             .field("change", kind)
-            .field("at_ms", after.at_ms);
+            .field("at_ms", after.at_ms)
+            .field("time", time(after.at_ms));
         let event = match target {
             Some(target) => event.field("target", target),
             None => event,
@@ -231,10 +257,11 @@ pub fn changes(sink: &impl Sink, before: &PlantSnapshot, after: &PlantSnapshot) 
             let cause = cause_name(trip.cause);
             event
                 .level(Level::Notice)
-                .summary(format!("reactor trip: {cause}"))
+                .summary(format!("Reactor trip: {}", words(&cause)))
                 .field("cause", cause)
                 .field("tripped_ms", trip.at_ms)
                 .field("at_ms", after.at_ms)
+                .field("time", time(after.at_ms))
         });
     } else if !before.truth.secondary.turbine_tripped && after.truth.secondary.turbine_tripped {
         // A reactor trip also trips the turbine, so only a turbine trip without
@@ -242,9 +269,10 @@ pub fn changes(sink: &impl Sink, before: &PlantSnapshot, after: &PlantSnapshot) 
         sink.record("trip", |event| {
             event
                 .level(Level::Notice)
-                .summary("turbine trip")
+                .summary("Turbine trip")
                 .field("cause", "turbine_trip")
                 .field("at_ms", after.at_ms)
+                .field("time", time(after.at_ms))
         });
     }
     if before.first_action_after_fault_ms.is_none()
@@ -252,41 +280,115 @@ pub fn changes(sink: &impl Sink, before: &PlantSnapshot, after: &PlantSnapshot) 
     {
         sink.record("first_action", |event| {
             event
-                .summary(format!("first command {delay} ms after a fault start"))
+                .summary(format!(
+                    "First command {:.1} s after a fault started",
+                    delay as f64 / 1_000.0
+                ))
                 .field("first_action_after_fault_ms", delay)
                 .field("at_ms", after.at_ms)
+                .field("time", time(after.at_ms))
         });
     }
 }
 
-/// Whether a divergence sample falls between two plant times: the plant time
-/// crosses a multiple of [`DIVERGENCE_MS`].
-pub fn divergence_due(before_ms: u64, after_ms: u64) -> bool {
-    before_ms / DIVERGENCE_MS != after_ms / DIVERGENCE_MS
+/// One sensor's true and reported values at a fault's start, peak, or clear.
+pub fn divergence(
+    sink: &impl Sink,
+    sensor: Sensor,
+    true_value: f64,
+    reported: f64,
+    at_ms: u64,
+    phase: &'static str,
+) {
+    sink.record("divergence", |event| {
+        let point = point_name(sensor);
+        let unit = match sensor.spec().unit {
+            Unit::Celsius => "°C",
+            Unit::Megapascal => "MPa",
+            Unit::Kilopascal => "kPa",
+            Unit::KilogramsPerSecond => "kg/s",
+            Unit::Megawatt => "MW",
+            Unit::Percent => "%",
+        };
+        event
+            .summary(format!(
+                "{} gauge {reported:.1} {unit}, plant {true_value:.1} {unit}",
+                sentence(&point)
+            ))
+            .field("point", point)
+            .field("true_value", float(true_value))
+            .field("reported_value", float(reported))
+            .field("at_ms", at_ms)
+            .field("time", time(at_ms))
+            .field("phase", phase)
+    });
 }
 
-/// One divergence line for each sensor fault that is active in `after`. The
-/// reported value is the channel's reading; the true value is the plant's
-/// truth for the same sensor.
-pub fn divergence(sink: &impl Sink, after: &PlantSnapshot) {
-    for channel in after
-        .readings
-        .iter()
-        .filter(|channel| channel.fault.is_some())
-    {
-        sink.record("divergence", |event| {
-            let point = point_name(channel.sensor);
-            let true_value = true_value_of(&after.truth, channel.sensor);
-            let reported = channel.reading.value;
-            event
-                .summary(format!(
-                    "{point} reads {reported:.1} against true {true_value:.1}"
-                ))
-                .field("point", point)
-                .field("true_value", float(true_value))
-                .field("reported_value", float(reported))
-                .field("at_ms", after.at_ms)
-        });
+fn words(id: &str) -> String {
+    id.split('_')
+        .map(|word| match word {
+            "a" => "A",
+            "b" => "B",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sentence(id: &str) -> String {
+    let text = words(id);
+    format!("{}{}", text[..1].to_uppercase(), &text[1..])
+}
+
+fn source_words(source: Source) -> &'static str {
+    match source {
+        Source::Hmi => "the HMI",
+        Source::Modbus => "a Modbus client",
+        Source::Panel => "the panel",
+    }
+}
+
+fn command_words(command: Command) -> String {
+    match command {
+        Command::RodDemand { tenths_percent } => {
+            format!("Rod demand {:.1}%", f64::from(tenths_percent) / 10.0)
+        }
+        Command::ManualTrip => "Manual trip".into(),
+        Command::ResetTrip => "Trip reset".into(),
+        Command::AcknowledgeAlarms => "Alarm acknowledgment".into(),
+        Command::Heaters { on } => format!("Heaters {}", if on { "on" } else { "off" }),
+        Command::Pump { pump, running } => {
+            let name = match pump {
+                Pump::Coolant(l) => format!("Coolant pump {}", words(loop_name(l))),
+                Pump::MainFeed(l) => format!("Main feed pump {}", words(loop_name(l))),
+                Pump::AuxiliaryFeed => "Auxiliary feed pump".into(),
+                Pump::CirculatingWater => "Circulating water pump".into(),
+            };
+            format!("{name} {}", if running { "started" } else { "stopped" })
+        }
+        Command::ValveDemand { valve, permille } => {
+            let name = match valve {
+                Valve::Feed(l) => format!("Feed valve {}", words(loop_name(l))),
+                Valve::Turbine => "Turbine valve".into(),
+                Valve::SteamDump => "Steam dump".into(),
+                Valve::PressurizerSpray => "Pressurizer spray".into(),
+            };
+            format!("{name} demand {:.1}%", f64::from(permille) / 10.0)
+        }
+        Command::Controller { controller, mode } => {
+            let name = match controller {
+                Controller::FeedLevel(l) => format!("Feed level {}", words(loop_name(l))),
+                Controller::PressurizerPressure => "Pressurizer pressure".into(),
+                Controller::SteamDump => "Steam dump".into(),
+            };
+            format!(
+                "{name} controller {}",
+                match mode {
+                    Mode::Automatic => "automatic",
+                    Mode::Manual => "manual",
+                }
+            )
+        }
     }
 }
 
@@ -398,7 +500,7 @@ fn loop_name(l: Loop) -> &'static str {
 
 /// The true value of a sensor's point, read from the snapshot's truth. This
 /// matches the plant's own sensor source.
-fn true_value_of(truth: &Truth, sensor: Sensor) -> f64 {
+pub(crate) fn true_value_of(truth: &Truth, sensor: Sensor) -> f64 {
     let reactor = &truth.reactor;
     let primary = &truth.primary;
     let secondary = &truth.secondary;
@@ -562,35 +664,33 @@ mod tests {
     }
 
     #[test]
-    fn divergence_is_due_when_a_sample_boundary_is_crossed() {
-        assert!(divergence_due(950, 1_000));
-        assert!(divergence_due(999, 2_000));
-        assert!(!divergence_due(0, 50));
-        assert!(!divergence_due(1_000, 1_950));
+    fn time_keeps_minutes_seconds_and_tenths() {
+        assert_eq!(time(0), "0:00.0");
+        assert_eq!(time(123_950), "2:03.9");
+        assert_eq!(time(3_600_000), "60:00.0");
     }
 
     #[test]
-    fn divergence_lines_follow_the_active_sensor_faults() {
-        let mut snap = snapshot();
+    fn divergence_lines_keep_the_sensor_values_and_phase() {
+        let snap = snapshot();
         let log = Log::default();
-        divergence(&log, &snap);
-        assert!(log.of("divergence").is_empty(), "no fault, no line");
-
-        // The plant puts the same fault in the fault table and in its channel.
-        let stuck = crate::faults::SensorFault::Stuck { value: 3000 };
-        let channel = Sensor::HotLeg(Loop::A).index();
-        snap.faults.sensors[channel] = Some(stuck);
-        snap.readings[channel].fault = Some(stuck);
-        snap.readings[channel].reading.value = 300.0;
-        divergence(&log, &snap);
+        let true_value = snap.truth.primary.loops[0].hot_leg_c;
+        divergence(
+            &log,
+            Sensor::HotLeg(Loop::A),
+            true_value,
+            300.0,
+            123_950,
+            "peak",
+        );
         let lines = log.of("divergence");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].str("point"), Some("hot_leg_a"));
         assert_eq!(lines[0].get("reported_value"), Some(&float(300.0)));
-        assert_eq!(
-            lines[0].get("true_value"),
-            Some(&float(snap.truth.primary.loops[0].hot_leg_c))
-        );
+        assert_eq!(lines[0].get("true_value"), Some(&float(true_value)));
+        assert_eq!(lines[0].str("phase"), Some("peak"));
+        assert_eq!(lines[0].str("time"), Some("2:03.9"));
+        assert_eq!(lines[0].u64("at_ms"), Some(123_950));
     }
 
     #[test]

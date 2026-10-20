@@ -48,6 +48,11 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         .map_err(|error| fictionet::Error::msg(format!("the story failed: {error}")))?;
 
     let spoken = spoken.lock();
+    println!(
+        "Story ends at {} ms; maneuver lasts {} ms",
+        spoken.last().unwrap().at_ms,
+        report.fault_at_ms - report.maneuver_at_ms
+    );
     assert!(spoken.windows(2).all(|pair| pair[0].at_ms <= pair[1].at_ms));
     let mut steps: Vec<_> = spoken.iter().map(|line| line.step).collect();
     steps.dedup();
@@ -59,14 +64,14 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
             .unwrap()
             .at_ms
     };
-    assert_eq!(at("maneuver:"), report.maneuver_at_ms);
-    assert_eq!(at("fault: loop B"), report.fault_at_ms);
-    assert_eq!(at("subcooling margin alarm:"), report.alarm_at_ms);
-    assert_eq!(at("operator trips"), report.trip_at_ms);
-    assert_eq!(at("fault: telemetry"), report.quiet_from_ms);
-    assert_eq!(at("fault cleared: telemetry"), report.quiet_to_ms);
+    assert_eq!(at("Maneuver:"), report.maneuver_at_ms);
+    assert_eq!(at("Fault: loop B"), report.fault_at_ms);
+    assert_eq!(at("Subcooling margin alarm:"), report.alarm_at_ms);
+    assert_eq!(at("Operator trips"), report.trip_at_ms);
+    assert_eq!(at("Fault: telemetry"), report.quiet_from_ms);
+    assert_eq!(at("Fault cleared: telemetry"), report.quiet_to_ms);
 
-    // The maneuver, the trip, and the auxiliary feed start all come from the HMI.
+    // Every operator action comes from the HMI.
     let actions = memory.checked_of("plant", "action")?;
     assert_eq!(actions[0].u64("at_ms"), Some(report.maneuver_at_ms));
     let commands: Vec<_> = actions
@@ -79,9 +84,21 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
             (Some("rod_demand"), Some("hmi")),
             (Some("manual_trip"), Some("hmi")),
             (Some("pump"), Some("hmi")),
+            (Some("pump"), Some("hmi")),
+            (Some("controller"), Some("hmi")),
+            (Some("valve_demand"), Some("hmi")),
+            (Some("valve_demand"), Some("hmi")),
         ],
-        "the operator's three commands, all from the HMI"
+        "all operator commands come from the HMI"
     );
+
+    assert_eq!(actions[3].summary, "Coolant pump B started from the HMI");
+    assert_eq!(
+        actions[4].summary,
+        "Steam dump controller manual from the HMI"
+    );
+    assert_eq!(actions[5].summary, "Steam dump demand 100.0% from the HMI");
+    assert_eq!(actions[6].summary, "Steam dump demand 0.0% from the HMI");
 
     // The fault starts with the stuck gauge and the pump trip, and clears later.
     let faults = memory.checked_of("plant", "fault")?;
@@ -115,9 +132,14 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         (Some("telemetry_quiet"), Some(report.quiet_from_ms))
     );
 
-    // One first action after the fault, with the delay the report gives.
+    // Each fault episode has one first action, with its measured delay.
     let first = memory.checked_of("plant", "first_action")?;
-    assert_eq!(first.len(), 1, "one first action per fault start");
+    assert_eq!(first.len(), 2, "one first action per fault episode");
+    assert_eq!(first[1].u64("at_ms"), actions[6].u64("at_ms"));
+    assert_eq!(
+        first[1].u64("first_action_after_fault_ms"),
+        Some(actions[6].u64("at_ms").unwrap() - report.quiet_from_ms)
+    );
     assert_eq!(
         first[0].u64("first_action_after_fault_ms"),
         Some(report.first_action_after_fault_ms)
@@ -145,6 +167,46 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
             .iter()
             .any(|line| line.str("point") == Some("hot_leg_b")),
         "the stuck gauge is logged as diverging"
+    );
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line.str("phase"))
+            .collect::<Vec<_>>(),
+        [Some("start"), Some("peak"), Some("clear")]
+    );
+    assert!(report.quiet_true_hot_b[0] - report.quiet_true_hot_b[1] >= story::QUIET_MIN_MOVE_C);
+    assert_eq!(report.quiet_hmi_hot_b[0], report.quiet_hmi_hot_b[1]);
+    assert!(actions[3].u64("at_ms").unwrap() <= report.quiet_from_ms);
+    assert!(actions[4].u64("at_ms").unwrap() <= report.quiet_from_ms);
+    assert!(actions[5].u64("at_ms").unwrap() <= report.quiet_from_ms);
+    assert!(actions[6].u64("at_ms").unwrap() > report.quiet_to_ms);
+    assert!(spoken.last().unwrap().at_ms <= 225_950 - 60_000);
+    for line in spoken.iter() {
+        assert_eq!(line.time, nuclear_world::facts::time(line.at_ms));
+        assert!(line.text.starts_with(char::is_uppercase));
+        assert!(line.text.ends_with('.'));
+    }
+    let all = actions
+        .iter()
+        .chain(&faults)
+        .chain(&first)
+        .chain(&trips)
+        .chain(&lines)
+        .collect::<Vec<_>>();
+    assert!(all.len() <= 20);
+    println!("Plant log: {} rows", all.len());
+    for event in all {
+        assert!(!event.summary.contains('_'));
+        assert_eq!(
+            event.str("time"),
+            Some(nuclear_world::facts::time(event.u64("at_ms").unwrap()).as_str())
+        );
+    }
+    println!(
+        "Quiet loop B: {:?}; HMI: {:?}",
+        report.quiet_true_hot_b, report.quiet_hmi_hot_b
     );
     Ok(())
 }

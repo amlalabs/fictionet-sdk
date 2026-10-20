@@ -65,9 +65,8 @@ const FULL_POWER_CHECK_MS: u64 = 10_000;
 /// Rod demand the operator takes out in step 2, in percent.
 const ROD_STEP_PERCENT: f64 = 3.0;
 
-/// Plant time after the maneuver before the story checks that power settled.
-/// Power falls over tens of seconds, so the check waits for the tail to flatten.
-const MANEUVER_SETTLE_MS: u64 = 90_000;
+/// Longest time allowed for maneuver settling.
+const MANEUVER_LIMIT_MS: u64 = 120_000;
 
 /// Window over which the story checks the settled power.
 const SETTLE_WINDOW_MS: u64 = 10_000;
@@ -91,7 +90,7 @@ const TRIP_LIMIT_MS: u64 = 240_000;
 /// Plant time after the trip before the story checks that the rods have dropped.
 const ROD_DROP_MS: u64 = 5_000;
 
-/// Plant time after auxiliary feed starts before the story checks for decay heat.
+/// Longest time after auxiliary feed starts allowed for decay heat.
 const DECAY_SETTLE_MS: u64 = 60_000;
 
 /// Power, in percent, below which the plant counts as settled on decay heat.
@@ -107,6 +106,9 @@ const GAUGE_TRACKING_MS: u64 = 3_000;
 /// Plant time the telemetry stays quiet in step 6.
 const QUIET_MS: u64 = 20_000;
 
+/// Minimum true loop B cooldown during the frozen display, in degrees Celsius.
+pub const QUIET_MIN_MOVE_C: f64 = 5.0;
+
 /// Plant time after the quiet fault clears before the story checks that readings resume.
 const RESUME_MS: u64 = 3_000;
 
@@ -114,6 +116,7 @@ const RESUME_MS: u64 = 3_000;
 #[derive(Clone, Debug, Serialize)]
 pub struct Line {
     pub at_ms: u64,
+    pub time: String,
     pub step: u8,
     pub text: String,
 }
@@ -135,6 +138,10 @@ pub struct Report {
     pub quiet_from_ms: u64,
     /// When the telemetry quiet fault cleared.
     pub quiet_to_ms: u64,
+    /// True loop B hot-leg temperatures across the quiet window.
+    pub quiet_true_hot_b: [f64; 2],
+    /// HMI loop B gauge values across the same window.
+    pub quiet_hmi_hot_b: [f64; 2],
 }
 
 /// Builds the operations network: hmi01 at its fixed address, with the
@@ -237,7 +244,7 @@ pub async fn run(
     say(line(
         full.at_ms,
         1,
-        &format!("full power: {power:.1} % power, {average:.1} C average"),
+        &format!("Full power: {power:.1} % power, {average:.1} C average"),
     ));
 
     // 2. A normal maneuver through the HMI.
@@ -248,36 +255,41 @@ pub async fn run(
     say(line(
         maneuver_at,
         2,
-        &format!("maneuver: rod demand from {demand:.1} % to {target:.1} % through the HMI"),
+        &format!("Maneuver: rod demand from {demand:.1} % to {target:.1} % through the HMI"),
     ));
-    let settled_from = wait_for(fcx, driver, maneuver_at + MANEUVER_SETTLE_MS).await?;
-    let before_view = hmi_view(fcx, operator).await?;
-    let settled_to = wait_for(fcx, driver, settled_from.at_ms + SETTLE_WINDOW_MS).await?;
-    let before = settled_from.truth.reactor.neutron_power_percent;
-    let after = settled_to.truth.reactor.neutron_power_percent;
+    let mut samples = Vec::new();
+    let (settled_to, before, shown_before, shown_after) = loop {
+        let second = SETTLE_WINDOW_MS / 1_000 + samples.len() as u64;
+        let snapshot = wait_for(fcx, driver, maneuver_at + second * 1_000).await?;
+        let view = hmi_view(fcx, operator).await?;
+        let power = snapshot.truth.reactor.neutron_power_percent;
+        let shown = reading(&view, "neutron_power")?;
+        samples.push((power, shown));
+        if second >= 20 {
+            let (before, shown_before) = samples[(second - 20) as usize];
+            if (power - before).abs() < SETTLED_POWER_BAND
+                && (shown - shown_before).abs() < SETTLED_POWER_BAND
+            {
+                break (snapshot, before, shown_before, shown);
+            }
+        }
+        check(
+            snapshot.at_ms < maneuver_at + MANEUVER_LIMIT_MS,
+            "Plant and HMI power have not settled within 120 s",
+        )?;
+    };
     check(
         100.0 - before >= MANEUVER_MIN_DROP_PERCENT,
         format!("power did not fall after the maneuver: {before:.2} %"),
     )?;
     check(
-        (after - before).abs() < SETTLED_POWER_BAND,
-        format!("power has not settled: {before:.2} % then {after:.2} % in 10 s"),
-    )?;
-    let after_view = hmi_view(fcx, operator).await?;
-    let shown_before = reading(&before_view, "neutron_power")?;
-    let shown_after = reading(&after_view, "neutron_power")?;
-    check(
         100.0 - shown_before >= MANEUVER_MIN_DROP_PERCENT,
         "HMI power did not fall after the maneuver",
-    )?;
-    check(
-        (shown_after - shown_before).abs() < SETTLED_POWER_BAND,
-        "HMI power has not settled",
     )?;
     say(line(
         settled_to.at_ms,
         2,
-        &format!("power settled at {shown_after:.1} %"),
+        &format!("Power settled at {shown_after:.1} %"),
     ));
 
     // 3. The fault: the hot-leg gauge sticks at its present count, and coolant
@@ -307,7 +319,7 @@ pub async fn run(
     say(line(
         fault_at,
         3,
-        &format!("fault: loop B hot-leg gauge sticks at {stuck_c:.1} C, and coolant pump B trips"),
+        &format!("Fault: loop B hot-leg gauge sticks at {stuck_c:.1} C, and coolant pump B trips"),
     ));
 
     // 4. The operator does nothing about loop B. The margin alarm comes from
@@ -358,7 +370,7 @@ pub async fn run(
         alarmed.at_ms,
         4,
         &format!(
-            "subcooling margin alarm: core exit reads {core_exit:.1} C, while the loop B gauge still reads {stuck_c:.1} C against {true_hot_b:.1} C"
+            "Subcooling margin alarm: core exit reads {core_exit:.1} C, while the loop B gauge still reads {stuck_c:.1} C against {true_hot_b:.1} C"
         ),
     ));
 
@@ -391,7 +403,7 @@ pub async fn run(
         trip_at,
         5,
         &format!(
-            "operator trips the reactor from the HMI, at an estimated {:.1} C margin",
+            "Operator trips the reactor from the HMI, at an estimated {:.1} C margin",
             estimated_margin_c(&trip_view)?
         ),
     ));
@@ -411,7 +423,7 @@ pub async fn run(
     say(line(
         dropped.at_ms,
         5,
-        "the rods are in; the operator starts auxiliary feed from the HMI",
+        "The rods are in; the operator starts auxiliary feed from the HMI",
     ));
     control(
         fcx,
@@ -420,7 +432,20 @@ pub async fn run(
         json!({ "name": "aux-feed", "running": true }),
     )
     .await?;
-    let settled = wait_for(fcx, driver, dropped.at_ms + DECAY_SETTLE_MS).await?;
+    let settled = loop {
+        let snapshot = driver.snapshot();
+        let view = hmi_view(fcx, operator).await?;
+        if snapshot.truth.reactor.neutron_power_percent < DECAY_POWER_LIMIT
+            && reading(&view, "neutron_power")? < DECAY_POWER_LIMIT
+        {
+            break snapshot;
+        }
+        check(
+            snapshot.at_ms < dropped.at_ms + DECAY_SETTLE_MS,
+            "The plant did not reach decay heat within 60 s",
+        )?;
+        pause(fcx).await?;
+    };
     check(
         settled.truth.reactor.neutron_power_percent < DECAY_POWER_LIMIT,
         format!(
@@ -432,7 +457,7 @@ pub async fn run(
         settled.at_ms,
         5,
         &format!(
-            "settled on decay heat: {:.2} % power, {:.1} % decay heat",
+            "Settled on decay heat: {:.2} % power, {:.1} % decay heat",
             settled.truth.reactor.neutron_power_percent, settled.truth.reactor.decay_heat_percent
         ),
     ));
@@ -448,7 +473,7 @@ pub async fn run(
     say(line(
         cleared_at,
         5,
-        "fault cleared: loop B gauge and pump trip",
+        "Fault cleared: loop B gauge and pump trip",
     ));
     let mut tracking_since = None;
     let (gauge, true_hot_b) = loop {
@@ -474,15 +499,51 @@ pub async fn run(
         driver.snapshot().at_ms,
         5,
         &format!(
-            "the loop B gauge reads the plant again: HMI {gauge:.1} C, true hot leg {true_hot_b:.1} C"
+            "The loop B gauge reads the plant again: HMI {gauge:.1} C, true hot leg {true_hot_b:.1} C"
         ),
     ));
 
     // 6. A second fault: telemetry goes quiet. The readings and their sample
     // times stop while the plant moves. The HMI holds the last values it polled.
+    control(
+        fcx,
+        operator,
+        "pump",
+        json!({"name": "coolant-b", "running": true}),
+    )
+    .await?;
+    say(line(
+        driver.snapshot().at_ms,
+        6,
+        "Coolant pump B restarted from the HMI for cooldown",
+    ));
+    control(
+        fcx,
+        operator,
+        "controller",
+        json!({"name": "steam-dump", "auto": false}),
+    )
+    .await?;
+    say(line(
+        driver.snapshot().at_ms,
+        6,
+        "Steam dump set to manual from the HMI",
+    ));
+    control(
+        fcx,
+        operator,
+        "valve",
+        json!({"name": "steam-dump", "percent": 100}),
+    )
+    .await?;
+    say(line(
+        driver.snapshot().at_ms,
+        6,
+        "Steam dump opened to 100% from the HMI for cooldown",
+    ));
     inject(fcx, driver, FaultChange::Inject(Fault::TelemetryQuiet))?;
     let quiet_from = driver.snapshot().at_ms;
-    say(line(quiet_from, 6, "fault: telemetry goes quiet"));
+    say(line(quiet_from, 6, "Fault: telemetry goes quiet"));
     // The baseline is taken after the last sample before the fault, so every
     // reading and the heartbeat hold the values they will keep through the window.
     let baseline = wait_for(fcx, driver, quiet_from + QUIET_BASELINE_MS).await?;
@@ -503,9 +564,14 @@ pub async fn run(
         "a reading was sampled while telemetry was quiet",
     )?;
     check(
-        quiet_end.truth.primary.average_temperature_c
-            != baseline.truth.primary.average_temperature_c,
-        "the plant did not move while telemetry was quiet",
+        baseline.truth.primary.loops[Loop::B.index()].hot_leg_c
+            - quiet_end.truth.primary.loops[Loop::B.index()].hot_leg_c
+            >= QUIET_MIN_MOVE_C,
+        format!(
+            "The true loop B hot leg did not cool by at least 5 °C while telemetry was quiet: {:.1} to {:.1} °C",
+            baseline.truth.primary.loops[Loop::B.index()].hot_leg_c,
+            quiet_end.truth.primary.loops[Loop::B.index()].hot_leg_c
+        ),
     )?;
     let view_after = hmi_view(fcx, operator).await?;
     let hmi_after = reading(&view_after, "hot_leg_b")?;
@@ -525,13 +591,13 @@ pub async fn run(
         quiet_end.at_ms,
         6,
         &format!(
-            "telemetry quiet: the heartbeat stays at {}; the HMI holds loop B at {:.1} C while the plant moves",
+            "Telemetry quiet: the heartbeat stays at {}; the HMI holds loop B at {:.1} C while the plant moves",
             heartbeat_before[0], hmi_after
         ),
     ));
     inject(fcx, driver, FaultChange::Clear(FaultTarget::TelemetryQuiet))?;
     let quiet_to = driver.snapshot().at_ms;
-    say(line(quiet_to, 6, "fault cleared: telemetry quiet"));
+    say(line(quiet_to, 6, "Fault cleared: telemetry quiet"));
     let resumed = wait_for(fcx, driver, quiet_to + RESUME_MS).await?;
     check(
         !resumed.telemetry.quiet && resumed.telemetry.heartbeat > quiet_end.telemetry.heartbeat,
@@ -548,7 +614,20 @@ pub async fn run(
     say(line(
         resumed.at_ms,
         6,
-        "telemetry resumes; the gauges catch up",
+        "Telemetry resumes; the gauges catch up",
+    ));
+
+    control(
+        fcx,
+        operator,
+        "valve",
+        json!({"name": "steam-dump", "percent": 0}),
+    )
+    .await?;
+    say(line(
+        driver.snapshot().at_ms,
+        6,
+        "Steam dump closed from the HMI",
     ));
 
     let first_action_after_fault_ms = tripped.first_action_after_fault_ms.ok_or_else(|| {
@@ -562,14 +641,20 @@ pub async fn run(
         first_action_after_fault_ms,
         quiet_from_ms: quiet_from,
         quiet_to_ms: quiet_to,
+        quiet_true_hot_b: [
+            baseline.truth.primary.loops[Loop::B.index()].hot_leg_c,
+            quiet_end.truth.primary.loops[Loop::B.index()].hot_leg_c,
+        ],
+        quiet_hmi_hot_b: [hmi_before, hmi_after],
     })
 }
 
 fn line(at_ms: u64, step: u8, text: &str) -> Line {
     Line {
         at_ms,
+        time: crate::facts::time(at_ms),
         step,
-        text: text.to_owned(),
+        text: format!("{}{}.", text[..1].to_uppercase(), &text[1..]),
     }
 }
 
