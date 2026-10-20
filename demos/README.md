@@ -182,11 +182,7 @@ pays for them.
 The scripts that run inside the VM are in [`guest/`](guest), one per demo, with
 [`lib.sh`](guest/lib.sh) for the steps, the commands and the checks. Each starts
 with a `# needs:` line that says what [`vm/guest/build.sh`](../vm/guest/build.sh)
-builds for it: `sdk` is `fictionet` and the crate's examples; `fakewiki` is that
-example's world. The Compose demos
-run the examples' own Compose files, plus a small file next to the script
-(`scan.compose.yaml`) that puts the binaries the VM built in
-place of the Dockerfile's build stage, so nothing compiles twice.
+builds for it: `sdk` is `fictionet` and the crate's examples.
 
 A demo stops at the first step that does not go as it says, and prints the
 world's log. A refusal, such as `curl` failing without the world's CA, must
@@ -267,10 +263,9 @@ one stage per container, and a Compose file.
 4. Run it from the repository root with your machine's Docker, as the scan
    README does: `docker compose -f examples/<name>/compose.yaml up -d --build --wait`,
    then `exec` into the agent's service, and `down -v` at the end.
-5. For `cargo xtask demo <name>`, copy `demos/guest/border.sh` to
-   `demos/guest/<name>.sh` and `border.compose.yaml` to `<name>.compose.yaml`,
-   and change the Compose file, the project name and the steps. Keep the
-   `# needs: sdk` line: the VM builds every example. `cargo xtask demo` finds
-   the script by its name. Add a row to the table above.
+5. For `cargo xtask demo <name>`, copy `demos/guest/web.sh` to
+   `demos/guest/<name>.sh` and change the steps. Keep the `# needs: sdk` line:
+   the VM builds every example. `cargo xtask demo` finds the script by its
+   name. Add a row to the table above.
 
 Preview the search page without a VM with `cargo run --locked -p fictionet-demo --example search_page`. It prints a loopback URL and drives real in-process searches with a scripted client. The screen says “NO VM”. Press Ctrl-C to close the page.
