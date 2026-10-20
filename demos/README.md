@@ -231,12 +231,23 @@ page's access controls and terminal.
 
 `Kit::page` takes a builder over the dashboard and the declared hosts:
 `Page::new("Desktop", dashboard).host(hosts.take("workstation")).standard_panels()`.
-The kit adds one dashboard observer with startup packet capture, each host's
-status, the containment probes and labels. The standard panels are the
+The kit installs one observation policy before the world starts. It skips the
+jump host's events and packets and excludes SSH and VNC console flows before
+copying. Agent traffic keeps whole packets: 8,192 copies and 32 MiB per link,
+without thinning. Internal taps use watched bulk capture: 4,096 copies, 1 MiB,
+96 bytes per packet and a burst of 64 per 100 ms. `Kit::policy` delegates the
+remaining selection to world code, including mirror classification where the
+world knows its addresses. Shared-budget eviction ranks bulk, noise, agent
+packets, ordinary events and keys from lowest to highest.
+
+The page includes each host's status, containment probes and labels. The standard panels are the
 screen, terminal, packets, events, map, Left the box, containment, labels and
 export. `Page::table` adds a view over a world-owned `StateTopic`.
 [Fictionet Observe](../observe/README.md) covers the collector, the page and
-capture limits.
+capture limits. Events and packets share a bounded list and loss line. Exports
+read the selected host or links directly from retention; a pcapng download needs
+no watch. Flow labels become packet comments. Services supply protocol names;
+`Page::protocols` sets the presenters, with port matching for unclaimed flows.
 
 The page binds to loopback. Data and commands need its per-run bearer token,
 with exact Host and Origin checks. Consoles use short-lived, single-use

@@ -11,7 +11,11 @@
 //! | [`Stream::Keys`] | `Interest::TlsKey` | `Observation::TlsKey` | A [`KeyRef`] with TLS label, client random, secret and optional connection context. |
 //! | [`Stream::Topology`] | `Interest::Topology` | `Observation::Topology` | [`TopologyRef`] changes for tasks, groups, hosts, links and connection bindings. |
 //!
-//! Packet bytes are borrowed, without copying, decoding or sampling in core.
+//! World code names facts with [`Cx::emit`](crate::Cx::emit) and observable links
+//! with [`Cx::tap`](crate::Cx::tap). Untapped links offer no packets. Attachments
+//! are tapped by their sandbox names; the stdlib taps its named network links.
+//! Packet interest borrows the bytes before any copy, clock read or number.
+//! Core does no packet copying, decoding or sampling.
 //! [`LinkType::Ip`] means IP bytes without a link-layer header. The packet
 //! includes its link, tap name, sandbox, sending side and original length.
 //! TLS key debug output omits secret bytes. Topology includes link owners, taps
@@ -75,11 +79,16 @@
 //! producer hooks and the rustls key adapter. It keeps no history, topology
 //! graph, retained keys, packet collection or decoders.
 //! [Fictionet Observe](../../fictionet_observe/index.html) owns those consumers:
-//! `Memory` and `Aggregate` for grading, `Jsonl` for files, `Collector` for
-//! bounded collection, and `DashboardObserver` for dashboard requests.
+//! `Policy` selects events, packets and keys before work, then assigns retained
+//! observations to classes with separate budgets. `Memory` supports grading,
+//! `Aggregate` combines repeats, and `Jsonl` writes interested events. `Collector`
+//! shares retention and loss accounting across typed stores; `DashboardObserver`
+//! supplies page requests. Logging remains an installed observer.
 //! A world's page reads its handle in process; serve the handle on an
 //! observation socket for `fictionet observe`. Late clients see what the
-//! installed consumer kept.
+//! installed consumer kept. Services name their protocol through
+//! [`Cx::connection_opened`](crate::Cx::connection_opened); presenters and
+//! protocol selection stay in the companion.
 //!
 //! ```
 //! use std::sync::Arc;

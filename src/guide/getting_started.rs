@@ -307,9 +307,11 @@
 //! ```
 //!
 //! The observer shows the world's side. With the third argument, `web_world`
-//! installs bounded retention and repeat aggregation in the companion. Its
-//! sites emit DNS queries, TLS handshakes and HTTP requests to that observer.
-//! Core retains no history.
+//! installs a companion observer with repeat aggregation and bounded retention.
+//! Its policy selects events, tapped packets and keys before work, with separate
+//! class budgets and one loss ledger. Sites emit DNS queries, TLS handshakes and
+//! HTTP requests; services name their protocols on connections. Core retains no
+//! history. Use `Cx::tap` to make another link observable.
 //! `fictionet observe` prints each event as a line of JSON while it watches.
 //! These lines come from a separate run of the same two requests (cut short
 //! here):
@@ -323,6 +325,10 @@
 //!
 //! A world can serve its own page with `fictionet_observe::page::Page`, over
 //! the same `DashboardObserver` handle, and print a loopback address to open.
+//! Its event and packet lists share loss reporting. JSONL and pcapng exports
+//! read retained rings for the selected scope, even without an active watch.
+//! A custom presenter joins its service by protocol name; other flows use ports
+//! and byte prefixes.
 //! `web_world` serves none; `cargo xtask demo desktop` runs a world that does.
 //! See [Fictionet Observe](../../../fictionet_observe/index.html) for the page,
 //! resource limits and the observation protocol.

@@ -2,9 +2,12 @@
 
 `fictionet-observe` consumes the four streams produced by
 [`fictionet::events`](../src/events.rs):
-events, packets, TLS keys and topology. Core delivers borrowed observations.
-This crate owns retention, decoding and the request service that a world's
-page and `fictionet observe` use. Install one collector per run, before it starts.
+events, tapped packets, TLS keys and topology. A `Policy` selects observations
+before work and sorts them into classes with independent budgets. Typed stores
+share ring retention and one loss ledger. The world's page and
+`fictionet observe` read those stores; JSONL and pcapng exports use one selection
+without requiring a packet watch. Core retains no history. Install the observer
+before the run starts.
 
 There are no default features.
 
@@ -19,7 +22,9 @@ There are no default features.
 ## Retain events for grading
 
 Install `Memory` through `RunOptions`. Wrap it in `Aggregate` to combine
-repeated network facts. `checked_of` rejects a history that lost events.
+repeated network facts. `checked_of` checks the selected class when the policy
+fixes a kind's class before building; otherwise it checks the event stream.
+`Limits` sets standalone event budgets.
 
 ```rust
 use std::sync::Arc;
@@ -72,6 +77,10 @@ assert!(replies[0].end);
 The `page` feature serves a loopback page directly from the run's
 `DashboardHandle`. Compose hosts and standard panels with `Page`, add tables
 over `StateTopic` values, and connect typed controls with `CommandPort`.
+Events and packets share a bounded list and loss-line component. Export buttons
+use the selected host or links. Services name protocols on connections;
+`Page::protocols` installs their presenters before the first watch. Unclaimed
+flows still use port and prefix matching.
 Screen and terminal consoles share the page's bearer and single-use ticket
 boundary; browser screen input also needs a host lease. Browser libraries
 are pinned and embedded by `cargo xtask demo libraries`.

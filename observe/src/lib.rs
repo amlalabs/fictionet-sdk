@@ -273,35 +273,40 @@
 //!
 //! # Packets
 //!
-//! The collector exists before clients connect. A late client can read retained
-//! events, current topology, kept packet copies and TLS keys. Capture policy
-//! decides which links have copies. [`DashboardOptions::default()`] captures
-//! all links on demand. `Options::default()` captures sandbox links
-//! from startup and other links on demand. Both retain TLS keys from startup.
-//! [`Policy`] defines selection and independent class budgets.
+//! World code taps links with [`Cx::tap`](fictionet::Cx::tap). Attachments are
+//! tapped by their sandbox names, and the stdlib taps its named links. Untapped
+//! links offer no packets. [`Policy::admit`] reads a tapped packet's name,
+//! sandbox and borrowed bytes before copying, timing or numbering it.
 //!
-//! A `packets` subscriber holds capture demand for its link. Dropping the last
-//! demand handle stops demand capture. Always classes retain copies without
-//! subscribers. `Admit::Skip` declines capture. Packets that were
-//! not captured cannot be recovered later. Watching the graph alone does not
-//! start demand capture.
+//! Install the collector before the run. [`Options::default()`] keeps sandbox
+//! packets from startup and other tapped packets while watched.
+//! [`DashboardOptions::default()`] requires a viewer for both. Both retain
+//! interested events and TLS keys from startup. A `packets` subscription takes
+//! demand on its link; the last subscriber releases it. Always classes keep
+//! history without a viewer. A graph subscription takes no packet demand.
 //!
-//! Packet interest carries the tap and sandbox, so policy applies before
-//! topology arrives. Removed links keep copies within the same budgets.
-//! Under shared byte pressure removed captures go first, then the lowest class
-//! rank, then the largest ring among equal ranks.
+//! Each policy class has its own count, bytes, snap and burst budget per link.
+//! `snap: None` keeps whole packets; `burst: None` never thins. The default
+//! packet classes copy at most 65,535 bytes and keep the first 64 packets per
+//! 100 ms of run time, then one in two, one in four, and so on. A declined
+//! packet is selection, not loss. Sampling, truncation and eviction enter the
+//! shared ledger with the stream and class. Removed links keep copies within
+//! the same budgets. Shared pressure removes retired captures first, then the
+//! lowest class rank, then the largest ring at that rank.
 //!
-//! Sampling uses run time. Each default packet class on a link keeps the first
-//! 64 packets in each 100 ms window, then one in two, one in four, and so on.
-//! Each [`PacketCopy`]
-//! keeps its stream stamp, original length and preceding sampling count.
-//! The core stream sequence is the copy cursor; per-class totals track eviction.
+//! [`PacketCopy`] carries its source tap, class, original length and core
+//! sequence. Rings on one link merge by that sequence. Watches decode them in
+//! order, separately per class, on the polling caller's thread. All viewers of
+//! one link share its decoded rows. The browser uses one bounded list component
+//! and one loss line for events and packets. Its packet policy count subtracts
+//! the last admitted sequence from link crossings; other packet observers in
+//! a fanout can also advance that shared sequence.
 //!
-//! A watch decodes kept copies in order. All subscribers to a link share its
-//! decoder and rows. The packet list shows sampling, capture eviction and subscriber
-//! overruns separately. Its totals count reports in the loaded history;
-//! evicted rows may have carried other reports. Pausing and browser queue
-//! trimming do not clear those totals.
+//! [`Collector::export`] reads retained rings through [`export::Selection`]:
+//! streams, classes, sandbox and sequence range. JSONL carries event classes,
+//! labels and loss rows. Pcapng merges packet classes per link, preserves
+//! original lengths, includes retained TLS keys and attaches flow labels as
+//! comments. Downloads need no watch and create no capture demand.
 //!
 //! Selecting a packet clears the preceding layers and bytes while it loads.
 //! Only that selection can fill them. Closing or reopening the packet list, or
@@ -313,14 +318,21 @@
 //! or broken frame shows its reason and stops that stream. In a merged view,
 //! a refusal names its link; the other links keep streaming.
 //!
-//! A merged capture download fails as a whole if any link has no capture.
+//! A merged capture download fails as a whole if any requested link is unknown.
 //! The HTTP 404 JSON has an `error` naming all failed links, and a `links`
 //! array with each failed `link` and its `error`. It returns no partial capture.
 //!
 //! # Decoding and decryption
 //!
 //! Packets are raw IPv4 or IPv6, with no Ethernet header. The decoder reads
-//! IP, TCP, UDP and ICMP, then the selected application protocol. The built-in
+//! IP, TCP, UDP and ICMP, then the selected application protocol. A live service
+//! names its protocol with `ServeOptions.protocol` or
+//! [`Cx::connection_opened`](fictionet::Cx::connection_opened). The watch joins
+//! current connection endpoints to a registered name first, with port and prefix
+//! matching as fallback. TLS connections select the TLS presenter on the wire.
+//! Truncated copies supply no application payload. Sampling or eviction resets
+//! the affected class's conversations; a full copy can still decode between gaps.
+//! The built-in
 //! [`Registry`] registers `http1`, `http2`, `tls`, `modbus`, `dhcp` and `dns`.
 //! TCP reassembly presents a message on the packet that completes it.
 //! HTTP/2 includes headers and recognized gRPC message layers under shared
@@ -361,11 +373,13 @@
 //! to the item's raw bytes. [`Observed`] drives bounded input. [`Placement`]
 //! maps exact spans to packet bytes or uses a separate reassembly buffer.
 //!
-//! Add the presenter to [`Registry`] with a port or prefix matcher, or select
-//! its name with [`Registry::choose`]. Built-ins use the same API.
+//! Add the presenter to [`Registry`] under the service's protocol name. A
+//! matcher may return [`Match::No`] when only named connections should select it.
+//! Port and prefix matchers handle unclaimed flows. [`Registry::choose`] selects
+//! a name explicitly for one transport. Built-ins use the same API.
 //! [`Dissector::with_registry`] decodes raw IP from a pcap reader or live source.
 //! Set [`DashboardOptions::protocols`] before constructing the observer to use
-//! the registry in its watches. See the
+//! the registry in its watches, or set `Page::protocols` before any watch exists. See the
 //! [protocol guide](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/observe-protocols.md)
 //! for adapters and selection rules.
 //!
@@ -417,18 +431,22 @@
 //!
 //! # Resource limits
 //!
-//! Set [`DashboardOptions::collector`] before constructing the observer.
-//! `<dyn Policy>::default()` supplies these class budgets:
+//! Set [`Options::policy`] and [`Options::bytes`] before constructing the observer.
+//! One ring mechanism serves the separate event, packet and key stores. Each
+//! class bounds count and bytes per stream; packets additionally use `snap`,
+//! and packet or noise classes can use `burst`. [`Limits`] remains the type for
+//! standalone event sinks. `<dyn Policy>::events()` supplies event-only retention;
+//! `<dyn Policy>::default()` supplies these budgets:
 //!
 //! | Budget | Default | What it charges |
 //! |---|---|---|
 //! | `events` | 50,000 events, 16 MiB | Ordinary events, sized by [`Event::size`](fictionet::events::Event::size). |
 //! | `noise` | 5,000 events, 2 MiB | Separate storage for facts marked with [`Event::repeat`](fictionet::events::Event::repeat). |
 //! | `packets` | 4,096 copies, 8 MiB per link | Packet payload bytes. |
-//! | `Options::bytes` | Sum of default class budgets across allowed links | Bytes across every event, packet and key ring. |
+//! | `Options::bytes` | 90 MiB | Bytes across every event, packet and key ring. |
 //! | Packet class `snap` | 65,535 bytes | Maximum copied bytes per packet; excess bytes count as truncation. |
 //! | `keys` | 20,000 keys, 8 MiB | Key entries, labels, randoms, secrets and owned connection text. |
-//! | `loss_streams` | 4,099 streams | Detailed loss totals by stream and reason. |
+//! | `loss_streams` | 4,099 streams | Detailed loss totals by stream, class and reason. |
 //!
 //! [`TopologyLimits`] defaults to 16,384 tasks, 4,096 groups, 4,096 hosts,
 //! 4,096 links including capture state, and 20,000 active connections.
@@ -437,9 +455,19 @@
 //! and owned text. Bounds can refuse entries or shorten text at UTF-8 boundaries.
 //! Missing references and loss mark topology incomplete.
 //!
-//! Loss totals persist by stream and cause. After `loss_streams` fills,
+//! The shared budget covers every retained ring. Lower class ranks are evicted
+//! first, with the largest ring breaking ties. The default ranks packets below
+//! events and noise, and keys above them. The kit ranks bulk packets, noise,
+//! agent packets, ordinary events and keys in that order. Its agent class keeps
+//! 8,192 whole copies and 32 MiB per link without thinning; bulk uses 4,096 copies,
+//! 1 MiB, a 96-byte snap and a burst of 64, while watched.
+//!
+//! Loss totals persist by stream, class and cause. After `loss_streams` fills,
 //! additional streams contribute to [`LossStatus::untracked`] by cause without
-//! stream identity. A refreshed snapshot cannot repair collector loss.
+//! stream identity. Declined observations do not enter the ledger. A refreshed
+//! snapshot cannot repair collector loss. `checked_of` uses the class ledger
+//! when admission fixes that kind's class, and the event stream when it needs
+//! a built event to decide.
 //! Zero count or byte bounds refuse retention. Event byte accounting includes
 //! owned capacities, task names and shared connection metadata charged in full
 //! per copy, plus estimated allocation overhead. It excludes spare collection
@@ -661,7 +689,9 @@
 //! The initial `link` event describes the edge. Its `a`, `b` and `label` can
 //! be `null` if the link is absent from the graph, including a removed link
 //! whose capture remains. Each `packet` event has `seq`, `t`, `side`, `len`,
-//! `skipped`, `evicted`, `src`, `dst`, `proto`, `info` and `tags`.
+//! `class`, `source`, `skipped`, `evicted`, `src`, `dst`, `proto`, `info` and `tags`.
+//! When crossing totals are available, `link` and `packet` include `declined`.
+//! A poll with no rows sends `policy` when that count changes.
 //! `seq` numbers decoded rows from 1 within a watch. It is separate from the
 //! core packet stream sequence, which is also the capture cursor. `t` is run
 //! time in seconds. `len` is the original length before snap truncation.

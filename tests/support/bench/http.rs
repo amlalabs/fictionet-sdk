@@ -55,11 +55,81 @@ pub enum Watch {
     Graph,
     /// The graph, and a `packets` stream on every sandbox link.
     Packets,
+    /// Packet streams with separate agent and bulk class budgets.
+    Policy,
 }
 
 impl Watch {
     fn enabled(self) -> bool {
-        self == Self::Graph || self == Self::Packets
+        self != Self::None
+    }
+}
+
+struct LinkPolicy;
+impl fictionet_observe::Policy for LinkPolicy {
+    fn classes(&self) -> &[fictionet_observe::Class] {
+        use fictionet_observe::Class;
+        const CLASSES: &[Class] = &[
+            Class::new("events").count(50_000).bytes(16 << 20).rank(3),
+            Class::new("noise")
+                .count(5_000)
+                .bytes(2 << 20)
+                .burst(64)
+                .rank(1),
+            Class::new("keys").count(20_000).bytes(8 << 20).rank(4),
+            Class::new("agent").count(8_192).bytes(32 << 20).rank(2),
+            Class::new("bulk")
+                .watched()
+                .count(4_096)
+                .bytes(1 << 20)
+                .snap(96)
+                .burst(64),
+        ];
+        CLASSES
+    }
+    fn admit(&self, interest: fictionet::events::Interest<'_>) -> fictionet_observe::Admit {
+        use fictionet::events::Interest;
+        use fictionet::stdlib::network::ip;
+        use fictionet_observe::Admit;
+        match interest {
+            Interest::Event(_, conn)
+                if conn.sandbox.as_ref().is_some_and(|s| &*s.name == "jump") =>
+            {
+                Admit::Skip
+            }
+            Interest::Event(meta, _) if meta.source == "net" && meta.kind == "blocked" => {
+                Admit::Class(1)
+            }
+            Interest::Event(..) | Interest::Topology(_) => Admit::Build,
+            Interest::TlsKey(_) => Admit::Class(2),
+            Interest::Packet(p) if p.sandbox == Some("jump") => Admit::Skip,
+            Interest::Packet(p) if p.sandbox.is_some() => {
+                match ip::Header::parse_truncated(p.bytes) {
+                    Some(h)
+                        if h.src == Ipv4Addr::new(10, 10, 5, 20)
+                            || h.dst == Ipv4Addr::new(10, 10, 5, 20) =>
+                    {
+                        Admit::Skip
+                    }
+                    Some(h)
+                        if h.src == Ipv4Addr::new(10, 10, 5, 30)
+                            || h.dst == Ipv4Addr::new(10, 10, 5, 30) =>
+                    {
+                        Admit::Class(4)
+                    }
+                    _ => Admit::Class(3),
+                }
+            }
+            Interest::Packet(_) => Admit::Class(4),
+        }
+    }
+    fn sort(&self, observation: &fictionet::events::Observation<'_>) -> Option<usize> {
+        match observation {
+            fictionet::events::Observation::Event(event) => {
+                Some(usize::from(event.repeat_fields().is_some()))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -171,10 +241,13 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
     // The observer reaches the world through an observation socket, as the
     // dashboard does.
     let path = socket_path("sites");
-    let dashboard = case
-        .watch
-        .enabled()
-        .then(|| fictionet_observe::DashboardObserver::new(Default::default()));
+    let dashboard = case.watch.enabled().then(|| {
+        let mut options = fictionet_observe::DashboardOptions::default();
+        if case.watch == Watch::Policy {
+            options.collector.policy = Arc::new(LinkPolicy);
+        }
+        fictionet_observe::DashboardObserver::new(options)
+    });
     let listening = dashboard
         .as_ref()
         .map(|dashboard| fictionet_observe::serve(dashboard.handle(), &path).unwrap());
@@ -252,7 +325,7 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
                     client.set_timeout(Some(Duration::from_millis(100)))?;
                     observer::watch_world(
                         &mut client,
-                        case.watch == Watch::Packets,
+                        matches!(case.watch, Watch::Packets | Watch::Policy),
                         case.sandboxes,
                         &stop,
                         &ready,
