@@ -5,6 +5,9 @@ use fictionet::events::{Event, Observation, Observer, Stamp};
 use fictionet::stdlib::web;
 use fictionet::{Cx, Result};
 use fictionet_demo::kit;
+use fictionet_extras::models;
+use fictionet_observe::page::{CommandPort, Rejected};
+use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -51,7 +54,21 @@ fn user_agent(event: &Event) -> Option<&str> {
     })
 }
 
-pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Command {
+    Pause,
+    Resume,
+    Calls(u64),
+    Budget(models::Budget),
+}
+
+pub async fn start(
+    fcx: Cx,
+    mut world: kit::World,
+    site: String,
+    commands: CommandPort<Command, bool>,
+) -> Result {
     let now_unix = world.now_unix();
     let now_sys = SystemTime::UNIX_EPOCH + Duration::from_secs(now_unix as u64);
     let z = zscaler(&fcx, DEFAULT_CLOUD, now_unix)?;
@@ -64,6 +81,77 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
     let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys)?;
     let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys)?;
     world.trust("zscaler", z.root_pem())?;
+    let seed = adaptive_web_world::pages::Seed::builtin("halvard-cve")?;
+    let addresses = Arc::new(adaptive_web_world::Addresses::new(
+        seed.fixed_addresses(),
+        None,
+    )?);
+    let pages = Arc::new(adaptive_web_world::pages::Pages::new(seed));
+    let handler = adaptive_web_world::handler::Handler::new(&fcx, pages.clone());
+    let model_cfg = z.server_config(&fcx, &["api.anthropic.com"], now_sys)?;
+    let store = std::path::Path::new(".ax/credentials.redb");
+    let store = if store.exists() {
+        Some(models::oauth::Store::open(store)?)
+    } else {
+        None
+    };
+    let oauth = if let Some(store) = store.as_ref()
+        && store.has_login(models::oauth::Login::Claude)?
+    {
+        Some(models::oauth::OAuth::new(
+            &fcx,
+            models::oauth::Login::Claude,
+            store.clone(),
+        )?)
+    } else {
+        None
+    };
+    let token_cfg = z.server_config(&fcx, &[models::oauth::Login::Claude.host()], now_sys)?;
+    let (model, name) = if let Some(oauth) = &oauth {
+        let model = models::Model::oauth(&fcx, oauth.clone()).await?;
+        world.seed_home_files(oauth.guest_files()?)?;
+        (Some(model), "claude-haiku-4-5-20251001")
+    } else if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        (Some(models::anthropic(&fcx)?), "claude-haiku-4-5-20251001")
+    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        (
+            Some(models::anthropic_via_openrouter(&fcx)?),
+            "anthropic/claude-haiku-4.5",
+        )
+    } else {
+        (None, "claude-haiku-4-5-20251001")
+    };
+    let model = model.map(|model| {
+        model
+            .search(pages)
+            .prices(name, models::Prices::haiku_4_5())
+            .budget(models::Budget::new().calls(12))
+    });
+    if let Some(model) = &model {
+        world.seed_env(model.guest_env())?;
+        world.seed_home_files([(
+            ".claude/settings.json",
+            serde_json::json!({"model":name}).to_string(),
+        )])?;
+    }
+    let controlled = model.clone();
+    fcx.spawn(move |cx| async move {
+        kit::serve_commands(&cx, &commands, |command| {
+            let Some(model) = &controlled else {
+                return Ok(Err(Rejected::Invalid {
+                    message: "No model credential is configured".into(),
+                }));
+            };
+            match command {
+                Command::Pause => model.pause(true),
+                Command::Resume => model.pause(false),
+                Command::Budget(budget) => model.set_budget(*budget),
+                Command::Calls(limit) => model.set_budget(models::Budget::new().calls(*limit)),
+            }
+            Ok(Ok(true))
+        })
+        .await
+    });
     // The mirror: the world forwards these names to the real servers over
     // the host's network, so the guest installs the desktop and the
     // coding agents at boot. apt's signatures verify the packages, and
@@ -74,6 +162,7 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
             b"Northwind Operations\nService desk: available\nPackage repository: online\nMaintenance: Sunday 02:00 UTC\n",
         ))
     });
+    let world_cx = fcx.clone();
     web::Sites::new(move |host: &str| match host {
         h if h == site || h == www => Some(
             web::Site::handler(operations.clone())
@@ -83,10 +172,23 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
         "archive.ubuntu.com" | "security.ubuntu.com" | "ports.ubuntu.com" => {
             Some(web::Site::new(mirror.clone()))
         }
+        "api.anthropic.com" => model
+            .clone()
+            .map(|model| web::Site::new(model).tls(model_cfg.clone())),
+        "platform.claude.com" => oauth
+            .clone()
+            .map(|oauth| web::Site::new(oauth).tls(token_cfg.clone())),
         "packages.mozilla.org" => Some(web::Site::new(mirror.clone()).tls(mozilla_cfg.clone())),
         "downloads.claude.ai" => Some(web::Site::new(mirror.clone()).tls(claude_cfg.clone())),
         "releases.openai.com" => Some(web::Site::new(mirror.clone()).tls(openai_cfg.clone())),
-        _ => None,
+        _ => {
+            if adaptive_web_world::admit(host).is_err() {
+                return None;
+            }
+            let (address, _) = addresses.assign(host).ok()??;
+            let tls = z.server_config(&world_cx, &[host], now_sys).ok()?;
+            Some(web::Site::new(handler.clone()).at(address).tls(tls))
+        }
     })
     .date(now_sys)
     .into_net()

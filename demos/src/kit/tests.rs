@@ -333,6 +333,8 @@ fn root_certificate_names_are_neutral() {
         setup: Arc::new(mirror::Setup::new([])),
         attachments,
         ca: Arc::new(Mutex::new(None)),
+        environment: Default::default(),
+        home_files: Default::default(),
         now_unix: 0,
         mirror: Arc::default(),
         mirror_addresses: Default::default(),
@@ -1797,4 +1799,68 @@ async fn configured_address_does_not_claim_network_readiness() {
         "failed"
     );
     fixture.run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn model_environment_is_seeded_before_login() {
+    let mut kit = Kit::new("office").guest(Guest::ubuntu("workstation", "analyst"));
+    let (mut run, prepared) = kit.prepare().unwrap();
+    run.start_world(
+        |cx, mut world| async move {
+            assert!(world.seed_env([("BAD", "a\nINJECT=value".into())]).is_err());
+            world.seed_env([("ANTHROPIC_API_KEY", "sk-ant-api03-placeholder".into())])?;
+            hold_world(cx, world).await
+        },
+        prepared,
+    )
+    .await
+    .unwrap();
+    let data = seed::user_data(&seed::Provision {
+        guest: &run.guests[0].guest,
+        authorized_key: "key",
+        ca: None,
+    });
+    assert!(data.contains(&base64::encode(
+        b"ANTHROPIC_API_KEY=sk-ant-api03-placeholder\n"
+    )));
+    assert!(data.contains(&base64::encode(
+        b"export ANTHROPIC_API_KEY=sk-ant-api03-placeholder\n"
+    )));
+    run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn private_home_files_are_seeded_with_the_guest_owner() {
+    let mut kit = Kit::new("office").guest(Guest::ubuntu("workstation", "analyst"));
+    let (mut run, prepared) = kit.prepare().unwrap();
+    run.start_world(
+        |cx, mut world| async move {
+            for path in ["../outside", "/etc/other", ""] {
+                assert!(world.seed_home_files([(path, "value".into())]).is_err());
+            }
+            world.seed_home_files([(".claude/settings.json", "{}".into())])?;
+            hold_world(cx, world).await
+        },
+        prepared,
+    )
+    .await
+    .unwrap();
+    let guest = &run.guests[0].guest;
+    let file = guest
+        .files
+        .iter()
+        .find(|f| f.path == "/home/analyst/.claude/settings.json")
+        .unwrap();
+    assert_eq!(file.mode, 0o600);
+    let data = seed::user_data(&seed::Provision {
+        guest,
+        authorized_key: "key",
+        ca: None,
+    });
+    assert_eq!(
+        seed::files(&data).unwrap()["/home/analyst/.claude/settings.json"],
+        "{}"
+    );
+    assert!(data.contains("owner: analyst:analyst\n    defer: true"));
+    run.shutdown().await.unwrap();
 }

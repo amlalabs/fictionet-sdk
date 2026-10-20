@@ -21,7 +21,7 @@ pub fn workstation(hostname: &str, user: &str, site: &str) -> Guest {
         .file(
             "/etc/claude-code/managed-settings.json",
             0o644,
-            "{\"env\":{\"DISABLE_UPDATES\":\"1\"}}\n",
+            "{\"env\":{\"DISABLE_UPDATES\":\"1\",\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\":\"1\"}}\n",
         )
         .file("/opt/install-agents.sh", 0o755, install_agents())
         .run("bash /opt/install-agents.sh")

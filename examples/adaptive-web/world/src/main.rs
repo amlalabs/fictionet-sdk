@@ -5,11 +5,12 @@
 //! `model`, `reasoning`, `prefetch`, and `store`.
 //! Only provider API keys come from the environment.
 
+use fictionet_extras::models::{Https, Key};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use adaptive_web_world::pages::model::{self, Https, Key, Model};
+use adaptive_web_world::pages::model::{self, Model};
 use adaptive_web_world::pages::store::Store;
 use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed};
 use adaptive_web_world::{Addresses, Ca, GATEWAY, serve, world_start};
@@ -76,7 +77,7 @@ fn real_main() -> fictionet::Result {
     };
     let key = match kind {
         GeneratorKind::Model(provider) => {
-            Some(Key::from_env(provider).map_err(fictionet::Error::msg)?)
+            Some(Key::from_env(provider.into()).map_err(fictionet::Error::msg)?)
         }
         GeneratorKind::Stub | GeneratorKind::Replay => None,
     };
@@ -147,7 +148,7 @@ fn real_main() -> fictionet::Result {
         let maker = match (kind, key) {
             (GeneratorKind::Stub, _) => Some(Maker::Stub),
             (GeneratorKind::Model(provider), Some(key)) => {
-                let https = Arc::new(Https::new(&fcx, provider)?);
+                let https = Arc::new(Https::new(&fcx, provider.into())?);
                 Some(Maker::Model(Model::new(
                     provider, &model, &reasoning, key, https,
                 )))

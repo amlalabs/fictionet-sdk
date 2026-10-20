@@ -1,11 +1,12 @@
 //! The model client against an HTTP server on 127.0.0.1, through the SDK's
 //! own HTTP client.
 
+use fictionet_extras::models::{Https, Key};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use adaptive_web_world::pages::model::{Https, Key, Model, Provider};
+use adaptive_web_world::pages::model::{Model, Provider};
 use adaptive_web_world::pages::prompts;
 use serde_json::{Value, json};
 

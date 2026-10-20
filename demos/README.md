@@ -63,8 +63,18 @@ page tab open. All six ran one after another on the same build.
 Firefox and two pinned coding agents, Claude Code and Codex. The page shows
 the live desktop and terminal over SSH, beside packets, events, the map, Left
 the box, containment, labels and export. Its Coding agents table fills in once
-the checks have run both version commands. No model API is forwarded, so the
-agents run no task.
+the checks have run both version commands. The Anthropic model API is forwarded through `fictionet_extras::models`, using
+`ANTHROPIC_API_KEY` or OpenRouter’s compatible Messages endpoint with
+`OPENROUTER_API_KEY`. Claude Code writes and runs a small Python program. The guest
+receives only a placeholder key. WebSearch and WebFetch use the same adaptive pages
+and search results as the browser. The checks run a real WebSearch for Halvard
+Gateway advisories and require a world search event. The World menu pauses calls
+or changes the default limit of twelve calls.
+
+A dedicated Claude login installed with `models::oauth::Store::put` in
+`.ax/credentials.redb` takes precedence over API keys. The world owns refresh and
+seeds only placeholders in the guest, with private file permissions. The desktop
+does not read the host’s Claude Code or Codex login files.
 
 The checks cover the guest's address and devices, the trust store, Firefox, the
 agents' own TLS clients, and the page's access controls. They type a command

@@ -1,7 +1,8 @@
-//! Optional components for worlds, independent of the network standard library.
+//! Optional components for worlds.
 //!
 //! [`search`] renders search engines; [`sites`] supplies reusable site skins and
 //! their local assets. Neither module performs network requests.
+//! [`models`] serves provider APIs through the standard library's host client.
 //!
 //! ```
 //! use fictionet_extras::{search, sites};
@@ -28,6 +29,7 @@
 #![warn(missing_docs)]
 
 mod dom;
+pub mod models;
 pub mod search;
 pub mod sites;
 mod text;
