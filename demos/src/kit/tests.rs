@@ -175,6 +175,46 @@ fn guest_files_packages_and_commands_hold_no_forbidden_word() {
     );
 }
 
+/// `Guest::validate` covers what a guest carries. This covers the kit's own
+/// lines in the seed: the user, the trust store, the network, the package
+/// setup, meta-data and network-config. File contents are read decoded.
+#[test]
+fn the_whole_seed_holds_no_forbidden_word() {
+    for guest in [
+        desktop::browser("station", "analyst", "https://example.test/"),
+        desktop::terminal("station", "analyst", "Office inventory", (960, 400), 15),
+    ] {
+        let image = seed::build(&seed::Provision {
+            guest: &guest,
+            authorized_key: "ssh-ed25519 key",
+            ca: Some(("office", "root")),
+        })
+        .unwrap();
+        let fs =
+            fatfs::FileSystem::new(std::io::Cursor::new(image), fatfs::FsOptions::new()).unwrap();
+        let mut names = Vec::new();
+        for entry in fs.root_dir().iter() {
+            let entry = entry.unwrap();
+            let mut text = String::new();
+            entry.to_file().read_to_string(&mut text).unwrap();
+            let files = seed::files(&text).unwrap();
+            let lines = text
+                .lines()
+                .filter(|line| !line.starts_with("    content: "))
+                .chain(files.values().flat_map(|content| content.lines()));
+            for line in lines {
+                assert_eq!(guest.reveals(line), None, "{}: {line}", entry.file_name());
+            }
+            names.push(entry.file_name());
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            ["meta-data", "network-config", "user-data", "vendor-data"]
+        );
+    }
+}
+
 #[tokio::test]
 async fn failed_world_start_cleans_up_before_boot() {
     let downloads = util::RunDir::new(&std::env::temp_dir(), "test").unwrap();

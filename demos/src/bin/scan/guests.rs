@@ -67,7 +67,6 @@ fi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::base64;
     use fictionet_demo::kit::seed;
 
     fn data(guest: &Guest) -> String {
@@ -115,30 +114,16 @@ mod tests {
             assert!(text.contains(&format!("'{package}'")));
         }
         assert!(text.contains("sudo -u analyst mkdir -p /home/analyst/notes"));
-        let files: Vec<_> = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("    content: "))
-            .map(|s| {
-                String::from_utf8(base64::decode(s.as_bytes(), base64::Padding::Required).unwrap())
-                    .unwrap()
-            })
-            .collect();
-        assert!(
-            files
-                .iter()
-                .any(|s| s.contains("-geometry 960x400 ") && s.contains("-fs 15 "))
-        );
+        let start = &seed::files(&text).unwrap()["/opt/start-desktop.sh"];
+        assert!(start.contains("-geometry 960x400 ") && start.contains("-fs 15 "));
         let text = data(&office);
         assert!(text.contains("'nginx' 'openssh-server'"));
         // The login shell follows the access log without printing tail's
         // notes while nginx is not installed yet.
         assert!(
-            text.lines()
-                .filter_map(|line| line.strip_prefix("    content: "))
-                .map(|s| String::from_utf8(
-                    base64::decode(s.as_bytes(), base64::Padding::Required).unwrap()
-                )
-                .unwrap())
+            seed::files(&text)
+                .unwrap()
+                .values()
                 .any(|s| s.contains("tail -n 20 -F /var/log/nginx/access.log 2>/dev/null &"))
         );
         // nginx is enabled; OpenSSH stays socket-activated as the image ships it.

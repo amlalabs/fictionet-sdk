@@ -121,7 +121,6 @@ esac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::base64;
     use fictionet_demo::kit::seed;
 
     #[test]
@@ -132,18 +131,8 @@ mod tests {
             authorized_key: "key",
             ca: None,
         });
-        let mut decoded = data.clone();
-        for line in data
-            .lines()
-            .filter_map(|line| line.strip_prefix("    content: "))
-        {
-            decoded.push_str(
-                &String::from_utf8(
-                    base64::decode(line.as_bytes(), base64::Padding::Required).unwrap(),
-                )
-                .unwrap(),
-            );
-        }
+        let files = seed::files(&data).unwrap();
+        let decoded = format!("{data}{}", files.into_values().collect::<String>());
         for package in [
             "bird2",
             "traceroute",

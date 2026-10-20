@@ -98,7 +98,6 @@ xdotool windowactivate --sync "$terminal"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::base64;
     #[test]
     fn the_colleague_has_curl_and_no_browser() {
         let guest = colleague();
@@ -119,19 +118,8 @@ mod tests {
             authorized_key: "key",
             ca: Some(("northwind", "certificate")),
         });
-        let content = |path: &str| {
-            let file = data.split_once(&format!("  - path: {path:?}\n")).unwrap().1;
-            let encoded = file
-                .lines()
-                .nth(2)
-                .unwrap()
-                .strip_prefix("    content: ")
-                .unwrap();
-            String::from_utf8(
-                base64::decode(encoded.as_bytes(), base64::Padding::Required).unwrap(),
-            )
-            .unwrap()
-        };
+        let files = kit::seed::files(&data).unwrap();
+        let content = |path: &str| files[path].as_str();
         for package in [
             "python3-venv",
             "python3-pip",

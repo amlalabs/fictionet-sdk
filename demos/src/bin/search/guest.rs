@@ -94,13 +94,19 @@ mod tests {
         ] {
             assert!(data.contains(&format!("'{package}'")), "{package}");
         }
+        let files = seed::files(&data).unwrap();
+        assert!(files["/opt/start-desktop.sh"].contains(&format!("firefox --no-remote '{START}'")));
+        assert!(
+            files["/etc/firefox/policies/policies.json"]
+                .contains("firefox.settings.services.mozilla.com")
+        );
+        assert!(files["/etc/apt/apt.conf.d/99periodic"].contains("APT::Periodic::Enable \"0\""));
+        assert!(files["/etc/default/motd-news"].contains("ENABLED=0"));
         for path in [
-            "/etc/apt/apt.conf.d/99periodic",
-            "/etc/default/motd-news",
             "/etc/systemd/timesyncd.conf",
             "/etc/systemd/system/apt-daily.timer.d/quiet.conf",
         ] {
-            assert!(data.contains(&format!("path: {path:?}")), "{path}");
+            assert!(files.contains_key(path), "{path}");
         }
         assert!(data.contains("then systemctl stop apt-daily.timer; fi"));
     }

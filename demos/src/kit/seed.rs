@@ -2,6 +2,7 @@
 use super::Guest;
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use fictionet::stdlib::codec::base64;
+use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 /// The variables that point TLS clients at the system trust store: Node,
@@ -69,6 +70,29 @@ pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
         }
     }
     Ok(cursor.into_inner())
+}
+
+/// Reads back the files a rendered [`user_data`] writes, by path. Tests use
+/// it to check a seed as the guest receives it.
+pub fn files(user_data: &str) -> std::io::Result<BTreeMap<String, String>> {
+    let mut files = BTreeMap::new();
+    let mut path = None;
+    for line in user_data.lines() {
+        if let Some(quoted) = line.strip_prefix("  - path: ") {
+            path = Some(serde_json::from_str::<String>(quoted)?);
+        } else if let Some(encoded) = line.strip_prefix("    content: ") {
+            let path = path
+                .take()
+                .ok_or_else(|| std::io::Error::other("file content without a path"))?;
+            let bytes = base64::decode(encoded.as_bytes(), base64::Padding::Required)
+                .ok_or_else(|| std::io::Error::other(format!("{path}: invalid base64")))?;
+            files.insert(
+                path,
+                String::from_utf8(bytes).map_err(std::io::Error::other)?,
+            );
+        }
+    }
+    Ok(files)
 }
 
 /// Builds cloud-init's user data, including the shared trust store.

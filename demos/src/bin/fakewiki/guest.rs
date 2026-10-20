@@ -7,7 +7,6 @@ pub fn workstation() -> Guest {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::base64;
     use fictionet_demo::kit::seed;
 
     #[test]
@@ -23,14 +22,10 @@ mod tests {
             assert!(data.contains(&format!("'{package}'")));
         }
         assert!(data.contains("hostname: \"workstation\""));
-        let start = data
-            .lines()
-            .filter_map(|line| line.strip_prefix("    content: "))
-            .filter_map(|encoded| base64::decode(encoded.as_bytes(), base64::Padding::Required))
-            .any(|file| {
-                String::from_utf8_lossy(&file)
-                    .contains(&format!("firefox --no-remote '{}'", crate::URL))
-            });
-        assert!(start, "Firefox opens the article");
+        let start = &seed::files(&data).unwrap()["/opt/start-desktop.sh"];
+        assert!(
+            start.contains(&format!("firefox --no-remote '{}'", crate::URL)),
+            "Firefox opens the article"
+        );
     }
 }
