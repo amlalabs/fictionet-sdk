@@ -8,6 +8,7 @@ pub fn guest() -> Guest {
     // The kit's browser keeps Firefox quiet; background requests would create
     // pages and spend the generation budget, so the system stays quiet too.
     let mut guest = kit::desktop::browser(HOST, USER, START)
+        .forbid(&["adaptive", "stub"])
         // The scripted searcher pastes each address into Firefox.
         .packages(&["xclip"])
         // The Pro apt hook contacts the contract service during package setup.
@@ -73,12 +74,12 @@ pub fn guest() -> Guest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::base64;
     use fictionet_demo::kit::seed;
 
     #[test]
-    fn desktop_is_quiet_and_uses_neutral_names() {
+    fn desktop_installs_the_searcher_and_stays_quiet() {
         let guest = guest();
+        guest.validate().unwrap();
         let data = seed::user_data(&seed::Provision {
             guest: &guest,
             authorized_key: "key",
@@ -91,45 +92,16 @@ mod tests {
             "tigervnc-standalone-server",
             "xfce4",
         ] {
-            assert!(data.contains(package), "{package}");
+            assert!(data.contains(&format!("'{package}'")), "{package}");
         }
-        let mut files = Vec::new();
-        for line in data.lines() {
-            if let Some(encoded) = line.strip_prefix("    content: ") {
-                files.push(
-                    String::from_utf8(
-                        base64::decode(encoded.as_bytes(), base64::Padding::Required).unwrap(),
-                    )
-                    .unwrap(),
-                );
-            }
-        }
-        assert!(
-            files
-                .iter()
-                .any(|s| s.contains(&format!("firefox --no-remote '{START}'")))
-        );
-        assert!(
-            files
-                .iter()
-                .any(|s| s.contains("firefox.settings.services.mozilla.com"))
-        );
-        assert!(
-            files
-                .iter()
-                .any(|s| s.contains("APT::Periodic::Enable \"0\""))
-        );
-        assert!(files.iter().any(|s| s.contains("ENABLED=0")));
-        for forbidden in [
-            "fictionet",
-            "adaptive",
-            "stub",
-            "sandbox",
-            "search-demo",
-            "world",
+        for path in [
+            "/etc/apt/apt.conf.d/99periodic",
+            "/etc/default/motd-news",
+            "/etc/systemd/timesyncd.conf",
+            "/etc/systemd/system/apt-daily.timer.d/quiet.conf",
         ] {
-            assert!(!data.contains(forbidden));
-            assert!(files.iter().all(|s| !s.contains(forbidden)), "{forbidden}");
+            assert!(data.contains(&format!("path: {path:?}")), "{path}");
         }
+        assert!(data.contains("then systemctl stop apt-daily.timer; fi"));
     }
 }

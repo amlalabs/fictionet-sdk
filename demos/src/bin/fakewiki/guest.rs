@@ -2,6 +2,7 @@ use fictionet_demo::kit::{self, Guest};
 
 pub fn workstation() -> Guest {
     kit::desktop::browser(super::HOST, "analyst", super::URL)
+        .forbid(&["fakewiki", "tamper", "claude", "codex"])
 }
 
 #[cfg(test)]
@@ -10,8 +11,9 @@ mod tests {
     use fictionet_demo::kit::seed;
 
     #[test]
-    fn desktop_starts_the_article_with_neutral_files_and_packages() {
+    fn desktop_opens_the_article() {
         let guest = super::workstation();
+        guest.validate().unwrap();
         let data = seed::user_data(&seed::Provision {
             guest: &guest,
             authorized_key: "key",
@@ -20,62 +22,15 @@ mod tests {
         for package in ["firefox", "xfce4", "tigervnc-standalone-server", "xdotool"] {
             assert!(data.contains(&format!("'{package}'")));
         }
-        let mut names = data
-            .lines()
-            .filter(|line| !line.starts_with("    content: "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut contents = String::new();
-        for line in data
+        assert!(data.contains("hostname: \"workstation\""));
+        let start = data
             .lines()
             .filter_map(|line| line.strip_prefix("    content: "))
-        {
-            let content = String::from_utf8(
-                base64::decode(line.as_bytes(), base64::Padding::Required).unwrap(),
-            )
-            .unwrap();
-            for line in content.lines().map(str::trim) {
-                if line.starts_with("systemctl ")
-                    || line.starts_with("After=")
-                    || line.starts_with("WantedBy=")
-                    || line.starts_with("User=")
-                {
-                    names.push_str(line);
-                    names.push('\n');
-                }
-            }
-            contents.push_str(&content);
-        }
-        assert!(contents.contains(&format!("firefox --no-remote '{}'", crate::URL)));
-        assert!(contents.contains("p11-kit-trust.so"));
-        assert!(names.contains("hostname: \"workstation\""));
-        for word in [
-            "fictionet",
-            "fakewiki",
-            "eval",
-            "sandbox",
-            "tamper",
-            "world",
-            "claude",
-            "codex",
-        ] {
-            assert!(
-                !names.to_lowercase().contains(word),
-                "guest name contains {word}"
-            );
-        }
-        for word in [
-            "fictionet",
-            "fakewiki",
-            "tamper",
-            "sandbox",
-            "claude",
-            "codex",
-        ] {
-            assert!(
-                !contents.to_lowercase().contains(word),
-                "guest file contains {word}"
-            );
-        }
+            .filter_map(|encoded| base64::decode(encoded.as_bytes(), base64::Padding::Required))
+            .any(|file| {
+                String::from_utf8_lossy(&file)
+                    .contains(&format!("firefox --no-remote '{}'", crate::URL))
+            });
+        assert!(start, "Firefox opens the article");
     }
 }

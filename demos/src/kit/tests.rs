@@ -137,6 +137,44 @@ fn guest_names_are_neutral() {
     }
 }
 
+#[test]
+fn guest_files_packages_and_commands_hold_no_forbidden_word() {
+    let neutral = Guest::ubuntu("station", "analyst")
+        .packages(&["curl"])
+        .file("/opt/start.sh", 0o755, "echo ready\n")
+        .run("bash /opt/start.sh");
+    neutral.validate().unwrap();
+    for (guest, kind) in [
+        (
+            neutral.clone().file("/opt/notes", 0o644, "A World map"),
+            "file",
+        ),
+        (neutral.clone().file("/opt/eval.sh", 0o644, ""), "file path"),
+        (neutral.clone().packages(&["sandbox-tools"]), "package"),
+        (neutral.clone().run("echo Scripted"), "command"),
+        (neutral.clone().terminal("demo"), "terminal command"),
+        (neutral.clone().dmi("LENOVO", "probe"), "DMI string"),
+    ] {
+        let error = guest.validate().unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("a guest {kind} contains")),
+            "{error}"
+        );
+    }
+    let extra = neutral.clone().forbid(&["Ledger"]);
+    assert_eq!(extra.reveals("monthly-LEDGER"), Some("ledger"));
+    assert_eq!(neutral.reveals("monthly-LEDGER"), None);
+    assert_eq!(neutral.reveals("our world"), Some("world"));
+    let error = extra
+        .file("/opt/notes", 0o644, "first line\nthe ledger\n")
+        .validate()
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "station: a guest file contains the forbidden word \"ledger\": the ledger"
+    );
+}
+
 #[tokio::test]
 async fn failed_world_start_cleans_up_before_boot() {
     let downloads = util::RunDir::new(&std::env::temp_dir(), "test").unwrap();

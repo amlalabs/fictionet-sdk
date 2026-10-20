@@ -1017,9 +1017,7 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>();
             assert_eq!(names.len(), steps.len());
             for step in &steps {
-                for word in ["fictionet", "eval", "sandbox", "world", "scripted", "probe"] {
-                    assert!(!step.command.contains(word));
-                }
+                assert_eq!(guest::definition().reveals(&step.command), None);
             }
         }
     }
@@ -1052,9 +1050,11 @@ mod tests {
                 Check::Folder { path: REPLY, revision: r } if *r == revision
             )));
             for step in &steps {
-                for word in ["fictionet", "eval", "sandbox", "world", "scripted", "probe"] {
-                    assert!(!step.command.contains(word));
-                }
+                let guest = match step.who {
+                    Who::Maya => guest::definition(),
+                    Who::Colleague => guest::colleague(),
+                };
+                assert_eq!(guest.reveals(&step.command), None);
             }
         }
         assert_eq!(Mode::parse("shared"), Some(Mode::Shared));

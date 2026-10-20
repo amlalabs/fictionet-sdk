@@ -21,7 +21,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         rest.is_some_and(|s| !s.is_empty()
             && s.bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"-._~:/?#[]@!&()*+,;=%".contains(&c)))
-            && super::neutral(start_url),
+            && super::forbidden_in(start_url, &[]).is_none(),
         "invalid start URL {start_url:?}; use a neutral http:// or https:// URL with URL characters and no whitespace, quotes, backslashes, dollar signs or backticks"
     );
     let mozilla_sources = "Types: deb\n\
@@ -300,7 +300,6 @@ fn setup_script(user: &str) -> String {
 mod tests {
     use super::*;
     use crate::kit::seed;
-    use fictionet::stdlib::codec::base64;
 
     #[test]
     fn browser_seed_has_the_desktop_and_firefox_policy() {
@@ -317,17 +316,8 @@ mod tests {
             ca: None,
         });
         let content = |path: &str| {
-            let file = data.split_once(&format!("  - path: {path:?}\n")).unwrap().1;
-            let encoded = file
-                .lines()
-                .nth(2)
-                .unwrap()
-                .strip_prefix("    content: ")
-                .unwrap();
-            String::from_utf8(
-                base64::decode(encoded.as_bytes(), base64::Padding::Required).unwrap(),
-            )
-            .unwrap()
+            let file = guest.files.iter().find(|f| f.path == path).unwrap();
+            file.content.clone()
         };
         assert_eq!(
             content("/etc/apt/keyrings/packages.mozilla.org.asc"),

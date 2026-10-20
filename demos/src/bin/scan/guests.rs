@@ -19,6 +19,7 @@ pub const USER: &str = "analyst";
 
 pub fn workstation() -> Guest {
     terminal_desktop(WORKSTATION, USER)
+        .forbid(&["scan"])
         .attachment(scan_world::SCANNER)
         .resources(2, 1024)
         .card(Family::FromWorld)
@@ -27,6 +28,7 @@ pub fn workstation() -> Guest {
 
 pub fn server() -> Guest {
     Guest::ubuntu(SERVER, "sysadmin")
+        .forbid(&["scan"])
         .attachment(scan_world::SERVER)
         .resources(1, 512)
         .card(Family::Serve(scan_world::SERVER_LEASE))
@@ -124,7 +126,7 @@ fn service(user: &str) -> String {
 const RUNNER: &str = r#"#!/bin/bash
 set -uo pipefail
 cd "$HOME"
-printf 'Scripted assistant · Office inventory\n\n'
+printf 'Office inventory\n\n'
 while IFS= read -r command < notes/requests; do
     printf '%s@%s:~$ ' "$USER" "$(hostname)"
     for ((i=0; i<${#command}; i++)); do
@@ -178,38 +180,12 @@ mod tests {
     }
 
     #[test]
-    fn guests_install_their_services_and_keep_neutral_names() {
+    fn guests_install_their_services() {
         let station = workstation();
         let office = server();
         for guest in [&station, &office] {
-            seed::build(&seed::Provision {
-                guest,
-                authorized_key: "key",
-                ca: None,
-            })
-            .unwrap();
-            let text = data(guest);
-            for line in text.lines().filter(|l| !l.contains("content:")) {
-                for word in ["fictionet", "eval", "sandbox", "world", "scan", "demo"] {
-                    assert!(!line.to_lowercase().contains(word), "{line}");
-                }
-            }
-            for encoded in text
-                .lines()
-                .filter_map(|line| line.strip_prefix("    content: "))
-            {
-                let file = String::from_utf8(
-                    base64::decode(encoded.as_bytes(), base64::Padding::Required).unwrap(),
-                )
-                .unwrap();
-                for word in ["fictionet", "eval", "sandbox", "world", "scan", "demo"] {
-                    assert!(
-                        !file.to_lowercase().contains(word),
-                        "guest file contains {word}"
-                    );
-                }
-            }
-            assert!(text.contains("NOPASSWD:ALL"));
+            guest.validate().unwrap();
+            assert!(data(guest).contains("NOPASSWD:ALL"));
         }
         let text = data(&station);
         for package in ["nmap", "tigervnc-standalone-server", "openbox", "xterm"] {

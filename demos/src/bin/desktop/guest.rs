@@ -4,9 +4,8 @@ use fictionet_demo::kit::{Guest, desktop};
 
 /// Claude Code's native build, on Anthropic's stable channel. The guest
 /// fetches the zstd file as Anthropic's installer does, and checks it and
-/// the binary it unpacks to against the sha256s in the release's
-/// `manifest.zst.json` and `manifest.json`, both signed with Anthropic's
-/// release key.
+/// the binary it unpacks to against two pinned sha256s, copied from the
+/// release's `manifest.zst.json` and `manifest.json`.
 pub const CLAUDE_VERSION: &str = "2.1.292";
 const CLAUDE_ZST_SHA256: &str = "28509427a53a5c15bd94d022d39013cc4b867a8e6305497f48162dcf91576326";
 const CLAUDE_SHA256: &str = "a967e7b1d8b4e47ee421d5433027880347952b0c0857abf880e2c942a4ec93b3";
@@ -65,6 +64,7 @@ mod tests {
     #[test]
     fn desktop_setup_precedes_agent_installation() {
         let guest = workstation("workstation", "analyst", "example.test");
+        guest.validate().unwrap();
         let data = seed::user_data(&seed::Provision {
             guest: &guest,
             authorized_key: "key",

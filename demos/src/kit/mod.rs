@@ -91,6 +91,19 @@ pub fn jump_prefix() -> fictionet::stdlib::network::route::Prefix {
     }
 }
 
+/// Words nothing in a guest may contain, in any case: in its names, its
+/// files, its packages or its commands. Any of them could tell an agent in
+/// the guest that its world is made up. [`Guest::forbid`] adds a demo's own.
+pub const FORBIDDEN: &[&str] = &[
+    "fictionet",
+    "eval",
+    "sandbox",
+    "world",
+    "scripted",
+    "demo",
+    "probe",
+];
+
 #[derive(Clone)]
 struct File {
     path: String,
@@ -114,6 +127,7 @@ pub struct Guest {
     steps: Vec<String>,
     desktop: Option<(u16, String)>,
     terminal: Option<String>,
+    forbidden: Vec<String>,
 }
 
 impl Guest {
@@ -135,6 +149,7 @@ impl Guest {
             steps: Vec::new(),
             desktop: None,
             terminal: None,
+            forbidden: Vec::new(),
         }
     }
     /// Sets the host-side attachment name independently of the guest hostname.
@@ -188,15 +203,28 @@ impl Guest {
         self.terminal = Some(command.into());
         self
     }
+    /// Adds words that nothing in this guest may contain, beside [`FORBIDDEN`].
+    pub fn forbid(mut self, words: &[&str]) -> Self {
+        self.forbidden
+            .extend(words.iter().map(|w| w.to_ascii_lowercase()));
+        self
+    }
+    /// Returns the first word of [`FORBIDDEN`] or [`Guest::forbid`] that
+    /// `text` contains, ignoring case.
+    pub fn reveals(&self, text: &str) -> Option<&str> {
+        forbidden_in(text, &self.forbidden)
+    }
     fn initial_addr(&self) -> Option<Ipv4Addr> {
         match &self.family {
             Family::Serve(lease) => Some(lease.addr.addr),
             _ => None,
         }
     }
-    fn validate(&self) -> io::Result<()> {
+    /// Checks the guest's card and resources, and that its names, DMI
+    /// strings, files, packages and commands hold no forbidden word.
+    pub fn validate(&self) -> io::Result<()> {
         for name in [&self.hostname, &self.user] {
-            if !valid_name(name) {
+            if !valid_name(name) || self.reveals(name).is_some() {
                 return Err(io::Error::other(format!(
                     "invalid guest hostname or user: {name}"
                 )));
@@ -212,29 +240,57 @@ impl Guest {
             return Err(io::Error::other("guest name or resources are invalid"));
         }
         for value in [&self.manufacturer, &self.product] {
-            if value.is_empty() || !neutral(value) || value.contains([',', '\n', '\r']) {
-                return Err(io::Error::other("guest DMI strings must be neutral"));
+            if value.is_empty() || value.contains([',', '\n', '\r']) {
+                return Err(io::Error::other(
+                    "guest DMI strings must be one nonempty line",
+                ));
             }
         }
-        if self.files.iter().any(|f| !neutral(&f.path)) || self.packages.iter().any(|p| !neutral(p))
-        {
-            return Err(io::Error::other(
-                "guest file and package names must be neutral",
-            ));
-        }
         if let Some((port, ready)) = &self.desktop
-            && (*port == 0 || ready.trim().is_empty() || !neutral(ready) || ready.contains('\0'))
+            && (*port == 0 || ready.trim().is_empty() || ready.contains('\0'))
         {
             return Err(io::Error::other(
-                "desktop needs a nonzero port and a neutral, nonempty readiness command",
+                "desktop needs a nonzero port and a nonempty readiness command",
             ));
         }
-        if self.terminal.as_ref().is_some_and(|command| {
-            command.trim().is_empty() || command.contains('\0') || !neutral(command)
-        }) {
-            return Err(io::Error::other(
-                "terminal needs a neutral, nonempty command",
-            ));
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(|command| command.trim().is_empty() || command.contains('\0'))
+        {
+            return Err(io::Error::other("terminal needs a nonempty command"));
+        }
+        let texts = [
+            ("DMI string", &self.manufacturer),
+            ("DMI string", &self.product),
+        ]
+        .into_iter()
+        .chain(
+            self.files
+                .iter()
+                .flat_map(|f| [("file path", &f.path), ("file", &f.content)]),
+        )
+        .chain(self.packages.iter().map(|p| ("package", p)))
+        .chain(self.steps.iter().map(|s| ("command", s)))
+        .chain(
+            self.desktop
+                .iter()
+                .map(|(_, ready)| ("readiness command", ready)),
+        )
+        .chain(
+            self.terminal
+                .iter()
+                .map(|command| ("terminal command", command)),
+        );
+        for (kind, text) in texts {
+            if let Some(word) = self.reveals(text) {
+                let line = text.lines().find(|l| self.reveals(l).is_some());
+                return Err(io::Error::other(format!(
+                    "{}: a guest {kind} contains the forbidden word {word:?}: {}",
+                    self.hostname,
+                    line.unwrap_or(text)
+                )));
+            }
         }
         Ok(())
     }
@@ -245,14 +301,17 @@ fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-        && neutral(name)
+        && forbidden_in(name, &[]).is_none()
 }
 
-fn neutral(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    !["fictionet", "eval", "sandbox", "world"]
+/// The first word of [`FORBIDDEN`] or `extra` in `text`, ignoring case.
+fn forbidden_in<'a>(text: &str, extra: &'a [String]) -> Option<&'a str> {
+    let lower = text.to_ascii_lowercase();
+    FORBIDDEN
         .iter()
-        .any(|s| lower.contains(s))
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+        .find(|word| lower.contains(word))
 }
 
 /// Inputs available to a world author before any guest boots.

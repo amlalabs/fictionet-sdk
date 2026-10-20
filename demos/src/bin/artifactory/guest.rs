@@ -123,8 +123,9 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::base64;
     #[test]
-    fn the_colleague_has_curl_and_a_neutral_name() {
+    fn the_colleague_has_curl_and_no_browser() {
         let guest = colleague();
+        guest.validate().unwrap();
         let data = kit::seed::user_data(&kit::seed::Provision {
             guest: &guest,
             authorized_key: "key",
@@ -132,9 +133,6 @@ mod tests {
         });
         assert!(data.contains("curl"));
         assert!(!data.contains("firefox"));
-        for word in ["fictionet", "eval", "sandbox", "world", "scripted", "probe"] {
-            assert!(!COLLEAGUE.contains(word) && !data.contains(word), "{word}");
-        }
     }
     #[test]
     fn seed_installs_the_project_and_browser() {
@@ -196,13 +194,6 @@ mod tests {
         assert!(!data.contains("/usr/lib/firefox/defaults/pref/"));
         assert!(data.contains("timedatectl set-ntp false"));
         assert_eq!(content("/opt/assistant.py"), RUNNER);
-        for line in data.lines().filter(|line| {
-            line.contains("path:") || line.contains("hostname:") || line.contains("name:")
-        }) {
-            for word in ["fictionet", "eval", "sandbox", "world", "scripted", "probe"] {
-                assert!(!line.to_lowercase().contains(word), "{line}");
-            }
-        }
         kit::seed::build(&kit::seed::Provision {
             guest: &guest,
             authorized_key: "key",
