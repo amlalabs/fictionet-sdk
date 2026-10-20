@@ -57,16 +57,16 @@ where
     ended_with_done(result).unwrap_or_else(|e| panic!("the world failed: {e}"));
 }
 
-/// Runs a lab fixture with explicitly installed event evidence.
+/// Runs a lab fixture with an event log installed.
 pub fn observed_world<F, Fut>(limit: Duration, f: F)
 where
     F: FnOnce(Cx, std::sync::Arc<fictionet_observe::Memory>) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    let evidence = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
     seeded_world(
-        RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
+        RunOptions::new(fictionet::Seed::from_u64(1)).observer(log.clone()),
         limit,
-        move |cx| f(cx, evidence),
+        move |cx| f(cx, log),
     );
 }

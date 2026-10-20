@@ -11,7 +11,7 @@ use fictionet::{Cancelled, JoinError, RaceError, RunMode, RunOptions, Seed, Time
 fn idle_drains_spawned_and_woken_work_before_advancing_time() {
     block_on(crate::common::observed_lab(
         Seed::from_u64(1),
-        |cx, evidence| async move {
+        |cx, log| async move {
             let task = cx.spawn(|cx| async move {
                 for _ in 0..100 {
                     cx.yield_now().await?;
@@ -26,14 +26,14 @@ fn idle_drains_spawned_and_woken_work_before_advancing_time() {
             });
             cx.idle().await?;
             assert_eq!(cx.now(), Instant::ZERO);
-            assert_eq!(evidence.checked_of("test", "ready").unwrap().len(), 1);
-            assert!(evidence.checked_of("test", "later").unwrap().is_empty());
+            assert_eq!(log.checked_of("test", "ready").unwrap().len(), 1);
+            assert!(log.checked_of("test", "later").unwrap().is_empty());
             task.join(&cx).await?;
             cx.idle().await?;
             assert_eq!(cx.now(), Instant::ZERO);
             cx.sleep(ms(1)).await?;
             cx.idle().await?;
-            assert_eq!(evidence.checked_of("test", "later").unwrap().len(), 1);
+            assert_eq!(log.checked_of("test", "later").unwrap().len(), 1);
             assert_eq!(cx.now(), Instant::ZERO + ms(1));
             cx.cancel();
             assert_eq!(cx.idle().await, Err(Cancelled));
@@ -65,7 +65,7 @@ fn event_wait_wakes_at_each_raw_fact() {
     for _ in 0..3 {
         block_on(crate::common::observed_lab(
             Seed::from_u64(1),
-            |cx, evidence| async move {
+            |cx, log| async move {
                 cx.spawn(|cx| async move {
                     cx.sleep(Duration::from_nanos(7)).await?;
                     cx.emit("test", "ready", |event| event);
@@ -74,7 +74,6 @@ fn event_wait_wakes_at_each_raw_fact() {
                     cx.emit("test", "repeat", |event| event);
                     Ok(())
                 });
-                let log = evidence;
                 let got = log
                     .wait(&cx, 0, 1, ms(1), |e| e.is("test", "ready"))
                     .await?;
@@ -107,11 +106,11 @@ fn event_wait_stops_at_its_exact_limit() {
     for limit in [Duration::ZERO, Duration::from_nanos(1), ms(1), ms(15)] {
         block_on(crate::common::observed_lab(
             Seed::from_u64(1),
-            |fcx, evidence| async move {
+            |fcx, log| async move {
                 fcx.sleep(ms(3)).await?;
                 fcx.emit("test", "tick", |event| event);
                 let start = fcx.now();
-                let got = evidence
+                let got = log
                     .wait(&fcx, 0, 2, limit, |event| event.is("test", "tick"))
                     .await?;
                 assert_eq!(got.len(), 1);
@@ -127,14 +126,14 @@ fn event_wait_stops_at_its_exact_limit() {
 fn event_wait_accepts_an_overflowing_limit() {
     block_on(crate::common::observed_lab(
         Seed::from_u64(1),
-        |fcx, evidence| async move {
+        |fcx, log| async move {
             fcx.sleep(ms(1)).await?;
             fcx.spawn(|fcx| async move {
                 fcx.sleep(ms(1)).await?;
                 fcx.emit("test", "tick", |event| event);
                 Ok(())
             });
-            let got = evidence
+            let got = log
                 .wait(&fcx, 0, 1, Duration::MAX, |event| event.is("test", "tick"))
                 .await?;
             assert_eq!(got.len(), 1);
@@ -149,8 +148,7 @@ fn event_wait_accepts_an_overflowing_limit() {
 fn event_wait_cancellation_wins_at_the_deadline() {
     block_on(crate::common::observed_lab(
         Seed::from_u64(1),
-        |fcx, evidence| async move {
-            let log = evidence;
+        |fcx, log| async move {
             let mut wait = pin!(log.wait(&fcx, 0, 1, ms(1), |e| e.is("test", "tick")));
             poll_fn(|cx| {
                 assert!(wait.as_mut().poll(cx).is_pending());
@@ -524,8 +522,8 @@ fn real_io_is_refused_before_opening_resources() {
 }
 
 fn recorded_world() -> Vec<u8> {
-    let evidence = Arc::new(fictionet_observe::Memory::default());
-    let out = evidence.clone();
+    let log = Arc::new(fictionet_observe::Memory::default());
+    let out = log.clone();
     block_on(lab(
         RunOptions::new(Seed::from_u64(7)).observer(out.clone()),
         move |cx| async move {
@@ -546,7 +544,7 @@ fn recorded_world() -> Vec<u8> {
         },
     ))
     .unwrap();
-    crate::common::evidence_bytes(&evidence)
+    crate::common::log_bytes(&log)
 }
 
 #[test]
@@ -574,8 +572,8 @@ fn seeded_service_faults_repeat_at_the_same_points() {
     }
 
     let episode = |seed| {
-        let evidence = Arc::new(fictionet_observe::Memory::default());
-        let output = evidence.clone();
+        let log = Arc::new(fictionet_observe::Memory::default());
+        let output = log.clone();
         let points = Arc::new(Mutex::new(Vec::new()));
         let replies = points.clone();
         block_on(lab(
@@ -623,7 +621,7 @@ fn seeded_service_faults_repeat_at_the_same_points() {
             },
         ))
         .unwrap();
-        let events = crate::common::evidence_bytes(&evidence);
+        let events = crate::common::log_bytes(&log);
         let points = points.lock().unwrap().clone();
         (events, points)
     };

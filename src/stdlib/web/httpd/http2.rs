@@ -1444,9 +1444,9 @@ mod tests {
 
     #[test]
     fn http2_body_timeout_uses_the_fictionet_deadline() {
-        let evidence = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
+        let log = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(log.clone()),
             |fcx| async move {
                 let mut input = PREFACE.to_vec();
                 input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
@@ -1475,7 +1475,6 @@ mod tests {
                     Arc::new(handler),
                     &opts
                 ));
-                let log = evidence;
                 let wait = async {
                     loop {
                         if let Some(event) = log.of("http", "request").pop() {

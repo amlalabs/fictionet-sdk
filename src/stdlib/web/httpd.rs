@@ -146,8 +146,8 @@
 //! Neither backend relaxes its limits to observe more bytes. Requests rejected
 //! before a parsed head reaches the service have no request event. Bytes after
 //! an upgrade handoff are outside HTTP observation. A missing handler label
-//! is not evidence of no exposure; consumers need complete receipt or an
-//! observer verdict to judge safety.
+//! does not show that nothing was exposed; consumers need complete receipt or
+//! an observer verdict to judge safety.
 //! If hyper's body read reports region cancellation, `received` is `cut_off`;
 //! its response still uses `answer: timeout` and status `408`. Consumers must
 //! use `received` to distinguish this from a body deadline.

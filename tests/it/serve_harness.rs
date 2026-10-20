@@ -9,8 +9,8 @@ use fictionet::stdlib::services::serve::{Ended, Flow, Harness, HarnessError};
 
 #[test]
 fn the_harness_runs_a_service_with_no_runtime() {
-    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(evidence_h.clone());
+    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(log.clone());
     assert_eq!(h.open().unwrap(), b"hello\n");
     assert_eq!(h.push(b"one\ntw").unwrap(), b"one\n");
     assert_eq!(h.push(b"o\n").unwrap(), b"two\n");
@@ -21,7 +21,7 @@ fn the_harness_runs_a_service_with_no_runtime() {
     assert!(h.closed());
     assert_eq!(h.end_reason(), Some(Ended::Closed));
     assert!(matches!(h.push(b"more\n"), Err(HarnessError::Closed)));
-    let lines: Vec<String> = evidence_h
+    let lines: Vec<String> = log
         .checked_all()
         .unwrap()
         .into_iter()
@@ -102,9 +102,8 @@ fn resuming_an_upgrade_keeps_the_observer_and_sequence() {
             Ok(if line == b"tls" { Flow::Upgrade(Upgrade::Tls) } else { Flow::Continue })
         }
     }
-    let evidence = Arc::new(Memory::default());
-    let mut harness =
-        Harness::new(fictionet::Seed::from_u64(1), Switch, ()).observer(evidence.clone());
+    let log = Arc::new(Memory::default());
+    let mut harness = Harness::new(fictionet::Seed::from_u64(1), Switch, ()).observer(log.clone());
     assert!(matches!(
         harness.push(b"tls\n"),
         Err(HarnessError::Upgraded(Upgrade::Tls))
@@ -116,7 +115,7 @@ fn resuming_an_upgrade_keeps_the_observer_and_sequence() {
         })
         .unwrap();
     harness.push(b"hello\n").unwrap();
-    let events = evidence.checked_of("test", "line").unwrap();
+    let events = log.checked_of("test", "line").unwrap();
     assert_eq!(
         events
             .iter()

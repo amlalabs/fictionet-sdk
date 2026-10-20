@@ -74,8 +74,8 @@ check_fails_with() {
 _capture_stderr() { "$@" 2>"$_assert_stderr_file"; }
 
 # NAME, PATTERN, CMD...: require a failed connection and its reason on stderr.
-# A NetworkPolicy may drop SYNs. A timeout is evidence only before connecting;
-# a stalled response (even with no bytes received) is not isolation evidence.
+# A NetworkPolicy may drop SYNs. A timeout counts only before connecting;
+# a stalled response (even with no bytes received) does not show isolation.
 check_connect_fails() {
     _assert_name=$1 _assert_want=$2
     shift 2

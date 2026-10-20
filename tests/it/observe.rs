@@ -87,7 +87,7 @@ async fn fetch<C: Connection>(
 fn one_run(observe: bool) -> Vec<Vec<u8>> {
     let out = Arc::new(fictionet::sync::Mutex::new(None));
     let o = out.clone();
-    let evidence = Arc::new(fictionet_observe::Memory::default());
+    let log = Arc::new(fictionet_observe::Memory::default());
     let collector = Arc::new(fictionet_observe::Collector::new(
         fictionet_observe::Options {
             keys: if observe {
@@ -100,7 +100,7 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
     ));
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(Arc::new(
-            fictionet::events::Fanout::new(vec![evidence.clone(), collector.clone()]),
+            fictionet::events::Fanout::new(vec![log.clone(), collector.clone()]),
         )),
         move |fcx| async move {
             let (server_cfg, client_cfg) = configs(&fcx);
@@ -137,7 +137,7 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
             fcx.sleep(ms(200)).await?;
             fcx.emit("test", "after_tls", |event| event);
             assert_eq!(!collector.keys().is_empty(), observe);
-            let events = evidence.checked_all().unwrap();
+            let events = log.checked_all().unwrap();
             assert_eq!(events.len(), 3);
             assert!(events[0].is("run", "start"));
             assert!(events[1].is("test", "before_tls"));

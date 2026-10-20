@@ -1080,11 +1080,11 @@ mod tests {
     }
 
     #[test]
-    fn retained_evidence_outlives_completed_and_dropped_runs() {
+    fn a_retained_log_outlives_completed_and_dropped_runs() {
         for complete in [true, false] {
-            let evidence = Arc::new(fictionet::events::recorder::Recorder::default());
+            let log = Arc::new(fictionet::events::recorder::Recorder::default());
             let shared = RunShared::with_options(
-                RunOptions::new(crate::Seed::from_u64(7)).observer(evidence.clone()),
+                RunOptions::new(crate::Seed::from_u64(7)).observer(log.clone()),
                 crate::RunMode::Lab,
             );
             let weak_run = Arc::downgrade(&shared);
@@ -1110,8 +1110,8 @@ mod tests {
             }
             assert!(weak_run.upgrade().is_none());
             assert!(weak_environment.upgrade().is_none());
-            assert_eq!(Arc::strong_count(&evidence), 1);
-            let events = evidence.all();
+            assert_eq!(Arc::strong_count(&log), 1);
+            let events = log.all();
             assert_eq!(
                 events
                     .iter()
@@ -1130,7 +1130,7 @@ mod tests {
                 assert_eq!(origin.task, 1);
                 assert_eq!(origin.name, "world");
             }
-            assert_eq!(evidence.all(), events);
+            assert_eq!(log.all(), events);
         }
     }
 }

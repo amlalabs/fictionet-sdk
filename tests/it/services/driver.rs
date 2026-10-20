@@ -91,9 +91,8 @@ fn replies_do_not_depend_on_chunk_boundaries() {
 
 #[test]
 fn listen_serves_each_connection_and_records_it() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        let kept = evidence;
         let transcript = Transcript::new(100, 1 << 16);
         let opts = ServeOptions::default().record(transcript.clone());
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, opts);
@@ -166,7 +165,7 @@ fn listen_serves_each_connection_and_records_it() {
 
 #[test]
 fn timers_tick_and_idle_connections_close() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -182,7 +181,6 @@ fn timers_tick_and_idle_connections_close() {
         assert_eq!(read_some(&fcx, &mut conn, 100).await, b"tick\ntick\ntick\n");
         assert!(fcx.now().since_start() - started.since_start() >= Duration::from_millis(90));
 
-        let kept = evidence;
         let opts = ServeOptions::default().idle(Some(Duration::from_millis(100)));
         serve::listen(&fcx, server.listen(2)?, Arc::new(()), || Echo, opts);
         let mut conn = client
@@ -286,8 +284,7 @@ fn fault_plans_change_bytes_and_items_both_ways() {
 
 #[test]
 fn a_connection_cap_resets_connections_past_it() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
-        let events = evidence;
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, events| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -433,47 +430,42 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Short, ());
     assert_eq!(h.push(&input).unwrap(), b"long\nok\n");
     assert!(!h.closed());
-    crate::common::world::observed_world(
-        Duration::from_secs(60),
-        move |fcx, evidence| async move {
-            let (server, _su, client, _cu) = two_machines(&fcx);
-            let kept = evidence;
-            serve::listen(
-                &fcx,
-                server.listen(7)?,
-                Arc::new(()),
-                || Short,
-                ServeOptions::default(),
-            );
-            let mut conn = client
-                .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
-                .await?;
-            conn.write_all(&fcx, &input).await?;
-            assert_eq!(read_some(&fcx, &mut conn, 8).await, b"long\nok\n");
-            assert!(
-                kept.checked_of("conn", "close").unwrap().is_empty(),
-                "{:?}",
-                kept.checked_of("conn", "close").unwrap()
-            );
-            Ok(())
-        },
-    );
+    crate::common::world::observed_world(Duration::from_secs(60), move |fcx, kept| async move {
+        let (server, _su, client, _cu) = two_machines(&fcx);
+        serve::listen(
+            &fcx,
+            server.listen(7)?,
+            Arc::new(()),
+            || Short,
+            ServeOptions::default(),
+        );
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
+            .await?;
+        conn.write_all(&fcx, &input).await?;
+        assert_eq!(read_some(&fcx, &mut conn, 8).await, b"long\nok\n");
+        assert!(
+            kept.checked_of("conn", "close").unwrap().is_empty(),
+            "{:?}",
+            kept.checked_of("conn", "close").unwrap()
+        );
+        Ok(())
+    });
 }
 
 /// The harness runs deferred work and reports an upgrade, as the driver
 /// does. Before, it dropped the work and took an upgrade for a close.
 #[test]
 fn the_harness_runs_deferred_work_and_reports_upgrades() {
-    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(evidence_h.clone());
+    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(log.clone());
     let got = h.push(b"one\nlater\ntwo\n");
     assert_eq!(
         got.as_deref().map(String::from_utf8_lossy).unwrap(),
         "hello\none\nlater\ntwo\n"
     );
     assert!(
-        evidence_h
-            .checked_all()
+        log.checked_all()
             .unwrap()
             .iter()
             .any(|e| e.is("echo", "later"))
@@ -955,29 +947,25 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
 
     let addr = Ipv4Addr::new(10, 40, 0, 9);
     let to = SocketAddr::new(addr.into(), 7);
-    crate::common::world::observed_world(
-        Duration::from_secs(60),
-        move |fcx, evidence| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            let kept = evidence;
-            Net::new()
-                .ipv4_only()
-                .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
-                .start(&fcx, attachments)?;
-            let s = machine(&fcx, attacher.attach("agent")?, ME);
-            let mut b = s.tcp.connect(&fcx, to).await?;
-            b.write_all(&fcx, b"hi\nfail\n").await?;
-            assert_eq!(read_some(&fcx, &mut b, 10).await, b"fine\n");
-            let error = kept
-                .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                    e.is("conn", "error")
-                })
-                .await?;
-            assert_eq!(error[0].str("error"), Some("the service gave up"));
-            assert_eq!(error[0].conn.id, Some(1));
-            Ok(())
-        },
-    );
+    crate::common::world::observed_world(Duration::from_secs(60), move |fcx, kept| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .ipv4_only()
+            .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
+            .start(&fcx, attachments)?;
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
+        let mut b = s.tcp.connect(&fcx, to).await?;
+        b.write_all(&fcx, b"hi\nfail\n").await?;
+        assert_eq!(read_some(&fcx, &mut b, 10).await, b"fine\n");
+        let error = kept
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("conn", "error")
+            })
+            .await?;
+        assert_eq!(error[0].str("error"), Some("the service gave up"));
+        assert_eq!(error[0].conn.id, Some(1));
+        Ok(())
+    });
 
     let ran = std::thread::spawn(move || {
         block_on(lab(

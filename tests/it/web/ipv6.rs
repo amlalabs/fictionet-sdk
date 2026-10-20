@@ -872,10 +872,10 @@ where
     F: FnOnce(Cx, Attacher, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    run_world::observed_world(Duration::from_secs(60), move |fcx, evidence| async move {
+    run_world::observed_world(Duration::from_secs(60), move |fcx, events| async move {
         let (attacher, attachments) = fictionet::attachments();
         make().start(&fcx, attachments)?;
-        let log = Log::new(evidence);
+        let log = Log::new(events);
         f(fcx, attacher, log).await?;
         Ok(())
     });

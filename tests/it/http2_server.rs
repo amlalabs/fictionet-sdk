@@ -233,9 +233,8 @@ fn replay() -> Trace {
     let trace: Arc<Mutex<Trace>> = Arc::default();
     let packets = trace.clone();
     let log = Arc::new(fictionet_observe::Memory::default());
-    let writer = log.clone();
-    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(71)).observer(writer.clone()), move |cx| async move {
-        let evidence = writer;
+    let recorded = log.clone();
+    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(71)).observer(recorded.clone()), move |cx| async move {
         let cert = rustls::pki_types::CertificateDer::from(include_bytes!("fixtures/tls/ed25519.cert.der").to_vec());
         let key = rustls::pki_types::PrivateKeyDer::try_from(include_bytes!("fixtures/tls/ed25519.key.der").to_vec()).unwrap();
         let mut roots = rustls::RootCertStore::empty();
@@ -279,7 +278,7 @@ fn replay() -> Trace {
                 break;
             }
         }
-        let events = evidence.checked_of("http", "request").unwrap();
+        let events = recorded.checked_of("http", "request").unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| e.str("version") == Some("HTTP/2.0")));
         cx.emit("test", "complete", |event| event.fields(Fields::new().with("requests", events.len() as u64)));
@@ -287,7 +286,7 @@ fn replay() -> Trace {
         Ok(())
     })).unwrap();
     let mut trace = std::mem::take(&mut *trace.lock().unwrap());
-    trace.events = crate::common::evidence_bytes(&log);
+    trace.events = crate::common::log_bytes(&log);
     trace
 }
 
@@ -393,8 +392,8 @@ window.addEventListener('load', () => {
                             let body = format!("/*{}*/completed++;", "x".repeat(1 << 20));
                             http::Response::builder().header("content-type", "application/javascript").body(Bytes::from(body)).unwrap()
                         })
-                        .route_async(Some(http::Method::GET), "/gate", move |cx, _| { let evidence = observed.clone(); async move {
-                            evidence.wait(&cx, 0, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();
+                        .route_async(Some(http::Method::GET), "/gate", move |cx, _| { let log = observed.clone(); async move {
+                            log.wait(&cx, 0, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();
                             http::Response::builder().header("content-type", "application/javascript").body(Bytes::new()).unwrap()
                         }});
                     let (attach, arrivals) = fictionet::attachments();

@@ -45,20 +45,20 @@ where
 
 fn world_events_with_memory<F, Fut>(
     options: impl FnOnce(Arc<Memory>) -> RunOptions,
-    evidence: Arc<Memory>,
+    events: Arc<Memory>,
     f: F,
 ) where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     run_world::seeded_world(
-        options(evidence.clone()),
+        options(events.clone()),
         Duration::from_secs(60),
         move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let t = sites(&fcx);
             let env = t.serve_with(&fcx, attachments)?;
-            let log = Log::new(evidence);
+            let log = Log::new(events);
             f(fcx, attacher, env, log).await?;
             Ok(())
         },
@@ -1190,7 +1190,7 @@ fn events_for_bytes_that_are_not_http() {
 /// A client that connects and sends nothing reaches the configured timeout.
 #[test]
 fn events_for_clients_that_send_nothing() {
-    run_world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
+    run_world::observed_world(Duration::from_secs(60), |fcx, events| async move {
         let (attacher, attachments) = fictionet::attachments();
         sites(&fcx)
             .sites
@@ -1201,7 +1201,7 @@ fn events_for_clients_that_send_nothing() {
                 ..Default::default()
             })
             .start(&fcx, attachments)?;
-        let log = Log::new(evidence);
+        let log = Log::new(events);
         let m = default_machine(&fcx, &attacher);
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let started = fcx.now();
@@ -1492,7 +1492,7 @@ fn events_for_blocked_packets() {
     });
 }
 
-/// A scan cannot evict grading evidence under the production observer limits.
+/// A scan cannot evict the events a grader reads under the production observer limits.
 #[test]
 fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     const SCAN: u16 = 55_000;
@@ -1591,7 +1591,7 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!(text.lines().count(), all.len());
-    assert_eq!(text.as_bytes(), crate::common::evidence_bytes(&events));
+    assert_eq!(text.as_bytes(), crate::common::log_bytes(&events));
     assert!(
         text.lines()
             .any(|l| l.contains(r#""source":"http","kind":"request""#))

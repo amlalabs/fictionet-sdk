@@ -26,7 +26,7 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
     let saved = kept.clone();
     block_on(crate::common::observed_lab(
         fictionet::Seed::from_u64(1),
-        |fcx, evidence| async move {
+        |fcx, log| async move {
             let conn = ConnInfo::new(9, "10.0.0.1:53".parse()?, "10.0.0.2:4000".parse()?);
             let udp = |port: u16, len| {
                 let mut payload = vec![0; len];
@@ -69,8 +69,8 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
                     |event| event.conn(&conn).field("owner", "edge"),
                 );
             }
-            assert_eq!(evidence.checked_of("test", "drop").unwrap().len(), 6);
-            *saved.lock().unwrap() = Some(evidence);
+            assert_eq!(log.checked_of("test", "drop").unwrap().len(), 6);
+            *saved.lock().unwrap() = Some(log);
             Ok(())
         },
     ))
@@ -1692,7 +1692,7 @@ fn every_task_stops_when_its_region_is_cancelled() {
 fn lan_drop_identity_comes_from_ingress_registration() {
     block_on(crate::common::observed_lab(
         fictionet::Seed::from_u64(1),
-        |fcx, evidence| async move {
+        |fcx, log| async move {
             let lan = lan(&fcx, "10.0.0.0/24".parse()?, |event| {
                 event.field("lan", "test")
             });
@@ -1712,7 +1712,7 @@ fn lan_drop_identity_comes_from_ingress_registration() {
                 &[],
             ));
             peer.send(Packet(vec![1, 2, 3]));
-            let events = evidence.clone();
+            let events = log.clone();
             let drops = events
                 .wait(&fcx, 0, 2, Duration::from_secs(10), |e| e.is("lan", "drop"))
                 .await?;
@@ -1729,7 +1729,7 @@ fn lan_drop_identity_comes_from_ingress_registration() {
             let (member, mut peer) = pair();
             lan.add("10.0.0.2".parse()?, member, None)?;
             peer.send(Packet(vec![1, 2, 3]));
-            let drops = evidence
+            let drops = log
                 .wait(&fcx, 0, 3, Duration::from_secs(10), |e| e.is("lan", "drop"))
                 .await?;
             assert_eq!(drops.len(), 3);
