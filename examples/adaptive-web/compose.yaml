@@ -30,7 +30,7 @@ services:
     # The world is trusted. NET_ADMIN lets it raise its socket buffers to
     # attach past the system limit, so a burst of packets is not lost.
     cap_add: [NET_ADMIN]
-    command: ["adaptive-web-world", "--seed", "${SAMPLE_METADATA_SEED:-halvard-cve}", "--generator", "stub"]
+    command: ["adaptive-web-world", '{"seed":"${SAMPLE_METADATA_SEED:-halvard-cve}","generator":"stub"}' ]
     environment:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}

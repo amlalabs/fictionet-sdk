@@ -1,13 +1,13 @@
 //! The Artifactory world process.
 //!
 //! ```text
-//! artifactory-world [--socket /run/relay/relay.sock] [--ca-dir /run/ca]
+//! artifactory-world JSON [--socket /run/relay/relay.sock] [--ca-dir /run/ca]
 //!     [--state-dir /var/lib/fictionet] [--ready /run/fictionet/ready]
 //!     [--observation <path>]
 //! ```
 //!
-//! Select packages with `--variant` and `--seed`. `--private-seed` accepts
-//! 64 hex digits for replay; omitting it draws a fresh private key.
+//! The first argument is JSON with `variant`, optional `seed`, and optional
+//! `private_seed` (64 hex digits for replay).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use artifactory_world::packages::{Variant, private_seed};
 use artifactory_world::repository::Contents;
 use artifactory_world::repository::Sessions;
 use artifactory_world::{Identity, Result};
-use example_common::args::{Args, unknown};
+use example_common::args::{Args, configuration, unknown};
 use example_common::names::{name, parse};
 
 fn main() {
@@ -34,42 +34,35 @@ fn parent(path: &Path) -> Result {
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configuration {
+    variant: String,
+    #[serde(default)]
+    seed: String,
+    private_seed: Option<String>,
+}
+
 fn serve() -> Result {
-    let mut variant = None;
-    let mut seed = String::new();
-    let mut private = None;
+    let mut argv = std::env::args().skip(1);
+    let config: Configuration = configuration(&mut argv).map_err(fictionet::Error::msg)?;
     let args = Args {
         socket: "/run/relay/relay.sock".into(),
         ca_dir: "/run/ca".into(),
         ..Args::default()
     }
-    .read(std::env::args().skip(1), |flag, value| match flag {
-        "--variant" => {
-            variant = Some(
-                parse::<Variant>(&value)
-                    .ok_or("--variant must be normal, missing, lookalike or peer")?,
-            );
-            Ok(())
-        }
-        "--seed" => {
-            seed = value;
-            Ok(())
-        }
-        "--private-seed" => {
-            private = Some(value);
-            Ok(())
-        }
-        _ => unknown(flag, value),
-    })
+    .read(argv, unknown)
     .map_err(fictionet::Error::msg)?;
     match std::fs::remove_file(&args.ready) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let variant = variant.ok_or_else(|| fictionet::Error::msg("--variant is required"))?;
-    let private = private_seed(private.as_deref())?;
-    let contents = Arc::new(Contents::new(variant, &seed, &private)?);
+    let variant = parse::<Variant>(&config.variant).ok_or_else(|| {
+        fictionet::Error::msg("variant must be normal, missing, lookalike or peer")
+    })?;
+    let private = private_seed(config.private_seed.as_deref())?;
+    let contents = Arc::new(Contents::new(variant, &config.seed, &private)?);
     std::fs::create_dir_all(&args.state_dir)?;
     std::fs::write(
         args.state_dir.join("state.json"),

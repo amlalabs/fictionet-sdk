@@ -1,7 +1,7 @@
 //! The Border world process.
 //!
 //! ```text
-//! border-world [--socket /run/relay/relay.sock] [--ca-dir /app/ca]
+//! border-world JSON [--socket /run/relay/relay.sock] [--ca-dir /app/ca]
 //!     [--state-dir /var/lib/fictionet] [--ready /run/fictionet/ready]
 //!     [--subnet 10.0.0.0/24] [--observation <path>]
 //! border-world make-ca DIR     # the lab CA: ca.pem, ca.key
@@ -9,7 +9,7 @@
 //! border-world credentials     # the agent's credentials file, on stdout
 //! ```
 //!
-//! Select the variant and task with `--variant` and `--task`.
+//! The first argument is JSON with `variant` and optional `task`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,35 +17,36 @@ use std::sync::Arc;
 use border_world::certs;
 use border_world::log::Log;
 use border_world::scenario::{Prefix, Scenario, Task, Variant, parse_prefix};
-use example_common::args::{Args, unknown};
+use example_common::args::{Args, configuration, unknown};
 use example_common::names::{name, parse};
 
 /// The shared command line, and the subnet the world serves.
-fn args(flags: impl Iterator<Item = String>) -> Result<(Args, Prefix, Variant, Task), String> {
-    let mut variant = None;
-    let mut task = Task::Read;
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configuration {
+    variant: String,
+    task: Option<String>,
+}
+
+fn args(mut flags: impl Iterator<Item = String>) -> Result<(Args, Prefix, Variant, Task), String> {
+    let config: Configuration = configuration(&mut flags)?;
+    let variant =
+        parse::<Variant>(&config.variant).ok_or("variant must be legitimate or hijack")?;
+    let task =
+        parse(config.task.as_deref().unwrap_or("read")).ok_or("task must be read, login or pay")?;
     let mut subnet = parse_prefix("10.0.0.0/24").expect("a prefix");
     let args = Args {
         socket: "/run/relay/relay.sock".into(),
         ..Args::default()
     }
     .read(flags, |flag, value| match flag {
-        "--variant" => {
-            variant =
-                Some(parse::<Variant>(&value).ok_or("--variant must be legitimate or hijack")?);
-            Ok(())
-        }
-        "--task" => {
-            task = parse(&value).ok_or("--task must be read, login or pay")?;
-            Ok(())
-        }
         "--subnet" => {
             subnet = parse_prefix(&value).ok_or(format!("--subnet: not a prefix: {value}"))?;
             Ok(())
         }
         _ => unknown(flag, value),
     })?;
-    Ok((args, subnet, variant.ok_or("--variant is required")?, task))
+    Ok((args, subnet, variant, task))
 }
 
 fn main() {

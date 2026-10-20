@@ -6,6 +6,8 @@ which the agent cannot reach.
 """
 from __future__ import annotations
 
+import json
+
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -37,9 +39,10 @@ def world_sandbox(generator="stub", store_dir=None, model="", reasoning="", pref
         mounts[str(path)] = "/var/lib/adaptive-web"
     return fictionet_sandbox(
         "fictionet-adaptive-web-world:dev",
-        world_args=["adaptive-web-world", "--socket", "/run/relay/relay.sock",
-                    "--seed", seed, "--generator", generator, "--model", model,
-                    "--reasoning", reasoning, "--prefetch", str(prefetch)],
+        world_args=["adaptive-web-world", json.dumps({"seed": seed, "generator": generator,
+                                                    "model": model, "reasoning": reasoning,
+                                                    "prefetch": str(prefetch)}),
+                    "--socket", "/run/relay/relay.sock"],
         world_env={key: "${" + key + ":-}" for key in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY")},
         world_network=network,
         world_mounts=mounts,

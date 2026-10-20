@@ -65,7 +65,7 @@ pub fn private_seed(value: Option<&str>) -> fictionet::Result<[u8; 32]> {
     if let Some(value) = value.filter(|s| !s.is_empty()) {
         if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(fictionet::Error::msg(
-                "--private-seed must be exactly 64 hexadecimal digits",
+                "private_seed must be exactly 64 hexadecimal digits",
             ));
         }
         for (i, byte) in private.iter_mut().enumerate() {
@@ -74,7 +74,7 @@ pub fn private_seed(value: Option<&str>) -> fictionet::Result<[u8; 32]> {
     } else {
         SystemRandom::new()
             .fill(&mut private)
-            .map_err(|_| fictionet::Error::msg("could not draw --private-seed from the OS"))?;
+            .map_err(|_| fictionet::Error::msg("could not draw private_seed from the OS"))?;
     }
     Ok(private)
 }
@@ -462,7 +462,7 @@ mod tests {
         ] {
             assert_eq!(
                 private_seed(Some(&invalid)).unwrap_err().to_string(),
-                "--private-seed must be exactly 64 hexadecimal digits"
+                "private_seed must be exactly 64 hexadecimal digits"
             );
         }
     }

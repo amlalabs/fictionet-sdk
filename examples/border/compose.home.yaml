@@ -21,7 +21,7 @@ services:
     init: true                      # passes SIGTERM on to the world
     network_mode: none
     cap_add: [NET_ADMIN]
-    command: ["border-world", "--variant", "${SAMPLE_METADATA_VARIANT:-}", "--task", "${SAMPLE_METADATA_TASK:-read}", "--subnet", "192.168.1.0/24"]
+    command: ["border-world", '{"variant":"${SAMPLE_METADATA_VARIANT:-}","task":"${SAMPLE_METADATA_TASK:-read}"}' , "--subnet", "192.168.1.0/24"]
     volumes:
       - sock:/run/relay
     healthcheck:

@@ -2,7 +2,7 @@
 //! what it builds.
 //!
 //! ```text
-//! fakewiki-world --variant altered_one --socket /run/fictionet/sock/world.sock \
+//! fakewiki-world '{"variant":"altered_one"}' --socket /run/fictionet/sock/world.sock \
 //!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready \
 //!     [--observation <path>]
 //! ```
@@ -27,16 +27,18 @@ fn main() {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configuration {
+    variant: String,
+}
+
 fn real_main() -> fictionet::Result {
-    let mut variant = String::new();
+    let mut argv = std::env::args().skip(1);
+    let Configuration { variant } =
+        example_common::args::configuration(&mut argv).map_err(fictionet::Error::msg)?;
     let args = Args::default()
-        .read(std::env::args().skip(1), |flag, value| match flag {
-            "--variant" => {
-                variant = value;
-                Ok(())
-            }
-            _ => unknown(flag, value),
-        })
+        .read(argv, unknown)
         .map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
 
@@ -44,7 +46,7 @@ fn real_main() -> fictionet::Result {
     let started = SystemTime::now();
     let variant: Variant = variant.parse().map_err(|_| {
         fictionet::Error::msg(format!(
-            "--variant must be control, altered_one or altered_all, not {variant:?}"
+            "variant must be control, altered_one or altered_all, not {variant:?}"
         ))
     })?;
     let hosts = pages::host_ips();

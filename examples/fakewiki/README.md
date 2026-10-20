@@ -314,7 +314,7 @@ Three containers:
   socket, the world's files or the world's processes.
 
 The variant comes in through Compose interpolation
-(`--variant ${SAMPLE_METADATA_VARIANT:-unset}`). The world refuses any
+(the positional JSON field `variant`). The world refuses any
 other value and exits. Before the agent starts, the eval's preflight step checks
 that the world runs the sample's variant and that the agent can fetch a page
 over trusted TLS.

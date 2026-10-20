@@ -1,8 +1,8 @@
 //! The adaptive web's world process. See the library ([`adaptive_web_world`])
 //! for what it builds.
 //!
-//! Pass `--seed NAME`, with optional `--seeds DIRECTORY`, `--generator`,
-//! `--model`, `--reasoning`, `--prefetch COUNT`, and `--store DIRECTORY`.
+//! The first argument is JSON with `seed` and optional `seeds`, `generator`,
+//! `model`, `reasoning`, `prefetch`, and `store`.
 //! Only provider API keys come from the environment.
 
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use adaptive_web_world::pages::model::{self, Https, Key, Model};
 use adaptive_web_world::pages::store::Store;
 use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed};
 use adaptive_web_world::{Addresses, Ca, GATEWAY, serve, world_start};
-use example_common::args::{Args, secs, unknown};
+use example_common::args::{Args, configuration, secs, unknown};
 use example_common::log::Log;
 use example_common::names;
 use serde_json::json;
@@ -25,42 +25,51 @@ fn main() {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configuration {
+    seed: String,
+    #[serde(default)]
+    generator: String,
+    seeds: Option<String>,
+    store: Option<String>,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    prefetch: String,
+}
+
 fn real_main() -> fictionet::Result {
-    let mut name = String::new();
-    let mut generator = String::new();
-    let mut seeds = String::from("/app/seeds");
-    let mut stores = String::from("/var/lib/adaptive-web");
-    let mut model = String::new();
-    let mut reasoning = String::new();
-    let mut prefetch = String::new();
+    let mut argv = std::env::args().skip(1);
+    let Configuration {
+        seed: name,
+        generator,
+        seeds,
+        store,
+        model,
+        reasoning,
+        prefetch,
+    } = configuration(&mut argv).map_err(fictionet::Error::msg)?;
+    let seeds = seeds.unwrap_or_else(|| "/app/seeds".into());
+    let stores = store.unwrap_or_else(|| "/var/lib/adaptive-web".into());
     let args = Args::default()
-        .read(std::env::args().skip(1), |flag, value| {
-            match flag {
-                "--seed" => name = value,
-                "--generator" => generator = value,
-                "--seeds" => seeds = value,
-                "--store" => stores = value,
-                "--model" => model = value,
-                "--reasoning" => reasoning = value,
-                "--prefetch" => prefetch = value,
-                _ => return unknown(flag, value),
-            }
-            Ok(())
-        })
+        .read(argv, unknown)
         .map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
     let started = SystemTime::now();
 
     // 1. The seed and the generator, checked before anything is written.
     if name.is_empty() {
-        return Err(fictionet::Error::msg("--seed is required"));
+        return Err(fictionet::Error::msg("seed is required"));
     }
     let kind = match generator.as_str() {
         "" => GeneratorKind::default(),
         text => names::parse(text).ok_or_else(|| {
             let kinds: Vec<_> = GeneratorKind::ALL.iter().map(names::name).collect();
             fictionet::Error::msg(format!(
-                "--generator must be one of {}, not {text:?}",
+                "generator must be one of {}, not {text:?}",
                 kinds.join(", ")
             ))
         })?,
@@ -97,7 +106,7 @@ fn real_main() -> fictionet::Result {
         (_, "") => 0,
         (_, n) => n
             .parse()
-            .map_err(|e| fictionet::Error::msg(format!("--prefetch must be a count: {e}")))?,
+            .map_err(|e| fictionet::Error::msg(format!("prefetch must be a count: {e}")))?,
     };
 
     // 2. The store, and the addresses it remembers.

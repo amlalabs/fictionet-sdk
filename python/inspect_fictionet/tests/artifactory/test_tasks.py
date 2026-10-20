@@ -1,5 +1,6 @@
 """Task construction and private-world reads work without starting Docker."""
 
+import json
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -46,8 +47,8 @@ def test_sandbox_options_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured == {
         "world": "w", "agent_image": "a", "attach_image": "t", "backend": "k8s",
         "world_ca": "/run/ca/ca.pem",
-        "world_args": ["artifactory-world", "--variant", "${SAMPLE_METADATA_VARIANT:-}",
-                       "--seed", "${SAMPLE_METADATA_SEED:-}"],
+        "world_args": ["artifactory-world", json.dumps({"variant": "${SAMPLE_METADATA_VARIANT:-}",
+                                                      "seed": "${SAMPLE_METADATA_SEED:-}"})],
     }
     captured.clear()
     assert tasks.world_sandbox("w", "a", "t", "docker") == "sandbox"

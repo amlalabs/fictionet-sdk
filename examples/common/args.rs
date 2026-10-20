@@ -63,9 +63,45 @@ pub fn args() -> Result<Args, String> {
     Args::default().read(std::env::args().skip(1), unknown)
 }
 
+/// Reads one positional JSON configuration before the shared path arguments.
+pub fn configuration<T: serde::de::DeserializeOwned>(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<T, String> {
+    let value = args.next().ok_or("a JSON configuration is required")?;
+    serde_json::from_str(&value).map_err(|error| format!("configuration: {error}"))
+}
+
 /// Seconds since the epoch.
 pub fn secs(t: SystemTime) -> f64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_keeps_path_arguments_separate() {
+        let mut argv = [
+            r#"{"variant":"normal","seed":"a value with spaces"}"#,
+            "--socket",
+            "/run/service.sock",
+        ]
+        .map(str::to_owned)
+        .into_iter();
+        let config: serde_json::Value = configuration(&mut argv).unwrap();
+        assert_eq!(config["variant"], "normal");
+        assert_eq!(config["seed"], "a value with spaces");
+        assert_eq!(
+            Args::default().read(argv, unknown).unwrap().socket,
+            "/run/service.sock"
+        );
+        for input in ["--variant", "{", ""] {
+            assert!(
+                configuration::<serde_json::Value>(&mut [input.to_owned()].into_iter()).is_err()
+            );
+        }
+    }
 }
