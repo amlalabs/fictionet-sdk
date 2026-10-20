@@ -21,6 +21,7 @@ use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
 use example_common::log::Log;
+use example_common::names::name;
 
 use example_common::headers;
 
@@ -49,7 +50,7 @@ impl Page {
     /// The page as fields of its request's event.
     pub fn fields(&self) -> Fields {
         Fields::new()
-            .with("served", opt(self.served.map(|v| v.as_str().to_owned())))
+            .with("served", opt(self.served.map(|v| name(&v))))
             .with("tamper_revision", self.tamper_revision)
             .with("kind", self.kind.as_str())
             .with("topic", opt(self.topic.clone()))

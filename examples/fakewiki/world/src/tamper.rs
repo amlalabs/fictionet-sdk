@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use example_common::names::name;
 use fictionet::{Cx, sync::Mutex};
 use serde::{Deserialize, Serialize};
 
@@ -19,16 +20,6 @@ pub enum Scope {
     Wikipedia,
     /// Every source changes.
     AllSources,
-}
-
-impl Scope {
-    /// The scope name used in events and JSON.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Wikipedia => "wikipedia",
-            Self::AllSources => "all_sources",
-        }
-    }
 }
 
 /// A snapshot of the world's selected content.
@@ -154,7 +145,7 @@ impl Tampering {
         fcx.emit("fakewiki", "tampering", |event| {
             event
                 .field("on", snapshot.on)
-                .field("scope", snapshot.scope.as_str())
+                .field("scope", name(&snapshot.scope))
                 .field("variant", snapshot.variant().as_str())
                 .field("revision", snapshot.revision)
                 .field("changed", changed)
@@ -219,7 +210,7 @@ mod tests {
             ] {
                 assert_eq!(event.kind, "tampering");
                 assert_eq!(event.get("on").and_then(|v| v.as_bool()), Some(on));
-                assert_eq!(event.str("scope"), Some(scope.as_str()));
+                assert_eq!(event.str("scope"), Some(name(&scope).as_str()));
                 assert_eq!(
                     event.str("variant"),
                     Some(Tampering::new(on, scope).state().variant().as_str())

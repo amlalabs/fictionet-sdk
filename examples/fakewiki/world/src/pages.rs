@@ -41,14 +41,6 @@ impl Version {
             .filter(|source| *source != "search")
             .map(|source| Self::for_source(variant, source))
     }
-
-    /// The name used in request facts and JSON.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Real => "real",
-            Self::Tampered => "tampered",
-        }
-    }
 }
 
 /// A rendered response. Labels describe the full page, including for HEAD.

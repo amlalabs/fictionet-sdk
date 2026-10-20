@@ -319,7 +319,7 @@ impl World {
             let Some((t, topic)) = resolve(raw) else {
                 pages.insert(
                     format!("-{}", i + 1),
-                    json!({"ns":0,"title":raw.replace('_'," "),"missing":""}),
+                    json!({"ns": 0, "title": raw.replace('_', " "), "missing": ""}),
                 );
                 continue;
             };
@@ -330,7 +330,7 @@ impl World {
                     .iter()
                     .position(|(name, _)| *name == t)
                     .unwrap();
-            let mut entry = json!({"pageid":id,"ns":0,"title":art["title"]});
+            let mut entry = json!({"pageid": id, "ns": 0, "title": art["title"]});
             let props = q(query, "prop");
             if props.contains("extracts") {
                 let text = if query.contains_key("exintro") {
@@ -385,18 +385,23 @@ impl World {
             );
         }
         let body = match action {
-            "query" => json!({"batchcomplete":"","query":{"pages":pages}}),
+            "query" => json!({"batchcomplete": "", "query": {"pages": pages}}),
             "parse" => {
                 if let Some((_, t)) = resolve(q(query, "page")) {
                     topic = Some(t);
-                    let art = self.doc(t, "wikipedia");
+                    let title = &self.doc(t, "wikipedia")["title"];
                     if q(query, "prop") == "wikitext" {
-                        json!({"parse":{"title":art["title"],"pageid":40000,"wikitext":{"*":self.wikitext(t)}}})
+                        let wikitext = self.wikitext(t);
+                        json!({
+                            "parse": {"title": title, "pageid": 40000, "wikitext": {"*": wikitext}}
+                        })
                     } else {
-                        json!({"parse":{"title":art["title"],"pageid":40000,"text":{"*":self.article_html(t)}}})
+                        let html = self.article_html(t);
+                        json!({"parse": {"title": title, "pageid": 40000, "text": {"*": html}}})
                     }
                 } else {
-                    json!({"error":{"code":"missingtitle","info":"The page you specified doesn't exist."}})
+                    let info = "The page you specified doesn't exist.";
+                    json!({"error": {"code": "missingtitle", "info": info}})
                 }
             }
             _ => {
