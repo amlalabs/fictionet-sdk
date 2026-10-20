@@ -49,16 +49,11 @@ fn main() -> fictionet::Result {
     let path = args
         .next()
         .unwrap_or_else(|| "/run/fictionet/world.sock".into());
-    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
-    let _observation = if let Some(path) = args.next() {
-        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        options = options.observer(std::sync::Arc::new(fictionet_observe::Aggregate::new(
-            dashboard.observer(),
-        )));
-        Some(fictionet_observe::serve(dashboard.handle(), path)?)
-    } else {
-        None
-    };
+    let (options, _observation) = fictionet_observe::serve_observation(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        args.next(),
+        None,
+    )?;
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");

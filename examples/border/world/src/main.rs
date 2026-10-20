@@ -128,43 +128,33 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     let finalization = Arc::new(log.finalization(&args.state_dir)?);
     let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
-    let mut observer: Arc<dyn fictionet::events::Observer> = Arc::new(log.clone());
-    let _observation = if let Some(path) = &args.observation {
-        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        observer = Arc::new(fictionet::events::Fanout::new(vec![
-            dashboard.observer(),
-            observer,
-        ]));
-        Some(fictionet_observe::serve(dashboard.handle(), path)?)
-    } else {
-        None
-    };
-    let result = fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
-        move |fcx| async move {
-            let ids = border_world::identities(&fcx, &world_ca)?;
-            log.attach(&fcx);
-            let _routing = border_world::start(&fcx, scenario.clone(), ids, attachments)?;
-            let _listening = fictionet::listen(
-                fictionet::WorldSocket::UnixSocket(args.socket.clone().into()),
-                attacher,
-            )?;
-            std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
-            if let Some(dir) = args.ready.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&args.ready, scenario.variant.as_str())?;
-            println!(
-                "border world up: variant={} task={}",
-                scenario.variant.as_str(),
-                scenario.task.as_str()
-            );
-            // The network serves every sandbox from here on. The listener lives
-            // as long as the world.
-            shutdown.wait(&fcx).await
-        },
-    ));
+    let (options, _observation) = fictionet_observe::serve_observation(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        args.observation.as_ref(),
+        Some(Arc::new(log.clone())),
+    )?;
+    let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
+        let ids = border_world::identities(&fcx, &world_ca)?;
+        log.attach(&fcx);
+        let _routing = border_world::start(&fcx, scenario.clone(), ids, attachments)?;
+        let _listening = fictionet::listen(
+            fictionet::WorldSocket::UnixSocket(args.socket.clone().into()),
+            attacher,
+        )?;
+        std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+        if let Some(dir) = args.ready.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&args.ready, scenario.variant.as_str())?;
+        println!(
+            "border world up: variant={} task={}",
+            scenario.variant.as_str(),
+            scenario.task.as_str()
+        );
+        // The network serves every sandbox from here on. The listener lives
+        // as long as the world.
+        shutdown.wait(&fcx).await
+    }));
     finalization.acknowledge(result)?;
     // Keep the container available for the harness to read the finalized files.
     loop {

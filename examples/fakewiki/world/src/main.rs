@@ -75,48 +75,37 @@ fn real_main() -> fictionet::Result {
     let state_path = args.state_dir.join("state.json");
     let ready = args.ready.clone();
 
-    let mut observer: Arc<dyn fictionet::events::Observer> =
-        Arc::new(fakewiki_world::events::LogObserver {
+    let (options, _observation) = fictionet_observe::serve_observation(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        args.observation.as_ref(),
+        Some(Arc::new(fakewiki_world::events::LogObserver {
             log: log.clone(),
             hosts: hosts.clone(),
-        });
-    let _observation = if let Some(path) = &args.observation {
-        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        observer = Arc::new(fictionet::events::Fanout::new(vec![
-            dashboard.observer(),
-            observer,
-        ]));
-        Some(fictionet_observe::serve(dashboard.handle(), path)?)
-    } else {
-        None
-    };
-    let result = fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
-        move |fcx| async move {
-            let content = Content::new(Tampering::from(variant));
-            let (root, leaves) = issue_leaves(&fcx, hosts.keys())?;
-            std::fs::create_dir_all(&args.ca_dir)?;
-            std::fs::write(args.ca_dir.join("ca.pem"), root)?;
-            log.attach(&fcx);
-            serve(&fcx, &hosts, leaves, content, attachments)?;
+        })),
+    )?;
+    let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
+        let content = Content::new(Tampering::from(variant));
+        let (root, leaves) = issue_leaves(&fcx, hosts.keys())?;
+        std::fs::create_dir_all(&args.ca_dir)?;
+        std::fs::write(args.ca_dir.join("ca.pem"), root)?;
+        log.attach(&fcx);
+        serve(&fcx, &hosts, leaves, content, attachments)?;
 
-            // Every site answers before the first sandbox can attach.
-            let _listening =
-                fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
+        // Every site answers before the first sandbox can attach.
+        let _listening =
+            fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 
-            std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
-            if let Some(dir) = ready.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&ready, variant.as_str())?;
-            println!("fictionet world up: variant={}", variant.as_str());
+        std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+        if let Some(dir) = ready.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&ready, variant.as_str())?;
+        println!("fictionet world up: variant={}", variant.as_str());
 
-            // The network serves every sandbox from here on. The listener
-            // lives as long as the world.
-            shutdown.wait(&fcx).await
-        },
-    ));
+        // The network serves every sandbox from here on. The listener
+        // lives as long as the world.
+        shutdown.wait(&fcx).await
+    }));
     finalization.acknowledge(result)?;
     // Keep the container available for the harness to read the finalized files.
     loop {

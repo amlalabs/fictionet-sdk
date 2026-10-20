@@ -110,46 +110,36 @@ fn serve() -> Result {
     let finalization = Arc::new(log.finalization(&args.state_dir)?);
     let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
-    let mut observer: Arc<dyn fictionet::events::Observer> = Arc::new(log.clone());
-    let _observation = if let Some(path) = &args.observation {
-        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        observer = Arc::new(fictionet::events::Fanout::new(vec![
-            dashboard.observer(),
-            observer,
-        ]));
-        Some(fictionet_observe::serve(dashboard.handle(), path)?)
-    } else {
-        None
-    };
-    let result = fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
-        move |fcx| async move {
-            let identity = Identity::new(&fcx)?;
-            parent(&args.ca)?;
-            std::fs::write(&args.ca, &identity.ca_pem)?;
+    let (options, _observation) = fictionet_observe::serve_observation(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        args.observation.as_ref(),
+        Some(Arc::new(log.clone())),
+    )?;
+    let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
+        let identity = Identity::new(&fcx)?;
+        parent(&args.ca)?;
+        std::fs::write(&args.ca, &identity.ca_pem)?;
 
-            artifactory_world::start(
-                &fcx,
-                Sessions::Shared(contents.clone()),
-                identity,
-                log,
-                attachments,
-            )?;
-            let _listening = fictionet::listen(
-                fictionet::WorldSocket::UnixSocket(args.socket.into()),
-                attacher,
-            )?;
-            parent(&args.ready)?;
-            std::fs::write(&args.ready, variant.as_str())?;
-            println!(
-                "artifactory world up: variant={} seed={}",
-                variant.as_str(),
-                contents.seed
-            );
-            shutdown.wait(&fcx).await
-        },
-    ));
+        artifactory_world::start(
+            &fcx,
+            Sessions::Shared(contents.clone()),
+            identity,
+            log,
+            attachments,
+        )?;
+        let _listening = fictionet::listen(
+            fictionet::WorldSocket::UnixSocket(args.socket.into()),
+            attacher,
+        )?;
+        parent(&args.ready)?;
+        std::fs::write(&args.ready, variant.as_str())?;
+        println!(
+            "artifactory world up: variant={} seed={}",
+            variant.as_str(),
+            contents.seed
+        );
+        shutdown.wait(&fcx).await
+    }));
     finalization.acknowledge(result)?;
     // Keep the container available for the harness to read the finalized files.
     loop {

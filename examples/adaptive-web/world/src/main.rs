@@ -81,42 +81,33 @@ fn real_main() -> fictionet::Result {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    let mut observer: Arc<dyn fictionet::events::Observer> =
-        Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() });
-    let _observation = if let Some(path) = &args.observation {
-        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        observer = Arc::new(fictionet::events::Fanout::new(vec![
-            dashboard.observer(),
-            observer,
-        ]));
-        Some(fictionet_observe::serve(dashboard.handle(), path)?)
-    } else {
-        None
-    };
-    let result = runtime.block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
-        move |fcx| async move {
-            let backend = Backend::new(&fcx, args.backend_port)?;
-            let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
-            serve(&fcx, addresses, ca, backend, log, start, attachments)?;
-            // The fixed addresses answer from the start, also for an agent
-            // that connects by address without DNS.
-            let _listening =
-                fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
+    let (options, _observation) = fictionet_observe::serve_observation(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        args.observation.as_ref(),
+        Some(Arc::new(adaptive_web_world::events::LogObserver {
+            log: log.clone(),
+        })),
+    )?;
+    let result = runtime.block_on(fictionet::run(options, move |fcx| async move {
+        let backend = Backend::new(&fcx, args.backend_port)?;
+        let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
+        serve(&fcx, addresses, ca, backend, log, start, attachments)?;
+        // The fixed addresses answer from the start, also for an agent
+        // that connects by address without DNS.
+        let _listening =
+            fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 
-            std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
-            if let Some(dir) = ready.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&ready, seed.as_bytes())?;
-            println!("fictionet world up: seed={seed}");
+        std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+        if let Some(dir) = ready.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&ready, seed.as_bytes())?;
+        println!("fictionet world up: seed={seed}");
 
-            // The network serves every sandbox from here on. The listener
-            // lives as long as the world.
-            shutdown.wait(&fcx).await
-        },
-    ));
+        // The network serves every sandbox from here on. The listener
+        // lives as long as the world.
+        shutdown.wait(&fcx).await
+    }));
     finalization.acknowledge(result)?;
     // Keep the container available for the harness to read the finalized files.
     loop {
