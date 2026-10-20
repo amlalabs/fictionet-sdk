@@ -31,7 +31,7 @@
 .doors-step-title { overflow: hidden; min-height: 24px; padding: 0; border: 0; background: none; color: var(--ink); font-size: 12px; text-align: left; text-decoration: underline; text-decoration-color: var(--edge); text-underline-offset: 3px; text-overflow: ellipsis; white-space: nowrap; }
 .doors-step-title:hover:not(:disabled) { color: var(--accent-text); text-decoration-color: currentColor; }
 .doors-step-title:disabled { color: var(--ink); text-decoration: none; cursor: default; }
-.doors-exit { color: var(--muted); font-size: 11px; }
+.doors-exit { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .doors-host, .door-host { color: var(--muted); font-size: 11px; }
 .doors-host:empty { display: none; }
 .art-sessions { font-weight: 500; }
