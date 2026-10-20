@@ -78,6 +78,10 @@ async function checkPacketLayout() {
   root.style.width = '420px';
   await frame();
   check($('th.c-info').getBoundingClientRect().width >= 60, 'Info has no room in a narrow list: ' + $('th.c-info').getBoundingClientRect().width);
+  for (const column of ['c-src', 'c-dst']) {
+    const address = $('th.' + column).getBoundingClientRect().width, info = $('th.c-info').getBoundingClientRect().width;
+    check(info > address * 1.2, `${column} did not give way to Info: ${address} against ${info}`);
+  }
   for (const cell of root.querySelectorAll('#prows tr:not(.gap) td.c-src, #prows tr:not(.gap) td.c-dst')) check(cell.title === cell.textContent, 'address without its full title: ' + cell.textContent);
   root.style.width = '530px';
   await frame();
@@ -110,6 +114,41 @@ async function checkPacketLayout() {
     while (root.querySelectorAll('#prows tr').length < rows + 2) await frame();
     check(host.getBoundingClientRect().width === bounds.width, 'host column moved');
     check($('#plist').scrollWidth <= $('#plist').clientWidth, 'host column overflows');
+  }
+  dispose(); root.remove(); css.remove();
+}
+
+async function checkContainmentLayout() {
+  const { mount } = await import('./components/containment.mjs');
+  const { createSelection } = await import('./selection.mjs');
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  const css = document.createElement('link');
+  css.rel = 'stylesheet'; css.href = '/page.css';
+  const loaded = new Promise((resolve, reject) => { css.onload = resolve; css.onerror = reject; });
+  document.head.append(css);
+  await loaded;
+  const root = document.createElement('section');
+  document.body.append(root);
+  const outcomes = ['contained', 'not_contained', 'unknown', 'missing_tool', 'timed_out', 'fact'];
+  const probes = outcomes.map((outcome) => ({
+    guest: 'east', name: 'Public DNS', command: 'dig @8.8.8.8 example.com', guest_result: 'connection timed out; no servers could be reached',
+    world_answer: 'no route: no machine at that address', outcome,
+  }));
+  const dispose = mount(root, {
+    selection: createSelection(), hosts: [{ name: 'east', sandbox: 'east' }],
+    state: (_, update) => { update({ value: { probes } }); return () => {}; },
+  }, { state: 'containment' });
+  // The inspector is about 530 px wide at 1280 and 457 px in a shared workspace at 1440.
+  for (const width of [530, 457]) {
+    root.style.width = width + 'px';
+    await new Promise(requestAnimationFrame);
+    for (const pill of root.querySelectorAll('.outcome-pill')) {
+      const label = [...pill.childNodes].find((node) => node.nodeType === Node.TEXT_NODE);
+      const range = document.createRange(); range.selectNode(label);
+      const lines = range.getClientRects(), icon = pill.querySelector('svg').getBoundingClientRect();
+      check(lines.length === 1, `${label.textContent} wraps at ${width} px`);
+      check(icon.right <= lines[0].left, `${label.textContent} has its icon above it at ${width} px`);
+    }
   }
   dispose(); root.remove(); css.remove();
 }
@@ -207,6 +246,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
         if (location.pathname === '/') {
           try {
             await (${checkPacketLayout.toString()})();
+            await (${checkContainmentLayout.toString()})();
             await fetch('/layout-result', { method: 'POST', body: 'PASS' });
           } catch (error) {
             await fetch('/layout-result', { method: 'POST', body: error.message });
@@ -296,7 +336,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     assert.fail(`Chromium exited before reporting a result (code ${outcome.code}, signal ${outcome.signal})\n${diagnostics}`);
   }
   if (outcome.timeout) assert.fail(`Chromium did not report a result within 30 s\n${diagnostics}`);
-  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width', () => {
+  await t.test('narrow packets keep whole addresses and times, move Protocol into Info and preserve the filter width; containment labels stay on one line', () => {
     assert.equal(layoutReport, 'PASS');
   });
   assert.match(outcome.report, /^PASS: isolated$/);

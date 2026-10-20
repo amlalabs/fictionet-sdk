@@ -857,10 +857,16 @@ tr.moment td:first-child {
   .packet-panel .packet-info-protocol { display: inline; font-weight: 600; }
 }
 /* In a narrow inspector the addresses give way so Info keeps room; a cut
-   address shows in full on hover and in the packet's layers. */
+   address shows in full on hover and in the packet's layers. A fixed table
+   takes a plain percentage only: with min() the columns went auto and split
+   the width evenly with Info. A Host column already names the guest, so the
+   addresses give more. Cells pad 4 px a side, so fitted columns need 8 px. */
 @container (width < 480px) {
-  .packet-panel col.c-src { width: min(var(--packet-src, 15ch), 24%); }
-  .packet-panel col.c-dst { width: min(var(--packet-dst, 15ch), 24%); }
+  .packet-panel col.c-src, .packet-panel col.c-dst { width: 23%; }
+  .packet-panel.merged-hosts col.c-src, .packet-panel.merged-hosts col.c-dst { width: 18%; }
+  .packet-panel col.c-time { width: calc(var(--packet-time, calc(6ch + 16px)) - 8px); }
+  .packet-panel.merged-hosts col.c-host { width: calc(var(--packet-host, calc(12ch + 16px)) - 8px); }
+  .packet-panel .plist td, .packet-panel .plist th { padding-right: 4px; padding-left: 4px; }
   .packet-panel .plist td.c-src,
   .packet-panel .plist td.c-dst {
     overflow: hidden;
@@ -1150,7 +1156,8 @@ body.licenses {
 .containment-guest { margin: 16px 0 8px; font-size: 13px; }
 .containment-probe { border-top: 1px solid var(--line); padding: 10px 8px; border-left: 3px solid transparent; }
 .containment-probe.not-contained { border-left-color: var(--danger); }
-.containment-probe > summary { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) minmax(80px, .9fr); gap: 10px; cursor: pointer; align-items: start; }
+/* The outcome column fits every label but the forwarded one on one line. */
+.containment-probe > summary { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) minmax(112px, .9fr); gap: 10px; cursor: pointer; align-items: start; }
 .containment-probe strong { font-weight: 600; }
 .probe-title { min-width: 0; }
 .probe-command { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); font: 11px/1.6 var(--mono); }
