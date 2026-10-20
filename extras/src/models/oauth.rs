@@ -486,11 +486,7 @@ impl OAuth {
     pub fn guest_files(&self) -> fictionet::Result<Vec<(&'static str, String)>> {
         let tokens = self.store.row(self.login)?.tokens()?;
         let mut placeholders = self.placeholders.lock().unwrap();
-        if self.login == Login::Codex && placeholders.expires_at != tokens.expires_at {
-            let next = placeholder(&self.cx, self.login, &tokens);
-            placeholders.previous = Some(std::mem::replace(&mut placeholders.access, next));
-            placeholders.expires_at = tokens.expires_at;
-        }
+        self.follow(&mut placeholders, &tokens);
         let (path, value) = match self.login {
             Login::Claude => (
                 ".claude/.credentials.json",
@@ -500,8 +496,10 @@ impl OAuth {
             ),
             Login::Codex => (
                 ".codex/auth.json",
+                // Codex reads token data only from a file with `last_refresh`.
                 json!({"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{
-                "access_token":placeholders.access,"refresh_token":placeholders.refresh,"id_token":identity(&self.cx, &tokens),"account_id":tokens.account_id}}),
+                "access_token":placeholders.access,"refresh_token":placeholders.refresh,"id_token":identity(&self.cx, &tokens),"account_id":tokens.account_id},
+                "last_refresh":rfc3339(time::OffsetDateTime::now_utc())}),
             ),
         };
         Ok(vec![(path, value.to_string())])
@@ -536,9 +534,7 @@ impl OAuth {
         }
         let tokens = self.store.row(self.login)?.tokens()?;
         let mut placeholders = self.placeholders.lock().unwrap();
-        let next = placeholder(&self.cx, self.login, &tokens);
-        placeholders.previous = Some(std::mem::replace(&mut placeholders.access, next));
-        placeholders.expires_at = tokens.expires_at;
+        self.follow(&mut placeholders, &tokens);
         let mut response = json!({"token_type":"Bearer","access_token":placeholders.access,"refresh_token":placeholders.refresh,
             "expires_in":tokens.expires_at.saturating_sub(now()),"scope":tokens.scopes.join(" ")});
         if self.login == Login::Codex {
@@ -547,6 +543,16 @@ impl OAuth {
         Ok(Response::builder()
             .header("content-type", "application/json")
             .body(Body::from(response.to_string()))?)
+    }
+    /// Mints a new guest access token when the host's token has a new expiry.
+    /// A guest refresh with no new host token gets the current one back, so
+    /// concurrent refreshes in the guest cannot invalidate each other.
+    fn follow(&self, placeholders: &mut Placeholders, tokens: &Tokens) {
+        if placeholders.expires_at != tokens.expires_at {
+            let next = placeholder(&self.cx, self.login, tokens);
+            placeholders.previous = Some(std::mem::replace(&mut placeholders.access, next));
+            placeholders.expires_at = tokens.expires_at;
+        }
     }
     pub(super) fn account(&self) -> fictionet::Result<String> {
         Ok(self.store.row(self.login)?.tokens()?.account_id)
@@ -638,11 +644,36 @@ fn jwt(cx: &Cx, value: Value) -> String {
         encode(&signature)
     )
 }
+/// The claims of a JWT, if it is one.
+fn claims(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?.replace('-', "+").replace('_', "/");
+    let bytes = fictionet::stdlib::codec::base64::decode(
+        payload.as_bytes(),
+        fictionet::stdlib::codec::base64::Padding::Optional,
+    )?;
+    serde_json::from_slice(&bytes).ok()
+}
+/// Codex's identity token for the guest. It keeps the real login's identity
+/// claims, such as the email and user id Codex uses to tell that a refreshed
+/// login is the same account, and drops its signature.
 fn identity(cx: &Cx, tokens: &Tokens) -> String {
-    jwt(
-        cx,
-        json!({"exp":tokens.expires_at,"https://api.openai.com/auth":{"chatgpt_account_id":tokens.account_id,"chatgpt_plan_type":tokens.plan}}),
-    )
+    let real = tokens.id_token.as_ref().and_then(|t| claims(&t.value));
+    let mut value = json!({"exp":tokens.expires_at});
+    if let Some(email) = real.as_ref().and_then(|r| r.get("email")) {
+        value["email"] = email.clone();
+    }
+    let mut auth = real
+        .as_ref()
+        .map(|r| r["https://api.openai.com/auth"].clone())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    auth["chatgpt_account_id"] = json!(tokens.account_id);
+    auth["chatgpt_plan_type"] = json!(tokens.plan);
+    if auth["chatgpt_user_id"].as_str().is_none_or(str::is_empty) {
+        auth["chatgpt_user_id"] = json!(format!("user-{}", tokens.account_id));
+    }
+    value["https://api.openai.com/auth"] = auth;
+    jwt(cx, value)
 }
 fn placeholder(cx: &Cx, login: Login, tokens: &Tokens) -> String {
     if login == Login::Codex {

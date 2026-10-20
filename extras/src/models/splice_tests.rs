@@ -1,7 +1,7 @@
 use super::*;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-struct Pages(AtomicUsize);
+pub(super) struct Pages(pub(super) AtomicUsize);
 impl Engine for Pages {
     fn search(self: Arc<Self>, _: Cx, _: String) -> tools::Answer<Vec<crate::search::Result>> {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -27,7 +27,7 @@ impl Engine for Pages {
         host == "example.com"
     }
 }
-fn receive(socket: &mut std::net::TcpStream) -> Value {
+pub(super) fn receive(socket: &mut std::net::TcpStream) -> Value {
     socket
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();

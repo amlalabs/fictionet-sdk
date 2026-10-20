@@ -14,7 +14,7 @@ impl Seal {
             aead::UnboundKey::new(&aead::AES_256_GCM, &bytes).unwrap(),
         ))
     }
-    fn seal(&self, cx: &Cx, value: &Value) -> String {
+    pub(super) fn seal(&self, cx: &Cx, value: &Value) -> String {
         let mut nonce = [0; 12];
         cx.fill_random(&mut nonce);
         let mut bytes = value.to_string().into_bytes();
@@ -31,7 +31,7 @@ impl Seal {
             .replace('+', "-")
             .replace('/', "_")
     }
-    fn open(&self, value: &str) -> fictionet::Result<Value> {
+    pub(super) fn open(&self, value: &str) -> fictionet::Result<Value> {
         let mut value = value.replace('-', "+").replace('_', "/");
         while !value.len().is_multiple_of(4) {
             value.push('=');
@@ -227,7 +227,7 @@ impl Output {
         Ok(())
     }
 }
-struct Channel(mpsc::Receiver<fictionet::Result<Frame<Bytes>>>);
+pub(super) struct Channel(pub(super) mpsc::Receiver<fictionet::Result<Frame<Bytes>>>);
 impl HttpBody for Channel {
     type Data = Bytes;
     type Error = Error;
@@ -297,7 +297,7 @@ pub(super) async fn serve(
             .body(Body::from(output.message.to_string()))?)
     }
 }
-async fn upstream(
+pub(super) async fn upstream(
     model: &Model,
     parts: &http::request::Parts,
     body: &Value,
@@ -608,17 +608,8 @@ async fn answer(
         let pdf = page.media_type == "application/pdf";
         let mut text = if pdf {
             fictionet::stdlib::codec::base64::encode(&page.body)
-        } else if page.media_type == "text/html" {
-            use kuchiki::traits::TendrilSink;
-            let doc = kuchiki::parse_html().one(String::from_utf8_lossy(&page.body).into_owned());
-            if let Ok(nodes) = doc.select("script,style,noscript") {
-                for node in nodes {
-                    node.as_node().detach();
-                }
-            }
-            doc.text_contents()
-        } else if page.media_type.starts_with("text/") {
-            String::from_utf8_lossy(&page.body).into_owned()
+        } else if let Some(text) = tools::text(&page) {
+            text
         } else {
             return error("unsupported_content_type");
         };
@@ -633,7 +624,7 @@ async fn answer(
                     .collect();
             }
         }
-        let content = json!({"type":"web_fetch_result","url":url,"retrieved_at":time::OffsetDateTime::now_utc().to_string(),"content":{"type":"document","source":{"type":if pdf {"base64"} else {"text"},"media_type":if pdf {"application/pdf"} else {"text/plain"},"data":text},"title":page.title,"citations":{"enabled":settings["citations"]["enabled"] == true}}});
+        let content = json!({"type":"web_fetch_result","url":url,"retrieved_at":rfc3339(time::OffsetDateTime::now_utc()),"content":{"type":"document","source":{"type":if pdf {"base64"} else {"text"},"media_type":if pdf {"application/pdf"} else {"text/plain"},"data":text},"title":page.title,"citations":{"enabled":settings["citations"]["enabled"] == true}}});
         (content, text)
     }
 }

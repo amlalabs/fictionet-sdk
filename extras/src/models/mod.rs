@@ -5,7 +5,8 @@
 //!
 //! Budget responses follow the vendors' documented status and error envelope:
 //! [Anthropic spend limits](https://platform.claude.com/docs/en/api/rate-limits),
-//! [OpenAI spend limits](https://developers.openai.com/api/docs/guides/error-codes),
+//! [OpenAI quota errors](https://developers.openai.com/api/docs/guides/error-codes)
+//! as quoted in [Codex's tests](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/sse/responses.rs),
 //! [OpenRouter credits](https://openrouter.ai/docs/api_reference/errors-and-debugging),
 //! and [Gemini quotas](https://ai.google.dev/gemini-api/docs/troubleshooting).
 //! These responses are constructed locally; no real quota is consumed to obtain them.
@@ -30,6 +31,9 @@ mod client;
 pub use client::{Https, Key, Post, Transport};
 pub mod oauth;
 mod response;
+mod responses;
+#[cfg(test)]
+mod responses_tests;
 mod splice;
 #[cfg(test)]
 mod splice_tests;
@@ -117,7 +121,7 @@ impl Provider {
     fn stop(self) -> Response<Body> {
         match self {
             Self::Anthropic => self.error(400, "invalid_request_error", "You have reached your specified workspace API usage limits. Please contact your workspace administrator to raise your usage limit."),
-            Self::OpenAi | Self::ChatGpt => self.error(429, "organization_spend_limit_exceeded", "You have reached your organization spend limit."),
+            Self::OpenAi | Self::ChatGpt => self.error(429, "insufficient_quota", "You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors."),
             Self::OpenRouter => self.error(402, "", "Insufficient credits. Add more credits and retry the request."),
             Self::Gemini => self.error(429, "RESOURCE_EXHAUSTED", "Quota exceeded for quota metric: Generate Content requests."),
         }
@@ -490,7 +494,24 @@ impl Model {
         {
             return Ok(Response::new(Body::empty()));
         }
-        if request.method() != http::Method::POST || !self.provider.allows(&path) {
+        let upgrade = request.method() == http::Method::GET
+            && path.ends_with("/responses")
+            && request
+                .headers()
+                .get("upgrade")
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+        // With a ChatGPT login, Codex reads its account, usage and models first.
+        let listing = self.provider == Provider::ChatGpt
+            && request.method() == http::Method::GET
+            && matches!(
+                path.as_str(),
+                "/backend-api/codex/models"
+                    | "/backend-api/wham/accounts/check"
+                    | "/backend-api/wham/usage"
+            );
+        if (request.method() != http::Method::POST && !upgrade && !listing)
+            || !(self.provider.allows(&path) || listing)
+        {
             self.refused(&path, "path");
             return Ok(self.provider.error(404, "not_found_error", "Not found"));
         }
@@ -517,10 +538,75 @@ impl Model {
                 "Invalid authentication credentials",
             ));
         }
+        if upgrade {
+            self.cx.emit("model", "transport", |e| {
+                e.field("provider", self.provider.host())
+                    .field("transport", "websocket")
+                    .field("status", 426u64)
+                    .field("fallback", "sse")
+            });
+            let mut response = self.provider.error(
+                426,
+                "invalid_request_error",
+                "Use the Responses HTTP endpoint.",
+            );
+            response
+                .headers_mut()
+                .insert("upgrade", "websocket".parse()?);
+            return Ok(response);
+        }
         let (mut parts, body) = request.into_parts();
-        let bytes = body.collect().await?.to_bytes();
+        let bytes = match http_body_util::Limited::new(body, 32 * 1024 * 1024)
+            .collect()
+            .await
+        {
+            Ok(body) => body.to_bytes(),
+            Err(_) => {
+                return Ok(self.provider.error(
+                    413,
+                    "request_too_large",
+                    "Model request is too large or unreadable",
+                ));
+            }
+        };
+        let bytes = match parts
+            .headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+        {
+            None | Some("identity") => bytes,
+            Some("zstd") => {
+                use std::io::Read;
+                let decoded =
+                    zstd::stream::read::Decoder::new(bytes.as_ref()).and_then(|decoder| {
+                        let mut data = Vec::new();
+                        decoder.take(32 * 1024 * 1024 + 1).read_to_end(&mut data)?;
+                        Ok(data)
+                    });
+                match decoded {
+                    Ok(data) if data.len() <= 32 * 1024 * 1024 => Bytes::from(data),
+                    _ => {
+                        return Ok(self.provider.error(
+                            400,
+                            "invalid_request_error",
+                            "Invalid compressed request",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Ok(self.provider.error(
+                    415,
+                    "invalid_request_error",
+                    "Unsupported content encoding",
+                ));
+            }
+        };
+        parts.headers.remove("content-encoding");
+        parts.headers.remove("content-length");
         let body: Value = match serde_json::from_slice(&bytes) {
             Ok(Value::Object(body)) => Value::Object(body),
+            _ if listing && bytes.is_empty() => json!({}),
             _ => {
                 return Ok(self.provider.error(
                     400,
@@ -532,14 +618,19 @@ impl Model {
         if self.provider == Provider::Anthropic && self.engine.is_some() && splice::needed(&body) {
             return Box::pin(splice::serve(self, parts, body)).await;
         }
+        if matches!(self.provider, Provider::OpenAi | Provider::ChatGpt)
+            && path.ends_with("/responses")
+            && self.engine.is_some()
+            && responses::needed(&body)
+        {
+            return Box::pin(responses::serve(self, parts, body)).await;
+        }
         if body
             .get("tools")
             .and_then(Value::as_array)
             .is_some_and(|tools| {
                 tools.iter().any(|t| {
-                    t.get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|kind| !matches!(kind, "custom" | "function"))
+                    !client_tool(t)
                         || t.get("google_search").is_some()
                         || t.get("googleSearch").is_some()
                         || t.get("codeExecution").is_some()
@@ -560,7 +651,7 @@ impl Model {
                 "Server tools are not enabled for this workspace.",
             ));
         }
-        let free = path.ends_with("/count_tokens");
+        let free = path.ends_with("/count_tokens") || listing;
         if !free {
             let mut ledger = self.ledger.lock().unwrap();
             if let Some(kind) = ledger.exhausted() {
@@ -660,6 +751,32 @@ impl httpd::Handler for Model {
         httpd::tower(self.clone()).call(request, ex)
     }
 }
+/// An RFC 3339 UTC timestamp to the second, as the providers write them.
+fn rfc3339(at: time::OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
+}
+/// A tool the client runs itself: a function, a custom tool, or a namespace
+/// of them. Anything else is a provider-side tool the world does not offer.
+fn client_tool(tool: &Value) -> bool {
+    match tool.get("type").and_then(Value::as_str) {
+        None | Some("custom" | "function") => true,
+        Some("namespace") => tool["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .all(|t| t.get("type").is_some() && client_tool(t))
+        }),
+        Some(_) => false,
+    }
+}
 fn from_env(cx: &Cx, provider: Provider) -> fictionet::Result<Model> {
     let credential = Credential::api_key(cx, Secret::from_env(provider.key_variable())?);
     Model::at(
@@ -706,4 +823,24 @@ pub fn anthropic_via_openrouter(cx: &Cx) -> fictionet::Result<Model> {
 /// Gemini using `GEMINI_API_KEY`.
 pub fn gemini(cx: &Cx) -> fictionet::Result<Model> {
     from_env(cx, Provider::Gemini)
+}
+
+/// OpenAI Responses served through OpenRouter, using only `OPENROUTER_API_KEY`.
+/// Use an OpenRouter model name in the guest's normal model settings.
+pub fn openai_via_openrouter(cx: &Cx) -> fictionet::Result<Model> {
+    let real = Secret::from_env("OPENROUTER_API_KEY")?;
+    let mut credential = Credential::api_key(
+        cx,
+        Secret::new("OPENAI_API_KEY", format!("sk-proj-{}", "a".repeat(128)))?,
+    );
+    credential.real = real;
+    let mut model = Model::at(
+        cx,
+        Provider::OpenAi,
+        credential,
+        "https://openrouter.ai".parse()?,
+    )?;
+    model.upstream_provider = Provider::OpenRouter;
+    model.path_prefix = "/api";
+    Ok(model)
 }
