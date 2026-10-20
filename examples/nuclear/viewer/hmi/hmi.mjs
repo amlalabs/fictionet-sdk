@@ -150,8 +150,8 @@ function formatValue(reading) {
   return `${reading.value.toFixed(digits)} ${reading.unit}`;
 }
 
-function seconds(ms) {
-  return `${(ms / 1000).toFixed(1)} s`;
+function siteTime(timestamp, zone) {
+  return timestamp ? `${timestamp.slice(11, 19)} ${zone}` : 'Time unavailable';
 }
 
 function partsFor(root) {
@@ -194,9 +194,9 @@ export function showNotice(root, text) {
  */
 export function render(root, plant, history = []) {
   const p = partsFor(root);
-  p.clock.textContent = plant.plant_time ?? 'Site time: awaiting first poll';
+  p.clock.textContent = plant.plant_time ? siteTime(plant.plant_time, plant.zone) : 'Site time: awaiting first poll';
   p.clock.setAttribute('datetime', plant.plant_time ?? '');
-  updateAnnunciators(p.annunciators, plant.alarms ?? []);
+  updateAnnunciators(p.annunciators, plant.alarms ?? [], plant.zone);
   updateMimic(p.mimic, plant);
   p.controls.update(plant);
   updateTrends(p.trends, plant, history);
@@ -218,7 +218,7 @@ function buildAnnunciators(doc) {
   return { doc, section, summary, list, entries, tiles: new Map() };
 }
 
-function updateAnnunciators(a, alarms) {
+function updateAnnunciators(a, alarms, zone) {
   let active = 0;
   for (const alarm of alarms) {
     let tile = a.tiles.get(alarm.id);
@@ -241,7 +241,7 @@ function updateAnnunciators(a, alarms) {
   a.entries.textContent = '';
   const current = alarms.filter((alarm) => alarm.state === 'active' || alarm.state === 'acknowledged');
   for (const alarm of current) {
-    const time = alarm.in_ms == null ? 'Time unavailable' : `${Math.floor(alarm.in_ms / 60000)}:${((alarm.in_ms % 60000) / 1000).toFixed(1).padStart(4, '0')}`;
+    const time = siteTime(alarm.arrived_at, zone);
     a.entries.appendChild(make(a.doc, 'li', {}, `${time} · ${alarm.label} · ${STATE_WORDS[alarm.state]}`));
   }
   if (!current.length) a.entries.appendChild(make(a.doc, 'li', {}, 'No active alarms.'));
@@ -568,8 +568,8 @@ function sparkSegments(samples) {
   if (values.length < 2) return [];
   const low = Math.min(...values);
   const span = Math.max(...values) - low || 1;
-  const start = samples[0].clock_ms;
-  const duration = samples.at(-1).clock_ms - start;
+  const start = Date.parse(samples[0].time);
+  const duration = Date.parse(samples.at(-1).time) - start;
   const segments = [];
   let segment = [];
   for (const [i, sample] of samples.entries()) {
@@ -578,7 +578,7 @@ function sparkSegments(samples) {
       segment = [];
       continue;
     }
-    const x = duration > 0 ? (sample.clock_ms - start) / duration * 160 : i / (samples.length - 1) * 160;
+    const x = duration > 0 ? (Date.parse(sample.time) - start) / duration * 160 : i / (samples.length - 1) * 160;
     segment.push(`${x.toFixed(1)},${(38 - (sample.value - low) / span * 32).toFixed(1)}`);
   }
   if (segment.length > 1) segments.push(segment);
@@ -589,7 +589,7 @@ function updateTrends(t, plant, history) {
   for (const row of t.rows) {
     row.value.textContent = formatValue(plant.readings?.[row.id]);
     const samples = Array.isArray(history)
-      ? history.map((sample) => ({ clock_ms: sample.clock_ms, value: sample.readings?.[row.id]?.value }))
+      ? history.map((sample) => ({ time: sample.plant_time, value: sample.readings?.[row.id]?.value }))
       : history[row.id]?.samples ?? [];
     const segments = sparkSegments(samples);
     row.line.setAttribute('points', segments[0]?.join(' ') ?? '');
@@ -615,13 +615,13 @@ function buildStatus(doc) {
 }
 
 function fillStatus(s, plant) {
-  s.clock.textContent = plant.clock_ms === null || plant.clock_ms === undefined
-    ? 'Clock: waiting for the first poll'
-    : `Elapsed ${seconds(plant.clock_ms)}`;
+  s.clock.textContent = plant.plant_time
+    ? siteTime(plant.plant_time, plant.zone)
+    : 'Clock: waiting for the first poll';
   for (const link of plant.links ?? []) {
     const item = s.links.get(link.id);
     if (!item) continue;
-    const last = link.read_ms === null || link.read_ms === undefined ? 'never read' : `last poll ${seconds(link.read_ms)}`;
+    const last = link.updated_at == null ? 'never read' : `last update ${siteTime(link.updated_at, plant.zone)}`;
     const heartbeat = link.heartbeat == null ? 'not yet read' : link.heartbeat;
     item.textContent = `${link.id} ${link.online ? 'COMM OK' : `COMM FAIL: ${link.error ?? 'awaiting first poll'}`}, ${last}, heartbeat ${heartbeat}`;
     setFlag(item, 'offline', !link.online);

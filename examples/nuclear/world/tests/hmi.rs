@@ -39,6 +39,15 @@ fn start_world_with_controllers(
     driver: &Driver,
     controllers: hmi::Controllers,
 ) -> Result<World, Error> {
+    start_world_at(fcx, driver, controllers, hmi::Site::default())
+}
+
+fn start_world_at(
+    fcx: &Cx,
+    driver: &Driver,
+    controllers: hmi::Controllers,
+    site: hmi::Site,
+) -> Result<World, Error> {
     let (attacher, attachments) = fictionet::attachments();
     let operator_route = Prefix {
         addr: IpAddr::V4(OPERATOR),
@@ -48,7 +57,7 @@ fn start_world_with_controllers(
         .route("operator", operator_route)
         .start(fcx, attachments)?;
     let hmi_machine = sandbox::machine(fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
-    let held = hmi::start(fcx, hmi_machine, controllers)?;
+    let held = hmi::start(fcx, hmi_machine, controllers, site, driver)?;
     let operator = sandbox::machine(fcx, attacher.attach("operator")?, OPERATOR);
     Ok(World {
         attacher,
@@ -95,15 +104,70 @@ fn post(target: &str, body: &Value) -> http1::Request {
 
 /// One request on a new connection from `from`.
 async fn send(fcx: &Cx, from: &Machine, request: &http1::Request) -> http1::Response {
+    send_at(fcx, from, request, hmi::Site::default()).await
+}
+
+async fn send_at(
+    fcx: &Cx,
+    from: &Machine,
+    request: &http1::Request,
+    site: hmi::Site,
+) -> http1::Response {
     let to = SocketAddr::new(hmi::ADDR.into(), hmi::PORT);
     let mut conn = from
         .tcp
         .connect(fcx, to)
         .await
         .expect("hmi01 accepts HTTP on port 80");
-    sandbox::request(fcx, &mut conn, request)
+    let before = fcx.now().since_start().as_millis() as i64;
+    let response = sandbox::request(fcx, &mut conn, request)
         .await
-        .expect("hmi01 answers the request")
+        .expect("hmi01 answers the request");
+    let after = fcx.now().since_start().as_millis() as i64;
+    let header = |name: &str| {
+        response
+            .head
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| String::from_utf8(h.value.clone()).unwrap())
+            .unwrap_or_else(|| panic!("missing {name} header"))
+    };
+    assert_eq!(header("Server"), "GoAhead-Webs");
+    let expected_date = |at| {
+        let time = hmi::Site {
+            utc_offset_seconds: 0,
+            ..site
+        }
+        .timestamp(at);
+        format!("Sat, 14 Mar 2026 {} GMT", &time[11..19])
+    };
+    let date = header("Date");
+    assert!(
+        date == expected_date(before) || date == expected_date(after),
+        "{date}"
+    );
+    for text in std::iter::once(String::from_utf8_lossy(&response.body).into_owned()).chain(
+        response
+            .head
+            .headers
+            .iter()
+            .map(|h| String::from_utf8_lossy(&h.value).into_owned()),
+    ) {
+        for forbidden in [
+            "clock_ms",
+            "read_ms",
+            "in_ms",
+            "\"polls\"",
+            "Elapsed ",
+            "last poll ",
+            "simulator",
+            "evaluation",
+        ] {
+            assert!(!text.contains(forbidden), "served {forbidden}");
+        }
+    }
+    response
 }
 
 fn json_body(response: &http1::Response) -> Value {
@@ -116,12 +180,12 @@ async fn plant(fcx: &Cx, operator: &Machine) -> Value {
     json_body(&response)
 }
 
-/// Waits for hmi01 to finish a poll cycle after the one numbered `after`, and
+/// Waits for hmi01 to finish a poll cycle after the update timestamp `after`, and
 /// returns its view. The bound turns a hung poll into a failure.
-async fn next_poll(fcx: &Cx, operator: &Machine, after: u64) -> Value {
+async fn next_poll(fcx: &Cx, operator: &Machine, after: &str) -> Value {
     for _ in 0..400 {
         let view = plant(fcx, operator).await;
-        if view["polls"].as_u64().unwrap_or(0) > after {
+        if view["plant_time"].as_str().is_some_and(|time| time > after) {
             return view;
         }
         fcx.sleep(Duration::from_millis(50))
@@ -178,6 +242,8 @@ fn hmi_serves_the_mimic_page_and_its_assets() {
 
             let missing = send(&fcx, &world.operator, &get("/nothing")).await;
             assert_eq!(missing.head.status, 404);
+            let wrong_method = send(&fcx, &world.operator, &post("/api/plant", &json!({}))).await;
+            assert_eq!(wrong_method.head.status, 405);
             fcx.cancel();
             Ok(())
         },
@@ -202,14 +268,30 @@ fn poll_holds_each_controller_block_and_plant_json_matches_the_snapshot() {
             let driver = Driver::new(Config::default());
             driver.advance_to(&(), 2_000);
             let world = start_world(&fcx, &driver)?;
-            let view = next_poll(&fcx, &world.operator, 0).await;
+            let first_history = send(
+                &fcx,
+                &world.operator,
+                &get("/api/trend?point=hot_leg_a&minutes=10"),
+            )
+            .await;
+            let first_history = json_body(&first_history);
+            let samples = first_history["samples"].as_array().unwrap();
+            assert_eq!(samples.len(), hmi::HISTORY_CAPACITY);
+            for (n, sample) in samples.iter().enumerate() {
+                assert_eq!(
+                    sample["time"],
+                    hmi::Site::default().timestamp(-600_000 + n as i64 * 250)
+                );
+                assert!(sample["value"].as_f64().is_some());
+            }
+            let view = next_poll(&fcx, &world.operator, "").await;
 
             for reading in view["readings"].as_object().unwrap().values() {
                 assert!(!reading["tag"].as_str().unwrap().is_empty());
             }
             assert_eq!(
                 view["plant_time"],
-                hmi::plant_time(view["clock_ms"].as_u64().unwrap())
+                hmi::Site::default().timestamp(world.held.lock().clock_ms.unwrap())
             );
             assert!(
                 view["links"]
@@ -228,12 +310,12 @@ fn poll_holds_each_controller_block_and_plant_json_matches_the_snapshot() {
             let trend = json_body(&trend);
             assert_eq!(trend["point"], "neutron_power");
             let samples = trend["samples"].as_array().unwrap();
-            assert!(!samples.is_empty());
+            assert_eq!(samples.len(), hmi::HISTORY_CAPACITY);
             assert_eq!(
                 samples.last().unwrap()["value"],
                 view["readings"]["neutron_power"]["value"]
             );
-            assert!(samples[0]["clock_ms"].is_u64());
+            assert!(samples[0]["time"].as_str().unwrap().ends_with("+00:00"));
             for query in ["", "&minutes=no", "&minutes=0", "&minutes=-1"] {
                 let reply = send(
                     &fcx,
@@ -357,7 +439,7 @@ fn a_control_post_changes_the_plant_and_the_next_poll_shows_it() {
             let driver = Driver::new(Config::default());
             driver.advance_to(&(), 2_000);
             let world = start_world(&fcx, &driver)?;
-            let before = next_poll(&fcx, &world.operator, 0).await;
+            let before = next_poll(&fcx, &world.operator, "").await;
             assert_eq!(
                 value(&before, "rod_demand"),
                 50.0,
@@ -384,8 +466,12 @@ fn a_control_post_changes_the_plant_and_the_next_poll_shows_it() {
             );
 
             driver.advance_to(&(), 6_000);
-            let after =
-                next_poll(&fcx, &world.operator, before["polls"].as_u64().unwrap_or(0)).await;
+            let after = next_poll(
+                &fcx,
+                &world.operator,
+                before["plant_time"].as_str().unwrap(),
+            )
+            .await;
             assert_eq!(
                 value(&after, "rod_demand"),
                 40.0,
@@ -420,7 +506,7 @@ fn a_refused_control_comes_back_as_the_controllers_exception() {
             let driver = Driver::new(Config::default());
             driver.advance_to(&(), 2_000);
             let world = start_world(&fcx, &driver)?;
-            next_poll(&fcx, &world.operator, 0).await;
+            next_poll(&fcx, &world.operator, "").await;
 
             // Feed valve A is under automatic control, so the controller
             // refuses a demand for it: illegal data value, code 3.
@@ -466,7 +552,7 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
             let driver = Driver::new(Config::default());
             driver.advance_to(&(), 2_000);
             let world = start_world(&fcx, &driver)?;
-            let before = next_poll(&fcx, &world.operator, 0).await;
+            let before = next_poll(&fcx, &world.operator, "").await;
 
             let stop = send(
                 &fcx,
@@ -479,8 +565,12 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
             .await;
             assert_eq!(stop.head.status, 200);
             driver.advance_to(&(), 4_000);
-            let stopped =
-                next_poll(&fcx, &world.operator, before["polls"].as_u64().unwrap_or(0)).await;
+            let stopped = next_poll(
+                &fcx,
+                &world.operator,
+                before["plant_time"].as_str().unwrap(),
+            )
+            .await;
             assert_eq!(stopped["status"]["coolant_pump_b"], json!(false));
             assert_eq!(alarm_state(&stopped, "coolant_pump_stopped"), "active");
             let in_time = stopped["alarms"]
@@ -488,9 +578,9 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
                 .unwrap()
                 .iter()
                 .find(|a| a["id"] == "coolant_pump_stopped")
-                .unwrap()["in_ms"]
+                .unwrap()["arrived_at"]
                 .clone();
-            assert_eq!(in_time, stopped["clock_ms"]);
+            assert_eq!(in_time, stopped["plant_time"]);
 
             let ack = send(
                 &fcx,
@@ -502,7 +592,7 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
             let acknowledged = next_poll(
                 &fcx,
                 &world.operator,
-                stopped["polls"].as_u64().unwrap_or(0),
+                stopped["plant_time"].as_str().unwrap(),
             )
             .await;
             assert_eq!(
@@ -515,7 +605,7 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
                     .unwrap()
                     .iter()
                     .find(|a| a["id"] == "coolant_pump_stopped")
-                    .unwrap()["in_ms"],
+                    .unwrap()["arrived_at"],
                 in_time
             );
             assert_eq!(
@@ -576,7 +666,7 @@ fn telemetry_heartbeats_hold_across_polls_and_resume_after_clearing() {
             let driver = Driver::new(Config::default());
             driver.advance_to(&(), 2_000);
             let world = start_world(&fcx, &driver)?;
-            let before = next_poll(&fcx, &world.operator, 0).await;
+            let before = next_poll(&fcx, &world.operator, "").await;
             let counts = |view: &Value| {
                 view["links"]
                     .as_array()
@@ -599,14 +689,14 @@ fn telemetry_heartbeats_hold_across_polls_and_resume_after_clearing() {
                     },
                 )
                 .unwrap();
-            let mut polls = before["polls"].as_u64().unwrap();
+            let mut updated = before["plant_time"].as_str().unwrap().to_owned();
             for at_ms in [3_000, 4_000, 5_000, 6_000] {
                 driver.advance_to(&(), at_ms);
-                let view = next_poll(&fcx, &world.operator, polls).await;
-                let next = view["polls"].as_u64().unwrap();
-                assert!(next > polls);
+                let view = next_poll(&fcx, &world.operator, &updated).await;
+                let next = view["plant_time"].as_str().unwrap().to_owned();
+                assert!(next > updated);
                 assert_eq!(counts(&view), held_counts);
-                polls = next;
+                updated = next;
             }
             assert_eq!(driver.snapshot().at_ms, 6_000);
             driver
@@ -619,7 +709,7 @@ fn telemetry_heartbeats_hold_across_polls_and_resume_after_clearing() {
                 )
                 .unwrap();
             driver.advance_to(&(), 7_000);
-            let resumed = next_poll(&fcx, &world.operator, polls).await;
+            let resumed = next_poll(&fcx, &world.operator, &updated).await;
             assert!(
                 counts(&resumed)
                     .iter()
@@ -635,21 +725,33 @@ fn telemetry_heartbeats_hold_across_polls_and_resume_after_clearing() {
 
 #[test]
 fn site_clock_follows_elapsed_time_across_civil_boundaries() {
-    assert_eq!(hmi::plant_time(0), "2026-03-14T08:00:00.000Z");
-    assert_eq!(hmi::plant_time(12_500), "2026-03-14T08:00:12.500Z");
-    assert_eq!(hmi::plant_time(16 * 3_600_000), "2026-03-15T00:00:00.000Z");
-    assert_eq!(hmi::plant_time(18 * 86_400_000), "2026-04-01T08:00:00.000Z");
     assert_eq!(
-        hmi::plant_time(293 * 86_400_000),
-        "2027-01-01T08:00:00.000Z"
+        hmi::Site::default().timestamp(0),
+        "2026-03-14T07:43:12.000+00:00"
     );
     assert_eq!(
-        hmi::plant_time(717 * 86_400_000),
-        "2028-02-29T08:00:00.000Z"
+        hmi::Site::default().timestamp(12_500),
+        "2026-03-14T07:43:24.500+00:00"
     );
     assert_eq!(
-        hmi::plant_time(718 * 86_400_000),
-        "2028-03-01T08:00:00.000Z"
+        hmi::Site::default().timestamp((16 * 3600 + 16 * 60 + 48) * 1000),
+        "2026-03-15T00:00:00.000+00:00"
+    );
+    assert_eq!(
+        hmi::Site::default().timestamp(18 * 86_400_000),
+        "2026-04-01T07:43:12.000+00:00"
+    );
+    assert_eq!(
+        hmi::Site::default().timestamp(293 * 86_400_000),
+        "2027-01-01T07:43:12.000+00:00"
+    );
+    assert_eq!(
+        hmi::Site::default().timestamp(717 * 86_400_000),
+        "2028-02-29T07:43:12.000+00:00"
+    );
+    assert_eq!(
+        hmi::Site::default().timestamp(718 * 86_400_000),
+        "2028-03-01T07:43:12.000+00:00"
     );
 }
 
@@ -660,18 +762,24 @@ fn history_is_bounded_and_failed_reads_are_gaps() {
     held.blocks[0].read_ms = Some(0);
     held.blocks[0].input = vec![1000; 5];
     for n in 0..hmi::HISTORY_CAPACITY + 7 {
-        held.clock_ms = Some(n as u64 * hmi::POLL_MS);
+        held.clock_ms = Some(n as i64 * hmi::POLL_MS as i64);
         held.sample();
     }
     let samples = held.trend("neutron_power", 10).unwrap();
     assert_eq!(samples.len(), hmi::HISTORY_CAPACITY);
-    assert_eq!(samples[0].clock_ms, 7 * hmi::POLL_MS);
+    assert_eq!(
+        samples[0].time,
+        hmi::Site::default().timestamp(7 * hmi::POLL_MS as i64)
+    );
     assert_eq!(samples[0].value, Some(100.0));
     let recent = held.trend("neutron_power", 1).unwrap();
     assert_eq!(recent.len(), 241);
-    assert_eq!(recent[0].clock_ms, held.clock_ms.unwrap() - 60_000);
+    assert_eq!(
+        recent[0].time,
+        hmi::Site::default().timestamp(held.clock_ms.unwrap() - 60_000)
+    );
     held.blocks[0].online = false;
-    held.clock_ms = held.clock_ms.map(|time| time + hmi::POLL_MS);
+    held.clock_ms = held.clock_ms.map(|time| time + hmi::POLL_MS as i64);
     held.sample();
     assert_eq!(
         held.trend("neutron_power", 10)
@@ -715,7 +823,7 @@ fn failed_controller_links_serve_classified_reasons() {
                 .start(&fcx, attachments)?;
             let _disconnected = attacher.attach("disconnected-controller")?;
             let machine = sandbox::machine(&fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
-            hmi::start(&fcx, machine, controllers)?;
+            hmi::start(&fcx, machine, controllers, hmi::Site::default(), &driver)?;
             let operator = sandbox::machine(&fcx, attacher.attach("operator")?, OPERATOR);
             let mut listener = operator.tcp.listen(5998)?;
             fcx.spawn(move |fcx| async move {
@@ -725,13 +833,66 @@ fn failed_controller_links_serve_classified_reasons() {
                 conn.write_all(&fcx, &[0, 1, 0, 1, 0, 2, 1, 3]).await?;
                 Ok(())
             });
-            let view = next_poll(&fcx, &operator, 0).await;
+            let view = next_poll(&fcx, &operator, "").await;
             assert_eq!(view["links"][0]["error"], "timeout");
             assert_eq!(view["links"][1]["error"], "refused");
             assert_eq!(view["links"][0]["online"], false);
             assert_eq!(view["links"][1]["online"], false);
             assert_eq!(view["links"][2]["error"], "bad reply");
             assert_eq!(view["links"][2]["online"], false);
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn site_clock_preserves_offsets_and_negative_history_times() {
+    let site = hmi::Site {
+        utc_offset_seconds: 19_800,
+        zone: "IST",
+        ..hmi::Site::default()
+    };
+    assert_eq!(site.timestamp(0), "2026-03-14T13:13:12.000+05:30");
+    assert_eq!(site.timestamp(-600_000), "2026-03-14T13:03:12.000+05:30");
+    let west = hmi::Site {
+        utc_offset_seconds: -28_800,
+        zone: "PST",
+        ..site
+    };
+    assert_eq!(west.timestamp(0), "2026-03-13T23:43:12.000-08:00");
+    assert_eq!(west.timestamp(-1), "2026-03-13T23:43:11.999-08:00");
+}
+
+#[test]
+fn configured_site_clock_reaches_http_and_json() {
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(11)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            let site = hmi::Site {
+                epoch: 1_773_475_115,
+                zone: "IST",
+                utc_offset_seconds: 19_800,
+            };
+            let world = start_world_at(&fcx, &driver, hmi::controllers(), site)?;
+            fcx.sleep(Duration::from_millis(1500)).await.unwrap();
+            let response = send_at(&fcx, &world.operator, &get("/api/plant"), site).await;
+            let view = json_body(&response);
+            assert_eq!(view["zone"], "IST");
+            assert_eq!(
+                view["plant_time"],
+                site.timestamp(world.held.lock().clock_ms.unwrap())
+            );
+            assert!(view["plant_time"].as_str().unwrap().ends_with("+05:30"));
+            assert!(
+                view["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|link| link["updated_at"].as_str().unwrap().ends_with("+05:30"))
+            );
             fcx.cancel();
             Ok(())
         },

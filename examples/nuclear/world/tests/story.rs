@@ -48,6 +48,9 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         .map_err(|error| fictionet::Error::msg(format!("the story failed: {error}")))?;
 
     let spoken = spoken.lock();
+    for line in spoken.iter() {
+        println!("{} {}", line.time, line.text);
+    }
     println!(
         "Story ends at {} ms; maneuver lasts {} ms",
         spoken.last().unwrap().at_ms,
@@ -84,21 +87,25 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
             (Some("rod_demand"), Some("hmi")),
             (Some("manual_trip"), Some("hmi")),
             (Some("pump"), Some("hmi")),
-            (Some("pump"), Some("hmi")),
             (Some("controller"), Some("hmi")),
             (Some("valve_demand"), Some("hmi")),
-            (Some("valve_demand"), Some("hmi")),
+            (Some("controller"), Some("hmi")),
         ],
         "all operator commands come from the HMI"
     );
 
-    assert_eq!(actions[3].summary, "Coolant pump B started from the HMI");
     assert_eq!(
-        actions[4].summary,
-        "Steam dump controller manual from the HMI"
+        actions[3].summary,
+        "Feed level A controller manual from the HMI"
     );
-    assert_eq!(actions[5].summary, "Steam dump demand 100.0% from the HMI");
-    assert_eq!(actions[6].summary, "Steam dump demand 0.0% from the HMI");
+    assert_eq!(actions[4].summary, "Feed valve A demand 20.0% from the HMI");
+    assert_eq!(
+        actions[5].summary,
+        "Feed level A controller automatic from the HMI"
+    );
+    for pair in actions.windows(2) {
+        assert!(pair[1].u64("at_ms").unwrap() >= pair[0].u64("at_ms").unwrap() + 3_000);
+    }
 
     // The fault starts with the stuck gauge and the pump trip, and clears later.
     let faults = memory.checked_of("plant", "fault")?;
@@ -135,10 +142,10 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     // Each fault episode has one first action, with its measured delay.
     let first = memory.checked_of("plant", "first_action")?;
     assert_eq!(first.len(), 2, "one first action per fault episode");
-    assert_eq!(first[1].u64("at_ms"), actions[6].u64("at_ms"));
+    assert_eq!(first[1].u64("at_ms"), actions[5].u64("at_ms"));
     assert_eq!(
         first[1].u64("first_action_after_fault_ms"),
-        Some(actions[6].u64("at_ms").unwrap() - report.quiet_from_ms)
+        Some(actions[5].u64("at_ms").unwrap() - report.quiet_from_ms)
     );
     assert_eq!(
         first[0].u64("first_action_after_fault_ms"),
@@ -176,12 +183,18 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
             .collect::<Vec<_>>(),
         [Some("start"), Some("peak"), Some("clear")]
     );
-    assert!(report.quiet_true_hot_b[0] - report.quiet_true_hot_b[1] >= story::QUIET_MIN_MOVE_C);
+    assert!(
+        report.quiet_true_sg_a[1] - report.quiet_true_sg_a[0]
+            >= story::QUIET_MIN_LEVEL_RISE_PERCENT
+    );
+    assert_eq!(report.quiet_hmi_sg_a[0], report.quiet_hmi_sg_a[1]);
+    assert!((report.quiet_true_hot_b[1] - report.quiet_true_hot_b[0]).abs() < 2.0);
+    assert!((report.quiet_true_average_c[1] - report.quiet_true_average_c[0]).abs() < 1.0);
     assert_eq!(report.quiet_hmi_hot_b[0], report.quiet_hmi_hot_b[1]);
     assert!(actions[3].u64("at_ms").unwrap() <= report.quiet_from_ms);
     assert!(actions[4].u64("at_ms").unwrap() <= report.quiet_from_ms);
-    assert!(actions[5].u64("at_ms").unwrap() <= report.quiet_from_ms);
-    assert!(actions[6].u64("at_ms").unwrap() > report.quiet_to_ms);
+    assert!(actions[4].u64("at_ms").unwrap() + 3_000 <= report.quiet_from_ms);
+    assert!(actions[5].u64("at_ms").unwrap() > report.quiet_to_ms);
     assert!(spoken.last().unwrap().at_ms <= 225_950 - 60_000);
     for line in spoken.iter() {
         assert_eq!(line.time, nuclear_world::facts::time(line.at_ms));
@@ -205,8 +218,12 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         );
     }
     println!(
-        "Quiet loop B: {:?}; HMI: {:?}",
-        report.quiet_true_hot_b, report.quiet_hmi_hot_b
+        "Quiet loop B: {:?}; HMI: {:?}; SG A: {:?}; held level: {:?}; average: {:?}",
+        report.quiet_true_hot_b,
+        report.quiet_hmi_hot_b,
+        report.quiet_true_sg_a,
+        report.quiet_hmi_sg_a,
+        report.quiet_true_average_c
     );
     Ok(())
 }

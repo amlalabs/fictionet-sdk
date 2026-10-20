@@ -92,13 +92,12 @@ const byLabel = (root, label) => find(root, (n) => n.getAttribute('aria-label') 
 // One reply of /api/plant, as the HMI sends it at full power with one active
 // alarm (relief valve open) and one acknowledged alarm (coolant pump B stopped).
 const SAMPLE = {
-  polls: 42,
-  clock_ms: 12500,
-  plant_time: '2026-03-14T08:00:12.500Z',
+  zone: 'GMT',
+  plant_time: '2026-03-14T07:43:24.500+00:00',
   links: [
-    { id: 'rps1', online: true, read_ms: 12500, error: null, heartbeat: 50 },
-    { id: 'rcs1', online: true, read_ms: 12000, error: null, heartbeat: 50 },
-    { id: 'bop1', online: true, read_ms: 12250, error: null, heartbeat: 50 },
+    { id: 'rps1', online: true, updated_at: '2026-03-14T07:43:24.500+00:00', error: null, heartbeat: 50 },
+    { id: 'rcs1', online: true, updated_at: '2026-03-14T07:43:24.000+00:00', error: null, heartbeat: 50 },
+    { id: 'bop1', online: true, updated_at: '2026-03-14T07:43:24.250+00:00', error: null, heartbeat: 50 },
   ],
   readings: {
     neutron_power: { tag: "NI-41", value: 100.0, unit: '%', stale: false },
@@ -150,22 +149,22 @@ const SAMPLE = {
     steam_dump: 'automatic',
   },
   alarms: [
-    { id: 'subcooling_margin_low', label: 'Subcooling margin low', state: 'normal', in_ms: null },
-    { id: 'pressurizer_pressure_high', label: 'Pressurizer pressure high', state: 'normal', in_ms: null },
-    { id: 'pressurizer_pressure_low', label: 'Pressurizer pressure low', state: 'normal', in_ms: null },
-    { id: 'pressurizer_level_high', label: 'Pressurizer level high', state: 'normal', in_ms: null },
-    { id: 'pressurizer_level_low', label: 'Pressurizer level low', state: 'normal', in_ms: null },
-    { id: 'hot_leg_high', label: 'Hot leg temperature high', state: 'normal', in_ms: null },
-    { id: 'sg_level_low', label: 'Steam generator level low', state: 'normal', in_ms: null },
-    { id: 'sg_level_high', label: 'Steam generator level high', state: 'normal', in_ms: null },
-    { id: 'coolant_flow_low', label: 'Coolant flow low', state: 'normal', in_ms: null },
-    { id: 'condenser_pressure_high', label: 'Condenser pressure high', state: 'normal', in_ms: null },
-    { id: 'neutron_power_high', label: 'Neutron power high', state: 'normal', in_ms: null },
-    { id: 'reactor_tripped', label: 'Reactor tripped', state: 'normal', in_ms: null },
-    { id: 'turbine_tripped', label: 'Turbine tripped', state: 'normal', in_ms: null },
-    { id: 'coolant_pump_stopped', label: 'Coolant pump stopped', state: 'acknowledged', in_ms: 10000 },
-    { id: 'feed_pump_stopped', label: 'Feed pump stopped', state: 'normal', in_ms: null },
-    { id: 'relief_open', label: 'Relief valve open', state: 'active', in_ms: 10000 },
+    { id: 'subcooling_margin_low', label: 'Subcooling margin low', state: 'normal', arrived_at: null },
+    { id: 'pressurizer_pressure_high', label: 'Pressurizer pressure high', state: 'normal', arrived_at: null },
+    { id: 'pressurizer_pressure_low', label: 'Pressurizer pressure low', state: 'normal', arrived_at: null },
+    { id: 'pressurizer_level_high', label: 'Pressurizer level high', state: 'normal', arrived_at: null },
+    { id: 'pressurizer_level_low', label: 'Pressurizer level low', state: 'normal', arrived_at: null },
+    { id: 'hot_leg_high', label: 'Hot leg temperature high', state: 'normal', arrived_at: null },
+    { id: 'sg_level_low', label: 'Steam generator level low', state: 'normal', arrived_at: null },
+    { id: 'sg_level_high', label: 'Steam generator level high', state: 'normal', arrived_at: null },
+    { id: 'coolant_flow_low', label: 'Coolant flow low', state: 'normal', arrived_at: null },
+    { id: 'condenser_pressure_high', label: 'Condenser pressure high', state: 'normal', arrived_at: null },
+    { id: 'neutron_power_high', label: 'Neutron power high', state: 'normal', arrived_at: null },
+    { id: 'reactor_tripped', label: 'Reactor tripped', state: 'normal', arrived_at: null },
+    { id: 'turbine_tripped', label: 'Turbine tripped', state: 'normal', arrived_at: null },
+    { id: 'coolant_pump_stopped', label: 'Coolant pump stopped', state: 'acknowledged', arrived_at: '2026-03-14T07:43:22.000+00:00' },
+    { id: 'feed_pump_stopped', label: 'Feed pump stopped', state: 'normal', arrived_at: null },
+    { id: 'relief_open', label: 'Relief valve open', state: 'active', arrived_at: '2026-03-14T07:43:22.000+00:00' },
   ],
 };
 
@@ -250,18 +249,16 @@ test('a trend with one sample has no line yet', () => {
 test('the status bar shows the clock, each controller and the heartbeat', () => {
   const root = fakeRoot();
   render(root, SAMPLE, []);
-  find(root, (n) => n.textContent === 'Elapsed 12.5 s');
+  find(root, (n) => n.textContent === '07:43:24 GMT');
   assert.ok(!root.textContent.includes('Heartbeat 42'));
-  find(root, (n) => n.textContent === 'rcs1 COMM OK, last poll 12.0 s, heartbeat 50');
+  find(root, (n) => n.textContent === 'rcs1 COMM OK, last update 07:43:24 GMT, heartbeat 50');
 });
 
 test('a controller that was never read shows dashes and no values', () => {
   const root = fakeRoot();
   const unread = structuredClone(SAMPLE);
-  unread.clock_ms = null;
   unread.plant_time = null;
-  unread.polls = 0;
-  unread.links = unread.links.map((link) => ({ ...link, online: false, read_ms: null, heartbeat: null }));
+  unread.links = unread.links.map((link) => ({ ...link, online: false, updated_at: null, heartbeat: null }));
   for (const reading of Object.values(unread.readings)) {
     reading.value = null;
     reading.stale = true;
@@ -383,7 +380,7 @@ test('a null link heartbeat is not yet read', () => {
   const plant = structuredClone(SAMPLE);
   plant.links[0].heartbeat = null;
   render(root, plant, []);
-  find(root, (n) => n.textContent === 'rps1 COMM OK, last poll 12.5 s, heartbeat not yet read');
+  find(root, (n) => n.textContent === 'rps1 COMM OK, last update 07:43:24 GMT, heartbeat not yet read');
 });
 
 
@@ -396,7 +393,7 @@ test('every analog and discrete state appears on the mimic', () => {
   for (const id of Object.keys(SAMPLE.status)) {
     find(root, (node) => node.getAttribute('data-status') === id);
   }
-  find(root, (node) => node.tagName === 'time' && node.textContent === SAMPLE.plant_time);
+  find(root, (node) => node.tagName === 'time' && node.textContent === '07:43:24 GMT');
 });
 
 test('alarm summary keeps the arrival time for active and acknowledged alarms', () => {
@@ -404,9 +401,9 @@ test('alarm summary keeps the arrival time for active and acknowledged alarms', 
   render(root, SAMPLE);
   const entries = find(root, (node) => node.classList.contains('alarm-entries'));
   assert.equal(entries.children.length, 2);
-  assert.match(entries.textContent, /0:10.0 · Relief valve open · Active/);
-  assert.match(entries.textContent, /0:10.0 · Coolant pump stopped · Acknowledged/);
-  render(root, { ...SAMPLE, alarms: SAMPLE.alarms.map((a) => ({ ...a, state: 'normal', in_ms: null })) });
+  assert.match(entries.textContent, /07:43:22 GMT · Relief valve open · Active/);
+  assert.match(entries.textContent, /07:43:22 GMT · Coolant pump stopped · Acknowledged/);
+  render(root, { ...SAMPLE, alarms: SAMPLE.alarms.map((a) => ({ ...a, state: 'normal', arrived_at: null })) });
   assert.equal(entries.textContent, 'No active alarms.');
 });
 
@@ -494,7 +491,7 @@ test('a reload fetches server history and draws it on the first poll', async () 
     calls.push(url);
     return { ok: true, json: async () => url === '/api/plant' ? SAMPLE : {
       point: new URL(url, 'http://hmi01').searchParams.get('point'),
-      samples: [{ clock_ms: 1000, value: 90 }, { clock_ms: 2000, value: 100 }],
+      samples: [{ time: '2026-03-14T07:43:13.000+00:00', value: 90 }, { time: '2026-03-14T07:43:14.000+00:00', value: 100 }],
     } };
   };
   try {
@@ -517,9 +514,9 @@ test('a reload fetches server history and draws it on the first poll', async () 
 test('history uses timestamps and leaves failed reads as gaps', () => {
   const root = fakeRoot();
   render(root, SAMPLE, { neutron_power: { samples: [
-    { clock_ms: 0, value: 90 }, { clock_ms: 1000, value: 95 },
-    { clock_ms: 2000, value: null },
-    { clock_ms: 3000, value: 97 }, { clock_ms: 4000, value: 100 },
+    { time: '2026-03-14T07:43:12.000+00:00', value: 90 }, { time: '2026-03-14T07:43:13.000+00:00', value: 95 },
+    { time: '2026-03-14T07:43:14.000+00:00', value: null },
+    { time: '2026-03-14T07:43:15.000+00:00', value: 97 }, { time: '2026-03-14T07:43:16.000+00:00', value: 100 },
   ] } });
   const line = findAll(root, (n) => n.tagName === 'polyline')[0];
   assert.equal(line.getAttribute('points'), '0.0,38.0 40.0,22.0');
@@ -538,4 +535,23 @@ test('held equipment states are marked stale after a link failure', () => {
     assert.equal(state.textContent, 'Stale');
     assert.ok(state.classList.contains('stale'));
   }
+});
+
+
+test('all visible times use the site zone without elapsed counters', () => {
+  const root = fakeRoot();
+  const plant = structuredClone(SAMPLE);
+  plant.zone = 'IST';
+  plant.plant_time = '2026-03-14T13:13:24.500+05:30';
+  plant.links.forEach((link) => { link.updated_at = plant.plant_time; });
+  plant.alarms.forEach((alarm) => {
+    if (alarm.arrived_at) alarm.arrived_at = '2026-03-14T13:13:22.000+05:30';
+  });
+  render(root, plant);
+  assert.ok(root.textContent.includes('13:13:24 IST'));
+  assert.ok(root.textContent.includes('last update 13:13:24 IST'));
+  assert.ok(root.textContent.includes('13:13:22 IST · Relief valve open'));
+  assert.doesNotMatch(root.textContent, /Elapsed|last poll|clock_ms|read_ms|in_ms|polls|\d+\.\d+ s\b/);
+  const clock = find(root, (node) => node.tagName === 'time');
+  assert.equal(clock.getAttribute('datetime'), plant.plant_time);
 });

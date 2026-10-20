@@ -23,13 +23,13 @@
 //! a supervisory system does. The limits are the HMI's configuration. They are
 //! not read from the plant.
 //!
-//! Site time is the fixed site epoch plus the run clock at the last poll.
+//! Site time is the configured site epoch plus the run clock at the last poll.
 //!
 //! Engineering values are the input-register count times its scale: 0.1 for
 //! most channels and 0.01 for the two pressures. Holding registers for rod and
 //! valve positions use 0.1 too.
 //! Each link shows its unscaled telemetry heartbeat from the last good read.
-//! It stops when the feed freezes, while the HMI poll count keeps advancing.
+//! It stops when the feed freezes, while the HMI update time keeps advancing.
 //!
 //! | Controller | Heartbeat address |
 //! | --- | --- |
@@ -73,57 +73,94 @@ pub const POLL_MS: u64 = 250;
 /// The path prefix of the control POSTs.
 pub const CONTROL_PREFIX: &str = "/api/control/";
 
-/// Site clock origin, in UTC civil fields.
-pub const SITE_EPOCH: (u64, u64, u64, u64) = (2026, 3, 14, 8);
-/// Ten minutes of samples at the poll interval.
-pub const HISTORY_CAPACITY: usize = 2400;
+/// The site clock at the observable start. No host clock is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Site {
+    /// Seconds since the Unix epoch, in UTC.
+    pub epoch: u64,
+    pub zone: &'static str,
+    pub utc_offset_seconds: i32,
+}
 
-/// Formats the site epoch plus elapsed milliseconds without a wall clock.
-pub fn plant_time(clock_ms: u64) -> String {
-    let (mut year, mut month, day, hour) = SITE_EPOCH;
-    let seconds = clock_ms / 1000 + hour * 3600;
-    let mut days = seconds / 86400 + day - 1;
-    year += (days / 146_097) * 400;
-    days %= 146_097;
-    loop {
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let length = match month {
-            2 => {
-                if leap {
-                    29
-                } else {
-                    28
-                }
-            }
-            4 | 6 | 9 | 11 => 30,
-            _ => 31,
-        };
-        if days < length {
-            break;
-        }
-        days -= length;
-        month += 1;
-        if month == 13 {
-            month = 1;
-            year += 1;
+impl Default for Site {
+    fn default() -> Self {
+        Self {
+            epoch: 1_773_474_192,
+            zone: "GMT",
+            utc_offset_seconds: 0,
         }
     }
-    let time = seconds % 86400;
-    format!(
-        "{year:04}-{month:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        days + 1,
-        time / 3600,
-        time / 60 % 60,
-        time % 60,
-        clock_ms % 1000
-    )
 }
+
+impl Site {
+    /// Formats site time, including historical samples before the start.
+    pub fn timestamp(self, elapsed_ms: i64) -> String {
+        let millis =
+            self.epoch as i64 * 1000 + elapsed_ms + i64::from(self.utc_offset_seconds) * 1000;
+        let seconds = millis.div_euclid(1000);
+        let mut days = seconds.div_euclid(86400);
+        let mut year = 1970;
+        loop {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let length = if leap { 366 } else { 365 };
+            if days < length {
+                break;
+            }
+            days -= length;
+            year += 1;
+        }
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let lengths = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        let mut month = 1;
+        for length in lengths {
+            if days < length {
+                break;
+            }
+            days -= length;
+            month += 1;
+        }
+        let time = seconds.rem_euclid(86400);
+        let offset = self.utc_offset_seconds.unsigned_abs();
+        format!(
+            "{year:04}-{month:02}-{:02}T{:02}:{:02}:{:02}.{:03}{}{:02}:{:02}",
+            days + 1,
+            time / 3600,
+            time / 60 % 60,
+            time % 60,
+            millis.rem_euclid(1000),
+            if self.utc_offset_seconds < 0 {
+                '-'
+            } else {
+                '+'
+            },
+            offset / 3600,
+            offset / 60 % 60
+        )
+    }
+}
+
+/// Ten minutes of samples, including both ends of the window.
+pub const HISTORY_CAPACITY: usize = 2401;
 
 /// One polled value; null marks a failed read.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Sample {
-    pub clock_ms: u64,
+    #[serde(skip)]
+    clock_ms: i64,
+    pub time: String,
     pub value: Option<f64>,
 }
 
@@ -230,7 +267,7 @@ pub struct Block {
     pub coils: Vec<bool>,
     pub holding: Vec<u16>,
     /// Run clock of the read, in ms. `None` until the first complete read.
-    pub read_ms: Option<u64>,
+    pub read_ms: Option<i64>,
     /// Whether the latest poll of this controller completed.
     pub online: bool,
     /// Why the latest poll failed, if it did.
@@ -241,7 +278,7 @@ pub struct Block {
 struct Latch {
     active: bool,
     acknowledged: bool,
-    in_ms: Option<u64>,
+    in_ms: Option<i64>,
 }
 
 impl Latch {
@@ -254,21 +291,52 @@ impl Latch {
     }
 }
 
-/// Everything the poll task holds: the three blocks, the poll counters, and
+/// Everything the poll task holds: the three blocks, the update time, and
 /// the alarm latches.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Held {
     /// One block per controller: rps1, rcs1, bop1.
     pub blocks: [Block; 3],
     /// Run clock of the last poll cycle, in ms.
-    pub clock_ms: Option<u64>,
-    /// Completed poll cycles.
-    pub polls: u64,
+    pub clock_ms: Option<i64>,
+    site: Site,
     alarms: [Latch; ALARM_COUNT],
     history: BTreeMap<&'static str, VecDeque<Sample>>,
 }
 
 impl Held {
+    /// Runs a private copy through the prior window without advancing the live plant.
+    fn warm(site: Site, driver: &Driver) -> Self {
+        let mut plant = driver.plant().lock().clone();
+        let origin = plant.snapshot().at_ms;
+        let mut held = Self {
+            site,
+            ..Self::default()
+        };
+        for n in 0..HISTORY_CAPACITY {
+            plant.advance(origin + n as u64 * POLL_MS);
+            let snapshot = plant.snapshot();
+            let clock = (n as i64 - (HISTORY_CAPACITY - 1) as i64) * POLL_MS as i64;
+            for plc in PLCS {
+                held.blocks[slot(plc)] = Block {
+                    input: crate::registers::input_registers(plc, &snapshot),
+                    discrete: crate::registers::discrete_inputs(plc, &snapshot),
+                    coils: crate::registers::coils(plc, &snapshot),
+                    holding: crate::registers::holding_registers(plc, &snapshot),
+                    read_ms: Some(clock),
+                    online: true,
+                    error: None,
+                };
+            }
+            held.clock_ms = Some(clock);
+            held.sample();
+        }
+        // Live values stay unread until a controller answers over the network.
+        held.blocks = Default::default();
+        held.clock_ms = None;
+        held
+    }
+
     /// Saves one poll and drops samples beyond the fixed capacity.
     pub fn sample(&mut self) {
         let Some(clock_ms) = self.clock_ms else {
@@ -281,10 +349,20 @@ impl Held {
                 None
             };
             let samples = self.history.entry(point.id).or_default();
+            if samples
+                .back()
+                .is_some_and(|sample| sample.clock_ms == clock_ms)
+            {
+                samples.pop_back();
+            }
             if samples.len() == HISTORY_CAPACITY {
                 samples.pop_front();
             }
-            samples.push_back(Sample { clock_ms, value });
+            samples.push_back(Sample {
+                clock_ms,
+                time: self.site.timestamp(clock_ms),
+                value,
+            });
         }
     }
 
@@ -294,7 +372,7 @@ impl Held {
         let cutoff = self
             .clock_ms
             .unwrap_or(0)
-            .saturating_sub(minutes.saturating_mul(60_000));
+            .saturating_sub(i64::try_from(minutes.saturating_mul(60_000)).unwrap_or(i64::MAX));
         Some(
             self.history
                 .get(point)
@@ -878,7 +956,7 @@ pub struct Link {
     pub heartbeat: Option<u16>,
     pub id: &'static str,
     pub online: bool,
-    pub read_ms: Option<u64>,
+    pub updated_at: Option<String>,
     pub error: Option<String>,
 }
 
@@ -889,15 +967,14 @@ pub struct AlarmView {
     pub label: &'static str,
     /// `normal`, `active` or `acknowledged`.
     pub state: &'static str,
-    pub in_ms: Option<u64>,
+    pub arrived_at: Option<String>,
 }
 
 /// What `/api/plant` returns.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct View {
     pub plant_time: Option<String>,
-    pub polls: u64,
-    pub clock_ms: Option<u64>,
+    pub zone: &'static str,
     pub links: Vec<Link>,
     pub readings: BTreeMap<&'static str, Reading>,
     /// Discrete states. `null` until the controller's first complete read.
@@ -910,9 +987,8 @@ pub struct View {
 /// The HMI's view of the held blocks.
 pub fn view(held: &Held) -> View {
     View {
-        plant_time: held.clock_ms.map(plant_time),
-        polls: held.polls,
-        clock_ms: held.clock_ms,
+        plant_time: held.clock_ms.map(|time| held.site.timestamp(time)),
+        zone: held.site.zone,
         links: PLCS
             .iter()
             .map(|&plc| {
@@ -923,7 +999,7 @@ pub fn view(held: &Held) -> View {
                         .and_then(|_| b.input.get(usize::from(layout(plc).input - 1)).copied()),
                     id: link_id(plc),
                     online: b.online,
-                    read_ms: b.read_ms,
+                    updated_at: b.read_ms.map(|time| held.site.timestamp(time)),
                     error: b.error.clone(),
                 }
             })
@@ -954,7 +1030,7 @@ pub fn view(held: &Held) -> View {
                 id: alarm.id,
                 label: alarm.label,
                 state: latch.state(),
-                in_ms: latch.in_ms,
+                arrived_at: latch.in_ms.map(|time| held.site.timestamp(time)),
             })
             .collect(),
     }
@@ -1158,8 +1234,8 @@ async fn read_controller(fcx: &Cx, session: &mut Session, plc: Plc) -> Result<Bl
     })
 }
 
-fn run_ms(fcx: &Cx) -> u64 {
-    u64::try_from(fcx.now().since_start().as_millis()).unwrap_or(u64::MAX)
+fn run_ms(fcx: &Cx) -> i64 {
+    i64::try_from(fcx.now().since_start().as_millis()).unwrap_or(i64::MAX)
 }
 
 fn mark_offline(held: &Mutex<Held>, plc: Plc, error: String) {
@@ -1205,7 +1281,6 @@ async fn poll(
         {
             let clock = run_ms(&fcx);
             let mut state = held.lock();
-            state.polls += 1;
             state.clock_ms = Some(clock);
             update_alarms(&mut state);
             state.sample();
@@ -1223,6 +1298,7 @@ async fn serve(
     mut listener: tcp::Listener,
     handler: Arc<dyn Handler>,
     local: SocketAddr,
+    site: Site,
 ) -> fictionet::Result {
     let mut id = 0u64;
     loop {
@@ -1233,8 +1309,11 @@ async fn serve(
         let info = ConnInfo::new(id, local, conn.peer_addr());
         let handler = handler.clone();
         fcx.spawn(move |fcx| async move {
-            let _ =
-                httpd::serve_connection(&fcx, conn, info, handler, &HttpOptions::default()).await;
+            let options = HttpOptions {
+                date: Some(std::time::UNIX_EPOCH + Duration::from_secs(site.epoch)),
+                ..HttpOptions::default()
+            };
+            let _ = httpd::serve_connection(&fcx, conn, info, handler, &options).await;
             Ok(())
         });
     }
@@ -1247,16 +1326,39 @@ pub fn start(
     fcx: &Cx,
     machine: Machine,
     controllers: Controllers,
+    site: Site,
+    driver: &Driver,
 ) -> Result<Arc<Mutex<Held>>, Error> {
-    let held = Arc::new(Mutex::new(Held::default()));
+    let held = Arc::new(Mutex::new(Held::warm(site, driver)));
     let tcp = machine.tcp.clone();
     let listener = tcp.listen(PORT)?;
-    let handler: Arc<dyn Handler> = Arc::new(router(held.clone(), tcp, controllers));
+    let handler: Arc<dyn Handler> = Arc::new(WebServer(router(held.clone(), tcp, controllers)));
     let local = SocketAddr::new(IpAddr::V4(ADDR), PORT);
-    fcx.spawn(move |fcx| serve(fcx, listener, handler, local));
+    fcx.spawn(move |fcx| serve(fcx, listener, handler, local, site));
     let poll_state = held.clone();
     fcx.spawn(move |fcx| poll(fcx, machine, controllers, poll_state));
     Ok(held)
+}
+
+struct WebServer(Router);
+
+fn server_header<T>(mut response: Response<T>) -> Response<T> {
+    response
+        .headers_mut()
+        .insert(header::SERVER, HeaderValue::from_static("GoAhead-Webs"));
+    response
+}
+
+impl Handler for WebServer {
+    fn call(&self, request: Request<httpd::Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        match self.0.call(request, ex) {
+            httpd::Reply::Now(response) => httpd::Reply::Now(server_header(response)),
+            httpd::Reply::Later(work) => httpd::Reply::Later(Box::new(move |fcx| {
+                Box::pin(async move { work(fcx).await.map(server_header) })
+            })),
+            reply => reply,
+        }
+    }
 }
 
 fn router(held: Arc<Mutex<Held>>, tcp: tcp::Endpoint, controllers: Controllers) -> Router {
@@ -1569,6 +1671,75 @@ mod tests {
             assert_eq!(held.blocks[slot(plc)].input.len(), usize::from(l.input));
         }
         held
+    }
+
+    #[test]
+    fn warm_history_uses_encoded_model_samples_and_leaves_the_live_plant_unchanged() {
+        for initial_power in [crate::InitialPower::Full, crate::InitialPower::Half] {
+            let config = Config {
+                initial_power,
+                seed: 29,
+                ..Config::default()
+            };
+            let driver = Driver::new(config.clone());
+            let before = driver.snapshot();
+            let site = Site {
+                utc_offset_seconds: 19_800,
+                zone: "IST",
+                ..Site::default()
+            };
+            let held = Held::warm(site, &driver);
+            assert_eq!(driver.snapshot(), before);
+            assert!(
+                view(&held)
+                    .links
+                    .iter()
+                    .all(|link| !link.online && link.updated_at.is_none())
+            );
+            let mut expected = Plant::new(config);
+            for n in 0..HISTORY_CAPACITY {
+                expected.advance(n as u64 * POLL_MS);
+                let snapshot = expected.snapshot();
+                for point in POINTS {
+                    let registers = match point.bank {
+                        Bank::Input => registers::input_registers(point.plc, &snapshot),
+                        Bank::Holding => registers::holding_registers(point.plc, &snapshot),
+                    };
+                    let count = registers[point.index];
+                    let expected_value = match point.scale {
+                        Scale::Tenth => f64::from(count) / 10.0,
+                        Scale::Hundredth => f64::from(count) / 100.0,
+                    };
+                    let sample = &held.history[point.id][n];
+                    assert_eq!(sample.value, Some(expected_value), "{} at {n}", point.id);
+                    assert_eq!(sample.time, site.timestamp(-600_000 + n as i64 * 250));
+                }
+            }
+            let samples = held.trend("hot_leg_a", 10).unwrap();
+            assert_eq!(samples.len(), HISTORY_CAPACITY);
+            assert_eq!(
+                samples.last().unwrap().clock_ms - samples[0].clock_ms,
+                600_000
+            );
+            assert!(
+                samples
+                    .windows(2)
+                    .all(|pair| pair[1].clock_ms - pair[0].clock_ms == 250)
+            );
+            assert!(
+                samples
+                    .windows(2)
+                    .any(|pair| pair[0].value != pair[1].value)
+            );
+            driver.advance_to(&(), 10_000);
+            let mut fresh = Plant::new(Config {
+                initial_power,
+                seed: 29,
+                ..Config::default()
+            });
+            fresh.advance(10_000);
+            assert_eq!(driver.snapshot(), fresh.snapshot());
+        }
     }
 
     #[test]

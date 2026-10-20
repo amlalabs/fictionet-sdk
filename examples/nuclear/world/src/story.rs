@@ -106,8 +106,9 @@ const GAUGE_TRACKING_MS: u64 = 3_000;
 /// Plant time the telemetry stays quiet in step 6.
 const QUIET_MS: u64 = 20_000;
 
-/// Minimum true loop B cooldown during the frozen display, in degrees Celsius.
-pub const QUIET_MIN_MOVE_C: f64 = 5.0;
+/// Minimum steam generator A level recovery during the frozen display, in percentage points.
+/// The measured feed trim raises level by about three points in twenty seconds.
+pub const QUIET_MIN_LEVEL_RISE_PERCENT: f64 = 2.0;
 
 /// Plant time after the quiet fault clears before the story checks that readings resume.
 const RESUME_MS: u64 = 3_000;
@@ -142,6 +143,11 @@ pub struct Report {
     pub quiet_true_hot_b: [f64; 2],
     /// HMI loop B gauge values across the same window.
     pub quiet_hmi_hot_b: [f64; 2],
+    /// True and held steam generator A levels across the quiet window, in percent.
+    pub quiet_true_sg_a: [f64; 2],
+    pub quiet_hmi_sg_a: [f64; 2],
+    /// True primary average temperatures across the quiet window, in Celsius.
+    pub quiet_true_average_c: [f64; 2],
 }
 
 /// Builds the operations network: hmi01 at its fixed address, with the
@@ -157,7 +163,13 @@ pub fn start_network(fcx: &Cx, driver: &Driver) -> Result<Machine, Error> {
         .route(OPERATOR_NAME, operator_route)
         .start(fcx, attachments)?;
     let hmi_machine = sandbox::machine(fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
-    hmi::start(fcx, hmi_machine, hmi::controllers())?;
+    hmi::start(
+        fcx,
+        hmi_machine,
+        hmi::controllers(),
+        hmi::Site::default(),
+        driver,
+    )?;
     Ok(sandbox::machine(
         fcx,
         attacher.attach(OPERATOR_NAME)?,
@@ -475,6 +487,18 @@ pub async fn run(
         5,
         "Fault cleared: loop B gauge and pump trip",
     ));
+    control(
+        fcx,
+        operator,
+        "controller",
+        json!({"name": "feed-a", "auto": false}),
+    )
+    .await?;
+    say(line(
+        driver.snapshot().at_ms,
+        5,
+        "Feed A set to manual from the HMI for level recovery",
+    ));
     let mut tracking_since = None;
     let (gauge, true_hot_b) = loop {
         let view = hmi_view(fcx, operator).await?;
@@ -508,39 +532,16 @@ pub async fn run(
     control(
         fcx,
         operator,
-        "pump",
-        json!({"name": "coolant-b", "running": true}),
-    )
-    .await?;
-    say(line(
-        driver.snapshot().at_ms,
-        6,
-        "Coolant pump B restarted from the HMI for cooldown",
-    ));
-    control(
-        fcx,
-        operator,
-        "controller",
-        json!({"name": "steam-dump", "auto": false}),
-    )
-    .await?;
-    say(line(
-        driver.snapshot().at_ms,
-        6,
-        "Steam dump set to manual from the HMI",
-    ));
-    control(
-        fcx,
-        operator,
         "valve",
-        json!({"name": "steam-dump", "percent": 100}),
+        json!({"name": "feed-a", "percent": 20}),
     )
     .await?;
     say(line(
         driver.snapshot().at_ms,
         6,
-        "Steam dump opened to 100% from the HMI for cooldown",
+        "Feed valve A opened to 20% from the HMI for level recovery",
     ));
+    wait_for(fcx, driver, driver.snapshot().at_ms + 3_000).await?;
     inject(fcx, driver, FaultChange::Inject(Fault::TelemetryQuiet))?;
     let quiet_from = driver.snapshot().at_ms;
     say(line(quiet_from, 6, "Fault: telemetry goes quiet"));
@@ -549,6 +550,7 @@ pub async fn run(
     let baseline = wait_for(fcx, driver, quiet_from + QUIET_BASELINE_MS).await?;
     let view_before = hmi_view(fcx, operator).await?;
     let hmi_before = reading(&view_before, "hot_leg_b")?;
+    let level_before = reading(&view_before, "sg_level_a")?;
     let heartbeat_before = heartbeats(&view_before)?;
     let quiet_end = wait_for(fcx, driver, baseline.at_ms + QUIET_MS).await?;
     check(
@@ -563,36 +565,42 @@ pub async fn run(
             .all(|(a, b)| a.reading.sampled_at_ms == b.reading.sampled_at_ms),
         "a reading was sampled while telemetry was quiet",
     )?;
+    let true_levels = [
+        baseline.truth.secondary.loops[Loop::A.index()].level_percent,
+        quiet_end.truth.secondary.loops[Loop::A.index()].level_percent,
+    ];
     check(
-        baseline.truth.primary.loops[Loop::B.index()].hot_leg_c
-            - quiet_end.truth.primary.loops[Loop::B.index()].hot_leg_c
-            >= QUIET_MIN_MOVE_C,
+        true_levels[1] - true_levels[0] >= QUIET_MIN_LEVEL_RISE_PERCENT,
         format!(
-            "The true loop B hot leg did not cool by at least 5 °C while telemetry was quiet: {:.1} to {:.1} °C",
-            baseline.truth.primary.loops[Loop::B.index()].hot_leg_c,
-            quiet_end.truth.primary.loops[Loop::B.index()].hot_leg_c
+            "The true steam generator A level did not rise by at least {QUIET_MIN_LEVEL_RISE_PERCENT:.1} percentage points while telemetry was quiet: {:.1} to {:.1} %",
+            true_levels[0], true_levels[1]
         ),
     )?;
     let view_after = hmi_view(fcx, operator).await?;
     let hmi_after = reading(&view_after, "hot_leg_b")?;
+    let level_after = reading(&view_after, "sg_level_a")?;
     check(
         heartbeats(&view_after)? == heartbeat_before,
         "the HMI heartbeats moved while telemetry was quiet",
     )?;
     check(
-        view_after["polls"].as_u64() > view_before["polls"].as_u64(),
+        view_after["plant_time"].as_str() > view_before["plant_time"].as_str(),
         "the HMI stopped polling",
     )?;
     check(
         hmi_before == hmi_after,
         format!("the HMI gauge moved while telemetry was quiet: {hmi_before:?} then {hmi_after:?}"),
     )?;
+    check(
+        level_before == level_after,
+        "the HMI steam generator A level moved while telemetry was quiet",
+    )?;
     say(line(
         quiet_end.at_ms,
         6,
         &format!(
-            "Telemetry quiet: the heartbeat stays at {}; the HMI holds loop B at {:.1} C while the plant moves",
-            heartbeat_before[0], hmi_after
+            "Telemetry quiet: the heartbeat stays at {}; the HMI holds steam generator A at {:.1} % while its true level rises from {:.1} % to {:.1} %",
+            heartbeat_before[0], level_after, true_levels[0], true_levels[1]
         ),
     ));
     inject(fcx, driver, FaultChange::Clear(FaultTarget::TelemetryQuiet))?;
@@ -620,14 +628,14 @@ pub async fn run(
     control(
         fcx,
         operator,
-        "valve",
-        json!({"name": "steam-dump", "percent": 0}),
+        "controller",
+        json!({"name": "feed-a", "auto": true}),
     )
     .await?;
     say(line(
         driver.snapshot().at_ms,
         6,
-        "Steam dump closed from the HMI",
+        "Feed A restored to automatic from the HMI",
     ));
 
     let first_action_after_fault_ms = tripped.first_action_after_fault_ms.ok_or_else(|| {
@@ -646,6 +654,12 @@ pub async fn run(
             quiet_end.truth.primary.loops[Loop::B.index()].hot_leg_c,
         ],
         quiet_hmi_hot_b: [hmi_before, hmi_after],
+        quiet_true_sg_a: true_levels,
+        quiet_hmi_sg_a: [level_before, level_after],
+        quiet_true_average_c: [
+            baseline.truth.primary.average_temperature_c,
+            quiet_end.truth.primary.average_temperature_c,
+        ],
     })
 }
 
