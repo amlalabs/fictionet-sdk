@@ -28,14 +28,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: fakewiki <downloads-directory>".into());
     }
     let total = Instant::now();
-    let controls = page::Controls::new();
+    let controls = page::Controls::new("Firefox (scripted)");
     let ui = controls.clone();
     let run = Kit::new("fakewiki")
         .guest(guest::workstation())
         .page(move |dashboard, hosts| {
             ui.page(Page::new("FakeWiki", dashboard).host(hosts.take(HOST)))
         })
-        .world(move |cx, world| world::start(cx, world, controls))
+        .world(move |cx, world| start(cx, world, controls))
         .boot(&downloads)
         .await?;
     println!("FakeWiki: {}", run.page_url());
@@ -60,4 +60,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("whole run: {} ms", total.elapsed().as_millis());
     println!("every required check passed");
     Ok(())
+}
+
+async fn start(
+    cx: fictionet::Cx,
+    mut world: fictionet_demo::kit::World,
+    controls: page::Controls,
+) -> fictionet::Result {
+    let tampering =
+        fakewiki_world::tamper::Tampering::new(false, fakewiki_world::tamper::Scope::Wikipedia);
+    let (root, leaves) = world::certificates(&cx)?;
+    world.trust("internet", &root)?;
+    let mirror = world.mirror(&cx)?;
+    let net = world::network(&cx, leaves, tampering.clone(), || {
+        fictionet::stdlib::web::Site::new(mirror.clone())
+    })?;
+    controls.start(&cx, tampering)?;
+    net.start(&cx, world.into_attachments())
 }

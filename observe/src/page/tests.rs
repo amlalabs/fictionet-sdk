@@ -2122,3 +2122,81 @@ async fn labels_are_world_commands_and_event_exports_keep_scope_labels_and_loss(
         ]
     );
 }
+
+#[tokio::test]
+async fn commands_without_panels_validate_names_and_bounds() {
+    let page = || {
+        Page::new(
+            "Commands",
+            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        )
+    };
+    let port =
+        || CommandPort::<serde_json::Value, serde_json::Value>::new(CommandLimits::default());
+    for invalid in [
+        page().command("", port()),
+        page().command("bad/name", port()),
+        page().command("same", port()).command("same", port()),
+        page().command(
+            "zero",
+            CommandPort::<serde_json::Value, serde_json::Value>::new(CommandLimits {
+                requests: 0,
+                ..CommandLimits::default()
+            }),
+        ),
+    ] {
+        assert!(invalid.bind_loopback(0).await.is_err());
+    }
+    let server = page()
+        .command("switch", port())
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let description = request(&server, "GET", "/api/page", &bearer(&server), "").await;
+    assert!(
+        json_body(&description)["panels"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let response = request(
+        &server,
+        "POST",
+        "/api/command/switch",
+        &format!("{}Origin: http://{}\r\n", bearer(&server), address(&server)),
+        "{}",
+    )
+    .await;
+    status(&response, 400);
+}
+
+#[tokio::test]
+async fn a_shared_workspace_keeps_declared_consoles() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let console = FakeConsole::default();
+    let server = Page::new("Shared workspace", dashboard.handle())
+        .host(Host::new("workstation").console(console))
+        .standard_panels()
+        .custom(
+            "Article",
+            "export function mount() { return () => {}; }",
+            StateTopic::<u32>::new(StateLimits::default()),
+        )
+        .workspace("Article")
+        .workspace_consoles()
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let response = request(&server, "GET", "/api/page", &bearer(&server), "").await;
+    let description: PageDescription = serde_json::from_value(json_body(&response)).unwrap();
+    let workspace: Vec<_> = description
+        .panels
+        .iter()
+        .filter(|panel| panel.area == Area::Workspace)
+        .map(|panel| panel.id.as_str())
+        .collect();
+    assert_eq!(
+        workspace,
+        ["article", "workstation-screen", "workstation-terminal"]
+    );
+}

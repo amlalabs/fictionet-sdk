@@ -43,6 +43,14 @@ checks both reads and saves guest and page screenshots before shutdown.
 It needs KVM and Chromium. Reviewer measurements pending: first-run download
 size, first-run time and cached-run time.
 
+For page design without a VM, run `cargo run --locked -p fictionet-demo --example fakewiki_page`.
+It uses the same page and world with a placeholder screen. The first stdout
+line is its loopback URL. Press Enter to make the in-world scripted client
+read the article, use the page's Tamper switch, then press Enter again.
+EOF stops the example. Its markers name the scripted client; the VM demo
+names Firefox (scripted). Article component tests run with
+`node --test demos/src/bin/fakewiki/article.test.mjs`.
+
 ## VM scripts
 
 The other demos are scripts in `demos/guest/` that run in the Fictionet VM.

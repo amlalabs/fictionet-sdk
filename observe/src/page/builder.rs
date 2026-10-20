@@ -158,6 +158,12 @@ impl Page {
         }
         self
     }
+    /// Keeps console tiles beside the custom panel selected by `workspace`.
+    pub fn workspace_consoles(mut self) -> Self {
+        self.workspace_consoles = true;
+        self
+    }
+
     /// Injects elapsed monotonic time for ticket expiration and lease timestamps.
     pub fn clock(mut self, clock: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
         self.clock = Arc::new(clock);
@@ -278,7 +284,14 @@ impl Page {
                     ))
                 })?;
             for panel in &mut self.panels {
-                panel.area = Area::Inspector;
+                if !self.workspace_consoles
+                    || !matches!(
+                        panel.content,
+                        PanelContent::Screen { .. } | PanelContent::Terminal { .. }
+                    )
+                {
+                    panel.area = Area::Inspector;
+                }
             }
             self.panels[selected].area = Area::Workspace;
         }

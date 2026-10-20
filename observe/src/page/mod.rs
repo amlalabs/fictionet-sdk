@@ -170,7 +170,9 @@
 //! each offered console. Their kinds are `packets`, `events`, `map`, `left_the_box`,
 //! `screen` or `terminal`; console panels also have `host`.
 //! `workspace(title)` places that custom panel in the workspace and moves
-//! the consoles to the inspector. Names, columns, actions, paths and
+//! the consoles to the inspector. Add `workspace_consoles()` to keep their
+//! tiles beside the custom panel. `command(name, port)` registers a mailbox
+//! at `/api/command/<name>` without a control panel. Names, columns, actions, paths and
 //! composition conflicts are checked before the listener binds.
 //!
 //! `left_the_box()` adds the destination panel by itself. `GET /api/egress`
@@ -447,6 +449,7 @@ pub struct Page {
     standard: bool,
     labels: Option<Labels>,
     workspace: Option<String>,
+    workspace_consoles: bool,
     modules: Vec<(String, String)>,
     assets: Vec<(String, String, Vec<u8>)>,
     filters: Vec<(String, EventFilter)>,
@@ -468,6 +471,7 @@ impl Page {
             standard: false,
             labels: None,
             workspace: None,
+            workspace_consoles: false,
             modules: vec![],
             assets: vec![],
             filters: vec![],
@@ -497,6 +501,16 @@ impl Page {
                 columns,
             },
         });
+        self
+    }
+
+    /// Registers a typed command mailbox without adding a panel.
+    pub fn command<C: serde::de::DeserializeOwned + Send + 'static, R: Serialize + 'static>(
+        mut self,
+        name: impl Into<String>,
+        port: CommandPort<C, R>,
+    ) -> Self {
+        self.commands.push((name.into(), Box::new(port)));
         self
     }
 
@@ -561,6 +575,23 @@ impl Page {
         }
         if let Some(error) = self.errors.first() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, error.clone()));
+        }
+        let mut commands = std::collections::BTreeSet::new();
+        for (name, port) in &self.commands {
+            if name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                || !commands.insert(name)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command needs a unique name of at most 128 ASCII letters, digits, hyphens or underscores",
+                ));
+            }
+            port.validate(&[], false)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         }
         let mut ids = std::collections::BTreeMap::new();
         for panel in &self.panels {

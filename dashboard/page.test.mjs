@@ -334,3 +334,41 @@ test('a custom workspace panel replaces the console tiles and hides the pins', a
   stop();
   assert.equal(h.budget.open, 0);
 });
+
+test('a shared custom workspace keeps the console tile and releases both on disposal', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = { ...DESCRIPTION, hosts: DESCRIPTION.hosts.map((host) => ({ ...host, screen: true, terminal: true })), panels: [
+    { id: 'plant', title: 'Plant', area: 'workspace', kind: 'custom', module: '/panels/plant.mjs', state: '/api/state/rows' },
+    { id: 'alpha-screen', title: 'Alpha', area: 'workspace', kind: 'screen', host: 'alpha' },
+  ] };
+  const stop = await mount(h.root, {
+    get: async (path) => path === '/api/page' ? description : { rows: [], next: 0, dropped: 0 },
+    stateStream: (topics) => h.stream('state', topics), watch: () => h.stream('watch'), close() {},
+  }, { subscribe: (listener) => { listener('light'); return () => {}; }, dispose() {} });
+  await settle();
+  const workspace = h.root.querySelector('#workspace');
+  assert.ok(workspace.classList.contains('shared-workspace'));
+  assert.ok(h.root.querySelector('#workbench').classList.contains('shared-workbench'));
+  assert.equal(h.root.querySelector('#workbench').style['--workspace'], '68%');
+  assert.equal(h.root.querySelector('#divider').getAttribute('aria-valuenow'), '68');
+  assert.equal(workspace.querySelectorAll('section.custom-workspace').length, 1);
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 1);
+  assert.equal(workspace.querySelector('section.workspace-tile').style.alignSelf, 'start');
+  const terminal = workspace.querySelectorAll('button').find((button) => button.textContent === 'Terminal');
+  terminal.click();
+  await settle();
+  assert.equal(workspace.querySelector('section.workspace-tile').style.alignSelf, undefined);
+  workspace.querySelectorAll('button').find((button) => button.textContent === 'Screen').click();
+  await settle();
+  assert.equal(workspace.querySelector('section.workspace-tile').style.alignSelf, 'start');
+  assert.ok(h.root.querySelectorAll('button.pin').every((pin) => !pin.hidden));
+  h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
+  h.document.hidden = false; h.document.dispatchEvent(new Event('visibilitychange'));
+  await settle();
+  assert.equal(workspace.querySelectorAll('section.custom-workspace').length, 1);
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 1);
+  stop();
+  assert.equal(h.budget.open, 0);
+  assert.equal(h.timers.size, 0);
+});

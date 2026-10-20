@@ -51,3 +51,7 @@ path = "src/bin/desktop/main.rs"
 [[bin]]
 name = "fakewiki"
 path = "src/bin/fakewiki/main.rs"
+
+[[example]]
+name = "fakewiki_page"
+path = "src/bin/fakewiki/example.rs"

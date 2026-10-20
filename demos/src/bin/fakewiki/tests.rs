@@ -28,9 +28,28 @@ use fictionet_observe::{
 
 use super::{ARTICLE, HOST, WIKI, gate, page::Controls, world};
 
+#[test]
+fn article_javascript() {
+    let output = std::process::Command::new("node")
+        .args(["--test", "src/bin/fakewiki/article.test.mjs"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("node is not installed");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("# fail 0") || text.contains("fail 0"),
+        "{text}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_commands_change_articles_and_publish_bounded_state() {
-    let controls = Controls::new();
+    let controls = Controls::new("Firefox (scripted)");
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
     let memory = Arc::new(Memory::default());
     let server = controls
@@ -41,6 +60,18 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
     let url = server.url().to_owned();
     let client = PageClient::from_url(&url).unwrap();
     client.bootstrap().await.unwrap();
+    let description = gate::get(&client, "/api/page").await.unwrap();
+    let panels = description["panels"].as_array().unwrap();
+    assert!(panels.iter().any(|panel| panel["id"] == "article"
+        && panel["area"] == "workspace"
+        && panel["module"] == "/panels/article.mjs"));
+    assert!(!panels.iter().any(|panel| panel["kind"] == "control"));
+    let module = client
+        .request("GET", "/panels/article.mjs", None, true)
+        .await
+        .unwrap();
+    assert_eq!(module.status, 200);
+    assert_eq!(module.body, include_bytes!("article.mjs"));
     let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(
         fictionet::events::Fanout::new(vec![memory.clone(), dashboard.observer()]),
     ));
@@ -87,6 +118,13 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
             assert_eq!(diff["value"]["revision"], revision);
             assert_eq!(state["status"]["too_large"], false);
             assert_eq!(diff["status"]["too_large"], false);
+            assert!(serde_json::to_vec(&state["value"])?.len() <= fakewiki_world::tamper::MAX_TAMPER_STATE_BYTES);
+            assert!(serde_json::to_vec(&diff["value"])?.len() <= pages::diff::MAX_DIFF_BYTES);
+            let context = gate::get(&client, "/api/state/article").await?;
+            assert_eq!(context["status"]["too_large"], false);
+            assert_eq!(context["value"]["reader"], "Firefox (scripted)");
+            assert_eq!(context["value"]["reader_host"], HOST);
+            assert_eq!(context["value"]["hosts"][WIKI], pages::host_ips()[WIKI].to_string());
             let diff: pages::diff::Diff = serde_json::from_value(diff["value"].clone())?;
             for source in diff.topics.iter().flat_map(|t| &t.sources) {
                 assert_eq!(source.served, if revision == 1 && source.source == "wikipedia" {
@@ -137,7 +175,7 @@ fn lab_reads_follow_commands_and_unknown_addresses_are_unreachable() {
     let result = fictionet::block_on(fictionet::lab(
         RunOptions::new(Seed::from_u64(2)),
         |cx| async move {
-            let controls = Controls::new();
+            let controls = Controls::new("Firefox (scripted)");
             let tampering = Tampering::new(false, Scope::Wikipedia);
             let (_, leaves) = world::certificates(&cx)?;
             let content = Content::in_process(tampering.clone());

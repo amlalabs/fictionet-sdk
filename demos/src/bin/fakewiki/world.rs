@@ -5,9 +5,7 @@ use std::time::SystemTime;
 use fakewiki_world::{content::Content, issue_leaves, pages, sites, tamper::Tampering};
 use fictionet::Cx;
 use fictionet::stdlib::{services::ca::Leaf, web, world::net::Net};
-use fictionet_demo::kit::{self, World};
-
-use super::page::Controls;
+use fictionet_demo::kit;
 
 pub const APT: &[&str] = &["archive.ubuntu.com", "security.ubuntu.com"];
 
@@ -43,16 +41,4 @@ pub fn network(
         net = net.add_host(host);
     }
     Ok(net.route(kit::JUMP, kit::jump_prefix()))
-}
-
-pub async fn start(cx: Cx, mut world: World, controls: Controls) -> fictionet::Result {
-    let tampering = Tampering::new(false, fakewiki_world::tamper::Scope::Wikipedia);
-    let (root, leaves) = certificates(&cx)?;
-    world.trust("internet", &root)?;
-    let mirror = world.mirror(&cx)?;
-    let net = network(&cx, leaves, tampering.clone(), || {
-        web::Site::new(mirror.clone())
-    })?;
-    controls.start(&cx, tampering)?;
-    net.start(&cx, world.into_attachments())
 }
