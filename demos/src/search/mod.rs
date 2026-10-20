@@ -150,59 +150,25 @@ impl Default for Topics {
     }
 }
 
-/// The in-memory generator and network shared by the guest run and preview.
-pub struct World {
-    pub ca: Arc<adaptive_web_world::Ca>,
-    pub pages: Arc<Pages>,
-    pub start: std::time::SystemTime,
-    addresses: Arc<adaptive_web_world::Addresses>,
+/// The world's network for the guest run and the preview: the adaptive web,
+/// with the names in [`FORWARDED`] served from the kit's package mirror.
+pub fn network(
+    world: &adaptive_web_world::World,
+    cx: &Cx,
     log: Arc<example_common::log::Log>,
-}
-
-impl World {
-    pub fn new(
-        cx: &Cx,
-        seed: adaptive_web_world::pages::Seed,
-        log: Arc<example_common::log::Log>,
-    ) -> fictionet::Result<Self> {
-        let start = adaptive_web_world::world_start(&seed.date)?;
-        Ok(Self {
-            ca: Arc::new(adaptive_web_world::Ca::in_memory(cx, start)?),
-            addresses: Arc::new(adaptive_web_world::Addresses::new(
-                seed.fixed_addresses(),
-                None,
-            )?),
-            pages: Arc::new(Pages::new(seed)),
-            start,
-            log,
+    mirror: crate::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,
+) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
+    let tls = world.ca.config(cx, crate::kit::desktop::HOSTS[0])?.0;
+    Ok(world.net(cx, log, move |host| {
+        FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
+            let site = fictionet::stdlib::web::Site::new(mirror.clone());
+            if crate::kit::desktop::HOSTS.contains(&host) {
+                site.tls(tls.clone())
+            } else {
+                site
+            }
         })
-    }
-
-    pub fn network(
-        &self,
-        cx: &Cx,
-        mirror: crate::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,
-    ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
-        let tls = self.ca.config(cx, crate::kit::desktop::HOSTS[0])?.0;
-        Ok(adaptive_web_world::net(
-            cx,
-            self.addresses.clone(),
-            self.ca.clone(),
-            self.pages.clone(),
-            self.log.clone(),
-            self.start,
-            move |host| {
-                FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
-                    let site = fictionet::stdlib::web::Site::new(mirror.clone());
-                    if crate::kit::desktop::HOSTS.contains(&host) {
-                        site.tls(tls.clone())
-                    } else {
-                        site
-                    }
-                })
-            },
-        ))
-    }
+    }))
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use super::*;
 use crate::kit::client::PageClient;
 use crate::search as page;
-use adaptive_web_world::{Addresses, Ca, pages::Seed};
+use adaptive_web_world::{World, pages::Seed};
 use example_common::log::Log;
 use fictionet::{
     Cx,
@@ -61,13 +61,16 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
         move |cx| async move {
             let start = adaptive_web_world::world_start(&seed.date)?;
-            let ca = Arc::new(Ca::in_memory(&cx, start)?);
-            let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
-            let pages = Arc::new(Pages::new(seed.clone()));
+            let world = World::new(&cx, seed.clone(), start)?;
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
             let (attacher, attachments) = fictionet::attachments();
-            adaptive_web_world::serve(&cx, addresses, ca, pages.clone(), log, start, attachments)?;
-            topics.start(&cx, searches.clone(), pages, "Firefox (scripted)")?;
+            world.serve(&cx, log, attachments)?;
+            topics.start(
+                &cx,
+                searches.clone(),
+                world.pages.clone(),
+                "Firefox (scripted)",
+            )?;
             let machine = machine(
                 &cx,
                 attacher.attach("workstation")?,

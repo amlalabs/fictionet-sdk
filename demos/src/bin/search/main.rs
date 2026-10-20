@@ -95,11 +95,11 @@ async fn main() -> Result {
         .observer(Arc::new(LogObserver { log: log.clone() }))
         .page(move |dashboard, hosts| view.page(dashboard, hosts.take(guest::HOST)))
         .world(move |cx, mut world| async move {
-            let network = page::World::new(&cx, seed, world_log)?;
-            world.trust("office", &network.ca.cert_pem())?;
-            topics.start(&cx, searches, network.pages.clone(), "Firefox (scripted)")?;
-            network
-                .network(&cx, world.mirror(&cx)?)?
+            let start = adaptive_web_world::world_start(&seed.date)?;
+            let web = adaptive_web_world::World::new(&cx, seed, start)?;
+            world.trust("office", &web.ca.cert_pem())?;
+            topics.start(&cx, searches, web.pages.clone(), "Firefox (scripted)")?;
+            page::network(&web, &cx, world_log, world.mirror(&cx)?)?
                 .route(kit::JUMP, kit::jump_prefix())
                 .start(&cx, world.into_attachments())
         });

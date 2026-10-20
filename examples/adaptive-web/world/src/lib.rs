@@ -30,24 +30,22 @@
 //!   ready file, and the store. The log is written from the run's events
 //!   ([`events`]).
 //!
-//! An in-process world can keep its addresses, pages and CA in memory.
+//! An in-process [`World`] keeps its addresses, pages and CA in memory.
 //! This example sends its log to standard output, and turns generation off
 //! once the network is up.
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use adaptive_web_world::{Addresses, Ca, serve, world_start};
+//! use adaptive_web_world::{World, world_start};
 //! use adaptive_web_world::{events::LogObserver, search::Searches};
-//! use adaptive_web_world::pages::{Command, Pages, Seed};
+//! use adaptive_web_world::pages::{Command, Seed};
 //! use example_common::log::Log;
 //! use fictionet::events::Fanout;
 //!
 //! # fn main() -> fictionet::Result {
 //! let seed = Seed::builtin("halvard-cve")?;
 //! let start = world_start(&seed.date)?;
-//! let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
-//! let pages = Arc::new(Pages::new(seed));
-//! let searches = Arc::new(Searches::of(&pages));
+//! let searches = Arc::new(Searches::from_seed(&seed));
 //! let log = Arc::new(Log::new(Box::new(std::io::stdout()), &[], |s| s));
 //! let observer = Arc::new(Fanout::new(vec![
 //!     searches.clone(),
@@ -57,11 +55,12 @@
 //!     .observer(observer);
 //! let output = log.clone();
 //! fictionet::block_on(fictionet::run(options, |cx| async move {
-//!     let ca = Arc::new(Ca::in_memory(&cx, start)?);
-//!     let root_pem = ca.cert_pem();
+//!     let world = World::new(&cx, seed, start)?;
+//!     let root_pem = world.ca.cert_pem();
 //!     let (attacher, attachments) = fictionet::attachments();
-//!     serve(&cx, addresses, ca, pages.clone(), log.clone(), start, attachments)?;
+//!     world.serve(&cx, log.clone(), attachments)?;
 //!     // Start a guest with root_pem and attacher here.
+//!     let pages = &world.pages;
 //!     let applied = pages.apply(&cx, Command::SetGeneration {
 //!         generate: false,
 //!         expected_revision: pages.generation().revision,
@@ -518,6 +517,56 @@ pub fn net(
         net = net.add_host(host);
     }
     net
+}
+
+/// A world kept in memory, made from one seed: a new CA, the seed's fixed
+/// addresses and its pages with the offline generator, dated from `start`,
+/// usually [`world_start`] of the seed's date. The executable keeps a store
+/// and may use a model instead.
+pub struct World {
+    pub ca: Arc<Ca>,
+    pub addresses: Arc<Addresses>,
+    pub pages: Arc<Pages>,
+    pub start: SystemTime,
+}
+
+impl World {
+    pub fn new(fcx: &Cx, seed: pages::Seed, start: SystemTime) -> fictionet::Result<World> {
+        Ok(World {
+            ca: Arc::new(Ca::in_memory(fcx, start)?),
+            addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
+            pages: Arc::new(Pages::new(seed)),
+            start,
+        })
+    }
+
+    /// The world's unstarted network, as [`net`] builds it.
+    pub fn net(
+        &self,
+        fcx: &Cx,
+        log: Arc<Log>,
+        forward: impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static,
+    ) -> fictionet::stdlib::world::net::Net {
+        net(
+            fcx,
+            self.addresses.clone(),
+            self.ca.clone(),
+            self.pages.clone(),
+            log,
+            self.start,
+            forward,
+        )
+    }
+
+    /// Starts the world's network, as [`serve`] does.
+    pub fn serve(
+        &self,
+        fcx: &Cx,
+        log: Arc<Log>,
+        attachments: fictionet::Attachments,
+    ) -> fictionet::Result {
+        self.net(fcx, log, |_| None).start(fcx, attachments)
+    }
 }
 
 #[cfg(test)]

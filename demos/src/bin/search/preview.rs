@@ -5,6 +5,7 @@
 //! new searches until the world refuses one for its generation budget.
 
 use adaptive_web_world::{
+    World,
     pages::{self, Seed},
     route::Engine,
     search::{Failure, Outcome, Searches},
@@ -28,7 +29,7 @@ use fictionet_demo::{
         client::PageClient,
         preview::{Input, Story},
     },
-    search::{Topics, World},
+    search::{self as page, Topics},
 };
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
@@ -76,11 +77,10 @@ pub async fn run(spend: bool) -> Result {
         move |cx| async move {
             containment.publish(cx.now(), &Containment::default())?;
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
-            let world = World::new(&cx, seed, log)?;
+            let start = adaptive_web_world::world_start(&seed.date)?;
+            let world = World::new(&cx, seed, start)?;
             let (attacher, attachments) = fictionet::attachments();
-            world
-                .network(&cx, kit::mirror::new(&cx)?)?
-                .start(&cx, attachments)?;
+            page::network(&world, &cx, log, kit::mirror::new(&cx)?)?.start(&cx, attachments)?;
             topics.start(
                 &cx,
                 searches.clone(),

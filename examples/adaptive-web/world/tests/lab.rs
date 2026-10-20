@@ -1,10 +1,9 @@
 //! The whole world, with its offline generator, runs in a lab: no sockets
 //! or files.
 use adaptive_web_world::{
-    Addresses, Ca,
-    pages::{Pages, Seed, render::google_results, text::target_of},
+    World,
+    pages::{Seed, render::google_results, text::target_of},
     search::Searches,
-    serve,
 };
 use fictionet::{
     Cx,
@@ -55,9 +54,7 @@ async fn fetch(cx: &Cx, m: &Machine, host: &str, path: &str, start: SystemTime) 
 fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
     let events = Arc::new(Memory::default());
     let seed = Seed::builtin("halvard-cve").unwrap();
-    let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None).unwrap());
-    let pages = Arc::new(Pages::new(seed));
-    let searches = Arc::new(Searches::of(&pages));
+    let searches = Arc::new(Searches::from_seed(&seed));
     let log = Arc::new(example_common::log::Log::new(
         Box::new(std::io::sink()),
         &[],
@@ -78,7 +75,8 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
                     .midnight()
                     .assume_utc(),
             );
-            let ca = Arc::new(Ca::in_memory(&cx, start)?);
+            let world = World::new(&cx, seed, start)?;
+            let pages = &world.pages;
             if exhaust {
                 // The cast and 199 pages spend the 200 generations.
                 for n in 0..199 {
@@ -90,7 +88,7 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
                 assert_eq!(last.await.status, 503);
             }
             let (attacher, attachments) = fictionet::attachments();
-            serve(&cx, addresses, ca, pages, log, start, attachments)?;
+            world.serve(&cx, log, attachments)?;
             let m = machine(&cx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
             let (status, body) = fetch(
                 &cx,
@@ -191,23 +189,16 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
         move |cx| async move {
             let seed = Seed::builtin("halvard-cve")?;
             let start = adaptive_web_world::world_start(&seed.date)?;
-            let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
-            let ca = Arc::new(Ca::in_memory(&cx, start)?);
-            let tls = ca.config(&cx, "forwarded.com")?.0;
+            let world = World::new(&cx, seed, start)?;
+            let tls = world.ca.config(&cx, "forwarded.com")?.0;
             let log = Arc::new(example_common::log::Log::new(
                 Box::new(std::io::sink()),
                 &[],
                 |s| s,
             ));
             let (attacher, attachments) = fictionet::attachments();
-            adaptive_web_world::net(
-                &cx,
-                addresses,
-                ca,
-                Arc::new(Pages::new(seed)),
-                log,
-                start,
-                move |name| {
+            world
+                .net(&cx, log, move |name| {
                     (name == "forwarded.com").then(|| {
                         fictionet::stdlib::web::Site::handler(
                             fictionet::stdlib::web::httpd::Router::new().get("/", |_, _| {
@@ -216,9 +207,8 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
                         )
                         .tls(tls.clone())
                     })
-                },
-            )
-            .start(&cx, attachments)?;
+                })
+                .start(&cx, attachments)?;
             let m = machine(
                 &cx,
                 attacher.attach("workstation")?,
