@@ -459,6 +459,14 @@ impl Searches {
             },
         )
     }
+    /// Reads the revision without cloning the snapshot.
+    pub fn revision(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revision
+    }
+
     /// Clones the current state.
     pub fn snapshot(&self) -> Snapshot {
         self.0

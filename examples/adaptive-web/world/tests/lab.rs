@@ -201,3 +201,77 @@ fn exhausted_search_emits_query_failed() {
     assert_eq!(answer["fields"]["query_id"], 1);
     assert_eq!(answer["fields"]["cache"], "budget");
 }
+
+#[test]
+fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
+    let events = Arc::new(Memory::default());
+    let observed = events.clone();
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(events.clone()),
+        move |cx| async move {
+            let seed = Seed::builtin("halvard-cve")?;
+            let start = adaptive_web_world::world_start(&seed.date)?;
+            let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
+            let ca = Arc::new(Ca::in_memory(&cx, start)?);
+            let tls = ca.config(&cx, "forwarded.com")?.0;
+            let log = Arc::new(example_common::log::Log::new(
+                Box::new(std::io::sink()),
+                &[],
+                |s| s,
+            ));
+            let (attacher, attachments) = fictionet::attachments();
+            adaptive_web_world::net(
+                &cx,
+                addresses,
+                ca,
+                Arc::new(Stub::new(seed)),
+                log,
+                start,
+                move |name| {
+                    (name == "forwarded.com").then(|| {
+                        fictionet::stdlib::web::Site::handler(
+                            fictionet::stdlib::web::httpd::Router::new().get("/", |_, _| {
+                                http::Response::new(bytes::Bytes::from_static(b"caller content"))
+                            }),
+                        )
+                        .tls(tls.clone())
+                    })
+                },
+            )
+            .start(&cx, attachments)?;
+            let m = machine(
+                &cx,
+                attacher.attach("workstation")?,
+                Ipv4Addr::new(10, 0, 0, 2),
+            );
+            let (status, body) = fetch(&cx, &m, "forwarded.com", "/", start).await;
+            assert_eq!(status, 200);
+            assert_eq!(body, b"caller content");
+            assert_eq!(fetch(&cx, &m, "freshnews.com", "/news", start).await.0, 200);
+            let refused = m
+                .lookup(&cx, "10.0.0.1".parse()?, "wiki.corp", RecordType::A)
+                .await?;
+            assert!(refused.answers.is_empty());
+            cx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+    let sites = observed.checked_of("adaptive", "site").unwrap();
+    assert!(sites.iter().any(|e| e.str("host") == Some("freshnews.com")));
+    assert!(!sites.iter().any(|e| e.str("host") == Some("forwarded.com")));
+    assert!(
+        !observed
+            .checked_of("adaptive", "cert")
+            .unwrap()
+            .iter()
+            .any(|e| e.str("host") == Some("forwarded.com"))
+    );
+    assert!(
+        observed
+            .checked_of("adaptive", "refused")
+            .unwrap()
+            .iter()
+            .any(|e| e.str("host") == Some("wiki.corp"))
+    );
+}

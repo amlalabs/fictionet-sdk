@@ -26,6 +26,22 @@ results to fit a scenario; this world does the same for the network, with
 real DNS, TLS and HTTP underneath, so `curl`, `requests` and `dig` behave as
 they do outside.
 
+## Live demo
+
+Run `cargo xtask demo search` on Linux with KVM. One executable boots an
+official Ubuntu 24.04 desktop through Cloud Hypervisor and runs the adaptive
+web in-process with its stub generator (no model). A scripted searcher drives
+Firefox across Google, Bing and DuckDuckGo; the loopback page has the desktop,
+standard observation panels, search events and generation control. Search results
+and opened web pages are made up for this run. Only package installation hosts are forwarded.
+
+The default seed is `halvard-cve`. Select another embedded seed with
+`cargo xtask demo search -- --seed corvane-acquisition` or
+`cargo xtask demo search -- --seed fastjsonl-package`. The gate prints each
+check, measurements and capture paths, then shuts the guest down. Captures and
+the log are written directly to the printed persistent output directory,
+`demos/downloads/cloudimage/runs/search-<unix seconds>/`.
+
 ## Quick start
 
 Prerequisites: Linux, Docker with Compose v2, `/dev/net/tun`, Python 3.12 or

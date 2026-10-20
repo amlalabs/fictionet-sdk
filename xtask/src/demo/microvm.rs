@@ -73,7 +73,7 @@ pub fn build(name: &str) -> Result {
 }
 
 /// Runs the demo with the downloaded paths, inheriting its output.
-pub fn launch(name: &str) -> Result {
+pub fn launch(name: &str, args: &[String]) -> Result {
     let dir = crate::root().join("demos/downloads/cloudimage");
     let metadata: serde_json::Value = serde_json::from_str(&capture(&mut cmd(
         "cargo",
@@ -83,5 +83,5 @@ pub fn launch(name: &str) -> Result {
         .as_str()
         .ok_or("cargo metadata gave no target directory")?;
     let binary = Path::new(target).join("release").join(name);
-    execute(std::process::Command::new(&binary).arg(dir))
+    execute(std::process::Command::new(&binary).arg(dir).args(args))
 }

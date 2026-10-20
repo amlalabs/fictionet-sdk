@@ -911,6 +911,7 @@ dependencies = [
 name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
+ "adaptive-web-world",
  "bytes",
  "crc32fast",
  "example-common",
@@ -924,6 +925,7 @@ dependencies = [
  "httpdate",
  "libc",
  "russh",
+ "serde",
  "serde_json",
  "tokio",
  "tower-service",

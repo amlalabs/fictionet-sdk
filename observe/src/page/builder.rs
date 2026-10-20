@@ -14,6 +14,9 @@ pub struct EventFilter {
     pub source: Option<String>,
     /// Event kind.
     pub kind: Option<String>,
+    /// Alternative event kinds. Empty matches any kind.
+    #[serde(default)]
+    pub kinds: Vec<String>,
     /// Equality on a named member of the event's fields object.
     pub field: Option<(String, serde_json::Value)>,
     /// Page host name, mapped to its sandbox.
@@ -410,6 +413,7 @@ pub(super) async fn projection(
     events.retain(|event| {
         filter.source.as_ref().is_none_or(|s| event["source"] == *s)
             && filter.kind.as_ref().is_none_or(|s| event["kind"] == *s)
+            && (filter.kinds.is_empty() || filter.kinds.iter().any(|kind| event["kind"] == *kind))
             && filter
                 .field
                 .as_ref()

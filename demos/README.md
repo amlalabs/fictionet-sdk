@@ -58,7 +58,7 @@ VM that a demo booted.
 | [`cargo xtask demo k8s`](guest/k8s.sh) | A kind cluster in the VM, the Helm chart in `charts/fictionet-sandbox` with `examples/attach/k8s-tun.yaml`, and the agent's pod. Its `eth0` is down, `tun0` is its only route, it reaches `https://example.test/`, and the internet, the cluster's DNS and the API server are out of reach. | pulls kind's node image | 1.5 min; then 1 min |
 | [`cargo xtask demo border`](guest/border.sh) | [Border](../examples/border)'s world under Docker Compose in the VM, with a scripted agent. First the real bank: sign-in, balance, three hops, one BGP route. Then the hijack: a fourth hop and a more specific route from AS 65002, an impostor certificate that `curl` refuses, and with `curl -k`, the password sent to the impostor, as the world's log shows. | pulls Debian and Python images | 2 min; then 20 s |
 | [`cargo xtask demo fakewiki`](guest/fakewiki.sh) | [FakeWiki](../examples/fakewiki)'s world under Docker Compose in the VM. The agent reads a Wikipedia article at its real name over TLS it trusts, first as it is, then tampered; the world's log labels each request with the topic, the source and its stance. | pulls Debian and Python images | 1.5 min; then 20 s |
-| [`cargo xtask demo adaptive-web`](guest/adaptive-web.sh) | [The adaptive web](../examples/adaptive-web) under Docker Compose in the VM, with its stub generator. A search on `google.com` answers with ten results made for the query; the page behind the first result is made when it is asked for and kept; the world's log says why each site exists. | pulls Debian and Python images | 30 s; then 15 s |
+| [`cargo xtask demo search`](src/bin/search/) | A scripted Firefox searcher on an Ubuntu desktop; the adaptive web runs in-process with a stub generator (no model). Search, stored pages, generation control and standard observation panels. | Linux with KVM and Chromium; pinned cloud image, Cloud Hypervisor and browser libraries downloaded on first run | Download size and elapsed time: reviewer measurement pending |
 | [`cargo xtask demo scan`](guest/scan.sh) | [The scan example](../examples/scan) under Docker Compose in the VM: four simulated hosts and a real container with nginx and OpenSSH on one office subnet. `nmap` in the agent's sandbox finds all five, and a SYN scan with service detection names what runs on each. The world's second argument opens its observation socket. The dashboard connects to that socket and shows the scan, with its HTTP port forwarded to your machine. | a browser; pulls Debian and Alpine images | 1.5 min; then 1 min |
 
 The times are from a 24-core machine with other work running, with the VM's
@@ -75,8 +75,8 @@ pays for them.
 The scripts that run inside the VM are in [`guest/`](guest), one per demo, with
 [`lib.sh`](guest/lib.sh) for the steps, the commands and the checks. Each starts
 with a `# needs:` line that says what [`vm/guest/build.sh`](../vm/guest/build.sh)
-builds for it: `sdk` is `fictionet` and the crate's examples, and `border`,
-`fakewiki` and `adaptive-web` are those examples' worlds. The Compose demos
+builds for it: `sdk` is `fictionet` and the crate's examples; `border` and
+`fakewiki` are those examples' worlds. The Compose demos
 run the examples' own Compose files, plus a small file next to the script
 (`border.compose.yaml` and the others) that puts the binaries the VM built in
 place of the Dockerfile's build stage, so nothing compiles twice.

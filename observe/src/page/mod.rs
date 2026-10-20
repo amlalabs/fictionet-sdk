@@ -477,6 +477,32 @@ impl Page {
         }
     }
 
+    /// Registers an authoritative topic without adding a panel.
+    pub fn state<T: Serialize>(mut self, name: impl Into<String>, topic: StateTopic<T>) -> Self {
+        self.topics.push((name.into(), topic.topic));
+        self
+    }
+
+    /// Selects a JSON pointer in the linked snapshot for command revisions.
+    pub fn control_revision(mut self, pointer: impl Into<String>) -> Self {
+        let pointer = pointer.into();
+        if !panel::valid_pointer(&pointer) {
+            self.errors
+                .push("control revision must be a JSON pointer".into());
+        }
+        if let Some(PanelDescription {
+            content: PanelContent::Control { revision, .. },
+            ..
+        }) = self.panels.last_mut()
+        {
+            *revision = Some(pointer);
+        } else {
+            self.errors
+                .push("control_revision must follow control".into());
+        }
+        self
+    }
+
     /// Adds a table over an authoritative state topic.
     pub fn table<T: Serialize>(
         mut self,
@@ -517,6 +543,7 @@ impl Page {
                 command: format!("/api/command/{id}"),
                 actions,
                 state: None,
+                revision: None,
             },
         });
         self

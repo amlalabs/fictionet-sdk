@@ -41,6 +41,7 @@ export function mount(root, services, options) {
   const cleanup = [];
   const buttons = [];
   let revision, busy = false;
+  const pointer = (value, path) => path === '' ? value : path.slice(1).split('/').reduce((item, key) => item?.[key.replace(/~1/g, '/').replace(/~0/g, '~')], value);
   const when = () => (services.runTime ? ` at ${fmtDuration(services.runTime())}` : '');
   function say(line, value) {
     reply.replaceChildren();
@@ -74,7 +75,7 @@ export function mount(root, services, options) {
   }
   if (options.state) {
     cleanup.push(services.state(options.state, (snapshot) => {
-      revision = snapshot.revision;
+      revision = options.revision ? pointer(snapshot, options.revision) : snapshot.revision;
       state.replaceChildren();
       if (snapshot.value === null || snapshot.value === undefined) el('p', { class: 'empty-note', text: 'The world has not published this state yet.' }, state);
       else keyValues(state, el, snapshot.value);

@@ -579,3 +579,14 @@ fn failed_answer_keeps_generation_timing() {
     feed(&s, 3, answer);
     assert_eq!(s.snapshot(), state);
 }
+
+#[test]
+fn revision_tracks_changes_without_a_snapshot() {
+    let s = searches();
+    assert_eq!(s.revision(), 0);
+    feed(&s, 1, query(1, "google", "a"));
+    assert_eq!(s.revision(), 1);
+    feed(&s, 2, Event::new("other", "event"));
+    assert_eq!(s.revision(), 1);
+    assert_eq!(s.revision(), s.snapshot().revision);
+}

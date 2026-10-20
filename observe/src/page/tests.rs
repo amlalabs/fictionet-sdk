@@ -1579,6 +1579,7 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
                 kind: Some("request".into()),
                 field: Some(("route".into(), "bank".into())),
                 host: None,
+                kinds: vec![],
             },
             vec![Column::new("Route", "/fields/route")],
         )
@@ -1589,6 +1590,7 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
                 kind: Some("request".into()),
                 field: Some(("route".into(), "bank".into())),
                 host: None,
+                kinds: vec![],
             },
         )
         .custom(
@@ -2049,4 +2051,92 @@ async fn labels_are_world_commands_and_event_exports_keep_scope_labels_and_loss(
             "labels"
         ]
     );
+}
+
+#[tokio::test]
+async fn state_can_be_registered_without_a_panel_and_controls_select_world_fields() {
+    let topic = StateTopic::new(StateLimits::default());
+    topic
+        .publish(
+            fictionet::time::Instant::from_since_start(std::time::Duration::ZERO),
+            &serde_json::json!({"enabled":true,"revision":0}),
+        )
+        .unwrap();
+    let page = Page::new(
+        "Settings",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .state("settings", topic.clone())
+    .control(
+        "Switch",
+        CommandPort::<serde_json::Value, u32>::new(CommandLimits::default()),
+        vec![
+            Action {
+                label: "On".into(),
+                command: serde_json::json!({"enabled":true}),
+            },
+            Action {
+                label: "Off".into(),
+                command: serde_json::json!({"enabled":false}),
+            },
+        ],
+    )
+    .control_state(topic)
+    .control_revision("/value/revision");
+    let server = page.bind_loopback(0).await.unwrap();
+    let state =
+        json_body(&request(&server, "GET", "/api/state/settings", &bearer(&server), "").await);
+    assert_eq!(state["revision"], 1);
+    assert_eq!(state["value"]["revision"], 0);
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    let panels = description["panels"].as_array().unwrap();
+    assert_eq!(panels.len(), 1);
+    assert_eq!(panels[0]["revision"], "/value/revision");
+}
+
+#[tokio::test]
+async fn event_tables_select_several_kinds_without_other_events() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(dashboard.observer()),
+        |cx| async move {
+            for kind in ["query", "site", "query_failed"] {
+                cx.emit("sample", kind, |event| event.field("search", "office"));
+            }
+            cx.emit("other", "query", |event| event);
+            cx.cancel();
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let server = Page::new("Queries", dashboard.handle())
+        .event_table(
+            "Queries",
+            EventFilter {
+                source: Some("sample".into()),
+                kinds: vec!["query".into(), "query_failed".into()],
+                ..EventFilter::default()
+            },
+            vec![Column::new("Event", "/kind")],
+        )
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let response = request(
+        &server,
+        "GET",
+        "/api/event-table/queries",
+        &bearer(&server),
+        "",
+    )
+    .await;
+    let rows = json_body(&response);
+    let kinds: Vec<_> = rows["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["query", "query_failed"]);
 }

@@ -425,11 +425,28 @@ pub fn serve(
     start: SystemTime,
     attachments: fictionet::Attachments,
 ) -> fictionet::Result {
+    net(fcx, addresses, ca, pages, log, start, |_| None).start(fcx, attachments)
+}
+
+/// Builds an unstarted network, giving the caller first choice of each name.
+/// Claimed names bypass adaptive addresses, certificates and site events.
+pub fn net(
+    fcx: &Cx,
+    addresses: Arc<Addresses>,
+    ca: Arc<Ca>,
+    pages: impl Into<Pages>,
+    log: Arc<Log>,
+    start: SystemTime,
+    forward: impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static,
+) -> fictionet::stdlib::world::net::Net {
     let handler = pages.into().handler(fcx);
     log.attach(fcx);
     let names = addresses.fixed.clone();
     let world = fcx.clone();
     let site_for = move |host: &str| {
+        if let Some(site) = forward(host) {
+            return Some(site);
+        }
         if let Err(why) = admit(host) {
             world.emit("adaptive", "refused", |event| {
                 event
@@ -498,8 +515,7 @@ pub fn serve(
     for host in hosts {
         net = net.add_host(host);
     }
-    net.start(fcx, attachments)?;
-    Ok(())
+    net
 }
 
 /// The fixed addresses in the backend's first line.
