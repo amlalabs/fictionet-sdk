@@ -266,7 +266,6 @@ fn artifact(
         (
             format!("{info}/WHEEL"),
             b"Wheel-Version: 1.0\n\
-              \
               Root-Is-Purelib: true\n\
               Tag: py3-none-any\n"
                 .to_vec(),

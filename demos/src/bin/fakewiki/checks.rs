@@ -305,6 +305,7 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
     client.bootstrap().await?;
     let guest = run.guest(HOST);
     guest.wait_desktop(Duration::from_secs(300)).await?;
+    guest.wait_cloud_init(Duration::from_secs(300)).await?;
     read(&client, "real", 0).await?;
     println!(
         "boot to desktop (article received over TLS): {} ms",

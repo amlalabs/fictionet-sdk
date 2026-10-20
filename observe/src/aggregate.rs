@@ -73,6 +73,13 @@ impl Aggregate {
 }
 
 impl Observer for Aggregate {
+    fn content(
+        &self,
+        source: fictionet::events::Content<'_>,
+    ) -> Option<Box<dyn fictionet::events::ContentSink>> {
+        self.next.content(source)
+    }
+
     fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
         self.next.enabled(interest)
     }

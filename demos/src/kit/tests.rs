@@ -23,7 +23,7 @@ async fn two_guests_have_separate_resources_and_shared_trust() {
     };
     let (run, mut prepared) = make_kit().prepare().unwrap();
     let key = ssh::Identity::generate().unwrap();
-    let ca = "-----BEGIN CERTIFICATE-----\nshared root\n-----END CERTIFICATE-----\n";
+    let ca = "-----BEGIN CERTIFICATE-----\nc2hhcmVkIHJvb3Q=\n-----END CERTIFICATE-----\n";
     let image = run.path().join("base.img");
     std::fs::write(&image, []).unwrap();
     run.provision(&image, &key.authorized_key, Some(("office", ca)))
@@ -181,7 +181,7 @@ fn guest_files_packages_and_commands_hold_no_forbidden_word() {
 #[test]
 fn the_whole_seed_holds_no_forbidden_word() {
     for guest in [
-        desktop::browser("station", "analyst", "https://example.test/"),
+        desktop::browser("station", "analyst", "https://intranet.northwind.internal/"),
         desktop::terminal("station", "analyst", "Office inventory", (960, 400), 15),
     ] {
         let image = seed::build(&seed::Provision {

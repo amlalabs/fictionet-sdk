@@ -302,7 +302,8 @@ impl Service for Greeting {
         let out = driver.reply();
         match self.0 {
             Kind::Smtp => {
-                let greeting = smtp::Reply::new(220, "mail.corp.test ESMTP Postfix (Debian/GNU)");
+                let greeting =
+                    smtp::Reply::new(220, "mail.northwind.internal ESMTP Postfix (Debian/GNU)");
                 greeting.write(out).expect("valid SMTP greeting");
             }
             Kind::Pop3 => {

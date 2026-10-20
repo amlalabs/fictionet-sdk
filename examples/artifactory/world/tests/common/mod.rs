@@ -63,10 +63,12 @@ where
     let buf = Buf::default();
     let log = Log::start(Box::new(buf.clone())).unwrap();
     let output = log.clone();
+    let audit = Arc::new(example_common::guest_content::Audit::default());
     let memory = Arc::new(fictionet_observe::Memory::default());
     fictionet_test_support::harness::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
             fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
+                audit.clone(),
                 memory.clone(),
                 Arc::new(log.clone()),
             ]))),
@@ -92,6 +94,7 @@ where
         },
     );
     output.finish().unwrap();
+    audit.check().unwrap();
 }
 
 /// One HTTPS request with the world's CA checked.

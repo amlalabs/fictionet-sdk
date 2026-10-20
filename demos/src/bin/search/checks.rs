@@ -196,6 +196,9 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     run.guest(HOST)
         .wait_desktop(Duration::from_secs(300))
         .await?;
+    run.guest(HOST)
+        .wait_cloud_init(Duration::from_secs(300))
+        .await?;
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
     // Home requests are HTTP facts; the search projection only retains content pages.

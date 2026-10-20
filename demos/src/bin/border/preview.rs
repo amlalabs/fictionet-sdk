@@ -20,6 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 
 type Request = oneshot::Sender<Result<(), String>>;
 pub struct Preview {
+    _access: kit::PageAccess,
+    audit: Arc<example_common::guest_content::Audit>,
     pub server: Server,
     screen: kit::preview::Console,
     requests: mpsc::Sender<Request>,
@@ -45,6 +47,7 @@ impl Preview {
         let _ = self.stop.send(());
         self.worker.await??;
         self.log.finish()?;
+        self.audit.check()?;
         Ok(self.server)
     }
 }
@@ -90,9 +93,11 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         .labels(Labels::default())
         .bind_loopback(0)
         .await?;
-    let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
+    let access = kit::PageAccess::new(server.url())?;
+    let audit = Arc::new(example_common::guest_content::Audit::default());
     let options = RunOptions::new(Seed::random()).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
+        audit.clone(),
         Arc::new(log.clone()),
         Arc::new(control.view.clone()),
     ])));
@@ -135,6 +140,8 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         return Err("the client stopped before startup completed".into());
     }
     Ok(Preview {
+        _access: access,
+        audit,
         server,
         screen,
         requests,

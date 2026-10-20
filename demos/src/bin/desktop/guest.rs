@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn desktop_setup_precedes_agent_installation() {
-        let guest = workstation("workstation", "analyst", "example.test");
+        let guest = workstation("workstation", "analyst", "intranet.northwind.internal");
         guest.validate().unwrap();
         let data = seed::user_data(&seed::Provision {
             guest: &guest,

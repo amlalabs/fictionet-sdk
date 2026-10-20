@@ -103,9 +103,13 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
     let mut input = kit::preview::Input::stdin(kit::preview::Story::Once, None)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
+    let audit = Arc::new(example_common::guest_content::Audit::default());
+    let output = audit.clone();
     let world = std::thread::spawn(move || {
         fictionet::block_on(fictionet::run(
-            RunOptions::new(Seed::from_u64(7)).observer(dashboard.observer()),
+            RunOptions::new(Seed::from_u64(7)).observer(Arc::new(fictionet::events::Fanout::new(
+                vec![audit, dashboard.observer()],
+            ))),
             move |cx| async move {
                 // The end of input or Ctrl-C stops the run, during the story too.
                 cx.spawn(move |cx| async move {
@@ -189,7 +193,7 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
     stop.store(true, Ordering::SeqCst);
     match world.join() {
         Ok(Err(error)) if !error.is::<fictionet::Cancelled>() => Err(error.into()),
-        Ok(_) => Ok(()),
+        Ok(_) => output.check().map(|_| ()).map_err(Into::into),
         Err(_) => Err("the preview world panicked".into()),
     }
 }

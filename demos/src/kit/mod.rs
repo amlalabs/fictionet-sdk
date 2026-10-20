@@ -506,6 +506,7 @@ impl GuestHandle {
 
 /// Owns every process, bridge, and temporary file of a run.
 pub struct Run {
+    audit: Arc<example_common::guest_content::Audit>,
     guests: Vec<GuestHandle>,
     fcx: Arc<Mutex<Option<Cx>>>,
     world: Option<JoinHandle<fictionet::Result>>,
@@ -614,6 +615,13 @@ impl Run {
                     failures.push("world did not stop within five seconds".into());
                 }
             }
+        }
+        match self.audit.check() {
+            Ok(report) => println!(
+                "guest content: {} items, {} bytes checked",
+                report.contents, report.bytes
+            ),
+            Err(error) => failures.push(error),
         }
         let mirror = self.mirror.lock().unwrap().take();
         if let Some(mirror) = mirror {
@@ -751,7 +759,10 @@ impl<W> Kit<W> {
         let setup = Arc::new(mirror::Setup::new(
             self.guests.iter().map(|g| g.hostname.clone()),
         ));
+        let audit = Arc::new(example_common::guest_content::Audit::default());
+        self.observers.push(audit.clone());
         let mut run = Run {
+            audit,
             guests: Vec::new(),
             setup: setup.clone(),
             mirror: Arc::default(),

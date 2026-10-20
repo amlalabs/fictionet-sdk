@@ -12,6 +12,7 @@ pub mod names;
 
 #[cfg(not(target_arch = "wasm32"))]
 fictionet::cfg_std! {
+    pub mod guest_content;
     pub mod web_world;
     pub mod zscaler;
 }

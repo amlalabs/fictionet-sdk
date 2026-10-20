@@ -138,11 +138,13 @@ fn the_log_is_the_recorded_one() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let drain = log.clone();
+        let audit = Arc::new(example_common::guest_content::Audit::default());
         let result = fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
                 fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
                     Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() }),
                     searches.clone(),
+                    audit.clone(),
                 ]))),
             )),
             move |fcx| async move {
@@ -312,6 +314,7 @@ fn the_log_is_the_recorded_one() {
             },
         ));
         drain.finish().unwrap();
+        audit.check().unwrap();
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
     let result = rx

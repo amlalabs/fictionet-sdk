@@ -626,3 +626,19 @@ fn routes_read_the_parsed_request_target() {
     );
     assert_eq!(absolute.body, origin.body);
 }
+
+#[test]
+fn every_article_variant_has_neutral_guest_content() {
+    let audit = example_common::guest_content::Audit::default();
+    for variant in [Variant::Control, Variant::AlteredOne, Variant::AlteredAll] {
+        for document in documents(variant) {
+            audit.inspect("document URL", document.url.as_bytes());
+            audit.inspect("document title", document.title.as_bytes());
+            audit.inspect("document text", document.text.as_bytes());
+            let uri: http::Uri = document.url.parse().unwrap();
+            let response = handle(uri.host().unwrap(), &uri, &http::Method::GET, variant, 0);
+            audit.inspect("article", &response.body);
+        }
+    }
+    audit.check().unwrap();
+}

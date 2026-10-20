@@ -139,10 +139,12 @@ async fn report(fcx: &Cx, attacher: &fictionet::Attacher) -> Vec<String> {
 
 #[test]
 fn the_scan_report_is_the_recorded_one() {
+    let audit = std::sync::Arc::new(example_common::guest_content::Audit::default());
+    let output = audit.clone();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         let result = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(audit),
             move |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
                 fcx.spawn(move |fcx| scan_world::world(fcx, attachments));
@@ -162,4 +164,6 @@ fn the_scan_report_is_the_recorded_one() {
     let got = got.join("\n") + "\n";
 
     assert_eq!(got, std::fs::read_to_string(file).unwrap());
+    thread.join().unwrap();
+    output.check().unwrap();
 }

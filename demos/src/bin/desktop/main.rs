@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 const HOSTNAME: &str = "workstation";
 const USER: &str = "analyst";
 /// The world's HTTPS site the guest fetches with the Zscaler chain.
-const SITE: &str = "example.test";
+const SITE: &str = "intranet.northwind.internal";
 
 type Error = Box<dyn std::error::Error>;
 
@@ -29,16 +29,14 @@ fn boxed<E: std::fmt::Display>(error: E) -> Error {
 }
 
 fn main() -> ExitCode {
-    let mut args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let stay = args.iter().any(|arg| arg == "--stay");
-    args.retain(|arg| arg != "--stay");
+    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     if args.first().is_some_and(|arg| arg == "preview") {
         eprintln!("desktop: this demo has no preview. Its page shows the guest's own desktop.");
         return ExitCode::FAILURE;
     }
     let [downloads, rest @ ..] = args.as_slice() else {
         eprintln!(
-            "usage: desktop <downloads-directory> [observation-socket] [--stay]\n\
+            "usage: desktop <downloads-directory> [observation-socket]\n\
              run it with `cargo xtask demo desktop` first to fetch the pinned files"
         );
         return ExitCode::FAILURE;
@@ -57,7 +55,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(downloads, rest.first().cloned(), stay)) {
+    match runtime.block_on(run(downloads, rest.first().cloned())) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("desktop: {error}");
@@ -66,7 +64,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(downloads: &Path, observation: Option<PathBuf>, stay: bool) -> Result<(), Error> {
+async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
     let total = Instant::now();
     let loaded = Arc::new(AtomicBool::new(false));
     let agents = StateTopic::<Vec<Value>>::new(StateLimits::default());
@@ -130,9 +128,6 @@ async fn run(downloads: &Path, observation: Option<PathBuf>, stay: bool) -> Resu
     if result.is_err() {
         eprint!("{}", workstation.diagnostics().await);
     }
-    if stay && result.is_ok() {
-        kit::checks::stay_open().await?;
-    }
     let stop = run.shutdown().await;
 
     println!("\n=== shutdown ===");
@@ -140,7 +135,7 @@ async fn run(downloads: &Path, observation: Option<PathBuf>, stay: bool) -> Resu
         println!("{error}");
     }
     let shutdown = check(
-        "the guest powered off over ACPI, and no Cloud Hypervisor process or run directory is left",
+        "shutdown, cleanup and guest content checks passed",
         stop.is_ok(),
     );
 

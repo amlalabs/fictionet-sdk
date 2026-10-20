@@ -70,7 +70,7 @@ The checks cover the guest's address and devices, the trust store, Firefox, the
 agents' own TLS clients, and the page's access controls. They type a command
 in the page terminal and move the pointer with and without the screen lease.
 
-- Options: `--stay` keeps the page open until Ctrl-C. A Unix socket path lets
+- A Unix socket path lets
   `fictionet observe --observation unix:PATH watch` follow the same
   collector from another terminal.
 - Screenshots: `downloads/cloudimage/shots/`, with `guest-desktop.png` from
@@ -197,7 +197,6 @@ keeps a strip of this run's reads. The inspector adds a Reads table.
 The checks cover both reads, the switch's revisions, a stale switch command,
 and that the panels have data.
 
-- Options: `--stay` keeps the page open after the checks until Ctrl-C.
 - Screenshots: `desktop.png` and `page.png` in a new directory under
   `downloads/cloudimage/shots/` for each run.
 - Without a VM: `cargo xtask demo fakewiki preview` serves the same page and
@@ -220,7 +219,6 @@ banners seen on the wire beside what nmap says, with the shared panels. See
 The checks compare each nmap report with the ports the world served, and the
 page's access controls and terminal.
 
-- Options: `--stay` keeps the page open after the checks until Ctrl-C.
 - Screenshots: `downloads/cloudimage/shots/`, with `viewer-scan.png`,
   `page-scan.png`, and each step's nmap report and the world's ports beside it.
 - Without a VM: `cargo xtask demo scan preview` serves the same page,
@@ -347,7 +345,10 @@ call gives.
 `Guest::typed_commands` adds that program to any guest, as Artifactory's
 browser desktop does. `Guest::validate` refuses a guest whose names, files,
 packages or commands contain one of the words in `kit::FORBIDDEN`, such as
-eval or world, and `Guest::forbid` adds a demo's own words. A demo's page
+eval or world, and `Guest::forbid` adds a demo's own words. The host also checks
+rendered guest files, served pages and headers, certificates, DNS names, service
+output and decoded package archives with the shared [guest content check](../examples/common/guest-content.md).
+VM runs, previews and example-world integration tests use the same check. A demo's page
 without a VM is its `preview` subcommand. See the [kit API](src/kit/mod.rs)
 and the desktop's [guest](src/bin/desktop/guest.rs) and
 [world](src/bin/desktop/world.rs).

@@ -111,7 +111,7 @@ async fn bank_session(
     let issuer = if mode == Variant::Hijack {
         ROGUE_CA_NAME
     } else {
-        "Test Root CA"
+        "Internet Security Root CA"
     };
     assert!(
         chain[1]
@@ -685,7 +685,10 @@ fn packets_in_flight_keep_their_destination_and_physical_return_path() {
                         Task::Read,
                         parse_prefix("10.0.0.0/24").unwrap(),
                     ));
-                    let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "Test Root CA")?;
+                    let ca = fictionet::stdlib::services::ca::Ca::new(
+                        &fcx,
+                        "Internet Security Root CA",
+                    )?;
                     let ids = border_world::identities(&fcx, &ca)?;
                     let (attacher, attachments) = fictionet::attachments();
                     let routing = border_world::start(&fcx, scenario, ids, attachments)?;

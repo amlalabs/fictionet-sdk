@@ -34,13 +34,8 @@ fn main() -> ExitCode {
     let rest: Vec<String> = args.collect();
     let start = |runtime: tokio::runtime::Runtime| match first.as_deref() {
         Some("preview") => runtime.block_on(preview::run(rest.into_iter())),
-        Some(downloads) if rest.is_empty() || rest == ["--stay"] => {
-            runtime.block_on(run(Path::new(downloads), !rest.is_empty()))
-        }
-        _ => Err(
-            "usage: scan <downloads> [--stay], or scan preview [--bound] [--no-os-match ADDR]"
-                .into(),
-        ),
+        Some(downloads) if rest.is_empty() => runtime.block_on(run(Path::new(downloads))),
+        _ => Err("usage: scan <downloads>, or scan preview [--bound] [--no-os-match ADDR]".into()),
     };
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -56,7 +51,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(downloads: &Path, stay: bool) -> Result<(), Error> {
+async fn run(downloads: &Path) -> Result<(), Error> {
     let total = Instant::now();
     let closed = Arc::new(AtomicBool::new(false));
     let cutoff = closed.clone();
@@ -133,9 +128,6 @@ async fn run(downloads: &Path, stay: bool) -> Result<(), Error> {
         for guest in run.guests() {
             eprint!("{}", guest.diagnostics().await);
         }
-    }
-    if stay && result.is_ok() {
-        kit::checks::stay_open().await?;
     }
     if let Err(error) = run.shutdown().await {
         return Err(format!("{error}; checks result: {result:?}").into());

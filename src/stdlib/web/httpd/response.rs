@@ -440,10 +440,173 @@ impl Drop for Track {
 }
 }
 
+/// Observes the response headers and body without changing their framing.
+pub(super) fn inspect(fcx: Option<&fictionet::Cx>, response: Response<Body>) -> Response<Body> {
+    let Some(fcx) = fcx else {
+        return response;
+    };
+    let fields = response.extensions().get::<Fields>();
+    let origin = fields
+        .and_then(|f| f.get("forwarded").or_else(|| f.get("served_by")))
+        .and_then(|v| v.as_str());
+    let source = fictionet::events::Content {
+        kind: "http",
+        name: origin.unwrap_or("response"),
+        encoding: "",
+        origin,
+    };
+    if let Some(mut sink) = fcx.content(source) {
+        for (name, value) in response.headers() {
+            sink.write(name.as_str().as_bytes());
+            sink.write(b": ");
+            sink.write(value.as_bytes());
+            sink.write(b"\n");
+        }
+        sink.finish();
+    }
+    let encoding = response
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(mut sink) = fcx.content(fictionet::events::Content { encoding, ..source }) else {
+        return response;
+    };
+    let complete = response.status() != StatusCode::PARTIAL_CONTENT;
+    if let Some(bytes) = response.body().bytes() {
+        sink.write(&bytes);
+        if complete {
+            sink.finish();
+        }
+        return response;
+    }
+    let origin = origin.map(str::to_owned);
+    response.map(|body| {
+        Body::new(Inspected {
+            body,
+            sink,
+            complete,
+            fcx: fcx.clone(),
+            origin,
+        })
+    })
+}
+
+struct Inspected {
+    fcx: fictionet::Cx,
+    origin: Option<String>,
+    body: Body,
+    sink: Box<dyn fictionet::events::ContentSink>,
+    complete: bool,
+}
+impl http_body::Body for Inspected {
+    type Data = bytes::Bytes;
+    type Error = Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Error>>> {
+        let frame = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+        if let std::task::Poll::Ready(value) = &frame {
+            match value {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        self.sink.write(data);
+                    }
+                    if let Some(headers) = frame.trailers_ref()
+                        && let Some(mut sink) = self.fcx.content(fictionet::events::Content {
+                            kind: "http",
+                            name: "trailers",
+                            encoding: "",
+                            origin: self.origin.as_deref(),
+                        })
+                    {
+                        for (name, value) in headers {
+                            sink.write(name.as_str().as_bytes());
+                            sink.write(b": ");
+                            sink.write(value.as_bytes());
+                            sink.write(b"\n");
+                        }
+                        sink.finish();
+                    }
+                    if self.complete && self.body.is_end_stream() {
+                        self.sink.finish();
+                    }
+                }
+                None if self.complete => self.sink.finish(),
+                _ => {}
+            }
+        }
+        frame
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::stdlib::web::httpd::RequestFields;
+
+    #[test]
+    fn response_trailers_reach_the_content_consumer() {
+        use http_body_util::BodyExt;
+        struct Trailer(Option<http::HeaderMap>);
+        impl http_body::Body for Trailer {
+            type Data = bytes::Bytes;
+            type Error = Error;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Error>>> {
+                std::task::Poll::Ready(
+                    self.0
+                        .take()
+                        .map(|headers| Ok(http_body::Frame::trailers(headers))),
+                )
+            }
+        }
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl crate::events::Observer for Capture {
+            fn enabled(&self, _: crate::events::Interest<'_>) -> bool {
+                false
+            }
+            fn observe(&self, _: crate::events::Stamp, _: crate::events::Observation<'_>) {}
+            fn content(
+                &self,
+                _: crate::events::Content<'_>,
+            ) -> Option<Box<dyn crate::events::ContentSink>> {
+                Some(Box::new(self.clone()))
+            }
+        }
+        impl crate::events::ContentSink for Capture {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+            }
+            fn finish(&mut self) {}
+        }
+        let audit = Arc::new(Capture::default());
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(audit.clone()),
+            |cx| async move {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-build", "fixture".parse().unwrap());
+                let mut response =
+                    inspect(Some(&cx), Response::new(Body::new(Trailer(Some(headers)))));
+                while let Some(frame) = response.body_mut().frame().await {
+                    frame?;
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        assert_eq!(*audit.0.lock().unwrap(), b"x-build: fixture\n");
+    }
 
     #[test]
     fn request_fields_handle_records_after_extensions_are_cleared() {
