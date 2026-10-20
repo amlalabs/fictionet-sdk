@@ -95,6 +95,19 @@ test('packets watches the busiest guest links and scopes a selected host', async
   h.clean();
 });
 
+test('all hosts lists the declared hosts\' links, not another sandbox\'s', async (t) => {
+  const h = fixture(t);
+  h.services.transport.get = async () => ({ links: [] });
+  const dispose = packets(h.root, h.services);
+  const nodes = [...h.snapshot.nodes, { id: 's9', kind: 'sandbox', name: 'jump' }];
+  const edges = [{ id: 'e1', a: 's1', b: 't1' }, { id: 'e9', a: 's9', b: 't1' }];
+  h.watches[0].emit('snapshot', { ...h.snapshot, nodes, edges, counters: { e1: [1, 0, 0, 0], e9: [9, 0, 0, 0] } });
+  await settle();
+  assert.equal(h.streams.at(-1).links, 'e1');
+  dispose();
+  h.clean();
+});
+
 test('all hosts keeps startup captures after their links leave the map', async (t) => {
   const h = fixture(t);
   const dispose = packets(h.root, h.services);

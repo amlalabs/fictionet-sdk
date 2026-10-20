@@ -1,7 +1,8 @@
 import { labelAction } from './labels.mjs';
 // mount(root, services, options) returns dispose. Services provide transport and selection.
-// The packet list for the selected host's links, or for every guest-facing
-// link when no host is selected, merged as the CLI dashboard merges them.
+// The packet list for the selected host's links, or for every declared
+// host's links when no host is selected, merged as the CLI dashboard merges
+// them. A page with no declared hosts lists every sandbox's links.
 import { scoped, listen } from '../dom.mjs';
 import { createPackets } from '../packets.mjs';
 import { fmtCount } from '../format.mjs';
@@ -81,7 +82,11 @@ export function mount(root, services, options = {}) {
     const attempt = ++generation;
     request?.abort();
     if (selected.links.length) show(selected.links, selected.host || 'Selected links');
-    const live = [...edges.values()].filter((e) => nodes.get(e.a)?.kind === 'sandbox' || nodes.get(e.b)?.kind === 'sandbox').map((e) => e.id);
+    // A sandbox the page does not declare, such as the kit's admin host, is
+    // not one of its hosts.
+    const declared = new Set((services.hosts || []).map((host) => host.sandbox));
+    const guest = (node) => node?.kind === 'sandbox' && (!declared.size || declared.has(node.name));
+    const live = [...edges.values()].filter((e) => guest(nodes.get(e.a)) || guest(nodes.get(e.b))).map((e) => e.id);
     if (!selected.host && !selected.links.length) {
       show(live, 'All hosts');
     }
