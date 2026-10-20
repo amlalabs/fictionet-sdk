@@ -58,6 +58,11 @@
 //! and terminates a refused stream. `end` carries `{reason}` and is terminal.
 //! There are at most 32 active SSE streams, shared with state streams;
 //! capacity returns 503 before starting a subscription.
+//! [`Server::shutdown`] stops accepting connections and drains available stream
+//! data, including `ended` when the run has ended, before the terminal `end`.
+//! State streams also end with `end`; the server reason is `the page server stopped`.
+//! Console WebSockets close with code 1001. Connections that exceed the supplied
+//! timeout are aborted. Dropping a server without shutdown aborts immediately.
 //!
 //! `packets?link=e3,e7` merges up to 32 links. Each event's data object gets
 //! `link`; a link's `end` becomes `link_end`, a refusal becomes `link_error`
@@ -284,7 +289,7 @@
 //!     .asset("plant/data.json", "application/json", b"{}".to_vec())
 //!     .workspace("Plant")
 //!     .control("Routing", commands, vec![Action {
-//!         label: "Bank".into(), command: serde_json::json!({"mode":"bank"}),
+//!         label: "Bank".into(), command: serde_json::json!({"mode":"bank","expected_revision":0}),
 //!     }])
 //!     .control_state(routing)
 //!     .bind_loopback(0).await?;
@@ -391,10 +396,11 @@ pub use state::{PublishError, Snapshot, StateLimits, StateStatus, StateTopic};
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::DashboardHandle;
@@ -674,19 +680,26 @@ impl Page {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
         let port = listener.local_addr()?.port();
         let url = format!("http://127.0.0.1:{port}/#token={}", auth.token);
+        let (stop, mut stopping) = watch::channel(false);
         let shared = Arc::new(Shared {
             page: self,
             auth,
             port,
             streams: Semaphore::new(32),
             consoles,
+            stopping: stopping.clone(),
         });
         let task = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(64));
             let mut connections = JoinSet::new();
             loop {
                 while connections.try_join_next().is_some() {}
-                let Ok((mut conn, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = stopping.changed() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((mut conn, _)) = accepted else {
                     break;
                 };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
@@ -698,8 +711,10 @@ impl Page {
                     let _ = serve(&mut conn, &shared).await;
                 });
             }
+            drop(listener);
+            while connections.join_next().await.is_some() {}
         });
-        Ok(Server { url, task })
+        Ok(Server { url, task, stop })
     }
 }
 
@@ -709,15 +724,26 @@ struct Shared {
     port: u16,
     streams: Semaphore,
     consoles: console::Sessions,
+    stopping: watch::Receiver<bool>,
 }
 
 /// A running page. Dropping it closes the listener and active connections.
 pub struct Server {
     url: String,
     task: JoinHandle<()>,
+    stop: watch::Sender<bool>,
 }
 
 impl Server {
+    /// Drains stream data and closes connections, aborting any left after `timeout`.
+    pub async fn shutdown(mut self, timeout: Duration) {
+        self.stop.send_replace(true);
+        if tokio::time::timeout(timeout, &mut self.task).await.is_err() {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+    }
+
     /// The loopback URL, with the per-run bearer token in its fragment.
     pub fn url(&self) -> &str {
         &self.url
@@ -802,7 +828,7 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
             let Ok(_permit) = shared.streams.try_acquire() else {
                 return http::error(conn, 503, "too many streams").await;
             };
-            state::stream(conn, &topics).await
+            state::stream(conn, &topics, shared.stopping.clone()).await
         }
         ("GET", path) if path.starts_with("/api/state/") => {
             let id = &path[11..];

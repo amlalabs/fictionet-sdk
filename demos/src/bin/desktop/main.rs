@@ -2,16 +2,19 @@
 //! Run with `cargo xtask demo desktop`.
 
 mod guest;
-mod page;
 mod world;
 
-use fictionet_demo::kit::{self, Kit, b64_decode, shot, ssh};
+use fictionet_demo::kit::client::{Capability, PageClient};
+use fictionet_demo::kit::{self, Kit, b64_decode, rfb, shot, ssh};
+use fictionet_observe::page::{Column, Page, StateLimits, StateTopic};
+use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const HOSTNAME: &str = "workstation";
 const USER: &str = "analyst";
@@ -59,45 +62,44 @@ fn main() -> ExitCode {
 async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
     let total = Instant::now();
     let loaded = Arc::new(AtomicBool::new(false));
-    let dashboard =
-        fictionet_observe::DashboardObserver::new(fictionet_observe::DashboardOptions::demo());
-    let _observation = observation
-        .as_ref()
-        .map(|p| fictionet_observe::serve(dashboard.handle(), p))
-        .transpose()
-        .map_err(boxed)?;
+    let agents = StateTopic::<Vec<Value>>::new(StateLimits::default());
+    let table = agents.clone();
+    let (world_clock, clock) = tokio::sync::oneshot::channel();
     let kit = Kit::new("desktop")
         .guest(guest::workstation(HOSTNAME, USER, SITE))
-        .observer(dashboard.observer())
+        .page(move |dashboard, hosts| {
+            Page::new("Desktop", dashboard)
+                .host(hosts.take(HOSTNAME))
+                .standard_panels()
+                .table(
+                    "Coding agents",
+                    table,
+                    vec![
+                        Column::new("Agent", "/name"),
+                        Column::new("Version", "/version"),
+                        Column::new("Status", "/status"),
+                    ],
+                )
+        })
         .observer(Arc::new(world::SiteLoaded {
             host: SITE.into(),
             loaded: loaded.clone(),
         }))
-        .world(|fcx, world| world::start(fcx, world, SITE.into()));
+        .world(move |fcx, world| async move {
+            let _ = world_clock.send(fcx.clone());
+            world::start(fcx, world, SITE.into()).await
+        });
     // Screenshots survive the run (the run dir does not).
     let shots = downloads.join("shots");
     std::fs::create_dir_all(&shots)?;
 
-    // The desktop viewer, bound before boot so a port already in use fails
-    // here rather than after a minute of install. It serves on 127.0.0.1
-    // only and tunnels to the guest's VNC through the admin's SSH session
-    // once that is up.
-    let page = page::Page::bind(0).await.map_err(boxed)?;
-    let page_url = page.url();
-    let page_port = page.port();
-
-    let tunnel = page::Tunnel::default();
-    let viewer = tokio::spawn(page.serve(tunnel.clone()));
-    println!("desktop viewer: {page_url}");
-    let run = match kit.boot(downloads).await {
-        Ok(run) => run,
-        Err(error) => {
-            viewer.abort();
-            let _ = viewer.await;
-            return Err(error.into());
-        }
-    };
-    let boot = run.boot_started();
+    let run = kit.boot(downloads).await?;
+    let cx = clock.await?;
+    let _observation = observation
+        .as_ref()
+        .map(|p| fictionet_observe::serve(run.dashboard(), p))
+        .transpose()
+        .map_err(boxed)?;
     let workstation = run.guest(HOSTNAME);
     let vm = workstation.vm();
 
@@ -116,12 +118,9 @@ async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Erro
             install\n",
         kit::jump::JUMP_ADDR
     );
-    let _ = tunnel.set(workstation.ssh().clone());
-    let result = run_checks(workstation, &loaded, boot, &shots, &page_url, page_port)
+    let result = run_checks(&run, &loaded, &shots, &agents, &cx)
         .await
         .map(|checks| (ssh_ready_ms, checks));
-    viewer.abort();
-    let _ = viewer.await;
     let run_dir = run.path().to_path_buf();
     let stop = run.shutdown().await;
 
@@ -146,6 +145,7 @@ async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Erro
     println!("\n=== measurements ===");
     println!("boot to ssh-ready:  {ssh_ready_ms} ms");
     println!("boot to desktop:    {} ms", checks.desktop_ready_ms);
+    println!("boot to cloud-init done: {} ms", checks.cloud_init_ready_ms);
     println!("coding agents:      {}", checks.agents_install);
     println!("whole run:          {} ms", total.elapsed().as_millis());
     println!("peak VM memory:     {} MiB", checks.peak_rss_mib);
@@ -169,6 +169,7 @@ fn check(failures: &mut Vec<String>, what: &str, ok: bool) {
 
 struct Checks {
     desktop_ready_ms: u128,
+    cloud_init_ready_ms: u128,
     /// The guest's own measure of the coding agents' install: bytes
     /// downloaded and seconds taken.
     agents_install: String,
@@ -177,13 +178,15 @@ struct Checks {
 }
 
 async fn run_checks(
-    workstation: &kit::GuestHandle,
+    run: &kit::Run,
     loaded: &AtomicBool,
-    boot: Instant,
     shots: &Path,
-    page_url: &str,
-    page_port: u16,
+    agents: &StateTopic<Vec<Value>>,
+    cx: &fictionet::Cx,
 ) -> Result<Checks, Error> {
+    let workstation = run.guest(HOSTNAME);
+    let boot = run.boot_started();
+    let page_url = run.page_url();
     let vm = workstation.vm();
     let session = workstation.ssh();
     // Every required check that failed; the gate fails at the end if any did.
@@ -200,10 +203,14 @@ async fn run_checks(
         Ok(result) => result?,
         Err(_) => return Err("cloud-init did not finish within 300 s".into()),
     };
-    let desktop_ready_ms = boot.elapsed().as_millis();
+    let cloud_init_ready_ms = boot.elapsed().as_millis();
     let cloud_init_rc = wait.stdout.trim().to_string();
-    println!("cloud-init finished after {desktop_ready_ms} ms (rc {cloud_init_rc})\n");
+    println!("cloud-init finished after {cloud_init_ready_ms} ms (rc {cloud_init_rc})\n");
     check(&mut failures, "cloud-init finished", cloud_init_rc == "0");
+    let desktop_ready_ms = workstation
+        .wait_desktop(Duration::from_secs(300))
+        .await?
+        .as_millis();
 
     // What the guest looks like, for the log.
     for command in [
@@ -368,6 +375,34 @@ async fn run_checks(
         }
     }
 
+    // Required: the coding agents are on the desktop user's PATH over SSH,
+    // each at its pinned release.
+    let claude = guest_cmd(session, "claude --version").await?;
+    check(
+        &mut failures,
+        &format!("claude --version is Claude Code {}", guest::CLAUDE_VERSION),
+        claude.code == 0
+            && claude
+                .stdout
+                .contains(&format!("{} (Claude Code)", guest::CLAUDE_VERSION)),
+    );
+    let codex = guest_cmd(session, "codex --version").await?;
+    check(
+        &mut failures,
+        &format!("codex --version is codex-cli {}", guest::CODEX_VERSION),
+        codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", guest::CODEX_VERSION),
+    );
+
+    let rows: Vec<_> = [("Claude Code", &claude), ("Codex", &codex)]
+        .into_iter()
+        .filter(|(_, output)| output.code == 0)
+        .filter_map(|(name, output)| {
+            agent_version(&output.stdout)
+                .map(|version| json!({"name":name, "version":version, "status":"installed"}))
+        })
+        .collect();
+    agents.publish(cx.now(), &rows).map_err(boxed)?;
+
     // A screenshot of the guest's own screen, over ssh, decoded on the host.
     let mut screenshots = Vec::new();
     let shot = session
@@ -391,7 +426,7 @@ async fn run_checks(
     let viewer_png = shots.join("viewer-desktop.png");
     let capture = tokio::time::timeout(
         Duration::from_secs(30),
-        page::capture_page(page_port, &viewer_png),
+        rfb::capture_page(page_url, HOSTNAME, &viewer_png),
     )
     .await
     .unwrap_or_else(|_| Err(std::io::Error::other("timed out")));
@@ -418,44 +453,28 @@ async fn run_checks(
     );
 
     // The same desktop as a real browser renders it: the host's headless
-    // Chromium loads the embedded noVNC page over the same bridge. Best
-    // effort -- it needs a Chromium whose network works in this sandbox.
-    let out = shots.join("novnc.png");
+    // Chromium loads the page with its token and waits for the screen to
+    // paint. Reported, not required: it needs Chromium on the host.
+    let out = shots.join("page-desktop.png");
     let url = page_url.to_string();
     let captured = tokio::task::spawn_blocking(move || {
         shot::capture(
             &url,
             &out,
-            &shot::canvas_painted("document.querySelector('canvas')"),
+            &shot::desktop_painted(HOSTNAME),
             Duration::from_secs(60),
         )
     })
     .await?;
     match captured {
         Ok(path) => {
-            println!("noVNC viewer screenshot saved: {path}");
+            println!("page screenshot saved: {path}");
             screenshots.push(path);
         }
-        Err(error) => println!("noVNC viewer screenshot: not captured ({error})"),
+        Err(error) => println!("page screenshot: not captured ({error})"),
     }
 
-    // Required: the coding agents are on the desktop user's PATH over SSH,
-    // each at its pinned release.
-    let claude = guest_cmd(session, "claude --version").await?;
-    check(
-        &mut failures,
-        &format!("claude --version is Claude Code {}", guest::CLAUDE_VERSION),
-        claude.code == 0
-            && claude
-                .stdout
-                .contains(&format!("{} (Claude Code)", guest::CLAUDE_VERSION)),
-    );
-    let codex = guest_cmd(session, "codex --version").await?;
-    check(
-        &mut failures,
-        &format!("codex --version is codex-cli {}", guest::CODEX_VERSION),
-        codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", guest::CODEX_VERSION),
-    );
+    page_checks(page_url, session, &mut failures).await;
 
     // Required: each agent's own HTTP client trusts the world's CA through
     // the system store, with no flags. Each asks the site for a path it does
@@ -508,10 +527,183 @@ async fn run_checks(
     }
     Ok(Checks {
         desktop_ready_ms,
+        cloud_init_ready_ms,
         agents_install,
         peak_rss_mib,
         screenshots,
     })
+}
+
+async fn probe(
+    failures: &mut Vec<String>,
+    name: &str,
+    test: impl std::future::Future<Output = std::io::Result<bool>>,
+) {
+    let result = tokio::time::timeout(Duration::from_secs(45), test).await;
+    let ok = match result {
+        Ok(Ok(ok)) => ok,
+        Ok(Err(error)) => {
+            println!("{name}: {error}");
+            false
+        }
+        Err(error) => {
+            println!("{name}: {error}");
+            false
+        }
+    };
+    check(failures, name, ok);
+}
+
+async fn page_checks(url: &str, session: &ssh::Session, failures: &mut Vec<String>) {
+    let page = PageClient::from_url(url).expect("the kit's signed page URL");
+    probe(
+        failures,
+        "the page requires the bearer for API calls",
+        async {
+            let refused = page.request("GET", "/api/page", None, false).await?;
+            page.bootstrap().await?;
+            let allowed = page.request("GET", "/api/page", None, true).await?;
+            Ok(refused.status == 401 && allowed.status == 200)
+        },
+    )
+    .await;
+    probe(
+        failures,
+        "the page requires a single-use screen ticket",
+        async {
+            let missing = page.open(HOSTNAME, Capability::Screen, None).await;
+            let ticket = page.ticket(HOSTNAME, Capability::Screen).await?;
+            let socket = page
+                .open(HOSTNAME, Capability::Screen, Some(&ticket.ticket))
+                .await?;
+            let viewer = rfb::Viewer::handshake(socket).await?;
+            drop(viewer);
+            let reused = page
+                .open(HOSTNAME, Capability::Screen, Some(&ticket.ticket))
+                .await;
+            let unauthorized = |result: std::io::Result<kit::client::Socket>| {
+                result
+                    .err()
+                    .is_some_and(|error| error.to_string().starts_with("HTTP/1.1 401 "))
+            };
+            Ok(unauthorized(missing) && unauthorized(reused))
+        },
+    )
+    .await;
+    probe(
+        failures,
+        "the page terminal runs hostname on workstation",
+        async {
+            let ticket = page.ticket(HOSTNAME, Capability::Terminal).await?;
+            let mut socket = page
+                .open(HOSTNAME, Capability::Terminal, Some(&ticket.ticket))
+                .await?;
+            socket.write_all(b"echo \"name:$(hostname):end\"\r").await?;
+            let expected = b"name:workstation:end";
+            let mut output = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await?;
+                if n == 0 {
+                    return Ok(false);
+                }
+                output.extend_from_slice(&chunk[..n]);
+                if output
+                    .windows(expected.len())
+                    .any(|bytes| bytes == expected)
+                {
+                    return Ok(true);
+                }
+                let keep = output.len().saturating_sub(expected.len() - 1);
+                output.drain(..keep);
+            }
+        },
+    )
+    .await;
+    probe(
+        failures,
+        "the screen drops pointer input without a lease and accepts it with a lease",
+        pointer_check(&page, session),
+    )
+    .await;
+}
+
+async fn pointer_position(session: &ssh::Session) -> std::io::Result<(u16, u16)> {
+    let output = session
+        .run("sudo -u analyst env DISPLAY=:1 xdotool getmouselocation --shell")
+        .await?;
+    if output.code != 0 {
+        return Err(std::io::Error::other(format!(
+            "pointer query: {}",
+            output.stderr
+        )));
+    }
+    let coordinate = |name| {
+        output
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| {
+                std::io::Error::other(format!("pointer query has no {name}: {}", output.stdout))
+            })
+    };
+    Ok((coordinate("X=")?, coordinate("Y=")?))
+}
+
+async fn pointer_check(page: &PageClient, session: &ssh::Session) -> std::io::Result<bool> {
+    let before = pointer_position(session).await?;
+    let ticket = page.ticket(HOSTNAME, Capability::Screen).await?;
+    let socket = page
+        .open(HOSTNAME, Capability::Screen, Some(&ticket.ticket))
+        .await?;
+    let mut viewer = rfb::Viewer::handshake(socket).await?;
+    let (width, height) = viewer.size();
+    if width < 4 || height < 4 || before.0 >= width || before.1 >= height {
+        return Err(std::io::Error::other(
+            "pointer or screen dimensions are invalid",
+        ));
+    }
+    let away = |point: (u16, u16)| {
+        (
+            ((u32::from(point.0) + u32::from(width / 2)) % u32::from(width)) as u16,
+            ((u32::from(point.1) + u32::from(height / 2)) % u32::from(height)) as u16,
+        )
+    };
+    let denied = away(before);
+    viewer.pointer(denied.0, denied.1, 0).await?;
+    viewer.update().await?;
+    let unchanged = pointer_position(session).await? == before;
+    drop(viewer);
+
+    let ticket = page.ticket(HOSTNAME, Capability::Screen).await?;
+    let socket = page
+        .open(HOSTNAME, Capability::Screen, Some(&ticket.ticket))
+        .await?;
+    let mut viewer = rfb::Viewer::handshake(socket).await?;
+    // The lease API requires an open screen session.
+    let body = json!({"host":HOSTNAME,"session":ticket.session});
+    let lease = page
+        .request("POST", "/api/lease", Some(&body), true)
+        .await?;
+    if lease.status != 200 {
+        return Err(std::io::Error::other(format!(
+            "claim input: {}",
+            lease.status_line
+        )));
+    }
+    let target = ((denied.0 + 1) % width, denied.1);
+    let moved = tokio::time::timeout(Duration::from_secs(20), async {
+        viewer.pointer(target.0, target.1, 0).await?;
+        viewer.update().await?;
+        Ok::<_, std::io::Error>(pointer_position(session).await? == target)
+    })
+    .await;
+    let released = page
+        .request("DELETE", "/api/lease", Some(&body), true)
+        .await?;
+    drop(viewer);
+    Ok(unchanged && moved?? && released.status == 200)
 }
 
 /// The address in an `ss` address column (`10.0.0.2:22`,
@@ -549,4 +741,41 @@ fn save_png(b64: &str, path: &Path) -> Option<String> {
     }
     std::fs::write(path, &bytes).ok()?;
     Some(path.display().to_string())
+}
+
+fn agent_version(output: &str) -> Option<&str> {
+    let output = output.trim();
+    let version = output
+        .strip_suffix(" (Claude Code)")
+        .or_else(|| output.strip_prefix("codex-cli "))?;
+    let parts: Vec<_> = version.split('.').collect();
+    (parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())))
+    .then_some(version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_version;
+
+    #[test]
+    fn agent_versions_come_from_command_output() {
+        for (output, expected) in [
+            ("2.1.292 (Claude Code)\n", Some("2.1.292")),
+            ("codex-cli 0.163.0\n", Some("0.163.0")),
+            ("9.8.7 (Claude Code)", Some("9.8.7")),
+            ("codex-cli 8.7.6", Some("8.7.6")),
+            ("", None),
+            ("command not found", None),
+            ("codex-cli 1.2", None),
+            ("codex-cli 1..3", None),
+            ("codex-cli x.2.3", None),
+            ("1.2.3.4 (Claude Code)", None),
+            ("error\ncodex-cli 1.2.3", None),
+        ] {
+            assert_eq!(agent_version(output), expected, "{output:?}");
+        }
+    }
 }

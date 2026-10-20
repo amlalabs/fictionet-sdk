@@ -425,6 +425,16 @@ impl Session {
         vec![reply(id, response)]
     }
 
+    #[cfg(feature = "page")]
+    pub(crate) fn drain_pending(&mut self, now: Instant) {
+        for sub in &mut self.subs {
+            sub.next = now;
+            if let Kind::Graph { next_graph, .. } = &mut sub.kind {
+                *next_graph = now;
+            }
+        }
+    }
+
     /// Returns the earliest subscription or download deadline, or none
     /// when idle.
     pub fn next_poll(&self) -> Option<Instant> {
