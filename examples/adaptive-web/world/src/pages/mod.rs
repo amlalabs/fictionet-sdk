@@ -459,6 +459,8 @@ pub struct Pages {
     /// Whether the canned store answers.
     canned_active: std::sync::atomic::AtomicBool,
     planted: Mutex<Planted>,
+    /// The id of the next search, shared by every way a search arrives.
+    queries: std::sync::atomic::AtomicU64,
     locks: Locks,
 }
 
@@ -486,8 +488,15 @@ impl Pages {
             canned: None,
             canned_active: Default::default(),
             planted: Mutex::default(),
+            queries: std::sync::atomic::AtomicU64::new(1),
             locks,
         }
+    }
+
+    /// A new search's id.
+    pub fn next_query_id(&self) -> u64 {
+        self.queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A world that serves the store at `root`, made ahead of time for
@@ -1661,10 +1670,43 @@ impl fictionet_extras::models::Engine for Pages {
         query: String,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
-            let (search, _, _) = self
-                .listing(&cx, &query, 0)
-                .await
-                .map_err(|_| fictionet::Error::msg("Search is unavailable"))?;
+            // An agent's own search tool: the world answers it with the list
+            // a Google search for the same words shows, and reports it as a
+            // search of its own.
+            let id = self.next_query_id();
+            cx.emit("adaptive", "query", |e| {
+                e.summary(format_args!("web search: {query}"))
+                    .field("query_id", id)
+                    .field("engine", names::name(&Engine::Google))
+                    .field("search", query.as_str())
+                    .field("start", 0u64)
+                    .field("key", query_key(&query, 0))
+                    .field("via", "web_search")
+            });
+            let started = cx.now().since_start();
+            let Ok((search, cache, usage)) = self.listing(&cx, &query, 0).await else {
+                cx.emit("adaptive", "query_failed", |e| {
+                    e.field("query_id", id).field("why", "error")
+                });
+                return Err(fictionet::Error::msg("Search is unavailable"));
+            };
+            let listing = Listing {
+                engine: Engine::Google,
+                search: query.clone(),
+                cache,
+                listed: (search.results.iter())
+                    .map(|r| (r.url.clone(), r.title.clone()))
+                    .collect(),
+                usage,
+            };
+            let mut fields = Meta::Search(Box::new(listing)).fields();
+            fields.set("query_id", id);
+            fields.set("complete", true);
+            fields.set(
+                "serve_ms",
+                (cx.now().since_start() - started).as_millis() as u64,
+            );
+            cx.emit("adaptive", "search_answer", |e| e.fields(fields));
             Ok(search.results)
         })
     }

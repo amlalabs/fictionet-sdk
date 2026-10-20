@@ -59,6 +59,8 @@ test('the rows are the newest six, newest first', () => {
   assert.deepEqual(all[1], { at: 7000, who: 'DNS', what: 'wiki.corp', tag: 'refused' });
   assert.equal(all[2].what, '/r/x');
   assert.equal(rows(s, 2).length, 2);
+  const agent = { ...s, queries: [query(9, { via: 'web_search', at_ms: 9000 })] };
+  assert.equal(rows(agent)[0].who, 'WebSearch');
 });
 
 test('the picture shows the newest search, its engines and the sites its list named', () => {

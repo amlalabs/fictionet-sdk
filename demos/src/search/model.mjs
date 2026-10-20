@@ -32,7 +32,8 @@ const typed = (r) => !r.name.startsWith('_');
 export function rows(s, limit = 6) {
   const path = (url) => { try { const u = new URL(url); return `${u.pathname}${u.search}`; } catch { return url; } };
   return [
-    ...s.queries.map((q) => ({ at: q.at_ms, who: ENGINE_HOSTS[q.engine] || q.engine, what: q.search, tag: queryTag(s, q) })),
+    // An agent's own search tool is answered from the same lists.
+    ...s.queries.map((q) => ({ at: q.at_ms, who: q.via === 'web_search' ? 'WebSearch' : ENGINE_HOSTS[q.engine] || q.engine, what: q.search, tag: queryTag(s, q) })),
     ...s.pages.map((p) => ({ at: p.at_ms, who: p.host, what: path(p.url), tag: pageTag(p) })),
     ...s.refused.filter(typed).map((r) => ({ at: r.at_ms, who: 'DNS', what: r.name, tag: 'refused' })),
     ...(s.planted || []).map((p) => ({ at: p.at_ms, who: p.kind === 'page' ? hostOf(p.url) : 'fact', what: p.text, tag: 'planted' })),

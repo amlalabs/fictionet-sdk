@@ -35,7 +35,7 @@ pub const MAX_SNAPSHOT_BYTES: usize = {
         // Two seed lists, with quotes and a comma per item.
         + 2 * MAX_SEED_ITEMS * (3 + string)
         // Query rows, including failure text and a comma per row.
-        + MAX_QUERIES * (422 + 5 * string)
+        + MAX_QUERIES * (431 + 6 * string)
         // Result lists and their entries, including array commas.
         + MAX_RESULTS * (75 + string + MAX_LISTED * (60 + 3 * string))
         // Page rows, including search reasons and a comma per row.
@@ -179,6 +179,10 @@ pub struct Query {
     pub start: u64,
     /// Name of the sandbox that asked.
     pub sandbox: Option<String>,
+    /// `web_search` for an agent's own search tool, which the world
+    /// answers without a browser; none for a search engine page.
+    #[serde(default)]
+    pub via: Option<String>,
     /// IP address of the client that asked.
     pub peer: Option<String>,
     /// Run time when the request began, in milliseconds.
@@ -497,6 +501,7 @@ impl Observer for Searches {
                     | "generation"
                     | "planted"
                     | "restarted"
+                    | "search_answer"
             ) | ("http", "request")
         )
     }
@@ -580,6 +585,7 @@ impl Snapshot {
                     engine,
                     start: e.u64("start").unwrap_or(0),
                     sandbox: e.conn.sandbox.as_ref().map(|s| bounded(&s.name)),
+                    via: e.str("via").map(bounded),
                     peer: e.conn.peer.map(|p| bounded(&p.ip().to_string())),
                     at_ms: ms,
                     seq,
@@ -621,7 +627,7 @@ impl Snapshot {
                 q.answer_at_ms = Some(ms);
                 true
             }
-            ("http", "request") => {
+            ("http", "request") | ("adaptive", "search_answer") => {
                 let mut changed = false;
                 let id = e.u64("query_id");
                 if let Some(q) = self.queries.iter_mut().find(|q| Some(q.id) == id)

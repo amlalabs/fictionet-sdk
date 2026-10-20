@@ -463,6 +463,7 @@ fn worst_case_snapshot_fits() {
         engine: Engine::DuckDuckGo,
         start: n,
         sandbox: Some(t.clone()),
+        via: Some(t.clone()),
         peer: Some(t.clone()),
         at_ms: n,
         seq: n,
@@ -615,4 +616,61 @@ fn revision_tracks_changes_without_a_snapshot() {
     feed(&s, 2, Event::new("other", "event"));
     assert_eq!(s.revision(), 1);
     assert_eq!(s.revision(), s.snapshot().revision);
+}
+
+#[test]
+fn an_agents_own_search_shows_as_a_search_with_its_list() {
+    let s = searches();
+    feed(
+        &s,
+        1,
+        query(7, "google", "halvard advisory").field("via", "web_search"),
+    );
+    feed(
+        &s,
+        2,
+        Event::new("adaptive", "search_answer")
+            .field("query_id", 7u64)
+            .field("kind", "search")
+            .field("cache", "cached")
+            .field("results", 1u64)
+            .field("complete", true)
+            .field(
+                "listed",
+                vec![field(
+                    &json!({"rank": 1, "url": "https://a.com/x", "title": "A"}),
+                )],
+            ),
+    );
+    let snap = s.snapshot();
+    let q = &snap.queries[0];
+    assert_eq!(q.via.as_deref(), Some("web_search"));
+    assert_eq!(q.sandbox, None);
+    assert_eq!(q.outcome, Outcome::Served);
+    assert_eq!(q.cache, Some(Cache::Cached));
+    assert_eq!(snap.results[0].listed[0].host, "a.com");
+}
+
+#[test]
+fn a_restart_clears_what_the_run_showed_and_plants_are_kept_in_order() {
+    let s = searches();
+    feed(&s, 1, query(1, "google", "a"));
+    feed(
+        &s,
+        2,
+        Event::new("adaptive", "planted")
+            .field("plant", "fact")
+            .field("text", "The fix is 7.2.5, not 7.2.4.")
+            .field("url", ""),
+    );
+    let snap = s.snapshot();
+    assert_eq!(snap.planted[0].kind, "fact");
+    assert_eq!(snap.queries.len(), 1);
+    feed(
+        &s,
+        3,
+        Event::new("adaptive", "restarted").field("revision", 2u64),
+    );
+    let snap = s.snapshot();
+    assert!(snap.queries.is_empty() && snap.planted.is_empty());
 }
