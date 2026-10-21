@@ -182,7 +182,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     const query = snapshot.queries.findLast((q) => ENGINES.includes(q.engine));
     if (!motion.typingRemaining(words)) words.textContent = cut(latest?.search || '', 54);
     queryTitle.textContent = latest?.search || '';
-    const claude = latest?.via === 'web_search';
+    const claude = ['claude_web_search', 'codex_web_search'].includes(latest?.via);
     attrs(browser, { visibility: claude ? 'hidden' : 'visible' });
     agent.textContent = claude ? '❯' : '';
     attrs(caret, { visibility: latest ? 'hidden' : 'visible' });
@@ -293,7 +293,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       if (change.type === 'search_started' && change.query.id === current?.id) {
         motion.typeInto(words, cut(current.search, 54), Math.min(600, current.search.length * 28));
         const target = queryTarget(current);
-        if (target) motion.travel(layers.fx, [260, 52], position(target), current.via === 'web_search' ? 'agent' : 'ink', 300);
+        if (target) motion.travel(layers.fx, [260, 52], position(target), ['claude_web_search', 'codex_web_search'].includes(current.via) ? 'agent' : 'ink', 300);
       }
       if (change.type === 'search_answered' && (e ? change.query.key === mapQuery?.key : change.query.id === current?.id)) {
         const target = queryTarget(change.query);

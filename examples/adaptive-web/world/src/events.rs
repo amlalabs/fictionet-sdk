@@ -97,6 +97,9 @@ fn line(e: &Event) -> Option<Value> {
             call["type"] = json!("model_call");
             Some(call)
         }
+        ("adaptive", "search") => Some(json!({"type":"search", "id":get(e,"query_id"),
+            "source":get(e,"source"), "query":get(e,"search"),
+            "results":e.str("returned").and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(Value::Null)})),
         ("adaptive", "generation") => Some(json!({"type": "generation",
             "generate": get(e, "generate"), "revision": get(e, "revision")})),
         ("adaptive", "query") => Some(json!({"type": "query", "id": get(e, "query_id"),

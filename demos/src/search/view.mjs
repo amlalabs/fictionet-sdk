@@ -2,7 +2,7 @@ import { diff, rows } from './model.mjs';
 import { createMotion } from './motion.mjs';
 import { createWeb } from './web.mjs';
 
-const NEW_PAGES = [['canned', 'Prepared first'], ['stub', 'Improvised'], ['off', 'Off']];
+const NEW_PAGES = [['canned', 'Prepared pages'], ['off', 'Off']];
 const relativeTime = (at, now) => {
   const seconds = Math.max(0, Math.floor((now - at) / 1000));
   return seconds < 60 ? 'now' : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago` : `${Math.floor(seconds / 3600)} hr ago`;
@@ -21,7 +21,7 @@ export function mount(root, services, options) {
   const controller = new AbortController();
   const cleanup = [motion.subscribe((disabled) => root.classList.toggle('no-motion', disabled))];
   const rowNodes = new Map();
-  let snapshot = null, disposed = false, closeTimer, timeTimer;
+  let snapshot = null, disposed = false, timeTimer;
   const window = root.ownerDocument.defaultView || globalThis;
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
@@ -41,10 +41,6 @@ export function mount(root, services, options) {
         note.textContent = rejection?.reason === 'stale_revision' ? 'The world changed. Try again.' : 'The request could not be completed.';
       },
     });
-    if (!disposed && ok && ['plant_fact', 'plant_page'].includes(command.command)) {
-      window.clearTimeout(closeTimer);
-      closeTimer = window.setTimeout(() => services.closeWorldMenu?.(), 250);
-    }
     return ok;
   }
   function buttons() {
@@ -54,7 +50,6 @@ export function mount(root, services, options) {
     const mode = !g.generate ? 'off' : g.canned ? 'canned' : 'stub';
     for (const button of segment.children) {
       button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
-      if (button.dataset.mode === 'stub') button.textContent = ['openrouter', 'anthropic'].includes(g.kind) ? 'Always live' : 'Improvised';
     }
   }
   if (menu) {
@@ -68,26 +63,6 @@ export function mount(root, services, options) {
       controls.push(button);
       cleanup.push(listen(button, 'click', () => send({ command: 'set_new_pages', new_pages: mode })));
     }
-    const field = (label, id) => {
-      const box = item('div', { class: 'field' }, menu);
-      item('label', { for: id, text: label }, box);
-      return box;
-    };
-    const factBox = field('Plant a fact', 'plant-fact');
-    const fact = item('input', { id: 'plant-fact', type: 'text', autocomplete: 'off' }, factBox);
-    const plantFact = item('button', { type: 'button', class: 'act', text: 'Plant' }, factBox);
-    controls.push(plantFact);
-    cleanup.push(listen(plantFact, 'click', async () => {
-      if (await send({ command: 'plant_fact', text: fact.value })) fact.value = '';
-    }));
-    const pageBox = field('Plant a page', 'plant-url');
-    const url = item('input', { id: 'plant-url', type: 'url', placeholder: 'https://', autocomplete: 'off' }, pageBox);
-    const plantPage = item('button', { type: 'button', class: 'act', text: 'Plant' }, pageBox);
-    const text = item('textarea', { 'aria-label': 'Page text', placeholder: 'Title, then the text', rows: '3' }, pageBox);
-    controls.push(plantPage);
-    cleanup.push(listen(plantPage, 'click', async () => {
-      if (await send({ command: 'plant_page', url: url.value, text: text.value })) { url.value = ''; text.value = ''; }
-    }));
     const restartRow = item('div', { class: 'row' }, menu);
     item('span', { text: 'Restart run' }, restartRow);
     const restart = item('button', { type: 'button', class: 'act quiet', text: 'Restart' }, restartRow);
@@ -147,7 +122,6 @@ export function mount(root, services, options) {
   }, () => { if (!disposed) note.textContent = 'The world could not be reached.'; }));
   return () => {
     disposed = true;
-    window.clearTimeout(closeTimer);
     window.clearTimeout(timeTimer);
     controller.abort();
     web.dispose();

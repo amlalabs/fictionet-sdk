@@ -3,10 +3,10 @@
 Start with the [no-model quick start](#quick-start) to inspect searches, pages
 and the world's request log.
 
-> **Everything this world serves is made up.** The seeds describe companies,
-> products, vulnerabilities and deals that do not exist, and a model writes
-> pages about them on demand. The world has no upstream: only the sandbox
-> attached to it can reach it.
+> Scenario seeds describe invented companies, products and deals. The Search
+> demo instead serves manually authored explanations about real software at
+> familiar URLs. They are shortened pages, not copies of live sites. Page
+> requests never reach a real website.
 
 The adaptive web is a Fictionet world that answers whatever an agent does
 on the web, as it does it. The agent can search Google, DuckDuckGo or Bing
@@ -30,8 +30,8 @@ they do outside.
 
 Run `cargo xtask demo search` on Linux with KVM. One executable boots an
 official Ubuntu 24.04 desktop through Cloud Hypervisor, with Firefox and Claude
-Code, and runs the adaptive web in-process. It serves the canned pages in
-whatever the store lacks, so no page costs a model call. The page opens in
+Code, and runs the adaptive web in-process. It serves finished pages from `stores/web/`, with empty results for unrelated
+searches and short missing pages for unknown URLs. No page costs a model call. The page opens in
 Chromium and stays up until Ctrl-C. `cargo xtask demo search check` runs the
 scripted story and its checks instead. See
 [demos/README.md](../../demos/README.md).

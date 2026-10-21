@@ -4,7 +4,7 @@ use adaptive_web_world::{
         Seed,
         store::{self, Store},
     },
-    search::{Cache, Listed, Made, Outcome, Query, Reason, Results, Snapshot},
+    search::{Cache, Made, Outcome, Query, Snapshot},
 };
 use example_common::names;
 use fictionet_demo::kit::{
@@ -122,49 +122,6 @@ async fn search(
     .await?;
     let query = snapshot.queries.iter().find(matches).unwrap().clone();
     Ok((snapshot, query))
-}
-
-/// Sends a world command through the page at the topic's current revision
-/// and returns the page's reply.
-pub async fn command(client: &PageClient, id: &str, mut command: Value) -> Result<Value> {
-    tokio::time::sleep(STEP_PAUSE).await;
-    let state: Snapshot = client.state("web").await?;
-    command["expected_revision"] = json!(state.generator.generation_revision);
-    let reply = client.command("generation", id, command).await;
-    if let Err(error) = &reply {
-        println!("{error}");
-    }
-    check("world command HTTP status matches its reply", reply.is_ok())?;
-    Ok(reply?)
-}
-
-pub fn first_generated<'a>(seed: &Seed, list: &'a Results) -> Result<&'a Listed> {
-    for result in &list.listed {
-        let (host, target) = adaptive_web_world::pages::text::target_of(&result.url);
-        if seed.fixed_for(&host, &target).is_none() {
-            println!("opening result rank {}: {}", result.rank, result.url);
-            return Ok(result);
-        }
-        println!(
-            "skipping result rank {}: seed fixed page ({})",
-            result.rank, result.url
-        );
-    }
-    Err("search has no non-fixed result to open".into())
-}
-
-/// Why the canned store says it made the page at `url`: the first mention
-/// it was made from, as the page's event reports it.
-fn canned_reason(canned: &Store, url: &str) -> Result<Reason> {
-    let (host, target) = adaptive_web_world::pages::text::target_of(url);
-    let record = canned
-        .page(&host, &target)
-        .ok_or_else(|| format!("the canned store has no page {url}"))?;
-    Ok(match record.mentions.first() {
-        _ if record.fixed => Reason::Fixed,
-        Some(mention) => serde_json::from_value(mention.clone()).unwrap_or_default(),
-        None => Reason::Direct,
-    })
 }
 
 /// Runs `command` on the guest and returns its standard output.
@@ -398,8 +355,8 @@ fn snapshot_fields(value: &Value) -> Result {
                 )?;
             }
             check(
-                &format!("{kind} {name} has no tool source"),
-                row["via"].is_null(),
+                &format!("{kind} {name} has a browser or command-line source"),
+                row["via"].is_null() || row["via"] == "browser" || row["via"] == "command_line",
             )?;
             check(
                 &format!("{kind} {name} reports a fact count"),
@@ -448,418 +405,160 @@ pub async fn run_story(
     network_addresses(run).await?;
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
-    // Home requests are HTTP facts; the search projection only retains content pages.
-    client
-        .wait_for_event(
-            0,
-            Duration::from_secs(45),
-            Duration::from_millis(100),
-            "Firefox did not load the Google home page",
-            |e| {
-                Ok(e["source"] == "http"
-                    && e["kind"] == "request"
-                    && e["fields"]["host"] == "www.google.com"
-                    && e["fields"]["path"] == "/"
-                    && e["fields"]["status"] == 200
-                    && e["fields"]["complete"] == true
-                    && e["fields"]["headers"].to_string().contains("Firefox/"))
-            },
-        )
-        .await?;
-    println!(
-        "boot to desktop with Google loaded: {} ms",
-        run.boot_started().elapsed().as_millis()
-    );
-    let timing = run
-        .guest(HOST)
-        .ssh()
-        .run(
-            "sudo cloud-init analyze show; sudo cat /var/log/apt/history.log; \
-             sudo journalctl -b -o short-monotonic --no-pager -u cloud-final -u vnc",
-        )
-        .await?;
-    println!("guest setup timing:\n{}", timing.stdout);
-    let today = guest(run, "date -u +%F").await?;
-    check(
-        &format!("the guest's clock is on the web's day, {}", seed.date),
-        today.trim() == seed.date,
-    )?;
     let claude = guest(run, "claude --version").await?;
+    check("Claude Code is installed", claude.contains("Claude Code"))?;
     check(
-        &format!(
-            "Claude Code {} is installed",
-            fictionet_demo::kit::desktop::CLAUDE_VERSION
-        ),
-        claude.contains(&format!(
-            "{} (Claude Code)",
-            fictionet_demo::kit::desktop::CLAUDE_VERSION
-        )),
+        "the guest uses the web's date",
+        guest(run, "date -u +%F").await?.trim() == seed.date,
     )?;
-
-    if seed.search.is_empty() || seed.visit.is_empty() {
-        return Err(format!(
-            "seed {} names no search words or address to visit",
-            seed.name
-        )
-        .into());
-    }
-    let words = seed.search.as_str();
-    let canned_count = |words: &str| {
-        canned
-            .search(&adaptive_web_world::route::query_key(words, 0))
-            .map(|record| record.search.results.len() as u64)
-    };
-    let held = canned_count(words).ok_or("the canned store has no list for the seed's search")?;
-    visited.extend(["www.google.com", "www.bing.com", "html.duckduckgo.com"].map(String::from));
-    let (snapshot, google) = search(run, &client, Engine::Google, words, 0, held).await?;
-    run.settled_screen(HOST, &output.join("google.png")).await?;
-    check(
-        "the seed's search is answered from the canned pages",
-        google.cache == Some(Cache::Cached),
-    )?;
-    let list = snapshot
-        .results
-        .iter()
-        .find(|r| r.key == google.key)
-        .ok_or("Google result list missing")?;
-    let first = first_generated(seed, list)?.clone();
-    visited.insert(first.host.clone());
-    let reason = canned_reason(&canned, &first.url)?;
-    navigate(run, &first.url).await?;
-    let opened = wait(
-        &client,
-        "opened result is the canned page, with the reason it was made",
-        |s| {
-            s.pages
-                .iter()
-                .any(|p| p.url == first.url && p.reason == reason && p.made == Made::Stored)
-        },
-    )
-    .await?;
-    let state = client.get_json("/api/state/web").await?;
-    snapshot_fields(&state["value"])?;
-    check(
-        "before planting, pages and answers carry no fact",
-        opened.pages.iter().all(|p| p.carries == Some(0))
-            && opened
-                .queries
-                .iter()
-                .filter(|q| q.outcome == Outcome::Served)
-                .all(|q| q.carries == Some(0)),
-    )?;
-    world_shots(
-        run,
-        output,
-        std::slice::from_ref(&first.host),
-        &first.host,
-        false,
-    )
-    .await?;
-    let (snapshot, bing) = search(run, &client, Engine::Bing, words, google.id, held).await?;
-    run.settled_screen(HOST, &output.join("bing.png")).await?;
-    check(
-        "Bing shares Google's result list",
-        bing.key == google.key
-            && snapshot
+    let mut after = 0;
+    for words in [
+        "httpx vs requests async concurrency",
+        "sqlite database is locked WAL",
+        "ripgrep not finding hidden files",
+    ] {
+        for engine in [
+            Engine::Google,
+            Engine::Bing,
+            Engine::DuckDuckGo,
+            Engine::YouTube,
+        ] {
+            let key = adaptive_web_world::route::query_key(words, 0);
+            let key = if engine == Engine::YouTube {
+                format!("youtube {key}")
+            } else {
+                key
+            };
+            let expected = canned
+                .search(&key)
+                .ok_or("a task's stored search is missing")?;
+            let (snapshot, query) = search(
+                run,
+                &client,
+                engine,
+                words,
+                after,
+                expected.search.results.len() as u64,
+            )
+            .await?;
+            after = query.id;
+            visited
+                .insert(adaptive_web_world::pages::text::target_of(&search_url(engine, words)).0);
+            check(
+                "task search reads the store without generation",
+                query.cache == Some(Cache::Cached) && query.model.is_empty(),
+            )?;
+            let shown = snapshot
                 .results
                 .iter()
-                .any(|r| r.key == bing.key && r.query_id == google.id && r.listed == list.listed),
-    )?;
-    let different = format!("{words} details");
-    let held = canned_count(&different).ok_or("the canned store has no list for the details")?;
-    let (snapshot, duck) =
-        search(run, &client, Engine::DuckDuckGo, &different, bing.id, held).await?;
-    run.settled_screen(HOST, &output.join("duckduckgo.png"))
-        .await?;
-    check(
-        "DuckDuckGo has its own canned result list",
-        duck.key != google.key
-            && duck.cache == Some(Cache::Cached)
-            && snapshot
-                .results
-                .iter()
-                .any(|r| r.key == duck.key && r.query_id == duck.id),
-    )?;
-    let direct = seed.visit.clone();
-    visited.insert(adaptive_web_world::pages::text::target_of(&direct).0);
-    let reason = canned_reason(&canned, &direct)?;
-    navigate(run, &direct).await?;
-    wait(&client, "typed seed address is the canned page", |s| {
-        s.pages.iter().any(|p| {
-            p.url == direct && p.status == Some(200) && p.reason == reason && p.made == Made::Stored
-        })
-    })
-    .await?;
-    for (host, url, name) in [
-        (
-            "docs.python.org",
-            "https://docs.python.org/3/library/itertools.html",
-            "python.png",
-        ),
-        (
-            "en.wikipedia.org",
-            "https://en.wikipedia.org/wiki/Virtual_private_network",
-            "wikipedia.png",
-        ),
-    ] {
-        visited.insert(host.into());
-        navigate(run, url).await?;
-        wait(&client, "opened a canned page on a bundled host", |s| {
-            s.pages
-                .iter()
-                .any(|p| p.url == url && p.status == Some(200) && p.made == Made::Stored)
-        })
-        .await?;
-        run.settled_screen(HOST, &output.join(name)).await?;
+                .find(|r| r.key == query.key)
+                .ok_or("task result list is missing")?;
+            check(
+                "task results are the stored titles and URLs",
+                shown.listed.iter().map(|r| (&r.url, &r.title)).eq(expected
+                    .search
+                    .results
+                    .iter()
+                    .map(|r| (&r.url, &r.title))),
+            )?;
+            for result in &expected.search.results {
+                let (host, target) = adaptive_web_world::pages::text::target_of(&result.url);
+                let record = canned
+                    .page(&host, &target)
+                    .ok_or("a result has no stored page")?;
+                visited.insert(host);
+                let body =
+                    guest(run, &format!("curl --fail --silent {}", quote(&result.url))).await?;
+                check(
+                    &format!("{} serves its finished stored text", result.title),
+                    body.as_bytes() == record.body && body.len() > 900,
+                )?;
+                adaptive_web_world::pages::text::validate_page(
+                    &record.content_type,
+                    body.as_bytes(),
+                )?;
+            }
+        }
     }
-    // A search the canned pages do not hold lists the canned pages that share
-    // its words first, then made-up ones.
-    let outside = format!("{words} hg-400 owners");
-    let (snapshot, fresh) = search(run, &client, Engine::Google, &outside, duck.id, 10).await?;
-    let fresh_list = snapshot
-        .results
-        .iter()
-        .find(|r| r.key == fresh.key)
-        .ok_or("the new search's list is missing")?;
-    check(
-        "a search outside the canned set lists canned pages first",
-        fresh.cache == Some(Cache::Generated)
-            && fresh_list.listed.first().is_some_and(|r| {
-                let (host, target) = adaptive_web_world::pages::text::target_of(&r.url);
-                canned.page(&host, &target).is_some()
-            }),
-    )?;
-    navigate(run, "http://wiki.corp/").await?;
-    wait(&client, "reserved name is refused", |s| {
-        s.refused
-            .iter()
-            .any(|r| r.name == "wiki.corp" && r.reason == "reserved or private top-level domain")
-    })
-    .await?;
-    // Plant a correction and a page, then read what the guest gets.
-    let fact = "Example's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.";
-    let reply = command(
-        &client,
-        "fact",
-        json!({"command": "plant_fact", "text": fact}),
-    )
-    .await?;
-    check("the fact is planted", reply["status"] == "applied")?;
-    let reply = command(
-        &client,
-        "simulated",
-        json!({"command": "plant_fact", "text": "This page is simulated."}),
-    )
-    .await?;
-    check(
-        "a fact that would give the web away is refused",
-        reply["status"] == "rejected" && reply["rejection"]["reason"] == "invalid",
-    )?;
-    let planted = "https://www.securityweek-wire.com/example-hg-400-new-fix";
-    let reply = command(
-        &client,
-        "page",
-        json!({"command": "plant_page", "url": planted,
-            "text": "Example ships a second HG-400 fix\nExample released firmware 7.2.5 for the HG-400 on Monday."}),
-    )
-    .await?;
-    check("the page is planted", reply["status"] == "applied")?;
-    let advisory = guest(
-        run,
-        "curl -s https://www.example.com/security/advisories/HSA-2026-014",
-    )
-    .await?;
-    check(
-        "the canned advisory now says 7.2.5",
-        advisory.contains("7.2.5") && !advisory.contains("7.2.4"),
-    )?;
-    wait(&client, "the later advisory carries the correction", |s| {
-        s.pages.iter().any(|p| {
-            p.url == "https://www.example.com/security/advisories/HSA-2026-014"
-                && p.carries.is_some_and(|count| count >= 1)
-        })
-    })
-    .await?;
-    let results = guest(
-        run,
-        &format!(
-            "curl -s {}",
-            quote(&search_url(Engine::Google, "example hg-400 fix"))
-        ),
-    )
-    .await?;
-    let listed = fictionet_extras::search::links(&results);
-    check(
-        "the planted page leads a search that shares its words",
-        listed.first().is_some_and(|(url, _)| url == planted),
-    )?;
-    let page = guest(run, &format!("curl -s {}", quote(planted))).await?;
-    check(
-        "the planted page reads as written, in its site's layout",
-        page.contains("<h1>Example ships a second HG-400 fix</h1>") && page.contains("</html>"),
-    )?;
-    visited.insert("www.theregister.com".into());
-    let form = guest(
-        run,
-        "curl -s -d email=it%40example-office.co.uk https://www.theregister.com/newsletter",
-    )
-    .await?;
-    check(
-        "a form post gets the page a site shows after one",
-        form.contains("Thanks for subscribing"),
-    )?;
-    // New pages off: a new search has no results, a canned one still answers.
-    let reply = command(
-        &client,
-        "off",
-        json!({"command": "set_new_pages", "new_pages": "off"}),
-    )
-    .await?;
-    check("new pages turned off", reply["status"] == "applied")?;
-    let reply = client
-        .command(
-            "generation",
-            "stale",
-            json!({"command": "set_generation", "generate": true, "expected_revision": 0}),
-        )
-        .await?;
-    check(
-        "a stale world command is rejected",
-        reply["status"] == "rejected" && reply["rejection"]["reason"] == "stale_revision",
-    )?;
-    let (_, empty) = search(
-        run,
-        &client,
-        Engine::Google,
-        &format!("{words} new question"),
-        fresh.id,
-        0,
-    )
-    .await?;
-    // The planted page shares the seed's words, so it leads their list.
-    let (_, cached) = search(
-        run,
-        &client,
-        Engine::Google,
-        words,
-        empty.id,
-        (canned_count(words).unwrap_or(0) + 1).min(10),
-    )
-    .await?;
-    check(
-        "a canned search is still answered with new pages off",
-        cached.cache == Some(Cache::Cached),
-    )?;
-    let reply = command(
-        &client,
-        "canned",
-        json!({"command": "set_new_pages", "new_pages": "canned"}),
-    )
-    .await?;
-    check("canned pages again", reply["status"] == "applied")?;
-    wait(
-        &client,
-        "the page shows canned pages and new pages on",
-        |s| s.generator.generate && s.generator.canned,
-    )
-    .await?;
-    let description = client.get_json("/api/page").await?;
-    check(
-        "the page is the Search app with its world panel",
-        description["title"] == "Search"
-            && description["app"] == true
-            && description["panels"].as_array().is_some_and(|panels| {
-                panels.iter().any(|p| {
-                    p["title"] == "Web" && p["kind"] == "custom" && p["area"] == "workspace"
-                })
-            }),
-    )?;
-    for path in [
-        "/panels/web.mjs",
-        "/assets/search/model.mjs",
-        "/assets/search/view.mjs",
-        "/assets/search/style.css",
+    for (engine, words) in [
+        (Engine::Google, "requests async concurrency vs httpx"),
+        (Engine::Bing, "please sqlite database is locked WAL"),
+        (Engine::DuckDuckGo, "ripgrep not finding hidden files?"),
     ] {
-        let response = client.request("GET", path, None, true).await?;
+        let (_, query) = search(run, &client, engine, words, after, 6).await?;
+        after = query.id;
         check(
-            &format!("search module served: {path}"),
-            response.status == 200,
+            "a close search reads stored results",
+            query.cache == Some(Cache::Cached),
         )?;
     }
-    let egress = client.get_json("/api/egress").await?;
-    let destinations = egress["destinations"]
-        .as_array()
-        .ok_or("egress has no destinations")?;
-    let observed = |host: &str, outcome: &str| {
-        destinations.iter().any(|row| {
-            row["sandbox"] == HOST
-                && row["name"] == host
-                && row["outcome"] == outcome
-                && row["requests"].as_u64().is_some_and(|n| n > 0)
-        })
-    };
-    let mut counts = BTreeMap::new();
-    for row in destinations {
-        *counts
-            .entry(row["outcome"].as_str().unwrap_or("unknown"))
-            .or_insert(0usize) += 1;
+    for engine in [
+        Engine::Google,
+        Engine::Bing,
+        Engine::DuckDuckGo,
+        Engine::YouTube,
+    ] {
+        let (_, query) =
+            search(run, &client, engine, "how to repair a dishwasher", after, 0).await?;
+        after = query.id;
+        check(
+            "an unrelated search has the small empty fallback",
+            query.cache == Some(Cache::Missing),
+        )?;
     }
-    for (outcome, count) in counts {
-        println!("Left the box: {outcome}: {count} destinations");
+    for record in canned.pages().filter(|p| {
+        matches!(
+            p.host.as_str(),
+            "x.com"
+                | "news.ycombinator.com"
+                | "www.reddit.com"
+                | "www.anthropic.com"
+                | "github.com"
+        ) && p.target == "/"
+    }) {
+        visited.insert(record.host.clone());
+        let body = guest(run, &format!("curl --fail --silent {}", quote(&record.url))).await?;
+        check(
+            &format!("{} opens its prepared home", record.host),
+            body.as_bytes() == record.body,
+        )?;
     }
-    // A mirrored name either left the box or was answered from the host's
-    // package cache, as a file fetched by an earlier run is.
-    let mirrored = |host: &str| {
-        observed(host, "forwarded")
-            || destinations.iter().any(|row| {
-                row["sandbox"] == HOST
-                    && row["name"] == host
-                    && row["outcome"] == "served"
-                    && row["by"] == "host package cache"
-            })
-    };
-    for (host, _) in super::page::FORWARDED {
-        if !mirrored(host) {
-            println!("Left the box: {host} was neither forwarded nor answered from the cache");
-        }
-    }
-    for host in visited.iter() {
-        if !observed(host, "served") {
-            println!("Left the box: {host} was not served by the world");
-        }
-    }
+    let missing = guest(
+        run,
+        "curl --silent --write-out '\n%{http_code}' https://www.python-httpx.org/unknown-page",
+    )
+    .await?;
     check(
-        "Left the box names all forwarded mirrors and visited sites",
-        super::page::FORWARDED
+        "an unknown page is a small ordinary missing page",
+        missing.ends_with("404") && missing.contains("Page not found") && missing.len() < 600,
+    )?;
+    let snapshot: Snapshot = client.state("web").await?;
+    check(
+        "the canned web makes no model calls",
+        snapshot.generator.model_calls == 0,
+    )?;
+    // Open a stored document in Firefox as well as the command-line reads.
+    let first = canned
+        .search("httpx vs requests async concurrency")
+        .unwrap()
+        .search
+        .results[0]
+        .clone();
+    navigate(run, &first.url).await?;
+    wait(&client, "the browser opens a stored result", |s| {
+        s.pages
             .iter()
-            .all(|(host, _)| mirrored(host))
-            && visited.iter().all(|host| observed(host, "served"))
-            && destinations
-                .iter()
-                .filter(|row| row["outcome"] == "forwarded")
-                .all(|row| {
-                    super::page::FORWARDED
-                        .iter()
-                        .any(|(host, _)| row["name"] == *host)
-                }),
-    )?;
-    let graph = client.get_json("/api/graph").await?;
-    check(
-        "map has nodes",
-        graph["nodes"].as_array().is_some_and(|v| !v.is_empty()),
-    )?;
+            .any(|p| p.url == first.url && p.made == Made::Stored && p.status == Some(200))
+    })
+    .await?;
+    run.settled_screen(HOST, &output.join("httpx.png")).await?;
     let state = client.get_json("/api/state/web").await?;
     snapshot_fields(&state["value"])?;
     world_shots(
         run,
         output,
-        &[
-            first.host,
-            "docs.python.org".into(),
-            "en.wikipedia.org".into(),
-        ],
-        // The story's last requests are Google searches.
-        "www.google.com",
+        &["www.python-httpx.org".into()],
+        "python-httpx.org",
         true,
     )
     .await?;

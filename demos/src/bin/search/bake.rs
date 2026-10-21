@@ -50,6 +50,7 @@ fn lines(text: &str) -> Result<Vec<Line>> {
             "google" => Line::Search(Engine::Google, rest),
             "bing" => Line::Search(Engine::Bing, rest),
             "duckduckgo" => Line::Search(Engine::DuckDuckGo, rest),
+            "youtube" => Line::Search(Engine::YouTube, rest),
             "visit" => Line::Visit(rest),
             other => return Err(format!("query list: unknown engine {other:?}").into()),
         });

@@ -99,6 +99,16 @@ impl Handler {
         let action = route(&target.host, path, form);
         let page = action == Route::Page;
         let mut query = None;
+        let source = if parts
+            .headers
+            .get(USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ua| ua.contains("Firefox/") || ua.contains("Chrome/"))
+        {
+            "browser"
+        } else {
+            "command_line"
+        };
         if let Route::Search {
             engine,
             query: search,
@@ -118,13 +128,38 @@ impl Handler {
                     .field("engine", name(&engine))
                     .field("search", search.as_str())
                     .field("start", *start)
-                    .field("key", query_key(search, *start))
+                    .field(
+                        "key",
+                        if *engine == fictionet_extras::search::Engine::YouTube {
+                            format!("youtube {}", query_key(search, *start))
+                        } else {
+                            query_key(search, *start)
+                        },
+                    )
+                    .field("via", source)
             });
         }
         let answer = self
             .pages
             .handle_route(&self.fcx, parts.method.as_str(), &target.host, path, action)
             .await;
+        if let (Some(q), Meta::Search(list)) = (&query, &answer.meta) {
+            self.fcx.emitter(&conn).emit("adaptive", "search", |e| {
+                e.field("query_id", q.id)
+                    .field("source", source)
+                    .field("search", list.search.as_str())
+                    .field(
+                        "returned",
+                        serde_json::json!(
+                            list.listed
+                                .iter()
+                                .map(|(url, title, _)| serde_json::json!({"url":url,"title":title}))
+                                .collect::<Vec<_>>()
+                        )
+                        .to_string(),
+                    )
+            });
+        }
         if let Some(q) = &mut query {
             match &answer.meta {
                 Meta::Error { error, .. } => q.fail("error", Some(error), answer.serve_ms),

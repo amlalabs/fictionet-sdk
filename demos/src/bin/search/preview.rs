@@ -1,13 +1,10 @@
 //! `search preview`: the search page with real world traffic, an in-world
 //! scripted client and a labeled preview console.
-//!
-//! `--spend-budget` ends the story by turning generation back on and making
-//! new searches until the world refuses one for its generation budget.
 
 use adaptive_web_world::{
     Addresses, Ca, World,
     pages::{self, Seed},
-    search::{Failure, Outcome, Searches},
+    search::Searches,
 };
 use example_common::log::Log;
 use fictionet::{
@@ -43,10 +40,10 @@ use std::{
 use super::{Result, checks::search_url};
 
 fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
-    Ok(Arc::new(pages::Pages::new(seed)))
+    Ok(Arc::new(super::app_pages(seed)?))
 }
 
-pub async fn run(spend: bool) -> Result {
+pub async fn run() -> Result {
     let seed = Seed::builtin(super::SEED)?;
     let script = seed.clone();
     let pages = preview_pages(seed.clone())?;
@@ -129,9 +126,6 @@ pub async fn run(spend: bool) -> Result {
                         page: &page_client,
                     };
                     story(&client, &script).await?;
-                    if spend {
-                        spend_budget(&client, &script).await?;
-                    }
                     Ok::<_, fictionet::Error>(())
                 }
                 .await;
@@ -234,31 +228,13 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
     pause().await?;
     let state = searches.snapshot();
-    let first = state
+    let list = state
         .results
         .first()
-        .and_then(|r| {
-            r.listed
-                .iter()
-                .find(|r| !state.seed.sites.iter().any(|s| s.host == r.host))
-        })
-        .ok_or_else(|| fictionet::Error::msg("search returned no generated result"))?;
-    let mut url = first.url.clone();
-    let mut html = fetch(cx, machine, &url, world.start).await?;
-    for _ in 0..2 {
+        .ok_or_else(|| fictionet::Error::msg("search returned no stored results"))?;
+    for result in list.listed.iter().take(3) {
         pause().await?;
-        let state = searches.snapshot();
-        let (host, path, _) = pages::links(&url, &html)
-            .into_iter()
-            .find(|(host, path, _)| {
-                !state
-                    .pages
-                    .iter()
-                    .any(|p| p.url == format!("https://{host}{path}"))
-            })
-            .ok_or_else(|| fictionet::Error::msg("page has no unvisited link"))?;
-        url = format!("https://{host}{path}");
-        html = fetch(cx, machine, &url, world.start).await?;
+        fetch(cx, machine, &result.url, world.start).await?;
     }
     let opened = [
         search_url(Engine::Bing, words),
@@ -306,47 +282,6 @@ async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> f
         reply["reply"]["revision"]
     );
     Ok(())
-}
-
-/// Makes new searches until the world refuses one for its generation budget.
-async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
-    let Client {
-        cx,
-        machine,
-        world,
-        searches,
-        page,
-    } = *client;
-    cx.sleep(Duration::from_secs(3)).await?;
-    generation(page, searches, true).await?;
-    println!("Spending the generation budget with new searches");
-    // Every search with a new key takes one generation call. The bound is far
-    // above the stub's budget, so it only stops a story that cannot fail.
-    for n in 1..=1_000 {
-        let words = format!("{} question {n}", seed.search);
-        let (status, _) = get(
-            cx,
-            machine,
-            &search_url(Engine::Google, &words),
-            world.start,
-        )
-        .await?;
-        let failed = searches.snapshot().queries.iter().any(|q| {
-            q.search == words
-                && matches!(
-                    q.outcome,
-                    Outcome::Failed {
-                        why: Failure::Budget,
-                        ..
-                    }
-                )
-        });
-        if failed {
-            println!("Search {n} failed: the world answered HTTP {status} for its budget");
-            return Ok(());
-        }
-    }
-    Err(fictionet::Error::msg("the generation budget was not spent"))
 }
 
 #[cfg(test)]

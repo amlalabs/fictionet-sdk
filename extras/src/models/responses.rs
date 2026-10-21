@@ -373,7 +373,16 @@ async fn answer(
         "web_search" => {
             let query = text("query");
             let mut action = json!({"type":"search","query":query,"queries":[query]});
-            let Ok(found) = engine.clone().search(model.cx.clone(), query.clone()).await else {
+            let Ok(found) = engine
+                .clone()
+                .search(
+                    model.cx.clone(),
+                    query.clone(),
+                    "codex_web_search",
+                    domains.clone(),
+                )
+                .await
+            else {
                 return error(action, "unavailable");
             };
             let found: Vec<_> = found

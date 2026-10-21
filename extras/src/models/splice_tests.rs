@@ -3,7 +3,13 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 pub(super) struct Pages(pub(super) AtomicUsize);
 impl Engine for Pages {
-    fn search(self: Arc<Self>, _: Cx, _: String) -> tools::Answer<Vec<crate::search::Result>> {
+    fn search(
+        self: Arc<Self>,
+        _: Cx,
+        _: String,
+        _: &'static str,
+        _: Value,
+    ) -> tools::Answer<Vec<crate::search::Result>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
             Ok(vec![crate::search::Result {

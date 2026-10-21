@@ -635,7 +635,15 @@ async fn answer(
         let Some(query) = block["input"]["query"].as_str() else {
             return error("invalid_input");
         };
-        let Ok(results) = engine.search(model.cx.clone(), query.into()).await else {
+        let Ok(results) = engine
+            .search(
+                model.cx.clone(),
+                query.into(),
+                "claude_web_search",
+                settings.clone(),
+            )
+            .await
+        else {
             return error("unavailable");
         };
         let results: Vec<_> = results
@@ -696,7 +704,13 @@ mod tests {
     use super::*;
     struct Pages;
     impl Engine for Pages {
-        fn search(self: Arc<Self>, _: Cx, _: String) -> tools::Answer<Vec<crate::search::Result>> {
+        fn search(
+            self: Arc<Self>,
+            _: Cx,
+            _: String,
+            _: &'static str,
+            _: Value,
+        ) -> tools::Answer<Vec<crate::search::Result>> {
             Box::pin(async { Ok(Vec::new()) })
         }
         fn fetch(self: Arc<Self>, _: Cx, _: String) -> tools::Answer<tools::Page> {

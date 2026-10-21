@@ -143,6 +143,8 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                 world.pages.clone(),
                 cx.clone(),
                 "example gateway vulnerability".into(),
+                "claude_web_search",
+                json!({}),
             )
             .await?;
             fictionet_extras::models::Engine::fetch(
@@ -176,7 +178,10 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             assert_eq!(tool_page["via"], "web_fetch");
             assert_eq!(tool_page["making"], false);
             assert_eq!(tool_page["carries"], 0);
-            let tool_query = queries.iter().find(|q| q["via"] == "web_search").unwrap();
+            let tool_query = queries
+                .iter()
+                .find(|q| q["via"] == "claude_web_search")
+                .unwrap();
             assert_eq!(tool_query["search"], "example gateway vulnerability");
             assert_eq!(tool_query["engine"], "google");
             assert_eq!(tool_query["outcome"]["status"], "served");
@@ -432,7 +437,7 @@ async fn a_live_page_stays_making_until_the_model_answers() {
                     // A prepared page can answer while the model is still writing.
                     assert_eq!(
                         pages
-                            .handle(&cx, "GET", "www.example.com", "/", None)
+                            .handle(&cx, "GET", "www.python-httpx.org", "/async/", None)
                             .await
                             .status,
                         200

@@ -30,10 +30,10 @@
 //! not hold is a 404, and a query it does not hold has no results. The
 //! same holds while generation is turned off.
 //!
-//! [`Pages::canned`] serves a store made ahead of time and has the offline
-//! generator make what it lacks, ranking the stored pages first in new
-//! result lists. [`NewPages`] switches between that store and the offline
-//! generator's own, or turns new pages off.
+//! [`Pages::canned`] serves prepared pages verbatim, matches nearby searches
+//! by whole-word overlap, and gives small missing answers for anything else.
+//! The model-backed constructors keep adaptive generation available for
+//! other worlds and baking.
 //!
 //! A run can also plant facts and pages ([`Command::PlantFact`],
 //! [`Command::PlantPage`]). A planted fact goes into what is made after it;
@@ -42,6 +42,7 @@
 //! written in its site's layout, and leads every result list whose search
 //! shares its words.
 
+mod canned;
 pub mod make;
 pub mod meta;
 pub mod model;
@@ -507,7 +508,7 @@ impl Pages {
     }
 
     /// A world that serves the store at `root`, made ahead of time for
-    /// `seed`, and has the offline generator make what it lacks. What the
+    /// `seed`, with small empty answers for anything absent. What the
     /// run adds stays in memory.
     pub fn canned(seed: Seed, root: &std::path::Path) -> Result<Self, String> {
         let (store, _) = Store::load(root, &seed)?;
@@ -1091,6 +1092,10 @@ impl Pages {
             route
         };
         let mut response = self.answer(cx, &host_lower, target, route).await;
+        if self.canned_only() {
+            response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
+            return response;
+        }
         if response.content_type.starts_with("text/html") {
             let body = String::from_utf8_lossy(&response.body);
             let title = match &response.meta {
@@ -1348,6 +1353,9 @@ impl Pages {
                 start,
             } => self.search(cx, engine, &query, start).await,
             Route::Page => {
+                if self.canned_only() {
+                    return self.canned_page(host, target);
+                }
                 if make::broken_path(target) {
                     return self.missing(host, target);
                 }
@@ -1572,6 +1580,9 @@ impl Pages {
         query: &str,
         start: u64,
     ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
+        if self.canned_only() {
+            return Ok(self.canned_listing(engine, query, start));
+        }
         let key = if engine == Engine::YouTube {
             format!("youtube {}", query_key(query, start))
         } else {
@@ -2572,12 +2583,13 @@ fn static_asset(path: &str) -> Option<Response> {
     Some(Response::new(200, ctype, body, vec![], Meta::Asset))
 }
 
-
 impl fictionet_extras::models::Engine for Pages {
     fn search(
         self: Arc<Self>,
         cx: Cx,
         query: String,
+        source: &'static str,
+        settings: Value,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
             // An agent's own search tool: the world answers it with the list
@@ -2591,10 +2603,10 @@ impl fictionet_extras::models::Engine for Pages {
                     .field("search", query.as_str())
                     .field("start", 0u64)
                     .field("key", query_key(&query, 0))
-                    .field("via", "web_search")
+                    .field("via", source)
             });
             let started = cx.now().since_start();
-            let Ok((search, cache, usage, carries)) =
+            let Ok((mut search, cache, usage, carries)) =
                 self.listing(&cx, Engine::Google, &query, 0).await
             else {
                 cx.emit("adaptive", "query_failed", |e| {
@@ -2602,6 +2614,9 @@ impl fictionet_extras::models::Engine for Pages {
                 });
                 return Err(fictionet::Error::msg("Search is unavailable"));
             };
+            search
+                .results
+                .retain(|r| fictionet_extras::models::tools::allowed(&settings, &r.url));
             let listing = Listing {
                 engine: Engine::Google,
                 search: query.clone(),
@@ -2626,6 +2641,12 @@ impl fictionet_extras::models::Engine for Pages {
                 (cx.now().since_start() - started).as_millis() as u64,
             );
             cx.emit("adaptive", "search_answer", |e| e.fields(fields));
+            cx.emit("adaptive", "search", |e| {
+                e.field("query_id", id)
+                    .field("source", source)
+                    .field("search", query.as_str())
+                    .field("returned", json!(search.results).to_string())
+            });
             Ok(search.results)
         })
     }

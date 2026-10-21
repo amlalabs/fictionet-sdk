@@ -106,7 +106,7 @@ const typed = (r) => !r.name.startsWith('_');
 
 // The newest rows first: searches, pages, refused names and plants.
 export function rows(s, limit = 8) {
-  const who = (item, fallback) => ['web_search', 'web_fetch'].includes(item.via) ? 'Claude Code' : fallback;
+  const who = (item, fallback) => item.via === 'codex_web_search' ? 'Codex' : ['claude_web_search', 'web_fetch'].includes(item.via) ? 'Claude Code' : item.via === 'command_line' ? 'Command line' : fallback;
   const badge = (tag) => ({ again: 'again', planted: 'planted', refused: 'refused', making: 'writing', asking: 'writing', missing: 'not found' }[tag] || null);
   return [
     ...s.queries.map((q) => ({ at: q.at_ms, seq: q.seq ?? 0, who: who(q, short(q.site || engine(q.engine))), what: `“${q.search}”`, tag: queryTag(s, q) })),

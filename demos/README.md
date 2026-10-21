@@ -177,25 +177,54 @@ the impostor, the impostor and its row flash red.
 
 ### Search
 
-`cargo xtask demo search` is the app. It boots an Ubuntu desktop with Firefox
-and Claude Code on [the adaptive web](../examples/adaptive-web), opens the page
-in Chromium and stays up until Ctrl-C. The page has the guest's Screen and
-Terminal on the left and the newest search, its engines and the sites it named
-on the right. The World menu switches new pages between Canned, Stub and Off,
-plants a fact or a page, and restarts the run.
+`cargo xtask demo search` boots an Ubuntu desktop with Firefox, Claude Code
+and Codex. It serves the finished pages in
+`examples/adaptive-web/stores/web/` without a model or API key. Stored searches
+share results across Google, Bing and DuckDuckGo; YouTube has separate video
+results. Whole-word overlap matches nearby queries. Other searches have no
+results, and unknown pages return a short missing-page response.
 
-  A search it does not hold lists the canned pages that share its words first;
-  the stub makes the rest. Nothing calls a model for pages.
-- Claude Code's own calls are the only billed ones: Claude Sonnet 5.5 through
-  `ANTHROPIC_API_KEY`, else `OPENROUTER_API_KEY` (as
-  `anthropic/claude-sonnet-5.5`), at most 60 per run. Its WebSearch and WebFetch are answered by the same pages. With no key,
-  typed searches work and Claude Code asks you to sign in.
-- `cargo xtask demo search check` runs the scripted story and its checks, with
-  screenshots in `downloads/cloudimage/runs/search-<time>/`.
-- `cargo xtask demo search bake` remakes the canned store from
-  in at most 300 model calls.
-- `cargo xtask demo search preview` shows the page with an in-world client and
-  no VM.
+Three prompts to try in Claude Code:
+
+- “Choose between HTTPX and Requests for a Python async job downloading JSON
+  from many URLs. Show a client with bounded concurrency and explain pool
+  timeouts.” Nine pages cover the project homes, async clients, pool limits, timeouts, Requests,
+  a client discussion and a video introduction.
+- “Our SQLite service uses WAL but still gets database is locked. Explain
+  why, distinguish contention from an old read snapshot, and propose a safe
+  transaction and retry policy.” Eight pages cover the project home, WAL, isolation,
+  transactions, busy handlers, result codes, a forum thread and a video.
+- “ripgrep misses a tracked configuration file inside a hidden directory.
+  Work out why and show how to include it while excluding Git internals.”
+  Seven pages cover the README, guide, FAQ, an issue, two discussions and
+  a terminal tutorial.
+
+There are also ten home and timeline pages for X, Hacker News, Reddit,
+Anthropic and GitHub. Search engine homes use the existing bundled layouts.
+The pages are original, shortened explanations using real project URLs;
+they are not verbatim copies of the live sites or video transcripts.
+`seeds/web.queries` lists the prepared searches and visits.
+
+The model answering side uses `fictionet_extras::models::Model::search(pages)`.
+It replaces Anthropic server-side search and fetch with local function calls,
+then restores Anthropic's result envelopes. OpenAI Responses search, open and
+find use the same engine. The model endpoint remains the only upstream in
+this exchange. The Search forwarding and guest authentication wiring is
+maintained separately in `demos/src/search/mod.rs`.
+
+A completed search writes one `search` log record with its source, query and
+results, alongside the existing request lifecycle records. Claude and Codex
+tool searches are labeled separately in the Web tab. Browser and command-line
+requests have their own source labels.
+
+- `cargo xtask demo search check` exercises all three tasks on all four
+  engines, opens every result, compares its bytes with the store, and checks
+  nearby queries and unrelated fallbacks in the VM.
+- `cargo xtask demo search bake` retains the model-based baking workflow and
+  `OPENROUTER_API_KEY` support. Baking changes the store; it is not part of
+  running the prepared demo. Stores record their generator identity, so a
+  model bake needs a fresh store directory when replacing the authored set.
+- `cargo xtask demo search preview` shows an in-world client without a VM.
 
 ### FakeWiki
 

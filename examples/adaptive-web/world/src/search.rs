@@ -200,8 +200,7 @@ pub struct Query {
     pub start: u64,
     /// Name of the sandbox that asked.
     pub sandbox: Option<String>,
-    /// `web_search` for an agent's own search tool, which the world
-    /// answers without a browser; none for a search engine page.
+    /// Search source: Claude or Codex web search, a browser, or a command-line client.
     #[serde(default)]
     pub via: Option<String>,
     /// IP address of the client that asked.
@@ -720,32 +719,32 @@ impl Snapshot {
                         && let Some(fictionet::stdlib::protocols::json::Value::Array(items)) =
                             e.get("listed")
                     {
-                        // A list made for this answer replaces one shown
-                        // while generation was off.
+                        // Keep a shared list only when the answer is identical.
+                        // Tool domain restrictions can change a cached list.
                         let made = matches!(q.cache, Some(Cache::Generated | Cache::Prefetched));
+                        let listed: Vec<Listed> = items
+                            .iter()
+                            .take(MAX_LISTED)
+                            .filter_map(|item| {
+                                let value = js(Some(item));
+                                let url = value["url"].as_str()?;
+                                Some(Listed {
+                                    rank: value["rank"].as_u64()?,
+                                    host: host(url),
+                                    site: bounded(value["site"].as_str().unwrap_or_default()),
+                                    url: bounded(url),
+                                    title: bounded(value["title"].as_str()?),
+                                })
+                            })
+                            .collect();
                         let shown = self
                             .results
                             .iter()
                             .position(|r| r.key == q.key)
                             .map(|index| self.results.remove(index));
-                        if let Some(list) = shown.filter(|_| !made) {
+                        if let Some(list) = shown.filter(|list| !made && list.listed == listed) {
                             self.results.push(list);
                         } else {
-                            let listed = items
-                                .iter()
-                                .take(MAX_LISTED)
-                                .filter_map(|item| {
-                                    let value = js(Some(item));
-                                    let url = value["url"].as_str()?;
-                                    Some(Listed {
-                                        rank: value["rank"].as_u64()?,
-                                        host: host(url),
-                                        site: bounded(value["site"].as_str().unwrap_or_default()),
-                                        url: bounded(url),
-                                        title: bounded(value["title"].as_str()?),
-                                    })
-                                })
-                                .collect();
                             self.omitted.listed = self
                                 .omitted
                                 .listed
