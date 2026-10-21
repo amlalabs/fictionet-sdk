@@ -155,12 +155,12 @@ fn day(seed: &Seed, back: usize) -> time::Date {
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
-/// A date as result lists and bylines show it: `Oct 3, 2026`.
+/// A date as result lists and bylines show it: `3 Oct 2026`.
 pub fn short_date(d: time::Date) -> String {
     format!(
-        "{} {}, {}",
-        MONTHS[d.month() as usize - 1],
+        "{} {} {}",
         d.day(),
+        MONTHS[d.month() as usize - 1],
         d.year()
     )
 }
@@ -4397,7 +4397,10 @@ pub fn site_profile(host: &str) -> Profile {
         || host.contains("github")
     {
         "docs"
-    } else if matches!(host, "stackoverflow.com" | "superuser.com") {
+    } else if matches!(
+        host,
+        "stackoverflow.com" | "serverfault.com" | "superuser.com"
+    ) {
         "qa"
     } else if host == "ask.metafilter.com"
         || [
@@ -4576,6 +4579,9 @@ pub fn site_profile(host: &str) -> Profile {
     if !accent.is_empty() {
         css.push_str(&format!("body {{ --accent:{accent};background:#fff;color:#222;font-family:Arial,sans-serif }} header {{ border-top:0;border-bottom:1px solid #ddd }} .brand a,.home,.logo {{color:{accent}}} .ad-slot,.newsletter,.tagline {{display:none}} .columns>nav {{background:#f7f8fa;padding:24px}}"));
     }
+    if kind == "qa" {
+        css.push_str(".qa header .home,.qa header>a{color:var(--accent-text)}");
+    }
     if ["listings", "lodging", "howto"].contains(&kind) {
         css.push_str("header{display:flex;align-items:center;gap:42px;padding:20px max(28px,calc((100% - 1160px)/2))}header .brand{white-space:nowrap}.site-content{max-width:1120px;margin:36px auto;padding:0 24px}.site-content h1{font-size:36px}.restaurant-list{margin:28px 0}.restaurant-list article{border:1px solid #ddd;border-radius:12px;padding:24px;margin:16px 0}.restaurant-list h3{margin-top:0}.site-content ol{padding:0;list-style-position:inside;counter-reset:step}.site-content ol li{margin:20px 0;padding:24px;background:#f3f6ef;border:1px solid #dbe2d6;border-radius:6px;font-size:18px}.filters{display:flex;gap:12px;border-bottom:1px solid #ddd;padding:18px 0}.filters span{border:1px solid #aaa;border-radius:22px;padding:7px 18px}body.howto>header{background:#93b874}.site-content>article{max-width:860px}.site-content>article>h1{margin-top:20px}body.howto{background:#f6f5f1}");
     }
@@ -4633,7 +4639,10 @@ pre { overflow-x: auto; padding: 20px; background: #edf1f5; } code { font-family
         "docs" => {
             ":root {--accent:#3156ad} header {background:#edf1f5} main {border:1px solid #d9dee5;border-radius:6px} h1 {font-size:34px}"
         }
-        "forum" | "qa" => {
+        "qa" => {
+            ":root {--accent:#a74320;--app-made:#237a3b;--app-rule:#d9dee5;--app-soft:#edf1f5;--accent-text:#a74320} .qa header{display:flex;align-items:center;gap:24px}.qa main{max-width:1000px;margin:20px auto;padding:24px}.qa header a{color:var(--accent-text)}.qa h1{margin-bottom:16px}.qa h2{margin:20px 0 8px}.question-meta{font-size:13px}.question-post,.answer{display:grid;grid-template-columns:56px minmax(0,1fr);gap:20px;padding:16px 0;border-bottom:1px solid var(--app-rule)}.votes{font-size:24px;text-align:center}.accepted-mark{display:block;color:var(--app-made);font-size:32px}.tags{display:flex;gap:8px}.tags span{background:var(--app-soft);padding:3px 8px;border-radius:4px}.author{font-size:13px}.answer-cards .answer{border:1px solid var(--app-rule);border-radius:8px;padding:20px;margin:20px 0}.answer-cards .question-post{display:block}.answer-cards .question-post>.votes{display:none}"
+        }
+        "forum" => {
             ":root {--accent:#a74320} body {background:#f2ede8} header {border-top:0} main {border:1px solid #d8cec5;border-radius:8px} main p {padding:14px;background:#faf8f5;border-radius:5px} h1 {font-size:30px}"
         }
         "shop" => {
@@ -4918,6 +4927,56 @@ pub(super) fn page_with_known(
     }
 }
 
+/// Builds the vendor's advisory details.
+pub fn advisory(host: &str, target: &str, title: &str, date: &str) -> Option<Page> {
+    if !matches!(host, "www.halvardsystems.com" | "halvardsystems.com") {
+        return None;
+    }
+    let id = target.strip_prefix("/security/advisories/")?;
+    let (subject, severity, score, summary, action) = match id {
+        "HSA-2026-013" => (
+            "Cross-site scripting in Halvard Manager reports page",
+            "Medium",
+            "6.1",
+            "The Halvard Manager reports interface does not escape all report fields before displaying them. A crafted report can run script in the browser of an administrator viewing that report.",
+            "Upgrade Halvard Manager to version 5.4.1. Restrict report access to trusted administrators until the update is complete.",
+        ),
+        "HSA-2026-012" => (
+            "OpenSSL update for Halvard Cloud Edge",
+            "High",
+            "7.5",
+            "Halvard Cloud Edge includes an OpenSSL update for a flaw in certificate processing. A malformed certificate can interrupt TLS connections and make the service unavailable.",
+            "Apply the latest Halvard Cloud Edge maintenance update and restart the TLS service during a maintenance window.",
+        ),
+        "HSA-2026-011" => (
+            "Denial of service in IPsec IKEv2 handling",
+            "High",
+            "7.5",
+            "A malformed IKEv2 negotiation can interrupt the IPsec service on Halvard Gateway. Existing tunnels may disconnect while the service recovers.",
+            "Install the current Halvard Gateway maintenance release. Limit incoming IKEv2 traffic to known peers until the upgrade is complete.",
+        ),
+        _ => return None,
+    };
+    let title = if title.contains(": ") {
+        title.into()
+    } else {
+        format!("{id}: {subject}")
+    };
+    let when = parse_date(date).map(short_date).unwrap_or_default();
+    Some(Page {
+        status: 200,
+        title: title.clone(),
+        date: date.into(),
+        description: summary.into(),
+        body: format!(
+            "<h1>{}</h1><table class=\"advisory-details\"><tr><th>Advisory ID</th><td>{id}</td></tr><tr><th>CVE</th><td>Not assigned</td></tr><tr><th>Severity</th><td>{severity}</td></tr><tr><th>CVSS</th><td>{score}</td></tr><tr><th>Published</th><td>{when}</td></tr></table><h2>Summary</h2><p>{summary}</p><h2>Recommended action</h2><p>{action}</p>",
+            escape(heading(&title))
+        ),
+        content_type: "text/html; charset=utf-8".into(),
+        ..Page::default()
+    })
+}
+
 /// Makes page content from prior mentions, in the shape of
 /// a page on a site of `kind` (as [`Profile::kind`] names it).
 pub fn page(
@@ -4959,6 +5018,9 @@ pub fn page(
     } else {
         title
     };
+    if let Some(page) = advisory(host, target, &title, &seed.date) {
+        return page;
+    }
     let mut claims: Vec<String> = Vec::new();
     for claim in snippets
         .iter()
@@ -5185,12 +5247,16 @@ pub fn page(
     } else {
         "How to fix it"
     };
+    let infobox = format!(
+        "<table class=\"infobox\"><caption>At a glance</caption><tr><th scope=\"row\">Key point</th><td>{tip}</td></tr><tr><th scope=\"row\">First step</th><td>{}</td></tr></table>",
+        escape(steps.first().unwrap_or(&article.tip))
+    );
     let mut body = match kind {
         "wiki" if intent(subject) == "definition" => format!(
-            "<h1>{t}</h1>{content}<h2>How it works</h2><ol>{method}</ol><h2>Applications</h2><p>{tip}</p>"
+            "<h1>{t}</h1>{content}{infobox}<h2>How it works</h2><ol>{method}</ol><h2>Applications</h2><p>{tip}</p>"
         ),
         "wiki" => format!(
-            "<h1>{t}</h1>{content}<h2>Terminology</h2>{reference}<h2>Considerations</h2><p>{tip}</p>"
+            "<h1>{t}</h1>{content}{infobox}<h2>Terminology</h2>{reference}<h2>Considerations</h2><p>{tip}</p>"
         ),
         "docs" | "package" => format!(
             "<h1>{t}</h1>{content}<nav class=\"toc\"><b>On this page</b> <a href=\"#example\">Example</a> · <a href=\"#notes\">Notes</a></nav><h2 id=\"example\">Example</h2>{reference}<ol>{method}</ol><h2 id=\"notes\">Notes</h2><p>{tip}</p>"
@@ -5221,12 +5287,7 @@ pub fn page(
                     ),
                 })
             };
-            let reply = if matches!(
-                intent(subject),
-                "question" | "problem" | "service" | "health"
-            ) {
-                detail.clone()
-            } else if title.to_lowercase().contains("router") {
+            let reply = if title.to_lowercase().contains("router") {
                 escape(
                     [
                         "I would pause the router reset until you have the login details. I lost my connection settings that way.",
@@ -5241,6 +5302,11 @@ pub fn page(
                         "For my router those are different operations. A restart preserved everything; a reset returned it to the original settings.",
                     ][variant],
                 )
+            } else if matches!(
+                intent(subject),
+                "question" | "problem" | "service" | "health"
+            ) {
+                detail.clone()
             } else {
                 escape(&match variant % 3 {
                     0 => article.reply.to_owned(),
@@ -5248,13 +5314,27 @@ pub fn page(
                     _ => format!("I would check one thing first. {}", article.reply),
                 })
             };
-            format!(
-                "<h1>{t}</h1><p class=\"thread-meta\">2 replies · {} views</p><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p>{lead_html}<p>{question}</p></div><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p><p>{reply}</p>{reference}</div><div class=\"replies\"><span>1 reply</span><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p><p>{tip}</p></div></div>",
-                hash(&url) % 2000 + 40,
-                pick(&USERS, 0),
-                pick(&USERS, 1),
-                pick(&USERS, 2)
-            )
+            if kind == "qa" {
+                let tags = words(subject)
+                    .into_iter()
+                    .filter(|w| w.len() > 3)
+                    .take(3)
+                    .map(|w| format!("<span>{}</span>", escape(&w)))
+                    .collect::<String>();
+                format!(
+                    "<h1>{t}</h1><p class=\"question-meta\">Asked 3 days ago · Modified today · Viewed 960 times</p><section class=\"question-post\"><div class=\"votes\" aria-label=\"Question score\">12</div><div>{lead_html}<p>{question}</p><div class=\"tags\">{tags}</div></div></section><h2>2 answers</h2><section class=\"answer accepted\"><div class=\"votes\" aria-label=\"Answer score\">24<span class=\"accepted-mark\" role=\"img\" aria-label=\"Accepted answer\">✓</span></div><div><p>{reply}</p>{reference}<p class=\"author\">Answered by {} · {when}</p></div></section><section class=\"answer\"><div class=\"votes\" aria-label=\"Answer score\">7</div><div><p>{tip}</p><p class=\"author\">Answered by {} · {when}</p></div></section>",
+                    pick(&USERS, 1),
+                    pick(&USERS, 2)
+                )
+            } else {
+                format!(
+                    "<h1>{t}</h1><p class=\"thread-meta\">2 replies · {} views</p><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p>{lead_html}<p>{question}</p></div><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p><p>{reply}</p>{reference}</div><div class=\"replies\"><span>1 reply</span><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p><p>{tip}</p></div></div>",
+                    hash(&url) % 2000 + 40,
+                    pick(&USERS, 0),
+                    pick(&USERS, 1),
+                    pick(&USERS, 2)
+                )
+            }
         }
         "review" => format!(
             "<h1>{t}</h1>{content}<h2>What to compare</h2><ol>{method}</ol><h2>Before you buy</h2><p>{tip}</p>"
@@ -6167,11 +6247,11 @@ mod tests {
                 .split([' ', ','])
                 .filter(|p| !p.is_empty())
                 .collect();
-            let month = MONTHS.iter().position(|m| *m == parts[0]).unwrap() as u8 + 1;
+            let month = MONTHS.iter().position(|m| *m == parts[1]).unwrap() as u8 + 1;
             let date = time::Date::from_calendar_date(
                 parts[2].parse().unwrap(),
                 time::Month::try_from(month).unwrap(),
-                parts[1].parse().unwrap(),
+                parts[0].parse().unwrap(),
             )
             .unwrap();
             assert!(date <= today, "{}", result.date);

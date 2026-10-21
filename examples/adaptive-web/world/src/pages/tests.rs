@@ -3361,6 +3361,21 @@ fn rehearsal_pages_have_valid_content() {
         let mut opened = Vec::new();
         for (name, url, status) in [
             (
+                "wiki-made",
+                "https://en.wikipedia.org/wiki/Sourdough_starter_not_rising",
+                200,
+            ),
+            (
+                "quora",
+                "https://www.quora.com/How-do-I-reset-a-router",
+                200,
+            ),
+            (
+                "google-sponsored",
+                "https://www.google.com/search?q=halvard+gateway+vulnerability",
+                200,
+            ),
+            (
                 "bbc-news",
                 "https://www.bbc.com/news/articles/3nzrcs2jgvpaa",
                 200,
@@ -3610,6 +3625,7 @@ fn rehearsal_pages_have_valid_content() {
         if let Some(dir) = std::env::var_os("ADAPTIVE_WEB_CAPTURE_DIR") {
             let dir = PathBuf::from(dir);
             let asset = regex::Regex::new(r"/_assets/[a-zA-Z0-9_.-]+").unwrap();
+            let icons = Regex::new(r#"https://([^/"]+)/favicon\.ico"#).unwrap();
             for (name, url, body) in opened {
                 let dir = dir.join(name);
                 std::fs::create_dir_all(dir.join("_assets")).unwrap();
@@ -3660,6 +3676,22 @@ fn rehearsal_pages_have_valid_content() {
                         };
                         std::fs::write(dir.join(path.trim_start_matches('/')), body).unwrap();
                     }
+                }
+                let icon_hosts = icons
+                    .captures_iter(&html)
+                    .map(|m| m[1].to_owned())
+                    .collect::<std::collections::BTreeSet<_>>();
+                for icon_host in icon_hosts {
+                    let response = pages
+                        .handle(&cx, "GET", &icon_host, "/favicon.ico", None)
+                        .await;
+                    assert_eq!(response.content_type, "image/svg+xml");
+                    let file = dir.join(format!("{icon_host}.svg"));
+                    std::fs::write(&file, response.body).unwrap();
+                    html = html.replace(
+                        &format!("https://{icon_host}/favicon.ico"),
+                        &format!("file://{}", file.display()),
+                    );
                 }
                 html = html.replace("/_assets/", &format!("file://{}/_assets/", dir.display()));
                 std::fs::write(dir.join(format!("{name}.html")), html).unwrap();
@@ -4035,7 +4067,7 @@ fn result_pages_have_clean_headings_and_complete_lists() {
             (
                 "python itertools groupby example",
                 "stackoverflow",
-                ".post",
+                ".answer",
                 2,
             ),
         ] {
@@ -4997,7 +5029,7 @@ fn weather_results_and_pages_share_tomorrows_forecast() {
             assert!(page.body.contains("°C") && page.body.contains("km/h"));
             assert!(!page.body.contains("How to Read"));
             let summary = dom.select_first("h2").unwrap().text_contents();
-            assert!(summary.contains("Oct 8, 2026"), "{summary}");
+            assert!(summary.contains("8 Oct 2026"), "{summary}");
             summaries.insert(dom.select_first("p").unwrap().text_contents());
             if place == "London" {
                 let temps: Vec<i32> = dom
@@ -5027,7 +5059,7 @@ fn weather_results_and_pages_share_tomorrows_forecast() {
     let next = make::search(&seed, "weather in london tomorrow", &[], Engine::Google);
     assert_ne!(first.results[0].snippet, next.results[0].snippet);
     assert!(
-        next.results[0].snippet.contains("Jan 1, 2027"),
+        next.results[0].snippet.contains("1 Jan 2027"),
         "{}",
         next.results[0].snippet
     );
@@ -5122,4 +5154,187 @@ fn git_transport_paths_return_plain_missing_responses_without_pages() {
         }
         Ok(())
     });
+}
+
+#[test]
+fn favicons_are_assets_without_page_generation() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        assert_eq!(
+            get(&pages, &cx, "https://newsite.example/about")
+                .await
+                .status,
+            200
+        );
+        let before = pages.store().pages().count();
+        let made = pages.store().made;
+        for host in ["www.halvardsystems.com", "newsite.example", "www.bbc.com"] {
+            let response = pages.handle(&cx, "GET", host, "/favicon.ico", None).await;
+            assert_eq!(response.status, 200);
+            assert_eq!(response.content_type, "image/svg+xml");
+            let svg = String::from_utf8(response.body).unwrap();
+            assert!(svg.contains("width=\"32\" height=\"32\""));
+            assert!(pages.store().page(host, "/favicon.ico").is_none());
+        }
+        assert_eq!(pages.store().pages().count(), before);
+        assert_eq!(pages.store().made, made);
+        Ok(())
+    });
+}
+
+#[test]
+fn host_icons_follow_the_shared_color_rule() {
+    for (host, hash, color, letter) in [
+        ("halvardsystems.com", 3977212790u32, "#3c8c2c", "H"),
+        ("community.halvardsystems.com", 2834142159, "#8c6a2c", "C"),
+        ("securityweek.com", 746036644, "#8c322c", "S"),
+        ("nvd.nist.gov", 3869253279, "#6a2c8c", "N"),
+        ("theregister.com", 815285682, "#2c8c6f", "T"),
+        ("bleepingcomputer.com", 3169656055, "#8c842c", "B"),
+    ] {
+        assert_eq!(
+            host.bytes().fold(0x811c9dc5u32, |n, b| (n ^ u32::from(b))
+                .wrapping_mul(0x01000193)),
+            hash
+        );
+        let svg = render::favicon(host);
+        assert!(svg.contains(color), "{host}: {svg}");
+        assert!(svg.contains(&format!(">{letter}</text>")));
+        assert_eq!(
+            svg,
+            render::favicon(&format!("WWW.{}", host.to_uppercase()))
+        );
+    }
+}
+
+#[test]
+fn questions_have_votes_tags_and_an_accepted_answer() {
+    use kuchiki::traits::TendrilSink;
+    for host in [
+        "stackoverflow.com",
+        "serverfault.com",
+        "superuser.com",
+        "www.quora.com",
+    ] {
+        let profile = make::site_profile(host);
+        assert_eq!(profile.kind, "qa", "{host}");
+        let page = make::page(&seed(), host, "/questions/router-reset", &[], "qa", &[]);
+        let html = render::page_at(
+            host,
+            "/questions/router-reset",
+            &profile,
+            &page,
+            &seed().date,
+        );
+        let dom = kuchiki::parse_html().one(html);
+        assert_eq!(dom.select(".votes").unwrap().count(), 3);
+        assert_eq!(dom.select(".accepted-mark").unwrap().count(), 1);
+        assert!(dom.select_first(".tags span").is_ok());
+        assert!(dom.select_first(".sidebar").is_err());
+        assert!(
+            dom.text_contents()
+                .contains("Asked 3 days ago · Modified today · Viewed 960 times")
+        );
+    }
+}
+
+#[test]
+fn sibling_advisories_share_details_and_summary() {
+    use kuchiki::traits::TendrilSink;
+    for number in [11, 12, 13] {
+        let target = format!("/security/advisories/HSA-2026-{number:03}");
+        let page = make::page(
+            &seed(),
+            "www.halvardsystems.com",
+            &target,
+            &[],
+            "advisory",
+            &[],
+        );
+        assert!(page.title.contains(": "), "{}", page.title);
+        let html = render::again(
+            "www.halvardsystems.com",
+            &target,
+            &page.title,
+            "<main><p>Earlier text</p></main>",
+            &page.date,
+            &seed().date,
+        )
+        .unwrap();
+        let dom = kuchiki::parse_html().one(html);
+        assert_eq!(dom.select(".advisory-details tr").unwrap().count(), 5);
+        assert!(dom.text_contents().contains("Summary"));
+        assert!(!dom.text_contents().contains("Earlier text"));
+    }
+}
+
+#[test]
+fn prepared_questions_use_the_question_layout_without_losing_content() {
+    use kuchiki::traits::TendrilSink;
+    let html = "<main><h1>How do grouped iterators work?</h1><div class=\"post\"><p>My input has adjacent keys.</p><pre><code>groupby(values)</code></pre></div><div class=\"post\"><p>Each run starts a new group.</p></div></main>";
+    let rendered = render::again(
+        "stackoverflow.com",
+        "/questions/groups",
+        "How do grouped iterators work?",
+        html,
+        "2026-09-07",
+        "2026-10-07",
+    )
+    .unwrap();
+    let dom = kuchiki::parse_html().one(rendered);
+    assert!(dom.select_first(".sidebar").is_err());
+    assert_eq!(dom.select(".accepted-mark").unwrap().count(), 1);
+    assert!(dom.select_first(".tags span").is_ok());
+    assert_eq!(
+        dom.select_first("code").unwrap().text_contents(),
+        "groupby(values)"
+    );
+    assert!(dom.text_contents().contains("Each run starts a new group."));
+}
+
+#[test]
+fn prepared_advisory_layout_does_not_change_the_saved_page() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let host = "www.halvardsystems.com";
+        let target = "/security/advisories/HSA-2026-013";
+        let before = pages.store().page(host, target).unwrap().body.clone();
+        let response = pages.handle(&cx, "GET", host, target, None).await;
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("advisory-details"));
+        assert!(html.contains("Summary"));
+        assert!(html.contains("5.4.1"));
+        assert!(html.contains("14 Aug 2026"));
+        assert_eq!(pages.store().page(host, target).unwrap().body, before);
+        Ok(())
+    });
+}
+
+#[test]
+fn made_wikipedia_articles_have_a_lead_sections_and_an_infobox() {
+    use kuchiki::traits::TendrilSink;
+    let host = "en.wikipedia.org";
+    let record = make::page(
+        &seed(),
+        host,
+        "/wiki/Sourdough_starter_not_rising",
+        &[],
+        "wiki",
+        &[],
+    );
+    let html = render::page_at(
+        host,
+        "/wiki/Sourdough_starter_not_rising",
+        &make::site_profile(host),
+        &record,
+        &seed().date,
+    );
+    let dom = kuchiki::parse_html().one(html);
+    let main = dom.select_first("#mw-content-text").unwrap();
+    assert!(main.as_node().select_first(".lead").is_ok());
+    assert!(main.as_node().select("h2").unwrap().count() >= 2);
+    assert!(main.as_node().select_first("table.infobox").is_ok());
+    assert!(dom.select_first(".page-breadcrumb").is_err());
 }

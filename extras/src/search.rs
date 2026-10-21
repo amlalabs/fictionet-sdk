@@ -154,7 +154,9 @@ footer a { color: inherit; }
 .body--html .result--ad .result__snippet { display: block; }
 .B6fmyf .csDOgf { display: none; }
 @media (max-width: 979.98px) { #gsr .logo { display: none; } }
-.uEierd { margin: 0 0 30px; font: 14px/1.58 Arial, sans-serif; color: #4d5156; }
+.uEierd { margin: 0 0 24px; font: 14px/1.58 Arial, sans-serif; color: #4d5156; }
+.uEierd + .MjjYud { padding-top: 0; margin-top: 0; }
+.result-icon { vertical-align: middle; margin-inline-end: 6px; border-radius: 50%; }
 .uEierd a { color: #1a0dab; text-decoration: none; }
 .uEierd [role=heading] { font-size: 20px; line-height: 1.3; margin-bottom: 5px; }
 .uEierd .U3A9Ac { display: block; color: #202124; font-weight: 600; margin-bottom: 8px; }
@@ -383,6 +385,13 @@ pub fn youtube(query: &str, record: &Search) -> String {
             })
             .copied()
             .unwrap_or("YouTube");
+        let channel = channel.strip_prefix("By ").unwrap_or(channel);
+        let initial = channel
+            .chars()
+            .next()
+            .unwrap_or('Y')
+            .to_uppercase()
+            .to_string();
         let title = e(&result.title);
         let description = labels
             .iter()
@@ -391,9 +400,9 @@ pub fn youtube(query: &str, record: &Search) -> String {
             .unwrap_or(&result.snippet);
         let thumbnail = video_thumbnail(&result.title);
         cards.push_str(&format!(
-            r#"<article class="video-result"><a href="{url}"><img src="{thumbnail}" alt="{title}"></a><div><h2><a href="{url}">{title}</a></h2><p class="views">{views}</p><p class="channel">{channel}</p><p>{snippet}</p></div></article>"#,
+            r#"<article class="video-result"><a class="video-thumbnail" href="{url}"><img src="{thumbnail}" alt="{title}"><span class="video-duration">8:41</span></a><div><h2><a href="{url}">{title}</a></h2><p class="views">{views}</p><p class="channel"><span class="channel-disc" aria-hidden="true" data-initial="{initial}"></span>{channel}</p><p>{snippet}</p></div></article>"#,
             url = e(&result.url),
-            views = e(views), channel = e(channel), snippet = e(description),
+            views = e(views), channel = e(channel), initial = e(&initial), snippet = e(description),
         ));
     }
     if count == 0 {
@@ -405,9 +414,27 @@ pub fn youtube(query: &str, record: &Search) -> String {
 
 /// A local SVG thumbnail derived from a video title.
 pub fn video_thumbnail(title: &str) -> String {
+    let hash = title
+        .bytes()
+        .fold(0u32, |n, b| n.wrapping_mul(31).wrapping_add(u32::from(b)));
+    let hue = hash % 360;
+    let skyline = title
+        .bytes()
+        .take(20)
+        .enumerate()
+        .map(|(i, b)| {
+            format!(
+                "{} {},{} {}",
+                i * 34,
+                90 + u32::from(b) % 170,
+                i * 34 + 34,
+                90 + u32::from(b) % 170
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360"><rect width="640" height="360" fill="#203c50"/><path d="M0 280 180 100 350 280 500 60 640 220V360H0Z" fill="#375f76"/><rect x="44" y="48" width="552" height="264" rx="12" fill="#102330" opacity=".7"/><path d="m291 130 90 50-90 50Z" fill="white"/><text x="40" y="330" font-family="Arial,sans-serif" font-size="17" fill="white">{}</text></svg>"##,
-        e(&title.chars().take(60).collect::<String>())
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360"><rect width="640" height="360" fill="hsl({hue},45%,28%)"/><path d="M0 360 {skyline} 640 360Z" fill="hsl({hue},48%,45%)"/><path d="m291 130 90 50-90 50Z" fill="white"/></svg>"##
     );
     format!("data:image/svg+xml,{}", quote(&svg, ""))
 }
@@ -458,7 +485,7 @@ fn duckduckgo(query: &str, record: &Search) -> String {
                 r#"<div class="result__extras"><div class="result__extras__url">"#,
                 r#"<span class="result__icon"><a rel="nofollow" href="{link}">"#,
                 r#"<img class="result__icon__img" width="16" height="16" alt="" "#,
-                r#"src="//external-content.duckduckgo.com/ip3/{host}.ico" name="i15" /></a></span>"#,
+                r#"src="https://{host}/favicon.ico" name="i15" /></a></span>"#,
                 r#"<a class="result__url" href="{link}">{shown}</a>{date}</div></div>"#,
                 r#"<a class="result__snippet" href="{link}">{snippet}</a>"#,
                 r#"<div class="clear"></div></div></div>"#,
@@ -599,11 +626,33 @@ fn result(
         attrs.remove("aria-label");
         attrs.remove("target");
     }
-    // A repeated result must not repeat the captured subject's icon or IDs.
-    for node in dom.select("img").unwrap().collect::<Vec<_>>() {
-        if node.attributes.borrow().get("alt") != Some("Global web icon") {
-            node.as_node().detach();
-        }
+    let host = text::split_url(url).0;
+    let icon = format!(
+        r#"<img class="result-icon" src="https://{}/favicon.ico" width="20" height="20" alt="">"#,
+        e(&host)
+    );
+    let images = dom.select("img").unwrap().collect::<Vec<_>>();
+    if let Some(first) = images.first() {
+        first.as_node().insert_before(
+            document(&icon)
+                .select_first("img")
+                .unwrap()
+                .as_node()
+                .clone(),
+        );
+    } else if let Ok(slot) = dom.select_first(".wr_fav, .result__icon, .b_favicon") {
+        replace(slot.as_node(), &icon);
+    } else {
+        one(&dom, layout.site)?.prepend(
+            document(&icon)
+                .select_first("img")
+                .unwrap()
+                .as_node()
+                .clone(),
+        );
+    }
+    for node in images {
+        node.as_node().detach();
     }
     for node in dom.select("[id]").unwrap() {
         node.attributes.borrow_mut().remove("id");
@@ -803,6 +852,60 @@ mod tests {
             }],
             ..Search::default()
         }
+    }
+
+    #[test]
+    fn result_rows_use_one_host_icon() {
+        let record = Search {
+            results: vec![Result {
+                url: "https://securityweek.com/article".into(),
+                title: "Security news".into(),
+                snippet: "Security updates.".into(),
+                date: String::new(),
+            }],
+            ..Search::default()
+        };
+        for engine in [Engine::Google, Engine::Bing, Engine::DuckDuckGo] {
+            let dom = document(&render(engine, "security", &record, 0));
+            let row = one(&dom, layout(engine).organic).unwrap();
+            let images = row.select("img").unwrap().collect::<Vec<_>>();
+            assert_eq!(images.len(), 1, "{engine:?}");
+            assert_eq!(
+                images[0].attributes.borrow().get("src"),
+                Some("https://securityweek.com/favicon.ico")
+            );
+        }
+    }
+
+    #[test]
+    fn video_art_varies_with_titles_and_includes_duration() {
+        let first = video_thumbnail("Resetting a router");
+        let second = video_thumbnail("Sourdough bread");
+        assert_ne!(first, second);
+        let svg = percent_encoding::percent_decode_str(
+            first.strip_prefix("data:image/svg+xml,").unwrap(),
+        )
+        .decode_utf8()
+        .unwrap();
+        assert!(svg.contains("hsl("));
+        let record = Search {
+            results: vec![Result {
+                url: "https://www.youtube.com/watch?v=router".into(),
+                title: "Resetting a router".into(),
+                ..Result::default()
+            }],
+            ..Search::default()
+        };
+        let html = render(Engine::YouTube, "router", &record, 0);
+        let dom = document(&html);
+        assert_eq!(
+            one(&dom, ".video-duration").unwrap().text_contents(),
+            "8:41"
+        );
+        let (_, css) = crate::sites::asset("www.youtube.com", "/_assets/site.css").unwrap();
+        let css = std::str::from_utf8(css).unwrap();
+        assert!(css.contains("font-size:12px"));
+        assert!(css.contains("background:#000a"));
     }
 
     #[test]

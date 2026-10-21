@@ -5,6 +5,14 @@ use include_dir::{Dir, include_dir};
 use std::collections::HashSet;
 use time::Date;
 
+/// Formats a page date for readers.
+fn short_date(date: Date) -> String {
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][date.month() as usize - 1];
+    format!("{} {month} {}", date.day(), date.year())
+}
+
 static FILES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/sites");
 
 /// The host whose captured layout a host shares: the same site under
@@ -164,12 +172,11 @@ impl Skin {
                     (year.parse(), month.parse::<u8>(), day.parse())
                 && let Ok(month) = time::Month::try_from(month)
                 && let Ok(date) = Date::from_calendar_date(year, month, day)
-                && date > today
             {
                 node.attributes
                     .borrow_mut()
-                    .insert("datetime", today.to_string());
-                replace(node.as_node(), &today.to_string());
+                    .insert("datetime", date.min(today).to_string());
+                replace(node.as_node(), &short_date(date.min(today)));
             }
         }
         if dom.select_first("body.youtube-results").is_ok() {
@@ -226,7 +233,7 @@ impl Skin {
                 replace(
                     &card,
                     &format!(
-                        "<a class=\"video-thumbnail\" href=\"{}\">{image}</a><div>{body}</div>",
+                        "<a class=\"video-thumbnail\" href=\"{}\">{image}<span class=\"video-duration\">8:41</span></a><div>{body}</div>",
                         escape(&href)
                     ),
                 );
@@ -298,13 +305,20 @@ impl Skin {
             .unwrap_or(heading);
         let breadcrumb = format!("<a href=\"/\">Home</a> › {}", escape(breadcrumb_heading));
         for node in dom.select(".page-breadcrumb").ok()? {
-            replace(node.as_node(), &breadcrumb);
+            if dom.select_first("#firstHeading").is_ok() {
+                node.as_node().detach();
+            } else {
+                replace(node.as_node(), &breadcrumb);
+            }
         }
         let date = published.min(today);
         for node in dom.select(".page-date").ok()? {
             replace(
                 node.as_node(),
-                &format!("Updated <time datetime=\"{date}\">{date}</time>"),
+                &format!(
+                    "Updated <time datetime=\"{date}\">{}</time>",
+                    short_date(date)
+                ),
             );
         }
         for node in dom.select(".page-year").ok()? {
@@ -602,17 +616,21 @@ mod tests {
                         assert_eq!(heading.text_contents(), link.text_contents());
                     }
                 }
-                assert!(
-                    one(&dom, ".page-breadcrumb")
-                        .unwrap()
-                        .text_contents()
-                        .contains("Itertools & iteration")
-                );
+                if host == "en.wikipedia.org" {
+                    assert!(dom.select_first(".page-breadcrumb").is_err());
+                } else {
+                    assert!(
+                        one(&dom, ".page-breadcrumb")
+                            .unwrap()
+                            .text_contents()
+                            .contains("Itertools & iteration")
+                    );
+                }
                 assert!(
                     one(&dom, ".page-date")
                         .unwrap()
                         .text_contents()
-                        .contains("2026-10-06")
+                        .contains("6 Oct 2026")
                 );
                 for source in [
                     "JSON encoder",

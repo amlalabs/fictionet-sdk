@@ -118,6 +118,28 @@
 .pageHeader .bottom-row .menu-list { width: 100%; justify-content: space-evenly; }
 .pageHeader .row.bottom-row .section .navigation.customMenu1 .menu-list .first-list-item a { padding-inline: clamp(8px, 1.1vw, 16px); }
 }
+:root { --app-term-bg:#0d1114;--accent-text:#b4441f; }
+.pageHeader .row.mainrow>.navigation.topBarMenu .menu-list .first-list-item.login-btn a { color:var(--app-term-bg); }
+#mainArticleSection a { color:var(--accent-text); }
+.pageHeader { margin-bottom: 0 !important; }
+.pageHeader + * { margin-top:0; }
+#mainArticleSection { padding-top: 12px; }
+@media (max-width: 1000px) {
+.pageHeader { height:72px; }
+.pageHeader .row.mainrow { display:flex;align-items:center;flex-wrap:nowrap;position:relative;height:72px; }
+.pageHeader .row.bottom-row { display:none; }
+.pageHeader .row.mainrow .hamburger { display:block;flex:0 0 48px;order:1; }
+.pageHeader .row.mainrow .logo { position:absolute;left:50%;transform:translateX(-50%);width:220px;max-width:36%; }
+.pageHeader .row.mainrow .navigation.topBarMenu { margin-left:auto;width:auto;flex:0 0 auto;white-space:nowrap;order:4; }
+.pageHeader .topBarMenu .menu-list { display:flex;flex-wrap:nowrap;white-space:nowrap; }
+.pageHeader .search.to-be-expanded { display:none; }
+}
+.pageHeader .hamburger-container { display:none;transition:none; }
+.pageHeader .hamburger[open] .hamburger-container { display:block;visibility:visible;opacity:1;position:absolute;left:0;right:0;top:100%; }
+.pageHeader .hamburger[open] .children { display:block !important; }
+.pageHeader .burger-btn { color:var(--app-term-bg);list-style:none;cursor:pointer;display:grid;place-items:center;width:32px;height:32px;padding:4px; }
+.pageHeader .burger-btn::marker { content:""; }
+.pageHeader :focus-visible { outline:2px solid currentColor;outline-offset:3px; }
 </style></head>
 
     <body class="l4 article site_theregister section_os platforms custom-bodytext-width custom-bodytext-alignment" style="padding: 0px 0px 120px;"><div id="oops" style="width: 0px; height: 0px; overflow: hidden; display: none;"><div id="google_ads_iframe_/6978/labrador/thereg/article/desktop/oops_0__container__" style="border: 0pt;"></div></div>
@@ -133,15 +155,7 @@
 
         <header class="pageElement pageHeader">
     <div class="row mainrow">
-    <div class="hamburger to-be-expanded">
-    <div class="positionRelative">
-        <span class="hamburger-button hamburger-expander ">
-            <button class="burger-btn" aria-label="Open menu" aria-expanded="false" aria-controls="hamburger-container" aria-haspopup="menu">
-                    <i class="open fi-list"></i>
-                    <i class="close fi-x"></i>
-            </button>
-        </span>
-            <div class="hamburger-container" id="hamburger-container">
+    <details class="hamburger to-be-expanded"><summary class="burger-btn" aria-label="Open menu"><svg class="menu-icon" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 5h20M2 12h20M2 19h20" fill="none" stroke="currentColor" stroke-width="2"/></svg></summary><div class="hamburger-container" id="hamburger-container">
                 <div class="search visible dac-hidden-desktop-up">
 
     <form class="search-container" action="/cse" method="get" role="search">
@@ -313,10 +327,7 @@
 
 
 
-            </div>
-    </div>
-
-</div>
+            </div></details>
 
 <div class="search to-be-expanded dac-hidden-desktop-down bonusButton">
 

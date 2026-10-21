@@ -5,6 +5,50 @@ use super::{
     text::{escape as e, normalize_space},
 };
 
+/// Returns a host's tab icon.
+pub fn favicon(host: &str) -> String {
+    let lower = host.to_lowercase();
+    let key = lower.strip_prefix("www.").unwrap_or(&lower);
+    let hash = key.bytes().fold(0x811c9dc5u32, |n, b| {
+        (n ^ u32::from(b)).wrapping_mul(0x01000193)
+    });
+    let hue = f64::from(hash % 360) / 60.0;
+    let chroma = (1.0 - (2.0 * 0.36f64 - 1.0).abs()) * 0.52;
+    let x = chroma * (1.0 - (hue % 2.0 - 1.0).abs());
+    let (r, g, b) = match hue as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let channel = |v: f64| ((v + 0.36 - chroma / 2.0) * 255.0).round() as u8;
+    let color = format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(b));
+    let letter = key.chars().next().unwrap_or('?').to_uppercase().to_string();
+    let (color, letter) = match key {
+        "google.com" => ("#4285f4", "G"),
+        "bing.com" => ("#00809d", "B"),
+        "duckduckgo.com" | "html.duckduckgo.com" | "lite.duckduckgo.com" => ("#de5833", "D"),
+        "reddit.com" => ("#ff4500", "R"),
+        "github.com" => ("#181717", "G"),
+        "wikipedia.org" => ("#333333", "W"),
+        _ if key.ends_with(".wikipedia.org") => ("#333333", "W"),
+        _ => (color.as_str(), letter.as_str()),
+    };
+    let mark = if matches!(key, "youtube.com" | "youtu.be") {
+        r##"<rect x="1" y="5" width="30" height="22" rx="6" fill="#ff0000"/><path d="m13 10 10 6-10 6Z" fill="white"/>"##.into()
+    } else {
+        format!(
+            r#"<rect width="32" height="32" rx="16" fill="{color}"/><text x="16" y="17" dominant-baseline="middle" text-anchor="middle" font-family="Arial,sans-serif" font-size="21" font-weight="700" fill="white">{}</text>"#,
+            e(letter)
+        )
+    };
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">{mark}</svg>"#
+    )
+}
+
 /// Selects a server header from the site's style.
 pub fn server_of(profile: Option<&Profile>) -> &'static str {
     [
@@ -41,6 +85,65 @@ fn nav(items: &[String], class: &str) -> String {
     }
     out + "</ul>"
 }
+fn question_body(record: &Page) -> String {
+    use kuchiki::traits::TendrilSink;
+    let dom = kuchiki::parse_html().one(record.body.as_str());
+    if dom.select_first(".question-post").is_ok() {
+        return record.body.clone();
+    }
+    let posts = dom.select(".post").unwrap().collect::<Vec<_>>();
+    if posts.is_empty() {
+        return record.body.clone();
+    }
+    let mut out = format!(
+        "<h1>{}</h1><p class=\"question-meta\">Asked 3 days ago · Modified today · Viewed 960 times</p>",
+        e(super::make::heading(&record.title))
+    );
+    for (index, post) in posts.iter().enumerate() {
+        let (class, score, mark) = if index == 0 {
+            ("question-post", 12, "")
+        } else if index == 1 {
+            (
+                "answer accepted",
+                24,
+                "<span class=\"accepted-mark\" role=\"img\" aria-label=\"Accepted answer\">✓</span>",
+            )
+        } else {
+            ("answer", 7, "")
+        };
+        if index == 1 {
+            out.push_str(&format!(
+                "<h2>{} {}</h2>",
+                posts.len() - 1,
+                if posts.len() == 2 {
+                    "answer"
+                } else {
+                    "answers"
+                }
+            ));
+        }
+        let body = post
+            .as_node()
+            .children()
+            .map(|n| n.to_string())
+            .collect::<String>();
+        out.push_str(&format!(
+            "<section class=\"{class}\"><div class=\"votes\">{score}{mark}</div><div>{body}"
+        ));
+        if index == 0 {
+            let tags = super::make::words(&record.title)
+                .into_iter()
+                .filter(|s| s.len() > 3)
+                .take(3)
+                .map(|tag| format!("<span>{}</span>", e(&tag)))
+                .collect::<String>();
+            out.push_str(&format!("<div class=\"tags\">{tags}</div>"));
+        }
+        out.push_str("</div></section>");
+    }
+    out
+}
+
 /// Wraps HTML content in the site's layout.
 pub fn page(host: &str, profile: &Profile, record: &Page, today: &str) -> String {
     page_at(host, "/", profile, record, today)
@@ -48,13 +151,28 @@ pub fn page(host: &str, profile: &Profile, record: &Page, today: &str) -> String
 
 /// Renders a page using the captured section layout when available.
 pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today: &str) -> String {
+    let advisory = super::make::advisory(host, target, &record.title, &record.date);
+    let record = advisory.as_ref().unwrap_or(record);
     let vendor = host == "www.halvardsystems.com" || host == "halvardsystems.com";
-    let canonical;
+    let mut canonical;
     let profile = if vendor {
         canonical = super::make::site_profile(host);
+        if advisory.is_some() {
+            canonical.kind = "advisory".into();
+        }
         &canonical
     } else {
         profile
+    };
+    let question;
+    let record = if profile.kind == "qa" {
+        question = Page {
+            body: question_body(record),
+            ..record.clone()
+        };
+        &question
+    } else {
+        record
     };
     let path = target.split('?').next().unwrap_or(target);
     let forum_listing = profile.kind == "forum"
@@ -198,7 +316,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
                 e(name)
             )
         }
-        "company" | "government" | "shop" | "weather" | "review" | "marketplace" => {
+        "company" | "government" | "shop" | "weather" | "review" | "marketplace" | "advisory" => {
             let topbar = if !style.is_multiple_of(2) {
                 "<div class=\"topbar\"><a href=\"/contact\">Contact</a> <a href=\"/support\">Support</a> <a href=\"/login\">Log in</a></div>\n"
             } else {
@@ -228,7 +346,16 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
                 e(title)
             )
         }
-        "forum" | "docs" | "wiki" | "qa" | "package" => {
+        "qa" => format!(
+            r#"<body class="qa"><header><a class="home" href="/">{}</a><form action="/search" class="search"><input name="q" aria-label="Search" placeholder="Search"></form><a href="/login">Sign in</a></header><main class="{}">{body}</main>"#,
+            e(name),
+            if host.contains("quora.com") {
+                "answer-cards"
+            } else {
+                "questions"
+            }
+        ),
+        "forum" | "docs" | "wiki" | "package" => {
             let related = ["See also", "Related", "More"][style % 3];
             let ad = if ad.is_empty() {
                 String::new()
@@ -334,17 +461,26 @@ pub fn again(
     date: &str,
     today: &str,
 ) -> Option<String> {
+    if let Some(record) = super::make::advisory(host, target, title, date) {
+        let mut profile = super::make::site_profile(host);
+        profile.kind = "advisory".into();
+        return Some(page_at(host, target, &profile, &record, today));
+    }
     let path = target.split('?').next().unwrap_or(target);
     if super::make::site_profile(host).kind == "forum"
         && ["/", "/search", "/search/", "/latest", "/categories", "/top"].contains(&path)
     {
         return None;
     }
-    let skin = fictionet_extras::sites::lookup(host, target)?;
+    let profile = super::make::site_profile(host);
+    let skin = fictionet_extras::sites::lookup(host, target);
+    if skin.is_none() && profile.kind != "qa" {
+        return None;
+    }
     let today = super::seed::parse_date(today).ok()?;
     let published = super::seed::parse_date(date).unwrap_or(today);
     use kuchiki::traits::TendrilSink;
-    let content = skin.content(html).or_else(|| {
+    let content = skin.and_then(|skin| skin.content(html)).or_else(|| {
         let dom = kuchiki::parse_html().one(html);
         let main = dom
             .select_first("main")

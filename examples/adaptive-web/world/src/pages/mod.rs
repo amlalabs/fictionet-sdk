@@ -1064,6 +1064,15 @@ impl Pages {
 
     async fn answer(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, route: Route) -> Response {
         let path = target.split('?').next().unwrap_or(target);
+        if path == "/favicon.ico" {
+            return Response::new(
+                200,
+                "image/svg+xml",
+                render::favicon(host),
+                vec![],
+                Meta::Asset,
+            );
+        }
         if path.starts_with("/_assets/") {
             return match fictionet_extras::sites::asset(host, path) {
                 Some((mime, bytes)) => Response::new(200, mime, bytes, vec![], Meta::Asset),
@@ -1576,6 +1585,10 @@ impl Pages {
     }
 
     async fn site_stylesheet(&self, cx: &Cx, host: &str) -> Result<make::Profile, Stop> {
+        let profile = make::site_profile(host);
+        if profile.kind == "qa" {
+            return Ok(profile);
+        }
         let _site = self
             .locks
             .lock(cx, format!("site {host}"))
