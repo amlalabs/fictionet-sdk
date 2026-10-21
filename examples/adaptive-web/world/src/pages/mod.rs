@@ -1073,6 +1073,31 @@ impl Pages {
                 Meta::Asset,
             );
         }
+        if matches!(
+            (host, path),
+            ("www.google.com", "/s2/favicons") | ("www.bing.com", "/th")
+        ) {
+            let query = target.split_once('?').map_or("", |(_, query)| query);
+            let domain = form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
+                match (host, key.as_ref()) {
+                    ("www.google.com", "domain") => Some(value.into_owned()),
+                    ("www.bing.com", "u") => url::Url::parse(&value)
+                        .ok()
+                        .and_then(|url| url.host_str().map(str::to_owned)),
+                    _ => None,
+                }
+            });
+            return match domain.filter(|domain| !domain.is_empty()) {
+                Some(domain) => Response::new(
+                    200,
+                    "image/svg+xml",
+                    render::favicon(&domain),
+                    vec![],
+                    Meta::Asset,
+                ),
+                None => Response::new(404, "text/plain", "Not found", vec![], Meta::Asset),
+            };
+        }
         if path.starts_with("/_assets/") {
             return match fictionet_extras::sites::asset(host, path) {
                 Some((mime, bytes)) => Response::new(200, mime, bytes, vec![], Meta::Asset),

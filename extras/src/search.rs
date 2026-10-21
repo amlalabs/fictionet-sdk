@@ -627,9 +627,20 @@ fn result(
         attrs.remove("target");
     }
     let host = text::split_url(url).0;
+    let icon_url = match layout.host {
+        "www.google.com" => format!(
+            "https://www.google.com/s2/favicons?domain={}&sz=32",
+            quote(&host, "")
+        ),
+        "www.bing.com" => format!(
+            "https://www.bing.com/th?u={}&w=32&h=32",
+            quote(&format!("https://{host}/favicon.ico"), "")
+        ),
+        _ => format!("https://{host}/favicon.ico"),
+    };
     let icon = format!(
-        r#"<img class="result-icon" src="https://{}/favicon.ico" width="20" height="20" alt="">"#,
-        e(&host)
+        r#"<img class="result-icon" src="{}" width="20" height="20" alt="">"#,
+        e(&icon_url)
     );
     let images = dom.select("img").unwrap().collect::<Vec<_>>();
     if let Some(first) = images.first() {
@@ -870,10 +881,27 @@ mod tests {
             let row = one(&dom, layout(engine).organic).unwrap();
             let images = row.select("img").unwrap().collect::<Vec<_>>();
             assert_eq!(images.len(), 1, "{engine:?}");
-            assert_eq!(
-                images[0].attributes.borrow().get("src"),
-                Some("https://securityweek.com/favicon.ico")
-            );
+            let attrs = images[0].attributes.borrow();
+            let icon = url::Url::parse(attrs.get("src").unwrap()).unwrap();
+            match engine {
+                Engine::Google => {
+                    assert_eq!(icon.host_str(), Some("www.google.com"));
+                    assert_eq!(icon.path(), "/s2/favicons");
+                    assert!(
+                        icon.query_pairs()
+                            .any(|(k, v)| k == "domain" && v == "securityweek.com")
+                    );
+                }
+                Engine::Bing => {
+                    assert_eq!(icon.host_str(), Some("www.bing.com"));
+                    assert_eq!(icon.path(), "/th");
+                    assert!(
+                        icon.query_pairs()
+                            .any(|(k, v)| k == "u" && v == "https://securityweek.com/favicon.ico")
+                    );
+                }
+                _ => assert_eq!(icon.as_str(), "https://securityweek.com/favicon.ico"),
+            }
         }
     }
 

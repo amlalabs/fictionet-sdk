@@ -3625,7 +3625,6 @@ fn rehearsal_pages_have_valid_content() {
         if let Some(dir) = std::env::var_os("ADAPTIVE_WEB_CAPTURE_DIR") {
             let dir = PathBuf::from(dir);
             let asset = regex::Regex::new(r"/_assets/[a-zA-Z0-9_.-]+").unwrap();
-            let icons = Regex::new(r#"https://([^/"]+)/favicon\.ico"#).unwrap();
             for (name, url, body) in opened {
                 let dir = dir.join(name);
                 std::fs::create_dir_all(dir.join("_assets")).unwrap();
@@ -3677,21 +3676,22 @@ fn rehearsal_pages_have_valid_content() {
                         std::fs::write(dir.join(path.trim_start_matches('/')), body).unwrap();
                     }
                 }
-                let icon_hosts = icons
-                    .captures_iter(&html)
-                    .map(|m| m[1].to_owned())
-                    .collect::<std::collections::BTreeSet<_>>();
-                for icon_host in icon_hosts {
-                    let response = pages
-                        .handle(&cx, "GET", &icon_host, "/favicon.ico", None)
-                        .await;
+                use kuchiki::traits::TendrilSink;
+                let icons = {
+                    let dom = kuchiki::parse_html().one(html.as_str());
+                    dom.select("img.result-icon, img[name=i15]")
+                        .unwrap()
+                        .map(|node| node.attributes.borrow().get("src").unwrap().to_owned())
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                for (index, icon) in icons.into_iter().enumerate() {
+                    let (icon_host, target) = text::target_of(&icon);
+                    let response = pages.handle(&cx, "GET", &icon_host, &target, None).await;
                     assert_eq!(response.content_type, "image/svg+xml");
-                    let file = dir.join(format!("{icon_host}.svg"));
+                    let file = dir.join(format!("icon-{index}.svg"));
                     std::fs::write(&file, response.body).unwrap();
-                    html = html.replace(
-                        &format!("https://{icon_host}/favicon.ico"),
-                        &format!("file://{}", file.display()),
-                    );
+                    html =
+                        html.replace(&text::escape(&icon), &format!("file://{}", file.display()));
                 }
                 html = html.replace("/_assets/", &format!("file://{}/_assets/", dir.display()));
                 std::fs::write(dir.join(format!("{name}.html")), html).unwrap();
@@ -5179,6 +5179,61 @@ fn favicons_are_assets_without_page_generation() {
         }
         assert_eq!(pages.store().pages().count(), before);
         assert_eq!(pages.store().made, made);
+        Ok(())
+    });
+}
+
+#[test]
+fn engine_favicons_use_the_listed_hosts_without_page_generation() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        for (host, target, domain) in [
+            (
+                "www.google.com",
+                "/s2/favicons?domain=securityweek.com&sz=32",
+                "securityweek.com",
+            ),
+            (
+                "www.google.com",
+                "/s2/favicons?sz=32&domain=WWW.NVD.NIST.GOV",
+                "www.nvd.nist.gov",
+            ),
+            (
+                "www.bing.com",
+                "/th?u=https%3A%2F%2Fsecurityweek.com%2Ffavicon.ico&w=32&h=32",
+                "securityweek.com",
+            ),
+            (
+                "www.bing.com",
+                "/th?w=32&u=https%3A%2F%2Fnvd.nist.gov%2Ffavicon.ico&h=32",
+                "nvd.nist.gov",
+            ),
+        ] {
+            let before = pages.store().pages().count();
+            let made = pages.store().made;
+            let response = pages.handle(&cx, "GET", host, target, None).await;
+            assert_eq!(response.status, 200);
+            assert_eq!(response.content_type, "image/svg+xml");
+            assert_eq!(response.body, render::favicon(domain).as_bytes());
+            assert_eq!(response.logged()["kind"], "asset");
+            let tab = pages.handle(&cx, "GET", domain, "/favicon.ico", None).await;
+            assert_eq!(response.body, tab.body);
+            assert!(pages.store().page(host, target).is_none());
+            assert_eq!(pages.store().pages().count(), before);
+            assert_eq!(pages.store().made, made);
+        }
+        for (host, target) in [
+            ("www.google.com", "/s2/favicons"),
+            ("www.google.com", "/s2/favicons?domain="),
+            ("www.bing.com", "/th?u=invalid"),
+        ] {
+            let made = pages.store().made;
+            let response = pages.handle(&cx, "GET", host, target, None).await;
+            assert_eq!(response.status, 404);
+            assert_eq!(response.logged()["kind"], "asset");
+            assert_eq!(pages.store().made, made);
+        }
         Ok(())
     });
 }

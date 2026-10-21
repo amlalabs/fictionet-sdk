@@ -335,3 +335,92 @@ fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
     ))
     .unwrap();
 }
+
+#[test]
+fn result_icons_only_contact_the_search_engine() {
+    use kuchiki::traits::TendrilSink;
+
+    let events = Arc::new(Memory::default());
+    for host in ["www.google.com", "www.bing.com"] {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        let searches = Arc::new(Searches::from_seed(&seed));
+        let observed = searches.clone();
+        let observer = Arc::new(Fanout::new(vec![events.clone(), searches]));
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
+            move |cx| async move {
+                let start = SystemTime::from(
+                    time::Date::from_calendar_date(2026, time::Month::October, 7)
+                        .unwrap()
+                        .midnight()
+                        .assume_utc(),
+                );
+                let world = World::new(&cx, seed, start)?;
+                let log = Arc::new(example_common::log::Log::new(
+                    Box::new(std::io::sink()),
+                    &[],
+                    |s| s,
+                ));
+                let (attacher, attachments) = fictionet::attachments();
+                world.serve(&cx, log, attachments)?;
+                let machine = machine(&cx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
+                let (status, body) = fetch(
+                    &cx,
+                    &machine,
+                    host,
+                    "/search?q=halvard+gateway+vulnerability",
+                    start,
+                    "Mozilla/5.0 Firefox/145.0",
+                )
+                .await;
+                assert_eq!(status, 200);
+                let icons = {
+                    let dom = kuchiki::parse_html().one(std::str::from_utf8(&body).unwrap());
+                    dom.select("img.result-icon")
+                        .unwrap()
+                        .map(|node| node.attributes.borrow().get("src").unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                };
+                let snapshot = observed.snapshot();
+                let listed = &snapshot.results[0].listed;
+                assert_eq!(icons.len(), listed.len());
+                assert_eq!(icons.len(), 10);
+                for (icon, result) in icons.iter().zip(listed) {
+                    let (icon_host, target) = target_of(icon);
+                    assert_eq!(icon_host, host);
+                    let (status, body) = fetch(
+                        &cx,
+                        &machine,
+                        &icon_host,
+                        &target,
+                        start,
+                        "Mozilla/5.0 Firefox/145.0",
+                    )
+                    .await;
+                    assert_eq!(status, 200);
+                    assert_eq!(
+                        body,
+                        adaptive_web_world::pages::render::favicon(&result.host).as_bytes()
+                    );
+                }
+                assert!(observed.snapshot().pages.is_empty());
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+    let requests = events
+        .checked_all()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.source == "http" && event.kind == "request")
+        .map(|event| example_common::events::js(event.fields.get("host")))
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 22);
+    assert!(
+        requests
+            .iter()
+            .all(|host| host == "www.google.com" || host == "www.bing.com")
+    );
+}
