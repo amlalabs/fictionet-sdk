@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createDocument, liveSubscriptions } from '../test-dom.mjs';
 import { createServices } from '../page.mjs';
 import { mount } from './packets.mjs';
-import { chipText, conversationRows, dnsRow } from './lanes.mjs';
+import { chipText, conversationRows, dnsRow, kindOf } from './lanes.mjs';
 
 const packets = JSON.parse(readFileSync(new URL('./fixtures/search-packets.json', import.meta.url)));
 
@@ -149,6 +149,10 @@ test('unknown TCP payload and tagged errors remain visible', () => {
   const p = { ...packets[4], info: '1 → 2 [ACK, PSH] Seq=1 Len=26' };
   assert.deepEqual(conversationRows([p]), [p]);
   for (const tags of [['reset'], ['malformed'], ['gap'], ['retransmission']]) {
+    const row = { ...p, tags };
+    assert.deepEqual(conversationRows([row]), [row]);
+  }
+  for (const tags of [['gap'], ['malformed']]) {
     const row = { ...packets[4], tags };
     assert.deepEqual(conversationRows([row]), [row]);
   }
@@ -210,4 +214,59 @@ test('model requests and responses use the same lane and decrypted rows as other
   assert.match(lane.textContent, /POST \/v1\/messages200DATA 4.1k/);
   assert.equal(lane.querySelectorAll('.back').length, 2);
   assert.equal(h.root.querySelectorAll('.packet-unlock').length, 3);
+});
+
+test('small ACKs and HTTP/2 control frames stay quiet regardless of retransmission tags', () => {
+  const tcp = (flags, length, tags = []) => ({ ...packets[4], tags, info: `443 → 50153 [${flags}] Seq=1 Ack=1 Win=32768 Len=${length}${tags.includes('retransmission') ? ' [retransmission]' : ''}` });
+  for (const tags of [[], ['retransmission'], ['decrypted'], ['reset']]) {
+    for (const length of [0, 1]) assert.deepEqual(conversationRows([tcp('ACK', length, tags)]), []);
+    for (const flags of ['SYN', 'SYN, ACK', 'FIN, ACK', 'RST, ACK']) {
+      const row = tcp(flags, 1, tags);
+      assert.deepEqual(conversationRows([row]), [row]);
+    }
+  }
+  const controls = ['PING', 'PING ack', 'SETTINGS', 'SETTINGS ack', 'WINDOW_UPDATE[0] +12517377', 'WINDOW_UPDATE[1] +65535', 'PRIORITY[3]', 'GOAWAY NO_ERROR'];
+  for (const info of controls) {
+    const row = { ...packets[4], proto: 'HTTP/2', info, tags: ['decrypted'] };
+    assert.deepEqual(conversationRows([row]), [], info);
+    for (const tag of ['gap', 'malformed']) assert.deepEqual(conversationRows([{ ...row, tags: [tag] }]), [{ ...row, tags: [tag] }]);
+  }
+  for (const info of ['GOAWAY INTERNAL_ERROR', 'RST_STREAM[1] CANCEL', 'HEADERS[1]: 200', 'DATA[1]']) {
+    const row = { ...packets[4], proto: 'HTTP/2', info };
+    assert.deepEqual(conversationRows([row]), [row]);
+  }
+});
+
+test('quiet-only sites disappear in conversations and return with visible traffic', (t) => {
+  const h = setup(t);
+  const ack = { ...packets[4], tags: ['retransmission'], info: '443 → 50153 [ACK] Seq=0 Ack=1 Win=32768 Len=1 [retransmission]' };
+  const ping = { ...ack, seq: 1001, proto: 'HTTP/2', info: 'PING ack', tags: ['decrypted'] };
+  h.services.packetFilter.set('every');
+  h.send([ack, ping]);
+  assert.equal(h.root.querySelectorAll('.packet-lane').length, 1);
+  assert.equal(h.root.querySelectorAll('.packet-chip.quiet').length, 2);
+  assert.equal(h.root.querySelector('#prows').children.length, 2);
+  h.services.packetFilter.set('conversations');
+  assert.equal(h.root.querySelectorAll('.packet-lane').length, 0);
+  assert.equal(h.root.querySelector('#prows').children.length, 0);
+  h.send([{ ...ping, seq: 1002, info: 'HEADERS[1]: 200' }]);
+  assert.equal(h.root.querySelectorAll('.packet-lane').length, 1);
+  assert.equal(h.root.querySelectorAll('.packet-chip').length, 1);
+  h.services.packetFilter.set('every');
+  assert.equal(h.root.querySelector('#prows').children.length, 3);
+});
+
+test('connection resets and encrypted TLS closes are neutral and retain decoder text', (t) => {
+  const h = setup(t);
+  const reset = { ...packets[4], tags: ['reset'], info: '443 → 50153 [RST, ACK] Seq=1 Ack=1 Win=0 Len=0' };
+  const close = { ...reset, seq: 1001, proto: 'TLSv1.3', info: 'Encrypted Alert', tags: [] };
+  h.send([reset, close]);
+  assert.equal(kindOf(reset), 'tcp');
+  assert.equal(kindOf(close), 'tcp');
+  assert.equal(h.root.querySelectorAll('.bad').length, 0);
+  const chips = h.root.querySelectorAll('.packet-chip');
+  assert.deepEqual(chips.map((c) => c.textContent), ['RST·ACK', 'TLS close']);
+  assert.equal(chips[1].getAttribute('title'), 'Encrypted Alert');
+  assert.match(h.root.querySelector('#prows').textContent, /Encrypted Alert/);
+  for (const tag of ['dns-error', 'malformed']) assert.equal(kindOf({ ...reset, tags: [tag] }), 'bad');
 });

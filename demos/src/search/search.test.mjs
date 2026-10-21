@@ -397,8 +397,8 @@ const publicText = (node) => {
 test('every captured snapshot renders its map and six newest rows with public words', () => {
   const expected = {
     'first-search': [9, 0, 10, 0, 1],
-    pages: [9, 3, 10, 2, 4],
-    planted: [14, 5, 10, 3, 6],
+    pages: [9, 3, 10, 0, 4],
+    planted: [14, 5, 10, 0, 6],
     restart: [2, 0, 0, 0, 0],
   };
   for (const [name, counts] of Object.entries(expected)) {
@@ -798,4 +798,73 @@ test('snapshot sites publish packet endpoint names only when the addresses chang
   h.publish({ ...s, sites: [] });
   assert.equal(h.services.endpointNames.get().size, 0);
   off(); h.dispose();
+});
+
+test('same-site links keep page arrival motion without a lasting arrow', async () => {
+  for (const reduced of [false, true]) {
+    const window = animationWindow({ reduced }), h = harness(window);
+    const first = servedPage('https://a.com/one');
+    h.publish(snapshot({ pages: [first] }));
+    const same = servedPage('https://a.com/two', { at_ms: 6000, reason: { via: 'link', from: first.url } });
+    h.publish(snapshot({ pages: [first, same] }));
+    assert.equal(h.root.querySelectorAll('.link').length, 0);
+    assert.equal(h.root.querySelectorAll('.page').length, 2);
+    assert.equal(window.calls.some((a) => a.node.classList.contains('travel') && a.options.duration === 520), !reduced);
+    const other = servedPage('https://b.com/three', { at_ms: 7000, reason: { via: 'link', from: same.url } });
+    h.publish(snapshot({ pages: [first, same, other] }));
+    assert.equal(h.root.querySelectorAll('.link').length, 1);
+    assert.equal(h.root.querySelector('.link-group').getAttribute('data-url'), other.url);
+    await window.finish();
+    assert.equal(transientNodes(h.root).length, 0);
+    h.dispose();
+  }
+});
+
+test('fact labels fit measured text at normal spacing and keep their full title', () => {
+  const window = animationWindow({ reduced: true });
+  const create = window.document.createElement;
+  window.document.createElement = (tag) => {
+    const node = create(tag);
+    if (tag === 'text') node.getComputedTextLength = () => [...node.textContent].reduce((sum, c) => sum + (c === 'W' ? 12 : 6), 0);
+    return node;
+  };
+  const h = harness(window);
+  for (const text of ['W'.repeat(70), 'The fix is ready.', 'i'.repeat(60)]) {
+    h.publish(snapshot({ planted: [{ kind: 'fact', text, at_ms: 2 }] }));
+    const mark = h.root.querySelector('.planted-mark'), label = mark.querySelector('text');
+    assert.ok(label.getComputedTextLength() <= 252);
+    assert.equal(label.getAttribute('textLength'), null);
+    assert.equal(label.getAttribute('lengthAdjust'), null);
+    assert.equal(mark.querySelector('title').textContent, text);
+    if (text.length > 40) assert.match(label.textContent, /…$/);
+    else assert.equal(label.textContent, text);
+  }
+  h.dispose();
+});
+
+test('fact labels refit when their tab becomes visible and stop observing on disposal', () => {
+  const window = animationWindow({ reduced: true });
+  let shown = false, resize, disconnected = false;
+  window.ResizeObserver = class {
+    constructor(callback) { resize = callback; }
+    observe() {}
+    disconnect() { disconnected = true; }
+  };
+  const create = window.document.createElement;
+  window.document.createElement = (tag) => {
+    const node = create(tag);
+    if (tag === 'text') node.getComputedTextLength = () => shown ? node.textContent.length * 9 : 0;
+    return node;
+  };
+  const h = harness(window), text = 'A fact with enough text to need cutting when the tab becomes visible.';
+  h.publish(snapshot({ planted: [{ kind: 'fact', text, at_ms: 1 }] }));
+  const label = h.root.querySelector('.planted-mark').querySelector('text');
+  assert.equal(label.textContent.length, 40);
+  shown = true;
+  resize();
+  assert.ok(label.getComputedTextLength() <= 252);
+  assert.match(label.textContent, /…$/);
+  assert.equal(h.root.querySelector('.planted-mark').querySelector('title').textContent, text);
+  h.dispose();
+  assert.equal(disconnected, true);
 });

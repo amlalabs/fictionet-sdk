@@ -19,7 +19,7 @@
 .search-picture .engine.again { fill: var(--app-mem); stroke: var(--app-mem); }
 .search-picture .engine.planted, .search-picture .page.planted { fill: var(--accent); stroke: var(--accent); }
 .search-picture .label { fill: var(--app-ink); font: 13px var(--sans); }
-.search-picture .label.small { fill: var(--app-mute); font: 11.5px var(--mono); }
+.search-picture .label.small { paint-order: stroke; stroke: var(--app-pane); stroke-width: 5px; stroke-linejoin: round; fill: var(--app-mute); font: 11.5px var(--mono); }
 .search-picture .label.refused { fill: var(--app-bad); font-weight: 600; }
 .search-picture .label.planted { fill: var(--accent-text); font: 500 12px var(--mono); }
 .search-picture .site { fill: var(--app-pane); stroke: var(--app-mute); stroke-width: 2; }
@@ -42,6 +42,8 @@
 .search-row time, .search-row > span { color: var(--app-mute); }
 .search-row span, .search-row b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-row b { display: flex; align-items: center; gap: 6px; min-width: 0; font-weight: 500; }
+.search-row b:last-child { grid-column: 3 / -1; }
+.search-row .row-text { min-width: 0; }
 .search-row em { padding: 1px 8px; border-radius: 999px; font: 500 11.5px var(--sans); white-space: nowrap; }
 .search-row em.made { background: var(--app-made-soft); color: var(--app-made); }
 .search-row em.again { background: var(--app-mem-soft); color: var(--app-mem); }

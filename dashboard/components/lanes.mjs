@@ -1,21 +1,24 @@
 import { scoped } from '../dom.mjs';
 
 export const addressOf = (value) => value.startsWith('[') ? value.slice(1, value.indexOf(']')) : value.split(':').length === 2 ? value.replace(/:\d+$/, '') : value;
-export const kindOf = (p) => p.tags.some((tag) => ['dns-error', 'reset', 'malformed'].includes(tag)) ? 'bad'
+export const kindOf = (p) => p.tags.some((tag) => ['dns-error', 'malformed'].includes(tag)) ? 'bad'
+  : p.proto.startsWith('TLS') && p.info === 'Encrypted Alert' ? 'tcp'
   : p.proto.startsWith('TLS') ? 'tls' : p.proto.startsWith('HTTP') ? 'http' : 'tcp';
 const flow = (p) => `${p.link}:${[p.src, p.dst].sort().join('|')}`;
 
 export function conversationRows(rows) {
   const decoded = new Set(rows.filter((p) => /^(TLS|HTTP)/.test(p.proto)).map(flow));
   return rows.filter((p) => {
+    if (p.tags.some((tag) => ['gap', 'malformed'].includes(tag))) return true;
+    if (p.proto === 'HTTP/2' && /^(?:PING(?: ack)?|SETTINGS(?: ack)?|WINDOW_UPDATE(?:\[\d+\])? \+\d+|PRIORITY(?:\[\d+\])?|GOAWAY NO_ERROR)$/.test(p.info)) return false;
     if (p.proto !== 'TCP') return true;
     const flags = p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/) || [];
+    if (flags.length === 1 && flags[0] === 'ACK' && /\bLen=[01]\b/.test(p.info)) return false;
     if (flags.some((flag) => ['SYN', 'FIN', 'RST'].includes(flag)) || p.tags.some((tag) => tag !== 'decrypted')) return true;
     // TCP keeps partial records until TLS or HTTP completes them. Only hide
     // payload on a decoded connection, including decrypted TCP without an
     // application message. Keep unknown protocols and tagged loss.
-    return !(flags.length === 1 && flags[0] === 'ACK' && /\bLen=0\b/.test(p.info))
-      && !(/\bLen=[1-9]\d*\b/.test(p.info) && (p.tags.includes('decrypted') || decoded.has(flow(p))) && flags.every((flag) => ['ACK', 'PSH'].includes(flag)));
+    return !(/\bLen=[1-9]\d*\b/.test(p.info) && (p.tags.includes('decrypted') || decoded.has(flow(p))) && flags.every((flag) => ['ACK', 'PSH'].includes(flag)));
   });
 }
 
@@ -32,7 +35,7 @@ export function chipText(p) {
   const dns = dnsRow(p);
   if (dns) return p.tags.includes('dns-error') ? 'no such name' : dns.back ? dns.answers.map((a) => `${a.type} ${a.address}`).join(' · ') || 'DNS' : 'DNS';
   if (p.proto === 'TCP') return p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/).sort((a, b) => (a === 'ACK') - (b === 'ACK')).join('·') || 'TCP';
-  if (p.proto.startsWith('TLS')) return p.info.match(/Client Hello|Server Hello|Certificate|Finished/)?.[0] || p.info.slice(0, 22);
+  if (p.proto.startsWith('TLS')) return p.info === 'Encrypted Alert' ? 'TLS close' : p.info.match(/Client Hello|Server Hello|Certificate|Finished/)?.[0] || p.info.slice(0, 22);
   if (/\bDATA(?:\[|\b)/.test(p.info)) return `DATA ${p.len > 999 ? `${(p.len / 1024).toFixed(1)}k` : p.len}`;
   const status = p.info.match(/^HTTP\/\S+ (\d{3})/);
   if (status) return status[1];

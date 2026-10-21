@@ -1359,6 +1359,7 @@ body.licenses {
 .packet-chip.bad, .packet-proto.bad { border-color: var(--app-bad); background: var(--app-bad-soft); color: var(--app-bad); }
 .app-packets tr.bad td { color: var(--app-bad); }
 .app-packets tr.quiet td, .packet-chip.quiet { color: var(--app-mute); }
+.packet-chip.quiet, .app-packets tr.quiet .packet-proto { border-color: var(--app-rule); background: var(--app-soft); color: var(--app-mute); }
 .app-packets .packet-unlock { width: 11px; height: 11px; margin-right: 5px; vertical-align: -1px; color: var(--app-made); }
 
 .app-pop .mode-description { margin: 0; padding: 0 10px 10px; color: var(--app-mute); font-size: 12px; white-space: nowrap; }

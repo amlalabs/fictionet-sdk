@@ -56,11 +56,6 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
   }, (group, { url, from: [x, y], to: [tx, ty] }) => {
     attrs(group, { 'data-url': url });
     const dx = tx - x, dy = ty - y, length = Math.hypot(dx, dy);
-    if (!length) {
-      attrs(group.children[0], { d: `M ${x + 12} ${y - 10} C ${x + 44} ${y - 26} ${x + 44} ${y + 22} ${x + 12} ${y + 6}` });
-      attrs(group.children[1], { d: `M ${x + 19} ${y + 5} L ${x + 12} ${y + 6} L ${x + 15} ${y + 12}` });
-      return;
-    }
     const bend = length * .18;
     const cx = (x + tx) / 2 - dy / length * bend, cy = (y + ty) / 2 + dx / length * bend;
     const angle = Math.atan2(ty - cy, tx - cx);
@@ -95,7 +90,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     attrs(g, { 'data-host': host });
     g.style.transformOrigin = `${x}px ${y}px`;
     attrs(g.children[0], { class: `site ${state}${scenario ? ' scenario' : ''}${pages.some((p) => p.making) ? ' making' : ''}`, cx: x, cy: y, r });
-    attrs(g.children[1], { x, y: y + r + 14 });
+    attrs(g.children[1], { x, y: y + r + 18 });
     g.children[1].textContent = short(host);
     g.children[2].textContent = host;
     g.dots(pages.map((page, index) => [page.url, { page, index, r, x, y }]));
@@ -108,8 +103,19 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
   const refusedTitle = add('title', {}, refused);
   const planted = add('g', { class: 'planted-mark' }, layers.marks);
   add('path', { class: 'diamond', d: 'M 488 533 L 495 540 L 488 547 L 481 540 Z' }, planted);
-  const fact = add('text', { class: 'label planted', x: 472, y: 544, 'text-anchor': 'end', textLength: 252, lengthAdjust: 'spacingAndGlyphs' }, planted);
+  const fact = add('text', { class: 'label planted', x: 472, y: 544, 'text-anchor': 'end' }, planted);
   const factTitle = add('title', {}, planted);
+  function fitFact() {
+    fact.textContent = cut(factTitle.textContent, 40);
+    if (!fact.getComputedTextLength?.()) return;
+    fact.textContent = factTitle.textContent;
+    while (fact.textContent.length > 1 && fact.getComputedTextLength() > 252) {
+      fact.textContent = `${fact.textContent.replace(/…$/, '').slice(0, -1)}…`;
+    }
+  }
+  const ResizeObserver = svg.ownerDocument.defaultView?.ResizeObserver;
+  const size = ResizeObserver ? new ResizeObserver(fitFact) : null;
+  size?.observe(svg);
   planted.children[0].style.transformOrigin = '488px 540px';
   function render(snapshot, changes = null) {
     const query = snapshot.queries.at(-1);
@@ -144,7 +150,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       const [x, y] = map.assignment.get(r.host);
       return [`${query.id}:${r.rank}:${r.url}`, { x1: asked.x, y1: 121, x2: x, y2: y - 10 - Math.min(pages(r.host).filter((p) => p.fetches > 0).length, 4) * 1.5, 'data-rank': r.rank }];
     }) : []);
-    links(snapshot.pages.filter((p) => p.reason?.via === 'link' && map.assignment.has(hostOf(p.reason.from)) && map.assignment.has(p.host)).map((p) => [p.url, { url: p.url, from: map.assignment.get(hostOf(p.reason.from)), to: map.assignment.get(p.host) }]));
+    links(snapshot.pages.filter((p) => p.reason?.via === 'link' && hostOf(p.reason.from) !== p.host && map.assignment.has(hostOf(p.reason.from)) && map.assignment.has(p.host)).map((p) => [p.url, { url: p.url, from: map.assignment.get(hostOf(p.reason.from)), to: map.assignment.get(p.host) }]));
     more.textContent = map.hidden ? `+${map.hidden}` : '';
     const refusal = snapshot.refused.filter((r) => !r.name.startsWith('_')).at(-1);
     attrs(refused, { visibility: refusal ? 'visible' : 'hidden' });
@@ -152,9 +158,8 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     refusedTitle.textContent = refusal?.name || '';
     const plant = snapshot.planted.filter((p) => p.kind === 'fact').at(-1);
     attrs(planted, { visibility: plant ? 'visible' : 'hidden' });
-    fact.textContent = cut(plant?.text || '', 40);
     factTitle.textContent = plant?.text || '';
-    attrs(fact, { textLength: Math.min(252, fact.textContent.length * 6.3) });
+    fitFact();
   }
   const position = (node) => [Number(node.getAttribute('cx')), Number(node.getAttribute('cy'))];
   const siteNode = (host) => [...layers.sites.children].find((g) => g.getAttribute('data-host') === host);
@@ -209,7 +214,9 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
         }
         if (change.type === 'page_opened' && p.reason?.via === 'link') {
           const link = [...layers.links.children].find((g) => g.getAttribute('data-url') === p.url);
-          if (link) {
+          if (hostOf(p.reason.from) === p.host) {
+            motion.travel(layers.fx, [sx, sy - Number(site.children[0].getAttribute('r')) - 2], [x, y], p.via === 'web_fetch' ? 'agent' : 'ink', 520);
+          } else if (link) {
             motion.drawIn(link.children[0], 520);
             fade(link.children[1], 100, 420);
             motion.travel(layers.fx, link.children[0], null, p.via === 'web_fetch' ? 'agent' : 'ink', 520);
@@ -270,6 +277,6 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       svg.getBoundingClientRect();
       motion.suppressed = false;
     },
-    dispose() { motion.dispose(); svg.replaceChildren(); },
+    dispose() { size?.disconnect(); motion.dispose(); svg.replaceChildren(); },
   };
 }

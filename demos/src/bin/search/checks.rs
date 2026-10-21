@@ -202,10 +202,20 @@ fn visible_words() -> String {
     )
 }
 
-async fn world_shots(run: &Run, output: &Path, hosts: &[String], full: bool) -> Result {
+/// Saves the world tabs once the map shows `hosts` and the packet list shows
+/// a DNS or HTTP row for `talked`, a site the story spoke to last (the list
+/// holds only the newest conversations).
+async fn world_shots(
+    run: &Run,
+    output: &Path,
+    hosts: &[String],
+    talked: &str,
+    full: bool,
+) -> Result {
     let url = run.page_url().to_string();
     let output = output.to_path_buf();
     let hosts = json!(hosts);
+    let talked = json!(talked.trim_start_matches("www."));
     tokio::task::spawn_blocking(move || {
         let web = format!(
             r#"(() => {{
@@ -225,7 +235,7 @@ async fn world_shots(run: &Run, output: &Path, hosts: &[String], full: bool) -> 
             return panel && !panel.hidden && panel.querySelector('.packet-lane')
                 && [...panel.querySelectorAll('tr[data-seq]')].some(row =>
                     /^(DNS|HTTP)/.test(row.querySelector('.packet-proto')?.innerText || '')
-                    && {hosts}.some(host => row.innerText.includes(host.replace(/^www\./, ''))))
+                    && row.innerText.includes({talked}))
                 && panel.getAnimations({{subtree: true}}).every(a => a.playState !== 'running' || a.effect.getTiming().iterations === Infinity);
         }})()"#
         );
@@ -452,7 +462,14 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
                 .filter(|q| q.outcome == Outcome::Served)
                 .all(|q| q.carries == Some(0)),
     )?;
-    world_shots(run, output, std::slice::from_ref(&first.host), false).await?;
+    world_shots(
+        run,
+        output,
+        std::slice::from_ref(&first.host),
+        &first.host,
+        false,
+    )
+    .await?;
     let (snapshot, bing) = search(run, &client, Engine::Bing, words, google.id, held).await?;
     run.settled_screen(HOST, &output.join("bing.png")).await?;
     check(
@@ -759,6 +776,8 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
             "docs.python.org".into(),
             "en.wikipedia.org".into(),
         ],
+        // The story's last requests are Google searches.
+        "www.google.com",
         true,
     )
     .await?;
