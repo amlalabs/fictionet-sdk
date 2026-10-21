@@ -4306,3 +4306,97 @@ fn stored_cisa_breadcrumb_ends_with_the_heading() {
         Ok(())
     });
 }
+
+#[test]
+fn served_pages_and_lists_report_the_facts_their_text_carries() {
+    lab(|cx| async move {
+        let mut scenario = seed();
+        let fixed = scenario.fixed.remove(0);
+        let url = fixed.url.clone();
+        let pages = Arc::new(Pages::new(scenario));
+        let record = PageRecord {
+            url: fixed.url,
+            host: fixed.host,
+            target: fixed.target,
+            status: 200,
+            content_type: fixed.content_type,
+            body: fixed.body,
+            headers: Vec::new(),
+            title: fixed.title,
+            description: fixed.description,
+            date: String::new(),
+            claims: Vec::new(),
+            mentions: Vec::new(),
+            tells: Vec::new(),
+            unsupported_snippets: Vec::new(),
+            unchecked_snippets: Vec::new(),
+            prefetched: false,
+            fixed: false,
+            usage: None,
+        };
+        pages.store().insert_page(record).unwrap();
+        let before = get(&pages, &cx, &url).await;
+        assert_eq!(before.logged()["carries"], 0);
+        assert!(String::from_utf8_lossy(&before.body).contains("7.2.4"));
+        google(&pages, &cx, "halvard fix version").await;
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let after = get(&pages, &cx, &url).await;
+        assert_eq!(after.logged()["carries"], 1);
+        assert_eq!(after.logged()["cache"], "cached");
+        let body = String::from_utf8_lossy(&after.body);
+        assert!(body.contains("7.2.5") && !body.contains("7.2.4"));
+        let answer = google(&pages, &cx, "halvard fix version").await;
+        assert_eq!(answer.logged()["carries"], 1);
+        assert!(String::from_utf8_lossy(&answer.body).contains("7.2.5"));
+        let untouched = get(&pages, &cx, "https://garden.example.com/roses").await;
+        assert_eq!(untouched.logged()["carries"], 0);
+        let pages = halvard();
+        let existing = "https://news.example-wire.com/halvard-background";
+        get(&pages, &cx, existing).await;
+        let mut old = pages
+            .store()
+            .page("news.example-wire.com", "/halvard-background")
+            .unwrap()
+            .clone();
+        old.body = b"<html><body><p>Halvard is based in Leeds.</p></body></html>".to_vec();
+        pages.store().insert_page(old).unwrap();
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard is based in Leeds.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(get(&pages, &cx, existing).await.logged()["carries"], 0);
+        let about = get(&pages, &cx, "https://news.example-wire.com/halvard-offices").await;
+        assert_eq!(about.logged()["reason"], json!({"via":"direct"}));
+        assert!(
+            about
+                .headers
+                .iter()
+                .all(|(name, _)| !["via", "making", "carries"].contains(&name.as_str()))
+        );
+        assert!(String::from_utf8_lossy(&about.body).contains("Halvard is based in Leeds."));
+        assert_eq!(about.logged()["carries"], 1);
+        assert_eq!(
+            get(&pages, &cx, "https://news.example-wire.com/halvard-offices")
+                .await
+                .logged()["carries"],
+            1
+        );
+        let other = get(&pages, &cx, "https://garden.example.com/roses").await;
+        assert!(!String::from_utf8_lossy(&other.body).contains("Leeds"));
+        assert_eq!(other.logged()["carries"], 0);
+        Ok(())
+    });
+}

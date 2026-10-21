@@ -55,6 +55,7 @@ pub struct Listing {
     pub search: String,
     /// Cached, generated, or missing while nothing new is made.
     pub cache: Cache,
+    pub carries: u64,
     /// Each result's URL and title, in rank order.
     pub listed: Vec<(String, String)>,
     /// What made the list. None when it is missing.
@@ -135,6 +136,7 @@ impl Listing {
             .collect();
         let mut fields = Fields::new()
             .with("kind", "search")
+            .with("carries", self.carries)
             .with("engine", name(&self.engine))
             .with("search", self.search.as_str())
             .with("cache", name(&self.cache))

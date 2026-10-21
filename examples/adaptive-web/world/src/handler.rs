@@ -97,6 +97,7 @@ impl Handler {
         .then_some(&body[..body.len().min(MAX_FORM_BYTES)]);
         let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         let action = route(&target.host, path, form);
+        let page = action == Route::Page;
         let mut query = None;
         if let Route::Search {
             engine,
@@ -121,6 +122,7 @@ impl Handler {
             });
         }
         let answer = if parts.method == http::Method::POST && action == Route::Page {
+            self.pages.making(&self.fcx, &target.host, path);
             self.pages.form(&target.host, path)
         } else {
             self.pages
@@ -134,7 +136,13 @@ impl Handler {
                 _ => q.finished = true,
             }
         }
-        let fields = observing.then(|| answer.fields());
+        let fields = observing.then(|| {
+            let mut fields = answer.fields();
+            if page && matches!(answer.meta, Meta::Error { .. }) {
+                fields.set("kind", "page");
+            }
+            fields
+        });
         let mut response = Response::builder()
             .status(StatusCode::from_u16(answer.status)?)
             .header(CONTENT_TYPE, answer.content_type)

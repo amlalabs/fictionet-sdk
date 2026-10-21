@@ -497,6 +497,12 @@ impl Model {
         Ok(site)
     }
 
+    fn anthropic_openrouter(mut self) -> Self {
+        self.upstream_provider = Provider::OpenRouter;
+        self.path_prefix = "/api";
+        self
+    }
+
     /// Installs a budget shared by all clones.
     pub fn budget(self, budget: Budget) -> Self {
         self.set_budget(budget);
@@ -913,15 +919,13 @@ pub fn anthropic_via_openrouter(cx: &Cx) -> fictionet::Result<Model> {
         )?,
     );
     credential.real = real;
-    let mut model = Model::at(
+    let model = Model::at(
         cx,
         Provider::Anthropic,
         credential,
         "https://openrouter.ai".parse()?,
     )?;
-    model.upstream_provider = Provider::OpenRouter;
-    model.path_prefix = "/api";
-    Ok(model)
+    Ok(model.anthropic_openrouter())
 }
 /// Gemini using `GEMINI_API_KEY`.
 pub fn gemini(cx: &Cx) -> fictionet::Result<Model> {

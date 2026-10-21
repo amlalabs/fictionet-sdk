@@ -25,7 +25,7 @@ pub const MAX_REFUSED: usize = 64;
 pub const MAX_SEED_ITEMS: usize = 32;
 /// Most recent planted facts and pages retained.
 pub const MAX_PLANTED: usize = 16;
-/// Maximum compact snapshot JSON size: 3,942,835 bytes at these limits.
+/// Maximum compact snapshot JSON size: 4,422,957 bytes at these limits.
 /// Each string byte can need six JSON bytes. Numbers use twenty digits.
 /// Fixed costs include field names, punctuation and the longest enum values.
 pub const MAX_SNAPSHOT_BYTES: usize = {
@@ -35,11 +35,11 @@ pub const MAX_SNAPSHOT_BYTES: usize = {
         // Two seed lists, with quotes and a comma per item.
         + 2 * MAX_SEED_ITEMS * (3 + string)
         // Query rows, including failure text and a comma per row.
-        + MAX_QUERIES * (431 + 6 * string)
+        + MAX_QUERIES * (462 + 6 * string)
         // Result lists and their entries, including array commas.
         + MAX_RESULTS * (75 + string + MAX_LISTED * (60 + 3 * string))
         // Page rows, including search reasons and a comma per row.
-        + MAX_PAGES * (431 + 5 * string)
+        + MAX_PAGES * (486 + 6 * string)
         // Site and refusal rows, including a comma per row.
         + MAX_SITES * (79 + 2 * string)
         + MAX_REFUSED * (53 + 2 * string)
@@ -191,6 +191,7 @@ pub struct Query {
     pub seq: u64,
     pub outcome: Outcome,
     pub cache: Option<Cache>,
+    pub carries: Option<u64>,
     /// Result count the answer reported.
     pub results: Option<u64>,
     /// Time spent generating the answer, in milliseconds.
@@ -315,7 +316,10 @@ pub struct Page {
     pub at_ms: u64,
     pub fetches: u64,
     /// HTTP status of the latest fetch.
-    pub status: u64,
+    pub status: Option<u64>,
+    pub via: Option<String>,
+    pub making: bool,
+    pub carries: Option<u64>,
     /// Title from the first served fetch.
     pub title: String,
     /// Model from the first served fetch.
@@ -502,6 +506,8 @@ impl Observer for Searches {
                     | "planted"
                     | "restarted"
                     | "search_answer"
+                    | "making"
+                    | "page_failed"
             ) | ("http", "request")
         )
     }
@@ -591,6 +597,7 @@ impl Snapshot {
                     seq,
                     outcome: Outcome::Pending,
                     cache: None,
+                    carries: None,
                     results: None,
                     gen_ms: None,
                     serve_ms: None,
@@ -649,6 +656,7 @@ impl Snapshot {
                         .or(q.cache)
                         .or(pending.then_some(Cache::Unknown));
                     q.results = e.u64("results");
+                    q.carries = e.u64("carries");
                     q.gen_ms = e.u64("gen_ms");
                     q.serve_ms = e.u64("serve_ms").or(q.serve_ms);
                     q.answer_seq = Some(seq);
@@ -723,7 +731,10 @@ impl Snapshot {
                         host: bounded(host_name),
                         at_ms: ms,
                         fetches: 1,
-                        status: e.u64("status").unwrap_or(0),
+                        status: e.u64("status"),
+                        via: e.str("via").map(bounded),
+                        making: false,
+                        carries: e.u64("carries"),
                         title: text(e, "title"),
                         model: text(e, "model"),
                         cache,
@@ -734,25 +745,37 @@ impl Snapshot {
                         made,
                         latest: made,
                     };
-                    if let Some(index) = self.pages.iter().position(|p| p.url == fetched.url) {
+                    if let Some(index) = self.pages.iter().position(|p| {
+                        p.url == fetched.url
+                            || (p.making
+                                && p.fetches == 0
+                                && p.url
+                                    .strip_prefix("https://")
+                                    .zip(fetched.url.strip_prefix("http://"))
+                                    .is_some_and(|(pending, served)| pending == served))
+                    }) {
                         let old = self.pages.remove(index);
-                        let mut page = if !old.made.supplied() && made.supplied() {
-                            // The fetch that made the page says why and how.
-                            Page {
-                                seq: old.seq,
-                                first_serve_ms: old.first_serve_ms,
-                                at_ms: old.at_ms,
-                                fetches: old.fetches,
-                                ..fetched
-                            }
-                        } else {
-                            Page {
-                                status: fetched.status,
-                                latest_serve_ms: fetched.latest_serve_ms,
-                                latest: made,
-                                ..old
-                            }
-                        };
+                        let mut page =
+                            if old.fetches == 0 || (!old.made.supplied() && made.supplied()) {
+                                // The fetch that made the page says why and how.
+                                Page {
+                                    seq: old.seq,
+                                    first_serve_ms: old.first_serve_ms.or(fetched.first_serve_ms),
+                                    at_ms: old.at_ms,
+                                    fetches: old.fetches,
+                                    ..fetched
+                                }
+                            } else {
+                                Page {
+                                    status: fetched.status,
+                                    via: fetched.via,
+                                    making: false,
+                                    carries: fetched.carries,
+                                    latest_serve_ms: fetched.latest_serve_ms,
+                                    latest: made,
+                                    ..old
+                                }
+                            };
                         page.fetches = page.fetches.saturating_add(1);
                         self.pages.push(page);
                     } else {
@@ -761,6 +784,49 @@ impl Snapshot {
                     changed = true;
                 }
                 changed
+            }
+            ("adaptive", "page_failed") => {
+                let url = text(e, "url");
+                let Some(page) = self.pages.iter_mut().find(|p| p.url == url) else {
+                    return false;
+                };
+                page.making = false;
+                page.status = e.u64("status");
+                true
+            }
+            ("adaptive", "making") => {
+                let url = text(e, "url");
+                if let Some(page) = self.pages.iter_mut().find(|p| p.url == url) {
+                    page.making = true;
+                } else {
+                    recent(
+                        &mut self.pages,
+                        Page {
+                            seq,
+                            first_serve_ms: None,
+                            url,
+                            host: text(e, "host"),
+                            at_ms: ms,
+                            fetches: 0,
+                            status: None,
+                            via: None,
+                            making: true,
+                            carries: None,
+                            title: String::new(),
+                            model: String::new(),
+                            cache: Cache::Unknown,
+                            serve_ms: None,
+                            gen_ms: None,
+                            latest_serve_ms: None,
+                            reason: Reason::Unknown,
+                            made: Made::Unknown,
+                            latest: Made::Unknown,
+                        },
+                        MAX_PAGES,
+                        &mut self.omitted.pages,
+                    );
+                }
+                true
             }
             ("adaptive", "site") => {
                 let host = text(e, "host");

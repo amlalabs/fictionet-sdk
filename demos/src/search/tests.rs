@@ -123,6 +123,10 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                 json!({"via":"search", "query":"halvard gateway vulnerability", "rank":first.rank})
             );
             assert_eq!(opened["made"], "stubbed");
+            assert_eq!(opened["via"], serde_json::Value::Null);
+            assert_eq!(opened["making"], false);
+            assert_eq!(opened["carries"], 0);
+            assert_eq!(snapshot["value"]["queries"][0]["carries"], 0);
             let published = snapshot["revision"].clone();
             cx.sleep(std::time::Duration::from_millis(250)).await?;
             assert_eq!(
@@ -135,6 +139,18 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             let reply = command(&client, true, 0, "old").await.unwrap();
             assert_eq!(reply["rejection"]["reason"], "stale_revision");
             assert_eq!(reply["rejection"]["current"], 1);
+            fictionet_extras::models::Engine::search(
+                world.pages.clone(),
+                cx.clone(),
+                "halvard gateway vulnerability".into(),
+            )
+            .await?;
+            fictionet_extras::models::Engine::fetch(
+                world.pages.clone(),
+                cx.clone(),
+                first.url.clone(),
+            )
+            .await?;
             fetch(
                 &cx,
                 &machine,
@@ -151,6 +167,20 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             assert_eq!(queries.last().unwrap()["outcome"]["status"], "served");
             assert_eq!(snapshot["value"]["generator"]["generate"], false);
             assert_eq!(snapshot["value"]["generator"]["generation_revision"], 1);
+            let tool_page = snapshot["value"]["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["url"] == first.url)
+                .unwrap();
+            assert_eq!(tool_page["via"], "web_fetch");
+            assert_eq!(tool_page["making"], false);
+            assert_eq!(tool_page["carries"], 0);
+            let tool_query = queries.iter().find(|q| q["via"] == "web_search").unwrap();
+            assert_eq!(tool_query["search"], "halvard gateway vulnerability");
+            assert_eq!(tool_query["engine"], "google");
+            assert_eq!(tool_query["outcome"]["status"], "served");
+            assert_eq!(tool_query["carries"], 0);
             // A planted fact reaches the page through the same port; one that
             // would give the web away is refused with why.
             let plant = |id: &str, text: &str| {

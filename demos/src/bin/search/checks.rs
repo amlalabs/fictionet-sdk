@@ -311,7 +311,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     navigate(run, &direct).await?;
     wait(&client, "typed seed address is the canned page", |s| {
         s.pages.iter().any(|p| {
-            p.url == direct && p.status == 200 && p.reason == reason && p.made == Made::Stored
+            p.url == direct && p.status == Some(200) && p.reason == reason && p.made == Made::Stored
         })
     })
     .await?;
@@ -332,7 +332,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         wait(&client, "opened a canned page on a bundled host", |s| {
             s.pages
                 .iter()
-                .any(|p| p.url == url && p.status == 200 && p.made == Made::Stored)
+                .any(|p| p.url == url && p.status == Some(200) && p.made == Made::Stored)
         })
         .await?;
         run.settled_screen(HOST, &output.join(name)).await?;

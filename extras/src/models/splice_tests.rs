@@ -458,3 +458,51 @@ fn continuation_status_error_types() {
         }
     }
 }
+
+#[test]
+fn anthropic_openrouter_runs_world_tools_before_continuing() {
+    for stream in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for content in [
+                vec![
+                    json!({"type":"tool_use","id":"toolu_search","name":"web_search","input":{"query":"page"}}),
+                ],
+                vec![
+                    json!({"type":"tool_use","id":"toolu_fetch","name":"web_fetch","input":{"url":"https://example.com/page"}}),
+                ],
+                vec![json!({"type":"text","text":"Done."})],
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (headers, body) = exchange(&mut socket);
+                assert!(headers.starts_with("POST /api/v1/messages "));
+                assert!(headers.contains("authorization: Bearer sk-ant-api03-private"));
+                assert!(body["tools"][0].get("type").is_none());
+                let stop = if content[0]["type"] == "text" {
+                    "end_turn"
+                } else {
+                    "tool_use"
+                };
+                response(&mut socket, content, stop, stream);
+            }
+        });
+        let pages = Arc::new(Pages(AtomicUsize::new(0)));
+        let engine = pages.clone();
+        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)), |cx| async move {
+            let credential = Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "sk-ant-api03-private".into())?);
+            let key = credential.placeholder().to_owned();
+            let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.anthropic_openrouter().search(engine);
+            let body = json!({"model":"claude","stream":stream,"max_tokens":1000,"messages":[{"role":"user","content":"Search for page and read https://example.com/page"}],"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":8},{"type":"web_fetch_20250910","name":"web_fetch","max_uses":8}]});
+            let request = Request::post("/v1/messages").header("x-api-key", key).body(Body::from(body.to_string()))?;
+            let answer = collected(model.send(request).await?, stream).await;
+            assert_eq!(answer["stop_reason"], "end_turn");
+            assert_eq!(answer["content"][1]["type"], "web_search_tool_result");
+            assert_eq!(answer["content"][3]["type"], "web_fetch_tool_result");
+            assert_eq!(answer["content"][3]["content"]["content"]["source"]["data"], "Page title\nThe page text");
+            Ok(())
+        })).unwrap();
+        server.join().unwrap();
+        assert_eq!(pages.0.load(Ordering::SeqCst), 1);
+    }
+}

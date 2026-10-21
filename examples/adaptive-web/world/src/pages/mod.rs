@@ -66,7 +66,7 @@ use prompts::{Claim, HostPage, Person};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use store::{CastRecord, PageRecord, SearchRecord, Store};
 
@@ -192,6 +192,7 @@ pub struct Response {
     pub meta: Meta,
     /// How long a routed request took on the run's clock, in milliseconds.
     pub serve_ms: Option<u64>,
+    pub carries: u64,
 }
 impl Response {
     fn new(
@@ -208,6 +209,7 @@ impl Response {
             headers,
             meta,
             serve_ms: None,
+            carries: 0,
         }
     }
 
@@ -221,6 +223,9 @@ impl Response {
     /// `serve_ms`.
     pub fn fields(&self) -> Fields {
         let mut fields = self.meta.fields();
+        if !matches!(self.meta, Meta::Search(_)) {
+            fields.set("carries", self.carries);
+        }
         if let Some(ms) = self.serve_ms {
             fields.set("serve_ms", ms);
         }
@@ -539,12 +544,17 @@ impl Pages {
     }
 
     /// Corrects only the claim named by a fact, retaining surrounding history.
-    fn corrected_fragment(&self, text: &str, context: &str) -> String {
+    fn corrected_fragment(
+        &self,
+        text: &str,
+        context: &str,
+        reached: &mut HashSet<usize>,
+    ) -> String {
         let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
         let mut text = text.to_owned();
         static CVE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let cve = CVE.get_or_init(|| regex::Regex::new(r"(?i)CVE-[0-9]{4}-[0-9]+").unwrap());
-        for (old, new) in &planted.corrections {
+        for (index, (old, new)) in planted.corrections.iter().enumerate() {
             let fact = planted
                 .facts
                 .iter()
@@ -582,21 +592,30 @@ impl Pages {
                     continue;
                 }
             }
-            text = replace_content_value(&text, old, new);
+            let changed = replace_content_value(&text, old, new);
+            if changed != text {
+                reached.insert(index);
+            }
+            text = changed;
         }
         text
     }
 
-    fn corrected(&self, text: &str) -> String {
+    fn corrected(&self, text: &str, reached: &mut HashSet<usize>) -> String {
         sentences()
             .replace_all(text, |c: &regex::Captures<'_>| {
-                self.corrected_fragment(&c[0], &c[0])
+                self.corrected_fragment(&c[0], &c[0], reached)
             })
             .into_owned()
     }
 
     /// Keeps inline markup while using the whole surrounding sentence as context.
-    fn corrected_node(&self, node: &kuchiki::NodeRef, original: &str) -> String {
+    fn corrected_node(
+        &self,
+        node: &kuchiki::NodeRef,
+        original: &str,
+        reached: &mut HashSet<usize>,
+    ) -> String {
         let block = node
             .ancestors()
             .find(|a| {
@@ -630,10 +649,10 @@ impl Pages {
                 })
                 .map(|n| n.text_contents())
                 .unwrap_or_default();
-            return self.corrected_fragment(original, &format!("{header}: {original}"));
+            return self.corrected_fragment(original, &format!("{header}: {original}"), reached);
         }
         if block == *node {
-            return self.corrected_fragment(original, original);
+            return self.corrected_fragment(original, original, reached);
         }
         let mut context = String::new();
         let mut offset = 0;
@@ -650,15 +669,14 @@ impl Pages {
             let start = sentence.start().max(offset);
             let end = sentence.end().min(offset + original.len());
             if start < end {
-                corrected
-                    .push_str(&self.corrected_fragment(&context[start..end], sentence.as_str()));
+                corrected.push_str(&self.corrected_fragment(
+                    &context[start..end],
+                    sentence.as_str(),
+                    reached,
+                ));
             }
         }
         corrected
-    }
-
-    fn corrected_content(&self, text: &str) -> String {
-        self.corrected(text)
     }
 
     /// Returns the seed used by this world.
@@ -852,6 +870,7 @@ impl Pages {
         };
         let route = route(host, target, form);
         if method == "POST" && route == Route::Page {
+            self.making(cx, host, target);
             return self.form(host, target);
         }
         self.handle_route(cx, host, target, route).await
@@ -966,6 +985,7 @@ impl Pages {
         let started = cx.now().since_start();
         let search = matches!(route, Route::Search { .. });
         let mut response = self.answer(cx, &host.to_lowercase(), target, route).await;
+        let mut reached = HashSet::new();
         // A result list is corrected result by result, so its search box
         // keeps what was typed.
         if !search
@@ -979,18 +999,20 @@ impl Pages {
             && let Ok(body) = std::str::from_utf8(&response.body)
         {
             let corrected = if response.content_type.contains("json") {
-                fn correct(pages: &Pages, value: &mut Value) {
+                fn correct(pages: &Pages, value: &mut Value, reached: &mut HashSet<usize>) {
                     match value {
-                        Value::String(text) => *text = pages.corrected_content(text),
-                        Value::Array(values) => values.iter_mut().for_each(|v| correct(pages, v)),
+                        Value::String(text) => *text = pages.corrected(text, reached),
+                        Value::Array(values) => {
+                            values.iter_mut().for_each(|v| correct(pages, v, reached))
+                        }
                         Value::Object(values) => {
-                            values.values_mut().for_each(|v| correct(pages, v))
+                            values.values_mut().for_each(|v| correct(pages, v, reached))
                         }
                         _ => {}
                     }
                 }
                 serde_json::from_str::<Value>(body).ok().map(|mut value| {
-                    correct(self, &mut value);
+                    correct(self, &mut value, &mut reached);
                     value.to_string()
                 })
             } else if response.content_type.starts_with("text/html") {
@@ -1005,19 +1027,19 @@ impl Pages {
                         })
                     {
                         let original = text.borrow().to_string();
-                        let corrected = self.corrected_node(&node, &original);
+                        let corrected = self.corrected_node(&node, &original, &mut reached);
                         *text.borrow_mut() = corrected;
                     }
                 }
                 for meta in dom.select("meta[name=description], meta[property=\"og:title\"], meta[property=\"og:description\"]").unwrap() {
                     let mut attributes = meta.attributes.borrow_mut();
                     if let Some(content) = attributes.get_mut("content") {
-                        *content = self.corrected_content(content);
+                        *content = self.corrected(content, &mut reached);
                     }
                 }
                 Some(dom.to_string())
             } else if response.content_type.starts_with("text/plain") {
-                Some(self.corrected_content(body))
+                Some(self.corrected(body, &mut reached))
             } else {
                 None
             };
@@ -1025,6 +1047,7 @@ impl Pages {
                 response.body = corrected.into_bytes();
             }
         }
+        response.carries += reached.len() as u64;
         response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
         response
     }
@@ -1206,7 +1229,7 @@ impl Pages {
         query: &str,
         start: u64,
     ) -> Response {
-        let (search, cache, usage) = match self.listing(cx, engine, query, start).await {
+        let (search, cache, usage, carries) = match self.listing(cx, engine, query, start).await {
             Ok(listing) => listing,
             Err(stop) => return stop.response(Asked::Search),
         };
@@ -1215,6 +1238,7 @@ impl Pages {
             engine,
             search: query.into(),
             cache,
+            carries,
             listed: (search.results.iter())
                 .map(|r| (r.url.clone(), r.title.clone()))
                 .collect(),
@@ -1238,7 +1262,7 @@ impl Pages {
         engine: Engine,
         query: &str,
         start: u64,
-    ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>), Stop> {
+    ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
         let key = if engine == Engine::YouTube {
             format!("youtube {}", query_key(query, start))
         } else {
@@ -1254,6 +1278,7 @@ impl Pages {
                 fictionet_extras::search::Search::default(),
                 Cache::Missing,
                 None,
+                0,
             ));
         }
         let stored = self.store().search(&key).cloned();
@@ -1312,6 +1337,7 @@ impl Pages {
                 }
             }
         }
+        let mut reached = HashSet::new();
         for result in &mut search.results {
             if self
                 .planted
@@ -1323,10 +1349,10 @@ impl Pages {
             {
                 continue;
             }
-            result.title = self.corrected(&result.title);
-            result.snippet = self.corrected(&result.snippet);
+            result.title = self.corrected(&result.title, &mut reached);
+            result.snippet = self.corrected(&result.snippet, &mut reached);
         }
-        Ok((search, cache, record.map(|r| r.usage)))
+        Ok((search, cache, record.map(|r| r.usage), reached.len() as u64))
     }
 
     async fn make_search(
@@ -1437,6 +1463,12 @@ impl Pages {
             cx.spawn(move |cx| async move {
                 let started = cx.now().since_start();
                 let response = pages.page(&cx, &host, &target, true).await;
+                if matches!(response.meta, Meta::Error { .. } | Meta::Budget(_)) {
+                    cx.emit("adaptive", "page_failed", |e| {
+                        e.field("url", format!("https://{host}{target}"))
+                            .field("status", response.status as u64)
+                    });
+                }
                 if let Meta::Error { error, usage } = &response.meta {
                     let mut row = json!({
                         "kind": "prefetch_error",
@@ -1509,6 +1541,9 @@ impl Pages {
             Ok(lock) => lock,
             Err(error) => return Stop::store(error).response(Asked::Page),
         };
+        if self.generating() && self.store().page(host, target).is_none() {
+            self.making(cx, host, target);
+        }
         if self.generating()
             && let Err(stop) = self.site_stylesheet(cx, host).await
         {
@@ -1616,9 +1651,29 @@ impl Pages {
             cache = Cache::Prefetched;
         }
         // A page asked for before anything mentioned it came direct.
-        let reason = (record.mentions.first()).map_or(Reason::Direct, |m| {
-            Reason::deserialize(m).unwrap_or_default()
+        let reason = record
+            .mentions
+            .iter()
+            .find(|m| m["via"] != "fact")
+            .map_or(Reason::Direct, |m| {
+                Reason::deserialize(m).unwrap_or_default()
+            });
+        let visible = String::from_utf8_lossy(&record.body);
+        let visible = normalize(&if record.content_type.starts_with("text/html") {
+            text::text_of(&visible)
+        } else {
+            visible.into_owned()
         });
+        let carries = record
+            .mentions
+            .iter()
+            .filter(|m| {
+                m["via"] == "fact"
+                    && m["snippet"]
+                        .as_str()
+                        .is_some_and(|fact| visible.contains(&normalize(fact)))
+            })
+            .count() as u64;
         let shown = Shown {
             cache,
             title: record.title,
@@ -1632,13 +1687,22 @@ impl Pages {
             usage: record.usage,
         };
         let meta = Meta::Page(Box::new(shown));
-        Response::new(
+        let mut response = Response::new(
             record.status,
             record.content_type,
             record.body,
             record.headers,
             meta,
-        )
+        );
+        response.carries = carries;
+        response
+    }
+
+    pub(crate) fn making(&self, cx: &Cx, host: &str, target: &str) {
+        cx.emit("adaptive", "making", |e| {
+            e.field("url", format!("https://{host}{target}"))
+                .field("host", host)
+        });
     }
 
     async fn make_page(
@@ -1648,6 +1712,7 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
+        self.making(cx, host, target);
         let site_lock = self
             .locks
             .lock(cx, format!("site {host}"))
@@ -1656,7 +1721,7 @@ impl Pages {
         self.reserve()?;
         let cast = self.cast(cx).await?;
         let url = format!("https://{host}{target}");
-        let ask = {
+        let mut ask = {
             let store = self.store();
             PageAsk {
                 url: url.clone(),
@@ -1669,7 +1734,21 @@ impl Pages {
         };
         let _site = ask.profile.is_none().then_some(site_lock);
         let expected = prompts::expected_type(&url);
-        let seed = self.context();
+        let mut seed = self.context().into_owned();
+        let subject = format!("{url} {}", make::title_from(host, target));
+        {
+            let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
+            seed.facts.retain(|fact| {
+                !planted.facts.contains(fact)
+                    || correction(fact).is_some()
+                    || make::shares_words(fact, &subject)
+            });
+            for fact in &planted.facts {
+                if correction(fact).is_none() && make::shares_words(fact, &subject) {
+                    ask.mentions.push(json!({"via":"fact", "snippet":fact}));
+                }
+            }
+        }
         let kind = self
             .store()
             .site(host)
@@ -1718,10 +1797,12 @@ impl Pages {
                 || {
                     let mut mentions = ask.mentions.clone();
                     for fact in &self.planted.lock().unwrap_or_else(|e| e.into_inner()).facts {
-                        if make::shares_words(
-                            fact,
-                            &format!("{url} {}", make::title_from(host, target)),
-                        ) {
+                        if correction(fact).is_some()
+                            && make::shares_words(
+                                fact,
+                                &format!("{url} {}", make::title_from(host, target)),
+                            )
+                        {
                             mentions.push(json!({"snippet": fact}));
                         }
                     }
@@ -2000,7 +2081,8 @@ impl fictionet_extras::models::Engine for Pages {
                     .field("via", "web_search")
             });
             let started = cx.now().since_start();
-            let Ok((search, cache, usage)) = self.listing(&cx, Engine::Google, &query, 0).await
+            let Ok((search, cache, usage, carries)) =
+                self.listing(&cx, Engine::Google, &query, 0).await
             else {
                 cx.emit("adaptive", "query_failed", |e| {
                     e.field("query_id", id).field("why", "error")
@@ -2011,6 +2093,7 @@ impl fictionet_extras::models::Engine for Pages {
                 engine: Engine::Google,
                 search: query.clone(),
                 cache,
+                carries,
                 listed: (search.results.iter())
                     .map(|r| (r.url.clone(), r.title.clone()))
                     .collect(),
@@ -2033,8 +2116,22 @@ impl fictionet_extras::models::Engine for Pages {
         url: String,
     ) -> fictionet_extras::models::tools::Answer<fictionet_extras::models::tools::Page> {
         Box::pin(async move {
+            let parsed = url::Url::parse(&url)?;
             let (host, target) = text::target_of(&url);
             let response = self.handle(&cx, "GET", &host, &target, None).await;
+            let mut fields = response.fields();
+            fields.set("kind", "page");
+            fields.set("via", "web_fetch");
+            fields.set("method", "GET");
+            fields.set("scheme", parsed.scheme());
+            fields.set("host", host.as_str());
+            fields.set("path", parsed.path());
+            if let Some(query) = parsed.query() {
+                fields.set("query", query);
+            }
+            fields.set("status", response.status as u64);
+            fields.set("complete", true);
+            cx.emit("http", "request", |e| e.fields(fields));
             if response.status != 200 {
                 return Err(fictionet::Error::msg("Page is unavailable"));
             }

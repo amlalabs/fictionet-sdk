@@ -325,7 +325,7 @@ fn a_page_made_after_a_404_takes_its_reason_from_the_fetch_that_made_it() {
     assert_eq!(p.first_serve_ms, Some(20));
     assert_eq!((p.title.as_str(), p.model.as_str()), ("Title", "stub"));
     assert_eq!((p.serve_ms, p.gen_ms), (Some(5), Some(15)));
-    assert_eq!((p.at_ms, p.fetches, p.status), (10, 3, 200));
+    assert_eq!((p.at_ms, p.fetches, p.status), (10, 3, Some(200)));
 
     feed(
         &s,
@@ -472,6 +472,7 @@ fn worst_case_snapshot_fits() {
             error: Some(t.clone()),
         },
         cache: Some(Cache::Prefetched),
+        carries: Some(n),
         results: Some(n),
         gen_ms: Some(n),
         serve_ms: Some(n),
@@ -499,7 +500,10 @@ fn worst_case_snapshot_fits() {
         host: t.clone(),
         at_ms: n,
         fetches: n,
-        status: n,
+        status: Some(n),
+        via: Some(t.clone()),
+        making: false,
+        carries: Some(n),
         title: t.clone(),
         model: t.clone(),
         cache: Cache::Prefetched,
@@ -673,4 +677,259 @@ fn a_restart_clears_what_the_run_showed_and_plants_are_kept_in_order() {
     );
     let snap = s.snapshot();
     assert!(snap.queries.is_empty() && snap.planted.is_empty());
+}
+
+#[test]
+fn model_server_tools_publish_the_world_search_and_fetch() {
+    for stream in [false, true] {
+        model_world_tools(stream);
+    }
+}
+
+fn model_world_tools(stream: bool) {
+    use adaptive_web_world::pages::{Pages as WorldPages, Seed as WorldSeed};
+    use fictionet::stdlib::web::{Body, httpd};
+    use fictionet_extras::models::{Credential, Model, Provider, Secret};
+    use http_body_util::BodyExt;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = "https://www.halvardsystems.com/security/advisories/HSA-2026-014";
+    let words = "Halvard Gateway HG-400 CVE-2026-41877 security advisory";
+    let server = std::thread::spawn(move || {
+        for content in [
+            json!([{"type":"tool_use","id":"toolu_search","name":"web_search","input":{"query":words}}]),
+            json!([{"type":"tool_use","id":"toolu_fetch","name":"web_fetch","input":{"url":url}}]),
+            json!([{"type":"text","text":"Done."}]),
+        ] {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let size: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; size];
+            socket.read_exact(&mut body).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(request["tools"][0].get("type").is_none());
+            let stop = if content[0]["type"] == "text" {
+                "end_turn"
+            } else {
+                "tool_use"
+            };
+            let body = json!({"type":"message","id":"msg_page","role":"assistant","model":"claude","content":content,"stop_reason":stop,"usage":{"input_tokens":7,"output_tokens":2}}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let state = Arc::new(Searches::from_seed(
+        &WorldSeed::builtin("halvard-cve").unwrap(),
+    ));
+    let observed = state.clone();
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(8)).observer(state),
+        move |cx| async move {
+            let pages = Arc::new(WorldPages::new(WorldSeed::builtin("halvard-cve").unwrap()));
+            let credential = Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "sk-ant-api03-private".into())?);
+            let key = credential.placeholder().to_owned();
+            let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.search(pages);
+            let body = json!({"model":"claude","stream":stream,"max_tokens":1000,"messages":[{"role":"user","content":format!("Search for {words}, then read {url}")}],"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":8},{"type":"web_fetch_20250910","name":"web_fetch","max_uses":8}]});
+            let request = http::Request::post("/v1/messages").header("x-api-key", key).body(Body::from(body.to_string()))?;
+            let conn = ConnInfo::default();
+            let mut exchange = httpd::Exchange::new(cx.now(), &cx, &conn);
+            let httpd::Reply::Later(work) = httpd::Handler::call(&model, request, &mut exchange) else { panic!("expected deferred model reply") };
+            let response = work(cx.clone()).await?;
+            assert_eq!(response.status(), 200);
+            response.into_body().collect().await?;
+            let snapshot = observed.snapshot();
+            assert_eq!(snapshot.queries.len(), 1, "{snapshot:?}");
+            let query = &snapshot.queries[0];
+            assert_eq!(serde_json::to_value(query).unwrap()["via"], "web_search");
+            assert_eq!(query.search, words);
+            assert_eq!(query.engine, Engine::Google);
+            assert_eq!(query.outcome, Outcome::Served);
+            assert!(query.results.unwrap() > 0);
+            assert!(!snapshot.results[0].listed.is_empty());
+            assert_eq!(snapshot.results[0].query_id, query.id);
+            assert!(snapshot.results[0].listed.iter().any(|result| result.url == url));
+            assert_eq!(query.carries, Some(0));
+            assert_eq!(snapshot.pages[0].url, url);
+            assert!(!snapshot.pages[0].making);
+            assert_eq!(snapshot.pages[0].carries, Some(0));
+            assert_eq!(serde_json::to_value(&snapshot.pages[0]).unwrap()["via"], "web_fetch");
+            Ok(())
+        },
+    )).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn pages_being_made_finish_with_the_latest_tool_and_reach() {
+    let s = searches();
+    let making = || {
+        Event::new("adaptive", "making")
+            .field("url", "https://a.com/a")
+            .field("host", "a.com")
+    };
+    feed(&s, 1, making());
+    let pending = s.snapshot().pages[0].clone();
+    assert!(pending.making);
+    assert_eq!(pending.status, None);
+    assert_eq!(pending.carries, None);
+    assert_eq!(pending.fetches, 0);
+    feed(
+        &s,
+        2,
+        page("/a", "generated", "stub", json!({"via":"direct"}))
+            .field("via", "web_fetch")
+            .field("carries", 1u64),
+    );
+    let first = s.snapshot().pages[0].clone();
+    assert!(!first.making);
+    assert_eq!(first.via.as_deref(), Some("web_fetch"));
+    assert_eq!(first.carries, Some(1));
+    assert_eq!(first.status, Some(200));
+    assert_eq!(first.fetches, 1);
+    assert_eq!(first.made, Made::Stubbed);
+    feed(
+        &s,
+        3,
+        page("/a", "cached", "stub", json!(null)).field("carries", 0u64),
+    );
+    let repeated = s.snapshot().pages[0].clone();
+    assert_eq!(repeated.via, None);
+    assert_eq!(repeated.carries, Some(0));
+    assert_eq!(repeated.fetches, 2);
+    feed(&s, 4, making());
+    assert!(s.snapshot().pages[0].making);
+    feed(
+        &s,
+        5,
+        page("/a", "budget", "", json!(null))
+            .field("status", 503u64)
+            .field("carries", 0u64),
+    );
+    let failed = s.snapshot().pages[0].clone();
+    assert!(!failed.making);
+    assert_eq!(failed.status, Some(503));
+    assert_eq!(failed.made, Made::Stubbed);
+    assert_eq!(failed.fetches, 3);
+    feed(&s, 6, making());
+    feed(
+        &s,
+        7,
+        Event::new("adaptive", "page_failed")
+            .field("url", "https://a.com/a")
+            .field("status", 500u64),
+    );
+    assert!(!s.snapshot().pages[0].making);
+    assert_eq!(s.snapshot().pages[0].status, Some(500));
+    feed(&s, 8, query(1, "google", "halvard"));
+    assert_eq!(s.snapshot().queries[0].carries, None);
+    feed(&s, 9, answer(1, true).field("carries", 1u64));
+    assert_eq!(s.snapshot().queries[0].carries, Some(1));
+    for i in 0..MAX_PAGES {
+        feed(
+            &s,
+            10 + i as u64,
+            Event::new("adaptive", "making")
+                .field("url", format!("https://a.com/{i}"))
+                .field("host", "a.com"),
+        );
+    }
+    assert_eq!(s.snapshot().pages.len(), MAX_PAGES);
+    assert_eq!(s.snapshot().omitted.pages, 1);
+}
+
+#[test]
+fn making_events_precede_page_work_and_failed_fetches_finish_the_row() {
+    use fictionet_extras::models::Engine as _;
+    use std::sync::{Arc, Mutex};
+    struct Pending {
+        searches: Arc<Searches>,
+        pages: Mutex<Vec<Page>>,
+    }
+    impl Observer for Pending {
+        fn enabled(&self, interest: Interest<'_>) -> bool {
+            matches!(
+                interest,
+                Interest::Event(
+                    Metadata {
+                        source: "adaptive",
+                        kind: "making"
+                    },
+                    _
+                )
+            )
+        }
+        fn observe(&self, _: Stamp, _: Observation<'_>) {
+            self.pages
+                .lock()
+                .unwrap()
+                .push(self.searches.snapshot().pages.last().unwrap().clone());
+        }
+    }
+    let pages = Arc::new(Pages::new(Seed::builtin("halvard-cve").unwrap()));
+    let searches = Arc::new(Searches::of(&pages));
+    let pending = Arc::new(Pending {
+        searches: searches.clone(),
+        pages: Mutex::new(Vec::new()),
+    });
+    let seen = pending.clone();
+    let observer = Arc::new(fictionet::events::Fanout::new(vec![
+        searches.clone(),
+        pending,
+    ]));
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(9)).observer(observer),
+        move |cx| async move {
+            let url = "http://news.example-wire.com/halvard-update";
+            pages.clone().fetch(cx.clone(), url.into()).await?;
+            let snapshot = searches.snapshot();
+            assert_eq!(snapshot.pages.len(), 1);
+            assert_eq!(snapshot.pages[0].url, url);
+            assert!(!snapshot.pages[0].making);
+            assert_eq!(snapshot.pages[0].status, Some(200));
+            for i in 0..adaptive_web_world::pages::GENERATION_BUDGET {
+                let _ = pages
+                    .clone()
+                    .fetch(
+                        cx.clone(),
+                        format!("https://news.example-wire.com/page-{i}"),
+                    )
+                    .await;
+            }
+            let failed = pages
+                .clone()
+                .fetch(cx, "https://news.example-wire.com/last".into())
+                .await;
+            assert!(failed.is_err());
+            let snapshot = searches.snapshot();
+            let last = snapshot.pages.last().unwrap();
+            assert!(!last.making);
+            assert_eq!(last.status, Some(503));
+            assert_eq!(last.via.as_deref(), Some("web_fetch"));
+            assert_eq!(last.carries, Some(0));
+            Ok(())
+        },
+    ))
+    .unwrap();
+    let pending = seen.pages.lock().unwrap();
+    assert!(!pending.is_empty());
+    assert!(
+        pending
+            .iter()
+            .all(|p| p.making && p.status.is_none() && p.carries.is_none() && p.fetches == 0)
+    );
 }
