@@ -45,6 +45,9 @@ export function conversationRows(rows) {
         const path = request[3].split('?')[0];
         const icon = /^\/(?:favicon\.(?:ico|png|svg)|s2\/favicons|th|ip3\/[^/]+\.ico)$/i.test(path);
         const asset = icon || /\.(?:css|js|mjs|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2|ttf|map)$/i.test(path) || /^\/(?:_assets|static|assets|images)\//.test(path);
+        if (!asset) for (const other of connections.values()) {
+          if (other.run && addressOf(other.run.row.dst) === addressOf(p.dst)) other.run = null;
+        }
         const route = `${p.src}|${request[2]}`;
         let run = connection.run;
         if (asset && run?.route === route) {
@@ -193,6 +196,11 @@ export function createLanes(root, { name, local, addressFor, animate }) {
     });
     const distance = before - lane.node.getBoundingClientRect().top;
     if (motion && (distance || lane.items.length === 0)) animate(lane.node, `translateY(${distance || 8}px)`, 240);
+    if (!p.summary && p.proto.startsWith('HTTP') && frames(p).some((frame) => /^(?:HEADERS\[\d+\]: )?[A-Z]+ \//.test(frame))) {
+      lane.assets?.clear();
+      const index = lane.items.findIndex((item) => item.asset);
+      if (index >= 0) lane.items.splice(index, 1)[0].node.remove();
+    }
     if (p.summary) {
       lane.assets ||= new Map();
       lane.assets.set(p.key, p.count);

@@ -573,6 +573,52 @@ function pageTraffic(proto) {
 }
 
 for (const proto of ['HTTP/2', 'HTTP']) {
+  test(`${proto} lane assets count each page load separately`, (t) => {
+    const h = setup(t);
+    const rows = pageTraffic(proto);
+    const chips = () => h.root.querySelector('.packet-lane').querySelectorAll('.packet-chip');
+    h.send(rows.slice(0, 9));
+    assert.equal(chips().at(-1).textContent, '+2 assets');
+    const document = { ...rows[0], seq: 6000, t: 600, info: proto === 'HTTP/2'
+      ? 'Magic, SETTINGS, WINDOW_UPDATE[0] +12517377, HEADERS[51]: GET /article (www.google.com)'
+      : 'GET /article HTTP/1.1' };
+    h.send([document]);
+    assert.equal(chips().some((chip) => /assets?$/.test(chip.textContent)), false);
+    h.send(rows.slice(9, 18).map((p, i) => ({ ...p, seq: 6001 + i, t: 601 + i })));
+    assert.equal(chips().at(-1).textContent, '+3 assets');
+    assert.ok(chips().some((chip) => chip.textContent === 'GET /search?q=network'));
+    assert.ok(chips().some((chip) => chip.textContent === 'GET /article'));
+    h.services.packetFilter.set('every');
+    h.services.packetFilter.set('conversations');
+    assert.equal(chips().at(-1).textContent, '+3 assets');
+  });
+
+  test(`${proto} assets before a document count until that page load starts`, (t) => {
+    const h = setup(t);
+    const rows = pageTraffic(proto);
+    const chips = () => h.root.querySelector('.packet-lane').querySelectorAll('.packet-chip');
+    h.send(rows.slice(3, 9));
+    assert.equal(chips().at(-1).textContent, '+2 assets');
+    h.send(rows.slice(0, 3).map((p, i) => ({ ...p, seq: 6000 + i, t: 600 + i })));
+    assert.equal(chips().some((chip) => /assets?$/.test(chip.textContent)), false);
+    h.send(rows.slice(9, 12).map((p, i) => ({ ...p, seq: 6003 + i, t: 603 + i })));
+    assert.equal(chips().at(-1).textContent, '+1 asset');
+  });
+
+  test(`${proto} asset groups on another connection count only their growth after a document`, (t) => {
+    const h = setup(t);
+    const rows = pageTraffic(proto);
+    h.send(rows.slice(0, 9));
+    const document = { ...rows[0], src: '10.0.0.2:50000', seq: 6000, t: 600 };
+    h.send([document]);
+    h.send(rows.slice(9, 12).map((p, i) => ({ ...p, seq: 6001 + i, t: 601 + i })));
+    assert.equal(h.root.querySelectorAll('.packet-lane').length, 1);
+    assert.equal(h.root.querySelectorAll('.packet-chip').at(-1).textContent, '+1 asset');
+    h.services.packetFilter.set('every');
+    h.services.packetFilter.set('conversations');
+    assert.equal(h.root.querySelectorAll('.packet-chip').at(-1).textContent, '+1 asset');
+  });
+
   test(`${proto} page assets grow in one row and chip while document rows and every packet remain`, (t) => {
     const h = setup(t, { motion: true });
     const rows = pageTraffic(proto);
@@ -671,6 +717,8 @@ test('different asset runs share a trailing count and document chips survive the
   h.send(rows.slice(0, 6));
   h.send([{ ...rows[0], seq: 6000, t: 600, info: 'HEADERS[51]: GET /article (www.google.com)' }]);
   h.send(rows.slice(6).map((p, i) => ({ ...p, seq: 6001 + i, t: 601 + i })));
+  assert.equal(h.root.querySelectorAll('.packet-chip').at(-1).textContent, '+11 assets');
+  h.send([{ ...rows[3], seq: 6100, t: 650, info: 'HEADERS[53]: GET /assets/article.css (www.google.com)' }]);
   h.send(Array.from({ length: 20 }, (_, i) => ({ ...packets[2], seq: 7000 + i, t: 700 + i })));
   const chips = h.root.querySelector('.packet-lane').querySelectorAll('.packet-chip');
   assert.equal(chips.length, 11);
