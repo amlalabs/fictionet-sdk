@@ -2510,7 +2510,17 @@ fn prepared_lists_answer_every_engine_as_written() {
         {
             let mut expected = list.search.clone();
             make::finish_listing(&list.query, &mut expected);
-            let stored: Vec<_> = expected.results.iter().map(|r| r.url.clone()).collect();
+            let mut stored = Vec::new();
+            for row in &expected.results {
+                let response = get(&pages, &cx, &row.url).await;
+                if let Meta::Redirect { location } = response.meta {
+                    assert_eq!(response.status, 301);
+                    assert_eq!(get(&pages, &cx, &location).await.status, 200);
+                    stored.push(location);
+                } else {
+                    stored.push(row.url.clone());
+                }
+            }
             for (host, path) in [
                 ("www.bing.com", "/search?q="),
                 ("html.duckduckgo.com", "/html/?q="),
@@ -6276,6 +6286,8 @@ fn language_hosts_share_prepared_articles_without_making_pages() {
         .await;
         for host in ["en.wikipedia.org", "fr.wikipedia.org", "wikipedia.org"] {
             let response = get(&pages, &cx, &format!("https://{host}/wiki/Halvard_Systems")).await;
+            assert_eq!(response.status, 200);
+            assert!(!response.headers.iter().any(|(name, _)| name == "Location"));
             assert_eq!(response.logged()["cache"], "cached");
             assert_eq!(response.logged()["title"], www.logged()["title"]);
             assert_eq!(response.body, www.body);
@@ -6292,6 +6304,8 @@ fn language_hosts_share_prepared_articles_without_making_pages() {
             "https://en.wikipedia.org/wiki/Virtual_private_network",
         )
         .await;
+        assert_eq!(www_vpn.status, 200);
+        assert_eq!(en_vpn.status, 200);
         assert_eq!(www_vpn.body, en_vpn.body);
         assert_eq!(pages.store().made, made);
         let html = render::normalize_page(
@@ -6933,12 +6947,265 @@ fn site_bylines_keep_the_page_brand_across_host_aliases() {
         pages.store().insert_page(record).unwrap();
         for host in ["www.theregister.com", "theregister.com"] {
             let response = get(&pages, &cx, &format!("https://{host}{target}")).await;
+            assert!(!response.headers.iter().any(|(name, _)| name == "Location"));
             assert_eq!(response.status, 200);
             assert!(
                 String::from_utf8(response.body)
                     .unwrap()
                     .contains("By The Register")
             );
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn written_advisory_links_and_fetches_use_the_corrected_canonical_page() {
+    use fictionet_extras::models::Engine as Tools;
+    use kuchiki::traits::TendrilSink;
+    lab(|cx| async move {
+        let canonical = "https://www.halvardsystems.com/security/advisories/HSA-2026-014";
+        let variant = canonical.to_lowercase();
+        let fake = Fake::script(vec![
+            completion(
+                5,
+                &format!(
+                    "RESULT\nURL: {variant}\nTITLE: Security Advisory HSA-2026-014 - Halvard Systems\nSNIPPET: Halvard Gateway HG-400 CVE-2026-41877 advisory: upgrade to 7.2.4."
+                ),
+                None,
+            ),
+            completion(5, "body { color: #234; }", None),
+        ]);
+        let dir = Dir::new("canonical-advisory");
+        let pages = on_disk(
+            &dir.0,
+            seed(),
+            Some(Maker::Model(openrouter(fake.clone()))),
+            5,
+        )
+        .unwrap();
+        no_cast(&pages);
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let found = Tools::search(
+            pages.clone(),
+            cx.clone(),
+            "Halvard Gateway HG-400 CVE-2026-41877 advisory".into(),
+        )
+        .await?;
+        let row = found.iter().find(|r| r.url == canonical).unwrap();
+        assert_eq!(
+            row.title,
+            pages
+                .seed
+                .fixed_for(
+                    "www.halvardsystems.com",
+                    "/security/advisories/HSA-2026-014"
+                )
+                .unwrap()
+                .title
+        );
+        assert!(row.snippet.contains("7.2.5"));
+        let redirect = get(&pages, &cx, &variant).await;
+        assert_eq!(redirect.status, 301);
+        assert!(
+            redirect
+                .headers
+                .contains(&("Location".into(), canonical.into()))
+        );
+        let followed = get(&pages, &cx, canonical).await;
+        assert_eq!(followed.status, 200);
+        assert_eq!(followed.logged()["carries"], 1);
+        let fetched = Tools::fetch(pages.clone(), cx.clone(), variant).await?;
+        assert_eq!(fetched.body, followed.body);
+        let audit = example_common::guest_content::Audit::default();
+        audit.inspect("advisory", &fetched.body);
+        audit.inspect("redirect", &redirect.body);
+        audit.check().unwrap();
+        let dom = kuchiki::parse_html().one(String::from_utf8(fetched.body).unwrap());
+        let visible = dom.text_contents();
+        assert!(visible.contains("7 Oct 2026 (revision 4)"));
+        assert!(visible.contains("Upgrade to firmware 7.2.5"));
+        assert!(!visible.contains("7.2.4"));
+        assert_eq!(fake.requests.lock().unwrap().len(), 2);
+        assert!(fake.users()[1].contains("stylesheet"));
+        assert!(
+            !pages
+                .store()
+                .pages()
+                .any(|p| p.url == canonical.to_lowercase())
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn known_page_variants_redirect_but_distinct_addresses_do_not() {
+    lab(|cx| async move {
+        let pages = Arc::new(Pages::canned(seed(), &store::canned_root("halvard-cve")).unwrap());
+        let stored = pages
+            .store()
+            .pages()
+            .find(|p| {
+                !p.fixed
+                    && p.target != "/"
+                    && !p.target.contains('?')
+                    && p.target.bytes().any(|b| b.is_ascii_alphabetic())
+            })
+            .unwrap()
+            .clone();
+        for url in [
+            format!("https://{}{}", stored.host, stored.target.to_uppercase()),
+            format!("{}/", stored.url.trim_end_matches('/')),
+        ] {
+            let redirect = get(&pages, &cx, &url).await;
+            assert_eq!(redirect.status, 301, "{url}");
+            assert!(
+                redirect
+                    .headers
+                    .contains(&("Location".into(), stored.url.clone()))
+            );
+            let followed = get(&pages, &cx, &stored.url).await;
+            assert_eq!(followed.status, stored.status);
+        }
+        let fixed = pages.seed.fixed[0].clone();
+        for url in [
+            format!("{}/", fixed.url),
+            format!("{}/", fixed.url.replace("www.", "")),
+            format!("{}/", fixed.url.replace("www.", "en.")),
+            fixed.url.replace("www.", "en.").to_lowercase(),
+        ] {
+            let redirect = get(&pages, &cx, &url).await;
+            assert_eq!(redirect.status, 301, "{url}");
+            assert!(
+                redirect
+                    .headers
+                    .contains(&("Location".into(), fixed.url.clone()))
+            );
+            assert_eq!(get(&pages, &cx, &fixed.url).await.status, 200);
+        }
+        for url in [
+            "https://www.halvardsystems.com/security/advisories/HSA-2026-015",
+            "https://www.halvardsystems.com/security/advisories/HSA-2026-014?revision=2",
+        ] {
+            assert_ne!(get(&pages, &cx, url).await.status, 301);
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn written_stored_page_variants_keep_the_page_address_and_title() {
+    lab(|cx| async move {
+        let fake = Fake::script(vec![]);
+        let prepared = live_world(fake);
+        let stored = prepared
+            .store()
+            .pages()
+            .find(|p| {
+                !p.fixed
+                    && p.target != "/"
+                    && !p.target.contains('?')
+                    && p.target.bytes().any(|b| b.is_ascii_alphabetic())
+            })
+            .unwrap()
+            .clone();
+        let variant = format!("https://{}{}/", stored.host, stored.target.to_uppercase());
+        let fake = Fake::script(vec![completion(
+            5,
+            &format!(
+                "RESULT\nURL: {variant}\nTITLE: Canonical address lookup\nSNIPPET: Canonical address lookup for this page."
+            ),
+            None,
+        )]);
+        let pages = live_world(fake.clone());
+        no_cast(&pages);
+        let response = google(&pages, &cx, "canonical address lookup").await;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            results(&response.body),
+            vec![(stored.url.clone(), stored.title.clone())]
+        );
+        let record = pages
+            .store()
+            .search("canonical address lookup")
+            .unwrap()
+            .clone();
+        assert_eq!(record.search.results[0].url, stored.url);
+        assert_eq!(record.search.results[0].title, stored.title);
+        assert_eq!(get(&pages, &cx, &variant).await.status, 301);
+        assert_eq!(fake.requests.lock().unwrap().len(), 1);
+        let audit = example_common::guest_content::Audit::default();
+        audit.inspect("search", &response.body);
+        audit.check().unwrap();
+        Ok(())
+    });
+}
+
+#[test]
+fn written_wikipedia_links_keep_exact_paths_on_host_aliases() {
+    use fictionet_extras::models::Engine as Tools;
+    lab(|cx| async move {
+        let canonical = "https://www.wikipedia.org/wiki/Halvard_Systems";
+        for host in ["en.wikipedia.org", "fr.wikipedia.org", "wikipedia.org"] {
+            for path in [
+                "/wiki/Halvard_Systems",
+                "/wiki/halvard_systems",
+                "/wiki/Halvard_Systems/",
+            ] {
+                let address = format!("https://{host}{path}");
+                let exact = path == "/wiki/Halvard_Systems";
+                let expected = if exact { address.as_str() } else { canonical };
+                let fake = Fake::script(vec![completion(
+                    5,
+                    &format!(
+                        "RESULT\nURL: {address}\nTITLE: Halvard Systems encyclopedia\nSNIPPET: Halvard Systems encyclopedia article."
+                    ),
+                    None,
+                )]);
+                let pages = live_world(fake.clone());
+                no_cast(&pages);
+                let original = get(&pages, &cx, canonical).await;
+                let title = original.logged()["title"].as_str().unwrap().to_owned();
+                for _ in 0..2 {
+                    let response = google(&pages, &cx, "Halvard Systems encyclopedia").await;
+                    assert_eq!(response.status, 200);
+                    assert_eq!(
+                        results(&response.body),
+                        vec![(expected.to_owned(), title.clone())]
+                    );
+                }
+                let record = pages
+                    .store()
+                    .search("halvard systems encyclopedia")
+                    .unwrap()
+                    .clone();
+                assert_eq!(record.search.results[0].url, expected);
+                assert_eq!(record.search.results[0].title, title);
+                let response = get(&pages, &cx, &address).await;
+                if exact {
+                    assert_eq!(response.status, 200);
+                    assert!(!response.headers.iter().any(|(name, _)| name == "Location"));
+                    assert_eq!(response.body, original.body);
+                } else {
+                    assert_eq!(response.status, 301);
+                    assert!(
+                        response
+                            .headers
+                            .contains(&("Location".into(), canonical.into()))
+                    );
+                }
+                let fetched = Tools::fetch(pages.clone(), cx.clone(), address).await?;
+                assert_eq!(fetched.body, original.body);
+                assert_eq!(fake.requests.lock().unwrap().len(), 1);
+            }
         }
         Ok(())
     });

@@ -1068,7 +1068,18 @@ impl Pages {
         }
         let started = cx.now().since_start();
         let search = matches!(route, Route::Search { .. });
-        let mut response = self.answer(cx, &host.to_lowercase(), target, route).await;
+        let host_lower = host.to_lowercase();
+        let route = if matches!(method, "GET" | "HEAD") && route == Route::Page {
+            self.canonical_page(&host_lower, target)
+                .filter(|(url, _)| text::target_of(url).1 != target)
+                .map_or(route, |(location, _)| Route::Redirect {
+                    location,
+                    status: 301,
+                })
+        } else {
+            route
+        };
+        let mut response = self.answer(cx, &host_lower, target, route).await;
         if response.content_type.starts_with("text/html") {
             let body = String::from_utf8_lossy(&response.body);
             let title = match &response.meta {
@@ -1225,6 +1236,27 @@ impl Pages {
         response.carries += reached.len() as u64;
         response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
         response
+    }
+
+    fn canonical_page(&self, host: &str, target: &str) -> Option<(String, String)> {
+        let matches = |other_host: &str, other_target: &str| {
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let (other_path, other_query) =
+                other_target.split_once('?').unwrap_or((other_target, ""));
+            store::site_key(host) == store::site_key(other_host)
+                && path
+                    .trim_end_matches('/')
+                    .eq_ignore_ascii_case(other_path.trim_end_matches('/'))
+                && query == other_query
+        };
+        if let Some(page) = self.seed.fixed.iter().find(|p| matches(&p.host, &p.target)) {
+            return Some((page.url.clone(), page.title.clone()));
+        }
+        let store = self.store();
+        store
+            .pages()
+            .find(|p| matches(&p.host, &p.target))
+            .map(|p| (p.url.clone(), p.title.clone()))
     }
 
     async fn answer(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, route: Route) -> Response {
@@ -1669,6 +1701,16 @@ impl Pages {
                 }
             }
         }
+        for result in &mut search.results {
+            let (host, target) = text::target_of(&result.url);
+            if let Some((url, title)) = self
+                .canonical_page(&host, &target)
+                .filter(|(url, _)| text::target_of(url).1 != target)
+            {
+                result.url = url;
+                result.title = title;
+            }
+        }
         make::finish_listing(query, &mut search);
         let mut reached = HashSet::new();
         for result in &mut search.results {
@@ -1744,6 +1786,14 @@ impl Pages {
         let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
             let (host, target) = text::target_of(&r.url);
+            if let Some((url, title)) = self
+                .canonical_page(&host, &target)
+                .filter(|(url, _)| text::target_of(url).1 != target)
+            {
+                r.url = url;
+                r.title = title;
+            }
+            let (host, target) = text::target_of(&r.url);
             let known_match = known.iter().find(|k| k.url == r.url);
             // A page the world already holds stays out of an unrelated list.
             // A model that lists it for this search with a row sharing the
@@ -1813,6 +1863,9 @@ impl Pages {
         }
         for r in record.search.results.iter().take(self.prefetch) {
             let (host, target) = text::target_of(&r.url);
+            if self.canonical_page(&host, &target).is_some() {
+                continue;
+            }
             let pages = self.clone();
             cx.spawn(move |cx| async move {
                 let started = cx.now().since_start();
@@ -2573,26 +2626,41 @@ impl fictionet_extras::models::Engine for Pages {
         url: String,
     ) -> fictionet_extras::models::tools::Answer<fictionet_extras::models::tools::Page> {
         Box::pin(async move {
-            let parsed = url::Url::parse(&url)?;
-            let (host, target) = text::target_of(&url);
-            let response = self.handle(&cx, "GET", &host, &target, None).await;
-            let mut fields = response.fields();
-            fields.set("kind", "page");
-            fields.set("via", "web_fetch");
-            fields.set("method", "GET");
-            fields.set("scheme", parsed.scheme());
-            fields.set("host", host.as_str());
-            fields.set("site", self.site_name(&host));
-            fields.set("path", parsed.path());
-            if let Some(query) = parsed.query() {
-                fields.set("query", query);
-            }
-            fields.set("status", response.status as u64);
-            fields.set("complete", true);
-            cx.emit("http", "request", |e| e.fields(fields));
-            if response.status != 200 {
-                return Err(fictionet::Error::msg("Page is unavailable"));
-            }
+            let mut url = url;
+            let mut redirects = 0;
+            let response = loop {
+                let parsed = url::Url::parse(&url)?;
+                let (host, target) = text::target_of(&url);
+                let response = self.handle(&cx, "GET", &host, &target, None).await;
+                let mut fields = response.fields();
+                if !matches!(response.meta, Meta::Redirect { .. }) {
+                    fields.set("kind", "page");
+                }
+                fields.set("via", "web_fetch");
+                fields.set("method", "GET");
+                fields.set("scheme", parsed.scheme());
+                fields.set("host", host.as_str());
+                fields.set("site", self.site_name(&host));
+                fields.set("path", parsed.path());
+                if let Some(query) = parsed.query() {
+                    fields.set("query", query);
+                }
+                fields.set("status", response.status as u64);
+                fields.set("complete", true);
+                cx.emit("http", "request", |e| e.fields(fields));
+                if let Meta::Redirect { location } = &response.meta {
+                    if redirects >= 10 {
+                        return Err(fictionet::Error::msg("Too many redirects"));
+                    }
+                    url = parsed.join(location)?.into();
+                    redirects += 1;
+                    continue;
+                }
+                if response.status != 200 {
+                    return Err(fictionet::Error::msg("Page is unavailable"));
+                }
+                break response;
+            };
             let title = match response.meta {
                 Meta::Page(p) => p.title,
                 Meta::Fixed { title } => title,
