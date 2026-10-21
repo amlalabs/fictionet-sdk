@@ -8,7 +8,8 @@
 //!   with its title and snippet, before anyone asks for that URL.
 //! - a fixed page from the seed: its bytes and response captured on first
 //!   use, then served from the store even if the source changes.
-//! - a page already in the store: served exactly as stored.
+//! - a page already in the store: reused with world bylines, date styles
+//!   and planted corrections.
 //! - a new page: made from the seed, its mentions (the searches and links
 //!   that led to it) and what the world has already said, then stored. Of
 //!   its first [`LINKS_PER_PAGE`](prompts::LINKS_PER_PAGE) link candidates,
@@ -389,7 +390,7 @@ impl Locks {
 }
 
 fn page_key(host: &str, target: &str) -> String {
-    format!("page {host}{target}")
+    format!("page {}{target}", store::site_key(host))
 }
 
 /// Returns host, target and anchor of the first
@@ -527,7 +528,7 @@ impl Pages {
         let mut pages = Self::canned(seed, root)?;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         pages.maker = Some(Maker::Model(model.live(calls.clone())));
-        pages.prefetch = 3;
+        pages.prefetch = 5;
         pages.live_calls = Some(calls);
         Ok(pages)
     }
@@ -1149,7 +1150,10 @@ impl Pages {
                     if let Some(text) = node.as_text()
                         && !node.ancestors().any(|ancestor| {
                             ancestor.as_element().is_some_and(|e| {
-                                matches!(e.name.local.as_ref(), "script" | "style" | "template")
+                                matches!(
+                                    e.name.local.as_ref(),
+                                    "script" | "style" | "template" | "code" | "pre"
+                                )
                             })
                         })
                     {
@@ -1158,11 +1162,28 @@ impl Pages {
                         *text.borrow_mut() = corrected;
                     }
                 }
-                for meta in dom.select("meta[name=description], meta[property=\"og:title\"], meta[property=\"og:description\"]").unwrap() {
+                for meta in dom.select("meta[name=title], meta[name=description], meta[property=\"og:title\"], meta[property=\"og:description\"], meta[name=\"twitter:title\"], meta[name=\"twitter:description\"]").unwrap() {
                     let mut attributes = meta.attributes.borrow_mut();
                     if let Some(content) = attributes.get_mut("content") {
                         *content = self.corrected(content, &mut reached);
                     }
+                }
+                if matches!(response.meta, Meta::Fixed { .. }) && !reached.is_empty() {
+                    let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
+                    let facts: Vec<_> = planted
+                        .corrections
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| reached.contains(index))
+                        .filter_map(|(_, pair)| {
+                            planted
+                                .facts
+                                .iter()
+                                .find(|f| correction(f).as_ref() == Some(pair))
+                        })
+                        .cloned()
+                        .collect();
+                    render::revise(&dom, &self.seed.date, &facts);
                 }
                 Some(dom.to_string())
             } else if response.content_type.starts_with("text/plain") {
@@ -1172,6 +1193,33 @@ impl Pages {
             };
             if let Some(corrected) = corrected {
                 response.body = corrected.into_bytes();
+            }
+        }
+        if !search
+            && response.content_type.starts_with("text/html")
+            && let Ok(body) = std::str::from_utf8(&response.body)
+        {
+            let store = self.store();
+            let url = format!("https://{}{target}", store::site_key(host));
+            let page_host = store
+                .page(host, target)
+                .map_or(host, |page| page.host.as_str());
+            let profile = store
+                .site(page_host)
+                .cloned()
+                .unwrap_or_else(|| make::site_profile(page_host));
+            if let Some(body) = render::normalize_page(
+                body,
+                &url,
+                &profile.name,
+                store.cast().map_or(&[], |cast| cast.people.as_slice()),
+                (make::site_profile(host).kind == "wiki").then(|| {
+                    store
+                        .page(host, target)
+                        .map_or(self.seed.date.as_str(), |p| p.date.as_str())
+                }),
+            ) {
+                response.body = body.into_bytes();
             }
         }
         response.carries += reached.len() as u64;
@@ -1637,6 +1685,10 @@ impl Pages {
             result.title = self.corrected(&result.title, &mut reached);
             result.snippet = self.corrected(&result.snippet, &mut reached);
         }
+        for ad in &mut search.ads {
+            ad.title = self.corrected(&ad.title, &mut reached);
+            ad.text = self.corrected(&ad.text, &mut reached);
+        }
         Ok((search, cache, record.map(|r| r.usage), reached.len() as u64))
     }
 
@@ -1677,7 +1729,7 @@ impl Pages {
                                 .map(|p| (&p.url, String::from_utf8_lossy(&p.body).into_owned())),
                         )
                     } else {
-                        make::search(&self.seed, query, &known, Engine::Google)
+                        make::search(&seed, query, &known, Engine::Google)
                     }
                 },
                 || {
@@ -1988,7 +2040,7 @@ impl Pages {
         };
         if record.content_type.starts_with("text/html")
             && let Some(html) = render::again(
-                host,
+                &record.host,
                 target,
                 &record.title,
                 &String::from_utf8_lossy(&record.body),
@@ -2004,7 +2056,10 @@ impl Pages {
         }
         if !prefetch
             && record.prefetched
-            && self.store().unserved.remove(&(host.into(), target.into()))
+            && self
+                .store()
+                .unserved
+                .remove(&(store::site_key(&record.host).into(), record.target.clone()))
         {
             cache = Cache::Prefetched;
         }
@@ -2290,7 +2345,9 @@ impl Pages {
         let mut store = self.store();
         store.insert_page(record.clone()).map_err(Stop::store)?;
         if prefetch {
-            store.unserved.insert((host.into(), target.into()));
+            store
+                .unserved
+                .insert((store::site_key(host).into(), target.into()));
         }
         Ok(record)
     }

@@ -5568,26 +5568,30 @@ fn live_world_serves_prepared_answers_without_calls_and_keeps_disk_unchanged() {
     let fake = Fake::script(vec![]);
     let pages = live_world(fake.clone());
     let before = std::fs::read(store::canned_root("halvard-cve").join("world.jsonl")).unwrap();
-    // A Google list whose every result is stored, so nothing is made or
-    // prefetched; the store keeps lists in no particular order.
-    let (query, url) = {
-        let store = pages.store();
-        let mut lists: Vec<_> = store
-            .searches()
-            .filter(|l| l.key == crate::route::query_key(&l.query, 0))
-            .filter(|l| {
-                l.search.results.iter().all(|r| {
-                    let (host, target) = text::target_of(&r.url);
-                    store.page(&host, &target).is_some()
-                })
-            })
-            .collect();
-        lists.sort_by(|a, b| a.key.cmp(&b.key));
-        let query = lists.first().expect("a fully stored list").query.clone();
-        (query, store.pages().next().unwrap().url.clone())
-    };
+    let queries: Vec<_> = pages
+        .store()
+        .searches()
+        .map(|record| (record.query.clone(), record.key.starts_with("youtube ")))
+        .collect();
+    let url = pages.store().pages().next().unwrap().url.clone();
     lab(move |cx| async move {
-        assert_eq!(google(&pages, &cx, &query).await.status, 200);
+        for (query, youtube) in queries {
+            let response = if youtube {
+                get(
+                    &pages,
+                    &cx,
+                    &format!(
+                        "https://www.youtube.com/results?search_query={}",
+                        text::quote_plus(&query)
+                    ),
+                )
+                .await
+            } else {
+                google(&pages, &cx, &query).await
+            };
+            assert_eq!(response.status, 200, "{query}");
+            assert!(fake.users().is_empty(), "{query}");
+        }
         assert_eq!(get(&pages, &cx, &url).await.status, 200);
         assert!(fake.users().is_empty());
         assert_eq!(pages.live_calls.as_ref().unwrap().load(Ordering::SeqCst), 0);
@@ -5707,7 +5711,7 @@ fn live_model_cap_survives_store_switches_and_restart() {
 }
 
 #[test]
-fn live_search_prefetches_three_pages_and_counts_the_calls() {
+fn live_search_prefetches_five_pages_and_counts_the_calls() {
     let fake = fake_openrouter(Arc::default());
     let pages = live_world(fake.clone());
     let searches = Arc::new(crate::search::Searches::of(&pages));
@@ -5719,17 +5723,17 @@ fn live_search_prefetches_three_pages_and_counts_the_calls() {
             assert_eq!(response.logged()["model"], "requested/model");
             assert_eq!(response.logged()["cost"], 0.0021);
             cx.sleep(ms(1000)).await?;
-            for (url, _) in results(&response.body).into_iter().take(3) {
+            for (url, _) in results(&response.body).into_iter().take(5) {
                 let page = get(&pages, &cx, &url).await;
                 assert_eq!(page.logged()["cache"], "prefetched");
                 assert_eq!(page.logged()["model"], "requested/model");
                 assert_eq!(page.logged()["cost"], 0.0021);
             }
-            assert_eq!(fake.users().len(), 4);
-            assert_eq!(pages.live_calls.as_ref().unwrap().load(Ordering::SeqCst), 4);
+            assert_eq!(fake.users().len(), 6);
+            assert_eq!(pages.live_calls.as_ref().unwrap().load(Ordering::SeqCst), 6);
             let snapshot = state.snapshot();
-            assert_eq!(snapshot.generator.model_calls, 4);
-            assert!((snapshot.generator.model_cost_known.as_f64().unwrap() - 0.0084).abs() < 1e-9);
+            assert_eq!(snapshot.generator.model_calls, 6);
+            assert!((snapshot.generator.model_cost_known.as_f64().unwrap() - 0.0126).abs() < 1e-9);
             Ok(())
         },
     ))
@@ -6034,4 +6038,908 @@ fn prefetch_completion_removes_only_background_placeholders() {
             }
         }
     }
+}
+
+fn byline_names(dom: &kuchiki::NodeRef) -> Vec<String> {
+    let label =
+        regex::Regex::new(r"(?i)^(?:(?:posted|written|answered)\s+by|by|author:)\s+").unwrap();
+    let end = regex::Regex::new(
+        r"(?i)\s*[·|•\n,(]|\s+[-–—]\s+|\s+(?:published|updated|on\s+\d+|\d{4}-\d{2}-\d{2})\b",
+    )
+    .unwrap();
+    let mut names = Vec::new();
+    for node in dom.descendants() {
+        let Some(element) = node.as_element() else {
+            continue;
+        };
+        let attributes = element.attributes.borrow();
+        if element.name.local.as_ref() == "meta" {
+            if ["name", "property", "itemprop"].iter().any(|key| {
+                attributes
+                    .get(*key)
+                    .is_some_and(|value| value.ends_with("author") || value.ends_with("creator"))
+            }) && let Some(content) = attributes.get("content")
+            {
+                names.push(content.to_owned());
+            }
+            continue;
+        }
+        if node.ancestors().any(|ancestor| {
+            ancestor.as_element().is_some_and(|element| {
+                matches!(
+                    element.name.local.as_ref(),
+                    "blockquote" | "q" | "pre" | "code" | "script" | "style" | "template"
+                )
+            })
+        }) {
+            continue;
+        }
+        let text = node.text_contents();
+        let text = text.trim();
+        let dedicated = attributes
+            .get("class")
+            .unwrap_or("")
+            .split_whitespace()
+            .any(|class| class.contains("author") || class.contains("byline"));
+        let labeled = label.find(text);
+        if dedicated || labeled.is_some() {
+            let tail = &text[labeled.map_or(0, |label| label.end())..];
+            let name = tail[..end.find(tail).map_or(tail.len(), |m| m.start())].trim();
+            if !name.is_empty() {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+#[test]
+fn the_world_assigns_every_article_author_and_keeps_quoted_people() {
+    use kuchiki::traits::TendrilSink;
+    lab(|cx| async move {
+        let pages = Arc::new(Pages::canned(seed(), &store::canned_root("halvard-cve")).unwrap());
+        let stored: Vec<_> = pages.store().pages().map(|p| p.url.clone()).collect();
+        for url in stored
+            .into_iter()
+            .chain((0..48).map(|n| format!("https://news.example-wire.com/articles/halvard-{n}")))
+        {
+            let response = get(&pages, &cx, &url).await;
+            if !response.content_type.starts_with("text/html") {
+                continue;
+            }
+            let html = String::from_utf8(response.body).unwrap();
+            let (host, _) = text::target_of(&url);
+            let store = pages.store();
+            let site = store
+                .site(&host)
+                .cloned()
+                .unwrap_or_else(|| make::site_profile(&host));
+            let cast = &store.cast().unwrap().people;
+            let dom = kuchiki::parse_html().one(html.clone());
+            for name in byline_names(&dom) {
+                if render::person_name(&name, &site.name) {
+                    assert!(render::invented_name(&name, cast), "{url}: {name}");
+                }
+            }
+            if host == "www.bleepingcomputer.com" || host == "www.theregister.com" {
+                assert!(
+                    !html.contains("By Lawrence Abrams")
+                        && !html.contains("By Thomas Fox-Brewster")
+                );
+                for node in dom.select(".byline, .author").unwrap() {
+                    assert!(!node.text_contents().contains("Lawrence Abrams"));
+                    assert!(!node.text_contents().contains("Thomas Fox-Brewster"));
+                }
+            }
+        }
+        let url = "https://news.example-wire.com/one";
+        for label in ["By", "Posted by", "Written by", "Author:"] {
+            let html = format!(
+                "<article><h1>News</h1><p>{label} <a href='/people/editor'>Lawrence Abrams</a> · <time datetime='2026-09-23'>2026-09-23</time></p><blockquote><p>Lawrence Abrams said, ‘Keep the quote.’</p></blockquote><p>Thomas Fox-Brewster reported the news.</p></article><meta name='author' content='Thomas Fox-Brewster'>"
+            );
+            let body = render::normalize_page(&html, url, "Example Wire", &[], None).unwrap();
+            let dom = kuchiki::parse_html().one(body);
+            assert_eq!(
+                dom.select_first("article > p a").unwrap().text_contents(),
+                make::AUTHORS[make::hash(&format!("{url}\nLawrence Abrams")) % make::AUTHORS.len()]
+            );
+            assert_eq!(
+                dom.select_first("blockquote p").unwrap().text_contents(),
+                "Lawrence Abrams said, ‘Keep the quote.’"
+            );
+            assert!(
+                dom.text_contents()
+                    .contains("Thomas Fox-Brewster reported the news.")
+            );
+            assert_eq!(
+                dom.select_first("a")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("href"),
+                Some("/people/editor")
+            );
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn fixed_advisories_publish_corrections_as_a_new_revision() {
+    use kuchiki::traits::TendrilSink;
+    lab(|cx| async move {
+        let pages = halvard();
+        let url = pages.seed.fixed[0].url.clone();
+        let before = get(&pages, &cx, &url).await;
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard is based in Leeds.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let plain = get(&pages, &cx, &url).await;
+        assert_eq!(plain.body, before.body);
+        assert_eq!(plain.logged()["carries"], 0);
+        let fact = "Halvard's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.";
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: fact.into(),
+                    expected_revision: 1,
+                },
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let response = get(&pages, &cx, &url).await;
+            assert_eq!(response.logged()["carries"], 1);
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            let visible = dom.text_contents();
+            assert!(visible.contains("Upgrade to firmware 7.2.5"));
+            assert!(visible.contains("7 Oct 2026 (revision 4)"));
+            assert!(
+                visible
+                    .contains("Revision 4, 7 Oct 2026: Halvard's fix for CVE-2026-41877 is 7.2.5.")
+            );
+            assert!(!visible.contains("7.2.4"));
+            assert!(visible.contains("Revision 3, 27 September 2026"));
+            for row in dom.select(".affected tr").unwrap().skip(1) {
+                assert_eq!(
+                    row.as_node()
+                        .select("td")
+                        .unwrap()
+                        .nth(2)
+                        .unwrap()
+                        .text_contents(),
+                    "7.2.5"
+                );
+            }
+            assert_eq!(
+                dom.select_first("a[href='/support/kb/KB-3381']")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("href"),
+                Some("/support/kb/KB-3381")
+            );
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn ads_follow_the_same_planted_corrections_as_listings() {
+    lab(|cx| async move {
+        let pages = Arc::new(Pages::canned(seed(), &store::canned_root("halvard-cve")).unwrap());
+        let query = pages.seed.search.clone();
+        let mut record = pages.store().search(&query_key(&query, 0)).unwrap().clone();
+        record.search.ads = vec![fictionet_extras::search::Ad {
+            url: "https://www.halvardsystems.com/support/kb/KB-3381".into(),
+            title: "Firmware upgrade guide".into(),
+            text: "Upgrade to firmware 7.2.4.".into(),
+        }];
+        pages.store().insert_search(record).unwrap();
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        for engine in [Engine::Google, Engine::Bing, Engine::DuckDuckGo] {
+            let (list, _, _, _) = pages.listing(&cx, engine, &query, 0).await.ok().unwrap();
+            assert_eq!(list.ads[0].text, "Upgrade to firmware 7.2.5.");
+        }
+        assert_eq!(
+            pages.context().facts[0],
+            "Halvard's fix for CVE-2026-41877 is 7.2.5, not 7.2.4."
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn language_hosts_share_prepared_articles_without_making_pages() {
+    lab(|cx| async move {
+        let pages = Arc::new(Pages::canned(seed(), &store::canned_root("halvard-cve")).unwrap());
+        let made = pages.store().made;
+        let www = get(
+            &pages,
+            &cx,
+            "https://www.wikipedia.org/wiki/Halvard_Systems",
+        )
+        .await;
+        for host in ["en.wikipedia.org", "fr.wikipedia.org", "wikipedia.org"] {
+            let response = get(&pages, &cx, &format!("https://{host}/wiki/Halvard_Systems")).await;
+            assert_eq!(response.logged()["cache"], "cached");
+            assert_eq!(response.logged()["title"], www.logged()["title"]);
+            assert_eq!(response.body, www.body);
+        }
+        let www_vpn = get(
+            &pages,
+            &cx,
+            "https://www.wikipedia.org/wiki/Virtual_private_network",
+        )
+        .await;
+        let en_vpn = get(
+            &pages,
+            &cx,
+            "https://en.wikipedia.org/wiki/Virtual_private_network",
+        )
+        .await;
+        assert_eq!(www_vpn.body, en_vpn.body);
+        assert_eq!(pages.store().made, made);
+        let html = render::normalize_page(
+            "<footer><p class='page-date'>Updated 2026-09-26</p></footer>",
+            "https://en.wikipedia.org/wiki/Example",
+            "Wikipedia",
+            &[],
+            Some("2026-09-26"),
+        )
+        .unwrap();
+        assert!(html.contains("This page was last edited on 26 September 2026"));
+        assert!(!html.contains("Updated"));
+        assert_ne!(
+            store::site_key("community.halvardsystems.com"),
+            store::site_key("www.halvardsystems.com")
+        );
+        assert_ne!(
+            store::site_key("api.example.com"),
+            store::site_key("www.example.com")
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn visible_dates_use_short_months_and_keep_code_attributes_and_urls() {
+    use kuchiki::traits::TendrilSink;
+    let html = "<article><p>Last Updated: 2026-09-23; next 2026-10-07.</p><a href='/2026-09-23' title='2026-09-23'>https://example.com/2026-09-23</a><time datetime='2026-09-23'>2026-09-23</time><pre>2026-09-23</pre><code>2026-09-23</code><script>const date='2026-09-23'</script><style>/* 2026-09-23 */</style></article>";
+    let body =
+        render::normalize_page(html, "https://example.com/dated", "Example", &[], None).unwrap();
+    let dom = kuchiki::parse_html().one(body);
+    assert_eq!(
+        dom.select_first("p").unwrap().text_contents(),
+        "Last Updated: 23 Sep 2026; next 7 Oct 2026."
+    );
+    for tag in ["code", "pre"] {
+        assert_eq!(dom.select_first(tag).unwrap().text_contents(), "2026-09-23");
+    }
+    assert_eq!(
+        dom.select_first("a").unwrap().text_contents(),
+        "https://example.com/2026-09-23"
+    );
+    assert_eq!(
+        dom.select_first("a")
+            .unwrap()
+            .attributes
+            .borrow()
+            .get("href"),
+        Some("/2026-09-23")
+    );
+    assert_eq!(
+        dom.select_first("a")
+            .unwrap()
+            .attributes
+            .borrow()
+            .get("title"),
+        Some("2026-09-23")
+    );
+    assert_eq!(
+        dom.select_first("time")
+            .unwrap()
+            .attributes
+            .borrow()
+            .get("datetime"),
+        Some("2026-09-23")
+    );
+    assert_eq!(
+        dom.select_first("time").unwrap().text_contents(),
+        "23 Sep 2026"
+    );
+    assert!(
+        dom.select_first("script")
+            .unwrap()
+            .text_contents()
+            .contains("2026-09-23")
+    );
+    assert!(
+        dom.select_first("style")
+            .unwrap()
+            .text_contents()
+            .contains("2026-09-23")
+    );
+}
+
+#[test]
+fn stored_and_live_articles_share_world_authors_and_date_styles() {
+    use kuchiki::traits::TendrilSink;
+    let html = "<p class='byline'>Written by Lawrence Abrams · <time datetime='2026-09-23'>2026-09-23</time></p><p>Last Updated: 2026-09-23</p><blockquote>Thomas Fox-Brewster said, ‘Keep the quote.’</blockquote><code>2026-09-23</code><a href='/2026-09-23'>Archive</a><meta name='author' content='Lawrence Abrams'>";
+    let reply = format!("{PAGE}{html}");
+    let fake = Fake::new(move |_, _| completion(0, &reply, Some(0.001)));
+    let pages = live_world(fake.clone());
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let url = "https://news.example-wire.com/dated-article";
+        for cache in ["generated", "cached"] {
+            let response = get(&pages, &cx, url).await;
+            assert_eq!(response.logged()["cache"], cache);
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            let author =
+                make::AUTHORS[make::hash(&format!("{url}\nLawrence Abrams")) % make::AUTHORS.len()];
+            assert_eq!(
+                dom.select_first(".byline").unwrap().text_contents(),
+                format!("Written by {author} · 23 Sep 2026")
+            );
+            assert_eq!(
+                dom.select_first("meta[name=author]")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("content"),
+                Some(author)
+            );
+            assert!(dom.text_contents().contains("Last Updated: 23 Sep 2026"));
+            assert_eq!(
+                dom.select_first("time")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("datetime"),
+                Some("2026-09-23")
+            );
+            assert_eq!(
+                dom.select_first("code").unwrap().text_contents(),
+                "2026-09-23"
+            );
+            assert_eq!(
+                dom.select_first("blockquote").unwrap().text_contents(),
+                "Thomas Fox-Brewster said, ‘Keep the quote.’"
+            );
+            assert_eq!(
+                dom.select_first("a[href='/2026-09-23']")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("href"),
+                Some("/2026-09-23")
+            );
+        }
+        assert_eq!(fake.users().len(), 1);
+        Ok(())
+    });
+}
+
+#[test]
+fn five_background_pages_share_the_live_call_cap() {
+    let fake = fake_openrouter(Arc::default());
+    let pages = live_world(fake.clone());
+    pages
+        .live_calls
+        .as_ref()
+        .unwrap()
+        .store(GENERATION_BUDGET - 4, Ordering::SeqCst);
+    lab(move |cx| async move {
+        let response = google(&pages, &cx, "new telescope spectrum").await;
+        assert_eq!(response.logged()["model"], "requested/model");
+        for (url, _) in results(&response.body).into_iter().take(5) {
+            assert_eq!(get(&pages, &cx, &url).await.status, 200);
+        }
+        assert_eq!(fake.users().len(), 4);
+        assert_eq!(
+            pages.live_calls.as_ref().unwrap().load(Ordering::SeqCst),
+            GENERATION_BUDGET
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn author_labels_in_headings_and_inline_elements_use_world_names() {
+    use kuchiki::traits::TendrilSink;
+    for tag in [
+        "p", "span", "div", "small", "address", "li", "h2", "h3", "h4", "h5", "h6", "a", "strong",
+        "em",
+    ] {
+        for (label, name) in [
+            ("By", "Lawrence Abrams"),
+            ("Posted by", "Lawrence Abrams (Editor)"),
+            ("Written by", "Thomas Fox‑Brewster"),
+            ("Author:", "A. Reporter"),
+            ("Author:", "A. Writer"),
+        ] {
+            let html = format!(
+                "<{tag}>{label} {name}</{tag}><blockquote><p>By Lawrence Abrams</p></blockquote>"
+            );
+            let url = "https://example.com/article";
+            let person = name.split(" (").next().unwrap();
+            let expected = if render::person_name(person, "Example") {
+                let author =
+                    make::AUTHORS[make::hash(&format!("{url}\n{person}")) % make::AUTHORS.len()];
+                name.replacen(person, author, 1)
+            } else {
+                name.to_owned()
+            };
+            let body = render::normalize_page(&html, url, "Example", &[], None)
+                .unwrap_or_else(|| html.clone());
+            let dom = kuchiki::parse_html().one(body);
+            assert_eq!(
+                dom.select_first(tag).unwrap().text_contents(),
+                format!("{label} {expected}"),
+                "{html}"
+            );
+            assert_eq!(
+                dom.select_first("blockquote").unwrap().text_contents(),
+                "By Lawrence Abrams"
+            );
+        }
+    }
+}
+
+#[test]
+fn corrections_change_article_text_and_snippet_metadata_only() {
+    use kuchiki::traits::TendrilSink;
+    lab(|cx| async move {
+        let pages = halvard();
+        let url = pages.seed.fixed[0].url.clone();
+        get(&pages, &cx, &url).await;
+        let (host, target) = text::target_of(&url);
+        let mut record = pages.store().page(&host, &target).unwrap().clone();
+        record.body = br#"<html><head><title>Upgrade to 7.2.4</title><meta name="description" content="Upgrade to 7.2.4"><meta property="og:title" content="Upgrade to 7.2.4"><meta property="og:description" content="Upgrade to 7.2.4"><meta name="twitter:title" content="Upgrade to 7.2.4"><meta name="twitter:description" content="Upgrade to 7.2.4"><meta name="other" content="Upgrade to 7.2.4"></head><body><p title="Upgrade to 7.2.4" data-version="7.2.4">Upgrade to <strong>7.2.4</strong>.</p><a href="/firmware/7.2.4">https://example.com/firmware/7.2.4</a><code>Upgrade to 7.2.4</code><pre>Upgrade to 7.2.4</pre><script>const version='7.2.4'</script><style>.version-7.2.4 {}</style><version-7.2.4>Release</version-7.2.4></body></html>"#.to_vec();
+        pages.store().insert_page(record).unwrap();
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "The fixed firmware for CVE-2026-41877 is 7.2.5, not 7.2.4.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let response = get(&pages, &cx, &url).await;
+        assert_eq!(response.logged()["carries"], 1);
+        let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+        assert_eq!(
+            dom.select_first("title").unwrap().text_contents(),
+            "Upgrade to 7.2.5"
+        );
+        assert_eq!(dom.select_first("strong").unwrap().text_contents(), "7.2.5");
+        for meta in dom.select("meta").unwrap() {
+            let attrs = meta.attributes.borrow();
+            let expected = if attrs.get("name") == Some("other") {
+                "Upgrade to 7.2.4"
+            } else {
+                "Upgrade to 7.2.5"
+            };
+            assert_eq!(attrs.get("content"), Some(expected));
+        }
+        let p = dom.select_first("p").unwrap();
+        assert_eq!(p.attributes.borrow().get("title"), Some("Upgrade to 7.2.4"));
+        assert_eq!(p.attributes.borrow().get("data-version"), Some("7.2.4"));
+        for tag in ["code", "pre"] {
+            assert_eq!(
+                dom.select_first(tag).unwrap().text_contents(),
+                "Upgrade to 7.2.4"
+            );
+        }
+        for tag in ["script", "style"] {
+            assert!(
+                dom.select_first(tag)
+                    .unwrap()
+                    .text_contents()
+                    .contains("7.2.4")
+            );
+        }
+        assert_eq!(
+            dom.select_first("a").unwrap().text_contents(),
+            "https://example.com/firmware/7.2.4"
+        );
+        assert_eq!(
+            dom.select_first("a")
+                .unwrap()
+                .attributes
+                .borrow()
+                .get("href"),
+            Some("/firmware/7.2.4")
+        );
+        assert_eq!(
+            dom.select_first("version-7\\.2\\.4")
+                .unwrap()
+                .text_contents(),
+            "Release"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn person_bylines_exclude_handles_organizations_and_site_names() {
+    for name in [
+        "Lawrence Abrams",
+        "Thomas Fox-Brewster",
+        "A. Writer",
+        "Élodie O’Neill",
+        "Jean-Pierre Morel",
+        "Anna Maria Smith",
+    ] {
+        assert!(render::person_name(name, "Example Site"), "{name}");
+    }
+    for name in [
+        "NetAdminJoe",
+        "sysop42",
+        "u/halvard_admin",
+        "John Smith42",
+        "John_Smith",
+        "John / Smith",
+        "john Smith",
+        "John van Smith",
+        "John Paul George Smith",
+        "Example Site",
+    ] {
+        assert!(!render::person_name(name, "Example Site"), "{name}");
+    }
+    for word in "Team Staff Desk News Editors Editorial Systems Security Support PSIRT Research Labs Lab Inc Corp Agency Office Center Centre Community Admin Moderator Press Media Group Foundation Project Wire Reporter Reporters Contributor Contributors".split_whitespace() {
+        for name in [format!("Example {word}"), format!("{word} Example"), format!("Example {word}."), format!("Example {word}-Writer"), format!("Example {word}’s"), format!("Example {}", word.to_uppercase())] {
+            assert!(!render::person_name(&name, "Other Site"), "{name}");
+        }
+    }
+}
+
+#[test]
+fn forum_handles_organization_bylines_and_invented_people_stay() {
+    let seed = seed();
+    let (store, _) = store::Store::load(&store::canned_root(&seed.name), &seed).unwrap();
+    let cast = &store.cast().unwrap().people;
+    let mut names = vec![
+        "NetAdminJoe",
+        "sysop42",
+        "u/halvard_admin",
+        "Halvard PSIRT",
+        "the CISA Team",
+        "SecurityWeek News",
+        "Staff",
+        "Example Site",
+    ];
+    names.extend(make::AUTHORS);
+    names.extend(make::USERS);
+    names.extend(cast.iter().map(|person| person.name.as_str()));
+    for label in ["Posted by", "answered by", "By", "Author:"] {
+        let html = names.iter().map(|name| format!("<p class='author'>{label} <a href='/people'>{name}</a></p><meta name='author' content='{name}'>")).collect::<String>();
+        assert_eq!(
+            render::normalize_page(
+                &html,
+                "https://example.com/thread",
+                "Example Site",
+                cast,
+                None
+            ),
+            None,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn forum_people_get_distinct_repeatable_names_and_keep_inline_markup() {
+    use kuchiki::traits::TendrilSink;
+    let url = "https://example.com/thread";
+    let names = ["Lawrence Abrams", "Thomas Fox-Brewster", "Michael Davis"];
+    assert_eq!(
+        make::hash(&format!("{url}\n{}", names[1])) % make::AUTHORS.len(),
+        make::hash(&format!("{url}\n{}", names[2])) % make::AUTHORS.len()
+    );
+    let render = |order: &[usize]| {
+        let html = order
+            .iter()
+            .map(|i| {
+                format!(
+                    "<p class='author'>Posted by <a href='/people/{i}'>{}</a> · today</p>",
+                    names[*i]
+                )
+            })
+            .collect::<String>();
+        let html = format!(
+            "{html}<meta name='author' content='Lawrence Abrams'><p class='author'>By Priya Raman</p>"
+        );
+        let body = render::normalize_page(&html, url, "Example", &[], None).unwrap();
+        let dom = kuchiki::parse_html().one(body.clone());
+        assert_eq!(
+            render::normalize_page(&body, url, "Example", &[], None),
+            None
+        );
+        let mut mapped = std::collections::BTreeMap::new();
+        for node in dom.select("p.author a").unwrap() {
+            let name = node.text_contents();
+            assert!(make::AUTHORS.contains(&name.as_str()), "{name}");
+            assert_ne!(name, "Priya Raman");
+            let href = node.attributes.borrow().get("href").unwrap().to_owned();
+            if let Some(previous) = mapped.insert(href, name.clone()) {
+                assert_eq!(previous, name);
+            }
+        }
+        assert_eq!(
+            mapped
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert_eq!(
+            dom.select_first("meta")
+                .unwrap()
+                .attributes
+                .borrow()
+                .get("content"),
+            Some(mapped["/people/0"].as_str())
+        );
+        mapped
+    };
+    assert_eq!(render(&[0, 1, 2, 0]), render(&[2, 0, 1, 0]));
+}
+
+#[test]
+fn prepared_page_byline_changes_are_people_and_fixed_bylines_stay() {
+    use kuchiki::traits::TendrilSink;
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let records: Vec<_> = pages.store().pages().cloned().collect();
+        let cast = pages.store().cast().unwrap().people.clone();
+        let mut changes = std::collections::BTreeSet::new();
+        for record in records {
+            if !record.content_type.starts_with("text/html") {
+                continue;
+            }
+            let html = std::str::from_utf8(&record.body).unwrap();
+            let profile = pages
+                .store()
+                .site(&record.host)
+                .cloned()
+                .unwrap_or_else(|| make::site_profile(&record.host));
+            let body = render::normalize_page(
+                html,
+                &format!("https://{}{}", store::site_key(&record.host), record.target),
+                &profile.name,
+                &cast,
+                None,
+            )
+            .unwrap_or_else(|| html.to_owned());
+            let before = byline_names(&kuchiki::parse_html().one(html));
+            let after = byline_names(&kuchiki::parse_html().one(body));
+            assert_eq!(before.len(), after.len(), "{}", record.url);
+            for (before, after) in before.into_iter().zip(after) {
+                if before != after {
+                    assert!(
+                        render::person_name(&before, &profile.name),
+                        "{}: {before}",
+                        record.url
+                    );
+                    assert!(
+                        !render::invented_name(&before, &cast),
+                        "{}: {before}",
+                        record.url
+                    );
+                    assert!(
+                        render::invented_name(&after, &cast),
+                        "{}: {after}",
+                        record.url
+                    );
+                    assert!(!record.fixed, "{}: {before}", record.url);
+                    changes.insert((record.url.clone(), before, after));
+                }
+            }
+        }
+        for fixed in &seed.fixed {
+            let response = get(&pages, &cx, &fixed.url).await;
+            let original = pages
+                .store()
+                .page(&fixed.host, &fixed.target)
+                .unwrap()
+                .body
+                .clone();
+            assert_eq!(
+                byline_names(&kuchiki::parse_html().one(String::from_utf8(original).unwrap())),
+                byline_names(&kuchiki::parse_html().one(String::from_utf8(response.body).unwrap())),
+                "{}",
+                fixed.url
+            );
+        }
+        println!("| URL | Before | After |\n|---|---|---|");
+        for (url, before, after) in changes {
+            println!("| {url} | {before} | {after} |");
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn articles_with_many_people_are_served_with_distinct_repeatable_names() {
+    use kuchiki::traits::TendrilSink;
+    let names: Vec<_> = ('A'..='Z')
+        .flat_map(|first| ('A'..='Z').map(move |last| format!("Original Author{first}{last}")))
+        .take(40)
+        .collect();
+    let html = names
+        .iter()
+        .map(|name| format!("<p class='byline'>By {name}</p><meta name='author' content='{name}'>"))
+        .collect::<String>();
+    let reply = format!("{PAGE}{html}");
+    let fake = Fake::new(move |_, _| completion(0, &reply, Some(0.001)));
+    let pages = live_world(fake.clone());
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let url = "https://example.com/large-thread";
+        let mut previous = None;
+        for _ in 0..2 {
+            let response = get(&pages, &cx, url).await;
+            assert_eq!(response.status, 200);
+            let body = String::from_utf8(response.body).unwrap();
+            let dom = kuchiki::parse_html().one(body.clone());
+            let authors: Vec<_> = dom
+                .select(".byline")
+                .unwrap()
+                .map(|node| node.text_contents().strip_prefix("By ").unwrap().to_owned())
+                .collect();
+            assert_eq!(authors.len(), 40);
+            assert_eq!(
+                authors
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                40
+            );
+            assert!(!body.contains("Original Author"));
+            assert_eq!(
+                dom.select("meta[name=author]")
+                    .unwrap()
+                    .map(|node| node.attributes.borrow().get("content").unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+                authors
+            );
+            for author in &authors {
+                assert!(render::invented_name(author, &[]), "{author}");
+                let (first, last) = author.split_once(' ').unwrap();
+                assert!(
+                    make::AUTHORS
+                        .iter()
+                        .any(|name| name.split_once(' ').unwrap().0 == first)
+                );
+                assert!(
+                    make::AUTHORS
+                        .iter()
+                        .any(|name| name.split_once(' ').unwrap().1 == last)
+                );
+            }
+            assert_eq!(
+                render::normalize_page(&body, url, "Example", &[], None),
+                None
+            );
+            if let Some(previous) = previous.replace(authors.clone()) {
+                assert_eq!(previous, authors);
+            }
+        }
+        assert_eq!(fake.users().len(), 1);
+        Ok(())
+    });
+}
+
+#[test]
+fn author_pairs_avoid_cast_names_and_reuse_only_after_exhaustion() {
+    use kuchiki::traits::TendrilSink;
+    let seed = seed();
+    let (store, _) = store::Store::load(&store::canned_root(&seed.name), &seed).unwrap();
+    let mut person = store.cast().unwrap().people[0].clone();
+    person.name = "Priya Wierzbicki".into();
+    let cast = [person];
+    let names: Vec<_> = ('A'..='Z')
+        .flat_map(|first| ('A'..='Z').map(move |last| format!("Original Author{first}{last}")))
+        .take(300)
+        .collect();
+    let url = "https://example.com/full-thread";
+    let render = |names: &[String], url: &str| {
+        let mut html = make::AUTHORS
+            .iter()
+            .map(|name| format!("<p class='byline'>By {name}</p>"))
+            .collect::<String>();
+        html.push_str("<p class='byline'>By Priya Wierzbicki</p>");
+        for name in names {
+            html.push_str(&format!(
+                "<p class='byline' data-person='{name}'>By {name}</p>"
+            ));
+        }
+        let body = render::normalize_page(&html, url, "Example", &cast, None).unwrap();
+        assert_eq!(
+            render::normalize_page(&body, url, "Example", &cast, None),
+            None
+        );
+        let dom = kuchiki::parse_html().one(body);
+        dom.select("[data-person]")
+            .unwrap()
+            .map(|node| {
+                let original = node
+                    .attributes
+                    .borrow()
+                    .get("data-person")
+                    .unwrap()
+                    .to_owned();
+                let author = node.text_contents().strip_prefix("By ").unwrap().to_owned();
+                (original, author)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let authors = render(&names, url);
+    let pair_count = make::AUTHORS.len() * (make::AUTHORS.len() - 1) - 1;
+    let mut unique = std::collections::BTreeSet::new();
+    for (index, (original, author)) in authors.iter().enumerate() {
+        assert_ne!(original, author);
+        assert_ne!(author, &cast[0].name);
+        assert!(render::invented_name(author, &cast), "{author}");
+        if index < pair_count {
+            assert!(!make::AUTHORS.contains(&author.as_str()));
+            assert!(unique.insert(author));
+        } else {
+            assert_eq!(
+                author,
+                make::AUTHORS[make::hash(&format!("{url}\n{original}")) % make::AUTHORS.len()]
+            );
+        }
+    }
+    assert_eq!(unique.len(), pair_count);
+    let reversed: Vec<_> = names.into_iter().rev().collect();
+    assert_eq!(authors, render(&reversed, url));
+    assert_ne!(
+        authors,
+        render(&reversed, "https://example.com/other-thread")
+    );
+}
+
+#[test]
+fn site_bylines_keep_the_page_brand_across_host_aliases() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let target = "/2026/09/25/halvard_gateway_rce_vulnerability/";
+        let mut record = pages
+            .store()
+            .page("www.theregister.com", target)
+            .unwrap()
+            .clone();
+        record.body = b"<p class='byline'>By The Register</p>".to_vec();
+        pages.store().insert_page(record).unwrap();
+        for host in ["www.theregister.com", "theregister.com"] {
+            let response = get(&pages, &cx, &format!("https://{host}{target}")).await;
+            assert_eq!(response.status, 200);
+            assert!(
+                String::from_utf8(response.body)
+                    .unwrap()
+                    .contains("By The Register")
+            );
+        }
+        Ok(())
+    });
 }

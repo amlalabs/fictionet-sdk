@@ -162,8 +162,23 @@ pub struct Store {
     pub unserved: std::collections::HashSet<(String, String)>,
 }
 
+pub(super) fn site_key(host: &str) -> &str {
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    if let Some((language, domain)) = host.split_once('.') {
+        let parts: Vec<_> = domain.split('.').collect();
+        if language.len() == 2
+            && language.bytes().all(|b| b.is_ascii_lowercase())
+            && (parts.len() == 2
+                || (parts.len() == 3 && parts[2].len() == 2 && parts[1].len() <= 3))
+        {
+            return domain;
+        }
+    }
+    host
+}
+
 fn key(host: &str, target: &str) -> (String, String) {
-    (host.to_owned(), target.to_owned())
+    (site_key(host).to_owned(), target.to_owned())
 }
 
 /// Where the canned store for the seed named `seed` is kept in the
@@ -371,7 +386,7 @@ impl Store {
                 mention,
             } => self
                 .mentions
-                .entry((host, target))
+                .entry(key(&host, &target))
                 .or_default()
                 .push(mention),
             Entry::Site { host, profile } => {
@@ -419,7 +434,7 @@ impl Store {
     pub fn host_pages(&self, host: &str) -> Vec<HostPage> {
         self.order
             .iter()
-            .filter(|(h, _)| h == host)
+            .filter(|(h, _)| site_key(h) == site_key(host))
             .take(20)
             .map(|at| {
                 let page = &self.pages[at];
@@ -448,7 +463,7 @@ impl Store {
                 !seed
                     .fixed
                     .iter()
-                    .any(|f| f.host == at.0 && f.target == at.1)
+                    .any(|f| site_key(&f.host) == at.0 && f.target == at.1)
             })
             .map(|at| &self.pages[at])
             .filter(|p| {

@@ -16,7 +16,7 @@ const STOP: &[&str] = &[
     "owners", "version", "fixed", "fix", "latest",
 ];
 /// Bylines on articles the offline generator makes.
-const AUTHORS: [&str; 16] = [
+pub(super) const AUTHORS: [&str; 16] = [
     "Priya Raman",
     "Tomasz Wierzbicki",
     "Aoife Gallagher",
@@ -35,7 +35,7 @@ const AUTHORS: [&str; 16] = [
     "Arjun Mehta",
 ];
 /// Forum and Q&A user names.
-const USERS: [&str; 12] = [
+pub(super) const USERS: [&str; 12] = [
     "netadmin_dk",
     "ferrous_wheel",
     "kb_ops",
@@ -107,7 +107,7 @@ pub(super) fn shares_words(a: &str, b: &str) -> bool {
     words(b).iter().any(|w| w != "not" && a.contains(w))
 }
 /// A stable number for `text`, to vary dates, counts and names by URL.
-fn hash(text: &str) -> usize {
+pub(super) fn hash(text: &str) -> usize {
     text.bytes()
         .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize))
 }

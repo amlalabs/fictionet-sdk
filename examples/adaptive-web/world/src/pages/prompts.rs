@@ -71,11 +71,11 @@ Write like that kind of site writes:
 - A forum or Reddit thread: short informal posts, usernames, vote counts,
   timestamps, people who are wrong or off topic, typos, abbreviations.
 - A news story: dateline, attributed quotes, a byline, \"updated\" notes,
-  the house style of that outlet.
+  the house style of that outlet. Bylines are invented names, never a real journalist or editor.
 - A vendor or company page: marketing copy, legal boilerplate, product
   names, version numbers.
 - Wikipedia: neutral tone, citation markers like [3], section headings,
-  \"See also\", maintenance notices where they would appear.
+  \"See also\", maintenance notices where they would appear. Never write the word \"stub\"; say \"short article\" instead.
 - Documentation, package pages, Q&A sites: their own fixed structure.
 
 Real pages are untidy. Most of a site is not about the scenario: other

@@ -233,7 +233,7 @@ mod tests {
             GeneratorKind::Model(Provider::OpenRouter)
         );
         assert_eq!(live.model(), Provider::OpenRouter.default_model());
-        assert_eq!(live.prefetch(), 3);
+        assert_eq!(live.prefetch(), 5);
         assert_eq!(live.new_pages(), NewPages::Canned);
     }
 
