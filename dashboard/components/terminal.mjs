@@ -1,5 +1,5 @@
 // mount(root, services, options) -> dispose; shared services are described in README.md.
-// A shell on the host through ghostty-web. Output is acknowledged after the terminal
+// A shell on the host through xterm.js. Output is acknowledged after the terminal
 // has written it, so the page server stops reading when the browser lags.
 // With options.interactive the text starts large and options.controls gets
 // A− and A+ buttons; the size is kept for the next visit.
@@ -9,6 +9,10 @@ import { scoped, listen } from '../dom.mjs';
 const SIZE_KEY = 'fictionet-terminal-size';
 
 export function mount(root, services, options) {
+  const css = root.ownerDocument.createElement('link');
+  css.rel = 'stylesheet';
+  css.href = '/vendor/xterm/css/xterm.css';
+  root.append(css);
   let active, focus = options.focus, fontSize = 13;
   const sizing = [];
   if (options.interactive) {
@@ -67,7 +71,15 @@ export function mount(root, services, options) {
       const received = (event) => {
         if (active !== entry || !(event.data instanceof ArrayBuffer)) return;
         const bytes = new Uint8Array(event.data);
-        terminal.write(bytes, () => send(JSON.stringify({ type: 'ack', bytes: bytes.byteLength })));
+        const start = options.interactive && services.hosts.some((host) => host.name === options.host && host.claude_code) && !services.claudeStarted.has(options.host);
+        if (start) prompt = (prompt + decoder.decode(bytes, { stream: true })).slice(-4096);
+        terminal.write(bytes, () => {
+          send(JSON.stringify({ type: 'ack', bytes: bytes.byteLength }));
+          if (start && prompt.includes('$ ') && active === entry && socket.readyState === 1 && !services.claudeStarted.has(options.host)) {
+            services.claudeStarted.add(options.host);
+            send(new TextEncoder().encode('claude\r'));
+          }
+        });
       };
       const closed = (event) => { if (active === entry) disconnected(panel, event.reason); };
       const input = terminal.onData((text) => send(new TextEncoder().encode(text)));
@@ -105,9 +117,11 @@ export function mount(root, services, options) {
       ? `${options.host} is on the network. The terminal opens when SSH is up.`
       : `${options.host} is booting. The terminal opens when SSH is up.`),
     load: async () => {
-      const ghostty = await services.importModule('/vendor/ghostty-web/dist/ghostty-web.js').catch(() => { throw new Error('ghostty-web'); });
-      await ghostty.init();
-      return ghostty;
+      const [{ Terminal }, { FitAddon }] = await Promise.all([
+        services.importModule('/vendor/xterm/lib/xterm.mjs').catch(() => { throw new Error('xterm.js'); }),
+        services.importModule('/vendor/addon-fit/lib/addon-fit.mjs').catch(() => { throw new Error('The xterm.js fit addon'); }),
+      ]);
+      return { Terminal, FitAddon };
     },
   });
   const offTheme = services.theme.subscribe(() => {

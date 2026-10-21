@@ -15,15 +15,25 @@
     ]
   },
   {
-    "name": "ghostty-web",
-    "display": "ghostty-web",
-    "version": "0.4.0",
-    "url": "https://registry.npmjs.org/ghostty-web/-/ghostty-web-0.4.0.tgz",
-    "sha256": "90bf473b6c7f43ab5e52ee98d8295e04fb1c6b07b928e9795489df1e8cb8802e",
+    "name": "xterm",
+    "display": "xterm.js",
+    "version": "6.0.0",
+    "url": "https://registry.npmjs.org/@xterm/xterm/-/xterm-6.0.0.tgz",
+    "sha256": "908e66e04af6c8dc6b00dd3b54de088e2e81e5ed866284fd6c2fb3c2d1c7a3f6",
     "members": [
-      "dist/ghostty-web.js",
-      "dist/__vite-browser-external-2447137e.js",
-      "dist/ghostty-vt.wasm",
+      "lib/xterm.mjs",
+      "css/xterm.css",
+      "LICENSE"
+    ]
+  },
+  {
+    "name": "addon-fit",
+    "display": "xterm.js fit addon",
+    "version": "0.11.0",
+    "url": "https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.11.0.tgz",
+    "sha256": "26003b4517a132b64e4ff228fd88a5fda3fff5e606c76093f6dcff772e9ecec0",
+    "members": [
+      "lib/addon-fit.mjs",
       "LICENSE"
     ]
   },

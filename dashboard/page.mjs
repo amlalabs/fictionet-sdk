@@ -504,7 +504,7 @@ export function appShell(root, services, page) {
   const packetVisibility = store(false);
   function watchPackets() {
     if (!disposed && !document.hidden && packetVisible && !stopPackets) {
-      stopPackets = map(packetPanel, services);
+      stopPackets = packets(packetPanel, services, { compact: true, visibility: packetVisibility });
     }
     packetVisibility.set(!disposed && !document.hidden && packetVisible);
   }

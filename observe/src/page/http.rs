@@ -10,7 +10,7 @@ pub(super) const MAX_BODY: usize = 64 << 10;
 pub(super) const IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const SECURITY: &str = concat!(
     "Content-Security-Policy: default-src 'none'; ",
-    "script-src 'self' 'wasm-unsafe-eval'; ",
+    "script-src 'self'; ",
     "style-src 'self'; ",
     "img-src 'self' data: blob:; ",
     "font-src 'self'; ",
