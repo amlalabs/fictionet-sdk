@@ -5446,3 +5446,279 @@ fn prepared_profiles_supply_observer_names() {
         Ok(())
     });
 }
+
+fn live_world(fake: Arc<Fake>) -> Arc<Pages> {
+    Arc::new(
+        Pages::canned_with_model(seed(), &store::canned_root("halvard-cve"), openrouter(fake))
+            .unwrap(),
+    )
+}
+
+#[test]
+fn live_world_serves_prepared_answers_without_calls_and_keeps_disk_unchanged() {
+    let fake = Fake::script(vec![]);
+    let pages = live_world(fake.clone());
+    let before = std::fs::read(store::canned_root("halvard-cve").join("world.jsonl")).unwrap();
+    let query = pages.store().searches().next().unwrap().query.clone();
+    let url = pages.store().pages().next().unwrap().url.clone();
+    lab(move |cx| async move {
+        assert_eq!(google(&pages, &cx, &query).await.status, 200);
+        assert_eq!(get(&pages, &cx, &url).await.status, 200);
+        assert!(fake.users().is_empty());
+        assert_eq!(pages.live_calls.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        Ok(())
+    });
+    assert_eq!(
+        std::fs::read(store::canned_root("halvard-cve").join("world.jsonl")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn live_model_failures_refusals_and_deadlines_use_the_offline_maker() {
+    for reply in [
+        http_error(100, 503),
+        completion(100, "simulator", Some(0.01)),
+        completion(
+            100,
+            "STATUS: 200\nTITLE: Story\nBODY:\n<p>Lorem ipsum</p>",
+            Some(0.01),
+        ),
+        completion(
+            100,
+            "STATUS: 200
+TITLE: Lorem ipsum
+SITE_CSS: body {color: #234}
+BODY:
+<p>A view of the sky.</p>",
+            Some(0.01),
+        ),
+        (ms(100), Err("connection closed".into())),
+        completion(10_000, PAGE, Some(0.01)),
+    ] {
+        let fake = Fake::script(vec![reply]);
+        let pages = live_world(fake.clone());
+        lab(move |cx| async move {
+            let started = cx.now();
+            let response = get(&pages, &cx, "https://example.com/new-live-page").await;
+            assert_eq!(response.status, 200);
+            assert_eq!(response.logged()["model"], "stub");
+            assert!(cx.now().since_start() - started.since_start() <= Duration::from_secs(9));
+            assert_eq!(fake.users().len(), 1);
+            text::validate_page("text/html", &response.body).unwrap();
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn live_search_failure_and_deadline_use_the_offline_maker() {
+    for reply in [
+        http_error(0, 500),
+        completion(0, "simulator", None),
+        completion(10_000, SEARCH, None),
+    ] {
+        let fake = Fake::script(vec![reply]);
+        let pages = live_world(fake.clone());
+        lab(move |cx| async move {
+            let response = google(&pages, &cx, "new telescope spectrum").await;
+            assert_eq!(response.status, 200);
+            assert_eq!(response.logged()["model"], "stub");
+            assert_eq!(fake.users().len(), 1);
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn live_model_cap_survives_store_switches_and_restart() {
+    let fake = Fake::new(|_, _| completion(0, PAGE, Some(0.001)));
+    let pages = live_world(fake.clone());
+    lab(move |cx| async move {
+        for _ in 0..GENERATION_BUDGET {
+            let made = pages
+                .generate(
+                    &cx,
+                    json!({"kind":"page"}),
+                    || "offline".to_owned(),
+                    || (String::new(), String::new(), 10),
+                    |text| Ok(text.to_owned()),
+                )
+                .await
+                .ok()
+                .unwrap();
+            assert_eq!(made.usage.model, "answered/model");
+        }
+        for mode in [
+            NewPages::Stub,
+            NewPages::Canned,
+            NewPages::Off,
+            NewPages::Canned,
+        ] {
+            pages
+                .apply(
+                    &cx,
+                    Command::SetNewPages {
+                        new_pages: mode,
+                        expected_revision: pages.generation().revision,
+                    },
+                )
+                .unwrap();
+        }
+        pages
+            .apply(
+                &cx,
+                Command::Restart {
+                    expected_revision: pages.generation().revision,
+                },
+            )
+            .unwrap();
+        let response = get(&pages, &cx, "https://example.com/after-cap").await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.logged()["model"], "stub");
+        assert_eq!(fake.users().len(), GENERATION_BUDGET);
+        Ok(())
+    });
+}
+
+#[test]
+fn live_search_prefetches_three_pages_and_counts_the_calls() {
+    let fake = fake_openrouter(Arc::default());
+    let pages = live_world(fake.clone());
+    let searches = Arc::new(crate::search::Searches::of(&pages));
+    let state = searches.clone();
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(searches),
+        move |cx| async move {
+            let response = google(&pages, &cx, "new telescope spectrum").await;
+            assert_eq!(response.logged()["model"], "requested/model");
+            assert_eq!(response.logged()["cost"], 0.0021);
+            cx.sleep(ms(1000)).await?;
+            for (url, _) in results(&response.body).into_iter().take(3) {
+                let page = get(&pages, &cx, &url).await;
+                assert_eq!(page.logged()["cache"], "prefetched");
+                assert_eq!(page.logged()["model"], "requested/model");
+                assert_eq!(page.logged()["cost"], 0.0021);
+            }
+            assert_eq!(fake.users().len(), 4);
+            assert_eq!(pages.live_calls.as_ref().unwrap().load(Ordering::SeqCst), 4);
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.generator.model_calls, 4);
+            assert!((snapshot.generator.model_cost_known.as_f64().unwrap() - 0.0084).abs() < 1e-9);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn live_pages_on_one_site_are_written_concurrently() {
+    let fake = Fake::new(|_, _| completion(4000, PAGE, Some(0.001)));
+    let pages = live_world(fake.clone());
+    lab(move |cx| async move {
+        let a = pages.clone();
+        let b = pages.clone();
+        let first = cx.spawn(move |cx| async move {
+            assert_eq!(
+                get(&a, &cx, "https://example.com/first").await.logged()["model"],
+                "answered/model"
+            );
+            Ok(())
+        });
+        let second = cx.spawn(move |cx| async move {
+            assert_eq!(
+                get(&b, &cx, "https://example.com/second").await.logged()["model"],
+                "answered/model"
+            );
+            Ok(())
+        });
+        cx.sleep(ms(1000)).await?;
+        assert_eq!(fake.users().len(), 2);
+        first.join(&cx).await?;
+        second.join(&cx).await?;
+        assert_eq!(cx.now().since_start(), ms(4000));
+        Ok(())
+    });
+}
+
+#[test]
+fn live_modes_keep_prepared_pages_separate_and_off_makes_nothing() {
+    let fake = fake_openrouter(Arc::default());
+    let pages = live_world(fake.clone());
+    let url = pages.seed.fixed[0].url.clone();
+    lab(move |cx| async move {
+        let prepared = get(&pages, &cx, &url).await;
+        assert_eq!(prepared.status, 200);
+        assert!(fake.users().is_empty());
+        pages
+            .apply(
+                &cx,
+                Command::SetNewPages {
+                    new_pages: NewPages::Stub,
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let live = get(&pages, &cx, &url).await;
+        assert_eq!(live.status, 200);
+        assert_eq!(live.logged()["model"], "requested/model");
+        assert_eq!(fake.users().len(), 1);
+        pages
+            .apply(
+                &cx,
+                Command::SetNewPages {
+                    new_pages: NewPages::Canned,
+                    expected_revision: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(get(&pages, &cx, &url).await.body, prepared.body);
+        pages
+            .apply(
+                &cx,
+                Command::SetNewPages {
+                    new_pages: NewPages::Off,
+                    expected_revision: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            get(&pages, &cx, "https://example.com/never-made")
+                .await
+                .status,
+            404
+        );
+        assert_eq!(fake.users().len(), 1);
+        Ok(())
+    });
+}
+
+#[test]
+fn live_search_snapshot_carries_the_model_time_and_cost() {
+    let fake = fake_openrouter(Arc::default());
+    let mut pages =
+        Pages::canned_with_model(seed(), &store::canned_root("halvard-cve"), openrouter(fake))
+            .unwrap();
+    pages.prefetch = 0;
+    let pages = Arc::new(pages);
+    let searches = Arc::new(crate::search::Searches::of(&pages));
+    let state = searches.clone();
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(searches),
+        move |cx| async move {
+            fictionet_extras::models::Engine::search(pages, cx, "new telescope spectrum".into())
+                .await?;
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.queries[0].model, "requested/model");
+            assert_eq!(snapshot.queries[0].gen_ms, Some(10));
+            assert_eq!(snapshot.queries[0].serve_ms, Some(10));
+            assert_eq!(
+                snapshot.queries[0].cost.as_ref().unwrap().as_f64(),
+                Some(0.0021)
+            );
+            assert_eq!(snapshot.generator.model_calls, 1);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}

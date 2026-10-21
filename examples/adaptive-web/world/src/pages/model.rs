@@ -241,6 +241,7 @@ pub struct Model {
     pub reasoning: String,
     key: Key,
     transport: Arc<dyn Transport>,
+    live: bool,
 }
 
 /// A read answer, with the raw text the model gave.
@@ -269,7 +270,14 @@ impl Model {
             reasoning: reasoning.into(),
             key,
             transport,
+            live: false,
         }
+    }
+
+    /// One attempt with a nine-second deadline for an interactive request.
+    pub(super) fn live(mut self) -> Self {
+        self.live = true;
+        self
     }
 
     /// What a store made with this model records. See [`identity`].
@@ -353,7 +361,13 @@ impl Model {
         let what = format!("{} {}", self.provider.label(), self.model);
         let data = serde_json::to_vec(body).expect("a JSON value");
         let mut failure = String::new();
-        for index in 1..=ATTEMPTS {
+        let attempts = if self.live { 1 } else { ATTEMPTS };
+        let timeout = if self.live {
+            Duration::from_secs(9)
+        } else {
+            TIMEOUT
+        };
+        for index in 1..=attempts {
             let mut attempt = Attempt {
                 ask: ledger.ask,
                 attempt: index,
@@ -369,7 +383,7 @@ impl Model {
                 backoff_ms: 0,
                 error: None,
             };
-            let deadline = cx.now() + TIMEOUT;
+            let deadline = cx.now() + timeout;
             let sent = cx
                 .race(
                     Some(deadline),
@@ -416,7 +430,7 @@ impl Model {
                 }
                 Ok(Err(error)) => failure = self.redact(&error),
                 Err(fictionet::RaceError::Deadline) => {
-                    failure = format!("no answer within {} s", TIMEOUT.as_secs());
+                    failure = format!("no answer within {} s", timeout.as_secs());
                 }
                 Err(fictionet::RaceError::Cancelled) => {
                     failure = "the world stopped".into();
@@ -426,7 +440,7 @@ impl Model {
             attempt.error = Some(failure.clone());
             ledger.attempts.push(attempt);
             ledger.ended = Some(now(cx));
-            if !retry || index == ATTEMPTS {
+            if !retry || index == attempts {
                 break;
             }
             let started = cx.now().since_start();
@@ -514,7 +528,8 @@ impl Model {
     ) -> (Result<Answer<T>, Failure>, Ledger) {
         let mut ledger = Ledger::new();
         let mut user = user.to_owned();
-        for ask in 1..=2 {
+        let asks = if self.live { 1 } else { 2 };
+        for ask in 1..=asks {
             ledger.ask = ask;
             let text = match self
                 .complete(cx, system, &user, max_tokens, &mut ledger)
@@ -531,7 +546,7 @@ impl Model {
                     let last = ledger.attempts.last_mut().expect("an attempt");
                     last.outcome = "unreadable".into();
                     last.error = Some(reason.clone());
-                    if ask == 2 {
+                    if ask == asks {
                         return (Err(Failure { error: reason }), ledger);
                     }
                     user.push_str(&format!(

@@ -454,10 +454,10 @@ pub struct Pages {
     seed: Seed,
     maker: Option<Maker>,
     prefetch: usize,
+    live_calls: Option<std::sync::atomic::AtomicUsize>,
     store: Mutex<Store>,
-    /// For a world with canned pages, the store not answering now: the
-    /// offline generator's own while the canned one answers, or the canned
-    /// one while the offline generator's answers.
+    /// The run's other pages while prepared pages answer, or the prepared
+    /// pages while the run's other pages answer.
     parked: Mutex<Option<Store>>,
     /// Where the canned store was read from.
     canned: Option<std::path::PathBuf>,
@@ -488,6 +488,7 @@ impl Pages {
             seed,
             maker,
             prefetch,
+            live_calls: None,
             store: Mutex::new(store),
             parked: Mutex::new(None),
             canned: None,
@@ -513,6 +514,20 @@ impl Pages {
         pages.parked = Mutex::new(Some(Store::memory()));
         pages.canned = Some(root.to_owned());
         pages.canned_active = true.into();
+        Ok(pages)
+    }
+
+    /// Prepared pages first, with a bounded model and offline fallback.
+    /// All additions stay in memory, including after switching modes.
+    pub fn canned_with_model(
+        seed: Seed,
+        root: &std::path::Path,
+        model: Model,
+    ) -> Result<Self, String> {
+        let mut pages = Self::canned(seed, root)?;
+        pages.maker = Some(Maker::Model(model.live()));
+        pages.prefetch = 3;
+        pages.live_calls = Some(std::sync::atomic::AtomicUsize::new(0));
         Ok(pages)
     }
 
@@ -1133,7 +1148,10 @@ impl Pages {
                 if let Some(planted) = self.planted(host, target) {
                     return planted;
                 }
-                if let Some(fixed) = self.seed.fixed_for(host, target) {
+                if let Some(fixed) = self.seed.fixed_for(host, target)
+                    && (self.live_calls.is_none()
+                        || self.canned_active.load(std::sync::atomic::Ordering::SeqCst))
+                {
                     return self.fixed(cx, fixed).await;
                 }
                 let path = target.split('?').next().unwrap();
@@ -1160,16 +1178,31 @@ impl Pages {
     }
 
     /// Writes a generation's ledger rows, or a stub generation's one row.
-    fn log(&self, rows: &[Value]) -> Result<(), Stop> {
+    fn log(&self, cx: &Cx, rows: &[Value]) -> Result<(), Stop> {
         let mut store = self.store();
         for row in rows {
             store.log_generation(row).map_err(Stop::store)?;
+            if self.live_calls.is_some() && row["record"] == "attempt" {
+                cx.emit("adaptive", "model_call", |event| {
+                    event.field("call", example_common::events::field(row))
+                });
+            }
         }
         Ok(())
     }
 
     /// Starts one generation, or says the budget is spent.
     fn reserve(&self) -> Result<(), Stop> {
+        if let Some(calls) = &self.live_calls {
+            return calls
+                .try_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| (n < GENERATION_BUDGET).then_some(n + 1),
+                )
+                .map(|_| ())
+                .map_err(|_| Stop::Budget);
+        }
         let mut store = self.store();
         if store.made >= GENERATION_BUDGET {
             return Err(Stop::Budget);
@@ -1193,24 +1226,13 @@ impl Pages {
         read: impl Fn(&str) -> Result<T, prompts::Unreadable>,
     ) -> Result<Made<T>, Stop> {
         match self.maker() {
-            Maker::Stub => {
-                let started = cx.now().since_start();
-                let fields = stub();
-                let ms = (cx.now().since_start() - started).as_millis() as u64;
-                let usage = Usage::stub(ms);
-                let mut row = context;
-                row["record"] = json!("stub");
-                for (key, value) in serde_json::to_value(&usage).unwrap().as_object().unwrap() {
-                    row[key] = value.clone();
-                }
-                row["raw"] = Value::Null;
-                self.log(&[row])?;
-                Ok(Made { fields, usage })
-            }
+            Maker::Stub => self.offline(cx, context, stub),
             Maker::Model(model) => {
+                if self.live_calls.is_some() && self.reserve().is_err() {
+                    return self.offline(cx, context, stub);
+                }
                 let (system, user, max_tokens) = prompt();
-                // An answer that would fail the guest content check is asked
-                // for again, like any answer the world cannot use.
+                // Refuse text that reveals how pages are made.
                 let read = |text: &str| match gives_away(text) {
                     Some(word) => Err(prompts::Unreadable(format!(
                         "the answer contains {word:?}, which no page may contain; write it again without it"
@@ -1222,13 +1244,14 @@ impl Pages {
                 let status = if answer.is_ok() { "ok" } else { "error" };
                 let mut rows = ledger.rows(&context, status);
                 rows.iter_mut().for_each(|row| model.redact_json(row));
-                self.log(&rows)?;
+                self.log(cx, &rows)?;
                 let usage = ledger.usage();
                 match answer {
                     Ok(answer) => Ok(Made {
                         fields: answer.fields,
                         usage,
                     }),
+                    Err(_) if self.live_calls.is_some() => self.offline(cx, context, stub),
                     Err(Failure { error }) => Err(Stop::Failed {
                         error: model.redact(&error),
                         usage: Some(Box::new(usage)),
@@ -1236,6 +1259,24 @@ impl Pages {
                 }
             }
         }
+    }
+
+    fn offline<T>(
+        &self,
+        cx: &Cx,
+        mut context: Value,
+        stub: impl FnOnce() -> T,
+    ) -> Result<Made<T>, Stop> {
+        let started = cx.now().since_start();
+        let fields = stub();
+        let usage = Usage::stub((cx.now().since_start() - started).as_millis() as u64);
+        context["record"] = json!("stub");
+        for (key, value) in serde_json::to_value(&usage).unwrap().as_object().unwrap() {
+            context[key] = value.clone();
+        }
+        context["raw"] = Value::Null;
+        self.log(cx, &[context])?;
+        Ok(Made { fields, usage })
     }
 
     /// The people the world names, made the first time a list or page
@@ -1248,6 +1289,14 @@ impl Pages {
             .map_err(Stop::store)?;
         if let Some(cast) = self.store().cast() {
             return Ok(cast.people.clone());
+        }
+        if self.live_calls.is_some() {
+            let cast = CastRecord {
+                people: make::prepared_cast(&self.seed),
+                usage: Usage::stub(0),
+            };
+            self.store().set_cast(cast.clone()).map_err(Stop::store)?;
+            return Ok(cast.people);
         }
         self.reserve()?;
         let made = self
@@ -1482,7 +1531,9 @@ impl Pages {
         query: &str,
         engine: Engine,
     ) -> Result<SearchRecord, Stop> {
-        self.reserve()?;
+        if self.live_calls.is_none() {
+            self.reserve()?;
+        }
         let cast = self.cast(cx).await?;
         let seed = self.context();
         let (known, claims) = {
@@ -1522,7 +1573,7 @@ impl Pages {
             // A page the world already holds stays out of an unrelated list.
             // A model that lists it for this search with a row sharing the
             // search's words has said how it is related.
-            let chosen = matches!(self.maker(), Maker::Model(_))
+            let chosen = made.usage.model != "stub"
                 && make::shares_words(&format!("{} {} {}", r.title, r.url, r.snippet), query);
             if host.is_empty()
                 || results.iter().any(|x| x.url == r.url)
@@ -1559,7 +1610,7 @@ impl Pages {
                     .any(|k| k.url == r.url && make::relevant(k, query))
             })
             .count();
-        if matches!(self.maker(), Maker::Stub) && known_matches >= 8 {
+        if made.usage.model == "stub" && known_matches >= 8 {
             results.retain(|r| {
                 known
                     .iter()
@@ -1582,6 +1633,9 @@ impl Pages {
     /// Makes the pages behind a new list's first results in the background.
     /// A page that fails here is made again when it is asked for.
     fn start_prefetch(self: &Arc<Self>, cx: &Cx, record: &SearchRecord) {
+        if self.live_calls.is_some() && record.usage.model == "stub" {
+            return;
+        }
         for r in record.search.results.iter().take(self.prefetch) {
             let (host, target) = text::target_of(&r.url);
             let pages = self.clone();
@@ -1608,7 +1662,7 @@ impl Pages {
                         row["cost"] = json!(usage.cost);
                     }
                     // A world that cannot write the row says so on the next request.
-                    let _ = pages.log(&[row]);
+                    let _ = pages.log(&cx, &[row]);
                 }
                 Ok(())
             });
@@ -1637,7 +1691,9 @@ impl Pages {
             return Ok(profile);
         }
         if matches!(self.maker(), Maker::Model(_)) {
-            self.reserve()?;
+            if self.live_calls.is_none() {
+                self.reserve()?;
+            }
             let made = self
                 .generate(
                     cx,
@@ -1851,12 +1907,19 @@ impl Pages {
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
         self.making(cx, host, target);
-        let site_lock = self
-            .locks
-            .lock(cx, format!("site {host}"))
-            .await
-            .map_err(Stop::store)?;
-        self.reserve()?;
+        let site_lock = if self.live_calls.is_none() {
+            Some(
+                self.locks
+                    .lock(cx, format!("site {host}"))
+                    .await
+                    .map_err(Stop::store)?,
+            )
+        } else {
+            None
+        };
+        if self.live_calls.is_none() {
+            self.reserve()?;
+        }
         let cast = self.cast(cx).await?;
         let url = format!("https://{host}{target}");
         let mut ask = {
@@ -1964,6 +2027,21 @@ impl Pages {
                 },
                 |text| {
                     let page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
+                    if self.live_calls.is_some() {
+                        let body = if page.content_type.starts_with("text/html") {
+                            let profile = ask
+                                .profile
+                                .as_ref()
+                                .or(page.site.as_ref())
+                                .cloned()
+                                .unwrap_or_else(|| make::site_profile(host));
+                            render::page_at(host, target, &profile, &page, &seed.date)
+                        } else {
+                            page.body.clone()
+                        };
+                        text::validate_page(&page.content_type, body.as_bytes())
+                            .map_err(prompts::Unreadable)?;
+                    }
                     if ask.profile.is_none()
                         && fictionet_extras::sites::lookup(host, target).is_none()
                         && page.site.as_ref().is_none_or(|p| p.css.is_empty())

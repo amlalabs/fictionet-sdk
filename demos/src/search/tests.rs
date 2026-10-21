@@ -328,3 +328,124 @@ fn search_javascript() {
         "{text}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_page_stays_making_until_the_model_answers() {
+    use adaptive_web_world::pages::{
+        model::{Model, Provider},
+        store,
+    };
+    use fictionet_extras::models::{Key, Post, Transport};
+    use std::time::Duration;
+    struct Slow;
+    impl Transport for Slow {
+        fn post<'a>(&'a self, cx: &'a Cx, _: Vec<(&'static str, String)>, _: Vec<u8>) -> Post<'a> {
+            Box::pin(async move {
+                cx.sleep(Duration::from_secs(4))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok((200, json!({"model":"page-writer", "choices":[{"message":{"content":
+                    "STATUS: 200\nTITLE: Telescope\nSITE_CSS: body {color: #234}\nBODY:\n<h1>Telescope</h1><p>A clear view of the sky.</p>"}}],
+                    "usage":{"cost":0.001}}).to_string().into_bytes()))
+            })
+        }
+    }
+    let seed = Seed::builtin("halvard-cve").unwrap();
+    let pages = Arc::new(
+        Pages::canned_with_model(
+            seed,
+            &store::canned_root("halvard-cve"),
+            Model::new(
+                Provider::OpenRouter,
+                "",
+                "",
+                Key::new("OPENROUTER_API_KEY", Some("test-key".into())).unwrap(),
+                Arc::new(Slow),
+            ),
+        )
+        .unwrap(),
+    );
+    let searches = Arc::new(Searches::of(&pages));
+    let topics = page::Topics::new();
+    let dashboard = DashboardObserver::new(DashboardOptions::default());
+    let server = topics
+        .page(dashboard.handle(), Host::new("workstation"))
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let client = PageClient::from_url(server.url()).unwrap();
+    client.bootstrap().await.unwrap();
+    let observer = Arc::new(Fanout::new(vec![searches.clone(), dashboard.observer()]));
+    tokio::task::spawn_blocking(move || {
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
+            move |cx| async move {
+                topics.start(&cx, searches, pages.clone())?;
+                let writer = pages.clone();
+                let task = cx.spawn(move |cx| async move {
+                    fictionet_extras::models::Engine::fetch(
+                        writer,
+                        cx,
+                        "https://example.com/telescope".into(),
+                    )
+                    .await?;
+                    Ok(())
+                });
+                for _ in 0..3 {
+                    cx.sleep(Duration::from_secs(1)).await?;
+                    let snapshot = {
+                        let read = tokio::task::unconstrained(client.get_json("/api/state/web"));
+                        tokio::pin!(read);
+                        // Keep the lab clock fixed during the host HTTP read.
+                        loop {
+                            tokio::select! {
+                                biased;
+                                result = &mut read => break result.unwrap(),
+                                _ = cx.yield_now() => {}
+                            }
+                        }
+                    };
+                    let row = &snapshot["value"]["pages"][0];
+                    assert_eq!(row["making"], true);
+                    assert_eq!(row["fetches"], 0);
+                    // A prepared page can answer while the model is still writing.
+                    assert_eq!(
+                        pages
+                            .handle(&cx, "GET", "www.halvardsystems.com", "/", None)
+                            .await
+                            .status,
+                        200
+                    );
+                }
+                task.join(&cx).await?;
+                cx.sleep(Duration::from_millis(100)).await?;
+                let snapshot = {
+                    let read = tokio::task::unconstrained(client.get_json("/api/state/web"));
+                    tokio::pin!(read);
+                    // Keep the lab clock fixed during the host HTTP read.
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut read => break result.unwrap(),
+                            _ = cx.yield_now() => {}
+                        }
+                    }
+                };
+                let row = &snapshot["value"]["pages"][0];
+                assert_eq!(row["making"], false);
+                assert_eq!(row["made"], "written_live");
+                assert_eq!(row["model"], "page-writer");
+                assert_eq!(row["gen_ms"], 4000);
+                assert_eq!(row["serve_ms"], 4000);
+                assert_eq!(row["cost"], 0.001);
+                assert_eq!(snapshot["value"]["generator"]["model_calls"], 1);
+                cx.cancel();
+                Ok(())
+            },
+        ))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    server.shutdown(Duration::from_secs(1)).await;
+}

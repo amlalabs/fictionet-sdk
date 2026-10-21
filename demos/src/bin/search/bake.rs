@@ -2,7 +2,7 @@
 //! VM. It runs every search and address in the seed's query list
 //! (`examples/adaptive-web/seeds/<seed>.queries`), makes the page behind
 //! every result, and keeps them in `examples/adaptive-web/stores/<seed>/`.
-//! The app serves that store and never calls a model for pages.
+//! The app serves those pages first and writes the rest during the run.
 //!
 //! The key comes from `OPENROUTER_API_KEY`. Model calls stop before they
 //! could pass [`CALLS`]: each search or page is started only while the calls

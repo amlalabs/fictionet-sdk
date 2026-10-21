@@ -25,8 +25,9 @@ pub const MAX_REFUSED: usize = 64;
 pub const MAX_SEED_ITEMS: usize = 32;
 /// Most recent planted facts and pages retained.
 pub const MAX_PLANTED: usize = 16;
-/// Maximum compact snapshot JSON size: 5,239,533 bytes at these limits.
-/// Each string byte can need six JSON bytes. Numbers use twenty digits.
+/// Maximum compact snapshot JSON size: 5,445,605 bytes at these limits.
+/// Each string byte can need six JSON bytes. Counts use twenty digits;
+/// costs use up to twenty-three bytes.
 /// Fixed costs include field names, punctuation and the longest enum values.
 pub const MAX_SNAPSHOT_BYTES: usize = {
     let string = 6 * STRING_BYTES;
@@ -35,18 +36,18 @@ pub const MAX_SNAPSHOT_BYTES: usize = {
         // Facts and named sites, including array commas.
         + MAX_SEED_ITEMS * (3 + string) + MAX_SEED_ITEMS * (22 + 2 * string)
         // Query rows, including failure text and a comma per row.
-        + MAX_QUERIES * (462 + 6 * string)
+        + MAX_QUERIES * (504 + 7 * string)
         // Result lists and their entries, including array commas.
         + MAX_RESULTS * (75 + string + MAX_LISTED * (70 + 4 * string))
         // Page rows, including search reasons and a comma per row.
-        + MAX_PAGES * (496 + 7 * string)
+        + MAX_PAGES * (527 + 7 * string)
         // Site and refusal rows, including a comma per row.
         + MAX_SITES * (89 + 3 * string)
         + MAX_REFUSED * (53 + 2 * string)
         // Planted rows with a comma each but the last, the list's name and
         // brackets, the canned flag and the omitted count.
         + MAX_PLANTED * (60 + 3 * string)
-        + 58
+        + 178
 };
 
 fn bounded(text: &str) -> String {
@@ -101,6 +102,9 @@ impl SeedCard {
 /// The generator settings for a run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generator {
+    pub model_calls: u64,
+    pub model_cost_known: serde_json::Number,
+    pub model_cost_unknown: u64,
     pub kind: GeneratorKind,
     pub model: String,
     /// Maximum result pages to fetch ahead of time per search.
@@ -119,6 +123,9 @@ pub struct Generator {
 impl Default for Generator {
     fn default() -> Self {
         Self {
+            model_calls: 0,
+            model_cost_known: 0.into(),
+            model_cost_unknown: 0,
             kind: GeneratorKind::default(),
             model: String::new(),
             prefetch: 0,
@@ -208,8 +215,10 @@ pub struct Query {
     pub carries: Option<u64>,
     /// Result count the answer reported.
     pub results: Option<u64>,
+    pub model: String,
     /// Time spent generating the answer, in milliseconds.
     pub gen_ms: Option<u64>,
+    pub cost: Option<serde_json::Number>,
     /// Time spent serving the request, in milliseconds.
     pub serve_ms: Option<u64>,
     /// Sequence number of the latest answer or failure event.
@@ -346,6 +355,7 @@ pub struct Page {
     pub serve_ms: Option<u64>,
     /// Generation time of the first served fetch, in milliseconds.
     pub gen_ms: Option<u64>,
+    pub cost: Option<serde_json::Number>,
     /// Serving time of the latest fetch, in milliseconds.
     pub latest_serve_ms: Option<u64>,
     /// Creation reason from the first served fetch.
@@ -527,6 +537,7 @@ impl Observer for Searches {
                     | "restarted"
                     | "search_answer"
                     | "making"
+                    | "model_call"
                     | "page_failed"
             ) | ("http", "request")
         )
@@ -558,6 +569,21 @@ fn host(url: &str) -> String {
 impl Snapshot {
     fn apply(&mut self, e: &Event, seq: u64, ms: u64) -> bool {
         match (e.source, e.kind) {
+            ("adaptive", "model_call") => {
+                let Some(call) = e.get("call").map(|v| js(Some(v))) else {
+                    return false;
+                };
+                self.generator.model_calls += 1;
+                if let Some(cost) = call["cost"].as_f64() {
+                    let total = self.generator.model_cost_known.as_f64().unwrap_or(0.0) + cost;
+                    if let Some(total) = serde_json::Number::from_f64(total) {
+                        self.generator.model_cost_known = total;
+                    }
+                } else {
+                    self.generator.model_cost_unknown += 1;
+                }
+                true
+            }
             ("adaptive", "generation") => {
                 let (Some(generate), Some(revision)) = (parse(e, "generate"), e.u64("revision"))
                 else {
@@ -619,7 +645,9 @@ impl Snapshot {
                     cache: None,
                     carries: None,
                     results: None,
+                    model: String::new(),
                     gen_ms: None,
+                    cost: None,
                     serve_ms: None,
                     answer_seq: None,
                     answer_at_ms: None,
@@ -678,6 +706,8 @@ impl Snapshot {
                     q.results = e.u64("results");
                     q.carries = e.u64("carries");
                     q.gen_ms = e.u64("gen_ms");
+                    q.model = text(e, "model");
+                    q.cost = parse(e, "cost");
                     q.serve_ms = e.u64("serve_ms").or(q.serve_ms);
                     q.answer_seq = Some(seq);
                     q.answer_at_ms = Some(ms);
@@ -762,6 +792,7 @@ impl Snapshot {
                         cache,
                         serve_ms: e.u64("serve_ms"),
                         gen_ms: e.u64("gen_ms"),
+                        cost: parse(e, "cost"),
                         latest_serve_ms: e.u64("serve_ms"),
                         reason,
                         made,
@@ -840,6 +871,7 @@ impl Snapshot {
                             cache: Cache::Unknown,
                             serve_ms: None,
                             gen_ms: None,
+                            cost: None,
                             latest_serve_ms: None,
                             reason: Reason::Unknown,
                             made: Made::Unknown,

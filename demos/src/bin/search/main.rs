@@ -2,8 +2,8 @@
 //! adaptive web, with the canned pages for the halvard-cve seed.
 //!
 //! - `search <downloads>` is the app: it boots, opens the page and stays up
-//!   until Ctrl-C. Pages come from the canned store, and the offline
-//!   generator makes what it lacks; nothing calls a model for pages.
+//!   until Ctrl-C. Prepared pages answer first. A model fills the gaps
+//!   with an OpenRouter key; otherwise the offline maker does.
 //! - `search <downloads> check` runs the scripted story and its checks.
 //! - `search preview` shows the page with an in-world client and no VM.
 //! - `search bake` makes the canned store with a model (see `bake.rs`).
@@ -70,6 +70,50 @@ fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
     }
 }
 
+/// Connects to the provider using the request's run.
+struct OpenRouter;
+
+impl fictionet_extras::models::Transport for OpenRouter {
+    fn post<'a>(
+        &'a self,
+        cx: &'a fictionet::Cx,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    ) -> fictionet_extras::models::Post<'a> {
+        Box::pin(async move {
+            use fictionet_extras::models::{Https, Provider};
+            let https = Https::new(cx, Provider::OpenRouter).map_err(|e| e.to_string())?;
+            https.post(cx, headers, body).await
+        })
+    }
+}
+
+fn app_pages(seed: Seed, check: bool) -> Result<Pages> {
+    use adaptive_web_world::pages::model::Provider;
+    use fictionet_extras::models::Key;
+    let key = if !check && std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        Some(Key::from_env(Provider::OpenRouter.into())?)
+    } else {
+        None
+    };
+    pages_for_key(seed, key)
+}
+
+fn pages_for_key(seed: Seed, key: Option<fictionet_extras::models::Key>) -> Result<Pages> {
+    use adaptive_web_world::pages::model::{Model, Provider};
+    let root = store::canned_root(&seed.name);
+    if let Some(key) = key {
+        let provider = Provider::OpenRouter;
+        Ok(Pages::canned_with_model(
+            seed,
+            &root,
+            Model::new(provider, "", "", key, Arc::new(OpenRouter)),
+        )?)
+    } else {
+        Ok(Pages::canned(seed, &root)?)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result {
     let total = Instant::now();
@@ -80,7 +124,7 @@ async fn main() -> Result {
         Mode::Check { downloads } => (downloads, true),
     };
     let seed = Seed::builtin(SEED)?;
-    let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(SEED))?);
+    let pages = Arc::new(app_pages(seed.clone(), check)?);
     let output = downloads.join("runs").join(format!(
         "search-{}",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
@@ -167,6 +211,30 @@ mod tests {
 
     fn parse(args: &[&str]) -> Option<Mode> {
         arguments(args.iter().map(|a| a.to_string())).ok()
+    }
+
+    #[test]
+    fn the_key_selects_the_maker_and_checks_always_use_offline_pages() {
+        use adaptive_web_world::pages::model::Provider;
+        use adaptive_web_world::pages::{GeneratorKind, NewPages, Seed};
+        use fictionet_extras::models::Key;
+        let seed = || Seed::builtin(super::SEED).unwrap();
+        let offline = super::pages_for_key(seed(), None).unwrap();
+        assert_eq!(offline.generator_kind(), GeneratorKind::Stub);
+        assert_eq!(offline.prefetch(), 0);
+        assert_eq!(offline.new_pages(), NewPages::Canned);
+        let check = super::app_pages(seed(), true).unwrap();
+        assert_eq!(check.generator_kind(), GeneratorKind::Stub);
+        assert_eq!(check.prefetch(), 0);
+        let key = Key::new("OPENROUTER_API_KEY", Some("test-key".into())).unwrap();
+        let live = super::pages_for_key(seed(), Some(key)).unwrap();
+        assert_eq!(
+            live.generator_kind(),
+            GeneratorKind::Model(Provider::OpenRouter)
+        );
+        assert_eq!(live.model(), Provider::OpenRouter.default_model());
+        assert_eq!(live.prefetch(), 3);
+        assert_eq!(live.new_pages(), NewPages::Canned);
     }
 
     #[test]

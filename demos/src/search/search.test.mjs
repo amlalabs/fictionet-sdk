@@ -1102,3 +1102,16 @@ test('names survive older result lists leaving the snapshot', () => {
   assert.equal(h.root.querySelector('.site-group').querySelector('.label').textContent, 'Python Documentat…');
   h.dispose();
 });
+
+test('the World menu names the model choice and preserves its command', async () => {
+  const h = harness();
+  for (const kind of ['openrouter', 'anthropic', 'stub']) {
+    h.publish({ ...fixture(), generator: { ...fixture().generator, kind } });
+    const button = h.services.worldMenu.querySelector('.seg').children[1];
+    assert.equal(button.textContent, kind === 'stub' ? 'Improvised' : 'Written live');
+    button.dispatchEvent(new Event('click'));
+    await settle();
+    assert.equal(h.posts.at(-1).body.command.new_pages, 'stub');
+  }
+  h.dispose();
+});

@@ -92,13 +92,26 @@ fn get(e: &Event, name: &str) -> Value {
 fn line(e: &Event) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
     match (e.source, e.kind) {
+        ("adaptive", "model_call") => {
+            let mut call = get(e, "call");
+            call["type"] = json!("model_call");
+            Some(call)
+        }
         ("adaptive", "generation") => Some(json!({"type": "generation",
             "generate": get(e, "generate"), "revision": get(e, "revision")})),
         ("adaptive", "query") => Some(json!({"type": "query", "id": get(e, "query_id"),
             "engine": get(e, "engine"), "search": get(e, "search"), "start": get(e, "start")})),
-        ("adaptive", "search_answer") => Some(json!({"type": "search_answer",
-            "id": get(e, "query_id"), "cache": get(e, "cache"), "results": get(e, "results"),
-            "model": get(e, "model")})),
+        ("adaptive", "search_answer") => {
+            let mut row = json!({"type": "search_answer",
+                "id": get(e, "query_id"), "cache": get(e, "cache"), "results": get(e, "results"),
+                "model": get(e, "model")});
+            for name in ["gen_ms", "serve_ms", "cost"] {
+                if let Some(value) = e.get(name) {
+                    row[name] = js(Some(value));
+                }
+            }
+            Some(row)
+        }
         ("adaptive", "query_failed") => {
             let mut line =
                 json!({"type": "query_failed", "id": get(e, "query_id"), "why": get(e, "why")});
@@ -401,5 +414,29 @@ mod tests {
             assert_eq!(line["sent"], sent);
             assert_eq!(line["complete"], complete);
         }
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn model_calls_keep_cost_time_and_outcome_in_the_run_log() {
+        let call = json!({"record":"attempt", "kind":"page", "url":"https://example.com/a",
+            "model":"writer", "cost":0.001, "gen_ms":3200, "outcome":"ok", "terminal":true});
+        let event = Event::new("adaptive", "model_call")
+            .field("call", example_common::events::field(&call));
+        let mut expected = call;
+        expected["type"] = json!("model_call");
+        assert_eq!(line(&event), Some(expected));
+        let event = Event::new("adaptive", "search_answer")
+            .field("gen_ms", 3800u64)
+            .field("serve_ms", 3800u64)
+            .field("cost", fictionet::events::float(0.002));
+        let row = line(&event).unwrap();
+        assert_eq!(row["gen_ms"], 3800);
+        assert_eq!(row["serve_ms"], 3800);
+        assert_eq!(row["cost"], 0.002);
     }
 }

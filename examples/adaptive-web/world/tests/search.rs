@@ -505,7 +505,9 @@ fn worst_case_snapshot_fits() {
         cache: Some(Cache::Prefetched),
         carries: Some(n),
         results: Some(n),
+        model: t.clone(),
         gen_ms: Some(n),
+        cost: Some(serde_json::Number::from_f64(f64::MAX).unwrap()),
         serve_ms: Some(n),
         answer_seq: Some(n),
         answer_at_ms: Some(n),
@@ -542,6 +544,7 @@ fn worst_case_snapshot_fits() {
         cache: Cache::Prefetched,
         serve_ms: Some(n),
         gen_ms: Some(n),
+        cost: Some(serde_json::Number::from_f64(f64::MAX).unwrap()),
         latest_serve_ms: Some(n),
         reason: Reason::Search {
             query: t.clone(),
@@ -567,6 +570,9 @@ fn worst_case_snapshot_fits() {
         at_ms: n,
         seed,
         generator: Generator {
+            model_calls: n,
+            model_cost_known: serde_json::Number::from_f64(f64::MAX).unwrap(),
+            model_cost_unknown: n,
             kind: GeneratorKind::Model(Provider::OpenRouter),
             model: t.clone(),
             prefetch: n,

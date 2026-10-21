@@ -44,7 +44,10 @@ export function mount(root, services, options) {
     if (!segment || !snapshot?.generator) return;
     const g = snapshot.generator;
     const mode = !g.generate ? 'off' : g.canned ? 'canned' : 'stub';
-    for (const button of segment.children) button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
+    for (const button of segment.children) {
+      button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
+      if (button.dataset.mode === 'stub') button.textContent = ['openrouter', 'anthropic'].includes(g.kind) ? 'Written live' : 'Improvised';
+    }
   }
   if (menu) {
     const { el: item } = services.dom.scoped(menu);
