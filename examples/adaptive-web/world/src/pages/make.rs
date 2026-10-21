@@ -316,8 +316,153 @@ fn lower_first(text: &str) -> String {
     })
 }
 
+struct Question {
+    shape: &'static str,
+    subject: String,
+}
+
+impl Question {
+    fn parse(query: &str) -> Option<Self> {
+        let q = normalize_space(query).to_lowercase();
+        let q = q.trim_end_matches('?');
+        let (shape, rest) = [
+            ("how long ", "duration"),
+            ("how much ", "amount"),
+            ("how many ", "count"),
+            ("how often ", "frequency"),
+            ("why is ", "cause"),
+            ("why does ", "cause"),
+            ("what happens if ", "consequence"),
+            ("when should ", "timing"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, shape)| q.strip_prefix(prefix).map(|rest| (shape, rest)))?;
+        let rest = rest
+            .strip_prefix("does it take to ")
+            .or_else(|| rest.strip_prefix("do i need to "))
+            .or_else(|| rest.strip_prefix("should i "))
+            .or_else(|| rest.strip_prefix("should you "))
+            .or_else(|| rest.strip_prefix("do you "))
+            .or_else(|| rest.strip_prefix("do i "))
+            .or_else(|| rest.strip_prefix("you "))
+            .or_else(|| rest.strip_prefix("i "))
+            .or_else(|| rest.strip_prefix("to "))
+            .unwrap_or(rest);
+        let nominal = shape == "cause"
+            || ["does ", "do ", "is ", "are "]
+                .iter()
+                .any(|prefix| rest.starts_with(prefix));
+        let rest = ["does ", "do ", "is ", "are "]
+            .into_iter()
+            .find_map(|prefix| rest.strip_prefix(prefix))
+            .unwrap_or(rest);
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        let auxiliary = parts
+            .iter()
+            .position(|w| ["does", "do", "is", "are", "should", "can"].contains(w));
+        let noun_end = usize::from(
+            parts
+                .first()
+                .is_some_and(|word| ["a", "an", "the", "my", "your"].contains(word)),
+        ) + 1;
+        let copula = q.starts_with("why is ");
+        let verb = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !nominal || *index >= noun_end)
+            .find_map(|(index, w)| {
+                let matches = if copula {
+                    [
+                        "dense", "blue", "green", "red", "cold", "hot", "salty", "bright", "round",
+                    ]
+                    .contains(w)
+                } else {
+                    [
+                        "boil",
+                        "simmer",
+                        "freeze",
+                        "overwater",
+                        "cook",
+                        "bake",
+                        "charge",
+                        "swallow",
+                        "water",
+                        "replace",
+                        "prune",
+                        "clean",
+                        "wash",
+                        "feed",
+                        "use",
+                        "take",
+                        "knead",
+                        "purr",
+                        "sleep",
+                        "need",
+                        "turn",
+                        "form",
+                        "float",
+                        "rise",
+                        "fall",
+                        "change",
+                        "grow",
+                        "cost",
+                        "last",
+                        "have",
+                        "weigh",
+                        "dry",
+                        "rest",
+                        "soak",
+                        "walk",
+                        "leave",
+                        "plant",
+                        "harvest",
+                        "dense",
+                        "blue",
+                        "green",
+                        "red",
+                        "cold",
+                        "hot",
+                        "salty",
+                        "bright",
+                        "round",
+                    ]
+                    .contains(w)
+                };
+                matches.then_some(index)
+            });
+        let subject = if let Some(end) = auxiliary.filter(|end| *end > 0) {
+            parts[..end].join(" ")
+        } else if let Some(index) = verb {
+            if index == 0 {
+                parts[1..].join(" ")
+            } else {
+                parts[..index].join(" ")
+            }
+        } else {
+            rest.to_owned()
+        };
+        let subject = subject
+            .split(" before ")
+            .next()
+            .unwrap_or(&subject)
+            .split(" after ")
+            .next()
+            .unwrap_or(&subject)
+            .trim()
+            .to_owned();
+        if subject.is_empty() {
+            None
+        } else {
+            Some(Self { shape, subject })
+        }
+    }
+}
+
 fn intent(query: &str) -> &'static str {
     let q = query.to_lowercase();
+    if Question::parse(query).is_some() {
+        return "question";
+    }
     if q.starts_with("best ") || q.contains(" review") || q.contains(" vs ") {
         return "review";
     }
@@ -466,14 +611,36 @@ fn intent(query: &str) -> &'static str {
 }
 
 fn subreddit(query: &str) -> String {
-    let q = query.to_lowercase();
-    if q.contains("bike") || q.contains("bicycle") || q.contains("chain") {
+    let subject = Question::parse(query).map(|question| question.subject);
+    let q = subject.as_deref().unwrap_or(query).to_lowercase();
+    if [
+        "egg", "rice", "pasta", "bread", "bean", "lentil", "potato", "food",
+    ]
+    .iter()
+    .any(|word| q.contains(word))
+    {
+        "Cooking".into()
+    } else if ["plant", "fern", "tomato", "rose", "orchid"]
+        .iter()
+        .any(|word| q.contains(word))
+    {
+        "gardening".into()
+    } else if q.contains("electric car") || q.contains("battery") {
+        "electricvehicles".into()
+    } else if ["sky", "moon", "sun", "ocean", "water", "light", "earth"]
+        .iter()
+        .any(|word| q.contains(word))
+    {
+        "askscience".into()
+    } else if q.contains("gum") {
+        "AskScienceDiscussion".into()
+    } else if q.contains("bike") || q.contains("bicycle") || q.contains("chain") {
         "bikewrench".into()
     } else if q.contains("keyboard") {
         "MechanicalKeyboards".into()
     } else if q.contains("laptop") {
         "techsupport".into()
-    } else if q.contains("dog") || q.contains("cat ") {
+    } else if q.contains("dog") || q.contains("cat") {
         "AskVet".into()
     } else if q.contains("rust") {
         "rust".into()
@@ -498,10 +665,7 @@ fn subreddit(query: &str) -> String {
     } else if q.contains("halvard") {
         "sysadmin".into()
     } else {
-        words(query)
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "AskReddit".into())
+        "AskReddit".into()
     }
 }
 
@@ -674,13 +838,46 @@ impl Forecast {
     }
 }
 
+fn subtitle(subject: &str, suffix: &str) -> String {
+    let subject_words = subject.split_whitespace().collect::<Vec<_>>();
+    let suffix_words = suffix.split_whitespace().collect::<Vec<_>>();
+    let overlap = (1..=subject_words.len().min(suffix_words.len()))
+        .rev()
+        .find(|&count| {
+            subject_words[subject_words.len() - count..]
+                .iter()
+                .zip(&suffix_words[..count])
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        })
+        .unwrap_or(0);
+    let suffix = suffix_words[overlap..].join(" ");
+    if suffix.is_empty() {
+        subject.to_owned()
+    } else {
+        format!("{subject}: {suffix}")
+    }
+}
+
 fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &str) -> String {
+    let title = title_pattern(seed, query, host, angle, original);
+    let name = site_profile(host).name;
+    if title.to_lowercase().contains(&name.to_lowercase()) {
+        title
+    } else {
+        format!("{title} | {name}")
+    }
+}
+
+fn title_pattern(seed: &Seed, query: &str, host: &str, angle: usize, original: &str) -> String {
     let q = query.to_lowercase();
     let name = site_profile(host).name;
     let subject = proper(query);
+    if Question::parse(query).is_some() {
+        return format!("{}?", subject.trim_end_matches('?'));
+    }
     if q.contains(" vs ") {
         return format!(
-            "{subject}: {} | {name}",
+            "{subject}: {}",
             [
                 "key differences",
                 "compared in daily use",
@@ -751,49 +948,45 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
         } else if site_profile(host).kind == "qa" && intent(query) == "question" {
             format!("{}?", subject.trim_end_matches('?'))
         } else {
-            format!("{subject}: {angle_title}")
+            subtitle(&subject, angle_title)
         };
-        return format!("{title} | {name}");
+        return title;
     }
     if q.contains("cactus") {
-        return format!(
-            "{} | {name}",
-            [
-                "Repotting a Cactus: Pots, Compost and Aftercare",
-                "How to Repot a Cactus Safely",
-                "How to Repot a Cactus Without Getting Pricked",
-                "Repotting a Cactus: A Step-by-Step Project",
-                "When Your Cactus Needs a Bigger Pot",
-                "How do you lift a tall cactus out of its pot?",
-                "Cactus Care: Drainage and Root Health",
-                "A New Pot for Your Cactus",
-                "Repotting Cacti Without Burying the Stem",
-                "Spring Cactus Care: Check the Roots",
-                "Moving a Cactus: Tools That Protect Your Hands",
-                "Choosing the Right Pot for a Cactus",
-                "Cactus Repotting Mistakes to Avoid",
-            ][angle % 13]
-        );
+        return ([
+            "Repotting a Cactus: Pots, Compost and Aftercare",
+            "How to Repot a Cactus Safely",
+            "How to Repot a Cactus Without Getting Pricked",
+            "Repotting a Cactus: A Step-by-Step Project",
+            "When Your Cactus Needs a Bigger Pot",
+            "How do you lift a tall cactus out of its pot?",
+            "Cactus Care: Drainage and Root Health",
+            "A New Pot for Your Cactus",
+            "Repotting Cacti Without Burying the Stem",
+            "Spring Cactus Care: Check the Roots",
+            "Moving a Cactus: Tools That Protect Your Hands",
+            "Choosing the Right Pot for a Cactus",
+            "Cactus Repotting Mistakes to Avoid",
+        ][angle % 13])
+            .to_owned();
     }
     if q.contains("coffee") {
-        return format!(
-            "{} | {name}",
-            [
-                "Caffeine Before Exercise: Benefits and Side Effects",
-                "Coffee Before Running: How Much Is Too Much?",
-                "Should You Drink Coffee Before a Run?",
-                "Coffee and Running: Timing, Tolerance and Stomach Upset",
-                "A Runner’s Guide to Pre-Run Coffee",
-                "Why Coffee Can Upset Your Stomach Before Exercise",
-                "Caffeine, Hydration and Your Morning Run",
-                "Coffee Before a Workout: What to Consider",
-                "Does anyone else get stomach cramps after pre-run coffee?",
-                "Coffee and Fitness: Finding a Routine That Suits You",
-                "How Much Caffeine Is in Your Pre-Run Drink?",
-                "Feeling Shaky After Coffee and Exercise?",
-                "Evening Runs: Caffeine and Sleep",
-            ][angle % 13]
-        );
+        return ([
+            "Caffeine Before Exercise: Benefits and Side Effects",
+            "Coffee Before Running: How Much Is Too Much?",
+            "Should You Drink Coffee Before a Run?",
+            "Coffee and Running: Timing, Tolerance and Stomach Upset",
+            "A Runner’s Guide to Pre-Run Coffee",
+            "Why Coffee Can Upset Your Stomach Before Exercise",
+            "Caffeine, Hydration and Your Morning Run",
+            "Coffee Before a Workout: What to Consider",
+            "Does anyone else get stomach cramps after pre-run coffee?",
+            "Coffee and Fitness: Finding a Routine That Suits You",
+            "How Much Caffeine Is in Your Pre-Run Drink?",
+            "Feeling Shaky After Coffee and Exercise?",
+            "Evening Runs: Caffeine and Sleep",
+        ][angle % 13])
+            .to_owned();
     }
     let titles: &[&str] = if q.contains("bread") && !q.contains("sourdough") {
         &[
@@ -866,13 +1059,13 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
         return Forecast::new(seed, query, host).title(host, angle);
     }
     if !titles.is_empty() {
-        return format!("{} | {name}", titles[angle % titles.len()]);
+        return titles[angle % titles.len()].to_owned();
     }
     if (q.contains("airfare") || q.contains("airline") || q.contains("flight"))
         && !q.contains(" to ")
     {
         return format!(
-            "{}: {} | {name}",
+            "{}: {}",
             proper(query),
             [
                 "Fees and Conditions",
@@ -894,75 +1087,68 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
     if q.contains("flight") || q.contains("airfare") || q.contains("airline") {
         let destination = q.split_once(" to ").map_or("your destination", |(_, p)| p);
         let destination = upper_first(destination);
-        return format!(
-            "{} | {name}",
-            match angle % 13 {
-                0 => format!("Flights to {destination}: Fares and Baggage"),
-                1 => format!("Cheap Flights to {destination}: Compare Dates"),
-                2 => format!("{destination} Flights: Find Your Next Trip"),
-                3 => format!("Compare Cheap Flights to {destination}"),
-                4 => format!("Find Low Flight Fares to {destination}"),
-                5 => format!("{destination}: Direct Flights and Connections"),
-                6 => format!("Book Flights to {destination}"),
-                7 => format!("Flight Fare Finder: {destination}"),
-                8 => format!("Fly to {destination}: Routes and Flight Times"),
-                9 => format!("Flights and Airport Transfers in {destination}"),
-                10 => format!("{destination} Flight Deals for Flexible Dates"),
-                11 => format!("Your Flight to {destination}: Tickets and Travel"),
-                _ => format!("Planning Flights to {destination}: Airports and Transfers"),
-            }
-        );
+        return match angle % 13 {
+            0 => format!("Flights to {destination}: Fares and Baggage"),
+            1 => format!("Cheap Flights to {destination}: Compare Dates"),
+            2 => format!("{destination} Flights: Find Your Next Trip"),
+            3 => format!("Compare Cheap Flights to {destination}"),
+            4 => format!("Find Low Flight Fares to {destination}"),
+            5 => format!("{destination}: Direct Flights and Connections"),
+            6 => format!("Book Flights to {destination}"),
+            7 => format!("Flight Fare Finder: {destination}"),
+            8 => format!("Fly to {destination}: Routes and Flight Times"),
+            9 => format!("Flights and Airport Transfers in {destination}"),
+            10 => format!("{destination} Flight Deals for Flexible Dates"),
+            11 => format!("Your Flight to {destination}: Tickets and Travel"),
+            _ => format!("Planning Flights to {destination}: Airports and Transfers"),
+        };
     }
     if q.contains("pizza") && q.contains(" in ") {
         let city = q.split_once(" in ").map_or("Naples", |(_, p)| p);
-        return format!(
-            "{} | {name}",
-            [
-                format!("Where to Find Great Pizza in {}", upper_first(city)),
-                format!("Book a Table for Pizza in {}", upper_first(city)),
-                format!(
-                    "Where to Eat Pizza in {}: Our Favorite Pizzerias",
-                    upper_first(city)
-                ),
-                format!("Top-Rated Pizza in {}", upper_first(city)),
-                format!("Where would you go for pizza in {}?", upper_first(city)),
-                format!("A Pizza Lover’s Guide to {}", upper_first(city)),
-                format!("{} Pizza: Beyond the Longest Queues", upper_first(city)),
-                format!("Pizza Delivery in {}", upper_first(city)),
-                format!("{} Pizzerias for a Night Out", upper_first(city)),
-                format!("The Neighborhood Guide to Pizza in {}", upper_first(city)),
-                format!("{} Pizza Map: Traditional and Fried", upper_first(city)),
-                format!("Pizza in {}: Menus and Local Favorites", upper_first(city)),
-                format!("{} Pizza Kitchens Worth a Detour", upper_first(city)),
-            ][angle % 13]
-        );
+        return ([
+            format!("Where to Find Great Pizza in {}", upper_first(city)),
+            format!("Book a Table for Pizza in {}", upper_first(city)),
+            format!(
+                "Where to Eat Pizza in {}: Our Favorite Pizzerias",
+                upper_first(city)
+            ),
+            format!("Top-Rated Pizza in {}", upper_first(city)),
+            format!("Where would you go for pizza in {}?", upper_first(city)),
+            format!("A Pizza Lover’s Guide to {}", upper_first(city)),
+            format!("{} Pizza: Beyond the Longest Queues", upper_first(city)),
+            format!("Pizza Delivery in {}", upper_first(city)),
+            format!("{} Pizzerias for a Night Out", upper_first(city)),
+            format!("The Neighborhood Guide to Pizza in {}", upper_first(city)),
+            format!("{} Pizza Map: Traditional and Fried", upper_first(city)),
+            format!("Pizza in {}: Menus and Local Favorites", upper_first(city)),
+            format!("{} Pizza Kitchens Worth a Detour", upper_first(city)),
+        ][angle % 13])
+            .to_owned();
     }
     if ["halvard", "hg-400", "gateway", "41877"]
         .iter()
         .any(|w| q.contains(w))
     {
-        return format!(
-            "{} | {name}",
-            [
-                "Halvard fixes critical Gateway flaw in firmware 7.2.4",
-                "Halvard Gateway patch: what appliance owners need to know",
-                "How are other Halvard Gateway admins scheduling this update?",
-                "Halvard Gateway’s web portal flaw puts firmware upgrades in focus",
-                "Halvard Gateway admins plan upgrades after exploited portal flaw",
-                "The Halvard Gateway firmware advisory: affected releases and mitigation",
-                "Is an older Halvard Gateway firmware release safe to use?",
-                "Halvard Gateway: a guide to the September security fix",
-                "Halvard Gateway portal vulnerability and firmware update notes",
-                "Updating a Halvard Gateway: questions from administrators",
-                "Halvard Gateway patch closes a critical pre-authentication flaw",
-                "Halvard Gateway owners review firmware maintenance plans",
-                "What the Halvard Gateway portal fix means for VPN administrators",
-            ][angle % 13]
-        );
+        return ([
+            "Halvard fixes critical Gateway flaw in firmware 7.2.4",
+            "Halvard Gateway patch: what appliance owners need to know",
+            "How are other Halvard Gateway admins scheduling this update?",
+            "Halvard Gateway’s web portal flaw puts firmware upgrades in focus",
+            "Halvard Gateway admins plan upgrades after exploited portal flaw",
+            "The Halvard Gateway firmware advisory: affected releases and mitigation",
+            "Is an older Halvard Gateway firmware release safe to use?",
+            "Halvard Gateway: a guide to the September security fix",
+            "Halvard Gateway portal vulnerability and firmware update notes",
+            "Updating a Halvard Gateway: questions from administrators",
+            "Halvard Gateway patch closes a critical pre-authentication flaw",
+            "Halvard Gateway owners review firmware maintenance plans",
+            "What the Halvard Gateway portal fix means for VPN administrators",
+        ][angle % 13])
+            .to_owned();
     }
     if q.contains("router") {
         return format!(
-            "{original}: {} | {name}",
+            "{original}: {}",
             [
                 "Steps and Precautions",
                 "Model-Specific Instructions",
@@ -1000,12 +1186,12 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
     let forum_topic = topic.to_lowercase();
     if intent(query) == "review" {
         match site_profile(host).kind.as_str() {
-            "forum" | "qa" => return format!("Which {forum_topic} would you recommend? | {name}"),
+            "forum" | "qa" => return format!("Which {forum_topic} would you recommend?"),
             "shop" => return format!("Shop {topic} at {name}"),
             _ => {}
         }
     }
-    let title = match intent(query) {
+    match intent(query) {
         "review" => [
             format!("The Best {topic}: Our Picks for 2026"),
             format!("{topic}: Compared in Daily Use"),
@@ -1096,31 +1282,420 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
         _ => {
             let subject = heading(original);
             if host == "en.wikipedia.org" {
-                return format!("{} | Wikipedia", proper(query));
+                return proper(query);
             }
             match angle % 13 {
                 0 => original.to_owned(),
-                1 => format!("{subject}: Common Questions"),
+                1 => subtitle(subject, "Common Questions"),
                 2 => format!("How Does {subject} Work?"),
-                3 => format!("{subject}: A Practical Guide"),
+                3 => subtitle(subject, "A Practical Guide"),
                 4 => format!("Understanding {subject}"),
-                5 => format!("{subject}: Background and Terminology"),
-                6 => format!("{subject}: Examples and Methods"),
+                5 => subtitle(subject, "Background and Terminology"),
+                6 => subtitle(subject, "Examples and Methods"),
                 7 => format!("Getting Started With {subject}"),
-                8 => format!("{subject}: Details Worth Checking"),
+                8 => subtitle(subject, "Details Worth Checking"),
                 9 => format!("A Closer Look at {subject}"),
-                10 => format!("{subject}: Tips From Practice"),
-                11 => format!("{subject}: Questions From Readers"),
+                10 => subtitle(subject, "Tips From Practice"),
+                11 => subtitle(subject, "Questions From Readers"),
                 _ => format!("Working With {subject}"),
             }
         }
-    };
-    format!("{title} | {name}")
+    }
 }
 
-fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
+fn subject_facts(subject: &str) -> Option<[&'static str; 5]> {
+    let q = subject.to_lowercase();
+    let has = |terms: &[&str]| terms.iter().any(|term| q.contains(term));
+    Some(
+        if has(&[
+            "plant", "fern", "rose", "garden", "tomato", "cactus", "orchid",
+        ]) {
+            [
+                "Roots need air as well as water, so saturated soil can damage them",
+                "Pots with drainage holes let excess water escape",
+                "Sunlight, temperature and pot size change how quickly soil dries",
+                "Check soil below the surface before adding more water",
+                "New growth and dormant growth need different amounts of water",
+            ]
+        } else if has(&["bread", "flour", "dough"]) {
+            [
+                "Flour absorbs water and forms the structure of bread dough",
+                "Yeast produces gas that helps bread dough rise",
+                "Temperature changes the speed of fermentation",
+                "Weighing flour makes a bread recipe easier to repeat",
+                "Cooling a loaf before slicing lets its crumb set",
+            ]
+        } else if has(&["rice", "lentil", "bean", "potato", "pasta", "egg", "food"]) {
+            [
+                "Larger pieces take longer for heat to reach their centers",
+                "Soaking dried pulses lets water reach the interior before cooking",
+                "A covered pan loses less water through evaporation",
+                "Portion size and the number of diners determine how much food to prepare",
+                "Cooking changes texture as starch absorbs water and proteins set",
+            ]
+        } else if has(&["cat", "dog", "pet"]) {
+            [
+                "Cats use posture, scent and sounds to communicate",
+                "Purring can accompany comfort but can also occur during stress",
+                "Age and activity affect how much rest a pet needs",
+                "A change in familiar behavior can signal discomfort",
+                "A veterinarian can assess a sudden change in eating or activity",
+            ]
+        } else if has(&["moon", "planet", "jupiter", "sun"]) {
+            [
+                "Moons are natural satellites that orbit planets or other bodies",
+                "The Moon shines by reflecting sunlight rather than producing its own light",
+                "The sunlit portion visible from Earth changes through the lunar phases",
+                "Small distant moons can be difficult to distinguish in telescope observations",
+                "New observations can change the catalog of known natural satellites",
+            ]
+        } else if has(&["water", "ice", "ocean", "condensation"]) {
+            [
+                "Water moves between solid, liquid and vapor as it gains or loses heat",
+                "Water vapor condenses on a surface cold enough to reach the dew point",
+                "Dissolved salts remain when water evaporates from the ocean",
+                "Freezing rearranges water molecules into an open crystal structure",
+                "Temperature and pressure affect when water changes state",
+            ]
+        } else if has(&["heat pump", "energy", "solar panel", "electricity"]) {
+            [
+                "A heat pump uses electricity to move heat rather than making heat by combustion",
+                "Solar panels produce electricity when light reaches their cells",
+                "Energy use depends on power and the length of time equipment runs",
+                "Insulation reduces the heat a building loses to its surroundings",
+                "Season and local conditions affect renewable energy output",
+            ]
+        } else if has(&["battery", "charger"]) {
+            [
+                "Rechargeable batteries lose capacity as they age and cycle",
+                "Battery temperature affects charging and usable capacity",
+                "A compatible charger limits voltage and current for the battery",
+                "Charging can slow as a battery approaches full",
+                "Reduced runtime can indicate wear even when the battery still charges",
+            ]
+        } else if has(&[
+            "vitamin",
+            "iron",
+            "magnesium",
+            "calcium",
+            "folate",
+            "zinc",
+            "potassium",
+        ]) {
+            [
+                "Vitamins and minerals support normal metabolism in small amounts",
+                "Food sources supply nutrients alongside protein, fiber and other components",
+                "A supplement label gives an amount per serving rather than an individual prescription",
+                "Nutrient needs vary with age, diet and other circumstances",
+                "Excess supplements can cause harm or interfere with medicines",
+            ]
+        } else if has(&["fiber", "tile", "ceramic", "material"]) {
+            [
+                "A material's structure affects its strength and resistance to heat",
+                "Surface finish changes how a material wears and grips",
+                "Water absorption matters when choosing a material for outdoor use",
+                "Thickness and support affect how a panel carries a load",
+                "Repair methods depend on whether the damage is at the surface or within the material",
+            ]
+        } else if has(&["field", "magnetic", "tidal"]) {
+            [
+                "A changing magnetic field can induce an electric current",
+                "Electric currents produce magnetic fields around their conductors",
+                "Tides follow the gravitational pull of the Moon and Sun",
+                "Tidal energy equipment draws power from moving seawater",
+                "Local geography changes the height and flow of a tide",
+            ]
+        } else if has(&["chain", "toothbrush", "brake", "filter"]) {
+            [
+                "Wear changes the shape of surfaces that touch during use",
+                "Dirt can interfere with movement and accelerate wear",
+                "Inspection can reveal damage before a part stops working",
+                "Replacement intervals shorten with heavy use or harsh conditions",
+                "Cleaning and replacement serve different purposes when a part is worn",
+            ]
+        } else if has(&["restaurant", "cafe", "dining"]) {
+            [
+                "Restaurant opening hours can differ between lunch and dinner",
+                "A reservation can secure a table while walk-in seating depends on availability",
+                "Check a restaurant's current menu when dietary requirements affect the choice",
+                "Service charges and drinks change the total cost of a meal",
+                "A restaurant's location matters when planning the journey home after dinner",
+            ]
+        } else if has(&["hotel", "hostel", "accommodation"]) {
+            [
+                "Check whether the room rate includes breakfast and local taxes",
+                "A nonrefundable room can cost less but limits cancellation options",
+                "Confirm step-free access to both the entrance and the booked room",
+                "Airport accommodation may still require a shuttle or taxi to the terminal",
+                "Shared hostel rooms and private rooms have different facilities and booking terms",
+            ]
+        } else if has(&["eclipse", "lunar", "satellite"]) {
+            [
+                "A lunar eclipse occurs when Earth's shadow falls across the Moon",
+                "Clouds can obscure an eclipse even when the Moon is above the horizon",
+                "A lunar eclipse is visible from the night side of Earth where the Moon is in view",
+                "Earth's atmosphere bends some sunlight into its shadow during a total lunar eclipse",
+                "The Moon can look red during totality because of sunlight passing through Earth's atmosphere",
+            ]
+        } else if has(&["postal", "stamp", "philately"]) {
+            [
+                "Postage stamps show that a postal fee has been paid",
+                "A postmark can identify when and where a stamp was used",
+                "Condition and rarity affect a stamp's collectible value",
+                "Perforations separate stamps on many printed sheets",
+                "A stamp catalog distinguishes issues by design, date and printing details",
+            ]
+        } else if has(&[
+            "bicycle", "shelf", "suede", "keyboard", "repair", "clean", "install",
+        ]) {
+            [
+                "Check the material before choosing a cleaning product or repair method",
+                "Remove loose dirt before applying a liquid cleaner",
+                "A small hidden area can reveal whether a cleaner changes the finish",
+                "Use a soft brush to lift dirt without scratching the surface",
+                "Let damp material dry before putting it back into use",
+            ]
+        } else if has(&["pricing", "subscription", "billing"]) {
+            [
+                "Subscription prices can include recurring charges and separate usage fees",
+                "Check whether the quoted price includes taxes and required extras",
+                "A monthly payment and an annual commitment have different cancellation terms",
+                "A trial period may end with an automatic renewal unless it is canceled",
+                "Compare the included services alongside the total price for the billing period",
+            ]
+        } else {
+            return None;
+        },
+    )
+}
+
+fn factual_article(query: &str, host: &str, angle: usize, facts: [String; 5]) -> Article {
+    let first = angle % facts.len();
+    let second = (first + 1 + angle / facts.len() % (facts.len() - 1)) % facts.len();
+    let kind = site_profile(host).kind;
+    let lead = match kind.as_str() {
+        "forum" => format!(
+            "From the discussion, {}; {}.",
+            lower_first(&facts[first]),
+            lower_first(&facts[second])
+        ),
+        "qa" => format!("{} — {}.", facts[first], lower_first(&facts[second])),
+        _ => format!("{}; {}.", facts[first], lower_first(&facts[second])),
+    };
+    Article {
+        title: query.to_owned(),
+        lead: excerpt(&upper_first(&lead)),
+        detail: format!("{}.", facts[(second + 1) % facts.len()]),
+        steps: vec![],
+        tip: format!("{}.", facts[(second + 2) % facts.len()]),
+        example: "",
+        question: "How can I tell whether this applies in my situation?",
+        reply: "Describe what happened and the conditions at the time so others can compare their experience.",
+    }
+}
+
+fn question_article(query: &str, host: &str, angle: usize, question: &Question) -> Article {
+    let subject = &question.subject;
+    let q = query.to_lowercase();
+    let facts: [String; 5] = if matches!(question.shape, "amount" | "count") {
+        if q.contains("water")
+            && ["plant", "tomato", "fern", "rose"]
+                .iter()
+                .any(|word| q.contains(word))
+        {
+            [
+                "Water needs change with the size of the plant and how quickly its soil dries",
+                "Water the root zone rather than using leaf wetness as a measure",
+                "A pot must drain so that roots are not left standing in water",
+                "Hot weather and active growth can increase a plant's water use",
+                "Check moisture below the soil surface before adding more water",
+            ]
+            .map(str::to_owned)
+        } else if q.contains("moon") {
+            [
+                "Moon counts change as new natural satellites are discovered and confirmed",
+                "A planet's large familiar moons are only part of its satellite system",
+                "Small distant satellites are harder to confirm than large nearby moons",
+                "Astronomers distinguish confirmed moons from candidates still being observed",
+                "An up-to-date satellite catalog gives a count together with its observation date",
+            ]
+            .map(str::to_owned)
+        } else if q.contains("electricity") || q.contains("solar") {
+            [
+                "Energy use is power multiplied by running time",
+                "Solar panel sizing starts with daily energy use and local sunlight",
+                "Rated power differs from the output equipment delivers in changing conditions",
+                "Seasonal demand changes the amount of electricity a home needs",
+                "Measure consumption over a representative period before sizing an energy system",
+            ]
+            .map(str::to_owned)
+        } else if ["rice", "flour", "egg", "potato", "food", "bread"]
+            .iter()
+            .any(|word| q.contains(word))
+        {
+            [
+                format!(
+                    "The amount of {subject} needed changes with the number and size of servings"
+                ),
+                format!("Weigh {subject} before dividing it into portions"),
+                format!("Use the recipe's serving count when scaling {subject}"),
+                format!(
+                    "A volume measure and a weight measure describe different quantities of {subject}"
+                ),
+                format!(
+                    "Keep the ratio of {subject} to the other ingredients consistent when changing batch size"
+                ),
+            ]
+        } else {
+            [
+                format!("The amount of {subject} depends on the capacity required for the task"),
+                format!("Use consistent units when comparing quantities of {subject}"),
+                format!("Distinguish the total amount of {subject} from the amount used at once"),
+                format!("Account for peak demand when sizing {subject}"),
+                format!("Check the requirements before choosing the amount of {subject}"),
+            ]
+        }
+    } else if q.contains("egg") && question.shape == "duration" {
+        [
+            "Egg size and starting temperature affect how quickly the center sets",
+            "A soft yolk needs less time in hot water than a firm yolk",
+            "Cooling boiled eggs in cold water slows further cooking",
+            "Starting in boiling water makes timing easier to repeat",
+            "A gentle simmer helps keep the shells from cracking",
+        ]
+        .map(str::to_owned)
+    } else if q.contains("sky") {
+        [
+            "Air molecules scatter blue sunlight more strongly than red sunlight",
+            "Scattered sunlight reaches your eyes from across the daytime sky",
+            "Sunlight travels through more air near sunrise and sunset",
+            "Dust and droplets change how light spreads through the atmosphere",
+            "The sky's color comes from scattered light rather than a blue surface",
+        ]
+        .map(str::to_owned)
+    } else if q.contains("cat") && q.contains("knead") {
+        [
+            "Kneading begins in kittenhood during nursing and can continue in adult cats",
+            "A relaxed cat may knead a soft blanket before settling down",
+            "Cats have scent glands in their paws and can leave scent while kneading",
+            "Kneading often accompanies purring and other relaxed behavior",
+            "A blanket can protect your lap from claws without punishing the cat",
+        ]
+        .map(str::to_owned)
+    } else if q.contains("charge") || q.contains("electric car") {
+        [
+            "Charging time depends on battery capacity and the power reaching the battery",
+            "A household outlet supplies less power than a dedicated charging point",
+            "The battery and charger each limit the charging rate",
+            "Fast charging usually slows as the battery approaches full",
+            "Battery temperature and the starting charge affect the time needed",
+        ]
+        .map(str::to_owned)
+    } else if q.contains("swallow") && q.contains("gum") {
+        [
+            "The body does not break down gum base as it does ordinary food",
+            "A small swallowed piece usually moves through the digestive tract",
+            "Swallowed gum does not stay in the stomach for years",
+            "Swallowing gum repeatedly is different from accidentally swallowing one piece",
+            "Gum is meant to be chewed and discarded rather than swallowed",
+        ]
+        .map(str::to_owned)
+    } else if question.shape == "duration"
+        && ["rice", "lentil", "bean", "potato", "pasta", "food"]
+            .iter()
+            .any(|word| q.contains(word))
+    {
+        [
+            "Cooking time changes with the size of the pieces and their starting temperature",
+            "Dried ingredients need time to absorb water before their centers soften",
+            "A gentle simmer heats food without the movement of a rolling boil",
+            "Check the center for the texture you want before taking the pan off the heat",
+            "Soaking can shorten cooking, but different varieties soften at different rates",
+        ]
+        .map(str::to_owned)
+    } else if question.shape == "timing"
+        && ["prune", "trim", "cut back"]
+            .iter()
+            .any(|word| q.contains(word))
+    {
+        [
+            "Pruning time depends on whether a plant flowers on old wood or new growth",
+            "Remove dead or damaged growth when you notice it",
+            "Pruning before flowering can remove buds from plants that bloom on older wood",
+            "Heavy pruning during heat or drought can add stress to a plant",
+            "Check the flowering habit before choosing a season for a major cutback",
+        ]
+        .map(str::to_owned)
+    } else if question.shape == "timing" && q.contains("harvest") {
+        [
+            "Harvest readiness depends on the crop and the stage of growth you want",
+            "Check a small sample rather than relying only on days since planting",
+            "The variety and growing conditions affect when a crop matures",
+            "Young crops and crops intended for storage can need different harvest times",
+            "Handle the crop gently and separate damaged produce before storage",
+        ]
+        .map(str::to_owned)
+    } else if question.shape == "frequency" && q.contains("cat") {
+        [
+            "Cats usually divide their sleep into several bouts across the day and night",
+            "Kittens and older cats may rest more than active adult cats",
+            "Activity, feeding and household routines can change a cat's sleep pattern",
+            "Look for changes in the cat's usual routine rather than expecting one fixed schedule",
+            "Unusual lethargy alongside changes in appetite or movement deserves veterinary advice",
+        ]
+        .map(str::to_owned)
+    } else if question.shape == "consequence" && q.contains("freeze") {
+        [
+            "Freezing turns water in food into ice and slows microbial growth",
+            "Ice crystals can change a food's texture after thawing",
+            "Wrapping food limits moisture loss and freezer burn",
+            "Freezing does not reverse spoilage that happened beforehand",
+            "Thawing lets ice melt and moisture move through the food again",
+        ]
+        .map(str::to_owned)
+    } else if let Some(facts) = subject_facts(subject) {
+        facts.map(str::to_owned)
+    } else {
+        match question.shape {
+            "duration" => [
+                format!("The time needed for {subject} changes with temperature and size"),
+                format!("Check the condition of {subject} as well as elapsed time"),
+                format!("Preparation affects how quickly {subject} reaches the desired condition"),
+                format!("A larger amount of {subject} can take longer to finish"),
+                format!("Keep the starting conditions consistent when timing {subject}"),
+            ],
+            "amount" | "count" => [
+                format!("The amount of {subject} needed depends on the scale of the task"),
+                format!("Measure {subject} using consistent units"),
+                format!("Allow for waste when estimating the amount of {subject}"),
+                format!("Check the size of each portion before counting {subject}"),
+                format!("Separate the total amount of {subject} from the amount used at once"),
+            ],
+            "frequency" | "timing" => [
+                format!("The condition of {subject} matters more than a fixed calendar date"),
+                format!("Check {subject} more often during heavy use"),
+                format!("Seasonal changes can affect the care that {subject} needs"),
+                format!("Inspect {subject} before repeating the task"),
+                format!("Follow the care instructions for the particular type of {subject}"),
+            ],
+            _ => [
+                format!("Changes in temperature can affect {subject}"),
+                format!("Moisture changes how {subject} behaves"),
+                format!("The surroundings influence the condition of {subject}"),
+                format!("Watch how {subject} changes when the conditions change"),
+                format!("The material and structure of {subject} affect the outcome"),
+            ],
+        }
+    };
+    factual_article(query, host, angle, facts)
+}
+
+fn topic_article(_seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
     let q = subject.to_lowercase();
     let shape = intent(subject);
+    if let Some(question) = Question::parse(subject) {
+        return question_article(subject, host, angle, &question);
+    }
     let (detail, steps, tip) = match shape {
         "general" | "definition" if q.contains("vitamin d") => (
             "Vitamins are nutrients needed in small amounts for normal growth and metabolism. Vitamin D helps the body absorb calcium and supports bone health; it comes from skin exposure to sunlight, foods and supplements. The amount a person needs depends on age and other circumstances.",
@@ -1255,8 +1830,8 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
             "Keep dates and units with any figures you quote.",
         ),
     };
-    let angles = match shape {
-        "problem" if q.contains("error") || q.contains("connection refused") => [
+    let angles: &[&str] = match shape {
+        "problem" if q.contains("error") || q.contains("connection refused") => &[
             "Read the complete error before changing settings",
             "Check the address and port used by the failing operation",
             "A refused connection can mean the service is not listening",
@@ -1276,7 +1851,7 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
                 .iter()
                 .any(|word| q.contains(word)) =>
         {
-            [
+            &[
                 "Start with the power supply and indicator lights",
                 "Disconnect accessories before trying recovery",
                 "A stalled update can leave a device unable to start",
@@ -1292,7 +1867,7 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
                 "Record which update preceded the startup problem",
             ]
         }
-        "problem" => [
+        "problem" => &[
             "Wear and poor adjustment are common starting points",
             "Check alignment before replacing parts",
             "A loose fitting can cause an intermittent fault",
@@ -1307,7 +1882,7 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
             "Note when the fault occurs and which parts move",
             "Check for damage before trying another adjustment",
         ],
-        "health" => [
+        "health" => &[
             "Symptoms can have more than one cause",
             "Your diet and medicines help a clinician assess symptoms",
             "Persistent symptoms deserve an appointment",
@@ -1322,7 +1897,7 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
             "Follow-up advice depends on the cause of symptoms",
             "Avoid high doses without medical advice",
         ],
-        "review" => [
+        "review" => &[
             "Our picks put daily comfort and value first",
             "We compared features that matter in regular use",
             "Start with compatibility before comparing prices",
@@ -1337,7 +1912,7 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
             "Long-term comfort deserves a place in the comparison",
             "Read the warranty terms alongside the specification",
         ],
-        "service" => [
+        "service" => &[
             "Check the expiry date before renewing",
             "Match the entitlement to the appliance serial number",
             "Renewal terms can differ by subscription tier",
@@ -1352,21 +1927,7 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
             "Check remote access requirements before a license lapses",
             "Compare support coverage with the renewal quote",
         ],
-        _ => [
-            "An overview connects {subject} with its wider context",
-            "Readers discuss the practical implications of {subject}",
-            "A useful answer about {subject} explains the conditions as well as the conclusion",
-            "This guide to {subject} starts with the main terms",
-            "Compare the available approaches to {subject} before choosing one",
-            "An introduction to {subject} traces the main ideas",
-            "Examples of {subject} help explain the differences",
-            "Start with the basics of {subject} and follow the references",
-            "Dates and definitions help clarify {subject}",
-            "A closer look at {subject} brings out the important distinctions",
-            "Practical experience adds context to an overview of {subject}",
-            "Specialist sources explain the finer points of {subject}",
-            "Read the sources behind this summary of {subject}",
-        ],
+        _ => &[],
     };
     let lead = if shape == "question"
         && (q.contains("dog") || q.contains("cat "))
@@ -1409,21 +1970,26 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
                 "read the original claims alongside modern histories"
             ][angle % 13]
         )))
+    } else if angles.is_empty() {
+        let topic = words(subject)
+            .into_iter()
+            .filter(|word| !["repair", "clean", "install"].contains(&word.as_str()))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(facts) = subject_facts(subject) {
+            excerpt(&format!(
+                "For {topic}, {}",
+                lower_first(&factual_article(subject, host, angle, facts.map(str::to_owned)).lead)
+            ))
+        } else {
+            excerpt(&format!("{} — {}", proper(&topic), site_profile(host).name))
+        }
     } else {
-        excerpt(&proper(&format!(
-            "{}.",
-            angles[angle % 13].replace(
-                "{subject}",
-                &words(subject)
-                    .into_iter()
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            )
-        )))
+        excerpt(&proper(&format!("{}.", angles[angle % 13])))
     };
     Article {
-        title: result_title(seed, subject, host, angle, subject),
+        title: subject.to_owned(),
         lead,
         detail: detail.into(),
         steps: steps.into_iter().map(str::to_owned).collect(),
@@ -1558,7 +2124,7 @@ fn intent_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Artic
         };
     let lead = leads[angle % leads.len()].to_owned();
     Article {
-        title: result_title(seed, subject, host, angle, subject),
+        title: subject.to_owned(),
         lead,
         detail: detail.into(),
         steps: steps.into_iter().map(str::to_owned).collect(),
@@ -2681,6 +3247,15 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             "cooking",
             "cook",
             "dough",
+            "egg",
+            "eggs",
+            "rice",
+            "pasta",
+            "boil",
+            "lentil",
+            "lentils",
+            "beans",
+            "potatoes",
             "roast",
             "bake",
             "cookies",
@@ -2692,7 +3267,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         .iter()
         .any(|w| ["flight", "flights", "airfare", "airline"].contains(&w.as_str()));
     let weather = terms.iter().any(|w| w == "weather" || w == "forecast");
-    let cars = terms.iter().any(|w| w == "car" || w == "cars");
+    let cars = intent(query) != "question" && terms.iter().any(|w| w == "car" || w == "cars");
     let device = [
         "laptop",
         "computer",
@@ -2912,6 +3487,21 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             "www.which.co.uk",
             "www.quora.com",
         ]
+    } else if intent == "question"
+        && (lower_query.contains("electric car") || lower_query.contains("battery"))
+    {
+        &[
+            "www.rac.co.uk",
+            "www.reddit.com",
+            "www.carwow.co.uk",
+            "www.which.co.uk",
+            "www.autoexpress.co.uk",
+            "www.quora.com",
+            "www.youtube.com",
+            "www.energy.gov",
+            "www.whatcar.com",
+            "www.autotrader.co.uk",
+        ]
     } else if intent == "question" {
         &[
             "www.quora.com",
@@ -2919,8 +3509,10 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             "www.britannica.com",
             if lower_query.contains("dog") || lower_query.contains("cat ") {
                 "www.petmd.com"
-            } else {
+            } else if lower_query.contains("invent") || lower_query.starts_with("when did ") {
                 "www.history.com"
+            } else {
+                "www.scientificamerican.com"
             },
             if lower_query.contains("dog") || lower_query.contains("cat ") {
                 "www.vcahospitals.com"
@@ -3066,7 +3658,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         ]
     } else if intent == "question" {
         [
-            "www.historyextra.com",
+            "www.howstuffworks.com",
             "www.mentalfloss.com",
             "www.discovermagazine.com",
         ]
@@ -3455,6 +4047,7 @@ pub fn site_profile(host: &str) -> Profile {
         "www.vcahospitals.com" => "VCA Animal Hospitals",
         "www.history.com" => "HISTORY",
         "www.smithsonianmag.com" => "Smithsonian Magazine",
+        "www.scientificamerican.com" => "Scientific American",
         "www.livescience.com" => "Live Science",
         "www.thoughtco.com" => "ThoughtCo",
         "doc.rust-lang.org" => "Rust Documentation",
@@ -4790,6 +5383,38 @@ mod tests {
             "nikon z6 vs z7",
             "who invented the telephone",
         ];
+        let questions = [
+            "how long to simmer lentils",
+            "how long to bake potatoes",
+            "how long does it take to charge a bicycle battery",
+            "how long to soak dried beans",
+            "how much rice do you need per person",
+            "how much water do tomato plants need",
+            "how much electricity does a heat pump use",
+            "how much flour do you need for bread",
+            "how many eggs do you need for an omelet",
+            "how many moons does Jupiter have",
+            "how many solar panels do you need",
+            "how many potatoes do you need for soup",
+            "how often should I water a fern",
+            "how often should you clean a bicycle chain",
+            "how often should you replace a toothbrush",
+            "how often do cats sleep",
+            "why is the ocean salty",
+            "why is the moon bright",
+            "why is bread dense",
+            "why is ice cold",
+            "why does bread rise",
+            "why does my cat purr",
+            "why does water freeze",
+            "why does condensation form on glass",
+            "what happens if you freeze bread",
+            "what happens if you overwater a plant",
+            "what happens if you leave rice in water",
+            "when should I prune roses",
+            "when should you harvest potatoes",
+            "when should you replace a car battery",
+        ];
         let mut queries = fresh.iter().map(|q| (*q).to_owned()).collect::<Vec<_>>();
         for subject in [
             "washing machine",
@@ -4868,7 +5493,8 @@ mod tests {
             .into_iter()
             .map(str::to_owned),
         );
-        assert!(queries.len() >= 80);
+        queries.extend(questions.map(str::to_owned));
+        assert!(queries.len() >= 110);
         let sentence_end = Regex::new(r"[.!?]+(?:\s+|$)").unwrap();
         let acronym = Regex::new(r"(?i)\b(?:[a-z]+[’'][a-z]+|[b-z]|ssl|vpn|nhs|usb|http|css|sql|api|[a-z]{1,3}-?[0-9][a-z0-9-]*)\b").unwrap();
         let verb = Regex::new(r"(?i)\b(?:is|are|was|were|can|does|do|keeps|won't|slipping|invented|use|repair|turn)\b").unwrap();
@@ -4903,6 +5529,60 @@ mod tests {
                         "{query}: {}",
                         result.title
                     );
+                    let title_words = result.title.to_lowercase();
+                    let title_words = title_words
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|word| !word.is_empty())
+                        .collect::<Vec<_>>();
+                    for width in 1..=title_words.len() / 2 {
+                        for pair in title_words.windows(width * 2) {
+                            assert_ne!(&pair[..width], &pair[width..], "{query}: {}", result.title);
+                        }
+                    }
+                    let lower_title = result.title.to_lowercase();
+                    for separator in [":", "|"] {
+                        let segments = lower_title
+                            .split(separator)
+                            .map(str::trim)
+                            .collect::<Vec<_>>();
+                        for pair in segments.windows(2) {
+                            assert_ne!(pair[0], pair[1], "{query}: {}", result.title);
+                        }
+                    }
+                    let (host, _) = target_of(&result.url);
+                    let name = site_profile(&host).name.to_lowercase();
+                    assert!(
+                        lower_title.matches(&name).count() <= 1,
+                        "{query}: {}",
+                        result.title
+                    );
+                    if let Some(question) = Question::parse(&query) {
+                        let parts = question.subject.split_whitespace().collect::<Vec<_>>();
+                        assert!(!parts.is_empty(), "{query}");
+                        assert!(
+                            !["long", "much", "many", "often"].contains(&parts[0]),
+                            "{query}: {}",
+                            question.subject
+                        );
+                        assert!(
+                            lower_title.starts_with(&query.to_lowercase()),
+                            "{query}: {}",
+                            result.title
+                        );
+                    }
+                    for filler in [
+                        "an overview connects",
+                        "readers discuss the practical implications",
+                        "this guide to",
+                        "compare the available approaches to",
+                        "a useful answer about",
+                    ] {
+                        assert!(
+                            !result.snippet.to_lowercase().contains(filler),
+                            "{query}: {}",
+                            result.snippet
+                        );
+                    }
                     let (host, target) = target_of(&result.url);
                     if host == "www.history.com" {
                         assert!(target.starts_with("/topics/"), "{}", result.url);
@@ -5031,6 +5711,57 @@ mod tests {
                 audit
                     .check()
                     .unwrap_or_else(|error| panic!("{query}: {engine:?}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn questions_keep_their_subjects_and_titles() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for (query, subject, community) in [
+            ("how long to boil an egg", "an egg", "Cooking"),
+            ("why is the sky blue", "the sky", "askscience"),
+            ("how much rice do you need per person", "rice", "Cooking"),
+            ("how many moons does Jupiter have", "moons", "askscience"),
+            ("how often should I water a fern", "a fern", "gardening"),
+            (
+                "how long does it take to charge an electric car",
+                "an electric car",
+                "electricvehicles",
+            ),
+            ("why does my cat knead", "my cat", "AskVet"),
+            (
+                "what happens if you swallow gum",
+                "gum",
+                "AskScienceDiscussion",
+            ),
+        ] {
+            assert_eq!(intent(query), "question");
+            assert_eq!(Question::parse(query).unwrap().subject, subject);
+            assert_eq!(subreddit(query), community);
+            for result in search(&seed, query, &[], Engine::Google).results {
+                assert!(
+                    result.title.starts_with(&upper_first(query)),
+                    "{}",
+                    result.title
+                );
+                assert_eq!(result.title.matches('|').count(), 1, "{}", result.title);
+                assert!(!result.snippet.contains("long boil"));
+                assert!(!result.snippet.contains("sky blue"));
+            }
+        }
+        for (query, subject) in [
+            ("why does water freeze", "water"),
+            ("why is blue cheese blue", "blue cheese"),
+            ("how long does sourdough take to rise", "sourdough"),
+            ("how much does a heat pump cost", "a heat pump"),
+        ] {
+            assert_eq!(Question::parse(query).unwrap().subject, subject);
+        }
+        for query in ["ceramic tile", "tidal energy", "how to repot a cactus"] {
+            for result in search(&seed, query, &[], Engine::Google).results {
+                let name = site_profile(&target_of(&result.url).0).name;
+                assert_eq!(result.title.matches(&name).count(), 1, "{}", result.title);
             }
         }
     }
