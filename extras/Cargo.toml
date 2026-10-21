@@ -8,9 +8,12 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+brotli = "8"
 bytes = "1"
 fictionet = { path = "..", features = ["web-proxy"] }
 fictionet-host = { path = "../host" }
+flate2 = "1"
+httparse = "1"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"

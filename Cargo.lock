@@ -1066,13 +1066,16 @@ dependencies = [
 name = "fictionet-extras"
 version = "0.1.0"
 dependencies = [
+ "brotli",
  "bytes",
  "fictionet",
  "fictionet-host",
  "fictionet-observe",
+ "flate2",
  "http",
  "http-body",
  "http-body-util",
+ "httparse",
  "include_dir",
  "kuchiki",
  "percent-encoding",
