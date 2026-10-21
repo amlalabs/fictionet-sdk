@@ -709,11 +709,13 @@ test('an app page shows its agent tabs and world panel, with a World menu and no
   assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
   assert.equal(h.root.querySelector('.app-stage').dataset.kind, 'terminal');
   assert.match(h.root.textContent, /the world/);
-  const traffic = h.root.querySelector('.app-world-traffic');
-  assert.equal(traffic.parentNode, h.root.querySelector('.app-world'));
-  assert.equal(traffic.querySelector('#app-packets-tab').textContent, 'Packets');
-  assert.equal(traffic.querySelectorAll('button').length, 1);
-  assert.equal(traffic.querySelector('#app-packets-panel').hidden, false);
+  const world = h.root.querySelector('.app-world');
+  const worldTabs = world.querySelector('.app-tabs');
+  assert.equal(worldTabs.parentNode, world);
+  assert.equal(world.children[0], worldTabs);
+  assert.deepEqual(worldTabs.children.map((tab) => tab.textContent), ['World', 'Packets']);
+  assert.equal(world.querySelector('#app-world-panel').hidden, false);
+  assert.equal(world.querySelector('#app-packets-panel').hidden, true);
   const menu = h.root.querySelector('#world-menu');
   assert.equal(mounted, menu, 'the world panel fills the World menu');
   const button = h.root.querySelector('.app-menu-button');
@@ -732,33 +734,39 @@ test('an app page shows its agent tabs and world panel, with a World menu and no
   assert.equal(h.document.listenerCount, 0);
 });
 
-test('app traffic arrives newest first, stays bounded, and closes with either tab or shell', async (t) => {
+test('world tabs keep the custom view mounted and bound traffic to the visible packets tab', async (t) => {
   const h = harness(t);
   const { mount } = await import('./page.mjs');
   const description = {
     title: 'Border', app: true, hosts: [DESCRIPTION.hosts[0]],
     panels: [{ id: 'world', title: 'World', area: 'workspace', kind: 'custom', module: '/panels/world.mjs', state: '/api/state/rows' }],
   };
+  let mounts = 0, releases = 0;
   const stop = await mount(h.root, {
     get: async (path) => path === '/api/page' ? description : { links: ['guest-link'] },
     stateStream: (topics) => h.stream('state', { ...topics }),
     watch: () => h.stream('watch'), packetStream: (links) => h.stream('packets', links), close() {},
   }, { dispose() {} }, async () => ({ mount(root, services) {
+    mounts++;
     const { el } = services.dom.scoped(root);
     el('svg:svg', { 'aria-label': 'Route picture' }, root);
     const list = el('div', { role: 'list', text: 'Route activity' }, root);
-    return services.worldList(root, list, 'Route');
+    const off = services.state('/api/state/rows', ({ value }) => { list.textContent = value.activity; });
+    return () => { releases++; off(); };
   } }));
   t.after(stop);
   await settle();
-  const tabs = h.root.querySelector('.app-world-traffic').querySelectorAll('button');
-  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Packets', 'Route']);
+  const worldTabs = h.root.querySelector('.app-world').querySelector('.app-tabs');
+  const tabs = worldTabs.querySelectorAll('button');
+  assert.deepEqual(tabs.map((tab) => tab.textContent), ['World', 'Packets']);
+  assert.equal(mounts, 1);
+  assert.equal(h.streams.filter((s) => s.tag === 'packets').length, 0);
   const packetPanel = h.root.querySelector('#app-packets-panel');
-  const ownPanel = h.root.querySelector('#app-world-list-panel');
+  const ownPanel = h.root.querySelector('#app-world-panel');
   assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
   assert.equal(tabs[1].getAttribute('tabindex'), '-1');
-  assert.equal(packetPanel.hidden, false);
-  assert.equal(ownPanel.hidden, true);
+  assert.equal(packetPanel.hidden, true);
+  assert.equal(ownPanel.hidden, false);
   assert.match(ownPanel.textContent, /Route activity/);
   for (const tab of tabs) {
     const panel = h.root.querySelector(`#${tab.getAttribute('aria-controls')}`);
@@ -770,11 +778,18 @@ test('app traffic arrives newest first, stays bounded, and closes with either ta
     nodes: [{ id: 'guest', kind: 'sandbox', name: 'alpha' }], edges: [{ id: 'guest-link', a: 'guest', b: 'network' }],
   });
   await settle();
+  assert.equal(h.streams.filter((s) => s.tag === 'packets').length, 0);
+  tabs[1].click();
+  await settle();
+  assert.equal(packetPanel.hidden, false);
+  assert.equal(ownPanel.hidden, true);
+  assert.equal(tabs[0].getAttribute('tabindex'), '-1');
+  assert.equal(tabs[1].getAttribute('tabindex'), '0');
   const state = h.streams.findLast((s) => s.tag === 'state' && !s.closed);
   state.emit('snapshot', { topic: 'host-alpha', revision: 1, value: { addresses: ['192.168.1.2'] } });
   const source = h.streams.findLast((s) => s.tag === 'packets');
   assert.equal(source.args, 'guest-link');
-  tabs[0].click();
+  tabs[1].click();
   assert.equal(source.closed, undefined, 'selecting the current tab keeps its stream');
   const frame = () => {
     const callbacks = [...h.frames.values()]; h.frames.clear(); callbacks.forEach((fn) => fn());
@@ -807,29 +822,86 @@ test('app traffic arrives newest first, stays bounded, and closes with either ta
   for (let seq = 13; seq <= 1012; seq++) send(seq);
   frame();
   assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), [1012, 1011, 1010, 1009, 1008, 1007, 1006, 1005]);
-  tabs[1].click();
+  tabs[0].click();
   assert.equal(source.closed, true);
   assert.equal(source.listenerCount, 0);
   assert.equal(ownPanel.hidden, false);
   assert.equal(packetPanel.hidden, true);
-  const key = new Event('keydown'); key.key = 'Home';
-  h.root.querySelector('.app-world-traffic').querySelector('.app-tabs').dispatchEvent(key);
+  const key = (name, index) => {
+    const event = new Event('keydown', { cancelable: true }); event.key = name;
+    worldTabs.dispatchEvent(event);
+    assert.equal(event.defaultPrevented, true);
+    assert.equal(h.document.activeElement, tabs[index]);
+    assert.deepEqual(tabs.map((tab) => tab.getAttribute('tabindex')), index === 0 ? ['0', '-1'] : ['-1', '0']);
+    assert.deepEqual(tabs.map((tab) => tab.getAttribute('aria-selected')), index === 0 ? ['true', 'false'] : ['false', 'true']);
+  };
+  key('ArrowRight', 1);
+  state.emit('snapshot', { topic: 'rows', revision: 1, value: { activity: 'Current route' } });
+  key('ArrowRight', 0);
+  key('ArrowLeft', 1);
+  key('ArrowLeft', 0);
+  key('End', 1);
+  key('Home', 0);
+  assert.equal(mounts, 1);
+  assert.equal(releases, 0);
+  assert.match(ownPanel.textContent, /Current route/);
+  assert.equal(ownPanel.querySelector('svg').getAttribute('aria-label'), 'Route picture');
+  key('End', 1);
   await settle();
-  assert.equal(h.document.activeElement, tabs[0]);
   assert.equal(ownPanel.hidden, true);
   const reopened = h.streams.findLast((s) => s.tag === 'packets');
   assert.notEqual(reopened, source);
   assert.equal(packetPanel.querySelectorAll('#drawer').length, 1);
   h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
   assert.equal(reopened.closed, true);
+  const hiddenCount = h.streams.filter((s) => s.tag === 'packets').length;
+  key('Home', 0);
+  key('End', 1);
+  await settle();
+  assert.equal(h.streams.filter((s) => s.tag === 'packets').length, hiddenCount);
   assert.equal(h.frames.size, 0);
   h.document.hidden = false; h.document.dispatchEvent(new Event('visibilitychange'));
   await settle();
   const finalSource = h.streams.findLast((s) => s.tag === 'packets');
   assert.notEqual(finalSource, reopened);
-  stop();
+  key('Home', 0);
   assert.equal(finalSource.closed, true);
+  const count = h.streams.filter((s) => s.tag === 'packets').length;
+  h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
+  h.document.hidden = false; h.document.dispatchEvent(new Event('visibilitychange'));
+  await settle();
+  assert.equal(h.streams.filter((s) => s.tag === 'packets').length, count);
+  key('End', 1);
+  await settle();
+  const disposedSource = h.streams.findLast((s) => s.tag === 'packets');
+  stop();
+  assert.equal(disposedSource.closed, true);
+  assert.equal(finalSource.closed, true);
+  assert.equal(mounts, 1);
+  assert.equal(releases, 1);
+  assert.ok(tabs.every((tab) => tab.listenerCount === 0));
+  assert.equal(worldTabs.listenerCount, 0);
+  assert.ok(h.streams.every((stream) => stream.closed && stream.listenerCount === 0));
   assert.equal(h.budget.open, 0);
   assert.equal(h.frames.size, 0);
+  assert.equal(h.document.listenerCount, 0);
+});
+
+test('an app without a custom workspace starts with only Packets', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const stop = await mount(h.root, {
+    get: async (path) => path === '/api/page' ? { title: 'Network', app: true, hosts: [], panels: [] } : { links: [] },
+    watch: () => h.stream('watch'), packetStream: (links) => h.stream('packets', links), close() {},
+  }, { dispose() {} });
+  const world = h.root.querySelector('.app-world');
+  const tabs = world.querySelector('.app-tabs').children;
+  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Packets']);
+  assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
+  assert.equal(tabs[0].getAttribute('tabindex'), '0');
+  assert.equal(world.querySelector('#app-world-panel'), null);
+  assert.equal(world.querySelector('#app-packets-panel').hidden, false);
+  stop();
+  assert.equal(h.budget.open, 0);
   assert.equal(h.document.listenerCount, 0);
 });

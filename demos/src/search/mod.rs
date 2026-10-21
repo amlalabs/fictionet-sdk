@@ -52,7 +52,7 @@ impl Topics {
             .host(host)
             .standard_panels()
             .command("generation", self.commands.clone())
-            .custom("Search", include_str!("search.mjs"), self.searches.clone())
+            .custom("Web", include_str!("search.mjs"), self.searches.clone())
             .asset(
                 "search/model.mjs",
                 "text/javascript",
@@ -68,7 +68,7 @@ impl Topics {
                 "text/css",
                 include_bytes!("style.css").to_vec(),
             )
-            .workspace("Search")
+            .workspace("Web")
             .app()
     }
 

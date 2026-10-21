@@ -4,7 +4,7 @@
 // answers, plants a fact or a page, and restarts the run.
 import { picture, rows } from './model.mjs';
 
-const NEW_PAGES = [['canned', 'Canned'], ['stub', 'Stub'], ['off', 'Off']];
+const NEW_PAGES = [['canned', 'Prepared'], ['stub', 'Improvised'], ['off', 'Off']];
 // Run time as minutes and seconds.
 const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 
@@ -17,7 +17,6 @@ export function mount(root, services, options) {
   const list = el('div', { class: 'search-rows', role: 'list', 'aria-label': 'What the world served' }, root);
   const controller = new AbortController();
   const cleanup = [];
-  if (services.worldList) cleanup.push(services.worldList(root, list, 'Searches'));
   let snapshot = null, disposed = false;
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
@@ -150,7 +149,8 @@ export function mount(root, services, options) {
       el('time', { text: clock(row.at) }, line);
       el('span', { text: row.who, title: row.who }, line);
       el('b', { text: row.what, title: row.what }, line);
-      el('em', { class: row.tag, text: row.tag }, line);
+      const badge = ({ canned: '', made: 'made now', memory: 'again' })[row.tag] ?? row.tag;
+      if (badge) el('em', { class: row.tag, text: badge }, line);
     }
     buttons();
   }

@@ -34,7 +34,7 @@ async fn wait(
     };
     let value = client
         .wait_for(
-            "/api/state/search",
+            "/api/state/web",
             Duration::from_secs(45),
             Duration::from_millis(100),
             &format!("the page did not show: {label}"),
@@ -127,7 +127,7 @@ async fn search(
 /// and returns the page's reply.
 pub async fn command(client: &PageClient, id: &str, mut command: Value) -> Result<Value> {
     tokio::time::sleep(STEP_PAUSE).await;
-    let state: Snapshot = client.state("search").await?;
+    let state: Snapshot = client.state("web").await?;
     command["expected_revision"] = json!(state.generator.generation_revision);
     let reply = client.command("generation", id, command).await;
     if let Err(error) = &reply {
@@ -488,12 +488,12 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
             && description["app"] == true
             && description["panels"].as_array().is_some_and(|panels| {
                 panels.iter().any(|p| {
-                    p["title"] == "Search" && p["kind"] == "custom" && p["area"] == "workspace"
+                    p["title"] == "Web" && p["kind"] == "custom" && p["area"] == "workspace"
                 })
             }),
     )?;
     for path in [
-        "/panels/search.mjs",
+        "/panels/web.mjs",
         "/assets/search/model.mjs",
         "/assets/search/view.mjs",
         "/assets/search/style.css",

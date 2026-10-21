@@ -76,7 +76,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             );
             // Advance the lab clock through the spawned task's publication intervals.
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let initial = client.get_json("/api/state/search").await.unwrap();
+            let initial = client.get_json("/api/state/web").await.unwrap();
             fetch(
                 &cx,
                 &machine,
@@ -86,11 +86,11 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             )
             .await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let snapshot = client.get_json("/api/state/search").await.unwrap();
+            let snapshot = client.get_json("/api/state/web").await.unwrap();
             assert!(snapshot["revision"].as_u64().unwrap() > initial["revision"].as_u64().unwrap());
             let published = snapshot["revision"].clone();
             cx.sleep(std::time::Duration::from_millis(250)).await?;
-            let idle = client.get_json("/api/state/search").await.unwrap();
+            let idle = client.get_json("/api/state/web").await.unwrap();
             assert_eq!(idle["revision"], published);
             assert_eq!(snapshot["value"]["queries"][0]["sandbox"], "workstation");
             assert_eq!(
@@ -110,7 +110,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             let (host, path) = adaptive_web_world::pages::text::target_of(&first.url);
             fetch(&cx, &machine, &host, &path, start).await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let snapshot = client.get_json("/api/state/search").await.unwrap();
+            let snapshot = client.get_json("/api/state/web").await.unwrap();
             assert!(snapshot["revision"].as_u64().unwrap() > published.as_u64().unwrap());
             let opened = snapshot["value"]["pages"]
                 .as_array()
@@ -126,7 +126,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             let published = snapshot["revision"].clone();
             cx.sleep(std::time::Duration::from_millis(250)).await?;
             assert_eq!(
-                client.get_json("/api/state/search").await.unwrap()["revision"],
+                client.get_json("/api/state/web").await.unwrap()["revision"],
                 published
             );
             let reply = command(&client, false, 0, "stop").await.unwrap();
@@ -144,7 +144,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             )
             .await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let snapshot = client.get_json("/api/state/search").await.unwrap();
+            let snapshot = client.get_json("/api/state/web").await.unwrap();
             assert!(snapshot["revision"].as_u64().unwrap() > published.as_u64().unwrap());
             let queries = snapshot["value"]["queries"].as_array().unwrap();
             assert_eq!(queries.last().unwrap()["results"], 0);
@@ -179,7 +179,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                 .unwrap();
             assert_eq!(planted.status, 200);
             cx.sleep(std::time::Duration::from_millis(100)).await?;
-            let snapshot = client.get_json("/api/state/search").await.unwrap();
+            let snapshot = client.get_json("/api/state/web").await.unwrap();
             assert_eq!(snapshot["value"]["planted"][0]["kind"], "fact");
             assert_eq!(snapshot["value"]["generator"]["generation_revision"], 2);
             let commands = client.get_json("/api/events").await.unwrap();
@@ -244,7 +244,7 @@ async fn page_declares_the_workspace_and_serves_its_modules() {
     assert_eq!(
         panels
             .iter()
-            .filter(|p| p["state"] == "/api/state/search")
+            .filter(|p| p["state"] == "/api/state/web")
             .count(),
         1
     );
@@ -259,7 +259,7 @@ async fn page_declares_the_workspace_and_serves_its_modules() {
     assert!(
         panels
             .iter()
-            .any(|p| p["title"] == "Search" && p["kind"] == "custom" && p["area"] == "workspace")
+            .any(|p| p["title"] == "Web" && p["kind"] == "custom" && p["area"] == "workspace")
     );
     assert!(
         !panels
@@ -267,7 +267,7 @@ async fn page_declares_the_workspace_and_serves_its_modules() {
             .any(|p| p["kind"] == "control" || p["kind"] == "event_table")
     );
     for path in [
-        "/panels/search.mjs",
+        "/panels/web.mjs",
         "/assets/search/model.mjs",
         "/assets/search/view.mjs",
         "/assets/search/style.css",

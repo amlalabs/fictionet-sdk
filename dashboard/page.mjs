@@ -476,12 +476,14 @@ export function appShell(root, services, page) {
   const controls = el('div', { class: 'app-controls' });
   const stage = el('div', { id: 'app-agent-panel', class: 'app-stage', role: 'tabpanel' }, agent);
   const world = el('section', { class: 'app-world', 'aria-label': 'World' }, body);
-  const picture = el('div', { class: 'app-world-picture' }, world);
-  const traffic = el('section', { class: 'app-world-traffic', 'aria-label': 'Traffic' }, world);
-  const worldTabs = el('div', { class: 'app-tabs', role: 'tablist', 'aria-label': 'World traffic' }, traffic);
-  const packetTab = el('button', { id: 'app-packets-tab', type: 'button', role: 'tab', 'aria-selected': 'true', 'aria-controls': 'app-packets-panel', tabindex: '0', text: 'Packets' }, worldTabs);
-  const packetPanel = el('div', { id: 'app-packets-panel', role: 'tabpanel', 'aria-labelledby': 'app-packets-tab', tabindex: '0' }, traffic);
-  let ownTab, ownPanel, stopPackets = () => {}, packetVisible = true, disposed = false;
+  const own = page.panels.find((item) => item.area === 'workspace' && item.kind === 'custom');
+  const worldTabs = el('div', { class: 'app-tabs', role: 'tablist', 'aria-label': 'World' }, world);
+  const ownTab = own ? el('button', { id: 'app-world-tab', type: 'button', role: 'tab', 'aria-selected': 'true', 'aria-controls': 'app-world-panel', tabindex: '0', text: own.title }, worldTabs) : null;
+  const packetTab = el('button', { id: 'app-packets-tab', type: 'button', role: 'tab', 'aria-selected': String(!own), 'aria-controls': 'app-packets-panel', tabindex: own ? '-1' : '0', text: 'Packets' }, worldTabs);
+  const ownPanel = own ? el('div', { id: 'app-world-panel', role: 'tabpanel', 'aria-labelledby': 'app-world-tab', tabindex: '0' }, world) : null;
+  const packetPanel = el('div', { id: 'app-packets-panel', role: 'tabpanel', 'aria-labelledby': 'app-packets-tab', tabindex: '0' }, world);
+  packetPanel.hidden = Boolean(own);
+  let stopPackets = () => {}, packetVisible = !own, disposed = false;
   function watchPackets() {
     stopPackets();
     stopPackets = () => {};
@@ -501,29 +503,6 @@ export function appShell(root, services, page) {
     }
     if (changed) watchPackets();
   }
-  // A demo leaves its picture in place and hands its existing list to the
-  // shell. The shell moves that list into the second world tab.
-  services.worldList = (container, list, label) => {
-    picture.classList.add('with-world-list');
-    traffic.remove();
-    container.append(traffic);
-    ownTab = el('button', { id: 'app-world-list-tab', type: 'button', role: 'tab', 'aria-selected': 'false', 'aria-controls': 'app-world-list-panel', tabindex: '-1', text: label }, worldTabs);
-    ownPanel = el('div', { id: 'app-world-list-panel', role: 'tabpanel', 'aria-labelledby': 'app-world-list-tab', tabindex: '0', hidden: '' }, traffic);
-    ownPanel.hidden = true;
-    list.remove();
-    ownPanel.append(list);
-    const off = listen(ownTab, 'click', () => selectWorld(false));
-    return () => {
-      off();
-      container.append(list);
-      ownTab.remove();
-      ownPanel.remove();
-      ownTab = ownPanel = null;
-      world.append(traffic);
-      picture.classList.remove('with-world-list');
-      if (!disposed) selectWorld(true);
-    };
-  };
   const host = page.hosts[0];
   const kinds = ['screen', 'terminal'].filter((kind) => host?.[kind]);
   const cleanup = [];
@@ -556,15 +535,15 @@ export function appShell(root, services, page) {
   }));
   bar.append(controls);
   open();
-  const own = page.panels.find((item) => item.area === 'workspace' && item.kind === 'custom');
+  if (ownTab) cleanup.push(listen(ownTab, 'click', () => selectWorld(false)));
   cleanup.push(listen(packetTab, 'click', () => selectWorld(true)));
   cleanup.push(listen(worldTabs, 'keydown', (event) => {
     if (!ownTab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
-    selectWorld(event.key === 'Home' || (event.key !== 'End' && !packetVisible), true);
+    selectWorld(event.key === 'End' || (event.key !== 'Home' && !packetVisible), true);
   }));
   watchPackets();
-  if (own) cleanup.push(panel(services, page, picture, own));
+  if (own) cleanup.push(panel(services, page, ownPanel, own));
   const close = () => { pop.hidden = true; toggle.setAttribute('aria-expanded', 'false'); };
   cleanup.push(listen(toggle, 'click', () => {
     pop.hidden = !pop.hidden;
@@ -590,7 +569,6 @@ export function appShell(root, services, page) {
     disposed = true;
     stopConsole();
     stopPackets();
-    delete services.worldList;
     cleanup.reverse().forEach((off) => off());
     root.classList.remove('demo-app');
   };

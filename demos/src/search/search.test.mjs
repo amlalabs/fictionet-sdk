@@ -73,17 +73,16 @@ test('the picture shows the newest search, its engines and the sites its list na
   assert.equal(picture({ ...fixture(), queries: [], results: [], refused: [], planted: [] }).query, null);
 });
 
-function harness(worldList) {
+function harness() {
   const document = createDocument(), root = document.createElement('div');
   const subscriptions = new Map(), posts = [];
   const services = createServices({
     async post(path, body) { posts.push({ path, body }); return { status: 'applied', reply: { revision: 4, at_ms: 9000 } }; },
   });
   services.worldMenu = document.createElement('div');
-  if (worldList) services.worldList = worldList;
   services.state = (path, publish) => { subscriptions.set(path, publish); return () => subscriptions.delete(path); };
-  const dispose = mount(root, services, { state: '/api/state/search' });
-  return { root, services, subscriptions, posts, dispose, publish: (value) => subscriptions.get('/api/state/search')({ value }) };
+  const dispose = mount(root, services, { state: '/api/state/web' });
+  return { root, services, subscriptions, posts, dispose, publish: (value) => subscriptions.get('/api/state/web')({ value }) };
 }
 
 test('the world pane draws the picture and rows without explaining them', () => {
@@ -92,7 +91,8 @@ test('the world pane draws the picture and rows without explaining them', () => 
   const text = h.root.textContent;
   for (const word of ['Google', 'Bing', 'DuckDuckGo', 'new words', 'halvardsystems', 'wiki.corp', 'planted']) assert.match(text, new RegExp(word));
   assert.equal(h.root.querySelectorAll('.search-row').length, 6);
-  for (const caption of ['made up', 'stub generator', 'scripted', 'Firefox', 'seed', 'world']) assert.doesNotMatch(text, new RegExp(caption, 'i'));
+  assert.deepEqual(h.root.querySelectorAll('.search-row').map((row) => row.querySelector('em')?.textContent ?? ''), ['planted', 'refused', 'again', '', 'again', 'made now']);
+  for (const caption of ['made up', 'stub generator', 'scripted', 'Firefox', 'seed', 'world', 'canned', 'stub', 'store', 'generator', 'cache']) assert.doesNotMatch(text, new RegExp(caption, 'i'));
   h.dispose();
   assert.equal(h.subscriptions.size, 0);
   assert.equal(h.services.worldMenu.children.length, 0);
@@ -103,6 +103,8 @@ test('the World menu chooses new pages, plants a fact and a page, and restarts a
   h.publish(fixture());
   const menu = h.services.worldMenu;
   const [canned, stub, off] = menu.querySelector('.seg').children;
+  assert.deepEqual([canned, stub, off].map((button) => button.textContent), ['Prepared', 'Improvised', 'Off']);
+  assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
   assert.deepEqual([canned, stub, off].map((b) => b.getAttribute('aria-pressed')), ['true', 'false', 'false']);
   stub.dispatchEvent(new Event('click'));
   await settle();
@@ -128,20 +130,15 @@ test('the World menu chooses new pages, plants a fact and a page, and restarts a
   h.dispose();
 });
 
-test('the app hands its searches and pages to the shell and releases the tab on disposal', () => {
-  let registration, released = false;
-  const h = harness((container, list, label) => {
-    registration = { container, list, label };
-    return () => { released = true; };
-  });
+test('the view keeps its picture and activity rows together', () => {
+  const h = harness();
   h.publish(fixture());
-  assert.equal(registration.container, h.root);
-  assert.equal(registration.label, 'Searches');
-  assert.equal(registration.list, h.root.querySelector('.search-rows'));
-  assert.equal(registration.list.children.length, 6);
-  assert.match(registration.list.textContent, /wiki.corp/);
+  const list = h.root.querySelector('.search-rows');
+  assert.equal(list.parentNode, h.root);
+  assert.equal(list.children.length, 6);
+  assert.match(list.textContent, /wiki.corp/);
   assert.equal(h.root.querySelector('.search-picture').parentNode, h.root);
+  assert.ok(h.root.children.indexOf(list) > h.root.children.indexOf(h.root.querySelector('.search-picture')));
   h.dispose();
-  assert.equal(released, true);
   assert.equal(h.subscriptions.size, 0);
 });
