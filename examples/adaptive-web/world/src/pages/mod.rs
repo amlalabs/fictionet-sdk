@@ -998,7 +998,6 @@ impl Pages {
             target,
             &[serde_json::json!({"title":page.title})],
             "news",
-            &[],
         );
         use kuchiki::traits::TendrilSink;
         let dom = kuchiki::parse_html().one(article.body);
@@ -1030,6 +1029,13 @@ impl Pages {
                 )
             })
             .collect::<String>();
+        let related = if related.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<section class=\"related\"><p class=\"related-title\"><strong>Related</strong></p><ul>{related}</ul></section>"
+            )
+        };
         let paragraphs: String = page
             .text
             .iter()
@@ -1041,7 +1047,7 @@ impl Pages {
             description: text::take(&page.text.join(" "), 200),
             date: self.seed.date.clone(),
             body: format!(
-                "<h1>{}</h1>{byline}{paragraphs}<section class=\"related\"><p class=\"related-title\"><strong>Related</strong></p><ul>{related}</ul></section>",
+                "<h1>{}</h1>{byline}{paragraphs}{related}",
                 text::escape(&page.title)
             ),
             ..make::Page::default()
@@ -2304,7 +2310,7 @@ impl Pages {
                             mentions.push(json!({"snippet": fact}));
                         }
                     }
-                    make::page_with_known(&seed, host, target, &mentions, &kind, &known, &ask.cast)
+                    make::page_with_known(&seed, host, target, &mentions, &kind, &known)
                 },
                 || {
                     let (system, user) = prompts::page(
@@ -2572,7 +2578,6 @@ fn static_asset(path: &str) -> Option<Response> {
     Some(Response::new(200, ctype, body, vec![], Meta::Asset))
 }
 
-
 impl fictionet_extras::models::Engine for Pages {
     fn search(
         self: Arc<Self>,
@@ -2688,3 +2693,6 @@ impl fictionet_extras::models::Engine for Pages {
 }
 
 pub(crate) use make::misspelled_host;
+
+#[cfg(test)]
+mod tests;

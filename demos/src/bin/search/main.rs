@@ -1,10 +1,10 @@
-//! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
+//! The Search demo: an Ubuntu desktop with Firefox, Claude Code and Codex on the
 //! plain adaptive web: no scenario, nothing planted.
 //!
 //! - `search <downloads>` is the app: it boots, opens the page and stays up
-//!   until Ctrl-C. Prepared pages answer first. A model fills the gaps
-//!   with an OpenRouter key; otherwise the offline maker does.
-//! - `search <downloads> check` runs the scripted story and its checks.
+//!   until Ctrl-C. An optional OpenRouter key enables live page generation;
+//!   otherwise the offline maker answers.
+//! - `search <downloads> check` runs the scripted browser checks.
 //! - `search preview` shows the page with an in-world client and no VM.
 //! - `search bake` makes the canned store with a model (see `bake.rs`).
 
@@ -26,7 +26,7 @@ use std::{collections::BTreeSet, fs::File, path::PathBuf, sync::Arc, time::Insta
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The seed the app shows, and whose canned pages it serves.
+/// The plain web seed used by the app.
 const SEED: &str = "web";
 
 /// What to run: the app or its checks with the downloads folder, the
@@ -143,11 +143,8 @@ async fn main() -> Result {
                 start,
             };
             world.trust("office", &web.ca.cert_pem())?;
-            // Claude Code and Codex sign in inside the guest themselves; the
-            // world passes their model and sign-in traffic straight through.
-            let model = None;
             topics.start(&cx, searches, pages)?;
-            page::network(&web, &cx, world_log, world.mirror(&cx)?, model)?
+            page::network(&web, &cx, world_log, world.mirror(&cx)?)?
                 .route(kit::JUMP, kit::jump_prefix())
                 .start(&cx, world.into_attachments())
         });
@@ -186,7 +183,7 @@ mod tests {
         let offline = super::pages_for_key(seed(), None).unwrap();
         assert_eq!(offline.generator_kind(), GeneratorKind::Stub);
         assert_eq!(offline.prefetch(), 0);
-        assert_eq!(offline.new_pages(), NewPages::Canned);
+        assert_eq!(offline.new_pages(), NewPages::Stub);
         let check = super::app_pages(seed(), true).unwrap();
         assert_eq!(check.generator_kind(), GeneratorKind::Stub);
         assert_eq!(check.prefetch(), 0);
@@ -198,7 +195,7 @@ mod tests {
         );
         assert_eq!(live.model(), Provider::OpenRouter.default_model());
         assert_eq!(live.prefetch(), 5);
-        assert_eq!(live.new_pages(), NewPages::Canned);
+        assert_eq!(live.new_pages(), NewPages::Stub);
     }
 
     #[test]

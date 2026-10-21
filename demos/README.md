@@ -177,25 +177,30 @@ the impostor, the impostor and its row flash red.
 
 ### Search
 
-`cargo xtask demo search` is the app. It boots an Ubuntu desktop with Firefox
-and Claude Code on [the adaptive web](../examples/adaptive-web), opens the page
-in Chromium and stays up until Ctrl-C. The page has the guest's Screen and
-Terminal on the left and the newest search, its engines and the sites it named
-on the right. The World menu switches new pages between Canned, Stub and Off,
-plants a fact or a page, and restarts the run.
+`cargo xtask demo search` boots an Ubuntu desktop with Firefox, Claude Code,
+Codex and nmap on [the plain adaptive web](../examples/adaptive-web). There is
+no scenario or planted story. The page opens in Chromium and stays up until
+Ctrl-C, with Screen and Terminal beside the web view. The Packets tab shows
+the network graph and traffic moving along its links.
 
-  A search it does not hold lists the canned pages that share its words first;
-  the stub makes the rest. Nothing calls a model for pages.
-- Claude Code's own calls are the only billed ones: Claude Sonnet 5.5 through
-  `ANTHROPIC_API_KEY`, else `OPENROUTER_API_KEY` (as
-  `anthropic/claude-sonnet-5.5`), at most 60 per run. Its WebSearch and WebFetch are answered by the same pages. With no key,
-  typed searches work and Claude Code asks you to sign in.
-- `cargo xtask demo search check` runs the scripted story and its checks, with
-  screenshots in `downloads/cloudimage/runs/search-<time>/`.
-- `cargo xtask demo search bake` remakes the canned store from
-  in at most 300 model calls.
-- `cargo xtask demo search preview` shows the page with an in-world client and
-  no VM.
+Sign in to Claude Code and Codex inside the guest with your own accounts.
+Search injects no keys and needs no host model key. Sign-in hosts carry raw
+TLS to the providers. The world terminates model API connections with its
+trusted CA and forwards the guest's credentials unchanged. Built-in web
+search and fetch tools use the same simulated pages as Firefox.
+
+The offline maker answers new pages without a key. An optional
+`OPENROUTER_API_KEY` enables live page generation with an offline fallback;
+it is independent of the agents' sign-in. The World menu controls generation,
+can plant a fact or page, and can restart the web.
+
+- `cargo xtask demo search check` checks ordinary searches, result pages,
+  generation controls and the guest's network, and saves screenshots under
+  `downloads/cloudimage/runs/search-<time>/`. It runs without API keys.
+- `cargo xtask demo search bake` prepares a reusable plain-web store with a
+  model, in at most 400 calls.
+- `cargo xtask demo search preview` shows the page with an in-world client
+  and no VM.
 
 ### FakeWiki
 
@@ -275,7 +280,7 @@ host's input lease. Taking control claims browser input only. It does not
 pause an agent. A host takes four screen sessions and four terminal sessions
 at once. The checks' own captures use one or two, so with several page tabs
 open a page shot can be refused a session and fail. The pinned noVNC and
-xterm.js files are embedded from `observe/downloads/vendor/`.
+ghostty-web files are embedded from `observe/downloads/vendor/`.
 
 The page's consoles and the checks reach each guest over SSH from the kit's
 jump host, so that traffic crosses the guest's link too. The kit excludes
