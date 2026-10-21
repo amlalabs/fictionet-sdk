@@ -114,6 +114,9 @@ export function mount(root, services, options) {
   }
   cleanup.push(services.state(options.state, ({ value }) => {
     if (disposed || !value) return;
+    const names = new Map((value.sites || []).map(({ address, host }) => [address, host]));
+    const previousNames = services.endpointNames.get();
+    if (names.size !== previousNames.size || [...names].some(([address, host]) => previousNames.get(address) !== host)) services.endpointNames.set(names);
     const changes = diff(snapshot, value);
     const reset = !snapshot || changes.some((change) => change.type === 'restart');
     if (reset) web.reset(value);

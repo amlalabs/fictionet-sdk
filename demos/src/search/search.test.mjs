@@ -785,3 +785,17 @@ test('restart clears current motion immediately and starts no new animation', as
   assert.equal(window.frameCount, 0);
   await settle(); h.dispose();
 });
+
+test('snapshot sites publish packet endpoint names only when the addresses change', () => {
+  const h = harness();
+  const updates = [];
+  const off = h.services.endpointNames.subscribe((names) => updates.push(names));
+  const s = { ...fixture(), sites: [{ address: '192.0.2.1', host: 'www.example.com' }, { address: '192.0.2.2', host: 'api.anthropic.com' }] };
+  h.publish(s);
+  assert.deepEqual([...h.services.endpointNames.get()], [['192.0.2.1', 'www.example.com'], ['192.0.2.2', 'api.anthropic.com']]);
+  h.publish({ ...s, revision: 2 });
+  assert.equal(updates.length, 2);
+  h.publish({ ...s, sites: [] });
+  assert.equal(h.services.endpointNames.get().size, 0);
+  off(); h.dispose();
+});

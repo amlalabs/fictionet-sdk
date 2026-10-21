@@ -2,16 +2,19 @@
 // components/packets.mjs passes in DOM helpers, the transport's packet calls,
 // labels and orientation.
 import { listen, scoped, lossLine, observationList, reconcile } from './dom.mjs';
+import { kindOf } from './components/lanes.mjs';
 
 // What the detail pane says until a packet is selected.
 const PICK = 'Select a packet';
 
 export function createPackets({
-  $, el, packetStream, packet, download, fmtCount, maxRows = 3000,
+  $, el, packetStream, packet, download, fmtCount, compact = false, maxRows = compact ? 40 : 3000,
   onDetail = () => {}, stopped = () => null,
+  onRow = () => {}, onClear = () => {}, onReplay = () => {}, onPending = () => {},
+  filterRows = (rows) => rows, animate = () => {},
   // A table with a Host column gives every row that cell, so gap rows span
   // all nine columns whichever are hidden.
-  hostColumn = false, compact = false, endpointLabel = (value) => value,
+  hostColumn = false, endpointLabel = (value) => value,
 }) {
   const cleanup = [];
   const streamCleanup = [];
@@ -21,7 +24,7 @@ export function createPackets({
   const prows = $('prows');
   const plist = $('plist');
   let rowKey = 0;
-  let recent = [];
+  let recent = [], history = [];
   const compactRows = new Map();
   const createRow = (row) => {
     const parent = document.createDocumentFragment();
@@ -31,10 +34,21 @@ export function createPackets({
   };
   const tail = compact ? {
     append(next) {
-      recent = [...recent, ...next].sort((a, b) => b.t - a.t || b.key - a.key).slice(0, maxRows);
-      reconcile(prows, recent, (row) => row.key, createRow, () => {}, compactRows);
+      history = [...history, ...next].sort((a, b) => a.t - b.t || a.key - b.key).slice(-3000);
+      const visible = filterRows(history);
+      recent = visible.slice(-maxRows).reverse();
+      reconcile(prows, recent, (row) => row.key, createRow, (entry, row) => {
+        entry.node.classList.toggle('quiet', !!row.quiet);
+        entry.node.children[1].textContent = `${endpointLabel(row.src)} → ${endpointLabel(row.dst)}`;
+      }, compactRows);
+      const shown = new Set(visible);
+      next.filter((row) => shown.has(row)).forEach((row) => {
+        onRow(row);
+        const entry = compactRows.get(row.key);
+        if (entry) animate(entry.node, 'translateY(-6px)', 200);
+      });
     },
-    clear() { recent = []; compactRows.clear(); prows.replaceChildren(); },
+    clear() { recent = []; history = []; compactRows.clear(); prows.replaceChildren(); onClear(); },
   } : observationList(prows, {
     limit: maxRows, key: (row) => row.key,
     create: createRow,
@@ -52,7 +66,7 @@ export function createPackets({
   let selection = 0;
   let detailRequest = null;
   /// Rows the packet list keeps.
-  const MAX_ROWS = maxRows;
+  const MAX_ROWS = compact ? 3000 : maxRows;
   /// How long a merged packet view holds packets to put them in order.
   const MERGE_HOLD_MS = 400;
   // `10.0.0.2:22` or `[fe80::1]:22` as [address, port]; a bare address has
@@ -175,6 +189,7 @@ export function createPackets({
     // view is paused or the tab is hidden. Gap notices share the same limit.
     const q = packets.paused ? packets.held : packets.queue;
     q.push(entry);
+    onPending();
     if (compact) q.sort((a, b) => a.t - b.t);
     if (q.length > MAX_ROWS * 2) q.splice(0, q.length - MAX_ROWS);
   }
@@ -270,7 +285,9 @@ export function createPackets({
       }
       if (!batch.length) return;
     }
-    tail.append((compact ? batch : batch.slice(-MAX_ROWS)).map((row) => ({ ...row, key: ++rowKey })));
+    const next = (compact ? batch : batch.slice(-MAX_ROWS)).map((row) => ({ ...row, key: ++rowKey }));
+    tail.append(next);
+    if (!compact) next.filter((row) => !row.gap).forEach(onRow);
     fitColumns();
     if (compact) return;
     if (nearBottom) { plist.scrollTop = plist.scrollHeight; clearUnread(); }
@@ -293,10 +310,18 @@ export function createPackets({
     // One link numbers its own packets; merged links are numbered here.
     const no = packets.many ? packets.rows : p.seq;
     if (compact) {
-      const tr = el('tr', { 'data-seq': p.seq, 'data-link': p.link }, parent);
-      for (const [index, value] of [p.t.toFixed(2), `${endpointLabel(p.src)} → ${endpointLabel(p.dst)}`, p.proto, p.info].entries()) {
-        el('td', { class: ['app-packet-time', 'app-packet-route', 'app-packet-protocol', 'app-packet-info'][index], text: value, title: value }, tr);
+      const tr = el('tr', { class: `${kindOf(p)}${p.quiet ? ' quiet' : ''}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
+      const route = `${endpointLabel(p.src)} → ${endpointLabel(p.dst)}`;
+      el('td', { class: 'app-packet-time', text: p.t.toFixed(2) }, tr);
+      el('td', { class: 'app-packet-route', text: route, title: `${p.src} → ${p.dst}` }, tr);
+      const protocol = el('td', { class: 'app-packet-protocol' }, tr);
+      el('span', { class: `packet-proto ${kindOf(p)}`, text: p.proto }, protocol);
+      const info = el('td', { class: 'app-packet-info', title: p.info }, tr);
+      if (p.tags.includes('decrypted')) {
+        const lock = el('svg:svg', { class: 'packet-unlock', viewBox: '0 0 12 12', role: 'img', 'aria-label': 'Decrypted' }, info);
+        el('svg:path', { d: 'M3 6V4.2a3 3 0 0 1 5.6-1.4M2.5 6h7v4.5h-7z', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.3', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, lock);
       }
+      info.append(p.info);
       return;
     }
     const tr = el('tr', { class: `${p.side === 1 ? 'back' : ''} ${p.skipped > 0 || p.evicted > 0 ? 'after-gap' : ''} ${p.tags.join(' ')}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
@@ -517,6 +542,13 @@ export function createPackets({
     tail.clear();
     clearDetail(PICK);
   }, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels,
+  refresh() {
+    if (!compact || !packets) return;
+    compactRows.clear();
+    prows.replaceChildren();
+    tail.append([]);
+    onReplay(filterRows(history));
+  },
   /// Packets received but not shown yet, or -1 while no stream is open.
   queued: () => (packets ? packets.queue.length + packets.held.length : -1) };
 }

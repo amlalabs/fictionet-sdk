@@ -9,7 +9,7 @@ const $ = (id) => document.getElementById(id);
 
 import { Element } from './test-dom.mjs';
 
-function setup(t, links = ['a'], maxRows = 3000) {
+function setup(t, links = ['a'], maxRows = 3000, options = {}) {
   const elements = new Map();
   const previousDocument = globalThis.document;
   t.after(() => {
@@ -56,7 +56,7 @@ function setup(t, links = ['a'], maxRows = 3000) {
     packet: (p, signal) => new Promise((resolve, reject) => requests.push({ url: `api/packet?link=${p.link}&seq=${p.seq}`, signal, resolve, reject })),
     download: async (...args) => { downloads.push(args); if (downloadError) throw downloadError; },
   };
-  const view = createPackets({ $, el, ...transport, fmtCount: String, maxRows });
+  const view = createPackets({ $, el, ...transport, fmtCount: String, maxRows, ...options });
   const open = () => view.openLinks('From', 'To', links.map((id) => ({ e: { id }, flip: false })));
   open();
   const source = sources[0];
@@ -620,4 +620,35 @@ test('packet class is shown only after selecting its detail', async (t) => {
   h.requests[0].resolve({ ok: true, json: async () => detail(1) });
   await settle();
   assert.match($('tree').textContent, /guest.agent/);
+});
+
+test('row callbacks follow merge releases once and omit gaps', (t) => {
+  const seen = [];
+  const h = setup(t, ['a', 'b'], 3000, { onRow: (p) => seen.push(`${p.link}:${p.seq}`) });
+  h.send(3, { link: 'b', t: 3 });
+  h.send(1, { link: 'a', t: 1 });
+  h.view.flush();
+  assert.deepEqual(seen, ['a:1']);
+  h.send(2, { link: 'a', t: 2 });
+  h.source.emit('gap', { link: 'a', missed: 1 });
+  h.flush();
+  assert.deepEqual(seen, ['a:1', 'a:2', 'b:3']);
+  assert.deepEqual(h.rows().map((row) => `${row.dataset.link}:${row.dataset.seq}`), seen);
+  h.view.flush();
+  assert.equal(seen.length, 3);
+});
+
+test('compact callbacks follow chronological releases and the list reverses them', (t) => {
+  const seen = [];
+  const h = setup(t, ['a', 'b'], 40, { compact: true, onRow: (p) => seen.push(p.seq) });
+  h.send(3, { link: 'b', t: 3 });
+  h.send(1, { link: 'a', t: 1 });
+  h.view.flush();
+  assert.deepEqual(seen, [1]);
+  h.send(2, { link: 'a', t: 2 });
+  h.flush();
+  assert.deepEqual(seen, [1, 2, 3]);
+  assert.deepEqual(h.rows().map((row) => Number(row.dataset.seq)), [...seen].reverse());
+  h.view.refresh();
+  assert.deepEqual(seen, [1, 2, 3]);
 });

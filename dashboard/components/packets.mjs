@@ -7,6 +7,7 @@ import { labelAction } from './labels.mjs';
 import { scoped, listen } from '../dom.mjs';
 import { createPackets } from '../packets.mjs';
 import { fmtCount } from '../format.mjs';
+import { addressOf, conversationRows, createLanes, dnsRow } from './lanes.mjs';
 
 // The page server merges at most this many links: the busiest are shown.
 const MAX_MERGED = 32;
@@ -20,28 +21,63 @@ export function mount(root, services, options = {}) {
   const { $: lookup, el } = scoped(root);
   const support = structure(root, el, options.compact);
   const $ = (id) => support?.get(id) || lookup(id);
-  const addresses = new Map();
+  const addresses = new Map(), dnsNames = new Map(), resolvers = new Set();
+  const media = root.ownerDocument?.defaultView?.matchMedia('(prefers-reduced-motion: reduce)');
+  const animations = new Map();
+  function animate(node, transform, duration) {
+    if (media?.matches || !node.animate) return;
+    animations.get(node)?.cancel();
+    const animation = node.animate([{ opacity: 0, transform }, { opacity: 1, transform: 'none' }], { duration, easing: 'cubic-bezier(.2,.7,.3,1)' });
+    animations.set(node, animation);
+    const finished = () => { if (animations.get(node) === animation) animations.delete(node); };
+    animation.finished.then(finished, finished);
+  }
+  function name(value) {
+    const address = addressOf(value);
+    for (const host of services.hosts) if ((addresses.get(host.name) || []).includes(address)) return host.name;
+    return services.endpointNames?.get().get(address) || dnsNames.get(address) || (resolvers.has(address) ? 'resolver' : value);
+  }
+  const lanes = options.compact ? createLanes($('packet-lanes'), { name, animate, local: (value) => [...addresses.values()].some((list) => list.includes(addressOf(value))), addressFor: (host) => [...(services.endpointNames?.get() || []), ...dnsNames].find(([, value]) => value === host)?.[0] }) : null;
+  let animation, timer, disposed = false;
+  function schedule() {
+    if (disposed || animation !== undefined) return;
+    clearTimeout(timer);
+    animation = requestAnimationFrame(frame);
+  }
   const view = createPackets({
     onDetail(packet, header) {
       labelAction(header, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
     },
-    endpointLabel(value) {
-      for (const host of services.hosts) {
-        const address = (addresses.get(host.name) || []).find((address) => value === address || value.startsWith(`${address}:`) || value.startsWith(`[${address}]:`));
-        if (address) return host.name;
+    endpointLabel: (value) => name(value).replace(/^www\./, ''),
+    onRow: (p) => lanes?.add(p),
+    onClear: () => { lanes?.clear(); dnsNames.clear(); resolvers.clear(); },
+    onReplay: (rows) => lanes?.replace(rows),
+    onPending: schedule,
+    animate,
+    filterRows(rows) {
+      for (const p of rows) {
+        const dns = dnsRow(p);
+        if (!dns) continue;
+        resolvers.add(addressOf(dns.back ? p.src : p.dst));
+        for (const answer of dns.answers) dnsNames.set(answer.address, dns.name);
       }
-      return value;
+      const conversations = new Set(conversationRows(rows));
+      for (const row of rows) row.quiet = !conversations.has(row);
+      return services.packetFilter?.get() === 'every' ? rows : rows.filter((row) => !row.quiet);
     },
     $, el, ...services.transport, fmtCount, stopped: () => (services.stopped() ? STOPPED : null), hostColumn: true,
     ...options,
   });
-  let animation;
   // An empty list says whether its links are still opening or have nothing
   // captured yet. Packets already received are about to be shown.
   const note = $('plist-empty');
   const frame = () => {
+    animation = undefined;
     view.flush();
-    if (options.compact) { animation = requestAnimationFrame(frame); return; }
+    if (options.compact) {
+      if (view.queued() > 0) timer = setTimeout(schedule, 400);
+      return;
+    }
     const queued = view.queued();
     const empty = !$('drawer').hidden && !$('prows').children.length && queued <= 0;
     if (note.hidden === empty) note.hidden = !empty;
@@ -49,10 +85,17 @@ export function mount(root, services, options = {}) {
     if (empty && note.textContent !== text) note.textContent = text;
     animation = requestAnimationFrame(frame);
   };
-  animation = requestAnimationFrame(frame);
+  schedule();
   const cleanup = [];
+  if (options.compact) {
+    if (services.packetFilter) cleanup.push(services.packetFilter.subscribe(() => view.refresh()));
+    if (services.endpointNames) cleanup.push(services.endpointNames.subscribe(() => view.refresh()));
+    if (media) cleanup.push(listen(media, 'change', () => {
+      if (media.matches) { animations.forEach((animation) => animation.cancel()); animations.clear(); }
+    }));
+  }
   if (options.compact) for (const host of services.hosts) {
-    if (host.status) cleanup.push(services.state(host.status, ({ value }) => addresses.set(host.name, value?.addresses || [])));
+    if (host.status) cleanup.push(services.state(host.status, ({ value }) => { addresses.set(host.name, value?.addresses || []); view.refresh(); }));
   }
   const { state } = services.graph;
   const owners = new Map();
@@ -66,6 +109,7 @@ export function mount(root, services, options = {}) {
     $('drawer-title').title = 'Packets';
     $('drawer-title').setAttribute('aria-label', 'Packets');
     $('prows').replaceChildren();
+    lanes?.clear();
     if (!options.compact) el('td', { colspan: 9, text }, el('tr', { class: 'gap' }, $('prows')));
   }
   function show(links, label) {
@@ -140,10 +184,14 @@ export function mount(root, services, options = {}) {
   }));
   void scope();
   return () => {
+    disposed = true;
     generation++;
     request?.abort();
     cleanup.forEach((remove) => remove());
     cancelAnimationFrame(animation);
+    clearTimeout(timer);
+    animations.forEach((animation) => animation.cancel());
+    animations.clear();
     view.dispose();
   };
 }
@@ -165,9 +213,10 @@ function structure(root, el, compact = false) {
   const pair = el('p', { id: 'pair', class: 'pair-note', hidden: '' }, drawer);
   el('span', { id: 'pair-text' }, pair);
   el('button', { id: 'pair-clear', class: 'text-button', type: 'button', text: 'Show all packets' }, pair);
+  if (compact) el('div', { id: 'packet-lanes', class: 'packet-lanes', 'aria-label': 'Site conversations' }, drawer);
   const body = el('div', { class: 'drawer-body' }, drawer);
   const list = el('div', { class: 'plist-wrap' }, body);
-  const scroller = el('div', { id: 'plist', class: 'plist' }, list);
+  const scroller = el('div', { id: 'plist', class: 'plist', ...(compact ? { tabindex: '0', role: 'region', 'aria-label': 'Decoded packets' } : {}) }, list);
   const table = el('table', {}, scroller);
   const cols = el('colgroup', {}, table);
   for (const name of ['c-no', 'c-time', 'c-dir', 'c-host', 'c-src', 'c-dst', 'c-proto', 'c-len', 'c-info']) el('col', { class: name }, cols);

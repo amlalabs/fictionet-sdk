@@ -1,0 +1,97 @@
+import { scoped } from '../dom.mjs';
+
+export const addressOf = (value) => value.startsWith('[') ? value.slice(1, value.indexOf(']')) : value.split(':').length === 2 ? value.replace(/:\d+$/, '') : value;
+export const kindOf = (p) => p.tags.some((tag) => ['dns-error', 'reset', 'malformed'].includes(tag)) ? 'bad'
+  : p.proto.startsWith('TLS') ? 'tls' : p.proto.startsWith('HTTP') ? 'http' : 'tcp';
+const flow = (p) => `${p.link}:${[p.src, p.dst].sort().join('|')}`;
+
+export function conversationRows(rows) {
+  const decoded = new Set(rows.filter((p) => /^(TLS|HTTP)/.test(p.proto)).map(flow));
+  return rows.filter((p) => {
+    if (p.proto !== 'TCP') return true;
+    const flags = p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/) || [];
+    if (flags.some((flag) => ['SYN', 'FIN', 'RST'].includes(flag)) || p.tags.some((tag) => tag !== 'decrypted')) return true;
+    // TCP keeps partial records until TLS or HTTP completes them. Only hide
+    // payload on a decoded connection, including decrypted TCP without an
+    // application message. Keep unknown protocols and tagged loss.
+    return !(flags.length === 1 && flags[0] === 'ACK' && /\bLen=0\b/.test(p.info))
+      && !(/\bLen=[1-9]\d*\b/.test(p.info) && (p.tags.includes('decrypted') || decoded.has(flow(p))) && flags.every((flag) => ['ACK', 'PSH'].includes(flag)));
+  });
+}
+
+export function dnsRow(p) {
+  if (p.proto !== 'DNS') return null;
+  const question = p.info.match(/^Standard query(?: response)? \S+ (?:A|AAAA) (\S+)/);
+  if (!question) return null;
+  const name = question[1];
+  const answers = [...p.info.slice(question[0].length).matchAll(/\b(A|AAAA) ([\da-f.:]+)(?=\s|$)/gi)].map((m) => ({ type: m[1], address: m[2] }));
+  return { name: name.replace(/\.$/, ''), answers, back: p.info.startsWith('Standard query response') };
+}
+
+export function chipText(p) {
+  const dns = dnsRow(p);
+  if (dns) return p.tags.includes('dns-error') ? 'no such name' : dns.back ? dns.answers.map((a) => `${a.type} ${a.address}`).join(' · ') || 'DNS' : 'DNS';
+  if (p.proto === 'TCP') return p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/).sort((a, b) => (a === 'ACK') - (b === 'ACK')).join('·') || 'TCP';
+  if (p.proto.startsWith('TLS')) return p.info.match(/Client Hello|Server Hello|Certificate|Finished/)?.[0] || p.info.slice(0, 22);
+  if (/\bDATA(?:\[|\b)/.test(p.info)) return `DATA ${p.len > 999 ? `${(p.len / 1024).toFixed(1)}k` : p.len}`;
+  const status = p.info.match(/^HTTP\/\S+ (\d{3})/);
+  if (status) return status[1];
+  const text = p.info.replace(/^HEADERS\[\d+\]: /, '').replace(/ \([^)]*\)$/, '').replace(/ HTTP\/\d(?:\.\d)?$/, '');
+  return text.length > 22 ? `${text.slice(0, 21)}…` : text;
+}
+
+export function createLanes(root, { name, local, addressFor, animate }) {
+  const { el } = scoped(root);
+  const lanes = new Map();
+  const quiet = () => el('div', { class: 'packet-lanes-quiet', text: '—' }, root);
+  quiet();
+  function clear() { root.replaceChildren(); lanes.clear(); quiet(); }
+  function add(p, motion = true) {
+    const dns = dnsRow(p);
+    const back = dns ? dns.back : !local(p.src);
+    const remote = back ? p.src : p.dst;
+    if (!dns && !local(p.src) && !local(p.dst)) return;
+    const address = dns ? dns.answers[0]?.address || addressFor(dns.name) : addressOf(remote);
+    const host = dns ? address && name(address) !== address ? name(address) : dns.name : name(remote);
+    const key = address || host;
+    const previousKey = dns?.name || host;
+    let lane = lanes.get(key) || lanes.get(previousKey);
+    if (lane && key !== previousKey && lanes.has(previousKey)) { lanes.delete(previousKey); lanes.set(key, lane); }
+    if (!lane) {
+      root.querySelector('.packet-lanes-quiet')?.remove();
+      const node = el('div', { class: 'packet-lane' }, root);
+      const head = el('div', { class: 'packet-lane-head' }, node);
+      const title = el('b', { text: host, title: host }, head);
+      const label = el('span', { text: address || 'no address' }, head);
+      lane = { node, title, address: label, last: -Infinity, items: [], chips: el('div', { class: 'packet-chips' }, node) };
+      lanes.set(key, lane);
+    } else if (dns?.answers.length) lane.address.textContent = dns.answers[0].address;
+    lane.title.textContent = host;
+    lane.title.setAttribute('title', host);
+    lane.last = Math.max(lane.last, p.t);
+    const ordered = [...lanes.values()].sort((a, b) => b.last - a.last);
+    const before = lane.node.getBoundingClientRect().top;
+    ordered.forEach((item, index) => {
+      if (root.children[index] !== item.node) root.insertBefore(item.node, root.children[index] || null);
+    });
+    const distance = before - lane.node.getBoundingClientRect().top;
+    if (motion && (distance || lane.items.length === 0)) animate(lane.node, `translateY(${distance || 8}px)`, 240);
+    const texts = p.proto.startsWith('TLS') ? p.info.match(/Client Hello|Server Hello|Certificate(?=,|$)|Finished/g) || [chipText(p)] : [chipText(p)];
+    for (const text of texts) {
+      const chip = el('span', { class: `packet-chip ${kindOf(p)}${back ? ' back' : ''}${p.quiet ? ' quiet' : ''}`, text, title: p.info }, lane.chips);
+      lane.items.push({ node: chip, t: p.t });
+      if (motion) animate(chip, 'translateX(10px) scale(.9)', 220);
+    }
+    lane.items.sort((a, b) => a.t - b.t);
+    while (lane.items.length > 11) lane.items.shift().node.remove();
+    lane.items.forEach((item, index) => {
+      if (lane.chips.children[index] !== item.node) lane.chips.insertBefore(item.node, lane.chips.children[index] || null);
+    });
+    while (lanes.size > 7) {
+      const last = root.children[root.children.length - 1];
+      for (const [key, value] of lanes) if (value.node === last) lanes.delete(key);
+      last.remove();
+    }
+  }
+  return { add, clear, replace(rows) { clear(); rows.forEach((p) => add(p, false)); } };
+}

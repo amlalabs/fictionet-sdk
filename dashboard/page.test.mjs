@@ -856,26 +856,26 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   assert.deepEqual(rows()[0].children.map((c) => c.textContent), ['0.10', 'alpha → 203.0.113.8:443', 'TLS', 'Client hello 1']);
   for (const seq of [4, 2, 3, 10, 8, 9, 7, 6, 5, 11]) send(seq);
   frame();
-  assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), [11, 10, 9, 8, 7, 6, 5, 4]);
+  assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
   // Policy drops happen upstream; the stream reports totals without rows
   // for the console packets the collector did not admit.
   source.emit('policy', { link: 'guest-link', declined: 2000 });
   frame();
   source.emit('gap', { link: 'guest-link', missed: 50 });
   frame();
-  assert.equal(rows().length, 8);
+  assert.equal(rows().length, 11);
   assert.doesNotMatch(packetPanel.textContent, /:22|:5900|missed|policy/);
   // Guest SSH is still visible when admitted upstream. The shell must not
   // hide a protocol or port to imitate the kit's address-aware policy.
   source.emit('packet', { seq: 12, t: 1.2, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:22', proto: 'SSH', len: 60, info: 'SSH handshake' });
   frame();
   assert.match(rows()[0].textContent, /203.0.113.8:22/);
-  assert.equal(rows().length, 8);
+  assert.equal(rows().length, 12);
   send(2); frame();
   assert.equal(Number(rows()[0].dataset.seq), 12, 'late older packets stay below newer traffic');
   for (let seq = 13; seq <= 1012; seq++) send(seq);
   frame();
-  assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), [1012, 1011, 1010, 1009, 1008, 1007, 1006, 1005]);
+  assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), Array.from({ length: 40 }, (_, i) => 1012 - i));
   tabs[0].click();
   assert.equal(source.closed, true);
   assert.equal(source.listenerCount, 0);
