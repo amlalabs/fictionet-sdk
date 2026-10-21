@@ -25,6 +25,293 @@ const SETTLE_LIMIT: Duration = Duration::from_secs(20);
 /// depend on it: every check waits for the world's state.
 pub const STEP_PAUSE: Duration = Duration::from_millis(1500);
 
+/// The setup bounds used by every check run.
+const CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(300);
+const DESKTOP_TIMEOUT: Duration = Duration::from_secs(300);
+
+type Error = Box<dyn std::error::Error>;
+/// A demo's story borrows the running guests and its output folder.
+pub type Story<'a, E = Error> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), E>> + 'a>>;
+
+/// Creates the output folder shared by check runs and their logs.
+pub fn output(downloads: &Path, name: &str) -> io::Result<PathBuf> {
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let out = downloads.join("runs").join(format!("{name}-{time}"));
+    std::fs::create_dir_all(&out)?;
+    println!("Output: {}", out.display());
+    Ok(out)
+}
+
+/// A story and its checks after the guests have stopped.
+pub trait Check<E: From<io::Error>> {
+    fn play<'a>(&'a mut self, run: &'a Run, out: &'a Path) -> Story<'a, E>;
+    fn finish(&mut self) -> Story<'_, E> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A story closure and optional log checks.
+pub struct Closure<F, E> {
+    play: Option<F>,
+    finish: Option<Box<dyn FnOnce() -> Story<'static, E>>>,
+}
+
+pub fn story<E, F>(play: F) -> Closure<F, E>
+where
+    F: for<'a> FnOnce(&'a Run, &'a Path) -> Story<'a, E>,
+{
+    Closure {
+        play: Some(play),
+        finish: None,
+    }
+}
+
+impl<F, E> Closure<F, E> {
+    /// Checks a demo's log after all producers have stopped.
+    pub fn finish_with(mut self, finish: impl FnOnce() -> Story<'static, E> + 'static) -> Self {
+        self.finish = Some(Box::new(finish));
+        self
+    }
+}
+
+impl<E, F> Check<E> for Closure<F, E>
+where
+    E: From<io::Error>,
+    F: for<'a> FnOnce(&'a Run, &'a Path) -> Story<'a, E>,
+{
+    fn play<'a>(&'a mut self, run: &'a Run, out: &'a Path) -> Story<'a, E> {
+        self.play.take().expect("story runs once")(run, out)
+    }
+    fn finish(&mut self) -> Story<'_, E> {
+        Box::pin(async move {
+            match self.finish.take() {
+                Some(finish) => finish().await,
+                None => Ok(()),
+            }
+        })
+    }
+}
+
+/// Boots, checks and shuts down a demo. Only the story is demo owned.
+pub async fn run<W, F, E>(
+    kit: super::Kit<W>,
+    downloads: &Path,
+    out: &Path,
+    mut story: impl Check<E>,
+) -> Result<(), E>
+where
+    E: From<io::Error> + std::fmt::Display,
+    W: FnOnce(fictionet::Cx, super::World) -> F + Send + 'static,
+    F: std::future::Future<Output = fictionet::Result> + Send + 'static,
+{
+    let run = match kit.boot(downloads).await {
+        Ok(run) => run,
+        Err(error) => {
+            let _ = story.finish().await;
+            return Err(error.into());
+        }
+    };
+    let result = sequence(&run, out, &mut story).await;
+    if let Err(error) = &result {
+        eprintln!("checks failed: {error}");
+        for guest in run.guests() {
+            eprint!("{}", guest.diagnostics().await);
+        }
+    }
+    let shutdown = run.shutdown().await;
+    let finished = story.finish().await;
+    if let Err(error) = &shutdown {
+        eprintln!("shutdown failed: {error}");
+    }
+    if let Err(error) = &finished {
+        eprintln!("final checks failed: {error}");
+    }
+    result?;
+    shutdown?;
+    finished?;
+    println!("every required check passed");
+    Ok(())
+}
+
+pub(super) async fn sequence<E: From<io::Error>>(
+    run: &Run,
+    out: &Path,
+    story: &mut impl Check<E>,
+) -> Result<(), E> {
+    for guest in run.guests() {
+        guest.wait_cloud_init(CLOUD_INIT_TIMEOUT).await?;
+    }
+    for guest in run.guests() {
+        if guest.guest.desktop.is_some() {
+            guest.wait_desktop(DESKTOP_TIMEOUT).await?;
+        }
+    }
+    let client = PageClient::from_url(run.page_url())?;
+    bearer_required(&client).await?;
+    let page = client.get_json("/api/page").await?;
+    let hosts = page["hosts"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("page has no hosts"))?;
+    for host in hosts {
+        let name = host["name"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("host has no name"))?;
+        if host["screen"].is_string() {
+            single_use_ticket(&client, name, Capability::Screen).await?;
+        }
+        if host["terminal"].is_string() {
+            single_use_ticket(&client, name, Capability::Terminal).await?;
+            let guest = run.guest(name);
+            if read_only_terminal(guest.guest.terminal.as_deref()) {
+                terminal_rejects_input(&client, guest).await?;
+            } else {
+                terminal_runs_on(&client, name).await?;
+            }
+        }
+    }
+    story.play(run, out).await?;
+    run.containment().await?;
+    for host in hosts {
+        if host["screen"].is_string() {
+            let name = host["name"].as_str().unwrap();
+            run.screenshots(
+                name,
+                &out.join(format!("{name}-screen.png")),
+                &out.join(format!("{name}-page.png")),
+            )
+            .await?;
+        }
+    }
+    let screens = hosts
+        .iter()
+        .filter(|host| host["screen"].is_string())
+        .map(|host| host["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    run.world_shots(out, page["app"] == true, &screens).await?;
+    Ok(())
+}
+
+fn word_pattern<'a>(words: impl Iterator<Item = &'a str>) -> serde_json::Value {
+    let escaped = words
+        .map(|word| {
+            let mut escaped = String::new();
+            for character in word.chars() {
+                if r"\^$.*+?()[]{}|".contains(character) {
+                    escaped.push('\\');
+                }
+                escaped.push(character);
+            }
+            escaped
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!(if escaped.is_empty() {
+        "(?!)".into()
+    } else {
+        format!("\\b(?:{})\\b", escaped.join("|"))
+    })
+}
+
+impl Run {
+    /// Scans page words and the visible terminal output separately.
+    pub fn visible_words(&self) -> String {
+        let page_pattern = word_pattern(self.page_words.iter().map(String::as_str));
+        let guest_pattern = word_pattern(
+            super::FORBIDDEN.iter().copied().chain(
+                self.guests
+                    .iter()
+                    .flat_map(|guest| guest.guest.forbidden.iter().map(String::as_str)),
+            ),
+        );
+        format!(
+            r#"(() => {{
+            const pagePattern = new RegExp({page_pattern}, 'gi');
+            const guestPattern = new RegExp({guest_pattern}, 'gi');
+            const inspect = (where, text, pattern = pagePattern) => {{
+                const hits = Array.from(text.matchAll(pattern), match => match[0]);
+                if (hits.length) throw new Error(`Visible words '${{hits.join("', '")}}' in ${{where}}`);
+            }};
+            const tab = document.querySelector('.app-world [role="tab"][aria-selected="true"]')?.innerText;
+            for (const node of document.querySelectorAll('svg text, svg [aria-label]')) {{
+                if (node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden') {{
+                    inspect('map', node.textContent);
+                    inspect('map label', node.getAttribute('aria-label') || '');
+                }}
+            }}
+            inspect(tab ? tab + ' tab' : 'page', document.body.innerText);
+            for (const rows of document.querySelectorAll('.xterm-rows')) {{
+                if (rows.getClientRects().length && getComputedStyle(rows).visibility !== 'hidden')
+                    inspect('terminal', rows.innerText, guestPattern);
+            }}
+            const button = document.querySelector('.app-menu-button');
+            if (button) {{
+                button.click();
+                try {{ inspect('open World menu', document.querySelector('#world-menu').innerText); }}
+                finally {{ button.click(); }}
+            }}
+        }})()"#
+        )
+    }
+
+    async fn world_shots(&self, out: &Path, app: bool, screens: &[String]) -> io::Result<()> {
+        let url = self.page_url().to_string();
+        let out = out.to_path_buf();
+        let words = self.visible_words();
+        let screens = screens
+            .iter()
+            .map(|host| shot::desktop_painted(host))
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            let light = out.join("world-light.png");
+            let dark = out.join("world-dark.png");
+            let loaded = "document.querySelector('#demo')?.dataset.state === 'ready'";
+            let ready = r#"(() => {
+                if (document.querySelector('#demo')?.dataset.state !== 'ready') return false;
+                const panel = [...document.querySelectorAll('#app-world-panel, #app-packets-panel, #inspector-content')]
+                    .find(node => !node.hidden && node.getClientRects().length);
+                return panel && panel.childElementCount > 0 && !panel.querySelector('.loading-line')
+                    && panel.getAnimations({subtree: true}).every(animation =>
+                        animation.playState !== 'running' || animation.effect.getTiming().iterations === Infinity);
+            })()"#;
+            let ready = std::iter::once(ready.to_string()).chain(screens)
+                .map(|condition| format!("({condition})")).collect::<Vec<_>>().join(" && ");
+            let select = r#"document.querySelector('#app-world-tab')?.click()"#;
+            let mut steps = Vec::new();
+            if app {
+                steps.push(shot::Step {
+                    ready: loaded,
+                    action: Some(select),
+                    ..Default::default()
+                });
+                steps.push(shot::Step {
+                    ready: &ready,
+                    action: Some(&words),
+                    color_scheme: Some("light"),
+                    out: Some(&light),
+                });
+            }
+            steps.push(shot::Step {
+                ready: &ready,
+                action: Some(&words),
+                color_scheme: Some("dark"),
+                out: Some(&dark),
+            });
+            shot::capture(&url, &steps, PAGE_TIMEOUT)?;
+            for step in steps {
+                if let Some(path) = step.out {
+                    println!("page in Chromium: {}", path.display());
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
+
 /// Prints a required check as `[pass] name` or `[FAIL] name`. A failed check
 /// is an error that names it.
 pub fn check(name: &str, ok: bool) -> io::Result<()> {
@@ -112,6 +399,104 @@ pub async fn terminal_runs_on(client: &PageClient, host: &str) -> io::Result<()>
         &format!("the page terminal runs a command on {host}"),
         matches!(ran, Ok(Ok(()))),
     )
+}
+
+fn read_only_terminal(command: Option<&str>) -> bool {
+    command.is_some_and(|command| {
+        command
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(3)
+            .any(|words| words == ["tmux", "attach", "-r"])
+    })
+}
+
+/// Checks a read-only tmux view from both the page and admin SSH.
+pub async fn terminal_rejects_input(client: &PageClient, guest: &GuestHandle) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let ticket = client.ticket(guest.name(), Capability::Terminal).await?;
+        let mut socket = client
+            .open(guest.name(), Capability::Terminal, Some(&ticket.ticket))
+            .await?;
+        let ssh = guest.ssh();
+        // tmux enters the alternate screen after attaching its client.
+        socket.read_until(b"\x1b[?1049h", 64 << 10).await?;
+        let clients = ssh
+            .run("tmux list-clients -F '#{client_readonly} #{session_id}'")
+            .await?;
+        let sessions = clients
+            .stdout
+            .lines()
+            .map(|line| line.split_once(' '))
+            .collect::<Option<Vec<_>>>();
+        let sessions = sessions
+            .filter(|sessions| {
+                clients.code == 0
+                    && !sessions.is_empty()
+                    && sessions.iter().all(|(mode, _)| *mode == "1")
+            })
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "the attached terminal clients are not read-only: exit {}; {}{}",
+                    clients.code, clients.stdout, clients.stderr
+                ))
+            })?;
+        let target = super::ssh::quote(sessions[0].1);
+        let token = super::random_uuid();
+        let path = format!("/tmp/{token}");
+        let command = format!("printf reached > {path}");
+        pane_round_trip(ssh, &mut socket, &target, "ready", &token).await?;
+        socket.write_all(format!("{command}\r").as_bytes()).await?;
+        pane_round_trip(ssh, &mut socket, &target, "done", &token).await?;
+        let absent = ssh.run(&format!("[ ! -e {path} ]")).await?;
+        check(
+            &format!("the page terminal cannot run a command on {}", guest.name()),
+            absent.code == 0,
+        )?;
+        let control = format!(
+            "tmux send-keys -t {target} {} Enter",
+            super::ssh::quote(&command)
+        );
+        check(
+            "the same command reaches the pane over admin SSH",
+            ssh.run(&control).await?.code == 0,
+        )?;
+        pane_round_trip(ssh, &mut socket, &target, "finished", &token).await?;
+        let output = ssh.run(&format!("cat {path}; rm -f {path}")).await?;
+        check(
+            "admin SSH confirms the command can run in the guest",
+            output.code == 0 && output.stdout == "reached",
+        )
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "read-only terminal check timed out",
+        )
+    })?
+}
+
+async fn pane_round_trip(
+    ssh: &super::ssh::Session,
+    socket: &mut super::client::Socket,
+    target: &str,
+    phase: &str,
+    token: &str,
+) -> io::Result<()> {
+    // The command echo cannot contain the formatted response.
+    let command = super::ssh::quote(&format!("printf '{phase}:%s:end\\n' '{token}'"));
+    let output = ssh
+        .run(&format!("tmux send-keys -t {target} {command} Enter"))
+        .await?;
+    check(
+        "admin SSH can type into the terminal pane",
+        output.code == 0,
+    )?;
+    socket
+        .read_until(format!("{phase}:{token}:end").as_bytes(), 64 << 10)
+        .await
 }
 
 /// Prints that the page stays open, then waits for Ctrl-C.
@@ -395,6 +780,160 @@ mod tests {
     use super::*;
     use fictionet_observe::page::{Host, HostState, HostStatus, Page, StateLimits, StateTopic};
     use fictionet_observe::{DashboardObserver, DashboardOptions};
+
+    #[tokio::test]
+    async fn visible_words_checks_tabs_and_open_menu_in_chromium() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let Ok(byte) = stream.read_u8().await else {
+                            return;
+                        };
+                        request.push(byte);
+                    }
+                    let body = r#"<div class="app-world"><button role="tab" aria-selected="true">Web</button></div>
+                        <header>Fictionet</header><p id="tab-text">Prepared pages</p><div class="xterm-rows">Ready</div>
+                        <button class="app-menu-button" onclick="document.querySelector('#world-menu').hidden = !document.querySelector('#world-menu').hidden">World</button>
+                        <div id="world-menu" hidden>Improvised</div>"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let action = format!(
+            r#"(() => {{
+            const scan = () => {scan};
+            const tab = document.querySelector('[role="tab"]');
+            const text = document.querySelector('#tab-text');
+            const menu = document.querySelector('#world-menu');
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            const label = document.createElementNS(svg.namespaceURI, 'text');
+            label.setAttribute('y', '20');
+            svg.append(label);
+            document.body.append(svg);
+            for (const name of ['Web', 'Packets']) {{
+                tab.innerText = name;
+                for (const word of ['canned','stub','stubbed','seed','splice','store','stored','generator','generated','cache']) {{
+                    for (const where of [name + ' tab', 'open World menu', 'map', 'map label']) {{
+                        text.innerText = where.endsWith('tab') ? word.toUpperCase() : 'Prepared pages';
+                        menu.innerText = where.endsWith('menu') ? word.toUpperCase() : 'Improvised';
+                        label.textContent = where === 'map' ? word.toUpperCase() : 'Map';
+                        label.setAttribute('aria-label', where === 'map label' ? word.toUpperCase() : 'Map');
+                        let failure;
+                        try {{ scan(); }} catch (error) {{ failure = error.message; }}
+                        if (!failure?.includes(word.toUpperCase()) || !failure.includes(where))
+                            throw new Error(`Missing word or location: ${{word}} ${{where}} ${{failure}}`);
+                        if (!menu.hidden) throw new Error('World menu stayed open');
+                    }}
+                }}
+            }}
+            label.remove();
+            text.innerText = 'bookstore seedling cached generation';
+            menu.innerText = 'Prepared';
+            scan();
+            const rows = document.querySelector('.xterm-rows');
+            for (const word of ['fictionet', 'eval', 'sandbox', 'world', 'scripted', 'demo', 'probe', 'privateword', 'private-word', 'two words']) {{
+                text.innerText = word;
+                menu.innerText = word;
+                scan();
+                rows.innerText = word.toUpperCase();
+                let failure;
+                try {{ scan(); }} catch (error) {{ failure = error.message; }}
+                if (!failure?.includes(word.toUpperCase()) || !failure.includes('terminal'))
+                    throw new Error(`Missing terminal word: ${{word}} ${{failure}}`);
+                rows.hidden = true;
+                scan();
+                rows.hidden = false;
+                rows.innerText = 'Ready';
+            }}
+        }})()"#,
+            scan = {
+                let mut kit = super::super::Kit::new("words")
+                    .page_words(&[
+                        "canned",
+                        "stub",
+                        "stubbed",
+                        "seed",
+                        "splice",
+                        "store",
+                        "stored",
+                        "generator",
+                        "generated",
+                        "cache",
+                    ])
+                    .guest(super::super::Guest::ubuntu("station", "analyst").forbid(&[
+                        "privateword",
+                        "private-word",
+                        "two words",
+                    ]));
+                let (run, _) = kit.prepare().unwrap();
+                run.visible_words()
+            }
+        );
+        let result = tokio::task::spawn_blocking(move || {
+            shot::capture(
+                &url,
+                &[shot::Step {
+                    ready: "!!document.querySelector('.app-menu-button')",
+                    action: Some(&action),
+                    ..Default::default()
+                }],
+                Duration::from_secs(10),
+            )
+        })
+        .await;
+        server.abort();
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn page_scan_adds_no_words_when_the_demo_supplies_none() {
+        let mut kit = super::super::Kit::new("words")
+            .guest(super::super::Guest::ubuntu("station", "analyst"));
+        let (run, _) = kit.prepare().unwrap();
+        let scan = run.visible_words();
+        tokio::task::spawn_blocking(move || {
+            shot::capture(
+                "data:text/html,<header>Fictionet canned cache</header><button class='app-menu-button' onclick=\"document.getElementById('world-menu').hidden=!document.getElementById('world-menu').hidden\">World</button><div id='world-menu' hidden>generated</div>",
+                &[shot::Step {
+                    ready: "!!document.querySelector('.app-menu-button')",
+                    action: Some(&scan),
+                    ..Default::default()
+                }],
+                Duration::from_secs(10),
+            )
+        }).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn terminal_access_follows_the_declared_console_command() {
+        assert!(!read_only_terminal(None));
+        assert!(!read_only_terminal(Some(
+            "cloud-init status --wait; exec bash -l"
+        )));
+        assert!(!read_only_terminal(Some("tmux attach -t main")));
+        assert!(read_only_terminal(Some(
+            "cloud-init status --wait && tmux attach -r -t main; exec bash -l"
+        )));
+    }
+
+    #[test]
+    fn setup_timeouts_are_owned_by_the_kit() {
+        assert_eq!(CLOUD_INIT_TIMEOUT, Duration::from_secs(300));
+        assert_eq!(DESKTOP_TIMEOUT, Duration::from_secs(300));
+        assert_eq!(STEP_PAUSE, Duration::from_millis(1500));
+    }
 
     #[test]
     fn a_failed_check_is_an_error_that_names_it() {

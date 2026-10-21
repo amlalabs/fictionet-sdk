@@ -476,6 +476,7 @@ type PageBuilder = Box<dyn FnOnce(DashboardHandle, &mut Hosts) -> Page + Send>;
 /// Declares guests and observers before starting the world.
 pub struct Kit<W = ()> {
     name: String,
+    page_words: Vec<String>,
     guests: Vec<Guest>,
     observers: Vec<Arc<dyn Observer>>,
     world: W,
@@ -492,6 +493,7 @@ impl Kit {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.into(),
+            page_words: Vec::new(),
             guests: Vec::new(),
             observers: Vec::new(),
             world: (),
@@ -504,6 +506,13 @@ impl Kit {
 }
 
 impl<W> Kit<W> {
+    /// Adds words that the page must not display.
+    pub fn page_words(mut self, words: &[&str]) -> Self {
+        self.page_words
+            .extend(words.iter().map(|word| (*word).into()));
+        self
+    }
+
     /// Adds a guest with its world attachment.
     pub fn guest(mut self, guest: Guest) -> Self {
         self.guests.push(guest);
@@ -546,6 +555,7 @@ impl<W> Kit<W> {
     {
         Kit {
             name: self.name,
+            page_words: self.page_words,
             guests: self.guests,
             observers: self.observers,
             world,
@@ -636,6 +646,7 @@ impl GuestHandle {
 
 /// Owns every process, bridge, and temporary file of a run.
 pub struct Run {
+    page_words: Vec<String>,
     audit: Arc<example_common::guest_content::Audit>,
     guests: Vec<GuestHandle>,
     fcx: Arc<Mutex<Option<Cx>>>,
@@ -918,6 +929,7 @@ impl<W> Kit<W> {
         let audit = Arc::new(example_common::guest_content::Audit::default());
         self.observers.push(audit.clone());
         let mut run = Run {
+            page_words: self.page_words.clone(),
             audit,
             guests: Vec::new(),
             setup: setup.clone(),
@@ -1017,6 +1029,9 @@ where
         match result {
             Ok(()) => Ok(run),
             Err(error) => {
+                for guest in run.guests() {
+                    eprint!("{}", guest.diagnostics().await);
+                }
                 let _ = run.shutdown().await;
                 Err(error)
             }

@@ -8,9 +8,8 @@ mod world;
 mod tests;
 
 use std::path::PathBuf;
-use std::time::Instant;
 
-use fictionet_demo::kit::Kit;
+use fictionet_demo::kit::{self, Kit};
 use fictionet_observe::page::Page;
 
 const HOST: &str = "workstation";
@@ -32,33 +31,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return preview::run().await;
     }
     let downloads = first;
-    let total = Instant::now();
+    let output = kit::checks::output(downloads, "fakewiki")?;
     let controls = page::Controls::new("Firefox (scripted)");
     let ui = controls.clone();
-    let run = Kit::new("fakewiki")
+    let kit = Kit::new("fakewiki")
         .guest(guest::workstation())
         .page(move |dashboard, hosts| {
             ui.page(Page::new("FakeWiki", dashboard).host(hosts.take(HOST)))
         })
-        .world(move |cx, world| start(cx, world, controls))
-        .boot(downloads)
-        .await?;
-    println!("Scripted reader: Firefox on workstation");
-    println!(
-        "boot to SSH-ready: {} ms",
-        run.guest(HOST).ssh_ready().as_millis()
-    );
-    let output = downloads
-        .join("shots")
-        .join(run.path().file_name().unwrap());
-    let result = checks::run(&run, &output).await;
-    if result.is_err() {
-        eprint!("{}", run.guest(HOST).diagnostics().await);
-    }
-    run.shutdown().await?;
-    result?;
-    println!("whole run: {} ms", total.elapsed().as_millis());
-    println!("every required check passed");
+        .world(move |cx, world| start(cx, world, controls));
+    kit::checks::run(
+        kit,
+        downloads,
+        &output,
+        kit::checks::story(
+            |run, out| -> kit::checks::Story<'_, Box<dyn std::error::Error + Send + Sync>> {
+                Box::pin(async move { checks::run(run, out).await.map_err(Into::into) })
+            },
+        ),
+    )
+    .await?;
     Ok(())
 }
 

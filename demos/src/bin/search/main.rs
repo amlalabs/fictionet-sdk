@@ -22,13 +22,7 @@ use adaptive_web_world::{
 };
 use example_common::log::Log;
 use fictionet_demo::kit::{self, Kit};
-use std::{
-    collections::BTreeSet,
-    fs::File,
-    path::PathBuf,
-    sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeSet, fs::File, path::PathBuf, sync::Arc, time::Instant};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -125,13 +119,7 @@ async fn main() -> Result {
     };
     let seed = Seed::builtin(SEED)?;
     let pages = Arc::new(app_pages(seed.clone(), check)?);
-    let output = downloads.join("runs").join(format!(
-        "search-{}",
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
-    ));
-    std::fs::create_dir_all(output.parent().unwrap())?;
-    std::fs::create_dir(&output)?;
-    println!("output: {}", output.display());
+    let output = kit::checks::output(&downloads, "search")?;
     let searches = Arc::new(Searches::of(&pages));
     let topics = page::Topics::new();
     let view = topics.clone();
@@ -143,6 +131,7 @@ async fn main() -> Result {
     let world_log = log.clone();
     let scenario = seed.clone();
     let kit = Kit::new("search")
+        .page_words(checks::PAGE_WORDS)
         .guest(guest::guest(&seed.date))
         .observer(searches.clone())
         .observer(Arc::new(LogObserver { log: log.clone() }))
@@ -179,29 +168,13 @@ async fn main() -> Result {
         finish?;
         return Ok(());
     }
-    let run = kit.boot(downloads).await?;
-    println!(
-        "boot to SSH-ready: {} ms",
-        run.guest(guest::HOST).ssh_ready().as_millis()
-    );
-    let mut visited = BTreeSet::new();
-    let result = checks::run(&run, &scenario, &output, &mut visited).await;
-    if result.is_ok() {
-        println!(
-            "story done: {} ms",
-            run.boot_started().elapsed().as_millis()
-        );
-    }
-    if result.is_err() {
-        eprint!("{}", run.guest(guest::HOST).diagnostics().await);
-    }
-    let shutdown = run.shutdown().await;
-    let finish = log.finish();
-    println!("whole run: {} ms", total.elapsed().as_millis());
-    finish?;
-    let result = result.and(shutdown.map_err(Into::into));
-    checks::finish(result, &output.join("log.jsonl"), &visited)?;
-    println!("every required check passed");
+    let story = checks::Story {
+        seed: scenario,
+        log,
+        visited: BTreeSet::new(),
+        output: output.clone(),
+    };
+    kit::checks::run(kit, &downloads, &output, story).await?;
     Ok(())
 }
 

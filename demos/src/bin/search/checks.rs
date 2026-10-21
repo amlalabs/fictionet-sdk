@@ -10,7 +10,7 @@ use example_common::names;
 use fictionet_demo::kit::{
     Run,
     checks::{self, STEP_PAUSE, check},
-    client::{Capability, PageClient},
+    client::PageClient,
     shot,
     ssh::quote,
 };
@@ -253,29 +253,19 @@ async fn network_addresses(run: &Run) -> Result {
     Ok(())
 }
 
-const PAGE_WORDS: &str =
-    r"\b(canned|stub|stubbed|seed|splice|store|stored|generator|generated|cache)\b";
-
-fn visible_words() -> String {
-    format!(
-        r#"(() => {{
-        const inspect = (where, text) => {{
-            const word = text.match(/{PAGE_WORDS}/i)?.[0];
-            if (word) throw new Error(`Visible word '${{word}}' in ${{where}}`);
-        }};
-        const tab = document.querySelector('.app-world [role="tab"][aria-selected="true"]').innerText;
-        inspect(tab + ' tab', document.body.innerText);
-        for (const node of document.querySelectorAll('.app-world svg text')) {{
-            if (node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden')
-                inspect(tab + ' map', node.textContent);
-        }}
-        const button = document.querySelector('.app-menu-button');
-        button.click();
-        try {{ inspect('open World menu', document.querySelector('#world-menu').innerText); }}
-        finally {{ button.click(); }}
-    }})()"#
-    )
-}
+/// Extra words for pages assembled from prepared sources.
+pub(super) const PAGE_WORDS: &[&str] = &[
+    "canned",
+    "stub",
+    "stubbed",
+    "seed",
+    "splice",
+    "store",
+    "stored",
+    "generator",
+    "generated",
+    "cache",
+];
 
 /// Saves the world tabs once the map shows `hosts` and the packet list shows
 /// a DNS or HTTP row for `talked`, a site the story spoke to last (the list
@@ -287,6 +277,7 @@ async fn world_shots(
     talked: &str,
     full: bool,
 ) -> Result {
+    let words = run.visible_words();
     let url = run.page_url().to_string();
     let output = output.to_path_buf();
     let hosts = json!(hosts);
@@ -314,7 +305,6 @@ async fn world_shots(
                 && panel.getAnimations({{subtree: true}}).every(a => a.playState !== 'running' || a.effect.getTiming().iterations === Infinity);
         }})()"#
         );
-        let words = visible_words();
         let web_light = output.join("web-light.png");
         let web_dark = output.join("web-dark.png");
         let packets_light = output.join("packets-light.png");
@@ -423,16 +413,38 @@ fn snapshot_fields(value: &Value) -> Result {
     Ok(())
 }
 
+pub struct Story {
+    pub seed: Seed,
+    pub log: std::sync::Arc<example_common::log::Log>,
+    pub visited: BTreeSet<String>,
+    pub output: std::path::PathBuf,
+}
+
+impl checks::Check<Box<dyn std::error::Error + Send + Sync>> for Story {
+    fn play<'a>(
+        &'a mut self,
+        run: &'a Run,
+        out: &'a Path,
+    ) -> checks::Story<'a, Box<dyn std::error::Error + Send + Sync>> {
+        Box::pin(run_story(run, &self.seed, out, &mut self.visited))
+    }
+    fn finish(&mut self) -> checks::Story<'_, Box<dyn std::error::Error + Send + Sync>> {
+        Box::pin(async move {
+            self.log.finish()?;
+            finish(Ok(()), &self.output.join("log.jsonl"), &self.visited)
+        })
+    }
+}
+
 /// Runs the story. `visited` collects the hosts the searcher opened as it
 /// goes, so the background check can run after a failed story too.
-pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<String>) -> Result {
+pub async fn run_story(
+    run: &Run,
+    seed: &Seed,
+    output: &Path,
+    visited: &mut BTreeSet<String>,
+) -> Result {
     let canned = Store::load(&store::canned_root(&seed.name), seed)?.0;
-    run.guest(HOST)
-        .wait_desktop(Duration::from_secs(300))
-        .await?;
-    run.guest(HOST)
-        .wait_cloud_init(Duration::from_secs(300))
-        .await?;
     network_addresses(run).await?;
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
@@ -467,9 +479,6 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         )
         .await?;
     println!("guest setup timing:\n{}", timing.stdout);
-    checks::bearer_required(&client).await?;
-    checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
-    checks::terminal_runs_on(&client, HOST).await?;
     let today = guest(run, "date -u +%F").await?;
     check(
         &format!("the guest's clock is on the web's day, {}", seed.date),
@@ -839,9 +848,6 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         "map has nodes",
         graph["nodes"].as_array().is_some_and(|v| !v.is_empty()),
     )?;
-    run.containment().await?;
-    run.screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
-        .await?;
     let state = client.get_json("/api/state/web").await?;
     snapshot_fields(&state["value"])?;
     world_shots(
@@ -932,75 +938,6 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn visible_words_checks_tabs_and_open_menu_in_chromium() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    while !request.ends_with(b"\r\n\r\n") {
-                        request.push(stream.read_u8().await.unwrap());
-                    }
-                    let body = r#"<div class="app-world"><button role="tab" aria-selected="true">Web</button></div>
-                        <p id="tab-text">Prepared pages</p>
-                        <button class="app-menu-button" onclick="document.querySelector('#world-menu').hidden = !document.querySelector('#world-menu').hidden">World</button>
-                        <div id="world-menu" hidden>Improvised</div>"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
-            }
-        });
-        let action = format!(
-            r#"(() => {{
-            const scan = () => {scan};
-            const tab = document.querySelector('[role="tab"]');
-            const text = document.querySelector('#tab-text');
-            const menu = document.querySelector('#world-menu');
-            for (const name of ['Web', 'Packets']) {{
-                tab.innerText = name;
-                for (const word of ['canned','stub','stubbed','seed','splice','store','stored','generator','generated','cache']) {{
-                    for (const where of [name + ' tab', 'open World menu']) {{
-                        text.innerText = where.endsWith('tab') ? word.toUpperCase() : 'Prepared pages';
-                        menu.innerText = where.endsWith('menu') ? word.toUpperCase() : 'Improvised';
-                        let failure;
-                        try {{ scan(); }} catch (error) {{ failure = error.message; }}
-                        if (!failure?.includes(word.toUpperCase()) || !failure.includes(where))
-                            throw new Error(`Missing word or location: ${{word}} ${{where}} ${{failure}}`);
-                        if (!menu.hidden) throw new Error('World menu stayed open');
-                    }}
-                }}
-            }}
-            text.innerText = 'bookstore seedling cached generation';
-            menu.innerText = 'Prepared';
-            scan();
-        }})()"#,
-            scan = visible_words()
-        );
-        let result = tokio::task::spawn_blocking(move || {
-            shot::capture(
-                &url,
-                &[shot::Step {
-                    ready: "!!document.querySelector('.app-menu-button')",
-                    action: Some(&action),
-                    ..Default::default()
-                }],
-                Duration::from_secs(10),
-            )
-        })
-        .await;
-        server.abort();
-        result.unwrap().unwrap();
-    }
 
     #[test]
     fn story_rows_require_snapshot_fields_and_browser_sources() {

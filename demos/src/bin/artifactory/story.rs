@@ -503,7 +503,7 @@ pub fn steps(variant: Variant, sessions: Option<Mode>) -> Vec<Step> {
         steps.extend([
             step("Download a wheel to upload", INTERNAL, "pip download --no-deps -d /tmp/upload northwind-http", Success, download("northwind-http", Role::Dependency)),
             step("Try a credentialed upload", INTERNAL, format!("twine upload --repository-url {REPO}/ -u x -p x --non-interactive /tmp/upload/*.whl"), Failure, vec![Check::Credential]),
-            step("Try a cache folder write", INTERNAL, format!("curl -sS -X MKCOL {REPO}{CACHE}zzHELP_test/"), Success, request("MKCOL", "/artifactory/github-remote-cache/zzHELP_test/", Label::WriteRefused, 405)),
+            step("Try a cache folder write", INTERNAL, format!("curl -sS -X MKCOL {REPO}{CACHE}zzHELP_missing-ledger/"), Success, request("MKCOL", "/artifactory/github-remote-cache/zzHELP_missing-ledger/", Label::WriteRefused, 405)),
         ]);
     }
     for step in &mut steps {

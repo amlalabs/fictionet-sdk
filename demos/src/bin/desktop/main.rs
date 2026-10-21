@@ -67,7 +67,6 @@ fn main() -> ExitCode {
 }
 
 async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
-    let total = Instant::now();
     let (logins, store) = world::Logins::load().map_err(boxed)?;
     let loaded = Arc::new(AtomicBool::new(false));
     let agents = StateTopic::<Vec<Value>>::new(StateLimits::default());
@@ -128,150 +127,51 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
             let _ = world_clock.send(fcx.clone());
             world::start(fcx, world, SITE.into(), commands, logins, store).await
         });
-    // Screenshots survive the run (the run dir does not).
-    let shots = downloads.join("shots");
-    std::fs::create_dir_all(&shots)?;
-
-    let run = kit.boot(downloads).await?;
-    let cx = clock.await?;
-    let _observation = observation
-        .as_ref()
-        .map(|p| fictionet_observe::serve(run.dashboard(), p))
-        .transpose()
-        .map_err(boxed)?;
-    let workstation = run.guest(HOSTNAME);
-    let vm = workstation.vm();
-
-    // Show where Cloud Hypervisor runs from: a memfd when the binary is
-    // embedded (nothing on disk), the downloaded path otherwise.
-    let ch_pid = vm.pid();
-    if let Some(pid) = ch_pid
-        && let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
-    {
-        println!("Cloud Hypervisor (pid {pid}) runs from {}\n", exe.display());
-    }
-
-    let ssh_ready_ms = workstation.ssh_ready().as_millis();
-    println!(
-        "ssh from the jump host ({}) is up after {ssh_ready_ms} ms; waiting for the desktop \
-            install\n",
-        kit::jump::JUMP_ADDR
-    );
-    let result = run_checks(&run, &loaded, &shots, &agents, &cx, logins)
-        .await
-        .map(|checks| (ssh_ready_ms, checks));
-    if result.is_err() {
-        eprint!("{}", workstation.diagnostics().await);
-    }
-    let stop = run.shutdown().await;
-
-    println!("\n=== shutdown ===");
-    if let Err(error) = &stop {
-        println!("{error}");
-    }
-    let shutdown = check(
-        "shutdown, cleanup and guest content checks passed",
-        stop.is_ok(),
-    );
-
-    let (ssh_ready_ms, checks) = result?;
-    println!("\n=== measurements ===");
-    println!("boot to ssh-ready:  {ssh_ready_ms} ms");
-    println!("boot to desktop:    {} ms", checks.desktop_ready_ms);
-    println!("boot to cloud-init done: {} ms", checks.cloud_init_ready_ms);
-    println!("coding agents:      {}", checks.agents_install);
-    println!("whole run:          {} ms", total.elapsed().as_millis());
-    println!("peak VM memory:     {} MiB", checks.peak_rss_mib);
-    for shot in &checks.screenshots {
-        println!("screenshot:         {shot}");
-    }
-    shutdown?;
-    println!("\nevery required check passed");
-    Ok(())
+    let shots = kit::checks::output(downloads, "desktop")?;
+    let observation_server = Arc::new(std::sync::Mutex::new(None));
+    let observing = observation_server.clone();
+    kit::checks::run(
+        kit,
+        downloads,
+        &shots,
+        kit::checks::story(move |run, shots| -> kit::checks::Story<'_, Error> {
+            Box::pin(async move {
+                let cx = clock.await?;
+                let server = observation
+                    .as_ref()
+                    .map(|p| fictionet_observe::serve(run.dashboard(), p))
+                    .transpose()
+                    .map_err(boxed)?;
+                *observation_server.lock().unwrap() = server;
+                let workstation = run.guest(HOSTNAME);
+                let session = workstation.ssh();
+                machine_checks(workstation).await?;
+                trust_checks(session, &loaded).await?;
+                agent_checks(session, &agents, &cx).await?;
+                let screenshots = screen_checks(run, shots).await?;
+                let agents_install = agent_tls_checks(session, run.page_url(), logins).await?;
+                println!("coding agents: {agents_install}");
+                println!(
+                    "peak VM memory: {} MiB",
+                    workstation.vm().peak_rss_mib().unwrap_or(0)
+                );
+                for shot in screenshots {
+                    println!("screenshot: {shot}");
+                }
+                Ok(())
+            })
+        })
+        .finish_with(move || {
+            Box::pin(async move {
+                drop(observing);
+                Ok(())
+            })
+        }),
+    )
+    .await
 }
 
-fn joined(failures: &[std::io::Error]) -> String {
-    failures
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-struct Checks {
-    desktop_ready_ms: u128,
-    cloud_init_ready_ms: u128,
-    /// The guest's own measure of the coding agents' install: bytes
-    /// downloaded and seconds taken.
-    agents_install: String,
-    peak_rss_mib: u64,
-    screenshots: Vec<String>,
-}
-
-async fn run_checks(
-    run: &kit::Run,
-    loaded: &AtomicBool,
-    shots: &Path,
-    agents: &StateTopic<Vec<Value>>,
-    cx: &fictionet::Cx,
-    logins: world::Logins,
-) -> Result<Checks, Error> {
-    let workstation = run.guest(HOSTNAME);
-    let session = workstation.ssh();
-    let mut failures = Vec::new();
-    let (cloud_init_ready_ms, desktop_ready_ms) = provisioning(run, &mut failures).await?;
-    machine_checks(workstation, &mut failures).await?;
-    trust_checks(session, loaded, &mut failures).await?;
-    agent_checks(session, agents, cx, &mut failures).await?;
-    let screenshots = screen_checks(run, shots, &mut failures).await?;
-    let agents_install = agent_tls_checks(session, run.page_url(), &mut failures, logins).await?;
-    failures.extend(run.containment().await.err());
-    let peak_rss_mib = workstation.vm().peak_rss_mib().unwrap_or(0);
-    if !failures.is_empty() {
-        return Err(format!("the required checks failed: {}", joined(&failures)).into());
-    }
-    Ok(Checks {
-        desktop_ready_ms,
-        cloud_init_ready_ms,
-        agents_install,
-        peak_rss_mib,
-        screenshots,
-    })
-}
-
-async fn provisioning(
-    run: &kit::Run,
-    failures: &mut Vec<std::io::Error>,
-) -> Result<(u128, u128), Error> {
-    let workstation = run.guest(HOSTNAME);
-    let boot = run.boot_started();
-    let cloud_init = workstation.wait_cloud_init(Duration::from_secs(300)).await;
-    let cloud_init_ready_ms = match &cloud_init {
-        Ok(ready) => {
-            println!("cloud-init finished after {} ms\n", ready.as_millis());
-            ready.as_millis()
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-            return Err(error.to_string().into());
-        }
-        Err(error) => {
-            println!("{error}\n");
-            boot.elapsed().as_millis()
-        }
-    };
-    failures.extend(check("cloud-init finished", cloud_init.is_ok()).err());
-    let desktop_ready_ms = workstation
-        .wait_desktop(Duration::from_secs(300))
-        .await?
-        .as_millis();
-
-    Ok((cloud_init_ready_ms, desktop_ready_ms))
-}
-
-async fn machine_checks(
-    workstation: &kit::GuestHandle,
-    failures: &mut Vec<std::io::Error>,
-) -> Result<(), Error> {
+async fn machine_checks(workstation: &kit::GuestHandle) -> Result<(), Error> {
     let session = workstation.ssh();
     // What the guest looks like, for the log.
     for command in [
@@ -292,29 +192,23 @@ async fn machine_checks(
 
     let lease = workstation.addr();
     let addr = guest_cmd(session, "ip -4 -o addr show dev eth0").await?;
-    failures.extend(
-        check(
-            &format!(
-                "the guest has its address from the world's DHCP ({})",
-                lease.map_or("no lease".to_string(), |a| a.to_string())
-            ),
-            lease.is_some_and(|a| addr.stdout.contains(&format!("inet {a}/"))),
-        )
-        .err(),
-    );
+    check(
+        &format!(
+            "the guest has its address from the world's DHCP ({})",
+            lease.map_or("no lease".to_string(), |a| a.to_string())
+        ),
+        lease.is_some_and(|a| addr.stdout.contains(&format!("inet {a}/"))),
+    )?;
 
     let pci = guest_cmd(session, "lspci -nn").await?;
     let vsock = pci.stdout.lines().any(|line| {
         let line = line.to_ascii_lowercase();
         line.contains("socket") || line.contains("[1af4:1053]") || line.contains("[1af4:1012]")
     });
-    failures.extend(
-        check(
-            "lspci shows no Virtio socket device",
-            pci.code == 0 && !pci.stdout.is_empty() && !vsock,
-        )
-        .err(),
-    );
+    check(
+        "lspci shows no Virtio socket device",
+        pci.code == 0 && !pci.stdout.is_empty() && !vsock,
+    )?;
 
     let ssh_peers = guest_cmd(session, "ss -tnH state established '( sport = :22 )'").await?;
     let peers: Vec<Option<IpAddr>> = ssh_peers
@@ -323,33 +217,27 @@ async fn machine_checks(
         .filter_map(|line| line.split_whitespace().last())
         .map(peer_ip)
         .collect();
-    failures.extend(
-        check(
-            &format!(
-                "ss shows the SSH session coming from the jump host ({})",
-                kit::jump::JUMP_ADDR
-            ),
-            !peers.is_empty()
-                && peers
-                    .iter()
-                    .all(|p| *p == Some(kit::jump::JUMP_ADDR.into())),
-        )
-        .err(),
-    );
+    check(
+        &format!(
+            "ss shows the SSH session coming from the jump host ({})",
+            kit::jump::JUMP_ADDR
+        ),
+        !peers.is_empty()
+            && peers
+                .iter()
+                .all(|p| *p == Some(kit::jump::JUMP_ADDR.into())),
+    )?;
 
     let services = guest_cmd(session, "systemctl is-active ssh.service vnc.service").await?;
-    failures.extend(
-        check(
-            "ssh.service and vnc.service are active",
-            services
-                .stdout
-                .lines()
-                .filter(|l| l.trim() == "active")
-                .count()
-                == 2,
-        )
-        .err(),
-    );
+    check(
+        "ssh.service and vnc.service are active",
+        services
+            .stdout
+            .lines()
+            .filter(|l| l.trim() == "active")
+            .count()
+            == 2,
+    )?;
     let vnc = guest_cmd(session, "ss -tlnH '( sport = :5900 or sport = :5901 )'").await?;
     let vnc_listeners: Vec<Option<IpAddr>> = vnc
         .stdout
@@ -357,50 +245,37 @@ async fn machine_checks(
         .filter_map(|line| line.split_whitespace().nth(3))
         .map(peer_ip)
         .collect();
-    failures.extend(
-        check(
-            "Xvnc listens on the guest's loopback only",
-            !vnc_listeners.is_empty()
-                && vnc_listeners
-                    .iter()
-                    .all(|a| a.is_some_and(|a| a.is_loopback())),
-        )
-        .err(),
-    );
+    check(
+        "Xvnc listens on the guest's loopback only",
+        !vnc_listeners.is_empty()
+            && vnc_listeners
+                .iter()
+                .all(|a| a.is_some_and(|a| a.is_loopback())),
+    )?;
 
     Ok(())
 }
 
-async fn trust_checks(
-    session: &ssh::Session,
-    loaded: &AtomicBool,
-    failures: &mut Vec<std::io::Error>,
-) -> Result<(), Error> {
+async fn trust_checks(session: &ssh::Session, loaded: &AtomicBool) -> Result<(), Error> {
     let login_env = guest_cmd(
         session,
         "bash -lc 'env | grep -iE \"SSL_CERT|REQUESTS_CA|NODE_USE\"' || echo 'no login trust env'",
     )
     .await?;
-    failures.extend(
-        check(
-            "login shells have the trust environment",
-            login_env.stdout.contains("SSL_CERT_FILE="),
-        )
-        .err(),
-    );
+    check(
+        "login shells have the trust environment",
+        login_env.stdout.contains("SSL_CERT_FILE="),
+    )?;
     let session_env = guest_cmd(
         session,
         "sudo cat /proc/$(pgrep -xo xfce4-session || echo 1)/environ 2>/dev/null | tr '\\0' \
             '\\n' | grep -iE 'SSL_CERT|REQUESTS_CA|NODE_USE' || echo 'no session trust env'",
     )
     .await?;
-    failures.extend(
-        check(
-            "the desktop session has the trust environment",
-            session_env.stdout.contains("SSL_CERT_FILE="),
-        )
-        .err(),
-    );
+    check(
+        "the desktop session has the trust environment",
+        session_env.stdout.contains("SSL_CERT_FILE="),
+    )?;
     let verify = guest_cmd(
         session,
         &format!(
@@ -409,38 +284,29 @@ async fn trust_checks(
         ),
     )
     .await?;
-    failures.extend(
-        check(
-            &format!("openssl verifies the {SITE} chain"),
-            verify.stdout.contains("Verify return code: 0"),
-        )
-        .err(),
-    );
+    check(
+        &format!("openssl verifies the {SITE} chain"),
+        verify.stdout.contains("Verify return code: 0"),
+    )?;
     let firefox = guest_cmd(
         session,
         "firefox --version 2>/dev/null; test -x /usr/lib/firefox/firefox && echo 'Mozilla \
             firefox (not snap)'",
     )
     .await?;
-    failures.extend(
-        check(
-            "Mozilla's Firefox is installed, not the snap",
-            firefox.stdout.contains("not snap"),
-        )
-        .err(),
-    );
+    check(
+        "Mozilla's Firefox is installed, not the snap",
+        firefox.stdout.contains("not snap"),
+    )?;
 
     let firefox_deadline = Instant::now() + Duration::from_secs(90);
     while !loaded.load(Ordering::SeqCst) && Instant::now() < firefox_deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    failures.extend(
-        check(
-            "Firefox loaded the site (the world's http.request event)",
-            loaded.load(Ordering::SeqCst),
-        )
-        .err(),
-    );
+    check(
+        "Firefox loaded the site (the world's http.request event)",
+        loaded.load(Ordering::SeqCst),
+    )?;
 
     Ok(())
 }
@@ -449,27 +315,20 @@ async fn agent_checks(
     session: &ssh::Session,
     agents: &StateTopic<Vec<Value>>,
     cx: &fictionet::Cx,
-    failures: &mut Vec<std::io::Error>,
 ) -> Result<(), Error> {
     let claude = guest_cmd(session, "claude --version").await?;
-    failures.extend(
-        check(
-            &format!("claude --version is Claude Code {}", guest::CLAUDE_VERSION),
-            claude.code == 0
-                && claude
-                    .stdout
-                    .contains(&format!("{} (Claude Code)", guest::CLAUDE_VERSION)),
-        )
-        .err(),
-    );
+    check(
+        &format!("claude --version is Claude Code {}", guest::CLAUDE_VERSION),
+        claude.code == 0
+            && claude
+                .stdout
+                .contains(&format!("{} (Claude Code)", guest::CLAUDE_VERSION)),
+    )?;
     let codex = guest_cmd(session, "codex --version").await?;
-    failures.extend(
-        check(
-            &format!("codex --version is codex-cli {}", guest::CODEX_VERSION),
-            codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", guest::CODEX_VERSION),
-        )
-        .err(),
-    );
+    check(
+        &format!("codex --version is codex-cli {}", guest::CODEX_VERSION),
+        codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", guest::CODEX_VERSION),
+    )?;
 
     let rows: Vec<_> = [("Claude Code", &claude), ("Codex", &codex)]
         .into_iter()
@@ -483,36 +342,10 @@ async fn agent_checks(
     Ok(())
 }
 
-async fn screen_checks(
-    run: &kit::Run,
-    shots: &Path,
-    failures: &mut Vec<std::io::Error>,
-) -> Result<Vec<String>, Error> {
+async fn screen_checks(run: &kit::Run, shots: &Path) -> Result<Vec<String>, Error> {
     let session = run.guest(HOSTNAME).ssh();
     let page_url = run.page_url();
     let mut screenshots = Vec::new();
-    let captured = run
-        .screenshots(
-            HOSTNAME,
-            &shots.join("viewer-desktop.png"),
-            &shots.join("page-desktop.png"),
-        )
-        .await;
-    match &captured {
-        Ok(saved) => screenshots.extend([
-            saved.screen.png.display().to_string(),
-            saved.page.display().to_string(),
-        ]),
-        Err(error) => println!("screenshots: {error}"),
-    }
-    failures.extend(
-        check(
-            "the viewer shows the desktop through the SSH tunnel",
-            captured.is_ok(),
-        )
-        .err(),
-    );
-
     // A screenshot of the guest's own screen, over ssh, decoded on the host.
     let shot = session
         .run(
@@ -521,10 +354,10 @@ async fn screen_checks(
         )
         .await?;
     let guest_png = save_png(&shot.stdout, &shots.join("guest-desktop.png"));
-    failures.extend(check("the guest's own screen was captured", guest_png.is_some()).err());
+    check("the guest's own screen was captured", guest_png.is_some())?;
     screenshots.extend(guest_png);
 
-    page_checks(page_url, session, failures).await;
+    page_checks(page_url, session).await?;
 
     Ok(screenshots)
 }
@@ -532,7 +365,6 @@ async fn screen_checks(
 async fn agent_tls_checks(
     session: &ssh::Session,
     page_url: &str,
-    failures: &mut Vec<std::io::Error>,
     logins: world::Logins,
 ) -> Result<String, Error> {
     let task = guest_cmd(
@@ -542,21 +374,15 @@ async fn agent_tls_checks(
          --max-turns 4 --allowedTools Bash,Write,Read < /dev/null 2>&1",
     )
     .await?;
-    failures.extend(
-        check(
-            "Claude Code completes a task through the model site",
-            task.code == 0,
-        )
-        .err(),
-    );
+    check(
+        "Claude Code completes a task through the model site",
+        task.code == 0,
+    )?;
     let result = guest_cmd(session, "cd /home/analyst && python3 sum.py").await?;
-    failures.extend(
-        check(
-            "the program Claude Code wrote prints 42",
-            result.code == 0 && result.stdout.trim() == "42",
-        )
-        .err(),
-    );
+    check(
+        "the program Claude Code wrote prints 42",
+        result.code == 0 && result.stdout.trim() == "42",
+    )?;
     let page = PageClient::from_url(page_url)?;
     let call = page
         .find_event(&mut 0, |event| {
@@ -566,13 +392,10 @@ async fn agent_tls_checks(
                 && event["fields"]["credential"] == "placeholder")
         })
         .await?;
-    failures.extend(
-        check(
-            "the page reports the completed model call with a placeholder",
-            call.is_some(),
-        )
-        .err(),
-    );
+    check(
+        "the page reports the completed model call with a placeholder",
+        call.is_some(),
+    )?;
     let search = guest_cmd(session,
         "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --max-turns 3 --allowedTools WebSearch,WebFetch < /dev/null 2>&1"
     ).await?;
@@ -585,13 +408,10 @@ async fn agent_tls_checks(
             println!("model diagnostic: {event}");
         }
     }
-    failures.extend(
-        check(
-            "Claude Code searches the world",
-            search.code == 0 && search.stdout.to_lowercase().contains("halvard"),
-        )
-        .err(),
-    );
+    check(
+        "Claude Code searches the world",
+        search.code == 0 && search.stdout.to_lowercase().contains("halvard"),
+    )?;
     let search_event = page
         .find_event(&mut 0, |event| {
             Ok(event["source"] == "model"
@@ -601,15 +421,12 @@ async fn agent_tls_checks(
                 && event["fields"]["results"].as_u64().is_some_and(|n| n > 0))
         })
         .await?;
-    failures.extend(
-        check(
-            "the page reports search results from the world",
-            search_event.is_some(),
-        )
-        .err(),
-    );
-    codex_checks(session, &page, failures).await?;
-    stop_checks(session, &page, failures, logins).await?;
+    check(
+        "the page reports search results from the world",
+        search_event.is_some(),
+    )?;
+    codex_checks(session, &page).await?;
+    stop_checks(session, &page, logins).await?;
     let agents = guest_cmd(
         session,
         "sudo grep -h '^coding agents:' /var/log/cloud-init-output.log || echo 'coding agents: \
@@ -628,11 +445,7 @@ async fn agent_tls_checks(
 
 /// Codex reaches the model through the world as well: it keeps the
 /// Responses WebSocket it opens, and the world answers its search.
-async fn codex_checks(
-    session: &ssh::Session,
-    page: &PageClient,
-    failures: &mut Vec<std::io::Error>,
-) -> Result<(), Error> {
+async fn codex_checks(session: &ssh::Session, page: &PageClient) -> Result<(), Error> {
     let start = page.last_event().await?;
     let codex = guest_cmd(
         session,
@@ -641,13 +454,10 @@ async fn codex_checks(
          URLs.' < /dev/null 2>&1",
     )
     .await?;
-    failures.extend(
-        check(
-            "Codex completes a search through the model site",
-            codex.code == 0 && codex.stdout.to_lowercase().contains("halvard"),
-        )
-        .err(),
-    );
+    check(
+        "Codex completes a search through the model site",
+        codex.code == 0 && codex.stdout.to_lowercase().contains("halvard"),
+    )?;
     let openai = |event: &Value| {
         event["source"] == "model"
             && matches!(
@@ -677,25 +487,19 @@ async fn codex_checks(
                         ))))
         })
         .await?;
-    failures.extend(
-        check(
-            "Codex refreshes its model catalog without an error",
-            !codex.stdout.contains("failed to refresh available models"),
-        )
-        .err(),
-    );
+    check(
+        "Codex refreshes its model catalog without an error",
+        !codex.stdout.contains("failed to refresh available models"),
+    )?;
     let output = codex.stdout.to_lowercase();
-    failures.extend(
-        check(
-            "Codex keeps its WebSocket, with no refusal or fallback",
-            websocket.is_some()
-                && refused.is_none()
-                && !output.contains("websocket")
-                && !output.contains("426")
-                && !output.contains("falling back to http"),
-        )
-        .err(),
-    );
+    check(
+        "Codex keeps its WebSocket, with no refusal or fallback",
+        websocket.is_some()
+            && refused.is_none()
+            && !output.contains("websocket")
+            && !output.contains("426")
+            && !output.contains("falling back to http"),
+    )?;
     let response = page
         .find_event(&mut start.clone(), |event| {
             Ok(openai(event)
@@ -710,13 +514,10 @@ async fn codex_checks(
                     .is_some_and(|n| n > 0))
         })
         .await?;
-    failures.extend(
-        check(
-            "Codex completes a Responses call over its WebSocket",
-            response.is_some(),
-        )
-        .err(),
-    );
+    check(
+        "Codex completes a Responses call over its WebSocket",
+        response.is_some(),
+    )?;
     let search = page
         .find_event(&mut start.clone(), |event| {
             Ok(openai(event)
@@ -726,13 +527,10 @@ async fn codex_checks(
                 && event["fields"]["results"].as_u64().is_some_and(|n| n > 0))
         })
         .await?;
-    failures.extend(
-        check(
-            "Codex receives search results from the world",
-            search.is_some(),
-        )
-        .err(),
-    );
+    check(
+        "Codex receives search results from the world",
+        search.is_some(),
+    )?;
     if codex.code != 0 {
         let mut cursor = start;
         while let Some(event) = page
@@ -750,7 +548,6 @@ async fn codex_checks(
 async fn stop_checks(
     session: &ssh::Session,
     page: &PageClient,
-    failures: &mut Vec<std::io::Error>,
     logins: world::Logins,
 ) -> Result<(), Error> {
     page.command("model", "pause-for-stop-check", json!("pause"))
@@ -782,7 +579,7 @@ async fn stop_checks(
             .as_str()
             .is_some_and(|path| path.ends_with("/messages") || path.ends_with("/responses"));
     }
-    failures.extend(check("paused calls never reach a provider", !forwarded).err());
+    check("paused calls never reach a provider", !forwarded)?;
     for ((name, result, message), provider) in [
         (
             "Claude Code shows its limit error",
@@ -804,13 +601,10 @@ async fn stop_checks(
                     Ok(budget_refusal(event, provider))
                 })
                 .await?;
-            failures.extend(
-                check(
-                    name,
-                    stopped(result.code, &result.stdout, message) && refused.is_some(),
-                )
-                .err(),
-            );
+            check(
+                name,
+                stopped(result.code, &result.stdout, message) && refused.is_some(),
+            )?;
         }
     }
     Ok(())
@@ -828,10 +622,9 @@ fn budget_refusal(event: &Value, provider: &str) -> bool {
 }
 
 async fn probe(
-    failures: &mut Vec<std::io::Error>,
     name: &str,
     test: impl std::future::Future<Output = std::io::Result<bool>>,
-) {
+) -> std::io::Result<()> {
     let result = tokio::time::timeout(Duration::from_secs(45), test)
         .await
         .map_err(std::io::Error::other)
@@ -840,24 +633,16 @@ async fn probe(
         println!("{name}: {error}");
         false
     });
-    failures.extend(check(name, ok).err());
+    check(name, ok)
 }
 
-async fn page_checks(url: &str, session: &ssh::Session, failures: &mut Vec<std::io::Error>) {
+async fn page_checks(url: &str, session: &ssh::Session) -> std::io::Result<()> {
     let page = PageClient::from_url(url).expect("the kit's signed page URL");
-    probe(failures, "the page's access checks", async {
-        kit::checks::bearer_required(&page).await?;
-        kit::checks::single_use_ticket(&page, HOSTNAME, Capability::Screen).await?;
-        kit::checks::terminal_runs_on(&page, HOSTNAME).await?;
-        Ok(true)
-    })
-    .await;
     probe(
-        failures,
         "the screen drops pointer input without a lease and accepts it with a lease",
         pointer_check(&page, session),
     )
-    .await;
+    .await
 }
 
 async fn pointer_position(session: &ssh::Session) -> std::io::Result<(u16, u16)> {

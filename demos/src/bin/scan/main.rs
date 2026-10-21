@@ -13,10 +13,7 @@ mod script;
 mod story;
 mod world;
 
-use fictionet_demo::kit::{
-    self, Kit,
-    client::{Capability, PageClient},
-};
+use fictionet_demo::kit::{self, Kit, client::PageClient};
 use fictionet_observe::page::Page;
 use std::path::Path;
 use std::process::ExitCode;
@@ -52,7 +49,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(downloads: &Path) -> Result<(), Error> {
-    let total = Instant::now();
+    let out = kit::checks::output(downloads, "scan")?;
     let closed = Arc::new(AtomicBool::new(false));
     let cutoff = closed.clone();
     let (send, receive) = tokio::sync::oneshot::channel();
@@ -76,82 +73,35 @@ async fn run(downloads: &Path) -> Result<(), Error> {
             let _ = send.send(ports);
             Ok(())
         });
-    let shots = downloads.join("shots");
-    std::fs::create_dir_all(&shots)?;
-    let run = kit.boot(downloads).await?;
-    for guest in run.guests() {
-        println!(
-            "{} boot to SSH-ready: {} ms",
-            guest.name(),
-            guest.ssh_ready().as_millis()
-        );
-    }
-    let result = async {
-        let ports = receive.await?;
-        let cloud_init = Duration::from_secs(300);
-        let (station, server) = tokio::join!(
-            run.guest(guests::WORKSTATION).wait_cloud_init(cloud_init),
-            run.guest(guests::SERVER).wait_cloud_init(cloud_init)
-        );
-        let station = station?;
-        let server = server?;
-        println!(
-            "{} cloud-init done: {} ms",
-            guests::WORKSTATION,
-            station.as_millis()
-        );
-        println!(
-            "{} cloud-init done: {} ms",
-            guests::SERVER,
-            server.as_millis()
-        );
-        closed.store(true, Ordering::SeqCst);
-        println!("apt mirror closed: subsequent HTTP requests receive 403");
-        run.guest(guests::WORKSTATION)
-            .wait_desktop(Duration::from_secs(60))
-            .await?;
-        let boot = run.boot_started().elapsed();
-        let story = story::run(&run, &ports, &shots, &progress).await?;
-        run.containment().await?;
-        tokio::time::timeout(Duration::from_secs(45), page_checks(run.page_url())).await??;
-        run.screenshots(
-            guests::WORKSTATION,
-            &shots.join("viewer-scan.png"),
-            &shots.join("page-scan.png"),
-        )
-        .await?;
-        Ok::<_, Error>((boot, story))
-    }
-    .await;
-    if let Err(error) = &result {
-        eprintln!("checks failed: {error}");
-        for guest in run.guests() {
-            eprint!("{}", guest.diagnostics().await);
-        }
-    }
-    if let Err(error) = run.shutdown().await {
-        return Err(format!("{error}; checks result: {result:?}").into());
-    }
-    let (boot, story) = result?;
-    println!("boot time: {} ms", boot.as_millis());
-    println!("story time: {} ms", story.as_millis());
-    println!("whole run: {} ms", total.elapsed().as_millis());
-    println!("every required check passed");
+    kit::checks::run(
+        kit,
+        downloads,
+        &out,
+        kit::checks::story(move |run, out| -> kit::checks::Story<'_, Error> {
+            Box::pin(async move {
+                let ports = receive.await?;
+                closed.store(true, Ordering::SeqCst);
+                println!("apt mirror closed: subsequent HTTP requests receive 403");
+                story::run(run, &ports, out, &progress).await?;
+                tokio::time::timeout(Duration::from_secs(45), page_checks(run.page_url()))
+                    .await??;
+                Ok::<_, Error>(())
+            })
+        }),
+    )
+    .await?;
     Ok(())
 }
 
 async fn page_checks(url: &str) -> Result<(), Error> {
     let client = PageClient::from_url(url)?;
-    kit::checks::bearer_required(&client).await?;
+    client.bootstrap().await?;
     let description = client.get_json("/api/page").await?;
     let hosts = description["hosts"].as_array().ok_or("page has no hosts")?;
     kit::checks::check(
         "the page pins both guests",
         hosts.len() == 2 && hosts.iter().all(|h| h["pinned"] == true),
     )?;
-    kit::checks::single_use_ticket(&client, guests::WORKSTATION, Capability::Screen).await?;
-    kit::checks::single_use_ticket(&client, guests::SERVER, Capability::Terminal).await?;
-    kit::checks::terminal_runs_on(&client, guests::SERVER).await?;
     // The world task publishes at most every 250 ms, so the last story step
     // can reach the page a moment after the story ends.
     let deadline = Instant::now() + Duration::from_secs(5);

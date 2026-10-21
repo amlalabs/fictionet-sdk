@@ -6,6 +6,7 @@ use fictionet::{RunOptions, Seed};
 use fictionet_demo::kit::client::PageClient;
 use fictionet_observe::{DashboardObserver, DashboardOptions};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_commands_change_the_route_and_record_inputs() {

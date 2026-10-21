@@ -470,7 +470,7 @@ impl Client<'_> {
                     ),
                     "Try a cache folder write" => (
                         "MKCOL",
-                        "/artifactory/github-remote-cache/zzHELP_test/",
+                        "/artifactory/github-remote-cache/zzHELP_missing-ledger/",
                         &[],
                         "",
                     ),

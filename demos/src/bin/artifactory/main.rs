@@ -33,7 +33,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use story::Mode;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -112,9 +112,7 @@ async fn execute() -> Result {
     let Some(downloads) = downloads else {
         return preview::serve(variant, sessions, extra_reads).await;
     };
-    let start = Instant::now();
-    let shots = downloads.join("shots");
-    std::fs::create_dir_all(&shots)?;
+    let shots = kit::checks::output(&downloads, "artifactory")?;
     let log_path = shots.join("artifactory.jsonl");
     let log = Log::start(Box::new(std::io::BufWriter::new(std::fs::File::create(
         &log_path,
@@ -138,7 +136,7 @@ async fn execute() -> Result {
         names,
         ServedNames::new(kit::desktop::HOSTS),
     ));
-    let publisher = facts::Publisher::start(facts.clone());
+    let publisher = Arc::new(facts::Publisher::start(facts.clone()));
     let inventory = contents.inventory();
     let states = world::sessions(
         facts.listen(facts::Store::Main, contents),
@@ -176,54 +174,40 @@ async fn execute() -> Result {
         .world(move |fcx, world| async move {
             world::start(&fcx, world, states, world_log, mirror_closed)
         });
-    let run = match kit.boot(&downloads).await {
-        Ok(run) => run,
-        Err(error) => {
-            log.finish()?;
-            tail(&log_path)?;
-            return Err(error.into());
-        }
-    };
-    let boot = run.guest(HOSTNAME).ssh_ready();
-    println!("boot to SSH-ready: {} ms", boot.as_millis());
-    let result = checks(&run, &facts, &publisher, &closed, variant, sessions, &shots).await;
-    let result = match result {
-        Ok(duration) if stay => {
-            println!("checks passed");
-            kit::checks::stay_open()
-                .await
-                .map(|()| duration)
-                .map_err(Into::into)
-        }
-        result => result,
-    };
+    let final_facts = facts.clone();
+    let final_publisher = publisher.clone();
+    let result = kit::checks::run(
+        kit,
+        &downloads,
+        &shots,
+        kit::checks::story(
+            move |run, _| -> kit::checks::Story<'_, Box<dyn std::error::Error>> {
+                Box::pin(async move {
+                    checks(run, &facts, &publisher, &closed, variant, sessions).await?;
+                    if stay {
+                        kit::checks::stay_open().await?;
+                    }
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                })
+            },
+        )
+        .finish_with(move || {
+            Box::pin(async move {
+                let published = final_publisher
+                    .flush()
+                    .await
+                    .and_then(|()| final_facts.state.lock().unwrap().check_complete());
+                let finished = log.finish();
+                published?;
+                finished.map_err(Into::into)
+            })
+        }),
+    )
+    .await;
     if result.is_err() {
-        eprint!("{}", run.guest(HOSTNAME).diagnostics().await);
-        if two {
-            eprint!("{}", run.guest(guest::COLLEAGUE).diagnostics().await);
-        }
-    }
-    let shutdown = run.shutdown().await;
-    let published = publisher
-        .flush()
-        .await
-        .and_then(|()| facts.state.lock().unwrap().check_complete());
-    let finished = log.finish();
-    println!("world log: {}", log_path.display());
-    if result.is_err() || shutdown.is_err() || published.is_err() || finished.is_err() {
         tail(&log_path)?;
     }
-    let story_time = result?;
-    shutdown?;
-    published?;
-    finished?;
-    println!(
-        "totals: boot {} ms; story {} ms; whole run {} ms",
-        boot.as_millis(),
-        story_time.as_millis(),
-        start.elapsed().as_millis()
-    );
-    println!("every required check passed");
+    result?;
     Ok(())
 }
 
@@ -234,19 +218,11 @@ async fn checks(
     closed: &AtomicBool,
     variant: Variant,
     sessions: Option<Mode>,
-    shots: &Path,
 ) -> Result<Duration> {
     let guest = run.guest(HOSTNAME);
     let colleague = sessions.map(|_| run.guest(guest::COLLEAGUE));
-    for handle in std::iter::once(guest).chain(colleague) {
-        handle.wait_cloud_init(Duration::from_secs(300)).await?;
-        println!("cloud-init done: {}", handle.name());
-    }
     closed.store(true, Ordering::SeqCst);
     println!("mirror closed");
-    guest.wait_desktop(Duration::from_secs(300)).await?;
-    // The probes' traffic is setup traffic, so it ends before the story.
-    run.containment().await?;
     let index = facts.wait_until(Duration::from_secs(30), |state| {
         state.requests.iter().any(|r| {
             r.step == "setup"
@@ -262,12 +238,6 @@ async fn checks(
     guest::open_terminal(guest).await?;
     let story_time = story::run(guest, colleague, facts, publisher, variant, sessions).await?;
     println!("{}", page::check(run.page_url(), variant, sessions).await?);
-    run.screenshots(
-        HOSTNAME,
-        &shots.join("artifactory-screen.png"),
-        &shots.join("artifactory-page.png"),
-    )
-    .await?;
     Ok(story_time)
 }
 

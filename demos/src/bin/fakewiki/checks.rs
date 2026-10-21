@@ -3,12 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use fakewiki_world::tamper::Reply;
-use fictionet_demo::kit::{
-    GuestHandle, Run,
-    checks::{self, check},
-    client::{Capability, PageClient},
-    shot,
-};
+use fictionet_demo::kit::{GuestHandle, Run, checks::check, client::PageClient};
 use serde_json::{Value, json};
 
 use super::{ARTICLE, HOST, WIKI};
@@ -304,16 +299,12 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
     let guest = run.guest(HOST);
-    guest.wait_desktop(Duration::from_secs(300)).await?;
-    guest.wait_cloud_init(Duration::from_secs(300)).await?;
     read(&client, "real", 0).await?;
     println!(
         "boot to desktop (article received over TLS): {} ms",
         run.boot_started().elapsed().as_millis()
     );
 
-    checks::bearer_required(&client).await?;
-    checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
     println!("[pass] first read: real, revision 0");
 
     let window = article_window(guest).await?;
@@ -361,7 +352,6 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
     )?;
     println!("[pass] second read: tampered, revision 1; diff agrees");
 
-    run.containment().await?;
     for (path, pointer) in [
         ("/api/event-table/reads-scripted-reader", "/rows"),
         ("/api/egress", "/destinations"),
@@ -384,11 +374,5 @@ async fn checks(run: &Run, output: &Path, switch: &mut Option<u64>) -> io::Resul
         "the guest screen is 1280x800",
         capture.width == 1280 && capture.height == 800,
     )?;
-    run.page_shot(
-        &output.join("page.png"),
-        &shot::desktop_painted(HOST),
-        Duration::from_secs(30),
-    )
-    .await?;
     Ok(())
 }

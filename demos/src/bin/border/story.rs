@@ -283,9 +283,6 @@ async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
 
 pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     let ssh = run.guest(HOSTNAME).ssh();
-    run.guest(HOSTNAME)
-        .wait_cloud_init(Duration::from_secs(100))
-        .await?;
     command(ssh, "tmux has-session -t main").await?;
     println!(
         "Boot to agent-ready: {:.2} s",

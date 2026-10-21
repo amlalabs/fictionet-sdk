@@ -388,13 +388,17 @@ pub(crate) struct PageFixture {
 }
 impl PageFixture {
     pub async fn new() -> Self {
+        Self::with_app(false).await
+    }
+    async fn with_app(app: bool) -> Self {
         let mut kit = Kit::new("console")
             .guest(Guest::ubuntu("workstation", "analyst").desktop(5901, "desktop-ready"))
             .guest(Guest::ubuntu("server", "operator"))
-            .page(|dashboard, hosts| {
-                Page::new("Desktop", dashboard)
+            .page(move |dashboard, hosts| {
+                let page = Page::new("Desktop", dashboard)
                     .host(hosts.take("workstation"))
-                    .standard_panels()
+                    .standard_panels();
+                if app { page.app() } else { page }
             });
         let build = kit.page.take().unwrap();
         let (mut run, mut prepared) = kit.prepare().unwrap();
@@ -1980,4 +1984,165 @@ fn network_checks_distinguish_lan_and_public_addresses_and_local_macs() {
     assert!(!checks::vendor_mac([1, 0, 0, 0, 0, 2]));
     assert!(!checks::vendor_mac([0x74, 0x83, 0xc2, 0x66, 0x6e, 1]));
     assert!(checks::vendor_mac([0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]));
+}
+
+#[test]
+fn demos_use_the_shared_check_sequence() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+    for entry in std::fs::read_dir(root).unwrap() {
+        let directory = entry.unwrap().path();
+        let path = directory.join("main.rs");
+        if !path.is_file() {
+            continue;
+        }
+        let main = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            main.contains("kit::checks::run("),
+            "{} has no shared runner",
+            path.display()
+        );
+        for file in ["main.rs", "checks.rs", "story.rs"] {
+            let path = directory.join(file);
+            if !path.exists() {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            for call in [
+                ".wait_cloud_init(",
+                ".wait_desktop(",
+                ".boot(",
+                ".shutdown(",
+                ".containment(",
+                ".screenshots(",
+                "every required check passed",
+            ] {
+                assert!(!source.contains(call), "{} owns {call}", path.display());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_checks_wait_before_access_and_story_and_stop_on_failure() {
+    let mut fixture = PageFixture::new().await;
+    fixture
+        .peer
+        .ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    fixture.network();
+    fixture.connect();
+    fixture.run.guests[1].ssh = Some(fixture.peer.session.clone());
+    let out = fixture.run.path().join("shots");
+    std::fs::create_dir(&out).unwrap();
+    let played = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reached = played.clone();
+    let mut story = checks::story(move |run, _| -> checks::Story<'_, std::io::Error> {
+        Box::pin(async move {
+            let client = client::PageClient::from_url(run.page_url())?;
+            assert_eq!(
+                client.get_json("/api/page").await?["hosts"][0]["name"],
+                "workstation"
+            );
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::other("story stopped"))
+        })
+    });
+    let error = checks::sequence(&fixture.run, &out, &mut story)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "story stopped");
+    assert!(played.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!out.join("world-dark.png").exists());
+    let mut events = Vec::new();
+    while let Ok(event) = fixture.peer.events.try_recv() {
+        events.push(event);
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.as_str() == "exec sudo cloud-init status --wait --long")
+            .count(),
+        2
+    );
+    let first_shell = events.iter().position(|event| event == "shell").unwrap();
+    let last_wait = events
+        .iter()
+        .rposition(|event| event == "exec sudo cloud-init status --wait --long")
+        .unwrap();
+    assert!(last_wait < first_shell, "{events:?}");
+    fixture.run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_checks_capture_light_and_dark_after_the_story() {
+    use fictionet_observe::page::{ProbeOutcome, ProbeResult};
+    let mut fixture = PageFixture::with_app(true).await;
+    fixture
+        .peer
+        .ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    fixture.network();
+    fixture.connect();
+    fixture.run.guests[1].ssh = Some(fixture.peer.session.clone());
+    let out = fixture.run.path().join("shots");
+    std::fs::create_dir(&out).unwrap();
+    let mut story = checks::story(|run, out| -> checks::Story<'_, std::io::Error> {
+        Box::pin(async move {
+            assert!(!out.join("world-light.png").exists());
+            assert!(!out.join("world-dark.png").exists());
+            let probes = Containment {
+                probes: run
+                    .guests()
+                    .iter()
+                    .flat_map(|guest| {
+                        containment::PROBES
+                            .iter()
+                            .enumerate()
+                            .map(move |(index, probe)| ProbeResult {
+                                guest: guest.guest.attachment.clone(),
+                                name: probe.name.into(),
+                                command: probe.command.into(),
+                                destination: probe.destination.into(),
+                                outcome: if index < 5 {
+                                    ProbeOutcome::Contained
+                                } else {
+                                    ProbeOutcome::Fact
+                                },
+                                guest_result: "fixture response".into(),
+                                summary: "fixture response".into(),
+                                world_answer: "fixture response".into(),
+                                proxies: vec![],
+                            })
+                    })
+                    .collect(),
+            };
+            run.containment
+                .publish(fictionet::time::Instant::ZERO, &probes)
+                .map_err(std::io::Error::other)?;
+            Ok(())
+        })
+    });
+    checks::sequence(&fixture.run, &out, &mut story)
+        .await
+        .unwrap();
+    assert!(out.join("workstation-screen.png").is_file());
+    assert!(out.join("workstation-page.png").is_file());
+    let light = std::fs::read(out.join("world-light.png")).unwrap();
+    let dark = std::fs::read(out.join("world-dark.png")).unwrap();
+    assert_ne!(light, dark, "both themes must render differently");
+    fixture.run.page_words.push("Desktop".into());
+    let refused = fixture.run.path().join("refused");
+    std::fs::create_dir(&refused).unwrap();
+    let mut story =
+        checks::story(|_, _| -> checks::Story<'_, std::io::Error> { Box::pin(async { Ok(()) }) });
+    let error = checks::sequence(&fixture.run, &refused, &mut story)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Visible words 'Desktop'"),
+        "{error}"
+    );
+    assert!(!refused.join("world-light.png").exists());
+    assert!(!refused.join("world-dark.png").exists());
+    fixture.run.shutdown().await.unwrap();
 }

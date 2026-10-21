@@ -24,7 +24,7 @@ use fictionet_demo::kit::{self, Kit};
 use fictionet_observe::page::Page;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -66,11 +66,7 @@ async fn main() -> Result<(), Error> {
         Mode::Check { downloads } => (downloads, true),
     };
     let started = Instant::now();
-    let out = downloads
-        .join("shots")
-        .join(format!("border-{}", kit::random_uuid()));
-    std::fs::create_dir_all(&out)?;
-    println!("Output: {}", out.display());
+    let out = kit::checks::output(&downloads, "border")?;
     let scenario = control::scenario();
     let control = control::Control::new(&scenario)?;
     let log = Log::start(
@@ -109,46 +105,16 @@ async fn main() -> Result<(), Error> {
         finished?;
         return Ok(());
     }
-    let run = match kit.boot(&downloads).await {
-        Ok(run) => run,
-        Err(error) => {
-            log.finish()?;
-            return Err(error.into());
-        }
-    };
-    println!(
-        "Boot to SSH-ready: {:.2} s",
-        run.guest(guest::HOSTNAME).ssh_ready().as_secs_f64()
-    );
-    let result: Result<(), Error> = async {
-        let ready = run
-            .guest(guest::HOSTNAME)
-            .wait_desktop(Duration::from_secs(300))
-            .await?;
-        println!("Boot to desktop-ready: {:.2} s", ready.as_secs_f64());
-        story::run(&run, &out).await?;
-        run.containment().await?;
-        println!(
-            "Story completed in {:.2} s",
-            started.elapsed().as_secs_f64()
-        );
-        Ok(())
-    }
-    .await;
-    if result.is_err() {
-        eprint!("{}", run.guest(guest::HOSTNAME).diagnostics().await);
-    }
-    let shutdown = run.shutdown().await;
-    let finished = log.finish();
-    result?;
-    shutdown?;
-    finished?;
-    println!("Output: {}", out.display());
-    println!(
-        "Shutdown complete; whole run: {:.2} s",
-        started.elapsed().as_secs_f64()
-    );
-    println!("every required check passed");
+    kit::checks::run(
+        kit,
+        &downloads,
+        &out,
+        kit::checks::story(|run, out| -> kit::checks::Story<'_, Error> {
+            Box::pin(async move { story::run(run, out).await.map_err(Into::into) })
+        })
+        .finish_with(move || Box::pin(async move { log.finish().map_err(Into::into) })),
+    )
+    .await?;
     Ok(())
 }
 
