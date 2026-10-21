@@ -226,10 +226,9 @@ const CLAUDE_SHA256: &str = "a967e7b1d8b4e47ee421d5433027880347952b0c0857abf880e
 /// Where the guest downloads Claude Code. Serve it through World::mirror,
 /// with TLS from the CA passed to World::trust.
 pub const CLAUDE_HOST: &str = "downloads.claude.ai";
-/// Claude Code's settings for every user: no updates and no traffic beyond
-/// its model calls.
-pub const CLAUDE_SETTINGS: &str =
-    "{\"env\":{\"DISABLE_UPDATES\":\"1\",\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\":\"1\"}}\n";
+/// Claude Code's settings for every user: no updates, telemetry, or
+/// automatic marketplace downloads.
+pub const CLAUDE_SETTINGS: &str = "{\"env\":{\"DISABLE_UPDATES\":\"1\",\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\":\"1\",\"CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL\":\"1\"}}\n";
 
 /// Shell lines that download Claude Code into `$work`, check it against
 /// its pinned sha256s and install it as /usr/local/bin/claude. `sha256sum
@@ -980,6 +979,20 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn claude_code_disables_automatic_marketplace_downloads() {
+        let settings: serde_json::Value = serde_json::from_str(CLAUDE_SETTINGS).unwrap();
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL"],
+            "1"
+        );
+        assert_eq!(settings["env"]["DISABLE_UPDATES"], "1");
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
+            "1"
+        );
     }
 
     #[test]

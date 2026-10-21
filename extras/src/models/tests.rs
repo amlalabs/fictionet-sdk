@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn claude_code_policy_limits_require_credentials() {
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+        |cx| async move {
+            let credential =
+                Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "private-key".into())?);
+            let key = credential.placeholder().to_owned();
+            let site = Model::at(
+                &cx,
+                Provider::Anthropic,
+                credential,
+                "http://127.0.0.1:1".parse()?,
+            )?;
+            let path = "/api/claude_code/policy_limits";
+            let response = site
+                .clone()
+                .send(
+                    Request::get(path)
+                        .header("x-api-key", &key)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let body = response.into_body().collect().await?.to_bytes();
+            assert_eq!(body, r#"{"restrictions":{}}"#);
+            for credential in [None, Some("wrong")] {
+                let mut request = Request::get(path);
+                if let Some(credential) = credential {
+                    request = request.header("x-api-key", credential);
+                }
+                let response = site.clone().send(request.body(Body::empty())?).await?;
+                assert_eq!(response.status(), 401);
+                assert_eq!(response.headers()["content-type"], "application/json");
+                let body = response.into_body().collect().await?.to_bytes();
+                let body: Value = serde_json::from_slice(&body)?;
+                assert_eq!(body["error"]["type"], "authentication_error");
+            }
+            let response = site
+                .clone()
+                .send(
+                    Request::get("/api/claude_code/settings")
+                        .header("x-api-key", &key)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), 404);
+            assert_eq!(site.ledger.lock().unwrap().calls, 0);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
 fn paths_are_exact() {
     for (provider, path) in [
         (Provider::Anthropic, "/v1/messages"),

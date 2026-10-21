@@ -636,8 +636,11 @@ impl Model {
                     | "/backend-api/wham/accounts/check"
                     | "/backend-api/wham/usage"
             );
-        if (request.method() != http::Method::POST && !listing)
-            || !(self.provider.allows(&path) || listing)
+        let policy_limits = self.provider == Provider::Anthropic
+            && request.method() == http::Method::GET
+            && path == "/api/claude_code/policy_limits";
+        if (request.method() != http::Method::POST && !listing && !policy_limits)
+            || !(self.provider.allows(&path) || listing || policy_limits)
         {
             self.refused(&path, "path");
             return Ok(self.provider.error(404, "not_found_error", "Not found"));
@@ -645,6 +648,11 @@ impl Model {
         if !self.authorized(request.headers()) {
             self.refused(&path, "credential");
             return Ok(self.unauthorized());
+        }
+        if policy_limits {
+            return Ok(Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"restrictions":{}}"#))?);
         }
         if let Some(Catalog::Answer { origin, body }) = &self.catalog {
             return Ok(Response::builder()
