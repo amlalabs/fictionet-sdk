@@ -869,11 +869,7 @@ impl Pages {
             None
         };
         let route = route(host, target, form);
-        if method == "POST" && route == Route::Page {
-            self.making(cx, host, target);
-            return self.form(host, target);
-        }
-        self.handle_route(cx, host, target, route).await
+        self.handle_route(cx, method, host, target, route).await
     }
 
     /// The page a site shows after a form is posted to it: a failed sign
@@ -978,10 +974,24 @@ impl Pages {
     pub(crate) async fn handle_route(
         self: &Arc<Self>,
         cx: &Cx,
+        method: &str,
         host: &str,
         target: &str,
         route: Route,
     ) -> Response {
+        if make::git_path(target) {
+            return Response::new(
+                404,
+                "text/plain; charset=utf-8",
+                "Not found",
+                vec![],
+                Meta::Asset,
+            );
+        }
+        if method == "POST" && route == Route::Page {
+            self.making(cx, host, target);
+            return self.form(host, target);
+        }
         let started = cx.now().since_start();
         let search = matches!(route, Route::Search { .. });
         let mut response = self.answer(cx, &host.to_lowercase(), target, route).await;

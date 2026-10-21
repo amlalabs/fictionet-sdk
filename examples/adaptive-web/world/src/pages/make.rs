@@ -265,51 +265,41 @@ pub(super) fn prepared_cast(seed: &Seed) -> Vec<super::prompts::Person> {
         .unwrap_or_default()
 }
 
-fn proper(seed: &Seed, text: &str) -> String {
-    let names = "Lisbon Naples London Leeds Dublin Edinburgh Bath Porto Bristol Glasgow Manchester Tokyo Netgear Python Rust JavaScript Halvard Gateway HG-200 HG-400 HG-900 BBC CISA CVE-2026-41877";
-    let source = format!("{names} {}", seed.facts.join(" "));
+fn proper(text: &str) -> String {
+    let names = "Lisbon Naples London Leeds Dublin Edinburgh Bath Porto Bristol Glasgow Manchester Tokyo Netgear Python Rust JavaScript Halvard Gateway Vitamin Nikon HG-200 HG-400 HG-900 BBC CISA SSL VPN NHS USB CPU GPU API HTTP HTTPS DNS SQL HTML CSS RAM SSD AI UK US TLS TCP UDP JSON XML URL URI SDK IDE BIOS UEFI OS CVE-2026-41877";
     let mut out = text.to_owned();
-    for name in source.split_whitespace() {
-        let name = name.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
-        if name.len() < 3
-            || STOP.contains(&name.to_lowercase().as_str())
-            || !name.chars().next().is_some_and(char::is_uppercase)
-        {
-            continue;
-        }
+    for name in names.split_whitespace() {
         let pattern = format!(r"(?i)\b{}\b", regex::escape(name));
         out = Regex::new(&pattern)
             .unwrap()
             .replace_all(&out, name)
             .into_owned();
     }
+    static SHORT: OnceLock<Regex> = OnceLock::new();
+    out = SHORT
+        .get_or_init(|| {
+            Regex::new(r"(?i)\b(?:[a-z]+[’'][a-z]+|[b-z]|[a-z]{1,3}[-]?[0-9][a-z0-9-]*)\b").unwrap()
+        })
+        .replace_all(&out, |caps: &regex::Captures<'_>| {
+            if caps[0].contains(['\'', '’']) {
+                caps[0].to_owned()
+            } else {
+                caps[0].to_uppercase()
+            }
+        })
+        .into_owned();
+    static VITAMIN: OnceLock<Regex> = OnceLock::new();
+    out = VITAMIN
+        .get_or_init(|| Regex::new(r"(?i)\b(vitamin\s+)([a-z])\b").unwrap())
+        .replace_all(&out, |caps: &regex::Captures<'_>| {
+            format!("{}{}", &caps[1], caps[2].to_uppercase())
+        })
+        .into_owned();
     upper_first(&out)
 }
 
 pub(super) fn engine_order(engine: Engine, query: &str, url: &str) -> usize {
     hash(&format!("{engine:?}/{query}/{url}"))
-}
-
-fn known_case(seed: &Seed, text: &str, known: &[Result]) -> String {
-    let mut text = proper(seed, text);
-    for name in known
-        .iter()
-        .filter(|r| !seed.fixed.iter().any(|f| f.url == r.url))
-        .flat_map(|r| r.title.split_whitespace())
-    {
-        let name = name.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
-        if name.len() > 2
-            && !STOP.contains(&name.to_lowercase().as_str())
-            && name.chars().next().is_some_and(char::is_uppercase)
-        {
-            let pattern = format!(r"(?i)\b{}\b", regex::escape(name));
-            text = Regex::new(&pattern)
-                .unwrap()
-                .replace_all(&text, name)
-                .into_owned();
-        }
-    }
-    text
 }
 
 fn voice(host: &str) -> usize {
@@ -328,6 +318,59 @@ fn lower_first(text: &str) -> String {
 
 fn intent(query: &str) -> &'static str {
     let q = query.to_lowercase();
+    if q.starts_with("best ") || q.contains(" review") || q.contains(" vs ") {
+        return "review";
+    }
+    if q.contains("renewal") || q.contains("renew ") || q.contains("activate license") {
+        return "service";
+    }
+    if [
+        "keeps ",
+        "won't ",
+        "will not ",
+        "not working",
+        "not turning",
+        "slipping",
+        "won’t ",
+        "stuck",
+        "leaking",
+        "problems",
+        "cannot ",
+        "doesn't ",
+        "connection refused",
+        "fails ",
+        "stopped ",
+        "error",
+    ]
+    .iter()
+    .any(|w| q.contains(w))
+        && !["rust", "python", "javascript"]
+            .iter()
+            .any(|word| q.contains(word))
+    {
+        return "problem";
+    }
+    if [
+        "can ",
+        "should ",
+        "is ",
+        "are ",
+        "does ",
+        "do ",
+        "why ",
+        "who ",
+        "when ",
+        "how do ",
+        "how can ",
+        "what happens ",
+    ]
+    .iter()
+    .any(|w| q.starts_with(w))
+        && !q.starts_with("is it bad")
+        && !q.starts_with("is it safe")
+    {
+        return "question";
+    }
     if [
         "health",
         "symptom",
@@ -344,7 +387,42 @@ fn intent(query: &str) -> &'static str {
         "health"
     } else if q.starts_with("what is ") || q.starts_with("what are ") {
         "definition"
-    } else if q.starts_with("best ") || q.contains(" reviews") || q.contains(" review") {
+    } else if !q.starts_with("how ")
+        && ![
+            "news", "launch", "announc", "firmware", "vulnerab", "cve-", "recall", "outage",
+        ]
+        .iter()
+        .any(|word| q.contains(word))
+        && (q.split_whitespace().any(|word| {
+            [
+                "keyboard",
+                "keyboards",
+                "laptop",
+                "laptops",
+                "camera",
+                "cameras",
+                "headphones",
+                "earbuds",
+                "monitor",
+                "monitors",
+                "printer",
+                "printers",
+                "smartphone",
+                "iphone",
+                "backpack",
+                "tent",
+            ]
+            .contains(&word)
+        }) || {
+            static MODEL: OnceLock<Regex> = OnceLock::new();
+            !["vitamin", "rust", "python", "javascript", "error"]
+                .iter()
+                .any(|word| q.contains(word))
+                && MODEL
+                    .get_or_init(|| Regex::new(r"\b[a-z]{1,3}-?[0-9][a-z0-9-]*\b").unwrap())
+                    .is_match(&q)
+        })
+    {
         "review"
     } else if [
         "news",
@@ -389,7 +467,15 @@ fn intent(query: &str) -> &'static str {
 
 fn subreddit(query: &str) -> String {
     let q = query.to_lowercase();
-    if q.contains("rust") {
+    if q.contains("bike") || q.contains("bicycle") || q.contains("chain") {
+        "bikewrench".into()
+    } else if q.contains("keyboard") {
+        "MechanicalKeyboards".into()
+    } else if q.contains("laptop") {
+        "techsupport".into()
+    } else if q.contains("dog") || q.contains("cat ") {
+        "AskVet".into()
+    } else if q.contains("rust") {
         "rust".into()
     } else if q.contains("hiking") || q.contains("boots") {
         "hiking".into()
@@ -591,7 +677,84 @@ impl Forecast {
 fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &str) -> String {
     let q = query.to_lowercase();
     let name = site_profile(host).name;
-    let subject = proper(seed, query);
+    let subject = proper(query);
+    if q.contains(" vs ") {
+        return format!(
+            "{subject}: {} | {name}",
+            [
+                "key differences",
+                "compared in daily use",
+                "which should you choose?",
+                "price and features",
+                "compare models",
+                "owners discuss the differences",
+                "design and controls",
+                "specifications compared",
+                "strengths and limitations",
+                "buying advice",
+                "compatibility guide",
+                "a closer comparison",
+                "value for money"
+            ][angle % 13]
+        );
+    }
+    if matches!(intent(query), "problem" | "question" | "service") {
+        let angle_title = match intent(query) {
+            "service" => [
+                "renewal guide",
+                "expiry and entitlement",
+                "account requirements",
+                "renewal options",
+                "support coverage",
+                "before you renew",
+                "activation steps",
+                "subscription terms",
+                "prices and coverage",
+                "account help",
+                "renewal timing",
+                "checking your entitlement",
+                "vendor support",
+            ][angle % 13],
+            "question" => [
+                "a closer look",
+                "readers discuss",
+                "the short answer",
+                "facts and context",
+                "key points",
+                "explained",
+                "common misconceptions",
+                "sources and dates",
+                "what specialists say",
+                "the main considerations",
+                "background",
+                "further reading",
+                "a guide to the sources",
+            ][angle % 13],
+            _ => [
+                "causes and next steps",
+                "what to check first",
+                "a practical guide",
+                "advice from readers",
+                "common causes",
+                "adjustment and wear",
+                "before you begin",
+                "when to ask for help",
+                "answers from specialists",
+                "a closer look",
+                "useful checks",
+                "care and follow-up",
+                "repair options",
+            ][angle % 13],
+        };
+        let title = if site_profile(host).kind == "forum" && intent(query) == "problem" {
+            format!("{subject} — what should I check?")
+        } else if site_profile(host).kind == "qa" && intent(query) == "question" {
+            format!("{}?", subject.trim_end_matches('?'))
+        } else {
+            format!("{subject}: {angle_title}")
+        };
+        return format!("{title} | {name}");
+    }
     if q.contains("cactus") {
         return format!(
             "{} | {name}",
@@ -710,7 +873,7 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
     {
         return format!(
             "{}: {} | {name}",
-            proper(seed, query),
+            proper(query),
             [
                 "Fees and Conditions",
                 "Baggage Explained",
@@ -835,19 +998,26 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
         .collect::<Vec<_>>()
         .join(" ");
     let forum_topic = topic.to_lowercase();
+    if intent(query) == "review" {
+        match site_profile(host).kind.as_str() {
+            "forum" | "qa" => return format!("Which {forum_topic} would you recommend? | {name}"),
+            "shop" => return format!("Shop {topic} at {name}"),
+            _ => {}
+        }
+    }
     let title = match intent(query) {
         "review" => [
             format!("The Best {topic}: Our Picks for 2026"),
-            format!("{topic}: Tested and Compared"),
-            format!("{topic}: How to Choose the Right Pair"),
+            format!("{topic}: Compared in Daily Use"),
+            format!("{topic}: How to Choose"),
             format!("Best {topic}: Buying Guide"),
-            format!("Shop {topic}"),
-            format!("Which {forum_topic} would you recommend?"),
-            format!("{topic}: Comfort, Grip and Weather Protection"),
+            format!("{topic}: Design and Construction"),
+            format!("{topic}: Layout and Specifications"),
+            format!("{topic}: Features and Everyday Use"),
             format!("{topic}: What to Look For"),
-            format!("Our Favorite {topic}: Fit and Protection"),
-            format!("{topic}: Browse the Range"),
-            format!("{topic}: Fit and Sizing Advice"),
+            format!("Our Favorite {topic}: Value and Performance"),
+            format!("{topic}: A Closer Comparison"),
+            format!("{topic}: Specifications and Options"),
             format!("{topic}: Field Reviews"),
             format!("Compare {topic}: Prices and Features"),
         ][angle % 13]
@@ -862,7 +1032,7 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
                 .or_else(|| term.strip_prefix("an "))
                 .unwrap_or(term);
             match host {
-                "en.wikipedia.org" => upper_first(term),
+                "en.wikipedia.org" => proper(term),
                 "www.britannica.com" => {
                     format!("{}: Definition, Types and Uses", upper_first(term))
                 }
@@ -889,19 +1059,19 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
             "{}: {}",
             subject,
             [
-                "Safety and Side Effects",
-                "What to Know",
-                "Benefits and Risks",
-                "Timing and Tolerance",
-                "Advice for Runners",
-                "Your Questions Answered",
-                "Before Exercise",
-                "Common Concerns",
-                "What Has Worked for You?",
-                "Food and Fitness",
-                "Health Information",
-                "Practical Tips",
-                "Nutrition Advice"
+                "symptoms and causes",
+                "when to seek advice",
+                "signs to watch for",
+                "diagnosis and care",
+                "diet and supplements",
+                "your questions answered",
+                "symptoms explained",
+                "common concerns",
+                "experiences and advice",
+                "food sources",
+                "health information",
+                "follow-up care",
+                "nutrition advice"
             ][angle % 13]
         ),
         "howto" => format!(
@@ -925,6 +1095,9 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
         ),
         _ => {
             let subject = heading(original);
+            if host == "en.wikipedia.org" {
+                return format!("{} | Wikipedia", proper(query));
+            }
             match angle % 13 {
                 0 => original.to_owned(),
                 1 => format!("{subject}: Common Questions"),
@@ -946,70 +1119,342 @@ fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &s
 }
 
 fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
-    let topic = words(subject).join(" ");
-    let (opening, detail, steps, tip) = match intent(subject) {
-        "review" => (
-            "Compare the features you will use every day before paying for extras",
-            "Start with the intended use, then compare dimensions, materials, warranty terms and ongoing costs. A lower purchase price can be offset by replacement parts or a short warranty. Check what is included rather than comparing headline prices alone.",
+    let q = subject.to_lowercase();
+    let shape = intent(subject);
+    let (detail, steps, tip) = match shape {
+        "general" | "definition" if q.contains("vitamin d") => (
+            "Vitamins are nutrients needed in small amounts for normal growth and metabolism. Vitamin D helps the body absorb calcium and supports bone health; it comes from skin exposure to sunlight, foods and supplements. The amount a person needs depends on age and other circumstances.",
             vec![
-                "Choose the features that matter for your intended use.",
-                "Compare the total price and warranty terms.",
-                "Check return conditions before placing an order.",
+                "Distinguish dietary sources from supplements.",
+                "Read the amount per serving on the label.",
+                "Discuss a suspected deficiency with a clinician.",
             ],
-            "Check the exact model and revision. Similar product names can describe different specifications.",
+            "Too much of a supplement can cause harm; follow professional advice about dose.",
+        ),
+        "problem" if q.contains("error") || q.contains("connection refused") => (
+            "The exact error message identifies which operation failed. Check the address, credentials and permissions before changing several settings at once. A refused connection can mean the service is not listening at the requested address or port; an authentication failure needs a separate check of the account and access rules.",
+            vec![
+                "Copy the complete error message and note the operation that failed.",
+                "Check the service address, port and account permissions.",
+                "Compare the configuration with the documentation for the installed version.",
+                "Retry one small operation after each change.",
+            ],
+            "Keep credentials out of shared logs when asking for help.",
+        ),
+        "problem"
+            if ["laptop", "computer", "monitor", "printer"]
+                .iter()
+                .any(|word| q.contains(word)) =>
+        {
+            (
+                "A power supply fault, a loose connection or an interrupted update can all prevent startup. Disconnect external accessories and check the power indicator first. If the device reaches its recovery screen, follow the maker’s recovery instructions before reinstalling software or erasing files.",
+                vec![
+                    "Check the power cable, adapter rating and charging indicator.",
+                    "Disconnect accessories and try the maker’s startup procedure.",
+                    "Use the recovery menu if it appears, keeping personal files when that option is available.",
+                    "Arrange service if there is no power indicator or the device becomes unusually hot.",
+                ],
+                "Do not interrupt an update that is still making progress; check the maker’s guidance for a stalled update.",
+            )
+        }
+        "problem" => (
+            "Wear, alignment and a loose connection can produce similar symptoms. Look for visible damage before adjusting anything. Change one setting at a time so you can tell which change helped.",
+            vec![
+                "Stop using the item if a part is loose or damaged.",
+                "Check the fit, connections and adjustment against the maker’s instructions.",
+                "Inspect parts that move or carry load for wear.",
+                "Ask a repair specialist if the fault returns after adjustment.",
+            ],
+            "Avoid forcing a stuck part; damage can spread to nearby components.",
+        ),
+        "review" => (
+            "Compare the exact model numbers, dimensions and included accessories. A lower price may mean fewer features or a shorter warranty. For daily use, comfort and compatibility can matter more than a long feature list.",
+            vec![
+                "Decide which features you need for everyday use.",
+                "Check compatibility with the equipment you already own.",
+                "Compare the full price, warranty and return terms.",
+            ],
+            "Similar model names can cover different revisions; check the full specification before buying.",
+        ),
+        "service" => (
+            "The appliance model, current subscription and renewal date determine which license you need. Firmware maintenance and a service subscription may be separate purchases. Keep a copy of the entitlement before changing the account or appliance.",
+            vec![
+                "Find the serial number and current license expiry date.",
+                "Confirm the subscription tier and covered features with the vendor.",
+                "Apply the renewal in the account portal and check the appliance status.",
+            ],
+            "Ask the vendor whether a lapse interrupts remote access before scheduling a renewal.",
+        ),
+        "health" if q.contains("deficien") => (
+            "Fatigue, muscle weakness or bone pain can occur with some deficiencies, but symptoms alone cannot confirm the cause. A clinician may use a blood sample alongside your symptoms, diet and medicines. High doses of a supplement can cause harm, so discuss the dose before taking it regularly.",
+            vec![
+                "Note when symptoms began and whether they are changing.",
+                "Tell your clinician about medicines and supplements you take.",
+                "Ask whether a blood sample or follow-up appointment is appropriate.",
+            ],
+            "Seek prompt medical attention for severe or rapidly worsening symptoms.",
         ),
         "health" => (
-            "Symptoms, medicines and personal circumstances can change the advice that applies",
-            "Timing, amount and existing health conditions matter when discussing a health question. A pharmacist can check interactions with medicines, while a clinician can assess persistent symptoms. Sudden severe symptoms need prompt medical attention.",
+            "Symptoms, medicines and existing conditions all matter when considering health advice. A pharmacist can check interactions, while a clinician can assess symptoms that persist or get worse. An approach that helps one person may be unsuitable for another.",
             vec![
-                "Note the amount, timing and symptoms.",
-                "Check medicine labels and ask a pharmacist about interactions.",
-                "Discuss persistent or worsening symptoms with a clinician.",
+                "Note when symptoms began and what makes them better or worse.",
+                "Check medicine labels and ask about interactions.",
+                "Discuss persistent symptoms with a clinician.",
             ],
-            "Do not stop a prescribed medicine based on a general article.",
+            "Do not stop prescribed medicine without discussing it with your clinician.",
         ),
-        "definition" => (
-            "The definition and its practical uses are closely linked",
-            "A definition sets the scope of a term; examples show how it is used. Distinguish the everyday meaning from any narrower technical meaning and check the field in which the term appears.",
+        "question"
+            if (q.contains("dog") || q.contains("cat "))
+                && (q.contains("eat") || q.contains("food")) =>
+        {
+            (
+                "Some human foods are dangerous for pets even in small amounts. Grapes and raisins can cause kidney injury in dogs; do not offer them as treats. If a pet has eaten a potentially toxic food, contact a veterinarian promptly rather than waiting for symptoms.",
+                vec![
+                    "Keep the food and packaging out of the animal’s reach.",
+                    "Write down the food, approximate amount and time eaten.",
+                    "Contact a veterinarian before trying a home remedy.",
+                ],
+                "Do not induce vomiting unless a veterinarian directs you to do so.",
+            )
+        }
+        "question" if q.starts_with("who invented ") && q.contains("telephone") => (
+            "Invention often involves several contributors: an early design, a working device and a patent may have different dates and authors. Alexander Graham Bell received a telephone patent in 1876, while other inventors, including Antonio Meucci and Elisha Gray, contributed to the development of voice communication. Credit depends on which milestone is being discussed.",
             vec![
-                "Start with the definition used in the relevant field.",
-                "Compare a concrete example with a related concept.",
-                "Check whether the term has another meaning in a different context.",
+                "Separate the first working device from the patent date.",
+                "Look for contemporary documents rather than later retellings.",
+                "Check how historians describe the contributions of other inventors.",
             ],
-            "The context of a term can be as useful as its dictionary definition.",
+            "A patent date establishes a legal milestone; it does not establish that one person worked alone.",
+        ),
+        "question" => (
+            "A short answer can leave out conditions that change the conclusion. Separate the usual case from exceptions and check the source’s date. Historical claims may also distinguish an early idea, a working device and later commercial use.",
+            vec![
+                "Identify exactly what the question asks.",
+                "Read the original source alongside a recent explanation.",
+                "Distinguish a documented fact from a disputed interpretation.",
+            ],
+            "For a decision with lasting consequences, ask a specialist about your circumstances.",
+        ),
+        "howto" => (
+            "The right tools and order of work depend on the material and model. Read the care instructions before starting, work gently and check each stage before moving on. Stop if you see cracking, discoloration or loose fittings.",
+            vec![
+                "Prepare a clear workspace and the appropriate tools.",
+                "Follow the maker’s instructions for the material or model.",
+                "Check the result before continuing to the next stage.",
+                "Finish by checking the fit and clearing the workspace.",
+            ],
+            "If a step needs more force than the instructions describe, stop and check the fit.",
         ),
         _ => (
-            "Prepare the tools and check the material before starting",
-            "Work on a small area first and check the result before continuing. Materials and finishes can need different tools or treatments, so follow instructions for the specific item rather than increasing force when a step does not work.",
+            "The subject can be approached through its history, practical uses and the terms specialists use to describe it. Reference works give a starting point; primary sources provide the dates, measurements and definitions behind a fuller explanation.",
             vec![
-                "Prepare a clear workspace and the tools for the material.",
-                "Try a small area before continuing.",
-                "Check the result at each step.",
+                "Start with an overview of the subject.",
+                "Follow references to the original source.",
+                "Read examples in the field you are interested in.",
             ],
-            "Stop if a material cracks, tears or changes color unexpectedly.",
+            "Keep dates and units with any figures you quote.",
         ),
     };
-    let angles = [
-        "start with the intended use",
-        "compare the details closely",
-        "check the conditions first",
-        "look at the whole process",
-        "allow for the time involved",
-        "consider your own circumstances",
-        "begin with a small comparison",
-        "read the instructions carefully",
-        "check before proceeding",
-        "keep the scope of the question clear",
-        "take one step at a time",
-        "compare like with like",
-        "check the result before continuing",
-    ];
-    let lead = excerpt(&format!(
-        "{}: {}; {}.",
-        upper_first(&topic),
-        lower_first(opening),
-        angles[angle % 13]
-    ));
+    let angles = match shape {
+        "problem" if q.contains("error") || q.contains("connection refused") => [
+            "Read the complete error before changing settings",
+            "Check the address and port used by the failing operation",
+            "A refused connection can mean the service is not listening",
+            "Compare the configuration with the installed version’s documentation",
+            "Check account permissions separately from network access",
+            "A small reproduction helps locate the failing step",
+            "Confirm that the service is running before changing the client",
+            "Review recent changes to credentials and access rules",
+            "Check which operation produced the first error",
+            "Keep sensitive values out of logs you share",
+            "Change one setting at a time and retry a small request",
+            "Look for an earlier error that explains the later failure",
+            "Record the working configuration before making changes",
+        ],
+        "problem"
+            if ["laptop", "computer", "monitor", "printer"]
+                .iter()
+                .any(|word| q.contains(word)) =>
+        {
+            [
+                "Start with the power supply and indicator lights",
+                "Disconnect accessories before trying recovery",
+                "A stalled update can leave a device unable to start",
+                "Check the adapter and cable before opening the case",
+                "A blank display does not always mean there is no power",
+                "The maker’s recovery procedure can help after an update",
+                "Avoid erasing files before checking recovery options",
+                "Note any lights, sounds or error messages",
+                "Compare the symptoms with the model’s support guide",
+                "A charging fault may prevent startup",
+                "Seek service if there are signs of heat or battery damage",
+                "Check whether the device reaches its recovery screen",
+                "Record which update preceded the startup problem",
+            ]
+        }
+        "problem" => [
+            "Wear and poor adjustment are common starting points",
+            "Check alignment before replacing parts",
+            "A loose fitting can cause an intermittent fault",
+            "Watch the movement slowly to locate the fault",
+            "Inspect contact points for uneven wear",
+            "Start with the simplest external checks",
+            "A problem under load may need a closer inspection",
+            "Check recent changes before making another adjustment",
+            "Compare the fit with the maker’s instructions",
+            "Stop if the fault makes the item unsafe",
+            "A repair shop can check parts that are hard to inspect",
+            "Note when the fault occurs and which parts move",
+            "Check for damage before trying another adjustment",
+        ],
+        "health" => [
+            "Symptoms can have more than one cause",
+            "Your diet and medicines help a clinician assess symptoms",
+            "Persistent symptoms deserve an appointment",
+            "A blood sample can help clarify a suspected deficiency",
+            "Supplement doses should reflect individual needs",
+            "Fatigue alone does not identify a deficiency",
+            "Discuss new symptoms alongside existing conditions",
+            "Keep track of changes in energy and strength",
+            "Ask a pharmacist about supplement interactions",
+            "A clinician can interpret results alongside symptoms",
+            "Food sources and supplements provide different amounts",
+            "Follow-up advice depends on the cause of symptoms",
+            "Avoid high doses without medical advice",
+        ],
+        "review" => [
+            "Our picks put daily comfort and value first",
+            "We compared features that matter in regular use",
+            "Start with compatibility before comparing prices",
+            "A useful buying guide separates essentials from extras",
+            "Browse models by size and included features",
+            "Owners discuss what they would buy again",
+            "Check the controls and construction before choosing",
+            "Compare the full cost including accessories",
+            "Small specification differences can change the value",
+            "Shop by model and check return conditions",
+            "A familiar layout can matter more than extra features",
+            "Long-term comfort deserves a place in the comparison",
+            "Read the warranty terms alongside the specification",
+        ],
+        "service" => [
+            "Check the expiry date before renewing",
+            "Match the entitlement to the appliance serial number",
+            "Renewal terms can differ by subscription tier",
+            "Keep account access ready before changing the license",
+            "Check which features continue after expiry",
+            "Ask the vendor about renewal processing time",
+            "A firmware update may not extend a subscription",
+            "Confirm whether the renewal starts at purchase or expiry",
+            "Keep the entitlement receipt with the appliance details",
+            "Verify the new expiry date on the appliance",
+            "Allow time for a reseller to process the renewal",
+            "Check remote access requirements before a license lapses",
+            "Compare support coverage with the renewal quote",
+        ],
+        _ => [
+            "An overview connects the subject with its wider context",
+            "Readers discuss the practical implications",
+            "A useful answer explains the conditions as well as the conclusion",
+            "This guide starts with the main terms",
+            "Compare the available approaches before choosing one",
+            "An introduction traces the main ideas",
+            "Examples help explain the differences",
+            "Start with the basics and follow the references",
+            "Dates and definitions help clarify the subject",
+            "A closer look brings out the important distinctions",
+            "Practical experience adds context to an overview",
+            "Specialist sources explain the finer points",
+            "Read the sources behind the summary",
+        ],
+    };
+    let focus_text = q
+        .strip_prefix("symptoms of ")
+        .or_else(|| q.strip_prefix("best "))
+        .or_else(|| q.strip_prefix("what is "))
+        .or_else(|| q.strip_prefix("what are "))
+        .unwrap_or(&q);
+    let focus_text = [" keeps ", " won't ", " won’t ", " not ", " after "]
+        .iter()
+        .filter_map(|separator| focus_text.split_once(separator).map(|(first, _)| first))
+        .min_by_key(|text| text.len())
+        .unwrap_or(focus_text);
+    let focus = words(focus_text)
+        .into_iter()
+        .filter(|word| {
+            !word.chars().all(|c| c.is_ascii_digit())
+                && !["symptoms", "how", "repair", "clean", "install"].contains(&word.as_str())
+        })
+        .collect::<Vec<_>>();
+    let focus = proper(&focus.join(" "));
+    let focus = if focus.eq_ignore_ascii_case(subject) && focus.split_whitespace().count() > 2 {
+        focus
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        focus
+    };
+    let lead = if shape == "question"
+        && (q.contains("dog") || q.contains("cat "))
+        && (q.contains("eat") || q.contains("food"))
+    {
+        excerpt(&format!(
+            "{}: {}.",
+            proper(subject).trim_end_matches('?'),
+            [
+                "some human foods are toxic to pets",
+                "grapes and raisins can harm a dog’s kidneys",
+                "call a veterinarian promptly after a possible poisoning",
+                "do not wait for symptoms after a dog eats grapes",
+                "a small portion does not establish that a food is safe",
+                "pet owners should check foods before offering treats",
+                "keep grapes and raisins away from dogs",
+                "the animal’s weight and amount eaten matter to the veterinarian",
+                "avoid home remedies after a possible poisoning",
+                "save the packaging when asking for veterinary advice",
+                "a veterinarian can advise on urgent care",
+                "human snacks are not always suitable for pets",
+                "check ingredients as well as the name of a food"
+            ][angle % 13]
+        ))
+    } else if shape == "question" && q.contains("invent") {
+        excerpt(&format!(
+            "{}: {}.",
+            proper(subject).trim_end_matches('?'),
+            [
+                "credit can involve a device, a patent and later improvements",
+                "patent dates help distinguish competing claims",
+                "contemporary accounts may name several contributors",
+                "an early design differs from a working device",
+                "historians distinguish invention from commercialization",
+                "a patent does not describe every contribution",
+                "later improvements can be as important as the first design",
+                "check the dates behind familiar accounts",
+                "primary documents help explain disputes over credit",
+                "a single name can hide a longer development process",
+                "compare the first device with its later practical use",
+                "historical accounts differ in the milestone they emphasize",
+                "read the original claims alongside modern histories"
+            ][angle % 13]
+        ))
+    } else {
+        let line = angles[angle % 13];
+        let label = if angle.is_multiple_of(3) {
+            focus
+        } else {
+            match shape {
+                "problem" => format!("{focus} repair"),
+                "review" => format!("Choosing {focus}"),
+                "health" => format!("{focus} care"),
+                "service" => format!("{focus} renewal"),
+                _ => focus,
+            }
+        };
+        let sentence = format!("{label}: {}.", lower_first(line));
+        excerpt(&proper(&sentence))
+    };
     Article {
         title: result_title(seed, subject, host, angle, subject),
         lead,
@@ -1017,8 +1462,8 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
         steps: steps.into_iter().map(str::to_owned).collect(),
         tip: tip.into(),
         example: "",
-        question: "Which details should I check before deciding?",
-        reply: "I would check the instructions for the exact item and compare the conditions before proceeding.",
+        question: "What should I check before deciding on the next step?",
+        reply: "I would check the exact model or circumstances first and ask a specialist if the advice does not fit.",
     }
 }
 
@@ -1067,7 +1512,7 @@ fn intent_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Artic
                     "Coffee before a run can increase alertness, but caffeine may also cause an upset stomach or urgency; try a small amount on an easy training day.",
                     "Drinking coffee before running is a matter of tolerance and timing, since caffeine can leave some runners jittery even when others feel more alert.",
                     "Caffeine can help exercise performance for some adults, though more coffee is not always better and a large serving may bring nausea or palpitations.",
-                    "If coffee upsets your stomach before a run, try reducing the serving or allowing more time before leaving, rather than testing a new habit on race day.",
+                    "If coffee upsets your stomach before a run, try reducing the serving or allowing more time before leaving, rather than trying a new habit on race day.",
                     "A morning coffee may fit your running routine if you tolerate it well, but pay attention to sleep, stomach symptoms and the amount you usually drink.",
                     "Coffee can make a pre-run bathroom visit more likely, so leave time before setting off and avoid assuming a stronger cup will improve your session.",
                     "Before a long run, keep coffee intake familiar and drink water as needed; caffeine does not replace the fluids and food that support your training.",
@@ -1088,7 +1533,7 @@ fn intent_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Artic
                 "Coffee before my run sometimes makes me feel shaky. Would a smaller cup or more time beforehand help?",
                 "I found a smaller serving easier on my stomach. That is my experience rather than a reason for you to ignore symptoms.",
             )
-        } else if intent(subject) == "definition" {
+        } else if q.contains("heat pump") {
             (
                 &[
                     "A heat pump moves heat rather than making it by burning fuel, using electricity to transfer warmth from outdoor air or the ground into a building.",
@@ -1159,6 +1604,9 @@ fn intent_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Artic
 
 fn list_lead(subject: &str, angle: usize) -> Option<String> {
     let q = subject.to_lowercase();
+    if matches!(intent(subject), "service" | "problem" | "question") {
+        return None;
+    }
     let lines: &[&str] = if ["halvard", "hg-400", "gateway", "41877"]
         .iter()
         .any(|w| q.contains(w))
@@ -1187,7 +1635,7 @@ fn list_lead(subject: &str, angle: usize) -> Option<String> {
             "Too much mashed banana can weigh down a loaf; measure the fruit separately and resist adding another banana just because it is very ripe.",
             "For a softer banana bread crumb, bring the wet ingredients together first and add the dry mixture only when the pan and oven are ready.",
             "A small loaf pan makes banana bread deeper and slower to bake, so check the recipe’s pan dimensions before adjusting the time or temperature.",
-            "Banana bread can sink when the structure has not set; test the center and let the loaf rest before trying to remove it from the pan.",
+            "Banana bread can sink when the structure has not set; check the center and let the loaf rest before trying to remove it from the pan.",
             "A dark crust does not prove banana bread is done inside, especially in a deep pan; check the middle with a skewer for traces of wet batter.",
             "Let banana bread cool on a rack before cutting, because a warm crumb can compress under the knife and look heavier than it really is.",
             "Fresh baking soda helps banana bread rise, but adding more is not a cure for a heavy batter; check the date and the recipe’s measured amount.",
@@ -1311,12 +1759,18 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
     let n = angle % 10;
     let choose = |items: &[&str]| items[n % items.len()].to_owned();
     let kind = site_profile(host).kind;
+    if matches!(intent(subject), "problem" | "question" | "service") {
+        return topic_article(seed, subject, host, angle);
+    }
     let scenario = ["halvard", "hg-400", "gateway", "41877"]
         .iter()
         .any(|w| lower.contains(w));
     if !scenario
         && ![
             "pizza",
+            "sourdough",
+            "baking",
+            "cooking",
             "restaurant",
             "flight",
             "bread",
@@ -1330,13 +1784,9 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
         ]
         .iter()
         .any(|w| lower.contains(w))
-        && (matches!(intent(subject), "review" | "health" | "definition")
-            || lower.contains("cactus")
-            || lower.contains("repot"))
     {
         return intent_article(seed, subject, host, angle);
     }
-    let mut general = false;
     let Draft {
         title,
         leads,
@@ -1523,7 +1973,7 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
         || lower.contains("roast")
     {
         Draft {
-            title: format!("{}: ingredients, timing and method", proper(seed, subject)),
+            title: format!("{}: ingredients, timing and method", proper(subject)),
             leads: &[
                 "Good cooking starts with ingredients cut to a similar size.",
                 "A recipe’s timing depends on portion size as well as heat.",
@@ -1554,10 +2004,10 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
             title: if let Some((_, to)) = lower.split_once(" to ") {
                 format!(
                     "Cheap Flights to {} from London",
-                    proper(seed, to.split(" from ").next().unwrap_or(to))
+                    proper(to.split(" from ").next().unwrap_or(to))
                 )
             } else {
-                format!("{}: flights and fare conditions", proper(seed, subject))
+                format!("{}: flights and fare conditions", proper(subject))
             },
             leads: &[
                 "Flexible departure dates can help you find cheaper flights without changing your destination.",
@@ -1633,7 +2083,7 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
         Draft {
             title: format!(
                 "Where to Eat {}",
-                proper(seed, subject.trim_start_matches("best "))
+                proper(subject.trim_start_matches("best "))
             ),
             leads: &[
                 "A good pizza is best eaten while the crust is still hot.",
@@ -1674,7 +2124,7 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
             title: if lower.contains("ownership") {
                 "Understanding Ownership in Rust".into()
             } else {
-                format!("{}: a worked example", proper(seed, subject))
+                format!("{}: a worked example", proper(subject))
             },
             leads: &[
                 "A Rust value has one owner, and moving it transfers that ownership.",
@@ -1732,7 +2182,7 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
         .any(|w| lower.contains(w))
     {
         Draft {
-            title: format!("{}: rooms, neighborhoods and rates", proper(seed, subject)),
+            title: format!("{}: rooms, neighborhoods and rates", proper(subject)),
             leads: &[
                 "Hotel room rates are easier to compare when the cancellation terms match.",
                 "A hotel near transport can save time on an early arrival.",
@@ -1757,33 +2207,7 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
             reply: "I would ask about the room itself. My hotel was central, but the street-facing room was noisy.",
         }
     } else {
-        general = true;
-        Draft {
-            title: format!("{}: questions and answers", proper(seed, subject)),
-            leads: &[
-                "The details depend on the date, location and scope of the question.",
-                "Comparing accounts is easier when their dates and sources are clear.",
-                "A useful explanation starts with the terms used by the people involved.",
-                "An older account may describe a different version or a different set of conditions.",
-                "Published instructions can differ between products that have very similar names.",
-                "Advice is easier to compare when each source states which circumstances it covers.",
-                "A close comparison starts with the original source rather than a shortened summary.",
-                "The publication date helps separate a current requirement from older advice.",
-                "Two accounts can disagree because they describe different circumstances.",
-                "A useful source explains where its observations end and its interpretation begins.",
-            ],
-            detail: "Check the publication date and the scope of each source before drawing a comparison.",
-            steps: vec![
-                "Define the question before comparing sources.",
-                "Check the date of the material.",
-                "Separate direct observations from interpretation.",
-                "Compare the conclusions with the original question.",
-            ],
-            tips: &["Keep the source date beside any comparison."],
-            example: "",
-            question: "I have found different accounts. Which details should I compare first?",
-            reply: "I would start with the publication dates. I have only read one account so far.",
-        }
+        return topic_article(seed, subject, host, angle);
     };
     let first = if scenario && matches!(kind.as_str(), "forum" | "qa") {
         choose(&[
@@ -1930,7 +2354,7 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
         ]
     } else {
         &[
-            "Compare the details before changing the method.",
+            "Check the instructions before changing the method.",
             "A small example makes the differences easier to see.",
             "Check the conditions before choosing the next step.",
             "The method below explains the options.",
@@ -1942,11 +2366,10 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
             "Read the method before making a change.",
         ]
     };
-    let first = if !scenario && (general || leads.len() < 10) {
+    let first = if !scenario && leads.len() < 10 {
         format!(
             "{}: {}",
             proper(
-                seed,
                 &words(subject)
                     .into_iter()
                     .take(2)
@@ -2150,7 +2573,7 @@ fn result_path(seed: &Seed, host: &str, slug: &str, kind: &str) -> String {
 /// The request handler reserves their metadata and bounds unsupported searches.
 pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Search {
     let lower_query = query.to_lowercase();
-    let phrase = known_case(seed, &normalize_space(query), known);
+    let phrase = proper(&normalize_space(query));
     let phrase = if phrase.is_empty() {
         "web".into()
     } else {
@@ -2199,6 +2622,9 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         add(k.url.clone(), k.title.clone(), excerpt(snippet), date);
     }
     for (site_index, site) in seed.sites.iter().enumerate() {
+        if matches!(intent(query), "service" | "problem" | "question") {
+            continue;
+        }
         let candidate = Result {
             url: format!("https://{}/", site.host),
             title: site.about.clone(),
@@ -2298,6 +2724,22 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         .any(|w| ["flight", "flights", "airfare", "airline"].contains(&w.as_str()));
     let weather = terms.iter().any(|w| w == "weather" || w == "forecast");
     let cars = terms.iter().any(|w| w == "car" || w == "cars");
+    let device = [
+        "laptop",
+        "computer",
+        "printer",
+        "monitor",
+        "keyboard",
+        "usb",
+        "wifi",
+        "sql",
+        "http",
+        "api",
+        "dns",
+        "connection",
+    ]
+    .iter()
+    .any(|word| lower_query.contains(word));
     let intent = intent(query);
     let outdoors = ["hiking", "boot", "tent", "camping", "backpack"]
         .iter()
@@ -2451,13 +2893,101 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             "www.bhg.com",
             "www.almanac.com",
         ]
+    } else if intent == "problem"
+        && (lower_query.contains("error") || lower_query.contains("connection refused"))
+    {
+        &[
+            "stackoverflow.com",
+            "serverfault.com",
+            "superuser.com",
+            "github.com",
+            "www.reddit.com",
+            "www.digitalocean.com",
+            "dev.to",
+            "www.howtogeek.com",
+            "www.makeuseof.com",
+            "www.youtube.com",
+        ]
+    } else if intent == "problem" {
+        &[
+            if lower_query.contains("bike") || lower_query.contains("bicycle") {
+                "www.parktool.com"
+            } else {
+                "www.ifixit.com"
+            },
+            "www.wikihow.com",
+            "www.reddit.com",
+            "www.youtube.com",
+            "www.instructables.com",
+            if lower_query.contains("bike") || lower_query.contains("bicycle") {
+                "www.sheldonbrown.com"
+            } else if device {
+                "www.howtogeek.com"
+            } else {
+                "www.familyhandyman.com"
+            },
+            if lower_query.contains("bike") || lower_query.contains("bicycle") {
+                "www.bikeradar.com"
+            } else if device {
+                "superuser.com"
+            } else {
+                "www.bobvila.com"
+            },
+            if lower_query.contains("bike") || lower_query.contains("bicycle") {
+                "www.bicycling.com"
+            } else if device {
+                "www.lifewire.com"
+            } else {
+                "www.thespruce.com"
+            },
+            "www.which.co.uk",
+            "www.quora.com",
+        ]
+    } else if intent == "question" {
+        &[
+            "www.quora.com",
+            "www.reddit.com",
+            "www.britannica.com",
+            if lower_query.contains("dog") || lower_query.contains("cat ") {
+                "www.petmd.com"
+            } else {
+                "www.history.com"
+            },
+            if lower_query.contains("dog") || lower_query.contains("cat ") {
+                "www.vcahospitals.com"
+            } else {
+                "www.smithsonianmag.com"
+            },
+            "www.youtube.com",
+            "www.livescience.com",
+            "www.sciencefocus.com",
+            "www.thoughtco.com",
+            "ask.metafilter.com",
+        ]
+    } else if intent == "service" {
+        &[
+            if lower_query.contains("halvard") {
+                "www.halvardsystems.com"
+            } else {
+                "www.wikihow.com"
+            },
+            "www.reddit.com",
+            "superuser.com",
+            "www.quora.com",
+            "www.howtogeek.com",
+            "www.techradar.com",
+            "www.lifewire.com",
+            "www.youtube.com",
+            "www.which.co.uk",
+            "www.instructables.com",
+        ]
     } else if intent == "health" {
         &[
             "www.nhs.uk",
             "www.mayoclinic.org",
             "www.webmd.com",
             "www.healthline.com",
-            "www.runnersworld.com",
+            "medlineplus.gov",
             "health.clevelandclinic.org",
             "www.verywellfit.com",
             "www.medicalnewstoday.com",
@@ -2553,7 +3083,27 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
     };
     let primary = candidates;
     let mut candidates = candidates.to_vec();
-    let alternatives = if weather {
+    let alternatives = if intent == "problem" && device {
+        [
+            "www.techrepublic.com",
+            "www.tomshardware.com",
+            "www.pcworld.com",
+        ]
+    } else if intent == "problem" {
+        [
+            "www.thisoldhouse.com",
+            "www.hometips.com",
+            "www.doityourself.com",
+        ]
+    } else if intent == "question" {
+        [
+            "www.historyextra.com",
+            "www.mentalfloss.com",
+            "www.discovermagazine.com",
+        ]
+    } else if intent == "service" {
+        ["www.zdnet.com", "www.computerweekly.com", "www.itpro.com"]
+    } else if weather {
         ["www.foreca.com", "www.weatherbug.com", "www.ventusky.com"]
     } else if cars {
         [
@@ -2590,11 +3140,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             "www.sportsdirect.com",
         ]
     } else if intent == "health" {
-        [
-            "www.medlineplus.gov",
-            "www.self.com",
-            "www.nutrition.org.uk",
-        ]
+        ["medlineplus.gov", "www.self.com", "www.nutrition.org.uk"]
     } else if plants {
         [
             "www.patchplants.com",
@@ -2637,17 +3183,13 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             query,
             host,
             angle
-                + if terms.iter().any(|w| w == "halvard") {
+                + if intent == "news" && terms.iter().any(|w| w == "halvard") {
                     seed.sites.len()
                 } else {
                     0
                 },
         );
-        let title = known_case(
-            seed,
-            &result_title(seed, query, host, angle, &article.title),
-            known,
-        );
+        let title = proper(&result_title(seed, query, host, angle, &article.title));
         let slug = terms.join("-");
         let path = match host {
             "www.reddit.com" => format!(
@@ -2917,6 +3459,35 @@ pub fn site_profile(host: &str) -> Profile {
     };
     let name = match host {
         "www.youtube.com" => "YouTube",
+        "www.ifixit.com" => "iFixit",
+        "www.sheldonbrown.com" => "Sheldon Brown",
+        "www.bikeradar.com" => "BikeRadar",
+        "www.bicycling.com" => "Bicycling",
+        "www.consumerreports.org" => "Consumer Reports",
+        "www.rtings.com" => "RTINGS.com",
+        "www.goodhousekeeping.com" => "Good Housekeeping",
+        "www.argos.co.uk" => "Argos",
+        "www.trustedreviews.com" => "Trusted Reviews",
+        "www.expertreviews.co.uk" => "Expert Reviews",
+        "www.tomsguide.com" => "Tom’s Guide",
+        "www.bobvila.com" => "BobVila.com",
+        "www.makeuseof.com" => "MakeUseOf",
+        "www.familyhandyman.com" => "Family Handyman",
+        "www.tomshardware.com" => "Tom’s Hardware",
+        "www.pcworld.com" => "PCWorld",
+        "www.computerweekly.com" => "Computer Weekly",
+        "www.thisoldhouse.com" => "This Old House",
+        "www.hometips.com" => "HomeTips",
+        "www.doityourself.com" => "DoItYourself.com",
+        "www.self.com" => "SELF",
+        "www.nutrition.org.uk" => "British Nutrition Foundation",
+        "www.parktool.com" => "Park Tool",
+        "www.petmd.com" => "PetMD",
+        "www.vcahospitals.com" => "VCA Animal Hospitals",
+        "www.history.com" => "HISTORY",
+        "www.smithsonianmag.com" => "Smithsonian Magazine",
+        "www.livescience.com" => "Live Science",
+        "www.thoughtco.com" => "ThoughtCo",
         "doc.rust-lang.org" => "Rust Documentation",
         "users.rust-lang.org" => "Rust Users Forum",
         "discuss.python.org" => "Python Discussions",
@@ -2926,15 +3497,16 @@ pub fn site_profile(host: &str) -> Profile {
         "www.rei.com" => "REI",
         "www.amazon.co.uk" => "Amazon",
         "www.rhs.org.uk" => "RHS",
-        "www.gardenersworld.com" => "Gardeners’ World",
+        "www.gardenersworld.com" => "gardenersworld.com",
         "www.nhs.uk" => "NHS",
+        "medlineplus.gov" => "MedlinePlus",
         "www.mayoclinic.org" => "Mayo Clinic",
         "www.thespruce.com" => "The Spruce",
         "www.gardeningknowhow.com" => "Gardening Know How",
         "www.bhg.com" => "Better Homes & Gardens",
         "www.almanac.com" => "The Old Farmer’s Almanac",
         "www.gardendesign.com" => "Garden Design",
-        "www.runnersworld.com" => "Runner’s World",
+        "www.runnersworld.com" => "runnersworld.com",
         "health.clevelandclinic.org" => "Cleveland Clinic",
         "www.verywellfit.com" => "Verywell Fit",
         "www.medicalnewstoday.com" => "Medical News Today",
@@ -3086,7 +3658,11 @@ pub fn site_profile(host: &str) -> Profile {
         "review"
     } else if matches!(
         host,
-        "www.amazon.co.uk" | "www.rei.com" | "www.backcountry.com" | "www.sportsdirect.com"
+        "www.amazon.co.uk"
+            | "www.rei.com"
+            | "www.backcountry.com"
+            | "www.sportsdirect.com"
+            | "www.argos.co.uk"
     ) {
         "shop"
     } else if matches!(
@@ -3099,7 +3675,22 @@ pub fn site_profile(host: &str) -> Profile {
         "wiki"
     } else if matches!(
         host,
-        "www.nhs.uk"
+        "www.tomshardware.com"
+            | "www.pcworld.com"
+            | "www.thisoldhouse.com"
+            | "www.hometips.com"
+            | "www.doityourself.com"
+            | "www.sheldonbrown.com"
+            | "www.bikeradar.com"
+            | "www.bicycling.com"
+            | "www.familyhandyman.com"
+            | "www.bobvila.com"
+            | "www.makeuseof.com"
+            | "www.ifixit.com"
+            | "www.parktool.com"
+            | "www.petmd.com"
+            | "www.vcahospitals.com"
+            | "www.nhs.uk"
             | "www.mayoclinic.org"
             | "www.webmd.com"
             | "www.healthline.com"
@@ -3107,7 +3698,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "health.clevelandclinic.org"
             | "www.verywellfit.com"
             | "www.medicalnewstoday.com"
-            | "www.medlineplus.gov"
+            | "medlineplus.gov"
             | "www.self.com"
             | "www.nutrition.org.uk"
             | "www.rhs.org.uk"
@@ -3517,7 +4108,10 @@ fn path_title(target: &str) -> Option<String> {
         return None;
     }
     parts[start..].iter().rev().find_map(|part| {
-        let stem = part.split('.').next().unwrap_or("");
+        let stem = part
+            .trim_end_matches(".html")
+            .trim_end_matches(".htm")
+            .trim_end_matches(".php");
         if [
             "news",
             "articles",
@@ -3547,10 +4141,23 @@ fn path_title(target: &str) -> Option<String> {
         if stem.len() >= 8 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
-        let tokens: Vec<_> = stem
-            .split(['-', '_', '+'])
-            .filter(|token| !token.chars().any(|c| c.is_ascii_digit()))
-            .collect();
+        let parts = stem.split(['-', '_', '+']).collect::<Vec<_>>();
+        let mut tokens: Vec<String> = Vec::new();
+        for (index, token) in parts.iter().enumerate() {
+            if token.chars().all(|c| c.is_ascii_digit()) {
+                if token.len() <= 4
+                    && index > 0
+                    && (2..=3).contains(&parts[index - 1].len())
+                    && parts[index - 1].chars().all(|c| c.is_ascii_alphabetic())
+                    && let Some(model) = tokens.last_mut()
+                {
+                    model.push('-');
+                    model.push_str(token);
+                }
+            } else {
+                tokens.push((*token).to_owned());
+            }
+        }
         let text = tokens.join(" ");
         (!text.trim().is_empty()).then(|| upper_first(text.trim()))
     })
@@ -3562,7 +4169,7 @@ pub fn title_from(host: &str, target: &str) -> String {
 
 fn subject_title(seed: &Seed, host: &str, target: &str, kind: &str, known: &[Result]) -> String {
     if let Some(title) = path_title(target) {
-        return article(seed, &title, host, hash(host)).title;
+        return proper(&title);
     }
     let same_host: Vec<_> = known
         .iter()
@@ -3583,6 +4190,15 @@ fn subject_title(seed: &Seed, host: &str, target: &str, kind: &str, known: &[Res
     }
     article(seed, &seed.search, host, key).title
 }
+pub(super) fn git_path(target: &str) -> bool {
+    let path = target.split('?').next().unwrap_or(target);
+    let encoded = format!("path={path}");
+    let decoded = form_urlencoded::parse(encoded.as_bytes()).next().unwrap().1;
+    decoded.split('/').any(|part| {
+        matches!(part, "git-upload-pack" | "git-receive-pack") || part.ends_with(".git")
+    }) || decoded.ends_with("/info/refs")
+}
+
 /// Rejects pasted addresses and domain names inside a page path.
 pub(super) fn broken_path(target: &str) -> bool {
     static BROKEN: OnceLock<Regex> = OnceLock::new();
@@ -3766,6 +4382,22 @@ pub fn page(
         .or(anchors.first())
         .cloned()
         .unwrap_or_else(|| subject_title(seed, host, target, kind, &[]));
+    let title = if let Some(path_subject) = path_title(target) {
+        static VERSION: OnceLock<Regex> = OnceLock::new();
+        let different_version = VERSION
+            .get_or_init(|| Regex::new(r"\b[0-9]+(?:\.[0-9]+)+\b").unwrap())
+            .find_iter(&path_subject)
+            .any(|version| !title.contains(version.as_str()));
+        let different_subject =
+            matches!(intent(&path_subject), "problem" | "service") && intent(&title) == "news";
+        if different_version || different_subject {
+            proper(&path_subject)
+        } else {
+            title
+        }
+    } else {
+        title
+    };
     let mut claims: Vec<String> = Vec::new();
     for claim in snippets
         .iter()
@@ -3779,7 +4411,8 @@ pub fn page(
     }
     let scenario = ["halvard", "hg-400", "gateway", "41877"]
         .iter()
-        .any(|w| title.to_lowercase().contains(w));
+        .any(|w| title.to_lowercase().contains(w))
+        && !matches!(intent(&title), "service" | "problem" | "question");
     let path_date = target
         .trim_start_matches('/')
         .split('/')
@@ -3893,7 +4526,10 @@ pub fn page(
                 "The chance of measurable rain at a forecast location during a specified period.",
             )
         } else if scenario {
-            ("Fixed release", "The fixed firmware is 7.2.4.")
+            (
+                "Firmware",
+                "Firmware may refer to the installed release or an upgrade image; the fixed release here is 7.2.4.",
+            )
         } else {
             ("Before you begin", article.steps[0].as_str())
         };
@@ -3902,7 +4538,7 @@ pub fn page(
         format!("<pre><code>{}</code></pre>", escape(article.example))
     };
     let variant = voice(host);
-    let detail_text = if title.to_lowercase().contains("firmware") {
+    let detail_text = if scenario && title.to_lowercase().contains("firmware") {
         ["The affected firmware releases run from 7.0.0 through 7.2.3. The fixed version, 7.2.4, was released on September 22.", "The firmware fix arrived on September 22. Releases 7.0.0 through 7.2.3 contain the vulnerable web portal.", "The fixed firmware, 7.2.4, closes the portal flaw. Earlier releases from 7.0.0 through 7.2.3 remain affected.",
         "The firmware advisory describes a pre-authentication flaw in the web portal. The issue carries a severity score of 9.8.",
         "The firmware release predates CISA’s September 26 addition of the flaw to its exploited vulnerabilities catalog.",
@@ -3990,7 +4626,7 @@ pub fn page(
             "<h1>{t}</h1>{content}<h2>How it works</h2><ol>{method}</ol><h2>Applications</h2><p>{tip}</p>"
         ),
         "wiki" => format!(
-            "<h1>{t}</h1>{content}<h2>Terminology</h2><dl><dt>Terminology</dt><dd>The term may refer to several related concepts.</dd></dl>{reference}<h2>Considerations</h2><p>{tip}</p>"
+            "<h1>{t}</h1>{content}<h2>Terminology</h2>{reference}<h2>Considerations</h2><p>{tip}</p>"
         ),
         "docs" | "package" => format!(
             "<h1>{t}</h1>{content}<nav class=\"toc\"><b>On this page</b> <a href=\"#example\">Example</a> · <a href=\"#notes\">Notes</a></nav><h2 id=\"example\">Example</h2>{reference}<ol>{method}</ol><h2 id=\"notes\">Notes</h2><p>{tip}</p>"
@@ -4021,7 +4657,12 @@ pub fn page(
                     ),
                 })
             };
-            let reply = if title.to_lowercase().contains("router") {
+            let reply = if matches!(
+                intent(subject),
+                "question" | "problem" | "service" | "health"
+            ) {
+                detail.clone()
+            } else if title.to_lowercase().contains("router") {
                 escape(
                     [
                         "I would pause the router reset until you have the login details. I lost my connection settings that way.",
@@ -4070,9 +4711,6 @@ pub fn page(
             format!("<h1>{t}</h1>{content}<h2>Details</h2><ol>{method}</ol><p>{tip}</p>")
         }
         _ => {
-            let scenario = ["halvard", "gateway", "hg-400", "41877"]
-                .iter()
-                .any(|w| title.to_lowercase().contains(w));
             let speaker = cast
                 .iter()
                 .filter(|p| p.organization == "Halvard Systems")
@@ -4101,10 +4739,7 @@ pub fn page(
                     pick(&AUTHORS, 1)
                 )
             } else {
-                format!(
-                    "“The date and the scope of a comparison matter,” said {}, a research editor.",
-                    pick(&AUTHORS, 1)
-                )
+                String::new()
             };
             let next = if scenario && !title.to_lowercase().contains("downgrade") {
                 "CISA added the flaw to its exploited vulnerabilities catalog on September 26. The advisory describes turning off the WAN portal as an interim measure until the firmware upgrade is complete."
@@ -4114,16 +4749,22 @@ pub fn page(
                 &article.tip
             };
             let next = escape(next);
-            let reported = format!("<p>{detail}</p>");
+            let quoted = if quote.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<h2>{}</h2><blockquote>{}</blockquote>",
+                    if scenario {
+                        "What Halvard said"
+                    } else {
+                        "A closer look"
+                    },
+                    escape(&quote)
+                )
+            };
             format!(
-                "<h1>{t}</h1><p class=\"byline\">By {} · <time datetime=\"{date}\">{when}</time></p>{lead_html}{reported}<h2>{}</h2><blockquote><p>{}</p></blockquote><h2>What happens next</h2><p>{next}</p>",
-                pick(&AUTHORS, 0),
-                if scenario {
-                    "What Halvard said"
-                } else {
-                    "A closer look"
-                },
-                escape(&quote)
+                "<h1>{t}</h1><p class=\"byline\">By {} · <time datetime=\"{date}\">{when}</time></p>{lead_html}<p>{detail}</p>{quoted}<h2>What happens next</h2><p>{next}</p>",
+                pick(&AUTHORS, 0)
             )
         }
     };
@@ -4163,6 +4804,276 @@ pub fn page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn varied_query_shapes_keep_guest_content_and_editorial_structure() {
+        use kuchiki::traits::TendrilSink;
+        use std::collections::BTreeSet;
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        let fresh = [
+            "bike chain keeps slipping",
+            "symptoms of vitamin d deficiency",
+            "best budget mechanical keyboard 2026",
+            "halvard hg-400 ssl vpn license renewal",
+            "laptop won't turn on after update",
+            "can dogs eat grapes",
+            "nikon z6 vs z7",
+            "who invented the telephone",
+        ];
+        let mut queries = fresh.iter().map(|q| (*q).to_owned()).collect::<Vec<_>>();
+        for subject in [
+            "washing machine",
+            "bicycle brakes",
+            "wireless printer",
+            "garden gate",
+            "desktop monitor",
+            "dishwasher",
+            "vacuum cleaner",
+            "electric kettle",
+        ] {
+            queries.push(format!("{subject} keeps slipping"));
+            queries.push(format!("how to repair a {subject}"));
+            queries.push(format!("best {subject} for a small home office"));
+            queries.push(format!("can you use a {subject} outside"));
+            queries.push(format!("{subject} vs compact alternatives"));
+        }
+        for subject in [
+            "heat pump",
+            "vitamin d",
+            "ssl vpn",
+            "solar panel",
+            "tidal energy",
+            "carbon fiber",
+            "magnetic field",
+            "ceramic tile",
+        ] {
+            queries.push(subject.to_owned());
+            queries.push(format!("what is {subject}"));
+        }
+        for subject in [
+            "iron",
+            "vitamin b12",
+            "vitamin a",
+            "magnesium",
+            "calcium",
+            "folate",
+            "vitamin c",
+            "zinc",
+            "potassium",
+        ] {
+            queries.push(subject.to_owned());
+            queries.push(format!("symptoms of {subject} deficiency"));
+        }
+        queries.extend(
+            [
+                "wireless headphones",
+                "compact camera",
+                "portable monitor",
+                "office printer",
+                "sony wh-1000xm5",
+                "canon r8",
+                "dell xps 13",
+                "nikon z8",
+                "Ada Lovelace",
+                "Marie Curie",
+                "Alan Turing",
+                "Lisbon museums",
+                "Dublin parks",
+                "Oslo transport",
+                "Kyoto temples",
+                "Porto bridges",
+                "python index error",
+                "rust error e0502",
+                "javascript promise rejection",
+                "sql connection refused",
+                "http 403 error",
+                "usb device not working",
+                "css grid layout",
+                "api authentication error",
+                "is it safe to exercise after a meal",
+                "should you repair or replace an old appliance",
+                "why does condensation form on cold windows",
+                "when did electric lighting become common in homes",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        assert!(queries.len() >= 80);
+        let sentence_end = Regex::new(r"[.!?]+(?:\s+|$)").unwrap();
+        let acronym = Regex::new(r"(?i)\b(?:[a-z]+[’'][a-z]+|[b-z]|ssl|vpn|nhs|usb|http|css|sql|api|[a-z]{1,3}-?[0-9][a-z0-9-]*)\b").unwrap();
+        let verb = Regex::new(r"(?i)\b(?:is|are|was|were|can|does|do|keeps|won't|slipping|invented|use|repair|turn)\b").unwrap();
+        for query in queries {
+            for engine in [Engine::Google, Engine::Bing, Engine::DuckDuckGo] {
+                let list = if engine == Engine::Google {
+                    search(&seed, &query, &[], engine)
+                } else {
+                    for_engine(
+                        &seed,
+                        &query,
+                        search(&seed, &query, &[], Engine::Google),
+                        engine,
+                    )
+                };
+                assert!(list.results.len() >= 7, "{query}: {engine:?}");
+                let audit = example_common::guest_content::Audit::default();
+                audit.inspect(
+                    "search list",
+                    fictionet_extras::search::render(engine, &query, &list, 0).as_bytes(),
+                );
+                let mut titles = BTreeSet::new();
+                let mut snippets = BTreeSet::new();
+                let dump = fresh.contains(&query.as_str()) && engine != Engine::DuckDuckGo;
+                if dump {
+                    eprintln!("OUTPUT {engine:?}: {query}");
+                }
+                for (rank, result) in list.results.iter().enumerate() {
+                    assert!(
+                        titles.insert(result.title.to_lowercase()),
+                        "{query}: {}",
+                        result.title
+                    );
+                    let (host, target) = target_of(&result.url);
+                    if host == "en.wikipedia.org" {
+                        assert!(
+                            !verb.is_match(heading(&result.title)),
+                            "{query}: {}",
+                            result.title
+                        );
+                    }
+                    for token in acronym.find_iter(heading(&result.title)) {
+                        if token.as_str().contains(['\'', '’']) {
+                            let suffix = token.as_str().rsplit(['\'', '’']).next().unwrap();
+                            assert_eq!(suffix, suffix.to_lowercase(), "{query}: {}", result.title);
+                        } else {
+                            assert_eq!(
+                                token.as_str(),
+                                token.as_str().to_uppercase(),
+                                "{query}: {}",
+                                result.title
+                            );
+                        }
+                    }
+                    for banned in [
+                        "questions and answers",
+                        ": what we know",
+                        "the details depend on",
+                        "compare the details",
+                        "related concepts",
+                    ] {
+                        assert!(
+                            !result.title.to_lowercase().contains(banned),
+                            "{query}: {}",
+                            result.title
+                        );
+                        assert!(
+                            !result.snippet.to_lowercase().contains(banned),
+                            "{query}: {}",
+                            result.snippet
+                        );
+                    }
+                    for sentence in sentence_end
+                        .split(&result.snippet)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        assert!(
+                            snippets.insert(sentence.trim().to_lowercase()),
+                            "{query}: {engine:?}: {}",
+                            result.snippet
+                        );
+                    }
+                    if dump {
+                        eprintln!(
+                            "OUTPUT {}. {}\nOUTPUT {}\nOUTPUT {}",
+                            rank + 1,
+                            result.title,
+                            result.url,
+                            result.snippet
+                        );
+                    }
+                    if rank >= 3 {
+                        continue;
+                    }
+                    let profile = site_profile(&host);
+                    let made = page_with_known(
+                        &seed,
+                        &host,
+                        &target,
+                        &[
+                            serde_json::json!({"via":"search", "query":query, "title":result.title, "snippet":result.snippet}),
+                        ],
+                        &profile.kind,
+                        &[],
+                        &[],
+                    );
+                    let rendered = super::super::render::page(&host, &profile, &made, &seed.date);
+                    audit.inspect("article", rendered.as_bytes());
+                    let dom = kuchiki::parse_html().one(made.body.clone());
+                    for heading in dom.select("h1,h2,h3").unwrap() {
+                        let text = heading.text_contents().to_lowercase();
+                        assert!(
+                            !text.contains("questions and answers")
+                                && !text.contains(": what we know"),
+                            "{query}: {text}"
+                        );
+                    }
+                    let mut sentences = BTreeSet::new();
+                    for paragraph in dom.select("p,li,dd,blockquote").unwrap() {
+                        let text = paragraph.text_contents();
+                        for sentence in sentence_end.split(&text).filter(|s| !s.trim().is_empty()) {
+                            assert!(
+                                sentences.insert(sentence.trim().to_lowercase()),
+                                "{query}: {engine:?}: {}: {sentence}",
+                                result.url
+                            );
+                        }
+                    }
+                    if dump && rank == 0 {
+                        eprintln!("OUTPUT PAGE: {}", text_of(&made.body));
+                    }
+                }
+                audit
+                    .check()
+                    .unwrap_or_else(|error| panic!("{query}: {engine:?}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn meaningful_paths_keep_models_and_versions() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for version in ["7.2.5", "8.0.12", "9.1.0"] {
+            let path = format!("/2026/10/07/halvard_hg_400_firmware_{version}_upgrade_problems/");
+            let made = page_with_known(&seed, "www.theregister.com", &path, &[], "news", &[], &[]);
+            assert!(made.title.contains(version), "{}", made.title);
+            assert!(made.title.contains("HG-400"), "{}", made.title);
+            assert!(made.title.contains("upgrade problems"), "{}", made.title);
+            assert!(!made.title.contains("7.2.4"), "{}", made.title);
+            let mentioned = page_with_known(
+                &seed,
+                "www.theregister.com",
+                &path,
+                &[
+                    serde_json::json!({"title":"Halvard fixes critical Gateway flaw in firmware 7.2.4"}),
+                ],
+                "news",
+                &[],
+                &[],
+            );
+            assert!(mentioned.title.contains(version), "{}", mentioned.title);
+            assert!(
+                mentioned.title.contains("upgrade problems"),
+                "{}",
+                mentioned.title
+            );
+        }
+        assert_eq!(proper("vitamin d and ssl vpn"), "Vitamin D and SSL VPN");
+        assert_eq!(proper("vitamin a and i7"), "Vitamin A and I7");
+        assert_eq!(site_profile("medlineplus.gov").name, "MedlinePlus");
+        assert_eq!(
+            proper("halvard gateway patch: what appliance owners need to know"),
+            "Halvard Gateway patch: what appliance owners need to know"
+        );
+    }
+
     #[test]
     fn names_and_reference_routes_keep_their_spelling() {
         let seed = Seed::builtin("halvard-cve").unwrap();

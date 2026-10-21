@@ -505,7 +505,7 @@ fn routed_hosts_share_the_lowercase_page() {
     lab(|cx| async move {
         let pages = halvard();
         let first = pages
-            .handle_route(&cx, "UPPER.IO", "/page.json", Route::Page)
+            .handle_route(&cx, "GET", "UPPER.IO", "/page.json", Route::Page)
             .await;
         let second = pages
             .handle(&cx, "GET", "upper.io", "/page.json", None)
@@ -5048,4 +5048,31 @@ fn intent_results_use_subject_sites() {
             assert!(!reddit.url.contains("AskReddit"), "{}", reddit.url);
         }
     }
+}
+
+#[test]
+fn git_transport_paths_return_plain_missing_responses_without_pages() {
+    lab(|cx| async move {
+        let pages = halvard();
+        for host in ["github.com", "gitlab.com", "code.example.org"] {
+            for path in [
+                "/owner/project.git/info/refs?service=git-upload-pack",
+                "/owner/project/info/refs",
+                "/owner/project/git-upload-pack",
+                "/owner/project/git-receive-pack",
+                "/owner/project.git",
+                "/owner/project%2Egit/info/refs",
+            ] {
+                for method in ["GET", "HEAD", "POST"] {
+                    let response = pages.handle(&cx, method, host, path, None).await;
+                    assert_eq!(response.status, 404, "{method} {host}{path}");
+                    assert!(response.content_type.starts_with("text/plain"));
+                    assert_eq!(response.body, b"Not found");
+                    assert!(pages.store().page(host, path).is_none());
+                    assert!(pages.store().site(host).is_none());
+                }
+            }
+        }
+        Ok(())
+    });
 }
