@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { createDocument } from '../../../dashboard/test-dom.mjs';
 import { createServices } from '../../../dashboard/page.mjs';
-import { diff, slots, layout, picture, rows, queryTag, pageTag, short } from './model.mjs';
+import { diff, slots, layout, rows, queryTag, pageTag, short } from './model.mjs';
+import { createWeb } from './web.mjs';
 import { mount } from './view.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
@@ -64,14 +65,17 @@ test('the rows are the newest six, newest first', () => {
   assert.equal(rows(agent)[0].who, 'Claude Code');
 });
 
-test('the picture shows the newest search, its engines and the sites its list named', () => {
-  const view = picture(fixture());
-  assert.equal(view.query, 'new words');
-  assert.deepEqual(view.engines.map((e) => [e.label, e.tag]), [['Google', 'again'], ['Bing', 'idle'], ['DuckDuckGo', 'made']]);
-  assert.deepEqual(view.sites.map((site) => [site.label, site.pages, site.seed]), [['halvardsystems', 1, true], ['reddit', 1, false], ['theregister', 0, false]]);
-  assert.equal(view.refused, 'wiki.corp');
-  assert.deepEqual(view.planted, [{ label: 'fact', text: 'The fix is 7.2.5, not 7.2.4.' }]);
-  assert.equal(picture({ ...fixture(), queries: [], results: [], refused: [], planted: [] }).query, null);
+test('the map shows the newest search, its engines and all sites named', () => {
+  const h = harness();
+  h.publish(fixture());
+  assert.equal(h.root.querySelector('.query-text').textContent, 'new words');
+  assert.deepEqual(h.root.querySelectorAll('.engine').map((e) => e.getAttribute('class')), ['engine again', 'engine idle', 'engine made']);
+  assert.deepEqual(h.root.querySelectorAll('.site-group').map((g) => [g.children[1].textContent, g.querySelectorAll('.page').length, g.children[0].getAttribute('class').includes('scenario')]), [['halvardsystems', 1, true], ['reddit', 1, false], ['theregister', 0, false]]);
+  assert.equal(h.root.querySelector('.refused-mark').querySelector('text').textContent, 'wiki.corp');
+  assert.equal(h.root.querySelector('.planted-mark').querySelector('title').textContent, 'The fix is 7.2.5, not 7.2.4.');
+  h.publish({ ...fixture(), queries: [], results: [], refused: [], planted: [] });
+  assert.equal(h.root.querySelector('.query-text').textContent, '');
+  h.dispose();
 });
 
 function harness() {
@@ -291,4 +295,120 @@ test('full maps evict only the least recently touched eligible host and count al
   assert.equal(full.touched.get(hosts[2]), 2);
   const protectedMap = layout(null, hosts, { seed: { sites: hosts } });
   assert.deepEqual(layout(protectedMap, [...hosts, 'new.com'], { seed: { sites: hosts }, opened: ['new.com'] }).evicted, []);
+});
+
+const tree = (node) => typeof node === 'string' ? node : [node.tag, [...node.attributes], node.children.map(tree)];
+const publicText = (node) => {
+  assert.doesNotMatch(node.textContent, /\b(?:canned|stub|stubbed|seed|splice|store|stored|generator|cache|generated)\b/i);
+  for (const key of ['title', 'aria-label', 'placeholder']) assert.doesNotMatch(node.getAttribute(key) || '', /\b(?:canned|stub|stubbed|seed|splice|store|stored|generator|cache|generated)\b/i);
+  for (const child of node.children) if (typeof child !== 'string') publicText(child);
+};
+
+test('every captured snapshot renders its map and six newest rows with public words', () => {
+  const expected = {
+    'first-search': [9, 0, 10, 0, 1],
+    pages: [9, 3, 10, 2, 4],
+    planted: [14, 5, 10, 3, 6],
+    restart: [2, 0, 0, 0, 0],
+  };
+  for (const [name, counts] of Object.entries(expected)) {
+    const h = harness(), s = recorded(name);
+    h.publish(s);
+    assert.deepEqual(['.site-group', '.page', '.result', '.link', '.search-row'].map((selector) => h.root.querySelectorAll(selector).length), counts, name);
+    assert.equal(h.root.querySelector('.query-text').textContent, s.queries.at(-1)?.search || '');
+    assert.deepEqual(h.root.querySelectorAll('.page').map((p) => p.getAttribute('class').split(' ')[1]).sort(), s.pages.map(pageTag).sort());
+    publicText(h.root);
+    publicText(h.services.worldMenu);
+    h.dispose();
+  }
+});
+
+test('incremental maps equal resets through captured snapshots, repeats and restart', () => {
+  const h = harness();
+  const document = createDocument();
+  const el = (tag, attrs, parent) => {
+    const node = document.createElementNS('', tag.replace('svg:', ''));
+    for (const [key, value] of Object.entries(attrs)) key === 'text' ? node.textContent = value : node.setAttribute(key, value);
+    parent?.append(node);
+    return node;
+  };
+  for (const name of ['first-search', 'pages', 'planted', 'planted', 'restart', 'pages', 'first-search']) {
+    const svg = document.createElementNS('', 'svg');
+    const web = createWeb(svg, { el });
+    const s = recorded(name);
+    h.publish(s);
+    web.reset(s);
+    assert.deepEqual(tree(h.root.querySelector('.search-picture')).slice(2), tree(svg).slice(2), name);
+    web.dispose();
+    assert.equal(svg.children.length, 0);
+  }
+  h.dispose();
+});
+
+test('updates retain site, page, engine, result and arrow nodes', () => {
+  const h = harness(), s = recorded('pages');
+  h.publish(s);
+  const nodes = ['.site-group', '.page-group', '.engine-group', '.result-group', '.link-group'].flatMap((selector) => h.root.querySelectorAll(selector));
+  h.publish({ ...s, pages: s.pages.map((p) => ({ ...p, fetches: p.fetches + 1, carries: 1 })) });
+  for (const node of nodes) assert.ok(h.root.contains(node));
+  assert.ok(h.root.querySelectorAll('.page').every((p) => p.getAttribute('class') === 'page again'));
+  assert.ok(h.root.querySelectorAll('.page-ring').every((p) => p.getAttribute('visibility') === 'visible'));
+  h.dispose();
+});
+
+test('empty state keeps faint scenario sites and a caret without a caption', () => {
+  const h = harness();
+  h.publish(recorded('restart'));
+  assert.equal(h.root.querySelector('.query-text').textContent, '');
+  assert.equal(h.root.querySelector('.caret').getAttribute('visibility'), 'visible');
+  assert.equal(h.root.querySelector('.glyph-agent').textContent, '');
+  assert.ok(h.root.querySelectorAll('.site').every((n) => n.getAttribute('class') === 'site listed scenario'));
+  assert.equal(h.root.querySelectorAll('.search-row').length, 0);
+  h.dispose();
+});
+
+test('Claude Code, pending pages and fact reach use their own marks', () => {
+  const h = harness();
+  const s = snapshot({ queries: [query(1, { via: 'web_search', carries: 1 })], pages: [servedPage('https://a.com/', { making: true, status: null, fetches: 0, carries: 1 })] });
+  h.publish(s);
+  assert.equal(h.root.querySelector('.glyph-agent').textContent, '❯');
+  assert.equal(h.root.querySelector('.glyph-browser').getAttribute('visibility'), 'hidden');
+  assert.match(h.root.querySelectorAll('.search-row')[1].textContent, /❯ Claude Code/);
+  assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page making');
+  assert.match(h.root.querySelector('.site').getAttribute('class'), /\bmaking\b/);
+  assert.equal(h.root.querySelector('.page-ring').getAttribute('visibility'), 'visible');
+  assert.equal(h.root.querySelector('.halo').getAttribute('visibility'), 'visible');
+  h.publish({ ...s, queries: [{ ...s.queries[0], carries: 0, outcome: { status: 'pending' } }], pages: [{ ...s.pages[0], making: false, status: 200, fetches: 1, carries: 0 }] });
+  assert.equal(h.root.querySelector('.engine').getAttribute('class'), 'engine asking');
+  assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page stored');
+  assert.equal(h.root.querySelector('.halo').getAttribute('visibility'), 'hidden');
+  assert.equal(h.root.querySelector('.page-ring').getAttribute('visibility'), 'hidden');
+  h.dispose();
+});
+
+test('overflow counts hidden sites and retains the latest page and long tooltips', () => {
+  const h = harness();
+  const pages = Array.from({ length: 25 }, (_, i) => servedPage(`https://site${i}.com/a`, { at_ms: i }));
+  const text = 'A long fact about the new firmware and how to apply the update safely.';
+  h.publish(snapshot({ pages, refused: [{ name: 'a-very-long-private-host.example.corp', at_ms: 1 }], planted: [{ kind: 'fact', text, at_ms: 2 }] }));
+  assert.equal(h.root.querySelectorAll('.site-group').length, 21);
+  assert.match(h.root.textContent, /\+4/);
+  assert.ok(h.root.querySelectorAll('.site-group').some((g) => g.getAttribute('data-host') === 'site24.com'));
+  assert.equal(h.root.querySelector('.planted-mark').querySelector('text').textContent.length, 40);
+  assert.equal(h.root.querySelector('.planted-mark').querySelector('title').textContent, text);
+  assert.equal(h.root.querySelector('.refused-mark').querySelector('title').textContent, 'a-very-long-private-host.example.corp');
+  h.dispose();
+});
+
+test('site growth stops at four pages and result lines retain rank order', () => {
+  const h = harness();
+  const s = recorded('first-search');
+  h.publish({ ...s, pages: Array.from({ length: 5 }, (_, i) => servedPage(`https://www.halvardsystems.com/${i}`, { at_ms: i })) });
+  const group = h.root.querySelectorAll('.site-group').find((g) => g.getAttribute('data-host') === 'www.halvardsystems.com');
+  assert.equal(group.children[0].getAttribute('r'), '14');
+  assert.equal(group.querySelectorAll('.page-group').length, 5);
+  assert.deepEqual(h.root.querySelectorAll('.result').map((line) => Number(line.getAttribute('data-rank'))), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.equal(h.root.querySelector('.glyph-browser').getAttribute('visibility'), 'visible');
+  assert.equal(h.root.querySelector('.caret').getAttribute('visibility'), 'hidden');
+  h.dispose();
 });

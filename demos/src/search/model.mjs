@@ -134,26 +134,3 @@ export function short(host) {
   const text = label || name;
   return text.length > 16 ? `${text.slice(0, 15)}…` : text;
 }
-
-// The picture's parts: the newest search, how each engine answered it,
-// the sites its list named with the pages opened on each, the newest
-// planted items and the newest refused name.
-export function picture(s) {
-  const q = s.queries.at(-1);
-  const key = q?.key;
-  const engines = ENGINES.map((name) => {
-    const asked = s.queries.findLast((other) => other.engine === name && other.key === key);
-    return { name, label: engine(name), tag: asked ? queryTag(s, asked) : 'idle' };
-  });
-  const list = s.results.find((r) => r.key === key);
-  const seedHosts = new Set(s.seed?.sites || []);
-  const hosts = [];
-  for (const r of list?.listed || []) if (!hosts.includes(r.host)) hosts.push(r.host);
-  const sites = hosts.slice(0, 6).map((host) => {
-    const opened = s.pages.filter((p) => p.host === host);
-    return { host, label: short(host), pages: opened.length, seed: seedHosts.has(host), tag: opened.length ? pageTag(opened.at(-1)) : 'listed' };
-  });
-  const planted = (s.planted || []).slice(-2).map((p) => ({ label: p.kind === 'page' ? short(hostOf(p.url)) : 'fact', text: p.text }));
-  const refused = s.refused.filter(typed).at(-1)?.name || null;
-  return { query: q?.search || null, engines, sites, more: Math.max(0, hosts.length - 6), planted, refused };
-}

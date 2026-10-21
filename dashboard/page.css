@@ -1264,7 +1264,7 @@ body.licenses {
   --app-mute: light-dark(#5d6761, #93a09a);
   --app-rule: light-dark(#e0e4de, #263029);
   --app-soft: light-dark(#eef0eb, #1c2320);
-  --app-bad: light-dark(#c43a2f, #ff6b5e);
+  --app-bad: light-dark(#c1392e, #ff6b5e);
   --app-bad-soft: light-dark(#fbe9e7, #3a1a17);
   --app-made: light-dark(#0c6b57, #52c29d);
   --app-made-soft: light-dark(#e2f2ec, #15302a);
@@ -1272,6 +1272,7 @@ body.licenses {
   --app-mem-soft: light-dark(#e7eefc, #1a2340);
   --app-seed: light-dark(#5b45c2, #a898f2);
   --app-seed-soft: light-dark(#ece8fb, #262043);
+  --accent-soft: light-dark(#fbe7df, #3d1f14);
   --app-term-bg: #0d1114;
   --app-term-ink: #dbe3e8;
   --app-shadow: light-dark(rgba(22, 27, 24, 0.12), rgba(0, 0, 0, 0.5));

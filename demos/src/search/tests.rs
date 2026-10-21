@@ -269,6 +269,7 @@ async fn page_declares_the_workspace_and_serves_its_modules() {
     for path in [
         "/panels/web.mjs",
         "/assets/search/model.mjs",
+        "/assets/search/web.mjs",
         "/assets/search/view.mjs",
         "/assets/search/style.css",
     ] {

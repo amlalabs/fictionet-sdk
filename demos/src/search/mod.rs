@@ -59,6 +59,11 @@ impl Topics {
                 include_bytes!("model.mjs").to_vec(),
             )
             .asset(
+                "search/web.mjs",
+                "text/javascript",
+                include_bytes!("web.mjs").to_vec(),
+            )
+            .asset(
                 "search/view.mjs",
                 "text/javascript",
                 include_bytes!("view.mjs").to_vec(),

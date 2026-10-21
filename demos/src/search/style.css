@@ -1,36 +1,50 @@
-/* The world pane: the picture of the newest search above the rows. Colors
-   come from the app's tokens. */
-.search-world { display: flex; flex-direction: column; min-height: 100%; }
+.search-world { display: flex; flex-direction: column; min-height: 100%; color: var(--app-ink); }
 .search-picture { display: block; width: 100%; height: auto; }
-.search-picture .edge { stroke: var(--app-ink); stroke-width: 2; opacity: .55; }
-.search-picture .edge.idle { stroke-dasharray: 4 5; opacity: .25; }
-.search-picture .edge.thin { stroke-width: 1.25; opacity: .3; }
-.search-picture .edge.shared { stroke: var(--app-mem); stroke-dasharray: 4 4; opacity: .8; }
-.search-picture .node { fill: var(--app-pane); stroke: var(--app-ink); stroke-width: 2; }
-.search-picture .node.idle { opacity: .35; }
-.search-picture .node.made { fill: var(--app-made); stroke: var(--app-made); }
-.search-picture .node.again { fill: var(--app-mem); stroke: var(--app-mem); }
-.search-picture .node.stored { fill: var(--app-seed); stroke: var(--app-seed); }
-.search-picture .node.missing { fill: var(--app-soft); stroke: var(--app-mute); }
-.search-picture .node.listed { stroke: var(--app-mute); opacity: .6; }
-.search-picture .node.seed { stroke: var(--app-seed); stroke-width: 3; }
-.search-picture .node.planted { fill: var(--accent); stroke: var(--accent); }
-.search-picture .node.refused { stroke: var(--app-bad); }
-.search-picture .cross { stroke: var(--app-bad); stroke-width: 2.5; }
-.search-picture .label { fill: var(--app-ink); font: 13px var(--sans); }
-.search-picture .label.small { font: 11.5px var(--mono); fill: var(--app-mute); }
-.search-picture .label.muted { fill: var(--app-mute); }
-.search-picture .label.refused { fill: var(--app-bad); font-weight: 600; }
 .search-picture .query { fill: var(--app-soft); stroke: var(--app-rule); }
 .search-picture .query-text { fill: var(--app-ink); font: 13px var(--mono); }
-.search-picture .query-text.idle { fill: var(--app-mute); }
-.search-rows { border-top: 1px solid var(--app-rule); padding: 8px 0; }
-.search-row { display: grid; grid-template-columns: 52px 150px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 7px 18px; font: 12.5px var(--mono); }
+.search-picture .glyph-browser { fill: none; stroke: var(--app-mute); stroke-width: 1.4; }
+.search-picture .glyph-browser circle { fill: var(--app-mute); stroke: none; }
+.search-picture .glyph-agent { fill: var(--app-ink); font: 700 13px var(--mono); }
+.search-picture .caret { fill: var(--app-ink); animation: search-caret 1s steps(1) infinite; }
+@keyframes search-caret { 50% { opacity: 0; } }
+.search-picture .ask { stroke: var(--app-ink); stroke-width: 2; opacity: .55; }
+.search-picture .ask.idle { stroke-dasharray: 4 5; opacity: .22; }
+.search-picture .result { stroke: var(--app-ink); stroke-width: 1.25; opacity: .28; }
+.search-picture .link, .search-picture .arrowhead { fill: none; stroke: var(--app-ink); stroke-width: 1.6; opacity: .55; }
+.search-picture .engine { fill: var(--app-pane); stroke: var(--app-ink); stroke-width: 2; }
+.search-picture .engine.idle { opacity: .35; }
+.search-picture .engine.asking, .search-picture .making { stroke-dasharray: 3 3; }
+.search-picture .engine.stored, .search-picture .page.stored { fill: var(--app-seed); stroke: var(--app-seed); }
+.search-picture .engine.made, .search-picture .page.made { fill: var(--app-made); stroke: var(--app-made); }
+.search-picture .engine.again { fill: var(--app-mem); stroke: var(--app-mem); }
+.search-picture .engine.planted, .search-picture .page.planted { fill: var(--accent); stroke: var(--accent); }
+.search-picture .label { fill: var(--app-ink); font: 13px var(--sans); }
+.search-picture .label.small { fill: var(--app-mute); font: 11.5px var(--mono); }
+.search-picture .label.refused { fill: var(--app-bad); font-weight: 600; }
+.search-picture .label.planted { fill: var(--accent-text); font: 500 12px var(--mono); }
+.search-picture .site { fill: var(--app-pane); stroke: var(--app-mute); stroke-width: 2; }
+.search-picture .site.listed { opacity: .6; }
+.search-picture .site.scenario { stroke: var(--app-seed); stroke-width: 2.5; }
+.search-picture .site.stored { fill: var(--app-seed-soft); stroke: var(--app-seed); }
+.search-picture .site.made { fill: var(--app-made-soft); stroke: var(--app-made); }
+.search-picture .site.again { fill: var(--app-mem-soft); stroke: var(--app-mem); }
+.search-picture .site.planted { fill: var(--accent-soft); stroke: var(--accent); }
+.search-picture .page { stroke-width: 1.5; }
+.search-picture .page.again { fill: var(--app-pane); stroke: var(--app-mem); stroke-width: 2; }
+.search-picture .page.making { fill: var(--app-pane); stroke: var(--app-made); }
+.search-picture .page-ring, .search-picture .halo { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+.search-picture .halo { stroke-dasharray: 2 2.5; }
+.search-picture circle.refused { fill: var(--app-pane); stroke: var(--app-bad); stroke-width: 2; }
+.search-picture .cross { fill: none; stroke: var(--app-bad); stroke-width: 2; stroke-linecap: round; }
+.search-picture .diamond { fill: var(--accent); }
+.search-rows { flex: 1; border-top: 1px solid var(--app-rule); padding: 6px 0; }
+.search-row { display: grid; grid-template-columns: 48px 150px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 7px 18px; font: 12.5px var(--mono); }
 .search-row time, .search-row span { color: var(--app-mute); }
 .search-row span, .search-row b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-row b { font-weight: 500; }
-.search-row em { padding: 1px 8px; border-radius: 999px; background: var(--app-soft); color: var(--app-mute); font: 500 11.5px var(--sans); font-style: normal; }
+.search-row em { padding: 1px 8px; border-radius: 999px; font: 500 11.5px var(--sans); white-space: nowrap; }
 .search-row em.made { background: var(--app-made-soft); color: var(--app-made); }
 .search-row em.again { background: var(--app-mem-soft); color: var(--app-mem); }
-.search-row em.stored, .search-row em.planted { background: var(--app-seed-soft); color: var(--app-seed); }
+.search-row em.planted { background: var(--accent-soft); color: var(--accent-text); }
 .search-row em.refused { background: var(--app-bad-soft); color: var(--app-bad); }
+@media (prefers-reduced-motion: reduce) { .search-picture .caret { animation: none; } }
