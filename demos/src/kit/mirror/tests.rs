@@ -1698,7 +1698,7 @@ async fn served_addresses_feed_the_kit_bulk_policy() {
                 for (src, dst, class) in [
                     ([10, 0, 0, 1], [127, 0, 0, 1], crate::kit::BULK),
                     ([127, 0, 0, 1], [10, 0, 0, 1], crate::kit::BULK),
-                    ([10, 0, 0, 1], [198, 18, 0, 9], crate::kit::AGENT),
+                    ([10, 0, 0, 1], [104, 18, 0, 9], crate::kit::AGENT),
                 ] {
                     let mut data = vec![0; 20];
                     data[0] = 0x45;

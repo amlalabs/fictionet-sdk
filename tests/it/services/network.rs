@@ -1096,7 +1096,7 @@ fn net_keeps_one_budget_per_attachment() {
         let (attacher, attachments) = fictionet::attachments();
         let (addr, addr6) = (
             Ipv4Addr::new(10, 40, 0, 3),
-            "2001:2::3".parse::<Ipv6Addr>()?,
+            "2606:4700:100::3".parse::<Ipv6Addr>()?,
         );
         let me6: Ipv6Addr = "2001:db8::2".parse()?;
         let spy = Spy::default();
@@ -1237,7 +1237,7 @@ fn lan_cannot_overlap_the_automatic_address_pool() {
         let (_, attachments) = fictionet::attachments();
         let error = Net::new()
             .ipv4_only()
-            .lan("lab", "198.18.0.0/24".parse()?)
+            .lan("lab", "104.18.0.0/24".parse()?)
             .start(&fcx, attachments)
             .expect_err("overlapping LAN is refused");
         assert!(error.to_string().contains("automatic address pool"));
@@ -1250,7 +1250,7 @@ fn ipv6_lan_cannot_overlap_the_automatic_address_pool() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_, attachments) = fictionet::attachments();
         let error = Net::new()
-            .lan("lab", "2001:2::/64".parse()?)
+            .lan("lab", "2606:4700:100::/64".parse()?)
             .start(&fcx, attachments)
             .expect_err("overlapping LAN is refused");
         assert!(error.to_string().contains("automatic address pool"));

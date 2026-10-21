@@ -582,16 +582,16 @@ fn http_door_connects_and_forwards() {
 
     // Bearer works too, and the CONNECT target may be an address. (Sites
     // gives plain.test its address at the first lookup, above.)
-    let (_, head) = connect(&a, "198.18.0.1:80", Some(&format!("Bearer {TOKEN}")));
+    let (_, head) = connect(&a, "104.18.0.1:80", Some(&format!("Bearer {TOKEN}")));
     assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
 
     assert!(
-        a.logged("CONNECT plain.test:80 (198.18.0.1) 200"),
+        a.logged("CONNECT plain.test:80 (104.18.0.1) 200"),
         "{}",
         a.log()
     );
     assert!(
-        a.logged("GET http://plain.test:80/ (198.18.0.1) 200"),
+        a.logged("GET http://plain.test:80/ (104.18.0.1) 200"),
         "{}",
         a.log()
     );
@@ -973,7 +973,7 @@ fn socks5_carries_bytes_both_ways() {
     // By address, with ATYP 1.
     let mut s = a.connect();
     socks_login(&mut s, b"x", TOKEN.as_bytes());
-    s.write_all(&[5, 1, 0, 1, 198, 18, 0, 1, 0, 80]).unwrap();
+    s.write_all(&[5, 1, 0, 1, 104, 18, 0, 1, 0, 80]).unwrap();
     let mut reply = [0u8; 10];
     s.read_exact(&mut reply).unwrap();
     assert_eq!(reply[1], 0);

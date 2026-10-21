@@ -484,7 +484,12 @@ fn events_for_dns_queries() {
                     Some(1),
                     format!("addr {SECURE_ADDR}")
                 ),
-                (false, Some("secure.test"), Some(28), a("addr 2001:2::1")),
+                (
+                    false,
+                    Some("secure.test"),
+                    Some(28),
+                    a("addr 2606:4700:100::1")
+                ),
                 (false, Some("nope.test"), Some(1), a("nxdomain")),
                 (true, Some("nope.test"), Some(1), a("nxdomain")),
                 (false, None, None, a("error 1")),

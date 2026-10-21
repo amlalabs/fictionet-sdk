@@ -36,28 +36,7 @@ pub fn check(name: &str, ok: bool) -> io::Result<()> {
     }
 }
 
-/// Address ranges that must not appear on a guest's internet.
-pub fn reserved_address(address: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    match address {
-        IpAddr::V4(a) => {
-            let [a, b, c, _] = a.octets();
-            (a == 198 && (b == 18 || b == 19))
-                || (a == 192 && b == 0 && c == 2)
-                || (a == 198 && b == 51 && c == 100)
-                || (a == 203 && b == 0 && c == 113)
-                || (a == 100 && (64..128).contains(&b))
-                || a >= 240
-        }
-        IpAddr::V6(a) => {
-            if let Some(v4) = a.to_ipv4_mapped() {
-                return reserved_address(v4.into());
-            }
-            let s = a.segments();
-            s[0] == 0x2001 && ((s[1] == 2 && s[2] == 0) || s[1] == 0xdb8)
-        }
-    }
-}
+pub use fictionet::stdlib::network::ip::{non_public_address, reserved_address};
 
 /// Whether a link address has an ordinary vendor prefix.
 pub fn vendor_mac(mac: [u8; 6]) -> bool {

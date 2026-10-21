@@ -24,7 +24,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         assert_eq!(&icmp[8..], &sent.0[..]);
 
         // A site's address before its name was looked up: unreachable too.
-        raw.send(ping(me, Ipv4Addr::new(198, 18, 0, 1), 2));
+        raw.send(ping(me, Ipv4Addr::new(104, 18, 0, 1), 2));
         let (_, _, _, icmp) = parse(
             &recv_within(&fcx, &mut raw, Duration::from_secs(2))
                 .await
@@ -47,9 +47,9 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         assert_eq!((src, proto), (GATEWAY, 17));
         assert_eq!(
             parse_dns(&u[8..], 99),
-            (ResponseCode::NoError, vec![Ipv4Addr::new(198, 18, 0, 1)])
+            (ResponseCode::NoError, vec![Ipv4Addr::new(104, 18, 0, 1)])
         );
-        raw.send(ping(me, Ipv4Addr::new(198, 18, 0, 1), 3));
+        raw.send(ping(me, Ipv4Addr::new(104, 18, 0, 1), 3));
         let (src, dst, _, icmp) = parse(
             &recv_within(&fcx, &mut raw, Duration::from_secs(2))
                 .await
@@ -57,7 +57,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         );
         assert_eq!(
             (src, dst, icmp[0]),
-            (Ipv4Addr::new(198, 18, 0, 1), me, 0),
+            (Ipv4Addr::new(104, 18, 0, 1), me, 0),
             "an echo reply from the site"
         );
 
@@ -71,7 +71,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         assert_eq!((src, icmp[0]), (GATEWAY, 0));
 
         // UDP to a site: port unreachable, so clients fail at once.
-        raw.send(udp(me, 5000, Ipv4Addr::new(198, 18, 0, 1), 9999, b"x"));
+        raw.send(udp(me, 5000, Ipv4Addr::new(104, 18, 0, 1), 9999, b"x"));
         let (_, _, proto, icmp) = parse(
             &recv_within(&fcx, &mut raw, Duration::from_secs(2))
                 .await
@@ -347,23 +347,23 @@ pub(super) async fn raw_dns(
     }
 }
 
-/// A subnet inside `198.18.0.0/15`: automatic addresses skip it, so the
+/// A subnet inside `104.18.0.0/15`: automatic addresses skip it, so the
 /// first site does not take the gateway's address and DNS keeps answering.
 #[test]
 fn automatic_addresses_skip_the_sandboxes_subnet() {
-    world_on_subnet("198.18.0.0/24", |fcx, attacher| async move {
-        let gw = Ipv4Addr::new(198, 18, 0, 1);
-        let me = Ipv4Addr::new(198, 18, 0, 2);
+    world_on_subnet("104.18.0.0/24", |fcx, attacher| async move {
+        let gw = Ipv4Addr::new(104, 18, 0, 1);
+        let me = Ipv4Addr::new(104, 18, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let (code, first) = raw_dns(&fcx, &mut raw, me, gw, "one.test", 1)
             .await
             .expect("DNS answers");
         assert_eq!(code, ResponseCode::NoError);
-        assert_eq!(first, vec![Ipv4Addr::new(198, 18, 1, 0)]);
+        assert_eq!(first, vec![Ipv4Addr::new(104, 18, 1, 0)]);
         let (_, second) = raw_dns(&fcx, &mut raw, me, gw, "two.test", 2)
             .await
             .expect("DNS still answers");
-        assert_eq!(second, vec![Ipv4Addr::new(198, 18, 1, 1)]);
+        assert_eq!(second, vec![Ipv4Addr::new(104, 18, 1, 1)]);
         // The gateway still answers pings, and so does the site.
         for (to, seq) in [(gw, 1), (first[0], 2)] {
             raw.send(ping(me, to, seq));

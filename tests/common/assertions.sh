@@ -202,6 +202,6 @@ drain_connections() {
             [[ $remaining == 0 ]] && exit 0
             sleep 0.1
         done
-        echo "$remaining connections to 198.18.0.1:80 did not close within 10 s" >&2
+        echo "$remaining connections to 104.18.0.1:80 did not close within 10 s" >&2
         exit 1'
 }

@@ -237,18 +237,18 @@
 //!     1   0.000000 fe80::16b2:3fa9:a146:cf9c → ff02::2      ICMPv6 48 Router Solicitation
 //!     2   0.104195     10.0.0.2 → 10.0.0.1     DNS 58 Standard query 0x15e0 A example.test
 //!     3   0.104199     10.0.0.2 → 10.0.0.1     DNS 58 Standard query 0x095e AAAA example.test
-//!     4   0.104775     10.0.0.1 → 10.0.0.2     DNS 74 Standard query response 0x15e0 A example.test A 198.18.0.1
-//!     5   0.104778     10.0.0.1 → 10.0.0.2     DNS 86 Standard query response 0x095e AAAA example.test AAAA 2001:2::1
-//!     6   0.104854  2001:db8::2 → 2001:2::1    TCP 80 46286 → 80 [SYN] Seq=0 Win=64800 Len=0 MSS=1440 SACK_PERM TSval=828074653 TSecr=0 WS=1024
-//!     7   0.104977    2001:2::1 → 2001:db8::2  TCP 72 80 → 46286 [SYN, ACK] Seq=0 Ack=1 Win=65535 Len=0 MSS=1440 WS=8 SACK_PERM
-//!     8   0.105005  2001:db8::2 → 2001:2::1    TCP 60 46286 → 80 [ACK] Seq=1 Ack=1 Win=65536 Len=0
-//!     9   0.105018  2001:db8::2 → 2001:2::1    HTTP 136 GET / HTTP/1.1
-//!    10   0.105519    2001:2::1 → 2001:db8::2  HTTP 193 HTTP/1.1 200 OK  (text/plain)
-//!    11   0.105532  2001:db8::2 → 2001:2::1    TCP 60 46286 → 80 [ACK] Seq=77 Ack=134 Win=65536 Len=0
-//!    12   0.105568  2001:db8::2 → 2001:2::1    TCP 60 46286 → 80 [FIN, ACK] Seq=77 Ack=134 Win=65536 Len=0
-//!    13   0.105579    2001:2::1 → 2001:db8::2  TCP 60 80 → 46286 [ACK] Seq=134 Ack=78 Win=262144 Len=0
-//!    14   0.105581    2001:2::1 → 2001:db8::2  TCP 60 80 → 46286 [FIN, ACK] Seq=134 Ack=78 Win=262144 Len=0
-//!    15   0.105597  2001:db8::2 → 2001:2::1    TCP 60 46286 → 80 [ACK] Seq=78 Ack=135 Win=65536 Len=0
+//!     4   0.104775     10.0.0.1 → 10.0.0.2     DNS 74 Standard query response 0x15e0 A example.test A 104.18.0.1
+//!     5   0.104778     10.0.0.1 → 10.0.0.2     DNS 86 Standard query response 0x095e AAAA example.test AAAA 2606:4700:100::1
+//!     6   0.104854  2001:db8::2 → 2606:4700:100::1    TCP 80 46286 → 80 [SYN] Seq=0 Win=64800 Len=0 MSS=1440 SACK_PERM TSval=828074653 TSecr=0 WS=1024
+//!     7   0.104977    2606:4700:100::1 → 2001:db8::2  TCP 72 80 → 46286 [SYN, ACK] Seq=0 Ack=1 Win=65535 Len=0 MSS=1440 WS=8 SACK_PERM
+//!     8   0.105005  2001:db8::2 → 2606:4700:100::1    TCP 60 46286 → 80 [ACK] Seq=1 Ack=1 Win=65536 Len=0
+//!     9   0.105018  2001:db8::2 → 2606:4700:100::1    HTTP 136 GET / HTTP/1.1
+//!    10   0.105519    2606:4700:100::1 → 2001:db8::2  HTTP 193 HTTP/1.1 200 OK  (text/plain)
+//!    11   0.105532  2001:db8::2 → 2606:4700:100::1    TCP 60 46286 → 80 [ACK] Seq=77 Ack=134 Win=65536 Len=0
+//!    12   0.105568  2001:db8::2 → 2606:4700:100::1    TCP 60 46286 → 80 [FIN, ACK] Seq=77 Ack=134 Win=65536 Len=0
+//!    13   0.105579    2606:4700:100::1 → 2001:db8::2  TCP 60 80 → 46286 [ACK] Seq=134 Ack=78 Win=262144 Len=0
+//!    14   0.105581    2606:4700:100::1 → 2001:db8::2  TCP 60 80 → 46286 [FIN, ACK] Seq=134 Ack=78 Win=262144 Len=0
+//!    15   0.105597  2001:db8::2 → 2606:4700:100::1    TCP 60 46286 → 80 [ACK] Seq=78 Ack=135 Win=65536 Len=0
 //! ```
 //!
 //! The first packet is the sandbox's kernel looking for an IPv6 router as

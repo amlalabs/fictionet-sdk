@@ -351,7 +351,7 @@ async fn catalog_request(cx: &Cx, site: Model, request: Request<Body>) -> Respon
     let (attacher, attachments) = fictionet::attachments();
     net::Net::new()
         .host("catalog", |host| {
-            host.at(Ipv4Addr::new(198, 18, 0, 1))
+            host.at(Ipv4Addr::new(104, 18, 0, 1))
                 .dns_name("chatgpt.com")
                 .port_server(80, httpd::Server::new(site))
         })
@@ -360,7 +360,7 @@ async fn catalog_request(cx: &Cx, site: Model, request: Request<Body>) -> Respon
     let end = attacher.attach("client").unwrap();
     let (t, _u, _i, _o) = ip::split_protocols(cx, end);
     let mut conn = tcp::endpoint(cx, t, Ipv4Addr::new(10, 0, 0, 2).into())
-        .connect(cx, SocketAddr::from(([198, 18, 0, 1], 80)))
+        .connect(cx, SocketAddr::from(([104, 18, 0, 1], 80)))
         .await
         .unwrap();
     let mut wire = format!(

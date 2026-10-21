@@ -95,6 +95,102 @@ use fictionet::stdlib::network::{
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, End, Interface, Packet};
 
+pub(crate) const RESERVED_RANGES: [super::route::Prefix; 8] = [
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)),
+        len: 15,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)),
+        len: 24,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)),
+        len: 24,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)),
+        len: 24,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)),
+        len: 10,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0)),
+        len: 4,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V6(Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0)),
+        len: 48,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)),
+        len: 32,
+    },
+];
+
+pub(crate) const LOCAL_RANGES: [super::route::Prefix; 8] = [
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+        len: 8,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)),
+        len: 12,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)),
+        len: 16,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
+        len: 8,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)),
+        len: 7,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)),
+        len: 16,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+        len: 128,
+    },
+    super::route::Prefix {
+        addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)),
+        len: 10,
+    },
+];
+
+/// Whether an address is in benchmarking, documentation, shared address
+/// space or IPv4 future-use space, including IPv6 benchmarking and
+/// documentation ranges. These ranges are excluded even on a guest's LAN.
+/// Private, loopback, link-local and unique local addresses are allowed.
+/// IPv4-mapped addresses use IPv4 rules.
+pub fn reserved_address(address: IpAddr) -> bool {
+    let address = unmapped(address);
+    RESERVED_RANGES.iter().any(|range| range.contains(address))
+}
+
+/// Whether an address is unsuitable for a public internet host: the ranges
+/// in [`reserved_address`] plus private, loopback, link-local and unique
+/// local space. IPv4-mapped addresses use IPv4 rules.
+/// This covers these ranges, rather than every IANA special-purpose range.
+pub fn non_public_address(address: IpAddr) -> bool {
+    let address = unmapped(address);
+    reserved_address(address) || LOCAL_RANGES.iter().any(|range| range.contains(address))
+}
+
+fn unmapped(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(a) => a.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(address),
+        _ => address,
+    }
+}
+
 /// Each interface a split returns holds at most this many bytes of packets
 /// each way, counting 64 bytes more for each packet; past that, packets
 /// are dropped. A world that keeps an interface it never reads, such as
@@ -1683,6 +1779,33 @@ mod tests {
 
     fn at(secs: u64) -> Instant {
         Instant::from_since_start(Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn address_rules_distinguish_local_and_reserved_space() {
+        for (ranges, reserved) in [(&RESERVED_RANGES[..], true), (&LOCAL_RANGES[..], false)] {
+            for range in ranges {
+                for address in [range.addr, range.last()] {
+                    assert_eq!(reserved_address(address), reserved, "{address}");
+                    assert!(non_public_address(address), "{address}");
+                    if let IpAddr::V4(address) = address {
+                        let mapped = address.to_ipv6_mapped().into();
+                        assert_eq!(reserved_address(mapped), reserved, "{mapped}");
+                        assert!(non_public_address(mapped), "{mapped}");
+                    }
+                }
+            }
+        }
+        for address in [
+            "104.18.0.1", "104.19.255.254", "2606:4700:100::1",
+            "172.15.255.255", "172.32.0.0", "100.63.255.255", "100.128.0.0",
+            "169.253.255.255", "169.255.0.0", "fe7f:ffff::1", "fec0::1",
+            "fbff::1", "fe00::1", "::ffff:104.18.0.1",
+        ] {
+            let address = address.parse().unwrap();
+            assert!(!reserved_address(address), "{address}");
+            assert!(!non_public_address(address), "{address}");
+        }
     }
 
     #[test]

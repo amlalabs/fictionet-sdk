@@ -287,7 +287,7 @@ fn a_host_that_is_not_this_site_gets_421() {
             StatusCode::MISDIRECTED_REQUEST
         );
         assert_eq!(
-            client.get("http", "198.18.0.1", "/").await.status,
+            client.get("http", "104.18.0.1", "/").await.status,
             StatusCode::MISDIRECTED_REQUEST
         );
         Ok(())
@@ -1060,4 +1060,62 @@ fn eager_sites_send_the_world_date_without_a_lookup() {
         });
         assert!(result.is_err_and(|e| e.downcast_ref::<Done>().is_some()));
     }
+}
+
+#[cfg(feature = "web-proxy")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarding_bypasses_a_world_host_at_the_upstream_address() {
+    let route = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    route.connect("192.0.2.1:9").unwrap();
+    let IpAddr::V4(address) = route.local_addr().unwrap().ip() else {
+        panic!("an IPv4 socket has an IPv4 address");
+    };
+    let listener = tokio::net::TcpListener::bind((address, 0)).await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let (seen_tx, seen) = mpsc::channel();
+    let server = tokio::spawn(test_upstream(listener, seen_tx));
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        run(
+            RunOptions::new(fictionet::Seed::random()),
+            move |fcx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                let forward =
+                    web::forward(&fcx, upstream, Arc::new(fictionet_host::Client::new()))?;
+                web::Sites::new(move |name| match name {
+                    "world.test" => Some(web::Site::new(Plain("world")).at(address)),
+                    "forward.test" => Some(web::Site::new(forward.clone())),
+                    _ => None,
+                })
+                .start(&fcx, attachments)?;
+                let m = default_machine(&fcx, &attacher);
+                assert_eq!(lookup(&fcx, &m, "world.test").await, address);
+                let mut local = plain_client(&fcx, &m, address, false).await;
+                assert_eq!(
+                    local.get("http", "world.test", "/").await.body,
+                    "world http world.test 80 HTTP/1.1 /"
+                );
+                assert_eq!(seen.try_recv(), Err(mpsc::TryRecvError::Empty));
+                let forward_address = lookup(&fcx, &m, "forward.test").await;
+                let mut client = plain_client(&fcx, &m, forward_address, false).await;
+                let response = client.get("http", "forward.test", "/forwarded").await;
+                assert_eq!(response.status, StatusCode::OK);
+                assert_eq!(response.body, "upstream");
+                let request = seen.try_recv().expect("the real host receives the request");
+                assert!(
+                    request.starts_with("GET /forwarded HTTP/1.1\r\n"),
+                    "{request}"
+                );
+                assert_eq!(seen.try_recv(), Err(mpsc::TryRecvError::Empty));
+                fcx.cancel();
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .expect("timed out");
+    server.abort();
+    result.unwrap();
 }

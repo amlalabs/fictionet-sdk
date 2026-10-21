@@ -375,7 +375,7 @@ mod tests {
             .await,
         );
         lines.push(ask(plain(shared).await, false, "GET", "/x", "nope.test", vec![]).await);
-        let auto: IpAddr = Ipv4Addr::new(198, 18, 0, 1).into();
+        let auto: IpAddr = Ipv4Addr::new(104, 18, 0, 1).into();
         lines.push(ask(plain(auto).await, false, "GET", "/mb", "plain.test", vec![]).await);
         lines.push(
             ask(
@@ -399,7 +399,7 @@ mod tests {
             )
             .await,
         );
-        let v4: IpAddr = Ipv4Addr::new(198, 18, 0, 2).into();
+        let v4: IpAddr = Ipv4Addr::new(104, 18, 0, 2).into();
         lines.push(
             ask(
                 tls(v4, "v4only.test", b"http/1.1").await,

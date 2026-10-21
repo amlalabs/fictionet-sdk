@@ -29,7 +29,7 @@ pub async fn start(
     let ids = border_world::identities(&cx, &ca)?;
     let mirror = world.mirror(&cx)?;
     let mut extra = Extra::default().route(kit::JUMP, kit::jump_prefix());
-    let address = |index: u8| Ipv4Addr::new(198, 18, 0, index + 10);
+    let address = |index: u8| Ipv4Addr::new(104, 18, 0, index + 10);
     for (index, name) in ["archive.ubuntu.com", "security.ubuntu.com"]
         .into_iter()
         .chain(kit::desktop::HOSTS.iter().copied())

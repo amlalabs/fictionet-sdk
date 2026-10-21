@@ -179,11 +179,18 @@ async fn guest(run: &Run, command: &str) -> Result<String> {
 }
 
 async fn network_addresses(run: &Run) -> Result {
-    fn address(text: &str) -> Result {
+    fn address(text: &str, public: bool) -> Result {
         let address = text.parse::<std::net::IpAddr>()?;
         check(
-            &format!("guest address {address} is outside reserved ranges"),
-            !checks::reserved_address(address),
+            &format!(
+                "guest address {address} is outside {} ranges",
+                if public { "non-public" } else { "reserved" },
+            ),
+            !(if public {
+                checks::non_public_address(address)
+            } else {
+                checks::reserved_address(address)
+            }),
         )?;
         Ok(())
     }
@@ -202,6 +209,19 @@ async fn network_addresses(run: &Run) -> Result {
     let link: Vec<Value> = serde_json::from_str(&guest(run, "ip -j link show dev eth0").await?)?;
     check("guest has one Ethernet link", link.len() == 1)?;
     mac(link[0]["address"].as_str().ok_or("missing link address")?)?;
+    let interfaces: Vec<Value> =
+        serde_json::from_str(&guest(run, "ip -j addr show dev eth0").await?)?;
+    let mut addresses = 0;
+    for interface in interfaces {
+        for local in interface["addr_info"]
+            .as_array()
+            .ok_or("missing interface addresses")?
+        {
+            address(local["local"].as_str().ok_or("missing LAN address")?, false)?;
+            addresses += 1;
+        }
+    }
+    check("guest has a LAN address", addresses > 0)?;
     for host in [
         "api.anthropic.com",
         "www.google.com",
@@ -214,6 +234,7 @@ async fn network_addresses(run: &Run) -> Result {
                 line.split_whitespace()
                     .next()
                     .ok_or("missing DNS address")?,
+                true,
             )?;
         }
     }
@@ -221,7 +242,10 @@ async fn network_addresses(run: &Run) -> Result {
         serde_json::from_str(&guest(run, "ip -j neigh show dev eth0").await?)?;
     check("guest has a gateway neighbor", !neighbors.is_empty())?;
     for neighbor in neighbors {
-        address(neighbor["dst"].as_str().ok_or("missing neighbor address")?)?;
+        address(
+            neighbor["dst"].as_str().ok_or("missing neighbor address")?,
+            false,
+        )?;
         mac(neighbor["lladdr"]
             .as_str()
             .ok_or("missing neighbor link address")?)?;

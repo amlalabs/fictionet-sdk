@@ -1362,7 +1362,7 @@ mod tests {
             w.remember(
                 &format!("s{i}.test"),
                 Known::Host(Placed {
-                    v4: Some(Ipv4Addr::new(198, 18, 0, i + 1)),
+                    v4: Some(Ipv4Addr::new(104, 18, 0, i + 1)),
                     v6: None,
                 }),
             );

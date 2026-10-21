@@ -62,7 +62,7 @@ fn dst(to: u8) -> Ipv4Addr {
         GATEWAY,
         SITE_ADDR,
         DEFAULT_ADDR,
-        Ipv4Addr::new(198, 18, 0, 1),
+        Ipv4Addr::new(104, 18, 0, 1),
         Ipv4Addr::new(10, 0, 0, 3),
     ][to as usize % 5]
 }

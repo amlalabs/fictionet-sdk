@@ -915,7 +915,7 @@ pub(super) mod tests {
             at: Instant::ZERO,
         };
         let mirror = base("GET").conn(&ConnInfo {
-            local: Some(([198, 18, 0, 1], 80).into()),
+            local: Some(([104, 18, 0, 1], 80).into()),
             ..Default::default()
         });
         facts.observe(stamp, Observation::Event(&mirror));

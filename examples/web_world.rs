@@ -21,7 +21,7 @@
 //!   Both live at 203.0.113.10 and 2001:db8:113::10.
 //! - `shared.test`: a plain HTTP site at the same addresses, with no TLS.
 //! - `plain.test`: a plain HTTP site with addresses of its own, from
-//!   `198.18.0.0/15` and `2001:2::/48`, with no TLS, so its port 443 is
+//!   `104.18.0.0/15` and `2606:4700:100::/48`, with no TLS, so its port 443 is
 //!   closed. Every path answers with the request's target.
 //! - `v4only.test` and `v6only.test`: the same app over HTTPS, with only
 //!   an IPv4 or only an IPv6 address. DNS answers the other record type

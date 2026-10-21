@@ -475,7 +475,7 @@ async fn a_live_page_stays_making_until_the_model_answers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
-    use crate::kit::{checks::reserved_address, mirror};
+    use crate::kit::{checks::non_public_address, mirror};
     use fictionet::stdlib::protocols::x509::Certificate;
     use fictionet_extras::models::{Credential, Model, Provider, Secret};
     let seed = Seed::builtin("halvard-cve").unwrap();
@@ -521,7 +521,11 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
                     let RData::A(address) = record.data else {
                         panic!("unexpected answer for {host}")
                     };
-                    assert!(!reserved_address(address.0.into()), "{host}: {}", address.0);
+                    assert!(
+                        !non_public_address(address.0.into()),
+                        "{host}: {}",
+                        address.0
+                    );
                     assert_eq!(address.0, assigned, "{host}");
                 }
                 let answer = machine

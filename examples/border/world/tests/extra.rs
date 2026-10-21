@@ -22,7 +22,7 @@ fn extra_hosts_and_admin_routes_work_in_both_modes() {
         let ca = Ca::new(&cx, "Test Root CA")?;
         let ids = border_world::identities(&cx, &ca)?;
         let (attacher, attachments) = fictionet::attachments();
-        let extra = Ipv4Addr::new(198, 18, 0, 10);
+        let extra = Ipv4Addr::new(104, 18, 0, 10);
         let admin = Ipv4Addr::new(10, 10, 5, 20);
         let routing = border_world::start_with(
             &cx,

@@ -314,7 +314,7 @@ fn connections_that_send_nothing_are_closed() {
             .start(&fcx, attachments)?;
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let plain = Ipv4Addr::new(198, 18, 0, 1);
+        let plain = Ipv4Addr::new(104, 18, 0, 1);
         // Look the names up, over raw DNS, so their machines exist.
         for name in ["secure.test", "plain.test"] {
             let mut q = Message::new(7, MessageType::Query, OpCode::Query);
@@ -480,7 +480,7 @@ fn ten_thousand_sites_do_not_slow_the_network() {
         }
         assert_eq!(answers, n);
         // The last site answers.
-        let last = Ipv4Addr::from(u32::from(Ipv4Addr::new(198, 18, 0, 0)) + n);
+        let last = Ipv4Addr::from(u32::from(Ipv4Addr::new(104, 18, 0, 0)) + n);
         raw.send(ping(me, last, 1));
         let (src, _, _, icmp) = parse(
             &recv_within(&fcx, &mut raw, Duration::from_secs(2))

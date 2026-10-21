@@ -847,10 +847,10 @@
 //! ```text
 //! fictionet attach: agent attached; HTTP proxy on 0.0.0.0:8080, as 10.0.0.2 with DNS at 10.0.0.1
 //! fictionet attach: CONNECT example.test:443 (203.0.113.10) 200, 1927 bytes up, 1190 down, 0.002 s
-//! fictionet attach: GET http://plain.test:80/x (198.18.0.1) 200, 0 bytes up, 30 down, 0.000 s
-//! fictionet attach: GET http://plain.test:80/broken (198.18.0.1) 200, 0 bytes up, 100 down, 0.001 s, ended early by the world: connection reset
-//! fictionet attach: POST http://plain.test:80/upload (198.18.0.1) 502, 1000 bytes up, 0 down, 0.001 s, no answer from the site, ended early by the world: connection reset
-//! fictionet attach: POST http://plain.test:80/upload (198.18.0.1) no final response, 0 bytes up, 0 down, 0.001 s
+//! fictionet attach: GET http://plain.test:80/x (104.18.0.1) 200, 0 bytes up, 30 down, 0.000 s
+//! fictionet attach: GET http://plain.test:80/broken (104.18.0.1) 200, 0 bytes up, 100 down, 0.001 s, ended early by the world: connection reset
+//! fictionet attach: POST http://plain.test:80/upload (104.18.0.1) 502, 1000 bytes up, 0 down, 0.001 s, no answer from the site, ended early by the world: connection reset
+//! fictionet attach: POST http://plain.test:80/upload (104.18.0.1) no final response, 0 bytes up, 0 down, 0.001 s
 //! fictionet attach: CONNECT nope.test:443 502 no such name in the world
 //! fictionet attach: CONNECT example.test:443 407 no token
 //! ```

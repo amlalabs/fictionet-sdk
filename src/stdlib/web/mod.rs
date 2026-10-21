@@ -336,8 +336,8 @@
 //!   is made [`ipv4_only`](Site::ipv4_only) or
 //!   [`ipv6_only`](Site::ipv6_only). A site with [`at`](Site::at) uses the
 //!   addresses given there. For a family without one, it gets a free
-//!   address from a range set aside for testing: `198.18.0.0/15` for IPv4,
-//!   `2001:2::/48` for IPv6. Sites with the same address share one
+//!   address from the automatic pools: `104.18.0.0/15` for IPv4,
+//!   `2606:4700:100::/48` for IPv6. Sites with the same address share one
 //!   machine.
 //! - **A router** with one route per machine, added as sites appear. A
 //!   packet for any other address gets an ICMP "host unreachable" reply, or
@@ -407,8 +407,8 @@
 //!   rules of RFC 6724, and with a unique local source address they prefer
 //!   IPv4 for every site with a global address. With a global-looking
 //!   source address, they prefer IPv6, as on a real dual-stack network.
-//! - **Sites' automatic addresses, `2001:2::/48`,** come from the range
-//!   set aside for benchmarking (RFC 5180), as `198.18.0.0/15` is for IPv4.
+//! - **Sites' automatic addresses, `2606:4700:100::/48`,** use public CDN
+//!   space, as `104.18.0.0/15` does for IPv4.
 //!
 //! How IPv6 works here:
 //!
@@ -546,10 +546,10 @@
 //! - **Names.** The callback gets each name in lowercase, without the
 //!   trailing dot. Lookups of `Example.COM.` and `example.com` are the same
 //!   lookup. Answers have a TTL of 60 seconds.
-//! - **Automatic addresses** are handed out in order from `198.18.0.1` and
-//!   `2001:2::1`. Addresses inside the sandboxes' subnets are skipped, so a
-//!   subnet such as `198.18.0.0/24` works too. A subnet that covers all of
-//!   `198.18.0.0/15` or `2001:2::/48` leaves no automatic addresses of that
+//! - **Automatic addresses** are handed out in order from `104.18.0.1` and
+//!   `2606:4700:100::1`. Addresses inside the sandboxes' subnets are skipped, so a
+//!   subnet such as `104.18.0.0/24` works too. A subnet that covers all of
+//!   `104.18.0.0/15` or `2606:4700:100::/48` leaves no automatic addresses of that
 //!   family: sites without [`at`](Site::at) then have only the other
 //!   family, and a site with neither gets NXDOMAIN.
 //! - **Machines** answer pings, refuse TCP on ports other than 80 and 443
@@ -820,7 +820,7 @@ impl Site {
     /// ```
     ///
     /// A family without `at` gets a free address from that family's pool:
-    /// `198.18.0.0/15` for IPv4, `2001:2::/48` for IPv6. An address given
+    /// `104.18.0.0/15` for IPv4, `2606:4700:100::/48` for IPv6. An address given
     /// for a family the site does not have (see
     /// [`ipv4_only`](Site::ipv4_only)) is not used.
     ///

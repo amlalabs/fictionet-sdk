@@ -1890,7 +1890,28 @@ fn guest_macs_have_a_stable_vendor_address_per_hostname() {
 }
 
 #[test]
-fn network_checks_reject_reserved_addresses_and_local_macs() {
+fn network_checks_distinguish_lan_and_public_addresses_and_local_macs() {
+    for address in [
+        "10.0.0.1",
+        "10.10.5.20",
+        "172.16.0.1",
+        "172.31.255.255",
+        "192.168.1.1",
+        "127.0.0.1",
+        "fc00::1",
+        "fdff:ffff::1",
+        "169.254.0.1",
+        "169.254.255.255",
+        "::1",
+        "fe80::1",
+        "febf:ffff::1",
+        "::ffff:10.0.0.1",
+        "::ffff:169.254.1.1",
+    ] {
+        let address = address.parse().unwrap();
+        assert!(!checks::reserved_address(address), "{address}");
+        assert!(checks::non_public_address(address), "{address}");
+    }
     for address in [
         "198.18.0.0",
         "198.19.255.255",
@@ -1909,19 +1930,29 @@ fn network_checks_reject_reserved_addresses_and_local_macs() {
             checks::reserved_address(address.parse().unwrap()),
             "{address}"
         );
+        assert!(
+            checks::non_public_address(address.parse().unwrap()),
+            "{address}"
+        );
     }
     for address in [
-        "10.0.0.1",
-        "10.10.5.20",
+        "104.18.0.1",
+        "104.19.255.254",
+        "2606:4700:100::1",
+        "172.15.255.255",
+        "172.32.0.0",
         "104.21.48.57",
         "172.67.13.55",
         "100.63.255.255",
         "100.128.0.0",
         "2001:4860:4860::8888",
-        "fe80::1",
     ] {
         assert!(
             !checks::reserved_address(address.parse().unwrap()),
+            "{address}"
+        );
+        assert!(
+            !checks::non_public_address(address.parse().unwrap()),
             "{address}"
         );
     }

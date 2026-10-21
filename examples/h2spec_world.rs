@@ -27,7 +27,7 @@ use fictionet::stdlib::world::net::{Net, Sni};
 use fictionet::stdlib::{services::ca::Ca, web::httpd, world::sandbox};
 use fictionet::tokio::ConnectionTokioExt;
 
-const SITE: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+const SITE: Ipv4Addr = Ipv4Addr::new(104, 18, 0, 1);
 const BODY: &[u8] = b"hello from the native HTTP/2 server\n";
 
 fn main() -> fictionet::Result {

@@ -1747,11 +1747,11 @@ fn peer_admission_is_shared_by_machines_and_dns() {
                 ..Default::default()
             })
             .host("one", |h| {
-                h.at(Ipv4Addr::new(198, 18, 0, 2))
+                h.at(Ipv4Addr::new(104, 18, 0, 2))
                     .tcp(7, Arc::new(()), || Loud { size: 1 })
             })
             .host("two", |h| {
-                h.at(Ipv4Addr::new(198, 18, 0, 3))
+                h.at(Ipv4Addr::new(104, 18, 0, 3))
                     .tcp(7, Arc::new(()), || Loud { size: 1 })
             })
             .start(&fcx, attachments)?;
@@ -1760,10 +1760,10 @@ fn peer_admission_is_shared_by_machines_and_dns() {
             attacher.attach("a")?,
             Ipv4Addr::new(10, 0, 0, 2),
         );
-        let mut first = m.tcp.connect(&fcx, "198.18.0.2:7".parse()?).await?;
+        let mut first = m.tcp.connect(&fcx, "104.18.0.2:7".parse()?).await?;
         first.write_all(&fcx, b"hello\n").await?;
         assert_eq!(io::read_some(&fcx, &mut first, 1).await, b"x");
-        let mut second = m.tcp.connect(&fcx, "198.18.0.3:7".parse()?).await?;
+        let mut second = m.tcp.connect(&fcx, "104.18.0.3:7".parse()?).await?;
         let result = fcx
             .race(
                 Some(fcx.now() + Duration::from_secs(1)),

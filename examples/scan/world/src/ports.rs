@@ -1107,7 +1107,7 @@ mod tests {
         }
         for outside in [
             Ipv4Addr::new(10, 0, 9, 1),
-            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(104, 18, 0, 1),
             Ipv4Addr::new(10, 0, 1, 0),
         ] {
             t.packet(FromInner, &tcp(SCANNER, outside, (4000, 80), 1, 0, 2), 1);

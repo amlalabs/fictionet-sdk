@@ -147,10 +147,10 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
         let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
 
         // A site with only an IPv4 `at` gets an automatic IPv6 address,
-        // from 2001:2::/48, and keeps it.
+        // from 2606:4700:100::/48, and keeps it.
         assert_eq!(
             dns_at(&fcx, &m, gw, "secure.test", RecordType::AAAA).await,
-            ok(&[v6("2001:2::1")])
+            ok(&[v6("2606:4700:100::1")])
         );
         assert_eq!(
             dns_at(&fcx, &m, gw, "secure.test", RecordType::A).await,
@@ -158,7 +158,7 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
         );
         assert_eq!(
             dns_at(&fcx, &m, gw, "SECURE.test.", RecordType::AAAA).await,
-            ok(&[v6("2001:2::1")])
+            ok(&[v6("2606:4700:100::1")])
         );
         // A site at two addresses of its own.
         assert_eq!(
@@ -176,7 +176,7 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
         );
         assert_eq!(
             dns_at(&fcx, &m, gw, "v4only.test", RecordType::A).await,
-            ok(&[Ipv4Addr::new(198, 18, 0, 1).into()])
+            ok(&[Ipv4Addr::new(104, 18, 0, 1).into()])
         );
         assert_eq!(
             dns_at(&fcx, &m, gw, "v6only.test", RecordType::A).await,
@@ -900,7 +900,7 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
             dns_at(&fcx, &m, gw, "one.test", RecordType::A).await,
             (
                 ResponseCode::NoError,
-                vec![Ipv4Addr::new(198, 18, 0, 1).into()]
+                vec![Ipv4Addr::new(104, 18, 0, 1).into()]
             )
         );
         assert_eq!(
@@ -927,26 +927,34 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
 
 #[test]
 fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
-    // A subnet inside 2001:2::/48: automatic addresses jump past it.
+    // A subnet inside 2606:4700:100::/48: automatic addresses jump past it.
     let make = || {
         web::Sites::new(|host| {
             host.ends_with(".test")
                 .then(|| web::Site::new(Plain("auto")))
         })
-        .subnet("2001:2::/64".parse().unwrap())
+        .subnet("2606:4700:100::/64".parse().unwrap())
     };
     world_of(make, |fcx, attacher, _log| async move {
-        let (gw, me): (Ipv6Addr, Ipv6Addr) =
-            ("2001:2::1".parse().unwrap(), "2001:2::2".parse().unwrap());
+        let (gw, me): (Ipv6Addr, Ipv6Addr) = (
+            "2606:4700:100::1".parse().unwrap(),
+            "2606:4700:100::2".parse().unwrap(),
+        );
         let mut raw = attacher.attach("a").unwrap();
         let (_, first) = raw_dns6(&fcx, &mut raw, me, gw, "one.test", RecordType::AAAA)
             .await
             .expect("DNS answers");
-        assert_eq!(first, vec![IpAddr::V6("2001:2:0:1::".parse().unwrap())]);
+        assert_eq!(
+            first,
+            vec![IpAddr::V6("2606:4700:100:1::".parse().unwrap())]
+        );
         let (_, second) = raw_dns6(&fcx, &mut raw, me, gw, "two.test", RecordType::AAAA)
             .await
             .expect("DNS answers");
-        assert_eq!(second, vec![IpAddr::V6("2001:2:0:1::1".parse().unwrap())]);
+        assert_eq!(
+            second,
+            vec![IpAddr::V6("2606:4700:100:1::1".parse().unwrap())]
+        );
         let IpAddr::V6(site) = first[0] else {
             unreachable!()
         };
@@ -960,14 +968,14 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
         Ok(())
     });
 
-    // A subnet that covers all of 2001:2::/48 leaves no automatic IPv6
+    // A subnet that covers all of 2606:4700:100::/48 leaves no automatic IPv6
     // addresses. Sites then have IPv4 only.
     let make = || {
         web::Sites::new(|host| {
             host.ends_with(".test")
                 .then(|| web::Site::new(Plain("auto")))
         })
-        .subnet("2001::/16".parse().unwrap())
+        .subnet("2606::/16".parse().unwrap())
     };
     world_of(make, |fcx, attacher, _log| async move {
         let m = default_machine(&fcx, &attacher);
@@ -980,7 +988,7 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
             dns_at(&fcx, &m, gw, "one.test", RecordType::A).await,
             (
                 ResponseCode::NoError,
-                vec![Ipv4Addr::new(198, 18, 0, 1).into()]
+                vec![Ipv4Addr::new(104, 18, 0, 1).into()]
             )
         );
         Ok(())
@@ -1332,12 +1340,12 @@ fn dns_makes_no_more_sites_than_the_limit() {
             3
         );
         // The first eight still answer, and have machines.
-        let site0 = Ipv6Addr::from(u128::from("2001:2::".parse::<Ipv6Addr>().unwrap()) + 1);
+        let site0 = Ipv6Addr::from(u128::from("2606:4700:100::".parse::<Ipv6Addr>().unwrap()) + 1);
         let answer = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, "n0.test", RecordType::AAAA)
             .await
             .unwrap();
         assert_eq!(answer, (ResponseCode::NoError, vec![site0.into()]));
-        let base = u128::from("2001:2::".parse::<Ipv6Addr>().unwrap());
+        let base = u128::from("2606:4700:100::".parse::<Ipv6Addr>().unwrap());
         for i in 1..=9u16 {
             let addr = Ipv6Addr::from(base + u128::from(i));
             raw.send(ping6(ME6, addr, i));

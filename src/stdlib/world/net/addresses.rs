@@ -12,17 +12,18 @@ use std::sync::Arc;
 /// detaches; the lease time only tells the client when to renew.
 const LEASE: u32 = 3600;
 
+// Public CDN space keeps automatic hosts in ordinary internet ranges.
 /// Where hosts without an IPv4 [`super::Host::at`] get their addresses:
-/// `198.18.0.0/15`.
+/// `104.18.0.0/15`.
 pub(super) const AUTO: Prefix = Prefix {
-    addr: IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)),
+    addr: IpAddr::V4(Ipv4Addr::new(104, 18, 0, 0)),
     len: 15,
 };
 
-/// Where hosts without an IPv6 [`super::Host::at`] get theirs: `2001:2::/48`,
-/// the IPv6 range set aside for benchmarking (RFC 5180).
+/// Where hosts without an IPv6 [`super::Host::at`] get theirs: `2606:4700:100::/48`,
+/// matching the public CDN space used for IPv4.
 pub(super) const AUTO6: Prefix = Prefix {
-    addr: IpAddr::V6(Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0)),
+    addr: IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x100, 0, 0, 0, 0, 0)),
     len: 48,
 };
 
@@ -470,6 +471,18 @@ mod tests {
     use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     #[test]
+    fn default_pools_avoid_non_public_ranges() {
+        use fictionet::stdlib::network::ip::{LOCAL_RANGES, RESERVED_RANGES, non_public_address};
+        for pool in [AUTO, AUTO6] {
+            assert!(!non_public_address(pool.addr));
+            assert!(!non_public_address(pool.last()));
+            for reserved in RESERVED_RANGES.into_iter().chain(LOCAL_RANGES) {
+                assert!(!pool.overlaps(reserved), "{pool:?} overlaps {reserved:?}");
+            }
+        }
+    }
+
+    #[test]
     fn failed_hosts_reuse_automatic_addresses_even_without_negative_caching() {
         fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(fictionet::Seed::from_u64(1)), |fcx| async move {
             let shared = Arc::new(Shared {
@@ -514,8 +527,8 @@ mod tests {
             let Lookup::Host(placed) = shared.lookup("good.test") else {
                 panic!("a valid host fits after rejected hosts");
             };
-            assert_eq!(placed.v4, Some("198.18.0.1".parse().unwrap()));
-            assert_eq!(placed.v6, Some("2001:2::1".parse().unwrap()));
+            assert_eq!(placed.v4, Some("104.18.0.1".parse().unwrap()));
+            assert_eq!(placed.v6, Some("2606:4700:100::1".parse().unwrap()));
             fcx.cancel();
             Ok(())
         })).unwrap();
@@ -527,7 +540,7 @@ mod tests {
             let shared = Arc::new(Shared {
                 fcx: fcx.clone(),
                 resolver: Some(Arc::new(|name| Some(Host::new(name)))),
-                subnet: Subnet::new("198.18.0.0/15".parse().unwrap()).unwrap(),
+                subnet: Subnet::new("104.18.0.0/15".parse().unwrap()).unwrap(),
                 subnet6: None,
                 router: route::router(&fcx, Vec::new()),
                 world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
@@ -566,7 +579,7 @@ mod tests {
             |size| {
                 let mut w = World::new(MAX_HOSTS);
                 let subnet = Subnet::new(Prefix {
-                    addr: Ipv4Addr::new(198, 0, 0, 0).into(),
+                    addr: Ipv4Addr::new(104, 0, 0, 0).into(),
                     len: 8,
                 })
                 .unwrap();
@@ -611,14 +624,14 @@ mod tests {
         w.addresses.next_auto = (1 << 17) - 2;
         assert_eq!(
             w.free_auto(&subnet),
-            Some("198.19.255.254".parse().unwrap())
+            Some("104.19.255.254".parse().unwrap())
         );
-        assert_eq!(w.free_auto(&subnet), Some("198.18.0.1".parse().unwrap()));
-        let inside = Subnet::new("198.18.0.0/16".parse().unwrap()).unwrap();
-        assert_eq!(w.free_auto(&inside), Some("198.19.0.0".parse().unwrap()));
+        assert_eq!(w.free_auto(&subnet), Some("104.18.0.1".parse().unwrap()));
+        let inside = Subnet::new("104.18.0.0/16".parse().unwrap()).unwrap();
+        assert_eq!(w.free_auto(&inside), Some("104.19.0.0".parse().unwrap()));
         assert_eq!(
             World::new(MAX_HOSTS)
-                .free_auto(&Subnet::new("198.18.0.0/15".parse().unwrap()).unwrap()),
+                .free_auto(&Subnet::new("104.18.0.0/15".parse().unwrap()).unwrap()),
             None
         );
 
@@ -626,13 +639,13 @@ mod tests {
         w.addresses.next_auto6 = (1 << 80) - 1;
         assert_eq!(
             w.free_auto6(&subnet),
-            Some("2001:2:0:ffff:ffff:ffff:ffff:ffff".parse().unwrap())
+            Some("2606:4700:100:ffff:ffff:ffff:ffff:ffff".parse().unwrap())
         );
-        assert_eq!(w.free_auto6(&subnet), Some("2001:2::1".parse().unwrap()));
+        assert_eq!(w.free_auto6(&subnet), Some("2606:4700:100::1".parse().unwrap()));
         w.addresses.next_auto6 = (1 << 80) - 2;
-        let end = subnet6("2001:2:0:ffff:ffff:ffff:ffff:fffc/126").unwrap();
-        assert_eq!(w.free_auto6(&end), Some("2001:2::1".parse().unwrap()));
-        assert_eq!(w.free_auto6(&subnet6("2001:2::/48").unwrap()), None);
+        let end = subnet6("2606:4700:100:ffff:ffff:ffff:ffff:fffc/126").unwrap();
+        assert_eq!(w.free_auto6(&end), Some("2606:4700:100::1".parse().unwrap()));
+        assert_eq!(w.free_auto6(&subnet6("2606:4700:100::/48").unwrap()), None);
     }
 
     #[test]
@@ -668,13 +681,13 @@ mod tests {
     fn automatic_ipv6_addresses_count_up_and_skip_the_subnet() {
         let mut w = World::new(MAX_HOSTS);
         let s = subnet6("2001:db8::/64").unwrap();
-        assert_eq!(w.free_auto6(&s), Some("2001:2::1".parse().unwrap()));
-        assert_eq!(w.free_auto6(&s), Some("2001:2::2".parse().unwrap()));
+        assert_eq!(w.free_auto6(&s), Some("2606:4700:100::1".parse().unwrap()));
+        assert_eq!(w.free_auto6(&s), Some("2606:4700:100::2".parse().unwrap()));
         let mut w = World::new(MAX_HOSTS);
-        let inside = subnet6("2001:2::/120").unwrap();
-        assert_eq!(w.free_auto6(&inside), Some("2001:2::100".parse().unwrap()));
+        let inside = subnet6("2606:4700:100::/120").unwrap();
+        assert_eq!(w.free_auto6(&inside), Some("2606:4700:100::100".parse().unwrap()));
         assert_eq!(
-            World::new(MAX_HOSTS).free_auto6(&subnet6("2001::/16").unwrap()),
+            World::new(MAX_HOSTS).free_auto6(&subnet6("2606::/16").unwrap()),
             None
         );
     }

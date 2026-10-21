@@ -161,7 +161,7 @@ fn scan_snapshot_deltas_and_facts_follow_the_packets() {
                 datagram(Ipv4Addr::new(10, 0, 0, 11), 53),
                 datagram(SERVER_ADDR, 161),
                 syn(Ipv4Addr::new(10, 0, 9, 1), 53),
-                syn(Ipv4Addr::new(198, 18, 0, 1), 80),
+                syn(Ipv4Addr::new(104, 18, 0, 1), 80),
             ];
             for (i, packet) in packets.into_iter().enumerate() {
                 scanner.send(packet);

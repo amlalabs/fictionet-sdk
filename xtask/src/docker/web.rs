@@ -261,13 +261,13 @@ fn initial(compose: &Compose, checks: &mut Checks) -> Result {
         &mut compose.agent(&["dig", "nope.test", "A"]),
     )?;
     checks.ok(
-        "dig +tcp plain.test (an address from 198.18.0.0/15)",
-        "^198\\.18\\.0\\.1 $",
+        "dig +tcp plain.test (an address from 104.18.0.0/15)",
+        "^104\\.18\\.0\\.1 $",
         &mut compose.agent(&["dig", "+tcp", "+short", "plain.test", "A"]),
     )?;
     checks.ok(
-        "dig AAAA plain.test (an address from 2001:2::/48)",
-        "^2001:2::1 $",
+        "dig AAAA plain.test (an address from 2606:4700:100::/48)",
+        "^2606:4700:100::1 $",
         &mut compose.agent(&["dig", "+tcp", "+short", "plain.test", "AAAA"]),
     )?;
     checks.ok(
@@ -439,12 +439,12 @@ fn upstream(compose: &Compose, checks: &mut Checks) -> Result {
         " 2 received",
         &mut compose.agent(&["ping", "-c", "2", "-W", "2", "-s", "20000", "10.0.0.1"]),
     )?;
-    checks.ok("300 open connections: 256 kept, the rest reset at once; idle ones closed after 10 s", "opened 300 established 256 HTTP/1.1 200 OK closed-before-8s 1 sampled at [89]\\.[0-9] s closed-by-30s 256 after (1[0-9]|2[0-9])\\.[0-9] s", &mut compose.agent(&["bash", "-c", "\n        fds=()\n        start=$(date +%s%N)\n        for i in $(seq 300); do exec {fd}<>/dev/tcp/198.18.0.1/80 || break; fds+=(\"$fd\"); done\n        # Tenths of a second since the first connection.\n        since() { echo $(( ($(date +%s%N) - start) / 100000000 )); }\n        # Connections to port 80 (0050) by state: ESTABLISHED (01), and\n        # CLOSE_WAIT (08) once the other side has closed. Reset ones are gone.\n        count() { awk \"\\$3 ~ /:0050\\$/ && \\$4 == \\\"$1\\\"\" /proc/net/tcp | wc -l; }\n        closed() { count 08; }\n        sleep 1\n        echo \"opened ${#fds[@]} established $(count 01)\"\n        printf \"GET / HTTP/1.1\\r\\nHost: plain.test\\r\\nConnection: close\\r\\n\\r\\n\" >&\"${fds[0]}\"\n        head -c 15 <&\"${fds[0]}\"; echo\n        while (( $(since) < 80 )); do sleep 0.1; done\n        c=$(closed) t=$(since)\n        echo \"closed-before-8s $c sampled at $((t / 10)).$((t % 10)) s\"\n        while (( $(closed) < 256 && $(since) < 300 )); do sleep 0.1; done\n        t=$(since)\n        echo \"closed-by-30s $(closed) after $((t / 10)).$((t % 10)) s\""]))?;
+    checks.ok("300 open connections: 256 kept, the rest reset at once; idle ones closed after 10 s", "opened 300 established 256 HTTP/1.1 200 OK closed-before-8s 1 sampled at [89]\\.[0-9] s closed-by-30s 256 after (1[0-9]|2[0-9])\\.[0-9] s", &mut compose.agent(&["bash", "-c", "\n        fds=()\n        start=$(date +%s%N)\n        for i in $(seq 300); do exec {fd}<>/dev/tcp/104.18.0.1/80 || break; fds+=(\"$fd\"); done\n        # Tenths of a second since the first connection.\n        since() { echo $(( ($(date +%s%N) - start) / 100000000 )); }\n        # Connections to port 80 (0050) by state: ESTABLISHED (01), and\n        # CLOSE_WAIT (08) once the other side has closed. Reset ones are gone.\n        count() { awk \"\\$3 ~ /:0050\\$/ && \\$4 == \\\"$1\\\"\" /proc/net/tcp | wc -l; }\n        closed() { count 08; }\n        sleep 1\n        echo \"opened ${#fds[@]} established $(count 01)\"\n        printf \"GET / HTTP/1.1\\r\\nHost: plain.test\\r\\nConnection: close\\r\\n\\r\\n\" >&\"${fds[0]}\"\n        head -c 15 <&\"${fds[0]}\"; echo\n        while (( $(since) < 80 )); do sleep 0.1; done\n        c=$(closed) t=$(since)\n        echo \"closed-before-8s $c sampled at $((t / 10)).$((t % 10)) s\"\n        while (( $(closed) < 256 && $(since) < 300 )); do sleep 0.1; done\n        t=$(since)\n        echo \"closed-by-30s $(closed) after $((t / 10)).$((t % 10)) s\""]))?;
     Ok(())
 }
 
 fn half_close(compose: &Compose, checks: &mut Checks) -> Result {
-    checks.ok("a client that half-closes after its request gets the response", "^200 OK 200 OK $", &mut compose.agent(&["python3", "-c", "\nimport socket\nfor req in [b\"GET / HTTP/1.1\\r\\nHost: plain.test\\r\\nConnection: close\\r\\n\\r\\n\",\n            b\"GET / HTTP/1.0\\r\\nHost: plain.test\\r\\n\\r\\n\"]:\n    s = socket.create_connection((\"198.18.0.1\", 80), timeout=5)\n    s.sendall(req)\n    s.shutdown(socket.SHUT_WR)\n    data = b\"\"\n    while True:\n        x = s.recv(4096)\n        if not x:\n            break\n        data += x\n    print(data.split(b\"\\r\\n\")[0].split(b\" \", 1)[1].decode())\n"]))?;
+    checks.ok("a client that half-closes after its request gets the response", "^200 OK 200 OK $", &mut compose.agent(&["python3", "-c", "\nimport socket\nfor req in [b\"GET / HTTP/1.1\\r\\nHost: plain.test\\r\\nConnection: close\\r\\n\\r\\n\",\n            b\"GET / HTTP/1.0\\r\\nHost: plain.test\\r\\n\\r\\n\"]:\n    s = socket.create_connection((\"104.18.0.1\", 80), timeout=5)\n    s.sendall(req)\n    s.shutdown(socket.SHUT_WR)\n    data = b\"\"\n    while True:\n        x = s.recv(4096)\n        if not x:\n            break\n        data += x\n    print(data.split(b\"\\r\\n\")[0].split(b\" \", 1)[1].decode())\n"]))?;
     Ok(())
 }
 
@@ -493,7 +493,7 @@ fn ipv6(compose: &Compose, checks: &mut Checks) -> Result {
     )?;
     checks.ok(
         "an IPv4-only site is reached over IPv4",
-        "^hello from https v4only.test 443 over HTTP/2.0 198\\.18\\.0\\.[0-9]+ $",
+        "^hello from https v4only.test 443 over HTTP/2.0 104\\.18\\.0\\.[0-9]+ $",
         &mut compose.agent(&[
             "curl",
             "-sS",
@@ -506,7 +506,7 @@ fn ipv6(compose: &Compose, checks: &mut Checks) -> Result {
     )?;
     checks.ok(
         "an IPv6-only site",
-        "^hello from https v6only.test 443 over HTTP/2.0 2001:2::[0-9a-f]+ $",
+        "^hello from https v6only.test 443 over HTTP/2.0 2606:4700:100::[0-9a-f]+ $",
         &mut compose.agent(&[
             "curl",
             "-sS",
@@ -519,7 +519,7 @@ fn ipv6(compose: &Compose, checks: &mut Checks) -> Result {
     )?;
     checks.ok(
         "plain HTTP over IPv6",
-        "^plain site http plain.test 80 2001:2::1 $",
+        "^plain site http plain.test 80 2606:4700:100::1 $",
         &mut compose.agent(&["curl", "-sS", "-w", "%{remote_ip}\\n", "http://plain.test/"]),
     )?;
     checks.ok(
@@ -573,7 +573,7 @@ const MEMORY: &str = r###"
 import socket, sys
 socks = []
 for i in range(250):
-    s = socket.create_connection(("198.18.0.1", 80), timeout=30)
+    s = socket.create_connection(("104.18.0.1", 80), timeout=30)
     s.sendall(b"GET /mb HTTP/1.1\r\nHost: plain.test\r\n\r\n")
     buf = b""
     while b"\r\n\r\n" not in buf:
@@ -600,7 +600,7 @@ for i in range(2000):
     # A connection past the limit is reset right after the handshake. The
     # reset can arrive before connect() returns, and then connect() fails.
     try:
-        s = socket.create_connection(("198.18.0.1", 80), timeout=30)
+        s = socket.create_connection(("104.18.0.1", 80), timeout=30)
     except ConnectionResetError:
         reset += 1
         continue
@@ -628,5 +628,5 @@ const DRAIN: &str = r###"
             [[ $remaining == 0 ]] && exit 0
             sleep 0.1
         done
-        echo "$remaining connections to 198.18.0.1:80 did not close within 10 s" >&2
+        echo "$remaining connections to 104.18.0.1:80 did not close within 10 s" >&2
         exit 1"###;

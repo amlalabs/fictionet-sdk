@@ -17,7 +17,7 @@ use fictionet::stdlib::{
 };
 use fictionet::{Cx, RunOptions, Seed};
 
-const SITE: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+const SITE: Ipv4Addr = Ipv4Addr::new(104, 18, 0, 1);
 const DATE: u64 = 1_893_456_000;
 
 fn headers(stream: u32, path: &str, end: bool) -> Vec<u8> {

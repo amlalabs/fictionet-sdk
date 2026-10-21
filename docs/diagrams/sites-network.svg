@@ -1,7 +1,7 @@
 <div style="overflow-x:auto;margin:1.25em 0">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 560" role="img" aria-labelledby="fn-sites-t fn-sites-d" style="display:block;width:100%;max-width:770px;min-width:640px;height:auto">
 <title id="fn-sites-t">The network that Sites::start builds</title>
-<desc id="fn-sites-d">Each attached sandbox gets its own filter task, which answers DHCP, binds one IPv4 and one IPv6 address, and drops spoofed sources and packets for other sandboxes. Each filter connects to one router through a /32 or /128 route for each bound address, such as 10.0.0.2/32. The router has three kinds of routes. First, the gateway at 10.0.0.1 and 2001:db8::1, with DNS on UDP and TCP port 53 and ping replies. Second, one machine per site address, such as 198.18.0.1 or 2001:2::1, with HTTP on TCP port 80, TLS then HTTP on TCP port 443, ICMP port unreachable for UDP, and ping replies. Third, the default routes 0.0.0.0/0 and ::/0, which answer every other address with ICMP host unreachable, or ICMPv6 address unreachable, from the gateway.</desc>
+<desc id="fn-sites-d">Each attached sandbox gets its own filter task, which answers DHCP, binds one IPv4 and one IPv6 address, and drops spoofed sources and packets for other sandboxes. Each filter connects to one router through a /32 or /128 route for each bound address, such as 10.0.0.2/32. The router has three kinds of routes. First, the gateway at 10.0.0.1 and 2001:db8::1, with DNS on UDP and TCP port 53 and ping replies. Second, one machine per site address, such as 104.18.0.1 or 2606:4700:100::1, with HTTP on TCP port 80, TLS then HTTP on TCP port 443, ICMP port unreachable for UDP, and ping replies. Third, the default routes 0.0.0.0/0 and ::/0, which answer every other address with ICMP host unreachable, or ICMPv6 address unreachable, from the gateway.</desc>
 <g fill="none" stroke="currentColor" stroke-width="1.25">
 <rect x="30" y="14" width="160" height="40" rx="6" stroke-dasharray="5 4"/>
 <rect x="210" y="14" width="160" height="40" rx="6" stroke-dasharray="5 4"/>
@@ -61,7 +61,7 @@
 <text x="105" y="397" text-anchor="middle" font-size="12">TCP 53: DNS</text>
 <text x="105" y="427" text-anchor="middle" font-size="12">ICMP: answers pings</text>
 <text x="305" y="320" text-anchor="middle" font-weight="500">a machine per address</text>
-<text x="305" y="338" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">198.18.0.1, 2001:2::1, …</text>
+<text x="305" y="333" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">104.18.0.1<tspan x="305" dy="12">2606:4700:100::1, …</tspan></text>
 <text x="305" y="367" text-anchor="middle" font-size="12">TCP 80: HTTP</text>
 <text x="305" y="397" text-anchor="middle" font-size="12">TCP 443: TLS, then HTTP</text>
 <text x="305" y="427" text-anchor="middle" font-size="12">UDP: port unreachable</text>
@@ -81,7 +81,7 @@
 <text x="562" y="185">address, once bound</text>
 </g>
 <g font-size="12">
-<text x="20" y="508">Default subnets: 10.0.0.0/24 and 2001:db8::/64. Sites without Site::at: 198.18.0.0/15, 2001:2::/48.</text>
+<text x="20" y="508">Default subnets: 10.0.0.0/24 and 2001:db8::/64. Sites without Site::at: 104.18.0.0/15, 2606:4700:100::/48.</text>
 <text x="20" y="526">A name’s first lookup runs the callback. Then its site gets a machine and a route.</text>
 <text x="20" y="544">Port 443 is open only on a machine with a TLS site. Other TCP ports get a RST.</text>
 </g>

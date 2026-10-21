@@ -70,7 +70,7 @@
 //!   each host's names, NODATA for other types, NXDOMAIN for every other
 //!   name.
 //! - **Addresses.** A host with [`Host::at`] uses that address; otherwise
-//!   it gets a free one from `198.18.0.0/15` (IPv4) and `2001:2::/48`
+//!   it gets a free one from `104.18.0.0/15` (IPv4) and `2606:4700:100::/48`
 //!   (IPv6). Hosts with the same address share one machine.
 //! - **A router** with one route per machine. A packet for any other address
 //!   gets ICMP "host unreachable" (ICMPv6 "address unreachable"). The router is
@@ -335,8 +335,8 @@ impl Net {
     /// and the LAN name in `lan`.
     ///
     /// [`start`](Net::start) fails if `prefix` overlaps the sandboxes'
-    /// subnets, the automatic address pools (`198.18.0.0/15` and
-    /// `2001:2::/48`), or another LAN, or leaves no room for members.
+    /// subnets, the automatic address pools (`104.18.0.0/15` and
+    /// `2606:4700:100::/48`), or another LAN, or leaves no room for members.
     pub fn lan(mut self, name: &str, prefix: Prefix) -> Net {
         self.lans.push((name.to_owned(), prefix.canonical()));
         self
@@ -749,7 +749,7 @@ mod tests {
         fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
-                let subnet = Subnet::new("198.18.0.0/16".parse().unwrap()).unwrap();
+                let subnet = Subnet::new("104.18.0.0/16".parse().unwrap()).unwrap();
                 let router = route::router::<Box<dyn Interface>>(&fcx, Vec::new());
                 let hooks = Arc::new(Hooks {
                     by_addr: Mutex::default(),
@@ -795,7 +795,7 @@ mod tests {
                     .collect();
                 assert_eq!(
                     addresses,
-                    ["198.18.0.1", "10.0.3.1", "10.0.2.1", "10.0.1.1"]
+                    ["104.18.0.1", "10.0.3.1", "10.0.2.1", "10.0.1.1"]
                         .map(|s| s.parse::<IpAddr>().unwrap())
                 );
                 fcx.cancel();
@@ -853,7 +853,7 @@ mod tests {
     fn closed_udp_ports_use_the_declared_datagram_boundary() {
         for (src, dst) in [
             ("10.0.0.2", "10.40.0.1"),
-            ("2001:db8::2", "2001:2::1"),
+            ("2001:db8::2", "2606:4700:100::1"),
         ] {
             let src: IpAddr = src.parse().unwrap();
             let dst: IpAddr = dst.parse().unwrap();

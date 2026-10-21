@@ -12,12 +12,12 @@ fn dns_answers_sites_nodata_and_nxdomain() {
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         assert_eq!(lookup(&fcx, &m, "secure.test.").await, SECURE_ADDR);
         assert_eq!(lookup(&fcx, &m, "SeCuRe.TeSt").await, SECURE_ADDR);
-        // Without `at`, an address from 198.18.0.0/15.
+        // Without `at`, an address from 104.18.0.0/15.
         let plain = lookup(&fcx, &m, "plain.test").await;
-        assert_eq!(plain, Ipv4Addr::new(198, 18, 0, 1));
+        assert_eq!(plain, Ipv4Addr::new(104, 18, 0, 1));
         assert_eq!(
             lookup(&fcx, &m, "broken.test").await,
-            Ipv4Addr::new(198, 18, 0, 2)
+            Ipv4Addr::new(104, 18, 0, 2)
         );
         assert_eq!(lookup(&fcx, &m, "plain.test").await, plain);
 

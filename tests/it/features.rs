@@ -32,7 +32,7 @@ mod http {
         let (attacher, attachments) = fictionet::attachments();
         net::Net::new()
             .host("site", |host| {
-                host.at(Ipv4Addr::new(198, 18, 0, 1))
+                host.at(Ipv4Addr::new(104, 18, 0, 1))
                     .dns_name("example.test")
                     .port_server(80, httpd::Server::new(router))
             })
@@ -42,7 +42,7 @@ mod http {
         let (t, _u, _i, _o) = ip::split_protocols(fcx, end);
         let endpoint = tcp::endpoint(fcx, t, Ipv4Addr::new(10, 0, 0, 2).into());
         endpoint
-            .connect(fcx, SocketAddr::from(([198, 18, 0, 1], 80)))
+            .connect(fcx, SocketAddr::from(([104, 18, 0, 1], 80)))
             .await
             .unwrap()
     }

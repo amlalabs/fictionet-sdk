@@ -476,7 +476,7 @@ it on the next call. Use it with `test_support::contract` to check chunking.
 ## 3. A network
 
 `Net` builds the network around its hosts. Each host has addresses (given
-with `at`, or picked from `198.18.0.0/15` and `2001:2::/48`), DNS names,
+with `at`, or picked from `104.18.0.0/15` and `2606:4700:100::/48`), DNS names,
 and services on its ports:
 
 ```rust

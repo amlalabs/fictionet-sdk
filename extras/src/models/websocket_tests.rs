@@ -45,7 +45,7 @@ impl Client {
         let (attacher, attachments) = fictionet::attachments();
         net::Net::new()
             .host("api", |host| {
-                host.at(Ipv4Addr::new(198, 18, 0, 1))
+                host.at(Ipv4Addr::new(104, 18, 0, 1))
                     .dns_name("api.openai.com")
                     .port_server(80, httpd::Server::new(model))
             })
@@ -54,7 +54,7 @@ impl Client {
         let end = attacher.attach("client").unwrap();
         let (t, _u, _i, _o) = ip::split_protocols(cx, end);
         tcp::endpoint(cx, t, Ipv4Addr::new(10, 0, 0, 2).into())
-            .connect(cx, SocketAddr::from(([198, 18, 0, 1], 80)))
+            .connect(cx, SocketAddr::from(([104, 18, 0, 1], 80)))
             .await
             .unwrap()
     }
