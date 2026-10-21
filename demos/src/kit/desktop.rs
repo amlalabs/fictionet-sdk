@@ -322,6 +322,10 @@ fn claude_files(user: &str, key: &str) -> Vec<(&'static str, String)> {
         .collect();
     let state = serde_json::json!({
         "hasCompletedOnboarding": true,
+        "lastReleaseNotesSeen": CLAUDE_VERSION,
+        "hasSeenAutoDefaultNotice": true,
+        "hasSeenAutoModeEntryWarning": true,
+        "fullscreenDownsellSeenCount": 5,
         "theme": "dark",
         "customApiKeyResponses": { "approved": [tail], "rejected": [] },
         "projects": { format!("/home/{user}"): { "hasTrustDialogAccepted": true } },
@@ -392,14 +396,12 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         "Preferences": quiet_preferences(),
     }}).to_string();
     // The Xfce session, then its window manager, then Firefox, in order.
-    // Firefox starts once its profile root exists.
     let session = format!(
         "while IFS= read -r entry; do export \"$entry\"; done < <(dbus-launch)\n\
          startxfce4 >/tmp/xfce.log 2>&1 &\n\
          for _ in $(seq 1 150); do pgrep -x xfwm4 >/dev/null 2>&1 && break; sleep 0.2; done\n\
          sleep 2\n\
-         mkdir -p \"$HOME/.mozilla/firefox\"\n\
-         firefox --no-remote '{start_url}' >/tmp/firefox.log 2>&1 &\n\
+         firefox --no-remote --profile \"$HOME/.mozilla/firefox/default\" '{start_url}' >/tmp/firefox.log 2>&1 &\n\
          # Maximized, Firefox follows the screen when the viewer resizes it.\n\
          for _ in $(seq 1 300); do wmctrl -x -r firefox -b add,maximized_vert,maximized_horz 2>/dev/null && break; sleep 0.2; done\n\
          wait\n"
@@ -437,6 +439,92 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
     )
     .file("/etc/apt/preferences.d/mozilla", 0o644, mozilla_pref)
     .file("/etc/firefox/policies/policies.json", 0o644, policies)
+    .file(
+        "/opt/desktop/firefox/profiles.ini",
+        0o644,
+        "[General]\nStartWithLastProfile=1\n\n[Profile0]\nName=default\nIsRelative=1\nPath=default\nDefault=1\n",
+    )
+    .file(
+        "/opt/desktop/firefox/default/chrome/userChrome.css",
+        0o644,
+        "#TabsToolbar { visibility: collapse }\n",
+    )
+    .file(
+        "/opt/desktop/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml",
+        0o644,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-session" version="1.0">
+  <property name="general" type="empty">
+    <property name="FailsafeSessionName" type="string" value="Failsafe"/>
+  </property>
+  <property name="sessions" type="empty">
+    <property name="Failsafe" type="empty">
+      <property name="IsFailsafe" type="bool" value="true"/>
+      <property name="Count" type="int" value="4"/>
+      <property name="Client0_Command" type="array"><value type="string" value="xfwm4"/></property>
+      <property name="Client0_Priority" type="int" value="15"/>
+      <property name="Client1_Command" type="array"><value type="string" value="xfsettingsd"/></property>
+      <property name="Client1_Priority" type="int" value="20"/>
+      <property name="Client2_Command" type="array">
+        <value type="string" value="Thunar"/>
+        <value type="string" value="--daemon"/>
+      </property>
+      <property name="Client2_Priority" type="int" value="30"/>
+      <property name="Client3_Command" type="array"><value type="string" value="xfdesktop"/></property>
+      <property name="Client3_Priority" type="int" value="35"/>
+    </property>
+  </property>
+</channel>
+"#,
+    )
+    .file(
+        "/opt/desktop/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml",
+        0o644,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="titleless_maximize" type="bool" value="true"/>
+  </property>
+</channel>
+"#,
+    )
+    .file(
+        "/opt/desktop/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml",
+        0o644,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-panel" version="1.0">
+  <property name="configver" type="int" value="2"/>
+  <property name="panels" type="array"/>
+</channel>
+"#,
+    )
+    .file(
+        "/opt/desktop/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml",
+        0o644,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-desktop" version="1.0">
+  <property name="desktop-icons" type="empty">
+    <property name="style" type="int" value="0"/>
+  </property>
+  <property name="backdrop" type="empty">
+    <property name="screen0" type="empty">
+      <property name="monitorVNC-0" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="image-style" type="int" value="0"/>
+          <property name="color-style" type="int" value="0"/>
+          <property name="rgba1" type="array">
+            <value type="double" value="0.062745098"/>
+            <value type="double" value="0.094117647"/>
+            <value type="double" value="0.125490196"/>
+            <value type="double" value="1"/>
+          </property>
+        </property>
+      </property>
+    </property>
+  </property>
+</channel>
+"#,
+    )
     .file("/opt/setup-desktop.sh", 0o755, setup_script(user))
     .run("bash /opt/setup-desktop.sh")
 }
@@ -449,6 +537,10 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
 fn quiet_preferences() -> serde_json::Value {
     let preferences: &[(&str, serde_json::Value)] = &[
         ("browser.preonboarding.enabled", false.into()),
+        (
+            "toolkit.legacyUserProfileCustomizations.stylesheets",
+            true.into(),
+        ),
         (
             "datareporting.policy.dataSubmissionPolicyBypassNotification",
             true.into(),
@@ -582,11 +674,10 @@ fn setup_script(user: &str) -> String {
            --divert /usr/lib/x86_64-linux-gnu/nss/libnssckbi.so \
            /usr/lib/x86_64-linux-gnu/libnssckbi.so\n\
          ln -sf pkcs11/p11-kit-trust.so /usr/lib/x86_64-linux-gnu/libnssckbi.so\n\
-         # Xfce's default panel for {user}, so no first-run dialog.\n\
-         install -d -o {user} -g {user} /home/{user}/.config/xfce4/xfconf/xfce-perchannel-xml\n\
-         install -o {user} -g {user} -m0644 /etc/xdg/xfce4/panel/default.xml \
-           /home/{user}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml\n\
-         chown -R {user}:{user} /home/{user}/.config\n\
+         install -d -o {user} -g {user} /home/{user}/.config /home/{user}/.mozilla\n\
+         cp -R /opt/desktop/xfce4 /home/{user}/.config/\n\
+         cp -R /opt/desktop/firefox /home/{user}/.mozilla/\n\
+         chown -R {user}:{user} /home/{user}/.config /home/{user}/.mozilla\n\
          # Bring the desktop up.\n\
          systemctl daemon-reload\n\
          systemctl enable --now vnc.service\n\
@@ -664,6 +755,10 @@ mod tests {
             ("dom.push.connection.enabled", false.into()),
             ("browser.safebrowsing.provider.google4.updateURL", "".into()),
             ("network.trr.mode", 5.into()),
+            (
+                "toolkit.legacyUserProfileCustomizations.stylesheets",
+                true.into(),
+            ),
         ] {
             assert_eq!(policy["Preferences"][name]["Value"], value, "{name}");
             assert_eq!(policy["Preferences"][name]["Status"], "locked", "{name}");
@@ -678,7 +773,8 @@ mod tests {
                     "media.",
                     "extensions.",
                     "app.update.",
-                    "datareporting.policy."
+                    "datareporting.policy.",
+                    "toolkit.legacyUserProfileCustomizations."
                 ]
                 .iter()
                 .any(|prefix| name.starts_with(prefix)),
@@ -694,13 +790,45 @@ mod tests {
         let start = content("/opt/start-desktop.sh");
         assert!(start.contains("Xvnc :1 -localhost"));
         assert!(start.contains(" -SendCutText=0 "));
-        assert!(start.contains(&format!("firefox --no-remote '{url}'")));
+        assert!(start.contains(&format!(
+            "firefox --no-remote --profile \"$HOME/.mozilla/firefox/default\" '{url}'"
+        )));
         assert!(
             content("/etc/systemd/system/vnc.service").contains("ExecStart=/opt/start-desktop.sh")
         );
         let setup = content("/opt/setup-desktop.sh");
         assert!(setup.contains("ln -sf pkcs11/p11-kit-trust.so"));
-        assert!(setup.contains("/etc/xdg/xfce4/panel/default.xml"));
+        assert!(
+            setup.contains("chown -R analyst:analyst /home/analyst/.config /home/analyst/.mozilla")
+        );
+        assert!(setup.contains("cp -R /opt/desktop/xfce4 /home/analyst/.config/"));
+        assert!(setup.contains("cp -R /opt/desktop/firefox /home/analyst/.mozilla/"));
+        let profile = content("/opt/desktop/firefox/profiles.ini");
+        assert!(profile.contains("Path=default\nDefault=1"));
+        assert_eq!(
+            content("/opt/desktop/firefox/default/chrome/userChrome.css"),
+            "#TabsToolbar { visibility: collapse }\n"
+        );
+        let config = "/opt/desktop/xfce4/xfconf/xfce-perchannel-xml";
+        let session = content(&format!("{config}/xfce4-session.xml"));
+        assert!(session.contains(r#"name="Count" type="int" value="4""#));
+        for name in ["xfwm4", "xfsettingsd", "Thunar", "xfdesktop"] {
+            assert!(session.contains(&format!(r#"value="{name}""#)));
+        }
+        assert!(!session.contains(r#"value="xfce4-panel""#));
+        let wm = content(&format!("{config}/xfwm4.xml"));
+        assert!(wm.contains(r#"name="titleless_maximize" type="bool" value="true""#));
+        let panel = content(&format!("{config}/xfce4-panel.xml"));
+        assert!(panel.contains(r#"name="configver" type="int" value="2""#));
+        assert!(panel.contains(r#"<property name="panels" type="array"/>"#));
+        assert!(!panel.contains("panel-1"));
+        assert!(!panel.contains("panel-2"));
+        let desktop = content(&format!("{config}/xfce4-desktop.xml"));
+        for name in ["style", "image-style", "color-style"] {
+            assert!(desktop.contains(&format!(r#"name="{name}" type="int" value="0""#)));
+        }
+        assert!(desktop.contains(r#"name="monitorVNC-0""#));
+        assert!(desktop.contains(r#"name="rgba1" type="array""#));
         assert!(
             data.find("bash /opt/setup-desktop.sh").unwrap() < data.find("echo caller").unwrap()
         );
@@ -846,6 +974,10 @@ mod tests {
             "b".repeat(20)
         );
         assert_eq!(state["hasCompletedOnboarding"], true);
+        assert_eq!(state["lastReleaseNotesSeen"], CLAUDE_VERSION);
+        assert_eq!(state["hasSeenAutoDefaultNotice"], true);
+        assert_eq!(state["hasSeenAutoModeEntryWarning"], true);
+        assert_eq!(state["fullscreenDownsellSeenCount"], 5);
         assert_eq!(
             state["projects"]["/home/analyst"]["hasTrustDialogAccepted"],
             true

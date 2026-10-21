@@ -24,7 +24,10 @@ mod tests {
         assert!(data.contains("hostname: \"workstation\""));
         let start = &seed::files(&data).unwrap()["/opt/start-desktop.sh"];
         assert!(
-            start.contains(&format!("firefox --no-remote '{}'", crate::URL)),
+            start.contains(&format!(
+                "firefox --no-remote --profile \"$HOME/.mozilla/firefox/default\" '{}'",
+                crate::URL
+            )),
             "Firefox opens the article"
         );
     }
