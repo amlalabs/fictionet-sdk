@@ -42,6 +42,25 @@ pub async fn start(
         }
         extra = extra.host(address, site.into_host(name));
     }
+    let provider = fictionet_extras::models::Provider::Anthropic;
+    let model = fictionet_extras::models::Model::guest(&cx, provider)?;
+    let model_address = address(9);
+    let tls = certs::leaf(&cx, &ca, &[provider.host()], model_address)?
+        .server_config(&cx, SystemTime::now())?;
+    extra = extra.host(
+        model_address,
+        web::Site::handler(model)
+            .tls(tls)
+            .into_host(provider.host()),
+    );
+    for (index, host) in fictionet_demo::search::PASSED.iter().enumerate() {
+        extra = extra.host(
+            address(10 + index as u8),
+            fictionet::stdlib::world::net::Host::new(host)
+                .dns_name(host)
+                .port_server(443, fictionet_demo::search::Relay(format!("{host}:443"))),
+        );
+    }
     let routing = border_world::start_with(&cx, scenario, ids, world.into_attachments(), extra)?;
     cx.spawn(move |cx| control.serve(cx, routing));
     Ok(())

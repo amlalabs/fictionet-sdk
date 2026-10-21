@@ -39,7 +39,11 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
     // coding agents at boot. apt's signatures verify the packages, and
     // the guest checks each agent download against its pinned sha256.
     let mirror = world.mirror(&fcx)?;
-    let operations = fictionet::stdlib::web::httpd::Router::new().get("/", |_, _| {
+    let operations_cx = fcx.clone();
+    let operations = fictionet::stdlib::web::httpd::Router::new().get("/", move |exchange, request| {
+        operations_cx.emitter(exchange.conn()).emit("adaptive", "request", |event| {
+            event.field("path", request.uri().path())
+        });
         http::Response::new(bytes::Bytes::from_static(
             b"Northwind Operations\nService desk: available\nPackage repository: online\nMaintenance: Sunday 02:00 UTC\n",
         ))

@@ -83,6 +83,7 @@ impl Control {
                 "text/css",
                 include_bytes!("style.css").to_vec(),
             )
+            .architecture(fictionet_demo::kit::architecture("http"))
             .workspace("Border")
             .app()
     }

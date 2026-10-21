@@ -22,6 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Page::new("Desktop", dashboard)
                 .host(hosts.take(HOSTNAME))
                 .standard_panels()
+                .architecture(fictionet_demo::kit::architecture("adaptive"))
+                .app()
         })
         .world(|cx, world| world::start(cx, world, SITE.into()))
         .run_app(downloads, HOSTNAME)

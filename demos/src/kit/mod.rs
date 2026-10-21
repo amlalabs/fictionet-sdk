@@ -1197,50 +1197,6 @@ impl Run {
         );
         let labels = Labels::default();
         let page = build(dashboard.clone(), &mut hosts)
-            .architecture(vec![
-                fictionet_observe::page::ArchitectureService {
-                    title: "DNS".into(),
-                    source: "dns".into(),
-                    kinds: vec![],
-                    detail: "name".into(),
-                    outside: false,
-                },
-                fictionet_observe::page::ArchitectureService {
-                    title: "Simulated web".into(),
-                    source: "adaptive".into(),
-                    kinds: vec!["request".into()],
-                    detail: "path".into(),
-                    outside: false,
-                },
-                fictionet_observe::page::ArchitectureService {
-                    title: "Package mirror".into(),
-                    source: "mirror".into(),
-                    kinds: vec![],
-                    detail: "path".into(),
-                    outside: false,
-                },
-                fictionet_observe::page::ArchitectureService {
-                    title: "Model gateway".into(),
-                    source: "model".into(),
-                    kinds: vec!["tool".into()],
-                    detail: "query".into(),
-                    outside: false,
-                },
-                fictionet_observe::page::ArchitectureService {
-                    title: "Model calls".into(),
-                    source: "model".into(),
-                    kinds: vec!["call".into()],
-                    detail: "provider".into(),
-                    outside: true,
-                },
-                fictionet_observe::page::ArchitectureService {
-                    title: "Sign-in".into(),
-                    source: "signin".into(),
-                    kinds: vec!["connection".into()],
-                    detail: "host".into(),
-                    outside: true,
-                },
-            ])
             .containment(self.containment.clone())
             .labels(labels.clone());
         self.page = Some(page.bind_loopback(PAGE_PORT).await.map_err(|error| {
@@ -1493,6 +1449,54 @@ impl Run {
             });
         }
     }
+}
+
+/// Declares the services exposed by a demo world and its web observation source.
+pub fn architecture(web_source: &str) -> Vec<fictionet_observe::page::ArchitectureService> {
+    vec![
+        fictionet_observe::page::ArchitectureService {
+            title: "DNS".into(),
+            source: "dns".into(),
+            kinds: vec![],
+            detail: "name".into(),
+            outside: false,
+        },
+        fictionet_observe::page::ArchitectureService {
+            title: "Simulated web".into(),
+            source: web_source.into(),
+            kinds: vec!["request".into()],
+            detail: "path".into(),
+            outside: false,
+        },
+        fictionet_observe::page::ArchitectureService {
+            title: "Package mirror".into(),
+            source: "mirror".into(),
+            kinds: vec![],
+            detail: "path".into(),
+            outside: false,
+        },
+        fictionet_observe::page::ArchitectureService {
+            title: "Model gateway".into(),
+            source: "model".into(),
+            kinds: vec!["tool".into()],
+            detail: "query".into(),
+            outside: false,
+        },
+        fictionet_observe::page::ArchitectureService {
+            title: "Model calls".into(),
+            source: "model".into(),
+            kinds: vec!["call".into()],
+            detail: "provider".into(),
+            outside: true,
+        },
+        fictionet_observe::page::ArchitectureService {
+            title: "Sign-in".into(),
+            source: "signin".into(),
+            kinds: vec!["connection".into()],
+            detail: "host".into(),
+            outside: true,
+        },
+    ]
 }
 
 #[cfg(test)]

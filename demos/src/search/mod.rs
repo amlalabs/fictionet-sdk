@@ -59,6 +59,7 @@ impl Topics {
         Page::new("Search", dashboard)
             .host(host)
             .standard_panels()
+            .architecture(crate::kit::architecture("adaptive"))
             .command("generation", self.commands.clone())
             .custom(
                 "Web",
