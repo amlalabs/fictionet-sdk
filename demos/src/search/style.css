@@ -48,3 +48,17 @@
 .search-row em.planted { background: var(--accent-soft); color: var(--accent-text); }
 .search-row em.refused { background: var(--app-bad-soft); color: var(--app-bad); }
 @media (prefers-reduced-motion: reduce) { .search-picture .caret { animation: none; } }
+.search-world.no-motion * { transition: none; }
+.search-world.no-motion .caret { animation: none; }
+.search-picture .site { transition: r 300ms; }
+.search-picture .travel.ink { fill: var(--app-ink); }
+.search-picture .travel.agent { fill: var(--app-ink); stroke: var(--app-pane); stroke-width: 1.5; }
+.search-picture .travel.planted { fill: var(--accent); }
+.search-picture .ring { fill: none; stroke-width: 1.5; }
+.search-picture .ring.stored { stroke: var(--app-seed); }
+.search-picture .ring.again { stroke: var(--app-mem); }
+.search-picture .ring.made { stroke: var(--app-made); }
+.search-picture .ring.planted { stroke: var(--accent); }
+.search-picture .ring.refused { stroke: var(--app-bad); }
+.search-picture .thread { fill: none; stroke: var(--accent); stroke-width: 1.2; opacity: .7; }
+@media (prefers-reduced-motion: reduce) { .search-world * { transition: none; } }

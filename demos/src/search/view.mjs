@@ -1,4 +1,5 @@
 import { diff, rows } from './model.mjs';
+import { createMotion } from './motion.mjs';
 import { createWeb } from './web.mjs';
 
 const NEW_PAGES = [['canned', 'Prepared'], ['stub', 'Improvised'], ['off', 'Off']];
@@ -12,9 +13,11 @@ export function mount(root, services, options) {
   root.classList.add('search-world');
   const svg = el('svg:svg', { class: 'search-picture', viewBox: '0 0 520 560', role: 'img', 'aria-label': 'Searches and the sites they named' }, root);
   const list = el('div', { class: 'search-rows', role: 'list', 'aria-label': 'What the world served' }, root);
-  const web = createWeb(svg, { el });
+  const motion = createMotion(root.ownerDocument.defaultView || globalThis);
+  const web = createWeb(svg, { el, motion });
   const controller = new AbortController();
-  const cleanup = [];
+  const cleanup = [motion.subscribe((disabled) => root.classList.toggle('no-motion', disabled))];
+  const rowNodes = new Map();
   let snapshot = null, disposed = false;
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
@@ -86,25 +89,33 @@ export function mount(root, services, options) {
   }
   buttons();
 
-  function render() {
-    list.replaceChildren();
-    for (const row of rows(snapshot)) {
-      const line = el('div', { class: 'search-row', role: 'listitem', title: `${clock(row.at)} · ${row.who === 'Claude Code' ? '❯ Claude Code' : row.who} · ${row.what}${row.badge ? ` · ${row.badge}` : ''}` }, list);
-      el('time', { text: clock(row.at) }, line);
-      el('span', { text: row.who === 'Claude Code' ? '❯ Claude Code' : row.who, title: row.who === 'Claude Code' ? '❯ Claude Code' : row.who }, line);
-      el('b', { text: row.what, title: row.what }, line);
-      const badge = row.badge;
-      if (badge) el('em', { class: row.tag, text: badge }, line);
-    }
+  function render(changes = []) {
+    const entries = rows(snapshot).map((row) => [JSON.stringify(row), row]);
+    const keys = new Set(entries.map(([key]) => key));
+    for (const [key, node] of rowNodes) if (!keys.has(key)) { node.remove(); rowNodes.delete(key); }
+    entries.forEach(([key, row], index) => {
+      let line = rowNodes.get(key);
+      if (!line) {
+        line = el('div', { class: 'search-row', role: 'listitem', title: `${clock(row.at)} · ${row.who === 'Claude Code' ? '❯ Claude Code' : row.who} · ${row.what}${row.badge ? ` · ${row.badge}` : ''}` }, list);
+        rowNodes.set(key, line);
+        if (changes.length) motion.anim(line, [{ opacity: 0, transform: 'translateY(-10px)' }, { opacity: 1, transform: 'translateY(0)' }], { duration: 260, easing: 'cubic-bezier(.2,.7,.3,1)' });
+        el('time', { text: clock(row.at) }, line);
+        el('span', { text: row.who === 'Claude Code' ? '❯ Claude Code' : row.who, title: row.who === 'Claude Code' ? '❯ Claude Code' : row.who }, line);
+        el('b', { text: row.what, title: row.what }, line);
+        if (row.badge) el('em', { class: row.tag, text: row.badge }, line);
+      }
+      if (list.children[index] !== line) list.insertBefore(line, list.children[index] || null);
+    });
     buttons();
   }
   cleanup.push(services.state(options.state, ({ value }) => {
     if (disposed || !value) return;
     const changes = diff(snapshot, value);
-    if (!snapshot || changes.some((change) => change.type === 'restart')) web.reset(value);
+    const reset = !snapshot || changes.some((change) => change.type === 'restart');
+    if (reset) web.reset(value);
     else web.apply(changes, value);
     snapshot = value;
-    render();
+    render(reset ? [] : changes);
   }, (error) => { if (!disposed) note.textContent = error.message; }));
   return () => {
     disposed = true;
@@ -113,6 +124,7 @@ export function mount(root, services, options) {
     cleanup.forEach((off) => off());
     menu?.replaceChildren();
     root.classList.remove('search-world');
+    root.classList.remove('no-motion');
     root.replaceChildren();
   };
 }

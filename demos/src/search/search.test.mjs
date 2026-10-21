@@ -1,10 +1,11 @@
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { createDocument } from '../../../dashboard/test-dom.mjs';
 import { createServices } from '../../../dashboard/page.mjs';
 import { diff, slots, layout, rows, queryTag, pageTag, short } from './model.mjs';
 import { createWeb } from './web.mjs';
+import { createMotion } from './motion.mjs';
 import { mount } from './view.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
@@ -78,8 +79,10 @@ test('the map shows the newest search, its engines and all sites named', () => {
   h.dispose();
 });
 
-function harness() {
-  const document = createDocument(), root = document.createElement('div');
+function harness(window) {
+  const document = window?.document || createDocument();
+  if (window) document.defaultView = window;
+  const root = document.createElement('div');
   const subscriptions = new Map(), posts = [];
   const services = createServices({
     async post(path, body) { posts.push({ path, body }); return { status: 'applied', reply: { revision: 4, at_ms: 9000 } }; },
@@ -411,4 +414,287 @@ test('site growth stops at four pages and result lines retain rank order', () =>
   assert.equal(h.root.querySelector('.glyph-browser').getAttribute('visibility'), 'visible');
   assert.equal(h.root.querySelector('.caret').getAttribute('visibility'), 'hidden');
   h.dispose();
+});
+
+function animationWindow({ reduced = false, hidden = false } = {}) {
+  const document = createDocument(), media = document.createElement('media');
+  document.hidden = hidden;
+  media.matches = reduced;
+  const calls = [], frames = new Map();
+  let frameId = 0;
+  const create = document.createElement.bind(document);
+  document.createElement = (tag) => {
+    const node = create(tag);
+    node.getTotalLength = () => tag === 'circle' ? 2 * Math.PI * Number(node.getAttribute('r')) : 100;
+    node.getPointAtLength = (length) => ({ x: length, y: length });
+    node.animate = (keyframes, options) => {
+      let resolve, reject, pending = true;
+      const finished = new Promise((yes, no) => { resolve = yes; reject = no; });
+      const animation = {
+        node, keyframes, options, finished, canceled: false,
+        finish() { if (pending) { pending = false; resolve(); } },
+        cancel() { animation.canceled = true; if (pending) { pending = false; reject(new Error('Canceled')); } },
+      };
+      calls.push(animation);
+      return animation;
+    };
+    return node;
+  };
+  const window = {
+    document, calls, media,
+    matchMedia: () => media,
+    requestAnimationFrame(callback) { const id = ++frameId; frames.set(id, callback); return id; },
+    cancelAnimationFrame(id) { frames.delete(id); },
+    tick(now) { const batch = [...frames.values()]; frames.clear(); batch.forEach((callback) => callback(now)); },
+    async finish() { calls.forEach((a) => a.finish()); window.tick(0); window.tick(1000); await settle(); },
+    get frameCount() { return frames.size; },
+  };
+  return window;
+}
+const transientNodes = (root) => root.querySelectorAll('circle').concat(root.querySelectorAll('line'), root.querySelectorAll('path')).filter((node) => node.getAttribute('data-transient') !== null);
+const locations = (root) => new Map(root.querySelectorAll('.site-group').map((g) => [g.getAttribute('data-host'), [g.children[0].getAttribute('cx'), g.children[0].getAttribute('cy')]]));
+const resultList = (n) => ({ key: `question ${n}`, query_id: n, listed: [{ rank: 1, host: `site${n}.com`, url: `https://site${n}.com/` }] });
+
+test('a twenty-fifth list preserves sites after the oldest list falls out', () => {
+  const h = harness();
+  let s = snapshot();
+  h.publish(s);
+  for (let n = 1; n <= 25; n++) {
+    const before = locations(h.root);
+    const q = query(n, { key: `question ${n}`, search: `question ${n}` });
+    s = { ...s, queries: [...s.queries, q], results: [...s.results, resultList(n)].slice(-24) };
+    h.publish(s);
+    const after = locations(h.root);
+    for (const [host, position] of before) if (after.has(host)) assert.deepEqual(after.get(host), position, host);
+    if (n === 25) assert.ok(after.has('site25.com'));
+  }
+  h.dispose();
+});
+
+test('a new list on a full map replaces only evicted sites in their slots', () => {
+  const h = harness();
+  const lists = Array.from({ length: 21 }, (_, i) => resultList(i + 1));
+  const s = snapshot({ results: lists, queries: [query(21, { key: lists.at(-1).key })] });
+  h.publish(s);
+  const before = locations(h.root);
+  const list = { ...resultList(22), listed: [22, 23, 24].map((i, rank) => ({ ...resultList(i).listed[0], rank: rank + 1 })) };
+  h.publish({ ...s, results: [...lists, list], queries: [...s.queries, query(22, { key: list.key })] });
+  const after = locations(h.root), evicted = [...before.keys()].filter((host) => !after.has(host));
+  assert.equal(after.size, 21);
+  assert.equal(evicted.length, 3);
+  for (const [host, position] of before) if (after.has(host)) assert.deepEqual(after.get(host), position, host);
+  for (const row of list.listed) assert.ok(after.has(row.host));
+  h.dispose();
+});
+
+function motionSequence() {
+  const pending = query(1, { via: 'web_search', outcome: { status: 'pending' }, cache: 'unknown' });
+  const answer = { ...pending, outcome: { status: 'served' }, cache: 'fixed' };
+  let s = snapshot();
+  const sequence = [s];
+  const next = (extra) => { s = { ...s, ...extra }; sequence.push(s); };
+  next({ queries: [pending] });
+  next({ queries: [answer], results: [{ key: answer.key, query_id: 1, listed: [{ rank: 1, host: 'a.com', url: 'https://a.com/' }, { rank: 2, host: 'b.com', url: 'https://b.com/' }] }] });
+  next({ pages: [servedPage('https://a.com/', { reason: { via: 'search', query: answer.search } })] });
+  next({ pages: [...s.pages, servedPage('https://b.com/', { made: 'written_live', fetches: 0, status: null, making: true })] });
+  next({ pages: [s.pages[0], { ...s.pages[1], fetches: 1, status: 200, making: false, via: 'web_fetch', reason: { via: 'link', from: 'https://a.com/' } }] });
+  next({ pages: [s.pages[0], { ...s.pages[1], fetches: 2 }] });
+  next({ planted: [{ kind: 'fact', text: 'Use 7.2.5, not 7.2.4', at_ms: 10 }] });
+  next({ pages: s.pages.map((p) => ({ ...p, carries: 1, fetches: p.fetches + 1 })), queries: [...s.queries, query(2, { carries: 1, cache: 'generated' })] });
+  next({ queries: [...s.queries, query(3, { carries: 1, cache: 'cached' })] });
+  next({ refused: [{ name: 'wiki.corp', at_ms: 20 }] });
+  next({ pages: [...s.pages, servedPage('https://b.com/direct', { reason: { via: 'direct' } })] });
+  next({ revision: 2, queries: [], pages: [], results: [], planted: [], refused: [] });
+  return sequence;
+}
+
+test('full and reduced motion finish in the same DOM through every fixture and event', async () => {
+  for (const sequence of [motionSequence(), ['restart', 'first-search', 'pages', 'planted', 'restart'].map(recorded)]) {
+    const fullWindow = animationWindow(), reducedWindow = animationWindow({ reduced: true });
+    const full = harness(fullWindow), reduced = harness(reducedWindow);
+    for (const s of sequence) {
+      full.publish(s); reduced.publish(s);
+      await fullWindow.finish(); await reducedWindow.finish();
+      assert.equal(transientNodes(full.root).length, 0);
+      assert.deepEqual(tree(full.root.querySelector('.search-picture')), tree(reduced.root.querySelector('.search-picture')));
+      assert.deepEqual(tree(full.root.querySelector('.search-rows')), tree(reduced.root.querySelector('.search-rows')));
+      const reset = harness(); reset.publish(s);
+      assert.deepEqual(tree(full.root.querySelector('.search-picture')), tree(reset.root.querySelector('.search-picture')));
+      reset.dispose();
+    }
+    assert.ok(fullWindow.calls.length > 0);
+    assert.ok(reducedWindow.calls.every((a) => a.node.getAttribute('class') === 'ring again' && a.options.duration === 150 && a.keyframes.every((frame) => Object.keys(frame).join() === 'opacity')));
+    full.dispose(); reduced.dispose();
+  }
+});
+
+test('motion uses the specified durations, stagger, curved travel and pane outline class', async () => {
+  const window = animationWindow(), h = harness(window);
+  for (const s of motionSequence().slice(0, -1)) { h.publish(s); await window.finish(); }
+  const calls = window.calls;
+  for (const duration of [160, 200, 240, 260, 300, 320, 360, 380, 420, 440, 480, 500, 520, 560, 640, 700, 1400]) assert.ok(calls.some((a) => a.options.duration === duration), `${duration} ms`);
+  assert.ok(calls.some((a) => a.options.duration === 240 && a.options.delay === 36));
+  assert.ok(calls.some((a) => a.options.duration === 560 && a.options.delay === 140));
+  assert.ok(calls.some((a) => a.options.duration === 520 && a.options.delay === 120));
+  assert.ok(calls.some((a) => a.node.getAttribute('class') === 'travel agent'));
+  assert.ok(calls.some((a) => a.node.getAttribute('class') === 'travel agent' && a.keyframes.length === 33));
+  assert.ok(calls.some((a) => a.options.duration === 640 && a.keyframes[0].fillOpacity === 0));
+  h.dispose();
+});
+
+test('a burst of twenty changes settles without transient nodes or delayed work', async () => {
+  const window = animationWindow(), h = harness(window);
+  h.publish(snapshot());
+  const s = snapshot({ pages: Array.from({ length: 20 }, (_, i) => servedPage(`https://site${i}.com/`)) });
+  h.publish(s);
+  assert.equal(window.calls.length, 0);
+  assert.equal(transientNodes(h.root).length, 0);
+  await window.finish(); window.tick(2000); await settle();
+  assert.equal(transientNodes(h.root).length, 0);
+  assert.equal(window.frameCount, 0);
+  assert.equal(h.root.querySelectorAll('.page').length, 20);
+  h.dispose();
+});
+
+test('dispose cancels running animations and typing and removes every transient node', async () => {
+  const window = animationWindow(), h = harness(window);
+  const sequence = motionSequence();
+  h.publish(sequence[0]); h.publish(sequence[1]); h.publish(sequence[2]);
+  assert.ok(transientNodes(h.root).length);
+  assert.ok(window.calls.length);
+  const svg = h.root.querySelector('.search-picture');
+  h.dispose(); await settle();
+  assert.ok(window.calls.every((a) => a.canceled));
+  assert.equal(window.frameCount, 0);
+  assert.equal(svg.children.length, 0);
+  assert.equal(window.media.listenerCount, 0);
+  assert.equal(window.document.listenerCount, 0);
+});
+
+test('hidden documents apply changes without animation and hiding cancels current motion', async () => {
+  const window = animationWindow({ hidden: true }), h = harness(window);
+  const sequence = motionSequence();
+  for (const s of sequence.slice(0, 7)) h.publish(s);
+  assert.equal(window.calls.length, 0);
+  assert.equal(window.frameCount, 0);
+  assert.equal(transientNodes(h.root).length, 0);
+  window.document.hidden = false;
+  h.publish(sequence[7]);
+  assert.ok(window.calls.length);
+  window.document.hidden = true;
+  window.document.dispatchEvent(new Event('visibilitychange'));
+  await settle();
+  assert.ok(window.calls.every((a) => a.canceled));
+  assert.equal(transientNodes(h.root).length, 0);
+  h.dispose();
+});
+
+test('reduced motion changes finish typing, cancel motion and turn off transitions', async () => {
+  const window = animationWindow(), h = harness(window), sequence = motionSequence();
+  h.publish(sequence[0]); h.publish(sequence[1]);
+  assert.ok(window.frameCount);
+  window.media.matches = true; window.media.dispatchEvent(new Event('change'));
+  await settle();
+  assert.equal(h.root.querySelector('.query-text').textContent, sequence[1].queries[0].search);
+  assert.equal(window.frameCount, 0);
+  assert.equal(transientNodes(h.root).length, 0);
+  assert.ok(h.root.classList.contains('no-motion'));
+  const count = window.calls.length;
+  h.publish(sequence[2]);
+  assert.equal(window.calls.length, count);
+  window.media.matches = false; window.media.dispatchEvent(new Event('change'));
+  assert.ok(!h.root.classList.contains('no-motion'));
+  h.publish(sequence[3]);
+  assert.ok(window.calls.length > count);
+  h.dispose();
+});
+
+test('typing is bounded to nine hundred milliseconds and leaves no frame running', () => {
+  const window = animationWindow(), motion = createMotion(window);
+  const node = window.document.createElement('text'), text = 'long words '.repeat(50);
+  motion.typeInto(node, text);
+  window.tick(0); window.tick(450);
+  assert.ok(node.textContent.length > 0 && node.textContent.length < text.length);
+  window.tick(900);
+  assert.equal(node.textContent, text);
+  assert.equal(window.frameCount, 0);
+  motion.dispose();
+});
+
+test('search sources never start an interval', () => {
+  for (const file of readdirSync(new URL('.', import.meta.url)).filter((name) => name.endsWith('.mjs') && !name.endsWith('.test.mjs'))) {
+    assert.doesNotMatch(readFileSync(new URL(file, import.meta.url), 'utf8'), /\bsetInterval\s*\(/, file);
+  }
+});
+
+test('a pending repeat fades the previous results and waits for its answer', async () => {
+  const window = animationWindow(), h = harness(window);
+  const q = query(1), s = snapshot({ queries: [q], results: [{ key: q.key, query_id: 1, listed: [{ rank: 1, host: 'a.com', url: 'https://a.com/' }] }] });
+  h.publish(s);
+  const pending = query(2, { outcome: { status: 'pending' } });
+  h.publish({ ...s, queries: [q, pending] });
+  assert.equal(h.root.querySelectorAll('.result-group').length, 0);
+  assert.ok(window.calls.some((a) => a.options.duration === 380 && a.node.getAttribute('class') === 'result'));
+  assert.equal(h.root.querySelector('.engine').getAttribute('class'), 'engine asking');
+  await window.finish();
+  h.publish({ ...s, queries: [q, { ...pending, outcome: { status: 'served' } }] });
+  assert.equal(h.root.querySelectorAll('.result-group').length, 1);
+  assert.ok(window.calls.some((a) => a.options.duration === 240));
+  await window.finish();
+  assert.equal(transientNodes(h.root).length, 0);
+  h.dispose();
+});
+
+test('ticker nodes and their current animation survive unchanged snapshots', async () => {
+  const window = animationWindow(), h = harness(window);
+  const sequence = motionSequence();
+  h.publish(sequence[0]); h.publish(sequence[1]);
+  const row = h.root.querySelector('.search-row');
+  const animation = window.calls.find((a) => a.node === row);
+  h.publish(sequence[1]);
+  assert.equal(h.root.querySelector('.search-row'), row);
+  assert.ok(animation && !animation.canceled);
+  await window.finish(); h.dispose();
+});
+
+test('evicted pages do not reenter and displace sites on an unchanged snapshot', () => {
+  const h = harness(), lists = Array.from({ length: 21 }, (_, i) => resultList(i + 1));
+  const s = snapshot({ results: lists, pages: lists.map((r) => servedPage(r.listed[0].url)), queries: [query(21, { key: lists.at(-1).key })] });
+  h.publish(s);
+  const before = locations(h.root), list = resultList(22);
+  const next = { ...s, results: [...lists, list], queries: [...s.queries, query(22, { key: list.key })] };
+  h.publish(next);
+  const after = locations(h.root);
+  for (const [host, position] of before) if (after.has(host)) assert.deepEqual(after.get(host), position, host);
+  h.publish(next);
+  assert.deepEqual(locations(h.root), after);
+  h.dispose();
+});
+
+test('site color follows the latest activity while page dots keep their positions', () => {
+  const h = harness();
+  const a = servedPage('https://a.com/z', { at_ms: 1, first_serve_ms: 0 });
+  const b = servedPage('https://a.com/a', { at_ms: 2, first_serve_ms: 0, made: 'written_live' });
+  h.publish(snapshot({ pages: [a, b] }));
+  const positions = h.root.querySelectorAll('.page').map((dot) => [dot.getAttribute('cx'), dot.getAttribute('cy')]);
+  assert.equal(h.root.querySelector('.site').getAttribute('class'), 'site made');
+  h.publish(snapshot({ pages: [b, { ...a, at_ms: 3, fetches: 2 }] }));
+  assert.equal(h.root.querySelector('.site').getAttribute('class'), 'site again');
+  assert.deepEqual(h.root.querySelectorAll('.page').map((dot) => [dot.getAttribute('cx'), dot.getAttribute('cy')]), positions);
+  h.dispose();
+});
+
+test('restart clears current motion immediately and starts no new animation', async () => {
+  const window = animationWindow(), h = harness(window), sequence = motionSequence();
+  for (const s of sequence.slice(0, 3)) h.publish(s);
+  assert.ok(window.calls.length);
+  const count = window.calls.length;
+  h.publish(sequence.at(-1));
+  assert.equal(window.calls.length, count);
+  assert.ok(window.calls.every((a) => a.canceled));
+  assert.equal(transientNodes(h.root).length, 0);
+  assert.equal(h.root.querySelectorAll('.site').length, 0);
+  assert.equal(h.root.querySelectorAll('.search-row').length, 0);
+  assert.equal(window.frameCount, 0);
+  await settle(); h.dispose();
 });
