@@ -1643,12 +1643,10 @@ impl Pages {
             cx.spawn(move |cx| async move {
                 let started = cx.now().since_start();
                 let response = pages.page(&cx, &host, &target, true).await;
-                if matches!(response.meta, Meta::Error { .. } | Meta::Budget(_)) {
-                    cx.emit("adaptive", "page_failed", |e| {
-                        e.field("url", format!("https://{host}{target}"))
-                            .field("status", response.status as u64)
-                    });
-                }
+                cx.emit("adaptive", "prefetch_finished", |e| {
+                    e.field("url", format!("https://{host}{target}"))
+                        .field("status", response.status as u64)
+                });
                 if let Meta::Error { error, usage } = &response.meta {
                     let mut row = json!({
                         "kind": "prefetch_error",
@@ -1798,6 +1796,9 @@ impl Pages {
     }
 
     async fn page(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, prefetch: bool) -> Response {
+        if !prefetch && self.store().page(host, target).is_none() {
+            self.making(cx, host, target);
+        }
         let lock = match self.locks.lock(cx, page_key(host, target)).await {
             Ok(lock) => lock,
             Err(error) => return Stop::store(error).response(Asked::Page),
@@ -1907,7 +1908,12 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
-        self.making(cx, host, target);
+        cx.emit("adaptive", "making", |e| {
+            e.field("url", format!("https://{host}{target}"))
+                .field("host", host)
+                .field("site", self.site_name(host))
+                .field("prefetch", prefetch)
+        });
         let site_lock = if self.live_calls.is_none() {
             Some(
                 self.locks

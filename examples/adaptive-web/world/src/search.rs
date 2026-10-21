@@ -344,6 +344,9 @@ pub struct Page {
     pub status: Option<u64>,
     pub via: Option<String>,
     pub making: bool,
+    /// A request is waiting for this page to be served.
+    #[serde(skip)]
+    pub waiting: bool,
     pub carries: Option<u64>,
     /// Title from the first served fetch.
     pub title: String,
@@ -539,6 +542,7 @@ impl Observer for Searches {
                     | "making"
                     | "model_call"
                     | "page_failed"
+                    | "prefetch_finished"
             ) | ("http", "request")
         )
     }
@@ -786,6 +790,7 @@ impl Snapshot {
                         status: e.u64("status"),
                         via: e.str("via").map(bounded),
                         making: false,
+                        waiting: false,
                         carries: e.u64("carries"),
                         title: text(e, "title"),
                         model: text(e, "model"),
@@ -823,6 +828,7 @@ impl Snapshot {
                                     status: fetched.status,
                                     via: fetched.via,
                                     making: false,
+                                    waiting: false,
                                     carries: fetched.carries,
                                     latest_serve_ms: fetched.latest_serve_ms,
                                     latest: made,
@@ -838,19 +844,29 @@ impl Snapshot {
                 }
                 changed
             }
+            ("adaptive", "prefetch_finished") => {
+                let url = text(e, "url");
+                let before = self.pages.len();
+                self.pages
+                    .retain(|p| p.url != url || p.fetches > 0 || p.waiting);
+                before != self.pages.len()
+            }
             ("adaptive", "page_failed") => {
                 let url = text(e, "url");
                 let Some(page) = self.pages.iter_mut().find(|p| p.url == url) else {
                     return false;
                 };
                 page.making = false;
+                page.waiting = false;
                 page.status = e.u64("status");
                 true
             }
             ("adaptive", "making") => {
                 let url = text(e, "url");
+                let waiting = !parse::<bool>(e, "prefetch").unwrap_or(false);
                 if let Some(page) = self.pages.iter_mut().find(|p| p.url == url) {
                     page.making = true;
+                    page.waiting |= waiting;
                 } else {
                     recent(
                         &mut self.pages,
@@ -865,6 +881,7 @@ impl Snapshot {
                             status: None,
                             via: None,
                             making: true,
+                            waiting,
                             carries: None,
                             title: String::new(),
                             model: String::new(),

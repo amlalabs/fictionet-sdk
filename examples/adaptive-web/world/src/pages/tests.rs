@@ -1743,18 +1743,25 @@ fn a_failed_prefetch_is_recorded_and_made_again_on_request() {
     no_cast(&pages);
     let world = pages.clone();
     let task = script.clone();
-    lab(|cx| async move {
-        let search = google(&world, &cx, "halvard flaw").await;
-        let (url, _) = results(&search.body)[0].clone();
-        task.bad.store(2, Ordering::SeqCst);
-        cx.sleep(ms(1000)).await?;
-        let page = get(&world, &cx, &url).await;
-        assert_eq!(
-            (page.status, &page.logged()["cache"]),
-            (200, &json!("generated"))
-        );
-        Ok(())
-    });
+    let searches = Arc::new(crate::search::Searches::of(&pages));
+    let state = searches.clone();
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(searches),
+        |cx| async move {
+            let search = google(&world, &cx, "halvard flaw").await;
+            let (url, _) = results(&search.body)[0].clone();
+            task.bad.store(2, Ordering::SeqCst);
+            cx.sleep(ms(1000)).await?;
+            assert!(state.snapshot().pages.is_empty());
+            let page = get(&world, &cx, &url).await;
+            assert_eq!(
+                (page.status, &page.logged()["cache"]),
+                (200, &json!("generated"))
+            );
+            Ok(())
+        },
+    ))
+    .unwrap();
     let rows = dir.rows();
     let diagnostic = rows.iter().find(|r| r["kind"] == "prefetch_error").unwrap();
     assert_eq!(diagnostic["record"], "diagnostic");
@@ -5816,5 +5823,97 @@ fn live_word_refusal_does_not_exceed_the_call_cap() {
             assert_eq!(fake.users().len(), remaining);
             Ok(())
         });
+    }
+}
+
+#[test]
+fn prefetch_completion_removes_only_background_placeholders() {
+    use fictionet::events::{Interest, Metadata, Observation, Observer, Stamp};
+    use fictionet_extras::models::Engine as _;
+
+    struct Finished {
+        searches: Arc<crate::search::Searches>,
+        pages: Mutex<Vec<Vec<crate::search::Page>>>,
+    }
+    impl Observer for Finished {
+        fn enabled(&self, interest: Interest<'_>) -> bool {
+            matches!(
+                interest,
+                Interest::Event(
+                    Metadata {
+                        source: "adaptive",
+                        kind: "prefetch_finished"
+                    },
+                    _
+                )
+            )
+        }
+        fn observe(&self, _: Stamp, _: Observation<'_>) {
+            self.pages
+                .lock()
+                .unwrap()
+                .push(self.searches.snapshot().pages);
+        }
+    }
+
+    for (reply, expected_model) in [
+        (completion(100, PAGE, None), "answered/model"),
+        (http_error(100, 503), "stub"),
+        (
+            completion(100, "I cannot help with that request.", None),
+            "stub",
+        ),
+    ] {
+        for waiting in [false, true] {
+            let fake = Fake::script(vec![completion(0, SEARCH, None), reply.clone()]);
+            let pages = live_world(fake);
+            no_cast(&pages);
+            let searches = Arc::new(crate::search::Searches::of(&pages));
+            let finished = Arc::new(Finished {
+                searches: searches.clone(),
+                pages: Mutex::default(),
+            });
+            let seen = finished.clone();
+            let observer = Arc::new(fictionet::events::Fanout::new(vec![
+                searches.clone(),
+                finished,
+            ]));
+            fictionet::block_on(fictionet::lab(
+                fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(observer),
+                move |cx| async move {
+                    let response = google(&pages, &cx, "new telescope spectrum").await;
+                    let url = results(&response.body)[0].0.clone();
+                    cx.sleep(ms(1)).await?;
+                    let pending = searches.snapshot();
+                    assert_eq!(pending.pages.len(), 1);
+                    assert!(pending.pages[0].making);
+                    assert_eq!(pending.pages[0].fetches, 0);
+                    if !waiting {
+                        cx.sleep(ms(200)).await?;
+                        assert!(searches.snapshot().pages.is_empty());
+                    }
+                    let response = pages.clone().fetch(cx.clone(), url.clone()).await?;
+                    assert!(!response.body.is_empty());
+                    let snapshot = searches.snapshot();
+                    assert_eq!(snapshot.pages.len(), 1);
+                    assert_eq!(snapshot.pages[0].url, url);
+                    assert_eq!(snapshot.pages[0].cache, Cache::Prefetched);
+                    assert_eq!(snapshot.pages[0].model, expected_model);
+                    assert!(!snapshot.pages[0].making);
+                    assert_eq!(snapshot.pages[0].fetches, 1);
+                    Ok(())
+                },
+            ))
+            .unwrap();
+            let completed = seen.pages.lock().unwrap();
+            assert_eq!(completed.len(), 1);
+            if waiting {
+                assert_eq!(completed[0].len(), 1);
+                assert!(completed[0][0].making);
+                assert_eq!(completed[0][0].fetches, 0);
+            } else {
+                assert!(completed[0].is_empty());
+            }
+        }
     }
 }

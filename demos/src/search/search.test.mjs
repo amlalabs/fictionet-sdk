@@ -1115,3 +1115,41 @@ test('the World menu names the model choice and preserves its command', async ()
   }
   h.dispose();
 });
+
+test('completed background pages leave no making marks until opened', () => {
+  for (const made of ['written_live', 'stubbed']) {
+    const h = harness();
+    const p = servedPage('https://a.com/page', { making: true, status: null, fetches: 0 });
+    const pending = snapshot({ queries: [query(1)], pages: [p] });
+    h.publish(pending);
+    assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page making');
+    assert.match(h.root.textContent, /making/);
+    const completed = { ...pending, pages: [] };
+    assert.deepEqual(diff(pending, completed), []);
+    h.publish(completed);
+    assert.equal(h.root.querySelectorAll('.page').length, 0);
+    assert.ok(h.root.querySelectorAll('.site').every((n) => !/\bmaking\b/.test(n.getAttribute('class'))));
+    assert.doesNotMatch(h.root.textContent, /making/);
+    const opened = { ...completed, pages: [{ ...p, making: false, status: 200, fetches: 1, cache: 'prefetched', made }] };
+    assert.equal(diff(completed, opened)[0].type, 'page_opened');
+    h.publish(opened);
+    assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page made');
+    assert.doesNotMatch(h.root.textContent, /making/);
+    h.dispose();
+  }
+});
+
+test('a request waiting for a background page stays making until served', () => {
+  const h = harness();
+  const p = servedPage('https://a.com/page', { making: true, status: null, fetches: 0 });
+  const pending = snapshot({ queries: [query(1)], pages: [p] });
+  h.publish(pending);
+  const completed = { ...pending, revision: pending.revision + 1 };
+  h.publish(completed);
+  assert.match(h.root.textContent, /making/);
+  assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page making');
+  h.publish({ ...completed, pages: [{ ...p, making: false, status: 200, fetches: 1, cache: 'prefetched', made: 'written_live' }] });
+  assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page made');
+  assert.doesNotMatch(h.root.textContent, /making/);
+  h.dispose();
+});

@@ -538,6 +538,7 @@ fn worst_case_snapshot_fits() {
         status: Some(n),
         via: Some(t.clone()),
         making: false,
+        waiting: false,
         carries: Some(n),
         title: t.clone(),
         model: t.clone(),
@@ -1006,4 +1007,47 @@ fn host_rows_keep_display_names() {
     assert_eq!(snap.results[0].listed[0].site, "Python Documentation");
     assert_eq!(snap.pages[0].site, "A Company");
     assert_eq!(snap.sites[0].site, "A Company");
+}
+
+#[test]
+fn prefetch_finishes_without_creating_a_served_page() {
+    for status in [200, 503, 500] {
+        for waiting in [false, true] {
+            let s = searches();
+            let making = || {
+                Event::new("adaptive", "making")
+                    .field("url", "https://a.com/page")
+                    .field("host", "a.com")
+                    .field("prefetch", true)
+            };
+            feed(&s, 1, making());
+            assert!(s.snapshot().pages[0].making);
+            if waiting {
+                feed(
+                    &s,
+                    2,
+                    Event::new("adaptive", "making")
+                        .field("url", "https://a.com/page")
+                        .field("host", "a.com"),
+                );
+                feed(&s, 3, making());
+            }
+            feed(
+                &s,
+                4,
+                Event::new("adaptive", "prefetch_finished")
+                    .field("url", "https://a.com/page")
+                    .field("status", status),
+            );
+            let snapshot = s.snapshot();
+            if waiting {
+                assert_eq!(snapshot.pages.len(), 1);
+                assert!(snapshot.pages[0].making);
+                assert_eq!(snapshot.pages[0].fetches, 0);
+                assert_eq!(snapshot.pages[0].status, None);
+            } else {
+                assert!(snapshot.pages.is_empty());
+            }
+        }
+    }
 }
