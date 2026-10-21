@@ -2422,7 +2422,7 @@ fn canned_pages_come_first_and_the_stub_makes_the_rest() {
         let fresh = google(&pages, &cx, "register outage").await;
         assert_eq!(fresh.logged()["cache"], json!("generated"));
         let listed = results(&fresh.body);
-        assert_eq!(listed.len(), 3);
+        assert_eq!(listed.len(), 10);
         assert!(listed[0].0.contains("theregister.com"), "{listed:?}");
         assert!(canned.iter().any(|(c, _)| *c == listed[0].0));
         assert!(
@@ -3010,7 +3010,7 @@ fn unrelated_queries_do_not_borrow_scenario_pages_or_article_titles() {
         ] {
             let response = google(&pages, &cx, query).await;
             let listed = results(&response.body);
-            assert!(listed.len() <= 3, "{query}: {listed:?}");
+            assert!((8..=10).contains(&listed.len()), "{query}: {listed:?}");
             for (url, title) in listed {
                 assert!(!url.contains("halvard"), "{query}: {url}");
                 assert!(
@@ -3167,6 +3167,25 @@ fn rehearsal_pages_have_valid_content() {
         let audit = example_common::guest_content::Audit::default();
         let mut opened = Vec::new();
         for (name, url, status) in [
+            ("google-home", "https://www.google.com/", 200),
+            ("bing-home", "https://www.bing.com/", 200),
+            ("duckduckgo-home", "https://www.duckduckgo.com/", 200),
+            (
+                "youtube-results",
+                "https://www.youtube.com/results?search_query=halvard+hg-400+factory+reset",
+                200,
+            ),
+            (
+                "reddit-thread",
+                "https://www.reddit.com/r/networking/comments/1fuvw2x/anyone_else_patching_halvard_this_weekend/",
+                200,
+            ),
+            ("ebay-item", "https://www.ebay.com/itm/185920384912", 200),
+            (
+                "linkedin-company",
+                "https://www.linkedin.com/company/halvard-systems-ltd",
+                200,
+            ),
             (
                 "advisory",
                 "https://www.halvardsystems.com/security/advisories/HSA-2026-014",
@@ -3283,19 +3302,54 @@ fn rehearsal_pages_have_valid_content() {
         text::validate_page(&response.content_type, &response.body).unwrap();
         audit.inspect(url, &response.body);
         opened.push(("planted-release", url.into(), response.body));
+        let response = google(&pages, &cx, "best pizza in leeds").await;
+        let listed = results(&response.body);
+        let reddit = listed
+            .iter()
+            .find(|(url, _)| url.contains("reddit.com/r/"))
+            .unwrap();
+        let response = get(&pages, &cx, &reddit.0).await;
+        text::validate_page(&response.content_type, &response.body).unwrap();
+        audit.inspect(&reddit.0, &response.body);
+        opened.push(("reddit-new-thread", reddit.0.clone(), response.body));
+        for (name, query) in [
+            ("pizza-article", "best pizza in leeds"),
+            ("router-article", "how to reset a router"),
+            ("python-article", "Python itertools groupby example"),
+        ] {
+            let response = google(&pages, &cx, query).await;
+            let listed = results(&response.body);
+            let url = &listed[0].0;
+            let response = get(&pages, &cx, url).await;
+            text::validate_page(&response.content_type, &response.body).unwrap();
+            audit.inspect(url, &response.body);
+            opened.push((name, url.clone(), response.body));
+        }
         audit.check().unwrap();
         if let Some(dir) = std::env::var_os("ADAPTIVE_WEB_CAPTURE_DIR") {
             let dir = PathBuf::from(dir);
-            std::fs::create_dir_all(dir.join("_assets")).unwrap();
             let asset = regex::Regex::new(r"/_assets/[a-zA-Z0-9_.-]+").unwrap();
             for (name, url, body) in opened {
+                let dir = dir.join(name);
+                std::fs::create_dir_all(dir.join("_assets")).unwrap();
                 let (host, _) = text::target_of(&url);
                 let mut html = String::from_utf8(body).unwrap();
                 if html.contains("/static/css/main.css")
+                    || html.contains("/search.css")
                     || html.contains("/assets/css/site.min.css")
                 {
                     let css = pages
-                        .handle(&cx, "GET", &host, "/static/css/main.css", None)
+                        .handle(
+                            &cx,
+                            "GET",
+                            &host,
+                            if html.contains("/search.css") {
+                                "/search.css"
+                            } else {
+                                "/static/css/main.css"
+                            },
+                            None,
+                        )
                         .await;
                     html = html.replace(
                         "</head>",
@@ -3362,6 +3416,270 @@ fn planted_articles_do_not_keep_empty_skin_panels() {
         let html = String::from_utf8(response.body).unwrap();
         assert!(html.contains("Keep a copy of the configuration"));
         assert!(!html.contains("On this page"));
+        Ok(())
+    });
+}
+
+#[test]
+fn engine_homes_and_social_pages_use_bundled_layouts() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        for (host, action) in [
+            ("www.google.com", "/search"),
+            ("google.com", "/search"),
+            ("www.bing.com", "/search"),
+            ("bing.com", "/search"),
+            ("duckduckgo.com", "/html/"),
+            ("www.duckduckgo.com", "/html/"),
+            ("html.duckduckgo.com", "/html/"),
+        ] {
+            let response = pages.handle(&cx, "GET", host, "/", None).await;
+            assert_eq!(response.status, 200, "{host}");
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            let form = dom.select_first("form").unwrap();
+            assert_eq!(
+                form.attributes.borrow().get("action"),
+                Some(action),
+                "{host}"
+            );
+            assert!(
+                dom.select_first("link[href^='/_assets/']").is_ok(),
+                "{host}"
+            );
+        }
+        get(
+            &pages,
+            &cx,
+            "https://www.youtube.com/results?search_query=halvard+hg-400+factory+reset",
+        )
+        .await;
+        for (url, selector, content) in [
+            (
+                "https://www.reddit.com/r/networking/comments/1fuvw2x/anyone_else_patching_halvard_this_weekend/",
+                "main.reddit-content",
+                "7.2.4",
+            ),
+            (
+                "https://www.ebay.com/itm/185920384912",
+                "main.ebay-content",
+                "HG-400",
+            ),
+            (
+                "https://www.ebay.com/itm/wireless-router",
+                "main.ebay-content",
+                "Item details",
+            ),
+            (
+                "https://www.linkedin.com/company/halvard-systems-ltd",
+                "main.linkedin-content",
+                "Halvard",
+            ),
+            (
+                "https://www.linkedin.com/company/northern-networks",
+                "main.linkedin-content",
+                "About",
+            ),
+            (
+                "https://www.youtube.com/watch?v=kL92nx_zP2",
+                "main.youtube-content",
+                "reset",
+            ),
+            (
+                "https://www.reddit.com/r/networking/comments/router_reset/resetting_a_home_router/",
+                "main.reddit-content",
+                "router",
+            ),
+        ] {
+            let response = get(&pages, &cx, url).await;
+            assert_eq!(response.status, 200, "{url}");
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            let main = dom
+                .select_first(selector)
+                .unwrap_or_else(|_| panic!("{url}"));
+            assert!(
+                main.text_contents().contains(content),
+                "{url}: {}",
+                main.text_contents()
+            );
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn youtube_search_uses_world_records_and_its_own_form() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let query = "halvard hg-400 factory reset";
+        let response = get(
+            &pages,
+            &cx,
+            &format!(
+                "https://www.youtube.com/results?search_query={}",
+                text::quote_plus(query)
+            ),
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.logged()["search"], query);
+        let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+        assert!(dom.select(".video-result").unwrap().count() > 0);
+        assert_eq!(
+            dom.select_first("form")
+                .unwrap()
+                .attributes
+                .borrow()
+                .get("action"),
+            Some("/results")
+        );
+        assert_eq!(
+            dom.select_first("input[name=search_query]")
+                .unwrap()
+                .attributes
+                .borrow()
+                .get("value"),
+            Some(query)
+        );
+        let record = pages
+            .store()
+            .search(&format!("youtube {}", query_key(query, 0)))
+            .unwrap()
+            .clone();
+        for result in record
+            .search
+            .results
+            .iter()
+            .filter(|r| r.url.contains("youtube.com/watch"))
+        {
+            assert!(dom.text_contents().contains(&result.title));
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn finite_searches_do_not_advertise_or_repeat_more_pages() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let pages = halvard();
+        let response = google(&pages, &cx, "best pizza in leeds").await;
+        {
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            assert!(
+                dom.select("#botstuff table a, #foot table a, .b_pag a, .nav-link form")
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+        let next = get(
+            &pages,
+            &cx,
+            "https://www.google.com/search?q=best+pizza+in+leeds&start=10",
+        )
+        .await;
+        assert!(results(&next.body).is_empty());
+        Ok(())
+    });
+}
+
+#[test]
+fn thread_content_and_navigation_survive_layout_and_corrections() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let response = get(&pages, &cx, "https://www.reddit.com/r/networking/comments/1fuvw2x/anyone_else_patching_halvard_this_weekend/").await;
+        {
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            assert_eq!(dom.select("header").unwrap().count(), 1);
+            assert!(dom.text_contents().contains("u/packet_pusher_77"));
+        }
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "The fixed firmware is 7.2.5, not 7.2.4.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let response = google(&pages, &cx, "best pizza in leeds").await;
+        let listed = results(&response.body);
+        let url = &listed
+            .iter()
+            .find(|(url, _)| url.contains("reddit.com/r/"))
+            .unwrap()
+            .0;
+        let response = get(&pages, &cx, url).await;
+        let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+        assert!(dom.select_first(".post").is_ok());
+        assert_eq!(
+            dom.select_first("header button").unwrap().text_contents(),
+            "Search"
+        );
+        assert!(!dom.text_contents().contains("No matching pages were found"));
+        Ok(())
+    });
+}
+
+#[test]
+fn result_articles_have_content_in_their_sites_format() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let pages = halvard();
+        for (query, host, selector) in [
+            (
+                "best pizza in leeds",
+                "tripadvisor.co.uk",
+                ".restaurant-list",
+            ),
+            ("how to reset a router", "wikihow.com", "ol li"),
+            (
+                "python itertools groupby example",
+                "realpython.com",
+                "pre code",
+            ),
+        ] {
+            let response = google(&pages, &cx, query).await;
+            let listed = results(&response.body);
+            let url = &listed.iter().find(|(url, _)| url.contains(host)).unwrap().0;
+            let response = get(&pages, &cx, url).await;
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            assert!(dom.select_first(selector).is_ok(), "{url}: {selector}");
+            assert!(!dom.text_contents().contains("Halvard"));
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn query_kinds_extend_beyond_the_first_examples() {
+    lab(|cx| async move {
+        let pages = halvard();
+        for (query, site, wrong) in [
+            ("best hotels in york", "booking.com", "pizza"),
+            ("how to clean a keyboard", "wikihow.com", "router"),
+            (
+                "rust borrow checker example",
+                "doc.rust-lang.org",
+                "groupby",
+            ),
+        ] {
+            let response = google(&pages, &cx, query).await;
+            let listed = results(&response.body);
+            assert!((8..=10).contains(&listed.len()));
+            assert!(
+                listed.iter().any(|(url, _)| url.contains(site)),
+                "{query}: {listed:?}"
+            );
+            let html = String::from_utf8(response.body).unwrap();
+            assert!(!html.to_lowercase().contains(wrong), "{query}: {wrong}");
+        }
         Ok(())
     });
 }

@@ -632,6 +632,9 @@ impl Pages {
                 .unwrap_or_default();
             return self.corrected_fragment(original, &format!("{header}: {original}"));
         }
+        if block == *node {
+            return self.corrected_fragment(original, original);
+        }
         let mut context = String::new();
         let mut offset = 0;
         for child in block.descendants() {
@@ -1203,7 +1206,7 @@ impl Pages {
         query: &str,
         start: u64,
     ) -> Response {
-        let (search, cache, usage) = match self.listing(cx, query, start).await {
+        let (search, cache, usage) = match self.listing(cx, engine, query, start).await {
             Ok(listing) => listing,
             Err(stop) => return stop.response(Asked::Search),
         };
@@ -1232,21 +1235,33 @@ impl Pages {
     async fn listing(
         self: &Arc<Self>,
         cx: &Cx,
+        engine: Engine,
         query: &str,
         start: u64,
     ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>), Stop> {
-        let key = query_key(query, start);
+        let key = if engine == Engine::YouTube {
+            format!("youtube {}", query_key(query, start))
+        } else {
+            query_key(query, start)
+        };
         let _lock = self
             .locks
             .lock(cx, format!("search {key}"))
             .await
             .map_err(Stop::store)?;
+        if start >= 10 && matches!(self.maker.as_ref(), Some(Maker::Stub)) {
+            return Ok((
+                fictionet_extras::search::Search::default(),
+                Cache::Missing,
+                None,
+            ));
+        }
         let stored = self.store().search(&key).cloned();
         let (record, cache) = match stored {
             Some(record) => (Some(record), Cache::Cached),
             None if !self.generating() => (None, Cache::Missing),
             None => {
-                let record = self.make_search(cx, &key, query).await?;
+                let record = self.make_search(cx, &key, query, engine).await?;
                 self.start_prefetch(cx, &record);
                 (Some(record), Cache::Generated)
             }
@@ -1314,7 +1329,13 @@ impl Pages {
         Ok((search, cache, record.map(|r| r.usage)))
     }
 
-    async fn make_search(&self, cx: &Cx, key: &str, query: &str) -> Result<SearchRecord, Stop> {
+    async fn make_search(
+        &self,
+        cx: &Cx,
+        key: &str,
+        query: &str,
+        engine: Engine,
+    ) -> Result<SearchRecord, Stop> {
         self.reserve()?;
         let cast = self.cast(cx).await?;
         let seed = self.context();
@@ -1326,7 +1347,20 @@ impl Pages {
             .generate(
                 cx,
                 json!({"kind": "search", "query": query}),
-                || make::search(&self.seed, query, &known),
+                || {
+                    if engine == Engine::YouTube {
+                        let store = self.store();
+                        make::videos(
+                            query,
+                            store
+                                .pages()
+                                .filter(|p| p.host == "www.youtube.com")
+                                .map(|p| (&p.url, String::from_utf8_lossy(&p.body).into_owned())),
+                        )
+                    } else {
+                        make::search(&self.seed, query, &known)
+                    }
+                },
                 || {
                     let (system, user) = prompts::search(&seed, &cast, query, &known, &claims);
                     (system, user, SEARCH_TOKENS)
@@ -1338,7 +1372,8 @@ impl Pages {
         let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
             let (host, _) = text::target_of(&r.url);
-            if matches!(self.maker(), Maker::Stub)
+            if engine != Engine::YouTube
+                && matches!(self.maker(), Maker::Stub)
                 && self.seed.about(&host).is_some()
                 && !known.iter().any(|k| k.url == r.url)
             {
@@ -1389,32 +1424,12 @@ impl Pages {
                     .any(|k| k.url == r.url && make::relevant(k, query))
             })
             .count();
-        if matches!(self.maker(), Maker::Stub) && known_matches >= 3 {
+        if matches!(self.maker(), Maker::Stub) && known_matches >= 8 {
             results.retain(|r| {
                 known
                     .iter()
                     .any(|k| k.url == r.url && make::relevant(k, query))
             });
-        }
-        if matches!(self.maker(), Maker::Stub)
-            && !results
-                .iter()
-                .any(|r| self.seed.about(&text::target_of(&r.url).0).is_some())
-        {
-            let mut directories = 0;
-            results.retain(|r| {
-                if known
-                    .iter()
-                    .any(|k| k.url == r.url && make::relevant(k, query))
-                {
-                    true
-                } else {
-                    directories += 1;
-                    directories <= 2
-                }
-            });
-            search.related.clear();
-            search.questions.clear();
         }
         search.results = results;
         let record = SearchRecord {
@@ -1583,7 +1598,7 @@ impl Pages {
             Err(error) => return Stop::store(error).response(Asked::Page),
         };
         let stored = self.store().page(host, target).cloned();
-        let (record, mut cache) = match stored {
+        let (mut record, mut cache) = match stored {
             Some(record) => (record, Cache::Cached),
             None if !self.generating() => {
                 drop(lock);
@@ -1594,6 +1609,18 @@ impl Pages {
                 Err(stop) => return stop.response(Asked::Page),
             },
         };
+        if record.content_type.starts_with("text/html")
+            && let Some(html) = render::again(
+                host,
+                target,
+                &record.title,
+                &String::from_utf8_lossy(&record.body),
+                &record.date,
+                &self.seed.date,
+            )
+        {
+            record.body = html.into_bytes();
+        }
         drop(lock);
         if cache == Cache::Generated && record.content_type.starts_with("text/html") {
             self.note_links(&record.url, &String::from_utf8_lossy(&record.body));
@@ -1976,7 +2003,8 @@ impl fictionet_extras::models::Engine for Pages {
                     .field("via", "web_search")
             });
             let started = cx.now().since_start();
-            let Ok((search, cache, usage)) = self.listing(&cx, &query, 0).await else {
+            let Ok((search, cache, usage)) = self.listing(&cx, Engine::Google, &query, 0).await
+            else {
                 cx.emit("adaptive", "query_failed", |e| {
                     e.field("query_id", id).field("why", "error")
                 });

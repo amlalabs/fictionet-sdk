@@ -14,6 +14,9 @@ fn skin_host(host: &str) -> &str {
         "www.wikipedia.org" | "wikipedia.org" => "en.wikipedia.org",
         "www.bbc.co.uk" | "bbc.co.uk" | "bbc.com" => "www.bbc.com",
         "theregister.com" => "www.theregister.com",
+        "google.com" => "www.google.com",
+        "bing.com" => "www.bing.com",
+        "duckduckgo.com" | "www.duckduckgo.com" | "lite.duckduckgo.com" => "html.duckduckgo.com",
         _ => host,
     }
 }
@@ -22,6 +25,13 @@ pub(crate) fn source(host: &str, target: &str) -> Option<&'static str> {
     let host = skin_host(host);
     let page = if host == "www.bbc.com" && target.starts_with("/sport") {
         "sport.html"
+    } else if host == "www.youtube.com" && target.split('?').next() == Some("/results") {
+        "results.html"
+    } else if host == "www.reddit.com"
+        && target.starts_with("/r/")
+        && !target.contains("/comments/")
+    {
+        "subreddit.html"
     } else {
         "page.html"
     };
@@ -30,12 +40,7 @@ pub(crate) fn source(host: &str, target: &str) -> Option<&'static str> {
 
 /// Returns a local asset without asking the page generator.
 pub fn asset(host: &str, path: &str) -> Option<(&'static str, &'static [u8])> {
-    let host = match host {
-        "google.com" => "www.google.com",
-        "bing.com" => "www.bing.com",
-        "duckduckgo.com" | "lite.duckduckgo.com" => "html.duckduckgo.com",
-        _ => skin_host(host),
-    };
+    let host = skin_host(host);
     let name = path.strip_prefix("/_assets/")?;
     if name.contains('/') || name.contains('\\') || name.contains("..") {
         return None;
@@ -67,6 +72,10 @@ fn container(host: &str, target: &str) -> Option<&'static str> {
         "docs.python.org" => "div.body[role=main]",
         "pypi.org" => "main#content",
         "www.theregister.com" => "main.pageWidth",
+        "www.reddit.com" => "main.reddit-content",
+        "www.youtube.com" => "main.youtube-content",
+        "www.ebay.com" => "main.ebay-content",
+        "www.linkedin.com" => "main.linkedin-content",
         _ => return None,
     })
 }
@@ -74,7 +83,7 @@ fn container(host: &str, target: &str) -> Option<&'static str> {
 /// A page's heading: its title without the site name the title ends with,
 /// as "Iterator - Wikipedia" heads its page "Iterator".
 fn heading(title: &str) -> &str {
-    [" - ", " — ", " | ", " • "]
+    [" - ", " — ", " | ", " • ", " : r/"]
         .iter()
         .filter_map(|separator| title.rsplit_once(separator))
         .filter(|(page, site)| !page.trim().is_empty() && site.chars().count() <= 40)
@@ -161,6 +170,71 @@ impl Skin {
                 replace(node.as_node(), &today.to_string());
             }
         }
+        if dom.select_first("body.youtube-results").is_ok() {
+            if let Ok(input) = dom.select_first("input[name=search_query]") {
+                input
+                    .attributes
+                    .borrow_mut()
+                    .insert("value", heading(title).to_owned());
+            }
+            for link in main
+                .select("h2 a[href], h3 a[href]")
+                .ok()?
+                .collect::<Vec<_>>()
+            {
+                let href = link.attributes.borrow().get("href").unwrap().to_owned();
+                if !href.starts_with("/watch?")
+                    && !href.starts_with("https://www.youtube.com/watch?")
+                {
+                    continue;
+                }
+                if link.as_node().ancestors().any(|node| {
+                    node.as_element().is_some_and(|element| {
+                        element
+                            .attributes
+                            .borrow()
+                            .get("class")
+                            .is_some_and(|classes| {
+                                classes
+                                    .split_whitespace()
+                                    .any(|class| class == "video-result")
+                            })
+                    })
+                }) {
+                    continue;
+                }
+                let card = link.as_node().parent()?.parent()?;
+                let title = link.text_contents();
+                let thumbnail = crate::search::video_thumbnail(&title);
+                let image = if let Ok(image) = card.select_first("img") {
+                    image.attributes.borrow_mut().insert("src", thumbnail);
+                    image.as_node().detach();
+                    image.as_node().to_string()
+                } else {
+                    format!("<img src=\"{thumbnail}\" alt=\"{}\">", escape(&title))
+                };
+                let body = card
+                    .children()
+                    .map(|node| node.to_string())
+                    .collect::<String>();
+                replace(
+                    &card,
+                    &format!(
+                        "<a class=\"video-thumbnail\" href=\"{}\">{image}</a><div>{body}</div>",
+                        escape(&href)
+                    ),
+                );
+                let element = card.as_element()?;
+                let mut attrs = element.attributes.borrow_mut();
+                let classes = format!("{} video-result", attrs.get("class").unwrap_or_default());
+                attrs.insert("class", classes);
+            }
+        }
+        if let Ok(price) = main.select_first(".product-summary strong") {
+            for node in dom.select(".item-price").ok()? {
+                replace(node.as_node(), &escape(&price.text_contents()));
+            }
+        }
         let mut ids = dom
             .select("[id]")
             .ok()?
@@ -187,13 +261,36 @@ impl Skin {
             contents.push_str(&format!("<li class=\"vector-toc-list-item\"><a class=\"vector-toc-link\" href=\"#{}\">{}</a></li>", escape(&id), escape(&heading.text_contents())));
         }
         let heading = heading(title);
+        if let Some((_, community)) = title.rsplit_once("r/") {
+            let community = community.split([' ', ':', '|']).next().unwrap_or_default();
+            for node in dom.select(".community-name").ok()? {
+                replace(node.as_node(), &escape(&format!("r/{community}")));
+            }
+        }
+        for node in dom.select(".company-mark").ok()? {
+            let initials = heading
+                .split_whitespace()
+                .take(2)
+                .filter_map(|part| part.chars().next())
+                .collect::<String>();
+            replace(node.as_node(), &escape(&initials));
+        }
         for node in dom.select(".page-title").ok()? {
             replace(node.as_node(), &escape(heading));
         }
         for node in dom.select(".page-contents").ok()? {
             replace(node.as_node(), &contents);
         }
-        let breadcrumb = format!("<a href=\"/\">Home</a> › {}", escape(heading));
+        let page_heading = main
+            .select_first("h1")
+            .ok()
+            .map(|node| node.text_contents());
+        let breadcrumb_heading = page_heading
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or(heading);
+        let breadcrumb = format!("<a href=\"/\">Home</a> › {}", escape(breadcrumb_heading));
         for node in dom.select(".page-breadcrumb").ok()? {
             replace(node.as_node(), &breadcrumb);
         }
@@ -222,6 +319,101 @@ mod tests {
 
     fn today() -> Date {
         Date::from_calendar_date(2026, time::Month::October, 7).unwrap()
+    }
+
+    #[test]
+    fn youtube_search_skin_draws_thumbnails_without_replacing_video_content() {
+        let skin = lookup("www.youtube.com", "/results?search_query=paths").unwrap();
+        let body = "<h1 id=\"query\">Paths</h1><article id=\"video\"><h2 id=\"title\"><a href=\"/watch?v=paths\">Paths and files</a></h2><p id=\"stats\">Python Channel • 12,345 views</p></article>";
+        let page = skin
+            .render("Paths - YouTube", body, today(), today())
+            .unwrap();
+        let dom = document(&page);
+        assert!(dom.select_first(".video-player").is_err());
+        assert_eq!(dom.select(".video-result").unwrap().count(), 1);
+        for id in ["query", "video", "title", "stats"] {
+            assert!(dom.select_first(&format!("#{id}")).is_ok());
+        }
+        assert_eq!(
+            one(&dom, "#stats").unwrap().text_contents(),
+            "Python Channel • 12,345 views"
+        );
+        let image = dom.select_first(".video-thumbnail img").unwrap();
+        assert!(
+            image
+                .attributes
+                .borrow()
+                .get("src")
+                .unwrap()
+                .starts_with("data:image/svg+xml,")
+        );
+        let field = dom.select_first("input[name=search_query]").unwrap();
+        assert_eq!(field.attributes.borrow().get("value"), Some("Paths"));
+        assert_eq!(
+            skin.render(
+                "Paths - YouTube",
+                &skin.content(&page).unwrap(),
+                today(),
+                today()
+            )
+            .unwrap(),
+            page
+        );
+    }
+
+    #[test]
+    fn social_and_shop_skins_preserve_page_ids_and_heading_breadcrumbs() {
+        for (host, path, suffix) in [
+            ("www.reddit.com", "/r/python/", "Reddit"),
+            ("www.reddit.com", "/r/python/comments/paths/", "Reddit"),
+            ("www.youtube.com", "/watch?v=paths", "YouTube"),
+            ("www.ebay.com", "/itm/paths", "eBay"),
+            ("www.linkedin.com", "/company/paths/", "LinkedIn"),
+        ] {
+            let skin = lookup(host, path).unwrap();
+            let page = skin.render(&format!("Paths - {suffix}"), "<h1 id=\"page-heading\">Working with paths</h1><h2 id=\"details\">Details</h2><p id=\"description\">Description</p>", today(), today()).unwrap();
+            let dom = document(&page);
+            for id in ["page-heading", "details", "description"] {
+                assert!(dom.select_first(&format!("#{id}")).is_ok(), "{host}: {id}");
+            }
+            assert_eq!(
+                one(&dom, ".page-breadcrumb").unwrap().text_contents(),
+                "Home › Working with paths"
+            );
+            assert!(skin.content(&page).unwrap().contains("id=\"details\""));
+        }
+        let skin = lookup("www.reddit.com", "/r/python/").unwrap();
+        let page = skin
+            .render("Paths - Reddit", "<h2>Details</h2>", today(), today())
+            .unwrap();
+        assert_eq!(
+            one(&document(&page), ".page-breadcrumb")
+                .unwrap()
+                .text_contents(),
+            "Home › Paths"
+        );
+    }
+
+    #[test]
+    fn video_thumbnails_keep_the_original_image_id() {
+        let skin = lookup("www.youtube.com", "/results?search_query=paths").unwrap();
+        let body = "<article id=\"video\"><img id=\"thumbnail\" src=\"thumb.jpg\"><h2 id=\"name\"><a href=\"/watch?v=paths\">Working with paths</a></h2><p>Python Channel • 123 views</p></article>";
+        let page = skin
+            .render("Paths - YouTube", body, today(), today())
+            .unwrap();
+        let dom = document(&page);
+        assert_eq!(dom.select("main img").unwrap().count(), 1);
+        let image = dom.select_first(".video-thumbnail img#thumbnail").unwrap();
+        assert!(
+            image
+                .attributes
+                .borrow()
+                .get("src")
+                .unwrap()
+                .starts_with("data:image/svg+xml,")
+        );
+        assert!(dom.select_first("article#video h2#name").is_ok());
+        assert!(page.contains("Python Channel • 123 views"));
     }
 
     #[test]

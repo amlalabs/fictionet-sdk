@@ -85,6 +85,7 @@ pub(super) fn search_url(engine: Engine, words: &str) -> String {
         Engine::Google => "https://www.google.com/search?q=",
         Engine::Bing => "https://www.bing.com/search?q=",
         Engine::DuckDuckGo => "https://html.duckduckgo.com/html/?q=",
+        Engine::YouTube => "https://www.youtube.com/results?search_query=",
     };
     format!(
         "{base}{}",
@@ -653,6 +654,74 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_search_pages_pass_the_guest_content_audit() {
+        let audit = example_common::guest_content::Audit::default();
+        let inspect = |name: &str, bytes: &[u8]| {
+            audit.inspect(name, bytes);
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                let text = text.to_ascii_lowercase();
+                for word in fictionet_demo::kit::FORBIDDEN {
+                    assert!(!text.contains(word), "{name} contains {word}");
+                }
+            }
+        };
+        for (engine, host) in [
+            (Engine::Google, "www.google.com"),
+            (Engine::Bing, "www.bing.com"),
+            (Engine::DuckDuckGo, "html.duckduckgo.com"),
+        ] {
+            inspect(host, fictionet_extras::search::home(engine).as_bytes());
+            let (_, css) = fictionet_extras::sites::asset(host, "/_assets/home.css").unwrap();
+            inspect(host, css);
+        }
+        let rendered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served = rendered.clone();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+            move |cx| async move {
+                let pages = std::sync::Arc::new(adaptive_web_world::pages::Pages::new(
+                    Seed::builtin("halvard-cve")?,
+                ));
+                for (host, target) in [
+                    ("www.reddit.com", "/r/python/"),
+                    ("www.reddit.com", "/r/python/comments/paths/"),
+                    ("www.youtube.com", "/watch?v=paths"),
+                    ("www.youtube.com", "/results?search_query=paths"),
+                    ("www.ebay.com", "/itm/paths"),
+                    ("www.linkedin.com", "/company/paths/"),
+                ] {
+                    let page = pages.handle(&cx, "GET", host, target, None).await;
+                    assert_eq!(page.status, 200, "{host}{target}");
+                    served.lock().unwrap().push((host, page.body));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        for (host, page) in rendered.lock().unwrap().iter() {
+            inspect(host, page);
+            for path in ["/_assets/site.css", "/_assets/logo.svg"] {
+                let (_, bytes) = fictionet_extras::sites::asset(host, path).unwrap();
+                inspect(host, bytes);
+            }
+        }
+        let videos = fictionet_extras::search::Search {
+            results: vec![fictionet_extras::search::Result {
+                url: "https://www.youtube.com/watch?v=paths".into(),
+                title: "Working with paths".into(),
+                snippet: "Python Channel • 12,345 views".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        inspect(
+            "www.youtube.com",
+            fictionet_extras::search::youtube("paths", &videos).as_bytes(),
+        );
+        audit.check().unwrap();
+    }
 
     #[test]
     fn every_embedded_seed_names_its_search_and_an_address_on_its_sites() {

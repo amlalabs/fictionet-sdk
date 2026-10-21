@@ -6,11 +6,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The search engines' hosts. Links to them are not mentions of pages.
-pub const SEARCH_HOSTS: [&str; 7] = [
+pub const SEARCH_HOSTS: [&str; 8] = [
     "www.google.com",
     "google.com",
     "html.duckduckgo.com",
     "duckduckgo.com",
+    "www.duckduckgo.com",
     "lite.duckduckgo.com",
     "www.bing.com",
     "bing.com",
@@ -85,6 +86,22 @@ pub fn route(host: &str, target: &str, form: Option<&[u8]>) -> Route {
         start,
     };
     let redirect = |location, status| Route::Redirect { location, status };
+    if path == "/" && matches!(host.as_str(), "google.com" | "bing.com" | "www.bing.com") {
+        return Route::SearchHome {
+            engine: if host == "google.com" {
+                Engine::Google
+            } else {
+                Engine::Bing
+            },
+        };
+    }
+    if host == "www.youtube.com" && path == "/results" && !arg("search_query").trim().is_empty() {
+        return Route::Search {
+            engine: Engine::YouTube,
+            query: arg("search_query").trim().to_owned(),
+            start: 0,
+        };
+    }
     if matches!(host.as_str(), "google.com" | "bing.com") {
         return redirect(format!("https://www.{host}{target}"), 301);
     }
@@ -103,7 +120,7 @@ pub fn route(host: &str, target: &str, form: Option<&[u8]>) -> Route {
     }
     if matches!(
         host.as_str(),
-        "html.duckduckgo.com" | "duckduckgo.com" | "lite.duckduckgo.com"
+        "html.duckduckgo.com" | "duckduckgo.com" | "www.duckduckgo.com" | "lite.duckduckgo.com"
     ) {
         if path == "/l/" && arg("uddg").starts_with("http") {
             return redirect(arg("uddg").into(), 302);
@@ -138,6 +155,12 @@ mod tests {
                 }
             );
         }
+        assert_eq!(
+            route("www.bing.com", "/", None),
+            Route::SearchHome {
+                engine: Engine::Bing
+            }
+        );
         for path in ["/", "/webhp"] {
             assert_eq!(
                 route("www.google.com", path, None),
@@ -186,7 +209,6 @@ mod tests {
         for (host, target) in [
             ("www.google.com", "/url?q=+https://a.com"),
             ("www.google.com", "/search?q="),
-            ("www.bing.com", "/"),
             ("www.bing.com", "/search"),
             ("else.com", "/search?q=x"),
             ("else.com", "/x.css"),

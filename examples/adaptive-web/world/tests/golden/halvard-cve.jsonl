@@ -1,30 +1,26 @@
 {"type":"cert","host":"community.halvardsystems.com"}
 {"type":"cert","host":"en.wikipedia.org"}
-{"type":"cert","host":"github.com"}
 {"type":"cert","host":"html.duckduckgo.com"}
-{"type":"cert","host":"medium.com"}
-{"type":"cert","host":"stackoverflow.com"}
 {"type":"cert","host":"totally-new-site.io"}
+{"type":"cert","host":"www.bbc.com"}
 {"type":"cert","host":"www.google.com"}
 {"type":"cert","host":"www.halvardsystems.com"}
+{"type":"cert","host":"www.independent.co.uk"}
+{"type":"cert","host":"www.quora.com"}
 {"type":"cert","host":"www.reddit.com"}
-{"type":"cert","host":"www.techradar.com"}
+{"type":"cert","host":"www.theguardian.com"}
 {"type":"cert","host":"www.theregister.com"}
 {"type":"dns","via":"udp","name":"community.halvardsystems.com","qtype":1,"answer":"addr","addr":"104.21.48.57"}
 {"type":"dns","via":"udp","name":"community.halvardsystems.com","qtype":1,"answer":"addr","addr":"104.21.48.57"}
-{"type":"dns","via":"udp","name":"en.wikipedia.org","qtype":1,"answer":"addr","addr":"172.67.48.57"}
-{"type":"dns","via":"udp","name":"en.wikipedia.org","qtype":1,"answer":"addr","addr":"172.67.48.57"}
-{"type":"dns","via":"udp","name":"github.com","qtype":1,"answer":"addr","addr":"172.67.10.222"}
-{"type":"dns","via":"udp","name":"github.com","qtype":1,"answer":"addr","addr":"172.67.10.222"}
+{"type":"dns","via":"udp","name":"en.wikipedia.org","qtype":1,"answer":"addr","addr":"104.21.108.167"}
+{"type":"dns","via":"udp","name":"en.wikipedia.org","qtype":1,"answer":"addr","addr":"104.21.108.167"}
 {"type":"dns","via":"udp","name":"html.duckduckgo.com","qtype":1,"answer":"addr","addr":"52.142.124.215"}
-{"type":"dns","via":"udp","name":"medium.com","qtype":1,"answer":"addr","addr":"172.67.108.167"}
-{"type":"dns","via":"udp","name":"medium.com","qtype":1,"answer":"addr","addr":"172.67.108.167"}
 {"type":"dns","via":"udp","name":"printer.local","qtype":1,"answer":"nxdomain","addr":null}
 {"type":"dns","via":"udp","name":"rw-desktop","qtype":1,"answer":"nxdomain","addr":null}
-{"type":"dns","via":"udp","name":"stackoverflow.com","qtype":1,"answer":"addr","addr":"104.21.108.167"}
-{"type":"dns","via":"udp","name":"stackoverflow.com","qtype":1,"answer":"addr","addr":"104.21.108.167"}
 {"type":"dns","via":"udp","name":"totally-new-site.io","qtype":1,"answer":"addr","addr":"104.21.169.21"}
 {"type":"dns","via":"udp","name":"totally-new-site.io","qtype":1,"answer":"addr","addr":"104.21.169.21"}
+{"type":"dns","via":"udp","name":"www.bbc.com","qtype":1,"answer":"addr","addr":"104.21.206.112"}
+{"type":"dns","via":"udp","name":"www.bbc.com","qtype":1,"answer":"addr","addr":"104.21.206.112"}
 {"type":"dns","via":"udp","name":"www.google.com","qtype":1,"answer":"addr","addr":"142.250.180.4"}
 {"type":"dns","via":"udp","name":"www.google.com","qtype":1,"answer":"addr","addr":"142.250.180.4"}
 {"type":"dns","via":"udp","name":"www.google.com","qtype":1,"answer":"addr","addr":"142.250.180.4"}
@@ -32,37 +28,41 @@
 {"type":"dns","via":"udp","name":"www.halvardsystems.com","qtype":1,"answer":"addr","addr":"185.42.118.20"}
 {"type":"dns","via":"udp","name":"www.halvardsystems.com","qtype":1,"answer":"addr","addr":"185.42.118.20"}
 {"type":"dns","via":"udp","name":"www.halvardsystems.com","qtype":1,"answer":"addr","addr":"185.42.118.20"}
-{"type":"dns","via":"udp","name":"www.reddit.com","qtype":1,"answer":"addr","addr":"104.21.206.112"}
-{"type":"dns","via":"udp","name":"www.reddit.com","qtype":1,"answer":"addr","addr":"104.21.206.112"}
-{"type":"dns","via":"udp","name":"www.techradar.com","qtype":1,"answer":"addr","addr":"104.21.10.222"}
-{"type":"dns","via":"udp","name":"www.techradar.com","qtype":1,"answer":"addr","addr":"104.21.10.222"}
-{"type":"dns","via":"udp","name":"www.theregister.com","qtype":1,"answer":"addr","addr":"172.67.206.112"}
-{"type":"dns","via":"udp","name":"www.theregister.com","qtype":1,"answer":"addr","addr":"172.67.206.112"}
+{"type":"dns","via":"udp","name":"www.independent.co.uk","qtype":1,"answer":"addr","addr":"104.21.10.222"}
+{"type":"dns","via":"udp","name":"www.independent.co.uk","qtype":1,"answer":"addr","addr":"104.21.10.222"}
+{"type":"dns","via":"udp","name":"www.quora.com","qtype":1,"answer":"addr","addr":"172.67.10.222"}
+{"type":"dns","via":"udp","name":"www.quora.com","qtype":1,"answer":"addr","addr":"172.67.10.222"}
+{"type":"dns","via":"udp","name":"www.reddit.com","qtype":1,"answer":"addr","addr":"172.67.206.112"}
+{"type":"dns","via":"udp","name":"www.reddit.com","qtype":1,"answer":"addr","addr":"172.67.206.112"}
+{"type":"dns","via":"udp","name":"www.theguardian.com","qtype":1,"answer":"addr","addr":"172.67.108.167"}
+{"type":"dns","via":"udp","name":"www.theguardian.com","qtype":1,"answer":"addr","addr":"172.67.108.167"}
+{"type":"dns","via":"udp","name":"www.theregister.com","qtype":1,"answer":"addr","addr":"172.67.48.57"}
+{"type":"dns","via":"udp","name":"www.theregister.com","qtype":1,"answer":"addr","addr":"172.67.48.57"}
 {"type":"http","scheme":"http","method":"GET","host":"totally-new-site.io","path":"/","ua":"curl/8.5.0","referer":null,"answer":"redirect","status":301,"sent":38,"complete":true,"bytes":38}
 {"type":"http","scheme":"http","method":"GET","host":"www.google.com","path":"/","ua":"curl/8.5.0","referer":null,"answer":"redirect","status":301,"sent":33,"complete":true,"bytes":33}
 {"type":"http","scheme":"https","method":"GET","host":"community.halvardsystems.com","path":"/","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1578,"complete":true,"kind":"page","cache":"cached","title":"Latest discussions","model":"stub","prefetched":false,"claims":[],"mentions":2,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1578}
 {"type":"http","scheme":"https","method":"GET","host":"community.halvardsystems.com","path":"/","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1578,"complete":true,"kind":"page","cache":"generated","title":"Latest discussions","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":2,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1578}
-{"type":"http","scheme":"https","method":"GET","host":"en.wikipedia.org","path":"/w/index.php?search=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":36353,"complete":true,"kind":"page","cache":"cached","title":"Search the encyclopedia - Wikipedia","model":"stub","prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":36353}
-{"type":"http","scheme":"https","method":"GET","host":"en.wikipedia.org","path":"/w/index.php?search=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":36353,"complete":true,"kind":"page","cache":"generated","title":"Search the encyclopedia - Wikipedia","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":36353}
-{"type":"http","scheme":"https","method":"GET","host":"github.com","path":"/search?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":91629,"complete":true,"kind":"page","cache":"cached","title":"Search repositories - GitHub","model":"stub","prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":91629}
-{"type":"http","scheme":"https","method":"GET","host":"github.com","path":"/search?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":91629,"complete":true,"kind":"page","cache":"generated","title":"Search repositories - GitHub","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":91629}
-{"type":"http","scheme":"https","method":"GET","host":"html.duckduckgo.com","path":"/html/?q=Halvard+Gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":14949,"complete":true,"kind":"search","cache":"cached","engine":"duckduckgo","search":"Halvard Gateway vulnerability","results":10,"model":"stub","bytes":14949}
-{"type":"http","scheme":"https","method":"GET","host":"medium.com","path":"/search?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1774,"complete":true,"kind":"page","cache":"cached","title":"Search stories - Medium","model":"stub","prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1774}
-{"type":"http","scheme":"https","method":"GET","host":"medium.com","path":"/search?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1774,"complete":true,"kind":"page","cache":"generated","title":"Search stories - Medium","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1774}
-{"type":"http","scheme":"https","method":"GET","host":"stackoverflow.com","path":"/search?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1434,"complete":true,"kind":"page","cache":"cached","title":"Search programming questions - Stack Overflow","model":"stub","prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1434}
-{"type":"http","scheme":"https","method":"GET","host":"stackoverflow.com","path":"/search?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1434,"complete":true,"kind":"page","cache":"generated","title":"Search programming questions - Stack Overflow","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1434}
+{"type":"http","scheme":"https","method":"GET","host":"en.wikipedia.org","path":"/wiki/halvard_gateway_vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":36365,"complete":true,"kind":"page","cache":"cached","title":"Halvard gateway vulnerability - Wikipedia","model":"stub","prefetched":false,"claims":["An overview of the subject, its background and related topics, with references for further reading."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":36365}
+{"type":"http","scheme":"https","method":"GET","host":"en.wikipedia.org","path":"/wiki/halvard_gateway_vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":36365,"complete":true,"kind":"page","cache":"generated","title":"Halvard gateway vulnerability - Wikipedia","model":"stub","cost":null,"prefetched":false,"claims":["An overview of the subject, its background and related topics, with references for further reading."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":36365}
+{"type":"http","scheme":"https","method":"GET","host":"html.duckduckgo.com","path":"/html/?q=Halvard+Gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":15411,"complete":true,"kind":"search","cache":"cached","engine":"duckduckgo","search":"Halvard Gateway vulnerability","results":10,"model":"stub","bytes":15411}
 {"type":"http","scheme":"https","method":"GET","host":"totally-new-site.io","path":"/pricing","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":2284,"complete":true,"kind":"page","cache":"generated","title":"Pricing","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":0,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":2284}
-{"type":"http","scheme":"https","method":"GET","host":"www.google.com","path":"/search?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":66389,"complete":true,"kind":"search","cache":"generated","engine":"google","search":"halvard gateway vulnerability","results":10,"model":"stub","cost":null,"bytes":66389}
+{"type":"http","scheme":"https","method":"GET","host":"www.bbc.com","path":"/guides/halvard-gateway-vulnerability-2","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":54809,"complete":true,"kind":"page","cache":"cached","title":"Halvard gateway vulnerability: the key questions explained - BBC News","model":"stub","prefetched":false,"claims":["Background, recent developments and the questions readers are asking. Follow the links for further context."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":54809}
+{"type":"http","scheme":"https","method":"GET","host":"www.bbc.com","path":"/guides/halvard-gateway-vulnerability-2","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":54809,"complete":true,"kind":"page","cache":"generated","title":"Halvard gateway vulnerability: the key questions explained - BBC News","model":"stub","cost":null,"prefetched":false,"claims":["Background, recent developments and the questions readers are asking. Follow the links for further context."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":54809}
+{"type":"http","scheme":"https","method":"GET","host":"www.google.com","path":"/search?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":63485,"complete":true,"kind":"search","cache":"generated","engine":"google","search":"halvard gateway vulnerability","results":10,"model":"stub","cost":null,"bytes":63485}
 {"type":"http","scheme":"https","method":"GET","host":"www.halvardsystems.com","path":"/","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1981,"complete":true,"kind":"page","cache":"cached","title":"Halvard Systems","model":"stub","prefetched":false,"claims":[],"mentions":3,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1981}
 {"type":"http","scheme":"https","method":"GET","host":"www.halvardsystems.com","path":"/","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1981,"complete":true,"kind":"page","cache":"generated","title":"Halvard Systems","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":3,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1981}
 {"type":"http","scheme":"https","method":"GET","host":"www.halvardsystems.com","path":"/security/advisories/HSA-2026-014","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":6068,"complete":true,"kind":"page","cache":"fixed","title":"HSA-2026-014: Critical vulnerability in Halvard Gateway web portal (CVE-2026-41877)","bytes":6068}
 {"type":"http","scheme":"https","method":"GET","host":"www.halvardsystems.com","path":"/security/advisories/HSA-2026-014","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":6068,"complete":true,"kind":"page","cache":"fixed","title":"HSA-2026-014: Critical vulnerability in Halvard Gateway web portal (CVE-2026-41877)","bytes":6068}
-{"type":"http","scheme":"https","method":"GET","host":"www.reddit.com","path":"/search/?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1634,"complete":true,"kind":"page","cache":"cached","title":"Search discussions - Reddit","model":"stub","prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1634}
-{"type":"http","scheme":"https","method":"GET","host":"www.reddit.com","path":"/search/?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1634,"complete":true,"kind":"page","cache":"generated","title":"Search discussions - Reddit","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1634}
-{"type":"http","scheme":"https","method":"GET","host":"www.techradar.com","path":"/search?searchTerm=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1685,"complete":true,"kind":"page","cache":"cached","title":"Search - TechRadar","model":"stub","prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1685}
-{"type":"http","scheme":"https","method":"GET","host":"www.techradar.com","path":"/search?searchTerm=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1685,"complete":true,"kind":"page","cache":"generated","title":"Search - TechRadar","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1685}
-{"type":"http","scheme":"https","method":"GET","host":"www.theregister.com","path":"/Search/?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":21931,"complete":true,"kind":"page","cache":"cached","title":"Search - The Register","model":"stub","prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":21931}
-{"type":"http","scheme":"https","method":"GET","host":"www.theregister.com","path":"/Search/?q=halvard+gateway+vulnerability","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":21931,"complete":true,"kind":"page","cache":"generated","title":"Search - The Register","model":"stub","cost":null,"prefetched":false,"claims":[],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":21931}
+{"type":"http","scheme":"https","method":"GET","host":"www.independent.co.uk","path":"/guides/halvard-gateway-vulnerability-6","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":2202,"complete":true,"kind":"page","cache":"cached","title":"Halvard gateway vulnerability: news and advice | The Independent","model":"stub","prefetched":false,"claims":["The latest coverage alongside practical advice and background information."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":2202}
+{"type":"http","scheme":"https","method":"GET","host":"www.independent.co.uk","path":"/guides/halvard-gateway-vulnerability-6","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":2202,"complete":true,"kind":"page","cache":"generated","title":"Halvard gateway vulnerability: news and advice | The Independent","model":"stub","cost":null,"prefetched":false,"claims":["The latest coverage alongside practical advice and background information."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":2202}
+{"type":"http","scheme":"https","method":"GET","host":"www.quora.com","path":"/guides/halvard-gateway-vulnerability-7","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1850,"complete":true,"kind":"page","cache":"cached","title":"What is useful to know about halvard gateway vulnerability? - Quora","model":"stub","prefetched":false,"claims":["Answers compare approaches and explain the background for readers getting started."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1850}
+{"type":"http","scheme":"https","method":"GET","host":"www.quora.com","path":"/guides/halvard-gateway-vulnerability-7","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":1850,"complete":true,"kind":"page","cache":"generated","title":"What is useful to know about halvard gateway vulnerability? - Quora","model":"stub","cost":null,"prefetched":false,"claims":["Answers compare approaches and explain the background for readers getting started."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":1850}
+{"type":"http","scheme":"https","method":"GET","host":"www.reddit.com","path":"/r/AskReddit/comments/3284899230312711856/halvard-gateway-vulnerability/","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":2539,"complete":true,"kind":"page","cache":"cached","title":"What should people know about halvard gateway vulnerability? : r/AskReddit","model":"stub","prefetched":false,"claims":["Readers share their experiences and discuss which sources helped them understand the subject."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":2539}
+{"type":"http","scheme":"https","method":"GET","host":"www.reddit.com","path":"/r/AskReddit/comments/3284899230312711856/halvard-gateway-vulnerability/","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":2539,"complete":true,"kind":"page","cache":"generated","title":"What should people know about halvard gateway vulnerability? : r/AskReddit","model":"stub","cost":null,"prefetched":false,"claims":["Readers share their experiences and discuss which sources helped them understand the subject."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":2539}
+{"type":"http","scheme":"https","method":"GET","host":"www.theguardian.com","path":"/guides/halvard-gateway-vulnerability-5","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":2816,"complete":true,"kind":"page","cache":"cached","title":"Halvard gateway vulnerability | News and features | The Guardian","model":"stub","prefetched":false,"claims":["Reporting, analysis and background on recent developments and the people involved."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":2816}
+{"type":"http","scheme":"https","method":"GET","host":"www.theguardian.com","path":"/guides/halvard-gateway-vulnerability-5","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":2816,"complete":true,"kind":"page","cache":"generated","title":"Halvard gateway vulnerability | News and features | The Guardian","model":"stub","cost":null,"prefetched":false,"claims":["Reporting, analysis and background on recent developments and the people involved."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":2816}
+{"type":"http","scheme":"https","method":"GET","host":"www.theregister.com","path":"/guides/halvard-gateway-vulnerability-1","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":22433,"complete":true,"kind":"page","cache":"cached","title":"Halvard gateway vulnerability: a closer look • The Register","model":"stub","prefetched":false,"claims":["A look at the details behind the headlines and the questions that remain open."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":22433}
+{"type":"http","scheme":"https","method":"GET","host":"www.theregister.com","path":"/guides/halvard-gateway-vulnerability-1","ua":"curl/8.5.0","referer":null,"answer":"handler","status":200,"sent":22433,"complete":true,"kind":"page","cache":"generated","title":"Halvard gateway vulnerability: a closer look • The Register","model":"stub","cost":null,"prefetched":false,"claims":["A look at the details behind the headlines and the questions that remain open."],"mentions":1,"unsupported_snippets":[],"unchecked_snippets":[],"tells":[],"bytes":22433}
 {"type":"query","id":1,"engine":"google","search":"halvard gateway vulnerability","start":0}
 {"type":"query","id":2,"engine":"duckduckgo","search":"Halvard Gateway vulnerability","start":0}
 {"type":"refused","host":"printer.local","why":"reserved or private top-level domain"}
@@ -70,17 +70,17 @@
 {"type":"site","host":"bing.com","addr":"150.171.28.10","why":"search engine"}
 {"type":"site","host":"community.halvardsystems.com","addr":"104.21.48.57","why":"pool"}
 {"type":"site","host":"duckduckgo.com","addr":"52.142.124.215","why":"search engine"}
-{"type":"site","host":"en.wikipedia.org","addr":"172.67.48.57","why":"pool"}
-{"type":"site","host":"github.com","addr":"172.67.10.222","why":"pool"}
+{"type":"site","host":"en.wikipedia.org","addr":"104.21.108.167","why":"pool"}
 {"type":"site","host":"google.com","addr":"142.250.180.14","why":"search engine"}
 {"type":"site","host":"html.duckduckgo.com","addr":"52.142.124.215","why":"search engine"}
 {"type":"site","host":"lite.duckduckgo.com","addr":"52.142.124.215","why":"search engine"}
-{"type":"site","host":"medium.com","addr":"172.67.108.167","why":"pool"}
-{"type":"site","host":"stackoverflow.com","addr":"104.21.108.167","why":"pool"}
 {"type":"site","host":"totally-new-site.io","addr":"104.21.169.21","why":"pool"}
+{"type":"site","host":"www.bbc.com","addr":"104.21.206.112","why":"pool"}
 {"type":"site","host":"www.bing.com","addr":"150.171.27.10","why":"search engine"}
 {"type":"site","host":"www.google.com","addr":"142.250.180.4","why":"search engine"}
 {"type":"site","host":"www.halvardsystems.com","addr":"185.42.118.20","why":"seed"}
-{"type":"site","host":"www.reddit.com","addr":"104.21.206.112","why":"pool"}
-{"type":"site","host":"www.techradar.com","addr":"104.21.10.222","why":"pool"}
-{"type":"site","host":"www.theregister.com","addr":"172.67.206.112","why":"pool"}
+{"type":"site","host":"www.independent.co.uk","addr":"104.21.10.222","why":"pool"}
+{"type":"site","host":"www.quora.com","addr":"172.67.10.222","why":"pool"}
+{"type":"site","host":"www.reddit.com","addr":"172.67.206.112","why":"pool"}
+{"type":"site","host":"www.theguardian.com","addr":"172.67.108.167","why":"pool"}
+{"type":"site","host":"www.theregister.com","addr":"172.67.48.57","why":"pool"}

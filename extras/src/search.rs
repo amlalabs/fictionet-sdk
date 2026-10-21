@@ -15,6 +15,8 @@ pub enum Engine {
     DuckDuckGo,
     /// Bing search.
     Bing,
+    /// YouTube video search.
+    YouTube,
 }
 
 /// One generated search result.
@@ -167,10 +169,9 @@ fn display_url(url: &str) -> String {
     }
     host
 }
-/// Makes a synthetic result count with comma separators.
-fn result_count(query: &str) -> String {
-    let words = normalize_space(query).split(' ').count().max(1);
-    let n = (48_300_000 / (words * words) + 1270 * query.chars().count()).to_string();
+/// Formats the number of available results with comma separators.
+fn result_count(count: usize) -> String {
+    let n = count.to_string();
     let mut out = String::new();
     for (i, c) in n.chars().enumerate() {
         if i > 0 && (n.len() - i).is_multiple_of(3) {
@@ -183,13 +184,16 @@ fn result_count(query: &str) -> String {
 /// Returns the engine's server header.
 pub fn engine_server(engine: Engine) -> &'static str {
     match engine {
-        Engine::Google => "gws",
+        Engine::Google | Engine::YouTube => "gws",
         Engine::DuckDuckGo => "nginx",
         Engine::Bing => "Microsoft-IIS/10.0",
     }
 }
 /// Renders results in the selected engine's layout.
 pub fn render(engine: Engine, query: &str, record: &Search, start: u64) -> String {
+    if engine == Engine::YouTube {
+        return youtube(query, record);
+    }
     render_with(
         source(layout(engine).host, "/"),
         engine,
@@ -210,7 +214,7 @@ fn render_with(
         return page;
     }
     match engine {
-        Engine::Google => google(query, record, start),
+        Engine::Google | Engine::YouTube => google(query, record, start),
         Engine::DuckDuckGo => duckduckgo(query, record),
         Engine::Bing => bing(query, record),
     }
@@ -219,15 +223,14 @@ fn render_with(
 fn google(query: &str, record: &Search, start: u64) -> String {
     let q = e(query);
     let qp = quote_plus(query);
-    let count = result_count(query);
-    let seconds = 31 + query.chars().count() % 60;
+    let count = result_count(record.results.len());
     let mut out = vec![format!(
         r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{q} - Google Search</title><link rel="stylesheet" href="/search.css"></head>
 <body class="google"><div id="gb"><a href="https://mail.google.com/mail/">Gmail</a> <a href="https://www.google.com/imghp">Images</a> <a href="https://accounts.google.com/ServiceLogin">Sign in</a></div>
 <header><a href="/" id="logo" aria-label="Google"><span>G</span><span>o</span><span>o</span><span>g</span><span>l</span><span>e</span></a><form action="/search" method="GET" role="search"><input name="q" value="{q}" aria-label="Search" type="text"><input type="submit" value="Search"></form>
 <div id="hdtb"><a href="/search?q={qp}">All</a> <a href="/search?q={qp}&amp;tbm=nws">News</a> <a href="/search?q={qp}&amp;tbm=isch">Images</a> <a href="/search?q={qp}&amp;tbm=vid">Videos</a> <a href="https://maps.google.com/maps?q={qp}">Maps</a> <span>More</span> <span>Tools</span></div></header>
-<div id="main"><div id="result-stats">About {count} results <nobr>(0.{seconds} seconds)</nobr></div><div id="res"><div id="search">"#
+<div id="main"><div id="result-stats">{count} results</div><div id="res"><div id="search">"#
     )];
     if start == 0 {
         for ad in record.ads.iter().take(2) {
@@ -282,9 +285,8 @@ fn google(query: &str, record: &Search, start: u64) -> String {
             e(rel)
         ));
     }
-    let nxt = u128::from(start) + 10;
-    out.push(format!(r#"</div><div id="foot"><table><tr><td><a href="/search?q={qp}&amp;start={nxt}">Next</a></td></tr></table></div></div>
-<footer><span>United Kingdom</span> · <a href="https://support.google.com/websearch">Help</a> · <a href="https://www.google.com/tools/feedback">Send feedback</a> · <a href="https://policies.google.com/privacy">Privacy</a> · <a href="https://policies.google.com/terms">Terms</a></footer></body></html>"#));
+    out.push(r#"</div></div>
+<footer><span>United Kingdom</span> · <a href="https://support.google.com/websearch">Help</a> · <a href="https://www.google.com/tools/feedback">Send feedback</a> · <a href="https://policies.google.com/privacy">Privacy</a> · <a href="https://policies.google.com/terms">Terms</a></footer></body></html>"#.into());
     out.join("\n")
 }
 /// The links and titles of the results a [`render`] page lists, unescaped.
@@ -301,23 +303,100 @@ pub fn links(page: &str) -> Vec<(String, String)> {
         })
         .collect()
 }
-/// Returns a search form for the selected engine.
+/// Returns the bundled home page for the selected engine.
 pub fn home(engine: Engine) -> &'static str {
     match engine {
-        Engine::Google => google_home(),
-        Engine::DuckDuckGo => duckduckgo_home(),
-        Engine::Bing => {
-            r#"<!doctype html><title>Bing</title><form action="/search"><input name="q"><button>Search</button></form>"#
-        }
+        Engine::Google => include_str!("../sites/www.google.com/home.html"),
+        Engine::YouTube => include_str!("../sites/www.youtube.com/results.html"),
+        Engine::DuckDuckGo => include_str!("../sites/html.duckduckgo.com/home.html"),
+        Engine::Bing => include_str!("../sites/www.bing.com/home.html"),
     }
 }
-fn google_home() -> &'static str {
-    r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><title>Google</title></head>
-<body><div id="gb"><a href="https://mail.google.com/mail/">Gmail</a> <a href="https://www.google.com/imghp">Images</a> <a href="https://accounts.google.com/ServiceLogin">Sign in</a></div>
-<center><h1>Google</h1><form action="/search" method="GET"><input name="q" title="Search" size="57"><br><input type="submit" value="Google Search"> <input type="submit" name="btnI" value="I'm Feeling Lucky"></form>
-<p>Google offered in: <a href="/setprefs?hl=cy">Cymraeg</a> <a href="/setprefs?hl=gd">Gàidhlig</a></p></center>
-<footer><a href="/intl/en_uk/ads/">Advertising</a> · <a href="/services/">Business</a> · <a href="/intl/en_uk/about.html">About Google</a> · <a href="https://policies.google.com/privacy">Privacy</a> · <a href="https://policies.google.com/terms">Terms</a></footer></body></html>"#
+/// Renders video results from a search record in YouTube's local layout.
+/// Channel and view labels are taken from the snippet when supplied.
+pub fn youtube(query: &str, record: &Search) -> String {
+    let dom = document(include_str!("../sites/www.youtube.com/results.html"));
+    set_text(&dom, "title", &format!("{query} - YouTube")).unwrap();
+    set_text(&dom, ".page-title", query).unwrap();
+    let input = one(&dom, "input[name=search_query]").unwrap();
+    input
+        .as_element()
+        .unwrap()
+        .attributes
+        .borrow_mut()
+        .insert("value", query.to_owned());
+    for node in dom
+        .select(".video-player, .page-date, .page-breadcrumb")
+        .unwrap()
+        .collect::<Vec<_>>()
+    {
+        node.as_node().detach();
+    }
+    let mut cards = String::from(r#"<nav class="search-filters"><a href="/results?search_query="#);
+    cards.push_str(&e(&quote_plus(query)));
+    cards.push_str(r#"">All</a><span>Videos</span></nav>"#);
+    let mut count = 0;
+    for result in &record.results {
+        let Ok(url) = url::Url::parse(&result.url) else {
+            continue;
+        };
+        if !matches!(
+            url.host_str(),
+            Some("www.youtube.com" | "youtube.com" | "youtu.be")
+        ) || !(url.path() == "/watch"
+            || url.path().starts_with("/shorts/")
+            || url.host_str() == Some("youtu.be"))
+        {
+            continue;
+        }
+        count += 1;
+        let labels = result
+            .snippet
+            .split(['•', '·'])
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        let views = labels
+            .iter()
+            .find(|label| label.contains(" views"))
+            .copied()
+            .unwrap_or("Views not listed");
+        let channel = labels
+            .iter()
+            .find(|label| {
+                !label.contains(" views")
+                    && !label.contains(" ago")
+                    && !label.chars().all(|c| c.is_ascii_digit() || c == ':')
+            })
+            .copied()
+            .unwrap_or("YouTube");
+        let title = e(&result.title);
+        let description = labels
+            .iter()
+            .find(|label| label.len() > 100)
+            .copied()
+            .unwrap_or(&result.snippet);
+        let thumbnail = video_thumbnail(&result.title);
+        cards.push_str(&format!(
+            r#"<article class="video-result"><a href="{url}"><img src="{thumbnail}" alt="{title}"></a><div><h2><a href="{url}">{title}</a></h2><p class="views">{views}</p><p class="channel">{channel}</p><p>{snippet}</p></div></article>"#,
+            url = e(&result.url),
+            views = e(views), channel = e(channel), snippet = e(description),
+        ));
+    }
+    if count == 0 {
+        cards.push_str("<p>No videos found. Try another search.</p>");
+    }
+    replace(&one(&dom, "main.youtube-content").unwrap(), &cards);
+    dom.to_string()
 }
+
+pub(crate) fn video_thumbnail(title: &str) -> String {
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360"><rect width="640" height="360" fill="#203c50"/><path d="M0 280 180 100 350 280 500 60 640 220V360H0Z" fill="#375f76"/><rect x="44" y="48" width="552" height="264" rx="12" fill="#102330" opacity=".7"/><path d="m291 130 90 50-90 50Z" fill="white"/><text x="40" y="330" font-family="Arial,sans-serif" font-size="17" fill="white">{}</text></svg>"##,
+        e(&title.chars().take(60).collect::<String>())
+    );
+    format!("data:image/svg+xml,{}", quote(&svg, ""))
+}
+
 fn ddg_link(url: &str) -> String {
     format!("//duckduckgo.com/l/?uddg={}", quote(url, ""))
 }
@@ -377,19 +456,14 @@ fn duckduckgo(query: &str, record: &Search) -> String {
             snippet = e(&r.snippet),
         ));
     }
-    out.push(format!(r#"<div class="nav-link"><form action="/html/" method="post"><input type="submit" class="btn btn--alt" value="Next" /><input type="hidden" name="q" value="{q}" /><input type="hidden" name="s" value="10" /><input type="hidden" name="dc" value="11" /></form></div>
-</div></div><div class="feedback-btn"><a rel="nofollow" href="//duckduckgo.com/feedback.html">Feedback</a></div></body></html>"#));
+    out.push(r#"</div></div><div class="feedback-btn"><a rel="nofollow" href="//duckduckgo.com/feedback.html">Feedback</a></div></body></html>"#.into());
     out.join("\n")
-}
-fn duckduckgo_home() -> &'static str {
-    r#"<!DOCTYPE html><html><head><meta charset="UTF-8"><title>DuckDuckGo</title></head>
-<body><form action="/html/" method="post"><input type="text" name="q" autofocus /><input type="submit" value="Search" /></form></body></html>"#
 }
 /// Renders Bing results.
 fn bing(query: &str, record: &Search) -> String {
     let q = e(query);
     let qp = quote_plus(query);
-    let count = result_count(query);
+    let count = result_count(record.results.len());
     let mut out = vec![format!(
         r#"<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{q} - Search</title><link rel="stylesheet" href="/search.css"></head>
 <body class="bing"><header id="b_header"><a class="bing-brand" href="/"><b>◇</b>Microsoft Bing</a><form action="/search" id="sb_form" role="search"><input id="sb_form_q" name="q" type="search" value="{q}" aria-label="Search"><button type="submit">Search</button></form>
@@ -444,7 +518,7 @@ struct EngineLayout {
 
 fn layout(engine: Engine) -> EngineLayout {
     match engine {
-        Engine::Google => EngineLayout {
+        Engine::Google | Engine::YouTube => EngineLayout {
             host: "www.google.com",
             list: "#rso",
             organic: ".tF2Cxc.asEBEc",
@@ -557,7 +631,7 @@ fn results(
     if start == 0 && !record.ads.is_empty() {
         if let Ok(ad) = one(&list, layout.ad) {
             let (title, snippet) = match engine {
-                Engine::Google => ("[role=heading]", ".MUxGbd"),
+                Engine::Google | Engine::YouTube => ("[role=heading]", ".MUxGbd"),
                 Engine::Bing => ("h2 a", "p"),
                 Engine::DuckDuckGo => (".result__a", ".result__snippet"),
             };
@@ -578,7 +652,7 @@ fn results(
         } else {
             // These captures have no ads. Preserve the existing sponsored markup.
             let fallback = match engine {
-                Engine::Google => google(query, record, start),
+                Engine::Google | Engine::YouTube => google(query, record, start),
                 Engine::Bing => bing(query, record),
                 Engine::DuckDuckGo => duckduckgo(query, record),
             };
@@ -590,7 +664,7 @@ fn results(
                 let mut attrs = ad.attributes.borrow_mut();
                 let class = attrs.get("class").unwrap_or_default();
                 let scope = match engine {
-                    Engine::Google => "google",
+                    Engine::Google | Engine::YouTube => "google",
                     Engine::Bing => "bing",
                     Engine::DuckDuckGo => "body--html",
                 };
@@ -603,7 +677,7 @@ fn results(
     }
     for row in &record.results {
         let snippet = if row.date.is_empty() {
-            row.snippet.clone()
+            normalize_space(&row.snippet)
         } else {
             format!("{} — {}", row.date, row.snippet)
         };
@@ -616,7 +690,7 @@ fn results(
         &format!(
             "{query} - {}",
             match engine {
-                Engine::Google => "Google Search",
+                Engine::Google | Engine::YouTube => "Google Search",
                 Engine::Bing => "Search",
                 Engine::DuckDuckGo => "DuckDuckGo",
             }
@@ -639,10 +713,17 @@ fn results(
                 .insert("value", query.to_owned());
         }
     }
+    for node in dom
+        .select("#botstuff table, #foot, .b_pag, .nav-link, .pagination")
+        .unwrap()
+        .collect::<Vec<_>>()
+    {
+        node.as_node().detach();
+    }
     for count in dom.select("#result-stats, .sb_count").unwrap() {
         replace(
             count.as_node(),
-            &format!("About {} results", result_count(query)),
+            &format!("About {} results", result_count(record.results.len())),
         );
     }
     for link in dom.select("a[href]").unwrap() {
@@ -707,6 +788,122 @@ mod tests {
             }],
             ..Search::default()
         }
+    }
+
+    #[test]
+    fn bundled_homes_submit_to_results_and_resolve_assets_for_every_name() {
+        for (engine, hosts, action) in [
+            (
+                Engine::Google,
+                &["www.google.com", "google.com"][..],
+                "/search",
+            ),
+            (Engine::Bing, &["www.bing.com", "bing.com"][..], "/search"),
+            (
+                Engine::DuckDuckGo,
+                &[
+                    "duckduckgo.com",
+                    "www.duckduckgo.com",
+                    "html.duckduckgo.com",
+                ][..],
+                "/html/",
+            ),
+        ] {
+            let dom = document(home(engine));
+            let form = dom.select_first("form[role=search]").unwrap();
+            assert_eq!(form.attributes.borrow().get("action"), Some(action));
+            assert!(form.as_node().select_first("input[name=q]").is_ok());
+            for host in hosts {
+                for node in dom.select("link[rel=stylesheet], img[src]").unwrap() {
+                    let attrs = node.attributes.borrow();
+                    let path = attrs.get("href").or_else(|| attrs.get("src")).unwrap();
+                    let (_, bytes) = crate::sites::asset(host, path).unwrap();
+                    assert!(!bytes.is_empty(), "{host}{path}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn youtube_results_keep_ranked_video_data_and_submit_to_the_same_route() {
+        let record = Search {
+            results: vec![
+                Result {
+                    url: "https://www.youtube.com/watch?v=paths".into(),
+                    title: "Paths & files".into(),
+                    snippet: "Python Channel • 12,345 views • A practical guide".into(),
+                    ..Default::default()
+                },
+                Result {
+                    url: "https://example.org/article".into(),
+                    title: "An article".into(),
+                    ..Default::default()
+                },
+                Result {
+                    url: "https://www.youtube.com/shorts/directories".into(),
+                    title: "Directories".into(),
+                    snippet: "Developer Channel • 567 views".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let dom = document(&youtube("paths <files> & directories", &record));
+        let form = dom.select_first("form[role=search]").unwrap();
+        assert_eq!(form.attributes.borrow().get("action"), Some("/results"));
+        let field = dom.select_first("input[name=search_query]").unwrap();
+        assert_eq!(
+            field.attributes.borrow().get("value"),
+            Some("paths <files> & directories")
+        );
+        let cards = dom.select(".video-result").unwrap().collect::<Vec<_>>();
+        assert_eq!(cards.len(), 2);
+        for (card, index) in cards.iter().zip([0, 2]) {
+            let result = &record.results[index];
+            assert_eq!(
+                card.as_node().select_first("h2").unwrap().text_contents(),
+                result.title
+            );
+            assert_eq!(
+                card.as_node()
+                    .select_first("h2 a")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("href"),
+                Some(result.url.as_str())
+            );
+            let image = card.as_node().select_first("img").unwrap();
+            assert!(
+                image
+                    .attributes
+                    .borrow()
+                    .get("src")
+                    .unwrap()
+                    .starts_with("data:image/svg+xml,")
+            );
+            assert!(card.text_contents().contains(&result.snippet));
+        }
+        assert_eq!(
+            cards[0]
+                .as_node()
+                .select_first(".channel")
+                .unwrap()
+                .text_contents(),
+            "Python Channel"
+        );
+        assert_eq!(
+            cards[0]
+                .as_node()
+                .select_first(".views")
+                .unwrap()
+                .text_contents(),
+            "12,345 views"
+        );
+        assert!(dom.select_first(".video-player").is_err());
+        let empty = youtube("directories", &Search::default());
+        assert!(empty.contains("No videos found"));
+        assert!(!empty.contains("12,345"));
     }
 
     #[test]
@@ -829,8 +1026,9 @@ mod tests {
 
     #[test]
     fn counts_and_urls() {
-        assert_eq!(result_count("one two"), "12,083,890");
-        assert_eq!(result_count("é 😀"), "12,078,810");
+        assert_eq!(result_count(10), "10");
+        assert_eq!(result_count(0), "0");
+        assert_eq!(result_count(12_078_810), "12,078,810");
         assert_eq!(
             display_url("https://User@EXAMPLE.com/a//b/é/d?q=x"),
             "example.com › a › b › é"

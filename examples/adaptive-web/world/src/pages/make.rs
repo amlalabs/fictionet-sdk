@@ -15,82 +15,6 @@ const STOP: &[&str] = &[
     "news", "com", "www", "https", "http", "best", "example", "details", "safe", "owners",
     "version", "fixed", "fix", "latest",
 ];
-/// Search directories for exploring a subject when no known article matches.
-/// These addresses open listings rather than inventing reporting or sources.
-const FILLER_SITES: [(&str, &str, &str, &str); 12] = [
-    (
-        "en.wikipedia.org",
-        "w/index.php?search={plus}",
-        "Search the encyclopedia - Wikipedia",
-        "Browse encyclopedia articles and related subjects.",
-    ),
-    (
-        "www.reddit.com",
-        "search/?q={plus}",
-        "Search discussions - Reddit",
-        "Find community discussions and questions.",
-    ),
-    (
-        "www.theregister.com",
-        "Search/?q={plus}",
-        "Search - The Register",
-        "Find technology reporting, outages and security news.",
-    ),
-    (
-        "stackoverflow.com",
-        "search?q={plus}",
-        "Search programming questions - Stack Overflow",
-        "Browse programming questions and answers.",
-    ),
-    (
-        "medium.com",
-        "search?q={plus}",
-        "Search stories - Medium",
-        "Find articles, authors and publications.",
-    ),
-    (
-        "www.techradar.com",
-        "search?searchTerm={plus}",
-        "Search - TechRadar",
-        "Find technology guides, reviews and advice.",
-    ),
-    (
-        "github.com",
-        "search?q={plus}",
-        "Search repositories - GitHub",
-        "Find repositories, code and project documentation.",
-    ),
-    (
-        "www.bbc.co.uk",
-        "search?q={plus}",
-        "Search - BBC",
-        "Find news, features and programmes from the BBC.",
-    ),
-    (
-        "www.youtube.com",
-        "results?search_query={plus}",
-        "Search videos - YouTube",
-        "Browse videos and channels.",
-    ),
-    (
-        "www.quora.com",
-        "search?q={plus}",
-        "Search questions - Quora",
-        "Browse questions and answers by topic.",
-    ),
-    (
-        "news.ycombinator.com",
-        "?q={plus}",
-        "Hacker News Search",
-        "Search stories and comments from Hacker News.",
-    ),
-    (
-        "www.linkedin.com",
-        "search/results/all/?keywords={plus}",
-        "Search - LinkedIn",
-        "Find people, companies and posts.",
-    ),
-];
 /// Bylines on articles the offline generator makes.
 const AUTHORS: [&str; 16] = [
     "Priya Raman",
@@ -365,25 +289,469 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             );
         }
     }
-    for (host, path, title, snippet) in FILLER_SITES {
-        let url = format!(
-            "https://{host}/{}",
-            path.replace("{plus}", &quote_plus(&phrase))
-        );
-        // Reference and listing pages carry no date in a result list.
-        let dated = ![
-            "en.wikipedia.org",
-            "stackoverflow.com",
-            "github.com",
-            "www.youtube.com",
+    let terms = words(query);
+    let subject = if terms.iter().any(|w| w == "groupby") {
+        "Python itertools.groupby()".into()
+    } else if let Some(place) = phrase.to_lowercase().strip_prefix("best ") {
+        place.split_once(" in ").map_or_else(
+            || place.to_owned(),
+            |(food, city)| format!("{food} in {}", upper_first(city)),
+        )
+    } else {
+        phrase
+            .to_lowercase()
+            .strip_prefix("how to ")
+            .map_or_else(|| terms.join(" "), str::to_owned)
+    };
+    let place = terms.iter().any(|w| {
+        [
+            "pizza",
+            "restaurant",
+            "restaurants",
+            "cafe",
+            "cafes",
+            "hotel",
+            "hotels",
         ]
-        .contains(&host);
-        let date = if dated {
+        .contains(&w.as_str())
+    });
+    let code = terms.iter().any(|w| {
+        [
+            "python",
+            "rust",
+            "javascript",
+            "code",
+            "itertools",
+            "groupby",
+            "programming",
+        ]
+        .contains(&w.as_str())
+    });
+    let lodging = terms
+        .iter()
+        .any(|w| ["hotel", "hotels", "accommodation", "hostel", "hostels"].contains(&w.as_str()));
+    let network = terms.iter().any(|w| w == "router");
+    let howto = network
+        || phrase.to_lowercase().starts_with("how ")
+        || terms
+            .iter()
+            .any(|w| ["repair", "install", "configure", "clean"].contains(&w.as_str()));
+    let topic = upper_first(&subject);
+    let candidates = if lodging {
+        vec![
+            (
+                "www.booking.com",
+                format!("The best {subject} | Booking.com"),
+                "Compare rooms, neighbourhoods and cancellation conditions. Check the location and the full price for your travel dates before reserving.",
+            ),
+            (
+                "www.tripadvisor.co.uk",
+                format!("{topic}: traveller reviews - Tripadvisor"),
+                "Read recent guest comments about comfort, cleanliness and service. Use the map to compare locations near the places you plan to visit.",
+            ),
+            (
+                "www.hotels.com",
+                format!("{topic} - Places to stay | Hotels.com"),
+                "Find rooms by area and compare the included amenities. Check whether breakfast, parking and local charges are included.",
+            ),
+            (
+                "www.expedia.co.uk",
+                format!("{topic}: find your next stay | Expedia"),
+                "Browse city-centre stays and quieter neighbourhoods. Review room types, accessibility information and cancellation terms.",
+            ),
+            (
+                "www.kayak.co.uk",
+                format!("{topic} - Compare places to stay | KAYAK"),
+                "Compare accommodation options and check what is included in each room rate. Availability depends on your travel dates.",
+            ),
+            (
+                "www.trivago.co.uk",
+                format!("{topic}: compare accommodation | trivago"),
+                "Compare room offers, locations and facilities. Read the booking conditions carefully before choosing where to stay.",
+            ),
+            (
+                "www.reddit.com",
+                format!("Any recommendations for {subject}? : r/AskUK"),
+                "Looking for a comfortable base with easy access to the centre. Locals discuss which areas are convenient without being too noisy at night.",
+            ),
+            (
+                "www.theguardian.com",
+                format!("Where to stay: {subject} | Travel | The Guardian"),
+                "A guide to choosing a base, from small guesthouses to larger city-centre properties. Consider transport, noise and the places you want to explore.",
+            ),
+            (
+                "www.independent.co.uk",
+                format!("{topic}: a city break guide | The Independent"),
+                "Plan a short stay around walkable neighbourhoods, local transport and a room that suits your budget.",
+            ),
+            (
+                "www.lonelyplanet.com",
+                format!("Where to stay near {subject} - Lonely Planet"),
+                "Get to know the neighbourhoods before choosing a room. Staying close to transport can make day trips and late arrivals simpler.",
+            ),
+        ]
+    } else if place {
+        vec![
+            (
+                "www.tripadvisor.co.uk",
+                format!("The 10 best places for {subject} - Tripadvisor"),
+                "Compare traveller ratings, opening hours and neighbourhoods. Read recent reviews before choosing a table.",
+            ),
+            (
+                "www.opentable.co.uk",
+                format!("{topic}: restaurants you can book | OpenTable"),
+                "Find a table for tonight. Browse menus, dining options and booking availability in the city centre and nearby neighbourhoods.",
+            ),
+            (
+                "www.timeout.com",
+                format!("Where to eat {subject}: our favourite spots"),
+                "Wood-fired ovens, crisp bases and seasonal toppings are the draw at these independent kitchens. Our guide covers quick lunches and relaxed dinners.",
+            ),
+            (
+                "www.yelp.co.uk",
+                format!("Top rated {subject} - Yelp"),
+                "Browse local recommendations with photos, price ranges and opening times. Filter by neighbourhood and takeaway options.",
+            ),
+            (
+                "www.reddit.com",
+                format!("Where would you go for {subject}? : r/AskUK"),
+                "Looking for somewhere independent with a good crust and a short menu. Locals share their favourite neighbourhood spots in the replies.",
+            ),
+            (
+                "www.bbc.com",
+                format!("The independent kitchens behind {subject} - BBC Food"),
+                "Small kitchens are building a following with slow-fermented dough and locally sourced toppings. Owners explain why a shorter menu works.",
+            ),
+            (
+                "www.theguardian.com",
+                format!("A local’s guide to {subject} | Food | The Guardian"),
+                "From busy market counters to quiet neighbourhood dining rooms, these are the places locals return to for a meal with friends.",
+            ),
+            (
+                "www.deliveroo.co.uk",
+                format!("{topic} delivered to your door | Deliveroo"),
+                "Explore nearby kitchens, delivery areas and collection options. Check the menu for vegetarian choices and current opening hours.",
+            ),
+            (
+                "www.designmynight.com",
+                format!("Our guide to {subject} | DesignMyNight"),
+                "Planning a casual evening out? Find relaxed dining rooms, outdoor tables and places that welcome groups.",
+            ),
+            (
+                "www.independent.co.uk",
+                format!("{topic}: a food lover’s guide | The Independent"),
+                "A good base needs time, heat and a light hand with toppings. We look at the neighbourhood restaurants keeping things simple.",
+            ),
+        ]
+    } else if code && terms.iter().any(|w| w == "groupby") {
+        vec![
+            (
+                "docs.python.org",
+                format!("{topic} — Python documentation"),
+                "groupby() returns consecutive keys and groups from an iterable. Sort the input with the same key function when equal keys should share a group.",
+            ),
+            (
+                "stackoverflow.com",
+                format!("Grouping consecutive values with {subject} - Stack Overflow"),
+                "The group iterator shares its input with the outer iterator. Convert each group to a list before advancing if you need to keep its values.",
+            ),
+            (
+                "realpython.com",
+                format!("Working with {subject} in Python – Real Python"),
+                "Build a key function, sort the records and iterate over key-group pairs. Each group contains only adjacent records with the same key.",
+            ),
+            (
+                "github.com",
+                format!("python-notes / {subject} · GitHub"),
+                "Short recipes for grouping records by a field, collecting each iterator and checking the output on a small list of dictionaries.",
+            ),
+            (
+                "www.reddit.com",
+                format!("Understanding {subject} : r/learnpython"),
+                "I wanted one group per distinct value but got repeated keys. Sorting first made the difference; the replies explain consecutive runs.",
+            ),
+            (
+                "www.geeksforgeeks.org",
+                format!("Using {subject} with iterables - GeeksforGeeks"),
+                "Pass a key function to group records by a chosen field. Remember that a new group begins whenever that key changes.",
+            ),
+            (
+                "www.programiz.com",
+                format!("{topic}: grouping records step by step | Programiz"),
+                "Start with a short sequence, choose the grouping key and collect the values from each group iterator.",
+            ),
+            (
+                "www.datacamp.com",
+                format!("A practical guide to {subject} | DataCamp"),
+                "Turn rows into groups without building an intermediate dictionary. Sorting and iterator lifetime are the two details to watch.",
+            ),
+            (
+                "www.digitalocean.com",
+                format!("How To Work With {topic} | DigitalOcean"),
+                "Use an explicit key function for structured records. Materialize each group before the outer loop moves to the next key.",
+            ),
+            (
+                "www.freecodecamp.org",
+                format!("{topic}: common iterator pitfalls explained"),
+                "Adjacent equal values belong to the same run. Compare sorted and unsorted input to see why the same key can appear more than once.",
+            ),
+        ]
+    } else if code {
+        let docs = if terms.iter().any(|w| w == "rust") {
+            "doc.rust-lang.org"
+        } else if terms.iter().any(|w| w == "javascript") {
+            "developer.mozilla.org"
+        } else {
+            "docs.python.org"
+        };
+        vec![
+            (
+                docs,
+                format!("{topic} — Language reference"),
+                "The reference describes the API, accepted arguments and return values. Check the examples and version notes before adapting the code.",
+            ),
+            (
+                "stackoverflow.com",
+                format!("How can I use {subject}? - Stack Overflow"),
+                "A short example makes the behaviour easier to see. Include the input, the output and the relevant part of the code when asking for help.",
+            ),
+            (
+                "github.com",
+                format!("Code notes / {subject} · GitHub"),
+                "Usage notes, small examples and a discussion of common edge cases. Read the package documentation for supported versions.",
+            ),
+            (
+                "www.reddit.com",
+                format!("Help understanding {subject} : r/learnprogramming"),
+                "I am working through a small example and trying to understand the behaviour. The replies compare approaches and explain the tradeoffs.",
+            ),
+            (
+                "www.geeksforgeeks.org",
+                format!("{topic} with examples - GeeksforGeeks"),
+                "Start with a small input and inspect the result at each step. The examples cover ordinary use and common boundary cases.",
+            ),
+            (
+                "www.programiz.com",
+                format!("{topic}: practical examples | Programiz"),
+                "A step-by-step explanation of the syntax and how the values flow through the program.",
+            ),
+            (
+                "www.digitalocean.com",
+                format!("How To Use {topic} | DigitalOcean"),
+                "Prepare a small project, check the runtime version and work through the example one step at a time.",
+            ),
+            (
+                "www.freecodecamp.org",
+                format!("Understanding {subject}: a practical guide"),
+                "An introduction to the main ideas, with small examples and notes on common errors.",
+            ),
+            (
+                "www.datacamp.com",
+                format!("Getting started with {subject} | DataCamp"),
+                "Learn the basic syntax and compare a few approaches using a small collection of values.",
+            ),
+            (
+                "medium.com",
+                format!("Notes on {subject} | Medium"),
+                "A walkthrough of the approach, the edge cases to consider and useful references for further reading.",
+            ),
+        ]
+    } else if howto && network {
+        vec![
+            (
+                "www.wikihow.com",
+                format!("{topic}: a step-by-step guide - wikiHow"),
+                "Save your settings before restoring factory defaults. A restart keeps your configuration; a factory reset removes it.",
+            ),
+            (
+                "www.tp-link.com",
+                format!("{topic} | TP-Link Support"),
+                "Keep the router powered on. Hold the recessed reset button until the status light changes, then wait for the device to finish restarting.",
+            ),
+            (
+                "www.netgear.com",
+                format!("{topic} - NETGEAR Support"),
+                "Record your network name and connection settings first. After restoring defaults, connect to the local administration page and choose a new password.",
+            ),
+            (
+                "www.reddit.com",
+                format!("{topic}: what should I check? : r/HomeNetworking"),
+                "Before pressing reset, check whether a simple power cycle solves the connection problem. A factory restore clears custom wireless settings.",
+            ),
+            (
+                "superuser.com",
+                format!("When should I {subject}? - Super User"),
+                "Rebooting and restoring defaults have different effects. Export the current configuration before clearing it and keep the ISP details handy.",
+            ),
+            (
+                "www.howtogeek.com",
+                format!("{topic}: restart or restore factory settings?"),
+                "Unplugging the power briefly restarts a router without erasing its settings. Use the reset button only when you intend to reconfigure it.",
+            ),
+            (
+                "www.lifewire.com",
+                format!("{topic} without losing track of your settings - Lifewire"),
+                "Find the model label and administration address before you begin. Keep a wired connection available while the wireless network is reconfigured.",
+            ),
+            (
+                "www.asus.com",
+                format!("{topic} | Official Support | ASUS"),
+                "Back up the configuration from the administration interface. Restore defaults from system settings or use the physical reset button.",
+            ),
+            (
+                "www.techradar.com",
+                format!("{topic}: get your home network connected again | TechRadar"),
+                "Check power, cables and service status first. If a factory restore is needed, set up a new administrator password afterwards.",
+            ),
+            (
+                "www.which.co.uk",
+                format!("{topic}: home networking advice - Which?"),
+                "Start by checking whether the outage affects more than one device. Keep your broadband account details nearby before changing the router configuration.",
+            ),
+        ]
+    } else if howto {
+        vec![
+            (
+                "www.wikihow.com",
+                format!("{topic}: a step-by-step guide - wikiHow"),
+                "Gather what you need and prepare a clear workspace. Work through each step in order and check the care instructions before you begin.",
+            ),
+            (
+                "www.ifixit.com",
+                format!("{topic} - Repair Guide - iFixit"),
+                "Check the model and review the tools list before starting. Take care around connectors and stop if parts do not move freely.",
+            ),
+            (
+                "www.howtogeek.com",
+                format!("{topic}: what to know before you start"),
+                "Preparation makes the job easier. Check the product instructions and keep track of any settings or small parts as you work.",
+            ),
+            (
+                "www.reddit.com",
+                format!("{topic}: looking for practical advice : r/HowTo"),
+                "I am looking for a careful approach and advice on common mistakes. People who have done it share what helped and what they would avoid.",
+            ),
+            (
+                "www.quora.com",
+                format!("What is a good way to {subject}? - Quora"),
+                "Start with the simplest approach recommended in the product instructions. Consider the materials, tools and time involved before choosing a method.",
+            ),
+            (
+                "superuser.com",
+                format!("How should I {subject}? - Super User"),
+                "Check the model and the relevant documentation first. A small, reversible step is easier to assess than changing several things at once.",
+            ),
+            (
+                "www.lifewire.com",
+                format!("{topic}: a practical guide - Lifewire"),
+                "Prepare the equipment, read the instructions and work carefully. Check the result before putting everything back into regular use.",
+            ),
+            (
+                "www.techradar.com",
+                format!("{topic}: the steps to follow | TechRadar"),
+                "Our guide explains how to prepare, what to look out for and when to consult the manufacturer’s instructions.",
+            ),
+            (
+                "www.instructables.com",
+                format!("{topic} : Steps - Instructables"),
+                "Read through the whole process before beginning. Gather the tools and materials, then work through the stages one at a time.",
+            ),
+            (
+                "www.which.co.uk",
+                format!("{topic}: practical advice - Which?"),
+                "Check the care information and avoid methods that could damage delicate components. Contact the manufacturer if the instructions are unclear.",
+            ),
+        ]
+    } else {
+        vec![
+            (
+                "www.theregister.com",
+                format!("{topic}: a closer look • The Register"),
+                "A look at the details behind the headlines and the questions that remain open.",
+            ),
+            (
+                "www.bbc.com",
+                format!("{topic}: the key questions explained - BBC News"),
+                "Background, recent developments and the questions readers are asking. Follow the links for further context.",
+            ),
+            (
+                "www.reddit.com",
+                format!("What should people know about {subject}? : r/AskReddit"),
+                "Readers share their experiences and discuss which sources helped them understand the subject.",
+            ),
+            (
+                "en.wikipedia.org",
+                format!("{topic} - Wikipedia"),
+                "An overview of the subject, its background and related topics, with references for further reading.",
+            ),
+            (
+                "www.theguardian.com",
+                format!("{topic} | News and features | The Guardian"),
+                "Reporting, analysis and background on recent developments and the people involved.",
+            ),
+            (
+                "www.independent.co.uk",
+                format!("{topic}: news and advice | The Independent"),
+                "The latest coverage alongside practical advice and background information.",
+            ),
+            (
+                "www.quora.com",
+                format!("What is useful to know about {subject}? - Quora"),
+                "Answers compare approaches and explain the background for readers getting started.",
+            ),
+            (
+                "medium.com",
+                format!("A closer look at {subject} | Medium"),
+                "Notes on the main ideas, common questions and lessons from practical experience.",
+            ),
+            (
+                "www.wikihow.com",
+                format!("Getting started with {subject} - wikiHow"),
+                "Work through the basics, gather the information you need and choose the next step.",
+            ),
+            (
+                "github.com",
+                format!("Resources for {subject} · GitHub"),
+                "A collection of notes, useful links and background reading organised by topic.",
+            ),
+        ]
+    };
+    for (index, (host, title, snippet)) in candidates.into_iter().enumerate() {
+        let slug = terms.join("-");
+        let path = match host {
+            "www.reddit.com" => format!(
+                "r/{}/comments/{}/{slug}/",
+                title
+                    .rsplit_once("r/")
+                    .map(|(_, name)| name)
+                    .unwrap_or("AskReddit"),
+                hash(query)
+            ),
+            "en.wikipedia.org" => format!("wiki/{}", subject.replace(' ', "_")),
+            "docs.python.org" if terms.iter().any(|w| w == "groupby") => {
+                "3/library/itertools.html".into()
+            }
+            "docs.python.org" => format!("3/library/{slug}.html"),
+            "doc.rust-lang.org" => format!("std/{slug}/index.html"),
+            "stackoverflow.com" => format!("questions/{}/{slug}", hash(query)),
+            "github.com" => format!("python-notes/{slug}"),
+            _ => format!("guides/{slug}-{}", index + 1),
+        };
+        let url = format!("https://{host}/{path}");
+        let date = if [
+            "www.bbc.com",
+            "www.theguardian.com",
+            "www.independent.co.uk",
+            "www.theregister.com",
+            "medium.com",
+        ]
+        .contains(&host)
+        {
             short_date(date_for(seed, &url, 45))
         } else {
             String::new()
         };
-        add(url, title.into(), snippet.into(), date);
+        add(url, title, snippet.into(), date);
     }
     Search {
         results,
@@ -396,6 +764,68 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             format!("How do I check {phrase}?"),
         ],
         ads: vec![],
+    }
+}
+
+/// Video listings drawn from the world's stored video pages.
+pub fn videos<'a>(query: &str, pages: impl Iterator<Item = (&'a String, String)>) -> Search {
+    use kuchiki::traits::TendrilSink;
+    let mut known = Vec::new();
+    for (url, html) in pages {
+        let dom = kuchiki::parse_html().one(html);
+        for card in dom.select("article, .video-item").unwrap() {
+            let Ok(link) = card.as_node().select_first("h2 a[href], h3 a[href]") else {
+                continue;
+            };
+            let href = link.attributes.borrow().get("href").unwrap().to_owned();
+            let Some(url) = join(url, &href) else {
+                continue;
+            };
+            let snippet = card
+                .as_node()
+                .select("p")
+                .unwrap()
+                .map(|p| p.text_contents())
+                .collect::<Vec<_>>()
+                .join(" • ");
+            if !known.iter().any(|r: &Result| r.url == url) {
+                known.push(Result {
+                    url,
+                    title: link.text_contents(),
+                    snippet,
+                    date: String::new(),
+                });
+            }
+        }
+    }
+    let mut results = rank(&known, query)
+        .into_iter()
+        .filter(|r| relevant(r, query))
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>();
+    if results.is_empty() {
+        let topic = upper_first(&words(query).join(" "));
+        for (i, suffix) in [
+            "A practical walkthrough",
+            "Getting started",
+            "Common questions",
+            "Step by step",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            results.push(Result {
+                url: format!("https://www.youtube.com/watch?v={:x}", hash(&format!("{query}{i}"))),
+                title: format!("{topic}: {suffix}"),
+                snippet: "A walkthrough of the basics, with preparation steps and answers to common questions.".into(),
+                date: String::new(),
+            });
+        }
+    }
+    Search {
+        results,
+        ..Search::default()
     }
 }
 
@@ -421,7 +851,77 @@ pub fn site_profile(host: &str) -> Profile {
     } else {
         name
     };
-    let kind = if host.contains("wiki") {
+    let name = match host {
+        "www.booking.com" => "Booking.com",
+        "www.hotels.com" => "Hotels.com",
+        "www.expedia.co.uk" => "Expedia",
+        "www.kayak.co.uk" => "KAYAK",
+        "www.trivago.co.uk" => "trivago",
+        "www.tripadvisor.co.uk" => "Tripadvisor",
+        "www.opentable.co.uk" => "OpenTable",
+        "www.timeout.com" => "Time Out",
+        "www.yelp.co.uk" => "yelp",
+        "www.deliveroo.co.uk" => "Deliveroo",
+        "www.designmynight.com" => "DesignMyNight",
+        "www.theguardian.com" => "The Guardian",
+        "www.independent.co.uk" => "Independent",
+        "www.wikihow.com" => "wikiHow",
+        "stackoverflow.com" => "Stack Overflow",
+        "superuser.com" => "Super User",
+        "realpython.com" => "Real Python",
+        "www.geeksforgeeks.org" => "GeeksforGeeks",
+        "www.programiz.com" => "Programiz",
+        "www.datacamp.com" => "DataCamp",
+        "www.digitalocean.com" => "DigitalOcean",
+        "www.freecodecamp.org" => "freeCodeCamp",
+        "www.tp-link.com" => "tp-link",
+        "www.netgear.com" => "NETGEAR",
+        "www.asus.com" => "ASUS",
+        "www.techradar.com" => "TechRadar",
+        "www.howtogeek.com" => "How-To Geek",
+        "www.lifewire.com" => "Lifewire",
+        "www.which.co.uk" => "Which?",
+        _ => &name,
+    }
+    .to_owned();
+    let kind = if host == "www.ebay.com" {
+        "shop"
+    } else if host == "www.linkedin.com" {
+        "company"
+    } else if matches!(
+        host,
+        "www.booking.com"
+            | "www.hotels.com"
+            | "www.expedia.co.uk"
+            | "www.kayak.co.uk"
+            | "www.trivago.co.uk"
+    ) {
+        "lodging"
+    } else if matches!(
+        host,
+        "www.tripadvisor.co.uk"
+            | "www.opentable.co.uk"
+            | "www.yelp.co.uk"
+            | "www.deliveroo.co.uk"
+            | "www.designmynight.com"
+    ) {
+        "listings"
+    } else if host == "www.wikihow.com" {
+        "howto"
+    } else if matches!(
+        host,
+        "realpython.com"
+            | "www.geeksforgeeks.org"
+            | "www.programiz.com"
+            | "www.datacamp.com"
+            | "www.digitalocean.com"
+            | "www.freecodecamp.org"
+            | "www.tp-link.com"
+            | "www.netgear.com"
+            | "www.asus.com"
+    ) {
+        "docs"
+    } else if host.contains("wiki") {
         "wiki"
     } else if host.starts_with("docs.") || host.contains("github") {
         "docs"
@@ -429,6 +929,7 @@ pub fn site_profile(host: &str) -> Profile {
         || host.contains("community")
         || host.contains("reddit")
         || host.contains("stackoverflow")
+        || host == "superuser.com"
     {
         "forum"
     } else if host.starts_with("shop.") || host.starts_with("store.") {
@@ -444,6 +945,34 @@ pub fn site_profile(host: &str) -> Profile {
     };
     let links = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let (tagline, nav) = match kind {
+        "lodging" => (
+            String::new(),
+            links(&[
+                "Stays|/",
+                "Flights|/flights/",
+                "Car rentals|/cars/",
+                "Attractions|/attractions/",
+                "Help|/help/",
+            ]),
+        ),
+        "listings" => (
+            String::new(),
+            links(&[
+                "Discover|/",
+                "Restaurants|/restaurants/",
+                "Things to do|/attractions/",
+                "Trips|/trips/",
+                "Review|/reviews/",
+            ]),
+        ),
+        "howto" => (
+            "How to do anything".into(),
+            links(&[
+                "Explore|/",
+                "Categories|/Category:Categories",
+                "Help|/Help:About-wikiHow",
+            ]),
+        ),
         "wiki" => (
             "The free encyclopedia".to_owned(),
             links(&[
@@ -514,8 +1043,32 @@ pub fn site_profile(host: &str) -> Profile {
             ]),
         ),
     };
+    let mut css = stylesheet(kind);
+    let accent = match host {
+        "www.tripadvisor.co.uk" => "#006b4e",
+        "www.opentable.co.uk" => "#da3743",
+        "www.yelp.co.uk" => "#d32323",
+        "www.wikihow.com" => "#476d3b",
+        "realpython.com" => "#3776ab",
+        "stackoverflow.com" => "#f48024",
+        "superuser.com" => "#2e6d91",
+        "www.theguardian.com" => "#052962",
+        "www.independent.co.uk" => "#c8102e",
+        "www.deliveroo.co.uk" => "#00a396",
+        "www.timeout.com" => "#e6001b",
+        "www.netgear.com" => "#6e2585",
+        "www.tp-link.com" => "#008c95",
+        "www.digitalocean.com" => "#0069ff",
+        _ => "",
+    };
+    if !accent.is_empty() {
+        css.push_str(&format!("body {{ --accent:{accent};background:#fff;color:#222;font-family:Arial,sans-serif }} header {{ border-top:0;border-bottom:1px solid #ddd }} .brand a,.home,.logo {{color:{accent}}} .ad-slot,.newsletter,.tagline {{display:none}} .columns>nav {{background:#f7f8fa;padding:24px}}"));
+    }
+    if ["listings", "lodging", "howto"].contains(&kind) {
+        css.push_str("header{display:flex;align-items:center;gap:42px;padding:20px max(28px,calc((100% - 1160px)/2))}header .brand{white-space:nowrap}.site-content{max-width:1120px;margin:36px auto;padding:0 24px}.site-content h1{font-size:36px}.restaurant-list{margin:28px 0}.restaurant-list article{border:1px solid #ddd;border-radius:12px;padding:24px;margin:16px 0}.restaurant-list h3{margin-top:0}.site-content ol{padding:0;list-style-position:inside;counter-reset:step}.site-content ol li{margin:20px 0;padding:24px;background:#f3f6ef;border:1px solid #dbe2d6;border-radius:6px;font-size:18px}.filters{display:flex;gap:12px;border-bottom:1px solid #ddd;padding:18px 0}.filters span{border:1px solid #aaa;border-radius:22px;padding:7px 18px}body.howto>header{background:#93b874}.site-content>article{max-width:860px}.site-content>article>h1{margin-top:20px}body.howto{background:#f6f5f1}");
+    }
     Profile {
-        css: stylesheet(kind),
+        css,
         tagline,
         name,
         kind: kind.into(),
@@ -641,9 +1194,20 @@ pub(crate) fn misspelled_host(host: &str) -> bool {
         short[at..] == long[at + 1..]
     };
     let known = || {
-        crate::route::SEARCH_HOSTS
-            .into_iter()
-            .chain(FILLER_SITES.iter().map(|s| s.0))
+        crate::route::SEARCH_HOSTS.into_iter().chain([
+            "en.wikipedia.org",
+            "www.reddit.com",
+            "www.theregister.com",
+            "stackoverflow.com",
+            "medium.com",
+            "www.techradar.com",
+            "github.com",
+            "www.bbc.co.uk",
+            "www.youtube.com",
+            "www.quora.com",
+            "news.ycombinator.com",
+            "www.linkedin.com",
+        ])
     };
     !known().any(|k| k == host) && known().any(close)
 }
@@ -663,7 +1227,7 @@ pub(super) fn page_with_known(
         .map(|(_, v)| v.into_owned());
     let search = query.is_some();
     let directory = path == "/"
-        || path.ends_with('/')
+        || (path.ends_with('/') && !path.contains("/comments/"))
         || ["/latest", "/categories", "/top", "/search"].contains(&path);
     if !search && !directory {
         let mut made = page(seed, host, target, mentions, kind);
@@ -877,7 +1441,16 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
                 "<div class=\"post\"><p class=\"author\"><b>{asker}</b> · <time datetime=\"{date}\">{when}</time></p><p>{}</p></div>",
                 escape(&question)
             )];
-            let generic = pick(&REPLIES, 0).to_owned();
+            let topic = words(&title);
+            let generic = if topic.iter().any(|w| w == "pizza") {
+                "We usually check the recent comments about the dough and the service, then look at the menu before booking. Going a little earlier helps avoid the dinner rush."
+            } else if topic.iter().any(|w| w.contains("groupby")) {
+                "The key detail is that groups contain consecutive values. Sort by the same key first, and collect each group before moving to the next one."
+            } else if topic.iter().any(|w| w == "router") {
+                "Keep a copy of the connection settings before you clear anything. A restart leaves them in place, while a factory restore means setting up the network again."
+            } else {
+                pick(&REPLIES, 0)
+            }.to_owned();
             for (i, claim) in claims.iter().chain(std::iter::once(&generic)).enumerate() {
                 let reply = (date + time::Duration::days(i as i64 + 1)).min(day(seed, 0));
                 posts.push(format!(
@@ -971,6 +1544,29 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
         }
     };
     page.body = body;
+    if host == "www.ebay.com" {
+        page.body.push_str(&format!("<h2>Item details</h2><dl><dt>Item</dt><dd>{t}</dd><dt>Condition</dt><dd>See the seller’s description</dd><dt>Included accessories</dt><dd>Contact the seller for details</dd></dl><h2>Description</h2><p>Review the description and included accessories before purchasing. Ask the seller about compatibility with your equipment.</p>"));
+    } else if host == "www.linkedin.com" {
+        page.body.push_str(&format!("<h2>About</h2><p>{t}</p><h3>Company information</h3><p>Visit the company’s website for its services, locations and contact information.</p>"));
+    }
+    let topic = words(&title);
+    if kind != "forum" && topic.iter().any(|w| w.contains("groupby")) {
+        page.body.push_str("<h2>Grouping consecutive records</h2><p>Sort with the same key used for grouping, then collect each group while its iterator is current.</p><pre><code>from itertools import groupby
+
+rows = [(\"blue\", 2), (\"red\", 1), (\"blue\", 3)]
+rows.sort(key=lambda row: row[0])
+for colour, items in groupby(rows, key=lambda row: row[0]):
+    print(colour, list(items))
+# blue [(\"blue\", 2), (\"blue\", 3)]
+# red [(\"red\", 1)]</code></pre><p>Without sorting, separated runs of the same colour produce separate groups. Collect the inner iterator before advancing the outer loop.</p>");
+    } else if kind != "forum"
+        && topic.iter().any(|w| w == "router")
+        && topic.iter().any(|w| w == "reset")
+    {
+        page.body.push_str("<h2>Before you begin</h2><p>A factory restore clears wireless names, passwords and custom settings. Check the instructions for your model and keep any broadband connection details nearby.</p><h2>Restore the router</h2><ol><li>Export the configuration if you can still reach the administration page.</li><li>Keep the router connected to power and locate the recessed reset button.</li><li>Follow the model’s instructions for holding the button, watching for the status lights to change.</li><li>Let the device finish starting up. Connect by cable if the wireless network is unavailable.</li><li>Open the administration page, choose a new administrator password and configure your wireless network.</li></ol><p>If you only need a restart, switch the power off briefly instead. This preserves the configuration.</p>");
+    } else if kind != "forum" && topic.iter().any(|w| w == "pizza") {
+        page.body.push_str("<section class=\"restaurant-list\"><h2>Finding a place to eat</h2><article><h3>City centre dining</h3><p>Look around the station and shopping streets for a quick lunch or an early dinner. Compare the menu and check whether tables need to be booked.</p></article><article><h3>Independent neighbourhood kitchens</h3><p>Neighbourhood kitchens offer relaxed evenings away from the centre. Look for a short menu, freshly stretched dough and seasonal toppings.</p></article><article><h3>Markets and takeaway counters</h3><p>For a casual stop, compare slices and whole pies at local counters. Check collection times and dietary options directly with the kitchen.</p></article><h2>Before you book</h2><p>Read recent comments about the base, service and value. Opening hours and menus can change; check directly before travelling.</p></section>");
+    }
     page.content_type = "text/html; charset=utf-8".into();
     page.description = excerpt(
         snippets

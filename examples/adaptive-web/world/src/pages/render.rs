@@ -140,6 +140,30 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         format!(r#"<span class="tagline">{}</span>"#, e(&profile.tagline))
     };
     let main = match kind {
+        "listings" | "lodging" | "howto" => format!(
+            r#"<body class="{kind}"><header><div class="brand"><a href="/">{}</a></div><nav>{nav}</nav></header><div class="site-content"><p class="page-breadcrumb"><a href="/">Home</a> › {}</p><div class="filters"><span>{}</span><span>{}</span><span>{}</span></div><article>{body}</article></div></body></html>"#,
+            e(name),
+            e(title),
+            if kind == "lodging" {
+                "Stays"
+            } else if kind == "listings" {
+                "Restaurants"
+            } else {
+                "Steps"
+            },
+            if kind == "lodging" {
+                "Room type"
+            } else if kind == "listings" {
+                "Cuisine"
+            } else {
+                "Tips"
+            },
+            if kind == "listings" {
+                "Price"
+            } else {
+                "Related articles"
+            }
+        ),
         "news" | "blog" => {
             let newsletter = if style.is_multiple_of(2) {
                 r#"<section class="newsletter"><h2>Newsletter</h2><form action="/newsletter" method="post"><input type="email" name="email" placeholder="Email address"><button>Sign up</button></form></section>"#
@@ -300,10 +324,37 @@ pub fn again(
     date: &str,
     today: &str,
 ) -> Option<String> {
+    let path = target.split('?').next().unwrap_or(target);
+    if super::make::site_profile(host).kind == "forum"
+        && ["/", "/search", "/search/", "/latest", "/categories", "/top"].contains(&path)
+    {
+        return None;
+    }
     let skin = fictionet_extras::sites::lookup(host, target)?;
     let today = super::seed::parse_date(today).ok()?;
     let published = super::seed::parse_date(date).unwrap_or(today);
-    let page = skin.render(title, &skin.content(html)?, published, today)?;
+    use kuchiki::traits::TendrilSink;
+    let content = skin.content(html).or_else(|| {
+        let dom = kuchiki::parse_html().one(html);
+        let main = dom
+            .select_first("main")
+            .or_else(|_| dom.select_first("article"))
+            .or_else(|_| dom.select_first("body"))
+            .ok()?;
+        Some(main.as_node().children().map(|n| n.to_string()).collect())
+    })?;
+    let page = page_at(
+        host,
+        target,
+        &super::make::site_profile(host),
+        &Page {
+            title: title.into(),
+            body: content,
+            date: published.to_string(),
+            ..Page::default()
+        },
+        &today.to_string(),
+    );
     (page != html).then_some(page)
 }
 
