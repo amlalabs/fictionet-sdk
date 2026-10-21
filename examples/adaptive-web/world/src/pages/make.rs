@@ -4100,6 +4100,13 @@ pub fn site_profile(host: &str) -> Profile {
         name
     };
     let name = match host {
+        "docs.python.org" => "Python Documentation",
+        "www.manualslib.com" | "manualslib.com" => "ManualsLib",
+        "www.cvedetails.com" | "cvedetails.com" => "CVE Details",
+        "community.halvardsystems.com" => "Halvard Community",
+        "docs.halvardsystems.com" => "Halvard Docs",
+        "www.cisa.gov" | "cisa.gov" => "CISA",
+        "nvd.nist.gov" | "www.nvd.nist.gov" => "NVD",
         "www.youtube.com" => "YouTube",
         "www.ifixit.com" => "iFixit",
         "www.sheldonbrown.com" => "Sheldon Brown",

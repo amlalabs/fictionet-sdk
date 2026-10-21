@@ -1,5 +1,5 @@
 import { createMotion } from './motion.mjs';
-import { ENGINES, engine, queryTag, pageTag, short, hostOf, hostMark, layout } from './model.mjs';
+import { ENGINES, engine, queryTag, pageTag, short, hostOf, hostMark, layout, siteKey } from './model.mjs';
 
 const cut = (text, size) => text.length > size ? `${text.slice(0, size - 1)}…` : text;
 
@@ -9,6 +9,12 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     for (const [key, value] of Object.entries(values)) node.setAttribute(key, value);
   };
   let previous = null;
+  const making = new Map();
+  const window = svg.ownerDocument.defaultView || globalThis;
+  const later = window.setTimeout?.bind(window) || globalThis.setTimeout;
+  const cancel = window.clearTimeout?.bind(window) || globalThis.clearTimeout;
+  let latestSnapshot;
+  const names = new Map(), representatives = new Map();
   const layers = {};
   for (const name of ['edges', 'links', 'sites', 'engines', 'top', 'marks', 'fx']) layers[name] = add('g', { class: `layer-${name}` });
   const keyed = (parent, make, update) => {
@@ -87,10 +93,10 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     });
     add('text', { class: 'mark', 'aria-hidden': 'true' }, group);
     return group;
-  }, (g, { host, x, y, pages, scenario }) => {
+  }, (g, { host, site, x, y, pages, scenario }) => {
     const count = pages.filter((p) => p.fetches > 0).length;
     const r = count ? 9 + Math.min(count - 1, 4) * 1.25 : 8;
-    const mark = hostMark(host);
+    const mark = hostMark(siteKey(host));
     const latest = [...pages].sort((a, b) => a.at_ms - b.at_ms || (a.seq ?? 0) - (b.seq ?? 0)).at(-1);
     const state = latest ? pageTag(latest) : 'listed';
     attrs(g, { 'data-host': host, class: `site-group ${count ? 'opened' : 'listed'}` });
@@ -98,9 +104,9 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     attrs(g.children[4], { x, y, 'font-size': count ? Math.min(r * 1.3, 17) : 10 });
     g.children[4].textContent = mark.letter;
     g.style.transformOrigin = `${x}px ${y}px`;
-    attrs(g.children[0], { class: `site ${state}${scenario ? ' scenario' : ''}${pages.some((p) => p.making) ? ' making' : ''}`, cx: x, cy: y, r });
+    attrs(g.children[0], { class: `site ${state}${scenario ? ' scenario' : ''}${pages.some((p) => p.making) || making.has(siteKey(host)) ? ' making' : ''}`, cx: x, cy: y, r });
     attrs(g.children[1], { x, y: y + r + 18 });
-    g.children[1].textContent = short(host);
+    g.children[1].textContent = short(site);
     while (g.children[1].textContent.length > 1 && g.children[1].getComputedTextLength?.() > 116) {
       g.children[1].textContent = `${g.children[1].textContent.replace(/…$/, '').slice(0, -1)}…`;
     }
@@ -144,6 +150,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
   size?.observe(svg);
   planted.children[0].style.transformOrigin = '488px 540px';
   function render(snapshot, changes = null) {
+    latestSnapshot = snapshot;
     const query = snapshot.queries.at(-1);
     words.textContent = cut(query?.search || '', 54);
     queryTitle.textContent = query?.search || '';
@@ -161,24 +168,35 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     }
     const listed = query?.outcome.status === 'pending' ? []
       : [...(snapshot.results.find((r) => r.key === query?.key)?.listed || [])].sort((a, b) => a.rank - b.rank);
-    const hosts = new Set(snapshot.seed?.sites || []);
+    const remember = (host, site) => {
+      const key = siteKey(host);
+      if (!representatives.has(key)) representatives.set(key, host);
+      if (site) names.set(key, site);
+      return key;
+    };
+    for (const row of snapshot.seed.sites) remember(row.host, row.site);
+    for (const row of snapshot.sites || []) remember(row.host, row.site);
+    for (const list of snapshot.results) for (const row of list.listed) remember(row.host, row.site);
+    for (const row of snapshot.pages) remember(row.host, row.site);
+    const hosts = new Set(snapshot.seed.sites.map((row) => remember(row.host, row.site)));
     const touched = new Map();
-    for (const list of [...snapshot.results].sort((a, b) => a.query_id - b.query_id)) for (const row of list.listed) hosts.add(row.host);
+    for (const list of [...snapshot.results].sort((a, b) => a.query_id - b.query_id)) for (const row of list.listed) hosts.add(remember(row.host, row.site));
     for (const p of snapshot.pages) {
-      hosts.add(p.host); touched.set(p.host, p.at_ms);
-      if (p.reason?.via === 'link') hosts.add(hostOf(p.reason.from));
+      hosts.add(remember(p.host, p.site)); touched.set(siteKey(p.host), p.at_ms);
+      if (p.reason?.via === 'link') hosts.add(remember(hostOf(p.reason.from)));
     }
     const opened = changes ? changes.filter((c) => c.page).map((c) => c.page) : snapshot.pages;
-    const map = layout(previous, [...hosts], { seed: snapshot.seed, list: listed, opened, touched });
+    const scenario = snapshot.seed.sites.map((row) => siteKey(row.host));
+    const map = layout(previous, [...hosts], { seed: { sites: scenario }, list: listed.map((r) => siteKey(r.host)), opened: opened.map((p) => siteKey(p.host)), touched });
     previous = map;
-    const pages = (host) => snapshot.pages.filter((p) => p.host === host).sort((a, b) => (a.first_serve_ms ?? a.at_ms) - (b.first_serve_ms ?? b.at_ms) || a.url.localeCompare(b.url));
-    sites([...map.assignment].map(([host, [x, y]]) => [host, { host, x, y, pages: pages(host), scenario: snapshot.seed?.sites.includes(host) }]));
+    const pages = (host) => snapshot.pages.filter((p) => siteKey(p.host) === host).sort((a, b) => (a.first_serve_ms ?? a.at_ms) - (b.first_serve_ms ?? b.at_ms) || a.url.localeCompare(b.url));
+    sites([...map.assignment].map(([host, [x, y]]) => [host, { host: representatives.get(host) || host, site: names.get(host) || host, x, y, pages: pages(host), scenario: scenario.includes(host) }]));
     const asked = engines.find((e) => e.name === query?.engine);
-    results(asked ? listed.filter((r) => map.assignment.has(r.host)).map((r) => {
-      const [x, y] = map.assignment.get(r.host);
-      return [`${query.id}:${r.rank}:${r.url}`, { x1: asked.x, y1: 121, x2: x, y2: y - (pages(r.host).some((p) => p.fetches > 0) ? 16 : 7), 'data-rank': r.rank }];
+    results(asked ? listed.filter((r) => map.assignment.has(siteKey(r.host))).map((r) => {
+      const [x, y] = map.assignment.get(siteKey(r.host));
+      return [`${query.id}:${r.rank}:${r.url}`, { x1: asked.x, y1: 121, x2: x, y2: y - (pages(siteKey(r.host)).some((p) => p.fetches > 0) ? 16 : 7), 'data-rank': r.rank }];
     }) : []);
-    links(snapshot.pages.filter((p) => p.reason?.via === 'link' && hostOf(p.reason.from) !== p.host && map.assignment.has(hostOf(p.reason.from)) && map.assignment.has(p.host)).map((p) => [p.url, { url: p.url, from: map.assignment.get(hostOf(p.reason.from)), to: map.assignment.get(p.host) }]));
+    links(snapshot.pages.filter((p) => p.reason?.via === 'link' && siteKey(hostOf(p.reason.from)) !== siteKey(p.host) && map.assignment.has(siteKey(hostOf(p.reason.from))) && map.assignment.has(siteKey(p.host))).map((p) => [p.url, { url: p.url, from: map.assignment.get(siteKey(hostOf(p.reason.from))), to: map.assignment.get(siteKey(p.host)) }]));
     more.textContent = map.hidden ? `+${map.hidden} more` : '';
     const refusal = snapshot.refused.filter((r) => !r.name.startsWith('_')).at(-1);
     attrs(refused, { visibility: refusal ? 'visible' : 'hidden' });
@@ -190,7 +208,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     fitFact();
   }
   const position = (node) => [Number(node.getAttribute('cx')), Number(node.getAttribute('cy'))];
-  const siteNode = (host) => [...layers.sites.children].find((g) => g.getAttribute('data-host') === host);
+  const siteNode = (host) => [...layers.sites.children].find((g) => siteKey(g.getAttribute('data-host')) === siteKey(host));
   const pageNode = (url) => [...svg.querySelectorAll('.page-group')].find((g) => g.getAttribute('data-url') === url);
   const fade = (node, duration, delay = 0) => motion.anim(node, [{ opacity: 0 }, { opacity: 1 }], { duration, delay });
   function outline(node, duration) {
@@ -203,7 +221,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
   }
   function animate(changes, snapshot, oldHosts) {
     const current = snapshot.queries.at(-1);
-    for (const group of layers.sites.children) if (!oldHosts.has(group.getAttribute('data-host'))) {
+    for (const group of layers.sites.children) if (!oldHosts.has(siteKey(group.getAttribute('data-host')))) {
       motion.anim(group, [{ opacity: 0, transform: 'scale(.6)' }, { opacity: 1, transform: 'scale(1)' }], { duration: 320, easing: 'cubic-bezier(.2,.9,.3,1.2)' });
     }
     for (const change of changes) {
@@ -229,7 +247,6 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
           motion.ring(layers.fx, sx, sy, 'again', Number(site.children[0].getAttribute('r')) + 10, 520, 120);
         } else if (change.state === 'made') {
           outline(dot, 640);
-          motion.anim(site.children[0], [{ strokeDasharray: '3 3' }, { strokeDasharray: '3 3' }], { duration: 640 });
         } else {
           fade(dot, 160);
           motion.ring(layers.fx, x, y, change.state, 14, 420);
@@ -242,7 +259,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
         }
         if (change.type === 'page_opened' && p.reason?.via === 'link') {
           const link = [...layers.links.children].find((g) => g.getAttribute('data-url') === p.url);
-          if (hostOf(p.reason.from) === p.host) {
+          if (siteKey(hostOf(p.reason.from)) === siteKey(p.host)) {
             motion.travel(layers.fx, [sx, sy - Number(site.children[0].getAttribute('r')) - 2], [x, y], p.via === 'web_fetch' ? 'agent' : 'ink', 520);
           } else if (link) {
             motion.drawIn(link.children[0], 520);
@@ -286,6 +303,17 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
           motion.removeAfter(old, motion.anim(old, [{ opacity: .28 }, { opacity: 0 }], { duration: 380 }));
         }
       }
+      for (const change of changes) if (window.document && !window.document.hidden && change.type === 'page_opened' && change.state === 'made') {
+        const key = siteKey(change.page.host);
+        cancel(making.get(key));
+        making.set(key, later(() => {
+          making.delete(key);
+          const site = siteNode(key)?.children[0];
+          if (site && !latestSnapshot.pages.some((p) => siteKey(p.host) === key && p.making)) {
+            site.setAttribute('class', site.getAttribute('class').replace(/ making/g, ''));
+          }
+        }, 900));
+      }
       render(snapshot, changes);
       if (motion.active) animate(changes, snapshot, oldHosts);
       else if (motion.reduced && changes.length <= 8 && !svg.ownerDocument.hidden) {
@@ -299,12 +327,15 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     },
     reset(snapshot) {
       motion.suppressed = true;
+      for (const timer of making.values()) cancel(timer);
+      making.clear();
       previous = null;
+      names.clear(); representatives.clear();
       render(snapshot);
       // Apply the reset before radius transitions resume.
       svg.getBoundingClientRect();
       motion.suppressed = false;
     },
-    dispose() { size?.disconnect(); motion.dispose(); svg.replaceChildren(); },
+    dispose() { for (const timer of making.values()) cancel(timer); making.clear(); size?.disconnect(); motion.dispose(); svg.replaceChildren(); },
   };
 }

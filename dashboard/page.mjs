@@ -656,15 +656,26 @@ export async function mount(root, transport, theme, importModule) {
 
 // One centered card in place of the hosts and panels: not signed in, or the
 // page description could not be read.
-function showNotice(root, title, text, action = false) {
-  const { $ } = scoped(root);
+export function showNotice(root, title, text, action = false) {
+  const { $, el } = scoped(root);
+  if (!$('notice')) {
+    const notice = el('section', { id: 'notice', class: 'notice', role: 'status' }, root);
+    notice.style.gridRow = '2';
+    const card = el('div', { class: 'card' }, notice);
+    el('h2', { id: 'notice-title' }, card);
+    el('p', { id: 'notice-text' }, card);
+    const reload = el('button', { id: 'notice-action', class: 'button', type: 'button', text: 'Reload' }, card);
+    reload.addEventListener('click', () => globalThis.location?.reload());
+    root.querySelector('.app-body').hidden = true;
+  }
   root.dataset.state = 'notice';
   $('notice').hidden = false;
   $('notice-title').textContent = title;
   $('notice-text').textContent = text;
   $('notice-action').hidden = !action;
-  $('host-bar').replaceChildren();
-  $('run-status').hidden = true;
+  $('host-bar')?.replaceChildren();
+  const status = $('run-status') || root.querySelector('.app-live');
+  if (status) status.hidden = true;
 }
 
 if (typeof document !== 'undefined' && document.querySelector?.('#demo')) {

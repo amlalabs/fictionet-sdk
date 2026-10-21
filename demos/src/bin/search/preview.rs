@@ -243,7 +243,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         .and_then(|r| {
             r.listed
                 .iter()
-                .find(|r| !state.seed.sites.contains(&r.host))
+                .find(|r| !state.seed.sites.iter().any(|s| s.host == r.host))
         })
         .ok_or_else(|| fictionet::Error::msg("search returned no generated result"))?;
     let mut url = first.url.clone();

@@ -927,7 +927,7 @@ fn listed_results_and_the_reason_each_page_was_made() {
         let listed: Vec<_> = found
             .iter()
             .enumerate()
-            .map(|(i, (url, title))| json!({"rank": i + 1, "url": url, "title": title}))
+            .map(|(i, (url, title))| json!({"rank": i + 1, "url": url, "title": title, "site": pages.site_name(&text::target_of(url).0)}))
             .collect();
         assert_eq!(response.logged()["listed"], json!(listed));
         for (rank, (url, _)) in found.iter().enumerate() {
@@ -2451,7 +2451,11 @@ fn model_tools_and_browser_share_search_results_and_pages() {
                 listing.listed,
                 results
                     .iter()
-                    .map(|r| (r.url.clone(), r.title.clone()))
+                    .map(|r| (
+                        r.url.clone(),
+                        r.title.clone(),
+                        pages.site_name(&text::target_of(&r.url).0)
+                    ))
                     .collect::<Vec<_>>()
             );
             let url = &results[0].url;
@@ -2507,7 +2511,11 @@ fn prepared_lists_answer_every_engine_as_written() {
                 let Meta::Search(listing) = &served.meta else {
                     panic!("{host} {}: {:?}", list.query, served.meta);
                 };
-                let urls: Vec<_> = listing.listed.iter().map(|(url, _)| url.clone()).collect();
+                let urls: Vec<_> = listing
+                    .listed
+                    .iter()
+                    .map(|(url, _, _)| url.clone())
+                    .collect();
                 assert_eq!(urls, stored, "{host} {}", list.query);
                 checked += 1;
             }
@@ -5402,4 +5410,39 @@ fn made_wikipedia_articles_have_a_lead_sections_and_an_infobox() {
     assert!(main.text_contents().contains("lactic acid bacteria"));
     assert!(main.text_contents().contains("Effects"));
     assert!(dom.select_first(".page-breadcrumb").is_err());
+}
+
+#[test]
+fn site_names_use_profiles() {
+    let pages = halvard();
+    for (host, name) in [
+        ("docs.python.org", "Python Documentation"),
+        ("www.manualslib.com", "ManualsLib"),
+        ("www.cvedetails.com", "CVE Details"),
+        ("halvard-shipping.com", "Halvard Shipping"),
+        ("www.wikipedia.org", "Wikipedia"),
+        ("en.wikipedia.org", "Wikipedia"),
+        ("community.halvardsystems.com", "Halvard Community"),
+        ("docs.halvardsystems.com", "Halvard Docs"),
+    ] {
+        assert_eq!(pages.site_name(host), name);
+    }
+}
+
+#[test]
+fn prepared_profiles_supply_observer_names() {
+    lab(|cx| async move {
+        let pages = halvard();
+        let mut profile = make::site_profile("www.halvardsystems.com");
+        profile.name = "Halvard Support".into();
+        pages.store().site_once("www.halvardsystems.com", profile)?;
+        assert_eq!(pages.site_name("www.halvardsystems.com"), "Halvard Support");
+        let snapshot = crate::search::Searches::of(&pages).snapshot();
+        assert_eq!(snapshot.seed.sites[0].site, "Halvard Support");
+        let response = google(&pages, &cx, "halvard gateway vulnerability").await;
+        let fields = response.logged();
+        let first = &fields["listed"][0];
+        assert_eq!(first["site"], "Halvard Support");
+        Ok(())
+    });
 }

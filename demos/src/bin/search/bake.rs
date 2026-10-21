@@ -125,7 +125,11 @@ pub async fn run() -> Result {
                             listing.listed.len(),
                             calls(&root, started)
                         );
-                        listing.listed.iter().map(|(url, _)| url.clone()).collect()
+                        listing
+                            .listed
+                            .iter()
+                            .map(|(url, _, _)| url.clone())
+                            .collect()
                     }
                     Line::Visit(url) => vec![url.clone()],
                 };

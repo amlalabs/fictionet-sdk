@@ -145,16 +145,28 @@ export function hostMark(host) {
   return { key, hash, color: brand?.[1] || color, letter: brand?.[0] || key.charAt(0).toUpperCase() };
 }
 
-// Names used on the map.
-export function short(host) {
+const languages = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
+
+// Language and www aliases share a site's map position.
+export function siteKey(host) {
   const name = host.toLowerCase().replace(/^www\./, '');
-  const display = {
-    'halvardsystems.com': 'Halvard Systems', 'community.halvardsystems.com': 'Halvard Community',
-    'docs.halvardsystems.com': 'Halvard Docs', 'cisa.gov': 'CISA',
-    'nvd.nist.gov': 'NVD', 'en.wikipedia.org': 'Wikipedia',
-  }[name];
   const parts = name.split('.');
-  const label = parts.length > 2 && parts.at(-2).length <= 3 ? parts.slice(0, -2).join('.') : parts.slice(0, -1).join('.');
-  const text = display || label || name;
-  return text.length > 18 ? `${text.slice(0, 17)}…` : text;
+  const domain = parts.slice(1);
+  const registrable = domain.length === 2 || (domain.length === 3 && domain.at(-1).length === 2 && domain.at(-2).length <= 3);
+  if (registrable && /^[a-z]{2,3}$/.test(parts[0])) {
+    const language = languages.of(parts[0]);
+    if (language) return domain.join('.');
+  }
+  return name;
+}
+
+// Display names arrive with the world's rows.
+export function short(site) {
+  const name = {
+    'Halvard Systems Community': 'Halvard Community',
+    'Halvard Systems Documentation': 'Halvard Docs',
+    'Cybersecurity and Infrastructure Security Agency': 'CISA',
+    'National Vulnerability Database': 'NVD',
+  }[site] || site;
+  return name.length > 18 ? `${name.slice(0, 17)}…` : name;
 }

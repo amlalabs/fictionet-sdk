@@ -68,7 +68,7 @@ export function createTransport({ setStatus = () => {} } = {}, {
       method,
       headers: { Authorization: `Bearer ${bearer}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      credentials: 'omit', mode: 'same-origin', redirect: 'error', cache: 'no-store', referrerPolicy: 'no-referrer',
+      credentials: 'omit', mode: 'same-origin', redirect: 'error', cache: 'no-store', referrerPolicy: 'same-origin',
       signal: signal ? AbortSignal.any([lifetime.signal, signal]) : lifetime.signal,
     });
   }

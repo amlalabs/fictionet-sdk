@@ -422,14 +422,22 @@ fn strings_and_lists_are_bounded() {
         SeedCard {
             name: long.clone(),
             facts: vec![long.clone(); MAX_SEED_ITEMS + 1],
-            sites: vec![long.clone(); MAX_SEED_ITEMS + 2],
+            sites: vec![
+                NamedSite {
+                    host: long.clone(),
+                    site: long.clone()
+                };
+                MAX_SEED_ITEMS + 2
+            ],
             ..SeedCard::default()
         },
         Generator::default(),
     );
     feed(&s, 1, query(1, "google", &long));
-    let listed =
-        vec![json!({"rank":1,"url":format!("https://a.com/{long}"),"title":long}); MAX_LISTED + 3];
+    let listed = vec![
+        json!({"rank":1,"url":format!("https://a.com/{long}"),"title":long,"site":long});
+        MAX_LISTED + 3
+    ];
     feed(
         &s,
         2,
@@ -440,10 +448,27 @@ fn strings_and_lists_are_bounded() {
     assert_eq!(snap.seed.facts.len(), MAX_SEED_ITEMS);
     assert_eq!(snap.omitted.seed_facts, 1);
     assert_eq!(snap.omitted.seed_sites, 2);
+    assert_eq!(snap.seed.sites[0].site.len(), STRING_BYTES);
     assert_eq!(snap.queries[0].search.len(), STRING_BYTES);
     assert_eq!(snap.results[0].listed.len(), MAX_LISTED);
     assert_eq!(snap.omitted.listed, 3);
     assert_eq!(snap.results[0].listed[0].title.len(), STRING_BYTES);
+    assert_eq!(snap.results[0].listed[0].site.len(), STRING_BYTES);
+    feed(
+        &s,
+        3,
+        page("/name", "generated", "stub", json!(null)).field("site", long.clone()),
+    );
+    feed(
+        &s,
+        4,
+        Event::new("adaptive", "site")
+            .field("host", "a.com")
+            .field("site", long),
+    );
+    let snap = s.snapshot();
+    assert_eq!(snap.pages[0].site.len(), STRING_BYTES);
+    assert_eq!(snap.sites[0].site.len(), STRING_BYTES);
 }
 #[test]
 fn worst_case_snapshot_fits() {
@@ -454,7 +479,13 @@ fn worst_case_snapshot_fits() {
         date: t.clone(),
         question: t.clone(),
         facts: vec![t.clone(); MAX_SEED_ITEMS],
-        sites: vec![t.clone(); MAX_SEED_ITEMS],
+        sites: vec![
+            NamedSite {
+                host: t.clone(),
+                site: t.clone()
+            };
+            MAX_SEED_ITEMS
+        ],
     };
     let q = Query {
         id: n,
@@ -486,6 +517,7 @@ fn worst_case_snapshot_fits() {
                 rank: n,
                 url: t.clone(),
                 host: t.clone(),
+                site: t.clone(),
                 title: t.clone()
             };
             MAX_LISTED
@@ -498,6 +530,7 @@ fn worst_case_snapshot_fits() {
         first_serve_ms: Some(n),
         url: t.clone(),
         host: t.clone(),
+        site: t.clone(),
         at_ms: n,
         fetches: n,
         status: Some(n),
@@ -519,6 +552,7 @@ fn worst_case_snapshot_fits() {
     };
     let site = Site {
         host: t.clone(),
+        site: t.clone(),
         address: t.clone(),
         reason: SiteReason::SearchEngine,
         at_ms: n,
@@ -932,4 +966,38 @@ fn making_events_precede_page_work_and_failed_fetches_finish_the_row() {
             .iter()
             .all(|p| p.making && p.status.is_none() && p.carries.is_none() && p.fetches == 0)
     );
+}
+
+#[test]
+fn host_rows_keep_display_names() {
+    let s = searches();
+    feed(&s, 1, query(1, "google", "a"));
+    feed(&s, 2, answer(1, true).field("listed", field(&json!([
+        {"rank": 1, "url": "https://docs.python.org/", "title": "Functions", "site": "Python Documentation"}
+    ]))));
+    feed(
+        &s,
+        3,
+        Event::new("adaptive", "making")
+            .field("url", "https://a.com/new")
+            .field("host", "a.com")
+            .field("site", "A Company"),
+    );
+    assert_eq!(s.snapshot().pages[0].site, "A Company");
+    feed(
+        &s,
+        4,
+        page("/new", "generated", "stub", json!(null)).field("site", "A Company"),
+    );
+    feed(
+        &s,
+        5,
+        Event::new("adaptive", "site")
+            .field("host", "a.com")
+            .field("site", "A Company"),
+    );
+    let snap = s.snapshot();
+    assert_eq!(snap.results[0].listed[0].site, "Python Documentation");
+    assert_eq!(snap.pages[0].site, "A Company");
+    assert_eq!(snap.sites[0].site, "A Company");
 }

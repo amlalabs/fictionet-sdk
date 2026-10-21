@@ -134,6 +134,7 @@ impl Handler {
         }
         let fields = observing.then(|| {
             let mut fields = answer.fields();
+            fields.set("site", self.pages.site_name(&target.host));
             if page && matches!(answer.meta, Meta::Error { .. }) {
                 fields.set("kind", "page");
             }

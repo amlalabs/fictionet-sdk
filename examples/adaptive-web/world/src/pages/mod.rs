@@ -1288,7 +1288,13 @@ impl Pages {
             cache,
             carries,
             listed: (search.results.iter())
-                .map(|r| (r.url.clone(), r.title.clone()))
+                .map(|r| {
+                    (
+                        r.url.clone(),
+                        r.title.clone(),
+                        self.site_name(&text::target_of(&r.url).0),
+                    )
+                })
                 .collect(),
             usage,
         };
@@ -1821,10 +1827,19 @@ impl Pages {
         response
     }
 
+    /// The site's display name, shared by pages and observers.
+    pub fn site_name(&self, host: &str) -> String {
+        self.store()
+            .site(host)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| make::site_profile(host).name)
+    }
+
     pub(crate) fn making(&self, cx: &Cx, host: &str, target: &str) {
         cx.emit("adaptive", "making", |e| {
             e.field("url", format!("https://{host}{target}"))
                 .field("host", host)
+                .field("site", self.site_name(host))
         });
     }
 
@@ -2218,7 +2233,13 @@ impl fictionet_extras::models::Engine for Pages {
                 cache,
                 carries,
                 listed: (search.results.iter())
-                    .map(|r| (r.url.clone(), r.title.clone()))
+                    .map(|r| {
+                        (
+                            r.url.clone(),
+                            r.title.clone(),
+                            self.site_name(&text::target_of(&r.url).0),
+                        )
+                    })
                     .collect(),
                 usage,
             };
@@ -2248,6 +2269,7 @@ impl fictionet_extras::models::Engine for Pages {
             fields.set("method", "GET");
             fields.set("scheme", parsed.scheme());
             fields.set("host", host.as_str());
+            fields.set("site", self.site_name(&host));
             fields.set("path", parsed.path());
             if let Some(query) = parsed.query() {
                 fields.set("query", query);

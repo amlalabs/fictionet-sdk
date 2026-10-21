@@ -56,8 +56,8 @@ pub struct Listing {
     /// Cached, generated, or missing while nothing new is made.
     pub cache: Cache,
     pub carries: u64,
-    /// Each result's URL and title, in rank order.
-    pub listed: Vec<(String, String)>,
+    /// Each result's URL, title and site name, in rank order.
+    pub listed: Vec<(String, String, String)>,
     /// What made the list. None when it is missing.
     pub usage: Option<Usage>,
 }
@@ -130,8 +130,8 @@ impl Listing {
             .listed
             .iter()
             .enumerate()
-            .map(|(i, (url, title))| {
-                field(&serde_json::json!({"rank": i + 1, "url": url, "title": title}))
+            .map(|(i, (url, title, site))| {
+                field(&serde_json::json!({"rank": i + 1, "url": url, "title": title, "site": site}))
             })
             .collect();
         let mut fields = Fields::new()

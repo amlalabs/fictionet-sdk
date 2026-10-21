@@ -45,6 +45,7 @@ function transport(t, { fragment = '', token = 'secret', bootstrap = 204 } = {})
       assert.equal(options.credentials, 'omit');
       assert.equal(options.redirect, 'error');
       assert.equal(options.mode, 'same-origin');
+      assert.equal(options.referrerPolicy, 'same-origin');
       assert.equal(options.cache, 'no-store');
       if (url.endsWith('/bootstrap')) {
         assert.equal(options.method, 'POST');

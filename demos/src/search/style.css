@@ -73,3 +73,7 @@
 .search-picture .mark { fill: var(--app-host-color); font-family: var(--sans); font-weight: 700; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
 .search-picture .engine-group .mark { font-size: 16px; }
 .search-picture .site-group.opened .mark, .search-picture .engine-group.answered .mark { fill: var(--app-mark-ink); }
+
+.search-picture .site.making { stroke-dasharray: 3 3; animation: site-making 600ms linear infinite; }
+@keyframes site-making { to { stroke-dashoffset: -12; } }
+@media (prefers-reduced-motion: reduce) { .search-picture .site.making { animation: none; } }

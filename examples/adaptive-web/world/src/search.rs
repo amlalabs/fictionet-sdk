@@ -25,23 +25,23 @@ pub const MAX_REFUSED: usize = 64;
 pub const MAX_SEED_ITEMS: usize = 32;
 /// Most recent planted facts and pages retained.
 pub const MAX_PLANTED: usize = 16;
-/// Maximum compact snapshot JSON size: 4,422,957 bytes at these limits.
+/// Maximum compact snapshot JSON size: 5,239,533 bytes at these limits.
 /// Each string byte can need six JSON bytes. Numbers use twenty digits.
 /// Fixed costs include field names, punctuation and the longest enum values.
 pub const MAX_SNAPSHOT_BYTES: usize = {
     let string = 6 * STRING_BYTES;
     // Snapshot, seed, generator and omitted counts, with four strings.
     619 + 4 * string
-        // Two seed lists, with quotes and a comma per item.
-        + 2 * MAX_SEED_ITEMS * (3 + string)
+        // Facts and named sites, including array commas.
+        + MAX_SEED_ITEMS * (3 + string) + MAX_SEED_ITEMS * (22 + 2 * string)
         // Query rows, including failure text and a comma per row.
         + MAX_QUERIES * (462 + 6 * string)
         // Result lists and their entries, including array commas.
-        + MAX_RESULTS * (75 + string + MAX_LISTED * (60 + 3 * string))
+        + MAX_RESULTS * (75 + string + MAX_LISTED * (70 + 4 * string))
         // Page rows, including search reasons and a comma per row.
-        + MAX_PAGES * (486 + 6 * string)
+        + MAX_PAGES * (496 + 7 * string)
         // Site and refusal rows, including a comma per row.
-        + MAX_SITES * (79 + 2 * string)
+        + MAX_SITES * (89 + 3 * string)
         + MAX_REFUSED * (53 + 2 * string)
         // Planted rows with a comma each but the last, the list's name and
         // brackets, the canned flag and the omitted count.
@@ -71,16 +71,30 @@ pub struct SeedCard {
     pub question: String,
     pub facts: Vec<String>,
     /// Site hosts supplied by the seed.
-    pub sites: Vec<String>,
+    pub sites: Vec<NamedSite>,
+}
+/// A site named before its first request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedSite {
+    pub host: String,
+    pub site: String,
 }
 impl SeedCard {
-    fn of(seed: &crate::pages::Seed) -> Self {
+    fn of(pages: &crate::pages::Pages) -> Self {
+        let seed = pages.seed();
         Self {
             name: seed.name.clone(),
             date: seed.date.clone(),
             question: seed.question.clone(),
             facts: seed.facts.clone(),
-            sites: seed.sites.iter().map(|s| s.host.clone()).collect(),
+            sites: seed
+                .sites
+                .iter()
+                .map(|s| NamedSite {
+                    host: s.host.clone(),
+                    site: pages.site_name(&s.host),
+                })
+                .collect(),
         }
     }
 }
@@ -210,6 +224,7 @@ pub struct Listed {
     pub rank: u64,
     pub url: String,
     pub host: String,
+    pub site: String,
     pub title: String,
 }
 /// A result list shared by searches with the same key.
@@ -312,6 +327,7 @@ pub struct Page {
     pub first_serve_ms: Option<u64>,
     pub url: String,
     pub host: String,
+    pub site: String,
     /// Run time of the first fetch, in milliseconds.
     pub at_ms: u64,
     pub fetches: u64,
@@ -361,6 +377,7 @@ pub enum SiteReason {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Site {
     pub host: String,
+    pub site: String,
     pub address: String,
     pub reason: SiteReason,
     /// Run time of the assignment, in milliseconds.
@@ -444,7 +461,10 @@ impl Searches {
             .sites
             .iter()
             .take(MAX_SEED_ITEMS)
-            .map(|s| bounded(s))
+            .map(|s| NamedSite {
+                host: bounded(&s.host),
+                site: bounded(&s.site),
+            })
             .collect();
         generator.model = bounded(&generator.model);
         Self(Mutex::new(Snapshot {
@@ -462,7 +482,7 @@ impl Searches {
     /// Starts with the card of a world's pages: its seed and its generator.
     pub fn of(pages: &crate::pages::Pages) -> Self {
         Self::new(
-            SeedCard::of(pages.seed()),
+            SeedCard::of(pages),
             Generator {
                 kind: pages.generator_kind(),
                 model: pages.model(),
@@ -686,6 +706,7 @@ impl Snapshot {
                                     Some(Listed {
                                         rank: value["rank"].as_u64()?,
                                         host: host(url),
+                                        site: bounded(value["site"].as_str().unwrap_or_default()),
                                         url: bounded(url),
                                         title: bounded(value["title"].as_str()?),
                                     })
@@ -729,6 +750,7 @@ impl Snapshot {
                         first_serve_ms: e.u64("serve_ms"),
                         url,
                         host: bounded(host_name),
+                        site: text(e, "site"),
                         at_ms: ms,
                         fetches: 1,
                         status: e.u64("status"),
@@ -806,6 +828,7 @@ impl Snapshot {
                             first_serve_ms: None,
                             url,
                             host: text(e, "host"),
+                            site: text(e, "site"),
                             at_ms: ms,
                             fetches: 0,
                             status: None,
@@ -846,6 +869,7 @@ impl Snapshot {
                 };
                 self.sites.push(Site {
                     host,
+                    site: text(e, "site"),
                     address: text(e, "addr"),
                     reason,
                     at_ms: ms,

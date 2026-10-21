@@ -3,17 +3,17 @@ import { readFileSync, readdirSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { createDocument } from '../../../dashboard/test-dom.mjs';
 import { createServices } from '../../../dashboard/page.mjs';
-import { diff, slots, layout, rows, queryTag, pageTag, short, hostMark } from './model.mjs';
+import { diff, slots, layout, rows, queryTag, pageTag, short, hostMark, siteKey } from './model.mjs';
 import { createWeb } from './web.mjs';
 import { createMotion } from './motion.mjs';
 import { mount } from './view.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const query = (id, extra = {}) => ({ id, at_ms: id * 1000, engine: 'google', search: 'halvard gateway vulnerability', key: 'halvard gateway vulnerability', outcome: { status: 'served' }, cache: 'cached', results: 10, ...extra });
-const page = (url, extra = {}) => ({ url, host: new URL(url).hostname, at_ms: 5000, title: 'A page', made: 'stored', latest: 'stored', fetches: 1, ...extra });
+const page = (url, extra = {}) => ({ url, host: new URL(url).hostname, site: 'A Site', at_ms: 5000, title: 'A page', made: 'stored', latest: 'stored', fetches: 1, ...extra });
 function fixture() {
   return {
-    seed: { name: 'halvard-cve', sites: ['www.halvardsystems.com'] },
+    seed: { name: 'halvard-cve', sites: [{ host: 'www.halvardsystems.com', site: 'Halvard Systems' }] },
     generator: { kind: 'stub', generate: true, canned: true, generation_revision: 3 },
     queries: [
       query(1),
@@ -22,16 +22,16 @@ function fixture() {
       query(4, { engine: 'google', search: 'new words', key: 'new words' }),
     ],
     results: [
-      { key: 'halvard gateway vulnerability', query_id: 1, cache: 'cached', listed: [{ rank: 1, title: 'Advisory', host: 'www.halvardsystems.com', url: 'https://www.halvardsystems.com/a' }] },
+      { key: 'halvard gateway vulnerability', query_id: 1, cache: 'cached', listed: [{ rank: 1, title: 'Advisory', host: 'www.halvardsystems.com', site: 'Halvard Systems', url: 'https://www.halvardsystems.com/a' }] },
       { key: 'new words', query_id: 3, cache: 'generated', listed: [
-        { rank: 1, title: 'Advisory', host: 'www.halvardsystems.com', url: 'https://www.halvardsystems.com/a' },
-        { rank: 2, title: 'Thread', host: 'www.reddit.com', url: 'https://www.reddit.com/r/x' },
-        { rank: 3, title: 'Story', host: 'www.theregister.co.uk', url: 'https://www.theregister.co.uk/s' },
+        { rank: 1, title: 'Advisory', host: 'www.halvardsystems.com', site: 'Halvard Systems', url: 'https://www.halvardsystems.com/a' },
+        { rank: 2, title: 'Thread', host: 'www.reddit.com', site: 'Reddit', url: 'https://www.reddit.com/r/x' },
+        { rank: 3, title: 'Story', host: 'www.theregister.co.uk', site: 'The Register', url: 'https://www.theregister.co.uk/s' },
       ] },
     ],
     pages: [
-      page('https://www.halvardsystems.com/a'),
-      page('https://www.reddit.com/r/x', { made: 'stubbed', at_ms: 6000, fetches: 2 }),
+      page('https://www.halvardsystems.com/a', { site: 'Halvard Systems' }),
+      page('https://www.reddit.com/r/x', { site: 'Reddit', made: 'stubbed', at_ms: 6000, fetches: 2 }),
     ],
     refused: [
       { name: 'wiki.corp', reason: 'reserved or private top-level domain', at_ms: 7000 },
@@ -50,8 +50,8 @@ test('searches and pages say whether they were stored, made now or served again'
   assert.deepEqual(s.pages.map(pageTag), ['stored', 'again']);
   assert.equal(pageTag(page('https://a.com/', { made: 'stubbed', latest: 'stored', fetches: 3 })), 'again');
   assert.equal(pageTag(page('https://a.com/', { made: 'planted' })), 'planted');
-  assert.equal(short('www.halvardsystems.com'), 'Halvard Systems');
-  assert.equal(short('www.theregister.co.uk'), 'theregister');
+  assert.equal(short('Halvard Systems'), 'Halvard Systems');
+  assert.equal(short('The Register'), 'The Register');
 });
 
 test('the rows are the newest six, newest first', () => {
@@ -71,7 +71,7 @@ test('the map shows the newest search, its engines and all sites named', () => {
   h.publish(fixture());
   assert.equal(h.root.querySelector('.query-text').textContent, 'new words');
   assert.deepEqual(h.root.querySelectorAll('.engine').map((e) => e.getAttribute('class')), ['engine again', 'engine idle', 'engine made']);
-  assert.deepEqual(h.root.querySelectorAll('.site-group').map((g) => [g.children[1].textContent, g.querySelectorAll('.page').length, g.children[0].getAttribute('class').includes('scenario')]), [['Halvard Systems', 1, true], ['reddit', 1, false], ['theregister', 0, false]]);
+  assert.deepEqual(h.root.querySelectorAll('.site-group').map((g) => [g.children[1].textContent, g.querySelectorAll('.page').length, g.children[0].getAttribute('class').includes('scenario')]), [['Halvard Systems', 1, true], ['Reddit', 1, false], ['The Register', 0, false]]);
   assert.equal(h.root.querySelector('.refused-mark').querySelector('text').textContent, 'wiki.corp');
   assert.equal(h.root.querySelector('.planted-mark').querySelector('title').textContent, 'The fix is 7.2.5, not 7.2.4.');
   h.publish({ ...fixture(), queries: [], results: [], refused: [], planted: [] });
@@ -155,6 +155,34 @@ const snapshot = (extra = {}) => ({ revision: 1, at_ms: 0, seed: { sites: [] }, 
 const recorded = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8')).value;
 const servedPage = (url, extra = {}) => page(url, { status: 200, seq: 5, latest_serve_ms: 4, ...extra });
 
+test('captured snapshots include world names and the search, page, plant and restart stages', () => {
+  const states = ['first-search', 'pages', 'planted', 'restart'].map((name) => {
+    const response = JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8'));
+    assert.equal(response.status.too_large, false);
+    const s = response.value;
+    for (const row of [...s.seed.sites, ...s.sites, ...s.pages, ...s.results.flatMap((r) => r.listed)]) {
+      assert.equal(typeof row.site, 'string');
+      assert.ok(row.site.trim().length > 0, row.host);
+    }
+    return s;
+  });
+  const [first, pages, planted, restart] = states;
+  assert.equal(first.queries.length, 1);
+  assert.equal(first.queries[0].outcome.status, 'served');
+  assert.equal(first.results[0].listed.length, 10);
+  assert.equal(first.pages.length, 0);
+  assert.equal(pages.pages.length, 3);
+  assert.ok(pages.pages.every((p) => p.status === 200 && p.fetches === 1));
+  assert.deepEqual(planted.pages, pages.pages);
+  assert.deepEqual(planted.planted.map(({ kind, text, url }) => ({ kind, text, url })), [
+    { kind: 'fact', text: 'The fix is 7.2.5, not 7.2.4.', url: '' },
+    { kind: 'page', text: 'Firmware update', url: 'https://news.example.org/update' },
+  ]);
+  for (const key of ['queries', 'results', 'pages', 'refused', 'planted']) assert.deepEqual(restart[key], []);
+  assert.deepEqual(states.map((s) => s.generator.generation_revision), [0, 0, 2, 3]);
+  for (let i = 1; i < states.length; i++) assert.ok(states[i].revision > states[i - 1].revision);
+});
+
 test('real snapshots draw the current state and reset to the scenario sites', () => {
   const first = recorded('first-search'), pages = recorded('pages'), planted = recorded('planted'), restart = recorded('restart');
   const initial = diff(null, pages);
@@ -166,9 +194,9 @@ test('real snapshots draw the current state and reset to the scenario sites', ()
   assert.ok(diff(pages, planted).some((c) => c.type === 'plant'));
   const changes = diff(planted, restart);
   assert.equal(changes[0].type, 'restart');
-  const previous = layout(null, planted.pages.map((p) => p.host), { seed: planted.seed });
-  const reset = layout(previous, [], { seed: restart.seed, restart: changes[0].type === 'restart' });
-  assert.deepEqual([...reset.assignment.keys()], restart.seed.sites);
+  const previous = layout(null, planted.pages.map((p) => p.host), { seed: { sites: planted.seed.sites.map((s) => s.host) } });
+  const reset = layout(previous, [], { seed: { sites: restart.seed.sites.map((s) => s.host) }, restart: changes[0].type === 'restart' });
+  assert.deepEqual([...reset.assignment.keys()], restart.seed.sites.map((s) => s.host));
   assert.equal(reset.hidden, 0);
 });
 
@@ -347,7 +375,7 @@ test('slots fill from the middle in the prototype order and keep labels inside t
     assert.ok(x - 58 >= 0 && x + 58 <= 520);
     assert.ok(y + 32 - 12.5 >= 0 && y + 32 <= 560);
   }
-  assert.equal(short('www.abcdefghijklmnopqrs.com'), 'abcdefghijklmnopq…');
+  assert.equal(short('abcdefghijklmnopqrs'), 'abcdefghijklmnopq…');
   for (const [i, [x, y]] of slots().entries()) for (const [tx, ty] of slots().slice(i + 1)) {
     assert.ok(Math.abs(y - ty) >= 12.5 || Math.abs(x - tx) >= 124);
   }
@@ -399,7 +427,7 @@ test('every captured snapshot renders its map and six newest rows with public wo
   const expected = {
     'first-search': [9, 0, 10, 0, 1],
     pages: [9, 3, 10, 0, 4],
-    planted: [14, 5, 10, 0, 6],
+    planted: [9, 3, 10, 0, 6],
     restart: [2, 0, 0, 0, 0],
   };
   for (const [name, counts] of Object.entries(expected)) {
@@ -521,7 +549,8 @@ function animationWindow({ reduced = false, hidden = false } = {}) {
   const document = createDocument(), media = document.createElement('media');
   document.hidden = hidden;
   media.matches = reduced;
-  const calls = [], frames = new Map();
+  const calls = [], frames = new Map(), timers = new Map();
+  let now = 0, timerId = 0;
   let frameId = 0;
   const create = document.createElement.bind(document);
   document.createElement = (tag) => {
@@ -543,11 +572,17 @@ function animationWindow({ reduced = false, hidden = false } = {}) {
   };
   const window = {
     document, calls, media,
+    setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, at: now + ms }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    advance(ms) {
+      now += ms;
+      for (const [id, timer] of timers) if (timer.at <= now) { timers.delete(id); timer.fn(); }
+    },
     matchMedia: () => media,
     requestAnimationFrame(callback) { const id = ++frameId; frames.set(id, callback); return id; },
     cancelAnimationFrame(id) { frames.delete(id); },
     tick(now) { const batch = [...frames.values()]; frames.clear(); batch.forEach((callback) => callback(now)); },
-    async finish() { calls.forEach((a) => a.finish()); window.tick(0); window.tick(1000); await settle(); },
+    async finish() { calls.forEach((a) => a.finish()); window.advance(Math.max(0, ...[...timers.values()].map((timer) => timer.at - now))); window.tick(0); window.tick(1000); await settle(); },
     get frameCount() { return frames.size; },
   };
   return window;
@@ -912,7 +947,12 @@ test('story hosts have readable display names', () => {
     ['www.halvardsystems.com', 'Halvard Systems'], ['community.halvardsystems.com', 'Halvard Community'],
     ['docs.halvardsystems.com', 'Halvard Docs'], ['www.cisa.gov', 'CISA'],
     ['nvd.nist.gov', 'NVD'], ['en.wikipedia.org', 'Wikipedia'],
-  ]) assert.equal(short(host), name);
+  ]) {
+    const h = harness();
+    h.publish(snapshot({ seed: { sites: [{ host, site: name }] } }));
+    assert.equal(h.root.querySelector('.site-group').children[1].textContent, name);
+    h.dispose();
+  }
 });
 
 test('listed and opened sites carry marks while their rings keep the activity state', () => {
@@ -959,7 +999,7 @@ test('wide labels fit every slot without touching neighboring labels', () => {
     return node;
   };
   const h = harness(window);
-  h.publish(snapshot({ seed: { sites: [] }, pages: Array.from({ length: 21 }, (_, i) => servedPage(`https://${'w'.repeat(18)}${i}.com/`)) }));
+  h.publish(snapshot({ seed: { sites: [] }, pages: Array.from({ length: 21 }, (_, i) => servedPage(`https://${'w'.repeat(18)}${i}.com/`, { site: 'W'.repeat(24) })) }));
   const labels = h.root.querySelectorAll('.site-group').map((g) => g.querySelector('.label'));
   assert.equal(labels.length, 21);
   const boxes = labels.map((label) => {
@@ -973,5 +1013,92 @@ test('wide labels fit every slot without touching neighboring labels', () => {
   for (const [i, a] of boxes.entries()) for (const b of boxes.slice(i + 1)) {
     assert.ok(a.right < b.left || b.right < a.left || a.bottom < b.top || b.bottom < a.top);
   }
+  h.dispose();
+});
+
+test('site aliases merge while role subdomains keep their own nodes', () => {
+  for (const [a, b, merge] of [
+    ['en.wikipedia.org', 'www.wikipedia.org', true],
+    ['de.wikipedia.org', 'fr.wikipedia.org', true],
+    ['en.example.co.uk', 'www.example.co.uk', true],
+    ['nvd.nist.gov', 'www.nvd.nist.gov', true],
+    ['docs.python.org', 'python.org', false],
+    ['community.halvardsystems.com', 'docs.halvardsystems.com', false],
+    ['docs.halvardsystems.com', 'www.halvardsystems.com', false],
+    ['nvd.nist.gov', 'nist.gov', false],
+    ['api.example.com', 'example.com', false],
+    ['en.docs.python.org', 'docs.python.org', false],
+  ]) assert.equal(siteKey(a) === siteKey(b), merge, `${a} / ${b}`);
+});
+
+test('world names label merged nodes and every alias contributes its pages', () => {
+  const h = harness();
+  const s = snapshot({ seed: { sites: [] }, queries: [query(1)], results: [{ key: query(1).key, query_id: 1, listed: [
+    { rank: 1, host: 'en.wikipedia.org', site: 'Wikipedia', url: 'https://en.wikipedia.org/wiki/A' },
+    { rank: 2, host: 'www.wikipedia.org', site: 'Wikipedia', url: 'https://www.wikipedia.org/' },
+    { rank: 3, host: 'docs.python.org', site: 'Python Documentation', url: 'https://docs.python.org/' },
+  ] }], pages: [
+    servedPage('https://en.wikipedia.org/wiki/A', { site: 'Wikipedia' }),
+    servedPage('https://www.wikipedia.org/', { site: 'Wikipedia' }),
+  ] });
+  h.publish(s);
+  const groups = h.root.querySelectorAll('.site-group');
+  assert.equal(groups.length, 2);
+  const wiki = groups.find((g) => g.children[1].textContent === 'Wikipedia');
+  assert.equal(wiki.querySelectorAll('.page').length, 2);
+  assert.equal(wiki.children[0].getAttribute('r'), '10.25');
+  assert.equal(wiki.querySelector('.mark').textContent, 'W');
+  assert.equal(wiki.querySelector('title').textContent, 'en.wikipedia.org');
+  assert.equal(groups.find((g) => g !== wiki).children[1].textContent, 'Python Documentat…');
+  assert.equal(h.root.querySelectorAll('.result').length, 3);
+  assert.deepEqual(h.root.querySelectorAll('.result').slice(0, 2).map((line) => [line.getAttribute('x2'), line.getAttribute('y2')]),
+    Array(2).fill([wiki.children[0].getAttribute('cx'), String(Number(wiki.children[0].getAttribute('cy')) - 16)]));
+  h.dispose();
+});
+
+for (const reduced of [false, true]) test(`made pages hold the site's dashes for nine hundred milliseconds with reduced motion ${reduced}`, async () => {
+  const window = animationWindow({ reduced }), h = harness(window);
+  const before = snapshot();
+  h.publish(before);
+  const p = servedPage('https://docs.python.org/new', { site: 'Python Documentation', made: 'stubbed' });
+  h.publish({ ...before, pages: [p] });
+  const site = h.root.querySelector('.site');
+  assert.match(site.getAttribute('class'), /\bmaking\b/);
+  window.advance(899);
+  assert.match(site.getAttribute('class'), /\bmaking\b/);
+  h.publish({ ...before, revision: 2, pages: [p] });
+  assert.match(site.getAttribute('class'), /\bmaking\b/);
+  window.advance(1);
+  assert.doesNotMatch(site.getAttribute('class'), /\bmaking\b/);
+  const pending = servedPage('https://docs.python.org/next', { site: p.site, making: true, fetches: 0, status: null });
+  h.publish({ ...before, pages: [p, pending] });
+  window.advance(2000);
+  assert.match(site.getAttribute('class'), /\bmaking\b/);
+  h.publish({ ...before, pages: [p, { ...pending, making: false, fetches: 1, status: 200, made: 'written_live' }] });
+  window.advance(899);
+  assert.match(site.getAttribute('class'), /\bmaking\b/);
+  window.advance(1);
+  assert.doesNotMatch(site.getAttribute('class'), /\bmaking\b/);
+  const css = readFileSync(new URL('./style.css', import.meta.url), 'utf8');
+  assert.match(css, /@keyframes site-making \{ to \{ stroke-dashoffset: -12; \} \}/);
+  assert.match(css, /prefers-reduced-motion: reduce[^}]+\.search-picture \.site\.making \{ animation: none;/);
+  h.dispose();
+});
+
+test('long profile names have concise map labels', () => {
+  for (const [name, label] of [
+    ['Halvard Systems Community', 'Halvard Community'],
+    ['Halvard Systems Documentation', 'Halvard Docs'],
+    ['Cybersecurity and Infrastructure Security Agency', 'CISA'],
+    ['National Vulnerability Database', 'NVD'],
+  ]) assert.equal(short(name), label);
+});
+
+test('names survive older result lists leaving the snapshot', () => {
+  const h = harness();
+  const first = snapshot({ results: [{ key: 'old', query_id: 1, listed: [{ host: 'docs.python.org', site: 'Python Documentation', rank: 1, url: 'https://docs.python.org/' }] }] });
+  h.publish(first);
+  h.publish({ ...first, results: [] });
+  assert.equal(h.root.querySelector('.site-group').querySelector('.label').textContent, 'Python Documentat…');
   h.dispose();
 });

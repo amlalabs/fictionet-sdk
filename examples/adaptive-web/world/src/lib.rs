@@ -443,7 +443,7 @@ pub fn net(
     start: SystemTime,
     forward: impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static,
 ) -> fictionet::stdlib::world::net::Net {
-    let handler = handler::Handler::new(fcx, pages);
+    let handler = handler::Handler::new(fcx, pages.clone());
     log.attach(fcx);
     let names = addresses.fixed.clone();
     let world = fcx.clone();
@@ -483,6 +483,7 @@ pub fn net(
             event
                 .summary(format_args!("{host} at {addr} ({why})"))
                 .field("host", host)
+                .field("site", pages.site_name(host))
                 .field("addr", addr.to_string())
                 .field("why", why)
         });

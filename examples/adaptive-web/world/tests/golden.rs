@@ -129,7 +129,7 @@ fn the_log_is_the_recorded_one() {
             .seed
             .sites
             .iter()
-            .any(|h| h == "www.halvardsystems.com")
+            .any(|h| h.host == "www.halvardsystems.com")
     );
     assert_eq!(initial.generator.kind, GeneratorKind::Stub);
     assert_eq!(initial.generator.model, "stub");

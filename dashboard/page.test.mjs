@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServices, divider, appShell } from './page.mjs';
+import { createServices, divider, appShell, showNotice } from './page.mjs';
 import { createStateHub, createWatchHub } from './streams.mjs';
 import { createDocument, Element } from './test-dom.mjs';
 
@@ -958,4 +958,21 @@ test('an app without a custom workspace starts with only Packets', async (t) => 
   stop();
   assert.equal(h.budget.open, 0);
   assert.equal(h.document.listenerCount, 0);
+});
+
+test('an app can show sign out after replacing the inspector shell', (t) => {
+  const h = harness(t);
+  const services = createServices({ watch: () => h.stream('watch') }, {});
+  const stop = appShell(h.root, services, { ...DESCRIPTION, hosts: [], panels: [] });
+  assert.equal(h.root.querySelector('#notice'), null);
+  showNotice(h.root, 'Not signed in', 'Open the page again.');
+  assert.equal(h.root.dataset.state, 'notice');
+  assert.equal(h.root.querySelector('.app-body').hidden, true);
+  assert.equal(h.root.querySelector('#notice-title').textContent, 'Not signed in');
+  assert.equal(h.root.querySelector('#notice-text').textContent, 'Open the page again.');
+  assert.equal(h.root.querySelector('#notice-action').hidden, true);
+  showNotice(h.root, 'Connection lost', 'Reload the page.', true);
+  assert.equal(h.root.querySelectorAll('#notice').length, 1);
+  assert.equal(h.root.querySelector('#notice-action').hidden, false);
+  stop(); services.dispose();
 });
