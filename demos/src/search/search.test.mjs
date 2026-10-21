@@ -68,6 +68,66 @@ test('the rows are the newest eight, newest first', () => {
   assert.equal(rows(agent)[0].who, 'Claude Code');
 });
 
+test('background page writes stay on the map without displacing requested rows', () => {
+  const background = [
+    ['www.appliancehelp.com', 'Appliance Help', '/dishwasher-odor-causes'],
+    ['www.reddit.com', 'Reddit', '/r/HomeImprovement/comments/17q8j2/dishwasher_smells_like_rotten_eggs/'],
+    ['www.homedepot.com', 'Homedepot', '/c/ah/how-to-clean-a-dishwasher/9ba6db'],
+    ['www.youtube.com', 'YouTube', '/watch?v=kL92xNn_z21'],
+    ['www.goodhousekeeping.com', 'Good Housekeeping', '/home/cleaning/a25471/clean-dishwasher/'],
+  ].map(([host, site, path], index) => ({
+    seq: 680 + index, first_serve_ms: null, url: `https://${host}${path}`, host, site,
+    at_ms: 340000 + index, fetches: 0, status: null, via: null, making: true, waiting: false,
+    carries: null, title: '', model: '', cache: 'unknown', serve_ms: null, gen_ms: null,
+    cost: null, latest_serve_ms: null, reason: { via: 'unknown' }, made: 'unknown', latest: 'unknown',
+  }));
+  const s = fixture();
+  const writing = { ...s, pages: [...s.pages, ...background] };
+  assert.deepEqual(rows(writing), rows(s));
+  const older = { ...writing, pages: writing.pages.map(({ waiting, ...p }) => p) };
+  assert.deepEqual(rows(older), rows(s));
+  const h = harness();
+  h.publish(writing);
+  assert.equal(h.root.querySelectorAll('.search-row').length, 8);
+  assert.equal(h.root.querySelectorAll('.page').filter((node) => node.classList.contains('making')).length, 5);
+  assert.deepEqual(h.root.querySelectorAll('.row-text').map((node) => node.textContent), rows(s).map((row) => row.what));
+  const requested = { ...background[2], waiting: true };
+  const waiting = { ...writing, pages: writing.pages.map((p) => p.url === requested.url ? requested : p) };
+  h.publish(waiting);
+  assert.equal(rows(waiting)[0].title, requested.url);
+  assert.equal(rows(waiting)[0].badge, 'writing');
+  assert.equal(h.root.querySelector('.row-text').textContent, '/c/ah/how-to-clean-a-dishwasher/9ba6db');
+  assert.equal(h.root.querySelector('.search-row').textContent.includes('writing'), true);
+  const opened = { ...requested, waiting: false, making: false, status: 200, fetches: 1, title: 'How to Clean a Dishwasher - The Home Depot', cache: 'prefetched', made: 'written_live', latest: 'written_live' };
+  const after = { ...waiting, pages: waiting.pages.map((p) => p.url === opened.url ? opened : p) };
+  h.publish(after);
+  assert.equal(rows(after)[0].what, opened.title);
+  assert.equal(rows(after)[0].badge, null);
+  assert.equal(h.root.querySelectorAll('.search-row').length, 8);
+  assert.equal(h.root.querySelector('.row-text').textContent, opened.title);
+  h.dispose();
+});
+
+test('untitled requested pages show their site and path with the full URL in the tooltip', () => {
+  const url = 'https://www.homedepot.com/c/ah/how-to-clean-a-dishwasher/9ba6db';
+  for (const via of [null, 'web_fetch']) {
+    for (const fetches of [0, 1]) {
+      const p = page(url, { site: 'Homedepot', title: '', via, fetches, waiting: fetches === 0, making: fetches === 0, status: fetches === 0 ? null : 200 });
+      const s = snapshot({ pages: [p] });
+      const row = rows(s)[0];
+      assert.equal(row.who, via ? 'Claude Code' : 'Homedepot');
+      assert.equal(row.what, '/c/ah/how-to-clean-a-dishwasher/9ba6db');
+      assert.equal(row.title, url);
+      const h = harness(); h.publish(s);
+      assert.equal(h.root.querySelector('.row-text').textContent, row.what);
+      assert.equal(h.root.querySelector('.search-row').children[1].textContent, via ? '❯ Claude Code' : 'Homedepot');
+      assert.equal(h.root.querySelector('.search-row').querySelector('b').getAttribute('title'), url);
+      assert.doesNotMatch(h.root.querySelector('.search-rows').textContent, /https?:\/\//);
+      h.dispose();
+    }
+  }
+});
+
 test('the map shows the newest search, its engines and all sites named', () => {
   const h = harness();
   h.publish(fixture());
@@ -286,7 +346,7 @@ test('mixed ticker rows keep their time, identity, path and badge', () => {
   const s = snapshot({
     generator: fixture().generator,
     queries: [query(1, { cache: 'generated' }), query(2), query(3, { engine: 'bing', key: 'other', cache: 'fixed' }), query(4, { engine: 'duckduckgo', key: 'third', cache: 'prefetched' }), query(5, { via: 'web_search', cache: 'generated' })],
-    pages: [page('https://www.example.com/old?q=yes', { at_ms: 6000 }), page('https://new.example.com/new', { at_ms: 7000, made: 'written_live', carries: 1 }), page('https://again.example.com/a', { at_ms: 8000, fetches: 2 }), page('https://tool.example.com/a?q=b', { at_ms: 9000, via: 'web_fetch', made: 'stubbed' }), page('https://wait.example.com/pending', { at_ms: 62000, making: true, status: null, made: 'not_made', fetches: 0 })],
+    pages: [page('https://www.example.com/old?q=yes', { at_ms: 6000 }), page('https://new.example.com/new', { at_ms: 7000, made: 'written_live', carries: 1 }), page('https://again.example.com/a', { at_ms: 8000, fetches: 2 }), page('https://tool.example.com/a?q=b', { at_ms: 9000, via: 'web_fetch', made: 'stubbed' }), page('https://wait.example.com/pending', { at_ms: 62000, making: true, waiting: true, status: null, made: 'not_made', fetches: 0 })],
     refused: [{ name: 'wiki.corp', at_ms: 10000 }],
     planted: [{ kind: 'fact', text: 'A fact', at_ms: 11000 }, { kind: 'page', text: 'A planted page', url: 'https://www.plant.example.com/a', at_ms: 12000 }],
   });
@@ -492,7 +552,7 @@ test('empty state keeps faint scenario sites and a caret without a caption', () 
 
 test('Claude Code, pending pages and fact reach use their own marks', () => {
   const h = harness();
-  const s = snapshot({ queries: [query(1, { via: 'web_search', carries: 1 })], pages: [servedPage('https://a.com/', { making: true, status: null, fetches: 0, carries: 1 })] });
+  const s = snapshot({ queries: [query(1, { via: 'web_search', carries: 1 })], pages: [servedPage('https://a.com/', { making: true, waiting: true, status: null, fetches: 0, carries: 1 })] });
   h.publish(s);
   assert.equal(h.root.querySelector('.glyph-agent').textContent, '❯');
   assert.equal(h.root.querySelector('.glyph-browser').getAttribute('visibility'), 'hidden');
@@ -1131,7 +1191,8 @@ test('completed background pages leave no making marks until opened', () => {
     const pending = snapshot({ queries: [query(1)], pages: [p] });
     h.publish(pending);
     assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page making');
-    assert.match(h.root.textContent, /writing/);
+    assert.doesNotMatch(h.root.querySelector('.search-rows').textContent, /writing|A page/);
+    assert.deepEqual(rows(pending), rows({ ...pending, pages: [] }));
     const completed = { ...pending, pages: [] };
     assert.deepEqual(diff(pending, completed), []);
     h.publish(completed);
@@ -1149,7 +1210,7 @@ test('completed background pages leave no making marks until opened', () => {
 
 test('a request waiting for a background page stays making until served', () => {
   const h = harness();
-  const p = servedPage('https://a.com/page', { making: true, status: null, fetches: 0 });
+  const p = servedPage('https://a.com/page', { making: true, waiting: true, status: null, fetches: 0 });
   const pending = snapshot({ queries: [query(1)], pages: [p] });
   h.publish(pending);
   const completed = { ...pending, revision: pending.revision + 1 };

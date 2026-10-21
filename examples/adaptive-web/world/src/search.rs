@@ -25,7 +25,7 @@ pub const MAX_REFUSED: usize = 64;
 pub const MAX_SEED_ITEMS: usize = 32;
 /// Most recent planted facts and pages retained.
 pub const MAX_PLANTED: usize = 16;
-/// Maximum compact snapshot JSON size: 5,445,605 bytes at these limits.
+/// Maximum compact snapshot JSON size: 5,447,653 bytes at these limits.
 /// Each string byte can need six JSON bytes. Counts use twenty digits;
 /// costs use up to twenty-three bytes.
 /// Fixed costs include field names, punctuation and the longest enum values.
@@ -40,7 +40,7 @@ pub const MAX_SNAPSHOT_BYTES: usize = {
         // Result lists and their entries, including array commas.
         + MAX_RESULTS * (75 + string + MAX_LISTED * (70 + 4 * string))
         // Page rows, including search reasons and a comma per row.
-        + MAX_PAGES * (527 + 7 * string)
+        + MAX_PAGES * (543 + 7 * string)
         // Site and refusal rows, including a comma per row.
         + MAX_SITES * (89 + 3 * string)
         + MAX_REFUSED * (53 + 2 * string)
@@ -345,7 +345,7 @@ pub struct Page {
     pub via: Option<String>,
     pub making: bool,
     /// A request is waiting for this page to be served.
-    #[serde(skip)]
+    #[serde(default)]
     pub waiting: bool,
     pub carries: Option<u64>,
     /// Title from the first served fetch.

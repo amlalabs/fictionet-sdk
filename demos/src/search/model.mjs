@@ -110,7 +110,7 @@ export function rows(s, limit = 8) {
   const badge = (tag) => ({ again: 'again', planted: 'planted', refused: 'refused', making: 'writing', asking: 'writing', missing: 'not found' }[tag] || null);
   return [
     ...s.queries.map((q) => ({ at: q.at_ms, seq: q.seq ?? 0, who: who(q, short(q.site || engine(q.engine))), what: `“${q.search}”`, tag: queryTag(s, q) })),
-    ...s.pages.map((p) => ({ at: pageTime(p), seq: p.seq ?? 0, who: who(p, short(p.site || p.host)), what: p.title || p.url, title: p.url, tag: pageTag(p), ...(p.carries > 0 ? { carries: true } : {}) })),
+    ...s.pages.filter((p) => p.fetches > 0 || p.waiting).map((p) => ({ at: pageTime(p), seq: p.seq ?? 0, who: who(p, short(p.site || p.host)), what: p.title || new URL(p.url).pathname, title: p.url, tag: pageTag(p), ...(p.carries > 0 ? { carries: true } : {}) })),
     ...s.refused.filter(typed).map((r) => ({ at: r.at_ms, seq: r.seq ?? 0, who: who(r, 'DNS'), what: r.name, tag: 'refused' })),
     ...(s.planted || []).map((p) => ({ at: p.at_ms, seq: p.seq ?? 0, who: 'You', what: p.text, tag: 'planted' })),
   ].sort((a, b) => b.at - a.at || b.seq - a.seq).slice(0, limit).map(({ seq, ...row }) => ({ ...row, badge: badge(row.tag) }));

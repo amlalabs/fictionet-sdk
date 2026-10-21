@@ -427,6 +427,7 @@ async fn a_live_page_stays_making_until_the_model_answers() {
                     };
                     let row = &snapshot["value"]["pages"][0];
                     assert_eq!(row["making"], true);
+                    assert_eq!(row["waiting"], true);
                     assert_eq!(row["fetches"], 0);
                     // A prepared page can answer while the model is still writing.
                     assert_eq!(
@@ -453,6 +454,8 @@ async fn a_live_page_stays_making_until_the_model_answers() {
                 };
                 let row = &snapshot["value"]["pages"][0];
                 assert_eq!(row["making"], false);
+                assert_eq!(row["waiting"], false);
+                assert_eq!(row["fetches"], 1);
                 assert_eq!(row["made"], "written_live");
                 assert_eq!(row["model"], "page-writer");
                 assert_eq!(row["gen_ms"], 4000);

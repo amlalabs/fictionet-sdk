@@ -1022,6 +1022,12 @@ fn prefetch_finishes_without_creating_a_served_page() {
             };
             feed(&s, 1, making());
             assert!(s.snapshot().pages[0].making);
+            let value = serde_json::to_value(s.snapshot()).unwrap();
+            assert_eq!(value["pages"][0]["waiting"], false);
+            let mut older = value;
+            older["pages"][0].as_object_mut().unwrap().remove("waiting");
+            let older: Snapshot = serde_json::from_value(older).unwrap();
+            assert!(!older.pages[0].waiting);
             if waiting {
                 feed(
                     &s,
@@ -1031,6 +1037,10 @@ fn prefetch_finishes_without_creating_a_served_page() {
                         .field("host", "a.com"),
                 );
                 feed(&s, 3, making());
+                let value = serde_json::to_value(s.snapshot()).unwrap();
+                assert_eq!(value["pages"][0]["waiting"], true);
+                assert_eq!(value["pages"][0]["making"], true);
+                assert_eq!(value["pages"][0]["fetches"], 0);
             }
             feed(
                 &s,
@@ -1045,6 +1055,8 @@ fn prefetch_finishes_without_creating_a_served_page() {
                 assert!(snapshot.pages[0].making);
                 assert_eq!(snapshot.pages[0].fetches, 0);
                 assert_eq!(snapshot.pages[0].status, None);
+                let value = serde_json::to_value(snapshot).unwrap();
+                assert_eq!(value["pages"][0]["waiting"], true);
             } else {
                 assert!(snapshot.pages.is_empty());
             }
