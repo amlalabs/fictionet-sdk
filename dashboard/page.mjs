@@ -599,11 +599,9 @@ export function appShell(root, services, page) {
     if (name === 'open' && !services.stopped()) { services.run.set('running'); status('Live', true); }
     if (name === 'world_error') { services.run.set('stopped'); status(value.error, false); }
   }));
-  // A hidden browser tab keeps neither console nor packets open.
-  cleanup.push(listen(document, 'visibilitychange', () => {
-    if (document.hidden) stopConsole(); else open();
-    watchPackets();
-  }));
+  // The console stays connected while the tab is hidden, so its session
+  // survives a tab switch; only the packet view pauses.
+  cleanup.push(listen(document, 'visibilitychange', () => watchPackets()));
   return () => {
     disposed = true;
     stopConsole();
