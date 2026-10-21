@@ -164,7 +164,7 @@ fn chatgpt_model(
 async fn bundled_catalog(cx: &Cx) -> Result<(String, bytes::Bytes)> {
     use http_body_util::BodyExt;
     use tower_service::Service;
-    let version = super::guest::CODEX_VERSION;
+    let version = fictionet_demo::kit::desktop::CODEX_VERSION;
     let origin = "https://raw.githubusercontent.com";
     let mut forward = web::forward(cx, origin.parse()?, Arc::new(fictionet_host::Client::new()))?;
     let request = http::Request::get(format!(

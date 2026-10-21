@@ -326,8 +326,12 @@ async fn agent_checks(
     )?;
     let codex = guest_cmd(session, "codex --version").await?;
     check(
-        &format!("codex --version is codex-cli {}", guest::CODEX_VERSION),
-        codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", guest::CODEX_VERSION),
+        &format!(
+            "codex --version is codex-cli {}",
+            kit::desktop::CODEX_VERSION
+        ),
+        codex.code == 0
+            && codex.stdout.trim() == format!("codex-cli {}", kit::desktop::CODEX_VERSION),
     )?;
 
     let rows: Vec<_> = [("Claude Code", &claude), ("Codex", &codex)]
