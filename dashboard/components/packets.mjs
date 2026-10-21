@@ -61,9 +61,10 @@ export function mount(root, services, options = {}) {
         resolvers.add(addressOf(dns.back ? p.src : p.dst));
         for (const answer of dns.answers) dnsNames.set(answer.address, dns.name);
       }
-      const conversations = new Set(conversationRows(rows));
-      for (const row of rows) row.quiet = !conversations.has(row);
-      return services.packetFilter?.get() === 'every' ? rows : rows.filter((row) => !row.quiet);
+      const folded = conversationRows(rows);
+      const conversations = new Set(folded.map((row) => row.key));
+      for (const row of rows) row.quiet = !conversations.has(row.key);
+      return services.packetFilter?.get() === 'every' ? rows : folded;
     },
     $, el, ...services.transport, fmtCount, stopped: () => (services.stopped() ? STOPPED : null), hostColumn: true,
     ...options,

@@ -462,3 +462,100 @@ test('packet times are printed only when the displayed time changes', (t) => {
   h.services.packetFilter.set('every');
   assert.deepEqual(times(), ['2.00', '', '1.00', '', '']);
 });
+
+function iconTraffic(proto = 'HTTP/2') {
+  let seq = 2000;
+  const rows = [];
+  const add = (info, back = false) => rows.push({ ...packets[7], proto, seq: seq++, t: seq / 10, src: back ? packets[7].dst : packets[7].src, dst: back ? packets[7].src : packets[7].dst, info });
+  add(proto === 'HTTP/2' ? 'HEADERS[1]: GET /search?q=network (www.google.com)' : 'GET /search?q=network HTTP/1.1');
+  add(proto === 'HTTP/2' ? 'HEADERS[1]: 200, DATA[1] 8192 bytes, end' : 'HTTP/1.1 200 OK', true);
+  for (let i = 0; i < 14; i++) {
+    const stream = 3 + i * 2;
+    add(proto === 'HTTP/2' ? `HEADERS[${stream}]: GET /s2/favicons?domain=site${i}.example&sz=32 (www.google.com)` : `GET /s2/favicons?domain=site${i}.example&sz=32 HTTP/1.1`);
+    add(proto === 'HTTP/2' ? `HEADERS[${stream}]: 200, DATA[${stream}] 412 bytes, end` : 'HTTP/1.1 200 OK', true);
+  }
+  return rows;
+}
+
+for (const proto of ['HTTP/2', 'HTTP']) test(`${proto} icons fold into one row and chip and every packet restores all rows`, (t) => {
+  const h = setup(t, { motion: true });
+  const rows = iconTraffic(proto);
+  h.send(rows.slice(0, 4));
+  const first = h.root.querySelector('#prows').children[0];
+  const chip = h.root.querySelectorAll('.packet-chip').at(-1);
+  const time = first.children[0].textContent;
+  for (const row of rows.slice(4)) h.send([row]);
+  assert.equal(h.root.querySelector('#prows').children.length, 3);
+  assert.equal(h.root.querySelector('#prows').children[0], first);
+  assert.equal(first.children[0].textContent, time);
+  assert.match(first.textContent, /GET \/s2\/favicons ×14/);
+  assert.equal(h.root.querySelectorAll('.packet-chip').length, 3);
+  assert.equal(h.root.querySelectorAll('.packet-chip').at(-1), chip);
+  assert.equal(chip.textContent, 'GET /s2/favicons ×14');
+  assert.ok(h.animations.some((a) => a.duration === 160));
+  h.media.matches = true;
+  h.media.dispatchEvent(new Event('change'));
+  const count = h.animations.length;
+  h.send([{ ...rows.at(-2), seq: 3000, t: 300, info: proto === 'HTTP/2' ? 'HEADERS[255]: GET /s2/favicons?domain=last.example (www.google.com)' : 'GET /s2/favicons?domain=last.example HTTP/1.1' }]);
+  assert.match(first.textContent, /×15/);
+  assert.equal(h.animations.length, count);
+  h.services.packetFilter.set('every');
+  assert.equal(h.root.querySelector('#prows').children.length, 31);
+  assert.equal(h.root.querySelector('#prows').textContent.includes('×15'), false);
+  h.services.packetFilter.set('conversations');
+  assert.equal(h.root.querySelector('#prows').children.length, 3);
+});
+
+test('HTTP/2 replies match their stream and flow and a new request path breaks a run', () => {
+  const rows = iconTraffic();
+  const other = { ...rows[3], seq: 3000, info: 'HEADERS[99]: 200, DATA[99] 54 bytes, end' };
+  const mixed = { ...other, info: 'HEADERS[3]: 200, DATA[3] 412 bytes, DATA[99] 54 bytes, end' };
+  const flow = { ...rows[3], src: '192.0.2.99:443' };
+  const article = { ...rows[2], info: 'HEADERS[101]: GET /article (www.google.com)' };
+  const shown = conversationRows([...rows.slice(0, 4), other, mixed, flow, article, ...rows.slice(4)]);
+  assert.ok(shown.includes(other));
+  assert.ok(shown.includes(flow));
+  assert.ok(shown.includes(article));
+  assert.ok(shown.some((p) => p.info === 'DATA[99] 54 bytes, end'));
+  assert.deepEqual(shown.filter((p) => p.summary).map((p) => p.count), [1, 13]);
+});
+
+test('HTTP replies follow request order while page replies remain separate', () => {
+  const rows = iconTraffic('HTTP');
+  const shown = conversationRows([rows[0], rows[2], rows[1], rows[3]]);
+  assert.equal(shown.length, 3);
+  assert.ok(shown.includes(rows[1]));
+  assert.equal(shown.includes(rows[3]), false);
+  for (const path of ['/favicon.ico', '/th?u=https://example.com/favicon.ico']) {
+    const request = { ...rows[2], info: `GET ${path} HTTP/1.1` };
+    assert.equal(conversationRows([request, rows[3]]).length, 1);
+  }
+});
+
+test('repeated paths ignore queries, keep page replies and count folded rows toward forty', (t) => {
+  const h = setup(t);
+  const rows = iconTraffic();
+  const repeat = { ...rows[0], seq: 3000, t: 300, info: 'HEADERS[255]: GET /search?q=other (www.google.com)' };
+  const shown = conversationRows([rows[0], rows[1], repeat]);
+  assert.equal(shown.length, 2);
+  assert.equal(shown[0].count, 2);
+  assert.equal(shown[1], rows[1]);
+  const earlier = Array.from({ length: 45 }, (_, i) => ({ ...packets[2], seq: i, t: i }));
+  h.send([...earlier, ...rows]);
+  const visible = h.root.querySelector('#prows').children;
+  assert.equal(visible.length, 40);
+  assert.match(visible[0].textContent, /×14/);
+  assert.ok(visible[1].textContent.includes('200'));
+  assert.ok(visible[2].textContent.includes('/search?q=network'));
+});
+
+test('HTTP icon bodies follow the reply direction and reconnects start a new run', () => {
+  const rows = iconTraffic('HTTP');
+  const body = { ...rows[3], info: 'HTTP body' };
+  const upload = { ...body, src: rows[2].src, dst: rows[2].dst };
+  const shown = conversationRows([rows[0], rows[2], rows[1], rows[3], body, upload]);
+  assert.equal(shown.includes(body), false);
+  assert.ok(shown.includes(upload));
+  const reset = { ...rows[2], proto: 'TCP', info: '50153 → 443 [SYN] Seq=0 Win=64240 Len=0' };
+  assert.deepEqual(conversationRows([rows[2], reset, rows[4]]).filter((p) => p.summary).map((p) => p.count), [1, 1]);
+});

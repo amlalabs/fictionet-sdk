@@ -13,7 +13,7 @@ const control = /^(?:Magic|PING(?: ack)?|SETTINGS(?: ack)?|WINDOW_UPDATE(?:\[\d+
 
 export function conversationRows(rows) {
   const decoded = new Set(rows.filter((p) => /^(TLS|HTTP)/.test(p.proto)).map(flow));
-  return rows.filter((p) => {
+  const visible = rows.filter((p) => {
     if (p.tags.some((tag) => ['gap', 'malformed'].includes(tag))) return true;
     if (p.proto === 'HTTP/2' && frames(p).every((frame) => control.test(frame))) return false;
     if (p.proto !== 'TCP') return true;
@@ -25,6 +25,56 @@ export function conversationRows(rows) {
     // application message. Keep unknown protocols and tagged loss.
     return !(/\bLen=[1-9]\d*\b/.test(p.info) && (p.tags.includes('decrypted') || decoded.has(flow(p))) && flags.every((flag) => ['ACK', 'PSH'].includes(flag)));
   });
+  const connections = new Map(), shown = [];
+  for (const p of visible) {
+    const key = flow(p);
+    if (p.proto === 'TCP' && /\[SYN(?:, ACK)?\]/.test(p.info)) connections.delete(key);
+    if (!p.proto.startsWith('HTTP') || p.tags.some((tag) => ['gap', 'malformed'].includes(tag))) {
+      shown.push(p);
+      continue;
+    }
+    let connection = connections.get(key);
+    if (!connection) {
+      connection = { streams: new Map(), requests: [], run: null, response: null };
+      connections.set(key, connection);
+    }
+    const kept = [];
+    for (const frame of p.proto === 'HTTP/2' ? frames(p) : [p.info]) {
+      const request = frame.match(/^(?:HEADERS\[(\d+)\]: )?([A-Z]+) (\S+)/);
+      if (request && request[2] !== 'HTTP') {
+        const path = request[3].split('?')[0];
+        const route = `${p.src}|${request[2]} ${path}`;
+        const icon = /^\/(?:favicon\.ico|s2\/favicons|th)$/.test(path);
+        let run = connection.run;
+        // Keep outstanding page loads separate until their replies arrive.
+        if (run?.route === route && (icon || request[1] || connection.requests.length === 0)) {
+          if (!run.row) {
+            run.row = { ...run.first, count: 1, summary: `${request[2]} ${path}` };
+            shown[shown.indexOf(run.first)] = run.row;
+          }
+          run.row.count++;
+        } else {
+          run = { route, first: p, row: icon ? { ...p, count: 1, summary: `${request[2]} ${path}` } : null };
+          connection.run = run;
+          shown.push(run.row || p);
+        }
+        if (request[1]) connection.streams.set(`${p.src}|${request[1]}`, icon);
+        else connection.requests.push(icon);
+        continue;
+      }
+      if (p.proto === 'HTTP/2') {
+        const reply = frame.match(/^(?:HEADERS|DATA)\[(\d+)\]/);
+        if (reply && connection.streams.get(`${p.dst}|${reply[1]}`)) continue;
+      } else if (/^HTTP\/1\.[01] \d{3}\b/.test(frame)) {
+        connection.response = { src: p.src, icon: connection.requests[0] ?? false };
+        if (!/^HTTP\/1\.[01] 1\d{2}\b/.test(frame)) connection.requests.shift();
+        if (connection.response.icon) continue;
+      } else if (/^(?:DATA|HTTP body)\b/.test(frame) && connection.response?.icon && connection.response.src === p.src) continue;
+      kept.push(frame);
+    }
+    if (kept.some((frame) => !control.test(frame))) shown.push(kept.length === frames(p).length ? p : { ...p, info: kept.join(', ') });
+  }
+  return shown;
 }
 
 export function dnsRow(p) {
@@ -37,6 +87,7 @@ export function dnsRow(p) {
 }
 
 export function chipText(p) {
+  if (p.summary) return `${p.summary} ×${p.count}`;
   const dns = dnsRow(p);
   if (dns) return p.tags.includes('dns-error') ? 'no such name' : dns.back ? dns.answers.map((a) => `${a.type} ${a.address}`).join(' · ') || 'DNS' : 'DNS';
   if (p.proto === 'TCP') return p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/).sort((a, b) => (a === 'ACK') - (b === 'ACK')).join('·') || 'TCP';
@@ -103,6 +154,15 @@ export function createLanes(root, { name, local, addressFor, animate }) {
     });
     const distance = before - lane.node.getBoundingClientRect().top;
     if (motion && (distance || lane.items.length === 0)) animate(lane.node, `translateY(${distance || 8}px)`, 240);
+    const existing = p.summary && lane.items.find((item) => item.key === p.key && item.connection === connection);
+    if (existing) {
+      if (existing.count !== p.count) {
+        existing.count = p.count;
+        existing.node.textContent = chipText(p);
+        if (motion) animate(existing.node, 'scale(.96)', 160);
+      }
+      return;
+    }
     const texts = p.proto.startsWith('TLS') ? p.info.match(/Client Hello|Server Hello|Certificate(?=,|$)|Finished/g) || [chipText(p)] : [chipText(p)];
     const data = dataRow(p);
     const last = lane.items.at(-1);
@@ -118,7 +178,7 @@ export function createLanes(root, { name, local, addressFor, animate }) {
       const chip = el('span', { class: `packet-chip ${kindOf(p)}${back ? ' back' : ''}${(p.quiet || quietReset) && kindOf(p) !== 'bad' ? ' quiet' : ''}`, title: p.info }, lane.chips);
       const label = data ? el('span', { text }, chip) : chip;
       if (!data) chip.textContent = text;
-      lane.items.push({ node: chip, t: p.t, data, back, bytes: p.len, count: 1, label });
+      lane.items.push({ key: p.key, connection, node: chip, t: p.t, data, back, bytes: p.len, count: p.count || 1, label });
       if (motion) animate(chip, 'translateX(10px) scale(.9)', 220);
     }
     lane.items.sort((a, b) => a.t - b.t);

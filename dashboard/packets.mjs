@@ -26,11 +26,12 @@ export function createPackets({
   let rowKey = 0;
   let recent = [], history = [];
   const compactRows = new Map();
+  let foldedCounts = new Map();
   const createRow = (row) => {
     const parent = document.createDocumentFragment();
     if (row.gap) renderGap(row.gap, parent);
     else addPacket(row, parent);
-    return { node: parent.firstChild };
+    return { node: parent.firstChild, count: row.count, info: row.info };
   };
   const tail = compact ? {
     append(next) {
@@ -40,6 +41,13 @@ export function createPackets({
       reconcile(prows, recent, (row) => row.key, createRow, (entry, row) => {
         entry.node.classList.toggle('quiet', !!row.quiet);
         entry.node.children[1].textContent = `${endpointLabel(row.src)} → ${endpointLabel(row.dst)}`;
+        const info = entry.node.children[3];
+        if (entry.count !== row.count || entry.info !== row.info) {
+          info.querySelector('span').textContent = row.summary ? `${row.summary} ×${row.count}` : row.info;
+          if (entry.count !== row.count) animate(entry.node, 'scale(.96)', 160);
+          entry.count = row.count;
+          entry.info = row.info;
+        }
       }, compactRows);
       let previousTime = null;
       for (const row of recent) {
@@ -48,14 +56,16 @@ export function createPackets({
         compactRows.get(row.key).node.children[0].textContent = time === previousTime ? '' : time;
         previousTime = time;
       }
-      const shown = new Set(visible);
-      next.filter((row) => shown.has(row)).forEach((row) => {
+      const added = new Set(next.map((row) => row.key));
+      visible.forEach((row) => {
+        if (!added.has(row.key) && (!row.summary || foldedCounts.get(row.key) === row.count)) return;
         onRow(row);
         const entry = compactRows.get(row.key);
-        if (entry) animate(entry.node, 'translateY(-6px)', 200);
+        if (entry && added.has(row.key)) animate(entry.node, 'translateY(-6px)', 200);
       });
+      foldedCounts = new Map(visible.filter((row) => row.summary).map((row) => [row.key, row.count]));
     },
-    clear() { recent = []; history = []; compactRows.clear(); prows.replaceChildren(); onClear(); },
+    clear() { foldedCounts.clear(); recent = []; history = []; compactRows.clear(); prows.replaceChildren(); onClear(); },
   } : observationList(prows, {
     limit: maxRows, key: (row) => row.key,
     create: createRow,
@@ -328,7 +338,7 @@ export function createPackets({
         const lock = el('svg:svg', { class: 'packet-unlock', viewBox: '0 0 12 12', role: 'img', 'aria-label': 'Decrypted' }, info);
         el('svg:path', { d: 'M3 6V4.2a3 3 0 0 1 5.6-1.4M2.5 6h7v4.5h-7z', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.3', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, lock);
       }
-      info.append(p.info);
+      el('span', { text: p.summary ? `${p.summary} ×${p.count}` : p.info }, info);
       return;
     }
     const tr = el('tr', { class: `${p.side === 1 ? 'back' : ''} ${p.skipped > 0 || p.evicted > 0 ? 'after-gap' : ''} ${p.tags.join(' ')}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
