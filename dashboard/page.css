@@ -1401,3 +1401,28 @@ body.licenses {
 }
 
 @starting-style { .demo-app .app-console { opacity: 0; } }
+
+/* The packet flow map, in the world pane's Packets tab: the map fills the */
+/* tab, with no details panel; the group breadcrumb steps back out. */
+#app-packets-panel:not([hidden]) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  position: relative;
+}
+#app-packets-panel .main {
+  display: grid;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+}
+#app-packets-panel .stage {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+#app-packets-panel .side {
+  display: none;
+}
