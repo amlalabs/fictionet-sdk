@@ -864,7 +864,7 @@ mod tests {
         assert_eq!(p[40], frame::NEIGHBOR_ADVERTISEMENT);
         assert_eq!(p[44], 0xe0, "router, solicited, override");
         assert_eq!(&p[48..64], &target.octets());
-        assert_eq!(&p[64..72], &[2, 1, 0x02, 0x66, 0x6e, 0, 0, 1]);
+        assert_eq!(&p[64..72], &[2, 1, 0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]);
 
         let rs = router_solicit(ll);
         let rs_frame = eth(VM, [0x33, 0x33, 0, 0, 0, 2], frame::IPV6, &rs);

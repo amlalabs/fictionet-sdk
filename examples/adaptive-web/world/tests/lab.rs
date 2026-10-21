@@ -238,6 +238,28 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
             .await;
             assert_eq!(status, 200);
             assert_eq!(body, b"caller content");
+            let answer = m
+                .lookup(&cx, "10.0.0.1".parse()?, "forwarded.com", RecordType::A)
+                .await?;
+            let (assigned, why) = world.addresses.assign("forwarded.com")?.unwrap();
+            assert_eq!(why, "pool");
+            assert!(matches!(
+                assigned.octets(),
+                [104, 21, _, _] | [172, 67, _, _]
+            ));
+            assert_eq!(answer.answers.len(), 1);
+            assert!(matches!(&answer.answers[0].data, RData::A(a) if a.0 == assigned));
+            let sites = events.checked_of("adaptive", "site").unwrap();
+            let forwarded: Vec<_> = sites
+                .iter()
+                .filter(|e| e.str("host") == Some("forwarded.com"))
+                .collect();
+            assert_eq!(forwarded.len(), 1);
+            assert_eq!(
+                forwarded[0].str("addr"),
+                Some(assigned.to_string().as_str())
+            );
+            assert_eq!(forwarded[0].str("why"), Some("pool"));
             assert_eq!(
                 fetch(
                     &cx,
@@ -262,7 +284,13 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
     .unwrap();
     let sites = observed.checked_of("adaptive", "site").unwrap();
     assert!(sites.iter().any(|e| e.str("host") == Some("freshnews.com")));
-    assert!(!sites.iter().any(|e| e.str("host") == Some("forwarded.com")));
+    assert_eq!(
+        sites
+            .iter()
+            .filter(|e| e.str("host") == Some("forwarded.com"))
+            .count(),
+        1
+    );
     assert!(
         !observed
             .checked_of("adaptive", "cert")

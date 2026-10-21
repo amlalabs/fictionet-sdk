@@ -19,7 +19,7 @@ use fictionet_test_support::{poll, temp, within};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 const VM: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
-const GATEWAY: [u8; 6] = [0x02, 0x66, 0x6e, 0x00, 0x00, 0x01];
+const GATEWAY: [u8; 6] = [0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1];
 
 fn ipv4(src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
     let mut p = vec![0x45, 0];

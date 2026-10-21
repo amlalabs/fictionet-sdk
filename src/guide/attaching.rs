@@ -1633,11 +1633,11 @@
 //! $ ip -6 route
 //! fd00::/64 dev ens3 proto ra metric 100 pref medium
 //! fe80::/64 dev ens3 proto kernel metric 256 pref medium
-//! default nhid 4117034846 via fe80::66:6eff:fe00:1 dev ens3 proto ra metric 100 expires 1799sec pref medium
+//! default nhid 4117034846 via fe80::7683:c2ff:fe9a:47d1 dev ens3 proto ra metric 100 expires 1799sec pref medium
 //! ```
 //!
 //! Attach answers every ARP request and neighbor solicitation with its own
-//! MAC address, `02:66:6e:00:00:01`, whatever address is asked for. So
+//! MAC address, `74:83:c2:9a:47:d1`, whatever address is asked for. So
 //! every IP packet the VM sends reaches attach. Attach passes on the ones
 //! from the VM's own addresses, and the world decides what is there, as
 //! it does for `tun`. A VM's kernel checks that its address is free with

@@ -469,3 +469,118 @@ async fn a_live_page_stays_making_until_the_model_answers() {
     .unwrap();
     server.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
+    use crate::kit::{checks::reserved_address, mirror};
+    use fictionet::stdlib::protocols::x509::Certificate;
+    use fictionet_extras::models::{Credential, Model, Provider, Secret};
+    let seed = Seed::builtin("halvard-cve").unwrap();
+    let searches = Arc::new(Searches::from_seed(&seed));
+    let observed = searches.clone();
+    fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(searches),
+        move |cx| async move {
+            let start = adaptive_web_world::world_start(&seed.date)?;
+            let prepared = seed.sites[0].host.clone();
+            let world = World::new(&cx, seed, start)?;
+            let root = Certificate::from_pem(world.ca.cert_pem().as_bytes())?;
+            assert_eq!(root.tbs.subject.to_string(), "CN=Internet Security Root CA");
+            assert_eq!(root.tbs.issuer, root.tbs.subject);
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(rustls::pki_types::CertificateDer::from(root.to_bytes()?))?;
+            let roots = Arc::new(roots);
+            let model = Model::at(
+                &cx,
+                Provider::Anthropic,
+                Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "test-key".into())?),
+                "https://api.anthropic.com".parse()?,
+            )?;
+            let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
+            let net = network(&world, &cx, log, mirror::new(&cx)?, Some(model))?;
+            let (attacher, attachments) = fictionet::attachments();
+            net.start(&cx, attachments)?;
+            let machine = machine(
+                &cx,
+                attacher.attach("workstation")?,
+                "10.0.0.2".parse::<std::net::Ipv4Addr>()?,
+            );
+            let mut names = vec!["api.anthropic.com", &prepared, "alder-notebook.com"];
+            names.extend(adaptive_web_world::route::SEARCH_HOSTS);
+            names.extend(FORWARDED.iter().map(|(host, _)| *host));
+            for host in names {
+                let answer = machine
+                    .lookup(&cx, adaptive_web_world::GATEWAY.into(), host, RecordType::A)
+                    .await?;
+                assert!(!answer.answers.is_empty(), "{host}");
+                let (assigned, _) = world.addresses.assign(host)?.unwrap();
+                for record in answer.answers {
+                    let RData::A(address) = record.data else {
+                        panic!("unexpected answer for {host}")
+                    };
+                    assert!(!reserved_address(address.0.into()), "{host}: {}", address.0);
+                    assert_eq!(address.0, assigned, "{host}");
+                }
+                let answer = machine
+                    .lookup(
+                        &cx,
+                        adaptive_web_world::GATEWAY.into(),
+                        host,
+                        RecordType::AAAA,
+                    )
+                    .await?;
+                assert!(answer.answers.is_empty(), "{host}: {:?}", answer.answers);
+                assert!(
+                    observed
+                        .snapshot()
+                        .sites
+                        .iter()
+                        .any(|site| site.host == host && site.address == assigned.to_string()),
+                    "{host}"
+                );
+                if !["archive.ubuntu.com", "security.ubuntu.com"].contains(&host) {
+                    let connection = machine
+                        .tls(&cx, (assigned, 443).into(), host, Some(&roots), start)
+                        .await?;
+                    let chain = connection
+                        .tls
+                        .peer_certificates()
+                        .expect("server certificates");
+                    assert_eq!(chain.len(), 2, "{host}");
+                    for (i, der) in chain.iter().enumerate() {
+                        let cert = Certificate::parse(der.as_ref())?;
+                        assert_eq!(cert.tbs.issuer, root.tbs.subject, "{host}");
+                        if i == 0 {
+                            assert_eq!(cert.tbs.subject.to_string(), format!("CN={host}"));
+                        } else {
+                            assert_eq!(cert.tbs.subject, root.tbs.subject);
+                        }
+                        for name in [cert.tbs.subject.to_string(), cert.tbs.issuer.to_string()] {
+                            for word in crate::kit::FORBIDDEN {
+                                assert!(
+                                    !name.to_ascii_lowercase().contains(word),
+                                    "{host}: {name}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for host in ["1.0.0.10.in-addr.arpa", "20.5.10.10.in-addr.arpa"] {
+                let answer = machine
+                    .lookup(
+                        &cx,
+                        adaptive_web_world::GATEWAY.into(),
+                        host,
+                        RecordType::PTR,
+                    )
+                    .await?;
+                assert!(answer.answers.is_empty(), "{host}: {:?}", answer.answers);
+            }
+            cx.cancel();
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+}

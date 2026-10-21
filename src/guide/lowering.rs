@@ -165,7 +165,7 @@
 //! EtherType:
 //!
 //! - **ARP.** `frame::arp_reply` answers every request with attach's own
-//!   MAC, `02:66:6e:00:00:01`, whatever address is asked for, as a proxy
+//!   MAC, `74:83:c2:9a:47:d1`, whatever address is asked for, as a proxy
 //!   ARP router does. It stays quiet for ARP probes, gratuitous ARP, and
 //!   the address attach handed the VM, so the VM never sees its own
 //!   address as taken. ARP never reaches the world.
@@ -441,9 +441,9 @@
 //!    `addresses::dhcp4`. The world sees neither.
 //! 2. Before it sends its first packet to `10.0.0.1`, the VM's kernel asks
 //!    for the gateway's MAC with ARP. `frame::arp_reply` answers with
-//!    `02:66:6e:00:00:01`. The world does not see this either. After the
+//!    `74:83:c2:9a:47:d1`. The world does not see this either. After the
 //!    request, `ip neigh` in the VM showed `10.0.0.1 dev ens3 lladdr
-//!    02:66:6e:00:00:01 REACHABLE`.
+//!    74:83:c2:9a:47:d1 REACHABLE`.
 //! 3. curl's DNS queries leave the VM as Ethernet frames to that MAC.
 //!    Attach takes the Ethernet header off and sends each IP packet to the
 //!    world. The answers come back with a header added by `Link::to_vm`.

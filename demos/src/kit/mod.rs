@@ -509,12 +509,16 @@ struct Resources {
 }
 
 impl Resources {
-    fn new(root: &Path, guest: &Guest, index: usize) -> io::Result<Self> {
+    fn new(root: &Path, guest: &Guest) -> io::Result<Self> {
         let dir = root.join(&guest.hostname);
         std::fs::create_dir(&dir)?;
-        let number = u32::try_from(index + 2)
-            .map_err(io::Error::other)?
-            .to_be_bytes();
+        let hash = crc32fast::hash(guest.hostname.as_bytes()).to_be_bytes();
+        let mut device = [hash[1], hash[2], hash[3]];
+        for i in 0..2 {
+            if device[i..i + 2] == [0x66, 0x6e] {
+                device[i + 1] = 0x6f;
+            }
+        }
         let socket_dir = std::fs::File::open(&dir)?;
         Ok(Self {
             socket: util::socket_path(&socket_dir, "net.sock"),
@@ -522,7 +526,7 @@ impl Resources {
             overlay: dir.join("overlay.qcow2"),
             seed: dir.join("seed.img"),
             dir,
-            mac: [2, 0, number[0], number[1], number[2], number[3]],
+            mac: [0xe4, 0xc7, 0x67, device[0], device[1], device[2]],
             uuid: random_uuid(),
         })
     }
@@ -883,8 +887,8 @@ impl<W> Kit<W> {
             backends: Vec::new(),
             observers: std::mem::take(&mut self.observers),
         };
-        for (index, guest) in self.guests.drain(..).enumerate() {
-            let resources = Resources::new(run.path(), &guest, index)?;
+        for guest in self.guests.drain(..) {
+            let resources = Resources::new(run.path(), &guest)?;
             let link = attacher
                 .attach(&guest.attachment)
                 .map_err(io::Error::other)?;

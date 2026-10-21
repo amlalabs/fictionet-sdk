@@ -433,7 +433,7 @@ pub fn serve(
 }
 
 /// Builds an unstarted network, giving the caller first choice of each name.
-/// Claimed names bypass adaptive addresses, certificates and site events.
+/// Claimed names use adaptive addresses and site events with their own TLS.
 pub fn net(
     fcx: &Cx,
     addresses: Arc<Addresses>,
@@ -448,9 +448,6 @@ pub fn net(
     let names = addresses.fixed.clone();
     let world = fcx.clone();
     let site_for = move |host: &str| {
-        if let Some(site) = forward(host) {
-            return Some(site);
-        }
         if let Err(why) = admit(host) {
             world.emit("adaptive", "refused", |event| {
                 event
@@ -487,6 +484,9 @@ pub fn net(
                 .field("addr", addr.to_string())
                 .field("why", why)
         });
+        if let Some(site) = forward(host) {
+            return Some(site.at(addr));
+        }
         let (ca, name) = (ca.clone(), host.to_owned());
         let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
         Some(

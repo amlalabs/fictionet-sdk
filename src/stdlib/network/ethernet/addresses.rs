@@ -631,7 +631,7 @@ pub(super) mod tests {
         assert_eq!(ra[5], 0xc0, "managed and other");
         assert_eq!(u16::from_be_bytes([ra[6], ra[7]]), 1800);
         let opts = &ra[16..];
-        assert_eq!(&opts[0..8], &[1, 1, 0x02, 0x66, 0x6e, 0, 0, 1]);
+        assert_eq!(&opts[0..8], &[1, 1, 0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]);
         assert_eq!(&opts[8..16], &[5, 1, 0, 0, 0, 0, 5, 220]);
         assert_eq!(
             &opts[16..20],
@@ -777,7 +777,10 @@ pub(super) mod tests {
         assert_eq!(adv.transaction, 0xabcdef);
         assert_eq!(adv.client_id(), Some(&Duid(CLIENT.to_vec())));
         assert_eq!(adv.server_id(), Some(&server_duid()));
-        assert_eq!(server_duid().0, [0, 3, 0, 1, 0x02, 0x66, 0x6e, 0, 0, 1]);
+        assert_eq!(
+            server_duid().0,
+            [0, 3, 0, 1, 0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]
+        );
         assert_eq!(
             adv.option(dhcpv6::opt::DNS_SERVERS),
             Some(&DhcpOption::DnsServers(vec![lease6().dns.unwrap()]))

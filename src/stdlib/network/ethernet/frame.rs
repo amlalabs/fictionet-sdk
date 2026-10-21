@@ -18,9 +18,9 @@ pub type Mac = [u8; 6];
 pub const BROADCAST: Mac = [0xff; 6];
 
 /// The link's own MAC, on the VM's side: the gateway's, as the VM sees
-/// it. It is locally administered (`02:...`), and the same every run, so a
+/// it. It uses a Ubiquiti prefix and stays the same every run, so a
 /// VM that keeps running while the link restarts keeps a valid ARP entry.
-pub const GATEWAY_MAC: Mac = [0x02, 0x66, 0x6e, 0x00, 0x00, 0x01];
+pub const GATEWAY_MAC: Mac = [0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1];
 
 /// The EtherType of IPv4.
 pub const IPV4: u16 = 0x0800;
@@ -490,6 +490,13 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn gateway_mac_is_a_universal_unicast_address() {
+        assert_eq!(GATEWAY_MAC[0] & 3, 0);
+        assert_eq!(&GATEWAY_MAC[..3], &[0x74, 0x83, 0xc2]);
+        assert!(!GATEWAY_MAC.windows(2).any(|bytes| bytes == [0x66, 0x6e]));
+    }
+
+    #[test]
     fn frames_parse_and_build() {
         let f = frame(VM, GATEWAY_MAC, IPV4, &[1, 2, 3]);
         assert_eq!(f.len(), 60, "padded to the minimum");
@@ -763,7 +770,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             link_local(GATEWAY_MAC),
-            "fe80::66:6eff:fe00:1".parse::<Ipv6Addr>().unwrap()
+            "fe80::7683:c2ff:fe9a:47d1".parse::<Ipv6Addr>().unwrap()
         );
     }
 }

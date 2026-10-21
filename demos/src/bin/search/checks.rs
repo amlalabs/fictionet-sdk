@@ -178,6 +178,57 @@ async fn guest(run: &Run, command: &str) -> Result<String> {
     Ok(output.stdout)
 }
 
+async fn network_addresses(run: &Run) -> Result {
+    fn address(text: &str) -> Result {
+        let address = text.parse::<std::net::IpAddr>()?;
+        check(
+            &format!("guest address {address} is outside reserved ranges"),
+            !checks::reserved_address(address),
+        )?;
+        Ok(())
+    }
+    fn mac(text: &str) -> Result {
+        let bytes = text
+            .split(':')
+            .map(|byte| u8::from_str_radix(byte, 16))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let bytes: [u8; 6] = bytes.try_into().map_err(|_| "invalid link address")?;
+        check(
+            &format!("guest link address {text} has a vendor prefix"),
+            checks::vendor_mac(bytes),
+        )?;
+        Ok(())
+    }
+    let link: Vec<Value> = serde_json::from_str(&guest(run, "ip -j link show dev eth0").await?)?;
+    check("guest has one Ethernet link", link.len() == 1)?;
+    mac(link[0]["address"].as_str().ok_or("missing link address")?)?;
+    for host in [
+        "api.anthropic.com",
+        "www.google.com",
+        super::page::FORWARDED[0].0,
+    ] {
+        let output = guest(run, &format!("getent ahosts {}", quote(host))).await?;
+        check(&format!("guest resolves {host}"), !output.trim().is_empty())?;
+        for line in output.lines() {
+            address(
+                line.split_whitespace()
+                    .next()
+                    .ok_or("missing DNS address")?,
+            )?;
+        }
+    }
+    let neighbors: Vec<Value> =
+        serde_json::from_str(&guest(run, "ip -j neigh show dev eth0").await?)?;
+    check("guest has a gateway neighbor", !neighbors.is_empty())?;
+    for neighbor in neighbors {
+        address(neighbor["dst"].as_str().ok_or("missing neighbor address")?)?;
+        mac(neighbor["lladdr"]
+            .as_str()
+            .ok_or("missing neighbor link address")?)?;
+    }
+    Ok(())
+}
+
 const PAGE_WORDS: &str =
     r"\b(canned|stub|stubbed|seed|splice|store|stored|generator|generated|cache)\b";
 
@@ -358,6 +409,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     run.guest(HOST)
         .wait_cloud_init(Duration::from_secs(300))
         .await?;
+    network_addresses(run).await?;
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
     // Home requests are HTTP facts; the search projection only retains content pages.

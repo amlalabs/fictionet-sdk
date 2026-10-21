@@ -63,8 +63,8 @@ async fn two_guests_have_separate_resources_and_shared_trust() {
     let first = &run.guests[0].resources;
     let second = &run.guests[1].resources;
     assert_ne!(first.mac, second.mac);
-    assert_eq!(first.mac[0] & 3, 2);
-    assert_eq!(second.mac[0] & 3, 2);
+    assert_eq!(first.mac[0] & 3, 0);
+    assert_eq!(second.mac[0] & 3, 0);
     assert_ne!(first.socket, second.socket);
     assert_ne!(first.overlay, second.overlay);
     assert_ne!(first.seed, second.seed);
@@ -273,13 +273,13 @@ async fn addresses_follow_each_guests_lease() {
     ];
     let mut observers: Vec<Arc<dyn Observer>> = Vec::new();
     let mut handles = Vec::new();
-    for (index, guest) in guests.into_iter().enumerate() {
+    for guest in guests {
         let (tx, addr) = watch::channel(guest.initial_addr());
         observers.push(Arc::new(Lease {
             name: guest.hostname.clone(),
             addr: tx,
         }));
-        let resources = Resources::new(dir.path(), &guest, index).unwrap();
+        let resources = Resources::new(dir.path(), &guest).unwrap();
         handles.push(GuestHandle {
             setup: Arc::new(mirror::Setup::new([])),
             console: page::GuestConsole::new(&guest),
@@ -1088,8 +1088,14 @@ async fn attachment_names_are_independent_of_guest_identity() {
     assert_eq!(run.guests[1].name(), "storage");
     assert_eq!(run.guests[0].guest.attachment, "client-link");
     assert_eq!(run.guests[1].guest.attachment, "storage-link");
-    assert_eq!(run.guests[0].resources.mac, [2, 0, 0, 0, 0, 2]);
-    assert_eq!(run.guests[1].resources.mac, [2, 0, 0, 0, 0, 3]);
+    assert_eq!(
+        run.guests[0].resources.mac,
+        [0xe4, 0xc7, 0x67, 0x01, 0x56, 0x3b]
+    );
+    assert_eq!(
+        run.guests[1].resources.mac,
+        [0xe4, 0xc7, 0x67, 0x7a, 0x1b, 0x34]
+    );
     assert_eq!(
         (run.guests[0].guest.vcpus, run.guests[0].guest.memory_mib),
         (3, 1536)
@@ -1863,4 +1869,64 @@ async fn private_home_files_are_seeded_with_the_guest_owner() {
     );
     assert!(data.contains("owner: analyst:analyst\n    defer: true"));
     run.shutdown().await.unwrap();
+}
+
+#[test]
+fn guest_macs_have_a_stable_vendor_address_per_hostname() {
+    let root = util::RunDir::new(&std::env::temp_dir(), "links").unwrap();
+    let mut addresses = std::collections::HashSet::new();
+    for hostname in (0..1024)
+        .map(|i| format!("laptop-{i}"))
+        .chain(["notebook-26269".into()])
+    {
+        let guest = Guest::ubuntu(&hostname, "analyst");
+        let first = Resources::new(root.path(), &guest).unwrap();
+        assert!(checks::vendor_mac(first.mac));
+        assert_eq!(&first.mac[..3], &[0xe4, 0xc7, 0x67]);
+        assert!(addresses.insert(first.mac));
+        let other = util::RunDir::new(&std::env::temp_dir(), "links").unwrap();
+        assert_eq!(first.mac, Resources::new(other.path(), &guest).unwrap().mac);
+    }
+}
+
+#[test]
+fn network_checks_reject_reserved_addresses_and_local_macs() {
+    for address in [
+        "198.18.0.0",
+        "198.19.255.255",
+        "192.0.2.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "100.64.0.0",
+        "100.127.255.255",
+        "240.0.0.0",
+        "255.255.255.255",
+        "2001:2::1",
+        "2001:db8::1",
+        "::ffff:198.18.0.1",
+    ] {
+        assert!(
+            checks::reserved_address(address.parse().unwrap()),
+            "{address}"
+        );
+    }
+    for address in [
+        "10.0.0.1",
+        "10.10.5.20",
+        "104.21.48.57",
+        "172.67.13.55",
+        "100.63.255.255",
+        "100.128.0.0",
+        "2001:4860:4860::8888",
+        "fe80::1",
+    ] {
+        assert!(
+            !checks::reserved_address(address.parse().unwrap()),
+            "{address}"
+        );
+    }
+    assert!(!checks::vendor_mac([2, 0, 0, 0, 0, 2]));
+    assert!(!checks::vendor_mac([1, 0, 0, 0, 0, 2]));
+    assert!(!checks::vendor_mac([0x74, 0x83, 0xc2, 0x66, 0x6e, 1]));
+    assert!(checks::vendor_mac([0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]));
 }

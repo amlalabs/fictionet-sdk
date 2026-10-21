@@ -314,7 +314,7 @@ pub fn run(fetch: bool) -> Result {
     let result = (|| {
         let mut checks = Checks::default();
         let ipv6_route =
-            Regex::new(r"(?m)^default (nhid [0-9]+ )?via fe80::66:6eff:fe00:1 dev ens3")?;
+            Regex::new(r"(?m)^default (nhid [0-9]+ )?via fe80::7683:c2ff:fe9a:47d1 dev ens3")?;
         for dual in [false, true] {
             let name = if dual { "dual" } else { "web" };
             let world_log = work.join("world.log");
