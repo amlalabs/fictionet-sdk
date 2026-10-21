@@ -234,7 +234,9 @@ async fn the_import_map_nonce_is_fresh_and_only_the_page_relaxes_style_elements(
         let value = nonce(response);
         assert_eq!(value.len(), 64);
         assert!(value.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert!(head.contains(&format!("script-src 'self' 'nonce-{value}';")));
+        assert!(head.contains(&format!(
+            "script-src 'self' 'wasm-unsafe-eval' 'nonce-{value}';"
+        )));
         assert!(head.contains("style-src 'self'; style-src-elem 'self' 'unsafe-inline';"));
         assert!(!head.contains("sha256-"));
         assert!(!body.contains("PAGE_NONCE"));

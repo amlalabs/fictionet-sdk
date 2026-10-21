@@ -74,7 +74,6 @@ export function createServices(transport, theme, importModule = (url) => import(
     // terminal sessions come from, and the state and command paths of its
     // labels and startup checks, or null when it has no such panel.
     hosts: [],
-    claudeStarted: new Set(),
     labelState: null,
     labelCommand: null,
     containmentState: null,
@@ -501,12 +500,13 @@ export function appShell(root, services, page) {
   packetPanel.hidden = Boolean(own);
   packetPanel.inert = Boolean(own);
   let stopPackets = null, packetVisible = !own, disposed = false;
-  const packetVisibility = store(false);
   function watchPackets() {
     if (!disposed && !document.hidden && packetVisible && !stopPackets) {
       stopPackets = map(packetPanel, services);
+    } else if (disposed || document.hidden || !packetVisible) {
+      stopPackets?.();
+      stopPackets = null;
     }
-    packetVisibility.set(!disposed && !document.hidden && packetVisible);
   }
   function selectWorld(showPackets, focus = false) {
     const changed = packetVisible !== showPackets;

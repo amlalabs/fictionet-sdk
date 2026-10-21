@@ -242,9 +242,9 @@ impl Run {
                 }}
             }}
             inspect(tab ? tab + ' tab' : 'page', document.body.innerText);
-            for (const rows of document.querySelectorAll('.xterm-rows')) {{
-                if (rows.getClientRects().length && getComputedStyle(rows).visibility !== 'hidden')
-                    inspect('terminal', rows.innerText, guestPattern);
+            for (const rows of document.querySelectorAll('.terminal-display')) {{
+                if (rows.terminal && rows.getClientRects().length && getComputedStyle(rows).visibility !== 'hidden')
+                    inspect('terminal', Array.from({{length: rows.terminal.buffer.active.length}}, (_, y) => rows.terminal.buffer.active.getLine(y)?.translateToString(true) || '').join('\n'), guestPattern);
             }}
             const button = document.querySelector('.app-menu-button');
             if (button) {{
@@ -800,7 +800,7 @@ mod tests {
                         request.push(byte);
                     }
                     let body = r#"<div class="app-world"><button role="tab" aria-selected="true">Web</button></div>
-                        <header>Fictionet</header><p id="tab-text">Prepared pages</p><div class="xterm-rows">Ready</div>
+                        <header>Fictionet</header><p id="tab-text">Prepared pages</p><div class="terminal-display">Ready</div>
                         <button class="app-menu-button" onclick="document.querySelector('#world-menu').hidden = !document.querySelector('#world-menu').hidden">World</button>
                         <div id="world-menu" hidden>Improvised</div>"#;
                     let response = format!(
@@ -842,7 +842,8 @@ mod tests {
             text.innerText = 'bookstore seedling cached generation';
             menu.innerText = 'Prepared';
             scan();
-            const rows = document.querySelector('.xterm-rows');
+            const rows = document.querySelector('.terminal-display');
+            rows.terminal = {{ buffer: {{ active: {{ length: 1, getLine: () => ({{ translateToString: () => rows.innerText }}) }} }} }};
             for (const word of ['fictionet', 'eval', 'sandbox', 'world', 'scripted', 'demo', 'probe', 'privateword', 'private-word', 'two words']) {{
                 text.innerText = word;
                 menu.innerText = word;

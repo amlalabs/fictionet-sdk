@@ -135,7 +135,83 @@ async function checkPacketLayout() {
     await frame();
     check(hidden($('#prows tr:not(.gap) td.c-proto')) === (width < 560), 'single-host Protocol breakpoint at ' + width);
   }
-  dispose(); services.dispose(); root.remove(); css.remove();
+  dispose(); services.dispose(); root.remove();
+  const { mount: map } = await import('./components/map.mjs');
+  const flow = document.createElement('div'); flow.id = 'app-packets-panel';
+  flow.style.cssText = 'width:800px;height:500px'; document.body.append(flow);
+  const flowWatch = new Source();
+  const flowServices = createServices({ watch: () => flowWatch });
+  const stopMap = map(flow, flowServices);
+  flowWatch.emit('snapshot', {
+    t: 0, started: 0, ended: false, hosts: [], events: [],
+    groups: [{ id: 'office', name: 'Office', parent: null }],
+    nodes: [{ id: 'guest', kind: 'sandbox', name: 'workstation' }, { id: 'router', kind: 'task', name: 'router', group: 'office' }],
+    edges: [{ id: 'wire', a: 'guest', b: 'router' }], counters: { wire: [0, 0, 0, 0] },
+  });
+  for (let n = 0; n < 5; n++) await frame();
+  const stage = flow.querySelector('#stage');
+  check(stage.getBoundingClientRect().width >= 790, 'flow map does not fill the tab');
+  check(getComputedStyle(flow.querySelector('.side')).display === 'none', 'flow details occupy the tab');
+  let dot;
+  for (let n = 1; n <= 80 && !dot; n++) {
+    flowWatch.emit('counters', { t: n / 10, edges: { wire: [n * 20, n * 2000, 0, 0] } });
+    await frame(); dot = flow.querySelector('.packet-dot');
+  }
+  check(dot, 'traffic has no moving packet');
+  const before = [dot.getAttribute('cx'), dot.getAttribute('cy')].join();
+  await frame();
+  check(before !== [dot.getAttribute('cx'), dot.getAttribute('cy')].join(), 'packet stayed still');
+  const item = flow.querySelector('.node');
+  item.dispatchEvent(new MouseEvent('click', { bubbles: true })); await frame();
+  check(flowServices.graph.state.selected, 'node did not select');
+  flow.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  check(!flowServices.graph.state.selected, 'Escape stranded the selection');
+  item.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  stage.dispatchEvent(new PointerEvent('pointerdown', { button: 0, clientX: 1, clientY: 1, bubbles: true }));
+  stage.dispatchEvent(new PointerEvent('pointerup', { button: 0, bubbles: true }));
+  check(!flowServices.graph.state.selected, 'empty space stranded the selection');
+  const close = flow.querySelector('.frame .toggle');
+  check(close, 'open group has no close control'); close.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await frame(); check(!flow.querySelector('.frame'), 'group did not close');
+  const group = flow.querySelector('.node.group');
+  check(group, 'closed group disappeared'); group.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+  await frame(); check(flow.querySelector('.frame .toggle'), 'group did not reopen');
+  stopMap(); flowServices.dispose(); flow.remove();
+  const ghostty = await import('/vendor/ghostty-web/dist/ghostty-web.js');
+  await ghostty.init();
+  const display = document.createElement('div'); display.style.cssText = 'width:600px;height:240px'; document.body.append(display);
+  const terminal = new ghostty.Terminal({ fontSize: 14, scrollback: 5000, theme: { background: '#101820', foreground: '#e7edf4' } });
+  const fit = new ghostty.FitAddon(); terminal.loadAddon(fit); terminal.open(display); fit.fit();
+  const written = (text) => new Promise((resolve) => terminal.write(text, resolve));
+  await written('hello\r\n');
+  check(terminal.buffer.active.getLine(0).translateToString(true) === 'hello', 'terminal output is unreadable');
+  const columns = terminal.cols; terminal.options.fontSize = 22;
+  let size = fit.proposeDimensions(); terminal.resize(size.cols, size.rows);
+  check(terminal.cols < columns, 'font size did not refit');
+  display.style.width = '800px'; size = fit.proposeDimensions(); terminal.resize(size.cols, size.rows);
+  check(terminal.cols > 30, 'terminal did not resize');
+  const { applyTheme } = await import('./components/terminal.mjs');
+  applyTheme(terminal, { background: '#ffffff', foreground: '#111111' });
+  await frame();
+  const canvas = display.querySelector('canvas');
+  const pixel = canvas.getContext('2d').getImageData(canvas.width - 2, canvas.height - 2, 1, 1).data;
+  check(pixel[0] === 255 && pixel[1] === 255 && pixel[2] === 255, 'theme did not repaint the terminal: ' + Array.from(pixel).join(',') + ' ' + JSON.stringify(terminal.wasmTerm.getColors()));
+  let input = ''; const off = terminal.onData((text) => { input += text; });
+  await written('\x1b[?2004h');
+  const paste = new DataTransfer(); paste.setData('text/plain', 'paste me');
+  terminal.textarea.dispatchEvent(new ClipboardEvent('paste', { clipboardData: paste, bubbles: true, cancelable: true }));
+  check(input === '\x1b[200~paste me\x1b[201~', 'bracketed paste changed');
+  terminal.select(0, 0, 5); check(terminal.getSelection() === 'hello', 'copy selection changed');
+  let copied; const clipboardWrite = navigator.clipboard.writeText;
+  navigator.clipboard.writeText = async (text) => { copied = text; };
+  try {
+    const bounds = canvas.getBoundingClientRect(), metrics = terminal.renderer.getMetrics();
+    canvas.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, clientX: bounds.left + metrics.width * 2, clientY: bounds.top + metrics.height / 2 }));
+    check(copied === 'hello', 'selected word did not reach the clipboard');
+  } finally { navigator.clipboard.writeText = clipboardWrite; }
+  for (let n = 0; n < 60; n++) await written('line ' + n + '\r\n');
+  check(terminal.buffer.active.length > terminal.rows, 'scrollback was lost');
+  off.dispose(); terminal.dispose(); display.remove(); css.remove();
 }
 
 async function checkContainmentLayout() {
@@ -295,6 +371,12 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
       return;
     }
     if (req.url === '/result') { recordResult(req, res); return; }
+    if (req.url.startsWith('/vendor/ghostty-web/dist/')) {
+      const path = req.url.slice('/vendor/'.length);
+      res.setHeader('Content-Type', req.url.endsWith('.wasm') ? 'application/wasm' : 'text/javascript');
+      res.end(await readFile(new URL('../observe/downloads/vendor/' + path, import.meta.url)));
+      return;
+    }
     if (req.url.endsWith('.mjs') || req.url.endsWith('.css')) {
       res.setHeader('Content-Type', req.url.endsWith('.css') ? 'text/css' : 'text/javascript');
       res.end(await readFile(new URL('.' + req.url, import.meta.url)));

@@ -265,6 +265,9 @@ function harness(t) {
   const previous = { document: globalThis.document, window: globalThis.window };
   globalThis.document = document; globalThis.window = window;
   t.after(() => { globalThis.document = previous.document; globalThis.window = previous.window; });
+  const resizeObserver = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  t.after(() => { globalThis.ResizeObserver = resizeObserver; });
   const timers = new Map(), frames = new Map();
   t.mock.method(globalThis, 'setInterval', (callback) => { const id = Symbol(); timers.set(id, callback); return id; });
   t.mock.method(globalThis, 'clearInterval', (id) => timers.delete(id));
@@ -418,14 +421,15 @@ test('choosing the terminal switch focuses the connected terminal but mounting i
   class Terminal {
     constructor() { this.options = {}; terminals.push(this); }
     loadAddon() {}
+    resize(cols, rows) { this.cols = cols; this.rows = rows; }
     open(display) { this.input = h.document.createElement('textarea'); display.append(this.input); }
+    blur() {}
     focus() { this.input.focus(); }
     onData() { return { dispose() {} }; }
-    onBinary() { return { dispose() {} }; }
     dispose() {}
   }
-  class FitAddon { fit() {} }
-  const modules = { '/vendor/xterm/lib/xterm.mjs': { Terminal }, '/vendor/addon-fit/lib/addon-fit.mjs': { FitAddon } };
+  class FitAddon { proposeDimensions() { return { cols: 80, rows: 24 }; } }
+  const modules = { '/vendor/ghostty-web/dist/ghostty-web.js': { Terminal, FitAddon, init: async () => {} } };
   // Node has no ResizeObserver or getComputedStyle; the terminal uses both.
   const previous = { ResizeObserver: globalThis.ResizeObserver, getComputedStyle: globalThis.getComputedStyle };
   t.after(() => Object.assign(globalThis, previous));
@@ -855,6 +859,7 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   });
   await settle();
   assert.equal(h.streams.filter((s) => s.tag === 'packets').length, 0);
+  const baseFrames = h.frames.size;
   tabs[1].click();
   await settle();
   assert.equal(packetPanel.hidden, false);
@@ -862,48 +867,18 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   assert.equal(tabs[0].getAttribute('tabindex'), '-1');
   assert.equal(tabs[1].getAttribute('tabindex'), '0');
   const state = h.streams.findLast((s) => s.tag === 'state' && !s.closed);
-  state.emit('snapshot', { topic: 'host-alpha', revision: 1, value: { addresses: ['192.168.1.2'] } });
-  const source = h.streams.findLast((s) => s.tag === 'packets');
-  assert.equal(source.args, 'guest-link');
-  tabs[1].click();
-  assert.equal(source.closed, undefined, 'selecting the current tab keeps its stream');
   const frame = () => {
-    const callbacks = [...h.frames.values()]; h.frames.clear(); callbacks.forEach((fn) => fn());
+    const callbacks = [...h.frames.values()]; h.frames.clear(); callbacks.forEach((fn) => fn(performance.now()));
   };
-  const rows = () => packetPanel.querySelector('#prows').children;
-  assert.equal(rows().length, 0);
-  const send = (seq) => source.emit('packet', { seq, t: seq / 10, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:443', proto: 'TLS', len: 60, info: `Client hello ${seq}` });
-  send(1); frame();
-  assert.equal(rows().length, 1);
-  assert.deepEqual(rows()[0].children.map((c) => c.textContent), ['0.10', 'alpha → 203.0.113.8:443', 'TLS', 'Client hello 1']);
-  for (const seq of [4, 2, 3, 10, 8, 9, 7, 6, 5, 11]) send(seq);
   frame();
-  assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
-  // Policy drops happen upstream; the stream reports totals without rows
-  // for the console packets the collector did not admit.
-  source.emit('policy', { link: 'guest-link', declined: 2000 });
-  frame();
-  source.emit('gap', { link: 'guest-link', missed: 50 });
-  frame();
-  assert.equal(rows().length, 11);
-  assert.doesNotMatch(packetPanel.textContent, /:22|:5900|missed|policy/);
-  // Guest SSH is still visible when admitted upstream. The shell must not
-  // hide a protocol or port to imitate the kit's address-aware policy.
-  source.emit('packet', { seq: 12, t: 1.2, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:22', proto: 'SSH', len: 60, info: 'SSH handshake' });
-  frame();
-  assert.match(rows()[0].textContent, /203.0.113.8:22/);
-  assert.equal(rows().length, 12);
-  send(2); frame();
-  assert.equal(Number(rows()[0].dataset.seq), 12, 'late older packets stay below newer traffic');
-  for (let seq = 13; seq <= 1012; seq++) send(seq);
-  frame();
-  assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), Array.from({ length: 40 }, (_, i) => 1012 - i));
+  assert.ok(packetPanel.querySelector('#graph'));
+  assert.equal(packetPanel.querySelector('#prows'), null);
+  tabs[1].click();
+  assert.equal(packetPanel.querySelectorAll('#graph').length, 1);
   tabs[0].click();
-  assert.equal(source.closed, true);
-  assert.equal(source.listenerCount, 0);
-  const keptRows = [...rows()];
   assert.equal(ownPanel.hidden, false);
   assert.equal(packetPanel.hidden, true);
+  assert.equal(h.frames.size, baseFrames);
   const key = (name, index) => {
     const event = new Event('keydown', { cancelable: true }); event.key = name;
     worldTabs.dispatchEvent(event);
@@ -926,41 +901,20 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   key('End', 1);
   await settle();
   assert.equal(ownPanel.hidden, true);
-  const reopened = h.streams.findLast((s) => s.tag === 'packets');
-  assert.notEqual(reopened, source);
-  assert.deepEqual(rows(), keptRows, 'switching views preserves the row elements');
-  reopened.emit('packet', { seq: 1012, t: 101.2, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:443', proto: 'TLS', len: 60, info: 'Client hello 1012' });
   frame();
-  assert.deepEqual(rows(), keptRows, 'retained history does not replay rows');
-  reopened.emit('packet', { seq: 1013, t: 101.3, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:443', proto: 'TLS', len: 60, info: 'Client hello 1013' });
+  assert.equal(packetPanel.querySelectorAll('#graph').length, 1);
+  const graph = packetPanel.querySelector('#graph');
+  h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
+  assert.equal(h.frames.size, baseFrames);
+  h.document.hidden = false; h.document.dispatchEvent(new Event('visibilitychange'));
   frame();
-  assert.equal(Number(rows()[0].dataset.seq), 1013, 'new traffic resumes');
-  assert.equal(packetPanel.querySelectorAll('#drawer').length, 1);
-  h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
-  assert.equal(reopened.closed, true);
-  const hiddenCount = h.streams.filter((s) => s.tag === 'packets').length;
+  assert.ok(packetPanel.querySelector('#graph'));
+  assert.notEqual(packetPanel.querySelector('#graph'), graph);
   key('Home', 0);
+  assert.equal(h.frames.size, baseFrames);
   key('End', 1);
-  await settle();
-  assert.equal(h.streams.filter((s) => s.tag === 'packets').length, hiddenCount);
-  assert.equal(h.frames.size, 0);
-  h.document.hidden = false; h.document.dispatchEvent(new Event('visibilitychange'));
-  await settle();
-  const finalSource = h.streams.findLast((s) => s.tag === 'packets');
-  assert.notEqual(finalSource, reopened);
-  key('Home', 0);
-  assert.equal(finalSource.closed, true);
-  const count = h.streams.filter((s) => s.tag === 'packets').length;
-  h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
-  h.document.hidden = false; h.document.dispatchEvent(new Event('visibilitychange'));
-  await settle();
-  assert.equal(h.streams.filter((s) => s.tag === 'packets').length, count);
-  key('End', 1);
-  await settle();
-  const disposedSource = h.streams.findLast((s) => s.tag === 'packets');
+  frame();
   stop();
-  assert.equal(disposedSource.closed, true);
-  assert.equal(finalSource.closed, true);
   assert.equal(mounts, 1);
   assert.equal(releases, 1);
   assert.ok(tabs.every((tab) => tab.listenerCount === 0));

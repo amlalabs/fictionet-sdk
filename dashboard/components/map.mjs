@@ -131,7 +131,11 @@ export function mount(root, services) {
       ev.preventDefault();
       $('search').focus();
     }
-    if (ev.key === 'Escape' && active === root.ownerDocument.body) select(null);
+    if (ev.key === 'Escape') {
+      $('search').value = '';
+      applySearch();
+      select(null);
+    }
   });
   const stop = services.graph.subscribe((name, data) => {
     if (name === 'event') pulse(data);

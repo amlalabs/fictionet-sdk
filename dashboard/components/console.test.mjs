@@ -41,20 +41,20 @@ function fixture(t) {
     disconnect() { this.disposed = true; this.disconnects = (this.disconnects || 0) + 1; }
   }
   class Terminal {
-    constructor(options) { this.options = options; this.writes = []; this.inputs = new Set(); this.cols = 80; this.rows = 24; terminals.push(this); }
-    loadAddon(addon) { this.addon = addon; }
+    constructor(options) { this.options = options; this.renderer = { setTheme: (value) => { this.colors = value; } }; this.writes = []; this.inputs = new Set(); this.cols = 80; this.rows = 24; terminals.push(this); }
+    loadAddon(addon) { this.addon = addon; addon.terminal = this; }
+    resize(cols, rows) { this.cols = cols; this.rows = rows; }
     open(display) { display.clientWidth = 800; display.clientHeight = 600; }
+    blur() {}
     focus() { this.focuses = (this.focuses || 0) + 1; }
     onData(callback) { this.data = callback; this.inputs.add(callback); return { dispose: () => this.inputs.delete(callback) }; }
-    onBinary(callback) { this.binary = callback; this.inputs.add(callback); return { dispose: () => this.inputs.delete(callback) }; }
     write(bytes, callback) { this.writes.push({ bytes, callback }); }
     dispose() { this.disposed = true; this.addon.dispose(); }
   }
-  class FitAddon { fit() { this.fitted = true; } dispose() { this.disposed = true; } }
+  class FitAddon { proposeDimensions() { this.fitted = true; return { cols: this.terminal.cols, rows: this.terminal.rows }; } dispose() { this.disposed = true; } }
   const modules = {
     '/vendor/novnc/core/rfb.js': { default: RFB },
-    '/vendor/xterm/lib/xterm.mjs': { Terminal },
-    '/vendor/addon-fit/lib/addon-fit.mjs': { FitAddon },
+    '/vendor/ghostty-web/dist/ghostty-web.js': { Terminal, FitAddon, init: async () => {} },
   };
   const transport = {
     ...createTransport({}, {
@@ -263,8 +263,6 @@ test('terminal acknowledges only consumed output and releases its socket, addon 
   assert.deepEqual(JSON.parse(socket.sent.at(-1)), { type: 'ack', bytes: 3 });
   term.data('é');
   assert.deepEqual(socket.sent.at(-1), new TextEncoder().encode('é'));
-  term.binary('\xff');
-  assert.deepEqual(socket.sent.at(-1), new Uint8Array([255]));
   socket.receive(new Uint8Array([1, 2]).buffer);
   const sent = socket.sent.length;
   const button = h.root.querySelector('button');
@@ -335,7 +333,7 @@ test('console disposal handles imports and socket requests that finish late', as
 });
 
 test('missing libraries fail inside their own panel with the asset command', async (t) => {
-  for (const [mount, library] of [[screen, 'noVNC'], [terminal, 'xterm.js']]) {
+  for (const [mount, library] of [[screen, 'noVNC'], [terminal, 'ghostty-web']]) {
     const h = fixture(t);
     h.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
     const dispose = mount(h.root, h.services, { host: 'alpha' });
@@ -439,7 +437,7 @@ test('the interactive desktop lists completed startup stages and the current sta
   dispose();
 });
 
-test('Claude Code starts once after a split shell prompt only in an interactive capable guest', async (t) => {
+test('the terminal leaves every shell prompt for the viewer', async (t) => {
   for (const [interactive, installed] of [[false, true], [true, false], [true, true]]) {
     const h = fixture(t);
     h.services.hosts = [{ name: 'alpha', claude_code: installed }];
@@ -457,9 +455,9 @@ test('Claude Code starts once after a split shell prompt only in an interactive 
     receive('analyst@workstation:~$');
     assert.deepEqual(commands(socket), []);
     receive(' ');
-    assert.deepEqual(commands(socket), interactive && installed ? ['claude\r'] : []);
+    assert.deepEqual(commands(socket), []);
     receive('$ ');
-    assert.deepEqual(commands(socket), interactive && installed ? ['claude\r'] : []);
+    assert.deepEqual(commands(socket), []);
     dispose();
     dispose = terminal(h.root, h.services, options);
     await settle();
