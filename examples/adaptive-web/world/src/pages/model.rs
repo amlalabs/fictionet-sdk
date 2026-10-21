@@ -14,6 +14,7 @@
 //! and is replaced by the variable's name in every error message.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fictionet::Cx;
@@ -241,7 +242,7 @@ pub struct Model {
     pub reasoning: String,
     key: Key,
     transport: Arc<dyn Transport>,
-    live: bool,
+    live: Option<Arc<AtomicUsize>>,
 }
 
 /// A read answer, with the raw text the model gave.
@@ -270,13 +271,13 @@ impl Model {
             reasoning: reasoning.into(),
             key,
             transport,
-            live: false,
+            live: None,
         }
     }
 
-    /// One attempt with a nine-second deadline for an interactive request.
-    pub(super) fn live(mut self) -> Self {
-        self.live = true;
+    /// A shared call cap and nine-second budget for an interactive request.
+    pub(super) fn live(mut self, calls: Arc<AtomicUsize>) -> Self {
+        self.live = Some(calls);
         self
     }
 
@@ -361,9 +362,10 @@ impl Model {
         let what = format!("{} {}", self.provider.label(), self.model);
         let data = serde_json::to_vec(body).expect("a JSON value");
         let mut failure = String::new();
-        let attempts = if self.live { 1 } else { ATTEMPTS };
-        let timeout = if self.live {
-            Duration::from_secs(9)
+        let attempts = if self.live.is_some() { 1 } else { ATTEMPTS };
+        let timeout = if self.live.is_some() {
+            let elapsed = ledger.attempts.first().map_or(0.0, |a| now(cx) - a.started);
+            Duration::from_secs(9).saturating_sub(Duration::from_secs_f64(elapsed))
         } else {
             TIMEOUT
         };
@@ -528,8 +530,7 @@ impl Model {
     ) -> (Result<Answer<T>, Failure>, Ledger) {
         let mut ledger = Ledger::new();
         let mut user = user.to_owned();
-        let asks = if self.live { 1 } else { 2 };
-        for ask in 1..=asks {
+        for ask in 1..=2 {
             ledger.ask = ask;
             let text = match self
                 .complete(cx, system, &user, max_tokens, &mut ledger)
@@ -546,7 +547,17 @@ impl Model {
                     let last = ledger.attempts.last_mut().expect("an attempt");
                     last.outcome = "unreadable".into();
                     last.error = Some(reason.clone());
-                    if ask == asks {
+                    let retry = ask < 2
+                        && self.live.as_ref().is_none_or(|calls| {
+                            super::gives_away(&text).is_some()
+                                && now(cx) - ledger.attempts[0].started <= 5.0
+                                && calls
+                                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                        (n < super::GENERATION_BUDGET).then_some(n + 1)
+                                    })
+                                    .is_ok()
+                        });
+                    if ask == 2 || !retry {
                         return (Err(Failure { error: reason }), ledger);
                     }
                     user.push_str(&format!(

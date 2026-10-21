@@ -454,7 +454,7 @@ pub struct Pages {
     seed: Seed,
     maker: Option<Maker>,
     prefetch: usize,
-    live_calls: Option<std::sync::atomic::AtomicUsize>,
+    live_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     store: Mutex<Store>,
     /// The run's other pages while prepared pages answer, or the prepared
     /// pages while the run's other pages answer.
@@ -525,9 +525,10 @@ impl Pages {
         model: Model,
     ) -> Result<Self, String> {
         let mut pages = Self::canned(seed, root)?;
-        pages.maker = Some(Maker::Model(model.live()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        pages.maker = Some(Maker::Model(model.live(calls.clone())));
         pages.prefetch = 3;
-        pages.live_calls = Some(std::sync::atomic::AtomicUsize::new(0));
+        pages.live_calls = Some(calls);
         Ok(pages)
     }
 

@@ -5722,3 +5722,99 @@ fn live_search_snapshot_carries_the_model_time_and_cost() {
     ))
     .unwrap();
 }
+
+#[test]
+fn live_word_refusals_retry_within_the_shared_deadline() {
+    for (first_ms, second_ms, second, model, calls, elapsed_ms) in [
+        (4_000, 4_000, PAGE, "answered/model", 2, 8_000),
+        (5_001, 0, PAGE, "stub", 1, 5_001),
+        (4_000, 6_000, PAGE, "stub", 2, 9_000),
+        (
+            4_000,
+            1_000,
+            "TITLE: Story\nBODY:\n<p>testing</p>",
+            "stub",
+            2,
+            5_000,
+        ),
+    ] {
+        let fake = Fake::script(vec![
+            completion(first_ms, "TITLE: Story\nBODY:\n<p>testing</p>", Some(0.001)),
+            completion(second_ms, second, Some(0.002)),
+        ]);
+        let pages = live_world(fake.clone());
+        lab(move |cx| async move {
+            let started = cx.now().since_start();
+            let response = get(&pages, &cx, "https://example.com/repaired-page").await;
+            assert_eq!(response.status, 200);
+            assert_eq!(response.logged()["model"], model);
+            assert_eq!((cx.now().since_start() - started).as_millis(), elapsed_ms);
+            assert_eq!(fake.users().len(), calls);
+            assert_eq!(
+                pages.live_calls.as_ref().unwrap().load(Ordering::SeqCst),
+                calls
+            );
+            if calls == 2 {
+                assert!(fake.users()[1].contains("contains \"testing\""));
+                assert!(fake.users()[1].contains("write it again without it"));
+            }
+            text::validate_page("text/html", &response.body).unwrap();
+            assert!(gives_away(&String::from_utf8_lossy(&response.body)).is_none());
+            if model == "answered/model" {
+                let usage = pages
+                    .store()
+                    .pages()
+                    .find(|p| p.url.ends_with("/repaired-page"))
+                    .unwrap()
+                    .usage
+                    .clone()
+                    .unwrap();
+                assert_eq!(usage.attempts, 2);
+                assert_eq!(usage.asks, 2);
+                assert_eq!(usage.gen_ms, 8_000);
+                assert_eq!(usage.cost, Some(0.003));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn live_word_refusal_does_not_exceed_the_call_cap() {
+    for remaining in [1, 2] {
+        let fake = Fake::script(vec![
+            completion(4_000, "TITLE: Story\nBODY:\n<p>expected</p>", None),
+            completion(1_000, PAGE, None),
+        ]);
+        let pages = live_world(fake.clone());
+        pages
+            .live_calls
+            .as_ref()
+            .unwrap()
+            .store(GENERATION_BUDGET - remaining, Ordering::SeqCst);
+        lab(move |cx| async move {
+            let response = get(&pages, &cx, "https://example.com/last-page").await;
+            assert_eq!(
+                response.logged()["model"],
+                if remaining == 2 {
+                    "answered/model"
+                } else {
+                    "stub"
+                }
+            );
+            assert_eq!(fake.users().len(), remaining);
+            assert_eq!(
+                pages.live_calls.as_ref().unwrap().load(Ordering::SeqCst),
+                GENERATION_BUDGET
+            );
+            assert_eq!(
+                get(&pages, &cx, "https://example.com/next-page")
+                    .await
+                    .logged()["model"],
+                "stub"
+            );
+            assert_eq!(fake.users().len(), remaining);
+            Ok(())
+        });
+    }
+}
