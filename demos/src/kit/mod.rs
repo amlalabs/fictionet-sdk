@@ -133,9 +133,9 @@ pub struct Guest {
 impl Guest {
     /// Creates an Ubuntu guest with 2 vCPUs, 2048 MiB, and `Family::FromWorld`.
     /// DMI defaults to manufacturer `LENOVO` and product `20UES000-WS`.
-    /// No additional packages, files, or commands are installed by default.
+    /// Disables background refreshes and network time.
     pub fn ubuntu(hostname: &str, user: &str) -> Self {
-        Self {
+        let mut guest = Self {
             hostname: hostname.into(),
             attachment: hostname.into(),
             user: user.into(),
@@ -150,7 +150,66 @@ impl Guest {
             desktop: None,
             terminal: None,
             forbidden: Vec::new(),
+        };
+        guest = guest
+            // The Pro apt hook contacts the contract service during package setup.
+            .file("/etc/apt/apt.conf.d/20apt-esm-hook.conf", 0o644, "")
+            // Pro apt news fetches a remote news feed during package setup.
+            .file(
+                "/etc/ubuntu-advantage/uaclient.conf",
+                0o644,
+                "ua_config:\n  apt_news: false\n",
+            )
+            // Release checks fetch the upgrade list even when no upgrade is wanted.
+            .file(
+                "/etc/update-manager/release-upgrades",
+                0o644,
+                "[DEFAULT]\nPrompt=never\n",
+            )
+            // The clock comes from the host; network time would request another name.
+            .file(
+                "/etc/systemd/timesyncd.conf",
+                0o644,
+                "[Time]\nNTP=\nFallbackNTP=\n",
+            )
+            // Stop unattended apt work after cloud-init's explicit package setup.
+            .file(
+                "/etc/apt/apt.conf.d/99periodic",
+                0o644,
+                "APT::Periodic::Enable \"0\";\n",
+            )
+            // Login messages do not need remote news.
+            .file("/etc/default/motd-news", 0o644, "ENABLED=0\n");
+        // Prevent later refresh starts when desktop setup reloads systemd.
+        for unit in [
+            "systemd-timesyncd.service",
+            "snapd.socket",
+            "snapd.service",
+            "snapd.seeded.service",
+            "motd-news.service",
+            "motd-news.timer",
+            "ua-timer.timer",
+            "ua-timer.service",
+            "ubuntu-advantage.service",
+            "fwupd-refresh.service",
+            "fwupd-refresh.timer",
+            "apt-daily.timer",
+            "apt-daily.service",
+            "apt-daily-upgrade.timer",
+            "apt-daily-upgrade.service",
+        ] {
+            guest = guest
+                .file(
+                    &format!("/etc/systemd/system/{unit}.d/quiet.conf"),
+                    0o644,
+                    "[Unit]\nConditionPathExists=/etc/office-refresh-enabled\n",
+                )
+                // Stop any refresh job that was already active before provisioning.
+                .run(format!(
+                    "if systemctl is-active --quiet {unit}; then systemctl stop {unit}; fi"
+                ));
         }
+        guest
     }
     /// Sets the host-side attachment name independently of the guest hostname.
     pub fn attachment(mut self, name: &str) -> Self {

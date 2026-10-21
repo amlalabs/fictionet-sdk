@@ -52,7 +52,6 @@ pub fn definition() -> Guest {
         "[Resolve]\nCache=no\n",
     )
     .typed_commands()
-    .run("timedatectl set-ntp false")
     .run("systemctl restart systemd-resolved")
     .run(format!("sudo -u {USER} python3 -m venv {PROJECT}/.venv"))
 }
@@ -60,9 +59,7 @@ pub fn definition() -> Guest {
 /// The colleague's laptop: a plain Ubuntu guest with curl and nothing the
 /// story does not need. Its story runs over SSH, so it has no screen.
 pub fn colleague() -> Guest {
-    Guest::ubuntu(COLLEAGUE, "dana")
-        .packages(&["curl"])
-        .run("timedatectl set-ntp false")
+    Guest::ubuntu(COLLEAGUE, "dana").packages(&["curl"])
 }
 
 /// Closes Firefox and opens a maximized terminal in the project, with its
@@ -157,7 +154,19 @@ mod tests {
                 < data.find("python3 -m venv").unwrap()
         );
         assert!(!data.contains("/usr/lib/firefox/defaults/pref/"));
-        assert!(data.contains("timedatectl set-ntp false"));
+        assert_eq!(
+            content("/etc/systemd/timesyncd.conf"),
+            "[Time]\nNTP=\nFallbackNTP=\n"
+        );
+        assert_eq!(
+            content("/etc/systemd/system/systemd-timesyncd.service.d/quiet.conf"),
+            "[Unit]\nConditionPathExists=/etc/office-refresh-enabled\n"
+        );
+        assert!(data.contains("then systemctl stop systemd-timesyncd.service; fi"));
+        assert_eq!(
+            content("/etc/systemd/resolved.conf.d/network.conf"),
+            "[Resolve]\nCache=no\n"
+        );
         assert!(data.contains("path: \"/opt/assistant\""));
         kit::seed::build(&kit::seed::Provision {
             guest: &guest,

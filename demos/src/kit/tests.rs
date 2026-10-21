@@ -88,6 +88,25 @@ fn user_data_installs_packages_files_and_steps() {
         authorized_key: "ssh-ed25519 key",
         ca: Some(("office", "root")),
     });
+    let files = seed::files(&data).unwrap();
+    assert_eq!(files["/etc/apt/apt.conf.d/20apt-esm-hook.conf"], "");
+    assert_eq!(
+        files["/etc/ubuntu-advantage/uaclient.conf"],
+        "ua_config:\n  apt_news: false\n"
+    );
+    assert_eq!(
+        files["/etc/update-manager/release-upgrades"],
+        "[DEFAULT]\nPrompt=never\n"
+    );
+    assert_eq!(
+        files["/etc/systemd/timesyncd.conf"],
+        "[Time]\nNTP=\nFallbackNTP=\n"
+    );
+    assert_eq!(
+        files["/etc/apt/apt.conf.d/99periodic"],
+        "APT::Periodic::Enable \"0\";\n"
+    );
+    assert_eq!(files["/etc/default/motd-news"], "ENABLED=0\n");
     assert!(data.contains("'curl' 'openssh-server'"));
     assert!(data.contains("path: \"/opt/start.sh\"\n    permissions: '0755'"));
     assert!(data.contains(&base64::encode(b"echo ready\n")));
@@ -184,6 +203,7 @@ fn guest_files_packages_and_commands_hold_no_forbidden_word() {
 #[test]
 fn the_whole_seed_holds_no_forbidden_word() {
     for guest in [
+        Guest::ubuntu("station", "analyst"),
         desktop::browser("station", "analyst", "https://intranet.northwind.internal/"),
         desktop::terminal("station", "analyst", "Office inventory", (960, 400), 15),
     ] {

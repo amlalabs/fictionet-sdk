@@ -254,11 +254,14 @@ pub async fn start(
             .budget(models::Budget::new().calls(12))
     });
     if let Some(model) = &model {
-        world.seed_env(model.guest_env())?;
-        world.seed_home_files([(
-            ".claude/settings.json",
-            serde_json::json!({"model":name}).to_string(),
-        )])?;
+        let env = model.guest_env();
+        let key = env.first().map(|(_, value)| value.as_str()).unwrap_or("");
+        world.seed_home_files(fictionet_demo::kit::desktop::claude_files(
+            super::USER,
+            key,
+            name,
+        ))?;
+        world.seed_env(env)?;
     }
     // Codex: a ChatGPT login from the store, or an API key, set up in the
     // guest the way `codex login` leaves a laptop.

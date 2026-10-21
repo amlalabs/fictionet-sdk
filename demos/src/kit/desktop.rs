@@ -304,13 +304,13 @@ pub fn sign_in_claude(
         .map(|(_, value)| value.clone())
         .unwrap_or_default();
     world.seed_env(env)?;
-    world.seed_home_files(claude_files(user, &key))
+    world.seed_home_files(claude_files(user, &key, CLAUDE_MODEL))
 }
 
-/// Claude Code's settings and state for `user`: the model, and the first-run
+/// Claude Code's settings and state for `user`: `model`, and the first-run
 /// questions answered for `key`.
-fn claude_files(user: &str, key: &str) -> Vec<(&'static str, String)> {
-    let settings = serde_json::json!({ "model": CLAUDE_MODEL, "spinnerTipsEnabled": false });
+pub fn claude_files(user: &str, key: &str, model: &str) -> Vec<(&'static str, String)> {
+    let settings = serde_json::json!({ "model": model, "spinnerTipsEnabled": false });
     let tail: String = key
         .chars()
         .rev()
@@ -996,9 +996,19 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_keeps_the_selected_model_and_disables_tips() {
+        let files = claude_files("analyst", "", "claude-haiku-4-5-20251001");
+        let settings: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
+        assert_eq!(settings["model"], "claude-haiku-4-5-20251001");
+        assert_eq!(settings["spinnerTipsEnabled"], false);
+        let state: serde_json::Value = serde_json::from_str(&files[1].1).unwrap();
+        assert_eq!(state["hasCompletedOnboarding"], true);
+    }
+
+    #[test]
     fn claude_code_starts_signed_in_with_the_placeholder_key() {
         let key = format!("sk-ant-api03-{}", "b".repeat(96));
-        let files = claude_files("analyst", &key);
+        let files = claude_files("analyst", &key, CLAUDE_MODEL);
         let settings: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
         assert_eq!(settings["model"], "claude-sonnet-5-5");
         assert_eq!(settings["spinnerTipsEnabled"], false);

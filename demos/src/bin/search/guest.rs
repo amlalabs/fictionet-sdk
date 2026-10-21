@@ -7,70 +7,11 @@ pub const START: &str = "https://www.google.com/";
 /// The workstation, with its clock on `date` (YYYY-MM-DD), the day the
 /// web it searches is on.
 pub fn guest(date: &str) -> Guest {
-    // The kit's browser keeps Firefox quiet; background requests would create
-    // pages and spend the generation budget, so the system stays quiet too.
-    let mut guest = kit::desktop::browser(HOST, USER, START)
+    let guest = kit::desktop::browser(HOST, USER, START)
         .resources(4, 4096)
         .forbid(&["adaptive", "stub", "canned", "planted"])
         // The searcher reads the address back before submitting it.
-        .packages(&["xclip"])
-        // The Pro apt hook contacts the contract service during package setup.
-        .file("/etc/apt/apt.conf.d/20apt-esm-hook.conf", 0o644, "")
-        // Pro apt news fetches a remote news feed during package setup.
-        .file(
-            "/etc/ubuntu-advantage/uaclient.conf",
-            0o644,
-            "ua_config:\n  apt_news: false\n",
-        )
-        // Release checks fetch the upgrade list even when no upgrade is wanted.
-        .file(
-            "/etc/update-manager/release-upgrades",
-            0o644,
-            "[DEFAULT]\nPrompt=never\n",
-        )
-        // The clock comes from the host; network time would request another name.
-        .file(
-            "/etc/systemd/timesyncd.conf",
-            0o644,
-            "[Time]\nNTP=\nFallbackNTP=\n",
-        )
-        // Stop unattended apt work after cloud-init's explicit package setup.
-        .file(
-            "/etc/apt/apt.conf.d/99periodic",
-            0o644,
-            "APT::Periodic::Enable \"0\";\n",
-        )
-        // MOTD must not fetch news when the scripted searcher logs in.
-        .file("/etc/default/motd-news", 0o644, "ENABLED=0\n");
-    // Prevent later refresh starts when desktop setup reloads systemd.
-    for unit in [
-        "systemd-timesyncd.service",
-        "snapd.socket",
-        "snapd.service",
-        "snapd.seeded.service",
-        "motd-news.service",
-        "motd-news.timer",
-        "ua-timer.timer",
-        "ua-timer.service",
-        "ubuntu-advantage.service",
-        "fwupd-refresh.service",
-        "fwupd-refresh.timer",
-        "apt-daily.timer",
-        "apt-daily.service",
-        "apt-daily-upgrade.timer",
-        "apt-daily-upgrade.service",
-    ] {
-        guest = guest
-            .file(
-                &format!("/etc/systemd/system/{unit}.d/quiet.conf"),
-                0o644,
-                "[Unit]\nConditionPathExists=/etc/office-refresh-enabled\n",
-            )
-            // Stop any refresh job that was already active before provisioning.
-            .run(format!(
-                "if systemctl is-active --quiet {unit}; then systemctl stop {unit}; fi"
-            ));
-    }
+        .packages(&["xclip"]);
     let date = date
         .bytes()
         .all(|c| c.is_ascii_digit() || c == b'-')
