@@ -2,7 +2,7 @@
 //! page content, with no model.
 
 use super::{Seed, prompts::expected_type, seed::parse_date, text::*};
-use fictionet_extras::search::{Result, Search};
+use fictionet_extras::search::{Engine, Result, Search};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,10 +10,10 @@ use std::sync::OnceLock;
 
 const STOP: &[&str] = &[
     "a", "an", "and", "are", "at", "be", "by", "can", "do", "does", "for", "from", "how", "i",
-    "in", "is", "it", "my", "of", "on", "or", "should", "the", "to", "what", "when", "which",
-    "who", "why", "with", "you", "our", "we", "this", "that", "was", "will", "about", "online",
-    "news", "com", "www", "https", "http", "best", "example", "details", "safe", "owners",
-    "version", "fixed", "fix", "latest",
+    "in", "is", "it", "its", "my", "of", "on", "or", "should", "the", "to", "what", "when",
+    "which", "who", "why", "with", "you", "our", "we", "this", "that", "was", "will", "about",
+    "online", "news", "com", "www", "https", "http", "best", "example", "details", "safe",
+    "owners", "version", "fixed", "fix", "latest",
 ];
 /// Bylines on articles the offline generator makes.
 const AUTHORS: [&str; 16] = [
@@ -183,7 +183,17 @@ pub fn rank<'a>(known: &'a [Result], query: &str) -> Vec<&'a Result> {
     let mut scored: Vec<(usize, &Result)> = known
         .iter()
         .map(|k| {
-            let have = words(&format!("{} {} {}", k.title, k.url, k.snippet));
+            let (host, _) = target_of(&k.url);
+            let have = words(&format!(
+                "{} {} {} {}",
+                k.title,
+                k.url,
+                k.snippet,
+                host.split('.')
+                    .map(|s| s.trim_start_matches("the"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
             (asked.iter().filter(|w| have.contains(w)).count(), k)
         })
         .filter(|(score, _)| *score > 0)
@@ -202,6 +212,12 @@ pub(super) fn relevant(result: &Result, query: &str) -> bool {
         result.title, result.url, result.snippet
     ));
     let score = asked.iter().filter(|w| have.contains(w)).count();
+    if asked.iter().any(|w| {
+        ["lisbon", "naples", "tokyo", "porto", "leeds", "dublin"].contains(&w.as_str())
+            && !have.contains(w)
+    }) {
+        return false;
+    }
     let (host, _) = target_of(&result.url);
     let named = asked.iter().any(|w| {
         w.len() > 3
@@ -209,22 +225,24 @@ pub(super) fn relevant(result: &Result, query: &str) -> bool {
                 .split('.')
                 .any(|label| label.trim_start_matches("the") == w)
     });
-    score > 0 && (named || (score >= asked.len().min(2) && score * 2 >= asked.len()))
+    named || (score > 0 && score >= asked.len().min(2) && score * 2 >= asked.len())
 }
 
 /// Text cut from a page as a snippet shows it: at most about 160
-/// characters, ending at a word with "...". Some start part way through.
-pub fn excerpt(text: &str, key: &str) -> String {
+/// characters, ending at a word with "...".
+pub fn excerpt(text: &str) -> String {
     let text = normalize_space(text);
+    if text.chars().count() <= 160 {
+        return if text.ends_with(['.', '!', '?']) {
+            text
+        } else {
+            format!("{text}.")
+        };
+    }
     let words: Vec<&str> = text.split(' ').collect();
-    let from = if words.len() > 18 && hash(key).is_multiple_of(3) {
-        words.len() / 4
-    } else {
-        0
-    };
     let mut out = String::new();
-    for word in &words[from..] {
-        if out.len() + word.len() > 160 {
+    for word in words {
+        if out.chars().count() + word.chars().count() + 5 > 160 {
             out.push_str(" ...");
             break;
         }
@@ -233,13 +251,1906 @@ pub fn excerpt(text: &str, key: &str) -> String {
         }
         out.push_str(word);
     }
-    if from > 0 { format!("... {out}") } else { out }
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    out
+}
+
+pub(super) fn prepared_cast(seed: &Seed) -> Vec<super::prompts::Person> {
+    let root = super::store::canned_root(&seed.name);
+    super::store::Store::load(&root, seed)
+        .ok()
+        .and_then(|(store, _)| store.cast().map(|cast| cast.people.clone()))
+        .unwrap_or_default()
+}
+
+fn proper(seed: &Seed, text: &str) -> String {
+    let names = "Lisbon Naples London Leeds Dublin Edinburgh Bath Porto Bristol Glasgow Manchester Tokyo Netgear Python Rust JavaScript Halvard Gateway HG-200 HG-400 HG-900 BBC CISA CVE-2026-41877";
+    let source = format!("{names} {}", seed.facts.join(" "));
+    let mut out = text.to_owned();
+    for name in source.split_whitespace() {
+        let name = name.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+        if name.len() < 3
+            || STOP.contains(&name.to_lowercase().as_str())
+            || !name.chars().next().is_some_and(char::is_uppercase)
+        {
+            continue;
+        }
+        let pattern = format!(r"(?i)\b{}\b", regex::escape(name));
+        out = Regex::new(&pattern)
+            .unwrap()
+            .replace_all(&out, name)
+            .into_owned();
+    }
+    upper_first(&out)
+}
+
+pub(super) fn engine_order(engine: Engine, query: &str, url: &str) -> usize {
+    hash(&format!("{engine:?}/{query}/{url}"))
+}
+
+fn known_case(seed: &Seed, text: &str, known: &[Result]) -> String {
+    let mut text = proper(seed, text);
+    for name in known
+        .iter()
+        .filter(|r| !seed.fixed.iter().any(|f| f.url == r.url))
+        .flat_map(|r| r.title.split_whitespace())
+    {
+        let name = name.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+        if name.len() > 2
+            && !STOP.contains(&name.to_lowercase().as_str())
+            && name.chars().next().is_some_and(char::is_uppercase)
+        {
+            let pattern = format!(r"(?i)\b{}\b", regex::escape(name));
+            text = Regex::new(&pattern)
+                .unwrap()
+                .replace_all(&text, name)
+                .into_owned();
+        }
+    }
+    text
+}
+
+fn voice(host: &str) -> usize {
+    host.bytes().fold(14_695_981_039_346_656_037u64, |n, b| {
+        (n ^ u64::from(b)).wrapping_mul(1_099_511_628_211)
+    }) as usize
+        % 10
+}
+
+fn lower_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |c| {
+        format!("{}{}", c.to_lowercase(), chars.as_str())
+    })
+}
+
+fn intent(query: &str) -> &'static str {
+    let q = query.to_lowercase();
+    if [
+        "health",
+        "symptom",
+        "pain",
+        "is it bad",
+        "is it safe",
+        "coffee",
+        "medicine",
+        "headache",
+    ]
+    .iter()
+    .any(|w| q.contains(w))
+    {
+        "health"
+    } else if q.starts_with("what is ") || q.starts_with("what are ") {
+        "definition"
+    } else if q.starts_with("best ") || q.contains(" reviews") || q.contains(" review") {
+        "review"
+    } else if [
+        "news",
+        "halvard",
+        "cve-",
+        "announced",
+        "launch",
+        "breach",
+        "election",
+        "earthquake",
+        "microsoft",
+        "apple ",
+        "google ",
+        "openai",
+        "samsung",
+        "nvidia",
+        "iphone",
+        "outage",
+        "recall",
+        "incident",
+        "crash",
+        "tesla",
+        "pixel",
+        "playstation",
+    ]
+    .iter()
+    .any(|w| q.contains(w))
+        || q.split_whitespace().any(|part| {
+            part.len() == 10
+                && part.as_bytes()[4] == b'-'
+                && part.as_bytes()[7] == b'-'
+                && part.chars().filter(|c| c.is_ascii_digit()).count() == 8
+        })
+    {
+        "news"
+    } else if q.starts_with("how to ") {
+        "howto"
+    } else {
+        "general"
+    }
+}
+
+fn subreddit(query: &str) -> String {
+    let q = query.to_lowercase();
+    if q.contains("rust") {
+        "rust".into()
+    } else if q.contains("hiking") || q.contains("boots") {
+        "hiking".into()
+    } else if q.contains("cactus") {
+        "cactus".into()
+    } else if q.contains("coffee") || q.contains("run") {
+        "running".into()
+    } else if q.contains("pizza") || q.contains("naples") {
+        "napoli".into()
+    } else if q.contains("heat pump") {
+        "heatpumps".into()
+    } else if q.contains("lunar") || q.contains("eclipse") {
+        "astronomy".into()
+    } else if q.contains("postal") || q.contains("stamps") {
+        "philately".into()
+    } else if q.contains("ocean") {
+        "oceanography".into()
+    } else if q.contains("router") {
+        "HomeNetworking".into()
+    } else if q.contains("halvard") {
+        "sysadmin".into()
+    } else {
+        words(query)
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "AskReddit".into())
+    }
+}
+
+struct Forecast {
+    place: String,
+    date: time::Date,
+    high: i32,
+    low: i32,
+    rain: usize,
+    wind: usize,
+}
+
+impl Forecast {
+    fn new(seed: &Seed, query: &str, host: &str) -> Self {
+        let q = query.to_lowercase().replace('-', " ");
+        let place = q
+            .split_whitespace()
+            .filter(|word| {
+                ![
+                    "weather", "forecast", "in", "for", "tomorrow", "today", "hourly", "next",
+                    "day",
+                ]
+                .contains(word)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let place = if place.is_empty() {
+            "London".into()
+        } else {
+            place
+                .split_whitespace()
+                .map(capitalize)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let date = day(seed, 0) + time::Duration::days(1);
+        let seasonal = [8, 9, 12, 15, 18, 21, 23, 22, 19, 16, 11, 8][date.month() as usize - 1];
+        let climate = if ["Lisbon", "Naples", "Madrid", "Rome"]
+            .iter()
+            .any(|p| place.contains(p))
+        {
+            6
+        } else if place.contains("Singapore") {
+            30 - seasonal
+        } else if place.contains("Sydney") {
+            [26, 26, 25, 23, 20, 18, 17, 18, 21, 23, 24, 25][date.month() as usize - 1] - seasonal
+        } else if ["Oslo", "Helsinki", "Stockholm"]
+            .iter()
+            .any(|p| place.contains(p))
+        {
+            -4
+        } else {
+            0
+        };
+        let local = (hash(&format!("{place}/{date}")) % 3) as i32 - 1;
+        let variation = (hash(host) % 3) as i32 - 1;
+        Self {
+            place: place.clone(),
+            date,
+            high: seasonal + climate + local + variation,
+            low: seasonal + climate + local - 5 + variation,
+            rain: 35 + hash(&format!("{date}/{host}")) % 5 * 5,
+            wind: 9 + hash(&format!("{place}/{host}")) % 7,
+        }
+    }
+
+    fn title(&self, host: &str, angle: usize) -> String {
+        let place = &self.place;
+        let date = short_date(self.date);
+        let name = site_profile(host).name;
+        match host {
+            "www.metoffice.gov.uk" => format!("{place} weather forecast for {date} - Met Office"),
+            "www.bbc.com" => format!("{place} weather: tomorrow’s forecast - BBC Weather"),
+            "weather.com" => {
+                format!("{place}: tomorrow’s weather and hourly outlook - The Weather Channel")
+            }
+            "www.accuweather.com" => {
+                format!("{place}: tomorrow’s local forecast | AccuWeather")
+            }
+            _ => format!(
+                "{place} {} for {date} | {name}",
+                [
+                    "weather",
+                    "hourly forecast",
+                    "temperatures and rain",
+                    "forecast",
+                    "weather outlook",
+                    "rain and wind forecast",
+                    "hour-by-hour weather",
+                    "day and night forecast",
+                    "local weather",
+                    "tomorrow’s conditions",
+                    "morning to evening forecast",
+                    "daily weather report",
+                    "weather by hour"
+                ][angle % 13]
+            ),
+        }
+    }
+
+    fn snippet(&self, angle: usize) -> String {
+        let outlook = [
+            "cloudy early, with showers by midday",
+            "morning cloud followed by lunchtime rain",
+            "showers near noon and a drier evening",
+            "overcast at dawn, then scattered showers",
+            "light rain around midday, clearing later",
+            "cloudy skies with a few daytime showers",
+            "a damp lunchtime and clearing skies later",
+            "morning cloud, rain at noon, then brighter",
+            "daytime showers easing before the evening",
+            "cloud and light rain giving way to clear skies",
+            "a cloudy commute before showers develop",
+            "rain at lunchtime and a cooler, clear night",
+            "a cloudy start, a wet midday and a dry finish",
+        ][angle % 13];
+        excerpt(&format!(
+            "{} weather for {}: {outlook}, high {} °C, low {} °C, rain up to {}%, WSW winds {} km/h.",
+            self.place,
+            short_date(self.date),
+            self.high,
+            self.low,
+            self.rain + 5,
+            self.wind
+        ))
+    }
+
+    fn body(&self, title: &str, claims: &[String]) -> String {
+        let mut body = format!(
+            "<h1>{}</h1><h2>{}: {}</h2><p>Cloudy with scattered showers, clearing later. High {} °C · Low {} °C.</p>",
+            escape(heading(title)),
+            escape(&self.place),
+            short_date(self.date),
+            self.high,
+            self.low
+        );
+        for claim in claims {
+            body.push_str(&format!("<p>{}</p>", escape(claim)));
+        }
+        body.push_str("<table><caption>Hourly forecast</caption><thead><tr><th scope=\"col\">Time</th><th scope=\"col\">Conditions</th><th scope=\"col\">Temperature</th><th scope=\"col\">Chance of rain</th><th scope=\"col\">Wind</th></tr></thead><tbody>");
+        let temperatures = [
+            self.low + 1,
+            self.low,
+            self.low + 1,
+            self.low + 3,
+            self.high - 1,
+            self.high,
+            self.high - 2,
+            self.low + 2,
+            self.low + 1,
+        ];
+        for hour in 0..24 {
+            let slot = hour / 3;
+            let temp = temperatures[slot]
+                + (temperatures[slot + 1] - temperatures[slot]) * (hour % 3) as i32 / 3;
+            let (symbol, rain) = match hour {
+                0..=2 => ("Cloudy", 20),
+                3..=5 => ("Cloudy", 15),
+                6..=8 => ("Overcast", 25),
+                9..=10 => ("Showers", self.rain),
+                11..=13 => ("Light rain", self.rain + 5),
+                14..=17 => ("Cloudy", 25),
+                18..=20 => ("Partly cloudy", 15),
+                _ => ("Clear", 10),
+            };
+            body.push_str(&format!("<tr><th scope=\"row\">{hour:02}:00</th><td>{symbol}</td><td>{temp} °C</td><td>{rain}%</td><td>WSW {} km/h</td></tr>", self.wind));
+        }
+        body.push_str("</tbody></table>");
+        body
+    }
+}
+
+fn result_title(seed: &Seed, query: &str, host: &str, angle: usize, original: &str) -> String {
+    let q = query.to_lowercase();
+    let name = site_profile(host).name;
+    let subject = proper(seed, query);
+    if q.contains("cactus") {
+        return format!(
+            "{} | {name}",
+            [
+                "Repotting a Cactus: Pots, Compost and Aftercare",
+                "How to Repot a Cactus Safely",
+                "How to Repot a Cactus Without Getting Pricked",
+                "Repotting a Cactus: A Step-by-Step Project",
+                "When Your Cactus Needs a Bigger Pot",
+                "How do you lift a tall cactus out of its pot?",
+                "Cactus Care: Drainage and Root Health",
+                "A New Pot for Your Cactus",
+                "Repotting Cacti Without Burying the Stem",
+                "Spring Cactus Care: Check the Roots",
+                "Moving a Cactus: Tools That Protect Your Hands",
+                "Choosing the Right Pot for a Cactus",
+                "Cactus Repotting Mistakes to Avoid",
+            ][angle % 13]
+        );
+    }
+    if q.contains("coffee") {
+        return format!(
+            "{} | {name}",
+            [
+                "Caffeine Before Exercise: Benefits and Side Effects",
+                "Coffee Before Running: How Much Is Too Much?",
+                "Should You Drink Coffee Before a Run?",
+                "Coffee and Running: Timing, Tolerance and Stomach Upset",
+                "A Runner’s Guide to Pre-Run Coffee",
+                "Why Coffee Can Upset Your Stomach Before Exercise",
+                "Caffeine, Hydration and Your Morning Run",
+                "Coffee Before a Workout: What to Consider",
+                "Does anyone else get stomach cramps after pre-run coffee?",
+                "Coffee and Fitness: Finding a Routine That Suits You",
+                "How Much Caffeine Is in Your Pre-Run Drink?",
+                "Feeling Shaky After Coffee and Exercise?",
+                "Evening Runs: Caffeine and Sleep",
+            ][angle % 13]
+        );
+    }
+    let titles: &[&str] = if q.contains("bread") && !q.contains("sourdough") {
+        &[
+            "Why Is My Banana Bread Dense? How to Fix It",
+            "The Secret to a Tender Banana Bread Crumb",
+            "Dense Banana Bread? Check Your Flour and Mixing",
+            "10 Mistakes That Make Banana Bread Heavy",
+            "How to Keep Banana Bread Moist Without a Gummy Center",
+            "A Better Banana Bread Starts With the Batter",
+            "Banana Bread Troubleshooting: Pan Size and Baking Time",
+            "Why Banana Bread Sinks After Baking",
+            "Is Your Banana Bread Baked in the Middle?",
+            "Why You Should Let Banana Bread Cool Before Slicing",
+            "Is Your Baking Soda Still Raising Your Banana Bread?",
+            "The Flour Measurement That Makes Banana Bread Dense",
+            "Getting the Right Banana Bread Batter Consistency",
+        ]
+    } else if q.contains("ownership") && q.contains("rust") {
+        &[
+            "Understanding Ownership in Rust",
+            "Why does assigning a Rust String move the value?",
+            "Rust ownership and borrowing: questions from learners",
+            "How did you learn Rust ownership?",
+            "Rust Ownership Rules With Examples",
+            "Rust Ownership: Move and Borrow",
+            "A Practical Introduction to Rust References",
+            "Learn Rust: Ownership and Lifetimes",
+            "Rust Values, Moves and Copies",
+            "Rust Ownership Exercises for Beginners",
+            "Rust Borrowing Tutorial",
+            "Moving a String Without Cloning in Rust",
+            "Practice Ownership in Rust",
+        ]
+    } else if q.contains("e0502") {
+        &[
+            "E0502: cannot borrow as mutable because it is also borrowed as immutable",
+            "How do I fix Rust error E0502 when pushing to a vector?",
+            "Conflicting borrows in Rust: E0502",
+            "Why does Rust keep this immutable borrow alive?",
+            "Rust E0502: Shared and Mutable Borrows",
+            "Fixing a Borrow Checker Error in Rust",
+            "Rust References: End the Borrow Before Mutation",
+            "Rust Borrow Checker: A Small E0502 Example",
+            "When Does a Rust Borrow End?",
+            "Rust E0502 and Nonlexical Lifetimes",
+            "Rust Mutable Borrow Examples",
+            "Solving Conflicting Rust Borrows",
+            "Practice Rust Borrowing Without Cloning",
+        ]
+    } else if q.contains("car") {
+        &[
+            "Used Car Prices 2026: Search Cars for Sale",
+            "Used Car Prices: What Should You Pay in 2026?",
+            "Used Car Valuations: Mileage, Age and Condition",
+            "Compare Used Car Prices Near You",
+            "Used Car Buying Guide: Prices and Running Costs",
+            "Why Used Car Prices Vary Between Dealers",
+            "Used Car Prices Explained: Trim and Service History",
+            "What Is Your Used Car Worth in 2026?",
+            "Used Cars for Sale: Compare Asking Prices",
+            "Buying a Used Car: Budget for the Next Service",
+            "Find a Used Car Within Your Budget",
+            "Best Value Used Cars: Our Buying Advice",
+            "Used Car Prices: What Owners Are Paying",
+        ]
+    } else {
+        &[]
+    };
+    if q.contains("weather") || q.contains("forecast") {
+        return Forecast::new(seed, query, host).title(host, angle);
+    }
+    if !titles.is_empty() {
+        return format!("{} | {name}", titles[angle % titles.len()]);
+    }
+    if (q.contains("airfare") || q.contains("airline") || q.contains("flight"))
+        && !q.contains(" to ")
+    {
+        return format!(
+            "{}: {} | {name}",
+            proper(seed, query),
+            [
+                "Fees and Conditions",
+                "Baggage Explained",
+                "What Is Included",
+                "Compare the Total",
+                "A Booking Guide",
+                "Travel Options",
+                "Before You Book",
+                "Cabin and Checked Bags",
+                "Flexible Tickets",
+                "Route Planning",
+                "Finding a Fare",
+                "Your Travel Checklist",
+                "Airport Advice"
+            ][angle % 13]
+        );
+    }
+    if q.contains("flight") || q.contains("airfare") || q.contains("airline") {
+        let destination = q.split_once(" to ").map_or("your destination", |(_, p)| p);
+        let destination = upper_first(destination);
+        return format!(
+            "{} | {name}",
+            match angle % 13 {
+                0 => format!("Flights to {destination}: Fares and Baggage"),
+                1 => format!("Cheap Flights to {destination}: Compare Dates"),
+                2 => format!("{destination} Flights: Find Your Next Trip"),
+                3 => format!("Compare Cheap Flights to {destination}"),
+                4 => format!("Find Low Flight Fares to {destination}"),
+                5 => format!("{destination}: Direct Flights and Connections"),
+                6 => format!("Book Flights to {destination}"),
+                7 => format!("Flight Fare Finder: {destination}"),
+                8 => format!("Fly to {destination}: Routes and Flight Times"),
+                9 => format!("Flights and Airport Transfers in {destination}"),
+                10 => format!("{destination} Flight Deals for Flexible Dates"),
+                11 => format!("Your Flight to {destination}: Tickets and Travel"),
+                _ => format!("Planning Flights to {destination}: Airports and Transfers"),
+            }
+        );
+    }
+    if q.contains("pizza") && q.contains(" in ") {
+        let city = q.split_once(" in ").map_or("Naples", |(_, p)| p);
+        return format!(
+            "{} | {name}",
+            [
+                format!("Where to Find Great Pizza in {}", upper_first(city)),
+                format!("Book a Table for Pizza in {}", upper_first(city)),
+                format!(
+                    "Where to Eat Pizza in {}: Our Favorite Pizzerias",
+                    upper_first(city)
+                ),
+                format!("Top-Rated Pizza in {}", upper_first(city)),
+                format!("Where would you go for pizza in {}?", upper_first(city)),
+                format!("A Pizza Lover’s Guide to {}", upper_first(city)),
+                format!("{} Pizza: Beyond the Longest Queues", upper_first(city)),
+                format!("Pizza Delivery in {}", upper_first(city)),
+                format!("{} Pizzerias for a Night Out", upper_first(city)),
+                format!("The Neighborhood Guide to Pizza in {}", upper_first(city)),
+                format!("{} Pizza Map: Traditional and Fried", upper_first(city)),
+                format!("Pizza in {}: Menus and Local Favorites", upper_first(city)),
+                format!("{} Pizza Kitchens Worth a Detour", upper_first(city)),
+            ][angle % 13]
+        );
+    }
+    if ["halvard", "hg-400", "gateway", "41877"]
+        .iter()
+        .any(|w| q.contains(w))
+    {
+        return format!(
+            "{} | {name}",
+            [
+                "Halvard fixes critical Gateway flaw in firmware 7.2.4",
+                "Halvard Gateway patch: what appliance owners need to know",
+                "How are other Halvard Gateway admins scheduling this update?",
+                "Halvard Gateway’s web portal flaw puts firmware upgrades in focus",
+                "Halvard Gateway admins plan upgrades after exploited portal flaw",
+                "The Halvard Gateway firmware advisory: affected releases and mitigation",
+                "Is an older Halvard Gateway firmware release safe to use?",
+                "Halvard Gateway: a guide to the September security fix",
+                "Halvard Gateway portal vulnerability and firmware update notes",
+                "Updating a Halvard Gateway: questions from administrators",
+                "Halvard Gateway patch closes a critical pre-authentication flaw",
+                "Halvard Gateway owners review firmware maintenance plans",
+                "What the Halvard Gateway portal fix means for VPN administrators",
+            ][angle % 13]
+        );
+    }
+    if q.contains("router") {
+        return format!(
+            "{original}: {} | {name}",
+            [
+                "Steps and Precautions",
+                "Model-Specific Instructions",
+                "Settings to Save First",
+                "Questions From Owners",
+                "Recovery Over Ethernet",
+                "Restart or Full Reset?",
+                "Before You Begin",
+                "After the Reset",
+                "Troubleshooting Access",
+                "Connection Checklist",
+                "Hardware Revision Guide",
+                "Restoring Wi-Fi",
+                "Keeping Access"
+            ][angle % 13]
+        );
+    }
+    let topic = subject
+        .strip_prefix("Best ")
+        .or_else(|| subject.strip_prefix("best "))
+        .unwrap_or(&subject);
+    let topic = topic.strip_suffix(" reviews").unwrap_or(topic);
+    let topic = topic.trim_end_matches(" 2026");
+    let topic = topic
+        .split_whitespace()
+        .map(|word| {
+            if STOP.contains(&word) {
+                word.to_owned()
+            } else {
+                capitalize(word)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let forum_topic = topic.to_lowercase();
+    let title = match intent(query) {
+        "review" => [
+            format!("The Best {topic}: Our Picks for 2026"),
+            format!("{topic}: Tested and Compared"),
+            format!("{topic}: How to Choose the Right Pair"),
+            format!("Best {topic}: Buying Guide"),
+            format!("Shop {topic}"),
+            format!("Which {forum_topic} would you recommend?"),
+            format!("{topic}: Comfort, Grip and Weather Protection"),
+            format!("{topic}: What to Look For"),
+            format!("Our Favorite {topic}: Fit and Protection"),
+            format!("{topic}: Browse the Range"),
+            format!("{topic}: Fit and Sizing Advice"),
+            format!("{topic}: Field Reviews"),
+            format!("Compare {topic}: Prices and Features"),
+        ][angle % 13]
+            .clone(),
+        "definition" => {
+            let term = query
+                .strip_prefix("what is ")
+                .or_else(|| query.strip_prefix("what are "))
+                .unwrap_or(query);
+            let term = term
+                .strip_prefix("a ")
+                .or_else(|| term.strip_prefix("an "))
+                .unwrap_or(term);
+            match host {
+                "en.wikipedia.org" => upper_first(term),
+                "www.britannica.com" => {
+                    format!("{}: Definition, Types and Uses", upper_first(term))
+                }
+                "dictionary.cambridge.org" => format!("Meaning of {term} in English"),
+                "www.merriam-webster.com" => format!("{} Definition", upper_first(term)),
+                "www.collinsdictionary.com" => {
+                    format!("{} Definition and Meaning", upper_first(term))
+                }
+                "www.energy.gov" => format!("{}s: How They Work", upper_first(term)),
+                "energysavingtrust.org.uk" => {
+                    format!("A Guide to {}s for Your Home", upper_first(term))
+                }
+                "www.which.co.uk" => {
+                    format!("{}s Explained: Types and Installation", upper_first(term))
+                }
+                "www.youtube.com" => format!("How a {term} Works: A Step-by-Step Explanation"),
+                "www.reddit.com" => format!("What should I know before choosing a {term}?"),
+                "www.sciencefocus.com" => format!("How Does a {term} Work in Practice?"),
+                "www.howstuffworks.com" => format!("How {}s Work", upper_first(term)),
+                _ => format!("How Does a {term} Work?"),
+            }
+        }
+        "health" => format!(
+            "{}: {}",
+            subject,
+            [
+                "Safety and Side Effects",
+                "What to Know",
+                "Benefits and Risks",
+                "Timing and Tolerance",
+                "Advice for Runners",
+                "Your Questions Answered",
+                "Before Exercise",
+                "Common Concerns",
+                "What Has Worked for You?",
+                "Food and Fitness",
+                "Health Information",
+                "Practical Tips",
+                "Nutrition Advice"
+            ][angle % 13]
+        ),
+        "howto" => format!(
+            "{}: {}",
+            subject,
+            [
+                "Step-by-Step Guide",
+                "When and How",
+                "Tools and Technique",
+                "A Practical Method",
+                "Common Mistakes",
+                "What Worked for Me",
+                "Care Afterward",
+                "A Beginner’s Guide",
+                "Tips for Success",
+                "Questions Answered",
+                "Getting Started",
+                "Do It Yourself",
+                "Before You Begin"
+            ][angle % 13]
+        ),
+        _ => {
+            let subject = heading(original);
+            match angle % 13 {
+                0 => original.to_owned(),
+                1 => format!("{subject}: Common Questions"),
+                2 => format!("How Does {subject} Work?"),
+                3 => format!("{subject}: A Practical Guide"),
+                4 => format!("Understanding {subject}"),
+                5 => format!("{subject}: Background and Terminology"),
+                6 => format!("{subject}: Examples and Methods"),
+                7 => format!("Getting Started With {subject}"),
+                8 => format!("{subject}: Details Worth Checking"),
+                9 => format!("A Closer Look at {subject}"),
+                10 => format!("{subject}: Tips From Practice"),
+                11 => format!("{subject}: Questions From Readers"),
+                _ => format!("Working With {subject}"),
+            }
+        }
+    };
+    format!("{title} | {name}")
+}
+
+fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
+    let topic = words(subject).join(" ");
+    let (opening, detail, steps, tip) = match intent(subject) {
+        "review" => (
+            "Compare the features you will use every day before paying for extras",
+            "Start with the intended use, then compare dimensions, materials, warranty terms and ongoing costs. A lower purchase price can be offset by replacement parts or a short warranty. Check what is included rather than comparing headline prices alone.",
+            vec![
+                "Choose the features that matter for your intended use.",
+                "Compare the total price and warranty terms.",
+                "Check return conditions before placing an order.",
+            ],
+            "Check the exact model and revision. Similar product names can describe different specifications.",
+        ),
+        "health" => (
+            "Symptoms, medicines and personal circumstances can change the advice that applies",
+            "Timing, amount and existing health conditions matter when discussing a health question. A pharmacist can check interactions with medicines, while a clinician can assess persistent symptoms. Sudden severe symptoms need prompt medical attention.",
+            vec![
+                "Note the amount, timing and symptoms.",
+                "Check medicine labels and ask a pharmacist about interactions.",
+                "Discuss persistent or worsening symptoms with a clinician.",
+            ],
+            "Do not stop a prescribed medicine based on a general article.",
+        ),
+        "definition" => (
+            "The definition and its practical uses are closely linked",
+            "A definition sets the scope of a term; examples show how it is used. Distinguish the everyday meaning from any narrower technical meaning and check the field in which the term appears.",
+            vec![
+                "Start with the definition used in the relevant field.",
+                "Compare a concrete example with a related concept.",
+                "Check whether the term has another meaning in a different context.",
+            ],
+            "The context of a term can be as useful as its dictionary definition.",
+        ),
+        _ => (
+            "Prepare the tools and check the material before starting",
+            "Work on a small area first and check the result before continuing. Materials and finishes can need different tools or treatments, so follow instructions for the specific item rather than increasing force when a step does not work.",
+            vec![
+                "Prepare a clear workspace and the tools for the material.",
+                "Try a small area before continuing.",
+                "Check the result at each step.",
+            ],
+            "Stop if a material cracks, tears or changes color unexpectedly.",
+        ),
+    };
+    let angles = [
+        "start with the intended use",
+        "compare the details closely",
+        "check the conditions first",
+        "look at the whole process",
+        "allow for the time involved",
+        "consider your own circumstances",
+        "begin with a small comparison",
+        "read the instructions carefully",
+        "check before proceeding",
+        "keep the scope of the question clear",
+        "take one step at a time",
+        "compare like with like",
+        "check the result before continuing",
+    ];
+    let lead = excerpt(&format!(
+        "{}: {}; {}.",
+        upper_first(&topic),
+        lower_first(opening),
+        angles[angle % 13]
+    ));
+    Article {
+        title: result_title(seed, subject, host, angle, subject),
+        lead,
+        detail: detail.into(),
+        steps: steps.into_iter().map(str::to_owned).collect(),
+        tip: tip.into(),
+        example: "",
+        question: "Which details should I check before deciding?",
+        reply: "I would check the instructions for the exact item and compare the conditions before proceeding.",
+    }
+}
+
+fn intent_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
+    let q = subject.to_lowercase();
+    if !q.contains("cactus")
+        && !q.contains("coffee")
+        && !q.contains("heat pump")
+        && !q.contains("boot")
+        && !q.contains("hiking")
+    {
+        return topic_article(seed, subject, host, angle);
+    }
+    let (leads, detail, steps, tip, question, reply): (&[&str], &str, Vec<&str>, &str, &str, &str) =
+        if q.contains("cactus") || q.contains("repot") {
+            (
+                &[
+                    "Repot a cactus into a container just wider than its roots, using a gritty mix that drains freely rather than moisture-retaining houseplant compost.",
+                    "A cactus needs repotting when its roots fill the pot; protect your hands with folded newspaper and keep the plant at its previous soil level.",
+                    "Move a cactus to a pot with drainage holes, loosening the dry root ball carefully so the roots can spread into fresh, free-draining compost.",
+                    "Use a folded towel to lift a cactus without gripping its spines, then settle the roots into a slightly larger pot filled with gritty compost.",
+                    "The easiest time to repot a cactus is at the start of active growth, when the roots can recover before the plant needs regular watering again.",
+                    "Has anyone repotted a tall cactus without breaking it? Mine is top-heavy, so I am planning to support the stem while I loosen the root ball.",
+                    "After repotting a cactus, let damaged roots dry before watering; wet compost around fresh injuries can make root rot more likely to develop.",
+                    "Choose a cactus pot for its drainage and root space, keeping the stem base above the compost rather than burying it to make the plant steady.",
+                    "A cactus root ball should come free with gentle pressure on the pot; cutting a plastic container is safer than pulling hard against the stem.",
+                    "Brush loose compost away from cactus roots and trim only damaged sections, allowing any cuts to dry before settling the plant into its new pot.",
+                    "Wear puncture-resistant gloves when moving a cactus, but use tongs or a newspaper collar as well because fine spines can pass through fabric.",
+                    "Spring cactus care starts with checking the drainage holes for crowded roots, then selecting a pot only one size larger if a move is needed.",
+                    "Keep a newly repotted cactus out of harsh direct sun while it settles, returning to normal light gradually rather than changing everything at once.",
+                ],
+                "Use a pot with an open drainage hole and a gritty cactus mix. Work with dry compost so the root ball is easier to release. Do not bury the stem deeper than before.",
+                vec![
+                    "Protect your hands and wrap the cactus in folded newspaper.",
+                    "Loosen the root ball and remove damaged roots.",
+                    "Set it at the same depth in a slightly larger pot.",
+                    "Wait several days before watering so root injuries can dry.",
+                ],
+                "A large pot holds damp compost around unused roots. Move up one size rather than choosing the biggest container.",
+                "My cactus roots are growing through the drainage holes. How can I move it without damaging the spines?",
+                "I wrapped mine in folded newspaper and worked with dry compost. I kept it at the same depth and waited before watering.",
+            )
+        } else if intent(subject) == "health" {
+            (
+                &[
+                    "Coffee before a run can increase alertness, but caffeine may also cause an upset stomach or urgency; try a small amount on an easy training day.",
+                    "Drinking coffee before running is a matter of tolerance and timing, since caffeine can leave some runners jittery even when others feel more alert.",
+                    "Caffeine can help exercise performance for some adults, though more coffee is not always better and a large serving may bring nausea or palpitations.",
+                    "If coffee upsets your stomach before a run, try reducing the serving or allowing more time before leaving, rather than testing a new habit on race day.",
+                    "A morning coffee may fit your running routine if you tolerate it well, but pay attention to sleep, stomach symptoms and the amount you usually drink.",
+                    "Coffee can make a pre-run bathroom visit more likely, so leave time before setting off and avoid assuming a stronger cup will improve your session.",
+                    "Before a long run, keep coffee intake familiar and drink water as needed; caffeine does not replace the fluids and food that support your training.",
+                    "Some runners feel shaky after coffee even at an ordinary serving size, making a smaller cup or a caffeine-free morning a more comfortable choice.",
+                    "Do you drink coffee before running? I like the routine, but on faster days I get stomach cramps and wonder whether changing the timing would help.",
+                    "Coffee before exercise works differently from person to person, and milk, food and serving size may affect how comfortable you feel once you start.",
+                    "Check the caffeine content of your pre-run drink because a large cafe coffee can contain much more than the small cup you normally make at home.",
+                    "If caffeine brings chest pain, faintness or persistent palpitations, stop exercising and seek medical advice instead of trying to run through symptoms.",
+                    "Evening runners may find coffee interferes with sleep long after the workout, so consider your bedtime as well as how alert you feel on the run.",
+                ],
+                "Caffeine may improve alertness and exercise performance, but it can also cause jitteriness, stomach upset and difficulty sleeping. People differ in sensitivity. Discuss caffeine with a clinician if you have a heart condition, are pregnant or take medicines that interact with it.",
+                vec![
+                    "Try your usual small serving before an easy run.",
+                    "Leave time to notice stomach symptoms before setting off.",
+                    "Avoid increasing the amount for the first time on race day.",
+                ],
+                "Stop if you feel unwell. Persistent palpitations or chest pain need medical attention.",
+                "Coffee before my run sometimes makes me feel shaky. Would a smaller cup or more time beforehand help?",
+                "I found a smaller serving easier on my stomach. That is my experience rather than a reason for you to ignore symptoms.",
+            )
+        } else if intent(subject) == "definition" {
+            (
+                &[
+                    "A heat pump moves heat rather than making it by burning fuel, using electricity to transfer warmth from outdoor air or the ground into a building.",
+                    "Heat pumps use a refrigerant circuit to carry heat between two places, with a compressor raising the temperature before heat reaches the indoor system.",
+                    "Heat pump means a device that transfers thermal energy from a cooler place to a warmer one by using external work, usually supplied as electricity.",
+                    "A heat pump is a heating and cooling machine whose refrigerant absorbs heat at one temperature and releases it at another after compression.",
+                    "An air-source heat pump takes energy from outdoor air even in cold weather, although its efficiency and available heating output depend on the conditions.",
+                    "A ground-source heat pump draws warmth from buried pipes, needing space for a ground loop as well as equipment inside or beside the building.",
+                    "Heat pumps often work best with steady, lower-temperature heating, making insulation and correctly sized radiators part of the installation design.",
+                    "Inside a heat pump, the evaporator, compressor, condenser and expansion valve form a circuit that moves energy without burning fuel in the home.",
+                    "Is a heat pump right for an older house? The answer depends on heat loss, radiator sizes and the water temperature needed to keep the rooms warm.",
+                    "A reversible heat pump can cool as well as heat, changing the direction of heat transfer so indoor warmth is released outside during warmer weather.",
+                    "Heat pump efficiency is expressed as heat delivered per unit of electricity, with seasonal performance reflecting changing outdoor temperatures.",
+                    "A heat pump installation needs a heat-loss calculation for the building, helping the installer choose equipment and emitters that can meet demand.",
+                    "Unlike a boiler that burns fuel, a heat pump transfers existing heat, so its electricity use depends on the temperature lift and the building’s demand.",
+                ],
+                "A heat pump transfers energy through a refrigerant circuit. The evaporator absorbs heat, the compressor raises the refrigerant pressure, and the condenser releases heat indoors. The expansion valve lowers the pressure before the cycle repeats.",
+                vec![
+                    "The refrigerant absorbs heat from the air or ground.",
+                    "The compressor raises its pressure and temperature.",
+                    "Heat passes into indoor air or a water heating circuit.",
+                ],
+                "Performance depends on outdoor conditions and the temperature needed indoors. A heat-loss calculation matters more than floor area alone.",
+                "Can a heat pump warm an older house without replacing every radiator?",
+                "It depends on the heat loss and the radiator output at a lower water temperature. An installer needs to calculate those values.",
+            )
+        } else {
+            (
+                &[
+                    "Winter hiking boots need dependable grip, enough room for warm socks and protection from wet ground; fit matters more than the insulation rating alone.",
+                    "We compare winter hiking boots for traction, warmth and comfort on long walks, paying particular attention to heel hold and space around the toes.",
+                    "Choose winter hiking boots for the terrain you walk most often, balancing waterproof protection with flexibility and the room needed for thicker socks.",
+                    "The best winter hiking boots stay comfortable after hours on wet trails, with secure lacing and soles that grip without making each step feel stiff.",
+                    "Browse winter hiking boots by size, lining and waterproof construction, then compare return terms so you can check the fit with your walking socks.",
+                    "Which winter hiking boots would you buy for muddy trails? I need room for thick socks, but I do not want my heel lifting every time I climb.",
+                    "A winter hiking boot should hold the heel while leaving the toes free, because tight footwear can feel colder as well as causing discomfort downhill.",
+                    "Deep lugs help winter hiking boots bite into soft ground, while icy paths may still need traction aids rather than a different rubber sole alone.",
+                    "For cold wet walks, compare winter hiking boots with a waterproof lining and a tongue that keeps splashes from entering through the laces.",
+                    "Shop winter hiking boots with cushioning and ankle support suited to your pack, checking the fit indoors before taking a new pair onto the trail.",
+                    "Insulated winter hiking boots suit slow walks in cold conditions, but a lighter waterproof pair may be more comfortable for brisk days above freezing.",
+                    "Our winter hiking boot comparison looks at wet-weather protection and underfoot grip, with fit notes to help narrow the choices before trying pairs.",
+                    "Winter hiking boots vary in stiffness and weight, so match the footwear to local trails rather than choosing a mountain boot for every weekend walk.",
+                ],
+                "For winter walks, compare a waterproof leather hiking boot with an insulated model. The first is often more flexible for mild, wet trails; the second adds warmth but can feel bulky. A deep tread helps in mud, while ice may call for separate traction aids.",
+                vec![
+                    "Try boots with the socks you plan to wear.",
+                    "Check heel hold on an incline and toe room on a descent.",
+                    "Compare wet-weather protection, weight and outsole grip.",
+                    "Check return terms before wearing a new pair outdoors.",
+                ],
+                "For sustained snow or steep frozen ground, check compatibility with the traction equipment your route requires.",
+                "I need winter hiking boots for wet weekend trails. Is insulation worth the extra weight?",
+                "For my mild, wet walks I prefer a waterproof pair with warm socks. I would choose more insulation for slower days in snow.",
+            )
+        };
+    let lead = leads[angle % leads.len()].to_owned();
+    Article {
+        title: result_title(seed, subject, host, angle, subject),
+        lead,
+        detail: detail.into(),
+        steps: steps.into_iter().map(str::to_owned).collect(),
+        tip: tip.into(),
+        example: "",
+        question,
+        reply,
+    }
+}
+
+fn list_lead(subject: &str, angle: usize) -> Option<String> {
+    let q = subject.to_lowercase();
+    let lines: &[&str] = if ["halvard", "hg-400", "gateway", "41877"]
+        .iter()
+        .any(|w| q.contains(w))
+    {
+        &[
+            "Halvard’s fixed firmware, 7.2.4, closes a critical web portal flaw that can be exploited without signing in to the affected appliance.",
+            "The Halvard advisory lists firmware 7.0.0 through 7.2.3 as affected, with the September 22 release fixing the vulnerable web portal code.",
+            "I need to schedule an update for our Halvard appliance and want to check the affected firmware range before choosing a maintenance window.",
+            "CISA added the Halvard portal flaw to its exploited vulnerabilities catalog on September 26, following the vendor’s firmware release four days earlier.",
+            "Administrators running Halvard appliances can disable the web portal on the WAN interface as an interim measure while arranging the firmware upgrade.",
+            "The critical Halvard vulnerability concerns the appliance’s web portal rather than a VPN client, with the advisory identifying release 7.2.4 as fixed.",
+            "Is a Halvard firmware rollback safe after this update? The advisory identifies older affected releases, so a working VPN tunnel does not settle that question.",
+            "Halvard’s September 22 advisory covers the HG-200, HG-400 and HG-900 appliance line, with a firmware fix for the pre-authentication portal flaw.",
+            "A severity score of 9.8 puts the Halvard web portal flaw among the critical issues, and the advisory describes an upgrade and an interim mitigation.",
+            "Halvard Gateway owners planning a maintenance window should check their installed release against the affected range before downloading a firmware image.",
+            "The Halvard patch addresses an unauthenticated attack against the portal, closing the vulnerable code path in the fixed firmware release.",
+            "Turning off the Halvard portal on the WAN blocks the described attack, but the advisory still identifies the firmware upgrade as the fix.",
+            "The Halvard firmware advisory separates affected releases from the fixed version, helping administrators choose an update rather than an unverified rollback.",
+        ]
+    } else if q.contains("banana") && q.contains("bread") {
+        &[
+            "Dense banana bread often starts with too much flour; weigh it before mixing, then fold only until the dry streaks disappear from the batter.",
+            "A tender banana loaf needs a light hand with the flour and a gentle fold, leaving a few small lumps rather than beating the batter smooth.",
+            "Overmixing develops gluten in banana bread batter, making the crumb tough even when the ingredients and oven temperature are otherwise right.",
+            "A gummy banana bread center may need more baking time rather than less flour, so check for wet batter before changing the recipe proportions.",
+            "Too much mashed banana can weigh down a loaf; measure the fruit separately and resist adding another banana just because it is very ripe.",
+            "For a softer banana bread crumb, bring the wet ingredients together first and add the dry mixture only when the pan and oven are ready.",
+            "A small loaf pan makes banana bread deeper and slower to bake, so check the recipe’s pan dimensions before adjusting the time or temperature.",
+            "Banana bread can sink when the structure has not set; test the center and let the loaf rest before trying to remove it from the pan.",
+            "A dark crust does not prove banana bread is done inside, especially in a deep pan; check the middle with a skewer for traces of wet batter.",
+            "Let banana bread cool on a rack before cutting, because a warm crumb can compress under the knife and look heavier than it really is.",
+            "Fresh baking soda helps banana bread rise, but adding more is not a cure for a heavy batter; check the date and the recipe’s measured amount.",
+            "Packed cups of flour can turn banana bread dry and dense, so spoon the flour lightly into a cup or use the recipe’s weight measurement.",
+            "Banana bread batter should be thick enough to hold its shape briefly; note the fruit weight and pan size when comparing one batch with another.",
+        ]
+    } else if q.contains("flight") || q.contains("airfare") || q.contains("airline") {
+        &[
+            "Compare departure dates and baggage allowances before choosing flights, since a lower fare can cost more once bags and seats are included.",
+            "Use the date grid for flights to compare nearby departure days, keeping the passenger count and cabin bag allowance the same across each search.",
+            "Direct flights can save transfer costs as well as time, while a connection may add meals, terminal changes or an overnight stay to the trip.",
+            "Check the arrival airport before booking cheap flights, especially when a late landing leaves few trains or buses into the city center.",
+            "Midweek flights may offer a different fare range from weekend departures, but compare the total return journey rather than one low outbound fare.",
+            "Cheap flights may include only a bag under the seat, so check cabin bag dimensions before adding the luggage you normally travel with.",
+            "Compare direct flights with connections by total journey time, including the time needed to change terminals and pass through security again.",
+            "Add the price of flights for every traveler before paying, since the lowest advertised fare may apply to fewer seats than your group needs.",
+            "Conditions on flexible flights can matter if your dates may change, so compare the change fee and any fare difference alongside the original ticket.",
+            "Early flights may require a night near the terminal, making a later service better value even when its ticket costs a little more.",
+            "Check airline cancellation conditions before booking flights, including whether a refund goes back to the payment card or comes as travel credit.",
+            "Compare flights from nearby departure airports with the cost and duration of the trip to the terminal, particularly when traveling with luggage.",
+            "For flights with a self-transfer, check whether bags need collecting and whether the next airline protects the connection if you arrive late.",
+        ]
+    } else if q.contains("pizza") && q.contains(" in ") {
+        &[
+            "Compare pizza restaurants by neighborhood, menu and opening hours, allowing time for a walk-up queue if the kitchen does not accept reservations.",
+            "Look for a pizza table that fits your evening plans, then check the service charge, drinks and booking terms before confirming a reservation.",
+            "A simple margherita is a useful way to compare pizza kitchens, showing the balance of dough, tomato and cheese without extra toppings.",
+            "Recent pizza reviews can reveal recurring queue and service problems, but check the date before relying on an account from a previous season.",
+            "I have one evening for pizza and would rather avoid crossing town twice, so I am choosing between one well-known kitchen and two neighborhood places.",
+            "Traditional pizza is best eaten promptly at a table, because a closed takeaway box softens the base before you get back to your accommodation.",
+            "Fried pizza offers a different meal from a wood-fired margherita, so consider a specialist counter as well as the busiest sit-down pizzerias.",
+            "Pizza delivery is easiest to compare by the full basket price, including service and delivery fees rather than the menu price of one margherita.",
+            "For a group pizza night, check whether everyone can sit together and whether the kitchen takes bookings or seats diners as tables become free.",
+            "Some pizza kitchens close between lunch and dinner, making the opening hours as useful as the reviews when planning a short visit to the city.",
+            "A walking route between pizza stops leaves more time to explore, but allow for queues and avoid planning several full meals too close together.",
+            "Ask about pizza ingredients before ordering if you have allergies, since a short traditional menu does not mean every topping is suitable.",
+            "Compare the pizza menu with the day’s specials before joining a queue, particularly if you want a fried pizza or a style beyond margherita.",
+        ]
+    } else if q.contains("rust") && q.contains("e0502") {
+        &[
+            "Rust rejects a mutable borrow while a conflicting shared borrow is still in use, so check the last expression that reads through the reference.",
+            "Pushing to a Rust vector needs mutable access, which conflicts with an element reference if that reference is used after the push operation.",
+            "A Rust borrow can end at its last use, allowing mutation later in the same block when no expression still needs the shared reference.",
+            "I can read a Rust vector element before pushing, but keeping that reference for a later print brings a borrow error I am trying to resolve.",
+            "Rust shared references permit reading, while a mutable reference needs exclusive access for the time it is used to change the borrowed value.",
+            "Moving a Rust reference into another expression can extend its use, so follow where the borrowed value is actually read rather than only its binding.",
+            "Use the borrowed Rust value before mutating the collection when the two operations do not need to overlap, letting the shared borrow end first.",
+            "For a Rust vector of integers, copying an element into a local value can avoid keeping a reference into the collection while another item is pushed.",
+            "A Rust clone may avoid a conflicting borrow by creating independent data, but changing the order of operations can sometimes remove the need to copy.",
+            "Nonlexical lifetimes let Rust track borrows through their last use, although a later read still keeps the earlier shared reference active.",
+            "Rust methods that take a mutable receiver can conflict with a shared reference into the same value, even if the mutation happens inside the method.",
+            "Reduce a Rust borrow error to one collection and one reference, then mark the point where the reference is created and the final place it is used.",
+            "A Rust inner scope can make a borrow’s end clear when all reference uses stay inside it, leaving mutation until after that scope finishes.",
+        ]
+    } else if q.contains("rust") {
+        &[
+            "Rust gives each value one owner and checks borrows at compile time, helping explain why moving a String differs from passing a reference to it.",
+            "A Rust function can borrow a String through a shared reference, reading its contents while the original binding continues to own the value.",
+            "Moving a Rust value transfers ownership to another binding, while copying a small Copy value leaves the original available for later expressions.",
+            "I can read a Rust vector element before pushing, but keeping its reference for later use brings a borrow error that I am trying to understand.",
+            "Rust prevents mutation through a value while a conflicting shared borrow is still active, so trace the reference through its final use.",
+            "A borrowed Rust value must remain alive for as long as the reference is used, even when the reference is passed between several functions.",
+            "Rust can end a borrow at its last use rather than the end of the surrounding block, allowing later mutation when the reference is no longer needed.",
+            "For a small Rust example, compare passing an integer by value with passing a reference into a vector that will later grow or change its contents.",
+            "A Rust clone creates an independent owned value when the type supports it, but it is worth checking whether a short borrow is enough instead.",
+            "When a Rust borrow error appears, reduce the code to one collection and follow the place where each reference is created and last used.",
+            "A mutable Rust reference grants exclusive access for its active lifetime, which prevents another conflicting borrow from reading the same value.",
+            "Borrowing in Rust lets functions work with data they do not own, while ownership determines which binding is responsible for dropping the value.",
+            "Rust references do not keep a value alive by themselves, so a reference returned from a function must point to data that outlives that call.",
+        ]
+    } else if q.contains("car") {
+        &[
+            "Compare used car asking prices for the same model year and trim, checking the mileage and service history before treating a cheaper car as a bargain.",
+            "A used car price guide gives a range rather than a guaranteed sale price, with condition and overdue maintenance affecting what a buyer should pay.",
+            "Mileage is only one part of a used car valuation, since a documented service history can explain a higher price between otherwise similar examples.",
+            "Search used cars within your budget, then compare the engine, equipment and seller type rather than assuming every example of one model costs alike.",
+            "Allow for insurance, tax and the next service when comparing used car prices, especially if a lower asking price leaves little room for repairs.",
+            "Dealer and private used car prices can differ, so check the warranty terms and the work already completed before deciding which offer is better.",
+            "A used car with missing service history may need immediate work, making a slightly more expensive example cheaper to own during the first few months.",
+            "To value a used car, compare similar advertised examples and account for condition, specification and mileage rather than relying on the model name alone.",
+            "Used car listings are easier to compare when you filter by age and engine first, then check the photographs and description for signs of wear.",
+            "An inspection can explain the price gap between two used cars, particularly when tires, brakes or a major service are due on the cheaper example.",
+            "Set a used car budget that leaves room for initial maintenance, then compare vehicles with similar mileage and a clear account of previous servicing.",
+            "A used car review can help identify recurring maintenance costs, but the condition of the individual vehicle still matters more than its reputation.",
+            "Ask a used car seller which work has been completed recently and compare the receipts with the mileage before agreeing the final purchase price.",
+        ]
+    } else {
+        return None;
+    };
+    Some(lines[angle % lines.len()].into())
+}
+
+struct Draft {
+    title: String,
+    leads: &'static [&'static str],
+    detail: &'static str,
+    steps: Vec<&'static str>,
+    tips: &'static [&'static str],
+    example: &'static str,
+    question: &'static str,
+    reply: &'static str,
+}
+
+struct Article {
+    title: String,
+    lead: String,
+    detail: String,
+    steps: Vec<String>,
+    tip: String,
+    example: &'static str,
+    question: &'static str,
+    reply: &'static str,
+}
+
+fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
+    let lower = heading(subject)
+        .split(" /")
+        .next()
+        .unwrap_or(subject)
+        .to_lowercase();
+    let n = angle % 10;
+    let choose = |items: &[&str]| items[n % items.len()].to_owned();
+    let kind = site_profile(host).kind;
+    let scenario = ["halvard", "hg-400", "gateway", "41877"]
+        .iter()
+        .any(|w| lower.contains(w));
+    if !scenario
+        && ![
+            "pizza",
+            "restaurant",
+            "flight",
+            "bread",
+            "recipe",
+            "hotel",
+            "router",
+            "rust",
+            "python",
+            "javascript",
+            "car",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
+        && (matches!(intent(subject), "review" | "health" | "definition")
+            || lower.contains("cactus")
+            || lower.contains("repot"))
+    {
+        return intent_article(seed, subject, host, angle);
+    }
+    let mut general = false;
+    let Draft {
+        title,
+        leads,
+        detail,
+        steps,
+        tips,
+        example,
+        question,
+        reply,
+    } = if scenario {
+        Draft {
+            title: if kind == "forum" || kind == "qa" {
+                if lower.contains("downgrade") {
+                    "Has anyone rolled back a Halvard Gateway HG-400 after the security update?"
+                        .into()
+                } else {
+                    "Has anyone installed the Halvard Gateway security update?".into()
+                }
+            } else if kind == "company" || kind == "docs" {
+                "Halvard Gateway vulnerability: firmware and security updates".into()
+            } else if lower.contains("downgrade") {
+                "Halvard admins weigh firmware downgrade risks after critical flaw".into()
+            } else {
+                "Halvard fixes critical Gateway flaw in firmware 7.2.4".into()
+            },
+            leads: &[
+                "Halvard has released a firmware fix for its VPN appliances after a critical flaw was found in the web portal.",
+                "A critical web portal flaw has put Halvard appliance administrators under pressure to upgrade their firmware.",
+                "Halvard Gateway owners face an urgent firmware decision after a remotely exploitable flaw was disclosed.",
+                "The latest Halvard firmware closes a web portal flaw that attackers can reach without signing in.",
+                "Halvard administrators are reviewing older firmware releases after the disclosure of a critical portal flaw.",
+                "A firmware release from Halvard addresses a critical flaw across three VPN appliance models.",
+                "Security teams running Halvard appliances are checking their firmware after a critical vulnerability disclosure.",
+                "Halvard has published a firmware update for a flaw affecting its Gateway VPN and firewall appliances.",
+                "An unauthenticated web portal attack is the focus of Halvard’s latest firmware advisory.",
+                "Halvard’s firmware advisory sets out which appliance releases are affected by a critical web portal flaw.",
+            ],
+            detail: "The affected firmware releases run from 7.0.0 through 7.2.3. The fixed release is 7.2.4, issued on September 22. The HG-200, HG-400 and HG-900 are part of the appliance line.",
+            steps: vec![
+                "Check the appliance model and installed firmware release in the management console.",
+                "Read the advisory before choosing a target release; an older image may reintroduce the vulnerability.",
+                "Turning off the web portal on the WAN interface blocks the attack until the upgrade is complete.",
+            ],
+            tips: &[
+                "A firmware downgrade is a separate operation from a reset; the advisory does not establish that an older release is safe.",
+                "Keeping the portal off the WAN interface is an interim measure while the firmware upgrade is arranged.",
+                "The firmware fix was published before CISA added the flaw to its exploited vulnerabilities catalog.",
+                "The firmware advisory lists 7.2.4 as the fixed release; earlier affected releases remain vulnerable.",
+                "The firmware update addresses a flaw in the portal, rather than in a VPN client.",
+                "The affected firmware range includes 7.2.1, the release running on the office appliance.",
+                "The firmware flaw can be reached before authentication; a strong portal password does not remove it.",
+                "The firmware advisory describes disabling the WAN portal as an interim measure.",
+                "A firmware rollback needs its own compatibility assessment before a maintenance window.",
+                "The firmware fix covers a critical issue with a CVSS base score of 9.8.",
+            ],
+            example: "",
+            question: "I have an HG-400 on 7.2.1. I need to schedule the upgrade, but can I roll back if our VPN clients have trouble?",
+            reply: "I would not treat a working VPN tunnel as proof that the portal is safe. I can help with the maintenance window, but I have not tried a rollback on this model.",
+        }
+    } else if lower.contains("groupby") || lower.contains("itertools") {
+        Draft {
+            title: if kind == "qa" {
+                "How do I use itertools.groupby() with a key function?".into()
+            } else {
+                "Python itertools.groupby(): grouping adjacent values by key".into()
+            },
+            leads: &[
+                "Python’s grouping function collects adjacent values with the same key.",
+                "The itertools module groups adjacent values rather than collecting every matching value in a sequence.",
+                "A Python grouping operation can produce several groups for the same value.",
+                "Python’s groupby() reads its input one item at a time.",
+                "An itertools grouping key decides where one run ends and the next begins.",
+                "Python grouping works on runs of matching values in the input.",
+                "The itertools grouping function does not sort its input for you.",
+                "Python’s groupby() returns a key and an iterator for each run.",
+                "A Python key function can group records by one field.",
+                "With itertools, matching values must be adjacent to share a group.",
+            ],
+            detail: "Each Python group shares the underlying input iterator. Read the group before requesting the next one, or materialize it as a list.",
+            steps: vec![
+                "Choose a key function, such as taking the first field of a tuple.",
+                "Sort with the same key if all matching values should appear together.",
+                "Call itertools.groupby() and consume each group before advancing.",
+            ],
+            tips: &[
+                "Python sorting changes the input order. Leave the sequence alone when runs are what you need.",
+                "The itertools groups are lazy; converting each to a list preserves it for later use.",
+                "A Python dictionary is a better fit when you need to collect matching values without sorting.",
+                "Python key functions can read a tuple field, an attribute or a calculated value.",
+                "An itertools group disappears as the outer iterator advances; read it immediately.",
+                "Use Python’s sorted() with the same key passed to groupby().",
+                "Python preserves the order of equal keys during sorting.",
+                "With itertools, a later occurrence of a key can start a new group.",
+                "A Python list comprehension can materialize the groups in one pass.",
+                "Python grouping does not merge nonadjacent runs unless you sort first.",
+            ],
+            example: "from itertools import groupby\nrows = [('a', 1), ('b', 2), ('a', 3)]\nkey = lambda row: row[0]\nfor name, group in groupby(sorted(rows, key=key), key=key):\n    print(name, list(group))\n# a [('a', 1), ('a', 3)]\n# b [('b', 2)]",
+            question: "I anticipated one Python group for each key, but 'a' appears twice. Do I need to sort first, and where does the key function go?",
+            reply: "I would sort first if you want all equal keys together. If you want adjacent runs, sorting would change the answer. The Python example below uses the same key in both calls.",
+        }
+    } else if lower.contains("sourdough") {
+        Draft {
+            title: if kind == "news" {
+                "Bakers explain why sourdough struggles to rise".into()
+            } else {
+                "Why Your Sourdough Starter Isn’t Rising".into()
+            },
+            leads: &[
+                "A cool kitchen can slow a sourdough culture without killing it.",
+                "A young sourdough culture may bubble for days before it doubles reliably.",
+                "The feeding ratio changes how quickly sourdough rises and falls.",
+                "Sourdough can peak overnight and fall before you check it.",
+                "A sourdough culture needs warmth and regular feeding to build strength.",
+                "Whole-grain flour can help a sluggish sourdough culture become more active.",
+                "Sourdough bubbles are useful, but the rise tells you more about its strength.",
+                "A narrow jar makes a sourdough culture’s rise easier to measure.",
+                "Water temperature affects how quickly sourdough ferments after a feed.",
+                "A sourdough culture can smell lively before it has enough strength for a loaf.",
+            ],
+            detail: "Mark the sourdough level just after feeding. A line of dried mixture above the current level can show that it rose and fell while you were away.",
+            steps: vec![
+                "Keep the feeding ratio consistent for several cycles.",
+                "Use a clean jar and mark the level after feeding.",
+                "Compare bubbles, aroma and rise before changing the schedule.",
+            ],
+            tips: &[
+                "Sourdough needs a warm spot, but direct heat can damage the culture.",
+                "A sourdough feeding log makes a slow improvement easier to see.",
+                "Give a young sourdough culture time before increasing the feeding frequency.",
+            ],
+            example: "",
+            question: "My sourdough bubbles but barely rises. Should I feed more often?",
+            reply: "I would measure the temperature first. More feeding did not help mine in a cold kitchen.",
+        }
+    } else if lower.contains("bread") || lower.contains("baking") {
+        Draft {
+            title: choose(&[
+                "Why Is My Banana Bread Dense? How to Fix It",
+                "The Secret to a Tender Banana Bread Crumb",
+                "Dense Banana Bread? Check Your Flour and Mixing",
+            ]),
+            leads: &[
+                "Dense banana bread usually comes down to too much flour or too much mixing.",
+                "A heavy banana loaf often starts with a tightly packed cup of flour.",
+                "Overmixing bread batter develops gluten and can leave the crumb tough.",
+                "A wet bread center and a dense crumb need different fixes.",
+                "Extra mashed fruit can make bread heavy even when the crust looks ready.",
+                "A tender quick bread starts with measured ingredients and gentle folding.",
+                "Bread batter needs only enough mixing to bring the wet and dry ingredients together.",
+                "Cutting warm bread can compress the crumb and leave heavy slices.",
+                "A dark crust does not always mean the bread is cooked through.",
+                "The wrong pan size can leave bread browned outside and wet in the middle.",
+            ],
+            detail: [
+                "Too much flour absorbs the moisture the bread needs. Spoon it lightly into the cup or, better still, weigh it.",
+                "Prolonged mixing makes quick bread tough. Stop folding as soon as the last streaks of dry flour disappear.",
+                "Too much mashed fruit weighs bread down. Measure the fruit separately rather than adding an extra banana.",
+            ][n % 3],
+            steps: vec![
+                "Weigh the flour and mashed fruit against the recipe quantities.",
+                "Fold the dry ingredients into the wet mixture until just combined.",
+                "Use the specified pan size and check the center for wet batter.",
+                "Let the loaf cool before slicing so the crumb can set.",
+            ],
+            tips: &[
+                "For tender bread, change one variable at a time; start with the flour weight.",
+                "A dense bread crumb can also mean the leavening has lost its strength. Check the date before the next batch.",
+                "Bread that browns before the center sets may need a lower rack or a lighter-colored pan.",
+                "Too much banana can make bread wet in the center. Measure the fruit as carefully as the flour.",
+                "Bread slices more cleanly after cooling; a warm crumb can collapse under the knife.",
+                "Dense bread can come from old leavening. Try a fresh package for the next loaf.",
+                "The bread pan’s depth affects baking time. A tall loaf takes longer to set in the middle.",
+                "For quick bread, a few lumps are better than a completely smooth batter.",
+                "A bread skewer should come out without wet batter. Moist crumbs are fine.",
+                "A heavy bread crumb often improves when the flour is weighed rather than scooped.",
+            ],
+            example: "",
+            question: "My banana bread looks cooked but the slices are dense. Is it the flour or the mixing?",
+            reply: "I had the same bread problem with packed cups of flour. Weighing helped, although an extra banana can still make the middle wet.",
+        }
+    } else if lower.contains("recipe")
+        || lower.contains("cooking")
+        || lower.contains("dough")
+        || lower.contains("roast")
+    {
+        Draft {
+            title: format!("{}: ingredients, timing and method", proper(seed, subject)),
+            leads: &[
+                "Good cooking starts with ingredients cut to a similar size.",
+                "A recipe’s timing depends on portion size as well as heat.",
+                "Resting dough gives the flour time to absorb the water.",
+                "Cooking over a crowded pan traps steam around the ingredients.",
+                "A recipe is easier to follow with the ingredients measured first.",
+                "Dough temperature changes how quickly it becomes ready to shape.",
+                "A hot oven helps roast vegetables brown at the edges.",
+                "Even cooking needs enough space for heat to reach each piece.",
+                "Recipe quantities matter when adjusting the size of a batch.",
+                "The cooking method should suit the ingredients and the pan.",
+            ],
+            detail: "Measure the ingredients before heating the pan or oven. The recipe’s timing is a guide; check the texture and doneness before serving.",
+            steps: vec![
+                "Prepare the ingredients in evenly sized pieces.",
+                "Leave space in the pan so moisture can escape.",
+                "Check the center before serving.",
+            ],
+            tips: &[
+                "Keep notes on the recipe quantities and cooking temperature when adjusting a batch.",
+            ],
+            example: "",
+            question: "I followed the recipe timing, but the center was still underdone. Should I use a smaller batch?",
+            reply: "I would check the pan size before changing the recipe. A crowded pan takes longer.",
+        }
+    } else if lower.contains("flight") || lower.contains("airfare") || lower.contains("airline") {
+        Draft {
+            title: if let Some((_, to)) = lower.split_once(" to ") {
+                format!(
+                    "Cheap Flights to {} from London",
+                    proper(seed, to.split(" from ").next().unwrap_or(to))
+                )
+            } else {
+                format!("{}: flights and fare conditions", proper(seed, subject))
+            },
+            leads: &[
+                "Flexible departure dates can help you find cheaper flights without changing your destination.",
+                "Compare flights with the same baggage allowance before choosing the cheapest ticket.",
+                "A direct flight can cost less overall once transfers and bags are included.",
+                "Nearby departure airports offer more choice, but the journey to the terminal adds up.",
+                "Midweek flights often offer a different fare range from weekend departures.",
+                "A low flight price may cover only a small bag under the seat.",
+                "The cheapest airfare can come with a long connection and a late arrival.",
+                "Compare the total flight price for every passenger before paying.",
+                "A flight’s change conditions matter as much as the initial fare if your dates may move.",
+                "Departure times can turn a cheap flight into an expensive overnight stay.",
+            ],
+            detail: "London Heathrow (LHR), Gatwick (LGW) and Luton (LTN) offer different departure options. An example £89 return fare with a £35 bag each way totals £159 before airport transport. This is a fare comparison example, not a bookable offer.",
+            steps: vec![
+                "Choose departure and return dates and use the same passenger count for each comparison.",
+                "Compare direct services with connections, including the time between terminals.",
+                "Add bags, seats and airport transport to the total.",
+            ],
+            tips: &[
+                "Read the fare’s change and cancellation conditions before payment. Confirm the price for your dates with the airline.",
+            ],
+            example: "",
+            question: "I can travel midweek. Is the cheaper airfare still worthwhile with a checked bag?",
+            reply: "I would compare the total first. My cheaper flight needed a bag fee in each direction.",
+        }
+    } else if lower.contains("router") {
+        Draft {
+            title: format!(
+                "How to Reset a {} Router Without Losing Access",
+                if lower.contains("netgear") {
+                    "Netgear"
+                } else {
+                    "Wi-Fi"
+                }
+            ),
+            leads: &[
+                "A router restart preserves settings, while a factory reset removes them.",
+                "Check the router model before using its reset control.",
+                "A router’s reset control and power switch do different jobs.",
+                "Resetting a router clears the settings you need to reconnect.",
+                "The router label identifies the model and hardware revision.",
+                "An Ethernet connection makes router recovery easier to follow.",
+                "A router reset will not usually change the installed firmware.",
+                "Export the router configuration before returning it to its defaults.",
+                "The router’s admin password may change after a full reset.",
+                "A router can take several minutes to reconnect after a reset.",
+            ],
+            detail: "A router reset removes Wi-Fi credentials and broadband configuration. Check the model’s instructions and keep the connection details somewhere you can reach offline.",
+            steps: vec![
+                "Identify the exact model and hardware revision.",
+                "Export the configuration and note the broadband login separately.",
+                "Follow the model-specific procedure with power connected.",
+                "Reconnect by Ethernet and check the internet connection.",
+            ],
+            tips: &[
+                "A router restart is worth trying before a reset if the connection has only just stopped working.",
+                "Do not reset the router until you have the connection details needed to set it up again.",
+                "After a router reset, change the admin password before reconnecting other devices.",
+                "Check the router label for the original access details before resetting it.",
+                "A router can take several minutes to start again after a reset.",
+                "Keep a copy of the router configuration somewhere you can reach without Wi-Fi.",
+                "A router reset and a firmware downgrade are separate operations.",
+                "Use Ethernet to set up the router if the old Wi-Fi name disappears.",
+                "The router’s hardware revision matters when choosing recovery instructions.",
+                "Keep the router powered throughout any firmware operation.",
+            ],
+            example: "",
+            question: "I want to reset my router, but I cannot get into the admin page. Will I lose my connection details?",
+            reply: "I would try a restart first. A full router reset cleared my Wi-Fi name and connection settings.",
+        }
+    } else if lower.contains("pizza") || lower.contains("restaurant") || lower.contains("cafe") {
+        Draft {
+            title: format!(
+                "Where to Eat {}",
+                proper(seed, subject.trim_start_matches("best "))
+            ),
+            leads: &[
+                "A good pizza is best eaten while the crust is still hot.",
+                "Pizza queues move quickly at some counters and slowly at sit-down restaurants.",
+                "A short pizza menu can make ordering much easier at a busy table.",
+                "A pizza’s soft center is part of the Neapolitan style.",
+                "Compare pizza menus before joining the longest queue.",
+                "Pizza prices vary with toppings, table service and location.",
+                "A pizza counter is a useful alternative when you have little time.",
+                "The best pizza stop may be the one close to your next walk.",
+                "Pizza reservations are useful for groups, but some kitchens take walk-ins only.",
+                "A long trip in a closed box softens a pizza’s crust.",
+            ],
+            detail: "In Naples, Da Michele, Sorbillo and Starita offer different settings for pizza. Choose a neighborhood first, then compare hours, queues and the menu.",
+            steps: vec![
+                "Check opening hours and whether reservations are accepted.",
+                "Compare table service with a quick counter meal.",
+                "Ask about ingredients and dietary requirements before ordering.",
+            ],
+            tips: &[
+                "Pizza at lunchtime can mean a shorter queue than the evening rush.",
+                "A simple margherita is a useful way to compare pizza crusts.",
+                "Check the full pizza bill for drinks and service charges before comparing prices.",
+                "Pizza counters can be a useful stop between museums and a longer evening meal.",
+                "A hot pizza tastes different after a long trip back to your room.",
+                "Ask about pizza portion sizes before ordering a second dish.",
+                "Fried pizza is often easier to buy at a counter than at a traditional table-service restaurant.",
+                "A pizza kitchen’s opening hours may differ from the bar’s hours.",
+                "For a group, check whether the pizza restaurant can seat everyone together.",
+                "Pizza menus can change; ask about the day’s ingredients before choosing.",
+            ],
+            example: "",
+            question: "I have one evening for pizza in Naples. Would you queue or reserve somewhere?",
+            reply: "I would stay near the center. I liked the pizza, but crossing town for one queue used up most of my evening.",
+        }
+    } else if lower.contains("rust") || lower.contains("python") || lower.contains("javascript") {
+        Draft {
+            title: if lower.contains("ownership") {
+                "Understanding Ownership in Rust".into()
+            } else {
+                format!("{}: a worked example", proper(seed, subject))
+            },
+            leads: &[
+                "A Rust value has one owner, and moving it transfers that ownership.",
+                "Rust borrowing lets a function use a value without taking ownership.",
+                "Python sequence indexes start at zero and stop before the length.",
+                "A JavaScript promise needs to settle before its result can be used.",
+                "A Rust shared borrow must end before a conflicting mutation.",
+                "Python iteration avoids indexing past the end of a sequence.",
+                "Rust ownership follows the value through each expression.",
+                "JavaScript error paths should reject a promise rather than leave it pending.",
+                "A Rust copy can avoid keeping a reference into a growing collection.",
+                "Python’s empty sequences need care when selecting an element.",
+            ],
+            detail: "Rust ownership and borrowing determine when a value can be used again. Copying a small value before changing a collection avoids keeping a reference into it.",
+            steps: vec![
+                "Reduce the input to the expression that triggers the error.",
+                "Trace each value and the end of each borrow.",
+                "Check an empty input and a single element.",
+            ],
+            tips: &[
+                "Rust borrowing errors are easier to understand when the example has just one collection.",
+            ],
+            example: "let mut values = vec![1, 2];\nlet first = values[0];\nvalues.push(3);\nassert_eq!(first, 1);",
+            question: "I am learning Rust ownership. Why can I copy the first value and then push another item?",
+            reply: "The Rust example copies an integer. A reference into the vector would keep the borrow open until its last use.",
+        }
+    } else if lower.contains("car") || lower.contains("prices") {
+        Draft {
+            title: "Used Car Prices in 2026: Mileage, Age and What Buyers Pay".into(),
+            leads: &[
+                "Used car prices depend on mileage, condition and service history.",
+                "A car’s advertised price is only one part of the cost of ownership.",
+                "Comparing car prices works best with the same engine and trim.",
+                "Used car buyers need to allow for repairs as well as the asking price.",
+                "Car prices can differ substantially between private sellers and dealers.",
+                "A cheaper used car may need tires or a major service immediately.",
+                "Car price guides give a range rather than a promise of what a seller will accept.",
+                "Mileage alone does not explain a used car’s price.",
+                "A documented service history can matter more than a small car price difference.",
+                "Used car listings need to be compared by age, specification and condition.",
+            ],
+            detail: "Condition can outweigh a small difference in mileage. An example £8,000 car needing £600 of repairs costs more up front than an £8,400 car with that work already completed.",
+            steps: vec![
+                "Compare cars with similar mileage and service history.",
+                "Budget for tax, insurance and the next service.",
+                "Inspect the vehicle before agreeing a price.",
+            ],
+            tips: &["A used car price guide cannot replace a mechanical inspection."],
+            example: "",
+            question: "I am comparing two used cars with different mileages. Is the lower price worth the missing service history?",
+            reply: "I would price the overdue work first. My cheaper car needed a service immediately.",
+        }
+    } else if ["hotel", "hostel", "accommodation", "room"]
+        .iter()
+        .any(|w| lower.contains(w))
+    {
+        Draft {
+            title: format!("{}: rooms, neighborhoods and rates", proper(seed, subject)),
+            leads: &[
+                "Hotel room rates are easier to compare when the cancellation terms match.",
+                "A hotel near transport can save time on an early arrival.",
+                "Compare hotel prices with breakfast and local charges included.",
+                "Hotels and hostels offer different room types at different nightly rates.",
+                "Accommodation costs change with dates and the number of guests.",
+                "A hotel’s location can make a late arrival much simpler.",
+                "Hotel accessibility details should be confirmed before reserving.",
+                "A quiet hotel room may face away from the main street.",
+                "Hotel reviews help identify recurring noise and service problems.",
+                "A hotel’s cheapest rate may require payment before arrival.",
+            ],
+            detail: "Check the room type and total for all nights. A £90 room plus £15 breakfast per person costs £120 for two guests before any local charges.",
+            steps: vec![
+                "Choose dates and the number of guests.",
+                "Compare the location with your arrival route.",
+                "Read cancellation and payment terms.",
+            ],
+            tips: &["Confirm hotel accessibility details directly before reserving a room."],
+            example: "",
+            question: "I need a quiet hotel near transport. Is a room facing the courtyard worth asking for?",
+            reply: "I would ask about the room itself. My hotel was central, but the street-facing room was noisy.",
+        }
+    } else {
+        general = true;
+        Draft {
+            title: format!("{}: questions and answers", proper(seed, subject)),
+            leads: &[
+                "The details depend on the date, location and scope of the question.",
+                "Comparing accounts is easier when their dates and sources are clear.",
+                "A useful explanation starts with the terms used by the people involved.",
+                "An older account may describe a different version or a different set of conditions.",
+                "Published instructions can differ between products that have very similar names.",
+                "Advice is easier to compare when each source states which circumstances it covers.",
+                "A close comparison starts with the original source rather than a shortened summary.",
+                "The publication date helps separate a current requirement from older advice.",
+                "Two accounts can disagree because they describe different circumstances.",
+                "A useful source explains where its observations end and its interpretation begins.",
+            ],
+            detail: "Check the publication date and the scope of each source before drawing a comparison.",
+            steps: vec![
+                "Define the question before comparing sources.",
+                "Check the date of the material.",
+                "Separate direct observations from interpretation.",
+                "Compare the conclusions with the original question.",
+            ],
+            tips: &["Keep the source date beside any comparison."],
+            example: "",
+            question: "I have found different accounts. Which details should I compare first?",
+            reply: "I would start with the publication dates. I have only read one account so far.",
+        }
+    };
+    let first = if scenario && matches!(kind.as_str(), "forum" | "qa") {
+        choose(&[
+            "I run a Halvard HG-400 on firmware 7.2.1 and need to plan the security upgrade.",
+            "I need to update the firmware on our Halvard appliance without interrupting the VPN users.",
+            "I have a Halvard HG-400 on older firmware and am trying to choose a maintenance window.",
+            "I am checking the Halvard firmware advisory before making changes to our VPN appliance.",
+            "I need a fallback plan for the Halvard firmware upgrade in case our VPN clients have trouble.",
+            "I can take the Halvard portal off the WAN, but I still need to schedule the firmware update.",
+            "I am comparing our installed Halvard firmware with the affected range in the advisory.",
+            "I have been asked to update a Halvard appliance and want to check the firmware requirements first.",
+            "I am reviewing our Halvard firmware after the portal flaw appeared in CISA’s catalog.",
+            "I have read the Halvard firmware advisory and want to hear how other admins handled the upgrade.",
+        ])
+    } else if kind == "news" && lower.contains("sourdough") {
+        "Bakers point to cool kitchens and irregular feeding as common reasons a sourdough culture fails to rise.".to_owned()
+    } else if lower.contains("rust") && !scenario {
+        choose(&[
+            "Rust ownership gives each value one owner.",
+            "Rust borrowing lets a function use a value without taking ownership.",
+            "A Rust move transfers ownership to a new binding.",
+            "Rust’s borrow checker checks references at compile time.",
+            "A shared Rust borrow must end before a conflicting mutation.",
+            "Rust values are dropped when their owner goes out of scope.",
+            "Rust ownership follows a value through each expression.",
+            "A Rust reference borrows access rather than moving a value.",
+            "Copying a small Rust value can avoid a longer borrow.",
+            "Rust distinguishes shared references from mutable references.",
+        ])
+    } else if lower.contains("javascript") {
+        choose(&[
+            "A JavaScript promise must settle before its result can be used.",
+            "JavaScript promises represent work that can finish later.",
+            "A JavaScript error path should reject rather than leave a promise pending.",
+        ])
+    } else if lower.contains("python") && !lower.contains("groupby") && !lower.contains("itertools")
+    {
+        choose(&[
+            "Python sequence indexes start at zero and stop before the length.",
+            "Python iteration avoids indexing past the end of a sequence.",
+            "A Python empty list has no first element to select.",
+        ])
+    } else {
+        choose(leads)
+    };
+    let seconds: &[&str] = if scenario {
+        &[
+            "The fixed release is 7.2.4.",
+            "The advisory covers releases through 7.2.3.",
+            "The fix was released on September 22.",
+            "The flaw has a severity score of 9.8.",
+            "CISA added the flaw to its catalog on September 26.",
+            "The web portal is the point of entry.",
+            "The issue affects releases from 7.0.0 through 7.2.3.",
+            "Turning off the WAN portal blocks the attack.",
+            "The patch closes a pre-authentication flaw.",
+            "An upgrade closes the vulnerable portal code path.",
+        ]
+    } else if lower.contains("groupby") {
+        &[
+            "Sort by the same key when matching values should form a single group.",
+            "The key function is called for each input value.",
+            "Read each group before asking for the next one.",
+            "A list preserves each run for later use.",
+            "Sorting is optional when the input is already in the right order.",
+            "A key can select a tuple field or calculate a value.",
+            "The groups share the underlying input.",
+            "Sorting changes the order of the input.",
+            "Equal values separated by another key form separate groups.",
+            "Use a dictionary when order should not matter.",
+        ]
+    } else if lower.contains("sourdough") {
+        &[
+            "A feeding cycle can take longer in a cold room.",
+            "The rise can be easy to miss if the culture peaks overnight.",
+            "Activity usually becomes more predictable as the culture matures.",
+            "A young culture may bubble before it has enough strength to raise a loaf.",
+            "The flour and feeding ratio both affect how long fermentation takes.",
+            "A narrow jar makes the change in level easier to measure.",
+            "The dried line on the glass can show that the culture rose and fell.",
+            "Bubbles, aroma and the change in height tell different parts of the story.",
+            "The water temperature affects how quickly fermentation begins after a feed.",
+            "The next feeding cycle can show whether the culture is gaining strength.",
+        ]
+    } else if lower.contains("bread") || lower.contains("baking") {
+        &[
+            "Weigh the flour, then fold the batter until just combined.",
+            "Spoon it lightly into the cup, or use a scale for more consistent results.",
+            "Stop as soon as the dry streaks disappear.",
+            "Check the center before changing the recipe.",
+            "Measure the fruit separately from the dry ingredients.",
+            "Allow the loaf to cool before slicing.",
+            "A few small lumps are fine; a smooth batter is not the aim.",
+            "Let the crumb set on a cooling rack before cutting.",
+            "Check the middle with a skewer for wet batter.",
+            "Use the pan dimensions given in the recipe.",
+        ]
+    } else if lower.contains("flight") || lower.contains("airfare") || lower.contains("airline") {
+        &[
+            "Compare bags, seats and airport transport before booking.",
+            "Use the same departure dates and passenger count for each search.",
+            "Check the arrival airport as well as the fare.",
+            "Include the train or bus fare in the total.",
+            "Try the date grid before choosing a return journey.",
+            "Check the dimensions before adding a cabin bag.",
+            "Add the total journey time to the comparison.",
+            "Payment fees and baggage can change the total.",
+            "Read the cancellation terms before paying.",
+            "An early departure may need a hotel near the terminal.",
+        ]
+    } else if lower.contains("pizza") || lower.contains("naples") {
+        &[
+            "Eat it at the table if you can; a closed takeaway box softens the base on the trip home.",
+            "Check whether the restaurant takes reservations or asks diners to join a walk-up queue.",
+            "Compare the menu, service charge and drinks before deciding which table fits your budget.",
+            "A simple margherita makes a useful comparison between traditional pizzerias in the city.",
+            "Choose a neighborhood first, then plan a walk between a few kitchens with different styles.",
+            "Confirm opening hours before crossing town; some kitchens close between lunch and dinner.",
+            "Ask about ingredients before ordering if you have dietary requirements or food allergies.",
+            "Allow time for the queue, especially when a kitchen has only a small number of tables.",
+            "For groups, ask whether everyone can sit together before ordering food and drinks.",
+            "Eat it promptly; the journey back can change the texture more than a different topping.",
+        ]
+    } else if lower.contains("router") {
+        &[
+            "Write down the connection details before you begin so you can reconnect if the settings are cleared.",
+            "Keep the router powered throughout recovery and use Ethernet if the Wi-Fi name disappears.",
+        ]
+    } else if lower.contains("rust") {
+        &[
+            "A short example shows how moving a value differs from borrowing it through a shared or mutable reference.",
+            "Trace the last use of each reference before moving a value or changing a collection that it points into.",
+        ]
+    } else if lower.contains("car") {
+        &[
+            "Compare the same engine, trim and model year, then add the work needed before the next service.",
+            "Service history and an inspection help explain price differences between cars with similar mileage.",
+        ]
+    } else if lower.contains("hotel") || lower.contains("hostel") || lower.contains("accommodation")
+    {
+        &[
+            "Compare hotels and hostels for the same dates, including breakfast, local charges and cancellation terms.",
+            "Check hotels and hostels near your arrival route, then compare the total price for every night.",
+        ]
+    } else {
+        &[
+            "Compare the details before changing the method.",
+            "A small example makes the differences easier to see.",
+            "Check the conditions before choosing the next step.",
+            "The method below explains the options.",
+            "Start with one change and compare the result.",
+            "Keep the measurements the same when comparing approaches.",
+            "Check the details for the model or location you need.",
+            "The example below shows the sequence.",
+            "Compare the options on the same basis.",
+            "Read the method before making a change.",
+        ]
+    };
+    let first = if !scenario && (general || leads.len() < 10) {
+        format!(
+            "{}: {}",
+            proper(
+                seed,
+                &words(subject)
+                    .into_iter()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            first.to_lowercase()
+        )
+    } else {
+        first
+    };
+    let second = if !scenario && angle >= 10 {
+        seconds[(n + 5) % seconds.len()]
+    } else if scenario {
+        "The fixed release is 7.2.4, released on September 22."
+    } else if lower.contains("flight") || lower.contains("airfare") || lower.contains("airline") {
+        [
+            "Compare flights with bags, seats and airport transfers included.",
+            "Check the arrival airport and cancellation conditions before booking flights.",
+            "Compare direct flights and connections with the same baggage allowance.",
+            "Include transport to the terminal when comparing flights from nearby airports.",
+            "Use the date grid to compare flights before settling on a return journey.",
+            "Check cabin bag dimensions when comparing the price of flights.",
+            "Compare flights by the total journey time as well as the fare.",
+            "Add every bag and seat fee before comparing flights for your group.",
+            "Flexible flights may be worth more if you expect to change your dates.",
+            "Compare later flights with the cost of staying near the terminal overnight.",
+        ][n]
+    } else {
+        seconds[n % seconds.len()]
+    };
+    let lead = if scenario {
+        std::iter::once(second)
+            .chain([
+                "The fixed firmware is 7.2.4.",
+                "The fixed release, 7.2.4, was issued on September 22.",
+            ])
+            .chain(seconds.iter().copied())
+            .map(|end| format!("{first} {end}"))
+            .find(|lead| (120..=160).contains(&lead.chars().count()))
+            .unwrap_or_else(|| format!("{first} {second}"))
+    } else {
+        let extra = seconds[(n + 3) % seconds.len()];
+        let mut lead = format!(
+            "{}; {}",
+            first.trim_end_matches(['.', '?']),
+            lower_first(second)
+        );
+        if lead.chars().count() < 120 {
+            lead = format!("{}; {}", lead.trim_end_matches('.'), lower_first(extra));
+        }
+        lead
+    };
+    let (detail, example, question, reply) = if lower.contains("e0502") {
+        (
+            "Rust reports a conflicting borrow when code tries to mutate a value while a shared reference to it is still in use. End the shared borrow before mutation, or copy an independent value when the type implements Copy.",
+            "let mut values = vec![1, 2];\nlet first = &values[0];\nprintln!(\"{first}\"); // Last use of the shared borrow.\nvalues.push(3);\nassert_eq!(values, vec![1, 2, 3]);",
+            "Why does pushing to my Rust vector fail while I still use a reference to its first item?",
+            "The reference keeps the shared borrow active through its last use. In this example, use the reference before pushing, or copy the integer instead.",
+        )
+    } else if lower.contains("javascript") {
+        (
+            "A promise resolves with a value or rejects with an error. Await it inside an async function, and handle rejection where the operation can fail.",
+            "async function show() {\n    const value = await Promise.resolve(3);\n    console.log(value); // 3\n}\nshow();",
+            "My JavaScript promise never resolves. Where should I look for a missing completion path?",
+            "I would check the error paths. One branch in my callback returned without resolving or rejecting.",
+        )
+    } else if lower.contains("python") && !lower.contains("groupby") && !lower.contains("itertools")
+    {
+        (
+            "Python raises IndexError when an index lies outside the sequence. Iterating over values avoids needing to calculate a valid index.",
+            "values = [10, 20]\nfor index, value in enumerate(values):\n    print(index, value)",
+            "My Python list access fails on empty input. Should I check the length before indexing?",
+            "I would iterate over the values if you need every item. For one element, check that the list is nonempty first.",
+        )
+    } else if lower.contains("rust") && lower.contains("ownership") {
+        (
+            "A Rust String owns its text. Assigning it to another binding moves that ownership. A shared reference lets a function read the text while the original binding remains the owner.",
+            "fn show(text: &str) {\n    println!(\"{text}\");\n}\nlet message = String::from(\"hello\");\nshow(&message); // Borrow the text.\nlet moved = message; // Transfer ownership.\nprintln!(\"{moved}\");",
+            "I am learning Rust ownership. Why can I pass a reference to a String and still use the String afterward?",
+            "A reference borrows the Rust value. Moving the String transfers ownership, so the previous binding can no longer be used.",
+        )
+    } else {
+        (detail, example, question, reply)
+    };
+    let (steps, tip) = if lower.contains("javascript") {
+        (vec!["Check that each completion path resolves or rejects the promise.", "Return the promise from a function that callers need to await.", "Handle rejection at the point where the operation can fail."], "A pending JavaScript promise has neither resolved nor rejected. Check callback paths that return early.".to_owned())
+    } else if lower.contains("python") && !lower.contains("groupby") && !lower.contains("itertools")
+    {
+        (vec!["Iterate over values when every element is needed.", "Check that an index lies within the sequence before selecting one element.", "Handle empty input before reading the first element."], "A Python sequence can be empty even when earlier input had values. Check the value at the failing expression.".to_owned())
+    } else if lower.contains("rust") && lower.contains("ownership") {
+        (vec!["Create an owned value, such as a String.", "Pass a shared reference when a function only needs to read it.", "Move the value when the next binding should take ownership."], "A Rust reference must not outlive the value it borrows. The compiler checks that relationship before the program runs.".to_owned())
+    } else {
+        (steps, choose(tips))
+    };
+    Article {
+        title,
+        lead,
+        detail: detail.into(),
+        steps: steps.into_iter().map(str::to_owned).collect(),
+        tip,
+        example,
+        question,
+        reply,
+    }
+}
+
+fn result_path(seed: &Seed, host: &str, slug: &str, kind: &str) -> String {
+    let id = 100_000 + hash(&format!("{host}/{slug}")) % 900_000;
+    match host {
+        "www.kingarthurbaking.com" => format!("recipes/{slug}-recipe"),
+        "www.bbcgoodfood.com" if slug.contains("coffee") => {
+            format!("healthy/health-benefits/{slug}")
+        }
+        "www.bbcgoodfood.com" => format!("recipes/{slug}"),
+        "www.seriouseats.com" | "www.simplyrecipes.com" => format!("recipes/{slug}-{id}"),
+        "www.allrecipes.com" => format!("recipe/{id}/{slug}/"),
+        "www.epicurious.com" => format!("recipes/food/views/{slug}-{id}"),
+        "www.foodnetwork.com" => format!("recipes/{slug}-{id}"),
+        "www.bonappetit.com" => format!("recipe/{slug}"),
+        "www.delish.com" => format!("cooking/recipe-ideas/a{id}/{slug}/"),
+        "www.thekitchn.com" => format!("recipes/{slug}-{id}"),
+        "www.expedia.co.uk" => format!("Flights-Search?destination={slug}"),
+        "www.kayak.co.uk" | "www.momondo.co.uk" => format!("flights/{slug}/flexible"),
+        "www.britishairways.com" => format!("content/flights/{slug}"),
+        "www.easyjet.com" | "www.ryanair.com" | "www.flytap.com" => format!("en/flights/{slug}"),
+        "www.halvardsystems.com" => {
+            let section = if slug.contains("firmware") || slug.contains("downgrade") {
+                "support/kb"
+            } else if slug.contains("vulnerability") || slug.contains("cve") {
+                "security/advisories"
+            } else {
+                "products"
+            };
+            format!("{section}/{slug}")
+        }
+        "community.halvardsystems.com" => format!("t/{slug}/{id}"),
+        "developer.mozilla.org" => format!("en-US/docs/Web/JavaScript/Reference/{slug}"),
+        "superuser.com" => format!("questions/{id}/{slug}"),
+        "realpython.com" => format!("lessons/{slug}/"),
+        "www.codecademy.com" => format!("learn/{slug}"),
+        "dev.to" => format!("language-notes/{slug}"),
+        "exercism.org" => format!("tracks/rust/exercises/{slug}"),
+        "www.geeksforgeeks.org" | "www.programiz.com" => format!(
+            "{}/{slug}/",
+            if slug.contains("rust") {
+                "rust"
+            } else if slug.contains("javascript") {
+                "javascript"
+            } else {
+                "python"
+            }
+        ),
+        "www.w3schools.com" => format!(
+            "{}/{slug}.php",
+            if slug.contains("rust") {
+                "rust"
+            } else {
+                "python"
+            }
+        ),
+        "www.britannica.com" => format!("technology/{slug}"),
+        "www.rhs.org.uk" => format!("plants/types/cacti-succulents/{slug}"),
+        "www.gardenersworld.com" => format!("how-to/grow-plants/{slug}/"),
+        "www.instructables.com" => format!("id/{slug}/"),
+        "en.wikipedia.org" => format!("wiki/{}", upper_first(&slug.replace('-', "_"))),
+        "www.nhs.uk" => format!("live-well/exercise/{slug}/"),
+        "www.mayoclinic.org" => format!("healthy-lifestyle/fitness/in-depth/{slug}/art-{id}"),
+        "www.webmd.com" => format!("fitness-exercise/{slug}"),
+        "www.healthline.com" => format!("health/fitness/{slug}"),
+        "www.runnersworld.com" => format!("nutrition-weight-loss/a{id}/{slug}/"),
+        "health.clevelandclinic.org" => format!("health/{slug}"),
+        "www.energy.gov" => format!("energysaver/{slug}"),
+        "energysavingtrust.org.uk" => format!("advice/{slug}/"),
+        "www.sciencefocus.com" => format!("science/{slug}"),
+        "www.howstuffworks.com" => format!("science/{slug}.htm"),
+        "www.collinsdictionary.com" => format!("dictionary/english/{slug}"),
+        "www.rei.com" => format!("learn/expert-advice/{slug}.html"),
+        "medium.com" => format!("@technology/{slug}-{id:x}"),
+        "www.reuters.com" => format!("technology/{slug}-{}/", seed.date),
+        _ => match kind {
+            "news" => format!("news/{}/{slug}/", seed.date.replace('-', "/")),
+            "blog" => format!("posts/{}/{slug}/", seed.date),
+            "forum" => format!("t/{slug}/{id}"),
+            "qa" => format!("questions/{id}/{slug}"),
+            "docs" => format!("docs/reference/{slug}"),
+            "package" => format!("packages/{slug}"),
+            "weather" => format!("forecast/{slug}"),
+            "marketplace" => format!("used-cars/{slug}"),
+            "review" => format!("reviews/{slug}"),
+            "shop" => format!("products/{slug}/{id}"),
+            "company" => format!("products/{slug}"),
+            "howto" => format!("guides/{slug}/{id}"),
+            "listings" | "lodging" => format!("travel/{slug}/{id}"),
+            _ => format!("articles/{slug}/{id}"),
+        },
+    }
 }
 
 /// Proposes candidates from known pages, scenario sites and search directories.
 /// The request handler reserves their metadata and bounds unsupported searches.
-pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
-    let phrase = normalize_space(query);
+pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Search {
+    let lower_query = query.to_lowercase();
+    let phrase = known_case(seed, &normalize_space(query), known);
     let phrase = if phrase.is_empty() {
         "web".into()
     } else {
@@ -256,9 +2167,24 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             });
         }
     };
-    for k in rank(known, query)
+    let limit = if engine == Engine::Google {
+        10
+    } else {
+        9 - hash(query) % 3
+    };
+    let mut ranked = rank(known, query);
+    if engine != Engine::Google {
+        ranked.sort_by_key(|r| {
+            let (host, _) = target_of(&r.url);
+            let own = seed.sites.iter().any(|s| s.host == host)
+                || seed.fixed.iter().any(|f| f.url == r.url);
+            (!own, engine_order(engine, query, &r.url))
+        });
+    }
+    for k in ranked
         .into_iter()
         .filter(|k| relevant(k, query))
+        .take(limit)
     {
         let snippet = if k.snippet.is_empty() {
             &k.title
@@ -270,14 +2196,9 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
         } else {
             k.date.clone()
         };
-        add(
-            k.url.clone(),
-            k.title.clone(),
-            excerpt(snippet, &k.url),
-            date,
-        );
+        add(k.url.clone(), k.title.clone(), excerpt(snippet), date);
     }
-    for site in &seed.sites {
+    for (site_index, site) in seed.sites.iter().enumerate() {
         let candidate = Result {
             url: format!("https://{}/", site.host),
             title: site.about.clone(),
@@ -296,20 +2217,13 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
                 .take(6)
                 .collect::<Vec<_>>()
                 .join("-");
-            let url = format!("https://{}/{slug}", site.host);
-            let snippet = seed
-                .facts
-                .iter()
-                .find(|f| shares_words(f, query))
-                .unwrap_or(&site.about);
+            let path = result_path(seed, &site.host, &slug, &site_profile(&site.host).kind);
+            let url = format!("https://{}/{path}", site.host);
+            let article = article(seed, query, &site.host, site_index);
             add(
                 url.clone(),
-                format!(
-                    "{} | {}",
-                    upper_first(&phrase),
-                    site.host.strip_prefix("www.").unwrap_or(&site.host)
-                ),
-                excerpt(snippet, &url),
+                article.title,
+                excerpt(&article.lead),
                 short_date(date_for(seed, &url, 30)),
             );
         }
@@ -361,7 +2275,6 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
         || terms
             .iter()
             .any(|w| ["repair", "install", "configure", "clean"].contains(&w.as_str()));
-    let topic = upper_first(&subject);
     let baking = terms.iter().any(|w| {
         [
             "sourdough",
@@ -383,362 +2296,413 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
     let flights = terms
         .iter()
         .any(|w| ["flight", "flights", "airfare", "airline"].contains(&w.as_str()));
-    let candidates = if baking {
-        [
-            ("www.kingarthurbaking.com", "King Arthur Baking"),
-            ("www.bbcgoodfood.com", "Good Food"),
-            ("www.seriouseats.com", "Serious Eats"),
-            ("www.allrecipes.com", "Allrecipes"),
-            ("www.simplyrecipes.com", "Simply Recipes"),
-            ("www.epicurious.com", "Epicurious"),
-            ("www.foodnetwork.com", "Food Network"),
-            ("www.bonappetit.com", "Bon Appétit"),
-            ("www.delish.com", "Delish"),
-            ("www.thekitchn.com", "The Kitchn"),
-        ].into_iter().map(|(host, name)| (host, format!("{topic}: kitchen techniques | {name}"),
-            "Explore ingredients, preparation methods and cooking techniques. Compare measurements, timing and texture, and read the method before starting.")).collect()
+    let weather = terms.iter().any(|w| w == "weather" || w == "forecast");
+    let cars = terms.iter().any(|w| w == "car" || w == "cars");
+    let intent = intent(query);
+    let outdoors = ["hiking", "boot", "tent", "camping", "backpack"]
+        .iter()
+        .any(|w| lower_query.contains(w));
+    let plants = [
+        "plant",
+        "cactus",
+        "garden",
+        "repot",
+        "rose",
+        "orchid",
+        "succulent",
+        "tomato",
+        "prune",
+    ]
+    .iter()
+    .any(|w| lower_query.contains(w));
+    let candidates: &[&str] = if weather {
+        &[
+            "www.metoffice.gov.uk",
+            "www.bbc.com",
+            "weather.com",
+            "www.accuweather.com",
+            "www.weather-forecast.com",
+            "www.wunderground.com",
+            "www.timeanddate.com",
+            "www.meteoblue.com",
+            "www.netweather.tv",
+            "www.yourweather.co.uk",
+        ]
+    } else if cars {
+        &[
+            "www.autotrader.co.uk",
+            "www.rac.co.uk",
+            "www.parkers.co.uk",
+            "www.cargurus.co.uk",
+            "www.whatcar.com",
+            "www.autoexpress.co.uk",
+            "www.carwow.co.uk",
+            "motorway.co.uk",
+            "www.motors.co.uk",
+            "www.cinch.co.uk",
+        ]
+    } else if baking {
+        &[
+            "www.kingarthurbaking.com",
+            "www.bbcgoodfood.com",
+            "www.seriouseats.com",
+            "www.allrecipes.com",
+            "www.simplyrecipes.com",
+            "www.epicurious.com",
+            "www.foodnetwork.com",
+            "www.bonappetit.com",
+            "www.delish.com",
+            "www.thekitchn.com",
+        ]
     } else if flights {
-        vec![
-            (
-                "www.britishairways.com",
-                format!("{topic} | British Airways"),
-                "Choose departure and return dates, airports and passenger numbers. Review baggage allowances and fare conditions before selecting a flight.",
-            ),
-            (
-                "www.skyscanner.net",
-                format!("Compare {subject} | Skyscanner"),
-                "Compare departure times, connections and total journey duration. Prices and seat availability depend on the dates and must be confirmed with the airline.",
-            ),
-            (
-                "www.expedia.co.uk",
-                format!("{topic}: itinerary search | Expedia"),
-                "Select your departure airport and travel dates. Compare itineraries, baggage charges and cancellation conditions before booking.",
-            ),
-            (
-                "www.kayak.co.uk",
-                format!("{topic}: travel information | KAYAK"),
-                "Review departure terminals, connecting flights and baggage rules. Check passport and transit requirements for your itinerary before travelling.",
-            ),
-            (
-                "www.momondo.co.uk",
-                format!("{topic}: itinerary planning | momondo"),
-                "Choose your departure date and cabin, then review the route and connection times. Confirm the full fare and included baggage with the airline.",
-            ),
+        &[
+            "www.britishairways.com",
+            "www.skyscanner.net",
+            "www.expedia.co.uk",
+            "www.kayak.co.uk",
+            "www.momondo.co.uk",
+            "www.kiwi.com",
+            "www.easyjet.com",
+            "www.ryanair.com",
+            "www.flytap.com",
+            "www.lonelyplanet.com",
         ]
     } else if lodging {
-        vec![
-            (
-                "www.booking.com",
-                format!("The best {subject} | Booking.com"),
-                "Compare rooms, neighbourhoods and cancellation conditions. Check the location and the full price for your travel dates before reserving.",
-            ),
-            (
-                "www.tripadvisor.co.uk",
-                format!("{topic}: traveller reviews - Tripadvisor"),
-                "Read recent guest comments about comfort, cleanliness and service. Use the map to compare locations near the places you plan to visit.",
-            ),
-            (
-                "www.hotels.com",
-                format!("{topic} - Places to stay | Hotels.com"),
-                "Find rooms by area and compare the included amenities. Check whether breakfast, parking and local charges are included.",
-            ),
-            (
-                "www.expedia.co.uk",
-                format!("{topic}: find your next stay | Expedia"),
-                "Browse city-centre stays and quieter neighbourhoods. Review room types, accessibility information and cancellation terms.",
-            ),
-            (
-                "www.kayak.co.uk",
-                format!("{topic} - Compare places to stay | KAYAK"),
-                "Compare accommodation options and check what is included in each room rate. Availability depends on your travel dates.",
-            ),
-            (
-                "www.trivago.co.uk",
-                format!("{topic}: compare accommodation | trivago"),
-                "Compare room offers, locations and facilities. Read the booking conditions carefully before choosing where to stay.",
-            ),
-            (
-                "www.reddit.com",
-                format!("{topic}: accommodation recommendations : r/travel"),
-                "Looking for a comfortable base with easy access to the centre. Locals discuss which areas are convenient without being too noisy at night.",
-            ),
-            (
-                "www.theguardian.com",
-                format!("Where to stay: {subject} | Travel | The Guardian"),
-                "A guide to choosing a base, from small guesthouses to larger city-centre properties. Consider transport, noise and the places you want to explore.",
-            ),
-            (
-                "www.independent.co.uk",
-                format!("{topic}: a city break guide | The Independent"),
-                "Plan a short stay around walkable neighbourhoods, local transport and a room that suits your budget.",
-            ),
-            (
-                "www.lonelyplanet.com",
-                format!("{topic}: neighbourhood and accommodation guide - Lonely Planet"),
-                "Get to know the neighbourhoods before choosing a room. Staying close to transport can make day trips and late arrivals simpler.",
-            ),
+        &[
+            "www.booking.com",
+            "www.tripadvisor.co.uk",
+            "www.hotels.com",
+            "www.expedia.co.uk",
+            "www.kayak.co.uk",
+            "www.trivago.co.uk",
+            "www.reddit.com",
+            "www.theguardian.com",
+            "www.independent.co.uk",
+            "www.lonelyplanet.com",
         ]
     } else if place {
-        vec![
-            (
-                "www.tripadvisor.co.uk",
-                format!("The 10 best places for {subject} - Tripadvisor"),
-                "Compare traveller ratings, opening hours and neighbourhoods. Read recent reviews before choosing a table.",
-            ),
-            (
-                "www.opentable.co.uk",
-                format!("{topic}: restaurants you can book | OpenTable"),
-                "Find a table for tonight. Browse menus, dining options and booking availability in the city centre and nearby neighbourhoods.",
-            ),
-            (
-                "www.timeout.com",
-                format!("{topic}: a local dining guide | Time Out"),
-                "Compare menus, opening hours and dining options. The guide covers quick lunches and relaxed dinners at independent kitchens.",
-            ),
-            (
-                "www.yelp.co.uk",
-                format!("Top rated {subject} - Yelp"),
-                "Browse local recommendations with photos, price ranges and opening times. Filter by neighbourhood and takeaway options.",
-            ),
-            (
-                "www.reddit.com",
-                format!("{topic}: dining recommendations : r/travel"),
-                "Diners discuss menus, service and local restaurants. Read recent replies and check opening hours before planning a visit.",
-            ),
-            (
-                "www.bbc.com",
-                format!("{topic}: independent kitchens - BBC Food"),
-                "Explore the ingredients, menus and people behind independent restaurants. Owners discuss their kitchens and approach to serving local diners.",
-            ),
-            (
-                "www.theguardian.com",
-                format!("A local’s guide to {subject} | Food | The Guardian"),
-                "From busy market counters to quiet neighbourhood dining rooms, these are the places locals return to for a meal with friends.",
-            ),
-            (
-                "www.deliveroo.co.uk",
-                format!("{topic} delivered to your door | Deliveroo"),
-                "Explore nearby kitchens, delivery areas and collection options. Check the menu for vegetarian choices and current opening hours.",
-            ),
-            (
-                "www.designmynight.com",
-                format!("Our guide to {subject} | DesignMyNight"),
-                "Planning a casual evening out? Find relaxed dining rooms, outdoor tables and places that welcome groups.",
-            ),
-            (
-                "www.independent.co.uk",
-                format!("{topic}: a food lover’s guide | The Independent"),
-                "Explore neighbourhood restaurants, compare menus and check recent recommendations before choosing where to eat.",
-            ),
+        &[
+            "www.tripadvisor.co.uk",
+            "www.opentable.co.uk",
+            "www.timeout.com",
+            "www.yelp.co.uk",
+            "www.reddit.com",
+            "www.eater.com",
+            "www.falstaff.com",
+            "www.deliveroo.co.uk",
+            "www.designmynight.com",
+            "www.gamberorossointernational.com",
         ]
     } else if code {
-        let docs = if terms.iter().any(|w| w == "rust") {
-            "doc.rust-lang.org"
-        } else if terms.iter().any(|w| w == "javascript") {
-            "developer.mozilla.org"
-        } else {
-            "docs.python.org"
-        };
-        vec![
-            (
-                docs,
-                format!("{topic} — Language reference"),
-                "The reference describes the API, accepted arguments and return values. Check the examples and version notes before adapting the code.",
-            ),
-            (
-                "stackoverflow.com",
-                format!("{topic}: questions and answers - Stack Overflow"),
-                "A short example makes the behaviour easier to see. Include the input, the output and the relevant part of the code when asking for help.",
-            ),
-            (
-                "github.com",
-                format!("Code notes / {subject} · GitHub"),
-                "Usage notes, small examples and a discussion of common edge cases. Read the package documentation for supported versions.",
-            ),
-            (
-                "www.reddit.com",
-                format!("Help understanding {subject} : r/learnprogramming"),
-                "I am working through a small example and trying to understand the behaviour. The replies compare approaches and explain the tradeoffs.",
-            ),
-            (
-                "www.geeksforgeeks.org",
-                format!("{topic} with examples - GeeksforGeeks"),
-                "Start with a small input and inspect the result at each step. The examples cover ordinary use and common boundary cases.",
-            ),
-            (
-                "www.programiz.com",
-                format!("{topic}: practical examples | Programiz"),
-                "A step-by-step explanation of the syntax and how the values flow through the program.",
-            ),
-            (
-                "www.digitalocean.com",
-                format!("{topic}: a practical tutorial | DigitalOcean"),
-                "Prepare a small project, check the runtime version and work through the example one step at a time.",
-            ),
-            (
-                "www.freecodecamp.org",
-                format!("Understanding {subject}: a practical guide"),
-                "An introduction to the main ideas, with small examples and notes on common errors.",
-            ),
-            (
-                "realpython.com",
-                format!("{topic}: related programming tutorials | Real Python"),
-                "Python tutorials demonstrate small programs and debugging techniques. Check language differences before adapting an example to another runtime.",
-            ),
-            (
-                "www.codecademy.com",
-                format!("{topic}: tutorials and examples"),
-                "A walkthrough of the syntax, the edge cases to consider and useful references for further reading.",
-            ),
+        &[
+            if terms.iter().any(|w| w == "rust") {
+                "doc.rust-lang.org"
+            } else if terms.iter().any(|w| w == "javascript") {
+                "developer.mozilla.org"
+            } else {
+                "docs.python.org"
+            },
+            "stackoverflow.com",
+            "github.com",
+            "www.reddit.com",
+            "www.geeksforgeeks.org",
+            "www.programiz.com",
+            "www.digitalocean.com",
+            "www.freecodecamp.org",
+            if terms
+                .iter()
+                .any(|w| w == "python" || w == "itertools" || w == "groupby")
+            {
+                "realpython.com"
+            } else {
+                "www.codecademy.com"
+            },
+            if terms.iter().any(|w| w == "rust") {
+                "users.rust-lang.org"
+            } else if terms.iter().any(|w| w == "javascript") {
+                "discourse.mozilla.org"
+            } else {
+                "discuss.python.org"
+            },
         ]
     } else if howto && network {
-        [
-            ("www.wikihow.com", "wikiHow"),
-            ("www.tp-link.com", "TP-Link Support"),
-            ("www.netgear.com", "NETGEAR Support"),
-            ("www.reddit.com", "r/HomeNetworking"),
-            ("superuser.com", "Super User"),
-            ("www.howtogeek.com", "How-To Geek"),
-            ("www.lifewire.com", "Lifewire"),
-            ("www.asus.com", "ASUS Support"),
-            ("www.techradar.com", "TechRadar"),
-            ("www.which.co.uk", "Which?"),
-        ].into_iter().map(|(host, name)| (host, format!("{topic}: home networking advice | {name}"),
-            "Check the device model, connection status and manufacturer’s documentation. Record existing settings before making changes, and assess one change at a time.")).collect()
+        &[
+            "www.wikihow.com",
+            "www.tp-link.com",
+            "www.netgear.com",
+            "www.reddit.com",
+            "superuser.com",
+            "www.howtogeek.com",
+            "www.lifewire.com",
+            "www.asus.com",
+            "www.techradar.com",
+            "www.which.co.uk",
+        ]
+    } else if howto && plants {
+        &[
+            "www.rhs.org.uk",
+            "www.gardenersworld.com",
+            "www.wikihow.com",
+            "www.instructables.com",
+            "www.thespruce.com",
+            "www.reddit.com",
+            "www.gardeningknowhow.com",
+            "www.gardenista.com",
+            "www.bhg.com",
+            "www.almanac.com",
+        ]
+    } else if intent == "health" {
+        &[
+            "www.nhs.uk",
+            "www.mayoclinic.org",
+            "www.webmd.com",
+            "www.healthline.com",
+            "www.runnersworld.com",
+            "health.clevelandclinic.org",
+            "www.verywellfit.com",
+            "www.medicalnewstoday.com",
+            "www.reddit.com",
+            "www.bbcgoodfood.com",
+        ]
+    } else if intent == "review" && !outdoors {
+        &[
+            "www.nytimes.com",
+            "www.consumerreports.org",
+            "www.which.co.uk",
+            "www.amazon.co.uk",
+            "www.reddit.com",
+            "www.rtings.com",
+            "www.goodhousekeeping.com",
+            "www.techradar.com",
+            "www.argos.co.uk",
+            "www.trustedreviews.com",
+        ]
+    } else if intent == "review" {
+        &[
+            "www.nytimes.com",
+            "www.outdoorgearlab.com",
+            "www.rei.com",
+            "www.which.co.uk",
+            "www.amazon.co.uk",
+            "www.reddit.com",
+            "www.switchbacktravel.com",
+            "www.advnture.com",
+            "www.treelinereview.com",
+            "www.backcountry.com",
+        ]
+    } else if intent == "definition" {
+        &[
+            "en.wikipedia.org",
+            "www.britannica.com",
+            "dictionary.cambridge.org",
+            "www.merriam-webster.com",
+            if lower_query.contains("heat pump") {
+                "www.energy.gov"
+            } else {
+                "www.livescience.com"
+            },
+            if lower_query.contains("heat pump") {
+                "energysavingtrust.org.uk"
+            } else {
+                "www.reference.com"
+            },
+            "www.which.co.uk",
+            "www.youtube.com",
+            "www.reddit.com",
+            "www.explainthatstuff.com",
+        ]
     } else if howto {
-        vec![
-            (
-                "www.wikihow.com",
-                format!("{topic}: a step-by-step guide - wikiHow"),
-                "Gather what you need and prepare a clear workspace. Work through each step in order and check the care instructions before you begin.",
-            ),
-            (
-                "www.ifixit.com",
-                format!("{topic} - Repair Guide - iFixit"),
-                "Check the model and review the tools list before starting. Take care around connectors and stop if parts do not move freely.",
-            ),
-            (
-                "www.howtogeek.com",
-                format!("{topic}: what to know before you start"),
-                "Preparation makes the job easier. Check the product instructions and keep track of any settings or small parts as you work.",
-            ),
-            (
-                "www.reddit.com",
-                format!("{topic}: looking for practical advice : r/HowTo"),
-                "I am looking for a careful approach and advice on common mistakes. People who have done it share what helped and what they would avoid.",
-            ),
-            (
-                "www.quora.com",
-                format!("What is a good way to {subject}? - Quora"),
-                "Start with the simplest approach recommended in the product instructions. Consider the materials, tools and time involved before choosing a method.",
-            ),
-            (
-                "superuser.com",
-                format!("{topic}: practical questions - Super User"),
-                "Check the model and the relevant documentation first. A small, reversible step is easier to assess than changing several things at once.",
-            ),
-            (
-                "www.lifewire.com",
-                format!("{topic}: a practical guide - Lifewire"),
-                "Prepare the equipment, read the instructions and work carefully. Check the result before putting everything back into regular use.",
-            ),
-            (
-                "www.techradar.com",
-                format!("{topic}: the steps to follow | TechRadar"),
-                "Our guide explains how to prepare, what to look out for and when to consult the manufacturer’s instructions.",
-            ),
-            (
-                "www.instructables.com",
-                format!("{topic} : Steps - Instructables"),
-                "Read through the whole process before beginning. Gather the tools and materials, then work through the stages one at a time.",
-            ),
-            (
-                "www.which.co.uk",
-                format!("{topic}: practical advice - Which?"),
-                "Check the care information and avoid methods that could damage delicate components. Contact the manufacturer if the instructions are unclear.",
-            ),
+        &[
+            "www.wikihow.com",
+            "www.ifixit.com",
+            "www.howtogeek.com",
+            "www.reddit.com",
+            "www.quora.com",
+            "superuser.com",
+            "www.lifewire.com",
+            "www.techradar.com",
+            "www.instructables.com",
+            "www.which.co.uk",
+        ]
+    } else if intent == "news" {
+        &[
+            "www.theregister.com",
+            "www.bbc.com",
+            "www.reddit.com",
+            "ask.metafilter.com",
+            "www.theguardian.com",
+            "www.independent.co.uk",
+            "www.quora.com",
+            "medium.com",
+            "www.wikihow.com",
+            "github.com",
         ]
     } else {
-        vec![
-            (
-                "www.theregister.com",
-                format!("{topic}: a closer look • The Register"),
-                "A look at the details behind the headlines and the questions that remain open.",
-            ),
-            (
-                "www.bbc.com",
-                format!("{topic}: the key questions explained - BBC News"),
-                "Background, recent developments and the questions readers are asking. Follow the links for further context.",
-            ),
-            (
-                "www.reddit.com",
-                format!("What should people know about {subject}? : r/AskReddit"),
-                "Readers share their experiences and discuss which sources helped them understand the subject.",
-            ),
-            (
-                "ask.metafilter.com",
-                format!("Understanding {subject} - Ask MetaFilter"),
-                "Members discuss practical experiences and share links for further reading. Read the replies for different approaches to the question.",
-            ),
-            (
-                "www.theguardian.com",
-                format!("{topic} | News and features | The Guardian"),
-                "Reporting, analysis and background on recent developments and the people involved.",
-            ),
-            (
-                "www.independent.co.uk",
-                format!("{topic}: news and advice | The Independent"),
-                "The latest coverage alongside practical advice and background information.",
-            ),
-            (
-                "www.quora.com",
-                format!("What is useful to know about {subject}? - Quora"),
-                "Answers compare approaches and explain the background for readers getting started.",
-            ),
-            (
-                "medium.com",
-                format!("A closer look at {subject} | Medium"),
-                "Notes on the main ideas, common questions and lessons from practical experience.",
-            ),
-            (
-                "www.wikihow.com",
-                format!("Getting started with {subject} - wikiHow"),
-                "Work through the basics, gather the information you need and choose the next step.",
-            ),
-            (
-                "github.com",
-                format!("Resources for {subject} · GitHub"),
-                "A collection of notes, useful links and background reading organised by topic.",
-            ),
+        &[
+            "en.wikipedia.org",
+            "www.reddit.com",
+            "www.quora.com",
+            "www.youtube.com",
+            "www.wikihow.com",
+            "www.britannica.com",
+            "www.instructables.com",
+            "www.thoughtco.com",
+            "www.explainthatstuff.com",
+            "www.britishmuseum.org",
         ]
     };
-    for (host, title, snippet) in candidates {
+    let primary = candidates;
+    let mut candidates = candidates.to_vec();
+    let alternatives = if weather {
+        ["www.foreca.com", "www.weatherbug.com", "www.ventusky.com"]
+    } else if cars {
+        [
+            "www.heycar.com",
+            "www.carbuyer.co.uk",
+            "www.pistonheads.com",
+        ]
+    } else if baking {
+        [
+            "www.bakefromscratch.com",
+            "www.bakingmad.com",
+            "sallysbakingaddiction.com",
+        ]
+    } else if place && !lodging {
+        [
+            "guide.michelin.com",
+            "www.visitnaples.eu",
+            "www.italymagazine.com",
+        ]
+    } else if flights || lodging {
+        [
+            "www.lastminute.com",
+            "www.travelocity.com",
+            "www.roughguides.com",
+        ]
+    } else if code {
+        ["www.w3schools.com", "dev.to", "exercism.org"]
+    } else if intent == "review" && !outdoors {
+        ["www.t3.com", "www.expertreviews.co.uk", "www.tomsguide.com"]
+    } else if intent == "review" {
+        [
+            "www.livefortheoutdoors.com",
+            "www.gearjunkie.com",
+            "www.sportsdirect.com",
+        ]
+    } else if intent == "health" {
+        [
+            "www.medlineplus.gov",
+            "www.self.com",
+            "www.nutrition.org.uk",
+        ]
+    } else if plants {
+        [
+            "www.patchplants.com",
+            "www.gardendesign.com",
+            "www.gardeningetc.com",
+        ]
+    } else if intent == "news" {
+        ["arstechnica.com", "www.zdnet.com", "www.wired.com"]
+    } else {
+        [
+            "www.collinsdictionary.com",
+            "www.sciencefocus.com",
+            "www.howstuffworks.com",
+        ]
+    };
+    if engine != Engine::Google {
+        let offset = if engine == Engine::Bing { 1 } else { 2 };
+        let count = 1 + hash(query) % 3;
+        let end = candidates.len();
+        for i in 0..count {
+            candidates[end - i - 1] = alternatives[(i + offset) % 3];
+        }
+        candidates.sort_by_key(|host| {
+            (
+                !alternatives.contains(host),
+                hash(&format!("{offset}/{query}/{host}")),
+            )
+        });
+    }
+    for &host in &candidates {
+        if engine != Engine::Google && known.iter().any(|r| target_of(&r.url).0 == host) {
+            continue;
+        }
+        let angle = primary
+            .iter()
+            .position(|h| *h == host)
+            .unwrap_or_else(|| 10 + alternatives.iter().position(|h| *h == host).unwrap());
+        let article = article(
+            seed,
+            query,
+            host,
+            angle
+                + if terms.iter().any(|w| w == "halvard") {
+                    seed.sites.len()
+                } else {
+                    0
+                },
+        );
+        let title = known_case(
+            seed,
+            &result_title(seed, query, host, angle, &article.title),
+            known,
+        );
         let slug = terms.join("-");
         let path = match host {
             "www.reddit.com" => format!(
                 "r/{}/comments/{}/{slug}/",
-                title
-                    .rsplit_once("r/")
-                    .map(|(_, name)| name)
-                    .unwrap_or("AskReddit"),
+                subreddit(query),
                 base36(hash(query) % 2_176_782_336)
             ),
-            "docs.python.org" => format!("3/library/{slug}.html"),
-            "doc.rust-lang.org" => format!("book/{slug}.html"),
+            "www.skyscanner.net" => format!(
+                "routes/anywhere/{}/{slug}/",
+                subject
+                    .rsplit_once(" to ")
+                    .map_or("everywhere".into(), |(_, to)| words(to).join("-"))
+            ),
+            "docs.python.org" => {
+                if lower_query.contains("groupby") {
+                    "3/library/itertools.html#itertools.groupby".into()
+                } else if lower_query.contains("list") || lower_query.contains("index") {
+                    "3/library/stdtypes.html#sequence-types-list-tuple-range".into()
+                } else {
+                    format!("3/search.html?q={}", quote_plus(query))
+                }
+            }
+            "doc.rust-lang.org" => {
+                if lower_query.contains("e0502") {
+                    "error_codes/E0502.html".into()
+                } else if lower_query.contains("ownership") || lower_query.contains("borrow") {
+                    "book/ch04-00-understanding-ownership.html".into()
+                } else {
+                    format!("std/?search={}", quote_plus(query))
+                }
+            }
+            "developer.mozilla.org" => {
+                if lower_query.contains("promise") {
+                    "en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise".into()
+                } else {
+                    format!("en-US/search?q={}", quote_plus(query))
+                }
+            }
             "stackoverflow.com" => {
                 format!("questions/{}/{slug}", 10_000_000 + hash(query) % 90_000_000)
             }
             "github.com" => format!("language-notes/{slug}"),
             "ask.metafilter.com" => format!("{}/{slug}", 100_000 + hash(query) % 900_000),
             "www.tripadvisor.co.uk" => format!(
-                "{}-{slug}.html",
+                "Tourism/{}-{slug}.html",
                 if lodging { "Hotels" } else { "Restaurants" }
             ),
-            "www.wikihow.com" => subject
-                .split_whitespace()
-                .map(capitalize)
-                .collect::<Vec<_>>()
-                .join("-"),
+            "www.wikihow.com" => format!(
+                "Guide/{}",
+                subject
+                    .split_whitespace()
+                    .map(capitalize)
+                    .collect::<Vec<_>>()
+                    .join("-")
+            ),
             "www.timeout.com" => format!(
                 "{}/restaurants/{slug}",
                 terms.last().map_or("uk", String::as_str)
@@ -758,7 +2722,35 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
                 day(seed, 0).year(),
                 MONTHS[day(seed, 0).month() as usize - 1].to_lowercase()
             ),
+            "www.bbc.com" if weather => format!(
+                "weather/{}",
+                if lower_query.contains("london") {
+                    "2643743".into()
+                } else {
+                    words(&Forecast::new(seed, query, host).place).join("-")
+                }
+            ),
             "www.bbc.com" => format!("news/articles/{}", base36(hash(query))),
+            "www.metoffice.gov.uk" => format!(
+                "weather/forecast/{}",
+                words(&Forecast::new(seed, query, host).place).join("-")
+            ),
+            "weather.com" => format!(
+                "weather/tenday/l/{}",
+                words(&Forecast::new(seed, query, host).place).join("-")
+            ),
+            _ if weather => format!(
+                "forecast/{}",
+                words(&Forecast::new(seed, query, host).place).join("-")
+            ),
+            _ if cars && site_profile(host).kind == "marketplace" => format!("used-cars/{slug}"),
+            _ if cars => format!("reviews/{slug}"),
+            "www.nytimes.com" => format!("wirecutter/reviews/{slug}/"),
+            "www.outdoorgearlab.com" => format!("topics/shoes-and-boots/best-{slug}"),
+            "www.amazon.co.uk" => format!("s?k={}", quote_plus(&subject)),
+            "www.youtube.com" => format!("watch?v={}", base36(hash(query))),
+            "dictionary.cambridge.org" => format!("dictionary/english/{slug}"),
+            "www.merriam-webster.com" => format!("dictionary/{slug}"),
             "www.independent.co.uk" => format!(
                 "life-style/{slug}-b{}.html",
                 1_000_000 + hash(query) % 9_000_000
@@ -766,15 +2758,20 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             "www.booking.com" => format!("searchresults.html?ss={}", quote_plus(&subject)),
             "www.opentable.co.uk" => format!("s?term={}", quote_plus(&subject)),
             "www.yelp.co.uk" => format!("search?find_desc={}", quote_plus(&subject)),
-            "www.techradar.com" | "www.howtogeek.com" | "www.lifewire.com" => {
+            "www.which.co.uk" if intent == "review" || intent == "definition" => {
+                format!("reviews/{slug}")
+            }
+            "www.techradar.com" | "www.howtogeek.com" | "www.lifewire.com" | "www.which.co.uk" => {
                 format!("how-to/{slug}")
             }
             "www.freecodecamp.org" => format!("news/{slug}/"),
             "www.digitalocean.com" => format!("community/tutorials/{slug}"),
-            _ => slug.clone(),
+            _ => result_path(seed, host, &slug, &site_profile(host).kind),
         };
         let url = format!("https://{host}/{path}");
-        let date = if [
+        let date = if host == "www.theregister.com" {
+            short_date(day(seed, 0))
+        } else if [
             "www.bbc.com",
             "www.theguardian.com",
             "www.independent.co.uk",
@@ -783,16 +2780,22 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
         ]
         .contains(&host)
         {
-            short_date(date_for(seed, &url, 45))
+            short_date(date_for(
+                seed,
+                &url,
+                if terms.iter().any(|w| w == "halvard" || w == "hg-400") {
+                    14
+                } else {
+                    45
+                },
+            ))
         } else {
             String::new()
         };
-        let snippet = if place && !lodging && site_profile(host).kind == "listings" {
-            format!(
-                "{snippet} Places to consider: Market Kitchen; Station Restaurant; The Dining Room; North Street Kitchen; Riverside Kitchen; The Garden Room; Central Kitchen; Parkside Restaurant; The Courtyard; Corner Kitchen. Compare opening hours and menus before choosing a table."
-            )
+        let snippet = if weather {
+            Forecast::new(seed, query, host).snippet(angle)
         } else {
-            snippet.into()
+            excerpt(&list_lead(query, angle).unwrap_or(article.lead))
         };
         add(url, title, snippet, date);
     }
@@ -808,6 +2811,39 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
         ],
         ads: vec![],
     }
+}
+
+pub(super) fn for_engine(
+    seed: &Seed,
+    query: &str,
+    mut canonical: Search,
+    engine: Engine,
+) -> Search {
+    let count = 1 + hash(query) % 3;
+    let hosts = canonical
+        .results
+        .iter()
+        .map(|r| target_of(&r.url).0)
+        .collect::<Vec<_>>();
+    let additions = search(seed, query, &[], engine)
+        .results
+        .into_iter()
+        .filter(|r| !hosts.contains(&target_of(&r.url).0))
+        .take(count)
+        .collect::<Vec<_>>();
+    canonical.results.sort_by_key(|r| {
+        let own = seed.fixed.iter().any(|f| f.url == r.url)
+            || seed.sites.iter().any(|s| s.host == target_of(&r.url).0);
+        (!own, engine_order(engine, query, &r.url))
+    });
+    canonical.results.truncate(10 - additions.len());
+    canonical.results.extend(additions);
+    canonical.results.sort_by_key(|r| {
+        let own = seed.fixed.iter().any(|f| f.url == r.url)
+            || seed.sites.iter().any(|s| s.host == target_of(&r.url).0);
+        (!own, engine_order(engine, query, &r.url))
+    });
+    canonical
 }
 
 /// Video listings drawn from the world's stored video pages.
@@ -841,7 +2877,7 @@ pub fn videos<'a>(query: &str, pages: impl Iterator<Item = (&'a String, String)>
             }
         }
     }
-    let mut results = if query.is_empty() {
+    let results = if query.is_empty() {
         known.iter().take(12).cloned().collect::<Vec<_>>()
     } else {
         rank(&known, query)
@@ -851,25 +2887,6 @@ pub fn videos<'a>(query: &str, pages: impl Iterator<Item = (&'a String, String)>
             .cloned()
             .collect::<Vec<_>>()
     };
-    if results.is_empty() && !query.is_empty() {
-        let topic = upper_first(&words(query).join(" "));
-        for (i, suffix) in [
-            "A practical walkthrough",
-            "Getting started",
-            "Common questions",
-            "Step by step",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            results.push(Result {
-                url: format!("https://www.youtube.com/watch?v={:x}", hash(&format!("{query}{i}"))),
-                title: format!("{topic}: {suffix}"),
-                snippet: "A walkthrough of the basics, with preparation steps and answers to common questions.".into(),
-                date: String::new(),
-            });
-        }
-    }
     Search {
         results,
         ..Search::default()
@@ -900,12 +2917,88 @@ pub fn site_profile(host: &str) -> Profile {
     };
     let name = match host {
         "www.youtube.com" => "YouTube",
+        "doc.rust-lang.org" => "Rust Documentation",
+        "users.rust-lang.org" => "Rust Users Forum",
+        "discuss.python.org" => "Python Discussions",
+        "discourse.mozilla.org" => "Mozilla Discourse",
+        "www.nytimes.com" => "Wirecutter",
+        "www.outdoorgearlab.com" => "OutdoorGearLab",
+        "www.rei.com" => "REI",
+        "www.amazon.co.uk" => "Amazon",
+        "www.rhs.org.uk" => "RHS",
+        "www.gardenersworld.com" => "Gardeners’ World",
+        "www.nhs.uk" => "NHS",
+        "www.mayoclinic.org" => "Mayo Clinic",
+        "www.thespruce.com" => "The Spruce",
+        "www.gardeningknowhow.com" => "Gardening Know How",
+        "www.bhg.com" => "Better Homes & Gardens",
+        "www.almanac.com" => "The Old Farmer’s Almanac",
+        "www.gardendesign.com" => "Garden Design",
+        "www.runnersworld.com" => "Runner’s World",
+        "health.clevelandclinic.org" => "Cleveland Clinic",
+        "www.verywellfit.com" => "Verywell Fit",
+        "www.medicalnewstoday.com" => "Medical News Today",
+        "www.energy.gov" => "Department of Energy",
+        "energysavingtrust.org.uk" => "Energy Saving Trust",
+        "www.explainthatstuff.com" => "Explain that Stuff",
+        "www.collinsdictionary.com" => "Collins Dictionary",
+        "www.sciencefocus.com" => "BBC Science Focus",
+        "www.howstuffworks.com" => "HowStuffWorks",
+        "www.cargurus.co.uk" => "CarGurus",
+        "www.autoexpress.co.uk" => "Auto Express",
+        "www.bakingmad.com" => "Baking Mad",
+        "sallysbakingaddiction.com" => "Sally’s Baking Addiction",
+        "arstechnica.com" => "Ars Technica",
+        "www.zdnet.com" => "ZDNET",
+        "www.wired.com" => "WIRED",
+        "dev.to" => "DEV Community",
+        "www.webmd.com" => "WebMD",
+        "www.britannica.com" => "Britannica",
+        "dictionary.cambridge.org" => "Cambridge Dictionary",
+        "www.merriam-webster.com" => "Merriam-Webster",
+        "www.bbc.com" | "www.bbc.co.uk" => "BBC News",
+        "www.theregister.com" => "The Register",
         "ask.metafilter.com" => "Ask MetaFilter",
         "www.kingarthurbaking.com" => "King Arthur Baking",
         "www.bbcgoodfood.com" => "Good Food",
         "www.seriouseats.com" => "Serious Eats",
         "www.britishairways.com" => "British Airways",
         "www.skyscanner.net" => "Skyscanner",
+        "www.kiwi.com" => "Kiwi.com",
+        "www.metoffice.gov.uk" => "Met Office",
+        "weather.com" => "Weather.com",
+        "www.accuweather.com" => "AccuWeather",
+        "www.weather-forecast.com" => "Weather Forecast",
+        "www.wunderground.com" => "Weather Underground",
+        "www.timeanddate.com" => "timeanddate",
+        "www.meteoblue.com" => "meteoblue",
+        "www.netweather.tv" => "Netweather",
+        "www.yourweather.co.uk" => "YourWeather",
+        "www.foreca.com" => "Foreca",
+        "www.weatherbug.com" => "WeatherBug",
+        "www.ventusky.com" => "Ventusky",
+        "www.switchbacktravel.com" => "Switchback Travel",
+        "www.treelinereview.com" => "Treeline Review",
+        "www.backcountry.com" => "Backcountry",
+        "www.livefortheoutdoors.com" => "Live for the Outdoors",
+        "www.gearjunkie.com" => "GearJunkie",
+        "www.sportsdirect.com" => "Sports Direct",
+        "www.easyjet.com" => "easyJet",
+        "www.flytap.com" => "TAP Air Portugal",
+        "www.ryanair.com" => "Ryanair",
+        "www.lonelyplanet.com" => "Lonely Planet",
+        "www.roughguides.com" => "Rough Guides",
+        "www.travelocity.com" => "Travelocity",
+        "www.autotrader.co.uk" => "Auto Trader",
+        "www.rac.co.uk" => "RAC",
+        "www.whatcar.com" => "What Car?",
+        "www.bonappetit.com" => "Bon Appétit",
+        "www.epicurious.com" => "Epicurious",
+        "www.allrecipes.com" => "Allrecipes",
+        "www.simplyrecipes.com" => "Simply Recipes",
+        "www.foodnetwork.com" => "Food Network",
+        "www.delish.com" => "Delish",
+        "www.thekitchn.com" => "The Kitchn",
         "www.momondo.co.uk" => "momondo",
         "github.com" => "GitHub",
         "www.booking.com" => "Booking.com",
@@ -930,7 +3023,7 @@ pub fn site_profile(host: &str) -> Profile {
         "www.datacamp.com" => "DataCamp",
         "www.digitalocean.com" => "DigitalOcean",
         "www.freecodecamp.org" => "freeCodeCamp",
-        "www.tp-link.com" => "tp-link",
+        "www.tp-link.com" => "TP-Link",
         "www.netgear.com" => "NETGEAR",
         "www.asus.com" => "ASUS",
         "www.techradar.com" => "TechRadar",
@@ -940,7 +3033,136 @@ pub fn site_profile(host: &str) -> Profile {
         _ => &name,
     }
     .to_owned();
-    let kind = if host == "www.ebay.com" {
+    let kind = if matches!(
+        host,
+        "www.metoffice.gov.uk"
+            | "weather.com"
+            | "www.accuweather.com"
+            | "www.weather-forecast.com"
+            | "www.wunderground.com"
+            | "www.timeanddate.com"
+            | "www.meteoblue.com"
+            | "www.netweather.tv"
+            | "www.yourweather.co.uk"
+            | "www.foreca.com"
+            | "www.weatherbug.com"
+            | "www.ventusky.com"
+    ) {
+        "weather"
+    } else if matches!(
+        host,
+        "www.autotrader.co.uk"
+            | "www.cargurus.co.uk"
+            | "motorway.co.uk"
+            | "www.motors.co.uk"
+            | "www.cinch.co.uk"
+            | "www.heycar.com"
+            | "www.pistonheads.com"
+    ) {
+        "marketplace"
+    } else if matches!(
+        host,
+        "www.rac.co.uk"
+            | "www.parkers.co.uk"
+            | "www.whatcar.com"
+            | "www.autoexpress.co.uk"
+            | "www.carwow.co.uk"
+            | "www.carbuyer.co.uk"
+            | "www.nytimes.com"
+            | "www.outdoorgearlab.com"
+            | "www.switchbacktravel.com"
+            | "www.advnture.com"
+            | "www.treelinereview.com"
+            | "www.gearjunkie.com"
+            | "www.livefortheoutdoors.com"
+            | "www.consumerreports.org"
+            | "www.rtings.com"
+            | "www.goodhousekeeping.com"
+            | "www.trustedreviews.com"
+            | "www.t3.com"
+            | "www.expertreviews.co.uk"
+            | "www.tomsguide.com"
+    ) {
+        "review"
+    } else if matches!(
+        host,
+        "www.amazon.co.uk" | "www.rei.com" | "www.backcountry.com" | "www.sportsdirect.com"
+    ) {
+        "shop"
+    } else if matches!(
+        host,
+        "www.britannica.com"
+            | "dictionary.cambridge.org"
+            | "www.merriam-webster.com"
+            | "www.collinsdictionary.com"
+    ) {
+        "wiki"
+    } else if matches!(
+        host,
+        "www.nhs.uk"
+            | "www.mayoclinic.org"
+            | "www.webmd.com"
+            | "www.healthline.com"
+            | "www.runnersworld.com"
+            | "health.clevelandclinic.org"
+            | "www.verywellfit.com"
+            | "www.medicalnewstoday.com"
+            | "www.medlineplus.gov"
+            | "www.self.com"
+            | "www.nutrition.org.uk"
+            | "www.rhs.org.uk"
+            | "www.gardenersworld.com"
+            | "www.instructables.com"
+            | "www.thespruce.com"
+            | "www.gardeningknowhow.com"
+            | "www.gardenista.com"
+            | "www.bhg.com"
+            | "www.almanac.com"
+            | "www.patchplants.com"
+            | "www.gardendesign.com"
+            | "www.gardeningetc.com"
+            | "www.explainthatstuff.com"
+    ) {
+        "howto"
+    } else if matches!(
+        host,
+        "www.reuters.com"
+            | "www.theguardian.com"
+            | "www.independent.co.uk"
+            | "arstechnica.com"
+            | "www.zdnet.com"
+            | "www.wired.com"
+    ) {
+        "news"
+    } else if matches!(host, "www.quora.com") {
+        "qa"
+    } else if matches!(
+        host,
+        "www.howtogeek.com" | "www.lifewire.com" | "www.techradar.com" | "www.which.co.uk"
+    ) {
+        "howto"
+    } else if matches!(
+        host,
+        "www.eater.com"
+            | "www.falstaff.com"
+            | "www.gamberorossointernational.com"
+            | "guide.michelin.com"
+            | "www.visitnaples.eu"
+            | "www.italymagazine.com"
+    ) {
+        "listings"
+    } else if matches!(
+        host,
+        "www.easyjet.com"
+            | "www.ryanair.com"
+            | "www.flytap.com"
+            | "www.lonelyplanet.com"
+            | "www.roughguides.com"
+            | "www.travelocity.com"
+            | "www.lastminute.com"
+    ) {
+        "lodging"
+    } else if host == "www.ebay.com" {
         "shop"
     } else if host == "www.linkedin.com" {
         "company"
@@ -975,12 +3197,19 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.bonappetit.com"
             | "www.delish.com"
             | "www.thekitchn.com"
+            | "www.bakefromscratch.com"
+            | "www.bakingmad.com"
+            | "sallysbakingaddiction.com"
             | "www.wikihow.com"
     ) {
         "howto"
     } else if matches!(
         host,
-        "www.britishairways.com" | "www.skyscanner.net" | "www.kayak.co.uk" | "www.momondo.co.uk"
+        "www.britishairways.com"
+            | "www.skyscanner.net"
+            | "www.kayak.co.uk"
+            | "www.momondo.co.uk"
+            | "www.kiwi.com"
     ) {
         "lodging"
     } else if matches!(
@@ -992,11 +3221,20 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.datacamp.com"
             | "www.digitalocean.com"
             | "www.freecodecamp.org"
+            | "www.w3schools.com"
+            | "dev.to"
+            | "exercism.org"
             | "www.tp-link.com"
             | "www.netgear.com"
             | "www.asus.com"
     ) {
-        "docs"
+        if host == "dev.to" {
+            "blog"
+        } else if matches!(host, "www.tp-link.com" | "www.netgear.com" | "www.asus.com") {
+            "docs"
+        } else {
+            "howto"
+        }
     } else if host.contains("wiki") {
         "wiki"
     } else if host.starts_with("docs.")
@@ -1005,7 +3243,15 @@ pub fn site_profile(host: &str) -> Profile {
         || host.contains("github")
     {
         "docs"
+    } else if matches!(host, "stackoverflow.com" | "superuser.com") {
+        "qa"
     } else if host == "ask.metafilter.com"
+        || [
+            "users.rust-lang.org",
+            "discuss.python.org",
+            "discourse.mozilla.org",
+        ]
+        .contains(&host)
         || host.contains("forum")
         || host.contains("community")
         || host.contains("reddit")
@@ -1026,6 +3272,22 @@ pub fn site_profile(host: &str) -> Profile {
     };
     let links = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let (tagline, nav) = match kind {
+        "weather" => (
+            String::new(),
+            links(&["Forecast|/weather/", "Maps|/maps/", "Warnings|/warnings/"]),
+        ),
+        "marketplace" => (
+            String::new(),
+            links(&[
+                "Used cars|/used-cars/",
+                "Sell your car|/sell/",
+                "Reviews|/reviews/",
+            ]),
+        ),
+        "review" => (
+            String::new(),
+            links(&["Reviews|/reviews/", "Buying guides|/buying-guides/"]),
+        ),
         "lodging" => (
             String::new(),
             links(&[
@@ -1074,7 +3336,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "Support|/support/",
             ]),
         ),
-        "forum" => (
+        "forum" | "qa" => (
             format!("{name} community"),
             links(&[
                 "Latest|/latest",
@@ -1126,7 +3388,11 @@ pub fn site_profile(host: &str) -> Profile {
     };
     let nav = if matches!(
         host,
-        "www.britishairways.com" | "www.skyscanner.net" | "www.kayak.co.uk" | "www.momondo.co.uk"
+        "www.britishairways.com"
+            | "www.skyscanner.net"
+            | "www.kayak.co.uk"
+            | "www.momondo.co.uk"
+            | "www.kiwi.com"
     ) {
         links(&[
             "Flights|/flights/",
@@ -1215,7 +3481,7 @@ pre { overflow-x: auto; padding: 20px; background: #edf1f5; } code { font-family
         "docs" => {
             ":root {--accent:#3156ad} header {background:#17263f;color:#fff} .home, .brand a {color:#fff} .tagline {color:#becbe2} main {border:1px solid #d9dee5;border-radius:6px} h1 {font-size:34px}"
         }
-        "forum" => {
+        "forum" | "qa" => {
             ":root {--accent:#a74320} body {background:#f2ede8} header {border-top:0} main {border:1px solid #d8cec5;border-radius:8px} main p {padding:14px;background:#faf8f5;border-radius:5px} h1 {font-size:30px}"
         }
         "shop" => {
@@ -1237,25 +3503,85 @@ pre { overflow-x: auto; padding: 20px; background: #edf1f5; } code { font-family
     format!("{base}\n{theme}")
 }
 /// Derives a page title from its path or site name.
-pub fn title_from(host: &str, target: &str) -> String {
-    static EXT: OnceLock<Regex> = OnceLock::new();
-    static SEP: OnceLock<Regex> = OnceLock::new();
-    let path = target.split('?').next().unwrap().trim_end_matches('/');
-    let last = path.rsplit('/').next().unwrap_or("");
-    let last = EXT
-        .get_or_init(|| Regex::new(r"\.(html?|php|aspx?)$").unwrap())
-        .replace(last, "");
-    let text = SEP
-        .get_or_init(|| Regex::new(r"[-_+]+").unwrap())
-        .split(&last)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let text = text.trim();
-    if text.is_empty() {
-        site_profile(host).name
-    } else {
-        upper_first(text)
+fn path_title(target: &str) -> Option<String> {
+    let path = target.split('?').next().unwrap_or("");
+    let parts: Vec<_> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let start = parts
+        .iter()
+        .position(|s| *s == "comments")
+        .map_or(0, |i| (i + 2).min(parts.len()));
+    if path.starts_with("/news/articles/")
+        && parts.len() == 3
+        && !parts[2].contains(['-', '_', '+'])
+    {
+        return None;
     }
+    parts[start..].iter().rev().find_map(|part| {
+        let stem = part.split('.').next().unwrap_or("");
+        if [
+            "news",
+            "articles",
+            "article",
+            "index",
+            "t",
+            "r",
+            "sub",
+            "comments",
+            "questions",
+            "p",
+            "story",
+            "forum",
+            "threads",
+            "thread",
+            "viewtopic",
+            "showthread",
+            "support",
+            "kb",
+            "security",
+            "advisories",
+        ]
+        .contains(&stem)
+        {
+            return None;
+        }
+        if stem.len() >= 8 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let tokens: Vec<_> = stem
+            .split(['-', '_', '+'])
+            .filter(|token| !token.chars().any(|c| c.is_ascii_digit()))
+            .collect();
+        let text = tokens.join(" ");
+        (!text.trim().is_empty()).then(|| upper_first(text.trim()))
+    })
+}
+
+pub fn title_from(host: &str, target: &str) -> String {
+    path_title(target).unwrap_or_else(|| site_profile(host).name)
+}
+
+fn subject_title(seed: &Seed, host: &str, target: &str, kind: &str, known: &[Result]) -> String {
+    if let Some(title) = path_title(target) {
+        return article(seed, &title, host, hash(host)).title;
+    }
+    let same_host: Vec<_> = known
+        .iter()
+        .filter(|r| target_of(&r.url).0 == host)
+        .collect();
+    let same_kind: Vec<_> = known
+        .iter()
+        .filter(|r| site_profile(&target_of(&r.url).0).kind == kind)
+        .collect();
+    let choices = if same_host.is_empty() {
+        &same_kind
+    } else {
+        &same_host
+    };
+    let key = hash(&format!("{host}{target}"));
+    if !choices.is_empty() {
+        return heading(&choices[key % choices.len()].title).to_owned();
+    }
+    article(seed, &seed.search, host, key).title
 }
 /// Rejects pasted addresses and domain names inside a page path.
 pub(super) fn broken_path(target: &str) -> bool {
@@ -1316,6 +3642,7 @@ pub(super) fn page_with_known(
     mentions: &[Value],
     kind: &str,
     known: &[Result],
+    cast: &[super::prompts::Person],
 ) -> Page {
     if host == "www.youtube.com" && target == "/" {
         let mut body = String::from("<h1>Recommended</h1><div class=\"video-grid\">");
@@ -1337,16 +3664,21 @@ pub(super) fn page_with_known(
         };
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let article = form_urlencoded::parse(query.as_bytes())
+        .any(|(key, value)| key == "p" && !value.is_empty());
     let query = form_urlencoded::parse(query.as_bytes())
         .find(|(k, _)| ["q", "search", "search_query", "searchTerm"].contains(&k.as_ref()))
         .map(|(_, v)| v.into_owned());
-    let search = query.is_some();
-    let directory = directory(target) && mentions.iter().all(|m| m["via"] != "search");
+    let search = query.is_some() && directory(target);
+    let directory = !article && directory(target) && mentions.iter().all(|m| m["via"] != "search");
     if !search && !directory {
-        let mut made = page(seed, host, target, mentions, kind);
-        if path.starts_with("/security/advisories/") {
-            made.body.push_str("<h2>Recommended action</h2><p>Review the affected component and apply the corresponding maintenance update from the download centre. Contact support with the advisory identifier and your installed release if you need assistance.</p><p><a href=\"/security/advisories/\">All security advisories</a></p>");
+        let mut mentions = mentions.to_vec();
+        if mentions.iter().all(|m| m["title"].as_str().is_none()) && path_title(target).is_none() {
+            mentions
+                .push(serde_json::json!({"title": subject_title(seed, host, target, kind, known)}));
         }
+        let made = page(seed, host, target, &mentions, kind, cast);
+
         return made;
     }
     let title = if let Some(query) = &query {
@@ -1411,7 +3743,14 @@ pub(super) fn page_with_known(
 
 /// Makes page content from prior mentions, in the shape of
 /// a page on a site of `kind` (as [`Profile::kind`] names it).
-pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &str) -> Page {
+pub fn page(
+    seed: &Seed,
+    host: &str,
+    target: &str,
+    mentions: &[Value],
+    kind: &str,
+    cast: &[super::prompts::Person],
+) -> Page {
     let url = format!("https://{host}{target}");
     let strings = |key: &str| {
         mentions
@@ -1426,24 +3765,31 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
         .first()
         .or(anchors.first())
         .cloned()
-        .unwrap_or_else(|| title_from(host, target));
-    // A snippet is text cut from the page, so the page holds it whole: a
-    // fact it came from, or the snippet without its ellipses.
+        .unwrap_or_else(|| subject_title(seed, host, target, kind, &[]));
     let mut claims: Vec<String> = Vec::new();
-    for claim in snippets.iter().map(|s| {
-        s.trim()
-            .trim_start_matches("...")
-            .trim_end_matches("...")
-            .trim()
-            .to_owned()
-    }) {
+    for claim in snippets
+        .iter()
+        .map(|s| s.trim().trim_start_matches("...").trim().to_owned())
+    {
         if claim.is_empty() || claims.iter().any(|c| c.contains(&claim)) {
             continue;
         }
         claims.retain(|c| !claim.contains(c.as_str()));
         claims.push(claim);
     }
-    let date = date_for(seed, &url, 30);
+    let scenario = ["halvard", "hg-400", "gateway", "41877"]
+        .iter()
+        .any(|w| title.to_lowercase().contains(w));
+    let path_date = target
+        .trim_start_matches('/')
+        .split('/')
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("-");
+    let date = parse_date(&path_date)
+        .ok()
+        .filter(|date| *date <= day(seed, 0))
+        .unwrap_or_else(|| date_for(seed, &url, if scenario { 14 } else { 30 }));
     let mut page = Page {
         status: 200,
         title: title.clone(),
@@ -1477,229 +3823,331 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
         _ => {}
     }
     let pick = |list: &[&'static str], salt: usize| list[(hash(&url) + salt) % list.len()];
-    let paras = |items: &[String]| {
-        items
-            .iter()
-            .map(|s| format!("<p>{}</p>", escape(s)))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let slug = words(&title)
-        .into_iter()
-        .take(5)
-        .collect::<Vec<_>>()
-        .join("-");
-    let slug = if slug.is_empty() { "update" } else { &slug };
-    let subject = heading(&title);
-    let t = escape(subject);
+    let t = escape(heading(&title));
     let when = short_date(date);
-    let (body, sidebar, ad): (String, &[(&str, &str)], &str) = match kind {
-        "wiki" => {
-            let body = if claims.is_empty() {
-                format!(
-                    "<h1>{t}</h1><p>{t} may refer to:</p><ul><li><a href=\"/w/index.php?search={}\">Browse matching articles</a></li></ul>",
-                    quote_plus(&title)
+    let subject = mentions
+        .iter()
+        .find_map(|m| m["query"].as_str())
+        .unwrap_or(heading(&title));
+    if kind == "weather" || (host == "www.bbc.com" && target.starts_with("/weather/")) {
+        let forecast = Forecast::new(seed, subject, host);
+        page.body = forecast.body(&title, &claims);
+        page.content_type = "text/html; charset=utf-8".into();
+        page.description = forecast.snippet(voice(host));
+        page.date = seed.date.clone();
+        return page;
+    }
+    let article = article(seed, subject, host, voice(host));
+    let lead = if claims.is_empty() {
+        article.lead.clone()
+    } else {
+        claims.join(" ")
+    };
+    let lead_html = if claims.is_empty() {
+        format!("<p class=\"lead\">{}</p>", escape(&lead))
+    } else {
+        claims
+            .iter()
+            .map(|c| format!("<p>{}</p>", escape(c)))
+            .collect::<String>()
+    };
+    let dining = title.to_lowercase().contains("pizza");
+    let dining_steps = [
+        "Choose between a traditional pizza and a fried pizza counter.",
+        "Compare a margherita before adding extra toppings.",
+        "Check the pizza menu’s prices for drinks and service.",
+        "Ask whether the pizza kitchen accepts reservations.",
+        "Allow time for a pizza queue at peak hours.",
+        "Eat the pizza promptly while the crust is hot.",
+        "Check the pizza kitchen’s last orders.",
+        "Ask about pizza ingredients and dietary requirements.",
+        "Compare takeaway pizza with eating at a table.",
+        "Plan a walking route between pizza stops.",
+    ];
+    let steps = if dining {
+        dining_steps
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        article.steps.clone()
+    };
+    let method = steps
+        .iter()
+        .map(|s| format!("<li>{}</li>", escape(s)))
+        .collect::<String>();
+    let reference = if article.example.is_empty() {
+        let (term, value) = if title.to_lowercase().contains("router") {
+            (
+                "Restart",
+                "Restarts the device while keeping its configuration.",
+            )
+        } else if title.to_lowercase().contains("bread") {
+            (
+                "Quick bread",
+                "A loaf raised with baking powder or baking soda rather than yeast.",
+            )
+        } else if title.to_lowercase().contains("weather") {
+            (
+                "Rain probability",
+                "The chance of measurable rain at a forecast location during a specified period.",
+            )
+        } else if scenario {
+            ("Fixed release", "The fixed firmware is 7.2.4.")
+        } else {
+            ("Before you begin", article.steps[0].as_str())
+        };
+        format!("<dl><dt>{term}</dt><dd>{}</dd></dl>", escape(value))
+    } else {
+        format!("<pre><code>{}</code></pre>", escape(article.example))
+    };
+    let variant = voice(host);
+    let detail_text = if title.to_lowercase().contains("firmware") {
+        ["The affected firmware releases run from 7.0.0 through 7.2.3. The fixed version, 7.2.4, was released on September 22.", "The firmware fix arrived on September 22. Releases 7.0.0 through 7.2.3 contain the vulnerable web portal.", "The fixed firmware, 7.2.4, closes the portal flaw. Earlier releases from 7.0.0 through 7.2.3 remain affected.",
+        "The firmware advisory describes a pre-authentication flaw in the web portal. The issue carries a severity score of 9.8.",
+        "The firmware release predates CISA’s September 26 addition of the flaw to its exploited vulnerabilities catalog.",
+        "The firmware fix applies to the vulnerable portal code. The advisory identifies releases 7.0.0 through 7.2.3 as affected.",
+        "The firmware update was released alongside the September 22 advisory. It addresses a remotely exploitable portal flaw.",
+        "A firmware flaw in the portal allows an attack before sign-in. The fixed release is 7.2.4.",
+        "The firmware issue has been assigned CVE-2026-41877. CISA listed it among known exploited vulnerabilities on September 26.",
+        "The firmware advisory gives the affected range and an interim way to block attacks. Release 7.2.4 is the fixed version."][variant].to_owned()
+    } else if title.to_lowercase().contains("groupby") {
+        ["Python groups share their underlying iterator. Consume each one before requesting the next.", "Each itertools group draws from the same input. Convert it to a list if you need it later.", "Python’s groupby() works on adjacent runs. Sorting first is useful when equal keys are scattered through the input.",
+        "A Python key function receives each element, not an entire group. It can select a tuple field or calculate a value.",
+        "The itertools function produces a new group when the key changes. Two separated runs with the same key remain separate.",
+        "A Python group is an iterator over the original input. Turning it into a list reads its remaining values immediately.",
+        "The Python example sorts the tuples by their first field. Passing that same key to groupby() puts matching names together.",
+        "Python sorting is stable. Items with equal keys keep their original order within the group.",
+        "With itertools, the outer iterator and each group share the input. Advancing to the next key discards the unread part of the previous group.",
+        "A Python dictionary can collect equal keys without sorting. Use groupby() when the sequence of runs matters."][variant].to_owned()
+    } else if kind == "news" && title.to_lowercase().contains("sourdough") {
+        "Bakers track the level after feeding to distinguish a slow rise from a missed peak. A line of dried mixture above the current level can show that the culture rose and fell overnight.".into()
+    } else {
+        article.detail.clone()
+    };
+    let detail_text = if title.to_lowercase().contains("flight") {
+        let destination = if title.contains("Tokyo") {
+            "Tokyo (HND or NRT)"
+        } else if title.contains("Lisbon") {
+            "Lisbon (LIS)"
+        } else {
+            "the arrival airport"
+        };
+        let fare = if title.contains("Tokyo") { 540 } else { 89 };
+        format!(
+            "Compare departure options from London Heathrow (LHR), Gatwick (LGW) and Luton (LTN) to {destination}. An example £{fare} return fare plus a £35 bag each way totals £{} before airport transport. These are example prices; confirm availability and the fare for your dates before booking.",
+            fare + 70
+        )
+    } else {
+        detail_text
+    };
+    let detail_text = if title.to_lowercase().contains("bread") {
+        ["Too much flour absorbs the moisture the bread needs. Weigh it rather than scooping it firmly into a cup.",
+        "Prolonged mixing makes quick bread tough. Stop when the final streaks of dry flour disappear.",
+        "Too much mashed fruit can weigh bread down. Measure the fruit separately instead of adding another banana.",
+        "Bread rises best when the leavening is still active. Check the date before opening an old package.",
+        "A small pan makes bread deeper and slower to cook. Match the dimensions in the recipe before adjusting the time.",
+        "Warm bread can compress under a knife. Let the crumb set on a rack before cutting the first slice.",
+        "Bread that looks dark outside can still contain wet batter. Check the center instead of relying on crust color.",
+        "A dense bread crumb may come from an overly wet batter. Record the fruit weight when comparing batches.",
+        "Quick bread needs gentle folding rather than beating. A few small lumps will bake out without making the crumb tough.",
+        "Bread takes longer to bake in a deep pan. Keep the loaf in the oven until the center no longer contains wet batter."][variant].to_owned()
+    } else if title.to_lowercase().contains("pizza") {
+        if title.to_lowercase().contains("naples") {
+            ["Naples has several distinct pizza traditions. Da Michele is known for a short menu, while other kitchens offer more toppings.",
+            "A Neapolitan pizza has a soft center and raised rim. Eat it promptly rather than expecting a crisp takeaway base.",
+            "Pizza queues at Sorbillo can be long during the evening. A late lunch may fit a short visit more easily.",
+            "Starita offers another setting for pizza beyond the busiest streets in the historic center. Allow time for the trip.",
+            "Fried pizza is a different meal from a wood-fired margherita. A specialist counter is worth comparing with a sit-down pizzeria.",
+            "A simple pizza helps reveal the balance between the dough, tomato and cheese. Extra toppings can obscure that comparison.",
+            "Pizza prices change with toppings and table service. Compare the full menu rather than one advertised item.",
+            "A pizza kitchen may close between lunch and evening service. Check the hours before walking across the city.",
+            "Traditional pizza is often served whole for one diner. Ask about portion size before ordering several dishes.",
+            "A pizza’s crust changes quickly in a closed box. Choose a nearby table if texture matters more than takeaway convenience."][variant].to_owned()
+        } else {
+            "Compare pizza kitchens in the neighborhood you plan to visit. Check the menu, opening hours and booking policy before joining a queue.".into()
+        }
+    } else {
+        detail_text
+    };
+    let detail = escape(&detail_text);
+    let tip = escape(&article.tip);
+    let content = format!("{lead_html}<p>{detail}</p>");
+    let sample = if article.example.is_empty() {
+        String::new()
+    } else {
+        format!("<h2>Example</h2>{reference}")
+    };
+    let method_title = if intent(subject) == "health" {
+        "What to consider"
+    } else if subject.to_lowercase().contains("repot") {
+        "Repotting steps"
+    } else {
+        "How to fix it"
+    };
+    let mut body = match kind {
+        "wiki" if intent(subject) == "definition" => format!(
+            "<h1>{t}</h1>{content}<h2>How it works</h2><ol>{method}</ol><h2>Applications</h2><p>{tip}</p>"
+        ),
+        "wiki" => format!(
+            "<h1>{t}</h1>{content}<h2>Terminology</h2><dl><dt>Terminology</dt><dd>The term may refer to several related concepts.</dd></dl>{reference}<h2>Considerations</h2><p>{tip}</p>"
+        ),
+        "docs" | "package" => format!(
+            "<h1>{t}</h1>{content}<nav class=\"toc\"><b>On this page</b> <a href=\"#example\">Example</a> · <a href=\"#notes\">Notes</a></nav><h2 id=\"example\">Example</h2>{reference}<ol>{method}</ol><h2 id=\"notes\">Notes</h2><p>{tip}</p>"
+        ),
+        "forum" | "qa" => {
+            let question = if title.to_lowercase().contains("router") {
+                escape(
+                    [
+                        "My router needs a reset, but I do not have the connection password. Should I stop here?",
+                        "I can reach the router by Ethernet. Is there a way to save the settings before resetting it?",
+                        "I want to reset my router, but I cannot get into the admin page. Will I lose the connection details?",
+                        "My router keeps dropping Wi-Fi. Would a restart be enough, or do I need a full reset?",
+                        "I reset the router and the old Wi-Fi name disappeared. Is that normal?",
+                        "I have two router revisions with similar labels. Does the reset procedure differ?",
+                        "I need to reset a router remotely. I am worried I will lose access before I can set it up again.",
+                        "I found a router reset guide for a different model. Can I use the same steps?",
+                        "I am planning a router reset tonight. What connection details should I write down first?",
+                        "I can restart my router from the admin page. Is that different from holding the reset control?",
+                    ][variant],
                 )
             } else {
-                format!("<h1>{t}</h1>{}", paras(&claims))
+                escape(&match variant % 3 {
+                    0 => article.question.to_owned(),
+                    1 => format!("{} What would you try first?", article.question),
+                    _ => format!(
+                        "{} I would like to hear from someone who has tried this.",
+                        article.question
+                    ),
+                })
             };
-            (
-                body,
-                &[
-                    ("Main page", "/wiki/Main_Page"),
-                    ("Current events", "/wiki/Portal:Current_events"),
-                    ("Random article", "/wiki/Special:Random"),
-                ],
-                "",
-            )
-        }
-        "docs" | "package" if host == "github.com" || host == "doc.rust-lang.org" => {
-            (format!("<h1>{t}</h1>{}", paras(&claims)), &[], "")
-        }
-        "docs" | "package" => {
-            let lead = claims
-                .first()
-                .cloned()
-                .unwrap_or_else(|| format!("Reference for {title}."));
-            let rest = paras(claims.get(1..).unwrap_or_default());
-            let body = format!(
-                "<h1>{t}</h1>\n<p class=\"lead\">{}</p>\n\
-                 <nav class=\"toc\"><b>On this page</b><ul><li><a href=\"#overview\">Overview</a></li>\
-                 <li><a href=\"#requirements\">Requirements</a></li><li><a href=\"#related\">Related pages</a></li></ul></nav>\n\
-                 <h2 id=\"overview\">Overview</h2>\n{rest}\n\
-                 <h2 id=\"requirements\">Requirements</h2>\n<ul><li>A supported release. See the <a href=\"/docs/release-notes/\">release notes</a>.</li>\
-                 <li>An administrator account.</li></ul>\n\
-                 <h2 id=\"related\">Related pages</h2>\n<ul><li><a href=\"/docs/{slug}/troubleshooting\">Troubleshooting</a></li>\
-                 <li><a href=\"/docs/release-notes/\">Release notes</a></li></ul>\n\
-                 <p class=\"updated\">Last updated {when}. Was this page helpful? <a href=\"/feedback\">Send feedback</a></p>",
-                escape(&lead)
-            );
-            (
-                body,
-                &[
-                    ("Getting started", "/docs/getting-started/"),
-                    ("Installation", "/docs/install/"),
-                    ("Configuration", "/docs/configuration/"),
-                    ("Release notes", "/docs/release-notes/"),
-                ],
-                "",
-            )
-        }
-        "forum" | "qa" => {
-            let asker = pick(&USERS, 0);
-            let question = format!(
-                "{}{} {}",
-                subject,
-                if subject.ends_with('?') { "" } else { "?" },
-                claims.first().map_or("", String::as_str)
-            );
-            let mut posts = vec![format!(
-                "<div class=\"post\"><p class=\"author\"><b>{asker}</b> · <time datetime=\"{date}\">{when}</time></p><p>{}</p></div>",
-                escape(&question)
-            )];
-            let generic = format!(
-                "For {subject}, start with the details in the question: {}. Which part differs in your situation?",
-                claims.first().map_or(subject, String::as_str)
-            );
-            for (i, claim) in claims
-                .iter()
-                .skip(1)
-                .chain(std::iter::once(&generic))
-                .enumerate()
-            {
-                let reply = (date + time::Duration::days(i as i64 + 1)).min(day(seed, 0));
-                posts.push(format!(
-                    "<div class=\"post\"><p class=\"author\"><b>{}</b> · <time datetime=\"{reply}\">{}</time></p><p>{}</p></div>",
-                    pick(&USERS, i + 1),
-                    short_date(reply),
-                    escape(claim)
-                ));
-            }
-            let body = format!(
-                "<h1>{t}</h1>\n<p class=\"thread-meta\">{} {} · {} views</p>\n{}",
-                posts.len() - 1,
-                if posts.len() == 2 { "reply" } else { "replies" },
+            let reply = if title.to_lowercase().contains("router") {
+                escape(
+                    [
+                        "I would pause the router reset until you have the login details. I lost my connection settings that way.",
+                        "I exported my router configuration from the admin page first. I would still write down the connection password separately.",
+                        "A router restart kept my settings. The full reset removed them, so I had to set the connection up again.",
+                        "I would restart the router first. It helped mine, but I cannot say whether your Wi-Fi problem has the same cause.",
+                        "My router returned to the name printed on its label. I had to reconnect by Ethernet to set my preferred name again.",
+                        "I would check the router revision carefully. I have only used the procedure for my own model.",
+                        "I would arrange local access before resetting the router. I would not assume that remote access comes back on its own.",
+                        "I would use the router maker’s model-specific guide. The controls on mine were different from the guide I first found.",
+                        "I noted the router’s login details and Wi-Fi settings. I also kept a copy of the configuration, although I did not need it.",
+                        "For my router those are different operations. A restart preserved everything; a reset returned it to the original settings.",
+                    ][variant],
+                )
+            } else {
+                escape(&match variant % 3 {
+                    0 => article.reply.to_owned(),
+                    1 => format!("My experience was similar. {}", article.reply),
+                    _ => format!("I would check one thing first. {}", article.reply),
+                })
+            };
+            format!(
+                "<h1>{t}</h1><p class=\"thread-meta\">2 replies · {} views</p><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p>{lead_html}<p>{question}</p></div><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p><p>{reply}</p>{reference}</div><div class=\"replies\"><span>1 reply</span><div class=\"post\"><p class=\"author\"><b>{}</b> · {when}</p><p>{tip}</p></div></div>",
                 hash(&url) % 2000 + 40,
-                posts.join("\n")
-            );
-            (
-                body,
-                &[
-                    ("Latest threads", "/latest"),
-                    ("Top this week", "/top?period=weekly"),
-                    ("Categories", "/categories"),
-                ],
-                "",
+                pick(&USERS, 0),
+                pick(&USERS, 1),
+                pick(&USERS, 2)
             )
         }
-        "listings" | "lodging" | "howto" => (format!("<h1>{t}</h1>{}", paras(&claims)), &[], ""),
+        "review" => format!(
+            "<h1>{t}</h1>{content}<h2>What to compare</h2><ol>{method}</ol><h2>Before you buy</h2><p>{tip}</p>"
+        ),
+        "marketplace" => {
+            format!("<h1>{t}</h1>{content}<h2>Compare used cars</h2><ol>{method}</ol><p>{tip}</p>")
+        }
+        "howto" => format!(
+            "<h1>{t}</h1>{content}<h2>{method_title}</h2><ol>{method}</ol>{sample}<h2>What to check next</h2><p>{tip}</p>"
+        ),
+        "listings" => format!(
+            "<h1>{t}</h1>{content}<section class=\"restaurant-list\"><h2>Before you book</h2><ol>{method}</ol></section><p>{tip}</p>"
+        ),
+        "lodging" => format!(
+            "<h1>{t}</h1>{content}<h2>Dates, prices and conditions</h2><ol>{method}</ol><p>{tip}</p>"
+        ),
         "company" | "government" | "shop" => {
-            let lead = claims
-                .first()
-                .cloned()
-                .unwrap_or_else(|| format!("{title}."));
-            let body = format!(
-                "<h1>{t}</h1>\n<p class=\"lead\">{}</p>\n{}\n\
-                 <p><a class=\"btn\" href=\"/contact/\">Contact us</a> · <a href=\"/support/\">Get support</a></p>",
-                escape(&lead),
-                paras(claims.get(1..).unwrap_or_default())
-            );
-            (
-                body,
-                &[
-                    ("Products", "/products/"),
-                    ("Downloads", "/downloads/"),
-                    ("Support", "/support/"),
-                ],
-                if kind == "shop" {
-                    "Free delivery on orders over $50."
-                } else {
-                    ""
-                },
-            )
+            format!("<h1>{t}</h1>{content}<h2>Details</h2><ol>{method}</ol><p>{tip}</p>")
         }
         _ => {
-            let author = pick(&AUTHORS, 0);
-            let text = if claims.is_empty() {
-                format!("<p>{t}.</p>\n<p>This is a developing story and will be updated.</p>")
+            let scenario = ["halvard", "gateway", "hg-400", "41877"]
+                .iter()
+                .any(|w| title.to_lowercase().contains(w));
+            let speaker = cast
+                .iter()
+                .filter(|p| p.organization == "Halvard Systems")
+                .nth(hash(host) % 3)
+                .or(cast.first());
+            let quote = if scenario {
+                speaker.map(|p| format!("“The firmware advisory identifies the affected releases and the fixed version,” said {}, {} at {}.", p.name, p.role, p.organization)).unwrap_or_else(|| format!("The firmware advisory identifies the affected releases; {}", article.tip.to_lowercase()))
+            } else if title.to_lowercase().contains("sourdough") {
+                format!(
+                    "“In a cool kitchen, the culture can take much longer to peak,” said {}, a baking instructor.",
+                    pick(&AUTHORS, 1)
+                )
+            } else if title.to_lowercase().contains("bread") {
+                format!(
+                    "“Gentle mixing makes a noticeable difference to the crumb,” said {}, a baking instructor.",
+                    pick(&AUTHORS, 1)
+                )
+            } else if title.to_lowercase().contains("pizza") {
+                format!(
+                    "“A simple margherita tells you a lot about the dough and the oven,” said {}, a food writer.",
+                    pick(&AUTHORS, 1)
+                )
+            } else if title.to_lowercase().contains("car") {
+                format!(
+                    "“A missing service history can cost more than the saving on the asking price,” said {}, a motoring editor.",
+                    pick(&AUTHORS, 1)
+                )
             } else {
-                paras(&claims)
+                format!(
+                    "“The date and the scope of a comparison matter,” said {}, a research editor.",
+                    pick(&AUTHORS, 1)
+                )
             };
-            let byline = if kind == "blog" {
-                format!("Posted by {author} on <time datetime=\"{date}\">{when}</time>")
+            let next = if scenario && !title.to_lowercase().contains("downgrade") {
+                "CISA added the flaw to its exploited vulnerabilities catalog on September 26. The advisory describes turning off the WAN portal as an interim measure until the firmware upgrade is complete."
+            } else if title.to_lowercase().contains("sourdough") {
+                "The next feeding cycle offers a chance to see whether the culture is gaining strength. A consistent rise matters more than one unusually active day."
             } else {
-                format!("By {author} · <time datetime=\"{date}\">{when}</time>")
+                &article.tip
             };
-            let mut body = format!("<h1>{t}</h1>\n<p class=\"byline\">{byline}</p>\n{text}");
-            if claims.is_empty() {
-                body.push_str(&format!(
-                    "<p><a href=\"/{slug}-what-we-know\">Background on {t}</a></p>"
-                ));
-            }
-            (body, &[], "")
+            let next = escape(next);
+            let reported = format!("<p>{detail}</p>");
+            format!(
+                "<h1>{t}</h1><p class=\"byline\">By {} · <time datetime=\"{date}\">{when}</time></p>{lead_html}{reported}<h2>{}</h2><blockquote><p>{}</p></blockquote><h2>What happens next</h2><p>{next}</p>",
+                pick(&AUTHORS, 0),
+                if scenario {
+                    "What Halvard said"
+                } else {
+                    "A closer look"
+                },
+                escape(&quote)
+            )
         }
     };
-    page.body = body;
-    if host == "www.ebay.com" {
-        page.body.push_str(&format!("<h2>Item details</h2><dl><dt>Item</dt><dd>{t}</dd><dt>Condition</dt><dd>See the seller’s description</dd><dt>Included accessories</dt><dd>Contact the seller for details</dd></dl><h2>Description</h2><p>Review the description and included accessories before purchasing. Ask the seller about compatibility with your equipment.</p>"));
-    } else if host == "www.linkedin.com" {
-        page.body.push_str(&format!("<h2>About</h2><p>{t}</p><h3>Company information</h3><p>Visit the company’s website for its services, locations and contact information.</p>"));
+    if !article.example.is_empty() && !body.contains("<code>") {
+        body.push_str(&format!("<h2>Example</h2>{reference}"));
     }
-    let topic = words(&title);
-    if kind == "howto" && host != "www.wikihow.com" {
-        page.body.push_str("<h2>Ingredients and techniques</h2><p>Read the method before starting. Compare ingredient weights, preparation, resting and cooking times. Techniques such as kneading, feeding cultures or folding mixtures depend on the recipe; follow the instructions for the food you are making.</p><h2>Check the result</h2><p>Keep notes on measurements, timing and texture. Change one variable at a time when comparing methods.</p>");
-    } else if topic
-        .iter()
-        .any(|w| ["flight", "flights", "airfare", "airline"].contains(&w.as_str()))
-    {
-        page.body.push_str("<h2>Plan your departure</h2><p>Choose dates and airports before comparing itineraries. Compare nearby departure airports and allow time for the transfer from the arrival airport to your destination.</p><h2>Before booking</h2><ul><li>Compare direct journeys with connections and check the total travel time.</li><li>Review cabin baggage, checked baggage and change conditions for the fare.</li><li>Confirm the current schedule, price and availability on the booking page for your dates.</li></ul>");
-    } else if kind == "docs"
-        && !matches!(host, "www.tp-link.com" | "www.netgear.com" | "www.asus.com")
-    {
-        page.body.push_str("<h2>Work through a small example</h2><p>Check the language version and read the reference for the syntax or API involved. Reduce the program to the smallest input that reproduces the behaviour. Trace the data through each operation:</p><pre><code>input → operation → output</code></pre><h2>Compare approaches</h2><p>Review boundary cases and the lifetime of values. Consult the language reference for ownership and borrowing rules where applicable.</p>");
-    } else if kind == "howto" {
-        page.body.push_str(&format!("<h2>Steps: {t}</h2><ol>"));
-        for step in claims
-            .iter()
-            .flat_map(|claim| claim.split(". "))
-            .filter(|step| !step.is_empty())
-        {
-            page.body.push_str(&format!("<li>{}</li>", escape(step)));
-        }
-        page.body.push_str("<li>Read the instructions and check which tools and materials are needed.</li><li>Prepare the workspace and protect nearby surfaces.</li><li>Work through the method one stage at a time.</li><li>Inspect the result before returning the item to regular use.</li></ol>");
-    } else if kind == "listings" || subject.to_lowercase().starts_with("the 10 best") {
-        let venues = claims
-            .first()
-            .and_then(|claim| claim.split_once(": "))
-            .map(|(_, names)| names.split(". Compare").next().unwrap_or(names))
-            .filter(|names| names.contains(';'));
-        let names: Vec<_> = venues
-            .map(|names| names.split(';').map(str::trim).collect())
-            .unwrap_or_default();
-        let details = [
-            "Compare the menu and recent comments about food and service.",
-            "Check the walking route and allow time for a table at busy periods.",
-            "Ask about the daily specials and any dietary requirements.",
-            "Check whether the kitchen offers smaller portions at lunchtime.",
-            "Compare indoor seating and collection options before travelling.",
-            "Compare menus and check when the kitchen serves food.",
-            "Check vegetarian choices and ask about ingredients.",
-            "Confirm the last food orders when planning an evening visit.",
-            "Ask about space for a group and the reservation conditions.",
-            "Compare takeaway and table service if you want a quick meal.",
-        ];
-        page.body.push_str(&format!(
-            "<section class=\"restaurant-list\"><h2>Places for {}</h2><ol>",
-            escape(subject.trim_start_matches("The 10 best places for "))
-        ));
-        for (name, detail) in names.iter().zip(details) {
-            page.body.push_str(&format!(
-                "<li><h3>{}</h3><p>{detail}</p></li>",
-                escape(name)
+    if matches!(kind, "news" | "blog") {
+        let slug = target.split('?').next().unwrap_or(target).trim_matches('/');
+        if !slug.ends_with("-what-we-know") {
+            body.push_str(&format!(
+                "<aside><a href=\"/{slug}-what-we-know\">Timeline and reactions</a></aside>"
             ));
         }
-        page.body.push_str("</ol></section>");
     }
+    if matches!(kind, "company" | "government" | "shop") {
+        body.push_str("<div><a class=\"btn\" href=\"/contact/\">Contact us</a> · <a href=\"/support/\">Get support</a></div>");
+    }
+    if host == "www.ebay.com" {
+        body.push_str("<h2>Item details</h2><p>Compare the model number and included accessories before purchasing.</p>");
+    }
+    if host == "www.linkedin.com" {
+        body.push_str("<h2>About</h2><p>Company information, services and contact details.</p>");
+    }
+    page.body = body;
     if host == "github.com" {
         page.body = format!(
             "<nav class=\"repo-tabs\"><a href=\"{target}\">Code</a><a href=\"{target}/issues\">Issues</a><a href=\"{target}/pulls\">Pull requests</a><a href=\"{target}/actions\">Actions</a></nav><h2>{}</h2><p>Public repository</p><table><tr><td>README.md</td><td>Documentation and usage</td></tr></table><article class=\"markdown-body\"><h2>README.md</h2>{}</article>",
@@ -1708,18 +4156,7 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
         );
     }
     page.content_type = "text/html; charset=utf-8".into();
-    page.description = excerpt(
-        snippets
-            .first()
-            .or(claims.first())
-            .map_or(title.as_str(), String::as_str),
-        &url,
-    );
-    page.sidebar = sidebar
-        .iter()
-        .map(|(a, b)| ((*a).into(), (*b).into()))
-        .collect();
-    page.ad = ad.into();
+    page.description = excerpt(&lead);
     page
 }
 
@@ -1727,10 +4164,277 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
 mod tests {
     use super::*;
     #[test]
+    fn names_and_reference_routes_keep_their_spelling() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for (query, names) in [
+            ("cheap flights to lisbon", vec!["Lisbon"]),
+            ("best pizza in naples", vec!["Naples"]),
+            ("how to reset a netgear router", vec!["Netgear"]),
+            ("python itertools groupby example", vec!["Python"]),
+            (
+                "halvard hg-400 firmware downgrade",
+                vec!["Halvard", "HG-400"],
+            ),
+            ("weather in london tomorrow", vec!["London"]),
+            ("learn rust ownership", vec!["Rust"]),
+        ] {
+            let found = search(&seed, query, &[], Engine::Google);
+            for name in names {
+                assert!(
+                    found.results.iter().any(|r| r.title.contains(name)),
+                    "{query}: {name}"
+                );
+                for r in &found.results {
+                    if r.title.to_lowercase().contains(&name.to_lowercase()) {
+                        assert!(r.title.contains(name), "{}", r.title);
+                    }
+                }
+            }
+        }
+        for (query, host, path) in [
+            (
+                "python itertools groupby example",
+                "docs.python.org",
+                "/3/library/itertools.html#itertools.groupby",
+            ),
+            (
+                "learn rust ownership",
+                "doc.rust-lang.org",
+                "/book/ch04-00-understanding-ownership.html",
+            ),
+            (
+                "javascript promise not resolving",
+                "developer.mozilla.org",
+                "/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise",
+            ),
+        ] {
+            let found = search(&seed, query, &[], Engine::Google);
+            let r = found
+                .results
+                .iter()
+                .find(|r| target_of(&r.url).0 == host)
+                .unwrap();
+            assert_eq!(r.url, format!("https://{host}{path}"));
+        }
+        let known = super::super::store::Store::memory().known(&seed);
+        let found = search(
+            &seed,
+            "cve-2026-41877 halvard gateway",
+            &known,
+            Engine::Google,
+        );
+        assert!(
+            found
+                .results
+                .iter()
+                .any(|r| r.title.contains("CVE-2026-41877"))
+        );
+        for r in &found.results {
+            assert!(!r.title.contains("cve-2026-41877"), "{}", r.title);
+        }
+        let cast = prepared_cast(&seed);
+        assert!(!cast.is_empty());
+        let made = page(
+            &seed,
+            "www.bbc.com",
+            "/news/articles/c3x9q1k7v2po",
+            &[],
+            "news",
+            &cast,
+        );
+        assert!(cast.iter().any(|person| made.body.contains(&person.name)
+            && made.body.contains(&person.role)
+            && made.body.contains(&person.organization)));
+        assert!(!made.body.contains("broadband"));
+        assert!(!made.body.contains("factory reset"));
+    }
+
+    #[test]
+    fn subject_pages_have_structure_and_no_shared_prose() {
+        use kuchiki::traits::TendrilSink;
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for (kind, title, selector) in [
+            ("news", "Halvard firmware downgrade", "blockquote"),
+            ("howto", "Banana bread too dense - wikiHow", "ol li"),
+            ("docs", "Python itertools groupby example", "pre code"),
+            ("forum", "Router reset", ".post"),
+            ("wiki", "Banana bread too dense", "dl"),
+            ("listings", "Pizza in Naples", ".restaurant-list li"),
+        ] {
+            let mut paragraphs = std::collections::BTreeSet::new();
+            for host in ["news.one.org", "news.two.org", "news.three.org"] {
+                let made = page(
+                    &seed,
+                    host,
+                    "/guides/subject",
+                    &[serde_json::json!({"title":title})],
+                    kind,
+                    &[],
+                );
+                let dom = kuchiki::parse_html().one(made.body.clone());
+                assert!(dom.select_first(selector).is_ok(), "{kind}: {}", made.body);
+                assert_eq!(
+                    dom.select_first("h1").unwrap().text_contents(),
+                    heading(title)
+                );
+                for paragraph in dom
+                    .select("p:not(.byline):not(.author):not(.thread-meta)")
+                    .unwrap()
+                {
+                    let text = paragraph.text_contents();
+                    assert!(shares_words(&text, title), "{text}");
+                    assert!(paragraphs.insert(text.clone()), "{kind}: {text}");
+                    for filler in [
+                        "developing story",
+                        "Background on",
+                        "More on this",
+                        "Read the method before starting",
+                        "input → operation → output",
+                    ] {
+                        assert!(!text.contains(filler), "{text}");
+                    }
+                }
+                assert_eq!(
+                    made.body,
+                    page(
+                        &seed,
+                        host,
+                        "/guides/subject",
+                        &[serde_json::json!({"title":title})],
+                        kind,
+                        &[]
+                    )
+                    .body
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn searches_have_distinct_subject_snippets_and_section_paths() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for query in [
+            "banana bread too dense",
+            "cheap flights to lisbon",
+            "python itertools groupby example",
+            "best pizza in naples",
+            "how to reset a netgear router",
+            "halvard hg-400 firmware downgrade",
+            "hotels in porto",
+            "how to clean suede",
+            "satellite launch",
+        ] {
+            let found = search(&seed, query, &[], Engine::Google);
+            assert_eq!(found.results.len(), 10, "{query}");
+            let snippets: std::collections::BTreeSet<_> =
+                found.results.iter().map(|r| &r.snippet).collect();
+            assert_eq!(snippets.len(), 10, "{query}");
+            for result in found.results {
+                assert!(shares_words(&result.snippet, query), "{}", result.snippet);
+                let uri: http::Uri = result.url.parse().unwrap();
+                assert!(
+                    uri.path().trim_matches('/').contains('/') || uri.query().is_some(),
+                    "{}",
+                    result.url
+                );
+                let made = page(
+                    &seed,
+                    uri.host().unwrap(),
+                    uri.path(),
+                    &[serde_json::json!({"title":result.title,"snippet":result.snippet})],
+                    &site_profile(uri.host().unwrap()).kind,
+                    &[],
+                );
+                assert!(made.body.contains(&escape(&result.snippet)));
+                for filler in [
+                    "developing story",
+                    "Background on",
+                    "More on this",
+                    "Read the method before starting",
+                    "input → operation → output",
+                    "Market Kitchen; Station Restaurant",
+                ] {
+                    assert!(!made.body.contains(filler), "{filler}: {}", made.body);
+                }
+                assert!(!made.body.split("</h1>").next().unwrap().contains(" | "));
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_article_addresses_get_subject_titles() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for (host, target) in [
+            ("www.bbc.com", "/news/articles/c3x9q1k7v2po"),
+            ("www.reddit.com", "/r/sub/comments/abc123/"),
+            ("news.example.org", "/?p=12345"),
+            ("forum.example.org", "/t/12345"),
+            ("forum.example.org", "/forum/12345"),
+            ("www.bbc.com", "/news/articles/abcfedde"),
+            ("www.bbc.com", "/news/articles/oygfldkffels"),
+            ("www.reddit.com", "/r/networking/comments/abcxyz/"),
+        ] {
+            let made =
+                page_with_known(&seed, host, target, &[], &site_profile(host).kind, &[], &[]);
+            assert!(shares_words(&made.title, &seed.search), "{}", made.title);
+            assert_eq!(
+                made.body,
+                page_with_known(&seed, host, target, &[], &site_profile(host).kind, &[], &[]).body
+            );
+        }
+        assert_eq!(
+            title_from("news.example.org", "/science/moon-mission/12345"),
+            "Moon mission"
+        );
+        assert_eq!(
+            title_from("news.example.org", "/science/moon-mission-12345"),
+            "Moon mission"
+        );
+    }
+
+    #[test]
+    fn opaque_titles_draw_from_the_host_then_its_kind() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        let known = [
+            Result {
+                url: "https://www.bbc.com/news/firmware".into(),
+                title: "Halvard operators plan firmware upgrades | BBC News".into(),
+                ..Result::default()
+            },
+            Result {
+                url: "https://www.theregister.com/security/firmware".into(),
+                title: "Halvard gateway owners review maintenance plans | The Register".into(),
+                ..Result::default()
+            },
+        ];
+        let made = page_with_known(
+            &seed,
+            "www.bbc.com",
+            "/news/articles/c3x9q1k7v2po",
+            &[],
+            "news",
+            &known,
+            &[],
+        );
+        assert_eq!(made.title, "Halvard operators plan firmware upgrades");
+        let made = page_with_known(
+            &seed,
+            "news.example.org",
+            "/?edition=uk&p=123",
+            &[],
+            "news",
+            &known,
+            &[],
+        );
+        assert!(known.iter().any(|r| heading(&r.title) == made.title));
+        assert!(!made.body.contains("Search results for"));
+    }
+
+    #[test]
     fn unrelated_search_omits_seed_and_known_pages() {
         let seed = Seed::builtin("halvard-cve").unwrap();
         let known = super::super::store::Store::memory().known(&seed);
-        let found = search(&seed, "chicken tikka masala recipe", &known);
+        let found = search(&seed, "chicken tikka masala recipe", &known, Engine::Google);
         assert_eq!(found.results.len(), 10);
         for result in &found.results {
             assert!(!seed.fixed.iter().any(|f| f.url == result.url));
@@ -1738,7 +4442,7 @@ mod tests {
             assert!(seed.about(&host).is_none());
         }
         assert!(
-            search(&seed, "Halvard Gateway", &known)
+            search(&seed, "Halvard Gateway", &known, Engine::Google)
                 .results
                 .iter()
                 .any(|r| r.url == seed.fixed[0].url)
@@ -1784,6 +4488,7 @@ mod tests {
                 target,
                 &mentions,
                 "company",
+                &[],
             );
             let unique: std::collections::BTreeSet<_> = page.claims.iter().collect();
             assert_eq!(page.claims.len(), unique.len());
@@ -1796,20 +4501,20 @@ mod tests {
     #[test]
     fn results_and_pages() {
         let seed = Seed::builtin("halvard-cve").unwrap();
-        let found = search(&seed, "halvard gateway vulnerability", &[]);
+        let found = search(&seed, "halvard gateway vulnerability", &[], Engine::Google);
         assert_eq!(found.results.len(), 10);
         assert_eq!(
             found.results[0].url,
-            "https://www.halvardsystems.com/halvard-gateway-vulnerability"
+            "https://www.halvardsystems.com/security/advisories/halvard-gateway-vulnerability"
         );
         assert_eq!(
             found.results[0].title,
-            "Halvard gateway vulnerability | halvardsystems.com"
+            "Halvard Gateway vulnerability: firmware and security updates"
         );
-        let snippet = found.results[0]
-            .snippet
-            .trim_matches(|c| c == '.' || c == ' ');
-        assert!(seed.facts[0].contains(snippet), "{snippet}");
+        assert_eq!(
+            found.results[0].snippet,
+            "Halvard has released a firmware fix for its VPN appliances after a critical flaw was found in the web portal. The fixed firmware is 7.2.4."
+        );
         let today = parse_date(&seed.date).unwrap();
         let mut dates = std::collections::BTreeSet::new();
         for result in &found.results {
@@ -1836,7 +4541,14 @@ mod tests {
         let mentions = vec![
             serde_json::json!({"via":"search","title":"Écho 😀","snippet":"Say \"hi\" & go."}),
         ];
-        let p = page(&seed, "api.other.com", "/items.json", &mentions, "news");
+        let p = page(
+            &seed,
+            "api.other.com",
+            "/items.json",
+            &mentions,
+            "news",
+            &[],
+        );
         assert_eq!(p.content_type, "application/json");
         assert_eq!(
             serde_json::from_str::<Value>(&p.body).unwrap(),
@@ -1848,10 +4560,10 @@ mod tests {
             })
         );
         assert_eq!(
-            page(&seed, "other.com", "/items.txt", &mentions, "news").body,
+            page(&seed, "other.com", "/items.txt", &mentions, "news", &[]).body,
             "Écho 😀\n\nSay \"hi\" & go.\n"
         );
-        assert_eq!(site_profile("www.bbc.co.uk").name, "Bbc");
+        assert_eq!(site_profile("www.bbc.co.uk").name, "BBC News");
         assert_eq!(title_from("other.com", "/new_story.php?x=y"), "New story");
         assert_eq!(
             words("The v7.2.4 a-b .. x and café"),
@@ -1867,7 +4579,7 @@ mod tests {
                 audit.inspect("page URL", fixed.url.as_bytes());
                 audit.inspect("page", &fixed.body);
             }
-            let results = search(&seed, &seed.search, &[]);
+            let results = search(&seed, &seed.search, &[], Engine::Google);
             for result in results.results {
                 audit.inspect("result URL", result.url.as_bytes());
                 audit.inspect("result title", result.title.as_bytes());
@@ -1875,7 +4587,7 @@ mod tests {
                 let uri: http::Uri = result.url.parse().unwrap();
                 let host = uri.host().unwrap();
                 let profile = site_profile(host);
-                let page = page(&seed, host, uri.path(), &[], &profile.kind);
+                let page = page(&seed, host, uri.path(), &[], &profile.kind, &[]);
                 let rendered = super::super::render::page(host, &profile, &page, "2026");
                 audit.inspect("page", rendered.as_bytes());
             }
@@ -1910,9 +4622,9 @@ mod tests {
     #[test]
     fn excerpts_are_cut_text() {
         let long = "word ".repeat(80);
-        let cut = excerpt(&long, "key");
+        let cut = excerpt(&long);
         assert!(cut.ends_with(" ...") && cut.len() < 170, "{cut}");
-        assert_eq!(excerpt("Short text.", "key"), "Short text.");
+        assert_eq!(excerpt("Short text."), "Short text.");
     }
 
     #[test]
@@ -1921,7 +4633,7 @@ mod tests {
         let about = [serde_json::json!({"title": "HG-400 firmware", "snippet": seed.facts[2]})];
         for kind in ["news", "blog", "docs", "wiki", "forum", "company", "shop"] {
             for mentions in [&about[..], &[]] {
-                let made = page(&seed, "site.example.org", "/hg-400", mentions, kind);
+                let made = page(&seed, "site.example.org", "/hg-400", mentions, kind, &[]);
                 let body = made.body.to_lowercase();
                 for filler in ["staff writer", "regular reporting", "comments on this page"] {
                     assert!(!body.contains(filler), "{kind}: {filler}");
@@ -1934,11 +4646,18 @@ mod tests {
                 assert!(made.date <= seed.date, "{kind}: {}", made.date);
             }
         }
-        let wiki = page(&seed, "en.wikipedia.org", "/wiki/Hg_400", &[], "wiki");
+        let wiki = page(&seed, "en.wikipedia.org", "/wiki/Hg_400", &[], "wiki", &[]);
         assert!(wiki.body.contains("may refer to"));
-        let docs = page(&seed, "docs.example.org", "/hg-400", &about, "docs");
+        let docs = page(&seed, "docs.example.org", "/hg-400", &about, "docs", &[]);
         assert!(docs.body.contains("On this page") && docs.body.contains(&escape(&seed.facts[2])));
-        let thread = page(&seed, "community.example.org", "/t/hg-400", &about, "forum");
+        let thread = page(
+            &seed,
+            "community.example.org",
+            "/t/hg-400",
+            &about,
+            "forum",
+            &[],
+        );
         assert!(thread.body.contains("class=\"post\""));
     }
 }

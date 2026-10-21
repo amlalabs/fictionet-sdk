@@ -101,10 +101,22 @@
 
 
     <style>
+#mainArticleSection { max-width: 1120px; margin: 0 auto; padding: 24px; }
+#mainArticleSection .page-breadcrumb { margin: 0 0 20px; }
+#mainArticleSection main.pageWidth { max-width: 760px; margin: 0; padding: 0; }
+#mainArticleSection main p { font-size: 18px; line-height: 1.6; }
+#mainArticleSection main h1 { margin-top: 0; }
+#mainArticleSection nav[aria-label="Contents"], #mainArticleSection .page-date { max-width: 760px; }
+
 @media (min-width: 1024px) {
-.pageHeader .row.mainrow > .search.to-be-expanded { flex: 0 0 44px; width: 44px; order: 4; position: relative; }
-.pageHeader .row.mainrow > .navigation.topBarMenu { flex: 0 0 auto; width: auto; margin-right: 16px; }
+.pageHeader .row.mainrow { flex-wrap: nowrap; align-items: center; }
+.pageHeader .row.mainrow > .search.to-be-expanded { flex: 0 0 44px; width: 44px; order: 3; position: relative; margin: 0 16px 0 auto; }
+.pageHeader .row.mainrow > .navigation.topBarMenu { flex: 0 0 auto; width: max-content; order: 4; margin: 0; white-space: nowrap; }
+.pageHeader .topBarMenu .menu-list { flex-wrap: nowrap; }
 .pageHeader .search.to-be-expanded .search-expander { position: static; width: 44px; height: 44px; }
+.pageHeader .bottom-row .section { width: 100%; min-width: 0; }
+.pageHeader .bottom-row .menu-list { width: 100%; justify-content: space-evenly; }
+.pageHeader .row.bottom-row .section .navigation.customMenu1 .menu-list .first-list-item a { padding-inline: clamp(8px, 1.1vw, 16px); }
 }
 </style></head>
 
@@ -409,15 +421,6 @@
 
 
         <section id="mainArticleSection" class="main article">
-            <div class="placeholder placement-top">
-<div class="column google-ad small-12 large-12 small-abs-12 large-abs-12" style="">
-
-        <span class="ad-label">REG AD</span>
-        <div class="adunit" id="labrador/thereg/article/desktop/a" style="min-height:90px;"><div id="google_ads_iframe_/6978/labrador/thereg/article/desktop/a_0__container__" style="border: 0pt;"></div></div>
-
-</div>
-
-</div>
             <nav class="page-breadcrumb" aria-label="Breadcrumb"></nav><main class="pageWidth"><h1 class="headline mainTitle below"></h1><h2 class="headline t19"></h2><p style="" class=" lab-article-section lab-article-section-top "></p></main><nav aria-label="Contents"><ul class="page-contents"></ul></nav><p class="page-date"></p>
 
 

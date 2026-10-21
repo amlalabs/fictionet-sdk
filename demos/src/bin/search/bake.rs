@@ -24,7 +24,7 @@ use fictionet_extras::search::Engine;
 use super::{Result, checks::search_url};
 
 /// The most model calls one bake makes, retries included.
-const CALLS: usize = 300;
+const CALLS: usize = 400;
 /// The most calls one search or page can take: three attempts for each of
 /// two asks.
 const MOST_PER_ITEM: usize = 6;
@@ -57,13 +57,14 @@ fn lines(text: &str) -> Result<Vec<Line>> {
     Ok(out)
 }
 
-/// Model calls so far: the attempt rows in `generations.jsonl`.
-fn calls(root: &Path) -> usize {
+/// Model attempts after the starting count.
+fn calls(root: &Path, started: usize) -> usize {
     std::fs::read_to_string(root.join("generations.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter(|line| line.contains("\"record\":\"attempt\""))
         .count()
+        .saturating_sub(started)
 }
 
 pub async fn run() -> Result {
@@ -75,6 +76,7 @@ pub async fn run() -> Result {
     )?;
     let list = lines(&list)?;
     let root = store::canned_root(&seed.name);
+    let started = calls(&root, 0);
     let provider = Provider::OpenRouter;
     let key = Key::from_env(provider.into())?;
     println!(
@@ -91,8 +93,9 @@ pub async fn run() -> Result {
             let (store, _) = Store::open(&root, &seed, Some(&maker.identity()))
                 .map_err(fictionet::Error::msg)?;
             let pages = Arc::new(Pages::open(seed, store, Some(maker), 0));
-            let fits = || calls(&root) + MOST_PER_ITEM <= CALLS;
+            let fits = || calls(&root, started) + MOST_PER_ITEM <= CALLS;
             let mut searches = 0;
+            let mut failed = 0;
             let mut stopped = None;
             'list: for line in &list {
                 let urls = match line {
@@ -103,18 +106,24 @@ pub async fn run() -> Result {
                         }
                         let (host, target) = target_of(&search_url(*engine, words));
                         let response = pages.handle(&cx, "GET", &host, &target, None).await;
+                        // A search the model could not write within its
+                        // attempts is left out; the app makes it on the spot.
                         let Meta::Search(listing) = &response.meta else {
-                            return Err(fictionet::Error::msg(format!(
-                                "the search {words:?} failed: HTTP {}: {:?}",
-                                response.status, response.meta
-                            )));
+                            println!(
+                                "{} search {words:?} not made: HTTP {}: {:?}",
+                                example_common::names::name(engine),
+                                response.status,
+                                response.meta
+                            );
+                            failed += 1;
+                            continue;
                         };
                         searches += 1;
                         println!(
                             "{} search {words:?}: {} results, {} calls so far",
                             example_common::names::name(engine),
                             listing.listed.len(),
-                            calls(&root)
+                            calls(&root, started)
                         );
                         listing.listed.iter().map(|(url, _)| url.clone()).collect()
                     }
@@ -133,8 +142,8 @@ pub async fn run() -> Result {
                 }
             }
             println!(
-                "{searches} searches, {} model calls{}",
-                calls(&root),
+                "{searches} searches, {failed} not made, {} model calls{}",
+                calls(&root, started),
                 stopped.map_or(String::new(), |at| format!(", stopped {at}"))
             );
             Ok(())
@@ -212,6 +221,23 @@ fn keep_made(root: &Path, seed: &Seed) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bake_counts_only_its_own_attempts() {
+        let root = std::env::temp_dir().join(format!("bake-calls-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let row = "{\"record\":\"attempt\"}\n";
+        std::fs::write(root.join("generations.jsonl"), row.repeat(151)).unwrap();
+        let started = calls(&root, 0);
+        assert_eq!(started, 151);
+        assert_eq!(calls(&root, started), 0);
+        std::fs::write(root.join("generations.jsonl"), row.repeat(545)).unwrap();
+        assert_eq!(calls(&root, started), CALLS - MOST_PER_ITEM);
+        assert!(calls(&root, started) + MOST_PER_ITEM <= CALLS);
+        std::fs::write(root.join("generations.jsonl"), row.repeat(546)).unwrap();
+        assert!(calls(&root, started) + MOST_PER_ITEM > CALLS);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn the_query_list_names_an_engine_or_an_address_per_line() {

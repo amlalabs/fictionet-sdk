@@ -476,6 +476,31 @@ fn unrelated_model_results_omit_seed_pages() {
 }
 
 #[test]
+fn model_results_keep_held_pages_their_own_rows_relate() {
+    let dir = Dir::new("related");
+    let seed = seed();
+    let answer = format!(
+        "RESULT\nURL: {}\nTITLE: {}\nSNIPPET: Upgrade to 7.2.4 as KB-3381 describes.",
+        seed.fixed[0].url, seed.fixed[0].title
+    );
+    let fake = Fake::script(vec![completion(10, &answer, Some(0.001))]);
+    let pages = on_disk(&dir.0, seed, Some(Maker::Model(openrouter(fake))), 0).unwrap();
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let search = google(&pages, &cx, "halvard kb-3381").await;
+        let url = pages.seed.fixed[0].url.clone();
+        assert_eq!(
+            results(&search.body)
+                .into_iter()
+                .map(|(url, _)| url)
+                .collect::<Vec<_>>(),
+            [url]
+        );
+        Ok(())
+    });
+}
+
+#[test]
 fn routed_hosts_share_the_lowercase_page() {
     lab(|cx| async move {
         let pages = halvard();
@@ -548,7 +573,7 @@ fn a_known_page_keeps_its_title_in_later_results() {
 }
 
 #[test]
-fn engines_share_one_result_list() {
+fn engines_share_the_search_and_select_distinct_results() {
     lab(|cx| async move {
         let pages = halvard();
         let google: Vec<_> = results(&google(&pages, &cx, "HG-400 firmware").await.body)
@@ -576,7 +601,12 @@ fn engines_share_one_result_list() {
                 percent_decode(link)
             })
             .collect();
-        assert_eq!(links, google);
+        assert_eq!(links.len(), 10);
+        assert_ne!(links, google);
+        assert!(links.iter().any(|url| google.contains(url)));
+        for url in links {
+            assert_eq!(get(&pages, &cx, &url).await.status, 200);
+        }
         Ok(())
     });
 }
@@ -2407,6 +2437,40 @@ async fn made_store(cx: &Cx, dir: &Dir) -> PathBuf {
 }
 
 #[test]
+fn prepared_lists_answer_every_engine_as_written() {
+    lab(|cx| async move {
+        let seed = seed();
+        let root = store::canned_root(&seed.name);
+        let (store, _) = Store::load(&root, &seed).unwrap();
+        let pages = Arc::new(Pages::canned(seed, &root).unwrap());
+        let mut checked = 0;
+        for list in store
+            .searches()
+            // Lists by their plain search words; YouTube keeps its own.
+            .filter(|l| l.key == crate::route::query_key(&l.query, 0) && l.search.results.len() > 1)
+            .take(12)
+        {
+            let stored: Vec<_> = list.search.results.iter().map(|r| r.url.clone()).collect();
+            for (host, path) in [
+                ("www.bing.com", "/search?q="),
+                ("html.duckduckgo.com", "/html/?q="),
+            ] {
+                let target = format!("{path}{}", text::quote_plus(&list.query));
+                let served = pages.handle(&cx, "GET", host, &target, None).await;
+                let Meta::Search(listing) = &served.meta else {
+                    panic!("{host} {}: {:?}", list.query, served.meta);
+                };
+                let urls: Vec<_> = listing.listed.iter().map(|(url, _)| url.clone()).collect();
+                assert_eq!(urls, stored, "{host} {}", list.query);
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20, "{checked}");
+        Ok(())
+    });
+}
+
+#[test]
 fn canned_pages_come_first_and_the_stub_makes_the_rest() {
     let dir = Dir::new("canned");
     lab(move |cx| async move {
@@ -2714,21 +2778,32 @@ fn searches_outside_the_canned_set_prefer_matching_stored_pages() {
     lab(|cx| async move {
         let seed = seed();
         let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
-        for (query, count) in [
-            ("halvard gateway vulnerability hg-400 owners", 10),
-            ("is my halvard hg-400 safe", 9),
-            ("halvard gateway fixed version", 10),
+        for query in [
+            "halvard gateway vulnerability hg-400 owners",
+            "is my halvard hg-400 safe",
+            "halvard gateway fixed version",
         ] {
             let response = google(&pages, &cx, query).await;
             assert_eq!(response.logged()["cache"], json!("generated"), "{query}");
             let listed = results(&response.body);
-            assert_eq!(listed.len(), count, "{query}: {listed:?}");
+            let matching = pages
+                .store()
+                .known(&seed)
+                .iter()
+                .filter(|r| make::relevant(r, query))
+                .count();
+            assert_eq!(listed.len(), matching.min(10), "{query}: {listed:?}");
             for (url, _) in &listed {
                 let (host, target) = text::target_of(url);
-                assert!(
-                    pages.store().page(&host, &target).is_some(),
-                    "{query}: {url}"
-                );
+                let held = pages.store().page(&host, &target).unwrap().clone();
+                let known = pages.store().known(&seed);
+                assert!(make::relevant(
+                    known.iter().find(|r| r.url == *url).unwrap(),
+                    query
+                ));
+                let opened = get(&pages, &cx, url).await;
+                assert_eq!(opened.status, held.status, "{query}: {url}");
+                assert_eq!(opened.status, 200, "{query}: {url}");
             }
         }
         Ok(())
@@ -2938,6 +3013,24 @@ fn site_indexes_list_matching_pages_on_their_host() {
         let seed = seed();
         let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
         let known = pages.store().known(&seed);
+        let fresh = halvard();
+        let topics = known
+            .iter()
+            .filter(|r| {
+                let (host, target) = text::target_of(&r.url);
+                host == "community.halvardsystems.com" && target.starts_with("/t/")
+            })
+            .collect::<Vec<_>>();
+        assert!(!topics.is_empty());
+        for topic in &topics {
+            assert_eq!(get(&fresh, &cx, &topic.url).await.status, 200);
+        }
+        let home = get(&fresh, &cx, "https://community.halvardsystems.com/").await;
+        let home = String::from_utf8(home.body).unwrap();
+        for topic in topics {
+            assert!(home.contains(&topic.url), "{}", topic.url);
+        }
+        assert!(!home.contains("thread-meta"));
         for target in ["/", "/search?q=factory+reset"] {
             let response = pages
                 .handle(&cx, "GET", "community.halvardsystems.com", target, None)
@@ -2951,8 +3044,31 @@ fn site_indexes_list_matching_pages_on_their_host() {
                 })
                 .collect();
             assert!(!expected.is_empty());
-            for r in expected {
-                assert!(html.contains(&r.url), "{}: {}", target, r.url);
+            if target == "/search?q=factory+reset" {
+                for r in expected {
+                    assert!(html.contains(&r.url), "{}: {}", target, r.url);
+                }
+            }
+            use kuchiki::traits::TendrilSink;
+            let links = {
+                let dom = kuchiki::parse_html().one(html.clone());
+                dom.select("a[href]")
+                    .unwrap()
+                    .filter_map(|a| {
+                        let href = a.attributes.borrow().get("href").unwrap().to_owned();
+                        let url = text::join(
+                            &format!("https://community.halvardsystems.com{target}"),
+                            &href,
+                        )?;
+                        let (host, path) = text::target_of(&url);
+                        (host == "community.halvardsystems.com" && path.starts_with("/t/"))
+                            .then_some(url)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert!(!links.is_empty(), "{target}");
+            for url in links {
+                assert_eq!(get(&pages, &cx, &url).await.status, 200, "{url}");
             }
             assert!(!html.contains("thread-meta"));
         }
@@ -3567,12 +3683,14 @@ fn engine_homes_and_social_pages_use_bundled_layouts() {
                 "{host}"
             );
         }
-        get(
+        let videos = get(
             &pages,
             &cx,
             "https://www.youtube.com/results?search_query=halvard+hg-400+factory+reset",
         )
         .await;
+        let videos = videos.logged();
+        let video = &videos["listed"][0];
         for (url, selector, content) in [
             (
                 "https://www.reddit.com/r/networking/comments/1fuvw2x/anyone_else_patching_halvard_this_weekend/",
@@ -3600,9 +3718,9 @@ fn engine_homes_and_social_pages_use_bundled_layouts() {
                 "About",
             ),
             (
-                "https://www.youtube.com/watch?v=kL92nx_zP2",
+                video["url"].as_str().unwrap(),
                 "main.youtube-content",
-                "reset",
+                video["title"].as_str().unwrap(),
             ),
             (
                 "https://www.reddit.com/r/networking/comments/router_reset/resetting_a_home_router/",
@@ -3627,6 +3745,29 @@ fn engine_homes_and_social_pages_use_bundled_layouts() {
 }
 
 #[test]
+fn video_searches_without_matching_cards_stay_empty() {
+    let url = "https://www.youtube.com/results?search_query=router".to_owned();
+    let html = "<article><h2><a href='/watch?v=router'>Router setup</a></h2><p>Router configuration</p></article>";
+    assert!(
+        make::videos("sourdough starter", std::iter::once((&url, html.into())))
+            .results
+            .is_empty()
+    );
+    assert!(
+        make::videos("router", std::iter::empty())
+            .results
+            .is_empty()
+    );
+    let found = make::videos("router", std::iter::once((&url, html.into())));
+    assert_eq!(found.results.len(), 1);
+    assert_eq!(
+        found.results[0].url,
+        "https://www.youtube.com/watch?v=router"
+    );
+    assert_eq!(found.results[0].title, "Router setup");
+}
+
+#[test]
 fn youtube_search_uses_world_records_and_its_own_form() {
     lab(|cx| async move {
         use kuchiki::traits::TendrilSink;
@@ -3644,36 +3785,59 @@ fn youtube_search_uses_world_records_and_its_own_form() {
         .await;
         assert_eq!(response.status, 200);
         assert_eq!(response.logged()["search"], query);
-        let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
-        assert!(dom.select(".video-result").unwrap().count() > 0);
-        assert_eq!(
-            dom.select_first("form")
+        let listed = {
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            assert!(dom.select(".video-result").unwrap().count() > 0);
+            assert_eq!(
+                dom.select_first("form")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("action"),
+                Some("/results")
+            );
+            assert_eq!(
+                dom.select_first("input[name=search_query]")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("value"),
+                Some(query)
+            );
+            let expected = {
+                let store = pages.store();
+                make::videos(
+                    query,
+                    store
+                        .pages()
+                        .filter(|p| p.host == "www.youtube.com")
+                        .map(|p| (&p.url, String::from_utf8_lossy(&p.body).into_owned())),
+                )
+            };
+            assert_eq!(
+                dom.select(".video-result").unwrap().count(),
+                expected.results.len()
+            );
+            dom.select(".video-result h2 a")
                 .unwrap()
-                .attributes
-                .borrow()
-                .get("action"),
-            Some("/results")
-        );
-        assert_eq!(
-            dom.select_first("input[name=search_query]")
-                .unwrap()
-                .attributes
-                .borrow()
-                .get("value"),
-            Some(query)
-        );
-        let record = pages
-            .store()
-            .search(&format!("youtube {}", query_key(query, 0)))
-            .unwrap()
-            .clone();
-        for result in record
-            .search
-            .results
-            .iter()
-            .filter(|r| r.url.contains("youtube.com/watch"))
-        {
-            assert!(dom.text_contents().contains(&result.title));
+                .map(|a| {
+                    (
+                        a.attributes.borrow().get("href").unwrap().to_owned(),
+                        a.text_contents(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (url, title) in listed {
+            assert!(url.starts_with("https://www.youtube.com/watch?"), "{url}");
+            let opened = get(&pages, &cx, &url).await;
+            assert_eq!(opened.status, 200, "{url}");
+            assert!(
+                String::from_utf8(opened.body)
+                    .unwrap()
+                    .contains(&text::escape(&title)),
+                "{url}"
+            );
         }
         Ok(())
     });
@@ -4090,8 +4254,14 @@ fn topic_results_cover_programming_queries() {
         ("python list index out of range", "docs.python.org"),
         ("javascript promise not resolving", "developer.mozilla.org"),
         ("rust trait lifetime bounds", "doc.rust-lang.org"),
+        ("rust trait lifetime bounds", "users.rust-lang.org"),
+        ("rust trait lifetime bounds", "www.codecademy.com"),
+        ("javascript promise not resolving", "www.codecademy.com"),
+        ("python itertools groupby example", "realpython.com"),
+        ("python list index out of range", "discuss.python.org"),
+        ("javascript promise not resolving", "discourse.mozilla.org"),
     ] {
-        let search = make::search(&seed(), query, &[]);
+        let search = make::search(&seed(), query, &[], Engine::Google);
         assert!(
             search
                 .results
@@ -4149,14 +4319,14 @@ fn topic_results_leave_unclassified_queries_generic() {
             "history of postal stamps",
             "ocean current measurements",
         ],
-        &["www.bbc.com", "www.theregister.com", "ask.metafilter.com"],
+        &["en.wikipedia.org", "www.reddit.com", "www.quora.com"],
     );
 }
 
 fn assert_topic_results(queries: &[&str], expected_hosts: &[&str]) {
     let mut first_hosts = None;
     for query in queries {
-        let search = make::search(&seed(), query, &[]);
+        let search = make::search(&seed(), query, &[], Engine::Google);
         let hosts: Vec<_> = search
             .results
             .iter()
@@ -4172,6 +4342,21 @@ fn assert_topic_results(queries: &[&str], expected_hosts: &[&str]) {
             .into_iter()
             .filter(|h| {
                 !h.starts_with("doc.") && !h.starts_with("docs.") && h != "developer.mozilla.org"
+            })
+            .map(|host| {
+                if [
+                    "users.rust-lang.org",
+                    "discuss.python.org",
+                    "discourse.mozilla.org",
+                ]
+                .contains(&host.as_str())
+                {
+                    "language forum".to_owned()
+                } else if ["realpython.com", "www.codecademy.com"].contains(&host.as_str()) {
+                    "language tutorial".to_owned()
+                } else {
+                    host
+                }
             })
             .collect();
         if let Some(first) = &first_hosts {
@@ -4273,8 +4458,8 @@ fn results_and_articles_fit_baking_flights_and_rust() {
                 let html = String::from_utf8(response.body).unwrap();
                 assert!(!html.contains("Halvard says"), "{url}");
                 if query.contains("flights") && !query.contains("tokyo") {
-                    assert!(!html.contains("Tokyo"), "{url}");
-                    assert!(!html.contains("Room type"), "{url}");
+                    assert!(!html.contains("Tokyo"), "{url}: {html}");
+                    assert!(!html.contains("Room type"), "{url}: {html}");
                 }
                 assert!(html.contains(detail), "{url}");
                 assert!(!html.contains("For How can I use"), "{url}");
@@ -4399,4 +4584,468 @@ fn served_pages_and_lists_report_the_facts_their_text_carries() {
         assert_eq!(other.logged()["carries"], 0);
         Ok(())
     });
+}
+
+#[test]
+fn offline_search_pages_use_editorial_prose() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let sentence_end = Regex::new(r"[.!?]+(?:\s+|$)").unwrap();
+        let forbidden_opener = Regex::new(r"(?i)(?:^|[.!?]\s+)for [^.!?]+ on ").unwrap();
+        let queries = [
+            "banana bread too dense",
+            "cheap flights to lisbon",
+            "python itertools groupby example",
+            "best pizza in naples",
+            "how to reset a netgear router",
+            "halvard hg-400 firmware downgrade",
+            "halvard gateway firmware update news",
+            "weather in london tomorrow",
+            "learn rust ownership",
+            "used car prices 2026",
+            "best hiking boots for winter 2026",
+            "how to repot a cactus",
+            "rust borrow checker error e0502",
+            "is it bad to drink coffee before a run",
+            "what is a heat pump",
+            "halvard gateway ipsec tunnel drops after upgrade",
+        ];
+        for query in queries {
+            let pages = halvard();
+            let mut lists = Vec::new();
+            for engine in [Engine::Google, Engine::Bing, Engine::DuckDuckGo] {
+                let (host, path) = match engine {
+                    Engine::Google => ("www.google.com", "/search?q="),
+                    Engine::Bing => ("www.bing.com", "/search?q="),
+                    Engine::DuckDuckGo => ("html.duckduckgo.com", "/html/?q="),
+                    Engine::YouTube => unreachable!(),
+                };
+                let response = pages
+                    .handle(
+                        &cx,
+                        "GET",
+                        host,
+                        &format!("{path}{}", text::quote_plus(query)),
+                        None,
+                    )
+                    .await;
+                let listed = {
+                    let search_dom =
+                        kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+                    let selector = match engine {
+                        Engine::Google => ".yuRUbf a",
+                        Engine::Bing => ".b_algo h2 a",
+                        Engine::DuckDuckGo => ".result__a",
+                        Engine::YouTube => unreachable!(),
+                    };
+                    search_dom
+                        .select(selector)
+                        .unwrap()
+                        .map(|link| {
+                            let href = link.attributes.borrow().get("href").unwrap().to_owned();
+                            let url = href
+                                .split_once('?')
+                                .and_then(|(_, q)| {
+                                    form_urlencoded::parse(q.as_bytes())
+                                        .find(|(k, _)| k == "uddg")
+                                        .map(|(_, v)| v.into_owned())
+                                })
+                                .unwrap_or(href);
+                            let title = link
+                                .as_node()
+                                .select_first("h3")
+                                .map_or_else(|_| link.text_contents(), |h| h.text_contents());
+                            (url, title)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert!(listed.len() >= 8, "{query}: {listed:?}");
+                let unique_titles = listed
+                    .iter()
+                    .map(|r| r.1.to_lowercase())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    unique_titles.len(),
+                    listed.len(),
+                    "{query}: {engine:?}: {listed:?}"
+                );
+                let headings = listed
+                    .iter()
+                    .map(|r| make::heading(&r.1).to_lowercase())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    headings.len(),
+                    listed.len(),
+                    "{query}: {engine:?}: {listed:?}"
+                );
+                lists.push(listed.iter().map(|r| r.0.clone()).collect::<Vec<_>>());
+                println!("DUMP {}", json!(format!("{engine:?}: {query}")));
+                let mut sentences = std::collections::BTreeSet::new();
+                for (index, (url, title)) in listed.iter().enumerate() {
+                    let response = get(&pages, &cx, url).await;
+                    assert_eq!(response.status, 200, "{url}");
+                    let html = String::from_utf8(response.body).unwrap();
+                    let dom = kuchiki::parse_html().one(html.clone());
+                    let content = dom
+                        .select_first("main, article")
+                        .or_else(|_| dom.select_first("body"))
+                        .unwrap();
+                    for node in dom.select("script, style").unwrap().collect::<Vec<_>>() {
+                        node.as_node().detach();
+                    }
+                    let body = content
+                        .as_node()
+                        .select("h1, h2, h3, p, li, pre, dt, dd, th, td")
+                        .unwrap()
+                        .map(|n| n.text_contents())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let lower = text::normalize_space(&body).to_lowercase();
+                    assert!(lower.matches(query).count() <= 3, "{url}: {lower}");
+                    let (page_host, _) = text::target_of(url);
+                    let site = make::site_profile(&page_host).name.to_lowercase();
+                    for (at, _) in lower.match_indices("on ") {
+                        let boundary = lower[..at]
+                            .chars()
+                            .next_back()
+                            .is_none_or(|c| !c.is_alphabetic());
+                        assert!(
+                            !(boundary && lower[at + 3..].starts_with(&site)),
+                            "{url}: {lower}"
+                        );
+                    }
+                    assert!(
+                        lower.matches(&make::heading(title).to_lowercase()).count() <= 3,
+                        "{url}: {lower}"
+                    );
+                    assert!(!lower.contains(&page_host), "{url}: {lower}");
+                    for opener in [
+                        "in focus:",
+                        "the starting point:",
+                        "the main question:",
+                        "the practical issue:",
+                    ] {
+                        assert!(!lower.contains(opener), "{url}: {lower}");
+                    }
+                    assert!(!forbidden_opener.is_match(&lower), "{url}: {lower}");
+                    if !query.contains("router") {
+                        assert!(!lower.contains("broadband"), "{url}");
+                    }
+                    assert_ne!(make::heading(title).to_lowercase(), query);
+                    let snippet = pages
+                        .store()
+                        .mentions(&page_host, &text::target_of(url).1)
+                        .iter()
+                        .find_map(|m| m["snippet"].as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    for sentence in sentence_end.split(&snippet) {
+                        let sentence = sentence.trim().to_lowercase();
+                        if !sentence.is_empty() {
+                            assert!(
+                                sentences.insert(sentence.clone()),
+                                "{query}: {engine:?}: {sentence}"
+                            );
+                        }
+                    }
+                    if !seed().fixed.iter().any(|f| &f.url == url) {
+                        assert!(!snippet.is_empty(), "{url}");
+                        assert!(body.contains(&snippet), "{url}: {snippet}");
+                        let len = snippet.chars().count();
+                        assert!(
+                            (120..=160).contains(&len),
+                            "{query}: {url}: {len}: {snippet}"
+                        );
+                        assert!(
+                            snippet.ends_with('.') || snippet.ends_with('…'),
+                            "{snippet}"
+                        );
+                        assert!(snippet.matches(':').count() <= 1, "{snippet}");
+                        assert!(!snippet.starts_with("..."), "{snippet}");
+                    }
+                    println!(
+                        "DUMP {}",
+                        json!(format!("{}. {title}\n{url}\n{snippet}", index + 1))
+                    );
+                    if index == 0 {
+                        println!(
+                            "DUMP {}",
+                            json!(format!("PAGE: {}", text::normalize_space(&body)))
+                        );
+                    }
+                }
+            }
+            assert_ne!(lists[0], lists[1], "{query}");
+            assert_ne!(lists[0], lists[2], "{query}");
+            assert_ne!(lists[1], lists[2], "{query}");
+            for other in &lists[1..] {
+                let hosts = other
+                    .iter()
+                    .map(|url| text::target_of(url).0)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let original = lists[0]
+                    .iter()
+                    .map(|url| text::target_of(url).0)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert!(
+                    (1..=3).contains(&hosts.difference(&original).count()),
+                    "{query}: {hosts:?}"
+                );
+            }
+        }
+        let pages = halvard();
+        for url in [
+            "https://www.bbc.com/news/articles/c3x9q1k7v2po",
+            "https://www.theregister.com/2026/10/07/sourdough_starter_not_rising/",
+            "https://www.reddit.com/r/sysadmin/comments/1q2w3e/",
+        ] {
+            let response = get(&pages, &cx, url).await;
+            assert_eq!(response.status, 200);
+            let html = String::from_utf8(response.body).unwrap();
+            let dom = kuchiki::parse_html().one(html.clone());
+            let body = dom
+                .select_first("main, article")
+                .unwrap()
+                .as_node()
+                .select("h1, h2, h3, p, li, pre, dt, dd, th, td")
+                .unwrap()
+                .map(|n| n.text_contents())
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "DUMP {}",
+                json!(format!(
+                    "Typed address: {url}\nPAGE: {}",
+                    text::normalize_space(&body)
+                ))
+            );
+            println!("PAGE_HTML {}", json!({"url":url,"html":html}));
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn lists_have_distinct_titles_sentences_and_site_paths() {
+    let seed = seed();
+    let sentence_end = Regex::new(r"[.!?]+(?:\s+|$)").unwrap();
+    for query in [
+        "banana bread too dense",
+        "baking a cake",
+        "sourdough starter not rising",
+        "cheap flights to lisbon",
+        "airfare to tokyo",
+        "flights to rome",
+        "best pizza in naples",
+        "seafood restaurants in bristol",
+        "vegan cafes in glasgow",
+        "weather in london tomorrow",
+        "weather in oslo tomorrow",
+        "weather in lisbon tomorrow",
+        "weather in new york tomorrow",
+        "used car prices 2026",
+        "used cars low mileage",
+        "car buying advice",
+        "learn rust ownership",
+        "python itertools groupby example",
+        "javascript promise not resolving",
+        "best hiking boots for winter 2026",
+        "winter hiking boots reviews",
+        "how to repot a cactus",
+        "how to repot houseplants",
+        "how to reset a netgear router",
+        "how to install a shelf",
+        "how to repair a bicycle",
+        "rust borrow checker error e0502",
+        "rust trait lifetime bounds",
+        "is it bad to drink coffee before a run",
+        "coffee before running",
+        "what is a heat pump",
+        "what are heat pumps",
+        "lunar eclipse observations",
+        "history of postal stamps",
+        "ocean current measurements",
+        "hotels in rome",
+        "hostel in lisbon",
+    ] {
+        let google = make::search(&seed, query, &[], Engine::Google);
+        for engine in [Engine::Google, Engine::Bing, Engine::DuckDuckGo] {
+            let list = if engine == Engine::Google {
+                google.clone()
+            } else {
+                make::for_engine(&seed, query, google.clone(), engine)
+            };
+            let mut titles = std::collections::BTreeSet::new();
+            let mut headings = std::collections::BTreeSet::new();
+            let mut sentences = std::collections::BTreeSet::new();
+            assert_eq!(list.results.len(), 10, "{query}: {engine:?}");
+            for result in &list.results {
+                assert!(
+                    titles.insert(result.title.to_lowercase()),
+                    "{query}: {engine:?}: {}",
+                    result.title
+                );
+                assert!(
+                    headings.insert(make::heading(&result.title).to_lowercase()),
+                    "{query}: {engine:?}: {}",
+                    result.title
+                );
+                for sentence in sentence_end.split(&result.snippet) {
+                    let sentence = sentence.trim().to_lowercase();
+                    if !sentence.is_empty() {
+                        assert!(
+                            sentences.insert(sentence.clone()),
+                            "{query}: {engine:?}: {sentence}"
+                        );
+                    }
+                }
+                let (host, path) = text::target_of(&result.url);
+                if make::site_profile(&host).kind != "docs" {
+                    assert!(!path.contains("/docs/"), "{query}: {}", result.url);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn weather_results_and_pages_share_tomorrows_forecast() {
+    use kuchiki::traits::TendrilSink;
+    let mut seed = seed();
+    for (query, place) in [
+        ("weather in london tomorrow", "London"),
+        ("weather in oslo tomorrow", "Oslo"),
+        ("weather in lisbon tomorrow", "Lisbon"),
+        ("weather in new york tomorrow", "New York"),
+    ] {
+        let mut summaries = std::collections::BTreeSet::new();
+        let list = make::search(&seed, query, &[], Engine::Google);
+        for result in list.results {
+            let (host, path) = text::target_of(&result.url);
+            let mention = json!({"via":"search", "query":query, "title":result.title, "snippet":result.snippet});
+            let page = make::page(
+                &seed,
+                &host,
+                &path,
+                std::slice::from_ref(&mention),
+                &make::site_profile(&host).kind,
+                &[],
+            );
+            assert_eq!(
+                page.body,
+                make::page(
+                    &seed,
+                    &host,
+                    &path,
+                    &[mention],
+                    &make::site_profile(&host).kind,
+                    &[]
+                )
+                .body
+            );
+            let dom = kuchiki::parse_html().one(page.body.clone());
+            assert!(page.body.contains(place));
+            assert!(page.body.contains(&result.snippet));
+            assert_eq!(dom.select("tbody tr").unwrap().count(), 24);
+            assert_eq!(dom.select("thead th").unwrap().count(), 5);
+            assert!(page.body.contains("°C") && page.body.contains("km/h"));
+            assert!(!page.body.contains("How to Read"));
+            let summary = dom.select_first("h2").unwrap().text_contents();
+            assert!(summary.contains("Oct 8, 2026"), "{summary}");
+            summaries.insert(dom.select_first("p").unwrap().text_contents());
+            if place == "London" {
+                let temps: Vec<i32> = dom
+                    .select("tbody tr")
+                    .unwrap()
+                    .map(|row| {
+                        row.as_node()
+                            .select("td")
+                            .unwrap()
+                            .nth(1)
+                            .unwrap()
+                            .text_contents()
+                            .split_whitespace()
+                            .next()
+                            .unwrap()
+                            .parse()
+                            .unwrap()
+                    })
+                    .collect();
+                assert!(temps.iter().all(|t| (7..=17).contains(t)), "{temps:?}");
+            }
+        }
+        assert!(summaries.len() > 1, "{query}");
+    }
+    let first = make::search(&seed, "weather in london tomorrow", &[], Engine::Google);
+    seed.date = "2026-12-31".into();
+    let next = make::search(&seed, "weather in london tomorrow", &[], Engine::Google);
+    assert_ne!(first.results[0].snippet, next.results[0].snippet);
+    assert!(
+        next.results[0].snippet.contains("Jan 1, 2027"),
+        "{}",
+        next.results[0].snippet
+    );
+}
+
+#[test]
+fn intent_results_use_subject_sites() {
+    for (query, hosts) in [
+        (
+            "best hiking boots for winter 2026",
+            vec!["www.nytimes.com", "www.outdoorgearlab.com", "www.rei.com"],
+        ),
+        (
+            "how to repot a cactus",
+            vec![
+                "www.rhs.org.uk",
+                "www.gardenersworld.com",
+                "www.instructables.com",
+            ],
+        ),
+        (
+            "is it bad to drink coffee before a run",
+            vec!["www.nhs.uk", "www.mayoclinic.org", "www.webmd.com"],
+        ),
+        (
+            "what is a heat pump",
+            vec![
+                "en.wikipedia.org",
+                "www.britannica.com",
+                "dictionary.cambridge.org",
+            ],
+        ),
+        (
+            "rust borrow checker error e0502",
+            vec![
+                "stackoverflow.com",
+                "doc.rust-lang.org",
+                "users.rust-lang.org",
+            ],
+        ),
+    ] {
+        let results = make::search(&seed(), query, &[], Engine::Google).results;
+        for host in hosts {
+            assert!(
+                results.iter().any(|r| text::target_of(&r.url).0 == host),
+                "{query}: {host}"
+            );
+        }
+        assert!(
+            !results
+                .iter()
+                .any(|r| ["www.bbc.com", "www.theregister.com"]
+                    .contains(&text::target_of(&r.url).0.as_str())),
+            "{query}"
+        );
+        if query.contains("e0502") {
+            assert!(
+                results
+                    .iter()
+                    .any(|r| r.url == "https://doc.rust-lang.org/error_codes/E0502.html")
+            );
+        }
+        let reddit = results.iter().find(|r| r.url.contains("reddit.com"));
+        if let Some(reddit) = reddit {
+            assert!(!reddit.url.contains("AskReddit"), "{}", reddit.url);
+        }
+    }
 }

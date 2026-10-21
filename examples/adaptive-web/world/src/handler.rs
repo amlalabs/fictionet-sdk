@@ -13,7 +13,7 @@ use bytes::Bytes;
 use example_common::names::name;
 use fictionet::events::ConnInfo;
 use fictionet::stdlib::web::{self, Body};
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 
@@ -140,6 +140,14 @@ impl Handler {
             let mut fields = answer.fields();
             if page && matches!(answer.meta, Meta::Error { .. }) {
                 fields.set("kind", "page");
+            }
+            if page
+                && parts
+                    .headers
+                    .get(USER_AGENT)
+                    .is_some_and(|value| value.as_bytes().starts_with(b"Claude-User"))
+            {
+                fields.set("via", "web_fetch");
             }
             fields
         });

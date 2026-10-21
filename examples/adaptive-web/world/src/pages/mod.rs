@@ -1206,7 +1206,7 @@ impl Pages {
             .generate(
                 cx,
                 json!({"kind": "cast"}),
-                Vec::new,
+                || make::prepared_cast(&self.seed),
                 || {
                     let (system, user) = prompts::cast(&self.seed);
                     (system, user, CAST_TOKENS)
@@ -1295,6 +1295,72 @@ impl Pages {
             .as_ref()
             .map(|r| r.search.clone())
             .unwrap_or_default();
+        if engine == Engine::YouTube && record.is_some() {
+            // Video searches draw from the site's video cards.
+            let store = self.store();
+            search = make::videos(
+                query,
+                store
+                    .pages()
+                    .filter(|p| p.host == "www.youtube.com")
+                    .map(|p| (&p.url, String::from_utf8_lossy(&p.body).into_owned())),
+            );
+        }
+        if record.is_some()
+            && engine != Engine::Google
+            // A prepared list answers every engine as it was written; only
+            // lists made on the spot differ by engine.
+            && (engine == Engine::YouTube
+                || record.as_ref().is_some_and(|r| r.usage.model == "stub"))
+        {
+            let proposed = if engine == Engine::YouTube {
+                search.clone()
+            } else {
+                make::for_engine(
+                    &self.context(),
+                    &query_key(query, 0),
+                    search.clone(),
+                    engine,
+                )
+            };
+            let replayable = proposed.results.iter().all(|r| {
+                let (host, target) = text::target_of(&r.url);
+                !self.store().mentions(&host, &target).is_empty()
+                    || self.seed.fixed.iter().any(|f| f.url == r.url)
+            });
+            if self.generating() || replayable {
+                search = proposed;
+                for result in &mut search.results {
+                    let (host, target) = text::target_of(&result.url);
+                    let mention = if self.generating() {
+                        let mention = json!({"via":"search", "query":query, "title":result.title, "snippet":result.snippet, "date":result.date});
+                        self.store()
+                            .reserve_mention(&self.seed, &host, &target, mention)
+                            .map_err(Stop::store)?
+                    } else {
+                        self.store()
+                            .mentions(&host, &target)
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(
+                                || json!({"title":result.title,"snippet":result.snippet}),
+                            )
+                    };
+                    result.title = mention["title"].as_str().unwrap_or_default().into();
+                    result.snippet = mention["snippet"].as_str().unwrap_or_default().into();
+                }
+            } else {
+                search.results.sort_by_key(|r| {
+                    let own = self.seed.fixed.iter().any(|f| f.url == r.url)
+                        || self
+                            .seed
+                            .sites
+                            .iter()
+                            .any(|s| s.host == text::target_of(&r.url).0);
+                    (!own, make::engine_order(engine, query, &r.url))
+                });
+            }
+        }
         if search.ads.is_empty() && record.is_some() {
             let store = self.store();
             for list in store.searches() {
@@ -1329,7 +1395,7 @@ impl Pages {
                         fictionet_extras::search::Result {
                             url: page.url.clone(),
                             title: page.title.clone(),
-                            snippet: make::excerpt(&page.text.join(" "), &page.url),
+                            snippet: make::excerpt(&page.text.join(" ")),
                             date: make::result_date(&self.seed.date),
                         },
                     );
@@ -1384,7 +1450,7 @@ impl Pages {
                                 .map(|p| (&p.url, String::from_utf8_lossy(&p.body).into_owned())),
                         )
                     } else {
-                        make::search(&self.seed, query, &known)
+                        make::search(&self.seed, query, &known, Engine::Google)
                     }
                 },
                 || {
@@ -1399,9 +1465,14 @@ impl Pages {
         for mut r in std::mem::take(&mut search.results) {
             let (host, target) = text::target_of(&r.url);
             let known_match = known.iter().find(|k| k.url == r.url);
+            // A page the world already holds stays out of an unrelated list.
+            // A model that lists it for this search with a row sharing the
+            // search's words has said how it is related.
+            let chosen = matches!(self.maker(), Maker::Model(_))
+                && make::shares_words(&format!("{} {} {}", r.title, r.url, r.snippet), query);
             if host.is_empty()
                 || results.iter().any(|x| x.url == r.url)
-                || known_match.is_some_and(|k| !make::relevant(k, query))
+                || known_match.is_some_and(|k| !make::relevant(k, query) && !chosen)
             {
                 continue;
             }
@@ -1806,7 +1877,7 @@ impl Pages {
                             mentions.push(json!({"snippet": fact}));
                         }
                     }
-                    make::page_with_known(&seed, host, target, &mentions, &kind, &known)
+                    make::page_with_known(&seed, host, target, &mentions, &kind, &known, &ask.cast)
                 },
                 || {
                     let (system, user) = prompts::page(

@@ -198,7 +198,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
                 e(name)
             )
         }
-        "company" | "government" | "shop" => {
+        "company" | "government" | "shop" | "weather" | "review" | "marketplace" => {
             let topbar = if !style.is_multiple_of(2) {
                 "<div class=\"topbar\"><a href=\"/contact\">Contact</a> <a href=\"/support\">Support</a> <a href=\"/login\">Log in</a></div>\n"
             } else {

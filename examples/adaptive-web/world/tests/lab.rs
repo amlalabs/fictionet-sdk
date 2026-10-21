@@ -26,7 +26,14 @@ use std::{
     time::SystemTime,
 };
 
-async fn fetch(cx: &Cx, m: &Machine, host: &str, path: &str, start: SystemTime) -> (u16, Vec<u8>) {
+async fn fetch(
+    cx: &Cx,
+    m: &Machine,
+    host: &str,
+    path: &str,
+    start: SystemTime,
+    user_agent: &str,
+) -> (u16, Vec<u8>) {
     let answer = m
         .lookup(cx, "10.0.0.1".parse().unwrap(), host, RecordType::A)
         .await
@@ -46,9 +53,11 @@ async fn fetch(cx: &Cx, m: &Machine, host: &str, path: &str, start: SystemTime) 
         .tls(cx, SocketAddr::new(addr.into(), 443), host, None, start)
         .await
         .unwrap();
-    let request =
-        http1::Request::parse(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
-            .unwrap();
+    let request = http1::Request::parse(
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
     let response = sandbox::request(cx, &mut conn, &request).await.unwrap();
     (response.head.status, response.body)
 }
@@ -97,6 +106,7 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
                 "www.google.com",
                 "/search?q=halvard+gateway+vulnerability",
                 start,
+                "Mozilla/5.0 Firefox/145.0",
             )
             .await;
             if exhaust {
@@ -111,9 +121,11 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
                 assert_eq!(results.len(), 10);
                 for (url, _) in results {
                     let (host, target) = target_of(&url);
-                    let (status, first) = fetch(&cx, &m, &host, &target, start).await;
+                    let (status, first) =
+                        fetch(&cx, &m, &host, &target, start, "Mozilla/5.0 Firefox/145.0").await;
                     assert_eq!(status, 200);
-                    let (status, second) = fetch(&cx, &m, &host, &target, start).await;
+                    let (status, second) =
+                        fetch(&cx, &m, &host, &target, start, "Mozilla/5.0 Firefox/145.0").await;
                     assert_eq!(status, 200);
                     assert_eq!(first, second);
                 }
@@ -215,10 +227,30 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
                 attacher.attach("workstation")?,
                 Ipv4Addr::new(10, 0, 0, 2),
             );
-            let (status, body) = fetch(&cx, &m, "forwarded.com", "/", start).await;
+            let (status, body) = fetch(
+                &cx,
+                &m,
+                "forwarded.com",
+                "/",
+                start,
+                "Mozilla/5.0 Firefox/145.0",
+            )
+            .await;
             assert_eq!(status, 200);
             assert_eq!(body, b"caller content");
-            assert_eq!(fetch(&cx, &m, "freshnews.com", "/news", start).await.0, 200);
+            assert_eq!(
+                fetch(
+                    &cx,
+                    &m,
+                    "freshnews.com",
+                    "/news",
+                    start,
+                    "Mozilla/5.0 Firefox/145.0"
+                )
+                .await
+                .0,
+                200
+            );
             let refused = m
                 .lookup(&cx, "10.0.0.1".parse()?, "wiki.corp", RecordType::A)
                 .await?;
@@ -245,4 +277,61 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
             .iter()
             .any(|e| e.str("host") == Some("wiki.corp"))
     );
+}
+
+#[test]
+fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
+    let events = Arc::new(Memory::default());
+    let seed = Seed::builtin("halvard-cve").unwrap();
+    let searches = Arc::new(Searches::from_seed(&seed));
+    let observed = events.clone();
+    let projection = searches.clone();
+    let observer = Arc::new(Fanout::new(vec![events, searches]));
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
+        move |cx| async move {
+            let start = adaptive_web_world::world_start(&seed.date)?;
+            let world = World::new(&cx, seed, start)?;
+            let log = Arc::new(example_common::log::Log::new(
+                Box::new(std::io::sink()),
+                &[],
+                |s| s,
+            ));
+            let (attacher, attachments) = fictionet::attachments();
+            world.serve(&cx, log, attachments)?;
+            let m = machine(&cx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
+            for (user_agent, via) in [
+                (
+                    "Claude-User (claude-code/2.1.292; +https://support.anthropic.com/)",
+                    Some("web_fetch"),
+                ),
+                (
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0",
+                    None,
+                ),
+            ] {
+                let (status, _) = fetch(
+                    &cx,
+                    &m,
+                    "www.halvardsystems.com",
+                    "/security/advisories/HSA-2026-014",
+                    start,
+                    user_agent,
+                )
+                .await;
+                assert_eq!(status, 200);
+                let requests = observed.checked_of("http", "request").unwrap();
+                let request = requests.last().unwrap();
+                assert_eq!(request.str("via"), via);
+                let snapshot = projection.snapshot();
+                assert_eq!(snapshot.pages.len(), 1);
+                assert_eq!(snapshot.pages[0].via.as_deref(), via);
+                assert_eq!(snapshot.pages[0].status, Some(200));
+            }
+            assert_eq!(projection.snapshot().pages[0].fetches, 2);
+            cx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
 }
