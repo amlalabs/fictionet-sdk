@@ -559,8 +559,14 @@ export function appShell(root, services, page) {
     selectWorld(event.key === 'End' || (event.key !== 'Home' && !packetVisible), true);
   }));
   watchPackets();
+  const close = () => {
+    const focused = pop.contains(document.activeElement);
+    pop.hidden = true; toggle.setAttribute('aria-expanded', 'false');
+    if (focused) toggle.focus();
+  };
+  services.closeWorldMenu = close;
+  cleanup.push(() => { delete services.closeWorldMenu; });
   if (own) cleanup.push(panel(services, page, ownPanel, own));
-  const close = () => { pop.hidden = true; toggle.setAttribute('aria-expanded', 'false'); };
   cleanup.push(listen(toggle, 'click', () => {
     pop.hidden = !pop.hidden;
     toggle.setAttribute('aria-expanded', String(!pop.hidden));

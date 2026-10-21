@@ -1,5 +1,5 @@
 import { createMotion } from './motion.mjs';
-import { ENGINES, engine, queryTag, pageTag, short, hostOf, hostMark, layout, siteKey } from './model.mjs';
+import { ENGINES, ENGINE_HOSTS, engine, queryTag, pageTag, short, hostOf, hostMark, layout, siteKey } from './model.mjs';
 
 const cut = (text, size) => text.length > size ? `${text.slice(0, size - 1)}…` : text;
 
@@ -9,6 +9,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     for (const [key, value] of Object.entries(values)) node.setAttribute(key, value);
   };
   let previous = null;
+  const waitingSites = new Set();
   const making = new Map();
   const window = svg.ownerDocument.defaultView || globalThis;
   const later = window.setTimeout?.bind(window) || globalThis.setTimeout;
@@ -45,6 +46,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     const group = add('g', { class: 'engine-group', 'data-engine': name }, layers.engines);
     const mark = hostMark(`${name}.com`);
     group.style.setProperty('--app-host-color', mark.color);
+    add('circle', { class: 'breathing', cx: x, cy: 108, r: 12, 'aria-hidden': 'true' }, group);
     const node = add('circle', { cx: x, cy: 108, r: 12 }, group);
     add('text', { class: 'mark', x, y: 108, 'aria-hidden': 'true', text: mark.letter }, group);
     add('text', { class: 'label', x, y: 84, 'text-anchor': 'middle', text: engine(name) }, group);
@@ -93,12 +95,12 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     });
     add('text', { class: 'mark', 'aria-hidden': 'true' }, group);
     return group;
-  }, (g, { host, site, x, y, pages, scenario }) => {
-    const count = pages.filter((p) => p.fetches > 0).length;
+  }, (g, { host, site, x, y, pages, scenario, visit }) => {
+    const count = pages.filter((p) => p.fetches > 0).length + (visit?.outcome.status === 'served' ? 1 : 0);
     const r = count ? 9 + Math.min(count - 1, 4) * 1.25 : 8;
     const mark = hostMark(siteKey(host));
     const latest = [...pages].sort((a, b) => a.at_ms - b.at_ms || (a.seq ?? 0) - (b.seq ?? 0)).at(-1);
-    const state = latest ? pageTag(latest) : 'listed';
+    const state = visit && (!latest || (visit.answer_at_ms ?? visit.at_ms) >= latest.at_ms) ? queryTag(latestSnapshot, visit) : latest ? pageTag(latest) : 'listed';
     attrs(g, { 'data-host': host, class: `site-group ${count ? 'opened' : 'listed'}` });
     g.style.setProperty('--app-host-color', mark.color);
     attrs(g.children[4], { x, y, 'font-size': count ? Math.min(r * 1.3, 17) : 10 });
@@ -151,18 +153,19 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
   planted.children[0].style.transformOrigin = '488px 540px';
   function render(snapshot, changes = null) {
     latestSnapshot = snapshot;
-    const query = snapshot.queries.at(-1);
-    words.textContent = cut(query?.search || '', 54);
-    queryTitle.textContent = query?.search || '';
-    const claude = query?.via === 'web_search';
+    const latest = snapshot.queries.at(-1);
+    const query = snapshot.queries.findLast((q) => ENGINES.includes(q.engine));
+    if (!motion.typingRemaining(words)) words.textContent = cut(latest?.search || '', 54);
+    queryTitle.textContent = latest?.search || '';
+    const claude = latest?.via === 'web_search';
     attrs(browser, { visibility: claude ? 'hidden' : 'visible' });
     agent.textContent = claude ? '❯' : '';
-    attrs(caret, { visibility: query ? 'hidden' : 'visible' });
+    attrs(caret, { visibility: latest ? 'hidden' : 'visible' });
     for (const e of engines) {
       const asked = query && snapshot.queries.findLast((q) => q.engine === e.name && q.key === query.key);
       const state = asked ? queryTag(snapshot, asked) : 'idle';
       attrs(e.node, { class: `engine ${state}` });
-      attrs(e.node.parentNode, { class: `engine-group ${asked?.outcome.status === 'served' ? 'answered' : 'idle'}` });
+      attrs(e.node.parentNode, { class: `engine-group ${asked?.outcome.status === 'pending' ? 'asking' : asked?.outcome.status === 'served' ? 'answered' : 'idle'}` });
       attrs(e.edge, { class: `ask ${query?.engine === e.name ? 'live' : 'idle'}` });
       attrs(e.halo, { visibility: asked?.carries > 0 ? 'visible' : 'hidden' });
     }
@@ -175,11 +178,17 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       return key;
     };
     for (const row of snapshot.seed.sites) remember(row.host, row.site);
+    const offMap = snapshot.queries.filter((q) => !ENGINES.includes(q.engine));
+    for (const q of offMap) remember(ENGINE_HOSTS[q.engine] || q.engine, engine(q.engine));
     for (const row of snapshot.sites || []) remember(row.host, row.site);
     for (const list of snapshot.results) for (const row of list.listed) remember(row.host, row.site);
     for (const row of snapshot.pages) remember(row.host, row.site);
     const hosts = new Set(snapshot.seed.sites.map((row) => remember(row.host, row.site)));
     const touched = new Map();
+    for (const q of offMap) {
+      const host = remember(ENGINE_HOSTS[q.engine] || q.engine);
+      hosts.add(host); touched.set(host, q.answer_at_ms ?? q.at_ms);
+    }
     for (const list of [...snapshot.results].sort((a, b) => a.query_id - b.query_id)) for (const row of list.listed) hosts.add(remember(row.host, row.site));
     for (const p of snapshot.pages) {
       hosts.add(remember(p.host, p.site)); touched.set(siteKey(p.host), p.at_ms);
@@ -187,10 +196,17 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     }
     const opened = changes ? changes.filter((c) => c.page).map((c) => c.page) : snapshot.pages;
     const scenario = snapshot.seed.sites.map((row) => siteKey(row.host));
-    const map = layout(previous, [...hosts], { seed: { sites: scenario }, list: listed.map((r) => siteKey(r.host)), opened: opened.map((p) => siteKey(p.host)), touched });
+    const map = layout(previous, [...hosts], { seed: { sites: scenario }, list: listed.map((r) => siteKey(r.host)), opened: [...opened.map((p) => siteKey(p.host)), ...offMap.map((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine))], touched });
+    if (changes && motion.active && query && (query.outcome.status === 'pending' || changes.some((c) => c.type === 'search_answered' && c.query.id === query.id))) {
+      for (const host of map.assignment.keys()) if (!previous?.assignment.has(host) && !offMap.some((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine) === host)) waitingSites.add(host);
+    }
     previous = map;
     const pages = (host) => snapshot.pages.filter((p) => siteKey(p.host) === host).sort((a, b) => (a.first_serve_ms ?? a.at_ms) - (b.first_serve_ms ?? b.at_ms) || a.url.localeCompare(b.url));
-    sites([...map.assignment].map(([host, [x, y]]) => [host, { host: representatives.get(host) || host, site: names.get(host) || host, x, y, pages: pages(host), scenario: scenario.includes(host) }]));
+    sites([...map.assignment].map(([host, [x, y]]) => [host, { host: representatives.get(host) || host, site: names.get(host) || host, x, y, pages: pages(host), scenario: scenario.includes(host), visit: offMap.findLast((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine) === host) }]));
+    if (!motion.active) waitingSites.clear();
+    for (const group of layers.sites.children) {
+      group.style.opacity = waitingSites.has(siteKey(group.getAttribute('data-host'))) ? '0' : '';
+    }
     const asked = engines.find((e) => e.name === query?.engine);
     results(asked ? listed.filter((r) => map.assignment.has(siteKey(r.host))).map((r) => {
       const [x, y] = map.assignment.get(siteKey(r.host));
@@ -209,34 +225,55 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
   }
   const position = (node) => [Number(node.getAttribute('cx')), Number(node.getAttribute('cy'))];
   const siteNode = (host) => [...layers.sites.children].find((g) => siteKey(g.getAttribute('data-host')) === siteKey(host));
+  const queryTarget = (q) => engines.find((e) => e.name === q?.engine)?.node || (q && siteNode(ENGINE_HOSTS[q.engine] || q.engine)?.children[0]);
   const pageNode = (url) => [...svg.querySelectorAll('.page-group')].find((g) => g.getAttribute('data-url') === url);
   const fade = (node, duration, delay = 0) => motion.anim(node, [{ opacity: 0 }, { opacity: 1 }], { duration, delay });
-  function outline(node, duration) {
+  function outline(node, duration, delay = 0) {
     const length = 2 * Math.PI * Number(node.getAttribute('r'));
     motion.anim(node, [
       { strokeDasharray: `${length}`, strokeDashoffset: length, fillOpacity: 0 },
       { strokeDasharray: `${length}`, strokeDashoffset: 0, fillOpacity: 0, offset: .7 },
       { strokeDasharray: `${length}`, strokeDashoffset: 0, fillOpacity: 1 },
-    ], { duration, easing: 'cubic-bezier(.4,0,.2,1)' });
+    ], { duration, delay, easing: 'cubic-bezier(.4,0,.2,1)' });
   }
   function animate(changes, snapshot, oldHosts) {
     const current = snapshot.queries.at(-1);
-    for (const group of layers.sites.children) if (!oldHosts.has(siteKey(group.getAttribute('data-host')))) {
+    const mapQuery = snapshot.queries.findLast((q) => ENGINES.includes(q.engine));
+    const threadDelay = changes.some((c) => c.type === 'fact_reached') ? 300 : 0;
+    for (const group of layers.sites.children) if (!oldHosts.has(siteKey(group.getAttribute('data-host'))) && !waitingSites.has(siteKey(group.getAttribute('data-host')))) {
       motion.anim(group, [{ opacity: 0, transform: 'scale(.6)' }, { opacity: 1, transform: 'scale(1)' }], { duration: 320, easing: 'cubic-bezier(.2,.9,.3,1.2)' });
     }
     for (const change of changes) {
       const e = engines.find((e) => e.name === change.query?.engine);
       if (change.type === 'search_started' && change.query.id === current?.id) {
-        motion.typeInto(words, cut(current.search, 54));
-        motion.travel(layers.fx, [260, 52], [e.x, 94], current.via === 'web_search' ? 'agent' : 'ink', 300);
+        motion.typeInto(words, cut(current.search, 54), Math.min(600, current.search.length * 28));
+        const target = queryTarget(current);
+        if (target) motion.travel(layers.fx, [260, 52], position(target), current.via === 'web_search' ? 'agent' : 'ink', 300);
       }
-      if (change.type === 'search_answered' && change.query.key === current?.key) {
-        if (change.state === 'made') outline(e.node, 520);
+      if (change.type === 'search_answered' && (e ? change.query.key === mapQuery?.key : change.query.id === current?.id)) {
+        const target = queryTarget(change.query);
+        if (!target) continue;
+        const [x, y] = position(target);
+        const delay = change.query.id === current?.id ? motion.typingRemaining(words) : 0;
+        if (change.state === 'made') outline(target, 520, delay);
         else if (change.state === 'again') {
-          motion.ring(layers.fx, e.x, 108, 'again', 20, 500);
-          motion.ring(layers.fx, e.x, 108, 'again', 26, 560, 140);
-        } else if (change.state === 'stored') motion.ring(layers.fx, e.x, 108, 'stored', 18, 420);
-        if (change.query.id === current.id) [...resultLayer.children].forEach((g) => motion.drawIn(g.firstChild, 240, Math.max(0, Number(g.firstChild.getAttribute('data-rank')) - 1) * 36));
+          motion.ring(layers.fx, x, y, 'again', 20, 500, delay);
+          motion.ring(layers.fx, x, y, 'again', 26, 560, delay + 140);
+        } else if (change.state === 'stored') motion.ring(layers.fx, x, y, 'stored', 18, 420, delay);
+        target.style.transformOrigin = `${x}px ${y}px`;
+        motion.pulse(target, delay);
+        if (e && change.query.id === mapQuery.id) {
+          const reveal = delay + 380 + threadDelay;
+          for (const group of layers.sites.children) {
+            const host = siteKey(group.getAttribute('data-host'));
+            if (!waitingSites.has(host)) continue;
+            const rank = change.list.find((r) => siteKey(r.host) === host)?.rank || 1;
+            motion.anim(group, [{ opacity: 0, transform: 'scale(.6)' }, { opacity: 1, transform: 'scale(1)' }], { duration: 320, delay: reveal + (rank - 1) * 36, easing: 'cubic-bezier(.2,.9,.3,1.2)' });
+            waitingSites.delete(host);
+            group.style.opacity = '';
+          }
+          for (const g of resultLayer.children) motion.drawIn(g.firstChild, 240, reveal + Math.max(0, Number(g.firstChild.getAttribute('data-rank')) - 1) * 36);
+        }
       }
       if (change.type === 'page_opened' || change.type === 'page_again') {
         const p = change.page, site = siteNode(p.host), group = pageNode(p.url);
@@ -279,23 +316,28 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
         fade(refusedName, 200);
       }
       if (change.type === 'fact_reached') {
-        const target = change.kind === 'query' ? engines.find((e) => e.name === change.target.engine)?.node : pageNode(change.target.url)?.children[0];
-        if (!target || (change.kind === 'query' && change.target.key !== current?.key)) continue;
+        const target = change.kind === 'query' ? queryTarget(change.target) : pageNode(change.target.url)?.children[0];
+        if (!target || (change.kind === 'query' && change.target.id !== current?.id)) continue;
         const [x, y] = position(target);
         const path = add('path', { class: 'thread', 'data-transient': '', d: `M 488 540 Q ${(488 + x) / 2 + 40} ${(540 + y) / 2} ${x} ${y}` }, layers.fx);
         motion.drawIn(path, 420);
         motion.travel(layers.fx, path, null, 'planted', 440);
         motion.ring(layers.fx, x, y, 'planted', 24, 640, 440);
-        motion.removeAfter(path, motion.anim(path, [{ opacity: 1 }, { opacity: 1, offset: .6 }, { opacity: 0 }], { duration: 1400 }));
+        motion.removeAfter(path, motion.anim(path, [{ opacity: 1 }, { opacity: 1, offset: 2920 / 3520 }, { opacity: 0 }], { duration: 3520 }));
       }
     }
   }
+  const stopMotion = motion.subscribe((disabled) => {
+    if (!disabled) return;
+    waitingSites.clear();
+    for (const group of layers.sites.children) group.style.opacity = '';
+  });
   return {
     apply(changes, snapshot) {
       if (changes.some((c) => c.type === 'restart')) { this.reset(snapshot); return; }
       motion.suppressed = changes.length > 8;
       const oldHosts = new Set(previous?.assignment.keys() || []);
-      if (motion.active && changes.some((c) => c.type === 'search_started' && c.query.id === snapshot.queries.at(-1)?.id)) {
+      if (motion.active && changes.some((c) => c.type === 'search_started' && c.query.id === snapshot.queries.at(-1)?.id && ENGINES.includes(c.query.engine))) {
         for (const group of resultLayer.children) {
           const line = group.firstChild;
           const old = add('line', Object.fromEntries(['x1', 'y1', 'x2', 'y2', 'class'].map((key) => [key, line.getAttribute(key)])), layers.fx);
@@ -320,7 +362,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
         for (const change of changes) {
           const target = change.type === 'page_again' ? pageNode(change.page.url)?.children[0]
             : change.type === 'search_answered' && change.state === 'again' && change.query.key === snapshot.queries.at(-1)?.key
-              ? engines.find((e) => e.name === change.query.engine)?.node : null;
+              ? queryTarget(change.query) : null;
           if (target) motion.ring(layers.fx, ...position(target), 'again', change.type === 'page_again' ? 14 : 20, 150);
         }
       }
@@ -330,12 +372,13 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       for (const timer of making.values()) cancel(timer);
       making.clear();
       previous = null;
+      waitingSites.clear();
       names.clear(); representatives.clear();
       render(snapshot);
       // Apply the reset before radius transitions resume.
       svg.getBoundingClientRect();
       motion.suppressed = false;
     },
-    dispose() { for (const timer of making.values()) cancel(timer); making.clear(); size?.disconnect(); motion.dispose(); svg.replaceChildren(); },
+    dispose() { for (const timer of making.values()) cancel(timer); making.clear(); size?.disconnect(); stopMotion(); motion.dispose(); svg.replaceChildren(); },
   };
 }

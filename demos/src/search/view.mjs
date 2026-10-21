@@ -2,7 +2,7 @@ import { diff, rows } from './model.mjs';
 import { createMotion } from './motion.mjs';
 import { createWeb } from './web.mjs';
 
-const NEW_PAGES = [['canned', 'Prepared'], ['stub', 'Improvised'], ['off', 'Off']];
+const NEW_PAGES = [['canned', 'Prepared first'], ['stub', 'Improvised'], ['off', 'Off']];
 // Run time as minutes and seconds.
 const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 
@@ -18,7 +18,8 @@ export function mount(root, services, options) {
   const controller = new AbortController();
   const cleanup = [motion.subscribe((disabled) => root.classList.toggle('no-motion', disabled))];
   const rowNodes = new Map();
-  let snapshot = null, disposed = false;
+  let snapshot = null, disposed = false, closeTimer;
+  const window = root.ownerDocument.defaultView || globalThis;
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
   const controls = [];
@@ -37,6 +38,10 @@ export function mount(root, services, options) {
         note.textContent = rejection?.reason === 'stale_revision' ? 'The world changed. Try again.' : 'The request could not be completed.';
       },
     });
+    if (!disposed && ok && ['plant_fact', 'plant_page'].includes(command.command)) {
+      window.clearTimeout(closeTimer);
+      closeTimer = window.setTimeout(() => services.closeWorldMenu?.(), 250);
+    }
     return ok;
   }
   function buttons() {
@@ -46,7 +51,7 @@ export function mount(root, services, options) {
     const mode = !g.generate ? 'off' : g.canned ? 'canned' : 'stub';
     for (const button of segment.children) {
       button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
-      if (button.dataset.mode === 'stub') button.textContent = ['openrouter', 'anthropic'].includes(g.kind) ? 'Written live' : 'Improvised';
+      if (button.dataset.mode === 'stub') button.textContent = ['openrouter', 'anthropic'].includes(g.kind) ? 'Always live' : 'Improvised';
     }
   }
   if (menu) {
@@ -126,6 +131,7 @@ export function mount(root, services, options) {
   }, () => { if (!disposed) note.textContent = 'The world could not be reached.'; }));
   return () => {
     disposed = true;
+    window.clearTimeout(closeTimer);
     controller.abort();
     web.dispose();
     cleanup.forEach((off) => off());

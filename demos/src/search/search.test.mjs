@@ -2,8 +2,8 @@ import test from 'node:test';
 import { readFileSync, readdirSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { createDocument } from '../../../dashboard/test-dom.mjs';
-import { createServices } from '../../../dashboard/page.mjs';
-import { diff, slots, layout, rows, queryTag, pageTag, short, hostMark, siteKey } from './model.mjs';
+import { createServices, appShell } from '../../../dashboard/page.mjs';
+import { diff, slots, layout, rows, engine, ENGINE_HOSTS, queryTag, pageTag, short, hostMark, siteKey } from './model.mjs';
 import { createWeb } from './web.mjs';
 import { createMotion } from './motion.mjs';
 import { mount } from './view.mjs';
@@ -111,7 +111,7 @@ test('the World menu chooses new pages, plants a fact and a page, and restarts a
   h.publish(fixture());
   const menu = h.services.worldMenu;
   const [canned, stub, off] = menu.querySelector('.seg').children;
-  assert.deepEqual([canned, stub, off].map((button) => button.textContent), ['Prepared', 'Improvised', 'Off']);
+  assert.deepEqual([canned, stub, off].map((button) => button.textContent), ['Prepared first', 'Improvised', 'Off']);
   assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
   assert.deepEqual([canned, stub, off].map((b) => b.getAttribute('aria-pressed')), ['true', 'false', 'false']);
   stub.dispatchEvent(new Event('click'));
@@ -274,7 +274,7 @@ test('ticker identifies both Claude Code tools and uses public badges', () => {
   const s = snapshot({ queries: [query(1, { via: 'web_search', cache: 'generated' })], pages: [servedPage('https://a.com/a?q=b', { via: 'web_fetch', made: 'written_live' })] });
   assert.deepEqual(rows(s).map((r) => [r.who, r.what, r.badge]), [['Claude Code', '/a?q=b', 'made now'], ['Claude Code', 'halvard gateway vulnerability', 'made now']]);
   assert.equal(rows(snapshot({ pages: [servedPage('https://a.com/')] }))[0].badge, null);
-  assert.equal(rows(snapshot({ planted: [{ kind: 'page', url: 'https://a.com/', text: 'A fact', at_ms: 1 }] }))[0].who, 'a.com');
+  assert.equal(rows(snapshot({ planted: [{ kind: 'page', url: 'https://a.com/', text: 'A fact', at_ms: 1 }] }))[0].who, 'You');
 });
 
 test('mixed ticker rows keep their time, identity, path and badge', () => {
@@ -288,8 +288,8 @@ test('mixed ticker rows keep their time, identity, path and badge', () => {
   const all = rows(s, 20);
   assert.deepEqual(all.map((r) => [r.at, r.who, r.what, r.badge]), [
     [62000, 'wait.example.com', '/pending', 'making'],
-    [12000, 'www.plant.example.com', 'A planted page', 'planted'],
-    [11000, 'fact', 'A fact', 'planted'],
+    [12000, 'You', 'A planted page', 'planted'],
+    [11000, 'You', 'A fact', 'planted'],
     [10000, 'DNS', 'wiki.corp', 'refused'],
     [9000, 'Claude Code', '/a?q=b', 'made now'],
     [8000, 'again.example.com', '/a', 'again'],
@@ -668,9 +668,9 @@ test('motion uses the specified durations, stagger, curved travel and pane outli
   const window = animationWindow(), h = harness(window);
   for (const s of motionSequence().slice(0, -1)) { h.publish(s); await window.finish(); }
   const calls = window.calls;
-  for (const duration of [160, 200, 240, 260, 300, 320, 360, 380, 420, 440, 480, 500, 520, 560, 640, 700, 1400]) assert.ok(calls.some((a) => a.options.duration === duration), `${duration} ms`);
-  assert.ok(calls.some((a) => a.options.duration === 240 && a.options.delay === 36));
-  assert.ok(calls.some((a) => a.options.duration === 560 && a.options.delay === 140));
+  for (const duration of [160, 200, 240, 260, 300, 320, 360, 380, 420, 440, 480, 500, 520, 560, 640, 700, 3520]) assert.ok(calls.some((a) => a.options.duration === duration), `${duration} ms`);
+  assert.ok(calls.some((a) => a.options.duration === 240 && a.options.delay === 416));
+  assert.ok(calls.some((a) => a.options.duration === 560 && a.options.delay === 740));
   assert.ok(calls.some((a) => a.options.duration === 520 && a.options.delay === 120));
   assert.ok(calls.some((a) => a.node.getAttribute('class') === 'travel agent'));
   assert.ok(calls.some((a) => a.node.getAttribute('class') === 'travel agent' && a.keyframes.length === 33));
@@ -1108,7 +1108,7 @@ test('the World menu names the model choice and preserves its command', async ()
   for (const kind of ['openrouter', 'anthropic', 'stub']) {
     h.publish({ ...fixture(), generator: { ...fixture().generator, kind } });
     const button = h.services.worldMenu.querySelector('.seg').children[1];
-    assert.equal(button.textContent, kind === 'stub' ? 'Improvised' : 'Written live');
+    assert.deepEqual(h.services.worldMenu.querySelector('.seg').children.map((b) => b.textContent), ['Prepared first', kind === 'stub' ? 'Improvised' : 'Always live', 'Off']);
     button.dispatchEvent(new Event('click'));
     await settle();
     assert.equal(h.posts.at(-1).body.command.new_pages, 'stub');
@@ -1152,4 +1152,220 @@ test('a request waiting for a background page stays making until served', () => 
   assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page made');
   assert.doesNotMatch(h.root.textContent, /making/);
   h.dispose();
+});
+
+test('off-map queries keep the last map search and target their site through every answer state', async () => {
+  assert.equal(engine('you_tube'), 'YouTube');
+  assert.equal(ENGINE_HOSTS.you_tube, 'youtube.com');
+  for (const name of ['you_tube', 'video.example.com']) {
+    for (const cache of ['fixed', 'generated', 'cached', 'planted', 'missing']) {
+      const window = animationWindow(), h = harness(window);
+      const s = fixture();
+      h.publish(s);
+      const lines = h.root.querySelectorAll('.result-group');
+      const pending = query(16, { engine: name, search: 'halvard gateway failover', key: 'halvard gateway failover', outcome: { status: 'pending' }, cache: 'unknown' });
+      const started = { ...s, queries: [...s.queries, pending] };
+      assert.doesNotThrow(() => h.publish(started));
+      const host = ENGINE_HOSTS[name] || name;
+      const site = h.root.querySelectorAll('.site-group').find((g) => siteKey(g.getAttribute('data-host')) === host);
+      assert.ok(site);
+      const travel = window.calls.find((a) => a.node.getAttribute('class') === 'travel ink');
+      assert.equal(travel.keyframes.at(-1).transform, `translate(${site.children[0].getAttribute('cx')}px, ${site.children[0].getAttribute('cy')}px)`);
+      const answered = { ...started, queries: [...s.queries, { ...pending, outcome: { status: 'served' }, cache, carries: 1 }] };
+      assert.doesNotThrow(() => h.publish(answered));
+      assert.deepEqual(h.root.querySelectorAll('.result-group'), lines);
+      assert.ok(h.root.querySelector('.thread'));
+      assert.equal(site.getAttribute('class'), 'site-group opened');
+      assert.equal(site.children[0].getAttribute('class'), `site ${queryTag(answered, answered.queries.at(-1))}`);
+      if (cache === 'generated') assert.ok(window.calls.some((a) => a.node === site.children[0] && a.options.duration === 520));
+      await window.finish();
+      const before = window.calls.length;
+      h.publish({ ...answered, refused: [{ name: 'wiki.corp', at_ms: 90000 }] });
+      assert.ok(window.calls.slice(before).some((a) => a.node.getAttribute('class') === 'refused-mark'));
+      assert.equal(rows(answered)[0].who, host);
+      assert.deepEqual(h.root.querySelectorAll('.result-group'), lines);
+      h.dispose();
+    }
+  }
+});
+
+test('a mixed completed snapshot keeps Google result lines with YouTube queries between Google queries', () => {
+  const h = harness(), s = fixture();
+  const queries = [
+    [14, 'you_tube', 'halvard gateway high availability failover', 'generated', 524631, 529584],
+    [15, 'you_tube', 'halvard gateway high availability failover', 'cached', 541292, 541294],
+    [16, 'you_tube', 'halvard gateway firmware upgrade', 'cached', 649704, 649706],
+    [17, 'google', 'halvard gateway fixed version', 'generated', 759748, 763870],
+    [18, 'bing', 'halvard pulls gateway firmware', 'generated', 779207, 783741],
+    [19, 'google', 'halvard gateway hg-400 cve-2026-41877 advisory', 'generated', 820880, 825340],
+    [20, 'google', 'halvard hg-400 firmware upgrade problems 7.2.5 7.2.4 failed', 'generated', 864189, 868988],
+  ].map(([id, engine, key, cache, at_ms, answer_at_ms]) => query(id, { engine, key, search: key, cache, at_ms, answer_at_ms, via: id >= 19 ? 'web_search' : null }));
+  const final = { ...s, revision: 199, at_ms: 868988, queries: [...s.queries, ...queries], results: [...s.results, { ...s.results.at(-1), key: queries.at(-1).key, query_id: 20 }] };
+  h.publish(final);
+  assert.equal(h.root.querySelectorAll('.result-group').length, 3);
+  assert.ok(h.root.querySelectorAll('.site-group').some((g) => siteKey(g.getAttribute('data-host')) === 'youtube.com'));
+  assert.equal(h.root.querySelector('.query-text').textContent, queries.at(-1).search.slice(0, 53) + '…');
+  h.dispose();
+});
+
+test('fan-out waits for typing and a pulse, then reveals new sites and ranked lines together', async () => {
+  const window = animationWindow(), h = harness(window), sequence = motionSequence();
+  h.publish(sequence[0]); h.publish(sequence[1]);
+  window.tick(0); window.tick(300);
+  const typed = h.root.querySelector('.query-text').textContent;
+  h.publish(sequence[2]);
+  assert.equal(h.root.querySelector('.query-text').textContent, typed);
+  const pulse = window.calls.find((a) => a.node.getAttribute('class') === 'engine stored' && a.options.duration === 380);
+  assert.equal(pulse.options.delay, 300);
+  const lines = window.calls.filter((a) => a.node.getAttribute('class') === 'result');
+  assert.deepEqual(lines.map((a) => [a.options.duration, a.options.delay]), [[240, 680], [240, 716]]);
+  const sites = window.calls.filter((a) => a.node.getAttribute('class')?.startsWith('site-group'));
+  assert.deepEqual(sites.map((a) => [a.options.duration, a.options.delay, a.keyframes[0].opacity, a.options.fill]), [[320, 680, 0, 'backwards'], [320, 716, 0, 'backwards']]);
+  await window.finish();
+  assert.equal(h.root.querySelector('.query-text').textContent, sequence[2].queries[0].search);
+  h.dispose();
+});
+
+test('sites arriving during a pending search stay hidden until the answer reveals them', () => {
+  const window = animationWindow(), h = harness(window), sequence = motionSequence();
+  h.publish(sequence[0]);
+  h.publish({ ...sequence[1], results: sequence[2].results });
+  assert.ok(h.root.querySelectorAll('.site-group').every((g) => g.style.opacity === '0'));
+  assert.ok(!window.calls.some((a) => a.node.getAttribute('class')?.startsWith('site-group')));
+  h.publish(sequence[2]);
+  assert.equal(window.calls.filter((a) => a.node.getAttribute('class')?.startsWith('site-group')).length, 2);
+  h.dispose();
+});
+
+test('pending searches show writing with marching dashes and a breathing ring that respects reduced motion', () => {
+  const h = harness(), pending = snapshot({ queries: [query(1, { outcome: { status: 'pending' } })] });
+  h.publish(pending);
+  assert.equal(rows(pending)[0].badge, 'writing');
+  assert.equal(h.root.querySelector('em.asking').textContent, 'writing');
+  assert.equal(h.root.querySelector('.breathing').parentNode.getAttribute('class'), 'engine-group asking');
+  const css = readFileSync(new URL('./style.css', import.meta.url), 'utf8');
+  assert.match(css, /\.engine\.asking\s*\{ animation: site-making 600ms linear infinite/);
+  assert.match(css, /\.engine-group\.asking \.breathing\s*\{ animation: engine-breathing 1500ms/);
+  assert.match(css, /@keyframes engine-breathing \{ from \{ r: 12; opacity: \.6; \} to \{ r: 15; opacity: 0;/);
+  assert.match(css, /\.search-row em\.making, \.search-row em\.asking \{ color: var\(--app-mute\)/);
+  assert.match(css, /\.search-world\.no-motion \.site\.making, \.search-world\.no-motion \.engine\.asking, \.search-world\.no-motion \.breathing \{ animation: none/);
+  h.dispose();
+});
+
+test('fact threads draw, hold and fade before removal while result lines wait an extra beat', async () => {
+  const window = animationWindow(), h = harness(window), sequence = motionSequence();
+  h.publish(sequence[0]);
+  h.publish({ ...sequence[2], queries: [{ ...sequence[2].queries[0], carries: 1 }] });
+  const draw = window.calls.find((a) => a.node.getAttribute('class') === 'thread' && a.options.duration === 420);
+  const fade = window.calls.find((a) => a.node === draw.node && a.options.duration === 3520);
+  assert.equal(fade.keyframes[1].offset * fade.options.duration, 2920);
+  assert.equal(fade.options.duration - 2920, 600);
+  assert.equal(fade.keyframes[1].opacity, 1);
+  assert.equal(fade.keyframes[2].opacity, 0);
+  assert.deepEqual(window.calls.filter((a) => a.node.getAttribute('class') === 'result').map((a) => a.options.delay), [1280, 1316]);
+  assert.match(readFileSync(new URL('./style.css', import.meta.url), 'utf8'), /\.thread \{[^}]*stroke-width: 2\.5/);
+  await window.finish();
+  assert.equal(h.root.querySelector('.thread'), null);
+  h.dispose();
+});
+
+test('only applied plant commands close the World menu after a quarter second and disposal cancels the close', async () => {
+  for (const kind of ['fact', 'page']) {
+    for (const status of ['applied', 'pending', 'rejected']) {
+      const window = animationWindow(), h = harness(window);
+      h.publish(fixture());
+      let closed = 0;
+      h.services.closeWorldMenu = () => closed++;
+      h.services.transport.post = async () => ({ status });
+      const menu = h.services.worldMenu;
+      menu.querySelector('#plant-fact').value = 'A fact';
+      menu.querySelector('#plant-url').value = 'https://example.com/';
+      menu.querySelector('textarea').value = 'A page';
+      menu.querySelectorAll('button.act')[kind === 'fact' ? 0 : 1].click();
+      await settle();
+      window.advance(249); assert.equal(closed, 0);
+      window.advance(1); assert.equal(closed, status === 'applied' ? 1 : 0);
+      h.dispose();
+    }
+  }
+  const window = animationWindow(), h = harness(window);
+  h.publish(fixture());
+  let closed = 0;
+  h.services.closeWorldMenu = () => closed++;
+  h.services.worldMenu.querySelectorAll('button.act')[0].click();
+  await settle(); h.dispose(); window.advance(250);
+  assert.equal(closed, 0);
+});
+
+test('the shell close service hides the menu, restores focus and is removed on disposal', async () => {
+  const document = createDocument(), root = document.createElement('div');
+  const source = document.createElement('source');
+  source.close = () => {};
+  const services = createServices({ watch: () => source }, {}, async () => ({ mount: () => () => {} }));
+  const stop = appShell(root, services, { title: 'Search', hosts: [], panels: [{ kind: 'custom', area: 'workspace', title: 'Web', module: '/panels/search.mjs' }] });
+  await settle();
+  const menu = root.querySelector('#world-menu'), toggle = root.querySelector('.app-menu-button');
+  toggle.click();
+  const input = document.createElement('input'); services.worldMenu.append(input); input.focus();
+  services.closeWorldMenu();
+  assert.equal(menu.hidden, true);
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+  assert.equal(document.activeElement, toggle);
+  stop();
+  assert.equal(services.closeWorldMenu, undefined);
+  services.dispose();
+});
+
+test('unknown engines tolerate failed answers and reduced-motion repeats without losing result lines', async () => {
+  for (const reduced of [false, true]) {
+    for (const status of ['failed', 'undelivered', 'served']) {
+      const window = animationWindow({ reduced }), h = harness(window), s = fixture();
+      h.publish(s);
+      const lines = h.root.querySelectorAll('.result-group');
+      const q = query(5, { engine: 'you_tube', outcome: { status: 'pending' } });
+      h.publish({ ...s, queries: [...s.queries, q] });
+      assert.doesNotThrow(() => h.publish({ ...s, queries: [...s.queries, { ...q, outcome: { status }, cache: 'cached' }] }));
+      assert.deepEqual(h.root.querySelectorAll('.result-group'), lines);
+      await window.finish();
+      h.dispose();
+    }
+  }
+});
+
+test('reduced motion reveals an early answer immediately without typing or fan-out delays', () => {
+  const window = animationWindow({ reduced: true }), h = harness(window), sequence = motionSequence();
+  h.publish(sequence[0]); h.publish(sequence[1]); h.publish(sequence[2]);
+  assert.equal(h.root.querySelector('.query-text').textContent, sequence[2].queries[0].search);
+  assert.ok(h.root.querySelectorAll('.site-group').every((g) => g.style.opacity === ''));
+  assert.equal(window.calls.length, 0);
+  assert.equal(window.frameCount, 0);
+  h.dispose();
+});
+
+test('turning on reduced motion reveals sites held for a pending answer', () => {
+  const window = animationWindow(), h = harness(window), sequence = motionSequence();
+  h.publish(sequence[0]); h.publish({ ...sequence[1], results: sequence[2].results });
+  assert.ok(h.root.querySelectorAll('.site-group').every((g) => g.style.opacity === '0'));
+  window.media.matches = true; window.media.dispatchEvent(new Event('change'));
+  assert.ok(h.root.querySelectorAll('.site-group').every((g) => g.style.opacity === ''));
+  assert.equal(window.frameCount, 0);
+  h.dispose();
+});
+
+test('a repeated YouTube answer pulses its site in full and reduced motion', async () => {
+  for (const reduced of [false, true]) {
+    const window = animationWindow({ reduced }), h = harness(window), s = fixture();
+    const q = query(5, { engine: 'you_tube', cache: 'generated' });
+    h.publish({ ...s, queries: [...s.queries, q] });
+    const lines = h.root.querySelectorAll('.result-group');
+    const repeat = { ...s, queries: [...s.queries, q, { ...q, id: 6, cache: 'cached' }] };
+    h.publish(repeat);
+    assert.deepEqual(h.root.querySelectorAll('.result-group'), lines);
+    const site = h.root.querySelectorAll('.site-group').find((g) => siteKey(g.getAttribute('data-host')) === 'youtube.com');
+    const ring = window.calls.find((a) => a.node.getAttribute('class') === 'ring again');
+    assert.ok(ring);
+    assert.equal(ring.node.getAttribute('cx'), site.children[0].getAttribute('cx'));
+    assert.equal(ring.options.duration, reduced ? 150 : 500);
+    await window.finish(); h.dispose();
+  }
 });

@@ -1,7 +1,7 @@
 // What the world pane shows, derived only from the run's search snapshot.
 export const ENGINES = ['google', 'bing', 'duckduckgo'];
-export const engine = (name) => ({ google: 'Google', bing: 'Bing', duckduckgo: 'DuckDuckGo' }[name] || name);
-const ENGINE_HOSTS = { google: 'google.com', bing: 'bing.com', duckduckgo: 'duckduckgo.com' };
+export const engine = (name) => ({ google: 'Google', bing: 'Bing', duckduckgo: 'DuckDuckGo', you_tube: 'YouTube' }[name] || name);
+export const ENGINE_HOSTS = { google: 'google.com', bing: 'bing.com', duckduckgo: 'duckduckgo.com', you_tube: 'youtube.com' };
 
 // How the latest answer reached the reader.
 export function queryTag(s, q) {
@@ -114,12 +114,12 @@ const typed = (r) => !r.name.startsWith('_');
 export function rows(s, limit = 6) {
   const path = (url) => { try { const u = new URL(url); return `${u.pathname}${u.search}`; } catch { return url; } };
   const who = (item, fallback) => ['web_search', 'web_fetch'].includes(item.via) ? 'Claude Code' : fallback;
-  const badge = (tag) => ({ made: 'made now', again: 'again', planted: 'planted', refused: 'refused', making: 'making' }[tag] || null);
+  const badge = (tag) => ({ made: 'made now', again: 'again', planted: 'planted', refused: 'refused', making: 'making', asking: 'writing' }[tag] || null);
   return [
     ...s.queries.map((q) => ({ at: q.at_ms, seq: q.seq ?? 0, who: who(q, ENGINE_HOSTS[q.engine] || q.engine), what: q.search, tag: queryTag(s, q) })),
     ...s.pages.map((p) => ({ at: pageTime(p), seq: p.seq ?? 0, who: who(p, p.host), what: path(p.url), tag: pageTag(p), ...(p.carries > 0 ? { carries: true } : {}) })),
     ...s.refused.filter(typed).map((r) => ({ at: r.at_ms, seq: r.seq ?? 0, who: who(r, 'DNS'), what: r.name, tag: 'refused' })),
-    ...(s.planted || []).map((p) => ({ at: p.at_ms, seq: p.seq ?? 0, who: who(p, p.kind === 'page' ? hostOf(p.url) : 'fact'), what: p.text, tag: 'planted' })),
+    ...(s.planted || []).map((p) => ({ at: p.at_ms, seq: p.seq ?? 0, who: 'You', what: p.text, tag: 'planted' })),
   ].sort((a, b) => b.at - a.at || b.seq - a.seq).slice(0, limit).map(({ seq, ...row }) => ({ ...row, badge: badge(row.tag) }));
 }
 
