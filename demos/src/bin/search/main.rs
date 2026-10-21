@@ -143,16 +143,9 @@ async fn main() -> Result {
                 start,
             };
             world.trust("office", &web.ca.cert_pem())?;
-            // The checks run with no key, so the guest has no model to call.
-            let model = if check {
-                None
-            } else {
-                kit::desktop::claude_model(&cx)?
-            };
-            let model = model.map(|model| model.search(pages.clone()));
-            if let Some(model) = &model {
-                kit::desktop::sign_in_claude(&mut world, model, guest::USER)?;
-            }
+            // Claude Code and Codex sign in inside the guest themselves; the
+            // world passes their model and sign-in traffic straight through.
+            let model = None;
             topics.start(&cx, searches, pages)?;
             page::network(&web, &cx, world_log, world.mirror(&cx)?, model)?
                 .route(kit::JUMP, kit::jump_prefix())

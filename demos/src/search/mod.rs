@@ -29,6 +29,19 @@ pub const FORWARDED: &[(&str, &str)] = &[
         crate::kit::desktop::CLAUDE_HOST,
         "Claude Code installed at boot",
     ),
+    ("releases.openai.com", "Codex installed at boot"),
+];
+
+/// Model and sign-in services, passed straight through to the real ones:
+/// Claude Code and Codex sign in and call their models as they normally do.
+pub const PASSED: &[&str] = &[
+    "api.anthropic.com",
+    "claude.ai",
+    "console.anthropic.com",
+    "platform.claude.com",
+    "api.openai.com",
+    "auth.openai.com",
+    "chatgpt.com",
 ];
 
 #[derive(Clone)]
@@ -160,11 +173,19 @@ pub fn network(
     let mozilla = world.ca.config(cx, crate::kit::desktop::HOSTS[0])?.0;
     let claude = world.ca.config(cx, crate::kit::desktop::CLAUDE_HOST)?.0;
     let api = world.ca.config(cx, models::Provider::Anthropic.host())?.0;
+    let passed: std::collections::HashMap<&'static str, _> = PASSED
+        .iter()
+        .map(|host| Ok((*host, world.ca.config(cx, host)?.0)))
+        .collect::<fictionet::Result<_>>()?;
+    let openai = world.ca.config(cx, "releases.openai.com")?.0;
     Ok(world.net(cx, log, move |host| {
-        if host == models::Provider::Anthropic.host() {
-            return model
-                .clone()
-                .map(|model| Site::handler(model).tls(api.clone()));
+        if host == models::Provider::Anthropic.host()
+            && let Some(model) = model.clone()
+        {
+            return Some(Site::handler(model).tls(api.clone()));
+        }
+        if let Some(config) = passed.get(host) {
+            return Some(Site::new(mirror.clone()).tls(config.clone()));
         }
         FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
             let site = Site::new(mirror.clone());
@@ -172,6 +193,8 @@ pub fn network(
                 site.tls(mozilla.clone())
             } else if host == crate::kit::desktop::CLAUDE_HOST {
                 site.tls(claude.clone())
+            } else if host == "releases.openai.com" {
+                site.tls(openai.clone())
             } else {
                 site
             }
