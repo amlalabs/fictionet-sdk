@@ -964,6 +964,60 @@ impl Pages {
             .site(host)
             .cloned()
             .unwrap_or_else(|| make::site_profile(host));
+        let related = self
+            .store()
+            .known(&self.seed)
+            .into_iter()
+            .filter(|r| {
+                r.url != page.url
+                    && (text::split_url(&r.url).0 == host
+                        || self
+                            .seed
+                            .sites
+                            .iter()
+                            .any(|site| site.host == text::split_url(&r.url).0))
+            })
+            .take(3)
+            .map(|r| (r.title, r.url))
+            .collect::<Vec<_>>();
+        let article = make::page(
+            &self.seed,
+            host,
+            target,
+            &[serde_json::json!({"title":page.title})],
+            "news",
+            &[],
+        );
+        use kuchiki::traits::TendrilSink;
+        let dom = kuchiki::parse_html().one(article.body);
+        let byline = dom
+            .select_first(".byline")
+            .map(|n| {
+                if let Ok(time) = n.as_node().select_first("time") {
+                    time.attributes
+                        .borrow_mut()
+                        .insert("datetime", self.seed.date.clone());
+                    for child in time.as_node().children().collect::<Vec<_>>() {
+                        child.detach();
+                    }
+                    time.as_node()
+                        .append(kuchiki::NodeRef::new_text(make::result_date(
+                            &self.seed.date,
+                        )));
+                }
+                n.as_node().to_string()
+            })
+            .unwrap_or_default();
+        let related = related
+            .iter()
+            .map(|(title, url)| {
+                format!(
+                    "<li><a href=\"{}\">{}</a></li>",
+                    text::escape(url),
+                    text::escape(title)
+                )
+            })
+            .collect::<String>();
         let paragraphs: String = page
             .text
             .iter()
@@ -974,7 +1028,10 @@ impl Pages {
             title: page.title.clone(),
             description: text::take(&page.text.join(" "), 200),
             date: self.seed.date.clone(),
-            body: format!("<h1>{}</h1>\n{paragraphs}", text::escape(&page.title)),
+            body: format!(
+                "<h1>{}</h1>{byline}{paragraphs}<section class=\"related\"><p class=\"related-title\"><strong>Related</strong></p><ul>{related}</ul></section>",
+                text::escape(&page.title)
+            ),
             ..make::Page::default()
         };
         Some(Response::html(
@@ -1011,6 +1068,50 @@ impl Pages {
         let started = cx.now().since_start();
         let search = matches!(route, Route::Search { .. });
         let mut response = self.answer(cx, &host.to_lowercase(), target, route).await;
+        if response.content_type.starts_with("text/html") {
+            let body = String::from_utf8_lossy(&response.body);
+            let title = match &response.meta {
+                Meta::Page(page) => page.title.as_str(),
+                _ => "",
+            };
+            let (title, mut body) = render::counted(title, &body);
+            if let Meta::Page(page) = &mut response.meta {
+                page.title = title;
+            }
+            if (!render::cookie_host(host)
+                || self.seed.sites.iter().any(|site| {
+                    site.host.trim_start_matches("www.") == host.trim_start_matches("www.")
+                }))
+                && body.contains("cookie-banner")
+            {
+                use kuchiki::traits::TendrilSink;
+                let dom = kuchiki::parse_html().one(body);
+                for node in dom.select(".cookie-banner").unwrap().collect::<Vec<_>>() {
+                    node.as_node().detach();
+                }
+                for node in dom.select("script").unwrap().collect::<Vec<_>>() {
+                    if node.text_contents().contains("site_cookies") {
+                        node.as_node().detach();
+                    }
+                }
+                body = dom.to_string();
+            }
+            if body.contains("class=\"cookie-banner\"") {
+                let (message, accept, reject) = render::cookie_words(host);
+                body = body
+                    .replace(
+                        "We use cookies for site preferences and analytics.",
+                        message,
+                    )
+                    .replace(">Accept</button>", &format!(">{accept}</button>"))
+                    .replace(
+                        ">Reject non-essential</button>",
+                        &format!(">{reject}</button>"),
+                    );
+            }
+            response.body = body.into_bytes();
+        }
+
         let mut reached = HashSet::new();
         // A result list is corrected result by result, so its search box
         // keeps what was typed.
@@ -1097,9 +1198,7 @@ impl Pages {
             let domain = form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
                 match (host, key.as_ref()) {
                     ("www.google.com", "domain") => Some(value.into_owned()),
-                    ("www.bing.com", "u") => url::Url::parse(&value)
-                        .ok()
-                        .and_then(|url| url.host_str().map(str::to_owned)),
+                    ("www.bing.com", "id") => Some(value.into_owned()),
                     _ => None,
                 }
             });
@@ -1112,6 +1211,21 @@ impl Pages {
                     Meta::Asset,
                 ),
                 None => Response::new(404, "text/plain", "Not found", vec![], Meta::Asset),
+            };
+        }
+        if host == "external-content.duckduckgo.com" && path.starts_with("/ip3/") {
+            return match path
+                .strip_prefix("/ip3/")
+                .and_then(|p| p.strip_suffix(".ico"))
+            {
+                Some(domain) if !domain.is_empty() => Response::new(
+                    200,
+                    "image/svg+xml",
+                    render::favicon(domain),
+                    vec![],
+                    Meta::Asset,
+                ),
+                _ => Response::new(404, "text/plain", "Not found", vec![], Meta::Asset),
             };
         }
         if path.starts_with("/_assets/") {
@@ -1507,6 +1621,7 @@ impl Pages {
                 }
             }
         }
+        make::finish_listing(query, &mut search);
         let mut reached = HashSet::new();
         for result in &mut search.results {
             if self
@@ -1541,6 +1656,12 @@ impl Pages {
             let store = self.store();
             (store.known(&seed), store.recent_claims(40))
         };
+        let mut normalized = search::Search {
+            results: known,
+            ..search::Search::default()
+        };
+        make::finish_listing(query, &mut normalized);
+        let known = normalized.results;
         let made = self
             .generate(
                 cx,
@@ -1567,6 +1688,7 @@ impl Pages {
             )
             .await?;
         let mut search = made.fields;
+        make::finish_listing(query, &mut search);
         let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
             let (host, target) = text::target_of(&r.url);
@@ -1795,6 +1917,54 @@ impl Pages {
         )
     }
 
+    fn listed_video(&self, host: &str, target: &str) -> Option<PageRecord> {
+        if host != "www.youtube.com" || !target.starts_with("/watch?v=") {
+            return None;
+        }
+        let store = self.store();
+        for listing in store.searches() {
+            for original in &listing.search.results {
+                let (source_host, source_target) = text::target_of(&original.url);
+                if source_host != host || !source_target.starts_with("/results?") {
+                    continue;
+                }
+                let mut normalized = search::Search {
+                    results: vec![original.clone()],
+                    ..search::Search::default()
+                };
+                make::finish_listing(&listing.query, &mut normalized);
+                let video = &normalized.results[0];
+                if text::target_of(&video.url).1 != target {
+                    continue;
+                }
+                let mut record = store.page(&source_host, &source_target)?.clone();
+                let page = make::Page {
+                    title: video.title.clone(),
+                    body: format!(
+                        "<h1>{}</h1><p class=\"channel\">{}</p>",
+                        text::escape(&video.title),
+                        text::escape(&video.snippet)
+                    ),
+                    date: record.date.clone(),
+                    ..make::Page::default()
+                };
+                record.url = video.url.clone();
+                record.target = target.into();
+                record.title = video.title.clone();
+                record.body = render::page_at(
+                    host,
+                    target,
+                    &make::site_profile(host),
+                    &page,
+                    &self.seed.date,
+                )
+                .into_bytes();
+                return Some(record);
+            }
+        }
+        None
+    }
+
     async fn page(self: &Arc<Self>, cx: &Cx, host: &str, target: &str, prefetch: bool) -> Response {
         if !prefetch && self.store().page(host, target).is_none() {
             self.making(cx, host, target);
@@ -1804,6 +1974,7 @@ impl Pages {
             Err(error) => return Stop::store(error).response(Asked::Page),
         };
         let stored = self.store().page(host, target).cloned();
+        let stored = stored.or_else(|| self.listed_video(host, target));
         let (mut record, mut cache) = match stored {
             Some(record) => (record, Cache::Cached),
             None if !self.generating() => {

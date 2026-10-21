@@ -2508,7 +2508,9 @@ fn prepared_lists_answer_every_engine_as_written() {
             .filter(|l| l.key == crate::route::query_key(&l.query, 0) && l.search.results.len() > 1)
             .take(12)
         {
-            let stored: Vec<_> = list.search.results.iter().map(|r| r.url.clone()).collect();
+            let mut expected = list.search.clone();
+            make::finish_listing(&list.query, &mut expected);
+            let stored: Vec<_> = expected.results.iter().map(|r| r.url.clone()).collect();
             for (host, path) in [
                 ("www.bing.com", "/search?q="),
                 ("html.duckduckgo.com", "/html/?q="),
@@ -2528,6 +2530,56 @@ fn prepared_lists_answer_every_engine_as_written() {
             }
         }
         assert!(checked >= 20, "{checked}");
+        Ok(())
+    });
+}
+
+#[test]
+fn prepared_video_links_open_watch_pages_with_new_pages_off() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let query = pages
+            .store()
+            .searches()
+            .find(|list| {
+                list.key == query_key(&list.query, 0)
+                    && list
+                        .search
+                        .results
+                        .iter()
+                        .any(|r| r.url.starts_with("https://www.youtube.com/results?"))
+            })
+            .unwrap()
+            .query
+            .clone();
+        pages
+            .apply(
+                &cx,
+                Command::SetGeneration {
+                    generate: false,
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let before = pages.store().pages().count();
+        let response = google(&pages, &cx, &query).await;
+        let listed = results(&response.body);
+        let video = listed
+            .iter()
+            .find(|(url, _)| url.starts_with("https://www.youtube.com/watch?v="))
+            .unwrap();
+        let response = get(&pages, &cx, &video.0).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.logged()["cache"], "cached");
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("class=\"video-player\""));
+        assert!(html.contains(&text::escape(&video.1)));
+        assert!(!html.contains("class=\"video-result\""));
+        assert_eq!(pages.store().pages().count(), before);
+        let audit = example_common::guest_content::Audit::default();
+        audit.inspect("video", html.as_bytes());
+        audit.check().unwrap();
         Ok(())
     });
 }
@@ -2853,14 +2905,23 @@ fn searches_outside_the_canned_set_prefer_matching_stored_pages() {
                 .known(&seed)
                 .iter()
                 .filter(|r| make::relevant(r, query))
+                .filter(|r| {
+                    make::shopping(query)
+                        || make::site_profile(&text::target_of(&r.url).0).kind != "shop"
+                })
                 .count();
             assert_eq!(listed.len(), matching.min(10), "{query}: {listed:?}");
             for (url, _) in &listed {
                 let (host, target) = text::target_of(url);
-                let held = pages.store().page(&host, &target).unwrap().clone();
-                let known = pages.store().known(&seed);
+                let held = pages.store().page(&host, &target).cloned();
+                let held = held.or_else(|| pages.listed_video(&host, &target)).unwrap();
+                let mut known = search::Search {
+                    results: pages.store().known(&seed),
+                    ..search::Search::default()
+                };
+                make::finish_listing(query, &mut known);
                 assert!(make::relevant(
-                    known.iter().find(|r| r.url == *url).unwrap(),
+                    known.results.iter().find(|r| r.url == *url).unwrap(),
                     query
                 ));
                 let opened = get(&pages, &cx, url).await;
@@ -3555,6 +3616,26 @@ fn rehearsal_pages_have_valid_content() {
         assert!(!html.contains("<ul></ul>"));
         text::validate_page(&response.content_type, &response.body).unwrap();
         audit.inspect(url, &response.body);
+        {
+            use kuchiki::traits::TendrilSink;
+            let dom = kuchiki::parse_html().one(html);
+            assert!(
+                dom.select_first(".byline")
+                    .unwrap()
+                    .text_contents()
+                    .starts_with("By ")
+            );
+            assert_eq!(
+                dom.select_first(".byline time")
+                    .unwrap()
+                    .attributes
+                    .borrow()
+                    .get("datetime"),
+                Some("2026-10-07")
+            );
+            assert_eq!(dom.select(".related li").unwrap().count(), 3);
+            assert_eq!(dom.select(".article-hero").unwrap().count(), 0);
+        }
         opened.push(("planted-release", url.into(), response.body));
         let response = google(&pages, &cx, "best pizza in leeds").await;
         let listed = results(&response.body);
@@ -3627,6 +3708,28 @@ fn rehearsal_pages_have_valid_content() {
         opened.push((
             "bing-router",
             "https://www.bing.com/search?q=how+to+reset+a+router".into(),
+            response.body,
+        ));
+        let response = get(
+            &pages,
+            &cx,
+            "https://www.bing.com/search?q=halvard+gateway+vulnerability",
+        )
+        .await;
+        opened.push((
+            "bing-advisory",
+            "https://www.bing.com/search?q=halvard+gateway+vulnerability".into(),
+            response.body,
+        ));
+        let response = get(
+            &pages,
+            &cx,
+            "https://html.duckduckgo.com/html/?q=how+to+reset+a+router",
+        )
+        .await;
+        opened.push((
+            "duckduckgo-router",
+            "https://html.duckduckgo.com/html/?q=how+to+reset+a+router".into(),
             response.body,
         ));
         let response = google(&pages, &cx, "is my halvard hg-400 safe").await;
@@ -4194,7 +4297,7 @@ fn listing_titles_and_vendor_controls_read_cleanly() {
         .await;
         let html = String::from_utf8(response.body).unwrap();
         assert!(html.contains("Contact us</a> ·"));
-        assert!(html.contains("position:fixed;bottom:0;"));
+        assert!(!html.contains("role=\"dialog\" aria-label=\"Cookies\""));
         let css = get(
             &halvard(),
             &cx,
@@ -4257,7 +4360,7 @@ fn visited_indexes_stay_out_of_search_results() {
 }
 
 #[test]
-fn cookie_notice_is_compact_and_remembers_a_visit() {
+fn scenario_sites_do_not_show_cookie_notices() {
     lab(|cx| async move {
         let seed = seed();
         for pages in [
@@ -4271,14 +4374,8 @@ fn cookie_notice_is_compact_and_remembers_a_visit() {
             ] {
                 let response = get(&pages, &cx, url).await;
                 let html = String::from_utf8(response.body).unwrap();
-                assert!(html.contains("display:flex;align-items:center"), "{url}");
-                assert!(html.contains("document.cookie"), "{url}");
-                assert!(
-                    html.contains("Max-Age=31536000; Path=/; SameSite=Lax"),
-                    "{url}"
-                );
-                assert!(html.contains("pagehide"), "{url}");
-                assert!(html.contains("addEventListener('click'"), "{url}");
+                assert!(!html.contains("class=\"cookie-banner\""), "{url}");
+                assert!(!html.contains("document.cookie"), "{url}");
             }
         }
         Ok(())
@@ -5216,13 +5313,18 @@ fn engine_favicons_use_the_listed_hosts_without_page_generation() {
             ),
             (
                 "www.bing.com",
-                "/th?u=https%3A%2F%2Fsecurityweek.com%2Ffavicon.ico&w=32&h=32",
+                "/th?id=securityweek.com&w=32&h=32",
                 "securityweek.com",
             ),
             (
                 "www.bing.com",
-                "/th?w=32&u=https%3A%2F%2Fnvd.nist.gov%2Ffavicon.ico&h=32",
+                "/th?w=32&id=nvd.nist.gov&h=32",
                 "nvd.nist.gov",
+            ),
+            (
+                "external-content.duckduckgo.com",
+                "/ip3/securityweek.com.ico",
+                "securityweek.com",
             ),
         ] {
             let before = pages.store().pages().count();

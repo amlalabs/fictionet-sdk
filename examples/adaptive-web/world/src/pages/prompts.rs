@@ -222,10 +222,12 @@ result lists are messy, not a tidy story:
 - Snippets are text cut out of the page, not summaries: often starting or
   ending mid-sentence, sometimes with a date, a rating, menu words or a
   list of links in them. Not every snippet repeats the query's facts.
-- Mix official sites, news, Wikipedia, forums, Q&A, video and shops.
-- Video results use the site's search URL with relevant query parameters
-  (YouTube: https://www.youtube.com/results?search_query=...). Do not use
-  watch URLs or remembered video IDs that could lead to unrelated content.";
+- Mix official sites, news, Wikipedia, forums, Q&A and video.
+- Include shops only when the query asks to buy, compare prices or choose products.
+- YouTube results link to /watch?v= with a video title, channel name and
+  duration in the snippet. Never link to YouTube's results page.
+- Site names use readable word boundaries: Mechanical Keyboards for
+  mechanicalkeyboards.com, not Mechanicalkeyboards.";
 
 const PAGE_FORMAT_HEAD: &str = "Answer in exactly this format, with nothing before or after it:
 
@@ -244,6 +246,8 @@ const PAGE_FORMAT_TAIL: &str = "SIDEBAR:
 AD: one line of ad copy shown on the page, or none
 BODY:
 the page's main content
+
+If the title names a number of items, list exactly that many items.
 
 For HTML, BODY is what goes inside <main>: start with the page's <h1>, then
 the content (article text, tables, code, posts with usernames and times,

@@ -249,13 +249,18 @@ fn google(query: &str, record: &Search, start: u64) -> String {
 <div id="main"><div id="result-stats">{count} results</div><div id="res"><div id="search">"#
     )];
     if start == 0 {
-        for ad in record.ads.iter().take(2) {
+        for (index, ad) in record.ads.iter().take(2).enumerate() {
             out.push(format!(
                 concat!(
-                    r#"<div class="uEierd"><span class="U3A9Ac">Sponsored</span>"#,
+                    r#"<div class="uEierd">{heading}"#,
                     r#"<a href="{url}"><div role="heading">{title}</div><span>{shown}</span></a>"#,
                     r#"<div class="MUxGbd">{text}</div></div>"#,
                 ),
+                heading = if index == 0 {
+                    r#"<span class="U3A9Ac">Sponsored</span>"#
+                } else {
+                    ""
+                },
                 url = e(&ad.url),
                 title = e(&ad.title),
                 shown = e(&display_url(&ad.url)),
@@ -485,7 +490,7 @@ fn duckduckgo(query: &str, record: &Search) -> String {
                 r#"<div class="result__extras"><div class="result__extras__url">"#,
                 r#"<span class="result__icon"><a rel="nofollow" href="{link}">"#,
                 r#"<img class="result__icon__img" width="16" height="16" alt="" "#,
-                r#"src="https://{host}/favicon.ico" name="i15" /></a></span>"#,
+                r#"src="https://external-content.duckduckgo.com/ip3/{host}.ico" name="i15" /></a></span>"#,
                 r#"<a class="result__url" href="{link}">{shown}</a>{date}</div></div>"#,
                 r#"<a class="result__snippet" href="{link}">{snippet}</a>"#,
                 r#"<div class="clear"></div></div></div>"#,
@@ -632,11 +637,8 @@ fn result(
             "https://www.google.com/s2/favicons?domain={}&sz=32",
             quote(&host, "")
         ),
-        "www.bing.com" => format!(
-            "https://www.bing.com/th?u={}&w=32&h=32",
-            quote(&format!("https://{host}/favicon.ico"), "")
-        ),
-        _ => format!("https://{host}/favicon.ico"),
+        "www.bing.com" => format!("https://www.bing.com/th?id={}&w=32&h=32", quote(&host, "")),
+        _ => format!("https://external-content.duckduckgo.com/ip3/{host}.ico"),
     };
     let icon = format!(
         r#"<img class="result-icon" src="{}" width="20" height="20" alt="">"#,
@@ -866,6 +868,24 @@ mod tests {
     }
 
     #[test]
+    fn google_ads_share_one_heading() {
+        let mut record = record();
+        record.ads.push(Ad {
+            url: "https://other.org/".into(),
+            title: "More choices".into(),
+            text: "Read more.".into(),
+        });
+        for html in [
+            google("storage", &record, 0),
+            render(Engine::Google, "storage", &record, 0),
+        ] {
+            let dom = document(&html);
+            assert_eq!(dom.select(".uEierd").unwrap().count(), 2);
+            assert_eq!(dom.select(".U3A9Ac").unwrap().count(), 1);
+        }
+    }
+
+    #[test]
     fn result_rows_use_one_host_icon() {
         let record = Search {
             results: vec![Result {
@@ -897,10 +917,13 @@ mod tests {
                     assert_eq!(icon.path(), "/th");
                     assert!(
                         icon.query_pairs()
-                            .any(|(k, v)| k == "u" && v == "https://securityweek.com/favicon.ico")
+                            .any(|(k, v)| k == "id" && v == "securityweek.com")
                     );
                 }
-                _ => assert_eq!(icon.as_str(), "https://securityweek.com/favicon.ico"),
+                _ => assert_eq!(
+                    icon.as_str(),
+                    "https://external-content.duckduckgo.com/ip3/securityweek.com.ico"
+                ),
             }
         }
     }

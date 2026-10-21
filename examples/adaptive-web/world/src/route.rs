@@ -106,6 +106,19 @@ pub fn route(host: &str, target: &str, form: Option<&[u8]>) -> Route {
         return redirect(format!("https://www.{host}{target}"), 301);
     }
     if host == "www.google.com" {
+        if path == "/search"
+            && !q.is_empty()
+            && (args.contains_key("client") || args.contains_key("channel"))
+        {
+            let mut clean = form_urlencoded::Serializer::new(String::new());
+            clean.append_pair("q", q);
+            for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+                if !["q", "client", "channel"].contains(&key.as_ref()) {
+                    clean.append_pair(&key, &value);
+                }
+            }
+            return redirect(format!("/search?{}", clean.finish()), 302);
+        }
         if path == "/search" && !q.is_empty() {
             return search(Engine::Google, number(arg("start")));
         }
@@ -144,6 +157,28 @@ pub fn route(host: &str, target: &str, form: Option<&[u8]>) -> Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_search_redirect_keeps_query_and_search_options() {
+        assert_eq!(
+            route(
+                "www.google.com",
+                "/search?client=firefox-b-d&channel=entpr&q=long+query+%26+details&start=10&hl=en&tbm=vid",
+                None
+            ),
+            Route::Redirect {
+                location: "/search?q=long+query+%26+details&start=10&hl=en&tbm=vid".into(),
+                status: 302,
+            }
+        );
+        assert_eq!(
+            route("www.google.com", "/search?q=long+query&start=10", None),
+            Route::Search {
+                engine: Engine::Google,
+                query: "long query".into(),
+                start: 10
+            }
+        );
+    }
     #[test]
     fn routing_branches() {
         for host in ["GOOGLE.COM", "bing.com"] {

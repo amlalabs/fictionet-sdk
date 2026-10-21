@@ -3775,6 +3775,71 @@ fn result_path(seed: &Seed, host: &str, slug: &str, kind: &str) -> String {
     }
 }
 
+pub(super) fn shopping(query: &str) -> bool {
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| {
+            [
+                "buy",
+                "shop",
+                "shopping",
+                "price",
+                "prices",
+                "budget",
+                "cheap",
+                "best",
+                "deals",
+                "purchase",
+                "cost",
+                "review",
+                "reviews",
+                "compare",
+                "comparison",
+                "vs",
+            ]
+            .contains(&word)
+        })
+}
+
+pub(super) fn finish_listing(query: &str, search: &mut Search) {
+    static DURATION: OnceLock<Regex> = OnceLock::new();
+    let duration = DURATION.get_or_init(|| Regex::new(r"\b\d{1,2}:\d{2}\b").unwrap());
+
+    if !shopping(query) {
+        search
+            .results
+            .retain(|r| site_profile(&target_of(&r.url).0).kind != "shop");
+        search
+            .ads
+            .retain(|r| site_profile(&target_of(&r.url).0).kind != "shop");
+    }
+    for result in &mut search.results {
+        let (host, target) = target_of(&result.url);
+        if !matches!(
+            host.as_str(),
+            "www.youtube.com" | "youtube.com" | "youtu.be"
+        ) {
+            continue;
+        }
+        if !target.starts_with("/watch?v=") {
+            result.url = format!(
+                "https://www.youtube.com/watch?v={}",
+                base36(hash(&result.url))
+            );
+            result.title = format!("{}: a step-by-step guide", proper(heading(&result.title)));
+        }
+        if !result.snippet.contains(" • ") || !duration.is_match(&result.snippet) {
+            result.snippet = excerpt(&format!(
+                "Practical Guides • {}:{:02} • {}",
+                4 + hash(&result.title) % 12,
+                hash(&result.url) % 60,
+                result.snippet
+            ));
+        }
+    }
+}
+
 /// Proposes candidates from known pages, scenario sites and search directories.
 /// The request handler reserves their metadata and bounds unsupported searches.
 pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Search {
@@ -3787,6 +3852,9 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
     };
     let mut results: Vec<Result> = Vec::new();
     let mut add = |url: String, title: String, snippet: String, date: String| {
+        if !shopping(query) && site_profile(&target_of(&url).0).kind == "shop" {
+            return;
+        }
         if results.len() < 10 && !results.iter().any(|r| r.url == url) {
             results.push(Result {
                 url,
@@ -3813,6 +3881,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
     for k in ranked
         .into_iter()
         .filter(|k| relevant(k, query))
+        .filter(|k| shopping(query) || site_profile(&target_of(&k.url).0).kind != "shop")
         .take(limit)
     {
         let snippet = if k.snippet.is_empty() {
@@ -4475,7 +4544,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             )
         });
     }
-    for &host in &candidates {
+    for &host in candidates.iter().chain(alternatives.iter()) {
         if engine != Engine::Google && known.iter().any(|r| target_of(&r.url).0 == host) {
             continue;
         }
@@ -4654,7 +4723,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         };
         add(url, title, snippet, date);
     }
-    Search {
+    let mut search = Search {
         results,
         related: ["reddit", "2026", "explained", "latest", "vs alternatives"]
             .map(|s| format!("{phrase} {s}"))
@@ -4665,7 +4734,9 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             format!("How do I check {phrase}?"),
         ],
         ads: vec![],
-    }
+    };
+    finish_listing(query, &mut search);
+    search
 }
 
 pub(super) fn for_engine(
@@ -4758,7 +4829,12 @@ pub fn site_profile(host: &str) -> Profile {
         } else {
             labels[n.saturating_sub(2)]
         };
-    let name = normalize_space(&label.replace('-', " "))
+    let readable = label.replace('-', " ");
+    let readable = readable
+        .replace("mechanicalkeyboards", "mechanical keyboards")
+        .replace("consumerreports", "consumer reports")
+        .replace("healthandsafety", "health and safety");
+    let name = normalize_space(&readable)
         .split(' ')
         .map(capitalize)
         .collect::<Vec<_>>()
@@ -4994,6 +5070,10 @@ pub fn site_profile(host: &str) -> Profile {
     } else if matches!(
         host,
         "www.amazon.co.uk"
+            | "www.amazon.com"
+            | "amazon.com"
+            | "www.walmart.com"
+            | "www.bestbuy.com"
             | "www.rei.com"
             | "www.backcountry.com"
             | "www.sportsdirect.com"
@@ -5396,7 +5476,7 @@ header { background: #fff; border-top: 5px solid var(--accent); border-bottom: 1
 .brand a, .logo, .home { color: inherit; font-size: 30px; font-weight: 800; letter-spacing: -1px; }
 .tagline { display: block; font-size: 13px; color: inherit; }
 .cookie-banner { position: fixed; bottom: 0; left: 0; right: 0; z-index: 100; display: flex; align-items: center; gap: 16px; padding: 12px 24px; background: #fff; border-top: 1px solid #bdc6d1; box-shadow: 0 -2px 12px #0002; }
-body { padding-bottom: 100px; }
+body:has(.cookie-banner) { padding-bottom: 80px; }
 nav ul, .nav, .footer-links, .topbar ul { list-style: none; padding: 0; display: flex; gap: 24px; flex-wrap: wrap; }
 nav a, .nav a { color: inherit; font-size: 14px; font-weight: 600; }
 .layout, .columns { max-width: 1160px; margin: 36px auto; display: grid; gap: 40px; grid-template-columns: minmax(0, 1fr) 260px; padding: 0 24px; }
@@ -6296,6 +6376,55 @@ pub fn page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn video_rows_and_shops_follow_search_intent() {
+        let mut listing = Search {
+            results: vec![
+                Result {
+                    url: "https://www.youtube.com/results?search_query=router+reset".into(),
+                    title: "router reset".into(),
+                    snippet: "Resetting a router without losing the configuration.".into(),
+                    ..Result::default()
+                },
+                Result {
+                    url: "https://www.amazon.co.uk/s?k=router".into(),
+                    title: "Routers".into(),
+                    ..Result::default()
+                },
+            ],
+            ..Search::default()
+        };
+        finish_listing("how to reset a router", &mut listing);
+        assert_eq!(listing.results.len(), 1);
+        let video = &listing.results[0];
+        assert!(video.url.starts_with("https://www.youtube.com/watch?v="));
+        assert_ne!(video.title, "router reset");
+        assert!(
+            regex::Regex::new(r"^[^•]+ • \d+:\d{2} • ")
+                .unwrap()
+                .is_match(&video.snippet)
+        );
+        let first = listing.clone();
+        finish_listing("how to reset a router", &mut listing);
+        assert_eq!(listing.results, first.results);
+        assert!(shopping("best budget mechanical keyboards"));
+        assert!(!shopping("how to clean a dishwasher"));
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for query in ["how to reset a router", "how to clean a dishwasher"] {
+            let found = search(&seed, query, &[], Engine::Google);
+            assert_eq!(found.results.len(), 10);
+            assert!(
+                found
+                    .results
+                    .iter()
+                    .all(|r| site_profile(&target_of(&r.url).0).kind != "shop")
+            );
+        }
+        assert_eq!(
+            site_profile("mechanicalkeyboards.com").name,
+            "Mechanical Keyboards"
+        );
+    }
     #[test]
     fn varied_query_shapes_keep_guest_content_and_editorial_structure() {
         use kuchiki::traits::TendrilSink;
