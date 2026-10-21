@@ -212,8 +212,9 @@
 //! apply. Both exports require the bearer;
 //! browser download links contain only local blob URLs.
 //!
-//! Each host is `{name,sandbox,status,screen,terminal}`. `status` is
+//! Each host is `{name,sandbox,status,screen,terminal,claude_code}`. `status` is
 //! `/api/state/host-<name>`; `screen` and `terminal` are panel IDs or null.
+//! `claude_code` reports whether Claude Code is installed.
 //! Capabilities are stable declarations; current availability comes from
 //! the status topic's value `{state,addresses,screen,terminal}`. `state` is
 //! `booting`, `network_up`, `ssh_up`, `desktop_up` or `stopped`, addresses

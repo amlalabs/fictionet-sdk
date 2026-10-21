@@ -38,9 +38,9 @@ export function mount(root, services, options = {}) {
     return services.endpointNames?.get().get(address) || dnsNames.get(address) || (resolvers.has(address) ? 'resolver' : value);
   }
   const lanes = options.compact ? createLanes($('packet-lanes'), { name, animate, local: (value) => [...addresses.values()].some((list) => list.includes(addressOf(value))), addressFor: (host) => [...(services.endpointNames?.get() || []), ...dnsNames].find(([, value]) => value === host)?.[0] }) : null;
-  let animation, timer, disposed = false;
+  let animation, timer, disposed = false, visible = !options.visibility || options.visibility.get();
   function schedule() {
-    if (disposed || animation !== undefined) return;
+    if (disposed || !visible || animation !== undefined) return;
     clearTimeout(timer);
     animation = requestAnimationFrame(frame);
   }
@@ -133,7 +133,7 @@ export function mount(root, services, options = {}) {
   async function scope() {
     // Opening before the graph is known would open the stream again once it
     // is, since each link's host and direction come from the graph.
-    if (!state.known) return;
+    if (!state.known || !visible) return;
     // A stopped run's links can no longer be read, so the list keeps what it
     // shows.
     if (current && services.stopped()) return;
@@ -182,6 +182,18 @@ export function mount(root, services, options = {}) {
     view.setPair(pair && [pair.local, pair.peer]);
     badge.hidden = !pair;
     text.textContent = pair ? `${pair.local} ↔ ${pair.peer}. ${APPROXIMATE}` : '';
+  }));
+  if (options.visibility) cleanup.push(options.visibility.subscribe((value) => {
+    visible = value;
+    if (value) { view.resume(); schedule(); void scope(); }
+    else {
+      generation++;
+      request?.abort();
+      view.suspend();
+      cancelAnimationFrame(animation);
+      animation = undefined;
+      clearTimeout(timer);
+    }
   }));
   void scope();
   return () => {

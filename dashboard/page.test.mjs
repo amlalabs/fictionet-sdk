@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { createServices, divider, appShell, showNotice } from './page.mjs';
 import { createStateHub, createWatchHub } from './streams.mjs';
@@ -759,9 +760,20 @@ test('an app page shows its agent tabs and world panel, with a World menu and no
   const tabs = h.root.querySelector('.app-tabs').children.filter((child) => child.getAttribute('role') === 'tab');
   assert.deepEqual(tabs.map((tab) => tab.textContent), ['Screen', 'Terminal']);
   assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
+  const screenPanel = h.root.querySelector('.app-console');
   tabs[1].click();
   assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
   assert.equal(h.root.querySelector('.app-stage').dataset.kind, 'terminal');
+  const terminalPanel = h.root.querySelectorAll('.app-console')[1];
+  assert.equal(screenPanel.hidden, true);
+  assert.equal(screenPanel.inert, true);
+  tabs[0].click();
+  assert.equal(h.root.querySelector('.app-console'), screenPanel);
+  assert.equal(screenPanel.hidden, false);
+  assert.equal(terminalPanel.hidden, true);
+  assert.equal(terminalPanel.inert, true);
+  tabs[1].click();
+  assert.equal(h.root.querySelectorAll('.app-console')[1], terminalPanel);
   assert.match(h.root.textContent, /the world/);
   const world = h.root.querySelector('.app-world');
   const worldTabs = world.querySelector('.app-tabs');
@@ -782,7 +794,17 @@ test('an app page shows its agent tabs and world panel, with a World menu and no
   const watch = h.streams.find((source) => source.tag === 'watch');
   watch.emit('snapshot', { t: 1, started: 0, ended: false, hosts: [], groups: [], nodes: [], edges: [], counters: {}, events: [] });
   await settle();
+  assert.equal(h.root.querySelector('.app-live').textContent, 'Booting');
+  assert.equal(h.root.querySelector('.app-live').dataset.live, 'false');
+  const state = h.streams.findLast((source) => source.tag === 'state' && !source.closed);
+  for (const [revision, readiness] of ['booting', 'network_up', 'ssh_up'].entries()) {
+    state.emit('snapshot', { topic: 'host-alpha', revision: revision + 1, value: { state: readiness } });
+    assert.equal(h.root.querySelector('.app-live').textContent, 'Booting');
+    assert.equal(h.root.querySelector('.app-live').dataset.live, 'false');
+  }
+  state.emit('snapshot', { topic: 'host-alpha', revision: 4, value: { state: 'desktop_up', screen: true, terminal: true } });
   assert.equal(h.root.querySelector('.app-live').textContent, 'Live');
+  assert.equal(h.root.querySelector('.app-live').dataset.live, 'true');
   stop();
   assert.equal(h.budget.open, 0);
   assert.equal(h.document.listenerCount, 0);
@@ -879,6 +901,7 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   tabs[0].click();
   assert.equal(source.closed, true);
   assert.equal(source.listenerCount, 0);
+  const keptRows = [...rows()];
   assert.equal(ownPanel.hidden, false);
   assert.equal(packetPanel.hidden, true);
   const key = (name, index) => {
@@ -905,6 +928,13 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   assert.equal(ownPanel.hidden, true);
   const reopened = h.streams.findLast((s) => s.tag === 'packets');
   assert.notEqual(reopened, source);
+  assert.deepEqual(rows(), keptRows, 'switching views preserves the row elements');
+  reopened.emit('packet', { seq: 1012, t: 101.2, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:443', proto: 'TLS', len: 60, info: 'Client hello 1012' });
+  frame();
+  assert.deepEqual(rows(), keptRows, 'retained history does not replay rows');
+  reopened.emit('packet', { seq: 1013, t: 101.3, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:443', proto: 'TLS', len: 60, info: 'Client hello 1013' });
+  frame();
+  assert.equal(Number(rows()[0].dataset.seq), 1013, 'new traffic resumes');
   assert.equal(packetPanel.querySelectorAll('#drawer').length, 1);
   h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
   assert.equal(reopened.closed, true);
@@ -975,4 +1005,19 @@ test('an app can show sign out after replacing the inspector shell', (t) => {
   assert.equal(h.root.querySelectorAll('#notice').length, 1);
   assert.equal(h.root.querySelector('#notice-action').hidden, false);
   stop(); services.dispose();
+});
+
+test('the agent stage edge has three to one contrast against the page in both schemes', () => {
+  const css = readFileSync(new URL('./page.css', import.meta.url), 'utf8');
+  const pair = (name) => css.match(new RegExp(`--${name}: light-dark\\((#[0-9a-f]{6}), (#[0-9a-f]{6})\\)`)).slice(1);
+  const luminance = (hex) => {
+    const channels = hex.slice(1).match(/../g).map((value) => parseInt(value, 16) / 255)
+      .map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+  };
+  const background = pair('app-bg'), edge = pair('app-stage-edge');
+  for (let i = 0; i < 2; i++) {
+    const values = [luminance(background[i]), luminance(edge[i])].sort((a, b) => a - b);
+    assert.ok((values[1] + 0.05) / (values[0] + 0.05) >= 3);
+  }
 });

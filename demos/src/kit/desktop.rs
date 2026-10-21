@@ -311,7 +311,7 @@ pub fn sign_in_claude(
 /// Claude Code's settings and state for `user`: the model, and the first-run
 /// questions answered for `key`.
 fn claude_files(user: &str, key: &str) -> Vec<(&'static str, String)> {
-    let settings = serde_json::json!({ "model": CLAUDE_MODEL });
+    let settings = serde_json::json!({ "model": CLAUDE_MODEL, "spinnerTipsEnabled": false });
     let tail: String = key
         .chars()
         .rev()
@@ -411,7 +411,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         user,
         (1280, 800),
         &session,
-        "env DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && pgrep -x xfwm4 >/dev/null",
+        "env DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && pgrep -x xfwm4 >/dev/null && env DISPLAY=:1 xdotool search --onlyvisible --class firefox >/dev/null",
     )
     .packages(&[
         "xfce4",
@@ -552,6 +552,12 @@ fn quiet_preferences() -> serde_json::Value {
         // Suggestions send a request for every address bar keystroke.
         ("browser.search.suggest.enabled", false.into()),
         ("browser.urlbar.suggest.searches", false.into()),
+        ("browser.urlbar.suggest.topsites", false.into()),
+        ("browser.urlbar.suggest.recentsearches", false.into()),
+        (
+            "browser.newtabpage.activity-stream.feeds.topsites",
+            false.into(),
+        ),
         ("browser.urlbar.quicksuggest.enabled", false.into()),
         // Speculation and prefetch request pages before anyone opens them.
         ("network.http.speculative-parallel-limit", 0.into()),
@@ -711,6 +717,8 @@ mod tests {
         assert_eq!(*port, VNC_PORT);
         assert!(ready.contains("DISPLAY=:1 xdpyinfo"));
         assert!(ready.contains("pgrep -x xfwm4"));
+        assert!(ready.contains("xdotool search --onlyvisible --class firefox"));
+        assert!(guest.packages.iter().any(|name| name == "xdotool"));
         let (data, files) = seed(&guest);
         let content = |path: &str| files[path].clone();
         assert_eq!(
@@ -751,6 +759,12 @@ mod tests {
         assert_eq!(local["Status"], "locked");
         for (name, value) in [
             ("browser.search.suggest.enabled", serde_json::json!(false)),
+            ("browser.urlbar.suggest.topsites", false.into()),
+            ("browser.urlbar.suggest.recentsearches", false.into()),
+            (
+                "browser.newtabpage.activity-stream.feeds.topsites",
+                false.into(),
+            ),
             ("network.captive-portal-service.enabled", false.into()),
             ("dom.push.connection.enabled", false.into()),
             ("browser.safebrowsing.provider.google4.updateURL", "".into()),
@@ -763,6 +777,12 @@ mod tests {
             assert_eq!(policy["Preferences"][name]["Value"], value, "{name}");
             assert_eq!(policy["Preferences"][name]["Status"], "locked", "{name}");
         }
+        assert!(
+            !policy["Preferences"]
+                .as_object()
+                .unwrap()
+                .contains_key("browser.urlbar.suggest.history")
+        );
         // The Preferences policy sets only these branches; others need their own policy.
         for name in policy["Preferences"].as_object().unwrap().keys() {
             assert!(
@@ -968,6 +988,7 @@ mod tests {
         let files = claude_files("analyst", &key);
         let settings: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
         assert_eq!(settings["model"], "claude-sonnet-5-5");
+        assert_eq!(settings["spinnerTipsEnabled"], false);
         let state: serde_json::Value = serde_json::from_str(&files[1].1).unwrap();
         assert_eq!(
             state["customApiKeyResponses"]["approved"][0],

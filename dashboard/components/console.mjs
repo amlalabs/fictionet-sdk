@@ -15,6 +15,8 @@
 //   unavailable(panel)  optional; the host stopped offering the console
 import { scoped } from '../dom.mjs';
 
+export const READINESS = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', failed: 'Failed', stopped: 'Stopped' };
+
 export function mountConsole(root, services, options, parts) {
   const { el } = scoped(root);
   const name = parts.kind;
@@ -24,22 +26,37 @@ export function mountConsole(root, services, options, parts) {
   const message = el('p', { role: 'status', text: `Loading the ${name}…` }, card);
   const retry = el('button', { class: 'button', type: 'button', text: parts.retry }, card);
   retry.hidden = true;
+  const steps = options.interactive && name === 'screen' ? el('ol', { class: 'console-readiness', 'aria-label': 'Desktop startup' }, card) : null;
+  const stages = ['booting', 'network_up', 'ssh_up', 'desktop_up'];
+  const rows = steps ? stages.map((state) => {
+    const row = el('li', {}, steps);
+    const mark = el('span', { 'aria-hidden': 'true' }, row);
+    el('span', { text: READINESS[state] }, row);
+    return { row, mark };
+  }) : [];
+
   root.classList.add('console-panel');
   root.append(stage);
   const closed = `The ${name} closed when the run stopped.`;
   const panel = {
-    display, disposed: false, available: false, missing: false, library: null,
+    display, disposed: false, available: false, missing: false, starting: false, library: null,
     // Each connection attempt gets a number; work that finishes for an
     // older one is dropped.
     generation: 0,
     show(text, again = false) {
       message.textContent = text;
+      if (steps) {
+        const progress = panel.starting && !again && !panel.missing && !services.stopped();
+        steps.hidden = !progress;
+        message.hidden = progress;
+      }
       card.hidden = false;
       retry.hidden = !again;
     },
-    hide() { card.hidden = true; },
+    hide() { card.hidden = true; display.dataset.ready = 'true'; },
     // Ends the connection, if any, and makes later work for it stale.
     stop() {
+      display.dataset.ready = 'false';
       panel.generation++;
       parts.close(panel);
       display.replaceChildren();
@@ -60,6 +77,17 @@ export function mountConsole(root, services, options, parts) {
   const reconnect = () => panel.open();
   retry.addEventListener('click', reconnect);
   const offStatus = services.state(options.status || `/api/state/host-${options.host}`, (snapshot) => {
+    const state = snapshot.value?.state;
+    if (steps) {
+      const index = stages.indexOf(state);
+      panel.starting = index >= 0;
+      rows.forEach(({ row, mark }, i) => {
+        const done = i < index || state === 'desktop_up';
+        row.dataset.done = String(done);
+        row.setAttribute('aria-current', String(i === index && !done ? 'step' : 'false'));
+        mark.textContent = done ? '✓' : '';
+      });
+    }
     const was = panel.available;
     panel.available = Boolean(snapshot.value?.[parts.kind]);
     if (!panel.available) {
@@ -71,6 +99,7 @@ export function mountConsole(root, services, options, parts) {
       }
     } else if (!was) panel.open();
   }, (error) => {
+    panel.starting = false;
     panel.available = false;
     parts.unavailable?.(panel);
     panel.stop();

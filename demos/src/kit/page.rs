@@ -60,6 +60,7 @@ impl Hosts {
                 panic!("guest {name} was already taken; call Hosts::take only once per guest")
             });
         Host::new(name)
+            .claude_code(console.claude_code)
             .sandbox(console.attachment.clone())
             .status(console.status.clone())
             .console(console)
@@ -68,6 +69,7 @@ impl Hosts {
 
 #[derive(Clone)]
 pub(super) struct GuestConsole {
+    claude_code: bool,
     name: String,
     attachment: String,
     desktop: Option<(u16, String)>,
@@ -95,6 +97,10 @@ enum Readiness {
 impl GuestConsole {
     pub(super) fn new(guest: &Guest) -> Self {
         Self {
+            claude_code: guest
+                .files
+                .iter()
+                .any(|file| file.path == "/opt/install-claude.sh"),
             name: guest.hostname.clone(),
             attachment: guest.attachment.clone(),
             desktop: guest.desktop.clone(),
@@ -421,6 +427,14 @@ pub fn open_bootstrap(path: &std::path::Path) -> io::Result<super::shot::AppWind
 mod tests {
     use super::PageAccess;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn consoles_report_whether_claude_code_is_installed() {
+        let guest = super::Guest::ubuntu("workstation", "analyst");
+        assert!(!super::GuestConsole::new(&guest).claude_code);
+        let guest = crate::kit::desktop::claude_code(guest);
+        assert!(super::GuestConsole::new(&guest).claude_code);
+    }
 
     #[test]
     fn bootstrap_is_private_and_removed_with_its_owner() {

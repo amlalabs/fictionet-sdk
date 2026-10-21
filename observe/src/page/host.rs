@@ -89,6 +89,8 @@ pub struct HostDescription {
     pub screen: Option<String>,
     /// Terminal panel ID, when offered.
     pub terminal: Option<String>,
+    /// Whether Claude Code is installed.
+    pub claude_code: bool,
 }
 
 /// One machine in a page composition.
@@ -100,6 +102,7 @@ pub struct Host {
     pub(super) status: StateTopic<HostStatus>,
     pub(super) screen: bool,
     pub(super) terminal: bool,
+    claude_code: bool,
 }
 
 impl Host {
@@ -114,6 +117,7 @@ impl Host {
             status: StateTopic::new(StateLimits::default()),
             screen: false,
             terminal: false,
+            claude_code: false,
         }
     }
     /// Pins this host in the initial tiled workspace.
@@ -131,6 +135,11 @@ impl Host {
         self.console = Some(Arc::new(console));
         self
     }
+    /// Declares that Claude Code is installed.
+    pub fn claude_code(mut self, installed: bool) -> Self {
+        self.claude_code = installed;
+        self
+    }
     /// Supplies live status from the machine owner.
     pub fn status(mut self, topic: StateTopic<HostStatus>) -> Self {
         self.status = topic;
@@ -139,6 +148,7 @@ impl Host {
     pub(super) fn description(&self) -> HostDescription {
         HostDescription {
             pinned: self.pinned,
+            claude_code: self.claude_code,
             name: self.name.clone(),
             sandbox: self.sandbox.clone(),
             status: format!("/api/state/host-{}", self.name),
@@ -149,5 +159,20 @@ impl Host {
                 .terminal
                 .then(|| format!("{}-terminal", super::panel::slug(&self.name))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Host;
+
+    #[test]
+    fn description_declares_claude_code_only_when_installed() {
+        assert!(!Host::new("workstation").description().claude_code);
+        let description = Host::new("workstation").claude_code(true).description();
+        assert_eq!(
+            serde_json::to_value(description).unwrap()["claude_code"],
+            true
+        );
     }
 }

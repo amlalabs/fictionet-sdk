@@ -66,10 +66,20 @@ export function mount(root, services, options) {
         resize();
         if (focus) { focus = false; terminal.focus(); }
       };
+      let prompt = '';
+      const decoder = new TextDecoder();
       const received = (event) => {
         if (active !== entry || !(event.data instanceof ArrayBuffer)) return;
         const bytes = new Uint8Array(event.data);
-        terminal.write(bytes, () => send(JSON.stringify({ type: 'ack', bytes: bytes.byteLength })));
+        const start = options.interactive && services.hosts.some((host) => host.name === options.host && host.claude_code) && !services.claudeStarted.has(options.host);
+        if (start) prompt = (prompt + decoder.decode(bytes, { stream: true })).slice(-4096);
+        terminal.write(bytes, () => {
+          send(JSON.stringify({ type: 'ack', bytes: bytes.byteLength }));
+          if (start && prompt.includes('$ ') && active === entry && socket.readyState === 1 && !services.claudeStarted.has(options.host)) {
+            services.claudeStarted.add(options.host);
+            send(new TextEncoder().encode('claude\r'));
+          }
+        });
       };
       const closed = (event) => { if (active === entry) disconnected(panel, event.reason); };
       const input = terminal.onData((text) => send(new TextEncoder().encode(text)));

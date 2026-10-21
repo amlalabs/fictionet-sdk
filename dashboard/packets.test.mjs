@@ -652,3 +652,36 @@ test('compact callbacks follow chronological releases and the list reverses them
   h.view.refresh();
   assert.deepEqual(seen, [1, 2, 3]);
 });
+
+test('suspending packet streams keeps rows and resumes each link without replay', (t) => {
+  const h = setup(t, ['a', 'b']);
+  h.send(8, { link: 'a' });
+  h.send(2, { link: 'b' });
+  h.flush();
+  const rows = [...h.rows()];
+  h.view.suspend();
+  assert.equal(h.source.closed, true);
+  assert.deepEqual(h.rows(), rows);
+  h.view.resume();
+  const resumed = h.sources.at(-1);
+  assert.notEqual(resumed, h.source);
+  const send = (link, seq) => resumed.emit('packet', { seq, link, t: seq, side: 0, tags: [], src: 'a', dst: 'b', proto: 'TCP', len: 40, info: `packet ${seq}` });
+  send('a', 8);
+  send('b', 2);
+  h.flush();
+  assert.deepEqual(h.rows(), rows);
+  send('b', 3);
+  h.flush();
+  assert.equal(h.rows().length, 3);
+  resumed.emit('open');
+  resumed.emit('open');
+  send('a', 1);
+  h.flush();
+  assert.equal(h.rows().length, 1, 'a reconnect replaces history when sequence numbers restart');
+  h.view.suspend();
+  h.view.close();
+  const count = h.sources.length;
+  h.view.resume();
+  assert.equal(h.sources.length, count, 'closing a suspended view clears its subscription');
+  h.view.dispose();
+});

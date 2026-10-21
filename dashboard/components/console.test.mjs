@@ -420,3 +420,74 @@ test('an interactive terminal starts large and its text size buttons resize it',
   dispose();
   assert.equal(controls.children.length, 0);
 });
+
+test('the interactive desktop lists completed startup stages and the current stage', async (t) => {
+  const h = fixture(t);
+  const dispose = screen(h.root, h.services, { ...h.screenOptions, interactive: true });
+  await settle();
+  const steps = h.root.querySelector('.console-readiness');
+  assert.deepEqual(steps.children.map((row) => row.children[1].textContent), ['Booting', 'Network up', 'SSH up', 'Desktop up']);
+  for (const [index, state] of ['booting', 'network_up', 'ssh_up', 'desktop_up'].entries()) {
+    h.publish({ state, screen: index === 3 });
+    await settle();
+    assert.deepEqual(steps.children.map((row) => row.dataset.done), steps.children.map((_, i) => String(i < index || index === 3)));
+    assert.deepEqual(steps.children.map((row) => row.getAttribute('aria-current')), steps.children.map((_, i) => i === index && index !== 3 ? 'step' : 'false'));
+  }
+  h.rfbs[0].dispatchEvent(new Event('connect'));
+  assert.equal(steps.parentNode.hidden, true);
+  assert.equal(h.root.querySelector('.screen-display').dataset.ready, 'true');
+  dispose();
+});
+
+test('Claude Code starts once after a split shell prompt only in an interactive capable guest', async (t) => {
+  for (const [interactive, installed] of [[false, true], [true, false], [true, true]]) {
+    const h = fixture(t);
+    h.services.hosts = [{ name: 'alpha', claude_code: installed }];
+    h.publish({ state: 'ssh_up', terminal: true });
+    const options = { ...h.terminalOptions, interactive };
+    let dispose = terminal(h.root, h.services, options);
+    await settle();
+    const socket = h.sockets[0];
+    socket.open();
+    const receive = (text) => {
+      socket.receive(new TextEncoder().encode(text).buffer);
+      h.terminals[0].writes.at(-1).callback();
+    };
+    const commands = (socket) => socket.sent.filter((value) => value instanceof Uint8Array).map((value) => new TextDecoder().decode(value));
+    receive('analyst@workstation:~$');
+    assert.deepEqual(commands(socket), []);
+    receive(' ');
+    assert.deepEqual(commands(socket), interactive && installed ? ['claude\r'] : []);
+    receive('$ ');
+    assert.deepEqual(commands(socket), interactive && installed ? ['claude\r'] : []);
+    dispose();
+    dispose = terminal(h.root, h.services, options);
+    await settle();
+    h.sockets[1].open();
+    h.sockets[1].receive(new TextEncoder().encode('$ ').buffer);
+    h.terminals[1].writes[0].callback();
+    assert.deepEqual(commands(h.sockets[1]), []);
+    dispose();
+  }
+});
+
+test('desktop startup steps yield to library errors and reconnect messages', async (t) => {
+  const h = fixture(t);
+  h.services.importModule = async () => { throw new Error('Unavailable'); };
+  const dispose = screen(h.root, h.services, { ...h.screenOptions, interactive: true });
+  await settle();
+  assert.equal(h.root.querySelector('.console-readiness').hidden, true);
+  assert.equal(h.root.querySelector('p').hidden, false);
+  assert.match(h.root.querySelector('p').textContent, /noVNC is not in this build/);
+  dispose();
+  const live = fixture(t);
+  const stop = screen(live.root, live.services, { ...live.screenOptions, interactive: true });
+  live.publish({ state: 'desktop_up', screen: true });
+  await settle();
+  live.rfbs[0].dispatchEvent(new Event('connect'));
+  live.sockets[0].close();
+  assert.equal(live.root.querySelector('.console-readiness').hidden, true);
+  assert.equal(live.root.querySelector('p').hidden, false);
+  assert.match(live.root.querySelector('p').textContent, /Reconnecting/);
+  stop();
+});

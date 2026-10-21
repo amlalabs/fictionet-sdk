@@ -23,7 +23,7 @@ export function createPackets({
   const document = drawer.ownerDocument || globalThis.document;
   const prows = $('prows');
   const plist = $('plist');
-  let rowKey = 0;
+  let rowKey = 0, suspended = false, reopen = null;
   let recent = [], history = [];
   const compactRows = new Map();
   let foldedCounts = new Map();
@@ -95,8 +95,12 @@ export function createPackets({
   /// Opens the packets of `members` ({ e, flip, host }): side 0 goes from
   /// `fromName` to `toName`. `total` counts the links the members were
   /// chosen from, when the page server's merge limit left some out.
-  function openLinks(fromName, toName, members, label, total = members.length) {
-    closePackets();
+  function openLinks(fromName, toName, members, label, total = members.length, resume = false) {
+    const previous = resume ? packets : null;
+    const cutoff = new Map(previous?.latest || []);
+    if (!resume) closePackets();
+    reopen = () => openLinks(fromName, toName, members, label, total, true);
+    suspended = false;
     clearUnread();
     drawer.hidden = false;
     const many = members.length > 1;
@@ -111,7 +115,7 @@ export function createPackets({
     $('pause').textContent = 'Pause';
     $('sampled').hidden = true;
     $('sampled').textContent = '';
-    tail.clear();
+    if (!resume) tail.clear();
     clearDetail(PICK);
     const hosts = new Map(members.filter((m) => m.host).map((m) => [m.e.id, m.host]));
     const showHost = new Set(hosts.values()).size > 1;
@@ -123,20 +127,23 @@ export function createPackets({
     const source = packetStream(list, () => {
       if (packets?.source !== source) return;
       invalidateSelection();
+      cutoff.clear();
       // A new subscription replays retained history, possibly with restarted
       // sequence numbers. Replace its state before accepting any replay.
-      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), losses: new Map(), open: members.length, failed: false };
+      packets = { ...packets, latest: new Map(), rows: 0, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), losses: new Map(), open: members.length, failed: false };
       tail.clear();
       addGap('Packet history reloaded');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
       clearDetail(`Packet history reloaded · ${PICK}`);
     });
-    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), losses: new Map(), open: members.length, failed: false };
+    packets = previous ? { ...previous, source } : { latest: new Map(), list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, declined: new Map(), losses: new Map(), open: members.length, failed: false };
     onStream('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
       p.link = p.link || list;
+      if (p.seq <= (cutoff.get(p.link) ?? -1)) return;
+      packets.latest.set(p.link, Math.max(p.seq, packets.latest.get(p.link) ?? -1));
       if (p.declined !== undefined) { packets.declined.set(p.link, p.declined); showCounts(); }
       packets.lastTime.set(p.link, p.t);
       if (flips.get(p.link)) p.side = 1 - p.side;
@@ -212,6 +219,8 @@ export function createPackets({
   }
 
   function closePackets() {
+    suspended = false;
+    reopen = null;
     invalidateSelection();
     streamCleanup.splice(0).forEach((remove) => remove());
     if (packets) packets.source.close();
@@ -558,7 +567,15 @@ export function createPackets({
     cleanup.splice(0).forEach((remove) => remove());
     tail.clear();
     clearDetail(PICK);
-  }, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels,
+  }, openLinks,
+  suspend() {
+    if (!packets || suspended) return;
+    suspended = true;
+    streamCleanup.splice(0).forEach((remove) => remove());
+    packets.source.close();
+  },
+  resume() { if (suspended) reopen?.(); },
+  close: closePackets, flush: flushPackets, setPair, setLabels,
   refresh() {
     if (!compact || !packets) return;
     compactRows.clear();
