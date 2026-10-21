@@ -181,7 +181,9 @@ impl Seed {
             "fastjsonl-package" => include_str!("../../../seeds/fastjsonl-package.md"),
             _ => return Err(invalid(format!("no seed named {name:?}"))),
         };
-        Self::parse(name, text, |file| Err(invalid(format!("no bundled fixed file {file:?}"))))
+        Self::parse(name, text, |file| {
+            Err(invalid(format!("no bundled fixed file {file:?}")))
+        })
     }
 
     /// What the seed declares, without its fixed pages' bytes or where it
