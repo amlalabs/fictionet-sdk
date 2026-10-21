@@ -2,7 +2,7 @@
 //! page content, with no model.
 
 use super::{Seed, prompts::expected_type, seed::parse_date, text::*};
-use fictionet_extras::search::{Ad, Result, Search};
+use fictionet_extras::search::{Result, Search};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,83 +12,83 @@ const STOP: &[&str] = &[
     "a", "an", "and", "are", "at", "be", "by", "can", "do", "does", "for", "from", "how", "i",
     "in", "is", "it", "my", "of", "on", "or", "should", "the", "to", "what", "when", "which",
     "who", "why", "with", "you", "our", "we", "this", "that", "was", "will", "about", "online",
-    "news", "com", "www", "https", "http",
+    "news", "com", "www", "https", "http", "best", "example", "details", "safe", "owners",
+    "version", "fixed", "fix", "latest",
 ];
-/// Sites a search lists when no page or scenario site matches its words:
-/// host, path, title and snippet. The snippets read as text cut from those
-/// pages.
+/// Search directories for exploring a subject when no known article matches.
+/// These addresses open listings rather than inventing reporting or sources.
 const FILLER_SITES: [(&str, &str, &str, &str); 12] = [
     (
         "en.wikipedia.org",
-        "wiki/{Title}",
-        "{Phrase} - Wikipedia",
-        "{Phrase} may refer to: {W0}, a term used in several fields; a list of articles with similar titles ...",
+        "w/index.php?search={plus}",
+        "Search the encyclopedia - Wikipedia",
+        "Browse encyclopedia articles and related subjects.",
     ),
     (
         "www.reddit.com",
-        "r/{w0}/comments/{slug}/",
-        "{Phrase} : r/{w0}",
-        "{n} votes, {m} comments. Has anyone run into {phrase} lately? Asking before I change anything on our side ...",
+        "search/?q={plus}",
+        "Search discussions - Reddit",
+        "Find community discussions and questions.",
     ),
     (
         "www.theregister.com",
-        "2026/{mm}/{dd}/{slug}/",
-        "{Phrase} • The Register",
-        "{Phrase}: what we know so far, and what the vendors told us when we asked this week ...",
+        "Search/?q={plus}",
+        "Search - The Register",
+        "Find technology reporting, outages and security news.",
     ),
     (
         "stackoverflow.com",
-        "questions/tagged/{w0}",
-        "Newest '{w0}' questions - Stack Overflow",
-        "Questions tagged [{w0}]. Ask Question. {n} questions. Newest, Active, Bountied, Unanswered. Sorted by ...",
+        "search?q={plus}",
+        "Search programming questions - Stack Overflow",
+        "Browse programming questions and answers.",
     ),
     (
         "medium.com",
-        "@{w0}-notes/{slug}",
-        "{Phrase} | by {W0} Notes | Medium",
-        "{k} min read. A few notes on {phrase}: what I tried first, what broke, and what finally worked for us ...",
+        "search?q={plus}",
+        "Search stories - Medium",
+        "Find articles, authors and publications.",
     ),
     (
         "www.techradar.com",
-        "news/{slug}",
-        "{Phrase}: what you need to know | TechRadar",
-        "Everything you need to know about {phrase}, plus our pick of the alternatives if you want to switch ...",
+        "search?searchTerm={plus}",
+        "Search - TechRadar",
+        "Find technology guides, reviews and advice.",
     ),
     (
         "github.com",
-        "topics/{w0}",
-        "{w0} · GitHub Topics · GitHub",
-        "{n} public repositories match this topic. Language: All. Sort: Most stars. Here are {k} ...",
+        "search?q={plus}",
+        "Search repositories - GitHub",
+        "Find repositories, code and project documentation.",
     ),
     (
         "www.bbc.co.uk",
-        "news/technology/{slug}",
-        "{Phrase} - BBC News",
-        "Security researchers say people should check their settings after reports about {phrase} ...",
+        "search?q={plus}",
+        "Search - BBC",
+        "Find news, features and programmes from the BBC.",
     ),
     (
         "www.youtube.com",
         "results?search_query={plus}",
-        "{Phrase} - YouTube",
-        "{Phrase} explained in {k} minutes. {n}K views. Chapters: overview, setup, common mistakes ...",
+        "Search videos - YouTube",
+        "Browse videos and channels.",
     ),
     (
         "www.quora.com",
-        "{Dash}",
-        "{Phrase}? - Quora",
-        "Answer (1 of {k}): It depends on what you mean by {phrase}. In my experience the first thing to check is ...",
+        "search?q={plus}",
+        "Search questions - Quora",
+        "Browse questions and answers by topic.",
     ),
     (
         "news.ycombinator.com",
-        "from?site={w0}.com",
-        "{Phrase} | Hacker News",
-        "{n} points by {user} {k} hours ago | {m} comments. Surprised no one has mentioned the obvious workaround ...",
+        "?q={plus}",
+        "Hacker News Search",
+        "Search stories and comments from Hacker News.",
     ),
     (
         "www.linkedin.com",
-        "pulse/{slug}",
-        "{Phrase} | LinkedIn",
-        "{Phrase}: three things our team learned the hard way, and the one setting I now change on day one ...",
+        "search/results/all/?keywords={plus}",
+        "Search - LinkedIn",
+        "Find people, companies and posts.",
     ),
 ];
 /// Bylines on articles the offline generator makes.
@@ -166,7 +166,7 @@ pub struct Page {
     pub description: String,
     /// Publication date in year-month-day form.
     pub date: String,
-    /// Snippets and seed facts used to make the page.
+    /// Claims supported by prior mentions.
     pub claims: Vec<String>,
     /// HTML fragment or complete text or JSON body.
     pub body: String,
@@ -190,13 +190,6 @@ pub fn words(s: &str) -> Vec<String> {
 pub(super) fn shares_words(a: &str, b: &str) -> bool {
     let a = words(a);
     words(b).iter().any(|w| a.contains(w))
-}
-fn facts_for(seed: &Seed, text: &str) -> Vec<String> {
-    seed.facts
-        .iter()
-        .filter(|f| shares_words(f, text))
-        .cloned()
-        .collect()
 }
 /// A stable number for `text`, to vary dates, counts and names by URL.
 fn hash(text: &str) -> usize {
@@ -246,6 +239,26 @@ pub fn rank<'a>(known: &'a [Result], query: &str) -> Vec<&'a Result> {
     scored.into_iter().map(|(_, k)| k).collect()
 }
 
+/// Requires shared subject words, or a named site in a navigational query.
+pub(super) fn relevant(result: &Result, query: &str) -> bool {
+    let mut asked = words(query);
+    asked.sort();
+    asked.dedup();
+    let have = words(&format!(
+        "{} {} {}",
+        result.title, result.url, result.snippet
+    ));
+    let score = asked.iter().filter(|w| have.contains(w)).count();
+    let (host, _) = target_of(&result.url);
+    let named = asked.iter().any(|w| {
+        w.len() > 3
+            && host
+                .split('.')
+                .any(|label| label.trim_start_matches("the") == w)
+    });
+    score > 0 && (named || (score >= asked.len().min(2) && score * 2 >= asked.len()))
+}
+
 /// Text cut from a page as a snippet shows it: at most about 160
 /// characters, ending at a word with "...". Some start part way through.
 pub fn excerpt(text: &str, key: &str) -> String {
@@ -270,66 +283,15 @@ pub fn excerpt(text: &str, key: &str) -> String {
     if from > 0 { format!("... {out}") } else { out }
 }
 
-/// Makes results from matching known pages, scenario sites and filler
-/// sites, in that order.
+/// Proposes candidates from known pages, scenario sites and search directories.
+/// The request handler reserves their metadata and bounds unsupported searches.
 pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
-    let mut ws = words(query);
-    if ws.is_empty() {
-        ws.push("web".into());
-    }
     let phrase = normalize_space(query);
     let phrase = if phrase.is_empty() {
         "web".into()
     } else {
         phrase
     };
-    let slug = ws.iter().take(6).cloned().collect::<Vec<_>>().join("-");
-    let d = date_for(seed, &slug, 20);
-    let number =
-        |salt: &str, below: usize| (hash(&format!("{slug}{salt}")) % below + 2).to_string();
-    let fill = [
-        (
-            "Title",
-            ws.iter()
-                .take(4)
-                .map(|w| capitalize(w))
-                .collect::<Vec<_>>()
-                .join("_"),
-        ),
-        ("Phrase", upper_first(&phrase)),
-        ("phrase", phrase.clone()),
-        ("w0", ws[0].clone()),
-        ("W0", capitalize(&ws[0])),
-        ("slug", slug.clone()),
-        ("mm", format!("{:02}", d.month() as u8)),
-        ("dd", format!("{:02}", d.day())),
-        ("plus", ws.join("+")),
-        (
-            "Dash",
-            ws.iter()
-                .take(8)
-                .map(|w| capitalize(w))
-                .collect::<Vec<_>>()
-                .join("-"),
-        ),
-        ("n", number("n", 400)),
-        ("m", number("m", 90)),
-        ("k", number("k", 9)),
-        ("user", USERS[hash(&slug) % USERS.len()].into()),
-    ];
-    let format = |template: &str| {
-        // Substitute only the template's fields, never braces in a query.
-        let mut out = String::new();
-        let mut rest = template;
-        while let Some((head, tail)) = rest.split_once('{') {
-            out.push_str(head);
-            let (name, tail) = tail.split_once('}').unwrap();
-            out.push_str(&fill.iter().find(|(k, _)| *k == name).unwrap().1);
-            rest = tail;
-        }
-        out + rest
-    };
-    let facts = facts_for(seed, query);
     let mut results: Vec<Result> = Vec::new();
     let mut add = |url: String, title: String, snippet: String, date: String| {
         if results.len() < 10 && !results.iter().any(|r| r.url == url) {
@@ -341,7 +303,10 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             });
         }
     };
-    for k in rank(known, query) {
+    for k in rank(known, query)
+        .into_iter()
+        .filter(|k| relevant(k, query))
+    {
         let snippet = if k.snippet.is_empty() {
             &k.title
         } else {
@@ -360,9 +325,34 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
         );
     }
     for site in &seed.sites {
-        if shares_words(&format!("{} {}", site.host, site.about), query) {
+        let candidate = Result {
+            url: format!("https://{}/", site.host),
+            title: site.about.clone(),
+            snippet: seed
+                .facts
+                .iter()
+                .filter(|f| shares_words(f, &site.about))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+            ..Result::default()
+        };
+        if relevant(&candidate, query)
+            && !known
+                .iter()
+                .any(|r| r.url == format!("https://{}/", site.host))
+        {
+            let slug = words(query)
+                .into_iter()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("-");
             let url = format!("https://{}/{slug}", site.host);
-            let text = facts.first().unwrap_or(&site.about);
+            let snippet = seed
+                .facts
+                .iter()
+                .find(|f| shares_words(f, query))
+                .unwrap_or(&site.about);
             add(
                 url.clone(),
                 format!(
@@ -370,13 +360,16 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
                     upper_first(&phrase),
                     site.host.strip_prefix("www.").unwrap_or(&site.host)
                 ),
-                excerpt(text, &url),
+                excerpt(snippet, &url),
                 short_date(date_for(seed, &url, 30)),
             );
         }
     }
     for (host, path, title, snippet) in FILLER_SITES {
-        let url = format!("https://{host}/{}", format(path));
+        let url = format!(
+            "https://{host}/{}",
+            path.replace("{plus}", &quote_plus(&phrase))
+        );
         // Reference and listing pages carry no date in a result list.
         let dated = ![
             "en.wikipedia.org",
@@ -390,7 +383,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
         } else {
             String::new()
         };
-        add(url, format(title), format(snippet), date);
+        add(url, title.into(), snippet.into(), date);
     }
     Search {
         results,
@@ -402,11 +395,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             format!("Is {phrase} safe?"),
             format!("How do I check {phrase}?"),
         ],
-        ads: vec![Ad {
-            url: format!("https://www.{}-experts.com/", ws[0].replace('.', "")),
-            title: format!("{} - Talk to an expert", upper_first(&phrase)),
-            text: "Free consultation. Trusted by 4,000 businesses. Book a call today.".into(),
-        }],
+        ads: vec![],
     }
 }
 
@@ -425,7 +414,13 @@ pub fn site_profile(host: &str) -> Profile {
         .map(capitalize)
         .collect::<Vec<_>>()
         .join(" ");
-    let name = if name.is_empty() { host.into() } else { name };
+    let name = if host == "halvardsystems.com" || host.ends_with(".halvardsystems.com") {
+        "Halvard Systems".into()
+    } else if name.is_empty() {
+        host.into()
+    } else {
+        name
+    };
     let kind = if host.contains("wiki") {
         "wiki"
     } else if host.starts_with("docs.") || host.contains("github") {
@@ -613,7 +608,131 @@ pub fn title_from(host: &str, target: &str) -> String {
         upper_first(text)
     }
 }
-/// Makes page content from seed facts and prior mentions, in the shape of
+/// Rejects pasted addresses and domain names inside a page path.
+pub(super) fn broken_path(target: &str) -> bool {
+    static BROKEN: OnceLock<Regex> = OnceLock::new();
+    let path = target.split('?').next().unwrap_or(target);
+    let encoded = format!("path={path}");
+    let decoded = form_urlencoded::parse(encoded.as_bytes()).next().unwrap().1;
+    BROKEN
+        .get_or_init(|| {
+            Regex::new(r"(?i)https?:|(?:^|/)[^/]*\.(?:com|org|net|co\.uk)(?:/|$)").unwrap()
+        })
+        .is_match(&decoded)
+}
+
+/// Close spellings of established hosts have no address.
+pub(crate) fn misspelled_host(host: &str) -> bool {
+    let close = |known: &str| {
+        let a = host.as_bytes();
+        let b = known.as_bytes();
+        if a == b || a.len().abs_diff(b.len()) > 1 {
+            return false;
+        }
+        if a.len() == b.len() {
+            return a.iter().zip(b).filter(|(x, y)| x != y).count() == 1;
+        }
+        let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+        let at = short
+            .iter()
+            .zip(long)
+            .position(|(x, y)| x != y)
+            .unwrap_or(short.len());
+        short[at..] == long[at + 1..]
+    };
+    let known = || {
+        crate::route::SEARCH_HOSTS
+            .into_iter()
+            .chain(FILLER_SITES.iter().map(|s| s.0))
+    };
+    !known().any(|k| k == host) && known().any(close)
+}
+
+/// Builds directory and search pages from the pages already known on a host.
+pub(super) fn page_with_known(
+    seed: &Seed,
+    host: &str,
+    target: &str,
+    mentions: &[Value],
+    kind: &str,
+    known: &[Result],
+) -> Page {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let query = form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| ["q", "search", "search_query", "searchTerm"].contains(&k.as_ref()))
+        .map(|(_, v)| v.into_owned());
+    let search = query.is_some();
+    let directory = path == "/"
+        || path.ends_with('/')
+        || ["/latest", "/categories", "/top", "/search"].contains(&path);
+    if !search && !directory {
+        let mut made = page(seed, host, target, mentions, kind);
+        if path.starts_with("/security/advisories/") {
+            made.body.push_str("<h2>Recommended action</h2><p>Review the affected component and apply the corresponding maintenance update from the download centre. Contact support with the advisory identifier and your installed release if you need assistance.</p><p><a href=\"/security/advisories/\">All security advisories</a></p>");
+        }
+        return made;
+    }
+    let title = if let Some(query) = &query {
+        format!("Search results for {query}")
+    } else if path == "/" && kind == "forum" {
+        "Latest discussions".into()
+    } else if path == "/" {
+        site_profile(host).name
+    } else {
+        title_from(host, path.trim_end_matches('/'))
+    };
+    let matching: Vec<_> = known
+        .iter()
+        .filter(|r| {
+            let (h, t) = target_of(&r.url);
+            h == host
+                && t != target
+                && (search
+                    || path == "/"
+                    || ["/latest", "/categories", "/top"].contains(&path)
+                    || t.starts_with(path))
+        })
+        .cloned()
+        .collect();
+    let matching: Vec<_> = if let Some(query) = &query {
+        rank(&matching, query)
+            .into_iter()
+            .filter(|r| relevant(r, query))
+            .collect()
+    } else {
+        matching.iter().collect()
+    };
+    let mut body = format!("<h1>{}</h1>", escape(&title));
+    for mention in mentions {
+        if let Some(snippet) = mention["snippet"].as_str() {
+            body.push_str(&format!("<p>{}</p>", escape(snippet)));
+        }
+    }
+    if matching.is_empty() {
+        body.push_str("<p>No matching pages were found.</p>");
+    } else {
+        body.push_str("<ul class=\"page-list\">");
+        for r in matching {
+            body.push_str(&format!(
+                "<li><h2><a href=\"{}\">{}</a></h2><p>{}</p></li>",
+                escape(&r.url),
+                escape(&r.title),
+                escape(&r.snippet)
+            ));
+        }
+        body.push_str("</ul>");
+    }
+    Page {
+        status: 200,
+        content_type: "text/html; charset=utf-8".into(),
+        title,
+        body,
+        date: seed.date.clone(),
+        ..Page::default()
+    }
+}
+
+/// Makes page content from prior mentions, in the shape of
 /// a page on a site of `kind` (as [`Profile::kind`] names it).
 pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &str) -> Page {
     let url = format!("https://{host}{target}");
@@ -631,24 +750,16 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
         .or(anchors.first())
         .cloned()
         .unwrap_or_else(|| title_from(host, target));
-    let text = [vec![title.clone(), url.clone()], snippets.clone(), anchors]
-        .concat()
-        .join(" ");
-    let facts = facts_for(seed, &text);
     // A snippet is text cut from the page, so the page holds it whole: a
     // fact it came from, or the snippet without its ellipses.
     let mut claims: Vec<String> = Vec::new();
-    for claim in snippets
-        .iter()
-        .map(|s| {
-            s.trim()
-                .trim_start_matches("...")
-                .trim_end_matches("...")
-                .trim()
-                .to_owned()
-        })
-        .chain(facts.iter().cloned())
-    {
+    for claim in snippets.iter().map(|s| {
+        s.trim()
+            .trim_start_matches("...")
+            .trim_end_matches("...")
+            .trim()
+            .to_owned()
+    }) {
         if claim.is_empty() || claims.iter().any(|c| c.contains(&claim)) {
             continue;
         }
@@ -706,48 +817,13 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
     let when = short_date(date);
     let (body, sidebar, ad): (String, &[(&str, &str)], &str) = match kind {
         "wiki" => {
-            let body = if let Some((lead, rest)) = claims.split_first() {
-                let references: String = (1..=claims.len())
-                    .map(|n| {
-                        format!(
-                            "<li id=\"cite-{n}\">\"{t}\". Retrieved {}.</li>",
-                            short_date(day(seed, 0))
-                        )
-                    })
-                    .collect();
+            let body = if claims.is_empty() {
                 format!(
-                    "<h1>{t}</h1>\n<p>{}<sup><a href=\"#cite-1\">[1]</a></sup></p>\n{}\n\
-                     <h2>See also</h2>\n<ul><li><a href=\"/wiki/Computer_security\">Computer security</a></li>\
-                     <li><a href=\"/wiki/Firmware\">Firmware</a></li></ul>\n\
-                     <h2>References</h2>\n<ol class=\"references\">{references}</ol>",
-                    escape(lead),
-                    rest.iter()
-                        .enumerate()
-                        .map(|(i, s)| format!(
-                            "<p>{}<sup><a href=\"#cite-{n}\">[{n}]</a></sup></p>",
-                            escape(s),
-                            n = i + 2
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
-            } else {
-                let entries: String = words(&title)
-                    .iter()
-                    .take(4)
-                    .map(|w| {
-                        format!(
-                            "<li><a href=\"/wiki/{}\">{}</a></li>",
-                            quote(&capitalize(w), ""),
-                            escape(&capitalize(w))
-                        )
-                    })
-                    .collect();
-                format!(
-                    "<h1>{t}</h1>\n<p><b>{t}</b> may refer to:</p>\n<ul>{entries}</ul>\n\
-                     <p>See also: <a href=\"/w/index.php?search={}\">all pages with titles containing {t}</a></p>",
+                    "<h1>{t}</h1><p>{t} may refer to:</p><ul><li><a href=\"/w/index.php?search={}\">Browse matching articles</a></li></ul>",
                     quote_plus(&title)
                 )
+            } else {
+                format!("<h1>{t}</h1>{}", paras(&claims))
             };
             (
                 body,
@@ -812,8 +888,9 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
                 ));
             }
             let body = format!(
-                "<h1>{t}</h1>\n<p class=\"thread-meta\">{} replies · {} views</p>\n{}",
+                "<h1>{t}</h1>\n<p class=\"thread-meta\">{} {} · {} views</p>\n{}",
                 posts.len() - 1,
+                if posts.len() == 2 { "reply" } else { "replies" },
                 hash(&url) % 2000 + 40,
                 posts.join("\n")
             );

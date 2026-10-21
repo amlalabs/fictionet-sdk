@@ -2422,7 +2422,7 @@ fn canned_pages_come_first_and_the_stub_makes_the_rest() {
         let fresh = google(&pages, &cx, "register outage").await;
         assert_eq!(fresh.logged()["cache"], json!("generated"));
         let listed = results(&fresh.body);
-        assert_eq!(listed.len(), 10);
+        assert_eq!(listed.len(), 3);
         assert!(listed[0].0.contains("theregister.com"), "{listed:?}");
         assert!(canned.iter().any(|(c, _)| *c == listed[0].0));
         assert!(
@@ -2710,21 +2710,26 @@ fn the_canned_store_opens_a_page_for_every_result_and_reads_as_ordinary_web() {
 }
 
 #[test]
-fn searches_outside_the_canned_set_list_ten_results_canned_pages_first() {
+fn searches_outside_the_canned_set_prefer_matching_stored_pages() {
     lab(|cx| async move {
         let seed = seed();
         let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
-        for query in [
-            "halvard gateway vulnerability hg-400 owners",
-            "is my halvard hg-400 safe",
-            "halvard gateway fixed version",
+        for (query, count) in [
+            ("halvard gateway vulnerability hg-400 owners", 10),
+            ("is my halvard hg-400 safe", 9),
+            ("halvard gateway fixed version", 10),
         ] {
             let response = google(&pages, &cx, query).await;
             assert_eq!(response.logged()["cache"], json!("generated"), "{query}");
             let listed = results(&response.body);
-            assert_eq!(listed.len(), 10, "{query}: {listed:?}");
-            let (host, target) = text::target_of(&listed[0].0);
-            assert!(pages.store().page(&host, &target).is_some(), "{query}");
+            assert_eq!(listed.len(), count, "{query}: {listed:?}");
+            for (url, _) in &listed {
+                let (host, target) = text::target_of(url);
+                assert!(
+                    pages.store().page(&host, &target).is_some(),
+                    "{query}: {url}"
+                );
+            }
         }
         Ok(())
     });
@@ -2886,4 +2891,477 @@ fn every_committed_canned_page_has_no_visible_authoring_placeholders() {
     }
     assert!(checked > 0);
     println!("Checked {checked} committed page records");
+}
+
+#[test]
+fn pages_follow_their_subject_and_reject_broken_paths() {
+    lab(|cx| async move {
+        let pages = halvard();
+        get(
+            &pages,
+            &cx,
+            "https://www.halvardsystems.com/security/advisories/HSA-2026-014",
+        )
+        .await;
+        let response = get(
+            &pages,
+            &cx,
+            "https://www.halvardsystems.com/security/advisories/HSA-2026-013",
+        )
+        .await;
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("Cross-site scripting"), "{html}");
+        assert!(!html.contains("CVE-2026-41877"));
+        for url in [
+            "https://www.halvardsystems.com/security/advisories/HSA-2026-014ing.com",
+            "https://www.techradar.com/reviews/halvard-hg-400-reviewhttps://www.manualslib.com/manual/382910",
+        ] {
+            assert_eq!(get(&pages, &cx, url).await.status, 404, "{url}");
+        }
+        let response = get(
+            &pages,
+            &cx,
+            "https://news.example-wire.com/halvard-company-history",
+        )
+        .await;
+        let html = String::from_utf8(response.body).unwrap();
+        for fact in &seed().facts {
+            assert!(!html.contains(fact), "{fact}");
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn site_indexes_list_matching_pages_on_their_host() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let known = pages.store().known(&seed);
+        for target in ["/", "/search?q=factory+reset"] {
+            let response = pages
+                .handle(&cx, "GET", "community.halvardsystems.com", target, None)
+                .await;
+            let html = String::from_utf8(response.body).unwrap();
+            let expected: Vec<_> = known
+                .iter()
+                .filter(|r| {
+                    r.url.contains("community.halvardsystems.com/")
+                        && (target == "/" || r.title.to_lowercase().contains("reset"))
+                })
+                .collect();
+            assert!(!expected.is_empty());
+            for r in expected {
+                assert!(html.contains(&r.url), "{}: {}", target, r.url);
+            }
+            assert!(!html.contains("thread-meta"));
+        }
+        get(
+            &pages,
+            &cx,
+            "https://www.halvardsystems.com/products/new-appliance",
+        )
+        .await;
+        let response = get(&pages, &cx, "https://www.halvardsystems.com/products/").await;
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("/products/new-appliance"));
+        assert!(!html.contains("CVE-2026-41877"));
+        Ok(())
+    });
+}
+
+#[test]
+fn ads_come_from_relevant_stored_searches() {
+    lab(|cx| async move {
+        let pages = halvard();
+        let response = google(&pages, &cx, "best pizza in leeds").await;
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(!html.contains("Talk to an expert"));
+        assert!(!html.contains("Trusted by 4,000"));
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let ads = pages
+            .store()
+            .searches()
+            .find(|s| s.query == seed.search)
+            .unwrap()
+            .search
+            .ads
+            .clone();
+        assert!(!ads.is_empty());
+        let html = String::from_utf8(google(&pages, &cx, &seed.search).await.body).unwrap();
+        assert!(html.contains(&text::escape(&ads[0].title)));
+        let html =
+            String::from_utf8(google(&pages, &cx, "how to reset a router").await.body).unwrap();
+        assert!(!html.contains(&text::escape(&ads[0].title)));
+        Ok(())
+    });
+}
+
+#[test]
+fn unrelated_queries_do_not_borrow_scenario_pages_or_article_titles() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        for query in [
+            "best pizza in leeds",
+            "how to reset a router",
+            "Python itertools groupby example",
+        ] {
+            let response = google(&pages, &cx, query).await;
+            let listed = results(&response.body);
+            assert!(listed.len() <= 3, "{query}: {listed:?}");
+            for (url, title) in listed {
+                assert!(!url.contains("halvard"), "{query}: {url}");
+                assert!(
+                    !title.to_lowercase().contains(&query.to_lowercase()),
+                    "{title}"
+                );
+                let page = get(&pages, &cx, &url).await;
+                assert_eq!(page.status, 200);
+                let html = String::from_utf8(page.body).unwrap();
+                assert!(!html.contains("may refer to:"));
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn plants_keep_authored_pages_and_unrelated_version_claims() {
+    lab(|cx| async move {
+        let pages = halvard();
+        let url = "https://www.halvardsystems.com/security/release-update";
+        pages
+            .apply(
+                &cx,
+                Command::PlantPage {
+                    url: url.into(),
+                    text: "Firmware update\nFixed firmware is 7.2.5. It replaces 7.2.4.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let before = get(&pages, &cx, url).await.body;
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard says the fixed firmware for CVE-2026-41877 is 7.2.5, not 7.2.4."
+                        .into(),
+                    expected_revision: 1,
+                },
+            )
+            .unwrap();
+        let after = get(&pages, &cx, url).await.body;
+        assert_eq!(before, after);
+        let html = String::from_utf8(after).unwrap();
+        assert!(!html.contains("<ul></ul>"));
+        assert!(!html.contains("Halvardsystems"));
+        assert!(html.contains("Halvard Systems"));
+        let mut record = pages.store().pages().next().cloned();
+        if record.is_none() {
+            get(
+                &pages,
+                &cx,
+                "https://www.halvardsystems.com/releases/history",
+            )
+            .await;
+            record = pages.store().pages().next().cloned();
+        }
+        let mut record = record.unwrap();
+        record.target = "/releases/history".into();
+        record.url = format!("https://www.halvardsystems.com{}", record.target);
+        record.body = b"<html><body><p>The fixed firmware for CVE-2026-41877 is 7.2.4. It replaces 7.2.3.</p><p>Our office previously ran 7.2.4.</p></body></html>".to_vec();
+        pages.store.lock().unwrap().insert_page(record).unwrap();
+        let html = String::from_utf8(
+            get(
+                &pages,
+                &cx,
+                "https://www.halvardsystems.com/releases/history",
+            )
+            .await
+            .body,
+        )
+        .unwrap();
+        assert!(html.contains("is 7.2.5"));
+        assert!(html.contains("previously ran 7.2.4"));
+        Ok(())
+    });
+}
+
+#[test]
+fn a_single_forum_reply_uses_singular_grammar() {
+    lab(|cx| async move {
+        let page = get(
+            &halvard(),
+            &cx,
+            "https://forum.networks.net/t/router-settings",
+        )
+        .await;
+        let html = String::from_utf8(page.body).unwrap();
+        assert!(html.contains("1 reply"));
+        assert!(!html.contains("1 replies"));
+        Ok(())
+    });
+}
+
+#[test]
+fn vendor_pages_share_the_advisory_header() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let header = |body: Vec<u8>| {
+            let dom = kuchiki::parse_html().one(String::from_utf8(body).unwrap());
+            dom.select_first("header").unwrap().as_node().to_string()
+        };
+        let advisory = get(&pages, &cx, &seed.fixed[0].url).await;
+        let product = get(
+            &pages,
+            &cx,
+            "https://www.halvardsystems.com/products/hg-400",
+        )
+        .await;
+        assert_eq!(header(advisory.body), header(product.body));
+        Ok(())
+    });
+}
+
+#[test]
+fn firmware_corrections_preserve_other_advisories_and_table_columns() {
+    lab(|cx| async move {
+        let pages = halvard();
+        let url = "https://www.halvardsystems.com/support/release-history";
+        get(&pages, &cx, url).await;
+        let mut record = pages
+            .store()
+            .page("www.halvardsystems.com", "/support/release-history")
+            .unwrap()
+            .clone();
+        record.body = br#"<html><body><p>The fixed firmware for CVE-2026-41877 is <strong>7.2.4</strong>. It replaces 7.2.3.</p><p>The fixed firmware for CVE-2026-12345 is 7.2.4.</p><p>It replaces 7.2.4.</p><table><tr><th>Affected firmware</th><th>Fixed firmware</th></tr><tr><td>7.2.4</td><td>7.2.4</td></tr></table></body></html>"#.to_vec();
+        pages.store.lock().unwrap().insert_page(record).unwrap();
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "The fixed firmware for CVE-2026-41877 is 7.2.5, not 7.2.4.".into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        let html = String::from_utf8(get(&pages, &cx, url).await.body).unwrap();
+        assert!(html.contains("<strong>7.2.5</strong>"), "{html}");
+        assert!(html.contains("CVE-2026-12345 is 7.2.4"), "{html}");
+        assert!(html.contains("It replaces 7.2.4"));
+        assert!(html.contains("<td>7.2.4</td><td>7.2.5</td>"), "{html}");
+        Ok(())
+    });
+}
+
+#[test]
+fn rehearsal_pages_have_valid_content() {
+    lab(|cx| async move {
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let audit = example_common::guest_content::Audit::default();
+        let mut opened = Vec::new();
+        for (name, url, status) in [
+            (
+                "advisory",
+                "https://www.halvardsystems.com/security/advisories/HSA-2026-014",
+                200,
+            ),
+            (
+                "earlier-advisory",
+                "https://www.halvardsystems.com/security/advisories/HSA-2026-013",
+                200,
+            ),
+            (
+                "bad-advisory",
+                "https://www.halvardsystems.com/security/advisories/HSA-2026-014ing.com",
+                404,
+            ),
+            (
+                "bad-review",
+                "https://www.techradar.com/reviews/halvard-hg-400-reviewhttps://www.manualslib.com/manual/382910",
+                404,
+            ),
+            (
+                "community-home",
+                "https://community.halvardsystems.com/",
+                200,
+            ),
+            (
+                "community-search",
+                "https://community.halvardsystems.com/search?q=factory+reset",
+                200,
+            ),
+            (
+                "advisories",
+                "https://www.halvardsystems.com/security/advisories/",
+                200,
+            ),
+            ("products", "https://www.halvardsystems.com/products/", 200),
+            (
+                "gateway",
+                "https://www.halvardsystems.com/products/hg-400",
+                200,
+            ),
+            (
+                "canned-search",
+                "https://www.google.com/search?q=halvard+gateway+vulnerability",
+                200,
+            ),
+            (
+                "pizza",
+                "https://www.google.com/search?q=best+pizza+in+leeds",
+                200,
+            ),
+            (
+                "router",
+                "https://www.google.com/search?q=how+to+reset+a+router",
+                200,
+            ),
+            (
+                "python",
+                "https://www.google.com/search?q=Python+itertools+groupby+example",
+                200,
+            ),
+            (
+                "encyclopedia",
+                "https://en.wikipedia.org/w/index.php?search=Python+itertools+groupby+example",
+                200,
+            ),
+            (
+                "discussions",
+                "https://www.reddit.com/search/?q=Python+itertools+groupby+example",
+                200,
+            ),
+        ] {
+            let response = get(&pages, &cx, url).await;
+            assert_eq!(response.status, status, "{url}");
+            text::validate_page(&response.content_type, &response.body).unwrap();
+            audit.inspect(url, &response.body);
+            let (host, _) = text::target_of(url);
+            if String::from_utf8_lossy(&response.body).contains("/static/css/main.css")
+                || String::from_utf8_lossy(&response.body).contains("/assets/css/site.min.css")
+            {
+                let css = pages
+                    .handle(&cx, "GET", &host, "/static/css/main.css", None)
+                    .await;
+                audit.inspect("site stylesheet", &css.body);
+                for word in
+                    String::from_utf8_lossy(&css.body).split(|c: char| !c.is_ascii_alphabetic())
+                {
+                    assert!(
+                        !example_common::guest_content::WORDS
+                            .iter()
+                            .any(|forbidden| word.eq_ignore_ascii_case(forbidden)),
+                        "{host} stylesheet contains {word}"
+                    );
+                }
+            }
+            opened.push((name, url.to_owned(), response.body));
+        }
+        let url = "https://www.halvardsystems.com/security/firmware-update";
+        pages.apply(&cx, Command::PlantPage { url: url.into(), text: "Firmware maintenance update\nThe fixed firmware for CVE-2026-41877 is 7.2.5. It replaces 7.2.4.".into(), expected_revision: 0 }).unwrap();
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard says the fixed firmware for CVE-2026-41877 is 7.2.5, not 7.2.4."
+                        .into(),
+                    expected_revision: 1,
+                },
+            )
+            .unwrap();
+        let response = get(&pages, &cx, url).await;
+        let html = String::from_utf8(response.body.clone()).unwrap();
+        assert!(html.contains("It replaces 7.2.4."));
+        assert!(!html.contains("<ul></ul>"));
+        text::validate_page(&response.content_type, &response.body).unwrap();
+        audit.inspect(url, &response.body);
+        opened.push(("planted-release", url.into(), response.body));
+        audit.check().unwrap();
+        if let Some(dir) = std::env::var_os("ADAPTIVE_WEB_CAPTURE_DIR") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(dir.join("_assets")).unwrap();
+            let asset = regex::Regex::new(r"/_assets/[a-zA-Z0-9_.-]+").unwrap();
+            for (name, url, body) in opened {
+                let (host, _) = text::target_of(&url);
+                let mut html = String::from_utf8(body).unwrap();
+                if html.contains("/static/css/main.css")
+                    || html.contains("/assets/css/site.min.css")
+                {
+                    let css = pages
+                        .handle(&cx, "GET", &host, "/static/css/main.css", None)
+                        .await;
+                    html = html.replace(
+                        "</head>",
+                        &format!(
+                            "<style>{}</style></head>",
+                            String::from_utf8(css.body).unwrap()
+                        ),
+                    );
+                }
+                let mut pending: Vec<_> = asset
+                    .find_iter(&html)
+                    .map(|m| m.as_str().to_owned())
+                    .collect();
+                let mut saved = std::collections::HashSet::new();
+                while let Some(path) = pending.pop() {
+                    if !saved.insert(path.clone()) {
+                        continue;
+                    }
+                    if let Some((mime, body)) = fictionet_extras::sites::asset(&host, &path) {
+                        let body = if mime.starts_with("text/css") {
+                            let css = String::from_utf8(body.to_vec()).unwrap();
+                            pending.extend(asset.find_iter(&css).map(|m| m.as_str().to_owned()));
+                            css.replace("/_assets/", &format!("file://{}/_assets/", dir.display()))
+                                .into_bytes()
+                        } else {
+                            body.to_vec()
+                        };
+                        std::fs::write(dir.join(path.trim_start_matches('/')), body).unwrap();
+                    }
+                }
+                html = html.replace("/_assets/", &format!("file://{}/_assets/", dir.display()));
+                std::fs::write(dir.join(format!("{name}.html")), html).unwrap();
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn forum_searches_do_not_use_thread_chrome() {
+    lab(|cx| async move {
+        let response = get(
+            &halvard(),
+            &cx,
+            "https://www.reddit.com/search/?q=router+settings",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("No matching pages were found"));
+        assert!(!html.contains("Community discussion"));
+        Ok(())
+    });
+}
+
+#[test]
+fn planted_articles_do_not_keep_empty_skin_panels() {
+    lab(|cx| async move {
+        let pages = halvard();
+        let url = "https://www.reddit.com/r/networking/comments/router-notes/";
+        pages.apply(&cx, Command::PlantPage { url: url.into(), text: "Router notes\nKeep a copy of the configuration before changing the router settings.".into(), expected_revision: 0 }).unwrap();
+        let response = get(&pages, &cx, url).await;
+        assert_eq!(response.status, 200);
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("Keep a copy of the configuration"));
+        assert!(!html.contains("On this page"));
+        Ok(())
+    });
 }

@@ -152,6 +152,9 @@ pub fn admit(name: &str) -> Result<(), &'static str> {
     if NOT_ON_THE_INTERNET.contains(&tld) {
         return Err("reserved or private top-level domain");
     }
+    if pages::misspelled_host(&name.to_ascii_lowercase()) {
+        return Err("unregistered host spelling");
+    }
     Ok(())
 }
 
@@ -973,5 +976,57 @@ mod tests {
         );
         assert!(!seen.contains(&again.assign("new.com").unwrap().unwrap().0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod spelling {
+    #[test]
+    fn misspelled_hosts_answer_nxdomain_over_dns() {
+        use super::*;
+        use fictionet::stdlib::{
+            protocols::dns::{op::ResponseCode, rr::RecordType},
+            world::sandbox::machine,
+        };
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            |cx| async move {
+                let seed = pages::Seed::builtin("halvard-cve")?;
+                let start = world_start(&seed.date)?;
+                let world = World::new(&cx, seed, start)?;
+                let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
+                let (attacher, attachments) = fictionet::attachments();
+                world.serve(&cx, log, attachments)?;
+                let client = machine(&cx, attacher.attach("reader")?, Ipv4Addr::new(10, 0, 0, 2));
+                for host in ["ww.bing.com", "gooogle.com", "WWW.GOOOGLE.COM"] {
+                    let answer = client
+                        .lookup(&cx, GATEWAY.into(), host, RecordType::A)
+                        .await?;
+                    assert_eq!(
+                        answer.metadata.response_code,
+                        ResponseCode::NXDomain,
+                        "{host}"
+                    );
+                    assert!(answer.answers.is_empty());
+                }
+                let answer = client
+                    .lookup(&cx, GATEWAY.into(), "www.bing.com", RecordType::A)
+                    .await?;
+                assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+                assert!(!answer.answers.is_empty());
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn close_spellings_of_known_hosts_do_not_resolve() {
+        for host in ["ww.bing.com", "gooogle.com", "www.gooogle.com"] {
+            assert!(super::admit(host).is_err(), "{host}");
+        }
+        assert!(super::admit("www.google.com").is_ok());
+        assert!(super::admit("community.halvardsystems.com").is_ok());
     }
 }

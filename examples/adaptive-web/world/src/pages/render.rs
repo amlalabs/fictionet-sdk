@@ -48,7 +48,19 @@ pub fn page(host: &str, profile: &Profile, record: &Page, today: &str) -> String
 
 /// Renders a page using the captured section layout when available.
 pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today: &str) -> String {
-    if let Some(skin) = fictionet_extras::sites::lookup(host, target)
+    let vendor = host == "www.halvardsystems.com" || host == "halvardsystems.com";
+    let canonical;
+    let profile = if vendor {
+        canonical = super::make::site_profile(host);
+        &canonical
+    } else {
+        profile
+    };
+    let path = target.split('?').next().unwrap_or(target);
+    let forum_listing = profile.kind == "forum"
+        && ["/", "/search", "/search/", "/latest", "/categories", "/top"].contains(&path);
+    if !forum_listing
+        && let Some(skin) = fictionet_extras::sites::lookup(host, target)
         && let Ok(today) = super::seed::parse_date(today)
         && let Some(html) = skin.render(
             &record.title,
@@ -57,7 +69,30 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
             today,
         )
     {
-        return html;
+        use kuchiki::traits::TendrilSink;
+        let dom = kuchiki::parse_html().one(html.as_str());
+        let mut changed = false;
+        let lists: Vec<_> = dom.select("ul, ol").unwrap().collect();
+        for list in lists {
+            if list.as_node().text_contents().trim().is_empty()
+                && list.as_node().select("li").unwrap().next().is_none()
+                && let Some(panel) = list.as_node().parent()
+                && panel
+                    .select("h1, h2, h3, h4, h5, h6")
+                    .unwrap()
+                    .next()
+                    .is_some()
+                && panel
+                    .select("a, p, img, table, input, pre")
+                    .unwrap()
+                    .next()
+                    .is_none()
+            {
+                panel.detach();
+                changed = true;
+            }
+        }
+        return if changed { dom.to_string() } else { html };
     }
     let year = today.get(..4).unwrap_or(today);
     let name = if profile.name.is_empty() {
@@ -138,6 +173,11 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
                 ""
             };
             let related = ["Related", "See also", "Explore"][style % 3];
+            let related = if sidebar.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<aside class="related"><h3>{related}</h3><ul>{sidebar}</ul></aside>"#)
+            };
             let ad = if ad.is_empty() {
                 String::new()
             } else {
@@ -150,7 +190,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
 <main id="main">
 {body}
 </main>
-<aside class="related"><h3>{related}</h3><ul>{sidebar}</ul></aside>
+{related}
 {ad}"#,
                 e(name),
                 e(title)
@@ -203,6 +243,42 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         1 => format!("Copyright © {year} {name}"),
         _ => format!("© {name} {year}"),
     };
+    let main = if vendor {
+        let source = include_str!("../../../seeds/fixed/halvard-hsa-2026-014.html");
+        let start = source.find("<header").unwrap();
+        let end = source[start..].find("</header>").unwrap() + start + "</header>".len();
+        let header = &source[start..end];
+        let start = main.find("<header").unwrap();
+        let end = main[start..].find("</header>").unwrap() + start + "</header>".len();
+        format!("{}{header}{}", &main[..start], &main[end..])
+    } else {
+        main
+    };
+    let main = if sidebar.is_empty() {
+        let main = main.replace(
+            &format!(
+                "<h4>{}</h4><ul></ul>",
+                ["See also", "Related", "More"][style % 3]
+            ),
+            "",
+        );
+        main.replace(
+            &format!(
+                r#"<section class="more"><h3>More from {}</h3><ul></ul></section>"#,
+                e(name)
+            ),
+            "",
+        )
+        .replace(
+            &format!(
+                r#"<aside class="rail"><h2>{}</h2><ol></ol></aside>"#,
+                ["Most read", "Popular", "Trending", "Latest"][style % 4]
+            ),
+            "",
+        )
+    } else {
+        main
+    };
     format!(
         r#"{head}
 {main}
@@ -233,15 +309,7 @@ pub fn again(
 
 /// Renders a missing page using the site's layout when available.
 pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str) -> String {
-    let fallback = Profile {
-        name: host.into(),
-        kind: String::new(),
-        tagline: String::new(),
-        nav: vec!["Home|/".into()],
-        footer: vec![],
-        style: 2,
-        css: String::new(),
-    };
+    let fallback = super::make::site_profile(host);
     let record = Page {
         title: "Page not found".into(),
         body: format!(

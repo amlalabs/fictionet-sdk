@@ -538,33 +538,124 @@ impl Pages {
         std::borrow::Cow::Owned(seed)
     }
 
-    /// `text` with every correction planted so far.
-    fn corrected(&self, text: &str) -> String {
+    /// Corrects only the claim named by a fact, retaining surrounding history.
+    fn corrected_fragment(&self, text: &str, context: &str) -> String {
         let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
         let mut text = text.to_owned();
+        static CVE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let cve = CVE.get_or_init(|| regex::Regex::new(r"(?i)CVE-[0-9]{4}-[0-9]+").unwrap());
         for (old, new) in &planted.corrections {
-            text = replace_value(&text, old, new);
+            let fact = planted
+                .facts
+                .iter()
+                .find(|f| correction(f).as_ref() == Some(&(old.clone(), new.clone())));
+            let firmware = fact.is_some_and(|f| {
+                let f = f.to_lowercase();
+                f.contains("firmware") || f.contains("fix") || f.contains("release")
+            });
+            if firmware {
+                let lower = context.to_lowercase();
+                if ![
+                    "fixed",
+                    "fix for",
+                    "fixes",
+                    "patched",
+                    "upgrade to",
+                    "update to",
+                    "resolved",
+                ]
+                .iter()
+                .any(|w| lower.contains(w))
+                {
+                    continue;
+                }
+                if let Some(subject) = fact.and_then(|f| cve.find(f))
+                    && cve
+                        .find_iter(context)
+                        .any(|found| !found.as_str().eq_ignore_ascii_case(subject.as_str()))
+                {
+                    continue;
+                }
+                if context.contains(&format!("{new}, not {old}"))
+                    || context.contains(&format!("{new} instead of {old}"))
+                {
+                    continue;
+                }
+            }
+            text = replace_content_value(&text, old, new);
         }
         text
     }
 
-    fn corrected_content(&self, text: &str) -> String {
-        static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let urls = URL.get_or_init(|| {
-            regex::Regex::new(
-                r#"(?i)(?:[a-z][a-z0-9+.-]*://|(?:mailto|data):|(?:^|\s)/)[^\s<>"']+"#,
-            )
-            .unwrap()
-        });
-        let mut corrected = String::new();
-        let mut end = 0;
-        for url in urls.find_iter(text) {
-            corrected.push_str(&self.corrected(&text[end..url.start()]));
-            corrected.push_str(url.as_str());
-            end = url.end();
+    fn corrected(&self, text: &str) -> String {
+        sentences()
+            .replace_all(text, |c: &regex::Captures<'_>| {
+                self.corrected_fragment(&c[0], &c[0])
+            })
+            .into_owned()
+    }
+
+    /// Keeps inline markup while using the whole surrounding sentence as context.
+    fn corrected_node(&self, node: &kuchiki::NodeRef, original: &str) -> String {
+        let block = node
+            .ancestors()
+            .find(|a| {
+                a.as_element().is_some_and(|e| {
+                    matches!(
+                        e.name.local.as_ref(),
+                        "p" | "li" | "td" | "th" | "h1" | "h2" | "h3"
+                    )
+                })
+            })
+            .unwrap_or_else(|| node.clone());
+        if block
+            .as_element()
+            .is_some_and(|e| e.name.local.as_ref() == "td")
+        {
+            let column = block
+                .preceding_siblings()
+                .filter(|n| n.as_element().is_some())
+                .count();
+            let table = block.ancestors().find(|a| {
+                a.as_element()
+                    .is_some_and(|e| e.name.local.as_ref() == "table")
+            });
+            let header = table
+                .and_then(|t| t.select("tr").ok()?.next())
+                .and_then(|r| {
+                    r.as_node()
+                        .children()
+                        .filter(|n| n.as_element().is_some())
+                        .nth(column)
+                })
+                .map(|n| n.text_contents())
+                .unwrap_or_default();
+            return self.corrected_fragment(original, &format!("{header}: {original}"));
         }
-        corrected.push_str(&self.corrected(&text[end..]));
+        let mut context = String::new();
+        let mut offset = 0;
+        for child in block.descendants() {
+            if child == *node {
+                offset = context.len();
+            }
+            if let Some(text) = child.as_text() {
+                context.push_str(&text.borrow());
+            }
+        }
+        let mut corrected = String::new();
+        for sentence in sentences().find_iter(&context) {
+            let start = sentence.start().max(offset);
+            let end = sentence.end().min(offset + original.len());
+            if start < end {
+                corrected
+                    .push_str(&self.corrected_fragment(&context[start..end], sentence.as_str()));
+            }
+        }
         corrected
+    }
+
+    fn corrected_content(&self, text: &str) -> String {
+        self.corrected(text)
     }
 
     /// Returns the seed used by this world.
@@ -875,6 +966,7 @@ impl Pages {
         // A result list is corrected result by result, so its search box
         // keeps what was typed.
         if !search
+            && !matches!(response.meta, Meta::Planted { .. })
             && !self
                 .planted
                 .lock()
@@ -909,7 +1001,8 @@ impl Pages {
                             })
                         })
                     {
-                        let corrected = self.corrected_content(&text.borrow());
+                        let original = text.borrow().to_string();
+                        let corrected = self.corrected_node(&node, &original);
                         *text.borrow_mut() = corrected;
                     }
                 }
@@ -964,6 +1057,9 @@ impl Pages {
                 start,
             } => self.search(cx, engine, &query, start).await,
             Route::Page => {
+                if make::broken_path(target) {
+                    return self.missing(host, target);
+                }
                 if let Some(planted) = self.planted(host, target) {
                     return planted;
                 }
@@ -1159,6 +1255,26 @@ impl Pages {
             .as_ref()
             .map(|r| r.search.clone())
             .unwrap_or_default();
+        if search.ads.is_empty() && record.is_some() {
+            let store = self.store();
+            for list in store.searches() {
+                if make::relevant(
+                    &fictionet_extras::search::Result {
+                        url: String::new(),
+                        title: list.query.clone(),
+                        snippet: String::new(),
+                        date: String::new(),
+                    },
+                    query,
+                ) {
+                    for ad in &list.search.ads {
+                        if !search.ads.iter().any(|a| a.url == ad.url) {
+                            search.ads.push(ad.clone());
+                        }
+                    }
+                }
+            }
+        }
         // A list with no results while nothing new is made stays empty.
         if start == 0 && record.is_some() {
             let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1182,6 +1298,16 @@ impl Pages {
             }
         }
         for result in &mut search.results {
+            if self
+                .planted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pages
+                .iter()
+                .any(|p| p.url == result.url)
+            {
+                continue;
+            }
             result.title = self.corrected(&result.title);
             result.snippet = self.corrected(&result.snippet);
         }
@@ -1200,7 +1326,7 @@ impl Pages {
             .generate(
                 cx,
                 json!({"kind": "search", "query": query}),
-                || make::search(&seed, query, &known),
+                || make::search(&self.seed, query, &known),
                 || {
                     let (system, user) = prompts::search(&seed, &cast, query, &known, &claims);
                     (system, user, SEARCH_TOKENS)
@@ -1211,15 +1337,26 @@ impl Pages {
         let mut search = made.fields;
         let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
+            let (host, _) = text::target_of(&r.url);
+            if matches!(self.maker(), Maker::Stub)
+                && self.seed.about(&host).is_some()
+                && !known.iter().any(|k| k.url == r.url)
+            {
+                r.url = format!("https://{host}/");
+                let profile = make::site_profile(&host);
+                r.title = if profile.kind == "forum" {
+                    "Latest discussions".into()
+                } else {
+                    profile.name
+                };
+                r.snippet = r.title.clone();
+                r.date.clear();
+            }
             let (host, target) = text::target_of(&r.url);
             let known_match = known.iter().find(|k| k.url == r.url);
-            let about = self.seed.about(&host);
             if host.is_empty()
                 || results.iter().any(|x| x.url == r.url)
-                || known_match.is_some_and(|k| {
-                    !make::shares_words(&format!("{} {} {}", k.title, k.url, k.snippet), query)
-                })
-                || about.is_some_and(|about| !make::shares_words(&format!("{host} {about}"), query))
+                || known_match.is_some_and(|k| !make::relevant(k, query))
             {
                 continue;
             }
@@ -1243,6 +1380,41 @@ impl Pages {
             r.title = mention["title"].as_str().unwrap_or_default().into();
             r.snippet = mention["snippet"].as_str().unwrap_or_default().into();
             results.push(r);
+        }
+        let known_matches = results
+            .iter()
+            .filter(|r| {
+                known
+                    .iter()
+                    .any(|k| k.url == r.url && make::relevant(k, query))
+            })
+            .count();
+        if matches!(self.maker(), Maker::Stub) && known_matches >= 3 {
+            results.retain(|r| {
+                known
+                    .iter()
+                    .any(|k| k.url == r.url && make::relevant(k, query))
+            });
+        }
+        if matches!(self.maker(), Maker::Stub)
+            && !results
+                .iter()
+                .any(|r| self.seed.about(&text::target_of(&r.url).0).is_some())
+        {
+            let mut directories = 0;
+            results.retain(|r| {
+                if known
+                    .iter()
+                    .any(|k| k.url == r.url && make::relevant(k, query))
+                {
+                    true
+                } else {
+                    directories += 1;
+                    directories <= 2
+                }
+            });
+            search.related.clear();
+            search.questions.clear();
         }
         search.results = results;
         let record = SearchRecord {
@@ -1492,11 +1664,45 @@ impl Pages {
             .site(host)
             .map(|p| p.kind.clone())
             .unwrap_or_else(|| make::site_profile(host).kind);
+        let mut known = {
+            let store = self.store();
+            let mut known = store.known(&seed);
+            for result in store.searches().flat_map(|s| &s.search.results) {
+                if !known.iter().any(|r| r.url == result.url) {
+                    known.push(result.clone());
+                }
+            }
+            known
+        };
+        known.extend(
+            self.planted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pages
+                .iter()
+                .map(|p| fictionet_extras::search::Result {
+                    url: p.url.clone(),
+                    title: p.title.clone(),
+                    snippet: p.text.join(" "),
+                    date: String::new(),
+                }),
+        );
         let made = self
             .generate(
                 cx,
                 json!({"kind": "page", "url": url}),
-                || make::page(&seed, host, target, &ask.mentions, &kind),
+                || {
+                    let mut mentions = ask.mentions.clone();
+                    for fact in &self.planted.lock().unwrap_or_else(|e| e.into_inner()).facts {
+                        if make::shares_words(
+                            fact,
+                            &format!("{url} {}", make::title_from(host, target)),
+                        ) {
+                            mentions.push(json!({"snippet": fact}));
+                        }
+                    }
+                    make::page_with_known(&seed, host, target, &mentions, &kind, &known)
+                },
                 || {
                     let (system, user) = prompts::page(
                         &seed,
@@ -1622,6 +1828,11 @@ fn gives_away(text: &str) -> Option<String> {
     Some(error.split('"').nth(1).unwrap_or("that word").to_owned())
 }
 
+fn sentences() -> &'static regex::Regex {
+    static SENTENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SENTENCE.get_or_init(|| regex::Regex::new(r"(?s).*?(?:[.!?](?:\s|$)|$)").unwrap())
+}
+
 /// The old and new value a fact corrects: "... is 7.2.5, not 7.2.4." or
 /// "... 7.2.5 instead of 7.2.4".
 fn correction(fact: &str) -> Option<(String, String)> {
@@ -1633,6 +1844,23 @@ fn correction(fact: &str) -> Option<(String, String)> {
     let new = before.split_whitespace().last()?.trim_end_matches(',');
     (!old.is_empty() && !old.contains(' ') && !new.is_empty() && old != new)
         .then(|| (old.to_owned(), new.to_owned()))
+}
+
+fn replace_content_value(text: &str, old: &str, new: &str) -> String {
+    static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let urls = URL.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(?:[a-z][a-z0-9+.-]*://|(?:mailto|data):|(?:^|\s)/)[^\s<>"']+"#)
+            .unwrap()
+    });
+    let mut corrected = String::new();
+    let mut end = 0;
+    for url in urls.find_iter(text) {
+        corrected.push_str(&replace_value(&text[end..url.start()], old, new));
+        corrected.push_str(url.as_str());
+        end = url.end();
+    }
+    corrected.push_str(&replace_value(&text[end..], old, new));
+    corrected
 }
 
 /// `text` with each whole `old` replaced by `new`: not inside a longer
@@ -1801,3 +2029,5 @@ impl fictionet_extras::models::Engine for Pages {
         crate::admit(host).is_ok()
     }
 }
+
+pub(crate) use make::misspelled_host;
