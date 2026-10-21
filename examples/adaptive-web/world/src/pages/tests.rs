@@ -5466,8 +5466,24 @@ fn live_world_serves_prepared_answers_without_calls_and_keeps_disk_unchanged() {
     let fake = Fake::script(vec![]);
     let pages = live_world(fake.clone());
     let before = std::fs::read(store::canned_root("halvard-cve").join("world.jsonl")).unwrap();
-    let query = pages.store().searches().next().unwrap().query.clone();
-    let url = pages.store().pages().next().unwrap().url.clone();
+    // A Google list whose every result is stored, so nothing is made or
+    // prefetched; the store keeps lists in no particular order.
+    let (query, url) = {
+        let store = pages.store();
+        let mut lists: Vec<_> = store
+            .searches()
+            .filter(|l| l.key == crate::route::query_key(&l.query, 0))
+            .filter(|l| {
+                l.search.results.iter().all(|r| {
+                    let (host, target) = text::target_of(&r.url);
+                    store.page(&host, &target).is_some()
+                })
+            })
+            .collect();
+        lists.sort_by(|a, b| a.key.cmp(&b.key));
+        let query = lists.first().expect("a fully stored list").query.clone();
+        (query, store.pages().next().unwrap().url.clone())
+    };
     lab(move |cx| async move {
         assert_eq!(google(&pages, &cx, &query).await.status, 200);
         assert_eq!(get(&pages, &cx, &url).await.status, 200);
