@@ -1353,56 +1353,27 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
             "Compare support coverage with the renewal quote",
         ],
         _ => [
-            "An overview connects the subject with its wider context",
-            "Readers discuss the practical implications",
-            "A useful answer explains the conditions as well as the conclusion",
-            "This guide starts with the main terms",
-            "Compare the available approaches before choosing one",
-            "An introduction traces the main ideas",
-            "Examples help explain the differences",
-            "Start with the basics and follow the references",
-            "Dates and definitions help clarify the subject",
-            "A closer look brings out the important distinctions",
-            "Practical experience adds context to an overview",
-            "Specialist sources explain the finer points",
-            "Read the sources behind the summary",
+            "An overview connects {subject} with its wider context",
+            "Readers discuss the practical implications of {subject}",
+            "A useful answer about {subject} explains the conditions as well as the conclusion",
+            "This guide to {subject} starts with the main terms",
+            "Compare the available approaches to {subject} before choosing one",
+            "An introduction to {subject} traces the main ideas",
+            "Examples of {subject} help explain the differences",
+            "Start with the basics of {subject} and follow the references",
+            "Dates and definitions help clarify {subject}",
+            "A closer look at {subject} brings out the important distinctions",
+            "Practical experience adds context to an overview of {subject}",
+            "Specialist sources explain the finer points of {subject}",
+            "Read the sources behind this summary of {subject}",
         ],
-    };
-    let focus_text = q
-        .strip_prefix("symptoms of ")
-        .or_else(|| q.strip_prefix("best "))
-        .or_else(|| q.strip_prefix("what is "))
-        .or_else(|| q.strip_prefix("what are "))
-        .unwrap_or(&q);
-    let focus_text = [" keeps ", " won't ", " won’t ", " not ", " after "]
-        .iter()
-        .filter_map(|separator| focus_text.split_once(separator).map(|(first, _)| first))
-        .min_by_key(|text| text.len())
-        .unwrap_or(focus_text);
-    let focus = words(focus_text)
-        .into_iter()
-        .filter(|word| {
-            !word.chars().all(|c| c.is_ascii_digit())
-                && !["symptoms", "how", "repair", "clean", "install"].contains(&word.as_str())
-        })
-        .collect::<Vec<_>>();
-    let focus = proper(&focus.join(" "));
-    let focus = if focus.eq_ignore_ascii_case(subject) && focus.split_whitespace().count() > 2 {
-        focus
-            .split_whitespace()
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        focus
     };
     let lead = if shape == "question"
         && (q.contains("dog") || q.contains("cat "))
         && (q.contains("eat") || q.contains("food"))
     {
-        excerpt(&format!(
-            "{}: {}.",
-            proper(subject).trim_end_matches('?'),
+        excerpt(&proper(&format!(
+            "{}.",
             [
                 "some human foods are toxic to pets",
                 "grapes and raisins can harm a dog’s kidneys",
@@ -1418,11 +1389,10 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
                 "human snacks are not always suitable for pets",
                 "check ingredients as well as the name of a food"
             ][angle % 13]
-        ))
+        )))
     } else if shape == "question" && q.contains("invent") {
-        excerpt(&format!(
-            "{}: {}.",
-            proper(subject).trim_end_matches('?'),
+        excerpt(&proper(&format!(
+            "{}.",
             [
                 "credit can involve a device, a patent and later improvements",
                 "patent dates help distinguish competing claims",
@@ -1438,22 +1408,19 @@ fn topic_article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Articl
                 "historical accounts differ in the milestone they emphasize",
                 "read the original claims alongside modern histories"
             ][angle % 13]
-        ))
+        )))
     } else {
-        let line = angles[angle % 13];
-        let label = if angle.is_multiple_of(3) {
-            focus
-        } else {
-            match shape {
-                "problem" => format!("{focus} repair"),
-                "review" => format!("Choosing {focus}"),
-                "health" => format!("{focus} care"),
-                "service" => format!("{focus} renewal"),
-                _ => focus,
-            }
-        };
-        let sentence = format!("{label}: {}.", lower_first(line));
-        excerpt(&proper(&sentence))
+        excerpt(&proper(&format!(
+            "{}.",
+            angles[angle % 13].replace(
+                "{subject}",
+                &words(subject)
+                    .into_iter()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        )))
     };
     Article {
         title: result_title(seed, subject, host, angle, subject),
@@ -2531,7 +2498,8 @@ fn result_path(seed: &Seed, host: &str, slug: &str, kind: &str) -> String {
                 "python"
             }
         ),
-        "www.britannica.com" => format!("technology/{slug}"),
+        "www.britannica.com" => format!("topic/{slug}"),
+        "www.history.com" => format!("topics/{slug}"),
         "www.rhs.org.uk" => format!("plants/types/cacti-succulents/{slug}"),
         "www.gardenersworld.com" => format!("how-to/grow-plants/{slug}/"),
         "www.instructables.com" => format!("id/{slug}/"),
@@ -2556,6 +2524,7 @@ fn result_path(seed: &Seed, host: &str, slug: &str, kind: &str) -> String {
             "forum" => format!("t/{slug}/{id}"),
             "qa" => format!("questions/{id}/{slug}"),
             "docs" => format!("docs/reference/{slug}"),
+            "wiki" => format!("topic/{slug}"),
             "package" => format!("packages/{slug}"),
             "weather" => format!("forecast/{slug}"),
             "marketplace" => format!("used-cars/{slug}"),
@@ -3718,6 +3687,7 @@ pub fn site_profile(host: &str) -> Profile {
     } else if matches!(
         host,
         "www.reuters.com"
+            | "www.history.com"
             | "www.theguardian.com"
             | "www.independent.co.uk"
             | "arstechnica.com"
@@ -3856,10 +3826,8 @@ pub fn site_profile(host: &str) -> Profile {
         "company"
     } else if host.contains("blog") || host.contains("medium") {
         "blog"
-    } else if host.starts_with("news.") || host.contains("bbc") || host.contains("register") {
-        "news"
     } else {
-        ["news", "company", "blog", "shop", "company", "news"][hash(host) % 6]
+        "news"
     };
     let links = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let (tagline, nav) = match kind {
@@ -4034,19 +4002,19 @@ pub fn site_profile(host: &str) -> Profile {
         ]),
     }
 }
-/// A small family of layouts for the offline sites.
-fn stylesheet(kind: &str) -> String {
+/// Shared layouts for each kind of site.
+pub(super) fn stylesheet(kind: &str) -> String {
     let base = r#"
 * { box-sizing: border-box; }
 body { margin: 0; color: #263345; background: #f5f6f8; font: 16px/1.65 Arial, sans-serif; }
 a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
 header { background: #fff; border-top: 5px solid var(--accent); border-bottom: 1px solid #d9dee5; padding: 24px max(24px, calc((100% - 1160px)/2)); }
-.brand a, .logo, .home { font-size: 30px; font-weight: 800; letter-spacing: -1px; }
-.tagline { display: block; font-size: 13px; color: #647085; }
+.brand a, .logo, .home { color: inherit; font-size: 30px; font-weight: 800; letter-spacing: -1px; }
+.tagline { display: block; font-size: 13px; color: inherit; }
 .cookie-banner { position: fixed; bottom: 0; left: 0; right: 0; z-index: 100; display: flex; align-items: center; gap: 16px; padding: 12px 24px; background: #fff; border-top: 1px solid #bdc6d1; box-shadow: 0 -2px 12px #0002; }
 body { padding-bottom: 100px; }
-nav ul, .footer-links, .topbar ul { list-style: none; padding: 0; display: flex; gap: 24px; flex-wrap: wrap; }
-nav a { color: inherit; font-size: 14px; font-weight: 600; }
+nav ul, .nav, .footer-links, .topbar ul { list-style: none; padding: 0; display: flex; gap: 24px; flex-wrap: wrap; }
+nav a, .nav a { color: inherit; font-size: 14px; font-weight: 600; }
 .layout, .columns { max-width: 1160px; margin: 36px auto; display: grid; gap: 40px; grid-template-columns: minmax(0, 1fr) 260px; padding: 0 24px; }
 main { min-width: 0; background: #fff; padding: 32px; }
 body > main { max-width: 1000px; margin: 32px auto; }
@@ -4070,7 +4038,7 @@ pre { overflow-x: auto; padding: 20px; background: #edf1f5; } code { font-family
 "#;
     let theme = match kind {
         "docs" => {
-            ":root {--accent:#3156ad} header {background:#17263f;color:#fff} .home, .brand a {color:#fff} .tagline {color:#becbe2} main {border:1px solid #d9dee5;border-radius:6px} h1 {font-size:34px}"
+            ":root {--accent:#3156ad} header {background:#edf1f5} main {border:1px solid #d9dee5;border-radius:6px} h1 {font-size:34px}"
         }
         "forum" | "qa" => {
             ":root {--accent:#a74320} body {background:#f2ede8} header {border-top:0} main {border:1px solid #d8cec5;border-radius:8px} main p {padding:14px;background:#faf8f5;border-radius:5px} h1 {font-size:30px}"
@@ -4079,7 +4047,7 @@ pre { overflow-x: auto; padding: 20px; background: #edf1f5; } code { font-family
             ":root {--accent:#265f4a} header {text-align:center;background:#eff5ed} header nav ul {justify-content:center} h1 {font-weight:500} main {border-radius:12px} .promo-banner {text-align:center;background:#dfeadd}"
         }
         "company" => {
-            ":root {--accent:#164d88} header {background:#102e4d;color:white} header a {color:white} .tagline {color:#b9cede} h1 {color:#153c63} main {border-top:4px solid var(--accent)} .topbar {text-align:right}"
+            ":root {--accent:#164d88} header {background:#edf1f5} header a {color:inherit} h1 {color:#153c63} main {border-top:4px solid var(--accent)} .topbar {text-align:right}"
         }
         "wiki" => {
             ":root {--accent:#365c99} body {background:white;font-family:Georgia,serif} header {border-top:0} h1 {font-weight:400;border-bottom:1px solid #aeb5be;padding-bottom:14px} nav, header, footer {font-family:Arial,sans-serif} main {padding-top:0}"
@@ -4088,10 +4056,10 @@ pre { overflow-x: auto; padding: 20px; background: #edf1f5; } code { font-family
             ":root {--accent:#805235} body {background:#f5f1e9} .masthead {background:#f5f1e9;border-top:0} .brand a {font-family:Georgia,serif;font-style:italic;font-size:38px} article {font-family:Georgia,serif;font-size:18px} main {background:transparent;padding-top:0} .rail {border-top:1px solid #cbbca9}"
         }
         _ => {
-            ":root {--accent:#ab242b} .brand a {font-family:Georgia,serif;font-size:40px;color:#20242a} .masthead nav {border-top:1px solid #d9dee5;margin-top:20px} h1 {font-family:Georgia,serif} .layout {border-top:1px solid #d9dee5;padding-top:28px}"
+            ":root {--accent:#ab242b} .brand a {font-family:Georgia,serif;font-size:40px} .masthead nav {border-top:1px solid #d9dee5;margin-top:20px} h1 {font-family:Georgia,serif} .layout {border-top:1px solid #d9dee5;padding-top:28px}"
         }
     };
-    format!("{base}\n{theme}")
+    format!("@layer {{\n{base}\n{theme}\n}}")
 }
 /// Derives a page title from its path or site name.
 fn path_title(target: &str) -> Option<String> {
@@ -4531,7 +4499,10 @@ pub fn page(
                 "Firmware may refer to the installed release or an upgrade image; the fixed release here is 7.2.4.",
             )
         } else {
-            ("Before you begin", article.steps[0].as_str())
+            (
+                "Before you begin",
+                "Check the tools, access and instructions required for the work.",
+            )
         };
         format!("<dl><dt>{term}</dt><dd>{}</dd></dl>", escape(value))
     } else {
@@ -4921,6 +4892,7 @@ mod tests {
                 );
                 let mut titles = BTreeSet::new();
                 let mut snippets = BTreeSet::new();
+                let mut labels = BTreeSet::new();
                 let dump = fresh.contains(&query.as_str()) && engine != Engine::DuckDuckGo;
                 if dump {
                     eprintln!("OUTPUT {engine:?}: {query}");
@@ -4932,6 +4904,16 @@ mod tests {
                         result.title
                     );
                     let (host, target) = target_of(&result.url);
+                    if host == "www.history.com" {
+                        assert!(target.starts_with("/topics/"), "{}", result.url);
+                        assert_eq!(site_profile(&host).kind, "news");
+                    }
+                    if site_profile(&host).kind == "wiki" && host == "www.britannica.com" {
+                        assert!(target.starts_with("/topic/"), "{}", result.url);
+                    }
+                    if !matches!(site_profile(&host).kind.as_str(), "shop" | "company") {
+                        assert!(!target.starts_with("/products/"), "{}", result.url);
+                    }
                     if host == "en.wikipedia.org" {
                         assert!(
                             !verb.is_match(heading(&result.title)),
@@ -4967,6 +4949,22 @@ mod tests {
                         assert!(
                             !result.snippet.to_lowercase().contains(banned),
                             "{query}: {}",
+                            result.snippet
+                        );
+                    }
+                    assert!(
+                        result
+                            .snippet
+                            .chars()
+                            .next()
+                            .is_some_and(char::is_uppercase),
+                        "{query}: {}",
+                        result.snippet
+                    );
+                    if let Some((label, _)) = result.snippet.split_once(':') {
+                        assert!(
+                            labels.insert(words(label)),
+                            "{query}: repeated snippet label: {}",
                             result.snippet
                         );
                     }

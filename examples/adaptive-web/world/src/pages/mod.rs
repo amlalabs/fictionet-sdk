@@ -1107,9 +1107,13 @@ impl Pages {
                     && !(path == "/search.css" && crate::route::SEARCH_HOSTS.contains(&host))
                 {
                     return match self.site_stylesheet(cx, host).await {
-                        Ok(profile) => {
-                            Response::new(200, "text/css", profile.css, vec![], Meta::Asset)
-                        }
+                        Ok(profile) => Response::new(
+                            200,
+                            "text/css",
+                            format!("{}\n{}", make::stylesheet(&profile.kind), profile.css),
+                            vec![],
+                            Meta::Asset,
+                        ),
                         Err(stop) => stop.response(Asked::Page),
                     };
                 }

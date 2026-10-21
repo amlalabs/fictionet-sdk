@@ -337,6 +337,47 @@ fn site_styles_survive_restart_and_generation_off() {
 }
 
 #[test]
+fn model_site_stylesheets_start_with_shared_layout_and_end_with_site_rules() {
+    let dir = Dir::new("shared-styles");
+    let own = "body { color: #234; font-family: Georgia; } header { background: #fff; }";
+    let fake = Fake::script(vec![completion(
+        10,
+        &format!(
+            "STATUS: 200\nTITLE: Article\nSITE_NAME: Field News\nSITE_KIND: news\nSITE_CSS: {own}\nBODY:\n<h1>Article</h1><p>A new report.</p>"
+        ),
+        Some(0.001),
+    )]);
+    let pages = on_disk(&dir.0, seed(), Some(Maker::Model(openrouter(fake))), 0).unwrap();
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let page = get(&pages, &cx, "https://news.fields.com/article").await;
+        assert_eq!(page.status, 200);
+        let css = get(&pages, &cx, "https://news.fields.com/static/css/main.css").await;
+        assert_eq!(css.status, 200);
+        assert_eq!(css.content_type, "text/css");
+        let css = String::from_utf8(css.body).unwrap();
+        let base = make::stylesheet("news");
+        for selector in [
+            "header {",
+            ".brand a,",
+            ".tagline {",
+            "nav ul,",
+            ".layout,",
+            "main {",
+            "footer {",
+        ] {
+            assert!(base.contains(selector), "{selector}");
+        }
+        assert_eq!(css, format!("{base}\n{own}"));
+        assert_eq!(pages.store().site("news.fields.com").unwrap().css, own);
+        let audit = example_common::guest_content::Audit::default();
+        audit.inspect("site stylesheet", css.as_bytes());
+        audit.check().unwrap();
+        Ok(())
+    });
+}
+
+#[test]
 fn concurrent_model_pages_share_one_stylesheet() {
     let dir = Dir::new("model-styles");
     let fake = Fake::new(|_, body| {
@@ -396,7 +437,10 @@ fn concurrent_model_pages_share_one_stylesheet() {
             )
             .unwrap();
         let css = get(&pages, &cx, "https://docs.fields.com/static/css/main.css").await;
-        assert_eq!(css.body, b"body { color: #17472c; }");
+        assert_eq!(
+            css.body,
+            format!("{}\nbody {{ color: #17472c; }}", make::stylesheet("docs")).as_bytes()
+        );
         let replay = on_disk(&path, seed(), None, 0).unwrap();
         assert_eq!(
             get(
@@ -434,7 +478,10 @@ fn fixed_model_host_gets_one_stylesheet_without_rewriting_pages() {
                 &format!("https://{}/assets/css/site.min.css?v=4.18.2", fixed.host),
             )
             .await;
-            assert_eq!(css.body, b"body {color: #17472c}");
+            assert_eq!(
+                css.body,
+                format!("{}\nbody {{color: #17472c}}", make::stylesheet("company")).as_bytes()
+            );
         }
         assert_eq!(fake.users().len(), 1);
         assert!(fake.users()[0].contains("page-advisory"));
