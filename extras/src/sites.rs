@@ -219,6 +219,12 @@ impl Skin {
                 let card = link.as_node().parent()?.parent()?;
                 let title = link.text_contents();
                 let thumbnail = crate::search::video_thumbnail(&title);
+                let seconds = 120
+                    + title
+                        .bytes()
+                        .fold(0u32, |n, b| n.wrapping_mul(31).wrapping_add(u32::from(b)))
+                        % (23 * 60 + 1);
+                let duration = format!("{}:{:02}", seconds / 60, seconds % 60);
                 let image = if let Ok(image) = card.select_first("img") {
                     image.attributes.borrow_mut().insert("src", thumbnail);
                     image.as_node().detach();
@@ -233,7 +239,7 @@ impl Skin {
                 replace(
                     &card,
                     &format!(
-                        "<a class=\"video-thumbnail\" href=\"{}\">{image}<span class=\"video-duration\">8:41</span></a><div>{body}</div>",
+                        "<a class=\"video-thumbnail\" href=\"{}\">{image}<span class=\"video-duration\">{duration}</span></a><div>{body}</div>",
                         escape(&href)
                     ),
                 );
@@ -445,6 +451,46 @@ mod tests {
                 .text_contents(),
             "Home › Paths"
         );
+    }
+
+    #[test]
+    fn video_durations_vary_by_title_and_remain_stable() {
+        let titles = [
+            "Paths and files",
+            "Working with iterators",
+            "A tour of Python",
+            "Bread baking",
+        ];
+        let body = titles
+            .iter()
+            .enumerate()
+            .map(|(i, title)| {
+                format!("<article><h2><a href=\"/watch?v={i}\">{title}</a></h2></article>")
+            })
+            .collect::<String>();
+        let durations = |path: &str| {
+            let html = lookup("www.youtube.com", path)
+                .unwrap()
+                .render("Videos", &body, today(), today())
+                .unwrap();
+            document(&html)
+                .select(".video-duration")
+                .unwrap()
+                .map(|node| node.text_contents())
+                .collect::<Vec<_>>()
+        };
+        let values = durations("/");
+        assert_eq!(values.len(), titles.len());
+        assert_eq!(values, durations("/results?search_query=python"));
+        assert!(values.iter().collect::<HashSet<_>>().len() > 1);
+        for value in values {
+            let (minutes, seconds) = value.split_once(':').unwrap();
+            assert_eq!(seconds.len(), 2);
+            let minutes = minutes.parse::<u32>().unwrap();
+            let seconds = seconds.parse::<u32>().unwrap();
+            assert!(seconds < 60);
+            assert!((120..=1500).contains(&(minutes * 60 + seconds)));
+        }
     }
 
     #[test]

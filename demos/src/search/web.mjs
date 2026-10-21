@@ -107,7 +107,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     g.children[2].textContent = host;
     g.dots(pages.map((page, index) => [page.url, { page, index, r, x, y }]));
   });
-  const more = add('text', { class: 'label small', x: 500, y: 158, 'text-anchor': 'end' }, layers.marks);
+  const more = add('text', { class: 'label small overflow', x: 500, y: 108, 'text-anchor': 'end' }, layers.marks);
   const refused = add('g', { class: 'refused-mark' }, layers.marks);
   add('circle', { class: 'refused', cx: 24, cy: 540, r: 9 }, refused);
   add('path', { class: 'cross', d: 'M 18 534 L 30 546 M 30 534 L 18 546' }, refused);

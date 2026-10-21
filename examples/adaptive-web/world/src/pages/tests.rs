@@ -5336,5 +5336,15 @@ fn made_wikipedia_articles_have_a_lead_sections_and_an_infobox() {
     assert!(main.as_node().select_first(".lead").is_ok());
     assert!(main.as_node().select("h2").unwrap().count() >= 2);
     assert!(main.as_node().select_first("table.infobox").is_ok());
+    for phrase in [
+        "Before you begin",
+        "Check the tools",
+        "Considerations",
+        "First step",
+    ] {
+        assert!(!main.text_contents().contains(phrase));
+    }
+    assert!(main.text_contents().contains("lactic acid bacteria"));
+    assert!(main.text_contents().contains("Effects"));
     assert!(dom.select_first(".page-breadcrumb").is_err());
 }

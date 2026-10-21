@@ -484,6 +484,18 @@ test('overflow counts hidden sites and retains the latest page and long tooltips
   h.publish(snapshot({ pages, refused: [{ name: 'a-very-long-private-host.example.corp', at_ms: 1 }], planted: [{ kind: 'fact', text, at_ms: 2 }] }));
   assert.equal(h.root.querySelectorAll('.site-group').length, 21);
   assert.match(h.root.textContent, /\+4 more/);
+  const overflow = h.root.querySelector('.overflow');
+  const right = Number(overflow.getAttribute('x'));
+  const bottom = Number(overflow.getAttribute('y')) + 4;
+  const left = right - overflow.textContent.length * 8;
+  const top = bottom - 18;
+  assert.equal(overflow.getAttribute('text-anchor'), 'end');
+  for (const [x, y] of slots()) {
+    const dx = Math.max(left - x, 0, x - right);
+    const dy = Math.max(top - y, 0, y - bottom);
+    assert.ok(Math.hypot(dx, dy) > 14 + 8 + 3.6 + 1.25);
+  }
+
   assert.ok(h.root.querySelectorAll('.site-group').some((g) => g.getAttribute('data-host') === 'site24.com'));
   assert.equal(h.root.querySelector('.planted-mark').querySelectorAll('tspan').length, 2);
   assert.equal(h.root.querySelector('.planted-mark').querySelectorAll('tspan').map((line) => line.textContent).join(''), text);

@@ -1146,6 +1146,11 @@ fn title_pattern(seed: &Seed, query: &str, host: &str, angle: usize, original: &
         ][angle % 13])
             .to_owned();
     }
+    if matches!(site_profile(host).kind.as_str(), "qa" | "forum")
+        && let Some((question, _)) = heading(original).split_once('?')
+    {
+        return format!("{question}?");
+    }
     if q.contains("router") {
         return format!(
             "{original}: {}",
@@ -1314,7 +1319,7 @@ fn subject_facts(subject: &str) -> Option<[&'static str; 5]> {
                 "Roots need air as well as water, so saturated soil can damage them",
                 "Pots with drainage holes let excess water escape",
                 "Sunlight, temperature and pot size change how quickly soil dries",
-                "Check soil below the surface before adding more water",
+                "Moisture below the soil surface can differ from moisture at the surface",
                 "New growth and dormant growth need different amounts of water",
             ]
         } else if has(&["bread", "flour", "dough"]) {
@@ -1417,15 +1422,15 @@ fn subject_facts(subject: &str) -> Option<[&'static str; 5]> {
             [
                 "Restaurant opening hours can differ between lunch and dinner",
                 "A reservation can secure a table while walk-in seating depends on availability",
-                "Check a restaurant's current menu when dietary requirements affect the choice",
+                "A restaurant's menu lists ingredients relevant to dietary requirements",
                 "Service charges and drinks change the total cost of a meal",
                 "A restaurant's location matters when planning the journey home after dinner",
             ]
         } else if has(&["hotel", "hostel", "accommodation"]) {
             [
-                "Check whether the room rate includes breakfast and local taxes",
+                "A room rate may include breakfast and local taxes or charge them separately",
                 "A nonrefundable room can cost less but limits cancellation options",
-                "Confirm step-free access to both the entrance and the booked room",
+                "Step-free access can differ between an entrance and individual rooms",
                 "Airport accommodation may still require a shuttle or taxi to the terminal",
                 "Shared hostel rooms and private rooms have different facilities and booking terms",
             ]
@@ -1449,19 +1454,19 @@ fn subject_facts(subject: &str) -> Option<[&'static str; 5]> {
             "bicycle", "shelf", "suede", "keyboard", "repair", "clean", "install",
         ]) {
             [
-                "Check the material before choosing a cleaning product or repair method",
-                "Remove loose dirt before applying a liquid cleaner",
+                "A material determines which cleaning products and repair methods are compatible",
+                "Loose dirt can scratch a surface when mixed with a liquid cleaner",
                 "A small hidden area can reveal whether a cleaner changes the finish",
-                "Use a soft brush to lift dirt without scratching the surface",
-                "Let damp material dry before putting it back into use",
+                "Soft brush bristles lift dirt with less abrasion than stiff bristles",
+                "Damp material can change shape or develop surface damage during use",
             ]
         } else if has(&["pricing", "subscription", "billing"]) {
             [
                 "Subscription prices can include recurring charges and separate usage fees",
-                "Check whether the quoted price includes taxes and required extras",
+                "A quoted price may include taxes and required extras or list them separately",
                 "A monthly payment and an annual commitment have different cancellation terms",
                 "A trial period may end with an automatic renewal unless it is canceled",
-                "Compare the included services alongside the total price for the billing period",
+                "Included services and the billing period determine the total subscription price",
             ]
         } else {
             return None;
@@ -2283,7 +2288,7 @@ struct Article {
     reply: &'static str,
 }
 
-fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
+fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> Article {
     let lower = heading(subject)
         .split(" /")
         .next()
@@ -2291,7 +2296,76 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
         .to_lowercase();
     let n = angle % 10;
     let choose = |items: &[&str]| items[n % items.len()].to_owned();
-    let kind = site_profile(host).kind;
+    if kind == "wiki" {
+        let facts = if lower.contains("sourdough") {
+            Some([
+                "A sourdough starter is a culture of yeasts and lactic acid bacteria in flour and water",
+                "Sourdough yeasts produce carbon dioxide that leavens bread",
+                "Sourdough bacteria produce acids that contribute to flavor and slow the growth of some other microbes",
+                "Sourdough fermentation slows at low temperatures and accelerates in warmer conditions",
+                "A young sourdough culture can rise unevenly as its microbial population develops",
+            ])
+        } else if lower.contains("bread") {
+            Some([
+                "Bread is a food made from a dough of flour and water, usually baked",
+                "Bread crumb consists of a network of air cells held within a set structure",
+                "Bread dough expands as fermentation or chemical leavening produces gas",
+                "Bread density depends on hydration, mixing and the amount of leavening",
+                "Bread develops a firm structure as starch gelatinizes and proteins set during baking",
+            ])
+        } else if lower.contains("groupby") || lower.contains("itertools") {
+            Some([
+                "Python's itertools.groupby divides consecutive elements into groups according to a key function",
+                "Python grouping starts a new group whenever the key changes",
+                "Python groups share their underlying input iterator",
+                "Python sorting brings equal keys together before grouping",
+                "Python's groupby is used to summarize adjacent runs of data",
+            ])
+        } else if lower.contains("heat pump") {
+            Some([
+                "A heat pump transfers thermal energy from a colder source to a warmer destination using external work",
+                "The refrigerant absorbs and releases heat as it circulates through a closed circuit",
+                "The compressor raises the pressure and temperature of the refrigerant",
+                "Reversible systems provide heating and cooling by changing the direction of heat transfer",
+                "Efficiency depends on the temperature difference between the source and the heated space",
+            ])
+        } else if lower.contains("router") || lower.contains("netgear") {
+            Some([
+                "A router forwards packets between computer networks",
+                "A router restart preserves its configuration, while a factory reset restores default settings",
+                "Router configuration includes network addresses, wireless settings and access credentials",
+                "Router firmware controls packet forwarding and the management interface",
+                "Router recovery procedures differ between models and hardware revisions",
+            ])
+        } else if lower.contains("halvard") || lower.contains("hg-400") {
+            Some([
+                "Halvard Gateway HG-400 is a network security appliance with a web management portal",
+                "Halvard Gateway firmware release 7.2.4 addresses a portal vulnerability",
+                "Halvard Gateway releases 7.0.0 through 7.2.3 contain the affected portal code",
+                "Halvard Gateway uses firmware to provide its routing and security functions",
+                "Halvard Gateway firmware updates replace the software running on the appliance",
+            ])
+        } else {
+            subject_facts(subject)
+        };
+        if let Some(facts) = facts {
+            let mut article = factual_article(subject, host, angle, facts.map(str::to_owned));
+            let first = angle % 5;
+            let second = (first + 1 + angle / 5 % 4) % 5;
+            article.lead = format!("{} and {}.", facts[first], lower_first(facts[second]));
+            let remaining = (1..5)
+                .map(|offset| (first + offset) % 5)
+                .filter(|index| *index != second)
+                .collect::<Vec<_>>();
+            article.detail = format!(
+                "{}; {}.",
+                facts[remaining[0]],
+                lower_first(facts[remaining[1]])
+            );
+            article.tip = format!("{}.", facts[remaining[2]]);
+            return article;
+        }
+    }
     if matches!(intent(subject), "problem" | "question" | "service") {
         return topic_article(seed, subject, host, angle);
     }
@@ -2554,14 +2628,14 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
                 "A flight’s change conditions matter as much as the initial fare if your dates may move.",
                 "Departure times can turn a cheap flight into an expensive overnight stay.",
             ],
-            detail: "London Heathrow (LHR), Gatwick (LGW) and Luton (LTN) offer different departure options. An example £89 return fare with a £35 bag each way totals £159 before airport transport. This is a fare comparison example, not a bookable offer.",
+            detail: "London Heathrow (LHR), Gatwick (LGW) and Luton (LTN) offer different departure options. Fares start from £89 return. A checked bag costs £35 each way, bringing the return total to £159 before airport transport.",
             steps: vec![
                 "Choose departure and return dates and use the same passenger count for each comparison.",
                 "Compare direct services with connections, including the time between terminals.",
                 "Add bags, seats and airport transport to the total.",
             ],
             tips: &[
-                "Read the fare’s change and cancellation conditions before payment. Confirm the price for your dates with the airline.",
+                "Flexible fares allow date changes; a fare difference may apply. Checked baggage and seat selection are priced separately.",
             ],
             example: "",
             question: "I can travel midweek. Is the cheaper airfare still worthwhile with a checked bag?",
@@ -2742,7 +2816,7 @@ fn article(seed: &Seed, subject: &str, host: &str, angle: usize) -> Article {
     } else {
         return topic_article(seed, subject, host, angle);
     };
-    let first = if scenario && matches!(kind.as_str(), "forum" | "qa") {
+    let first = if scenario && matches!(kind, "forum" | "qa") {
         choose(&[
             "I run a Halvard HG-400 on firmware 7.2.1 and need to plan the security upgrade.",
             "I need to update the firmware on our Halvard appliance without interrupting the VPN users.",
@@ -3180,7 +3254,13 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
                 .join("-");
             let path = result_path(seed, &site.host, &slug, &site_profile(&site.host).kind);
             let url = format!("https://{}/{path}", site.host);
-            let article = article(seed, query, &site.host, site_index);
+            let article = article(
+                seed,
+                query,
+                &site.host,
+                &site_profile(&site.host).kind,
+                site_index,
+            );
             add(
                 url.clone(),
                 article.title,
@@ -3743,6 +3823,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             seed,
             query,
             host,
+            &site_profile(host).kind,
             angle
                 + if intent == "news" && terms.iter().any(|w| w == "halvard") {
                     seed.sites.len()
@@ -4758,7 +4839,7 @@ fn subject_title(seed: &Seed, host: &str, target: &str, kind: &str, known: &[Res
     if !choices.is_empty() {
         return heading(&choices[key % choices.len()].title).to_owned();
     }
-    article(seed, &seed.search, host, key).title
+    article(seed, &seed.search, host, kind, key).title
 }
 pub(super) fn git_path(target: &str) -> bool {
     let path = target.split('?').next().unwrap_or(target);
@@ -5018,6 +5099,13 @@ pub fn page(
     } else {
         title
     };
+    let title = if matches!(kind, "qa" | "forum") {
+        title
+            .split_once('?')
+            .map_or_else(|| title.clone(), |(question, _)| format!("{question}?"))
+    } else {
+        title
+    };
     if let Some(page) = advisory(host, target, &title, &seed.date) {
         return page;
     }
@@ -5093,7 +5181,7 @@ pub fn page(
         page.date = seed.date.clone();
         return page;
     }
-    let article = article(seed, subject, host, voice(host));
+    let article = article(seed, subject, host, kind, voice(host));
     let lead = if claims.is_empty() {
         article.lead.clone()
     } else {
@@ -5197,7 +5285,7 @@ pub fn page(
         };
         let fare = if title.contains("Tokyo") { 540 } else { 89 };
         format!(
-            "Compare departure options from London Heathrow (LHR), Gatwick (LGW) and Luton (LTN) to {destination}. An example £{fare} return fare plus a £35 bag each way totals £{} before airport transport. These are example prices; confirm availability and the fare for your dates before booking.",
+            "Compare departure options from London Heathrow (LHR), Gatwick (LGW) and Luton (LTN) to {destination}. Fares start from £{fare} return. A checked bag costs £35 each way, bringing the return total to £{} before airport transport.",
             fare + 70
         )
     } else {
@@ -5247,17 +5335,32 @@ pub fn page(
     } else {
         "How to fix it"
     };
-    let infobox = format!(
-        "<table class=\"infobox\"><caption>At a glance</caption><tr><th scope=\"row\">Key point</th><td>{tip}</td></tr><tr><th scope=\"row\">First step</th><td>{}</td></tr></table>",
-        escape(steps.first().unwrap_or(&article.tip))
-    );
     let mut body = match kind {
-        "wiki" if intent(subject) == "definition" => format!(
-            "<h1>{t}</h1>{content}{infobox}<h2>How it works</h2><ol>{method}</ol><h2>Applications</h2><p>{tip}</p>"
-        ),
-        "wiki" => format!(
-            "<h1>{t}</h1>{content}{infobox}<h2>Terminology</h2>{reference}<h2>Considerations</h2><p>{tip}</p>"
-        ),
+        "wiki" => {
+            let lower = subject.to_lowercase();
+            let (field, value) = if lower.contains("sourdough") || lower.contains("bread") {
+                ("Process", "Fermentation and baking")
+            } else if lower.contains("heat pump") {
+                ("Technology", "Heat transfer")
+            } else if lower.contains("python") || lower.contains("groupby") {
+                ("Field", "Computer programming")
+            } else if lower.contains("router") || scenario {
+                ("Function", "Computer networking")
+            } else {
+                ("Subject", heading(&title))
+            };
+            let reference = if scenario {
+                "<dl><dt>Firmware</dt><dd>Firmware may refer to an installed release or an upgrade image.</dd></dl>".to_owned()
+            } else {
+                format!("<dl><dt>{field}</dt><dd>{}</dd></dl>", escape(value))
+            };
+            format!(
+                "<h1>{t}</h1>{lead_html}<table class=\"infobox\"><caption>At a glance</caption><tr><th scope=\"row\">{field}</th><td>{}</td></tr></table><h2>Overview</h2><p>{}</p><h2>Effects</h2><p>{}</p><h2>Terminology</h2>{reference}",
+                escape(value),
+                escape(&article.detail),
+                escape(&article.tip)
+            )
+        }
         "docs" | "package" => format!(
             "<h1>{t}</h1>{content}<nav class=\"toc\"><b>On this page</b> <a href=\"#example\">Example</a> · <a href=\"#notes\">Notes</a></nav><h2 id=\"example\">Example</h2>{reference}<ol>{method}</ol><h2 id=\"notes\">Notes</h2><p>{tip}</p>"
         ),
@@ -5630,6 +5733,9 @@ mod tests {
                         }
                     }
                     let (host, _) = target_of(&result.url);
+                    if matches!(site_profile(&host).kind.as_str(), "qa" | "forum") {
+                        assert!(!heading(&result.title).contains("?:"), "{}", result.title);
+                    }
                     let name = site_profile(&host).name.to_lowercase();
                     assert!(
                         lower_title.matches(&name).count() <= 1,
@@ -5746,6 +5852,20 @@ mod tests {
                             result.url,
                             result.snippet
                         );
+                    }
+                    if matches!(site_profile(&host).kind.as_str(), "qa" | "forum") {
+                        let made = page(
+                            &seed,
+                            &host,
+                            &target,
+                            &[serde_json::json!({"title":result.title,"query":query})],
+                            &site_profile(&host).kind,
+                            &[],
+                        );
+                        if let Some((_, suffix)) = made.title.split_once('?') {
+                            assert!(suffix.is_empty(), "{}", made.title);
+                        }
+                        assert!(!made.body.contains("?:"), "{}", made.body);
                     }
                     if rank >= 3 {
                         continue;
@@ -5967,6 +6087,63 @@ mod tests {
             && made.body.contains(&person.organization)));
         assert!(!made.body.contains("broadband"));
         assert!(!made.body.contains("factory reset"));
+    }
+
+    #[test]
+    fn questions_keep_their_heading_without_template_suffixes() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for host in ["stackoverflow.com", "www.quora.com", "www.reddit.com"] {
+            for suffix in ["Common Questions", "A Practical Guide", "a closer look"] {
+                let question = "How do I use itertools.groupby() with a key function?";
+                let title = format!("{question}: {suffix} | Site");
+                for angle in 0..13 {
+                    assert_eq!(
+                        title_pattern(
+                            &seed,
+                            "python itertools groupby example",
+                            host,
+                            angle,
+                            &title
+                        ),
+                        question
+                    );
+                }
+                let made = page(
+                    &seed,
+                    host,
+                    "/questions/groupby",
+                    &[serde_json::json!({"title":title})],
+                    &site_profile(host).kind,
+                    &[],
+                );
+                assert_eq!(made.title, question);
+                assert!(made.body.contains(&format!("<h1>{question}</h1>")));
+            }
+        }
+    }
+
+    #[test]
+    fn flight_fares_use_site_price_wording() {
+        let seed = Seed::builtin("halvard-cve").unwrap();
+        for (place, price) in [("Lisbon", 89), ("Tokyo", 540)] {
+            let made = page(
+                &seed,
+                "www.bbc.com",
+                "/news/flights",
+                &[serde_json::json!({"title":format!("Cheap flights to {place}")})],
+                "news",
+                &[],
+            );
+            assert!(made.body.contains(&format!("from £{price} return")));
+            for phrase in [
+                "example price",
+                "confirm availability",
+                "for illustration",
+                "An example £",
+            ] {
+                assert!(!made.body.contains(phrase), "{}", made.body);
+            }
+        }
     }
 
     #[test]
