@@ -52,7 +52,18 @@ impl Topics {
             .host(host)
             .standard_panels()
             .command("generation", self.commands.clone())
-            .custom("Web", include_str!("search.mjs"), self.searches.clone())
+            .custom(
+                "Web",
+                format!(
+                    "{}\nconst forwardedHosts = {};",
+                    include_str!("search.mjs"),
+                    serde_json::to_string(
+                        &FORWARDED.iter().map(|(host, _)| host).collect::<Vec<_>>()
+                    )
+                    .expect("host names serialize")
+                ),
+                self.searches.clone(),
+            )
             .asset(
                 "search/model.mjs",
                 "text/javascript",

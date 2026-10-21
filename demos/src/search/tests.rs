@@ -296,6 +296,26 @@ async fn page_declares_the_workspace_and_serves_its_modules() {
             .iter()
             .any(|p| p["kind"] == "control" || p["kind"] == "event_table")
     );
+    let module = client
+        .request("GET", "/panels/web.mjs", None, true)
+        .await
+        .unwrap();
+    let source = String::from_utf8(module.body).unwrap();
+    let hosts: Vec<String> = serde_json::from_str(
+        source
+            .split("const forwardedHosts = ")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(';'),
+    )
+    .unwrap();
+    assert_eq!(
+        hosts,
+        super::FORWARDED
+            .iter()
+            .map(|(host, _)| host.to_string())
+            .collect::<Vec<_>>()
+    );
     for path in [
         "/panels/web.mjs",
         "/assets/search/model.mjs",

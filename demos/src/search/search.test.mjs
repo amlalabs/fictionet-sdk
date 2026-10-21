@@ -81,7 +81,7 @@ test('the map shows the newest search, its engines and all sites named', () => {
   h.dispose();
 });
 
-function harness(window) {
+function harness(window, options = {}) {
   const document = window?.document || createDocument();
   if (window) document.defaultView = window;
   const root = document.createElement('div');
@@ -94,7 +94,7 @@ function harness(window) {
   });
   services.worldMenu = document.createElement('div');
   services.state = (path, publish) => { subscriptions.set(path, publish); return () => subscriptions.delete(path); };
-  const dispose = mount(root, services, { state: '/api/state/web' });
+  const dispose = mount(root, services, { state: '/api/state/web', ...options });
   return { root, services, subscriptions, posts, watch, dispose: () => { dispose(); services.dispose(); }, publish: (value) => subscriptions.get('/api/state/web')({ value }) };
 }
 
@@ -1540,4 +1540,10 @@ test('row times update during a quiet running session and stop after disposal', 
   now = 181;
   window.advance(60000);
   assert.equal(row.querySelector('time').textContent, '2 min ago');
+});
+
+test('the page registers its forwarded hosts with the packet view', () => {
+  const h = harness(undefined, { forwardedHosts: ['packages.mozilla.org', 'archive.ubuntu.com'] });
+  assert.deepEqual([...h.services.forwardedHosts.get()], ['packages.mozilla.org', 'archive.ubuntu.com']);
+  h.dispose();
 });

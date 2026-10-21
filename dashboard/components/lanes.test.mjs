@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createDocument, liveSubscriptions } from '../test-dom.mjs';
 import { createServices } from '../page.mjs';
 import { mount } from './packets.mjs';
-import { chipText, conversationRows, dnsRow, kindOf, createLanes } from './lanes.mjs';
+import { chipText, conversationRows, dnsRow, kindOf, createLanes, laneRows } from './lanes.mjs';
 
 const packets = JSON.parse(readFileSync(new URL('./fixtures/search-packets.json', import.meta.url)));
 
@@ -491,7 +491,7 @@ for (const proto of ['HTTP/2', 'HTTP']) test(`${proto} icons fold into one row a
   assert.match(first.textContent, /GET \/s2\/favicons ×14/);
   assert.equal(h.root.querySelectorAll('.packet-chip').length, 3);
   assert.equal(h.root.querySelectorAll('.packet-chip').at(-1), chip);
-  assert.equal(chip.textContent, 'GET /s2/favicons ×14');
+  assert.equal(chip.textContent, '+14 assets');
   assert.ok(h.animations.some((a) => a.duration === 160));
   h.media.matches = true;
   h.media.dispatchEvent(new Event('change'));
@@ -587,7 +587,7 @@ for (const proto of ['HTTP/2', 'HTTP']) {
     assert.match(first.textContent, /GET \/_assets\/… ×12/);
     assert.equal(h.root.querySelectorAll('.packet-chip').length, 4);
     assert.equal(h.root.querySelectorAll('.packet-chip').at(-1), chip);
-    assert.equal(chip.textContent, 'GET /_assets/… ×12');
+    assert.equal(chip.textContent, '+12 assets');
     assert.ok(h.animations.some((a) => a.duration === 160));
     h.services.packetFilter.set('every');
     assert.equal(h.root.querySelector('#prows').children.length, 39);
@@ -631,4 +631,151 @@ test('interleaved asset replies keep document frames and HTTP bodies follow requ
   const shown = conversationRows([http[0], http[3], http[6], http[1], http[2], http[4], http[5], http[7], http[8]]);
   assert.deepEqual(shown.filter((p) => !p.summary), http.slice(0, 3));
   assert.equal(shown.find((p) => p.summary).count, 2);
+});
+
+for (const proto of ['HTTP', 'HTTP/2']) test(`${proto} icon-only connections leave no lane and a run of one has no multiplier`, (t) => {
+  const h = setup(t);
+  h.send(packets.slice(0, 7));
+  assert.equal(h.root.querySelectorAll('.packet-lane').length, 1);
+  const request = { ...packets[7], seq: 5000, t: 500, proto, info: proto === 'HTTP' ? 'GET /favicon.ico HTTP/1.1' : 'HEADERS[1]: GET /favicon.ico (www.google.com)' };
+  h.send([request]);
+  assert.equal(h.root.querySelectorAll('.packet-lane').length, 0);
+  const list = h.root.querySelector('#prows');
+  assert.ok(list.textContent.includes('GET /favicon.ico'));
+  assert.equal(list.textContent.includes('×1'), false);
+  h.services.packetFilter.set('every');
+  assert.equal(h.root.querySelectorAll('.packet-lane').length, 1);
+  h.services.packetFilter.set('conversations');
+  h.send([{ ...request, seq: 5001, t: 501, info: proto === 'HTTP' ? 'GET /article HTTP/1.1' : 'HEADERS[3]: GET /article (www.google.com)' }]);
+  assert.equal(h.root.querySelectorAll('.packet-lane').length, 1);
+  assert.match(h.root.querySelector('.packet-lane').textContent, /Client Hello/);
+  assert.match(h.root.querySelector('.packet-lane').textContent, /GET \/article/);
+});
+
+test('idle TLS closes and TCP finishes and resets retain lane order', (t) => {
+  const h = setup(t);
+  h.send([{ ...packets[7], t: 1 }, { ...packets[7], seq: 5000, t: 2, dst: '192.0.2.2:443' }]);
+  const lanes = () => h.root.querySelectorAll('.packet-lane');
+  const newest = lanes()[0];
+  for (const [proto, info] of [['TLSv1.3', 'Encrypted Alert'], ['TCP', '443 → 50153 [FIN, ACK] Seq=1 Ack=1 Win=0 Len=0'], ['TCP', '443 → 50153 [RST] Seq=1 Win=0 Len=0']]) {
+    h.send([{ ...packets[8], seq: 5001, t: 300, proto, info }]);
+    assert.equal(lanes()[0], newest);
+  }
+  h.send([{ ...packets[7], seq: 5002, t: 301 }]);
+  assert.notEqual(lanes()[0], newest);
+});
+
+test('different asset runs share a trailing count and document chips survive the cap', (t) => {
+  const h = setup(t);
+  const rows = pageTraffic('HTTP/2');
+  h.send(rows.slice(0, 6));
+  h.send([{ ...rows[0], seq: 6000, t: 600, info: 'HEADERS[51]: GET /article (www.google.com)' }]);
+  h.send(rows.slice(6).map((p, i) => ({ ...p, seq: 6001 + i, t: 601 + i })));
+  h.send(Array.from({ length: 20 }, (_, i) => ({ ...packets[2], seq: 7000 + i, t: 700 + i })));
+  const chips = h.root.querySelector('.packet-lane').querySelectorAll('.packet-chip');
+  assert.equal(chips.length, 11);
+  assert.ok(chips.some((chip) => chip.textContent === 'GET /search?q=network'));
+  assert.ok(chips.some((chip) => chip.textContent === '200'));
+  assert.ok(chips.some((chip) => chip.textContent === 'GET /article'));
+  assert.equal(chips.at(-1).textContent, '+12 assets');
+});
+
+test('forwarded names and service lookups disappear only from conversations', (t) => {
+  const h = setup(t);
+  h.services.forwardedHosts.set(new Set(['packages.mozilla.org', 'archive.ubuntu.com', 'downloads.claude.ai']));
+  let seq = 8000;
+  for (const [host, ip] of [['packages.mozilla.org', '192.0.2.1'], ['archive.ubuntu.com', '192.0.2.2'], ['downloads.claude.ai', '192.0.2.3'], ['_https._tcp.example.com', '192.0.2.4']]) {
+    const add = (row) => ({ ...row, seq: seq++, t: seq });
+    h.send([
+      add({ ...packets[0], info: `Standard query 0x1234 A ${host}` }),
+      add({ ...packets[1], info: `Standard query response 0x1234 A ${host} A ${ip}` }),
+      add({ ...packets[2], dst: `${ip}:443` }),
+    ]);
+  }
+  h.send([{ ...packets[1], seq: seq++, t: seq, info: 'Standard query response 0x1234 SRV _ldap._tcp.example.com Non-Existent Domain', tags: ['dns-error'] }]);
+  assert.equal(h.root.querySelector('#prows').children.length, 0);
+  assert.equal(h.root.querySelectorAll('.packet-lane').length, 0);
+  h.services.packetFilter.set('every');
+  assert.equal(h.root.querySelector('#prows').children.length, 13);
+  assert.ok(h.root.querySelectorAll('.packet-lane').length > 0);
+});
+
+test('DNS and HTTP/2 data have compact summaries and keep full row titles', (t) => {
+  const h = setup(t);
+  const rows = [
+    { ...packets[0], info: 'Standard query 0xf2e5 A halvardsystems.com' },
+    { ...packets[1], info: 'Standard query response 0xf2e5 A halvardsystems.com A 185.42.118.20' },
+    { ...packets[8], seq: 9000, t: 900, proto: 'HTTP/2', info: 'DATA[287] 16384 bytes', len: 16450 },
+  ];
+  h.send(rows);
+  const shown = h.root.querySelector('#prows').children;
+  assert.equal(shown[0].children[3].textContent, '16 KB of the page');
+  assert.equal(shown[1].children[3].textContent, 'halvardsystems.com is 185.42.118.20');
+  assert.equal(shown[2].children[3].textContent, 'asks halvardsystems.com');
+  shown.forEach((row, i) => assert.equal(row.getAttribute('title'), rows[2 - i].info));
+});
+
+test('NTP port unreachable is quiet while other unreachable traffic remains visible', (t) => {
+  const h = setup(t);
+  const info = 'Destination unreachable (port unreachable) (10.0.0.2:45412 → 91.189.94.4:123 UDP)';
+  h.send([{ ...packets[8], seq: 9100, t: 910, proto: 'ICMP', src: '91.189.94.4', dst: '10.0.0.2', info }]);
+  assert.equal(h.root.querySelector('#prows').children[0].classList.contains('quiet'), true);
+  assert.equal(h.root.querySelector('.packet-chip').classList.contains('quiet'), true);
+  h.send([{ ...packets[8], seq: 9101, t: 911, proto: 'ICMP', src: '91.189.94.4', dst: '10.0.0.2', info: info.replace(':123 UDP', ':443 TCP') }]);
+  assert.equal(h.root.querySelector('#prows').children[0].classList.contains('quiet'), false);
+});
+
+test('document data still merges after the trailing asset count', (t) => {
+  const h = setup(t);
+  const rows = pageTraffic('HTTP/2');
+  h.send(rows.slice(0, 6));
+  h.send(Array.from({ length: 20 }, (_, i) => ({ ...rows[2], seq: 9200 + i, t: 920 + i })));
+  const chips = h.root.querySelectorAll('.packet-chip');
+  assert.equal(chips.length, 4);
+  assert.equal(chips[0].textContent, 'GET /search?q=network');
+  assert.equal(chips[1].textContent, '200');
+  assert.match(chips[2].textContent, /×21/);
+  assert.equal(chips[3].textContent, '+1 asset');
+});
+
+test('mixed asset and document frames preserve the decoder text in the list title', (t) => {
+  const h = setup(t);
+  const rows = pageTraffic('HTTP/2');
+  const reply = { ...rows[4], info: 'HEADERS[3]: 200, DATA[3] 6909 bytes, HEADERS[1]: 200, DATA[1] 8192 bytes, end' };
+  h.send([rows[0], rows[3], reply]);
+  const row = h.root.querySelector('#prows').children[0];
+  assert.equal(row.getAttribute('title'), reply.info);
+  assert.equal(row.children[3].getAttribute('title'), reply.info);
+  assert.equal(row.children[3].textContent, 'HEADERS[1]: 200, DATA[1] 8192 bytes, end');
+});
+
+test('narrow lanes give document chips room before handshake chips', () => {
+  const document = createDocument(), root = document.createElement('div');
+  const create = document.createElement;
+  document.createElement = (tag) => {
+    const node = create(tag);
+    Object.defineProperty(node, 'clientWidth', { get: () => node.classList.contains('packet-chips') ? 90 : 0 });
+    node.getBoundingClientRect = () => ({ width: 30, left: 0, top: 0 });
+    return node;
+  };
+  const lanes = createLanes(root, { name: (value) => value, local: (value) => value.startsWith('10.0.0.2:'), addressFor: () => null, animate() {} });
+  for (const p of [packets[2], packets[3], packets[7], packets[8]]) lanes.add({ ...p, link: 'wire' }, false);
+  const chips = root.querySelectorAll('.packet-chip');
+  assert.equal(chips[0].style.display, 'none');
+  assert.equal(chips[1].style.display, 'none');
+  assert.equal(chips[2].style.display, '');
+  assert.equal(chips[3].style.display, '');
+  assert.equal(chips[2].classList.contains('request'), true);
+  lanes.dispose();
+});
+
+
+test('engine icon routes do not open lanes while a stylesheet on their connection does', () => {
+  for (const path of ['/favicon.ico', '/s2/favicons?domain=example.com', '/th?id=example', '/ip3/example.com.ico']) {
+    const request = { ...packets[7], proto: 'HTTP/2', info: `HEADERS[1]: GET ${path} (www.google.com)` };
+    const rows = [...packets.slice(0, 7), request];
+    assert.deepEqual(laneRows(conversationRows(rows)), []);
+    const stylesheet = { ...request, info: 'HEADERS[3]: GET /assets/site.css (www.google.com)' };
+    assert.ok(laneRows(conversationRows([...rows, stylesheet])).length > 0);
+  }
 });

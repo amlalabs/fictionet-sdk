@@ -9,6 +9,7 @@ const relativeTime = (at, now) => {
 };
 
 export function mount(root, services, options) {
+  services.forwardedHosts.set(new Set(options.forwardedHosts || []));
   const { el } = services.dom.scoped(root);
   const { listen } = services.dom;
   el('link', { rel: 'stylesheet', href: '/assets/search/style.css' }, root);

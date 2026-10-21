@@ -2,7 +2,7 @@
 // components/packets.mjs passes in DOM helpers, the transport's packet calls,
 // labels and orientation.
 import { listen, scoped, lossLine, observationList, reconcile } from './dom.mjs';
-import { kindOf } from './components/lanes.mjs';
+import { kindOf, packetText } from './components/lanes.mjs';
 
 // What the detail pane says until a packet is selected.
 const PICK = 'Select a packet';
@@ -11,7 +11,7 @@ export function createPackets({
   $, el, packetStream, packet, download, fmtCount, compact = false, maxRows = compact ? 40 : 3000,
   onDetail = () => {}, stopped = () => null,
   onRow = () => {}, onClear = () => {}, onReplay = () => {}, onPending = () => {},
-  filterRows = (rows) => rows, animate = () => {},
+  filterRows = (rows) => rows, filterLanes = (rows) => rows, animate = () => {},
   // A table with a Host column gives every row that cell, so gap rows span
   // all nine columns whichever are hidden.
   hostColumn = false, endpointLabel = (value) => value,
@@ -26,7 +26,7 @@ export function createPackets({
   let rowKey = 0, suspended = false, reopen = null;
   let recent = [], history = [];
   const compactRows = new Map();
-  let foldedCounts = new Map();
+  let foldedCounts = new Map(), laneKeys = new Set();
   const createRow = (row) => {
     const parent = document.createDocumentFragment();
     if (row.gap) renderGap(row.gap, parent);
@@ -42,8 +42,9 @@ export function createPackets({
         entry.node.classList.toggle('quiet', !!row.quiet);
         entry.node.children[1].textContent = `${endpointLabel(row.src)} → ${endpointLabel(row.dst)}`;
         const info = entry.node.children[3];
+        entry.node.title = info.title = row.decoderInfo || row.info;
         if (entry.count !== row.count || entry.info !== row.info) {
-          info.querySelector('span').textContent = row.summary ? `${row.summary} ×${row.count}` : row.info;
+          info.querySelector('span').textContent = packetText(row);
           if (entry.count !== row.count) animate(entry.node, 'scale(.96)', 160);
           entry.count = row.count;
           entry.info = row.info;
@@ -57,15 +58,20 @@ export function createPackets({
         previousTime = time;
       }
       const added = new Set(next.map((row) => row.key));
-      visible.forEach((row) => {
+      const lanePackets = filterLanes(visible);
+      const nextLaneKeys = new Set(lanePackets.map((row) => row.key));
+      const replay = [...laneKeys].some((key) => !nextLaneKeys.has(key)) || lanePackets.some((row) => !laneKeys.has(row.key) && !added.has(row.key));
+      if (replay) onReplay(lanePackets);
+      laneKeys = nextLaneKeys;
+      lanePackets.forEach((row) => {
         if (!added.has(row.key) && (!row.summary || foldedCounts.get(row.key) === row.count)) return;
-        onRow(row);
+        if (!replay) onRow(row);
         const entry = compactRows.get(row.key);
         if (entry && added.has(row.key)) animate(entry.node, 'translateY(-6px)', 200);
       });
       foldedCounts = new Map(visible.filter((row) => row.summary).map((row) => [row.key, row.count]));
     },
-    clear() { foldedCounts.clear(); recent = []; history = []; compactRows.clear(); prows.replaceChildren(); onClear(); },
+    clear() { foldedCounts.clear(); laneKeys.clear(); recent = []; history = []; compactRows.clear(); prows.replaceChildren(); onClear(); },
   } : observationList(prows, {
     limit: maxRows, key: (row) => row.key,
     create: createRow,
@@ -336,18 +342,18 @@ export function createPackets({
     // One link numbers its own packets; merged links are numbered here.
     const no = packets.many ? packets.rows : p.seq;
     if (compact) {
-      const tr = el('tr', { class: `${kindOf(p)}${p.quiet ? ' quiet' : ''}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
+      const tr = el('tr', { class: `${kindOf(p)}${p.quiet ? ' quiet' : ''}`, 'data-seq': p.seq, 'data-link': p.link, title: p.decoderInfo || p.info }, parent);
       const route = `${endpointLabel(p.src)} → ${endpointLabel(p.dst)}`;
       el('td', { class: 'app-packet-time', text: p.t.toFixed(2) }, tr);
       el('td', { class: 'app-packet-route', text: route, title: `${p.src} → ${p.dst}` }, tr);
       const protocol = el('td', { class: 'app-packet-protocol' }, tr);
       el('span', { class: `packet-proto ${kindOf(p)}`, text: p.proto }, protocol);
-      const info = el('td', { class: 'app-packet-info', title: p.info }, tr);
+      const info = el('td', { class: 'app-packet-info', title: p.decoderInfo || p.info }, tr);
       if (p.tags.includes('decrypted')) {
         const lock = el('svg:svg', { class: 'packet-unlock', viewBox: '0 0 12 12', role: 'img', 'aria-label': 'Decrypted' }, info);
         el('svg:path', { d: 'M3 6V4.2a3 3 0 0 1 5.6-1.4M2.5 6h7v4.5h-7z', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.3', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, lock);
       }
-      el('span', { text: p.summary ? `${p.summary} ×${p.count}` : p.info }, info);
+      el('span', { text: packetText(p) }, info);
       return;
     }
     const tr = el('tr', { class: `${p.side === 1 ? 'back' : ''} ${p.skipped > 0 || p.evicted > 0 ? 'after-gap' : ''} ${p.tags.join(' ')}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
@@ -581,7 +587,7 @@ export function createPackets({
     compactRows.clear();
     prows.replaceChildren();
     tail.append([]);
-    onReplay(filterRows(history));
+    onReplay(filterLanes(filterRows(history)));
   },
   /// Packets received but not shown yet, or -1 while no stream is open.
   queued: () => (packets ? packets.queue.length + packets.held.length : -1) };

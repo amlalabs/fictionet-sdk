@@ -65,7 +65,7 @@ export function createServices(transport, theme, importModule = (url) => import(
   const momentListeners = new Set();
   const clock = { t: 0, at: performance.now(), ended: true };
   const services = {
-    transport, selection, theme, format, dom, clock, run, packetFilter, endpointNames: store(new Map()),
+    transport, selection, theme, format, dom, clock, run, packetFilter, endpointNames: store(new Map()), forwardedHosts: store(new Set()),
     command: (signal, changed) => createCommand(transport, signal, changed),
     // The page's one graph model (see state.mjs), on the page's watch. It
     // binds the first time a part of the page reads it.

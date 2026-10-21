@@ -1343,7 +1343,7 @@ body.licenses {
 .app-packets .plist table { width: 100%; table-layout: fixed; border-collapse: collapse; font: 11px/1.4 var(--mono); }
 .app-packets .plist td { padding: 7px 6px; border-bottom: 1px solid var(--app-rule); color: var(--app-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .app-packets .plist td:first-child { width: 70px; padding-left: 18px; color: var(--app-mute); }
-.app-packets .app-packet-route { width: 206px; color: var(--app-mute); }
+.app-packets .app-packet-route { width: 150px; color: var(--app-mute); }
 .app-packets .app-packet-protocol { width: 70px; }
 .app-packets tr:hover { background: var(--app-soft); }
 .packet-lanes { display: flex; flex-direction: column; flex-shrink: 0; border-bottom: 1px solid var(--app-rule); }
@@ -1355,6 +1355,7 @@ body.licenses {
 .packet-lane-head span { font: 10.5px var(--mono); color: var(--app-mute); }
 .packet-chips { position: relative; display: flex; justify-content: flex-end; gap: 4px; overflow: hidden; min-width: 0; padding: 2px 0; }
 .packet-chip { flex: 0 0 auto; padding: 3px 7px; border: 1px solid var(--app-rule); border-radius: 6px; background: var(--app-pane); color: var(--app-mute); font: 10.5px var(--mono); white-space: nowrap; }
+.packet-chip.request { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .packet-chip.back { border-style: dashed; }
 .packet-chip-count { margin-left: 5px; font-size: 9px; }
 .packet-proto { padding: 1px 6px; border-radius: 5px; font-size: 10px; font-weight: 600; background: var(--app-soft); color: var(--app-mute); }

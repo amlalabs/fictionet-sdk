@@ -7,7 +7,7 @@ import { labelAction } from './labels.mjs';
 import { scoped, listen } from '../dom.mjs';
 import { createPackets } from '../packets.mjs';
 import { fmtCount } from '../format.mjs';
-import { addressOf, conversationRows, createLanes, dnsRow } from './lanes.mjs';
+import { addressOf, conversationRows, createLanes, dnsRow, laneRows } from './lanes.mjs';
 
 // The page server merges at most this many links: the busiest are shown.
 const MAX_MERGED = 32;
@@ -16,6 +16,7 @@ const MAX_MERGED = 32;
 // and packets are matched by them, never by time.
 export const APPROXIMATE = 'Address and port match';
 const STOPPED = 'Run stopped';
+const ntpUnreachable = (p) => /Destination unreachable/i.test(p.info) && /:123 UDP\)/.test(p.info);
 
 export function mount(root, services, options = {}) {
   const { $: lookup, el } = scoped(root);
@@ -53,6 +54,7 @@ export function mount(root, services, options = {}) {
     onClear: () => { lanes?.clear(); dnsNames.clear(); resolvers.clear(); },
     onReplay: (rows) => lanes?.replace(rows),
     onPending: schedule,
+    filterLanes: (rows) => services.packetFilter?.get() === 'every' ? rows : laneRows(rows),
     animate,
     filterRows(rows) {
       for (const p of rows) {
@@ -61,9 +63,14 @@ export function mount(root, services, options = {}) {
         resolvers.add(addressOf(dns.back ? p.src : p.dst));
         for (const answer of dns.answers) dnsNames.set(answer.address, dns.name);
       }
-      const folded = conversationRows(rows);
+      const hidden = services.forwardedHosts?.get() || new Set();
+      const skip = (p) => {
+        const dns = dnsRow(p);
+        return [dns?.name, name(p.src), name(p.dst)].some((host) => host && (host.startsWith('_') || hidden.has(host)));
+      };
+      const folded = conversationRows(rows.filter((p) => !skip(p)));
       const conversations = new Set(folded.map((row) => row.key));
-      for (const row of rows) row.quiet = !conversations.has(row.key);
+      for (const row of rows) row.quiet = !conversations.has(row.key) || ntpUnreachable(row);
       return services.packetFilter?.get() === 'every' ? rows : folded;
     },
     $, el, ...services.transport, fmtCount, stopped: () => (services.stopped() ? STOPPED : null), hostColumn: true,
@@ -90,6 +97,7 @@ export function mount(root, services, options = {}) {
   const cleanup = [];
   if (options.compact) {
     if (services.packetFilter) cleanup.push(services.packetFilter.subscribe(() => view.refresh()));
+    if (services.forwardedHosts) cleanup.push(services.forwardedHosts.subscribe(() => view.refresh()));
     if (services.endpointNames) cleanup.push(services.endpointNames.subscribe(() => view.refresh()));
     if (media) cleanup.push(listen(media, 'change', () => {
       if (media.matches) { animations.forEach((animation) => animation.cancel()); animations.clear(); }
