@@ -53,8 +53,7 @@ function fixture(t) {
   class FitAddon { fit() { this.fitted = true; } dispose() { this.disposed = true; } }
   const modules = {
     '/vendor/novnc/core/rfb.js': { default: RFB },
-    '/vendor/xterm/lib/xterm.mjs': { Terminal },
-    '/vendor/addon-fit/lib/addon-fit.mjs': { FitAddon },
+    '/vendor/ghostty-web/dist/ghostty-web.js': { Terminal, FitAddon, async init() {} },
   };
   const transport = {
     ...createTransport({}, {
@@ -335,7 +334,7 @@ test('console disposal handles imports and socket requests that finish late', as
 });
 
 test('missing libraries fail inside their own panel with the asset command', async (t) => {
-  for (const [mount, library] of [[screen, 'noVNC'], [terminal, 'xterm.js']]) {
+  for (const [mount, library] of [[screen, 'noVNC'], [terminal, 'ghostty-web']]) {
     const h = fixture(t);
     h.services.importModule = async () => { throw new TypeError('Failed to fetch dynamically imported module'); };
     const dispose = mount(h.root, h.services, { host: 'alpha' });

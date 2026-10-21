@@ -251,7 +251,36 @@ pub struct Answer<T> {
     pub raw: String,
 }
 
+struct OpenRouter;
+
+impl Transport for OpenRouter {
+    fn post<'a>(
+        &'a self,
+        cx: &'a Cx,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    ) -> fictionet_extras::models::Post<'a> {
+        Box::pin(async move {
+            fictionet_extras::models::Https::new(cx, fictionet_extras::models::Provider::OpenRouter)
+                .map_err(|e| e.to_string())?
+                .post(cx, headers, body)
+                .await
+        })
+    }
+}
+
 impl Model {
+    /// The default page writer, using the existing OpenRouter credential.
+    pub fn openrouter() -> Result<Self, String> {
+        Ok(Self::new(
+            Provider::OpenRouter,
+            "",
+            "",
+            Key::from_env(fictionet_extras::models::Provider::OpenRouter)?,
+            Arc::new(OpenRouter),
+        ))
+    }
+
     /// A model of `provider`; an empty `model` is the provider's default.
     pub fn new(
         provider: Provider,

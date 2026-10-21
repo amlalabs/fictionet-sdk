@@ -24,16 +24,14 @@
 //! lock per URL, so a search and a request for the page publish one title.
 //! Worlds sharing a store share these locks too (see [`store`]).
 //!
-//! [`Maker::Stub`] makes everything offline and deterministically;
+//! [`Maker::Stub`] preserves known metadata and prior mentions;
 //! [`Maker::Model`] asks a model. Without a maker
 //! ([`GeneratorKind::Replay`]) nothing new is made: a URL the store does
 //! not hold is a 404, and a query it does not hold has no results. The
 //! same holds while generation is turned off.
 //!
-//! [`Pages::canned`] serves prepared pages verbatim, matches nearby searches
-//! by whole-word overlap, and gives small missing answers for anything else.
-//! The model-backed constructors keep adaptive generation available for
-//! other worlds and baking.
+//! Copied worlds crawl WARC responses into a full text index. Model mode
+//! keeps its own store and never falls back to keyword generated pages.
 //!
 //! A run can also plant facts and pages ([`Command::PlantFact`],
 //! [`Command::PlantPage`]). A planted fact goes into what is made after it;
@@ -42,7 +40,7 @@
 //! written in its site's layout, and leads every result list whose search
 //! shares its words.
 
-mod canned;
+mod copied;
 pub mod make;
 pub mod meta;
 pub mod model;
@@ -110,8 +108,7 @@ pub enum Command {
         text: String,
         expected_revision: u64,
     },
-    /// Forget what this run made and planted, and start from the canned
-    /// pages again.
+    /// Forget model-written pages and planted facts, and return to copied pages.
     Restart { expected_revision: u64 },
 }
 
@@ -135,14 +132,12 @@ impl Command {
     }
 }
 
-/// What answers requests the store cannot: the canned pages first and the
-/// offline generator for the rest, the offline generator alone, or nothing
-/// new.
+/// The source of pages for new requests. Other worlds can pause generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NewPages {
-    Canned,
-    Stub,
+    Copied,
+    ModelWritten,
     Off,
 }
 
@@ -190,6 +185,8 @@ pub struct Response {
     pub body: Vec<u8>,
     /// Extra headers, excluding content type and content length.
     pub headers: Vec<(String, String)>,
+    /// Original copied response headers, preserving duplicate and non UTF8 values.
+    pub stored_headers: Option<http::HeaderMap>,
     /// What the log records about the answer.
     pub meta: Meta,
     /// How long a routed request took on the run's clock, in milliseconds.
@@ -209,6 +206,7 @@ impl Response {
             content_type: content_type.into(),
             body: body.into(),
             headers,
+            stored_headers: None,
             meta,
             serve_ms: None,
             carries: 0,
@@ -458,13 +456,8 @@ pub struct Pages {
     prefetch: usize,
     live_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     store: Mutex<Store>,
-    /// The run's other pages while prepared pages answer, or the prepared
-    /// pages while the run's other pages answer.
-    parked: Mutex<Option<Store>>,
-    /// Where the canned store was read from.
-    canned: Option<std::path::PathBuf>,
-    /// Whether the canned store answers.
-    canned_active: std::sync::atomic::AtomicBool,
+    copied: Option<copied::Corpus>,
+    copied_active: std::sync::atomic::AtomicBool,
     planted: Mutex<Planted>,
     /// The id of the next search, shared by every way a search arrives.
     queries: std::sync::atomic::AtomicU64,
@@ -492,9 +485,8 @@ impl Pages {
             prefetch,
             live_calls: None,
             store: Mutex::new(store),
-            parked: Mutex::new(None),
-            canned: None,
-            canned_active: Default::default(),
+            copied: None,
+            copied_active: Default::default(),
             planted: Mutex::default(),
             queries: std::sync::atomic::AtomicU64::new(1),
             locks,
@@ -507,35 +499,7 @@ impl Pages {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// A world that serves the store at `root`, made ahead of time for
-    /// `seed`, with small empty answers for anything absent. What the
-    /// run adds stays in memory.
-    pub fn canned(seed: Seed, root: &std::path::Path) -> Result<Self, String> {
-        let (store, _) = Store::load(root, &seed)?;
-        let mut pages = Self::open(seed, store, Some(Maker::Stub), 0);
-        pages.parked = Mutex::new(Some(Store::memory()));
-        pages.canned = Some(root.to_owned());
-        pages.canned_active = true.into();
-        Ok(pages)
-    }
-
-    /// Prepared pages first, with a bounded model and offline fallback.
-    /// All additions stay in memory, including after switching modes.
-    pub fn canned_with_model(
-        seed: Seed,
-        root: &std::path::Path,
-        model: Model,
-    ) -> Result<Self, String> {
-        let mut pages = Self::canned(seed, root)?;
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        pages.maker = Some(Maker::Model(model.live(calls.clone())));
-        pages.prefetch = 5;
-        pages.live_calls = Some(calls);
-        Ok(pages)
-    }
-
-    /// A world with no prepared pages: a bounded model writes them, with
-    /// the offline generator as the fallback. Everything stays in memory.
+    /// A world whose pages are written by a bounded model. Everything stays in memory.
     pub fn with_model(seed: Seed, model: Model) -> Self {
         let mut pages = Self::new(seed);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -549,10 +513,10 @@ impl Pages {
     pub fn new_pages(&self) -> NewPages {
         if !self.generation().generate {
             NewPages::Off
-        } else if self.canned_active.load(std::sync::atomic::Ordering::SeqCst) {
-            NewPages::Canned
+        } else if self.copied_active.load(std::sync::atomic::Ordering::SeqCst) {
+            NewPages::Copied
         } else {
-            NewPages::Stub
+            NewPages::ModelWritten
         }
     }
 
@@ -773,21 +737,20 @@ impl Pages {
             }
             Command::SetNewPages { new_pages, .. } => {
                 let canned = match new_pages {
-                    NewPages::Canned => true,
-                    NewPages::Stub => false,
-                    NewPages::Off => self.canned_active.load(std::sync::atomic::Ordering::SeqCst),
+                    NewPages::Copied => true,
+                    NewPages::ModelWritten => false,
+                    NewPages::Off => self.copied_active.load(std::sync::atomic::Ordering::SeqCst),
                 };
-                if canned != self.canned_active.load(std::sync::atomic::Ordering::SeqCst) {
-                    let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-                    let Some(other) = parked.as_mut() else {
-                        return Err(invalid("This world has no canned pages"));
-                    };
-                    std::mem::swap(&mut *store, other);
-                    store.generation = other.generation;
-                    store.made = other.made;
-                    self.canned_active
-                        .store(canned, std::sync::atomic::Ordering::SeqCst);
+                if self.copied.is_none() && canned {
+                    return Err(invalid("This world has no copied corpus"));
                 }
+                if new_pages == NewPages::ModelWritten
+                    && !matches!(self.maker, Some(Maker::Model(_)))
+                {
+                    return Err(invalid("Model-written pages need OPENROUTER_API_KEY"));
+                }
+                self.copied_active
+                    .store(canned, std::sync::atomic::Ordering::SeqCst);
                 store.generation.generate = new_pages != NewPages::Off;
             }
             Command::PlantFact { text, .. } => {
@@ -816,25 +779,17 @@ impl Pages {
                 planted = Some(("page", page.title, page.url));
             }
             Command::Restart { .. } => {
-                let fresh = match &self.canned {
-                    Some(root) => Store::load(root, &self.seed).map_err(|e| invalid(&e))?.0,
-                    None => Store::memory(),
-                };
-                let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
                 if store.root().is_some() {
                     return Err(invalid("A world on a store directory cannot restart"));
                 }
                 let generation = store.generation;
-                *store = fresh;
+                *store = Store::memory();
                 store.generation = Generation {
-                    generate: self.maker.is_some(),
+                    generate: self.copied.is_some() || self.maker.is_some(),
                     ..generation
                 };
-                if let Some(other) = parked.as_mut() {
-                    *other = Store::memory();
-                }
-                self.canned_active
-                    .store(self.canned.is_some(), std::sync::atomic::Ordering::SeqCst);
+                self.copied_active
+                    .store(self.copied.is_some(), std::sync::atomic::Ordering::SeqCst);
                 *self.planted.lock().unwrap_or_else(|e| e.into_inner()) = Planted::default();
                 fcx.emit("web", "restarted", |event| {
                     event
@@ -845,7 +800,7 @@ impl Pages {
         }
         store.generation.revision = current + 1;
         let generation = store.generation;
-        let canned = self.canned_active.load(std::sync::atomic::Ordering::SeqCst);
+        let canned = self.copied_active.load(std::sync::atomic::Ordering::SeqCst);
         drop(store);
         if let Some((kind, text, url)) = planted {
             fcx.emit("web", "planted", |event| {
@@ -869,7 +824,7 @@ impl Pages {
                     generation.revision
                 ))
                 .field("generate", generation.generate)
-                .field("canned", canned)
+                .field("copied", canned)
                 .field("revision", generation.revision)
         });
         Ok(Applied {
@@ -1065,6 +1020,9 @@ impl Pages {
         target: &str,
         route: Route,
     ) -> Response {
+        if self.copied_only() && route == Route::Page {
+            return self.copied_page(host, target);
+        }
         if make::git_path(target) {
             return Response::new(
                 404,
@@ -1092,7 +1050,7 @@ impl Pages {
             route
         };
         let mut response = self.answer(cx, &host_lower, target, route).await;
-        if self.canned_only() {
+        if self.copied_only() {
             response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
             return response;
         }
@@ -1353,8 +1311,8 @@ impl Pages {
                 start,
             } => self.search(cx, engine, &query, start).await,
             Route::Page => {
-                if self.canned_only() {
-                    return self.canned_page(host, target);
+                if self.copied_only() {
+                    return self.copied_page(host, target);
                 }
                 if make::broken_path(target) {
                     return self.missing(host, target);
@@ -1364,7 +1322,7 @@ impl Pages {
                 }
                 if let Some(fixed) = self.seed.fixed_for(host, target)
                     && (self.live_calls.is_none()
-                        || self.canned_active.load(std::sync::atomic::Ordering::SeqCst))
+                        || self.copied_active.load(std::sync::atomic::Ordering::SeqCst))
                 {
                     return self.fixed(cx, fixed).await;
                 }
@@ -1442,8 +1400,8 @@ impl Pages {
         match self.maker() {
             Maker::Stub => self.offline(cx, context, stub),
             Maker::Model(model) => {
-                if self.live_calls.is_some() && self.reserve().is_err() {
-                    return self.offline(cx, context, stub);
+                if self.live_calls.is_some() {
+                    self.reserve()?;
                 }
                 let (system, user, max_tokens) = prompt();
                 // Refuse text that reveals how pages are made.
@@ -1465,7 +1423,6 @@ impl Pages {
                         fields: answer.fields,
                         usage,
                     }),
-                    Err(_) if self.live_calls.is_some() => self.offline(cx, context, stub),
                     Err(Failure { error }) => Err(Stop::Failed {
                         error: model.redact(&error),
                         usage: Some(Box::new(usage)),
@@ -1580,8 +1537,8 @@ impl Pages {
         query: &str,
         start: u64,
     ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
-        if self.canned_only() {
-            return Ok(self.canned_listing(engine, query, start));
+        if self.copied_only() {
+            return Ok(self.copied_listing(query, start));
         }
         let key = if engine == Engine::YouTube {
             format!("youtube {}", query_key(query, start))
@@ -2661,7 +2618,11 @@ impl fictionet_extras::models::Engine for Pages {
             let response = loop {
                 let parsed = url::Url::parse(&url)?;
                 let (host, target) = text::target_of(&url);
-                let response = self.handle(&cx, "GET", &host, &target, None).await;
+                let response = if self.copied_only() {
+                    self.copied_url(&url)
+                } else {
+                    self.handle(&cx, "GET", &host, &target, None).await
+                };
                 let mut fields = response.fields();
                 if !matches!(response.meta, Meta::Redirect { .. }) {
                     fields.set("kind", "page");
@@ -2699,7 +2660,15 @@ impl fictionet_extras::models::Engine for Pages {
             Ok(fictionet_extras::models::tools::Page {
                 title,
                 media_type: response.content_type.split(';').next().unwrap_or("").into(),
-                body: response.body,
+                body: match response.stored_headers {
+                    Some(headers) => fictionet_extras::warc::Response {
+                        status: http::StatusCode::from_u16(response.status)?,
+                        headers,
+                        body: response.body.into(),
+                    }
+                    .decoded()?,
+                    None => response.body,
+                },
             })
         })
     }

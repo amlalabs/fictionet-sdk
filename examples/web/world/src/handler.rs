@@ -139,10 +139,14 @@ impl Handler {
                     .field("via", source)
             });
         }
-        let answer = self
-            .pages
-            .handle_route(&self.fcx, parts.method.as_str(), &target.host, path, action)
-            .await;
+        let answer = if self.pages.copied_only() && action == Route::Page {
+            self.pages
+                .copied_url(&format!("{}://{}{path}", target.scheme, target.host))
+        } else {
+            self.pages
+                .handle_route(&self.fcx, parts.method.as_str(), &target.host, path, action)
+                .await
+        };
         if let (Some(q), Meta::Search(list)) = (&query, &answer.meta) {
             self.fcx.emitter(&conn).emit("web", "search", |e| {
                 e.field("query_id", q.id)
@@ -186,10 +190,13 @@ impl Handler {
         let mut response = Response::builder()
             .status(StatusCode::from_u16(answer.status)?)
             .header(CONTENT_TYPE, answer.content_type)
-            .header(CONTENT_LENGTH, answer.body.len())
-            .header("cache-control", "private, max-age=0");
-        for (name, value) in answer.headers {
-            response = response.header(name, value);
+            .header(CONTENT_LENGTH, answer.body.len());
+        if let Some(headers) = answer.stored_headers {
+            *response.headers_mut().expect("valid response headers") = headers;
+        } else {
+            for (name, value) in answer.headers {
+                response = response.header(name, value);
+            }
         }
         let bytes = answer.body.len();
         let body = if parts.method == http::Method::HEAD {

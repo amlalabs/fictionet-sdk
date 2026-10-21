@@ -301,10 +301,7 @@ mod tests {
         let (start, events) = all.split_first().unwrap();
         assert_eq!((start.source, start.kind), ("run", "start"));
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            (events[0].source, events[0].kind),
-            ("web", "generation")
-        );
+        assert_eq!((events[0].source, events[0].kind), ("web", "generation"));
         assert_eq!(
             line(&events[0]),
             Some(json!({"type":"generation","generate":false,"revision":1}))
@@ -428,8 +425,8 @@ mod live_tests {
     fn model_calls_keep_cost_time_and_outcome_in_the_run_log() {
         let call = json!({"record":"attempt", "kind":"page", "url":"https://example.com/a",
             "model":"writer", "cost":0.001, "gen_ms":3200, "outcome":"ok", "terminal":true});
-        let event = Event::new("web", "model_call")
-            .field("call", example_common::events::field(&call));
+        let event =
+            Event::new("web", "model_call").field("call", example_common::events::field(&call));
         let mut expected = call;
         expected["type"] = json!("model_call");
         assert_eq!(line(&event), Some(expected));

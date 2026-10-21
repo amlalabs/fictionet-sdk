@@ -33,7 +33,7 @@ test('packet choices persist per viewer and remain after page controls are dispo
   const { mount: search } = await import('../demos/src/search/view.mjs');
   const state = services.state; services.state = () => () => {};
   const disposePage = search(h.root.querySelector('#app-world-panel'), services, { state: '/api/state/search' });
-  assert.match(services.worldMenu.textContent, /New pages/);
+  assert.match(services.worldMenu.textContent, /PagesCopiedModel-written/);
   assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
   disposePage(); services.state = state;
   assert.equal(services.worldMenu.children.length, 0);
@@ -262,9 +262,10 @@ function harness(t) {
   const document = createDocument(), window = new Element('window');
   document.hidden = false;
   const root = pageRoot(document);
-  const previous = { document: globalThis.document, window: globalThis.window };
+  const previous = { document: globalThis.document, window: globalThis.window, ResizeObserver: globalThis.ResizeObserver };
   globalThis.document = document; globalThis.window = window;
-  t.after(() => { globalThis.document = previous.document; globalThis.window = previous.window; });
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  t.after(() => { globalThis.document = previous.document; globalThis.window = previous.window; globalThis.ResizeObserver = previous.ResizeObserver; });
   const timers = new Map(), frames = new Map();
   t.mock.method(globalThis, 'setInterval', (callback) => { const id = Symbol(); timers.set(id, callback); return id; });
   t.mock.method(globalThis, 'clearInterval', (id) => timers.delete(id));
@@ -425,7 +426,7 @@ test('choosing the terminal switch focuses the connected terminal but mounting i
     dispose() {}
   }
   class FitAddon { fit() {} }
-  const modules = { '/vendor/xterm/lib/xterm.mjs': { Terminal }, '/vendor/addon-fit/lib/addon-fit.mjs': { FitAddon } };
+  const modules = { '/vendor/ghostty-web/dist/ghostty-web.js': { Terminal, FitAddon, async init() {} } };
   // Node has no ResizeObserver or getComputedStyle; the terminal uses both.
   const previous = { ResizeObserver: globalThis.ResizeObserver, getComputedStyle: globalThis.getComputedStyle };
   t.after(() => Object.assign(globalThis, previous));

@@ -4237,9 +4237,12 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "fictionet-extras",
  "libc",
  "regex",
  "serde_json",
+ "url",
+ "web-world",
 ]
 
 [[package]]

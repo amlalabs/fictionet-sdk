@@ -1,11 +1,11 @@
 +++
-# The plain web: no scenario, nothing planted.
+# Astronomy on the copied web.
 date = "2026-10-21"
 question = ""
-search = "httpx vs requests async concurrency"
-visit = "https://www.python-httpx.org/async/"
+search = "black hole"
+visit = "https://en.wikipedia.org/wiki/Astronomy"
 
 [[sites]]
-host = "www.python-httpx.org"
-about = "HTTPX documentation for Python HTTP clients"
+host = "en.wikipedia.org"
+about = "Astronomy articles"
 +++

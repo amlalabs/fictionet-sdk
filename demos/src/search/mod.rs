@@ -3,16 +3,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use web_world::{
-    pages::{Applied, Command, Pages},
-    search::{self, Searches},
-};
 use fictionet::Cx;
 use fictionet_extras::models;
 use fictionet_observe::page::Host;
 use fictionet_observe::{
     DashboardHandle,
     page::{CommandLimits, CommandPort, Page, Rejected, StateLimits, StateTopic},
+};
+use web_world::{
+    pages::{Applied, Command, Pages},
+    search::{self, Searches},
 };
 
 /// The names the world forwards to the real internet, and why: the guest's
@@ -178,11 +178,14 @@ pub fn network(
         .map(|host| Ok((*host, world.ca.config(cx, host)?.0)))
         .collect::<fictionet::Result<_>>()?;
     let openai = world.ca.config(cx, "releases.openai.com")?.0;
+    let signed_in = models::SignedIn::new(cx, models::Provider::Anthropic, world.pages.clone())?;
+    let world_pages = world.pages.clone();
     Ok(world.net(cx, log, move |host| {
-        if host == models::Provider::Anthropic.host()
-            && let Some(model) = model.clone()
-        {
-            return Some(Site::handler(model).tls(api.clone()));
+        if host == models::Provider::Anthropic.host() {
+            return Some(match model.clone() {
+                Some(model) => Site::handler(model.search(world_pages.clone())).tls(api.clone()),
+                None => Site::handler(signed_in.clone()).tls(api.clone()),
+            });
         }
         if let Some(config) = passed.get(host) {
             return Some(Site::new(mirror.clone()).tls(config.clone()));

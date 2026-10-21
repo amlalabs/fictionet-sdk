@@ -805,7 +805,20 @@ mod tests {
     use serde_json::json;
 
     fn seed() -> Seed {
-        Seed::builtin("web").unwrap()
+        let mut seed = Seed::builtin("web").unwrap();
+        seed.date = "2026-10-07".into();
+        seed.facts = vec!["Example fixed a gateway flaw.".into()];
+        seed.fixed = vec![super::super::seed::Fixed {
+            url: "https://www.example.com/advisory".into(),
+            file: String::new(),
+            host: "www.example.com".into(),
+            target: "/advisory".into(),
+            title: "Example advisory".into(),
+            description: "Example fixed a gateway flaw.".into(),
+            content_type: "text/html".into(),
+            body: b"<h1>Example advisory</h1>".to_vec(),
+        }];
+        seed
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod corpus;
 mod libraries;
 mod microvm;
 
@@ -32,6 +33,11 @@ pub fn run(args: &[String]) -> Result {
     }
     if args == ["assets"] {
         return microvm::assets();
+    }
+    if let [name, rest @ ..] = args
+        && name == "corpus"
+    {
+        return corpus::run(rest);
     }
     if args == ["libraries"] {
         return libraries::assets();

@@ -14,7 +14,7 @@ binary each, with the world in the same process. Four are scripts in
 booting anything. `cargo xtask demo libraries` downloads only the pinned
 browser libraries, into `observe/downloads/vendor/` at the repository root.
 Options for a demo go after its name, as in
-`cargo xtask demo search check`.
+`cargo xtask demo search`.
 
 ## The microVM demos
 
@@ -71,7 +71,7 @@ the box, containment, labels and export. Its Coding agents table fills in once
 the checks have run both version commands. The Anthropic model API is forwarded through `fictionet_extras::models`, using
 `ANTHROPIC_API_KEY` or OpenRouter’s compatible Messages endpoint with
 `OPENROUTER_API_KEY`. Claude Code writes and runs a small Python program. The guest
-receives only a placeholder key. WebSearch and WebFetch use the same adaptive pages
+receives only a placeholder key. WebSearch and WebFetch use the same world pages
 Gateway advisories and require a world search event. The World menu pauses calls
 or changes the default limits of twelve calls for Claude Code and eight for Codex.
 
@@ -177,54 +177,38 @@ the impostor, the impostor and its row flash red.
 
 ### Search
 
-`cargo xtask demo search` boots an Ubuntu desktop with Firefox, Claude Code
-and Codex. It serves the finished pages in
-`examples/web/stores/web/` without a model or API key. Stored searches
-share results across Google, Bing and DuckDuckGo; YouTube has separate video
-results. Whole-word overlap matches nearby queries. Other searches have no
-results, and unknown pages return a short missing-page response.
+`cargo xtask demo corpus` captures the astronomy URLs in
+[`corpus/astronomy.urls`](corpus/astronomy.urls) with wget mirror mode and
+page requisites. Response records stay in compressed WARC files under
+`demos/downloads/astronomy/`, outside git. Capture follows robots.txt, waits
+between requests, identifies itself, and has pinned depth and byte limits.
+A resource error makes the fetch command fail; retained archives must not be
+mistaken for a completed, validated corpus. Wikipedia currently forbids wget
+in robots.txt and Astronomy Stack Exchange currently returns 403. Those
+restrictions need resolving before the requested source mix can be delivered.
 
-Three prompts to try in Claude Code:
+`cargo xtask demo search` boots Firefox, Claude Code and Codex on the copied
+sites. The world scans WARC members into an in-memory URL index, then crawls
+links from the seed URLs through the copied-site response handler. It indexes
+page titles and text with BM25. Google, Bing and DuckDuckGo render the same
+matches using their existing skins. Titles, URLs and snippets come from the
+indexed pages. Unknown URLs return 404; unrelated queries get no results.
+Startup prints WARC scan time, crawl/index time and the number of indexed pages.
 
-- “Choose between HTTPX and Requests for a Python async job downloading JSON
-  from many URLs. Show a client with bounded concurrency and explain pool
-  timeouts.” Nine pages cover the project homes, async clients, pool limits, timeouts, Requests,
-  a client discussion and a video introduction.
-- “Our SQLite service uses WAL but still gets database is locked. Explain
-  why, distinguish contention from an old read snapshot, and propose a safe
-  transaction and retry policy.” Eight pages cover the project home, WAL, isolation,
-  transactions, busy handlers, result codes, a forum thread and a video.
-- “ripgrep misses a tracked configuration file inside a hidden directory.
-  Work out why and show how to include it while excluding Git internals.”
-  Seven pages cover the README, guide, FAQ, an issue, two discussions and
-  a terminal tutorial.
+The World menu has **Pages: Copied** (the default) and **Pages: Model-written**.
+Switching affects new requests without restarting the VM. Model-written pages
+use the existing writer and `OPENROUTER_API_KEY`, keeping their generated store
+in memory. Model failures do not fall back to keyword-written pages.
 
-There are also ten home and timeline pages for X, Hacker News, Reddit,
-Anthropic and GitHub. Search engine homes use the existing bundled layouts.
-The pages are original, shortened explanations using real project URLs;
-they are not verbatim copies of the live sites or video transcripts.
-`seeds/web.queries` lists the prepared searches and visits.
+Claude keeps its own sign-in. Its model API handler replaces server search and
+fetch tools with local calls and restores the provider's result envelopes.
+Search and fetch never go to an external search service. Each completed search
+writes one `search` log record with its source, query and actual returned results.
+Browser and command-line requests use the same index and have their own source labels.
 
-The model answering side uses `fictionet_extras::models::Model::search(pages)`.
-It replaces Anthropic server-side search and fetch with local function calls,
-then restores Anthropic's result envelopes. OpenAI Responses search, open and
-find use the same engine. The model endpoint remains the only upstream in
-this exchange. The Search forwarding and guest authentication wiring is
-maintained separately in `demos/src/search/mod.rs`.
-
-A completed search writes one `search` log record with its source, query and
-results, alongside the existing request lifecycle records. Claude and Codex
-tool searches are labeled separately in the Web tab. Browser and command-line
-requests have their own source labels.
-
-- `cargo xtask demo search check` exercises all three tasks on all four
-  engines, opens every result, compares its bytes with the store, and checks
-  nearby queries and unrelated fallbacks in the VM.
-- `cargo xtask demo search bake` retains the model-based baking workflow and
-  `OPENROUTER_API_KEY` support. Baking changes the store; it is not part of
-  running the prepared demo. Stores record their generator identity, so a
-  model bake needs a fresh store directory when replacing the authored set.
-- `cargo xtask demo search preview` shows an in-world client without a VM.
+Try “black hole accretion”, “exoplanet transit” and “stellar evolution”.
+`cargo xtask demo search preview` runs an in-world client without a VM.
+There is no Search check or bake mode.
 
 ### FakeWiki
 

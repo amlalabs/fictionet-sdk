@@ -215,10 +215,7 @@ pub async fn start(
     let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys)?;
     world.trust("zscaler", z.root_pem())?;
     let seed = web_world::pages::Seed::builtin("web")?;
-    let addresses = Arc::new(web_world::Addresses::new(
-        seed.fixed_addresses(),
-        None,
-    )?);
+    let addresses = Arc::new(web_world::Addresses::new(seed.fixed_addresses(), None)?);
     let pages = Arc::new(web_world::pages::Pages::new(seed));
     let handler = web_world::handler::Handler::new(&fcx, pages.clone());
     let codex_pages = pages.clone();

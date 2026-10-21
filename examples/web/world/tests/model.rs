@@ -6,9 +6,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
+use serde_json::{Value, json};
 use web_world::pages::model::{Model, Provider};
 use web_world::pages::prompts;
-use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-key";
 

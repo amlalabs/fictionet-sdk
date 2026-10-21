@@ -1,45 +1,38 @@
 //! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
-//! plain web: no scenario, nothing planted.
+//! astronomy corpus, with optional model-written pages.
 //!
 //! - `search <downloads>` is the app: it boots, opens the page and stays up
-//!   until Ctrl-C. Prepared pages answer searches and fetches without a model.
-//! - `search <downloads> check` runs the scripted story and its checks.
+//!   until Ctrl-C. Copied pages answer searches and fetches without a model.
 //! - `search preview` shows the page with an in-world client and no VM.
-//! - `search bake` makes a store with a model (see `bake.rs`).
 
-mod bake;
-mod checks;
 mod guest;
 mod preview;
 use fictionet_demo::search as page;
 
+use example_common::log::Log;
+use fictionet_demo::kit::{self, Kit};
+use std::{fs::File, path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Addresses, Ca, World,
     events::LogObserver,
     pages::{Pages, Seed},
     search::Searches,
 };
-use example_common::log::Log;
-use fictionet_demo::kit::{self, Kit};
-use std::{collections::BTreeSet, fs::File, path::PathBuf, sync::Arc, time::Instant};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The seed the app shows, and whose canned pages it serves.
+/// The seed for model-written astronomy pages.
 const SEED: &str = "web";
 
-/// What to run: the app or its checks with the downloads folder, the
-/// preview without a VM, or the bake.
+/// The app with its downloads folder, or the preview without a VM.
 #[derive(Debug, PartialEq)]
 enum Mode {
     App { downloads: PathBuf },
-    Check { downloads: PathBuf },
     Preview,
-    Bake,
 }
 
 fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
-    const USAGE: &str = "usage: search <downloads> [check], search preview, or search bake";
+    const USAGE: &str = "usage: search <downloads> or search preview";
     let first = args.next().ok_or(USAGE)?;
     let second = args.next();
     if args.next().is_some() {
@@ -47,37 +40,40 @@ fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
     }
     match (first.as_str(), second.as_deref()) {
         ("preview", None) => Ok(Mode::Preview),
-        ("bake", None) => Ok(Mode::Bake),
-        ("preview" | "bake", _) => Err(USAGE.into()),
+        ("preview", _) => Err(USAGE.into()),
         (folder, _) if folder.starts_with('-') => Err(USAGE.into()),
         (folder, None) => Ok(Mode::App {
-            downloads: folder.into(),
-        }),
-        (folder, Some("check")) => Ok(Mode::Check {
             downloads: folder.into(),
         }),
         _ => Err(USAGE.into()),
     }
 }
 
-fn app_pages(seed: Seed) -> Result<Pages> {
-    Ok(Pages::canned(
+fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
+    let model = std::env::var_os("OPENROUTER_API_KEY")
+        .map(|_| web_world::pages::model::Model::openrouter())
+        .transpose()?;
+    let seeds = include_str!("../../../corpus/astronomy.urls")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    Ok(Pages::copied(
         seed,
-        &web_world::pages::store::canned_root(SEED),
+        &downloads.join("astronomy"),
+        &seeds,
+        model,
     )?)
 }
 
 #[tokio::main]
 async fn main() -> Result {
     let total = Instant::now();
-    let (downloads, check) = match arguments(std::env::args().skip(1))? {
+    let downloads = match arguments(std::env::args().skip(1))? {
         Mode::Preview => return preview::run().await,
-        Mode::Bake => return bake::run().await,
-        Mode::App { downloads } => (downloads, false),
-        Mode::Check { downloads } => (downloads, true),
+        Mode::App { downloads } => downloads,
     };
     let seed = Seed::builtin(SEED)?;
-    let pages = Arc::new(app_pages(seed.clone())?);
+    let pages = Arc::new(app_pages(seed.clone(), &downloads)?);
     let output = kit::checks::output(&downloads, "search")?;
     let searches = Arc::new(Searches::of(&pages));
     let topics = page::Topics::new();
@@ -88,9 +84,7 @@ async fn main() -> Result {
         |s| s,
     ));
     let world_log = log.clone();
-    let scenario = seed.clone();
     let kit = Kit::new("search")
-        .page_words(checks::PAGE_WORDS)
         .guest(guest::guest(&seed.date))
         .observer(searches.clone())
         .observer(Arc::new(LogObserver { log: log.clone() }))
@@ -112,21 +106,11 @@ async fn main() -> Result {
                 .route(kit::JUMP, kit::jump_prefix())
                 .start(&cx, world.into_attachments())
         });
-    if !check {
-        let result = kit.run_app(downloads, guest::HOST).await;
-        let finish = log.finish();
-        println!("whole run: {} ms", total.elapsed().as_millis());
-        result?;
-        finish?;
-        return Ok(());
-    }
-    let story = checks::Story {
-        seed: scenario,
-        log,
-        visited: BTreeSet::new(),
-        output: output.clone(),
-    };
-    kit::checks::run(kit, &downloads, &output, story).await?;
+    let result = kit.run_app(downloads, guest::HOST).await;
+    let finish = log.finish();
+    println!("whole run: {} ms", total.elapsed().as_millis());
+    result?;
+    finish?;
     Ok(())
 }
 
@@ -139,31 +123,15 @@ mod tests {
     }
 
     #[test]
-    fn the_app_always_serves_prepared_pages_without_a_model() {
-        use web_world::pages::{GeneratorKind, NewPages, Seed};
-        let pages = super::app_pages(Seed::builtin(super::SEED).unwrap()).unwrap();
-        assert_eq!(pages.generator_kind(), GeneratorKind::Stub);
-        assert_eq!(pages.prefetch(), 0);
-        assert_eq!(pages.new_pages(), NewPages::Canned);
-    }
-
-    #[test]
-    fn the_app_takes_only_its_folder_and_check_its_word() {
+    fn the_app_takes_its_folder_or_preview() {
         assert_eq!(
             parse(&["d"]),
             Some(Mode::App {
                 downloads: "d".into()
             })
         );
-        assert_eq!(
-            parse(&["d", "check"]),
-            Some(Mode::Check {
-                downloads: "d".into()
-            })
-        );
         assert_eq!(parse(&["preview"]), Some(Mode::Preview));
         assert_eq!(parse(&["preview", "--spend-budget"]), None);
-        assert_eq!(parse(&["bake"]), Some(Mode::Bake));
         for bad in [
             &[][..],
             &["--stay"],

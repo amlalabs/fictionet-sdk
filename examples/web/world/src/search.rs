@@ -115,10 +115,9 @@ pub struct Generator {
     pub generation_revision: u64,
     /// Run time of the last generation change, in milliseconds.
     pub generation_at_ms: u64,
-    /// Whether the canned pages answer, rather than the offline
-    /// generator's own (see [`NewPages`](crate::pages::NewPages)).
+    /// Whether new requests use the copied corpus.
     #[serde(default)]
-    pub canned: bool,
+    pub copied: bool,
 }
 impl Default for Generator {
     fn default() -> Self {
@@ -132,7 +131,7 @@ impl Default for Generator {
             generate: true,
             generation_revision: 0,
             generation_at_ms: 0,
-            canned: false,
+            copied: false,
         }
     }
 }
@@ -500,7 +499,7 @@ impl Searches {
                 model: pages.model(),
                 prefetch: pages.prefetch() as u64,
                 generate: pages.generation().generate,
-                canned: pages.new_pages() == crate::pages::NewPages::Canned,
+                copied: pages.new_pages() == crate::pages::NewPages::Copied,
                 ..Generator::default()
             },
         )
@@ -598,8 +597,8 @@ impl Snapshot {
                 self.generator.generate = generate;
                 self.generator.generation_revision = revision;
                 self.generator.generation_at_ms = ms;
-                if let Some(canned) = parse(e, "canned") {
-                    self.generator.canned = canned;
+                if let Some(copied) = parse(e, "copied") {
+                    self.generator.copied = copied;
                 }
                 true
             }

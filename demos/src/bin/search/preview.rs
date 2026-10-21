@@ -1,11 +1,6 @@
 //! `search preview`: the search page with real world traffic, an in-world
 //! scripted client and a labeled preview console.
 
-use web_world::{
-    Addresses, Ca, World,
-    pages::{self, Seed},
-    search::Searches,
-};
 use example_common::log::Log;
 use fictionet::{
     Cx,
@@ -22,7 +17,6 @@ use fictionet::{
 use fictionet_demo::{
     kit::{
         self,
-        client::PageClient,
         preview::{Input, Story},
     },
     search::{self as page, Topics},
@@ -36,11 +30,29 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
+use web_world::{
+    Addresses, Ca, World,
+    pages::{self, Seed},
+    search::Searches,
+};
 
-use super::{Result, checks::search_url};
+use super::Result;
+
+fn search_url(engine: Engine, words: &str) -> String {
+    let host = match engine {
+        Engine::Google => "www.google.com/search?q=",
+        Engine::Bing => "www.bing.com/search?q=",
+        Engine::DuckDuckGo => "html.duckduckgo.com/html/?q=",
+        Engine::YouTube => "www.youtube.com/results?search_query=",
+    };
+    format!("https://{host}{}", pages::text::quote(words, ""))
+}
 
 fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
-    Ok(Arc::new(super::app_pages(seed)?))
+    Ok(Arc::new(super::app_pages(
+        seed,
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("downloads"),
+    )?))
 }
 
 pub async fn run() -> Result {
@@ -74,7 +86,6 @@ pub async fn run() -> Result {
         "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
     );
     let mut input = Input::stdin(Story::Once, Some(console))?;
-    let page_client = PageClient::from_url(server.url())?;
     let audit = Arc::new(example_common::guest_content::Audit::default());
     let observer = Arc::new(Fanout::new(vec![
         audit.clone(),
@@ -123,7 +134,6 @@ pub async fn run() -> Result {
                         machine: &workstation,
                         world: &world,
                         searches: &searches,
-                        page: &page_client,
                     };
                     story(&client, &script).await?;
                     Ok::<_, fictionet::Error>(())
@@ -209,7 +219,6 @@ struct Client<'a> {
     machine: &'a Machine,
     world: &'a World,
     searches: &'a Searches,
-    page: &'a PageClient,
 }
 
 /// The seed's searches and pages, in the order a reader would make them.
@@ -219,7 +228,6 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         machine,
         world,
         searches,
-        page,
     } = *client;
     let words = seed.search.as_str();
     let pause = || cx.sleep(Duration::from_secs(3));
@@ -251,72 +259,9 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         .await?;
     println!("Scripted client asked for wiki.corp");
     pause().await?;
-    generation(page, searches, false).await?;
-    let new = format!("{words} new question");
-    fetch(cx, machine, &search_url(Engine::Google, &new), world.start).await?;
+    let new = "dishwasher repair";
+    fetch(cx, machine, &search_url(Engine::Google, new), world.start).await?;
     pause().await?;
     fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
     Ok(())
-}
-
-/// Sends the generation switch through the page, as a viewer's click would.
-async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> fictionet::Result {
-    let revision = searches.snapshot().generator.generation_revision;
-    let reply = page
-        .command(
-            "generation",
-            &format!("preview-generation-{revision}"),
-            serde_json::json!({"command": "set_generation", "generate": generate,
-                "expected_revision": revision}),
-        )
-        .await
-        .map_err(fictionet::Error::msg)?;
-    if reply["status"] != "applied" {
-        return Err(fictionet::Error::msg(format!(
-            "generation command: {reply}"
-        )));
-    }
-    println!(
-        "Generation {} at revision {}",
-        if generate { "on" } else { "off" },
-        reply["reply"]["revision"]
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preview_supports_every_page_mode() {
-        fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
-            |cx| async move {
-                let seed = Seed::builtin(super::super::SEED)?;
-                let pages = preview_pages(seed).unwrap();
-                assert_eq!(pages.new_pages(), pages::NewPages::Canned);
-                let searches = Searches::of(&pages);
-                assert!(searches.snapshot().generator.canned);
-                for new_pages in [
-                    pages::NewPages::Canned,
-                    pages::NewPages::Stub,
-                    pages::NewPages::Off,
-                ] {
-                    pages
-                        .apply(
-                            &cx,
-                            pages::Command::SetNewPages {
-                                new_pages,
-                                expected_revision: pages.generation().revision,
-                            },
-                        )
-                        .unwrap();
-                    assert_eq!(pages.new_pages(), new_pages);
-                }
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
 }

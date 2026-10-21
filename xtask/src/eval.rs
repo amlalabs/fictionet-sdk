@@ -2,7 +2,8 @@ use crate::process::{Checks, Cleanup, Result, capture, cmd, input, run as execut
 use serde_json::Value;
 use std::process::{Command, Stdio};
 
-const HELP: &str = "cargo xtask eval <border|fakewiki|web|artifactory> [--no-build] [Inspect arguments...]
+const HELP: &str =
+    "cargo xtask eval <border|fakewiki|web|artifactory> [--no-build] [Inspect arguments...]
   --probes       Run containment and world probes without a model
   --scripted     Run Border or Artifactory's scripted scorer tests
   --live [JSON] [query...]   Browse the web without an agent model

@@ -1987,7 +1987,7 @@ fn network_checks_distinguish_lan_and_public_addresses_and_local_macs() {
 }
 
 #[test]
-fn demos_use_the_shared_check_sequence() {
+fn demos_use_the_shared_lifecycle() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
     for entry in std::fs::read_dir(root).unwrap() {
         let directory = entry.unwrap().path();
@@ -1996,11 +1996,22 @@ fn demos_use_the_shared_check_sequence() {
             continue;
         }
         let main = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            main.contains("kit::checks::run("),
-            "{} has no shared runner",
-            path.display()
-        );
+        if directory.file_name().is_some_and(|name| name == "search") {
+            assert!(
+                main.contains("kit.run_app("),
+                "{} has no shared app runner",
+                path.display()
+            );
+            assert!(!directory.join("checks.rs").exists());
+            assert!(!main.contains("mod checks;"));
+            assert!(!main.contains("Mode::Check"));
+        } else {
+            assert!(
+                main.contains("kit::checks::run("),
+                "{} has no shared runner",
+                path.display()
+            );
+        }
         for file in ["main.rs", "checks.rs", "story.rs"] {
             let path = directory.join(file);
             if !path.exists() {

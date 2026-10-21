@@ -181,14 +181,6 @@ fn key(host: &str, target: &str) -> (String, String) {
     (site_key(host).to_owned(), target.to_owned())
 }
 
-/// Where the canned store for the seed named `seed` is kept in the
-/// repository: `examples/web/stores/<seed>/`.
-pub fn canned_root(seed: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../stores")
-        .join(seed)
-}
-
 /// Why a store cannot be used, and how to start over.
 fn incompatible(root: &Path, reason: &str) -> String {
     format!(
