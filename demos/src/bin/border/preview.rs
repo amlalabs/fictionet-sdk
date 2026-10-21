@@ -90,7 +90,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         )
         .containment(StateTopic::<Containment>::new(StateLimits::default()))
         .labels(Labels::default())
-        .bind_loopback(0)
+        .bind_loopback(kit::PAGE_PORT)
         .await?;
     let access = kit::PageAccess::new(server.url())?;
     let audit = Arc::new(example_common::guest_content::Audit::default());

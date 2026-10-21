@@ -94,7 +94,7 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
                     .pinned(),
             ),
         )
-        .bind_loopback(0)
+        .bind_loopback(kit::PAGE_PORT)
         .await?;
     let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     eprintln!(

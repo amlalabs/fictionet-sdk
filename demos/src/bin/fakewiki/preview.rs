@@ -37,7 +37,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .status(status.clone()),
                 ),
         )
-        .bind_loopback(0)
+        .bind_loopback(fictionet_demo::kit::PAGE_PORT)
         .await?;
     let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     eprintln!(

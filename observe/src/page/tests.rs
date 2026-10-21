@@ -2897,3 +2897,44 @@ async fn a_subscriber_gets_one_gap_per_stream_since_its_cursor() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn a_taken_port_binds_a_free_one() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let server = Page::new(
+        "Taken",
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
+    )
+    .bind_loopback(port)
+    .await
+    .unwrap();
+    let bound: u16 = server
+        .url()
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split_once('/'))
+        .and_then(|(port, _)| port.parse().ok())
+        .unwrap();
+    assert_ne!(bound, port);
+    drop(taken);
+    let reused = Page::new(
+        "Free",
+        crate::DashboardObserver::new(crate::DashboardOptions {
+            collector: crate::Options::default(),
+            ..Default::default()
+        })
+        .handle(),
+    )
+    .bind_loopback(port)
+    .await
+    .unwrap();
+    assert!(
+        reused
+            .url()
+            .starts_with(&format!("http://127.0.0.1:{port}/#token="))
+    );
+}

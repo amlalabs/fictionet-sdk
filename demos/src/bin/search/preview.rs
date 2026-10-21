@@ -73,7 +73,7 @@ pub async fn run(spend: bool) -> Result {
         )
         .labels(labels.clone())
         .containment(containment.clone())
-        .bind_loopback(0)
+        .bind_loopback(kit::PAGE_PORT)
         .await?;
     let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     println!(

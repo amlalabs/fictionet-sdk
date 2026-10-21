@@ -133,7 +133,7 @@ async fn bind(
         facts.topics.clone(),
         true,
     )
-    .bind_loopback(0)
+    .bind_loopback(fictionet_demo::kit::PAGE_PORT)
     .await
 }
 

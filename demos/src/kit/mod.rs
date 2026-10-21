@@ -47,7 +47,7 @@ pub mod bridge;
 pub mod checks;
 pub mod client;
 mod page;
-pub use page::{Hosts, PageAccess, answer_command, open_bootstrap, serve_commands};
+pub use page::{Hosts, PAGE_PORT, PageAccess, answer_command, open_bootstrap, serve_commands};
 pub mod containment;
 pub mod desktop;
 pub mod jump;
@@ -1264,7 +1264,7 @@ impl Run {
         let page = build(dashboard.clone(), &mut hosts)
             .containment(self.containment.clone())
             .labels(labels.clone());
-        self.page = Some(page.bind_loopback(0).await.map_err(|error| {
+        self.page = Some(page.bind_loopback(PAGE_PORT).await.map_err(|error| {
             let text = error.to_string();
             if text == "labels called twice" || text.contains("(\"Containment\")") {
                 io::Error::new(

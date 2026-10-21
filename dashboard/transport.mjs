@@ -1,5 +1,5 @@
 /// How a viewer signs in.
-export const SIGN_IN = 'Run the page-opening command printed by the demo.';
+export const SIGN_IN = 'Open the full link the demo printed, including the part after #.';
 const SIGNED_OUT = `Not signed in. ${SIGN_IN}`;
 
 // One owner for origin-scoped authorization, requests, streams and downloads.

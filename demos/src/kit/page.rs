@@ -349,6 +349,11 @@ impl Pty for ssh::Pty {
     }
 }
 
+/// The loopback port a demo's page binds, the same on every run so a port
+/// forward to it keeps working. A run whose port another holds binds a free
+/// one and prints that.
+pub const PAGE_PORT: u16 = 38877;
+
 /// A private file holding the page's address and token, removed when its
 /// run ends, and the app window the run opened, if any.
 pub struct PageAccess {
@@ -357,7 +362,8 @@ pub struct PageAccess {
 }
 
 impl PageAccess {
-    /// Prints the public address and the command that opens the page.
+    /// Prints the page's address with its token, and the command that
+    /// opens the page.
     pub fn new(url: &str) -> io::Result<Self> {
         let access = Self::bootstrap(url)?;
         access.print_open();
@@ -393,7 +399,7 @@ impl PageAccess {
             .mode(0o600)
             .open(dir.path().join(BOOTSTRAP))?;
         writeln!(file, "{url}")?;
-        println!("Page: {}", url.split('#').next().unwrap());
+        println!("Page: {url}");
         Ok(Self {
             _dir: dir,
             _window: None,

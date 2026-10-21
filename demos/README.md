@@ -31,14 +31,16 @@ world's mirror. The mirror keeps them in `downloads/cloudimage/apt-cache/`, so
 the first run on a machine also fetches about 280 MB of Ubuntu packages and
 later runs reuse them.
 
-Each run prints its public page URL before the guests boot, then
+Each run prints its page URL before the guests boot, with the page's token
+after `#`. The page listens on 127.0.0.1:38877, or on a free port when
+another run holds that one. Open the whole URL in a browser to sign in. The
+run then prints
 `Open: cargo xtask demo open PATH`. PATH is a private file that holds the
-page's address and token, and the run removes it when it ends. The command
-opens the page in a Chromium app window over DevTools, so the token never
-appears on a command line; closing the window or Ctrl-C ends it. A demo
-that runs as an app opens this window itself when there is a display.
-Routine output contains no token. A `check` run then runs the
-demo's story and its checks. Every demo requires each declared containment probe exactly once, with an
+same URL, and the run removes it when it ends. The command opens the page
+in a Chromium app window over DevTools, so the token never appears on a
+command line; closing the window or Ctrl-C ends it. A demo that runs as an
+app opens this window itself when there is a display. A `check` run then
+runs the demo's story and its checks. Every demo requires each declared containment probe exactly once, with an
 affirmative result. Configuration probes report facts. The shared package
 mirror closes once every guest has finished its cloud-init check. The run saves screenshots,
 powers the guests off, and checks that no Cloud Hypervisor process or run

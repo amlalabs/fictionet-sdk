@@ -592,7 +592,9 @@ impl Page {
         self
     }
 
-    /// Validates the composition and binds IPv4 loopback. Zero chooses a port.
+    /// Validates the composition and binds `port` on IPv4 loopback. Zero, or
+    /// a port another listener holds, binds a free port; [`Server::url`]
+    /// names the port bound.
     pub async fn bind_loopback(mut self, port: u16) -> io::Result<Server> {
         self.prepare()?;
         if self.title.trim().is_empty() {
@@ -672,7 +674,12 @@ impl Page {
         self.topics
             .push(("leases".into(), consoles.topic.topic.clone()));
         let auth = auth::Auth::new()?;
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        let listener = match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            Err(error) if port != 0 && error.kind() == io::ErrorKind::AddrInUse => {
+                TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?
+            }
+            bound => bound?,
+        };
         let port = listener.local_addr()?.port();
         let url = format!("http://127.0.0.1:{port}/#token={}", auth.token);
         let (stop, mut stopping) = watch::channel(false);
