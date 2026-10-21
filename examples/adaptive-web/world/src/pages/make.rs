@@ -267,14 +267,25 @@ pub(super) fn prepared_cast(seed: &Seed) -> Vec<super::prompts::Person> {
 
 fn proper(text: &str) -> String {
     let names = "Lisbon Naples London Leeds Dublin Edinburgh Bath Porto Bristol Glasgow Manchester Tokyo Netgear Python Rust JavaScript Halvard Gateway Vitamin Nikon HG-200 HG-400 HG-900 BBC CISA SSL VPN NHS USB CPU GPU API HTTP HTTPS DNS SQL HTML CSS RAM SSD AI UK US TLS TCP UDP JSON XML URL URI SDK IDE BIOS UEFI OS CVE-2026-41877";
-    let mut out = text.to_owned();
-    for name in names.split_whitespace() {
-        let pattern = format!(r"(?i)\b{}\b", regex::escape(name));
-        out = Regex::new(&pattern)
-            .unwrap()
-            .replace_all(&out, name)
-            .into_owned();
-    }
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    let mut out = NAME
+        .get_or_init(|| {
+            let alternatives = names
+                .split_whitespace()
+                .map(|name| format!("({})", regex::escape(name)))
+                .collect::<Vec<_>>()
+                .join("|");
+            Regex::new(&format!(r"(?i)\b(?:{alternatives})\b")).unwrap()
+        })
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            let index = caps
+                .iter()
+                .skip(1)
+                .position(|capture| capture.is_some())
+                .unwrap();
+            names.split_whitespace().nth(index).unwrap().to_owned()
+        })
+        .into_owned();
     static SHORT: OnceLock<Regex> = OnceLock::new();
     out = SHORT
         .get_or_init(|| {
@@ -334,11 +345,29 @@ impl Question {
             ("why does ", "cause"),
             ("what happens if ", "consequence"),
             ("when should ", "timing"),
+            ("how do ", "process"),
+            ("how does ", "process"),
+            ("how can ", "process"),
+            ("can ", "possibility"),
+            ("should ", "advice"),
+            ("is ", "assessment"),
+            ("are ", "assessment"),
+            ("does ", "assessment"),
+            ("do ", "assessment"),
+            ("why ", "cause"),
+            ("who ", "history"),
+            ("when ", "history"),
         ]
         .into_iter()
         .find_map(|(prefix, shape)| q.strip_prefix(prefix).map(|rest| (shape, rest)))?;
         let rest = rest
-            .strip_prefix("does it take to ")
+            .strip_prefix("invented ")
+            .or_else(|| rest.strip_prefix("discovered "))
+            .or_else(|| rest.strip_prefix("does it take to "))
+            .or_else(|| rest.strip_prefix("it safe to "))
+            .or_else(|| rest.strip_prefix("it bad to "))
+            .or_else(|| rest.strip_prefix("can "))
+            .or_else(|| rest.strip_prefix("will "))
             .or_else(|| rest.strip_prefix("do i need to "))
             .or_else(|| rest.strip_prefix("should i "))
             .or_else(|| rest.strip_prefix("should you "))
@@ -349,10 +378,10 @@ impl Question {
             .or_else(|| rest.strip_prefix("to "))
             .unwrap_or(rest);
         let nominal = shape == "cause"
-            || ["does ", "do ", "is ", "are "]
+            || ["does ", "do ", "is ", "are ", "was ", "were "]
                 .iter()
                 .any(|prefix| rest.starts_with(prefix));
-        let rest = ["does ", "do ", "is ", "are "]
+        let rest = ["does ", "do ", "is ", "are ", "was ", "were "]
             .into_iter()
             .find_map(|prefix| rest.strip_prefix(prefix))
             .unwrap_or(rest);
@@ -378,6 +407,19 @@ impl Question {
                     .contains(w)
                 } else {
                     [
+                        "work",
+                        "live",
+                        "fly",
+                        "see",
+                        "recycle",
+                        "navigate",
+                        "make",
+                        "melt",
+                        "happen",
+                        "migrate",
+                        "invented",
+                        "discovered",
+                        "insulate",
                         "boil",
                         "simmer",
                         "freeze",
@@ -428,7 +470,7 @@ impl Question {
                     ]
                     .contains(w)
                 };
-                matches.then_some(index)
+                (matches || (nominal && *w == "rust")).then_some(index)
             });
         let subject = if let Some(end) = auxiliary.filter(|end| *end > 0) {
             parts[..end].join(" ")
@@ -438,6 +480,12 @@ impl Question {
             } else {
                 parts[..index].join(" ")
             }
+        } else if shape == "assessment"
+            && !parts
+                .first()
+                .is_some_and(|word| ["it", "this", "that"].contains(word))
+        {
+            parts[..noun_end.min(parts.len())].join(" ")
         } else {
             rest.to_owned()
         };
@@ -460,7 +508,10 @@ impl Question {
 
 fn intent(query: &str) -> &'static str {
     let q = query.to_lowercase();
-    if Question::parse(query).is_some() {
+    if Question::parse(query).is_some()
+        && !q.starts_with("is it bad")
+        && !q.starts_with("is it safe")
+    {
         return "question";
     }
     if q.starts_with("best ") || q.contains(" review") || q.contains(" vs ") {
@@ -611,8 +662,7 @@ fn intent(query: &str) -> &'static str {
 }
 
 fn subreddit(query: &str) -> String {
-    let subject = Question::parse(query).map(|question| question.subject);
-    let q = subject.as_deref().unwrap_or(query).to_lowercase();
+    let q = query.to_lowercase();
     if [
         "egg", "rice", "pasta", "bread", "bean", "lentil", "potato", "food",
     ]
@@ -648,6 +698,10 @@ fn subreddit(query: &str) -> String {
         "hiking".into()
     } else if q.contains("cactus") {
         "cactus".into()
+    } else if q.contains("vaccin") {
+        "askscience".into()
+    } else if q.contains("coffee") && q.contains("heart") {
+        "AskDocs".into()
     } else if q.contains("coffee") || q.contains("run") {
         "running".into()
     } else if q.contains("pizza") || q.contains("naples") {
@@ -872,8 +926,96 @@ fn title_pattern(seed: &Seed, query: &str, host: &str, angle: usize, original: &
     let q = query.to_lowercase();
     let name = site_profile(host).name;
     let subject = proper(query);
-    if Question::parse(query).is_some() {
-        return format!("{}?", subject.trim_end_matches('?'));
+    if q.contains("coffee") && q.contains("run") {
+        return ([
+            "Caffeine Before Exercise: Benefits and Side Effects",
+            "Coffee Before Running: How Much Is Too Much?",
+            "Should You Drink Coffee Before a Run?",
+            "Coffee and Running: Timing, Tolerance and Stomach Upset",
+            "A Runner’s Guide to Pre-Run Coffee",
+            "Why Coffee Can Upset Your Stomach Before Exercise",
+            "Caffeine, Hydration and Your Morning Run",
+            "Coffee Before a Workout: What to Consider",
+            "Does anyone else get stomach cramps after pre-run coffee?",
+            "Coffee and Fitness: Finding a Routine That Suits You",
+            "How Much Caffeine Is in Your Pre-Run Drink?",
+            "Feeling Shaky After Coffee and Exercise?",
+            "Evening Runs: Caffeine and Sleep",
+        ][angle % 13])
+            .to_owned();
+    }
+    if let Some(question) = Question::parse(query) {
+        if let Some((titles, _)) = question_copy(query) {
+            return titles[angle % titles.len()].to_owned();
+        }
+        let topic = proper(&question.subject);
+        return match site_profile(host).kind.as_str() {
+            "qa" if host == "www.quora.com" => format!("{}?", subject.trim_end_matches('?')),
+            "qa" => format!("What should I know about {}?", lower_first(&topic)),
+            "wiki" => topic,
+            "forum" if host == "www.reddit.com" => {
+                format!("{topic}: what has your experience been?")
+            }
+            "forum" => format!("Has anyone looked into {}?", lower_first(&topic)),
+            _ => [
+                format!("Understanding {}", lower_first(&topic)),
+                format!("{topic}: causes and effects"),
+                format!("{topic}: facts and definitions"),
+                format!("The science behind {}", lower_first(&topic)),
+                format!("A closer look at {}", lower_first(&topic)),
+                format!("{topic} explained"),
+                format!("{topic}: a visual guide"),
+                format!("What changes {}?", lower_first(&topic)),
+                format!("{topic}: common misconceptions"),
+                format!("Learning about {}", lower_first(&topic)),
+                format!("{topic} in everyday life"),
+                format!("{topic}: the details that matter"),
+                format!("New perspectives on {}", lower_first(&topic)),
+            ][angle % 13]
+                .clone(),
+        };
+    }
+    if let Some(company) = q.strip_suffix(" acquisition") {
+        return format!(
+            "The deal for {}: {}",
+            proper(company),
+            [
+                "terms and timeline",
+                "what shareholders need to know",
+                "buyers and sellers",
+                "price and approvals",
+                "the effect on customers",
+                "ownership changes",
+                "inside the transaction",
+                "regulatory scrutiny",
+                "companies involved",
+                "questions from investors",
+                "next steps",
+                "the offer explained",
+                "a closer look",
+            ][angle % 13]
+        );
+    }
+    if let Some(package) = q.strip_suffix(" package") {
+        return format!(
+            "Using {}: {}",
+            proper(package),
+            [
+                "installation and usage",
+                "reading JSON Lines",
+                "getting started",
+                "Python compatibility",
+                "API reference",
+                "project setup",
+                "parsing files",
+                "iterators",
+                "common questions",
+                "release notes",
+                "large files",
+                "dependencies",
+                "configuration",
+            ][angle % 13]
+        );
     }
     if q.contains(" vs ") {
         return format!(
@@ -967,24 +1109,6 @@ fn title_pattern(seed: &Seed, query: &str, host: &str, angle: usize, original: &
             "Moving a Cactus: Tools That Protect Your Hands",
             "Choosing the Right Pot for a Cactus",
             "Cactus Repotting Mistakes to Avoid",
-        ][angle % 13])
-            .to_owned();
-    }
-    if q.contains("coffee") {
-        return ([
-            "Caffeine Before Exercise: Benefits and Side Effects",
-            "Coffee Before Running: How Much Is Too Much?",
-            "Should You Drink Coffee Before a Run?",
-            "Coffee and Running: Timing, Tolerance and Stomach Upset",
-            "A Runner’s Guide to Pre-Run Coffee",
-            "Why Coffee Can Upset Your Stomach Before Exercise",
-            "Caffeine, Hydration and Your Morning Run",
-            "Coffee Before a Workout: What to Consider",
-            "Does anyone else get stomach cramps after pre-run coffee?",
-            "Coffee and Fitness: Finding a Routine That Suits You",
-            "How Much Caffeine Is in Your Pre-Run Drink?",
-            "Feeling Shaky After Coffee and Exercise?",
-            "Evening Runs: Caffeine and Sleep",
         ][angle % 13])
             .to_owned();
     }
@@ -1474,18 +1598,335 @@ fn subject_facts(subject: &str) -> Option<[&'static str; 5]> {
     )
 }
 
+fn question_copy(query: &str) -> Option<([&'static str; 13], [&'static str; 13])> {
+    let q = query.to_lowercase();
+    if q.contains("egg") && (q.contains("boil") || q.contains("cook")) {
+        Some((
+            [
+                "How to Boil Eggs: Soft, Jammy and Hard",
+                "Boiled Eggs with Runny Yolks",
+                "The Science of Perfect Boiled Eggs",
+                "Easy Hard-Boiled Eggs",
+                "Soft-Boiled Eggs for Toast",
+                "Perfect Boiled Eggs Every Time",
+                "A Better Way to Peel Boiled Eggs",
+                "Six-Minute Eggs for Breakfast",
+                "Boiled Eggs: Timing and Temperature",
+                "My Egg Whites Set Before the Yolks Do",
+                "From Soft to Hard: An Egg Timing Guide",
+                "Why an Ice Bath Helps Boiled Eggs",
+                "Cooking Eggs in Gently Simmering Water",
+            ],
+            [
+                "For large eggs lowered into boiling water, allow about 6 minutes for soft yolks, 8 for jammy centers or 10–12 for firm yolks.",
+                "Set a timer as the eggs go into the pan, then lift them straight into cold water when the yolks reach the texture you like.",
+                "Egg whites and yolks set at different temperatures, so the center can remain creamy after the outside has become firm.",
+                "A gentle boil and a cold-water finish give hard-boiled eggs tender whites without a chalky yolk.",
+                "For yolks that run onto toast, lower the eggs into already boiling water and start timing immediately.",
+                "Watch the yolk change from liquid to jammy to fully set as we cut open eggs cooked for different lengths of time.",
+                "Older eggs often peel more easily than very fresh ones, and a cold bath makes them easier to handle.",
+                "A six-minute egg has a delicate white and a flowing center, especially when it goes into the pan straight from the fridge.",
+                "Size, starting temperature and altitude all affect the time heat takes to reach the middle of an egg.",
+                "I tried taking one egg out every minute and found the sweet spot for ramen was earlier than my usual breakfast timing.",
+                "Use the same pan and water level each time, then adjust your next batch by a minute if the first yolk is too soft or too firm.",
+                "Ice water removes heat quickly after cooking, helping prevent a greenish ring around the yolk.",
+                "Keep the eggs covered by water and reduce the heat if they knock against each other hard enough to crack.",
+            ],
+        ))
+    } else if q.contains("sky") && q.contains("blue") {
+        Some((
+            [
+                "Why Is the Sky Blue?",
+                "Why Doesn't the Sky Look Violet?",
+                "Rayleigh Scattering in the Sky",
+                "The Physics Behind a Blue Sky",
+                "Sunlight's Journey Through the Sky",
+                "The Blue Sky Explained with a Simple Experiment",
+                "How Air Gives the Daytime Sky Its Color",
+                "The Sky and the Colors Hidden in Sunlight",
+                "The Blue Sky and Red Sunsets",
+                "Where Does the Sky's Blue Color Come From?",
+                "What Makes the Sky Change Color?",
+                "Seeing a Blue Sky: Light and the Human Eye",
+                "A Sky Full of Scattered Sunlight",
+            ],
+            [
+                "Sunlight contains many colors, but air molecules scatter shorter blue wavelengths more strongly than longer red ones.",
+                "If violet light scatters even more than blue, why do we see blue overhead? Our eyes and the Sun's spectrum both play a part.",
+                "Rayleigh scattering describes the deflection of light by particles much smaller than its wavelength, including molecules in clear air.",
+                "The blue light reaching you from an empty patch of sky has changed direction after interacting with molecules in the atmosphere.",
+                "A beam of sunlight looks white until its component colors take different routes through the air above us.",
+                "Shine a flashlight through diluted milk to see how scattered light can look blue from the side and warmer at the far end.",
+                "On a clear day, scattered blue light arrives from all directions rather than only from the bright disk of the Sun.",
+                "Red, orange, yellow, green and blue travel together in sunlight, though the atmosphere does not scatter them equally.",
+                "At sunset, the longer path through the atmosphere removes much of the blue from the direct beam, leaving warmer colors.",
+                "Blue light scatters above deserts and landlocked cities just as it does over the ocean, so the water is not the source of the color.",
+                "Haze, dust and water droplets can wash out the blue, which is why a humid sky may look pale or nearly white.",
+                "Human color vision is less sensitive to violet, helping explain why strongly scattered short wavelengths appear predominantly blue.",
+                "Above most of the atmosphere, the sky looks black because there are too few molecules to scatter much sunlight toward an observer.",
+            ],
+        ))
+    } else if q.contains("dog") && q.contains("grape") {
+        Some((
+            [
+                "Can Dogs Eat Grapes?",
+                "My Dog Ate Grapes: What Should I Do?",
+                "Grape and Raisin Poisoning in Dogs",
+                "Why Grapes Are Dangerous for Dogs",
+                "Grapes and Dogs: When to Call Your Veterinarian",
+                "Grapes and Other Foods to Keep Away from Dogs",
+                "The Risk of Kidney Injury After Eating Grapes",
+                "Grapes, Raisins and Your Dog's Health",
+                "Recognizing Grape Poisoning in Dogs",
+                "Has Anyone Dealt with a Dog Eating Grapes?",
+                "Preventing Accidental Grape Poisoning in Dogs",
+                "What a Vet Needs to Know After a Dog Eats Grapes",
+                "Fruit Treats and Food Safety for Dogs",
+            ],
+            [
+                "Do not give grapes or raisins to dogs: they can cause acute kidney injury, and there is no reliably safe serving size.",
+                "My dog grabbed a grape off the floor; I called the vet with the time and amount rather than waiting to see if he became ill.",
+                "Grape and raisin ingestion can damage a dog's kidneys, with susceptibility varying enough that a small amount may be dangerous.",
+                "Tartaric acid is implicated in grape toxicity, and its concentration can vary between fruits and products.",
+                "Contact a veterinarian promptly after a dog eats grapes or raisins, even if the animal seems comfortable and alert.",
+                "Raisins in baked goods, trail mix and cereals pose the same concern as fresh grapes, so keep these foods out of reach.",
+                "Kidney injury may develop after the first digestive signs have passed, making early veterinary assessment especially important.",
+                "Dried grapes are not a safer treat: raisins, sultanas and currants made from grapes can all put dogs at risk.",
+                "Vomiting, loss of appetite and lethargy can follow grape ingestion, but an absence of symptoms does not rule out poisoning.",
+                "Our dog got into a bag of raisins, and the clinic wanted to know his weight, the amount missing and when it happened.",
+                "Clear dropped fruit quickly and keep lunchboxes closed so a dog cannot reach grapes while people are distracted.",
+                "Save the packaging and estimate the quantity eaten so your veterinarian can decide what assessment and treatment are needed.",
+                "Ask your vet about suitable fruit treats and do not attempt to induce vomiting unless a veterinary professional instructs you.",
+            ],
+        ))
+    } else if q.contains("vaccin") {
+        Some((
+            [
+                "How Do Vaccines Work?",
+                "What Does Your Immune System Remember After a Vaccine?",
+                "Vaccines and Immune Memory",
+                "How Vaccines Train the Immune System",
+                "Vaccines: From Antigens to Antibodies",
+                "Vaccines Explained: Inside the Immune Response",
+                "Why Some Vaccines Need More Than One Dose",
+                "Vaccines and the Cells That Remember an Infection",
+                "Different Vaccines, a Shared Goal",
+                "Why Does Protection Take Time After Vaccines?",
+                "What Happens After a Vaccine",
+                "Vaccines, Antibodies and Memory Cells",
+                "How Vaccines Help Prevent Disease",
+            ],
+            [
+                "Vaccines show the immune system an antigen, or instructions for making one, so it can recognize a pathogen before a later infection.",
+                "I understand that antibodies can decline, but do the cells that make them remain ready to respond after vaccination?",
+                "Vaccination can establish immune memory through B and T cells that respond more quickly when they encounter the same antigen again.",
+                "A vaccine prepares defenses without requiring you to face the full risks of the disease it is designed to prevent.",
+                "B cells can make antibodies that bind to specific targets, while other immune cells help coordinate and sustain the response.",
+                "Follow an antigen from the injection site to a lymph node, where immune cells begin learning to recognize it.",
+                "Additional doses can strengthen or renew protection, and the schedule depends on the vaccine and the person receiving it.",
+                "Memory cells persist after the initial immune response settles down, allowing a faster response to a familiar threat.",
+                "Protein, inactivated, viral-vector and mRNA vaccines deliver their lessons differently, but each aims to build useful immune recognition.",
+                "The immune response develops over days and weeks, so a person is not fully protected immediately after receiving a dose.",
+                "Soreness or a mild fever can accompany immune activation, although the absence of side effects does not mean a vaccine failed.",
+                "Antibody levels are only one part of protection, since cellular responses and immune memory also matter.",
+                "Vaccination reduces the risk of illness or severe disease, though the degree and duration of protection differ among infections.",
+            ],
+        ))
+    } else if q.contains("swallow") && q.contains("gum") {
+        Some((
+            [
+                "Does Swallowed Gum Really Stay in Your Stomach?",
+                "I Accidentally Swallowed My Chewing Gum",
+                "Chewing Gum and Digestion",
+                "The Seven-Year Gum Myth, Explained",
+                "Where Chewing Gum Goes After You Swallow It",
+                "A Piece of Gum's Journey Through Your Body",
+                "Swallowed Gum: When to Seek Medical Advice",
+                "Why Your Body Cannot Digest Gum Base",
+                "Children and Chewing Gum Safety",
+                "Is One Swallowed Piece of Gum a Problem?",
+                "What Happens to Gum in the Digestive Tract?",
+                "Separating Gum Facts from Playground Myths",
+                "Chewing Gum: Ingredients and Digestion",
+            ],
+            [
+                "A swallowed piece of gum usually passes through the digestive tract rather than remaining in the stomach for seven years.",
+                "I swallowed one piece by accident and wondered whether the sticky gum would cling to the inside of my stomach.",
+                "Digestive enzymes can break down some chewing-gum ingredients, but the gum base largely resists digestion.",
+                "The familiar seven-year warning is a myth: intestinal movement carries most swallowed gum onward with other material.",
+                "Gum does not need to dissolve completely to leave the body, just as some other indigestible material passes in stool.",
+                "Follow the route from the esophagus to the intestines to see why swallowed gum does not normally stay put.",
+                "Persistent abdominal pain, vomiting or trouble swallowing deserves medical attention rather than reassurance based only on the gum story.",
+                "Gum base contains materials that digestive enzymes do not readily dismantle, unlike the sugars and flavorings mixed into it.",
+                "Young children should use gum only when they can reliably chew without swallowing it, because choking is a separate risk.",
+                "Accidentally swallowing one small piece differs from repeatedly swallowing large quantities, which can rarely contribute to a blockage.",
+                "The stomach mixes swallowed gum with its contents, then moves it toward the bowel instead of keeping it in a special compartment.",
+                "Stickiness on a shoe does not predict behavior in the gut, where fluids and muscular movement keep material traveling.",
+                "Chewing gum combines a resistant base with sweeteners and softeners, so different ingredients have different digestive fates.",
+            ],
+        ))
+    } else if q.contains("coffee") && q.contains("heart") {
+        Some((
+            [
+                "Coffee and Heart Health: What to Know",
+                "Does Coffee Make Your Heart Race?",
+                "Coffee and the Cardiovascular System",
+                "What Coffee Studies Say About Heart Health",
+                "Coffee, Blood Pressure and Your Daily Cup",
+                "Coffee and Your Heart Explained",
+                "When Coffee Causes Palpitations",
+                "Filtered Coffee and Cholesterol",
+                "Finding a Coffee Habit That Suits Your Heart",
+                "Should I Switch to Decaf Coffee After Palpitations?",
+                "Reading the Research on Coffee and Heart Disease",
+                "How Much Caffeine Is in Your Coffee?",
+                "Coffee, Sleep and Cardiovascular Health",
+            ],
+            [
+                "Moderate coffee intake is not generally linked to higher heart disease risk, but caffeine sensitivity and existing conditions can change the advice.",
+                "Caffeine can make some people notice a racing or pounding heartbeat, particularly after a larger serving than usual.",
+                "Caffeine stimulates the nervous system and can temporarily raise blood pressure, with effects that vary among individuals.",
+                "Many coffee studies observe people's habits, making it difficult to separate the drink itself from diet, smoking and other influences.",
+                "If you have high blood pressure, ask your clinician whether your usual caffeine intake affects your readings.",
+                "A cup contains more than caffeine, and preparation method, portion size and added ingredients all shape the health picture.",
+                "New or persistent palpitations need assessment, especially with chest pain, breathlessness or fainting, rather than simply blaming coffee.",
+                "Unfiltered coffee contains compounds that can raise LDL cholesterol, while paper filters remove much of these substances.",
+                "Pay attention to jitteriness, sleep and the total caffeine from tea, energy drinks and medicines as well as coffee.",
+                "I noticed a fluttering heartbeat after my afternoon cup and want to discuss whether decaf would be a better choice with my doctor.",
+                "An association between coffee drinking and lower disease rates does not prove that starting coffee will protect an individual's heart.",
+                "A large cafe drink may contain far more caffeine than a small home-brewed cup, so cup counts can be misleading.",
+                "Late-day caffeine can disrupt sleep, an indirect consideration for people trying to improve their overall heart health.",
+            ],
+        ))
+    } else {
+        None
+    }
+}
+
 fn factual_article(query: &str, host: &str, angle: usize, facts: [String; 5]) -> Article {
     let first = angle % facts.len();
     let second = (first + 1 + angle / facts.len() % (facts.len() - 1)) % facts.len();
-    let kind = site_profile(host).kind;
-    let lead = match kind.as_str() {
-        "forum" => format!(
-            "From the discussion, {}; {}.",
-            lower_first(&facts[first]),
-            lower_first(&facts[second])
-        ),
-        "qa" => format!("{} — {}.", facts[first], lower_first(&facts[second])),
-        _ => format!("{}; {}.", facts[first], lower_first(&facts[second])),
+    let lead = if Question::parse(query).is_none() {
+        let kind = site_profile(host).kind;
+        match kind.as_str() {
+            "forum" => format!(
+                "From the discussion, {}; {}.",
+                lower_first(&facts[first]),
+                lower_first(&facts[second])
+            ),
+            "qa" => format!("{} — {}.", facts[first], lower_first(&facts[second])),
+            _ => format!("{}; {}.", facts[first], lower_first(&facts[second])),
+        }
+    } else if angle < facts.len() {
+        format!("{}.", facts[angle])
+    } else {
+        let question = Question::parse(query);
+        let subject = question.as_ref().map_or(query, |q| q.subject.as_str());
+        let lines = match question.as_ref().map(|q| q.shape) {
+            Some("duration") => [
+                format!(
+                    "Time {subject} from a clearly defined starting point so you can repeat the result next time."
+                ),
+                format!(
+                    "The outside and center of {subject} may reach the desired condition at different times."
+                ),
+                format!(
+                    "A timer is useful for {subject}, but checking the result tells you whether to stop."
+                ),
+                format!(
+                    "Compare a small batch of {subject} with a larger one before assuming the same timing will work."
+                ),
+                format!(
+                    "Starting with cold rather than warm {subject} can change the time required."
+                ),
+                format!(
+                    "Keep notes on {subject} and the conditions so you can adjust your next attempt."
+                ),
+                format!(
+                    "Allow time for preparing {subject} as well as the main task when planning your day."
+                ),
+                format!(
+                    "Look for a change in {subject} rather than relying on a single time estimate."
+                ),
+            ],
+            Some("amount" | "count") => [
+                format!(
+                    "Before measuring {subject}, decide whether the quantity refers to the whole batch or one serving."
+                ),
+                format!(
+                    "A count of {subject} needs a definition of what is included and what is left out."
+                ),
+                format!(
+                    "Small differences in the size of {subject} can add up when quantities are scaled."
+                ),
+                format!(
+                    "Use a written calculation for {subject} so that units remain consistent throughout."
+                ),
+                format!(
+                    "Round quantities of {subject} only after the calculation rather than at every step."
+                ),
+                format!(
+                    "An estimate of {subject} is more useful when the assumptions are given alongside it."
+                ),
+                format!("Compare like quantities of {subject}, separating a rate from a total."),
+                format!(
+                    "Check the scale of {subject} before applying a quantity from a different situation."
+                ),
+            ],
+            Some("frequency" | "timing") => [
+                format!(
+                    "For {subject}, a change in conditions can be a better cue than the calendar alone."
+                ),
+                format!(
+                    "Check the recent history of {subject} before deciding whether to repeat the task."
+                ),
+                format!(
+                    "Regular observation of {subject} helps distinguish gradual change from a sudden problem."
+                ),
+                format!(
+                    "Keep the care schedule for {subject} flexible enough to account for seasonal conditions."
+                ),
+                format!(
+                    "Inspect {subject} between routine appointments so a developing problem is noticed early."
+                ),
+                format!(
+                    "A new schedule for {subject} should account for age and condition as well as elapsed time."
+                ),
+                format!(
+                    "Compare the instructions for your particular type of {subject} before adopting someone else's routine."
+                ),
+                format!(
+                    "Make a note when caring for {subject} so the next interval starts from a known date."
+                ),
+            ],
+            _ => [
+                format!(
+                    "To understand {subject}, separate the underlying mechanism from the conditions that make it noticeable."
+                ),
+                format!(
+                    "A useful explanation of {subject} connects what can be observed with what is happening underneath."
+                ),
+                format!(
+                    "Changes in {subject} may have more than one contributing cause rather than a single trigger."
+                ),
+                format!(
+                    "Compare {subject} under similar conditions before attributing a difference to one factor."
+                ),
+                format!(
+                    "An everyday description of {subject} can leave out exceptions that matter in a closer explanation."
+                ),
+                format!(
+                    "The sequence of events matters when deciding which changes in {subject} are causes and which are consequences."
+                ),
+                format!(
+                    "Look at {subject} on both a small and a large scale to understand why the effects can differ."
+                ),
+                format!(
+                    "Distinguish a general explanation of {subject} from a prediction about one particular situation."
+                ),
+            ],
+        };
+        lines[(angle - facts.len()) % lines.len()].clone()
     };
     Article {
         title: query.to_owned(),
@@ -1502,7 +1943,28 @@ fn factual_article(query: &str, host: &str, angle: usize, facts: [String; 5]) ->
 fn question_article(query: &str, host: &str, angle: usize, question: &Question) -> Article {
     let subject = &question.subject;
     let q = query.to_lowercase();
-    let facts: [String; 5] = if matches!(question.shape, "amount" | "count") {
+    let facts: [String; 5] = if question.shape == "history" && q.contains("telephone") {
+        [
+            "Alexander Graham Bell received a US patent for the telephone in 1876",
+            "Elisha Gray filed a telephone caveat on the same day as Bell's patent application",
+            "Antonio Meucci developed earlier devices for transmitting speech electrically",
+            "The first telephone designs differed from the networks that later connected homes",
+            "Credit for the telephone involves several inventors and distinct technical milestones",
+        ]
+        .map(str::to_owned)
+    } else if question.shape == "history" {
+        [
+            format!(
+                "The history of {subject} distinguishes an early discovery from its later practical use"
+            ),
+            format!("Contemporary documents help establish the timeline of {subject}"),
+            format!("Accounts of {subject} can credit different people for different milestones"),
+            format!("The development of {subject} continued after its first public description"),
+            format!(
+                "A precise date for {subject} needs a clear definition of the event being dated"
+            ),
+        ]
+    } else if matches!(question.shape, "amount" | "count") {
         if q.contains("water")
             && ["plant", "tomato", "fern", "rose"]
                 .iter()
@@ -2296,6 +2758,96 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
         .to_lowercase();
     let n = angle % 10;
     let choose = |items: &[&str]| items[n % items.len()].to_owned();
+    if let Some((_, leads)) = question_copy(subject) {
+        let mut article = topic_article(seed, subject, host, angle);
+        article.lead = leads[angle % leads.len()].to_owned();
+        let q = subject.to_lowercase();
+        let (detail, tip, question) = if q.contains("egg") {
+            (
+                "Bring enough water to a boil to cover the eggs. Lower them in with a spoon, reduce to a steady simmer and keep the timer running from the moment they enter the water.",
+                "Transfer the eggs to a bowl of cold water when the timer sounds. For a larger or smaller egg, adjust the next batch after checking one yolk.",
+                "Should I time my eggs from cold water or wait until the water boils?",
+            )
+        } else if q.contains("sky") {
+            (
+                "The scattering strength rises sharply as wavelength falls. This favors blue over red in the light sent sideways, while the direct Sun can look redder when its light travels through a long stretch of atmosphere.",
+                "Clouds look white because their larger water droplets scatter a broad range of visible wavelengths much more evenly than individual air molecules do.",
+                "If shorter wavelengths scatter more, why isn't the sky violet?",
+            )
+        } else if q.contains("grape") {
+            (
+                "Call your veterinarian or an animal poison service immediately with your dog's weight, the food involved and the likely time of ingestion. Treatment decisions depend on those details and may include monitoring kidney function.",
+                "Move the remaining fruit out of reach while you make the call. Do not give a home treatment or try to make the dog vomit without professional instructions.",
+                "Does my dog need treatment even if there are no symptoms yet?",
+            )
+        } else if q.contains("vaccin") {
+            (
+                "Antigen-presenting cells help activate lymphocytes that recognize the vaccine's target. Some of these cells become long-lived memory cells, ready to multiply and respond when that target appears again.",
+                "Immune protection is specific to the disease and can change over time, which is why vaccination schedules and booster recommendations differ.",
+                "Can immune memory remain after antibody levels fall?",
+            )
+        } else if q.contains("gum") {
+            (
+                "The gut moves food and indigestible material along by muscular contractions. Gum base is not broken down like starch, but it usually travels through the bowel and leaves in stool.",
+                "Repeatedly swallowing gum, particularly in large amounts or along with other objects, is a different situation from one accidental piece.",
+                "How can gum leave the body if the stomach cannot digest it?",
+            )
+        } else {
+            (
+                "Individual responses to caffeine vary with dose, medicines and health conditions. People who notice palpitations or changes in blood pressure can discuss their intake with a clinician rather than assuming a population study applies to them.",
+                "Try keeping track of serving sizes and symptoms, including the timing of other caffeinated drinks, to make that conversation more useful.",
+                "Does changing to decaf affect palpitations after coffee?",
+            )
+        };
+        if q.contains("egg") {
+            article.steps = vec![
+                "Bring a pan of water to a boil, using enough water to cover the eggs.".into(),
+                "Lower the eggs carefully into the pan and start the timer.".into(),
+                "Simmer for 6 minutes for soft yolks, 8 for jammy centers or 10–12 for hard-boiled eggs.".into(),
+                "Lift the eggs into cold water before peeling and serving.".into(),
+            ];
+        }
+        article.detail = detail.into();
+        article.tip = tip.into();
+        article.question = question;
+        article.reply = detail;
+        if matches!(kind, "news" | "blog") {
+            let (background, note) = if q.contains("egg") {
+                (
+                    "Heat travels inward through an egg, setting the white before it reaches the yolk's center. That delay creates the range from a flowing middle to a fully firm yolk, even though the water stays close to the same temperature.",
+                    "Compare eggs from the same carton when adjusting a cooking method. A change in size or a colder starting point can shift the result even with an identical timer setting.",
+                )
+            } else if q.contains("sky") {
+                (
+                    "A molecule redirects only a tiny fraction of the light passing it, but the atmosphere contains an enormous number of molecules. Together they send short-wavelength light across the observer's field of view, giving clear air its familiar blue appearance.",
+                    "The effect depends on the light's route as well as its wavelength. Looking toward the horizon means looking through more air than looking straight overhead.",
+                )
+            } else if q.contains("grape") {
+                (
+                    "Grape poisoning does not follow a dependable fruit-count rule. The amount of the toxic components varies, and dogs differ in their response, so an apparently small exposure cannot be dismissed on that basis alone.",
+                    "Prevention includes foods with dried grapes mixed into them. A closed packet or a high shelf is more reliable protection than expecting a dog to avoid a human snack.",
+                )
+            } else if q.contains("vaccin") {
+                (
+                    "The first encounter with a new antigen starts a selection process among immune cells. Cells that recognize the target multiply, and some remain after the immediate response has faded, providing a head start during a later encounter.",
+                    "Immune memory helps explain both the value of vaccination and the need for different schedules. Protection can weaken or a pathogen can change, so one dose does not always provide lifelong protection.",
+                )
+            } else if q.contains("gum") {
+                (
+                    "Digestion and passage through the intestine are different processes. Enzymes dismantle food molecules, while muscles move the gut's contents along, so a material can resist digestion without being trapped inside the body.",
+                    "The everyday accident behind the myth is one swallowed piece. Large quantities or swallowing other objects introduce different risks and should not be treated as the same situation.",
+                )
+            } else {
+                (
+                    "Cup size makes coffee intake surprisingly hard to compare. Brewing method and the amount of ground coffee also change the caffeine delivered, while decaf usually retains a small amount rather than containing none at all.",
+                    "Research on long-term coffee habits asks a different question from an individual's immediate response to caffeine. Population averages cannot tell someone why a new episode of chest discomfort or palpitations occurred.",
+                )
+            };
+            article.detail = background.into();
+            article.tip = note.into();
+        }
+        return article;
+    }
     if kind == "wiki" {
         let facts = if lower.contains("sourdough") {
             Some([
@@ -2849,6 +3401,13 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
             "A JavaScript promise must settle before its result can be used.",
             "JavaScript promises represent work that can finish later.",
             "A JavaScript error path should reject rather than leave a promise pending.",
+            "Returning a JavaScript promise lets the caller wait for the operation.",
+            "An async JavaScript function always returns a promise.",
+            "A thrown error inside an async function rejects its returned JavaScript promise.",
+            "JavaScript's Promise.all rejects when one of its input promises rejects.",
+            "A missing resolve call can leave a JavaScript promise waiting indefinitely.",
+            "Use a catch handler to observe a rejected JavaScript promise.",
+            "JavaScript awaits the value of a promise without blocking the entire event loop.",
         ])
     } else if lower.contains("python") && !lower.contains("groupby") && !lower.contains("itertools")
     {
@@ -2856,6 +3415,13 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
             "Python sequence indexes start at zero and stop before the length.",
             "Python iteration avoids indexing past the end of a sequence.",
             "A Python empty list has no first element to select.",
+            "Negative Python indexes count backward from the end of a sequence.",
+            "Python raises IndexError when an index falls outside a sequence's bounds.",
+            "A Python slice can stop beyond the end without raising an index error.",
+            "Check the length of a Python list before selecting an element by position.",
+            "Python's enumerate pairs each item with its position during iteration.",
+            "Removing Python list items while indexing can change the positions that remain.",
+            "Nested Python lists can have different lengths in each row.",
         ])
     } else {
         choose(leads)
@@ -3084,6 +3650,16 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     }
 }
 
+fn title_slug(title: &str) -> String {
+    heading(title)
+        .to_lowercase()
+        .replace(['\'', '’'], "")
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 fn result_path(seed: &Seed, host: &str, slug: &str, kind: &str) -> String {
     let id = 100_000 + hash(&format!("{host}/{slug}")) % 900_000;
     match host {
@@ -3144,9 +3720,30 @@ fn result_path(seed: &Seed, host: &str, slug: &str, kind: &str) -> String {
         "www.gardenersworld.com" => format!("how-to/grow-plants/{slug}/"),
         "www.instructables.com" => format!("id/{slug}/"),
         "en.wikipedia.org" => format!("wiki/{}", upper_first(&slug.replace('-', "_"))),
+        "www.nhs.uk" if slug.contains("vaccin") => format!("conditions/vaccinations/{slug}/"),
         "www.nhs.uk" => format!("live-well/exercise/{slug}/"),
+        "www.cdc.gov" => format!("vaccines/basics/{slug}.html"),
+        "www.who.int" => format!("news-room/feature-stories/detail/{slug}"),
+        "www.immunology.org" => format!("public-information/{slug}"),
+        "www.chop.edu" => format!("vaccine-education-center/{slug}"),
+        "www.petmd.com" => format!("dog/nutrition/{slug}"),
+        "www.vcahospitals.com" => format!("know-your-pet/{slug}"),
+        "www.akc.org" => format!("expert-advice/nutrition/{slug}/"),
+        "www.vet.cornell.edu" => format!(
+            "departments-centers-and-institutes/cornell-richard-p-riney-canine-health-center/canine-health-information/{slug}"
+        ),
+        "www.merckvetmanual.com" => format!("toxicology/food-hazards/{slug}"),
+        "www.pdsa.org.uk" => format!("pet-help-and-advice/pet-health-hub/conditions/{slug}"),
+        "www.bluecross.org.uk" => format!("advice/dog/health-and-injuries/{slug}"),
+        "www.bhf.org.uk" => format!("informationsupport/heart-matters-magazine/nutrition/{slug}"),
+        "www.heart.org" => format!("en/healthy-living/healthy-eating/{slug}"),
+        "www.health.harvard.edu" => format!("heart-health/{slug}"),
+        "www.mayoclinic.org" if slug.contains("coffee") => {
+            format!("healthy-lifestyle/nutrition-and-healthy-eating/expert-answers/{slug}/faq-{id}")
+        }
         "www.mayoclinic.org" => format!("healthy-lifestyle/fitness/in-depth/{slug}/art-{id}"),
         "www.webmd.com" => format!("fitness-exercise/{slug}"),
+        "www.healthline.com" if slug.contains("coffee") => format!("nutrition/{slug}"),
         "www.healthline.com" => format!("health/fitness/{slug}"),
         "www.runnersworld.com" => format!("nutrition-weight-loss/a{id}/{slug}/"),
         "health.clevelandclinic.org" => format!("health/{slug}"),
@@ -3247,13 +3844,6 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             ..Result::default()
         };
         if relevant(&candidate, query) && !known.iter().any(|r| target_of(&r.url).0 == site.host) {
-            let slug = words(query)
-                .into_iter()
-                .take(6)
-                .collect::<Vec<_>>()
-                .join("-");
-            let path = result_path(seed, &site.host, &slug, &site_profile(&site.host).kind);
-            let url = format!("https://{}/{path}", site.host);
             let article = article(
                 seed,
                 query,
@@ -3261,9 +3851,27 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
                 &site_profile(&site.host).kind,
                 site_index,
             );
+            let category = query.to_lowercase().ends_with(" acquisition")
+                || query.to_lowercase().ends_with(" package");
+            let title = if category {
+                title_pattern(seed, query, &site.host, site_index, &article.title)
+            } else {
+                article.title
+            };
+            let slug = if category {
+                title_slug(&title)
+            } else {
+                words(query)
+                    .into_iter()
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .join("-")
+            };
+            let path = result_path(seed, &site.host, &slug, &site_profile(&site.host).kind);
+            let url = format!("https://{}/{path}", site.host);
             add(
                 url.clone(),
-                article.title,
+                title,
                 excerpt(&article.lead),
                 short_date(date_for(seed, &url, 30)),
             );
@@ -3295,7 +3903,9 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         ]
         .contains(&w.as_str())
     });
-    let code = terms.iter().any(|w| {
+    let code_terms =
+        Question::parse(query).map_or_else(|| terms.clone(), |question| words(&question.subject));
+    let code = code_terms.iter().any(|w| {
         [
             "python",
             "rust",
@@ -3381,7 +3991,61 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
     ]
     .iter()
     .any(|w| lower_query.contains(w));
-    let candidates: &[&str] = if weather {
+    let candidates: &[&str] = if lower_query.contains("dog") && lower_query.contains("grape") {
+        &[
+            "www.petmd.com",
+            "www.reddit.com",
+            "www.vcahospitals.com",
+            "www.akc.org",
+            "www.vet.cornell.edu",
+            "www.youtube.com",
+            "www.merckvetmanual.com",
+            "www.pdsa.org.uk",
+            "www.bluecross.org.uk",
+            "ask.metafilter.com",
+        ]
+    } else if lower_query.contains("vaccin") && intent == "question" {
+        &[
+            "www.cdc.gov",
+            "www.reddit.com",
+            "www.who.int",
+            "www.nhs.uk",
+            "www.immunology.org",
+            "www.youtube.com",
+            "www.chop.edu",
+            "www.britannica.com",
+            "health.clevelandclinic.org",
+            "ask.metafilter.com",
+        ]
+    } else if lower_query.contains("coffee") && lower_query.contains("heart") {
+        &[
+            "health.clevelandclinic.org",
+            "www.reddit.com",
+            "www.britannica.com",
+            "www.health.harvard.edu",
+            "www.bhf.org.uk",
+            "www.youtube.com",
+            "www.mayoclinic.org",
+            "www.healthline.com",
+            "www.heart.org",
+            "ask.metafilter.com",
+        ]
+    } else if lower_query.contains("egg")
+        && (lower_query.contains("boil") || lower_query.contains("cook"))
+    {
+        &[
+            "www.bbcgoodfood.com",
+            "www.simplyrecipes.com",
+            "www.seriouseats.com",
+            "www.allrecipes.com",
+            "www.epicurious.com",
+            "www.foodnetwork.com",
+            "www.bonappetit.com",
+            "www.delish.com",
+            "www.thekitchn.com",
+            "www.reddit.com",
+        ]
+    } else if weather {
         &[
             "www.metoffice.gov.uk",
             "www.bbc.com",
@@ -3832,7 +4496,14 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
                 },
         );
         let title = proper(&result_title(seed, query, host, angle, &article.title));
-        let slug = terms.join("-");
+        let slug = if Question::parse(query).is_some()
+            || lower_query.ends_with(" acquisition")
+            || lower_query.ends_with(" package")
+        {
+            title_slug(&title)
+        } else {
+            terms.join("-")
+        };
         let path = match host {
             "www.reddit.com" => format!(
                 "r/{}/comments/{}/{slug}/",
@@ -3881,8 +4552,8 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             ),
             "www.wikihow.com" => format!(
                 "Guide/{}",
-                subject
-                    .split_whitespace()
+                title_slug(&title)
+                    .split('-')
                     .map(capitalize)
                     .collect::<Vec<_>>()
                     .join("-")
@@ -4131,6 +4802,20 @@ pub fn site_profile(host: &str) -> Profile {
         "www.self.com" => "SELF",
         "www.nutrition.org.uk" => "British Nutrition Foundation",
         "www.parktool.com" => "Park Tool",
+        "www.cdc.gov" => "CDC",
+        "www.who.int" => "WHO",
+        "www.immunology.org" => "British Society for Immunology",
+        "www.chop.edu" => "Children's Hospital of Philadelphia",
+        "www.akc.org" => "American Kennel Club",
+        "www.vet.cornell.edu" => "Cornell University College of Veterinary Medicine",
+        "www.merckvetmanual.com" => "Merck Veterinary Manual",
+        "www.pdsa.org.uk" => "PDSA",
+        "www.bluecross.org.uk" => "Blue Cross",
+        "www.bhf.org.uk" => "British Heart Foundation",
+        "www.heart.org" => "American Heart Association",
+        "www.health.harvard.edu" => "Harvard Health Publishing",
+        "www.mentalfloss.com" => "Mental Floss",
+        "www.discovermagazine.com" => "Discover",
         "www.petmd.com" => "PetMD",
         "www.vcahospitals.com" => "VCA Animal Hospitals",
         "www.history.com" => "HISTORY",
@@ -4339,6 +5024,18 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.ifixit.com"
             | "www.parktool.com"
             | "www.petmd.com"
+            | "www.cdc.gov"
+            | "www.who.int"
+            | "www.immunology.org"
+            | "www.chop.edu"
+            | "www.akc.org"
+            | "www.vet.cornell.edu"
+            | "www.merckvetmanual.com"
+            | "www.pdsa.org.uk"
+            | "www.bluecross.org.uk"
+            | "www.bhf.org.uk"
+            | "www.heart.org"
+            | "www.health.harvard.edu"
             | "www.vcahospitals.com"
             | "www.nhs.uk"
             | "www.mayoclinic.org"
@@ -5188,7 +5885,25 @@ pub fn page(
         page.date = seed.date.clone();
         return page;
     }
-    let article = article(seed, subject, host, kind, voice(host));
+    let angle = mentions
+        .iter()
+        .find_map(|mention| mention["query"].as_str())
+        .filter(|query| Question::parse(query).is_some())
+        .and_then(|query| {
+            (0..13).find(|angle| {
+                let matching_lead = snippets.is_empty()
+                    || snippets.iter().any(|snippet| {
+                        let lead = list_lead(query, *angle)
+                            .unwrap_or_else(|| article(seed, query, host, kind, *angle).lead);
+                        *snippet == excerpt(&lead)
+                    });
+                matching_lead
+                    && heading(&title_pattern(seed, query, host, *angle, &title))
+                        .eq_ignore_ascii_case(heading(&title))
+            })
+        })
+        .unwrap_or_else(|| voice(host));
+    let article = article(seed, subject, host, kind, angle);
     let lead = if claims.is_empty() {
         article.lead.clone()
     } else {
@@ -5227,7 +5942,9 @@ pub fn page(
         .iter()
         .map(|s| format!("<li>{}</li>", escape(s)))
         .collect::<String>();
-    let reference = if article.example.is_empty() {
+    let reference = if Question::parse(subject).is_some() && article.example.is_empty() {
+        String::new()
+    } else if article.example.is_empty() {
         let (term, value) = if title.to_lowercase().contains("router") {
             (
                 "Restart",
@@ -5337,6 +6054,8 @@ pub fn page(
     };
     let method_title = if intent(subject) == "health" {
         "What to consider"
+    } else if subject.to_lowercase().contains("egg") {
+        "Method"
     } else if subject.to_lowercase().contains("repot") {
         "Repotting steps"
     } else {
@@ -5425,9 +6144,11 @@ pub fn page(
                 })
             };
             if kind == "qa" {
-                let tags = words(subject)
+                let tag_subject = Question::parse(subject)
+                    .map_or_else(|| subject.to_owned(), |question| question.subject);
+                let tags = words(&tag_subject)
                     .into_iter()
-                    .filter(|w| w.len() > 3)
+                    .filter(|w| w.len() > 2)
                     .take(3)
                     .map(|w| format!("<span>{}</span>", escape(&w)))
                     .collect::<String>();
@@ -5452,9 +6173,21 @@ pub fn page(
         "marketplace" => {
             format!("<h1>{t}</h1>{content}<h2>Compare used cars</h2><ol>{method}</ol><p>{tip}</p>")
         }
-        "howto" => format!(
-            "<h1>{t}</h1>{content}<h2>{method_title}</h2><ol>{method}</ol>{sample}<h2>What to check next</h2><p>{tip}</p>"
-        ),
+        "howto" => {
+            let method_section = if steps.is_empty() {
+                String::new()
+            } else {
+                format!("<h2>{method_title}</h2><ol>{method}</ol>")
+            };
+            let next_heading = if Question::parse(subject).is_some() {
+                "What to remember"
+            } else {
+                "What to check next"
+            };
+            format!(
+                "<h1>{t}</h1>{content}{method_section}{sample}<h2>{next_heading}</h2><p>{tip}</p>"
+            )
+        }
         "listings" => format!(
             "<h1>{t}</h1>{content}<section class=\"restaurant-list\"><h2>Before you book</h2><ol>{method}</ol></section><p>{tip}</p>"
         ),
@@ -5516,8 +6249,13 @@ pub fn page(
                     escape(&quote)
                 )
             };
+            let next_heading = if Question::parse(subject).is_some() {
+                "What to remember"
+            } else {
+                "What happens next"
+            };
             format!(
-                "<h1>{t}</h1><p class=\"byline\">By {} · <time datetime=\"{date}\">{when}</time></p>{lead_html}<p>{detail}</p>{quoted}<h2>What happens next</h2><p>{next}</p>",
+                "<h1>{t}</h1><p class=\"byline\">By {} · <time datetime=\"{date}\">{when}</time></p>{lead_html}<p>{detail}</p>{quoted}<h2>{next_heading}</h2><p>{next}</p>",
                 pick(&AUTHORS, 0)
             )
         }
@@ -5525,7 +6263,7 @@ pub fn page(
     if !article.example.is_empty() && !body.contains("<code>") {
         body.push_str(&format!("<h2>Example</h2>{reference}"));
     }
-    if matches!(kind, "news" | "blog") {
+    if matches!(kind, "news" | "blog") && Question::parse(subject).is_none() {
         let slug = target.split('?').next().unwrap_or(target).trim_matches('/');
         if !slug.ends_with("-what-we-know") {
             body.push_str(&format!(
@@ -5604,7 +6342,42 @@ mod tests {
             "when should I prune roses",
             "when should you harvest potatoes",
             "when should you replace a car battery",
+            "how long to boil an egg",
+            "why is the sky blue",
+            "how do vaccines work",
+            "what happens if you swallow gum",
+            "is coffee bad for your heart",
+            "how long does paint take to dry",
+            "how long to rest bread dough",
+            "how much water does a cactus need",
+            "how many hours do dogs sleep",
+            "how often should I wash wool",
+            "why does iron rust",
+            "why are leaves green",
+            "why do tides change",
+            "what happens if you heat ice",
+            "what happens if you mix oil and water",
+            "when should I plant tulips",
+            "when do swallows migrate",
+            "can penguins fly",
+            "can bees see colors",
+            "can you recycle glass",
+            "should I insulate the attic",
+            "should you wash mushrooms",
+            "is bamboo a grass",
+            "are tomatoes fruits",
+            "does salt melt ice",
+            "do fish sleep",
+            "how does a compass work",
+            "how do solar eclipses happen",
+            "how can birds navigate",
+            "who discovered penicillin",
+            "when was paper invented",
+            "why do onions make you cry",
+            "how long can turtles live",
+            "how many legs does a spider have",
         ];
+        assert!(questions.len() >= 60);
         let mut queries = fresh.iter().map(|q| (*q).to_owned()).collect::<Vec<_>>();
         for subject in [
             "washing machine",
@@ -5686,238 +6459,297 @@ mod tests {
         queries.extend(questions.map(str::to_owned));
         assert!(queries.len() >= 110);
         let sentence_end = Regex::new(r"[.!?]+(?:\s+|$)").unwrap();
+        let clause_end = Regex::new(r"(?:[.!?]+(?:\s+|$)|;\s*)").unwrap();
         let acronym = Regex::new(r"(?i)\b(?:[a-z]+[’'][a-z]+|[b-z]|ssl|vpn|nhs|usb|http|css|sql|api|[a-z]{1,3}-?[0-9][a-z0-9-]*)\b").unwrap();
         let verb = Regex::new(r"(?i)\b(?:is|are|was|were|can|does|do|keeps|won't|slipping|invented|use|repair|turn)\b").unwrap();
         for query in queries {
             for engine in [Engine::Google, Engine::Bing, Engine::DuckDuckGo] {
-                let list = if engine == Engine::Google {
-                    search(&seed, &query, &[], engine)
-                } else {
-                    for_engine(
+                let mut lists = vec![search(&seed, &query, &[], engine)];
+                if engine != Engine::Google {
+                    lists.push(for_engine(
                         &seed,
                         &query,
                         search(&seed, &query, &[], Engine::Google),
                         engine,
-                    )
-                };
-                assert!(list.results.len() >= 7, "{query}: {engine:?}");
-                let audit = example_common::guest_content::Audit::default();
-                audit.inspect(
-                    "search list",
-                    fictionet_extras::search::render(engine, &query, &list, 0).as_bytes(),
-                );
-                let mut titles = BTreeSet::new();
-                let mut snippets = BTreeSet::new();
-                let mut labels = BTreeSet::new();
-                let dump = fresh.contains(&query.as_str()) && engine != Engine::DuckDuckGo;
-                if dump {
-                    eprintln!("OUTPUT {engine:?}: {query}");
+                    ));
                 }
-                for (rank, result) in list.results.iter().enumerate() {
-                    assert!(
-                        titles.insert(result.title.to_lowercase()),
-                        "{query}: {}",
-                        result.title
+                for list in lists {
+                    assert!(list.results.len() >= 7, "{query}: {engine:?}");
+                    let audit = example_common::guest_content::Audit::default();
+                    audit.inspect(
+                        "search list",
+                        fictionet_extras::search::render(engine, &query, &list, 0).as_bytes(),
                     );
-                    let title_words = result.title.to_lowercase();
-                    let title_words = title_words
-                        .split(|c: char| !c.is_alphanumeric())
-                        .filter(|word| !word.is_empty())
-                        .collect::<Vec<_>>();
-                    for width in 1..=title_words.len() / 2 {
-                        for pair in title_words.windows(width * 2) {
-                            assert_ne!(&pair[..width], &pair[width..], "{query}: {}", result.title);
-                        }
+                    if Question::parse(&query).is_some() {
+                        assert!(
+                            list.results
+                                .iter()
+                                .filter(|result| result
+                                    .title
+                                    .to_lowercase()
+                                    .contains(query.trim_end_matches('?').to_lowercase().as_str()))
+                                .count()
+                                <= 2,
+                            "{query}: {engine:?}"
+                        );
+                        let headings = list
+                            .results
+                            .iter()
+                            .map(|result| heading(&result.title).to_lowercase())
+                            .collect::<BTreeSet<_>>();
+                        assert_eq!(headings.len(), list.results.len(), "{query}: {engine:?}");
                     }
-                    let lower_title = result.title.to_lowercase();
-                    for separator in [":", "|"] {
-                        let segments = lower_title
-                            .split(separator)
-                            .map(str::trim)
+                    let mut titles = BTreeSet::new();
+                    let mut snippets = BTreeSet::new();
+                    let mut clauses = BTreeSet::new();
+                    let mut labels = BTreeSet::new();
+                    let dump = fresh.contains(&query.as_str()) && engine != Engine::DuckDuckGo;
+                    if dump {
+                        eprintln!("OUTPUT {engine:?}: {query}");
+                    }
+                    for (rank, result) in list.results.iter().enumerate() {
+                        assert!(
+                            titles.insert(result.title.to_lowercase()),
+                            "{query}: {}",
+                            result.title
+                        );
+                        let title_words = result.title.to_lowercase();
+                        let title_words = title_words
+                            .split(|c: char| !c.is_alphanumeric())
+                            .filter(|word| !word.is_empty())
                             .collect::<Vec<_>>();
-                        for pair in segments.windows(2) {
-                            assert_ne!(pair[0], pair[1], "{query}: {}", result.title);
+                        for width in 1..=title_words.len() / 2 {
+                            for pair in title_words.windows(width * 2) {
+                                assert_ne!(
+                                    &pair[..width],
+                                    &pair[width..],
+                                    "{query}: {}",
+                                    result.title
+                                );
+                            }
                         }
-                    }
-                    let (host, _) = target_of(&result.url);
-                    if matches!(site_profile(&host).kind.as_str(), "qa" | "forum") {
-                        assert!(!heading(&result.title).contains("?:"), "{}", result.title);
-                    }
-                    let name = site_profile(&host).name.to_lowercase();
-                    assert!(
-                        lower_title.matches(&name).count() <= 1,
-                        "{query}: {}",
-                        result.title
-                    );
-                    if let Some(question) = Question::parse(&query) {
-                        let parts = question.subject.split_whitespace().collect::<Vec<_>>();
-                        assert!(!parts.is_empty(), "{query}");
+                        let lower_title = result.title.to_lowercase();
+                        for separator in [":", "|"] {
+                            let segments = lower_title
+                                .split(separator)
+                                .map(str::trim)
+                                .collect::<Vec<_>>();
+                            for pair in segments.windows(2) {
+                                assert_ne!(pair[0], pair[1], "{query}: {}", result.title);
+                            }
+                        }
+                        let (host, _) = target_of(&result.url);
+                        if matches!(site_profile(&host).kind.as_str(), "qa" | "forum") {
+                            assert!(!heading(&result.title).contains("?:"), "{}", result.title);
+                        }
+                        let name = site_profile(&host).name.to_lowercase();
                         assert!(
-                            !["long", "much", "many", "often"].contains(&parts[0]),
-                            "{query}: {}",
-                            question.subject
-                        );
-                        assert!(
-                            lower_title.starts_with(&query.to_lowercase()),
+                            lower_title.matches(&name).count() <= 1,
                             "{query}: {}",
                             result.title
                         );
-                    }
-                    for filler in [
-                        "an overview connects",
-                        "readers discuss the practical implications",
-                        "this guide to",
-                        "compare the available approaches to",
-                        "a useful answer about",
-                    ] {
-                        assert!(
-                            !result.snippet.to_lowercase().contains(filler),
-                            "{query}: {}",
-                            result.snippet
-                        );
-                    }
-                    let (host, target) = target_of(&result.url);
-                    if host == "www.history.com" {
-                        assert!(target.starts_with("/topics/"), "{}", result.url);
-                        assert_eq!(site_profile(&host).kind, "news");
-                    }
-                    if site_profile(&host).kind == "wiki" && host == "www.britannica.com" {
-                        assert!(target.starts_with("/topic/"), "{}", result.url);
-                    }
-                    if !matches!(site_profile(&host).kind.as_str(), "shop" | "company") {
-                        assert!(!target.starts_with("/products/"), "{}", result.url);
-                    }
-                    if host == "en.wikipedia.org" {
-                        assert!(
-                            !verb.is_match(heading(&result.title)),
-                            "{query}: {}",
-                            result.title
-                        );
-                    }
-                    for token in acronym.find_iter(heading(&result.title)) {
-                        if token.as_str().contains(['\'', '’']) {
-                            let suffix = token.as_str().rsplit(['\'', '’']).next().unwrap();
-                            assert_eq!(suffix, suffix.to_lowercase(), "{query}: {}", result.title);
-                        } else {
-                            assert_eq!(
-                                token.as_str(),
-                                token.as_str().to_uppercase(),
+                        if let Some(question) = Question::parse(&query) {
+                            let parts = question.subject.split_whitespace().collect::<Vec<_>>();
+                            assert!(!parts.is_empty(), "{query}");
+                            assert!(
+                                !["long", "much", "many", "often"].contains(&parts[0]),
+                                "{query}: {}",
+                                question.subject
+                            );
+                            assert!(
+                                words(&question.subject)
+                                    .iter()
+                                    .any(|word| words(&lower_title)
+                                        .iter()
+                                        .any(|title_word| title_word.trim_end_matches('s')
+                                            == word.trim_end_matches('s'))),
                                 "{query}: {}",
                                 result.title
                             );
                         }
-                    }
-                    for banned in [
-                        "questions and answers",
-                        ": what we know",
-                        "the details depend on",
-                        "compare the details",
-                        "related concepts",
-                    ] {
-                        assert!(
-                            !result.title.to_lowercase().contains(banned),
-                            "{query}: {}",
-                            result.title
-                        );
-                        assert!(
-                            !result.snippet.to_lowercase().contains(banned),
-                            "{query}: {}",
-                            result.snippet
-                        );
-                    }
-                    assert!(
-                        result
-                            .snippet
-                            .chars()
-                            .next()
-                            .is_some_and(char::is_uppercase),
-                        "{query}: {}",
-                        result.snippet
-                    );
-                    if let Some((label, _)) = result.snippet.split_once(':') {
-                        assert!(
-                            labels.insert(words(label)),
-                            "{query}: repeated snippet label: {}",
-                            result.snippet
-                        );
-                    }
-                    for sentence in sentence_end
-                        .split(&result.snippet)
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        assert!(
-                            snippets.insert(sentence.trim().to_lowercase()),
-                            "{query}: {engine:?}: {}",
-                            result.snippet
-                        );
-                    }
-                    if dump {
-                        eprintln!(
-                            "OUTPUT {}. {}\nOUTPUT {}\nOUTPUT {}",
-                            rank + 1,
-                            result.title,
-                            result.url,
-                            result.snippet
-                        );
-                    }
-                    if matches!(site_profile(&host).kind.as_str(), "qa" | "forum") {
-                        let made = page(
-                            &seed,
-                            &host,
-                            &target,
-                            &[serde_json::json!({"title":result.title,"query":query})],
-                            &site_profile(&host).kind,
-                            &[],
-                        );
-                        if let Some((_, suffix)) = made.title.split_once('?') {
-                            assert!(suffix.is_empty(), "{}", made.title);
-                        }
-                        assert!(!made.body.contains("?:"), "{}", made.body);
-                    }
-                    if rank >= 3 {
-                        continue;
-                    }
-                    let profile = site_profile(&host);
-                    let made = page_with_known(
-                        &seed,
-                        &host,
-                        &target,
-                        &[
-                            serde_json::json!({"via":"search", "query":query, "title":result.title, "snippet":result.snippet}),
-                        ],
-                        &profile.kind,
-                        &[],
-                        &[],
-                    );
-                    let rendered = super::super::render::page(&host, &profile, &made, &seed.date);
-                    audit.inspect("article", rendered.as_bytes());
-                    let dom = kuchiki::parse_html().one(made.body.clone());
-                    for heading in dom.select("h1,h2,h3").unwrap() {
-                        let text = heading.text_contents().to_lowercase();
-                        assert!(
-                            !text.contains("questions and answers")
-                                && !text.contains(": what we know"),
-                            "{query}: {text}"
-                        );
-                    }
-                    let mut sentences = BTreeSet::new();
-                    for paragraph in dom.select("p,li,dd,blockquote").unwrap() {
-                        let text = paragraph.text_contents();
-                        for sentence in sentence_end.split(&text).filter(|s| !s.trim().is_empty()) {
+                        for filler in [
+                            "an overview connects",
+                            "readers discuss the practical implications",
+                            "this guide to",
+                            "compare the available approaches to",
+                            "a useful answer about",
+                        ] {
                             assert!(
-                                sentences.insert(sentence.trim().to_lowercase()),
-                                "{query}: {engine:?}: {}: {sentence}",
+                                !result.snippet.to_lowercase().contains(filler),
+                                "{query}: {}",
+                                result.snippet
+                            );
+                        }
+                        let (host, target) = target_of(&result.url);
+                        if Question::parse(&query).is_some() {
+                            let fragment = words(&query).join("-");
+                            assert!(
+                                !target
+                                    .split(['/', '?', '#'])
+                                    .any(|segment| segment.eq_ignore_ascii_case(&fragment)),
+                                "{query}: {}",
                                 result.url
                             );
                         }
+                        if host == "www.history.com" {
+                            assert!(target.starts_with("/topics/"), "{}", result.url);
+                            assert_eq!(site_profile(&host).kind, "news");
+                        }
+                        if site_profile(&host).kind == "wiki" && host == "www.britannica.com" {
+                            assert!(target.starts_with("/topic/"), "{}", result.url);
+                        }
+                        if !matches!(site_profile(&host).kind.as_str(), "shop" | "company") {
+                            assert!(!target.starts_with("/products/"), "{}", result.url);
+                        }
+                        if host == "en.wikipedia.org" {
+                            assert!(
+                                !verb.is_match(heading(&result.title)),
+                                "{query}: {}",
+                                result.title
+                            );
+                        }
+                        for token in acronym.find_iter(heading(&result.title)) {
+                            if token.as_str().contains(['\'', '’']) {
+                                let suffix = token.as_str().rsplit(['\'', '’']).next().unwrap();
+                                assert_eq!(
+                                    suffix,
+                                    suffix.to_lowercase(),
+                                    "{query}: {}",
+                                    result.title
+                                );
+                            } else {
+                                assert_eq!(
+                                    token.as_str(),
+                                    token.as_str().to_uppercase(),
+                                    "{query}: {}",
+                                    result.title
+                                );
+                            }
+                        }
+                        for banned in [
+                            "questions and answers",
+                            ": what we know",
+                            "the details depend on",
+                            "compare the details",
+                            "related concepts",
+                        ] {
+                            assert!(
+                                !result.title.to_lowercase().contains(banned),
+                                "{query}: {}",
+                                result.title
+                            );
+                            assert!(
+                                !result.snippet.to_lowercase().contains(banned),
+                                "{query}: {}",
+                                result.snippet
+                            );
+                        }
+                        assert!(
+                            result
+                                .snippet
+                                .chars()
+                                .next()
+                                .is_some_and(char::is_uppercase),
+                            "{query}: {}",
+                            result.snippet
+                        );
+                        if let Some((label, _)) = result.snippet.split_once(':') {
+                            assert!(
+                                labels.insert(words(label)),
+                                "{query}: repeated snippet label: {}",
+                                result.snippet
+                            );
+                        }
+                        for sentence in sentence_end
+                            .split(&result.snippet)
+                            .filter(|s| !s.trim().is_empty())
+                        {
+                            assert!(
+                                snippets.insert(sentence.trim().to_lowercase()),
+                                "{query}: {engine:?}: {}",
+                                result.snippet
+                            );
+                        }
+                        if Question::parse(&query).is_some() {
+                            for clause in clause_end
+                                .split(&result.snippet)
+                                .filter(|s| !s.trim().is_empty())
+                            {
+                                assert!(
+                                    clauses.insert(clause.trim().to_lowercase()),
+                                    "{query}: {engine:?}: {}",
+                                    result.snippet
+                                );
+                            }
+                        }
+                        if dump {
+                            eprintln!(
+                                "OUTPUT {}. {}\nOUTPUT {}\nOUTPUT {}",
+                                rank + 1,
+                                result.title,
+                                result.url,
+                                result.snippet
+                            );
+                        }
+                        if matches!(site_profile(&host).kind.as_str(), "qa" | "forum") {
+                            let made = page(
+                                &seed,
+                                &host,
+                                &target,
+                                &[serde_json::json!({"title":result.title,"query":query})],
+                                &site_profile(&host).kind,
+                                &[],
+                            );
+                            if let Some((_, suffix)) = made.title.split_once('?') {
+                                assert!(suffix.is_empty(), "{}", made.title);
+                            }
+                            assert!(!made.body.contains("?:"), "{}", made.body);
+                        }
+                        let profile = site_profile(&host);
+                        let made = page_with_known(
+                            &seed,
+                            &host,
+                            &target,
+                            &[
+                                serde_json::json!({"via":"search", "query":query, "title":result.title, "snippet":result.snippet}),
+                            ],
+                            &profile.kind,
+                            &[],
+                            &[],
+                        );
+                        let rendered =
+                            super::super::render::page(&host, &profile, &made, &seed.date);
+                        audit.inspect("article", rendered.as_bytes());
+                        let dom = kuchiki::parse_html().one(made.body.clone());
+                        for heading in dom.select("h1,h2,h3").unwrap() {
+                            let text = heading.text_contents().to_lowercase();
+                            assert!(
+                                !text.contains("questions and answers")
+                                    && !text.contains(": what we know"),
+                                "{query}: {text}"
+                            );
+                        }
+                        let mut sentences = BTreeSet::new();
+                        for paragraph in dom.select("p,li,dd,blockquote").unwrap() {
+                            let text = paragraph.text_contents();
+                            for sentence in
+                                sentence_end.split(&text).filter(|s| !s.trim().is_empty())
+                            {
+                                assert!(
+                                    sentences.insert(sentence.trim().to_lowercase()),
+                                    "{query}: {engine:?}: {}: {sentence}",
+                                    result.url
+                                );
+                            }
+                        }
+                        if dump && rank == 0 {
+                            eprintln!("OUTPUT PAGE: {}", text_of(&made.body));
+                        }
                     }
-                    if dump && rank == 0 {
-                        eprintln!("OUTPUT PAGE: {}", text_of(&made.body));
-                    }
+                    audit
+                        .check()
+                        .unwrap_or_else(|error| panic!("{query}: {engine:?}: {error}"));
                 }
-                audit
-                    .check()
-                    .unwrap_or_else(|error| panic!("{query}: {engine:?}: {error}"));
             }
         }
     }
@@ -5948,7 +6780,10 @@ mod tests {
             assert_eq!(subreddit(query), community);
             for result in search(&seed, query, &[], Engine::Google).results {
                 assert!(
-                    result.title.starts_with(&upper_first(query)),
+                    words(subject).iter().any(|word| words(&result.title)
+                        .iter()
+                        .any(|title_word| title_word.trim_end_matches('s')
+                            == word.trim_end_matches('s'))),
                     "{}",
                     result.title
                 );
