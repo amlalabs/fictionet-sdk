@@ -43,33 +43,31 @@ export function conversationRows(rows) {
       const request = frame.match(/^(?:HEADERS\[(\d+)\]: )?([A-Z]+) (\S+)/);
       if (request && request[2] !== 'HTTP') {
         const path = request[3].split('?')[0];
-        const route = `${p.src}|${request[2]} ${path}`;
         const icon = /^\/(?:favicon\.ico|s2\/favicons|th)$/.test(path);
+        const asset = icon || /\.(?:css|js|mjs|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2|ttf|map)$/i.test(path) || /^\/(?:_assets|static|assets|images)\//.test(path);
+        const route = `${p.src}|${request[2]}`;
         let run = connection.run;
-        // Keep outstanding page loads separate until their replies arrive.
-        if (run?.route === route && (icon || request[1] || connection.requests.length === 0)) {
-          if (!run.row) {
-            run.row = { ...run.first, count: 1, summary: `${request[2]} ${path}` };
-            shown[shown.indexOf(run.first)] = run.row;
-          }
+        if (asset && run?.route === route) {
           run.row.count++;
         } else {
-          run = { route, first: p, row: icon ? { ...p, count: 1, summary: `${request[2]} ${path}` } : null };
+          const label = icon ? path : path.replace(/^(\/.+\/)\S+$/, '$1…');
+          const summary = `${request[2]} ${label}`;
+          run = asset ? { route, row: { ...p, count: 1, summary: summary.length > 22 ? `${summary.slice(0, 21)}…` : summary } } : null;
           connection.run = run;
-          shown.push(run.row || p);
+          shown.push(run?.row || p);
         }
-        if (request[1]) connection.streams.set(`${p.src}|${request[1]}`, icon);
-        else connection.requests.push(icon);
+        if (request[1]) connection.streams.set(`${p.src}|${request[1]}`, asset);
+        else connection.requests.push(asset);
         continue;
       }
       if (p.proto === 'HTTP/2') {
         const reply = frame.match(/^(?:HEADERS|DATA)\[(\d+)\]/);
         if (reply && connection.streams.get(`${p.dst}|${reply[1]}`)) continue;
       } else if (/^HTTP\/1\.[01] \d{3}\b/.test(frame)) {
-        connection.response = { src: p.src, icon: connection.requests[0] ?? false };
+        connection.response = { src: p.src, asset: connection.requests[0] ?? false };
         if (!/^HTTP\/1\.[01] 1\d{2}\b/.test(frame)) connection.requests.shift();
-        if (connection.response.icon) continue;
-      } else if (/^(?:DATA|HTTP body)\b/.test(frame) && connection.response?.icon && connection.response.src === p.src) continue;
+        if (connection.response.asset) continue;
+      } else if (/^(?:DATA|HTTP body)\b/.test(frame) && connection.response?.asset && connection.response.src === p.src) continue;
       kept.push(frame);
     }
     if (kept.some((frame) => !control.test(frame))) shown.push(kept.length === frames(p).length ? p : { ...p, info: kept.join(', ') });

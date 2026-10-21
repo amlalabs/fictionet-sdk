@@ -532,14 +532,12 @@ test('HTTP replies follow request order while page replies remain separate', () 
   }
 });
 
-test('repeated paths ignore queries, keep page replies and count folded rows toward forty', (t) => {
+test('repeated documents keep their rows and folded assets count toward forty', (t) => {
   const h = setup(t);
   const rows = iconTraffic();
   const repeat = { ...rows[0], seq: 3000, t: 300, info: 'HEADERS[255]: GET /search?q=other (www.google.com)' };
   const shown = conversationRows([rows[0], rows[1], repeat]);
-  assert.equal(shown.length, 2);
-  assert.equal(shown[0].count, 2);
-  assert.equal(shown[1], rows[1]);
+  assert.deepEqual(shown, [rows[0], rows[1], repeat]);
   const earlier = Array.from({ length: 45 }, (_, i) => ({ ...packets[2], seq: i, t: i }));
   h.send([...earlier, ...rows]);
   const visible = h.root.querySelector('#prows').children;
@@ -558,4 +556,79 @@ test('HTTP icon bodies follow the reply direction and reconnects start a new run
   assert.ok(shown.includes(upload));
   const reset = { ...rows[2], proto: 'TCP', info: '50153 → 443 [SYN] Seq=0 Win=64240 Len=0' };
   assert.deepEqual(conversationRows([rows[2], reset, rows[4]]).filter((p) => p.summary).map((p) => p.count), [1, 1]);
+});
+
+function pageTraffic(proto) {
+  let seq = 4000;
+  const rows = [];
+  const add = (info, back = false) => rows.push({ ...packets[7], proto, seq: seq++, t: seq / 10, src: back ? packets[7].dst : packets[7].src, dst: back ? packets[7].src : packets[7].dst, info });
+  for (let i = 0; i <= 12; i++) {
+    const stream = 1 + i * 2;
+    const path = i ? `/_assets/page-${i}.${i % 2 ? 'css' : 'js'}` : '/search?q=network';
+    add(proto === 'HTTP/2' ? `HEADERS[${stream}]: GET ${path} (www.google.com)` : `GET ${path} HTTP/1.1`);
+    add(proto === 'HTTP/2' ? `HEADERS[${stream}]: 200` : 'HTTP/1.1 200 OK', true);
+    add(proto === 'HTTP/2' ? `DATA[${stream}] 6909 bytes` : 'HTTP body', true);
+  }
+  return rows;
+}
+
+for (const proto of ['HTTP/2', 'HTTP']) {
+  test(`${proto} page assets grow in one row and chip while document rows and every packet remain`, (t) => {
+    const h = setup(t, { motion: true });
+    const rows = pageTraffic(proto);
+    assert.deepEqual(conversationRows(rows).slice(0, 3), rows.slice(0, 3));
+    h.send(rows.slice(0, 6));
+    const first = h.root.querySelector('#prows').children[0];
+    const chip = h.root.querySelectorAll('.packet-chip').at(-1);
+    for (const row of rows.slice(6)) h.send([row]);
+    const shown = h.root.querySelector('#prows').children;
+    assert.equal(shown.length, 4);
+    assert.equal(shown[0], first);
+    assert.match(first.textContent, /GET \/_assets\/… ×12/);
+    assert.equal(h.root.querySelectorAll('.packet-chip').length, 4);
+    assert.equal(h.root.querySelectorAll('.packet-chip').at(-1), chip);
+    assert.equal(chip.textContent, 'GET /_assets/… ×12');
+    assert.ok(h.animations.some((a) => a.duration === 160));
+    h.services.packetFilter.set('every');
+    assert.equal(h.root.querySelector('#prows').children.length, 39);
+    assert.equal(h.root.querySelector('#prows').textContent.includes('×12'), false);
+    h.services.packetFilter.set('conversations');
+    assert.equal(h.root.querySelector('#prows').children.length, 4);
+  });
+
+  test(`${proto} asset runs follow their connection and documents break the run`, () => {
+    const rows = pageTraffic(proto);
+    const other = rows.slice(3, 6).map((p) => ({ ...p, src: p.src === rows[0].src ? '10.0.0.2:50000' : p.src, dst: p.dst === rows[0].src ? '10.0.0.2:50000' : p.dst }));
+    const shown = conversationRows([...rows.slice(0, 6), ...other, ...rows.slice(6, 9), ...rows.slice(0, 3), ...rows.slice(9)]);
+    assert.deepEqual(shown.filter((p) => p.summary).map((p) => p.count), [2, 1, 10]);
+    assert.deepEqual(shown.filter((p) => !p.summary), [...rows.slice(0, 3), ...rows.slice(0, 3)]);
+    const anotherLink = rows.slice(3, 6).map((p) => ({ ...p, link: 'another' }));
+    assert.deepEqual(conversationRows([...rows.slice(3, 6), ...anotherLink]).map((p) => p.count), [1, 1]);
+  });
+}
+
+test('asset extensions and prefixes fold together while document paths stay separate', () => {
+  const request = pageTraffic('HTTP/2')[0];
+  const paths = ['css', 'js', 'mjs', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'map'].map((extension) => `/file.${extension}?v=2`);
+  paths.push('/_assets/chunk', '/static/chunk', '/assets/chunk', '/images/chunk', '/photo.PNG');
+  const rows = paths.map((path, i) => ({ ...request, info: `HEADERS[${1 + i * 2}]: GET ${path} (www.google.com)` }));
+  const shown = conversationRows(rows);
+  assert.equal(shown.length, 1);
+  assert.equal(shown[0].summary, 'GET /file.css');
+  assert.equal(shown[0].count, paths.length);
+  for (const path of ['/search?q=photo.png', '/article', '/static-page', '/file.css.html']) {
+    const document = { ...request, info: `HEADERS[101]: GET ${path} (www.google.com)` };
+    const traffic = [document, ...pageTraffic('HTTP/2').slice(1, 3)];
+    assert.deepEqual(conversationRows(traffic), traffic);
+  }
+});
+
+test('interleaved asset replies keep document frames and HTTP bodies follow request order', () => {
+  const rows = pageTraffic('HTTP/2');
+  const mixed = { ...rows[4], info: 'HEADERS[3]: 200, DATA[3] 6909 bytes, HEADERS[1]: 200, DATA[1] 8192 bytes, end' };
+  assert.equal(conversationRows([rows[0], rows[3], mixed]).at(-1).info, 'HEADERS[1]: 200, DATA[1] 8192 bytes, end');
+  const http = pageTraffic('HTTP');
+  const shown = conversationRows([http[0], http[3], http[6], http[1], http[2], http[4], http[5], http[7], http[8]]);
+  assert.deepEqual(shown.filter((p) => !p.summary), http.slice(0, 3));
+  assert.equal(shown.find((p) => p.summary).count, 2);
 });
