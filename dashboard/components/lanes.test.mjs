@@ -238,6 +238,12 @@ test('small ACKs and HTTP/2 control frames stay quiet regardless of retransmissi
     assert.deepEqual(conversationRows([row]), [], info);
     for (const tag of ['gap', 'malformed']) assert.deepEqual(conversationRows([{ ...row, tags: [tag] }]), [{ ...row, tags: [tag] }]);
   }
+  const preface = { ...packets[4], proto: 'HTTP/2', info: 'Magic, SETTINGS, WINDOW_UPDATE[0] +12517377', tags: ['decrypted'] };
+  assert.deepEqual(conversationRows([preface]), []);
+  const opening = { ...preface, info: 'Magic, SETTINGS, WINDOW_UPDATE[0] +12517377, HEADERS[1]: GET /claude-code-releases/latest' };
+  assert.deepEqual(conversationRows([opening]), [opening]);
+  assert.equal(chipText(opening), 'GET /claude-code-rele…');
+  assert.equal(chipText({ ...opening, info: 'SETTINGS ack, HEADERS[3]: 200, DATA[3] 19 bytes' }), '200');
   for (const info of ['GOAWAY INTERNAL_ERROR', 'RST_STREAM[1] CANCEL', 'HEADERS[1]: 200', 'DATA[1]']) {
     const row = { ...packets[4], proto: 'HTTP/2', info };
     assert.deepEqual(conversationRows([row]), [row]);

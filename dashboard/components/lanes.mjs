@@ -6,12 +6,16 @@ export const kindOf = (p) => p.tags.some((tag) => ['dns-error', 'malformed'].inc
   : p.proto.startsWith('TLS') ? 'tls' : p.proto.startsWith('HTTP') ? 'http' : 'tcp';
 const dataRow = (p) => p.proto.startsWith('HTTP') && /^DATA(?:\[|\b)/.test(p.info);
 const flow = (p) => `${p.link}:${[p.src, p.dst].sort().join('|')}`;
+// The decoder joins the frames of one packet with ", ", as in
+// "Magic, SETTINGS, WINDOW_UPDATE[0] +12517377, HEADERS[1]: GET /".
+const frames = (p) => p.info.split(/, (?=[A-Z][A-Z_]*\b)/);
+const control = /^(?:Magic|PING(?: ack)?|SETTINGS(?: ack)?|WINDOW_UPDATE(?:\[\d+\])? \+\d+|PRIORITY(?:\[\d+\])?|GOAWAY NO_ERROR)$/;
 
 export function conversationRows(rows) {
   const decoded = new Set(rows.filter((p) => /^(TLS|HTTP)/.test(p.proto)).map(flow));
   return rows.filter((p) => {
     if (p.tags.some((tag) => ['gap', 'malformed'].includes(tag))) return true;
-    if (p.proto === 'HTTP/2' && /^(?:PING(?: ack)?|SETTINGS(?: ack)?|WINDOW_UPDATE(?:\[\d+\])? \+\d+|PRIORITY(?:\[\d+\])?|GOAWAY NO_ERROR)$/.test(p.info)) return false;
+    if (p.proto === 'HTTP/2' && frames(p).every((frame) => control.test(frame))) return false;
     if (p.proto !== 'TCP') return true;
     const flags = p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/) || [];
     if (flags.length === 1 && flags[0] === 'ACK' && /\bLen=[01]\b/.test(p.info)) return false;
@@ -38,9 +42,11 @@ export function chipText(p) {
   if (p.proto === 'TCP') return p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/).sort((a, b) => (a === 'ACK') - (b === 'ACK')).join('·') || 'TCP';
   if (p.proto.startsWith('TLS')) return p.info === 'Encrypted Alert' ? 'TLS close' : p.info.match(/Client Hello|Server Hello|Certificate|Finished/)?.[0] || p.info.slice(0, 22);
   if (dataRow(p)) return `DATA ${p.len > 999 ? `${(p.len / 1024).toFixed(1)}k` : p.len}`;
-  const status = p.info.match(/^(?:HTTP\/\S+ |HEADERS\[\d+\]: )?(\d{3})\b/);
+  // A packet that joins frames is named by its request or reply.
+  const info = p.proto === 'HTTP/2' ? frames(p).find((frame) => frame.startsWith('HEADERS')) || frames(p).find((frame) => !control.test(frame)) || p.info : p.info;
+  const status = info.match(/^(?:HTTP\/\S+ |HEADERS\[\d+\]: )?(\d{3})\b/);
   if (status) return status[1];
-  const text = p.info.replace(/^HEADERS\[\d+\]: /, '').replace(/ \([^)]*\)$/, '').replace(/ HTTP\/\d(?:\.\d)?$/, '');
+  const text = info.replace(/^HEADERS\[\d+\]: /, '').replace(/ \([^)]*\)$/, '').replace(/ HTTP\/\d(?:\.\d)?$/, '');
   return text.length > 22 ? `${text.slice(0, 21)}…` : text;
 }
 
