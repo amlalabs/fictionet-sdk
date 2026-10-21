@@ -43,10 +43,7 @@ use std::{
 use super::{Result, checks::search_url};
 
 fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
-    Ok(Arc::new(pages::Pages::canned(
-        seed,
-        &pages::store::canned_root(super::SEED),
-    )?))
+    Ok(Arc::new(pages::Pages::new(seed)))
 }
 
 pub async fn run(spend: bool) -> Result {
