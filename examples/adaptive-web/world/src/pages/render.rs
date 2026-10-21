@@ -75,7 +75,7 @@ pub(super) fn normalize_page(
     static END: OnceLock<Regex> = OnceLock::new();
     static DATE: OnceLock<Regex> = OnceLock::new();
     let prefix = PREFIX.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:(?:posted|written|answered)\s+by|by|author:)\s+").unwrap()
+        Regex::new(r"(?i)\b(?:(?:posted|written|answered|reviewed)\s+by|by|author:)\s+").unwrap()
     });
     let end = END.get_or_init(|| {
         Regex::new(
@@ -103,9 +103,12 @@ pub(super) fn normalize_page(
             .any(|c| c.contains("byline") || c.contains("author"));
         let name = element.name.local.as_ref();
         let text = node.text_contents();
-        let label = prefix
-            .find(&text)
-            .filter(|m| dedicated || text[..m.start()].trim().is_empty());
+        let label = prefix.find_iter(&text).find(|m| {
+            let before = text[..m.start()].trim_end();
+            dedicated
+                || (text.split_whitespace().count() <= 20
+                    && (before.is_empty() || before.ends_with(['.', '!', '?'])))
+        });
         let attribution = matches!(
             name,
             "p" | "span"
@@ -122,7 +125,7 @@ pub(super) fn normalize_page(
                 | "strong"
                 | "em"
         );
-        let excluded = node.ancestors().any(|a| {
+        let excluded = node.ancestors().chain(node.descendants()).any(|a| {
             a.as_element().is_some_and(|e| {
                 matches!(
                     e.name.local.as_ref(),
@@ -139,7 +142,7 @@ pub(super) fn normalize_page(
             let start = label.map_or_else(|| text.len() - text.trim_start().len(), |m| m.end());
             let tail = &text[start..];
             let stop = end.find(tail).map_or(tail.len(), |m| m.start());
-            let stop = start + tail[..stop].trim_end().len();
+            let stop = start + tail[..stop].trim_end().trim_end_matches('.').len();
             let name = normalize_space(&text[start..stop]);
             if person_name(&name, site) {
                 names.insert(name.clone());

@@ -6391,6 +6391,133 @@ fn visible_dates_use_short_months_and_keep_code_attributes_and_urls() {
 }
 
 #[test]
+fn live_article_footer_uses_a_world_author_and_keeps_the_date() {
+    use kuchiki::traits::TendrilSink;
+    let html = "<p><em>Updated September 12, 2026. By Marcus Thorne.</em></p>";
+    let reply = format!("{PAGE}{html}");
+    let fake = Fake::new(move |_, _| completion(0, &reply, Some(0.001)));
+    let pages = live_world(fake.clone());
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let url = "https://news.example-wire.com/footer";
+        for cache in ["generated", "cached"] {
+            let response = get(&pages, &cx, url).await;
+            assert_eq!(response.logged()["cache"], cache);
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            let footer = dom.select_first("p > em").unwrap().text_contents();
+            let author = footer
+                .strip_prefix("Updated September 12, 2026. By ")
+                .unwrap()
+                .strip_suffix('.')
+                .unwrap();
+            assert!(render::invented_name(author, &[]), "{author}");
+            assert_ne!(author, "Marcus Thorne");
+        }
+        assert_eq!(fake.users().len(), 1);
+        Ok(())
+    });
+}
+
+#[test]
+fn short_attributions_after_sentence_ends_use_world_names() {
+    use kuchiki::traits::TendrilSink;
+    let url = "https://example.com/article";
+    let author = make::AUTHORS[make::hash(&format!("{url}\nMarcus Thorne")) % make::AUTHORS.len()];
+    for tag in [
+        "p", "span", "div", "small", "address", "li", "h2", "h3", "h4", "h5", "h6", "a", "strong",
+        "em",
+    ] {
+        for label in ["By", "Written by", "Posted by", "Author:", "Reviewed by"] {
+            for before in ["", "Updated September 12, 2026. ", "Revised! ", "Revised? "] {
+                let html = format!(
+                    "<article><h1>News</h1><p>The article ends here.</p><{tag}>{before}{label} Marcus Thorne on 3 Oct.</{tag}></article>"
+                );
+                let body = render::normalize_page(&html, url, "Example", &[], None).unwrap();
+                let dom = kuchiki::parse_html().one(body.clone());
+                assert_eq!(
+                    dom.select_first(&format!("article > {tag}:last-child"))
+                        .unwrap()
+                        .text_contents(),
+                    format!("{before}{label} {author} on 3 Oct."),
+                    "{html}"
+                );
+                assert_eq!(
+                    render::normalize_page(&body, url, "Example", &[], None),
+                    None
+                );
+            }
+        }
+    }
+    let before = "The issue was fixed by Halvard Systems. ";
+    let html = format!("<p>{before}By Marcus Thorne.</p>");
+    let body = render::normalize_page(&html, url, "Example", &[], None).unwrap();
+    assert_eq!(
+        kuchiki::parse_html()
+            .one(body)
+            .select_first("p")
+            .unwrap()
+            .text_contents(),
+        format!("{before}By {author}.")
+    );
+    for words in [20, 21] {
+        let html = format!(
+            "<p>{}. By Marcus Thorne.</p>",
+            vec!["Text"; words - 3].join(" ")
+        );
+        let result = render::normalize_page(&html, url, "Example", &[], None);
+        if words == 20 {
+            assert!(result.unwrap().contains(&format!("By {author}.")));
+        } else {
+            assert_eq!(result, None);
+        }
+    }
+}
+
+#[test]
+fn prose_and_quoted_attributions_keep_their_names() {
+    for text in [
+        "The issue was fixed by Halvard Systems.",
+        "This is a post by the team.",
+        "The issue was fixed by Marcus Thorne.",
+        "This is a post by Marcus Thorne.",
+        "Updated September 12, 2026, by Marcus Thorne.",
+        "This long paragraph describes the patch that was fixed by Marcus Thorne and explains how the team checked each affected system before publishing their results.",
+        "This long paragraph describes the patch and explains how the team checked each affected system before publishing their results. By Marcus Thorne.",
+    ] {
+        let html = format!("<p>{text}</p>");
+        assert_eq!(
+            render::normalize_page(&html, "https://example.com/article", "Example", &[], None),
+            None,
+            "{html}"
+        );
+    }
+    for tag in ["blockquote", "q", "pre", "code"] {
+        for label in ["By", "Written by", "Posted by", "Author:", "Reviewed by"] {
+            for html in [
+                format!(
+                    "<{tag}><em>Updated September 12, 2026. {label} Marcus Thorne on 3 Oct.</em></{tag}>"
+                ),
+                format!(
+                    "<div>Updated September 12, 2026. <{tag}><em>{label} Marcus Thorne on 3 Oct.</em></{tag}></div>"
+                ),
+            ] {
+                assert_eq!(
+                    render::normalize_page(
+                        &html,
+                        "https://example.com/article",
+                        "Example",
+                        &[],
+                        None
+                    ),
+                    None,
+                    "{html}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn stored_and_live_articles_share_world_authors_and_date_styles() {
     use kuchiki::traits::TendrilSink;
     let html = "<p class='byline'>Written by Lawrence Abrams · <time datetime='2026-09-23'>2026-09-23</time></p><p>Last Updated: 2026-09-23</p><blockquote>Thomas Fox-Brewster said, ‘Keep the quote.’</blockquote><code>2026-09-23</code><a href='/2026-09-23'>Archive</a><meta name='author' content='Lawrence Abrams'>";
