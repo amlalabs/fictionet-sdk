@@ -265,6 +265,31 @@ pub fn claude_code(guest: Guest) -> Guest {
         .run("bash /opt/install-claude.sh")
 }
 
+/// The pinned Codex release the guests install.
+pub const CODEX_VERSION: &str = "0.163.0";
+const CODEX_SHA256: &str = "df22dac1f24b7927e817e8b113067fbe1caa586aba7554247fabd49464cf9c96";
+
+/// Adds Codex, pinned and checked.
+pub fn codex(guest: Guest) -> Guest {
+    let script = format!(
+        "#!/bin/bash\n\
+         set -euo pipefail\n\
+         work=$(mktemp -d)\n\
+         curl -fsSLo \"$work/codex.tar.zst\" \
+           https://releases.openai.com/codex/releases/{CODEX_VERSION}/\
+             codex-package-x86_64-unknown-linux-musl.tar.zst\n\
+         echo \"{CODEX_SHA256}  $work/codex.tar.zst\" | sha256sum -c -\n\
+         install -d /opt/codex\n\
+         tar --zstd -xf \"$work/codex.tar.zst\" --no-same-owner -C /opt/codex\n\
+         ln -sf /opt/codex/bin/codex /usr/local/bin/codex\n\
+         rm -rf \"$work\"\n"
+    );
+    guest
+        .packages(&["zstd"])
+        .file("/opt/install-codex.sh", 0o755, script)
+        .run("bash /opt/install-codex.sh")
+}
+
 /// The model Claude Code runs. OpenRouter serves it under the same name as
 /// Anthropic does (as `anthropic/claude-sonnet-5.5`), and with the name it
 /// knows, Claude Code shapes its requests for this model.

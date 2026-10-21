@@ -17,7 +17,7 @@ pub fn guest(date: &str) -> Guest {
         .all(|c| c.is_ascii_digit() || c == b'-')
         .then_some(date)
         .expect("a YYYY-MM-DD date");
-    kit::desktop::claude_code(guest)
+    kit::desktop::codex(kit::desktop::claude_code(guest))
         // Once the packages are in, and before the desktop starts, the clock
         // moves to the web's day, at the same time of day.
         .run_first(format!("date -u -s {date}T$(date -u +%T)"))
