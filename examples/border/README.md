@@ -29,12 +29,11 @@ included.
 
 ## See the world's log
 
-From the repository root, run `cargo xtask demo border` for a scripted sign-in, a
-certificate refusal, and the world's log showing whether the password reached
-the impostor. No model key is needed. [demos/README.md](../../demos/README.md)
-has the KVM prerequisites and output paths. This command boots one Ubuntu
-workstation with the world in-process, and prints a loopback page URL. The
-page controls the live route; its terminal watches the scripted agent in tmux.
+From the repository root, run `cargo xtask demo border` to open the bank on
+an Ubuntu workstation. The World menu changes the route and impostor state;
+run commands in the terminal or use Firefox to see the resulting traffic.
+Claude Code signs in inside the VM. The world runs in-process and the page
+stays open until Ctrl-C. See [demos/README.md](../../demos/README.md).
 For local Docker, use the
 [no-model probes](#check-it-without-a-model), or run the world by hand with
 `docker compose`, as that section shows.

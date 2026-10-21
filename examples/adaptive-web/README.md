@@ -35,8 +35,7 @@ or planted story. The offline maker answers searches and pages without a key;
 an optional OpenRouter key enables live page generation. Sign in to the agents
 inside the guest with your own accounts. Their model searches use the same
 simulated pages as Firefox. The page opens in
-Chromium and stays up until Ctrl-C. `cargo xtask demo search check` runs the
-scripted story and its checks instead. See
+Chromium and stays up until Ctrl-C. See
 [demos/README.md](../../demos/README.md).
 
 ## Quick start

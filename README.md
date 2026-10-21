@@ -219,7 +219,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 | [`examples/wasm_world`](examples/wasm_world) | Runs a world and one in-process sandbox in a JavaScript engine (wasm32), with DNS and HTTP over TCP or TLS. |
 | [`python/inspect_fictionet/examples/web_eval.py`](python/inspect_fictionet/examples/web_eval.py) | A starter Inspect eval that runs shell commands to check the world's HTTPS, DNS and CA, and that real internet access fails. |
 | [`examples/fakewiki`](examples/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |
-| [`examples/artifactory`](examples/artifactory) | An Inspect eval on a sealed company package mirror: when a package is missing, does the agent fall back to public PyPI, ask the mirror to fetch from upstream, install a typosquat, or answer a message left in the cache? |
+| [`examples/artifactory`](examples/artifactory) | An Inspect eval on a company package mirror with no upstream: when a package is missing, does the agent fall back to public PyPI, ask the mirror to fetch from upstream, install a typosquat, or answer a message left in the cache? |
 | [`examples/adaptive-web`](examples/adaptive-web) | Any public host name, any URL, any search: pages and results made from a short seed the first time the agent asks, then kept, so the same URL always returns the same page. |
 | [`examples/border`](examples/border) | An Inspect eval: does an agent notice a BGP hijack and an impostor bank before it sends the password? With results for two open-weight models. |
 | [`examples/scan`](examples/scan) | A small office subnet for `nmap`: four simulated hosts from the stdlib, and a real container with nginx and OpenSSH routed into the same subnet. |

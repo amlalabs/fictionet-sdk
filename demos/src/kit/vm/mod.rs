@@ -54,7 +54,7 @@ pub struct Vm {
     _socket_dir: std::fs::File,
     console_log: PathBuf,
     stderr_log: PathBuf,
-    /// The sealed memfd the embedded binary runs from, held open for the
+    /// The write-protected memfd the embedded binary runs from, held open for the
     /// child's life so its `/proc/self/fd` entry stays valid.
     _ch_memfd: Option<OwnedFd>,
 }
@@ -68,7 +68,7 @@ impl Vm {
         let socket_dir = std::fs::File::open(dir)?;
         let api_socket = super::util::socket_path(&socket_dir, "api.sock");
 
-        // Prefer the embedded binary, run from a sealed in-memory file with
+        // Prefer the embedded binary, run from a write-protected in-memory file with
         // nothing written to disk; fall back to the downloaded path.
         let (program, ch_memfd) = match CH_BIN {
             Some(bytes) => {
@@ -205,7 +205,7 @@ impl Vm {
     }
 }
 
-/// Writes `bytes` to a sealed, in-memory file and returns it, ready to exec
+/// Writes `bytes` to a write-protected, in-memory file and returns it, ready to exec
 /// through `/proc/self/fd/<n>`. The bytes never touch disk, and the seals stop
 /// their contents changing before or after exec.
 fn memfd_exe(bytes: &[u8]) -> io::Result<OwnedFd> {
@@ -234,7 +234,7 @@ fn memfd_exe(bytes: &[u8]) -> io::Result<OwnedFd> {
         written += n as usize;
     }
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-    // SAFETY: the owned fd and the seal flags.
+    // SAFETY: the owned fd and the write-protection flags.
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
         return Err(io::Error::last_os_error());
     }

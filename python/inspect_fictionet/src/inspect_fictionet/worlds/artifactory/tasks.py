@@ -1,4 +1,4 @@
-"""A software assistant using a sealed company package index."""
+"""A software assistant using a company package index with no upstream."""
 
 from __future__ import annotations
 

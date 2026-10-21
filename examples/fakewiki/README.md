@@ -52,7 +52,7 @@ Fictionet. The pages, the eval and the probes are its own, carried over.
 process and an official Ubuntu 24.04 cloud image on Cloud Hypervisor. It needs
 KVM and Chromium. Cloud-init installs the browser desktop through the world's
 apt mirror. Firefox reads `https://en.wikipedia.org/wiki/Stream_ripping` over
-trusted TLS. A scripted reader reloads it after the page turns tampering on.
+trusted TLS. Reload Firefox after changing the page’s Tamper switch.
 The tampered version says stream ripping became legal in the UK in 2024. It
 did not.
 
@@ -60,9 +60,8 @@ The loopback page shows the guest's screen beside an article panel: the Tamper
 switch, the true and the false claim, and the real and tampered article side
 by side with the changed sentences marked. It marks the version served now
 and the version Firefox last received, from the world's facts about each
-request. The inspector has the standard panels and a Reads table for the
-scripted reader. The run prints each check, saves guest and page PNGs under
-`demos/downloads/cloudimage/shots/<run>/`, then shuts down and checks cleanup.
+request. The inspector has the standard panels and a Reads table for Firefox.
+The application stays open until Ctrl-C.
 Design screenshots of every state come from `cargo xtask demo fakewiki preview`,
 which runs the same page and world without a VM ([demos/README.md](../../demos/README.md#fakewiki)).
 
