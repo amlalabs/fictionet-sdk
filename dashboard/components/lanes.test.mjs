@@ -178,6 +178,13 @@ test('a DNS alias shares an address lane and old traffic keeps its time order', 
   assert.equal(chipText({ ...packets[2], info: '1 → 2 [ACK, FIN] Len=0' }), 'FIN·ACK');
 });
 
+test('combined HTTP/2 headers keep status chips short', () => {
+  for (const info of ['HEADERS[13]: 200, DATA[13] 19 bytes', '200, DATA[7] 19 bytes...', 'HEADERS[7]: 404']) {
+    assert.equal(chipText({ ...packets[8], proto: 'HTTP/2', info }), info.includes('404') ? '404' : '200');
+  }
+  assert.equal(chipText({ ...packets[7], proto: 'HTTP/2', info: 'HEADERS[13]: GET /topics (example.com)' }), 'GET /topics');
+});
+
 test('refused DNS names have red reply chips and no address', (t) => {
   const h = setup(t);
   const query = { ...packets[0], info: 'Standard query 0x1234 A wiki.corp' };

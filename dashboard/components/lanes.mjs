@@ -38,7 +38,7 @@ export function chipText(p) {
   if (p.proto === 'TCP') return p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/).sort((a, b) => (a === 'ACK') - (b === 'ACK')).join('·') || 'TCP';
   if (p.proto.startsWith('TLS')) return p.info === 'Encrypted Alert' ? 'TLS close' : p.info.match(/Client Hello|Server Hello|Certificate|Finished/)?.[0] || p.info.slice(0, 22);
   if (dataRow(p)) return `DATA ${p.len > 999 ? `${(p.len / 1024).toFixed(1)}k` : p.len}`;
-  const status = p.info.match(/^HTTP\/\S+ (\d{3})/);
+  const status = p.info.match(/^(?:HTTP\/\S+ |HEADERS\[\d+\]: )?(\d{3})\b/);
   if (status) return status[1];
   const text = p.info.replace(/^HEADERS\[\d+\]: /, '').replace(/ \([^)]*\)$/, '').replace(/ HTTP\/\d(?:\.\d)?$/, '');
   return text.length > 22 ? `${text.slice(0, 21)}…` : text;
