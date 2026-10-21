@@ -106,7 +106,7 @@ export function mount(root, services, options) {
     // Engines that showed the same list share it.
     const shown = view.engines.map((e, i) => [e, i]).filter(([e]) => e.tag !== 'idle');
     for (let n = 1; n < shown.length; n++) {
-      if (shown[n][0].tag === 'memory' || shown[n][0].tag === 'canned') {
+      if (shown[n][0].tag === 'again' || shown[n][0].tag === 'stored') {
         add('line', { class: 'edge shared', x1: ex[shown[n - 1][1]] + 14, y1: ey, x2: ex[shown[n][1]] - 14, y2: ey });
       }
     }
@@ -149,7 +149,7 @@ export function mount(root, services, options) {
       el('time', { text: clock(row.at) }, line);
       el('span', { text: row.who, title: row.who }, line);
       el('b', { text: row.what, title: row.what }, line);
-      const badge = ({ canned: '', made: 'made now', memory: 'again' })[row.tag] ?? row.tag;
+      const badge = row.badge;
       if (badge) el('em', { class: row.tag, text: badge }, line);
     }
     buttons();

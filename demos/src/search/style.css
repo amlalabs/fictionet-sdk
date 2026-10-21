@@ -9,8 +9,8 @@
 .search-picture .node { fill: var(--app-pane); stroke: var(--app-ink); stroke-width: 2; }
 .search-picture .node.idle { opacity: .35; }
 .search-picture .node.made { fill: var(--app-made); stroke: var(--app-made); }
-.search-picture .node.memory { fill: var(--app-mem); stroke: var(--app-mem); }
-.search-picture .node.canned { fill: var(--app-seed); stroke: var(--app-seed); }
+.search-picture .node.again { fill: var(--app-mem); stroke: var(--app-mem); }
+.search-picture .node.stored { fill: var(--app-seed); stroke: var(--app-seed); }
 .search-picture .node.missing { fill: var(--app-soft); stroke: var(--app-mute); }
 .search-picture .node.listed { stroke: var(--app-mute); opacity: .6; }
 .search-picture .node.seed { stroke: var(--app-seed); stroke-width: 3; }
@@ -31,6 +31,6 @@
 .search-row b { font-weight: 500; }
 .search-row em { padding: 1px 8px; border-radius: 999px; background: var(--app-soft); color: var(--app-mute); font: 500 11.5px var(--sans); font-style: normal; }
 .search-row em.made { background: var(--app-made-soft); color: var(--app-made); }
-.search-row em.memory { background: var(--app-mem-soft); color: var(--app-mem); }
-.search-row em.canned, .search-row em.planted { background: var(--app-seed-soft); color: var(--app-seed); }
+.search-row em.again { background: var(--app-mem-soft); color: var(--app-mem); }
+.search-row em.stored, .search-row em.planted { background: var(--app-seed-soft); color: var(--app-seed); }
 .search-row em.refused { background: var(--app-bad-soft); color: var(--app-bad); }
