@@ -5639,7 +5639,7 @@ pub fn page(
     target: &str,
     mentions: &[Value],
     kind: &str,
-    cast: &[super::prompts::Person],
+    _cast: &[super::prompts::Person],
 ) -> Page {
     let url = format!("https://{host}{target}");
     let strings = |key: &str| {
@@ -5703,7 +5703,7 @@ pub fn page(
     let date = parse_date(&path_date)
         .ok()
         .filter(|date| *date <= day(seed, 0))
-        .unwrap_or_else(|| date_for(seed, &url, { 30 }));
+        .unwrap_or_else(|| date_for(seed, &url, 30));
     let mut page = Page {
         status: 200,
         title: title.clone(),

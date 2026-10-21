@@ -17,7 +17,7 @@ use fictionet_demo::search as page;
 use adaptive_web_world::{
     Addresses, Ca, World,
     events::LogObserver,
-    pages::{Pages, Seed, store},
+    pages::{Pages, Seed},
     search::Searches,
 };
 use example_common::log::Log;
