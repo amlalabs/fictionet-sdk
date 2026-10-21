@@ -1,5 +1,5 @@
 // mount(root, services, options) -> dispose; shared services are described in README.md.
-// A shell on the host through xterm.js. Output is acknowledged after xterm
+// A shell on the host through ghostty-web. Output is acknowledged after the terminal
 // has written it, so the page server stops reading when the browser lags.
 // With options.interactive the text starts large and options.controls gets
 // A− and A+ buttons; the size is kept for the next visit.
@@ -9,10 +9,6 @@ import { scoped, listen } from '../dom.mjs';
 const SIZE_KEY = 'fictionet-terminal-size';
 
 export function mount(root, services, options) {
-  const css = root.ownerDocument.createElement('link');
-  css.rel = 'stylesheet';
-  css.href = '/vendor/xterm/css/xterm.css';
-  root.append(css);
   let active, focus = options.focus, fontSize = 13;
   const sizing = [];
   if (options.interactive) {
@@ -48,7 +44,7 @@ export function mount(root, services, options) {
       const { socket } = await services.transport.socket('terminal', options.host, controller.signal);
       if (panel.disposed || panel.generation !== current) { socket.close(); return; }
       entry.socket = socket;
-      const [{ Terminal }, { FitAddon }] = panel.library;
+      const { Terminal, FitAddon } = panel.library;
       const font = getComputedStyle(panel.display).fontFamily;
       const terminal = entry.terminal = new Terminal({ scrollback: 5000, theme: theme(panel.display), allowProposedApi: false, fontSize, ...(font ? { fontFamily: font } : {}) });
       const fit = new FitAddon();
@@ -108,10 +104,11 @@ export function mount(root, services, options) {
     waiting: (state) => (state === 'network_up'
       ? `${options.host} is on the network. The terminal opens when SSH is up.`
       : `${options.host} is booting. The terminal opens when SSH is up.`),
-    load: () => Promise.all([
-      services.importModule('/vendor/xterm/lib/xterm.mjs').catch(() => { throw new Error('xterm.js'); }),
-      services.importModule('/vendor/addon-fit/lib/addon-fit.mjs').catch(() => { throw new Error('The xterm.js fit addon'); }),
-    ]),
+    load: async () => {
+      const ghostty = await services.importModule('/vendor/ghostty-web/dist/ghostty-web.js').catch(() => { throw new Error('ghostty-web'); });
+      await ghostty.init();
+      return ghostty;
+    },
   });
   const offTheme = services.theme.subscribe(() => {
     if (active?.terminal) active.terminal.options.theme = theme(panel.display);

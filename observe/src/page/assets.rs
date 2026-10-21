@@ -54,6 +54,7 @@ pub(super) fn content_type(path: &str) -> &'static str {
         Some("js" | "mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("svg") => "image/svg+xml",
+        Some("wasm") => "application/wasm",
         _ => "text/plain; charset=utf-8",
     }
 }
