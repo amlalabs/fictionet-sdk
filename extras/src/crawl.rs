@@ -192,9 +192,12 @@ impl Index {
                     let lower = doc.text.to_lowercase();
                     let matched = words
                         .iter()
-                        .filter_map(|word| lower.find(word))
+                        .filter_map(|word| {
+                            let frequency = self.postings.get(word)?.len();
+                            lower.find(word).map(|position| (frequency, position))
+                        })
                         .min()
-                        .unwrap_or(0);
+                        .map_or(0, |(_, position)| position);
                     // Character offsets come from the original string, so non ASCII case folding
                     // cannot make a slice land inside a code point.
                     let begin = doc
@@ -278,6 +281,31 @@ mod tests {
         assert!(index.search("dishwasher", 0, 10).results.is_empty());
         assert_eq!(index.search("black hole", 1, 1).results[0], results[1]);
     }
+    #[test]
+    fn snippets_prefer_the_specific_matching_passage_over_repeated_navigation() {
+        let mut index = Index::default();
+        index.add(
+            "https://sky.org/black-hole".into(),
+            "Black holes".into(),
+            format!(
+                "Black holes {} Accretion disks heat gas around a black hole.",
+                "Navigation section ".repeat(40)
+            ),
+        );
+        index.add(
+            "https://sky.org/stars".into(),
+            "Stars".into(),
+            "Stars may collapse into a black hole.".into(),
+        );
+        let found = index.search("black hole accretion", 0, 10);
+        assert_eq!(found.results[0].url, "https://sky.org/black-hole");
+        assert!(
+            found.results[0]
+                .snippet
+                .contains("Accretion disks heat gas")
+        );
+    }
+
     #[test]
     fn non_ascii_whitespace_is_safe_in_snippets() {
         let mut index = Index::default();
