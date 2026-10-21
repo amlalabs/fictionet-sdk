@@ -14,15 +14,15 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
   const window = svg.ownerDocument.defaultView || globalThis;
   const later = window.setTimeout?.bind(window) || globalThis.setTimeout;
   const cancel = window.clearTimeout?.bind(window) || globalThis.clearTimeout;
-  let latestSnapshot;
-  const names = new Map(), representatives = new Map();
+  let latestSnapshot, requests = [];
+  const names = new Map(), representatives = new Map(), openedHosts = new Set();
   const layers = {};
   for (const name of ['edges', 'links', 'sites', 'engines', 'top', 'marks', 'fx']) layers[name] = add('g', { class: `layer-${name}` });
-  const keyed = (parent, make, update) => {
+  const keyed = (parent, make, update, remove = (node) => node.remove()) => {
     const nodes = new Map();
     return (items) => {
       const keys = new Set(items.map(([key]) => key));
-      for (const [key, node] of nodes) if (!keys.has(key)) { node.remove(); nodes.delete(key); }
+      for (const [key, node] of nodes) if (!keys.has(key)) { remove(node); nodes.delete(key); }
       items.forEach(([key, value], index) => {
         let node = nodes.get(key);
         if (!node) { node = make(parent); nodes.set(key, node); }
@@ -108,14 +108,39 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     g.style.transformOrigin = `${x}px ${y}px`;
     attrs(g.children[0], { class: `site ${state}${scenario ? ' scenario' : ''}${pages.some((p) => p.making) || making.has(siteKey(host)) ? ' making' : ''}`, cx: x, cy: y, r });
     attrs(g.children[1], { x, y: y + r + 18 });
-    g.children[1].textContent = short(site);
-    while (g.children[1].textContent.length > 1 && g.children[1].getComputedTextLength?.() > 116) {
-      g.children[1].textContent = `${g.children[1].textContent.replace(/…$/, '').slice(0, -1)}…`;
+    const label = g.children[1];
+    label.replaceChildren();
+    let rest = short(site);
+    for (let line = 0; line < 2 && rest; line++) {
+      const span = add('tspan', { x, dy: line ? 13 : 0, text: rest }, label);
+      const width = () => span.getComputedTextLength?.() || span.textContent.length * 6.5;
+      if (width() <= 116) break;
+      let end = rest.length;
+      while (end > 1 && width() > 116) {
+        end--;
+        span.textContent = rest.slice(0, end) + (line ? '…' : '');
+      }
+      const space = rest.lastIndexOf(' ', end);
+      if (!line && space > 0) {
+        span.textContent = rest.slice(0, space + 1);
+        rest = rest.slice(space + 1);
+      } else {
+        if (!line) {
+          // A name with no space to wrap at is cut, never broken mid-word.
+          while (end > 1 && (span.textContent = `${rest.slice(0, end)}…`, width() > 116)) end--;
+        }
+        rest = '';
+      }
     }
     g.children[2].textContent = host;
     g.dots(pages.map((page, index) => [page.url, { page, index, r, x, y }]));
+  }, (node) => {
+    if (!motion.active) { node.remove(); return; }
+    layers.fx.append(node);
+    node.setAttribute('data-transient', '');
+    motion.removeAfter(node, motion.anim(node, [{ opacity: 1 }, { opacity: 0 }], { duration: 320 }));
   });
-  const more = add('text', { class: 'label small overflow', x: 500, y: 108, 'text-anchor': 'end' }, layers.marks);
+  const current = add('circle', { class: 'current', visibility: 'hidden', 'aria-label': 'Current site', cx: 0, cy: 0, r: 0 }, layers.top);
   const refused = add('g', { class: 'refused-mark' }, layers.marks);
   add('circle', { class: 'refused', cx: 24, cy: 540, r: 9 }, refused);
   add('path', { class: 'cross', d: 'M 18 534 L 30 546 M 30 534 L 18 546' }, refused);
@@ -184,22 +209,28 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     for (const list of snapshot.results) for (const row of list.listed) remember(row.host, row.site);
     for (const row of snapshot.pages) remember(row.host, row.site);
     const hosts = new Set(snapshot.seed.sites.map((row) => remember(row.host, row.site)));
-    const touched = new Map();
     for (const q of offMap) {
       const host = remember(ENGINE_HOSTS[q.engine] || q.engine);
-      hosts.add(host); touched.set(host, q.answer_at_ms ?? q.at_ms);
+      if (q.outcome.status === 'served') openedHosts.add(host);
+      hosts.add(host);
     }
-    for (const list of [...snapshot.results].sort((a, b) => a.query_id - b.query_id)) for (const row of list.listed) hosts.add(remember(row.host, row.site));
+    const recent = snapshot.queries.filter((q) => ENGINES.includes(q.engine)).slice(-2);
+    const recentKeys = new Set(recent.map((q) => q.key));
+    if (!recent.length) for (const result of snapshot.results.slice(-2)) recentKeys.add(result.key);
+    for (const list of snapshot.results.filter((r) => recentKeys.has(r.key))) for (const row of list.listed) hosts.add(remember(row.host, row.site));
     for (const p of snapshot.pages) {
-      hosts.add(remember(p.host, p.site)); touched.set(siteKey(p.host), p.at_ms);
-      if (p.reason?.via === 'link') hosts.add(remember(hostOf(p.reason.from)));
+      const host = remember(p.host, p.site);
+      hosts.add(host);
+      if (p.fetches > 0) openedHosts.add(host);
+      if (p.reason?.via === 'link') openedHosts.add(remember(hostOf(p.reason.from)));
     }
-    const opened = changes ? changes.filter((c) => c.page).map((c) => c.page) : snapshot.pages;
+    for (const host of openedHosts) hosts.add(host);
     const scenario = snapshot.seed.sites.map((row) => siteKey(row.host));
-    const map = layout(previous, [...hosts], { seed: { sites: scenario }, list: listed.map((r) => siteKey(r.host)), opened: [...opened.map((p) => siteKey(p.host)), ...offMap.map((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine))], touched });
+    const map = layout(previous, [...hosts], { seed: { sites: scenario } });
     if (changes && motion.active && query && (query.outcome.status === 'pending' || changes.some((c) => c.type === 'search_answered' && c.query.id === query.id))) {
       for (const host of map.assignment.keys()) if (!previous?.assignment.has(host) && !offMap.some((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine) === host)) waitingSites.add(host);
     }
+    for (const host of waitingSites) if (!map.assignment.has(host)) waitingSites.delete(host);
     previous = map;
     const pages = (host) => snapshot.pages.filter((p) => siteKey(p.host) === host).sort((a, b) => (a.first_serve_ms ?? a.at_ms) - (b.first_serve_ms ?? b.at_ms) || a.url.localeCompare(b.url));
     sites([...map.assignment].map(([host, [x, y]]) => [host, { host: representatives.get(host) || host, site: names.get(host) || host, x, y, pages: pages(host), scenario: scenario.includes(host), visit: offMap.findLast((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine) === host) }]));
@@ -213,7 +244,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       return [`${query.id}:${r.rank}:${r.url}`, { x1: asked.x, y1: 121, x2: x, y2: y - (pages(siteKey(r.host)).some((p) => p.fetches > 0) ? 16 : 7), 'data-rank': r.rank }];
     }) : []);
     links(snapshot.pages.filter((p) => p.reason?.via === 'link' && siteKey(hostOf(p.reason.from)) !== siteKey(p.host) && map.assignment.has(siteKey(hostOf(p.reason.from))) && map.assignment.has(siteKey(p.host))).map((p) => [p.url, { url: p.url, from: map.assignment.get(siteKey(hostOf(p.reason.from))), to: map.assignment.get(siteKey(p.host)) }]));
-    more.textContent = map.hidden ? `+${map.hidden} more` : '';
+    locate(snapshot);
     const refusal = snapshot.refused.filter((r) => !r.name.startsWith('_')).at(-1);
     attrs(refused, { visibility: refusal ? 'visible' : 'hidden' });
     refusedName.textContent = cut(refusal?.name || '', 22);
@@ -222,6 +253,20 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     attrs(planted, { visibility: plant ? 'visible' : 'hidden' });
     factTitle.textContent = plant?.text || '';
     fitFact();
+  }
+  function locate(snapshot) {
+    const lastPage = snapshot.pages.filter((p) => p.fetches > 0).sort((a, b) => a.at_ms - b.at_ms || (a.seq ?? 0) - (b.seq ?? 0)).at(-1);
+    const request = requests.filter((e) => snapshot.pages.some((p) => p.fetches > 0 && siteKey(p.host) === siteKey(e.fields.host) && e.at * 1000 >= p.at_ms)).sort((a, b) => a.at - b.at || a.seq - b.seq).at(-1);
+    const pageAt = request ? request.at * 1000 : lastPage?.at_ms;
+    const pageHost = request?.fields.host || lastPage?.host;
+    const lastQuery = snapshot.queries.filter((q) => q.outcome.status === 'served').sort((a, b) => (a.answer_at_ms ?? a.at_ms) - (b.answer_at_ms ?? b.at_ms) || (a.answer_seq ?? a.seq ?? 0) - (b.answer_seq ?? b.seq ?? 0)).at(-1);
+    const queryIsLatest = lastQuery && (pageAt == null || (lastQuery.answer_at_ms ?? lastQuery.at_ms) > pageAt);
+    const target = queryIsLatest ? queryTarget(lastQuery) : pageHost && siteNode(pageHost)?.children[0];
+    if (target) attrs(current, { cx: target.getAttribute('cx'), cy: target.getAttribute('cy'), r: Number(target.getAttribute('r')) + 4, visibility: 'visible' });
+    else {
+      attrs(current, { visibility: 'hidden' });
+      attrs(current, { cx: 0, cy: 0, r: 0 });
+    }
   }
   const position = (node) => [Number(node.getAttribute('cx')), Number(node.getAttribute('cy'))];
   const siteNode = (host) => [...layers.sites.children].find((g) => siteKey(g.getAttribute('data-host')) === siteKey(host));
@@ -333,6 +378,10 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     for (const group of layers.sites.children) group.style.opacity = '';
   });
   return {
+    setEvents(events) {
+      requests = events.filter((e) => e.source === 'http' && e.kind === 'request' && e.fields?.kind === 'page');
+      if (latestSnapshot) locate(latestSnapshot);
+    },
     apply(changes, snapshot) {
       if (changes.some((c) => c.type === 'restart')) { this.reset(snapshot); return; }
       motion.suppressed = changes.length > 8;
@@ -373,7 +422,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       making.clear();
       previous = null;
       waitingSites.clear();
-      names.clear(); representatives.clear();
+      names.clear(); representatives.clear(); openedHosts.clear();
       render(snapshot);
       // Apply the reset before radius transitions resume.
       svg.getBoundingClientRect();

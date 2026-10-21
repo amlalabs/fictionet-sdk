@@ -54,13 +54,15 @@ test('searches and pages say whether they were stored, made now or served again'
   assert.equal(short('The Register'), 'The Register');
 });
 
-test('the rows are the newest six, newest first', () => {
+test('the rows are the newest eight, newest first', () => {
   const s = fixture();
   const all = rows(s);
-  assert.equal(all.length, 6);
-  assert.deepEqual(all.map((row) => row.tag), ['planted', 'refused', 'again', 'stored', 'again', 'made']);
+  assert.equal(all.length, 8);
+  assert.deepEqual(all.map((row) => row.tag), ['planted', 'refused', 'again', 'stored', 'again', 'made', 'stored', 'stored']);
   assert.deepEqual(all[1], { at: 7000, who: 'DNS', what: 'wiki.corp', tag: 'refused', badge: 'refused' });
-  assert.equal(all[2].what, '/r/x');
+  assert.equal(all[2].what, 'A page');
+  assert.equal(all[2].title, 'https://www.reddit.com/r/x');
+  assert.equal(all[2].who, 'Reddit');
   assert.equal(rows(s, 2).length, 2);
   const agent = { ...s, queries: [query(9, { via: 'web_search', at_ms: 9000 })] };
   assert.equal(rows(agent)[0].who, 'Claude Code');
@@ -84,13 +86,16 @@ function harness(window) {
   if (window) document.defaultView = window;
   const root = document.createElement('div');
   const subscriptions = new Map(), posts = [];
+  const watch = document.createElement('source');
+  watch.close = () => {};
   const services = createServices({
+    watch: () => watch,
     async post(path, body) { posts.push({ path, body }); return { status: 'applied', reply: { revision: 4, at_ms: 9000 } }; },
   });
   services.worldMenu = document.createElement('div');
   services.state = (path, publish) => { subscriptions.set(path, publish); return () => subscriptions.delete(path); };
   const dispose = mount(root, services, { state: '/api/state/web' });
-  return { root, services, subscriptions, posts, dispose, publish: (value) => subscriptions.get('/api/state/web')({ value }) };
+  return { root, services, subscriptions, posts, watch, dispose: () => { dispose(); services.dispose(); }, publish: (value) => subscriptions.get('/api/state/web')({ value }) };
 }
 
 test('the world pane draws the picture and rows without explaining them', () => {
@@ -98,8 +103,8 @@ test('the world pane draws the picture and rows without explaining them', () => 
   h.publish(fixture());
   const text = h.root.textContent;
   for (const word of ['Google', 'Bing', 'DuckDuckGo', 'new words', 'halvardsystems', 'wiki.corp', 'planted']) assert.match(text, new RegExp(word));
-  assert.equal(h.root.querySelectorAll('.search-row').length, 6);
-  assert.deepEqual(h.root.querySelectorAll('.search-row').map((row) => row.querySelector('em')?.textContent ?? ''), ['planted', 'refused', 'again', '', 'again', 'made now']);
+  assert.equal(h.root.querySelectorAll('.search-row').length, 8);
+  assert.deepEqual(h.root.querySelectorAll('.search-row').map((row) => row.querySelector('em')?.textContent ?? ''), ['planted', 'refused', 'again', '', 'again', '', '', '']);
   for (const caption of ['made up', 'stub generator', 'scripted', 'Firefox', 'seed', 'world', 'canned', 'stub', 'store', 'generator', 'cache']) assert.doesNotMatch(text, new RegExp(caption, 'i'));
   h.dispose();
   assert.equal(h.subscriptions.size, 0);
@@ -143,7 +148,7 @@ test('the view keeps its picture and activity rows together', () => {
   h.publish(fixture());
   const list = h.root.querySelector('.search-rows');
   assert.equal(list.parentNode, h.root);
-  assert.equal(list.children.length, 6);
+  assert.equal(list.children.length, 8);
   assert.match(list.textContent, /wiki.corp/);
   assert.equal(h.root.querySelector('.search-picture').parentNode, h.root);
   assert.ok(h.root.children.indexOf(list) > h.root.children.indexOf(h.root.querySelector('.search-picture')));
@@ -197,7 +202,7 @@ test('real snapshots draw the current state and reset to the scenario sites', ()
   const previous = layout(null, planted.pages.map((p) => p.host), { seed: { sites: planted.seed.sites.map((s) => s.host) } });
   const reset = layout(previous, [], { seed: { sites: restart.seed.sites.map((s) => s.host) }, restart: changes[0].type === 'restart' });
   assert.deepEqual([...reset.assignment.keys()], restart.seed.sites.map((s) => s.host));
-  assert.equal(reset.hidden, 0);
+  assert.deepEqual([...reset.assignment.values()], slots().slice(0, restart.seed.sites.length));
 });
 
 test('diff follows row identities rather than array lengths or positions', () => {
@@ -272,7 +277,7 @@ test('changes are in time and sequence order, with restart first', () => {
 
 test('ticker identifies both Claude Code tools and uses public badges', () => {
   const s = snapshot({ queries: [query(1, { via: 'web_search', cache: 'generated' })], pages: [servedPage('https://a.com/a?q=b', { via: 'web_fetch', made: 'written_live' })] });
-  assert.deepEqual(rows(s).map((r) => [r.who, r.what, r.badge]), [['Claude Code', '/a?q=b', 'made now'], ['Claude Code', 'halvard gateway vulnerability', 'made now']]);
+  assert.deepEqual(rows(s).map((r) => [r.who, r.what, r.badge]), [['Claude Code', 'A page', null], ['Claude Code', '“halvard gateway vulnerability”', null]]);
   assert.equal(rows(snapshot({ pages: [servedPage('https://a.com/')] }))[0].badge, null);
   assert.equal(rows(snapshot({ planted: [{ kind: 'page', url: 'https://a.com/', text: 'A fact', at_ms: 1 }] }))[0].who, 'You');
 });
@@ -287,32 +292,36 @@ test('mixed ticker rows keep their time, identity, path and badge', () => {
   });
   const all = rows(s, 20);
   assert.deepEqual(all.map((r) => [r.at, r.who, r.what, r.badge]), [
-    [62000, 'wait.example.com', '/pending', 'making'],
+    [62000, 'A Site', 'A page', 'writing'],
     [12000, 'You', 'A planted page', 'planted'],
     [11000, 'You', 'A fact', 'planted'],
     [10000, 'DNS', 'wiki.corp', 'refused'],
-    [9000, 'Claude Code', '/a?q=b', 'made now'],
-    [8000, 'again.example.com', '/a', 'again'],
-    [7000, 'new.example.com', '/new', 'made now'],
-    [6000, 'www.example.com', '/old?q=yes', null],
-    [5000, 'Claude Code', 'halvard gateway vulnerability', 'made now'],
-    [4000, 'duckduckgo.com', 'halvard gateway vulnerability', 'made now'],
-    [3000, 'bing.com', 'halvard gateway vulnerability', null],
-    [2000, 'google.com', 'halvard gateway vulnerability', 'again'],
-    [1000, 'google.com', 'halvard gateway vulnerability', 'made now'],
+    [9000, 'Claude Code', 'A page', null],
+    [8000, 'A Site', 'A page', 'again'],
+    [7000, 'A Site', 'A page', null],
+    [6000, 'A Site', 'A page', null],
+    [5000, 'Claude Code', '“halvard gateway vulnerability”', null],
+    [4000, 'DuckDuckGo', '“halvard gateway vulnerability”', null],
+    [3000, 'Bing', '“halvard gateway vulnerability”', null],
+    [2000, 'Google', '“halvard gateway vulnerability”', 'again'],
+    [1000, 'Google', '“halvard gateway vulnerability”', null],
   ]);
   const h = harness(); h.publish(s);
   const lines = h.root.querySelectorAll('.search-row');
-  assert.equal(lines.length, 6);
-  assert.equal(lines[0].querySelector('time').textContent, '1:02');
+  assert.equal(lines.length, 8);
+  assert.equal(lines[0].querySelector('time').textContent, 'now');
   assert.match(lines[4].textContent, /❯ Claude Code/);
-  assert.equal(lines[4].querySelector('b').getAttribute('title'), '/a?q=b');
+  assert.equal(lines[4].querySelector('b').getAttribute('title'), 'https://tool.example.com/a?q=b');
   h.publish({ ...s, pages: s.pages.filter((p) => p.at_ms < 9000), queries: [], refused: [], planted: [] });
   const made = h.root.querySelectorAll('.search-row')[1];
-  assert.equal(made.querySelector('em').textContent, 'made now');
+  assert.ok(made.querySelector('.made-dot'));
+  assert.equal(made.querySelector('.made-dot').getAttribute('role'), 'img');
+  assert.equal(made.querySelector('.made-dot').getAttribute('aria-label'), 'Made now');
+  assert.equal(made.querySelector('em'), null);
   assert.ok(made.querySelector('b').querySelector('.fact-dot'));
   h.publish({ ...s, pages: [{ ...s.pages.at(-1), making: false, status: 200, made: 'written_live', fetches: 1 }] });
-  assert.equal(h.root.querySelector('.search-row').querySelector('em').textContent, 'made now');
+  assert.ok(h.root.querySelector('.search-row').querySelector('.made-dot'));
+  assert.equal(h.root.querySelector('.search-row').querySelector('em'), null);
   h.dispose();
 });
 
@@ -357,8 +366,8 @@ test('long ticker values retain their full tooltip', () => {
   const h = harness(), text = 'A long question '.repeat(20);
   h.publish(snapshot({ queries: [query(1, { search: text })] }));
   const what = h.root.querySelector('.search-row').querySelector('b');
-  assert.equal(what.textContent, text);
-  assert.equal(what.getAttribute('title'), text);
+  assert.equal(what.textContent, `“${text}”`);
+  assert.equal(what.getAttribute('title'), `“${text}”`);
   h.dispose();
 });
 
@@ -375,7 +384,7 @@ test('slots fill from the middle in the prototype order and keep labels inside t
     assert.ok(x - 58 >= 0 && x + 58 <= 520);
     assert.ok(y + 32 - 12.5 >= 0 && y + 32 <= 560);
   }
-  assert.equal(short('abcdefghijklmnopqrs'), 'abcdefghijklmnopq…');
+  assert.equal(short('abcdefghijklmnopqrs'), 'abcdefghijklmnopqrs');
   for (const [i, [x, y]] of slots().entries()) for (const [tx, ty] of slots().slice(i + 1)) {
     assert.ok(Math.abs(y - ty) >= 12.5 || Math.abs(x - tx) >= 124);
   }
@@ -391,29 +400,24 @@ test('layout places scenario sites first and keeps existing hosts still', () => 
   for (const [host, position] of first.assignment) assert.deepEqual(next.assignment.get(host), position);
   assert.deepEqual(next.assignment.get('c.com'), slots()[3]);
   assert.deepEqual(first.assignment.size, 3);
-  assert.equal(next.hidden, 0);
+  assert.equal(next.assignment.size, 4);
   assert.deepEqual(next.evicted, []);
 });
 
-test('full maps evict only the least recently touched eligible host and count all hidden hosts', () => {
+test('layout removes departed sites, reuses their slots and retains every requested host', () => {
   const hosts = Array.from({ length: 21 }, (_, i) => `site${i}.com`);
   const seed = { sites: [hosts[0]] };
-  const touched = new Map(hosts.map((host, i) => [host, i]));
-  const full = layout(null, hosts, { seed, touched });
-  const quiet = layout(full, [...hosts, 'quiet.com'], { seed });
-  assert.equal(quiet.hidden, 1);
-  assert.deepEqual(quiet.evicted, []);
-  const next = layout(quiet, [...hosts, 'quiet.com', 'new.com'], { seed, list: [hosts[1], 'new.com'], touched: new Map([[hosts[2], 100]]) });
-  assert.deepEqual(next.evicted, [hosts[3]]);
-  assert.deepEqual(next.assignment.get('new.com'), full.assignment.get(hosts[3]));
-  assert.equal(next.hidden, 2);
-  for (const host of hosts.filter((h) => h !== hosts[3])) assert.deepEqual(next.assignment.get(host), full.assignment.get(host));
-  const opened = layout(next, [...hosts, 'quiet.com', 'new.com', 'opened.com'], { seed, list: [hosts[1], 'new.com'], opened: [{ host: 'opened.com' }] });
-  assert.deepEqual(opened.evicted, [hosts[4]]);
-  assert.equal(opened.hidden, 3);
-  assert.equal(full.touched.get(hosts[2]), 2);
-  const protectedMap = layout(null, hosts, { seed: { sites: hosts } });
-  assert.deepEqual(layout(protectedMap, [...hosts, 'new.com'], { seed: { sites: hosts }, opened: ['new.com'] }).evicted, []);
+  const full = layout(null, hosts, { seed });
+  const next = layout(full, [...hosts.slice(1, -1), 'new.com'], { seed });
+  assert.deepEqual(next.evicted, [hosts.at(-1)]);
+  assert.deepEqual(next.assignment.get('new.com'), full.assignment.get(hosts.at(-1)));
+  for (const host of hosts.slice(0, -1)) assert.deepEqual(next.assignment.get(host), full.assignment.get(host));
+  assert.equal(next.assignment.size, 21);
+  const expanded = layout(full, [...hosts, 'opened.com'], { seed });
+  assert.equal(expanded.assignment.size, 22);
+  assert.deepEqual(expanded.evicted, []);
+  for (const host of [...hosts, 'opened.com']) assert.ok(expanded.assignment.has(host));
+  assert.equal(new Set([...expanded.assignment.values()].map(String)).size, 22);
 });
 
 const tree = (node) => typeof node === 'string' ? node : [node.tag, [...node.attributes], node.children.map(tree)];
@@ -423,7 +427,7 @@ const publicText = (node) => {
   for (const child of node.children) if (typeof child !== 'string') publicText(child);
 };
 
-test('every captured snapshot renders its map and six newest rows with public words', () => {
+test('every captured snapshot renders its map and eight newest rows with public words', () => {
   const expected = {
     'first-search': [9, 0, 10, 0, 1],
     pages: [9, 3, 10, 0, 4],
@@ -505,23 +509,18 @@ test('Claude Code, pending pages and fact reach use their own marks', () => {
   h.dispose();
 });
 
-test('overflow counts hidden sites and retains the latest page and long tooltips', () => {
+test('opened sites all remain visible with the latest page and long tooltips', () => {
   const h = harness();
   const pages = Array.from({ length: 25 }, (_, i) => servedPage(`https://site${i}.com/a`, { at_ms: i }));
   const text = 'A long fact about the new firmware and how to apply the update safely.';
   h.publish(snapshot({ pages, refused: [{ name: 'a-very-long-private-host.example.corp', at_ms: 1 }], planted: [{ kind: 'fact', text, at_ms: 2 }] }));
-  assert.equal(h.root.querySelectorAll('.site-group').length, 21);
-  assert.match(h.root.textContent, /\+4 more/);
-  const overflow = h.root.querySelector('.overflow');
-  const right = Number(overflow.getAttribute('x'));
-  const bottom = Number(overflow.getAttribute('y')) + 4;
-  const left = right - overflow.textContent.length * 8;
-  const top = bottom - 18;
-  assert.equal(overflow.getAttribute('text-anchor'), 'end');
-  for (const [x, y] of slots()) {
-    const dx = Math.max(left - x, 0, x - right);
-    const dy = Math.max(top - y, 0, y - bottom);
-    assert.ok(Math.hypot(dx, dy) > 14 + 8 + 3.6 + 1.25);
+  assert.equal(h.root.querySelectorAll('.site-group').length, 25);
+  assert.equal(h.root.querySelector('.overflow'), null);
+  const positions = locations(h.root);
+  assert.equal(new Set([...positions.values()].map(String)).size, 25);
+  for (const [x, y] of positions.values()) {
+    assert.ok(Number(x) - 58 >= 0 && Number(x) + 58 <= 520);
+    assert.ok(Number(y) >= 178 && Number(y) <= 488);
   }
 
   assert.ok(h.root.querySelectorAll('.site-group').some((g) => g.getAttribute('data-host') === 'site24.com'));
@@ -607,7 +606,7 @@ test('a twenty-fifth list preserves sites after the oldest list falls out', () =
   h.dispose();
 });
 
-test('a new list on a full map replaces only evicted sites in their slots', () => {
+test('a new list retains the previous search in its slot and drops unrelated history', () => {
   const h = harness();
   const lists = Array.from({ length: 21 }, (_, i) => resultList(i + 1));
   const s = snapshot({ results: lists, queries: [query(21, { key: lists.at(-1).key })] });
@@ -616,8 +615,9 @@ test('a new list on a full map replaces only evicted sites in their slots', () =
   const list = { ...resultList(22), listed: [22, 23, 24].map((i, rank) => ({ ...resultList(i).listed[0], rank: rank + 1 })) };
   h.publish({ ...s, results: [...lists, list], queries: [...s.queries, query(22, { key: list.key })] });
   const after = locations(h.root), evicted = [...before.keys()].filter((host) => !after.has(host));
-  assert.equal(after.size, 21);
-  assert.equal(evicted.length, 3);
+  assert.equal(before.size, 1);
+  assert.equal(after.size, 4);
+  assert.equal(evicted.length, 0);
   for (const [host, position] of before) if (after.has(host)) assert.deepEqual(after.get(host), position, host);
   for (const row of list.listed) assert.ok(after.has(row.host));
   h.dispose();
@@ -793,7 +793,7 @@ test('ticker nodes and their current animation survive unchanged snapshots', asy
   await window.finish(); h.dispose();
 });
 
-test('evicted pages do not reenter and displace sites on an unchanged snapshot', () => {
+test('opened pages remain on the map across unchanged snapshots', () => {
   const h = harness(), lists = Array.from({ length: 21 }, (_, i) => resultList(i + 1));
   const s = snapshot({ results: lists, pages: lists.map((r) => servedPage(r.listed[0].url)), queries: [query(21, { key: lists.at(-1).key })] });
   h.publish(s);
@@ -801,7 +801,9 @@ test('evicted pages do not reenter and displace sites on an unchanged snapshot',
   const next = { ...s, results: [...lists, list], queries: [...s.queries, query(22, { key: list.key })] };
   h.publish(next);
   const after = locations(h.root);
-  for (const [host, position] of before) if (after.has(host)) assert.deepEqual(after.get(host), position, host);
+  assert.equal(after.size, 22);
+  for (const host of before.keys()) assert.ok(after.has(host), host);
+  assert.equal(new Set([...after.values()].map(String)).size, 22);
   h.publish(next);
   assert.deepEqual(locations(h.root), after);
   h.dispose();
@@ -995,20 +997,24 @@ test('wide labels fit every slot without touching neighboring labels', () => {
   const create = window.document.createElement;
   window.document.createElement = (tag) => {
     const node = create(tag);
-    if (tag === 'text') node.getComputedTextLength = () => node.textContent.length * 11;
+    if (tag === 'text' || tag === 'tspan') node.getComputedTextLength = () => node.textContent.length * 11;
     return node;
   };
   const h = harness(window);
-  h.publish(snapshot({ seed: { sites: [] }, pages: Array.from({ length: 21 }, (_, i) => servedPage(`https://${'w'.repeat(18)}${i}.com/`, { site: 'W'.repeat(24) })) }));
+  h.publish(snapshot({ seed: { sites: [] }, pages: Array.from({ length: 21 }, (_, i) => servedPage(`https://${'w'.repeat(18)}${i}.com/`, { site: `${'W'.repeat(8)} ${'W'.repeat(15)}` })) }));
   const labels = h.root.querySelectorAll('.site-group').map((g) => g.querySelector('.label'));
   assert.equal(labels.length, 21);
-  const boxes = labels.map((label) => {
-    const width = label.getComputedTextLength(), x = Number(label.getAttribute('x')), y = Number(label.getAttribute('y'));
-    assert.ok(width <= 116);
-    assert.ok(x - width / 2 >= 0 && x + width / 2 <= 520);
-    assert.ok(y - 12.5 >= 0 && y <= 560);
-    assert.match(label.textContent, /…$/);
-    return { left: x - width / 2, right: x + width / 2, top: y - 12.5, bottom: y };
+  const boxes = labels.flatMap((label) => {
+    const spans = label.querySelectorAll('tspan');
+    assert.equal(spans.length, 2);
+    assert.match(spans.at(-1).textContent, /…$/);
+    return spans.map((span, index) => {
+      const width = span.getComputedTextLength(), x = Number(span.getAttribute('x')), y = Number(label.getAttribute('y')) + index * 13;
+      assert.ok(width <= 116);
+      assert.ok(x - width / 2 >= 0 && x + width / 2 <= 520);
+      assert.ok(y - 13 >= 0 && y <= 560);
+      return { left: x - width / 2, right: x + width / 2, top: y - 12.5, bottom: y };
+    });
   });
   for (const [i, a] of boxes.entries()) for (const b of boxes.slice(i + 1)) {
     assert.ok(a.right < b.left || b.right < a.left || a.bottom < b.top || b.bottom < a.top);
@@ -1049,7 +1055,7 @@ test('world names label merged nodes and every alias contributes its pages', () 
   assert.equal(wiki.children[0].getAttribute('r'), '10.25');
   assert.equal(wiki.querySelector('.mark').textContent, 'W');
   assert.equal(wiki.querySelector('title').textContent, 'en.wikipedia.org');
-  assert.equal(groups.find((g) => g !== wiki).children[1].textContent, 'Python Documentat…');
+  assert.equal(groups.find((g) => g !== wiki).children[1].textContent, 'Python Documentation');
   assert.equal(h.root.querySelectorAll('.result').length, 3);
   assert.deepEqual(h.root.querySelectorAll('.result').slice(0, 2).map((line) => [line.getAttribute('x2'), line.getAttribute('y2')]),
     Array(2).fill([wiki.children[0].getAttribute('cx'), String(Number(wiki.children[0].getAttribute('cy')) - 16)]));
@@ -1099,7 +1105,9 @@ test('names survive older result lists leaving the snapshot', () => {
   const first = snapshot({ results: [{ key: 'old', query_id: 1, listed: [{ host: 'docs.python.org', site: 'Python Documentation', rank: 1, url: 'https://docs.python.org/' }] }] });
   h.publish(first);
   h.publish({ ...first, results: [] });
-  assert.equal(h.root.querySelector('.site-group').querySelector('.label').textContent, 'Python Documentat…');
+  assert.equal(h.root.querySelector('.site-group'), null);
+  h.publish({ ...first, results: [], pages: [servedPage('https://docs.python.org/', { site: null })] });
+  assert.equal(h.root.querySelector('.site-group').querySelector('.label').textContent, 'Python Documentation');
   h.dispose();
 });
 
@@ -1123,18 +1131,18 @@ test('completed background pages leave no making marks until opened', () => {
     const pending = snapshot({ queries: [query(1)], pages: [p] });
     h.publish(pending);
     assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page making');
-    assert.match(h.root.textContent, /making/);
+    assert.match(h.root.textContent, /writing/);
     const completed = { ...pending, pages: [] };
     assert.deepEqual(diff(pending, completed), []);
     h.publish(completed);
     assert.equal(h.root.querySelectorAll('.page').length, 0);
     assert.ok(h.root.querySelectorAll('.site').every((n) => !/\bmaking\b/.test(n.getAttribute('class'))));
-    assert.doesNotMatch(h.root.textContent, /making/);
+    assert.doesNotMatch(h.root.textContent, /writing/);
     const opened = { ...completed, pages: [{ ...p, making: false, status: 200, fetches: 1, cache: 'prefetched', made }] };
     assert.equal(diff(completed, opened)[0].type, 'page_opened');
     h.publish(opened);
     assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page made');
-    assert.doesNotMatch(h.root.textContent, /making/);
+    assert.doesNotMatch(h.root.textContent, /writing/);
     h.dispose();
   }
 });
@@ -1146,11 +1154,11 @@ test('a request waiting for a background page stays making until served', () => 
   h.publish(pending);
   const completed = { ...pending, revision: pending.revision + 1 };
   h.publish(completed);
-  assert.match(h.root.textContent, /making/);
+  assert.match(h.root.textContent, /writing/);
   assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page making');
   h.publish({ ...completed, pages: [{ ...p, making: false, status: 200, fetches: 1, cache: 'prefetched', made: 'written_live' }] });
   assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page made');
-  assert.doesNotMatch(h.root.textContent, /making/);
+  assert.doesNotMatch(h.root.textContent, /writing/);
   h.dispose();
 });
 
@@ -1182,7 +1190,7 @@ test('off-map queries keep the last map search and target their site through eve
       const before = window.calls.length;
       h.publish({ ...answered, refused: [{ name: 'wiki.corp', at_ms: 90000 }] });
       assert.ok(window.calls.slice(before).some((a) => a.node.getAttribute('class') === 'refused-mark'));
-      assert.equal(rows(answered)[0].who, host);
+      assert.equal(rows(answered)[0].who, engine(name));
       assert.deepEqual(h.root.querySelectorAll('.result-group'), lines);
       h.dispose();
     }
@@ -1368,4 +1376,168 @@ test('a repeated YouTube answer pulses its site in full and reduced motion', asy
     assert.equal(ring.options.duration, reduced ? 150 : 500);
     await window.finish(); h.dispose();
   }
+});
+
+test('relative row times advance with the run and leave names and titles readable', () => {
+  const h = harness();
+  let now = 0;
+  h.services.runTime = () => now;
+  const p = servedPage('https://www.securityweek.com/a-long-path', { site: 'SecurityWeek', title: 'A security update', at_ms: 1000 });
+  const s = snapshot({ pages: [p] });
+  h.publish(s);
+  const row = h.root.querySelector('.search-row');
+  assert.equal(row.querySelector('time').textContent, 'now');
+  assert.equal(row.children[1].textContent, 'SecurityWeek');
+  assert.equal(row.querySelector('.row-text').textContent, 'A security update');
+  assert.equal(row.querySelector('b').getAttribute('title'), p.url);
+  now = 121;
+  h.publish(s);
+  assert.equal(h.root.querySelector('.search-row'), row);
+  assert.equal(row.querySelector('time').textContent, '2 min ago');
+  now = 7201;
+  h.publish(s);
+  assert.equal(row.querySelector('time').textContent, '2 hr ago');
+  const css = readFileSync(new URL('./style.css', import.meta.url), 'utf8');
+  assert.match(css, /\.search-row \{[^}]*font: 13px var\(--sans\)/);
+  assert.match(css, /\.made-dot \{ width: 6px; height: 6px;[^}]*background: var\(--app-made\)/);
+  h.dispose();
+});
+
+test('missing pages stay hollow and say not found even on another visit', () => {
+  const h = harness();
+  for (const fetches of [1, 2]) {
+    const p = servedPage('https://www.cnet.com/missing', { site: 'CNET', title: 'Page not found', status: 404, made: 'missing', fetches });
+    h.publish(snapshot({ pages: [p] }));
+    assert.equal(pageTag(p), 'missing');
+    assert.equal(h.root.querySelector('.page').getAttribute('class'), 'page missing');
+    assert.equal(h.root.querySelector('em.missing').textContent, 'not found');
+    assert.equal(h.root.querySelector('.made-dot'), null);
+  }
+  const css = readFileSync(new URL('./style.css', import.meta.url), 'utf8');
+  assert.match(css, /\.page\.missing \{ fill: var\(--app-pane\); stroke: var\(--app-mute\); stroke-dasharray: 2 2/);
+  assert.match(css, /\.search-row em\.missing,[^}]*color: var\(--app-mute\)/);
+  h.dispose();
+});
+
+test('site labels wrap at the last fitting space before using an ellipsis', () => {
+  const window = animationWindow({ reduced: true });
+  const create = window.document.createElement;
+  window.document.createElement = (tag) => {
+    const node = create(tag);
+    if (tag === 'tspan') node.getComputedTextLength = () => node.textContent.trimEnd().length * 7;
+    return node;
+  };
+  const h = harness(window);
+  h.publish(snapshot({ pages: [servedPage('https://a.com/', { site: 'Health and Safety Executive' })] }));
+  const label = h.root.querySelector('.site-group').querySelector('.label');
+  assert.deepEqual(label.querySelectorAll('tspan').map((n) => n.textContent), ['Health and ', 'Safety Executive']);
+  assert.equal(label.querySelectorAll('tspan')[1].getAttribute('dy'), '13');
+  assert.equal(label.textContent, 'Health and Safety Executive');
+  h.publish(snapshot({ pages: [servedPage('https://a.com/', { site: 'Health and Safety Executive International Association' })] }));
+  assert.deepEqual(label.querySelectorAll('tspan').map((n) => n.textContent), ['Health and ', 'Safety Executiv…']);
+  assert.equal(label.querySelectorAll('tspan').length, 2);
+  h.publish(snapshot({ pages: [servedPage('https://a.com/', { site: 'Mechanicalkeyboards' })] }));
+  assert.deepEqual(label.querySelectorAll('tspan').map((n) => n.textContent), ['Mechanicalkeybo…']);
+  h.dispose();
+});
+
+for (const reduced of [false, true]) test(`current site follows request times and results with reduced motion ${reduced}`, async () => {
+  const window = animationWindow({ reduced }), h = harness(window);
+  const a = servedPage('https://a.com/', { latest_serve_ms: 9000, at_ms: 2000 });
+  const b = servedPage('https://b.com/', { latest_serve_ms: 8000, at_ms: 1000 });
+  let s = snapshot({ pages: [a, b] });
+  h.publish(s);
+  const ring = h.root.querySelector('.current');
+  const check = (node) => {
+    assert.equal(ring.getAttribute('visibility'), 'visible');
+    for (const key of ['cx', 'cy']) assert.equal(ring.getAttribute(key), node.getAttribute(key));
+    assert.equal(Number(ring.getAttribute('r')), Number(node.getAttribute('r')) + 4);
+  };
+  check(h.root.querySelectorAll('.site-group').find((g) => g.getAttribute('data-host') === 'a.com').children[0]);
+  await settle();
+  const event = new Event('event');
+  event.data = JSON.stringify({ source: 'http', kind: 'request', seq: 10, at: 10, fields: { kind: 'page', host: 'b.com' } });
+  h.watch.dispatchEvent(event);
+  s = { ...s, pages: [a, { ...b, latest_serve_ms: 1, fetches: 2 }] };
+  h.publish(s);
+  check(h.root.querySelectorAll('.site-group').find((g) => g.getAttribute('data-host') === 'b.com').children[0]);
+  const q = query(1, { engine: 'bing', answer_at_ms: 11000 });
+  s = { ...s, queries: [q] };
+  h.publish(s);
+  check(h.root.querySelectorAll('.engine')[1]);
+  h.publish({ ...s, queries: [q, query(2, { outcome: { status: 'pending' }, at_ms: 12000 })] });
+  check(h.root.querySelectorAll('.engine')[1]);
+  h.publish(snapshot({ revision: 2 }));
+  assert.equal(ring.getAttribute('visibility'), 'hidden');
+  h.publish(snapshot({ revision: 2, pages: [{ ...b, at_ms: 12000, latest_serve_ms: 1 }], queries: [q] }));
+  check(h.root.querySelector('.site-group').children[0]);
+  const css = readFileSync(new URL('./style.css', import.meta.url), 'utf8');
+  assert.match(css, /\.current \{[^}]*stroke: var\(--app-ink\); stroke-width: 2;[^}]*transition: cx 300ms, cy 300ms, r 300ms/);
+  assert.equal(h.root.classList.contains('no-motion'), reduced);
+  h.dispose();
+});
+
+test('many searches retain opened and scenario sites plus only two recent result lists', () => {
+  const h = harness();
+  const seed = { sites: [{ host: 'story.com', site: 'Story' }, { host: 'community.story.com', site: 'Story Community' }] };
+  const pages = ['cisa.gov', 'nvd.nist.gov', 'securityweek.com', 'theregister.com'].map((host) => servedPage(`https://${host}/`));
+  let s = snapshot({ seed, pages });
+  h.publish(s);
+  for (let n = 1; n <= 80; n++) {
+    const q = query(n, { key: `question ${n}` });
+    const listed = [...pages.map((p) => ({ host: p.host, site: p.site, url: p.url })), ...Array.from({ length: 6 }, (_, i) => ({ host: `site-${n}-${i}.com`, site: `Site ${n} ${i}`, url: `https://site-${n}-${i}.com/` }))].map((r, i) => ({ ...r, rank: i + 1 }));
+    s = { ...s, queries: [...s.queries, q].slice(-128), results: [...s.results, { key: q.key, query_id: n, listed }].slice(-24) };
+    h.publish(s);
+    const hosts = [...locations(h.root).keys()];
+    assert.equal(hosts.length, n === 1 ? 12 : 18);
+    for (const p of pages) assert.ok(hosts.includes(p.host));
+    for (const site of seed.sites) assert.ok(hosts.includes(site.host));
+    for (const host of hosts.filter((host) => host.startsWith('site-'))) assert.ok(host.startsWith(`site-${n}-`) || host.startsWith(`site-${n - 1}-`));
+  }
+  h.publish({ ...s, pages: [] });
+  for (const p of pages) assert.ok(locations(h.root).has(p.host));
+  h.dispose();
+});
+
+for (const reduced of [false, true]) test(`old listed sites fade and leave with reduced motion ${reduced}`, async () => {
+  const window = animationWindow({ reduced }), h = harness(window);
+  let s = snapshot();
+  for (let n = 1; n <= 3; n++) {
+    const q = query(n, { key: `question ${n}` });
+    s = { ...s, queries: [...s.queries, q], results: [...s.results, { ...resultList(n), key: q.key }] };
+    h.publish(s);
+    if (n < 3) await window.finish();
+  }
+  const fade = window.calls.find((a) => a.options.duration === 320 && a.keyframes.at(-1).opacity === 0);
+  if (reduced) {
+    assert.equal(fade, undefined);
+    assert.ok(![...locations(h.root).keys()].includes('site1.com'));
+  } else {
+    assert.ok(fade);
+    assert.equal(fade.node.parentNode.getAttribute('class'), 'layer-fx');
+    assert.deepEqual(fade.keyframes, [{ opacity: 1 }, { opacity: 0 }]);
+    assert.ok(h.root.contains(fade.node));
+    await window.finish();
+    assert.ok(!h.root.contains(fade.node));
+  }
+  assert.deepEqual([...locations(h.root).keys()], ['site2.com', 'site3.com']);
+  h.dispose();
+});
+
+test('row times update during a quiet running session and stop after disposal', () => {
+  const window = animationWindow(), h = harness(window);
+  let now = 1;
+  h.services.runTime = () => now;
+  h.services.clock.ended = false;
+  h.publish(snapshot({ pages: [servedPage('https://a.com/', { at_ms: 1000 })] }));
+  const row = h.root.querySelector('.search-row');
+  assert.equal(row.querySelector('time').textContent, 'now');
+  now = 121;
+  window.advance(120000);
+  assert.equal(row.querySelector('time').textContent, '2 min ago');
+  assert.match(row.getAttribute('title'), /^2 min ago/);
+  h.dispose();
+  now = 181;
+  window.advance(60000);
+  assert.equal(row.querySelector('time').textContent, '2 min ago');
 });

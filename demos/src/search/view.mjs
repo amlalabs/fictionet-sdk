@@ -3,8 +3,10 @@ import { createMotion } from './motion.mjs';
 import { createWeb } from './web.mjs';
 
 const NEW_PAGES = [['canned', 'Prepared first'], ['stub', 'Improvised'], ['off', 'Off']];
-// Run time as minutes and seconds.
-const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const relativeTime = (at, now) => {
+  const seconds = Math.max(0, Math.floor((now - at) / 1000));
+  return seconds < 60 ? 'now' : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago` : `${Math.floor(seconds / 3600)} hr ago`;
+};
 
 export function mount(root, services, options) {
   const { el } = services.dom.scoped(root);
@@ -18,7 +20,7 @@ export function mount(root, services, options) {
   const controller = new AbortController();
   const cleanup = [motion.subscribe((disabled) => root.classList.toggle('no-motion', disabled))];
   const rowNodes = new Map();
-  let snapshot = null, disposed = false, closeTimer;
+  let snapshot = null, disposed = false, closeTimer, timeTimer;
   const window = root.ownerDocument.defaultView || globalThis;
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
@@ -95,27 +97,40 @@ export function mount(root, services, options) {
     note = el('p', { class: 'note', role: 'status' }, null);
   }
   buttons();
+  const graph = services.graph;
+  web.setEvents(graph.state.events);
+  cleanup.push(graph.subscribe((name) => { if (name === 'event' || name === 'snapshot') web.setEvents(graph.state.events); }));
 
   function render(changes = []) {
+    window.clearTimeout(timeTimer);
+    const now = Math.max(snapshot.at_ms || 0, services.runTime() * 1000);
     const entries = rows(snapshot).map((row) => [JSON.stringify(row), row]);
     const keys = new Set(entries.map(([key]) => key));
     for (const [key, node] of rowNodes) if (!keys.has(key)) { node.remove(); rowNodes.delete(key); }
     entries.forEach(([key, row], index) => {
       let line = rowNodes.get(key);
       if (!line) {
-        line = el('div', { class: 'search-row', role: 'listitem', title: `${clock(row.at)} · ${row.who === 'Claude Code' ? '❯ Claude Code' : row.who} · ${row.what}${row.badge ? ` · ${row.badge}` : ''}` }, list);
+        line = el('div', { class: 'search-row', role: 'listitem' }, list);
         rowNodes.set(key, line);
         if (changes.length) motion.anim(line, [{ opacity: 0, transform: 'translateY(-10px)' }, { opacity: 1, transform: 'translateY(0)' }], { duration: 260, easing: 'cubic-bezier(.2,.7,.3,1)' });
-        el('time', { text: clock(row.at) }, line);
+        el('time', {}, line);
         el('span', { text: row.who === 'Claude Code' ? '❯ Claude Code' : row.who, title: row.who === 'Claude Code' ? '❯ Claude Code' : row.who }, line);
-        const what = el('b', { title: row.what }, line);
+        const what = el('b', { title: row.title || row.what }, line);
         if (row.carries) el('i', { class: 'fact-dot', 'aria-label': 'Carries a planted fact' }, what);
         el('span', { class: 'row-text', text: row.what }, what);
+        if (row.tag === 'made') el('i', { class: 'made-dot', role: 'img', 'aria-label': 'Made now', title: 'Made now' }, line);
         if (row.badge) el('em', { class: row.tag, text: row.badge }, line);
       }
+      const time = relativeTime(row.at, now);
+      line.querySelector('time').textContent = time;
+      line.setAttribute('title', `${time} · ${row.who === 'Claude Code' ? '❯ Claude Code' : row.who} · ${row.what}${row.badge ? ` · ${row.badge}` : ''}`);
       if (list.children[index] !== line) list.insertBefore(line, list.children[index] || null);
     });
     buttons();
+    if (!services.clock.ended && entries.length) {
+      const next = Math.min(...entries.map(([, row]) => 60000 - Math.max(0, now - row.at) % 60000));
+      timeTimer = window.setTimeout(() => { if (!disposed) render(); }, next);
+    }
   }
   cleanup.push(services.state(options.state, ({ value }) => {
     if (disposed || !value) return;
@@ -132,6 +147,7 @@ export function mount(root, services, options) {
   return () => {
     disposed = true;
     window.clearTimeout(closeTimer);
+    window.clearTimeout(timeTimer);
     controller.abort();
     web.dispose();
     cleanup.forEach((off) => off());

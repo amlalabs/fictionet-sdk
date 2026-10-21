@@ -18,10 +18,10 @@ export function queryTag(s, q) {
   return 'failed';
 }
 
-const pageState = (p) => ({ stubbed: 'made', written_live: 'made', stored: 'stored', fixed: 'stored', planted: 'planted', missing: 'missing', not_made: 'refused' }[p.made] || 'asking');
+const pageState = (p) => p.status === 404 ? 'missing' : ({ stubbed: 'made', written_live: 'made', stored: 'stored', fixed: 'stored', planted: 'planted', missing: 'missing', not_made: 'refused' }[p.made] || 'asking');
 
 export function pageTag(p) {
-  return p.making ? 'making' : p.fetches > 1 ? 'again' : pageState(p);
+  return p.making ? 'making' : p.made === 'missing' || p.status === 404 ? 'missing' : p.fetches > 1 ? 'again' : pageState(p);
 }
 
 const byTime = (a, b) => a.at_ms - b.at_ms || a.seq - b.seq;
@@ -78,32 +78,26 @@ export function slots() {
   return centers.sort((a, b) => distance(a) - distance(b));
 }
 
-// Hosts includes the whole run. Context supplies seed.sites, list, opened,
-// touched (a host-to-time Map), and restart. Assignment maps hosts to centers.
+// Assign active sites to the map's slots.
 export function layout(prev, hosts, context = {}) {
+  const all = new Set([...(context.seed?.sites || []), ...hosts]);
   const centers = slots();
-  const scenario = new Set(context.seed?.sites || []);
-  const list = new Set((context.list || []).map((r) => typeof r === 'string' ? r : r.host));
-  const opened = new Set((context.opened || []).map((p) => typeof p === 'string' ? p : p.host));
-  const all = new Set([...scenario, ...hosts]);
-  const assignment = new Map(context.restart ? [] : prev?.assignment || []);
-  const touched = new Map(context.restart ? [] : prev?.touched || []);
-  for (const [host, time] of context.touched || []) touched.set(host, time);
-  const evicted = [];
+  if (all.size > centers.length) {
+    const rows = Math.ceil(all.size / 3.5);
+    centers.length = 0;
+    for (let row = 0; row < rows; row++) {
+      for (const x of row % 2 === 0 ? [74, 198, 322, 446] : [136, 260, 384]) centers.push([x, 178 + row * 310 / (rows - 1)]);
+    }
+    centers.sort((a, b) => Math.hypot(a[0] - 260, a[1] - 335) - Math.hypot(b[0] - 260, b[1] - 335));
+  }
+  const old = context.restart ? new Map() : prev?.assignment || new Map();
+  const assignment = new Map([...old].filter(([host, pos]) => all.has(host) && centers.some(([x, y]) => x === pos[0] && y === pos[1])));
   for (const host of all) {
     if (assignment.has(host)) continue;
     const free = centers.find(([x, y]) => ![...assignment.values()].some(([px, py]) => px === x && py === y));
-    if (free) { assignment.set(host, free); continue; }
-    if (!list.has(host) && !opened.has(host)) continue;
-    const victim = [...assignment.keys()].filter((h) => !scenario.has(h) && !list.has(h))
-      .sort((a, b) => (touched.get(a) ?? 0) - (touched.get(b) ?? 0))[0];
-    if (!victim) continue;
-    const center = assignment.get(victim);
-    assignment.delete(victim);
-    assignment.set(host, center);
-    evicted.push(victim);
+    assignment.set(host, free);
   }
-  return { assignment, hidden: [...all].filter((host) => !assignment.has(host)).length, evicted, touched };
+  return { assignment, evicted: [...old.keys()].filter((host) => !all.has(host)) };
 }
 
 // Names a person might have typed: not the service lookups (`_http._tcp.…`)
@@ -111,13 +105,12 @@ export function layout(prev, hosts, context = {}) {
 const typed = (r) => !r.name.startsWith('_');
 
 // The newest rows first: searches, pages, refused names and plants.
-export function rows(s, limit = 6) {
-  const path = (url) => { try { const u = new URL(url); return `${u.pathname}${u.search}`; } catch { return url; } };
+export function rows(s, limit = 8) {
   const who = (item, fallback) => ['web_search', 'web_fetch'].includes(item.via) ? 'Claude Code' : fallback;
-  const badge = (tag) => ({ made: 'made now', again: 'again', planted: 'planted', refused: 'refused', making: 'making', asking: 'writing' }[tag] || null);
+  const badge = (tag) => ({ again: 'again', planted: 'planted', refused: 'refused', making: 'writing', asking: 'writing', missing: 'not found' }[tag] || null);
   return [
-    ...s.queries.map((q) => ({ at: q.at_ms, seq: q.seq ?? 0, who: who(q, ENGINE_HOSTS[q.engine] || q.engine), what: q.search, tag: queryTag(s, q) })),
-    ...s.pages.map((p) => ({ at: pageTime(p), seq: p.seq ?? 0, who: who(p, p.host), what: path(p.url), tag: pageTag(p), ...(p.carries > 0 ? { carries: true } : {}) })),
+    ...s.queries.map((q) => ({ at: q.at_ms, seq: q.seq ?? 0, who: who(q, short(q.site || engine(q.engine))), what: `“${q.search}”`, tag: queryTag(s, q) })),
+    ...s.pages.map((p) => ({ at: pageTime(p), seq: p.seq ?? 0, who: who(p, short(p.site || p.host)), what: p.title || p.url, title: p.url, tag: pageTag(p), ...(p.carries > 0 ? { carries: true } : {}) })),
     ...s.refused.filter(typed).map((r) => ({ at: r.at_ms, seq: r.seq ?? 0, who: who(r, 'DNS'), what: r.name, tag: 'refused' })),
     ...(s.planted || []).map((p) => ({ at: p.at_ms, seq: p.seq ?? 0, who: 'You', what: p.text, tag: 'planted' })),
   ].sort((a, b) => b.at - a.at || b.seq - a.seq).slice(0, limit).map(({ seq, ...row }) => ({ ...row, badge: badge(row.tag) }));
@@ -168,5 +161,5 @@ export function short(site) {
     'Cybersecurity and Infrastructure Security Agency': 'CISA',
     'National Vulnerability Database': 'NVD',
   }[site] || site;
-  return name.length > 18 ? `${name.slice(0, 17)}…` : name;
+  return name;
 }
