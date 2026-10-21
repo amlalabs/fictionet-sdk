@@ -141,53 +141,54 @@ async fn collected(response: Response<Body>, stream: bool) -> Value {
 }
 #[test]
 fn search_splices_and_replays_exact_history_with_thinking() {
-    for stream in [false, true] {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let first = vec![
-            json!({"type":"thinking","thinking":"Consider the question.","signature":"signed-thinking"}),
-            json!({"type":"tool_use","id":"toolu_original","name":"web_search","input":{"query":"page"}}),
-        ];
-        let second = vec![
-            json!({"type":"thinking","thinking":"Read the result.","signature":"next-signature"}),
-            json!({"type":"text","text":"The page text."}),
-        ];
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let a = receive(&mut socket);
-            assert!(a["tools"][0].get("type").is_none());
-            assert_eq!(a["tool_choice"], json!({"type":"tool","name":"web_search"}));
-            response(&mut socket, first.clone(), "tool_use", stream);
-            let (mut socket, _) = listener.accept().unwrap();
-            let b = receive(&mut socket);
-            assert_eq!(b["tools"], a["tools"]);
-            assert!(b.get("tool_choice").is_none());
-            assert_eq!(b["messages"][1]["content"], json!(first));
-            assert_eq!(
-                b["messages"][2]["content"][0]["tool_use_id"],
-                "toolu_original"
-            );
-            response(&mut socket, second.clone(), "end_turn", stream);
-            let (mut socket, _) = listener.accept().unwrap();
-            let c = receive(&mut socket);
-            assert_eq!(c["tools"], b["tools"]);
-            assert_eq!(c["messages"][1], b["messages"][1]);
-            assert_eq!(c["messages"][2], b["messages"][2]);
-            assert_eq!(c["messages"][3]["content"], json!(second));
-            assert_eq!(c["messages"][4]["content"], "Continue");
-            response(
-                &mut socket,
-                vec![json!({"type":"text","text":"Done."})],
-                "end_turn",
-                stream,
-            );
-        });
-        let pages = Arc::new(Pages(AtomicUsize::new(0)));
-        let engine = pages.clone();
-        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)), |cx| async move {
+    for guest in [false, true] {
+        for stream in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let first = vec![
+                json!({"type":"thinking","thinking":"Consider the question.","signature":"signed-thinking"}),
+                json!({"type":"tool_use","id":"toolu_original","name":"web_search","input":{"query":"page"}}),
+            ];
+            let second = vec![
+                json!({"type":"thinking","thinking":"Read the result.","signature":"next-signature"}),
+                json!({"type":"text","text":"The page text."}),
+            ];
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let a = receive(&mut socket);
+                assert!(a["tools"][0].get("type").is_none());
+                assert_eq!(a["tool_choice"], json!({"type":"tool","name":"web_search"}));
+                response(&mut socket, first.clone(), "tool_use", stream);
+                let (mut socket, _) = listener.accept().unwrap();
+                let b = receive(&mut socket);
+                assert_eq!(b["tools"], a["tools"]);
+                assert!(b.get("tool_choice").is_none());
+                assert_eq!(b["messages"][1]["content"], json!(first));
+                assert_eq!(
+                    b["messages"][2]["content"][0]["tool_use_id"],
+                    "toolu_original"
+                );
+                response(&mut socket, second.clone(), "end_turn", stream);
+                let (mut socket, _) = listener.accept().unwrap();
+                let c = receive(&mut socket);
+                assert_eq!(c["tools"], b["tools"]);
+                assert_eq!(c["messages"][1], b["messages"][1]);
+                assert_eq!(c["messages"][2], b["messages"][2]);
+                assert_eq!(c["messages"][3]["content"], json!(second));
+                assert_eq!(c["messages"][4]["content"], "Continue");
+                response(
+                    &mut socket,
+                    vec![json!({"type":"text","text":"Done."})],
+                    "end_turn",
+                    stream,
+                );
+            });
+            let pages = Arc::new(Pages(AtomicUsize::new(0)));
+            let engine = pages.clone();
+            fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "sk-ant-api03-private".into())?);
             let key = credential.placeholder().to_owned();
-            let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.search(engine);
+            let model = if guest { Model::guest_at(&cx, Provider::Anthropic, format!("http://{address}").parse()?)? } else { Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)? }.search(engine);
             let request = |body: &Value| Request::post("/v1/messages").header("x-api-key", &key).body(Body::from(body.to_string())).unwrap();
             let mut body = json!({"model":"claude","stream":stream,"max_tokens":100,"messages":[{"role":"user","content":"Search for page"}],"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],"tool_choice":{"type":"tool","name":"web_search"}});
             let answer = collected(model.clone().send(request(&body)).await?, stream).await;
@@ -206,8 +207,9 @@ fn search_splices_and_replays_exact_history_with_thinking() {
             assert_eq!(result["content"][0]["text"], "Done.");
             Ok(())
         })).unwrap();
-        server.join().unwrap();
-        assert_eq!(pages.0.load(Ordering::SeqCst), 1);
+            server.join().unwrap();
+            assert_eq!(pages.0.load(Ordering::SeqCst), 1);
+        }
     }
 }
 

@@ -29,6 +29,7 @@ pub(super) struct Call {
     ledger: Arc<Mutex<Ledger>>,
     prices: Option<Prices>,
     secret: Secret,
+    credential: &'static str,
 }
 impl Call {
     pub fn new(
@@ -38,16 +39,14 @@ impl Call {
         request: &[u8],
         free: bool,
         transport: &'static str,
+        secret: &Secret,
     ) -> Self {
         let call = Self {
             cx: site.cx.clone(),
             id: site.cx.random_u64(),
             provider: site.provider,
             path,
-            model: site
-                .credential
-                .real
-                .redact(body["model"].as_str().unwrap_or("")),
+            model: secret.redact(body["model"].as_str().unwrap_or("")),
             stream: body["stream"].as_bool().unwrap_or(false),
             transport,
             request_bytes: request.len(),
@@ -69,15 +68,17 @@ impl Call {
             prices: site.prices.as_ref().and_then(|(model, prices)| {
                 (body["model"].as_str() == Some(model.as_str())).then_some(*prices)
             }),
-            secret: site.credential.real.clone(),
+            secret: secret.clone(),
+            credential: if site.credential.is_none() {
+                "guest"
+            } else {
+                "placeholder"
+            },
         };
         if call.cx.event_enabled("model", "body") {
             call.transcript(
                 "request",
-                site.credential
-                    .real
-                    .redact(&String::from_utf8_lossy(request))
-                    .as_bytes(),
+                secret.redact(&String::from_utf8_lossy(request)).as_bytes(),
             );
         }
         call
@@ -214,7 +215,7 @@ impl Drop for Call {
                 .field("first_byte_ms", self.first.unwrap_or(0))
                 .field("total_ms", self.start.elapsed().as_millis() as u64)
                 .field("stop_reason", self.stop.as_str())
-                .field("credential", "placeholder")
+                .field("credential", self.credential)
         });
     }
 }

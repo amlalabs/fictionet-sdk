@@ -172,7 +172,7 @@ impl Transport for Https {
             let site = Model::with_forward(
                 cx,
                 self.provider,
-                credential,
+                Some(credential),
                 self.forward.clone(),
                 self.authority.clone(),
             );
