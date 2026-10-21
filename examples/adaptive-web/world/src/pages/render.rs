@@ -133,6 +133,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         e(name),
         e(title)
     );
+    let title = super::make::heading(title);
     let body = &record.body;
     let tagline = if profile.tagline.is_empty() {
         String::new()
@@ -258,7 +259,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         }
     };
     let cookies = if !["government", "wiki", "docs", "package"].contains(&kind) && style % 3 != 2 {
-        "<div class=\"cookie-banner\" role=\"dialog\" aria-label=\"Cookies\"><p>We use cookies to improve your experience and for analytics. <a href=\"/privacy\">Privacy policy</a></p><button>Accept</button> <button>Reject non-essential</button></div>\n"
+        "<div class=\"cookie-banner\" style=\"position:fixed;bottom:0;left:0;right:0;z-index:100;background:white;padding:16px 24px;border-top:1px solid #bdc6d1\" role=\"dialog\" aria-label=\"Cookies\"><p>We use cookies to improve your experience and for analytics. <a href=\"/privacy\">Privacy policy</a></p><button>Accept</button> <button>Reject non-essential</button></div>\n"
     } else {
         ""
     };

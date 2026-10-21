@@ -25,7 +25,9 @@ pub(crate) fn source(host: &str, target: &str) -> Option<&'static str> {
     let host = skin_host(host);
     let page = if host == "www.bbc.com" && target.starts_with("/sport") {
         "sport.html"
-    } else if host == "www.youtube.com" && target.split('?').next() == Some("/results") {
+    } else if host == "www.youtube.com"
+        && matches!(target.split('?').next(), Some("/results" | "/"))
+    {
         "results.html"
     } else if host == "www.reddit.com"
         && target.starts_with("/r/")
@@ -172,10 +174,14 @@ impl Skin {
         }
         if dom.select_first("body.youtube-results").is_ok() {
             if let Ok(input) = dom.select_first("input[name=search_query]") {
-                input
-                    .attributes
-                    .borrow_mut()
-                    .insert("value", heading(title).to_owned());
+                input.attributes.borrow_mut().insert(
+                    "value",
+                    if main.select_first(".video-grid").is_ok() {
+                        String::new()
+                    } else {
+                        heading(title).to_owned()
+                    },
+                );
             }
             for link in main
                 .select("h2 a[href], h3 a[href]")

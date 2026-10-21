@@ -1371,22 +1371,6 @@ impl Pages {
         let mut search = made.fields;
         let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
-            let (host, _) = text::target_of(&r.url);
-            if engine != Engine::YouTube
-                && matches!(self.maker(), Maker::Stub)
-                && self.seed.about(&host).is_some()
-                && !known.iter().any(|k| k.url == r.url)
-            {
-                r.url = format!("https://{host}/");
-                let profile = make::site_profile(&host);
-                r.title = if profile.kind == "forum" {
-                    "Latest discussions".into()
-                } else {
-                    profile.name
-                };
-                r.snippet = r.title.clone();
-                r.date.clear();
-            }
             let (host, target) = text::target_of(&r.url);
             let known_match = known.iter().find(|k| k.url == r.url);
             if host.is_empty()
@@ -1694,6 +1678,19 @@ impl Pages {
         let mut known = {
             let store = self.store();
             let mut known = store.known(&seed);
+            if host == "www.youtube.com" && target == "/" {
+                known.extend(
+                    make::videos(
+                        "",
+                        store
+                            .pages()
+                            .filter(|p| p.host == host)
+                            .map(|p| (&p.url, String::from_utf8_lossy(&p.body).into_owned())),
+                    )
+                    .results,
+                );
+            }
+
             for result in store.searches().flat_map(|s| &s.search.results) {
                 if !known.iter().any(|r| r.url == result.url) {
                     known.push(result.clone());

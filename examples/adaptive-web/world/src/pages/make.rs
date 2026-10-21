@@ -49,15 +49,6 @@ const USERS: [&str; 12] = [
     "oldschool_ccna",
     "pfeiffer_it",
 ];
-/// Replies that add little, as many forum replies do.
-const REPLIES: [&str; 6] = [
-    "Following. Same question here.",
-    "Did you check the vendor's release notes first? That usually answers it.",
-    "We saw something similar last month, a reboot after the update sorted it.",
-    "Not sure this is the right subforum for it, but bumping anyway.",
-    "Can you post your version and model? Hard to say otherwise.",
-    "Thanks, this helped. Marking as solved on our end.",
-];
 /// Site branding and layout settings shared by its pages.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
@@ -120,6 +111,44 @@ fn hash(text: &str) -> usize {
     text.bytes()
         .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize))
 }
+fn base36(mut number: usize) -> String {
+    let mut digits = Vec::new();
+    loop {
+        digits.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[number % 36] as char);
+        number /= 36;
+        if number == 0 {
+            return digits.into_iter().rev().collect();
+        }
+    }
+}
+
+/// Removes branding from a result title for headings and directory links.
+pub(super) fn heading(title: &str) -> &str {
+    [" - ", " — ", " – ", " | ", " · ", " : r/"]
+        .iter()
+        .filter_map(|separator| title.split_once(separator))
+        .map(|(subject, _)| subject.trim())
+        .min_by_key(|subject| subject.len())
+        .unwrap_or(title)
+}
+
+/// Directory and section routes have navigation content rather than articles.
+pub(super) fn directory(target: &str) -> bool {
+    let path = target.split('?').next().unwrap_or(target);
+    path == "/"
+        || (path.ends_with('/') && path.trim_matches('/').split('/').count() == 1)
+        || [
+            "/latest",
+            "/categories",
+            "/top",
+            "/search",
+            "/search/",
+            "/results",
+            "/w/index.php",
+        ]
+        .contains(&path)
+}
+
 fn day(seed: &Seed, back: usize) -> time::Date {
     parse_date(&seed.date).unwrap() - time::Duration::days(back as i64)
 }
@@ -261,11 +290,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
                 .join(" "),
             ..Result::default()
         };
-        if relevant(&candidate, query)
-            && !known
-                .iter()
-                .any(|r| r.url == format!("https://{}/", site.host))
-        {
+        if relevant(&candidate, query) && !known.iter().any(|r| target_of(&r.url).0 == site.host) {
             let slug = words(query)
                 .into_iter()
                 .take(6)
@@ -716,7 +741,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             ),
         ]
     };
-    for (index, (host, title, snippet)) in candidates.into_iter().enumerate() {
+    for (host, title, snippet) in candidates {
         let slug = terms.join("-");
         let path = match host {
             "www.reddit.com" => format!(
@@ -725,7 +750,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
                     .rsplit_once("r/")
                     .map(|(_, name)| name)
                     .unwrap_or("AskReddit"),
-                hash(query)
+                base36(hash(query) % 2_176_782_336)
             ),
             "en.wikipedia.org" => format!("wiki/{}", subject.replace(' ', "_")),
             "docs.python.org" if terms.iter().any(|w| w == "groupby") => {
@@ -733,9 +758,52 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
             }
             "docs.python.org" => format!("3/library/{slug}.html"),
             "doc.rust-lang.org" => format!("std/{slug}/index.html"),
-            "stackoverflow.com" => format!("questions/{}/{slug}", hash(query)),
+            "stackoverflow.com" => {
+                format!("questions/{}/{slug}", 10_000_000 + hash(query) % 90_000_000)
+            }
             "github.com" => format!("python-notes/{slug}"),
-            _ => format!("guides/{slug}-{}", index + 1),
+            "www.tripadvisor.co.uk" => format!(
+                "{}-g186411-{slug}.html",
+                if lodging { "Hotels" } else { "Restaurants" }
+            ),
+            "www.wikihow.com" => subject
+                .split_whitespace()
+                .map(capitalize)
+                .collect::<Vec<_>>()
+                .join("-"),
+            "www.timeout.com" => format!(
+                "{}/restaurants/{slug}",
+                terms.last().map_or("uk", String::as_str)
+            ),
+            "www.netgear.com" => format!("support/product/{slug}.aspx"),
+            "www.tp-link.com" => format!("uk/support/faq/{}/", 1000 + hash(query) % 9000),
+            "www.asus.com" => format!("support/faq/{}/", 1_000_000 + hash(query) % 9_000_000),
+            "www.theregister.com" => format!(
+                "{}/{:02}/{:02}/{}/",
+                day(seed, 0).year(),
+                day(seed, 0).month() as u8,
+                day(seed, 0).day(),
+                slug.replace('-', "_")
+            ),
+            "www.theguardian.com" => format!(
+                "lifeandstyle/{}/{}/20/{slug}",
+                day(seed, 0).year(),
+                MONTHS[day(seed, 0).month() as usize - 1].to_lowercase()
+            ),
+            "www.bbc.com" => format!("news/articles/{}", base36(hash(query))),
+            "www.independent.co.uk" => format!(
+                "life-style/{slug}-b{}.html",
+                1_000_000 + hash(query) % 9_000_000
+            ),
+            "www.booking.com" => format!("city/gb/{slug}.en-gb.html"),
+            "www.opentable.co.uk" => format!("s?term={}", quote_plus(&subject)),
+            "www.yelp.co.uk" => format!("search?find_desc={}", quote_plus(&subject)),
+            "www.techradar.com" | "www.howtogeek.com" | "www.lifewire.com" => {
+                format!("how-to/{slug}")
+            }
+            "www.freecodecamp.org" => format!("news/{slug}/"),
+            "www.digitalocean.com" => format!("community/tutorials/{slug}"),
+            _ => slug.clone(),
         };
         let url = format!("https://{host}/{path}");
         let date = if [
@@ -751,7 +819,14 @@ pub fn search(seed: &Seed, query: &str, known: &[Result]) -> Search {
         } else {
             String::new()
         };
-        add(url, title, snippet.into(), date);
+        let snippet = if place && !lodging && site_profile(host).kind == "listings" {
+            format!(
+                "{snippet} Places for {subject}: Market Kitchen; Station Pizzeria; The Stone Oven; North Street Pizza; Riverside Kitchen; The Dough House; Little Italy; Parkside Pizzeria; The Courtyard; Corner Slice. Compare opening hours and menus before choosing a table."
+            )
+        } else {
+            snippet.into()
+        };
+        add(url, title, snippet, date);
     }
     Search {
         results,
@@ -798,13 +873,17 @@ pub fn videos<'a>(query: &str, pages: impl Iterator<Item = (&'a String, String)>
             }
         }
     }
-    let mut results = rank(&known, query)
-        .into_iter()
-        .filter(|r| relevant(r, query))
-        .take(10)
-        .cloned()
-        .collect::<Vec<_>>();
-    if results.is_empty() {
+    let mut results = if query.is_empty() {
+        known.iter().take(12).cloned().collect::<Vec<_>>()
+    } else {
+        rank(&known, query)
+            .into_iter()
+            .filter(|r| relevant(r, query))
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if results.is_empty() && !query.is_empty() {
         let topic = upper_first(&words(query).join(" "));
         for (i, suffix) in [
             "A practical walkthrough",
@@ -852,6 +931,8 @@ pub fn site_profile(host: &str) -> Profile {
         name
     };
     let name = match host {
+        "www.youtube.com" => "YouTube",
+        "github.com" => "GitHub",
         "www.booking.com" => "Booking.com",
         "www.hotels.com" => "Hotels.com",
         "www.expedia.co.uk" => "Expedia",
@@ -900,6 +981,7 @@ pub fn site_profile(host: &str) -> Profile {
     } else if matches!(
         host,
         "www.tripadvisor.co.uk"
+            | "www.timeout.com"
             | "www.opentable.co.uk"
             | "www.yelp.co.uk"
             | "www.deliveroo.co.uk"
@@ -1092,6 +1174,8 @@ a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: un
 header { background: #fff; border-top: 5px solid var(--accent); border-bottom: 1px solid #d9dee5; padding: 24px max(24px, calc((100% - 1160px)/2)); }
 .brand a, .logo, .home { font-size: 30px; font-weight: 800; letter-spacing: -1px; }
 .tagline { display: block; font-size: 13px; color: #647085; }
+.cookie-banner { position: fixed; bottom: 0; left: 0; right: 0; z-index: 100; display: flex; align-items: center; gap: 16px; padding: 12px 24px; background: #fff; border-top: 1px solid #bdc6d1; box-shadow: 0 -2px 12px #0002; }
+body { padding-bottom: 100px; }
 nav ul, .footer-links, .topbar ul { list-style: none; padding: 0; display: flex; gap: 24px; flex-wrap: wrap; }
 nav a { color: inherit; font-size: 14px; font-weight: 600; }
 .layout, .columns { max-width: 1160px; margin: 36px auto; display: grid; gap: 40px; grid-template-columns: minmax(0, 1fr) 260px; padding: 0 24px; }
@@ -1221,14 +1305,31 @@ pub(super) fn page_with_known(
     kind: &str,
     known: &[Result],
 ) -> Page {
+    if host == "www.youtube.com" && target == "/" {
+        let mut body = String::from("<h1>Recommended</h1><div class=\"video-grid\">");
+        let videos: Vec<_> = known
+            .iter()
+            .filter(|r| r.url.contains("youtube.com/watch?"))
+            .collect();
+        for video in videos {
+            body.push_str(&format!("<article><a href=\"{}\"><img alt=\"\" src=\"{}\"></a><h2><a href=\"{}\">{}</a></h2><p>{}</p></article>", escape(&video.url), fictionet_extras::search::video_thumbnail(&video.title), escape(&video.url), escape(heading(&video.title)), escape(&video.snippet)));
+        }
+        body.push_str("</div>");
+        return Page {
+            status: 200,
+            content_type: "text/html; charset=utf-8".into(),
+            title: "YouTube".into(),
+            body,
+            date: seed.date.clone(),
+            ..Page::default()
+        };
+    }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let query = form_urlencoded::parse(query.as_bytes())
         .find(|(k, _)| ["q", "search", "search_query", "searchTerm"].contains(&k.as_ref()))
         .map(|(_, v)| v.into_owned());
     let search = query.is_some();
-    let directory = path == "/"
-        || (path.ends_with('/') && !path.contains("/comments/"))
-        || ["/latest", "/categories", "/top", "/search"].contains(&path);
+    let directory = directory(target) && mentions.iter().all(|m| m["via"] != "search");
     if !search && !directory {
         let mut made = page(seed, host, target, mentions, kind);
         if path.starts_with("/security/advisories/") {
@@ -1280,7 +1381,7 @@ pub(super) fn page_with_known(
             body.push_str(&format!(
                 "<li><h2><a href=\"{}\">{}</a></h2><p>{}</p></li>",
                 escape(&r.url),
-                escape(&r.title),
+                escape(heading(&r.title)),
                 escape(&r.snippet)
             ));
         }
@@ -1377,7 +1478,8 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
         .collect::<Vec<_>>()
         .join("-");
     let slug = if slug.is_empty() { "update" } else { &slug };
-    let t = escape(&title);
+    let subject = heading(&title);
+    let t = escape(subject);
     let when = short_date(date);
     let (body, sidebar, ad): (String, &[(&str, &str)], &str) = match kind {
         "wiki" => {
@@ -1398,6 +1500,9 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
                 ],
                 "",
             )
+        }
+        "docs" | "package" if host == "github.com" => {
+            (format!("<h1>{t}</h1>{}", paras(&claims)), &[], "")
         }
         "docs" | "package" => {
             let lead = claims
@@ -1430,18 +1535,21 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
         }
         "forum" | "qa" => {
             let asker = pick(&USERS, 0);
-            let question = if claims.is_empty() {
-                format!(
-                    "Anyone know more about this? Searching for {title} turns up very little so far."
-                )
-            } else {
-                "Saw this come up today. Posting what I found so far, corrections welcome.".into()
-            };
+            let question = format!(
+                "{}{} {}",
+                subject,
+                if subject.ends_with('?') { "" } else { "?" },
+                claims.first().map_or("", String::as_str)
+            );
             let mut posts = vec![format!(
                 "<div class=\"post\"><p class=\"author\"><b>{asker}</b> · <time datetime=\"{date}\">{when}</time></p><p>{}</p></div>",
                 escape(&question)
             )];
             let topic = words(&title);
+            let fallback = format!(
+                "For {subject}, start with the details in the question: {}. Which part differs in your situation?",
+                claims.first().map_or(subject, String::as_str)
+            );
             let generic = if topic.iter().any(|w| w == "pizza") {
                 "We usually check the recent comments about the dough and the service, then look at the menu before booking. Going a little earlier helps avoid the dinner rush."
             } else if topic.iter().any(|w| w.contains("groupby")) {
@@ -1449,9 +1557,14 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
             } else if topic.iter().any(|w| w == "router") {
                 "Keep a copy of the connection settings before you clear anything. A restart leaves them in place, while a factory restore means setting up the network again."
             } else {
-                pick(&REPLIES, 0)
+                &fallback
             }.to_owned();
-            for (i, claim) in claims.iter().chain(std::iter::once(&generic)).enumerate() {
+            for (i, claim) in claims
+                .iter()
+                .skip(1)
+                .chain(std::iter::once(&generic))
+                .enumerate()
+            {
                 let reply = (date + time::Duration::days(i as i64 + 1)).min(day(seed, 0));
                 posts.push(format!(
                     "<div class=\"post\"><p class=\"author\"><b>{}</b> · <time datetime=\"{reply}\">{}</time></p><p>{}</p></div>",
@@ -1477,6 +1590,7 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
                 "",
             )
         }
+        "listings" | "lodging" | "howto" => (format!("<h1>{t}</h1>{}", paras(&claims)), &[], ""),
         "company" | "government" | "shop" => {
             let lead = claims
                 .first()
@@ -1484,7 +1598,7 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
                 .unwrap_or_else(|| format!("{title}."));
             let body = format!(
                 "<h1>{t}</h1>\n<p class=\"lead\">{}</p>\n{}\n\
-                 <p><a class=\"btn\" href=\"/contact/\">Contact us</a> <a href=\"/support/\">Get support</a></p>",
+                 <p><a class=\"btn\" href=\"/contact/\">Contact us</a> · <a href=\"/support/\">Get support</a></p>",
                 escape(&lead),
                 paras(claims.get(1..).unwrap_or_default())
             );
@@ -1514,33 +1628,13 @@ pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &st
             } else {
                 format!("By {author} · <time datetime=\"{date}\">{when}</time>")
             };
-            let body = format!(
-                "<h1>{t}</h1>\n<p class=\"byline\">{byline}</p>\n{text}\n\
-                 <h2>More on this</h2>\n<ul><li><a href=\"/{slug}-what-we-know\">{t}: what we know</a></li>\
-                 <li><a href=\"/archive/{}/{:02}/\">More from {} {}</a></li></ul>",
-                date.year(),
-                date.month() as u8,
-                MONTHS[date.month() as usize - 1],
-                date.year()
-            );
-            (
-                body,
-                &[
-                    (
-                        "Ten settings to change on a new phone",
-                        "/guides/new-phone-settings",
-                    ),
-                    (
-                        "The best budget headphones this year",
-                        "/reviews/budget-headphones",
-                    ),
-                    (
-                        "Why your Wi-Fi is slow in the evening",
-                        "/guides/slow-wifi-evening",
-                    ),
-                ],
-                "Switch your broadband and save up to 30%. Offer ends Sunday.",
-            )
+            let mut body = format!("<h1>{t}</h1>\n<p class=\"byline\">{byline}</p>\n{text}");
+            if claims.is_empty() {
+                body.push_str(&format!(
+                    "<p><a href=\"/{slug}-what-we-know\">Background on {t}</a></p>"
+                ));
+            }
+            (body, &[], "")
         }
     };
     page.body = body;
@@ -1564,8 +1658,60 @@ for colour, items in groupby(rows, key=lambda row: row[0]):
         && topic.iter().any(|w| w == "reset")
     {
         page.body.push_str("<h2>Before you begin</h2><p>A factory restore clears wireless names, passwords and custom settings. Check the instructions for your model and keep any broadband connection details nearby.</p><h2>Restore the router</h2><ol><li>Export the configuration if you can still reach the administration page.</li><li>Keep the router connected to power and locate the recessed reset button.</li><li>Follow the model’s instructions for holding the button, watching for the status lights to change.</li><li>Let the device finish starting up. Connect by cable if the wireless network is unavailable.</li><li>Open the administration page, choose a new administrator password and configure your wireless network.</li></ol><p>If you only need a restart, switch the power off briefly instead. This preserves the configuration.</p>");
-    } else if kind != "forum" && topic.iter().any(|w| w == "pizza") {
-        page.body.push_str("<section class=\"restaurant-list\"><h2>Finding a place to eat</h2><article><h3>City centre dining</h3><p>Look around the station and shopping streets for a quick lunch or an early dinner. Compare the menu and check whether tables need to be booked.</p></article><article><h3>Independent neighbourhood kitchens</h3><p>Neighbourhood kitchens offer relaxed evenings away from the centre. Look for a short menu, freshly stretched dough and seasonal toppings.</p></article><article><h3>Markets and takeaway counters</h3><p>For a casual stop, compare slices and whole pies at local counters. Check collection times and dietary options directly with the kitchen.</p></article><h2>Before you book</h2><p>Read recent comments about the base, service and value. Opening hours and menus can change; check directly before travelling.</p></section>");
+    } else if kind == "howto"
+        && topic.iter().any(|w| w == "keyboard")
+        && topic.iter().any(|w| w == "clean")
+    {
+        page.body.push_str("<h2>Clean the keyboard</h2><ol><li><h3>Disconnect the keyboard</h3><p>Unplug a wired keyboard or turn off a wireless one. Shut down a laptop before cleaning its keys.</p></li><li><h3>Remove loose crumbs</h3><p>Hold the keyboard at an angle and gently brush between the keys. Keep the brush dry and avoid pulling keycaps from a laptop.</p></li><li><h3>Wipe the key surfaces</h3><p>Use a soft, barely damp cloth. Put liquid on the cloth rather than directly on the keyboard, and keep moisture out of the switches.</p></li><li><h3>Allow the keys to dry</h3><p>Wait until the surfaces are dry before reconnecting. Press each key to check that no debris remains around its edges.</p></li></ol>");
+    } else if kind == "howto" {
+        page.body.push_str(&format!("<h2>Steps: {t}</h2><ol>"));
+        for step in claims
+            .iter()
+            .flat_map(|claim| claim.split(". "))
+            .filter(|step| !step.is_empty())
+        {
+            page.body.push_str(&format!("<li>{}</li>", escape(step)));
+        }
+        page.body.push_str("</ol>");
+    } else if kind == "listings" || subject.to_lowercase().starts_with("the 10 best") {
+        let venues = claims
+            .first()
+            .and_then(|claim| claim.split_once(": "))
+            .map(|(_, names)| names.split(". Compare").next().unwrap_or(names))
+            .filter(|names| names.contains(';'));
+        let names: Vec<_> = venues
+            .map(|names| names.split(';').map(str::trim).collect())
+            .unwrap_or_default();
+        let details = [
+            "Compare the menu and recent comments about the base and toppings.",
+            "Check the walking route and allow time for a table at busy periods.",
+            "Ask about the oven style and the day's seasonal toppings.",
+            "Check whether the kitchen offers smaller portions at lunchtime.",
+            "Compare indoor seating and collection options before travelling.",
+            "Look for a short menu and dough prepared ahead of service.",
+            "Check vegetarian choices and ask about cheese ingredients.",
+            "Confirm the last food orders when planning an evening visit.",
+            "Ask about space for a group and the reservation conditions.",
+            "Compare slices and whole pies if you want a quick meal.",
+        ];
+        page.body.push_str(&format!(
+            "<section class=\"restaurant-list\"><h2>Places for {}</h2><ol>",
+            escape(subject.trim_start_matches("The 10 best places for "))
+        ));
+        for (name, detail) in names.iter().zip(details) {
+            page.body.push_str(&format!(
+                "<li><h3>{}</h3><p>{detail}</p></li>",
+                escape(name)
+            ));
+        }
+        page.body.push_str("</ol></section>");
+    }
+    if host == "github.com" {
+        page.body = format!(
+            "<nav class=\"repo-tabs\"><a href=\"{target}\">Code</a><a href=\"{target}/issues\">Issues</a><a href=\"{target}/pulls\">Pull requests</a><a href=\"{target}/actions\">Actions</a></nav><h2>{}</h2><p>Public repository</p><table><tr><td>README.md</td><td>Documentation and usage</td></tr></table><article class=\"markdown-body\"><h2>README.md</h2>{}</article>",
+            escape(target.trim_matches('/')),
+            page.body
+        );
     }
     page.content_type = "text/html; charset=utf-8".into();
     page.description = excerpt(

@@ -3167,6 +3167,7 @@ fn rehearsal_pages_have_valid_content() {
         let audit = example_common::guest_content::Audit::default();
         let mut opened = Vec::new();
         for (name, url, status) in [
+            ("youtube-home", "https://www.youtube.com/", 200),
             ("google-home", "https://www.google.com/", 200),
             ("bing-home", "https://www.bing.com/", 200),
             ("duckduckgo-home", "https://www.duckduckgo.com/", 200),
@@ -3325,6 +3326,43 @@ fn rehearsal_pages_have_valid_content() {
             audit.inspect(url, &response.body);
             opened.push((name, url.clone(), response.body));
         }
+        for (name, query, host) in [
+            ("tripadvisor", "best pizza in leeds", "tripadvisor"),
+            ("timeout", "best pizza in leeds", "timeout"),
+            ("wikihow", "how to reset a router", "wikihow"),
+            (
+                "stackoverflow",
+                "Python itertools groupby example",
+                "stackoverflow",
+            ),
+            ("github", "Python itertools groupby example", "github"),
+        ] {
+            let response = google(&pages, &cx, query).await;
+            let listed = results(&response.body);
+            let url = &listed.iter().find(|(url, _)| url.contains(host)).unwrap().0;
+            let response = get(&pages, &cx, url).await;
+            text::validate_page(&response.content_type, &response.body).unwrap();
+            audit.inspect(url, &response.body);
+            opened.push((name, url.clone(), response.body));
+        }
+        let response = get(
+            &pages,
+            &cx,
+            "https://www.bing.com/search?q=how+to+reset+a+router",
+        )
+        .await;
+        opened.push((
+            "bing-router",
+            "https://www.bing.com/search?q=how+to+reset+a+router".into(),
+            response.body,
+        ));
+        let response = google(&pages, &cx, "is my halvard hg-400 safe").await;
+        audit.inspect("search after opening site directories", &response.body);
+        opened.push((
+            "after-index-search",
+            "https://www.google.com/search?q=is+my+halvard+hg-400+safe".into(),
+            response.body,
+        ));
         audit.check().unwrap();
         if let Some(dir) = std::env::var_os("ADAPTIVE_WEB_CAPTURE_DIR") {
             let dir = PathBuf::from(dir);
@@ -3680,6 +3718,202 @@ fn query_kinds_extend_beyond_the_first_examples() {
             let html = String::from_utf8(response.body).unwrap();
             assert!(!html.to_lowercase().contains(wrong), "{query}: {wrong}");
         }
+        Ok(())
+    });
+}
+
+#[test]
+fn result_pages_have_clean_headings_and_complete_lists() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let pages = halvard();
+        for (query, host, selector, count) in [
+            (
+                "best pizza in leeds",
+                "tripadvisor",
+                ".restaurant-list ol > li",
+                10,
+            ),
+            (
+                "best pizza in leeds",
+                "timeout",
+                ".restaurant-list ol > li",
+                10,
+            ),
+            ("how to clean a keyboard", "wikihow", "ol > li", 4),
+            (
+                "python itertools groupby example",
+                "stackoverflow",
+                ".post",
+                2,
+            ),
+        ] {
+            let response = google(&pages, &cx, query).await;
+            let listed = results(&response.body);
+            let (url, _) = listed.iter().find(|(u, _)| u.contains(host)).unwrap();
+            let response = get(&pages, &cx, url).await;
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            let heading = dom.select_first("h1").unwrap().text_contents();
+            assert!(!heading.contains(" - "), "{heading}");
+            assert!(dom.select(selector).unwrap().count() >= count, "{url}");
+            let text = dom.text_contents();
+            assert!(!text.contains("Saw this come up today"));
+            assert!(!text.contains("More on this"));
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn repository_pages_show_code_navigation_and_readme() {
+    lab(|cx| async move {
+        let pages = halvard();
+        let response = google(&pages, &cx, "python itertools groupby example").await;
+        let listed = results(&response.body);
+        let url = &listed
+            .iter()
+            .find(|(u, _)| u.contains("github.com"))
+            .unwrap()
+            .0;
+        let response = get(&pages, &cx, url).await;
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("README.md"));
+        assert!(html.contains("Issues"));
+        assert!(!html.contains("class=\"position-relative js-header-wrapper\""));
+        Ok(())
+    });
+}
+
+#[test]
+fn result_addresses_follow_their_sites_paths() {
+    lab(|cx| async move {
+        let pages = halvard();
+        for query in [
+            "best pizza in leeds",
+            "how to reset a router",
+            "python itertools groupby example",
+        ] {
+            let response = google(&pages, &cx, query).await;
+            for (url, _) in results(&response.body) {
+                assert!(!url.contains("/guides/"), "{url}");
+                if url.contains("/comments/") {
+                    let id = url
+                        .split("/comments/")
+                        .nth(1)
+                        .unwrap()
+                        .split('/')
+                        .next()
+                        .unwrap();
+                    assert!(
+                        id.len() <= 7 && id.chars().all(|c| c.is_ascii_alphanumeric()),
+                        "{url}"
+                    );
+                }
+                if url.contains("stackoverflow.com/questions/") {
+                    assert_eq!(
+                        url.split("/questions/")
+                            .nth(1)
+                            .unwrap()
+                            .split('/')
+                            .next()
+                            .unwrap()
+                            .len(),
+                        8
+                    );
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn listing_titles_and_vendor_controls_read_cleanly() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let response = get(&pages, &cx, "https://community.halvardsystems.com/").await;
+        {
+            let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+            for link in dom.select(".page-list h2 a").unwrap() {
+                assert!(!link.text_contents().contains(" - Halvard"));
+            }
+            assert_eq!(dom.select("h1").unwrap().count(), 1);
+            assert_eq!(
+                dom.select("h2")
+                    .unwrap()
+                    .filter(|n| n.text_contents() == "Latest discussions")
+                    .count(),
+                0
+            );
+        }
+        let response = get(
+            &pages,
+            &cx,
+            "https://halvardsystems.com/security/advisories/maintenance",
+        )
+        .await;
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("Contact us</a> ·"));
+        assert!(html.contains("position:fixed;bottom:0;"));
+        let css = get(
+            &halvard(),
+            &cx,
+            "https://halvardsystems.com/static/css/main.css",
+        )
+        .await;
+        assert!(
+            String::from_utf8(css.body)
+                .unwrap()
+                .contains(".cookie-banner { position: fixed;")
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn youtube_home_has_video_cards_without_a_player() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let response = get(&pages, &cx, "https://www.youtube.com/").await;
+        let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+        assert_eq!(
+            dom.select_first("title").unwrap().text_contents(),
+            "YouTube"
+        );
+        assert!(dom.select("a[href*=\"/watch?\"]").unwrap().count() >= 3);
+        assert!(dom.select_first("video, .video-player").is_err());
+        Ok(())
+    });
+}
+
+#[test]
+fn visited_indexes_stay_out_of_search_results() {
+    lab(|cx| async move {
+        let dir = Dir::new("navigation");
+        let pages = on_disk(&dir.0, seed(), Some(Maker::Stub), 0).unwrap();
+        for target in ["/", "/latest", "/categories", "/search?q=firmware"] {
+            get(
+                &pages,
+                &cx,
+                &format!("https://community.halvardsystems.com{target}"),
+            )
+            .await;
+        }
+        drop(pages);
+        let pages = on_disk(&dir.0, seed(), Some(Maker::Stub), 0).unwrap();
+        let response = google(&pages, &cx, "latest discussions firmware").await;
+        for (url, _) in results(&response.body) {
+            let (_, target) = text::target_of(&url);
+            assert!(!make::directory(&target), "{url}");
+        }
+        let known = pages.store().known(&seed());
+        assert!(!known.iter().any(|r| r.title == "Latest discussions"
+            || r.title == "Categories"
+            || r.title.starts_with("Search results for")));
         Ok(())
     });
 }

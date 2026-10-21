@@ -169,6 +169,20 @@ fn display_url(url: &str) -> String {
     }
     host
 }
+fn estimate(query: &str, count: usize) -> String {
+    if count == 0 {
+        return "0".into();
+    }
+    let hash = query
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .bytes()
+        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize));
+    result_count(100_000 + (hash % 9_900) * 1_000)
+}
+
 /// Formats the number of available results with comma separators.
 fn result_count(count: usize) -> String {
     let n = count.to_string();
@@ -223,7 +237,7 @@ fn render_with(
 fn google(query: &str, record: &Search, start: u64) -> String {
     let q = e(query);
     let qp = quote_plus(query);
-    let count = result_count(record.results.len());
+    let count = estimate(query, record.results.len());
     let mut out = vec![format!(
         r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{q} - Google Search</title><link rel="stylesheet" href="/search.css"></head>
@@ -389,7 +403,8 @@ pub fn youtube(query: &str, record: &Search) -> String {
     dom.to_string()
 }
 
-pub(crate) fn video_thumbnail(title: &str) -> String {
+/// A local SVG thumbnail derived from a video title.
+pub fn video_thumbnail(title: &str) -> String {
     let svg = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360"><rect width="640" height="360" fill="#203c50"/><path d="M0 280 180 100 350 280 500 60 640 220V360H0Z" fill="#375f76"/><rect x="44" y="48" width="552" height="264" rx="12" fill="#102330" opacity=".7"/><path d="m291 130 90 50-90 50Z" fill="white"/><text x="40" y="330" font-family="Arial,sans-serif" font-size="17" fill="white">{}</text></svg>"##,
         e(&title.chars().take(60).collect::<String>())
@@ -463,7 +478,7 @@ fn duckduckgo(query: &str, record: &Search) -> String {
 fn bing(query: &str, record: &Search) -> String {
     let q = e(query);
     let qp = quote_plus(query);
-    let count = result_count(record.results.len());
+    let count = estimate(query, record.results.len());
     let mut out = vec![format!(
         r#"<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{q} - Search</title><link rel="stylesheet" href="/search.css"></head>
 <body class="bing"><header id="b_header"><a class="bing-brand" href="/"><b>◇</b>Microsoft Bing</a><form action="/search" id="sb_form" role="search"><input id="sb_form_q" name="q" type="search" value="{q}" aria-label="Search"><button type="submit">Search</button></form>
@@ -723,7 +738,7 @@ fn results(
     for count in dom.select("#result-stats, .sb_count").unwrap() {
         replace(
             count.as_node(),
-            &format!("About {} results", result_count(record.results.len())),
+            &format!("About {} results", estimate(query, record.results.len())),
         );
     }
     for link in dom.select("a[href]").unwrap() {
@@ -788,6 +803,31 @@ mod tests {
             }],
             ..Search::default()
         }
+    }
+
+    #[test]
+    fn bing_estimates_are_large_and_stable_for_the_query() {
+        let mut record = Search::default();
+        record.results.push(Result {
+            url: "https://example.org/article".into(),
+            title: "Router configuration".into(),
+            ..Result::default()
+        });
+        let first = document(&render(Engine::Bing, "router configuration", &record, 0));
+        let count = first.select_first(".sb_count").unwrap().text_contents();
+        let number: usize = count
+            .trim_start_matches("About ")
+            .trim_end_matches(" results")
+            .replace(',', "")
+            .parse()
+            .unwrap();
+        assert!(number >= 100_000, "{count}");
+        record.results.push(record.results[0].clone());
+        let second = document(&render(Engine::Bing, "router configuration", &record, 0));
+        assert_eq!(
+            count,
+            second.select_first(".sb_count").unwrap().text_contents()
+        );
     }
 
     #[test]

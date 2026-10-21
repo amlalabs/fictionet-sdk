@@ -451,7 +451,12 @@ impl Store {
                     .any(|f| f.host == at.0 && f.target == at.1)
             })
             .map(|at| &self.pages[at])
-            .filter(|p| p.status == 200 && !p.title.is_empty())
+            .filter(|p| {
+                p.status == 200
+                    && !p.title.is_empty()
+                    && (!super::make::directory(&p.target)
+                        || (!p.description.is_empty() && p.description != p.title))
+            })
             .map(|p| fictionet_extras::search::Result {
                 url: p.url.clone(),
                 title: p.title.clone(),
