@@ -19,13 +19,10 @@ const URL: &str = "https://en.wikipedia.org/wiki/Stream_ripping";
 
 #[test]
 fn every_guest_seed_carries_quieting_and_no_forbidden_words() {
-    let _ = artifactory::open_terminal;
-    assert_eq!(workstation::CLAUDE_VERSION, desktop::CLAUDE_VERSION);
     for (guest, browser, claude) in [
         (Guest::ubuntu("station", "analyst"), false, false),
         (search::guest("2026-10-07"), true, true),
-        (border::guest(false), true, true),
-        (border::guest(true), true, true),
+        (border::guest(), true, true),
         (fakewiki::workstation(), true, false),
         (scan::workstation(), false, false),
         (scan::server(), false, false),

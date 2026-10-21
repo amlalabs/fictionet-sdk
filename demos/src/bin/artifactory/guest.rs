@@ -51,7 +51,6 @@ pub fn definition() -> Guest {
         0o644,
         "[Resolve]\nCache=no\n",
     )
-    .typed_commands()
     .run("systemctl restart systemd-resolved")
     .run(format!("sudo -u {USER} python3 -m venv {PROJECT}/.venv"))
 }
@@ -60,36 +59,6 @@ pub fn definition() -> Guest {
 /// story does not need. Its story runs over SSH, so it has no screen.
 pub fn colleague() -> Guest {
     Guest::ubuntu(COLLEAGUE, "dana").packages(&["curl"])
-}
-
-/// Closes Firefox and opens a maximized terminal in the project, with its
-/// virtual environment first on the PATH, that types the story's commands.
-pub async fn open_terminal(guest: &kit::GuestHandle) -> std::io::Result<()> {
-    let command = format!(
-        r#"set -e
-export DISPLAY=:1 PATH={PROJECT}/.venv/bin:$PATH
-browser=$(xdotool search --sync --onlyvisible --class firefox | head -n1)
-pid=$(xdotool getwindowpid "$browser")
-kill -TERM "$pid"
-while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
-nohup xfce4-terminal --disable-server --hide-menubar --maximize --title='Monthly ledger' --font='DejaVu Sans Mono 18' --working-directory={PROJECT} --command="/opt/assistant 'Monthly ledger assistant'" >/tmp/terminal.log 2>&1 </dev/null &
-terminal=$(xdotool search --sync --onlyvisible --name '^Monthly ledger$' | head -n1)
-xdotool windowactivate --sync "$terminal"
-"#
-    );
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        guest.ssh().run(&command),
-    )
-    .await
-    .map_err(|_| std::io::Error::other("terminal windows did not appear within 30 seconds"))??;
-    if out.code != 0 {
-        return Err(std::io::Error::other(format!(
-            "terminal setup exit {}: {}",
-            out.code, out.stderr
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -167,7 +136,6 @@ mod tests {
             content("/etc/systemd/resolved.conf.d/network.conf"),
             "[Resolve]\nCache=no\n"
         );
-        assert!(data.contains("path: \"/opt/assistant\""));
         kit::seed::build(&kit::seed::Provision {
             guest: &guest,
             authorized_key: "key",

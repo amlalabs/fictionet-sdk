@@ -783,8 +783,9 @@ test('an app page shows its agent tabs and world panel, with a World menu and no
   const worldTabs = world.querySelector('.app-tabs');
   assert.equal(worldTabs.parentNode, world);
   assert.equal(world.children[0], worldTabs);
-  assert.deepEqual(worldTabs.children.map((tab) => tab.textContent), ['World', 'Packets']);
-  assert.equal(world.querySelector('#app-world-panel').hidden, false);
+  assert.deepEqual(worldTabs.children.map((tab) => tab.textContent), ['Architecture', 'Packets', 'World']);
+  assert.equal(world.querySelector('#app-world-panel').hidden, true);
+  assert.equal(world.querySelector('#app-architecture-panel').hidden, false);
   assert.equal(world.querySelector('#app-packets-panel').hidden, true);
   const menu = h.root.querySelector('#world-menu');
   assert.equal(mounted, menu.querySelector('.app-world-controls'), 'the world panel fills its own controls');
@@ -838,7 +839,7 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   await settle();
   const worldTabs = h.root.querySelector('.app-world').querySelector('.app-tabs');
   const tabs = worldTabs.querySelectorAll('button');
-  assert.deepEqual(tabs.map((tab) => tab.textContent), ['World', 'Packets']);
+  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Architecture', 'Packets', 'World']);
   assert.equal(mounts, 1);
   assert.equal(h.streams.filter((s) => s.tag === 'packets').length, 0);
   const packetPanel = h.root.querySelector('#app-packets-panel');
@@ -846,7 +847,7 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
   assert.equal(tabs[1].getAttribute('tabindex'), '-1');
   assert.equal(packetPanel.hidden, true);
-  assert.equal(ownPanel.hidden, false);
+  assert.equal(ownPanel.hidden, true);
   assert.match(ownPanel.textContent, /Route activity/);
   for (const tab of tabs) {
     const panel = h.root.querySelector(`#${tab.getAttribute('aria-controls')}`);
@@ -872,10 +873,13 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   };
   frame();
   assert.ok(packetPanel.querySelector('#graph'));
-  assert.equal(packetPanel.querySelector('#prows'), null);
+  assert.ok(packetPanel.querySelector('#prows'));
+  assert.ok(packetPanel.querySelector('#tree'));
+  assert.ok(packetPanel.querySelector('#hex'));
+  assert.ok(packetPanel.querySelector('#pcap'));
   tabs[1].click();
   assert.equal(packetPanel.querySelectorAll('#graph').length, 1);
-  tabs[0].click();
+  tabs[2].click();
   assert.equal(ownPanel.hidden, false);
   assert.equal(packetPanel.hidden, true);
   assert.equal(h.frames.size, baseFrames);
@@ -884,21 +888,22 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
     worldTabs.dispatchEvent(event);
     assert.equal(event.defaultPrevented, true);
     assert.equal(h.document.activeElement, tabs[index]);
-    assert.deepEqual(tabs.map((tab) => tab.getAttribute('tabindex')), index === 0 ? ['0', '-1'] : ['-1', '0']);
-    assert.deepEqual(tabs.map((tab) => tab.getAttribute('aria-selected')), index === 0 ? ['true', 'false'] : ['false', 'true']);
+    assert.deepEqual(tabs.map((tab) => tab.getAttribute('tabindex')), tabs.map((_, i) => i === index ? '0' : '-1'));
+    assert.deepEqual(tabs.map((tab) => tab.getAttribute('aria-selected')), tabs.map((_, i) => String(i === index)));
   };
-  key('ArrowRight', 1);
-  state.emit('snapshot', { topic: 'rows', revision: 1, value: { activity: 'Current route' } });
   key('ArrowRight', 0);
+  state.emit('snapshot', { topic: 'rows', revision: 1, value: { activity: 'Current route' } });
+  key('ArrowRight', 1);
+  key('ArrowRight', 2);
   key('ArrowLeft', 1);
-  key('ArrowLeft', 0);
-  key('End', 1);
+  key('End', 2);
   key('Home', 0);
   assert.equal(mounts, 1);
   assert.equal(releases, 0);
   assert.match(ownPanel.textContent, /Current route/);
   assert.equal(ownPanel.querySelector('svg').getAttribute('aria-label'), 'Route picture');
-  key('End', 1);
+  key('Home', 0);
+  key('ArrowRight', 1);
   await settle();
   assert.equal(ownPanel.hidden, true);
   frame();
@@ -912,7 +917,8 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   assert.notEqual(packetPanel.querySelector('#graph'), graph);
   key('Home', 0);
   assert.equal(h.frames.size, baseFrames);
-  key('End', 1);
+  key('Home', 0);
+  key('ArrowRight', 1);
   frame();
   stop();
   assert.equal(mounts, 1);
@@ -925,7 +931,7 @@ test('world tabs keep the custom view mounted and bound traffic to the visible p
   assert.equal(h.document.listenerCount, 0);
 });
 
-test('an app without a custom workspace starts with only Packets', async (t) => {
+test('an app without a custom workspace starts with Architecture', async (t) => {
   const h = harness(t);
   const { mount } = await import('./page.mjs');
   const stop = await mount(h.root, {
@@ -934,11 +940,12 @@ test('an app without a custom workspace starts with only Packets', async (t) => 
   }, { dispose() {} });
   const world = h.root.querySelector('.app-world');
   const tabs = world.querySelector('.app-tabs').children;
-  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Packets']);
+  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Architecture', 'Packets']);
   assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
   assert.equal(tabs[0].getAttribute('tabindex'), '0');
   assert.equal(world.querySelector('#app-world-panel'), null);
-  assert.equal(world.querySelector('#app-packets-panel').hidden, false);
+  assert.equal(world.querySelector('#app-packets-panel').hidden, true);
+  assert.equal(world.querySelector('#app-architecture-panel').hidden, false);
   stop();
   assert.equal(h.budget.open, 0);
   assert.equal(h.document.listenerCount, 0);

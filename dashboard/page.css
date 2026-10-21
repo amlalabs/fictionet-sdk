@@ -1402,8 +1402,7 @@ body.licenses {
 
 @starting-style { .demo-app .app-console { opacity: 0; } }
 
-/* The packet flow map, in the world pane's Packets tab: the map fills the */
-/* tab, with no details panel; the group breadcrumb steps back out. */
+/* The flow map and the full packet inspector share the Packets tab. */
 #app-packets-panel:not([hidden]) {
   display: flex;
   flex-direction: column;
@@ -1426,3 +1425,20 @@ body.licenses {
 #app-packets-panel .side {
   display: none;
 }
+
+#app-packets-panel .packet-map { flex: 0 0 340px; min-height: 340px; display: flex; flex-direction: column; }
+#app-packets-panel .packet-list { flex: 0 0 600px; min-height: 600px; position: relative; }
+#app-packets-panel .packet-list .drawer { position: relative; inset: auto; width: 100%; height: 100%; max-height: none; }
+.architecture { display: grid !important; grid-template-columns: minmax(0, 1fr) 36px minmax(0, 1.4fr) 70px minmax(0, 1fr); gap: 12px; align-content: center; padding: 24px; }
+.architecture-column { grid-row: 1; min-width: 0; }
+.architecture-column:nth-child(1) { grid-column: 1; }
+.architecture-column:nth-child(2) { grid-column: 3; }
+.architecture-column:nth-child(3) { grid-column: 5; }
+.architecture-column h2 { font: 600 14px var(--sans); }
+.architecture-box { display: block; width: 100%; margin: 14px 0; padding: 14px; text-align: left; border: 1px solid var(--app-rule); border-radius: 8px; background: var(--app-soft); color: var(--app-ink); }
+.architecture-count { float: right; font-family: var(--mono); }
+.architecture-events { margin-top: 8px; font: 11px/1.6 var(--mono); color: var(--app-mute); overflow-wrap: anywhere; }
+.architecture-in, .architecture-out { grid-row: 1; align-self: center; text-align: center; }
+.architecture-in { grid-column: 2; }
+.architecture-out { grid-column: 4; font-size: 11px; }
+.architecture-out span { display: block; }

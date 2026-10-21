@@ -1,4 +1,3 @@
-mod checks;
 mod guest;
 mod page;
 mod preview;
@@ -9,7 +8,7 @@ mod tests;
 
 use std::path::PathBuf;
 
-use fictionet_demo::kit::{self, Kit};
+use fictionet_demo::kit::Kit;
 use fictionet_observe::page::Page;
 
 const HOST: &str = "workstation";
@@ -31,8 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return preview::run().await;
     }
     let downloads = first;
-    let output = kit::checks::output(downloads, "fakewiki")?;
-    let controls = page::Controls::new("Firefox (scripted)");
+    let controls = page::Controls::new("Firefox");
     let ui = controls.clone();
     let kit = Kit::new("fakewiki")
         .guest(guest::workstation())
@@ -40,17 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ui.page(Page::new("FakeWiki", dashboard).host(hosts.take(HOST)))
         })
         .world(move |cx, world| start(cx, world, controls));
-    kit::checks::run(
-        kit,
-        downloads,
-        &output,
-        kit::checks::story(
-            |run, out| -> kit::checks::Story<'_, Box<dyn std::error::Error + Send + Sync>> {
-                Box::pin(async move { checks::run(run, out).await.map_err(Into::into) })
-            },
-        ),
-    )
-    .await?;
+    kit.run_app(downloads, HOST).await?;
     Ok(())
 }
 

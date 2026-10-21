@@ -2,21 +2,27 @@
 //! standard panels, the story's moments, and the checks' reading of the
 //! page's topics as a browser reads them.
 
-use super::facts::{
-    COLLEAGUE_STATE, Doors, RequestRow, Rows, Scenario, SessionsView, Status, Topics, View,
-};
-use super::story::{self, Mode, NOTE};
+use super::facts::{COLLEAGUE_STATE, Scenario, SessionsView, Topics};
+#[cfg(test)]
+use super::facts::{Doors, RequestRow, Rows, Status, View};
+#[cfg(test)]
+use super::story::NOTE;
+use super::story::{self, Mode};
+#[cfg(test)]
+use artifactory_world::packages::LOOKALIKE_PROJECT;
 use artifactory_world::{
     inventory::Inventory,
-    packages::{LOOKALIKE_PROJECT, Role, TARGET_PROJECT, Variant},
+    packages::{Role, TARGET_PROJECT, Variant},
 };
 use example_common::names;
+#[cfg(test)]
 use fictionet_demo::kit::client::PageClient;
 use fictionet_observe::{
     DashboardHandle,
     page::{EventFilter, Host, Page},
 };
 use std::borrow::Cow;
+#[cfg(test)]
 use std::io;
 
 const ENTRY: &str = "export { mount } from '../assets/artifactory/FILE.mjs';\n";
@@ -163,27 +169,7 @@ pub fn lookalike_wheel(inventory: &Inventory) -> Option<&str> {
 
 /// Reads the page's topics with the run's bearer and Origin, as a browser
 /// does, and checks that they show every step's facts.
-pub async fn check(url: &str, variant: Variant, sessions: Option<Mode>) -> io::Result<String> {
-    let client = PageClient::from_url(url)?;
-    client.bootstrap().await?;
-    let inventory: Inventory = client.state("packages").await?;
-    let requests: Rows<RequestRow> = client.state("requests").await?;
-    let doors: Doors = client.state("doors-tried").await?;
-    let colleague: Option<Inventory> = match sessions {
-        Some(Mode::Separate) => Some(client.state(COLLEAGUE_STATE).await?),
-        _ => None,
-    };
-    verify(
-        variant,
-        sessions,
-        &inventory,
-        colleague.as_ref(),
-        &requests,
-        &doors,
-    )
-    .map_err(io::Error::other)
-}
-
+#[cfg(test)]
 fn lists(inventory: &Inventory, path: &str) -> bool {
     inventory
         .repositories
@@ -192,6 +178,7 @@ fn lists(inventory: &Inventory, path: &str) -> bool {
         .any(|entry| entry.path == path)
 }
 
+#[cfg(test)]
 pub(super) fn verify(
     variant: Variant,
     sessions: Option<Mode>,
@@ -269,6 +256,28 @@ pub(super) fn verify(
         doors.rows.rows.len(),
         inventory.revision
     ))
+}
+
+#[cfg(test)]
+pub async fn check(url: &str, variant: Variant, sessions: Option<Mode>) -> io::Result<String> {
+    let client = PageClient::from_url(url)?;
+    client.bootstrap().await?;
+    let inventory: Inventory = client.state("packages").await?;
+    let requests: Rows<RequestRow> = client.state("requests").await?;
+    let doors: Doors = client.state("doors-tried").await?;
+    let colleague: Option<Inventory> = match sessions {
+        Some(Mode::Separate) => Some(client.state(COLLEAGUE_STATE).await?),
+        _ => None,
+    };
+    verify(
+        variant,
+        sessions,
+        &inventory,
+        colleague.as_ref(),
+        &requests,
+        &doors,
+    )
+    .map_err(io::Error::other)
 }
 
 #[cfg(test)]

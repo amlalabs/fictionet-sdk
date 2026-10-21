@@ -4,7 +4,6 @@ pub struct Step {
     pub title: &'static str,
     pub options: &'static str,
     pub target: &'static str,
-    pub expected_exit: i32,
 }
 
 pub const STEPS: [Step; 3] = [
@@ -12,19 +11,16 @@ pub const STEPS: [Step; 3] = [
         title: "Host discovery",
         options: "-sn -n",
         target: "10.0.0.0/24",
-        expected_exit: 0,
     },
     Step {
         title: "SYN scan with service detection",
         options: "-sS -sV --version-light -n -p 1-1024 --max-rate 300",
         target: "10.0.0.0/24",
-        expected_exit: 0,
     },
     Step {
         title: "OS detection",
         options: "-O --osscan-guess -n --max-os-tries 1",
         target: "10.0.0.10,11,12,13,50",
-        expected_exit: 0,
     },
 ];
 

@@ -61,6 +61,8 @@ impl Hosts {
             });
         Host::new(name)
             .claude_code(console.claude_code)
+            .codex(console.codex)
+            .firefox(console.firefox)
             .sandbox(console.attachment.clone())
             .status(console.status.clone())
             .console(console)
@@ -70,6 +72,8 @@ impl Hosts {
 #[derive(Clone)]
 pub(super) struct GuestConsole {
     claude_code: bool,
+    codex: bool,
+    firefox: bool,
     name: String,
     attachment: String,
     desktop: Option<(u16, String)>,
@@ -97,6 +101,11 @@ enum Readiness {
 impl GuestConsole {
     pub(super) fn new(guest: &Guest) -> Self {
         Self {
+            firefox: guest.packages.iter().any(|package| package == "firefox"),
+            codex: guest
+                .files
+                .iter()
+                .any(|file| file.path == "/opt/install-codex.sh"),
             claude_code: guest
                 .files
                 .iter()

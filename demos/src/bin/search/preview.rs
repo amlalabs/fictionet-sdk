@@ -40,7 +40,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use super::{Result, checks::search_url};
+use super::{Result, search_url};
 
 fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
     Ok(Arc::new(pages::Pages::new(seed)))

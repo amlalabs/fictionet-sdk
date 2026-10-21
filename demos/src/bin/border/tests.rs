@@ -27,21 +27,21 @@ async fn http_commands_change_the_route_and_record_inputs() {
     // Receive the external inputs before advancing the closed lab.
     let url = server.url().to_owned();
     let request = tokio::spawn(async move {
-        story::set_route(&PageClient::from_url(url).unwrap(), "flip", "hijack", 0)
+        api::set_route(&PageClient::from_url(url).unwrap(), "flip", "hijack", 0)
             .await
             .unwrap()
     });
     let first = control.port.recv().await.unwrap();
     let url = server.url().to_owned();
     let repeat = tokio::spawn(async move {
-        story::set_route(&PageClient::from_url(url).unwrap(), "stale", "hijack", 0)
+        api::set_route(&PageClient::from_url(url).unwrap(), "stale", "hijack", 0)
             .await
             .unwrap()
     });
     let second = control.port.recv().await.unwrap();
     let url = server.url().to_owned();
     let unchanged = tokio::spawn(async move {
-        story::set_route(
+        api::set_route(
             &PageClient::from_url(url).unwrap(),
             "unchanged",
             "hijack",
@@ -53,7 +53,7 @@ async fn http_commands_change_the_route_and_record_inputs() {
     let third = control.port.recv().await.unwrap();
     let url = server.url().to_owned();
     let off = tokio::spawn(async move {
-        story::world(
+        api::world(
             &PageClient::from_url(url).unwrap(),
             "off",
             json!({"command": "impostor", "on": false}),
@@ -65,7 +65,7 @@ async fn http_commands_change_the_route_and_record_inputs() {
     let fourth = control.port.recv().await.unwrap();
     let url = server.url().to_owned();
     let restart = tokio::spawn(async move {
-        story::world(
+        api::world(
             &PageClient::from_url(url).unwrap(),
             "restart",
             json!({"command": "restart"}),
@@ -256,4 +256,167 @@ async fn world_menu_buttons_use_the_world_revision() {
     }
     stop.send(()).unwrap();
     worker.await.unwrap().unwrap();
+}
+
+pub(super) mod api {
+    use super::*;
+    use border_world::scenario::{BANK_ADDR, HIJACK_PREFIX, IMPOSTOR_ADDR, Variant};
+    use std::io;
+    /// Sends a World menu command, as the page does, at `revision`.
+    pub async fn world(
+        client: &PageClient,
+        id: &str,
+        mut command: Value,
+        revision: u64,
+    ) -> io::Result<Value> {
+        command["expected_revision"] = revision.into();
+        client.command("world", id, command).await
+    }
+
+    /// Asks the World menu's Route for `mode` at `revision`.
+    pub async fn set_route(
+        client: &PageClient,
+        id: &str,
+        mode: &str,
+        revision: u64,
+    ) -> io::Result<Value> {
+        world(
+            client,
+            id,
+            json!({"command": "route", "mode": mode}),
+            revision,
+        )
+        .await
+    }
+
+    pub const HIJACKED_PAGE: &str = r#"(() => {
+    const world = document.querySelector('.border-world');
+    if (!world || world.dataset.mode !== 'hijack' || world.dataset.impostor !== 'on') return false;
+    const row = [...world.querySelectorAll('.border-row.hot')].find(r => r.textContent.includes('POST /login'));
+    return !!row && row.textContent.includes('workstation → impostor')
+        && !!world.querySelector('.node.impostor.hot')
+        && !!world.querySelector('.token.shown')
+        && !!world.querySelector('.edge.bad')
+        && !world.classList.contains('flash')
+        && world.getAnimations({ subtree: true }).every(a => a.playState !== 'running');
+})()"#;
+    pub async fn observed(client: &PageClient, hijacked: bool) -> io::Result<()> {
+        client
+            .wait_for(
+                "/api/state/border",
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                "Border observations did not contain the complete traffic story",
+                |snapshot| {
+                    if exposes_password(snapshot) {
+                        return Err(io::Error::other("Border state exposed the password"));
+                    }
+                    if snapshot["status"]["too_large"] == true {
+                        return Err(io::Error::other("Border state exceeded its byte bound"));
+                    }
+                    Ok(observed_complete(&snapshot["value"], hijacked))
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn exposes_password(value: &Value) -> bool {
+        value
+            .to_string()
+            .to_lowercase()
+            .contains(&border_world::bank::ACCOUNT.password.to_lowercase())
+    }
+
+    fn observed_complete(view: &Value, hijacked: bool) -> bool {
+        let rows = |key: &str| {
+            view[key]["rows"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        };
+        let mut hops: Vec<String> = routed(hijacked)
+            .hops(BANK_ADDR)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        hops.push(BANK_ADDR.to_string());
+        let hijack_prefix = format!("{}/{}", HIJACK_PREFIX.addr, HIJACK_PREFIX.len);
+        let trace =
+            view["links"].as_array().is_some_and(|links| {
+                links.iter().any(|t| {
+                    t["sandbox"] == crate::guest::HOSTNAME
+                        && t["trace"]["complete"] == true
+                        && t["trace"]["dropped"] == 0
+                        && t["trace"]["hops"].as_array().is_some_and(|actual| {
+                            actual.len() == hops.len()
+                                && actual.iter().zip(&hops).enumerate().all(|(i, (a, b))| {
+                                    a["address"] == b.as_str() && a["ttl"] == i + 1
+                                })
+                        })
+                })
+            });
+        let bgp = rows("bgp").iter().any(|e| {
+            e["sandbox"] == crate::guest::HOSTNAME
+                && e["kind"] == "sent"
+                && e["message"] == "UPDATE"
+                && e[if hijacked { "announced" } else { "withdrawn" }]
+                    .as_array()
+                    .is_some_and(|routes| routes.iter().any(|p| *p == hijack_prefix))
+        });
+        let moments: Vec<_> = rows("moments")
+            .iter()
+            .filter(|m| {
+                m["sandbox"] == crate::guest::HOSTNAME
+                    && m["password"] == true
+                    && m["endpoint"]["machine"] == IMPOSTOR_ADDR.to_string()
+                    && m["endpoint"]["reached"] == BANK_ADDR.to_string()
+            })
+            .collect();
+        let tls = moments.iter().any(|m| {
+            m["connection"].as_u64().is_some()
+                && rows("tls").iter().any(|t| {
+                    t["sandbox"] == crate::guest::HOSTNAME
+                        && t["identity"] == "impostor"
+                        && t["outcome"] == "accepted"
+                        && t["connection"] == m["connection"]
+                        && t["endpoint"] == m["endpoint"]
+                })
+        });
+        let row = |from: &str, to: Option<&str>, what: &str, tone: &str| {
+            rows("rows").iter().any(|r| {
+                r["from"] == from
+                    && r["to"] == to.map_or(Value::Null, Into::into)
+                    && r["what"] == what
+                    && r["tone"] == tone
+            })
+        };
+        let pictured = if hijacked {
+            row("Transpeak", None, "Route announced", "")
+                && row("workstation", Some("impostor"), "POST /login", "hot")
+                && row(
+                    "workstation",
+                    Some("impostor"),
+                    "Certificate refused",
+                    "warn",
+                )
+        } else {
+            row("Transpeak", None, "Route withdrawn", "")
+                && row("workstation", Some("Kestrelmoor"), "GET /balance", "")
+        };
+        trace
+            && bgp
+            && tls
+            && pictured
+            && moments.len() == 1
+            && view["lost"] == 0
+            && view["truncated"] == 0
+    }
+    fn routed(hijacked: bool) -> border_world::scenario::Scenario {
+        crate::control::scenario().routed(if hijacked {
+            Variant::Hijack
+        } else {
+            Variant::Legitimate
+        })
+    }
 }

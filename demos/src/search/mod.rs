@@ -214,7 +214,7 @@ pub fn network(
 mod tests;
 
 /// One vendor connection, carrying only the guest's encrypted bytes.
-struct Relay(String);
+pub struct Relay(pub String);
 
 impl fictionet::stdlib::world::net::PortServer for Relay {
     fn serve(
@@ -227,6 +227,10 @@ impl fictionet::stdlib::world::net::PortServer for Relay {
         Box::pin(async move {
             let work = async {
                 let mut upstream = tokio::net::TcpStream::connect(host.as_str()).await?;
+                cx.emitter(&arrival.info)
+                    .emit("signin", "connection", |event| {
+                        event.field("host", host.trim_end_matches(":443"))
+                    });
                 let mut guest = arrival.conn.into_tokio(&cx);
                 tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
                 Ok::<_, std::io::Error>(())

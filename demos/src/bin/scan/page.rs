@@ -635,8 +635,8 @@ pub mod tests {
             }
             world.join().unwrap().unwrap();
 
-            let (published, moment) = crate::checks::read(&client).await.unwrap();
-            let summary = crate::checks::check(&published, &moment).unwrap();
+            let (published, moment) = assertions::read(&client).await.unwrap();
+            let summary = assertions::check(&published, &moment).unwrap();
             assert!(
                 summary.starts_with("five hosts answered, 251 other addresses unreachable"),
                 "{summary}"
@@ -652,5 +652,170 @@ pub mod tests {
                 assert_eq!(map.rows, published.ports.rows);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod assertions {
+    //! The checks of the page's own API, read with the bearer as a
+    //! browser reads it: the port map and banners, nmap's reports, the story
+    //! and the discovery moment.
+    use crate::Error;
+    use crate::page::{self, Reports, StepState, Story};
+    const SERVER_PORTS: [u16; 2] = [22, 80];
+    fn hosts() -> std::collections::BTreeSet<std::net::Ipv4Addr> {
+        scan_world::open_ports()
+            .into_iter()
+            .map(|(addr, _)| addr)
+            .collect()
+    }
+    use fictionet_demo::kit::client::PageClient;
+    use scan_world::{PortMap, PortState, Protocol, SERVER_ADDR};
+    use std::collections::BTreeSet;
+    use std::net::Ipv4Addr;
+
+    /// The three topics as the page serves them.
+    pub struct Topics {
+        pub ports: PortMap,
+        pub reports: Reports,
+        pub story: Story,
+    }
+
+    /// Reads the page's topics and the moment's events through its API.
+    pub async fn read(client: &PageClient) -> Result<(Topics, serde_json::Value), Error> {
+        let topics = Topics {
+            ports: client.state(&page::PORTS.to_ascii_lowercase()).await?,
+            reports: client.state(&page::SERVICES.to_ascii_lowercase()).await?,
+            story: client.state(&page::OFFICE.to_ascii_lowercase()).await?,
+        };
+        let moment = client
+            .get_json("/api/event-table/all-five-hosts-answered")
+            .await?;
+        Ok((topics, moment))
+    }
+
+    /// Checks what the page shows after the story. Returns a one-line summary.
+    pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, String> {
+        let map = &topics.ports;
+        let office = hosts();
+        let answered = |host: Ipv4Addr| {
+            map.rows
+                .iter()
+                .any(|r| r.host == host && matches!(r.state, PortState::Open | PortState::Closed))
+        };
+        if let Some(host) = office.iter().find(|h| !answered(**h)) {
+            return Err(format!("port map: {host} has no answered row"));
+        }
+        let others: BTreeSet<Ipv4Addr> = map
+            .rows
+            .iter()
+            .map(|r| r.host)
+            .filter(|h| !office.contains(h))
+            .collect();
+        if others.is_empty() {
+            return Err("port map: no probes to other addresses".into());
+        }
+        for host in &others {
+            let rows = || map.rows.iter().filter(|r| r.host == *host);
+            if answered(*host) || !rows().any(|r| r.state == PortState::Unreachable) {
+                return Err(format!("port map: {host} is not only unreachable"));
+            }
+        }
+        for port in SERVER_PORTS {
+            if !map.rows.iter().any(|r| {
+                (r.host, r.protocol, r.port, r.state)
+                    == (SERVER_ADDR, Protocol::Tcp, port, PortState::Open)
+            }) {
+                return Err(format!("port map: {SERVER_ADDR}:{port} is not open"));
+            }
+        }
+        let banner = |port| {
+            map.banners
+                .iter()
+                .find(|b| b.host == SERVER_ADDR && b.port == port)
+                .ok_or(format!("port map: no banner for {SERVER_ADDR}:{port}"))
+        };
+        let ssh = banner(22)?;
+        if !ssh.text.starts_with("SSH-2.0-OpenSSH_") {
+            return Err(format!("{SERVER_ADDR}:22 banner is {:?}", ssh.text));
+        }
+        let web = banner(80)?;
+        if !web
+            .server
+            .as_deref()
+            .is_some_and(|s| s.starts_with("nginx"))
+        {
+            return Err(format!("{SERVER_ADDR}:80 server is {:?}", web.server));
+        }
+        let steps = &topics.reports.steps;
+        if steps.len() != 3 {
+            return Err(format!("nmap reports: {} steps, expected 3", steps.len()));
+        }
+        for step in steps {
+            let up: BTreeSet<_> = step
+                .hosts
+                .iter()
+                .filter(|h| h.state == "up")
+                .map(|h| h.addr)
+                .collect();
+            if up != office || step.up != office.len() {
+                return Err(format!("nmap reports: {} found {up:?} up", step.title));
+            }
+        }
+        if let Some(host) = steps[2].hosts.iter().find(|h| h.os.is_none()) {
+            return Err(format!("nmap reports: no OS entry for {}", host.addr));
+        }
+        if topics.story.replay {
+            return Err("story: the page calls the run a replay".into());
+        }
+        if topics.story.steps.len() != crate::script::STEPS.len()
+            || topics.story.steps.iter().enumerate().any(|(index, step)| {
+                step.title != crate::script::STEPS[index].title
+                    || step.command != crate::script::command(index)
+            })
+        {
+            return Err("story: steps or commands do not match the declared story".into());
+        }
+        if let Some(step) = topics
+            .story
+            .steps
+            .iter()
+            .find(|s| s.state != StepState::Done || s.exit != Some(0))
+        {
+            return Err(format!("story: {} is {:?}", step.title, step.state));
+        }
+        let rows = moment["rows"].as_array().map_or(&[][..], Vec::as_slice);
+        let [event] = rows else {
+            return Err(format!(
+                "moment: {} events, expected one ({} events lost or evicted)",
+                rows.len(),
+                moment["dropped"]
+            ));
+        };
+        let moment_hosts: BTreeSet<Ipv4Addr> = event["fields"]["hosts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|h| h.as_str()?.parse().ok())
+            .collect();
+        if moment_hosts != office {
+            return Err(format!("moment: hosts {moment_hosts:?}"));
+        }
+        let no_match = steps[2]
+            .hosts
+            .iter()
+            .filter(|h| h.os.as_ref().is_some_and(Vec::is_empty))
+            .count();
+        Ok(format!(
+            "five hosts answered, {} other addresses unreachable, {} banners \
+         ({SERVER_ADDR}:22 {:?}, :80 {:?}), three nmap reports with {} OS matches \
+         and {no_match} with no match, every step done, moment at {:.1} s",
+            others.len(),
+            map.banners.len(),
+            ssh.text,
+            web.server.as_deref().unwrap_or_default(),
+            5 - no_match,
+            event["at"].as_f64().unwrap_or_default(),
+        ))
     }
 }

@@ -176,12 +176,14 @@ mod tests {
         let preview = start(&dir).await.unwrap();
         let client = PageClient::from_url(preview.server.url()).unwrap();
         client.bootstrap().await.unwrap();
-        let reply = super::super::story::set_route(&client, "hijack", "hijack", 0)
+        let reply = super::super::tests::api::set_route(&client, "hijack", "hijack", 0)
             .await
             .unwrap();
         assert_eq!(reply["status"], "applied");
         preview.traffic().await.unwrap();
-        super::super::story::observed(&client, true).await.unwrap();
+        super::super::tests::api::observed(&client, true)
+            .await
+            .unwrap();
         // The VM run's Chromium condition holds on the page this traffic made.
         let url = preview.server.url().to_owned();
         let shot = dir.join("page-hijacked.png");
@@ -189,7 +191,7 @@ mod tests {
             fictionet_demo::kit::shot::capture(
                 &url,
                 &[fictionet_demo::kit::shot::Step {
-                    ready: super::super::story::HIJACKED_PAGE,
+                    ready: super::super::tests::api::HIJACKED_PAGE,
                     out: Some(&shot),
                     ..Default::default()
                 }],
@@ -199,12 +201,14 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let reply = super::super::story::set_route(&client, "restore", "legitimate", 1)
+        let reply = super::super::tests::api::set_route(&client, "restore", "legitimate", 1)
             .await
             .unwrap();
         assert_eq!(reply["status"], "applied");
         preview.traffic().await.unwrap();
-        super::super::story::observed(&client, false).await.unwrap();
+        super::super::tests::api::observed(&client, false)
+            .await
+            .unwrap();
         // After the world ends, the guest link is closed and keeps its last,
         // three-hop traceroute from the restored route.
         let server = preview.stop().await.unwrap();

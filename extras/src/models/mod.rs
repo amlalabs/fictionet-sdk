@@ -358,6 +358,7 @@ impl Ledger {
 #[derive(Clone)]
 pub struct Model {
     cx: Cx,
+    connection: fictionet::events::ConnInfo,
     provider: Provider,
     credential: Option<Credential>,
     forward: web::Forward,
@@ -367,7 +368,7 @@ pub struct Model {
     ledger: Arc<Mutex<Ledger>>,
     prices: Option<(String, Prices)>,
     engine: Option<Arc<dyn Engine>>,
-    seal: Arc<splice::Seal>,
+    cipher: Arc<splice::TokenCipher>,
     continued: Arc<Mutex<Continued>>,
     catalog: Option<Catalog>,
 }
@@ -474,6 +475,7 @@ impl Model {
     ) -> Self {
         Self {
             cx: cx.clone(),
+            connection: Default::default(),
             provider,
             credential,
             forward,
@@ -483,7 +485,7 @@ impl Model {
             ledger: Arc::new(Mutex::new(Ledger::default())),
             prices: None,
             engine: None,
-            seal: Arc::new(splice::Seal::new(cx)),
+            cipher: Arc::new(splice::TokenCipher::new(cx)),
             continued: Arc::default(),
             catalog: None,
         }
@@ -563,11 +565,13 @@ impl Model {
         vec![(self.provider.key_variable(), credential.placeholder.clone())]
     }
     fn refused(&self, path: &str, reason: &'static str) {
-        self.cx.emit("model", "refused", |e| {
-            e.field("provider", self.provider.host())
-                .field("path", path)
-                .field("reason", reason)
-        });
+        self.cx
+            .emitter(&self.connection)
+            .emit("model", "refused", |e| {
+                e.field("provider", self.provider.host())
+                    .field("path", path)
+                    .field("reason", reason)
+            });
     }
     /// Whether the request carries exactly the guest's credential.
     fn authorized(&self, headers: &http::HeaderMap) -> bool {
@@ -624,10 +628,12 @@ impl Model {
     fn admit(&self, path: &str, count: bool) -> Option<Response<Body>> {
         let mut ledger = self.ledger.lock().unwrap();
         if let Some(kind) = ledger.exhausted() {
-            self.cx.emit("model", "budget", |e| {
-                e.field("provider", self.provider.host())
-                    .field("kind", kind)
-            });
+            self.cx
+                .emitter(&self.connection)
+                .emit("model", "budget", |e| {
+                    e.field("provider", self.provider.host())
+                        .field("kind", kind)
+                });
             self.refused(path, "budget");
             return Some(
                 self.credential
@@ -934,11 +940,12 @@ fn set_catalog_origin(response: &mut Response<Body>, origin: &str) {
 /// The site's requests: a Responses WebSocket handshake gets its `101`
 /// here, and every other request runs as deferred work.
 impl httpd::Handler for Model {
-    fn call(&self, request: Request<Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+    fn call(&self, request: Request<Body>, exchange: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        let mut model = self.clone();
+        model.connection = exchange.conn().clone();
         if self.catalog.is_none() && websocket::wanted(self.provider, &request) {
-            return httpd::Reply::Now(websocket::accept(self.clone(), request));
+            return httpd::Reply::Now(websocket::accept(model, request));
         }
-        let model = self.clone();
         httpd::Reply::Later(Box::new(move |_| Box::pin(model.send(request))))
     }
 }

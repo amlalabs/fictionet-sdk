@@ -16,6 +16,7 @@ import { mount as labels } from './components/labels.mjs';
 import { mount as containment } from './components/containment.mjs';
 import { mount as leftTheBox } from './components/left-the-box.mjs';
 import { mount as events } from './components/events.mjs';
+import { mount as architecture } from './components/architecture.mjs';
 import { mount as map } from './components/map.mjs';
 import { mount as table } from './components/table.mjs';
 import { mount as eventTable } from './components/event-table.mjs';
@@ -86,7 +87,7 @@ export function createServices(transport, theme, importModule = (url) => import(
     // kind. The inspector sets it once its tabs exist.
     showPanel() {},
     // Shows the packets of a map item's links, or of one flow.
-    openLinks(_from, _to, members) { selection.set({ links: members.map(({ e }) => e.id) }); services.showPanel('packets'); },
+    openLinks(_from, _to, members) { services.packetPair.set(null); selection.set({ links: members.map(({ e }) => e.id) }); services.showPanel('packets'); },
     showPackets(pair) { services.packetPair.set(pair); services.showPanel('packets'); },
     // Loads a module by URL: a console's library or a world panel. Tests
     // pass their own, since Node cannot load the page's paths.
@@ -493,35 +494,47 @@ export function appShell(root, services, page) {
   const world = el('section', { class: 'app-world', 'aria-label': 'World' }, body);
   const own = page.panels.find((item) => item.area === 'workspace' && item.kind === 'custom');
   const worldTabs = el('div', { class: 'app-tabs', role: 'tablist', 'aria-label': 'World' }, world);
-  const ownTab = own ? el('button', { id: 'app-world-tab', type: 'button', role: 'tab', 'aria-selected': 'true', 'aria-controls': 'app-world-panel', tabindex: '0', text: own.title }, worldTabs) : null;
-  const packetTab = el('button', { id: 'app-packets-tab', type: 'button', role: 'tab', 'aria-selected': String(!own), 'aria-controls': 'app-packets-panel', tabindex: own ? '-1' : '0', text: 'Packets' }, worldTabs);
-  const ownPanel = own ? el('div', { id: 'app-world-panel', role: 'tabpanel', 'aria-labelledby': 'app-world-tab', tabindex: '0' }, world) : null;
-  const packetPanel = el('div', { id: 'app-packets-panel', role: 'tabpanel', 'aria-labelledby': 'app-packets-tab', tabindex: '0' }, world);
-  packetPanel.hidden = Boolean(own);
-  packetPanel.inert = Boolean(own);
-  let stopPackets = null, packetVisible = !own, disposed = false;
+  const architectureTab = el('button', { id: 'app-architecture-tab', type: 'button', role: 'tab', text: 'Architecture' }, worldTabs);
+  const packetTab = el('button', { id: 'app-packets-tab', type: 'button', role: 'tab', text: 'Packets' }, worldTabs);
+  const ownTab = own ? el('button', { id: 'app-world-tab', type: 'button', role: 'tab', text: own.title }, worldTabs) : null;
+  const architecturePanel = el('div', { id: 'app-architecture-panel', role: 'tabpanel' }, world);
+  const packetPanel = el('div', { id: 'app-packets-panel', role: 'tabpanel' }, world);
+  const ownPanel = own ? el('div', { id: 'app-world-panel', role: 'tabpanel' }, world) : null;
+  const worldViews = [[architectureTab, architecturePanel], [packetTab, packetPanel], ...(ownTab ? [[ownTab, ownPanel]] : [])];
+  for (const [tab, content] of worldViews) {
+    tab.setAttribute('aria-controls', content.id);
+    content.setAttribute('aria-labelledby', tab.id);
+    content.setAttribute('tabindex', '0');
+  }
+  let stopPackets = null, packetVisible = false, disposed = false, selectedWorld = architectureTab;
   function watchPackets() {
     if (!disposed && !document.hidden && packetVisible && !stopPackets) {
-      stopPackets = map(packetPanel, services);
+      const flow = el('section', { class: 'packet-map' }, packetPanel);
+      const list = el('section', { class: 'packet-list' }, packetPanel);
+      const stopMap = map(flow, services);
+      const stopList = packets(list, services);
+      stopPackets = () => { stopMap(); stopList(); flow.remove(); list.remove(); };
     } else if (disposed || document.hidden || !packetVisible) {
       stopPackets?.();
       stopPackets = null;
     }
   }
-  function selectWorld(showPackets, focus = false) {
-    const changed = packetVisible !== showPackets;
-    packetVisible = showPackets;
-    packetPanel.hidden = !showPackets;
-    packetPanel.inert = !showPackets;
-    if (ownPanel) { ownPanel.hidden = showPackets; ownPanel.inert = showPackets; }
-    for (const [tab, selected] of [[packetTab, showPackets], [ownTab, !showPackets]]) {
-      if (!tab) continue;
-      tab.setAttribute('aria-selected', String(selected));
-      tab.setAttribute('tabindex', selected ? '0' : '-1');
-      if (focus && selected) tab.focus();
+  function selectWorld(tab, focus = false) {
+    selectedWorld = tab;
+    packetVisible = tab === packetTab;
+    for (const [button, content] of worldViews) {
+      const selected = tab === button;
+      content.hidden = !selected;
+      content.inert = !selected;
+      button.setAttribute('aria-selected', String(selected));
+      button.setAttribute('tabindex', selected ? '0' : '-1');
+      if (focus && selected) button.focus();
     }
-    if (changed) watchPackets();
+    watchPackets();
   }
+  services.showPanel = (kind) => { if (kind === 'packets') selectWorld(packetTab); };
+  selectWorld(architectureTab);
+  const stopArchitecture = architecture(architecturePanel, services);
   const host = page.hosts[0];
   const kinds = ['screen', 'terminal'].filter((kind) => host?.[kind]);
   const cleanup = packetCleanup;
@@ -562,12 +575,13 @@ export function appShell(root, services, page) {
   }));
   bar.append(controls);
   open();
-  if (ownTab) cleanup.push(listen(ownTab, 'click', () => selectWorld(false)));
-  cleanup.push(listen(packetTab, 'click', () => selectWorld(true)));
+  for (const [tab] of worldViews) cleanup.push(listen(tab, 'click', () => selectWorld(tab)));
   cleanup.push(listen(worldTabs, 'keydown', (event) => {
-    if (!ownTab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
-    selectWorld(event.key === 'End' || (event.key !== 'Home' && !packetVisible), true);
+    const index = worldViews.findIndex(([tab]) => tab === selectedWorld);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? worldViews.length - 1 : (index + (event.key === 'ArrowLeft' ? -1 : 1) + worldViews.length) % worldViews.length;
+    selectWorld(worldViews[next][0], true);
   }));
   watchPackets();
   const close = () => {
@@ -606,6 +620,7 @@ export function appShell(root, services, page) {
     disposed = true;
     stopConsole();
     stopPackets?.();
+    stopArchitecture();
     cleanup.reverse().forEach((off) => off());
     root.classList.remove('demo-app');
   };
@@ -645,6 +660,7 @@ export async function mount(root, transport, theme, importModule) {
   if (disposed) return stop;
   root.dataset.state = 'ready';
   services.hosts = page.hosts;
+  services.architecture = page.architecture || [];
   services.labelState = page.panels.find((item) => item.kind === 'labels')?.state;
   services.labelCommand = page.panels.find((item) => item.kind === 'labels')?.command;
   services.containmentState = page.panels.find((item) => item.kind === 'containment')?.state;

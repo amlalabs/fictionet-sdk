@@ -43,16 +43,19 @@ type Answer = Result<Response<Body>, Error>;
 
 /// Opens the shared host cache and its upstream web proxy.
 pub fn new(fcx: &Cx) -> Result<Cache<web::Proxy>, Error> {
-    Ok(Cache::new(
+    let mut cache = Cache::new(
         web::proxy(fcx, std::sync::Arc::new(fictionet_host::Client::new()))?,
         Path::new(env!("CARGO_MANIFEST_DIR")).join("downloads/cloudimage/apt-cache"),
-    ))
+    );
+    cache.cx = Some(fcx.clone());
+    Ok(cache)
 }
 
 #[derive(Clone)]
 /// A web service that caches eligible upstream package downloads.
 pub struct Cache<S> {
     upstream: S,
+    cx: Option<Cx>,
     state: Arc<State>,
     pub(super) addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
     pub(crate) setup: Option<Arc<Setup>>,
@@ -140,6 +143,7 @@ impl<S> Cache<S> {
         };
         Self {
             upstream,
+            cx: None,
             addresses: Default::default(),
             setup: None,
             state: Arc::new(State {
@@ -302,6 +306,18 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
+        if let Some(cx) = &self.cx {
+            let info = request
+                .extensions()
+                .get::<fictionet::events::ConnInfo>()
+                .cloned()
+                .unwrap_or_default();
+            cx.emitter(&info).emit("mirror", "request", |event| {
+                event
+                    .field("path", request.uri().path())
+                    .field("host", request.uri().host().unwrap_or(""))
+            });
+        }
         if let Some(address) = request
             .extensions()
             .get::<fictionet::events::ConnInfo>()

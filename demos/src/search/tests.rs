@@ -495,7 +495,18 @@ async fn a_live_page_stays_making_until_the_model_answers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
-    use crate::kit::{checks::non_public_address, mirror};
+    use crate::kit::mirror;
+    let non_public_address = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    };
     use fictionet::stdlib::protocols::x509::Certificate;
     let seed = Seed::builtin("web").unwrap();
     let searches = Arc::new(Searches::from_seed(&seed));

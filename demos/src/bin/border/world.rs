@@ -8,20 +8,17 @@ use fictionet::{
     stdlib::{services::ca::Ca, web},
 };
 use fictionet_demo::kit;
-use fictionet_extras::models;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Starts the world. With `model`, Claude Code in the guest is signed in
-/// and its calls go out through the model site at `api.anthropic.com`.
+/// Starts the bank, mirrors and routing.
 pub async fn start(
     cx: Cx,
     mut world: kit::World,
     scenario: Arc<Scenario>,
     control: Control,
     log: Log,
-    model: Option<models::Model>,
 ) -> fictionet::Result {
     log.attach(&cx);
     let ca = Ca::new(&cx, certs::LAB_CA_NAME)?;
@@ -44,13 +41,6 @@ pub async fn start(
             );
         }
         extra = extra.host(address, site.into_host(name));
-    }
-    if let Some(model) = model {
-        kit::desktop::sign_in_claude(&mut world, &model, super::guest::USER)?;
-        let host = models::Provider::Anthropic.host();
-        let address = address(9);
-        let tls = certs::leaf(&cx, &ca, &[host], address)?.server_config(&cx, SystemTime::now())?;
-        extra = extra.host(address, web::Site::handler(model).tls(tls).into_host(host));
     }
     let routing = border_world::start_with(&cx, scenario, ids, world.into_attachments(), extra)?;
     cx.spawn(move |cx| control.serve(cx, routing));

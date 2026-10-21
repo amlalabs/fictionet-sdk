@@ -2,9 +2,8 @@
 //! install their packages at boot through the world's mirror.
 //!
 //! The workstation is the scanner, with nmap. Its screen is the kit's
-//! terminal desktop: one full-screen terminal that types and runs the
-//! story's nmap commands, sent with `GuestHandle::type_command`. nmap writes
-//! its reports to `~/notes`.
+//! terminal desktop: one full-screen interactive shell. Reports can be
+//! saved in `~/notes`.
 //!
 //! The office server runs nginx and OpenSSH at 10.0.0.50. Its login shell
 //! follows sshd's journal and nginx's access log, so the page's terminal

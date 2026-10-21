@@ -2,8 +2,6 @@
 
 use fictionet_demo::kit::{Guest, desktop};
 
-pub use fictionet_demo::kit::desktop::CLAUDE_VERSION;
-
 pub fn workstation(hostname: &str, user: &str, site: &str) -> Guest {
     desktop::codex(desktop::claude_code(
         desktop::browser(hostname, user, &format!("https://{site}/")).resources(4, 4096),

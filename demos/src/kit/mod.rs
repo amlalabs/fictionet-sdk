@@ -31,9 +31,6 @@
 //! let workstation = run.guest("workstation");
 //! workstation.wait_cloud_init(Duration::from_secs(300)).await?;
 //! workstation.wait_desktop(Duration::from_secs(300)).await?;
-//! let (screen, page) = (run.path().join("desktop.png"), run.path().join("page.png"));
-//! let shots = run.screenshots("workstation", &screen, &page).await?;
-//! kit::checks::check("the screen is 1280 pixels wide", shots.screen.width == 1280)?;
 //! run.shutdown().await?;
 //! # Ok(())
 //! # }
@@ -44,7 +41,6 @@
 //! serve `kit::desktop::HOSTS` through `World::mirror`.
 
 pub mod bridge;
-pub mod checks;
 pub mod client;
 mod page;
 pub use page::{Hosts, PAGE_PORT, PageAccess, answer_command, open_bootstrap, serve_commands};
@@ -54,7 +50,6 @@ pub mod jump;
 pub mod mirror;
 pub mod net;
 pub mod preview;
-pub mod rfb;
 pub mod seed;
 pub mod shot;
 pub mod ssh;
@@ -383,8 +378,6 @@ fn forbidden_in<'a>(text: &str, extra: &'a [String]) -> Option<&'a str> {
 pub struct World {
     attachments: Attachments,
     ca: Arc<Mutex<Option<(String, String)>>>,
-    environment: Arc<Mutex<Vec<(String, String)>>>,
-    home_files: Arc<Mutex<Vec<(String, String)>>>,
     now_unix: i64,
     mirror: Arc<Mutex<Option<mirror::Cache<fictionet::stdlib::web::Proxy>>>>,
     mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
@@ -392,52 +385,6 @@ pub struct World {
 }
 
 impl World {
-    /// Installs private files relative to each guest user's home before login.
-    pub fn seed_home_files(
-        &mut self,
-        files: impl IntoIterator<Item = (&'static str, String)>,
-    ) -> fictionet::Result {
-        let files: Vec<_> = files
-            .into_iter()
-            .map(|(path, content)| (path.to_owned(), content))
-            .collect();
-        if files.iter().any(|(path, _)| {
-            path.is_empty()
-                || std::path::Path::new(path)
-                    .components()
-                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
-        }) {
-            return Err(fictionet::Error::msg(
-                "Guest home file needs a relative path",
-            ));
-        }
-        self.home_files.lock().unwrap().extend(files);
-        Ok(())
-    }
-    /// Installs environment values in each guest before its first login.
-    /// Model sites supply placeholder credentials here.
-    pub fn seed_env(
-        &mut self,
-        values: impl IntoIterator<Item = (&'static str, String)>,
-    ) -> fictionet::Result {
-        let values: Vec<_> = values
-            .into_iter()
-            .map(|(name, value)| (name.to_owned(), value))
-            .collect();
-        if values.iter().any(|(name, value)| {
-            name.is_empty()
-                || !name.bytes().all(|c| c.is_ascii_uppercase() || c == b'_')
-                || !value
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"-_./:".contains(&c))
-        }) {
-            return Err(fictionet::Error::msg(
-                "invalid guest environment assignment",
-            ));
-        }
-        self.environment.lock().unwrap().extend(values);
-        Ok(())
-    }
     /// Returns the run start time as Unix seconds for certificate issuance.
     pub fn now_unix(&self) -> i64 {
         self.now_unix
@@ -476,7 +423,6 @@ type PageBuilder = Box<dyn FnOnce(DashboardHandle, &mut Hosts) -> Page + Send>;
 /// Declares guests and observers before starting the world.
 pub struct Kit<W = ()> {
     name: String,
-    page_words: Vec<String>,
     guests: Vec<Guest>,
     observers: Vec<Arc<dyn Observer>>,
     world: W,
@@ -493,7 +439,6 @@ impl Kit {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.into(),
-            page_words: Vec::new(),
             guests: Vec::new(),
             observers: Vec::new(),
             world: (),
@@ -506,13 +451,6 @@ impl Kit {
 }
 
 impl<W> Kit<W> {
-    /// Adds words that the page must not display.
-    pub fn page_words(mut self, words: &[&str]) -> Self {
-        self.page_words
-            .extend(words.iter().map(|word| (*word).into()));
-        self
-    }
-
     /// Adds a guest with its world attachment.
     pub fn guest(mut self, guest: Guest) -> Self {
         self.guests.push(guest);
@@ -555,7 +493,6 @@ impl<W> Kit<W> {
     {
         Kit {
             name: self.name,
-            page_words: self.page_words,
             guests: self.guests,
             observers: self.observers,
             world,
@@ -646,7 +583,6 @@ impl GuestHandle {
 
 /// Owns every process, bridge, and temporary file of a run.
 pub struct Run {
-    page_words: Vec<String>,
     audit: Arc<example_common::guest_content::Audit>,
     guests: Vec<GuestHandle>,
     fcx: Arc<Mutex<Option<Cx>>>,
@@ -929,7 +865,6 @@ impl<W> Kit<W> {
         let audit = Arc::new(example_common::guest_content::Audit::default());
         self.observers.push(audit.clone());
         let mut run = Run {
-            page_words: self.page_words.clone(),
             audit,
             guests: Vec::new(),
             setup: setup.clone(),
@@ -1262,6 +1197,50 @@ impl Run {
         );
         let labels = Labels::default();
         let page = build(dashboard.clone(), &mut hosts)
+            .architecture(vec![
+                fictionet_observe::page::ArchitectureService {
+                    title: "DNS".into(),
+                    source: "dns".into(),
+                    kinds: vec![],
+                    detail: "name".into(),
+                    outside: false,
+                },
+                fictionet_observe::page::ArchitectureService {
+                    title: "Simulated web".into(),
+                    source: "adaptive".into(),
+                    kinds: vec!["request".into()],
+                    detail: "path".into(),
+                    outside: false,
+                },
+                fictionet_observe::page::ArchitectureService {
+                    title: "Package mirror".into(),
+                    source: "mirror".into(),
+                    kinds: vec![],
+                    detail: "path".into(),
+                    outside: false,
+                },
+                fictionet_observe::page::ArchitectureService {
+                    title: "Model gateway".into(),
+                    source: "model".into(),
+                    kinds: vec!["tool".into()],
+                    detail: "query".into(),
+                    outside: false,
+                },
+                fictionet_observe::page::ArchitectureService {
+                    title: "Model calls".into(),
+                    source: "model".into(),
+                    kinds: vec!["call".into()],
+                    detail: "provider".into(),
+                    outside: true,
+                },
+                fictionet_observe::page::ArchitectureService {
+                    title: "Sign-in".into(),
+                    source: "signin".into(),
+                    kinds: vec!["connection".into()],
+                    detail: "host".into(),
+                    outside: true,
+                },
+            ])
             .containment(self.containment.clone())
             .labels(labels.clone());
         self.page = Some(page.bind_loopback(PAGE_PORT).await.map_err(|error| {
@@ -1298,13 +1277,9 @@ impl Run {
         F: Future<Output = fictionet::Result> + Send + 'static,
     {
         let ca = Arc::new(Mutex::new(None));
-        let environment = Arc::new(Mutex::new(Vec::new()));
-        let home_files = Arc::new(Mutex::new(Vec::new()));
         let world = World {
             attachments: prepared.attachments,
             ca: ca.clone(),
-            environment: environment.clone(),
-            home_files: home_files.clone(),
             mirror: self.mirror.clone(),
             mirror_addresses: prepared.mirror_addresses,
             setup: self.setup.clone(),
@@ -1363,61 +1338,6 @@ impl Run {
             .map_err(io::Error::other)?
             .map_err(io::Error::other)?;
         self.jump = Some(Arc::new(jump));
-        for guest in &mut self.guests {
-            // cloud-init makes a file's missing directories as root, so the
-            // user's own directories are made first, outermost first.
-            let user = guest.guest.user.clone();
-            let mut directories = Vec::new();
-            for (path, _) in home_files.lock().unwrap().iter() {
-                let mut directory = std::path::PathBuf::from(format!("/home/{user}"));
-                let parent = std::path::Path::new(path).parent();
-                for part in parent.into_iter().flat_map(std::path::Path::components) {
-                    directory.push(part);
-                    let step = format!(
-                        "install -d -m 0700 -o {user} -g {user} {}",
-                        ssh::quote(&directory.to_string_lossy())
-                    );
-                    if !directories.contains(&step) {
-                        directories.push(step);
-                    }
-                }
-            }
-            guest.guest.steps.splice(0..0, directories);
-            for (path, content) in home_files.lock().unwrap().iter() {
-                guest.guest.files.push(File {
-                    path: format!("/home/{}/{path}", guest.guest.user),
-                    mode: 0o600,
-                    content: content.clone(),
-                });
-            }
-            guest.guest.validate()?;
-        }
-        let environment = environment.lock().unwrap();
-        if !environment.is_empty() {
-            let assignments = environment
-                .iter()
-                .map(|(k, v)| format!("{k}={v}\n"))
-                .collect::<String>();
-            let exports = environment
-                .iter()
-                .map(|(k, v)| format!("export {k}={v}\n"))
-                .collect::<String>();
-            for guest in &mut self.guests {
-                guest.guest.files.extend([
-                    File {
-                        path: "/etc/environment".into(),
-                        mode: 0o644,
-                        content: assignments.clone(),
-                    },
-                    File {
-                        path: "/etc/profile.d/model.sh".into(),
-                        mode: 0o644,
-                        content: exports.clone(),
-                    },
-                ]);
-                guest.guest.validate()?;
-            }
-        }
         Ok(ca.lock().unwrap().clone())
     }
 
@@ -1577,3 +1497,90 @@ impl Run {
 
 #[cfg(test)]
 mod tests;
+
+impl GuestHandle {
+    /// Waits up to `timeout` for cloud-init to finish on the guest, and
+    /// returns the time from VM startup. Fails with cloud-init's exit code
+    /// and its `status --long` report, bounded to 64 KiB, unless cloud-init
+    /// finished cleanly.
+    pub async fn wait_cloud_init(&self, timeout: Duration) -> io::Result<Duration> {
+        let output = tokio::time::timeout(
+            timeout,
+            self.ssh()
+                .run_bounded("sudo cloud-init status --wait --long", 64 << 10),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{}: cloud-init did not finish within {} s",
+                    self.name(),
+                    timeout.as_secs()
+                ),
+            )
+        })??;
+        self.setup.done(self.name());
+        if output.code != 0 {
+            return Err(io::Error::other(format!(
+                "{}: cloud-init exit {}\n{}{}",
+                self.name(),
+                output.code,
+                output.stdout,
+                output.stderr
+            )));
+        }
+        Ok(self.boot.elapsed())
+    }
+
+    /// The guest's side of a failed run, for a demo to print: cloud-init's
+    /// report and log tail, the desktop's state and logs when the guest has
+    /// one, and the serial console tail. Each command has 3 s and 16 KiB.
+    pub async fn diagnostics(&self) -> String {
+        let mut out = format!("--- {} diagnostics ---\n", self.name());
+        match &self.ssh {
+            None => out.push_str("No SSH session; only the console tail is available.\n"),
+            Some(ssh) => {
+                let desktop = self.guest.desktop.is_some().then_some(DESKTOP_DIAGNOSTICS);
+                for command in DIAGNOSTICS.iter().chain(desktop.into_iter().flatten()) {
+                    let result = tokio::time::timeout(
+                        DIAGNOSTIC_TIMEOUT,
+                        ssh.run_bounded(command, DIAGNOSTIC_BYTES),
+                    )
+                    .await;
+                    out.push_str(&match result {
+                        Ok(Ok(output)) => format!(
+                            "guest$ {command}\n{}{}[exit {}]\n",
+                            output.stdout, output.stderr, output.code
+                        ),
+                        Ok(Err(error)) => format!("guest$ {command}\nunavailable: {error}\n"),
+                        Err(_) => format!("guest$ {command}\ntimed out\n"),
+                    });
+                }
+            }
+        }
+        if let Some(vm) = &self.vm {
+            out.push_str(&format!(
+                "--- {} console tail ---\n{}\n",
+                self.name(),
+                vm.console_tail()
+            ));
+        }
+        out
+    }
+}
+
+const DIAGNOSTICS: &[&str] = &[
+    "cloud-init status --long",
+    "sudo tail -n 30 /var/log/cloud-init-output.log",
+];
+/// The commands it adds for a guest with a desktop.
+const DESKTOP_DIAGNOSTICS: &[&str] = &[
+    "systemctl is-active vnc",
+    "tail -n 15 /tmp/xvnc.log /tmp/xfce.log",
+    "tail -n 40 /tmp/firefox.log",
+    desktop::FIREFOX_TITLE,
+];
+/// Each diagnostic command's time and output bounds.
+const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(3);
+const DIAGNOSTIC_BYTES: usize = 16 << 10;

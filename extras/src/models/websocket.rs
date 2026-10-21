@@ -90,12 +90,15 @@ pub(super) fn accept(model: Model, request: Request<Body>) -> Response<Body> {
     if let Ok(id) = http::HeaderValue::try_from(format!("req_{}", hex(&model.cx, 16))) {
         response.headers_mut().insert("x-request-id", id);
     }
-    model.cx.emit("model", "transport", |e| {
-        e.field("provider", model.provider.host())
-            .field("path", path.as_str())
-            .field("transport", "websocket")
-            .field("status", 101u64)
-    });
+    model
+        .cx
+        .emitter(&model.connection)
+        .emit("model", "transport", |e| {
+            e.field("provider", model.provider.host())
+                .field("path", path.as_str())
+                .field("transport", "websocket")
+                .field("status", 101u64)
+        });
     let (head, _) = request.into_parts();
     response
         .extensions_mut()
@@ -593,10 +596,13 @@ async fn relay(
         });
     };
     let failed = |model: &Model, error: Error| {
-        model.cx.emit("model", "socket_error", |e| {
-            e.field("provider", model.provider.host())
-                .field("message", error.to_string())
-        });
+        model
+            .cx
+            .emitter(&model.connection)
+            .emit("model", "socket_error", |e| {
+                e.field("provider", model.provider.host())
+                    .field("message", error.to_string())
+            });
         let event = wrapped(500, &http::HeaderMap::new(), b"");
         Out::Event(event.to_string(), event)
     };
@@ -781,12 +787,15 @@ async fn serve(model: Model, head: http::request::Parts, cx: Cx, mut conn: Box<d
         Some(_) => close_code::NO_STATUS,
         None => close_code::ABNORMAL,
     };
-    model.cx.emit("model", "transport", |e| {
-        e.field("provider", provider)
-            .field("transport", "websocket")
-            .field("closed", code as u64)
-            .field("responses", session.responses)
-    });
+    model
+        .cx
+        .emitter(&model.connection)
+        .emit("model", "transport", |e| {
+            e.field("provider", provider)
+                .field("transport", "websocket")
+                .field("closed", code as u64)
+                .field("responses", session.responses)
+        });
     if let Some(close) = close {
         session.outbox.push(close);
         if session.flush(&cx, &mut conn).await.is_ok() {

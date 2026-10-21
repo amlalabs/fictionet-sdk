@@ -21,7 +21,7 @@ use adaptive_web_world::pages::{
 use fictionet_extras::models::{Https, Key};
 use fictionet_extras::search::Engine;
 
-use super::{Result, checks::search_url};
+use super::{Result, search_url};
 
 /// The most model calls one bake makes, retries included.
 const CALLS: usize = 400;

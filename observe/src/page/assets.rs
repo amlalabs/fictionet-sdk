@@ -6,6 +6,10 @@ pub(super) const HTML: &str = include_str!("../../../dashboard/page.html");
 
 pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static [u8])> {
     let bytes: &[u8] = match path {
+        "/visibility.mjs" => include_bytes!("../../../dashboard/visibility.mjs"),
+        "/components/architecture.mjs" => {
+            include_bytes!("../../../dashboard/components/architecture.mjs")
+        }
         "/dom.mjs" => include_bytes!("../../../dashboard/dom.mjs"),
         "/format.mjs" => include_bytes!("../../../dashboard/format.mjs"),
         "/graph.mjs" => include_bytes!("../../../dashboard/graph.mjs"),
