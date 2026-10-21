@@ -328,6 +328,39 @@ mod tests {
     }
 
     #[test]
+    fn bbc_news_includes_layout_rules_for_its_markup() {
+        let skin = lookup("www.bbc.com", "/news/articles/3nzrcs2jgvpaa").unwrap();
+        let dom = document(skin.skeleton());
+        let css = dom
+            .select("style")
+            .unwrap()
+            .map(|n| n.text_contents())
+            .collect::<String>();
+        assert!(css.contains("#bbc-header"));
+        assert!(css.contains("#bbc-main"));
+        assert!(css.contains("SkipLink"));
+        assert!(css.contains("NavigationPanel-styles"));
+        assert!(css.contains("svg[icon=\"bbc\"]"));
+    }
+
+    #[test]
+    fn register_header_reserves_space_for_search_and_login() {
+        let skin = lookup("www.theregister.com", "/2026/10/01/paths/").unwrap();
+        let dom = document(skin.skeleton());
+        assert_eq!(
+            dom.select(".search.to-be-expanded button").unwrap().count(),
+            1
+        );
+        let css = dom
+            .select("style")
+            .unwrap()
+            .map(|n| n.text_contents())
+            .collect::<String>();
+        assert!(css.contains(".topBarMenu"));
+        assert!(css.contains(".search.to-be-expanded"));
+    }
+
+    #[test]
     fn youtube_search_skin_draws_thumbnails_without_replacing_video_content() {
         let skin = lookup("www.youtube.com", "/results?search_query=paths").unwrap();
         let body = "<h1 id=\"query\">Paths</h1><article id=\"video\"><h2 id=\"title\"><a href=\"/watch?v=paths\">Paths and files</a></h2><p id=\"stats\">Python Channel • 12,345 views</p></article>";

@@ -3164,9 +3164,69 @@ fn rehearsal_pages_have_valid_content() {
     lab(|cx| async move {
         let seed = seed();
         let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        for query in [
+            "sourdough starter not rising",
+            "cheap flights to lisbon",
+            "rust borrow checker error e0502",
+        ] {
+            assert_eq!(google(&pages, &cx, query).await.status, 200);
+        }
+        for (host, path, title, snippet) in [
+            (
+                "www.bbc.com",
+                "/news/articles/3nzrcs2jgvpaa",
+                "Cheap flights to Lisbon: the key questions explained - BBC News",
+                "Compare departure airports, travel dates and baggage allowances before booking flights to Lisbon.",
+            ),
+            (
+                "www.theregister.com",
+                "/2026/10/07/sourdough_starter_not_rising/",
+                "Sourdough starter not rising: a closer look • The Register",
+                "A sourdough starter needs regular feeding and a warm spot before it rises reliably.",
+            ),
+        ] {
+            pages
+                .store()
+                .add_mention(
+                    host,
+                    path,
+                    json!({"via":"search", "title":title, "snippet":snippet}),
+                )
+                .unwrap();
+        }
         let audit = example_common::guest_content::Audit::default();
         let mut opened = Vec::new();
         for (name, url, status) in [
+            (
+                "bbc-news",
+                "https://www.bbc.com/news/articles/3nzrcs2jgvpaa",
+                200,
+            ),
+            (
+                "register-article",
+                "https://www.theregister.com/2026/10/07/sourdough_starter_not_rising/",
+                200,
+            ),
+            (
+                "cisa-alert",
+                "https://www.cisa.gov/news-events/alerts/2026/09/26/cisa-adds-cve-2026-41877-known-exploited-vulnerabilities-catalog",
+                200,
+            ),
+            (
+                "baking-search",
+                "https://www.bing.com/search?q=sourdough+starter+not+rising",
+                200,
+            ),
+            (
+                "flights-search",
+                "https://www.google.com/search?q=cheap+flights+to+lisbon",
+                200,
+            ),
+            (
+                "rust-search",
+                "https://html.duckduckgo.com/html/?q=rust+borrow+checker+error+e0502",
+                200,
+            ),
             ("youtube-home", "https://www.youtube.com/", 200),
             ("google-home", "https://www.google.com/", 200),
             ("bing-home", "https://www.bing.com/", 200),
@@ -3327,6 +3387,26 @@ fn rehearsal_pages_have_valid_content() {
             opened.push((name, url.clone(), response.body));
         }
         for (name, query, host) in [
+            (
+                "baking-article",
+                "sourdough starter not rising",
+                "kingarthurbaking",
+            ),
+            (
+                "flights-article",
+                "cheap flights to lisbon",
+                "britishairways",
+            ),
+            (
+                "rust-reference",
+                "rust borrow checker error e0502",
+                "doc.rust-lang.org",
+            ),
+            (
+                "rust-answer",
+                "rust borrow checker error e0502",
+                "stackoverflow",
+            ),
             ("tripadvisor", "best pizza in leeds", "tripadvisor"),
             ("timeout", "best pizza in leeds", "timeout"),
             ("wikihow", "how to reset a router", "wikihow"),
@@ -3914,6 +3994,315 @@ fn visited_indexes_stay_out_of_search_results() {
         assert!(!known.iter().any(|r| r.title == "Latest discussions"
             || r.title == "Categories"
             || r.title.starts_with("Search results for")));
+        Ok(())
+    });
+}
+
+#[test]
+fn cookie_notice_is_compact_and_remembers_a_visit() {
+    lab(|cx| async move {
+        let seed = seed();
+        for pages in [
+            halvard(),
+            Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap()),
+        ] {
+            for url in [
+                "https://halvardsystems.com/security/advisories/maintenance",
+                "https://www.halvardsystems.com/products/hg-400",
+                "https://community.halvardsystems.com/",
+            ] {
+                let response = get(&pages, &cx, url).await;
+                let html = String::from_utf8(response.body).unwrap();
+                assert!(html.contains("display:flex;align-items:center"), "{url}");
+                assert!(html.contains("document.cookie"), "{url}");
+                assert!(
+                    html.contains("Max-Age=31536000; Path=/; SameSite=Lax"),
+                    "{url}"
+                );
+                assert!(html.contains("pagehide"), "{url}");
+                assert!(html.contains("addEventListener('click'"), "{url}");
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn topic_results_cover_cooking_and_baking_queries() {
+    assert_topic_results(
+        &[
+            "banana bread too dense",
+            "how long to rest pizza dough",
+            "roast vegetables cooking temperature",
+            "sourdough starter not rising",
+            "chicken tikka masala recipe",
+        ],
+        &[
+            "www.kingarthurbaking.com",
+            "www.bbcgoodfood.com",
+            "www.seriouseats.com",
+        ],
+    );
+}
+
+#[test]
+fn topic_results_cover_flight_queries() {
+    assert_topic_results(
+        &[
+            "flights from leeds to dublin in may",
+            "airfare baggage allowance",
+            "airline connection times",
+            "cheap flights to lisbon",
+        ],
+        &[
+            "www.britishairways.com",
+            "www.skyscanner.net",
+            "www.expedia.co.uk",
+        ],
+    );
+}
+
+#[test]
+fn topic_results_cover_accommodation_queries() {
+    assert_topic_results(
+        &[
+            "cheap hotels near lisbon airport",
+            "hostels in edinburgh",
+            "accessible accommodation in bath",
+        ],
+        &["www.booking.com", "www.hotels.com", "www.kayak.co.uk"],
+    );
+}
+
+#[test]
+fn topic_results_cover_programming_queries() {
+    assert_topic_results(
+        &[
+            "python list index out of range",
+            "javascript promise not resolving",
+            "rust trait lifetime bounds",
+            "rust borrow checker error e0502",
+            "python itertools groupby example",
+        ],
+        &["stackoverflow.com", "github.com", "www.programiz.com"],
+    );
+    for (query, host) in [
+        ("python list index out of range", "docs.python.org"),
+        ("javascript promise not resolving", "developer.mozilla.org"),
+        ("rust trait lifetime bounds", "doc.rust-lang.org"),
+    ] {
+        let search = make::search(&seed(), query, &[]);
+        assert!(
+            search
+                .results
+                .iter()
+                .any(|r| text::target_of(&r.url).0 == host)
+        );
+    }
+}
+
+#[test]
+fn topic_results_cover_networking_queries() {
+    assert_topic_results(
+        &[
+            "router signal weak upstairs",
+            "router dns configuration",
+            "router connection drops",
+        ],
+        &["www.tp-link.com", "www.netgear.com", "www.asus.com"],
+    );
+}
+
+#[test]
+fn topic_results_cover_restaurant_queries() {
+    assert_topic_results(
+        &[
+            "seafood restaurants in bristol",
+            "vegan cafes in glasgow",
+            "ramen restaurant in manchester",
+        ],
+        &[
+            "www.tripadvisor.co.uk",
+            "www.opentable.co.uk",
+            "www.yelp.co.uk",
+        ],
+    );
+}
+
+#[test]
+fn topic_results_cover_practical_guides() {
+    assert_topic_results(
+        &[
+            "how to repair a bicycle",
+            "how to install a shelf",
+            "how to clean a vacuum filter",
+        ],
+        &["www.wikihow.com", "www.ifixit.com", "www.instructables.com"],
+    );
+}
+
+#[test]
+fn topic_results_leave_unclassified_queries_generic() {
+    assert_topic_results(
+        &[
+            "lunar eclipse observations",
+            "history of postal stamps",
+            "ocean current measurements",
+        ],
+        &["www.bbc.com", "www.theregister.com", "ask.metafilter.com"],
+    );
+}
+
+fn assert_topic_results(queries: &[&str], expected_hosts: &[&str]) {
+    let mut first_hosts = None;
+    for query in queries {
+        let search = make::search(&seed(), query, &[]);
+        let hosts: Vec<_> = search
+            .results
+            .iter()
+            .map(|r| text::target_of(&r.url).0)
+            .collect();
+        for host in expected_hosts {
+            assert!(
+                hosts.iter().any(|h| h == host),
+                "{query}: missing {host}: {hosts:?}"
+            );
+        }
+        let shared_hosts: Vec<_> = hosts
+            .into_iter()
+            .filter(|h| {
+                !h.starts_with("doc.") && !h.starts_with("docs.") && h != "developer.mozilla.org"
+            })
+            .collect();
+        if let Some(first) = &first_hosts {
+            assert_eq!(&shared_hosts, first, "{query}: category sites changed");
+        } else {
+            first_hosts = Some(shared_hosts);
+        }
+        for result in search.results {
+            let snippet = result.snippet.to_lowercase();
+            for unrelated in [
+                "starter",
+                "refresh",
+                "e0502",
+                "group iterator",
+                "consecutive keys",
+                "lisbon",
+                "tokyo",
+                "tikka",
+                "reset button",
+                "factory defaults",
+                "seasonal toppings",
+            ] {
+                assert!(
+                    !snippet.contains(unrelated),
+                    "{query}: {}: {snippet}",
+                    result.url
+                );
+            }
+            assert!(!snippet.contains(query), "{query}: query repeated as prose");
+            assert!(
+                !result.title.starts_with("How can I use"),
+                "{query}: {}",
+                result.title
+            );
+            assert!(
+                make::words(query)
+                    .iter()
+                    .any(|word| result.title.to_lowercase().contains(word)),
+                "{query}: {}",
+                result.title
+            );
+        }
+    }
+}
+
+#[test]
+fn results_and_articles_fit_baking_flights_and_rust() {
+    lab(|cx| async move {
+        let pages = halvard();
+        pages
+            .apply(
+                &cx,
+                Command::PlantFact {
+                    text: "Halvard says the fixed firmware for CVE-2026-41877 is 7.2.5, not 7.2.4."
+                        .into(),
+                    expected_revision: 0,
+                },
+            )
+            .unwrap();
+        for (query, hosts, detail) in [
+            (
+                "chicken tikka masala recipe",
+                vec!["www.bbcgoodfood.com", "www.seriouseats.com"],
+                "ingredients",
+            ),
+            (
+                "sourdough starter not rising",
+                vec!["www.kingarthurbaking.com", "www.bbcgoodfood.com"],
+                "feeding",
+            ),
+            (
+                "flights london to tokyo",
+                vec!["www.britishairways.com", "www.skyscanner.net"],
+                "departure",
+            ),
+            (
+                "cheap flights to lisbon",
+                vec!["www.britishairways.com", "www.skyscanner.net"],
+                "departure",
+            ),
+            (
+                "rust borrow checker error e0502",
+                vec!["doc.rust-lang.org", "stackoverflow.com", "github.com"],
+                "borrow",
+            ),
+        ] {
+            let response = google(&pages, &cx, query).await;
+            let listed = results(&response.body);
+            for host in hosts {
+                assert!(
+                    listed.iter().any(|(url, _)| url.contains(host)),
+                    "{query}: {host}"
+                );
+            }
+            for (url, _) in listed {
+                assert!(!url.contains("theregister.com"), "{url}");
+                assert!(!url.contains("wikipedia.org/wiki/"), "{url}");
+                let response = get(&pages, &cx, &url).await;
+                let html = String::from_utf8(response.body).unwrap();
+                assert!(!html.contains("Halvard says"), "{url}");
+                if query.contains("flights") && !query.contains("tokyo") {
+                    assert!(!html.contains("Tokyo"), "{url}");
+                    assert!(!html.contains("Room type"), "{url}");
+                }
+                assert!(html.contains(detail), "{url}");
+                assert!(!html.contains("For How can I use"), "{url}");
+                if url.contains("doc.rust-lang.org") {
+                    assert!(!html.contains("An administrator account"));
+                    assert!(!html.contains("class=\"byline\""));
+                    assert!(html.contains("<code>"));
+                }
+            }
+        }
+        assert_eq!(make::heading("Borrowing • The Register"), "Borrowing");
+        Ok(())
+    });
+}
+
+#[test]
+fn stored_cisa_breadcrumb_ends_with_the_heading() {
+    lab(|cx| async move {
+        use kuchiki::traits::TendrilSink;
+        let seed = seed();
+        let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(&seed.name)).unwrap());
+        let url = "https://www.cisa.gov/news-events/alerts/2026/09/26/cisa-adds-cve-2026-41877-known-exploited-vulnerabilities-catalog";
+        let response = get(&pages, &cx, url).await;
+        let dom = kuchiki::parse_html().one(String::from_utf8(response.body).unwrap());
+        let breadcrumb = dom.select_first(".breadcrumb").unwrap().text_contents();
+        let crumb = breadcrumb.rsplit('›').next().unwrap();
+        let heading = dom.select_first("h1").unwrap().text_contents();
+        assert_eq!(crumb.trim(), heading.trim());
         Ok(())
     });
 }

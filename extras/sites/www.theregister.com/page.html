@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en-US" dir="ltr" class="resp_fonts" style="--lab-scrollbar-width: 0px;"><head>
+<!DOCTYPE html><html lang="en-US" dir="ltr" class="resp_fonts" style="--lab-scrollbar-width: 0px;"><head><meta charset="utf-8">
 
 
 
@@ -100,7 +100,13 @@
         <link rel="stylesheet" href="/_assets/70f57e6689660061.css">
 
 
-    </head>
+    <style>
+@media (min-width: 1024px) {
+.pageHeader .row.mainrow > .search.to-be-expanded { flex: 0 0 44px; width: 44px; order: 4; position: relative; }
+.pageHeader .row.mainrow > .navigation.topBarMenu { flex: 0 0 auto; width: auto; margin-right: 16px; }
+.pageHeader .search.to-be-expanded .search-expander { position: static; width: 44px; height: 44px; }
+}
+</style></head>
 
     <body class="l4 article site_theregister section_os platforms custom-bodytext-width custom-bodytext-alignment" style="padding: 0px 0px 120px;"><div id="oops" style="width: 0px; height: 0px; overflow: hidden; display: none;"><div id="google_ads_iframe_/6978/labrador/thereg/article/desktop/oops_0__container__" style="border: 0pt;"></div></div>
 
@@ -305,9 +311,7 @@
     <form class="search-container" action="/cse" method="get" role="search">
         <label for="search-input-7" class="visuallyhidden">Search</label>
         <input type="text" id="search-input-7" name="q" placeholder="Search...">
-                <button id="bonusButton" class="bonusButton">
-                        <i class="fi-magnifying-glass" aria-hidden="true"></i>
-                </button>
+
     </form>
 
             <button class="search-button search-expander" aria-label="Search" aria-expanded="false" aria-controls="search-input-7">

@@ -206,7 +206,10 @@ impl Audit {
                     "https://packages.mozilla.org",
                     "https://downloads.claude.ai",
                     "https://releases.openai.com",
-                    // OpenAI's Codex model catalog.
+                    // Provider APIs and OpenAI's Codex model catalog.
+                    "https://api.anthropic.com",
+                    "https://api.openai.com",
+                    "https://openrouter.ai",
                     "https://raw.githubusercontent.com",
                     "https://chatgpt.com/backend-api/codex/models",
                 ]
@@ -597,6 +600,46 @@ mod tests {
     }
 
     #[test]
+    fn provider_replies_and_local_pages_have_distinct_ownership() {
+        for origin in [
+            "https://api.anthropic.com",
+            "https://openrouter.ai",
+            "https://api.openai.com",
+        ] {
+            let audit = Audit::default();
+            let mut sink = audit
+                .content(Content {
+                    kind: "http",
+                    name: origin,
+                    encoding: "",
+                    origin: Some(origin),
+                })
+                .unwrap();
+            sink.write(b"{\"content\":\"world evaluation\"}");
+            sink.finish();
+            assert!(audit.check().is_ok(), "{origin}");
+        }
+        for origin in [
+            None,
+            Some("https://halvardsystems.com"),
+            Some("https://openrouter.ai.example.org"),
+        ] {
+            let audit = Audit::default();
+            let mut sink = audit
+                .content(Content {
+                    kind: "http",
+                    name: "https://openrouter.ai",
+                    encoding: "",
+                    origin,
+                })
+                .unwrap();
+            sink.write(b"{\"content\":\"world evaluation\"}");
+            sink.finish();
+            assert!(audit.check().unwrap_err().contains("world"));
+        }
+    }
+
+    #[test]
     fn completed_content_is_checked_before_drop() {
         let audit = Audit::default();
         let mut sink = audit.sink(Content {
@@ -609,8 +652,9 @@ mod tests {
         sink.finish();
         let result = audit.check();
         assert!(
-            result.as_ref().is_err_and(|error| error.contains("fictionet")
-                && error.contains("simulation")),
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("fictionet") && error.contains("simulation")),
             "{result:?}"
         );
     }
@@ -630,7 +674,9 @@ mod tests {
         sink.write(b"et");
         let result = audit.check();
         assert!(
-            result.as_ref().is_err_and(|error| error.contains("fictionet")),
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("fictionet")),
             "{result:?}"
         );
     }
@@ -664,7 +710,9 @@ mod tests {
         audit.inspect("page", bytes);
         let result = audit.check();
         assert!(
-            result.as_ref().is_err_and(|error| error.contains("fictionet")),
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("fictionet")),
             "{result:?}"
         );
     }
@@ -681,7 +729,9 @@ mod tests {
             audit.inspect("page", bytes);
             let result = audit.check();
             assert!(
-                result.as_ref().is_err_and(|error| error.contains("fictionet")),
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("fictionet")),
                 "{bytes:?}: {result:?}"
             );
         }
@@ -707,7 +757,9 @@ mod tests {
             drop(sink);
             let result = audit.check();
             assert!(
-                result.as_ref().is_err_and(|error| error.contains("fictionet")),
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("fictionet")),
                 "{bytes:?}: {result:?}"
             );
         }

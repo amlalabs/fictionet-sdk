@@ -135,6 +135,9 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
     );
     let title = super::make::heading(title);
     let body = &record.body;
+    let flights = super::make::words(title)
+        .iter()
+        .any(|word| ["flight", "flights", "airfare", "airline"].contains(&word.as_str()));
     let tagline = if profile.tagline.is_empty() {
         String::new()
     } else {
@@ -145,14 +148,18 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
             r#"<body class="{kind}"><header><div class="brand"><a href="/">{}</a></div><nav>{nav}</nav></header><div class="site-content"><p class="page-breadcrumb"><a href="/">Home</a> › {}</p><div class="filters"><span>{}</span><span>{}</span><span>{}</span></div><article>{body}</article></div></body></html>"#,
             e(name),
             e(title),
-            if kind == "lodging" {
+            if flights {
+                "Flights"
+            } else if kind == "lodging" {
                 "Stays"
             } else if kind == "listings" {
                 "Restaurants"
             } else {
                 "Steps"
             },
-            if kind == "lodging" {
+            if flights {
+                "Connections"
+            } else if kind == "lodging" {
                 "Room type"
             } else if kind == "listings" {
                 "Cuisine"
@@ -258,8 +265,10 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
             )
         }
     };
-    let cookies = if !["government", "wiki", "docs", "package"].contains(&kind) && style % 3 != 2 {
-        "<div class=\"cookie-banner\" style=\"position:fixed;bottom:0;left:0;right:0;z-index:100;background:white;padding:16px 24px;border-top:1px solid #bdc6d1\" role=\"dialog\" aria-label=\"Cookies\"><p>We use cookies to improve your experience and for analytics. <a href=\"/privacy\">Privacy policy</a></p><button>Accept</button> <button>Reject non-essential</button></div>\n"
+    let cookies = if !["government", "wiki", "docs", "package"].contains(&kind)
+        && (kind == "forum" || style % 3 != 2)
+    {
+        r#"<div class="cookie-banner" style="position:fixed;bottom:0;left:0;right:0;z-index:100;background:white;display:flex;align-items:center;gap:12px;padding:8px 20px;border-top:1px solid #bdc6d1;font:14px/1.4 system-ui,sans-serif" role="dialog" aria-label="Cookies"><p style="margin:0;flex:1">We use cookies for site preferences and analytics. <a href="/privacy">Privacy policy</a></p><button style="padding:6px 12px;margin:0" data-choice="accept">Accept</button><button style="padding:6px 12px;margin:0" data-choice="reject">Reject non-essential</button></div><script>(()=>{const bar=document.querySelector('.cookie-banner');let choice='seen';const remember=(value)=>{choice=value;document.cookie='site_cookies='+value+'; Max-Age=31536000; Path=/; SameSite=Lax';};if(document.cookie.split(';').some(value=>value.trim().startsWith('site_cookies='))){bar.remove();return;}remember('seen');bar.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>{remember(button.dataset.choice);bar.remove();}));window.addEventListener('pagehide',()=>remember(choice),{once:true});})();</script>"#
     } else {
         ""
     };
@@ -408,7 +417,8 @@ mod tests {
                 assert!(html.ends_with("</html>\n"));
                 assert_eq!(
                     html.contains("cookie-banner"),
-                    !["government", "wiki", "docs", "package"].contains(&kind) && style % 3 != 2
+                    !["government", "wiki", "docs", "package"].contains(&kind)
+                        && (kind == "forum" || style % 3 != 2)
                 );
             }
         }
