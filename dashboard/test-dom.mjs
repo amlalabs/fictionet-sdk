@@ -70,6 +70,7 @@ export class Element extends EventTarget {
   }
   append(...children) { children.forEach((child) => this.appendChild(child)); }
   replaceChildren(...children) {
+    for (const child of this.children) if (typeof child !== 'string') child.parent = null;
     this.children = [];
     this.append(...children);
   }

@@ -4,6 +4,7 @@ export const addressOf = (value) => value.startsWith('[') ? value.slice(1, value
 export const kindOf = (p) => p.tags.some((tag) => ['dns-error', 'malformed'].includes(tag)) ? 'bad'
   : p.proto.startsWith('TLS') && p.info === 'Encrypted Alert' ? 'tcp'
   : p.proto.startsWith('TLS') ? 'tls' : p.proto.startsWith('HTTP') ? 'http' : 'tcp';
+const dataRow = (p) => p.proto.startsWith('HTTP') && /^DATA(?:\[|\b)/.test(p.info);
 const flow = (p) => `${p.link}:${[p.src, p.dst].sort().join('|')}`;
 
 export function conversationRows(rows) {
@@ -24,7 +25,7 @@ export function conversationRows(rows) {
 
 export function dnsRow(p) {
   if (p.proto !== 'DNS') return null;
-  const question = p.info.match(/^Standard query(?: response)? \S+ (?:A|AAAA) (\S+)/);
+  const question = p.info.match(/^Standard query(?: response)? \S+ \S+ (\S+)/);
   if (!question) return null;
   const name = question[1];
   const answers = [...p.info.slice(question[0].length).matchAll(/\b(A|AAAA) ([\da-f.:]+)(?=\s|$)/gi)].map((m) => ({ type: m[1], address: m[2] }));
@@ -36,7 +37,7 @@ export function chipText(p) {
   if (dns) return p.tags.includes('dns-error') ? 'no such name' : dns.back ? dns.answers.map((a) => `${a.type} ${a.address}`).join(' · ') || 'DNS' : 'DNS';
   if (p.proto === 'TCP') return p.info.match(/\[([^\]]+)\]/)?.[1].split(/,\s*/).sort((a, b) => (a === 'ACK') - (b === 'ACK')).join('·') || 'TCP';
   if (p.proto.startsWith('TLS')) return p.info === 'Encrypted Alert' ? 'TLS close' : p.info.match(/Client Hello|Server Hello|Certificate|Finished/)?.[0] || p.info.slice(0, 22);
-  if (/\bDATA(?:\[|\b)/.test(p.info)) return `DATA ${p.len > 999 ? `${(p.len / 1024).toFixed(1)}k` : p.len}`;
+  if (dataRow(p)) return `DATA ${p.len > 999 ? `${(p.len / 1024).toFixed(1)}k` : p.len}`;
   const status = p.info.match(/^HTTP\/\S+ (\d{3})/);
   if (status) return status[1];
   const text = p.info.replace(/^HEADERS\[\d+\]: /, '').replace(/ \([^)]*\)$/, '').replace(/ HTTP\/\d(?:\.\d)?$/, '');
@@ -80,9 +81,21 @@ export function createLanes(root, { name, local, addressFor, animate }) {
     const distance = before - lane.node.getBoundingClientRect().top;
     if (motion && (distance || lane.items.length === 0)) animate(lane.node, `translateY(${distance || 8}px)`, 240);
     const texts = p.proto.startsWith('TLS') ? p.info.match(/Client Hello|Server Hello|Certificate(?=,|$)|Finished/g) || [chipText(p)] : [chipText(p)];
-    for (const text of texts) {
-      const chip = el('span', { class: `packet-chip ${kindOf(p)}${back ? ' back' : ''}${p.quiet ? ' quiet' : ''}`, text, title: p.info }, lane.chips);
-      lane.items.push({ node: chip, t: p.t });
+    const data = dataRow(p);
+    const last = lane.items.at(-1);
+    if (data && last?.data && last.back === back && p.t >= last.t) {
+      last.bytes += p.len;
+      last.count++;
+      last.t = p.t;
+      last.label.textContent = chipText({ ...p, len: last.bytes });
+      last.counter ||= el('small', { class: 'packet-chip-count' }, last.node);
+      last.counter.textContent = `×${last.count}`;
+      if (motion) animate(last.node, 'scale(.96)', 160);
+    } else for (const text of texts) {
+      const chip = el('span', { class: `packet-chip ${kindOf(p)}${back ? ' back' : ''}${p.quiet ? ' quiet' : ''}`, title: p.info }, lane.chips);
+      const label = data ? el('span', { text }, chip) : chip;
+      if (!data) chip.textContent = text;
+      lane.items.push({ node: chip, t: p.t, data, back, bytes: p.len, count: 1, label });
       if (motion) animate(chip, 'translateX(10px) scale(.9)', 220);
     }
     lane.items.sort((a, b) => a.t - b.t);

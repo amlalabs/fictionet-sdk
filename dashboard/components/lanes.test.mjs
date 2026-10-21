@@ -270,3 +270,118 @@ test('connection resets and encrypted TLS closes are neutral and retain decoder 
   assert.match(h.root.querySelector('#prows').textContent, /Encrypted Alert/);
   for (const tag of ['dns-error', 'malformed']) assert.equal(kindOf({ ...reset, tags: [tag] }), 'bad');
 });
+
+test('DNS record types join their queried name with address, empty and refused replies', (t) => {
+  const h = setup(t);
+  const cases = [
+    ['A', 'A 185.42.118.20', [{ type: 'A', address: '185.42.118.20' }]],
+    ['AAAA', 'AAAA 2001:db8::20', [{ type: 'AAAA', address: '2001:db8::20' }]],
+    ['HTTPS', '', []],
+    ['CNAME', 'CNAME bbc.example. A 185.42.118.20 AAAA 2001:db8::20', [{ type: 'A', address: '185.42.118.20' }, { type: 'AAAA', address: '2001:db8::20' }]],
+    ['MX', 'MX 10 mail.example.', []],
+    ['TXT', 'TXT "hello"', []],
+    ['Unknown', '', []],
+  ];
+  let seq = 1000;
+  for (const [type, answer, answers] of cases) {
+    const host = `${type.toLowerCase()}.example`;
+    const query = { ...packets[0], seq: seq++, t: seq, info: `Standard query 0xa17a ${type} ${host}` };
+    const reply = { ...packets[1], seq: seq++, t: seq, info: `Standard query response 0xa17a ${type} ${host}${answer ? ` ${answer}` : ''}` };
+    assert.deepEqual(dnsRow(query), { name: host, answers: [], back: false });
+    assert.deepEqual(dnsRow(reply), { name: host, answers, back: true });
+    assert.equal(chipText(query), 'DNS');
+    assert.equal(chipText(reply), answers.map((a) => `${a.type} ${a.address}`).join(' · ') || 'DNS');
+    h.send([query]);
+    assert.ok(h.root.querySelectorAll('.packet-lane').some((lane) => lane.querySelector('b').textContent === host));
+    h.send([reply]);
+    assert.equal(h.root.querySelectorAll('.packet-lane').some((lane) => lane.querySelector('b').textContent === 'resolver'), false);
+  }
+  const query = { ...packets[0], seq: seq++, t: seq, info: 'Standard query 0xa17a HTTPS wiki.corp' };
+  const reply = { ...packets[1], seq: seq++, t: seq, info: 'Standard query response 0xa17a HTTPS wiki.corp Non-Existent Domain', tags: ['dns-error'] };
+  h.send([query, reply]);
+  const lane = h.root.querySelectorAll('.packet-lane')[0];
+  assert.equal(lane.querySelector('b').textContent, 'wiki.corp');
+  assert.deepEqual(lane.querySelectorAll('.packet-chip').map((chip) => chip.textContent), ['DNS', 'no such name']);
+  assert.equal(lane.querySelector('.bad').classList.contains('back'), true);
+});
+
+test('HTTPS queries and empty responses share the later address and connection lane', (t) => {
+  const h = setup(t);
+  h.send([
+    { ...packets[0], info: 'Standard query 0xa17a HTTPS www.bbc.com' },
+    { ...packets[1], info: 'Standard query response 0xa17a HTTPS www.bbc.com' },
+    { ...packets[0], seq: 1000, t: 1000, info: 'Standard query 0xa17b A www.bbc.com' },
+    { ...packets[1], seq: 1001, t: 1001, info: 'Standard query response 0xa17b A www.bbc.com A 185.42.118.20' },
+    { ...packets[2], seq: 1002, t: 1002, dst: '185.42.118.20:443' },
+  ]);
+  const lanes = h.root.querySelectorAll('.packet-lane');
+  assert.equal(lanes.length, 1);
+  assert.equal(lanes[0].querySelector('b').textContent, 'www.bbc.com');
+  assert.deepEqual(lanes[0].querySelectorAll('.packet-chip').map((chip) => chip.textContent), ['DNS', 'DNS', 'DNS', 'A 185.42.118.20', 'SYN']);
+});
+
+test('DATA totals and counts update one chip while retaining every packet row', (t) => {
+  const h = setup(t, { motion: true });
+  const data = { ...packets[8], proto: 'HTTP/2', info: 'DATA[1]', len: 1536 };
+  h.send([{ ...packets[7], proto: 'HTTP/2', info: 'HEADERS[1]: GET / (www.google.com)' }, data]);
+  const lane = h.root.querySelector('.packet-lane');
+  const chip = lane.querySelectorAll('.packet-chip').at(-1);
+  for (let i = 1; i < 5; i++) h.send([{ ...data, seq: 1000 + i, t: 1000 + i }]);
+  assert.equal(lane.querySelectorAll('.packet-chip').length, 2);
+  assert.equal(lane.querySelectorAll('.packet-chip').at(-1), chip);
+  assert.equal(chip.textContent, 'DATA 7.5k×5');
+  assert.equal(chip.querySelector('small').textContent, '×5');
+  assert.equal(chip.classList.contains('back'), true);
+  assert.equal(h.root.querySelector('#prows').children.length, 6);
+  assert.equal(h.animations.filter((a) => a.duration === 160).length, 4);
+  h.services.packetFilter.set('every');
+  assert.equal(lane.parentNode, null);
+  const replay = h.root.querySelector('.packet-lane');
+  assert.deepEqual(replay.querySelectorAll('.packet-chip').map((c) => c.textContent), ['GET /', 'DATA 7.5k×5']);
+  assert.equal(h.animations.filter((a) => a.duration === 160).length, 4);
+});
+
+test('DATA runs reset after another chip or direction and stay independent per lane', (t) => {
+  const h = setup(t);
+  const data = { ...packets[8], proto: 'HTTP/2', info: 'DATA[1]', len: 100 };
+  const send = (row, seq) => h.send([{ ...row, seq, t: seq }]);
+  send(data, 1000);
+  send({ ...data, src: '192.0.2.9:443' }, 1001);
+  send(data, 1002);
+  send({ ...data, info: 'HEADERS[3]: 200' }, 1003);
+  send(data, 1004);
+  send({ ...data, src: data.dst, dst: data.src }, 1005);
+  send(data, 1006);
+  const lanes = h.root.querySelectorAll('.packet-lane');
+  assert.deepEqual(lanes[0].querySelectorAll('.packet-chip').map((c) => c.textContent), ['DATA 200×2', '200', 'DATA 100', 'DATA 100', 'DATA 100']);
+  assert.equal(lanes[1].querySelectorAll('.packet-chip').length, 1);
+  assert.equal(h.root.querySelector('#prows').children.length, 7);
+});
+
+test('DATA merging keeps its final state and stops pulses under reduced motion', (t) => {
+  const h = setup(t, { motion: true });
+  const data = { ...packets[8], proto: 'HTTP/2', info: 'DATA[1]', len: 1536 };
+  h.send([data, { ...data, seq: 1000, t: 1000 }]);
+  assert.equal(h.animations.filter((a) => a.duration === 160).length, 1);
+  h.media.matches = true;
+  h.media.dispatchEvent(new Event('change'));
+  assert.ok(h.animations.every((a) => a.cancelled));
+  const count = h.animations.length;
+  h.send([{ ...data, seq: 1001, t: 1001 }]);
+  assert.equal(h.animations.length, count);
+  assert.equal(h.root.querySelector('.packet-chip').textContent, 'DATA 4.5k×3');
+  assert.equal(h.root.querySelector('#prows').children.length, 3);
+});
+
+test('a long DATA run preserves DNS, TLS and GET chips with motion disabled', (t) => {
+  const h = setup(t);
+  h.send(packets.slice(0, 9));
+  const lane = h.root.querySelector('.packet-lane');
+  const conversation = lane.querySelectorAll('.packet-chip');
+  for (let i = 0; i < 20; i++) h.send([{ ...packets[8], seq: 1000 + i, t: 1000 + i, proto: 'HTTP/2', info: 'DATA[1]', len: 1536 }]);
+  const chips = lane.querySelectorAll('.packet-chip');
+  assert.deepEqual(chips.slice(0, -1), conversation);
+  assert.equal(chips.at(-1).textContent, 'DATA 30.0k×20');
+  assert.equal(h.root.querySelector('#prows').children.length, 28);
+  assert.equal(h.animations.length, 0);
+});

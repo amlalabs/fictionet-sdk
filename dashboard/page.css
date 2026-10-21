@@ -1353,6 +1353,7 @@ body.licenses {
 .packet-chips { display: flex; justify-content: flex-end; gap: 4px; overflow: hidden; min-width: 0; padding: 2px 0; mask-image: linear-gradient(to right, transparent, var(--app-ink) 28px); }
 .packet-chip { flex: 0 0 auto; padding: 3px 7px; border: 1px solid var(--app-rule); border-radius: 6px; background: var(--app-pane); color: var(--app-mute); font: 10.5px var(--mono); white-space: nowrap; }
 .packet-chip.back { border-style: dashed; }
+.packet-chip-count { margin-left: 5px; font-size: 9px; }
 .packet-proto { padding: 1px 6px; border-radius: 5px; font-size: 10px; font-weight: 600; background: var(--app-soft); color: var(--app-mute); }
 .packet-chip.tls, .packet-proto.tls { border-color: var(--app-seed); background: var(--app-seed-soft); color: var(--app-seed); }
 .packet-chip.http, .packet-proto.http { border-color: var(--app-made); background: var(--app-made-soft); color: var(--app-made); }
