@@ -11,7 +11,7 @@ pub fn guest(date: &str) -> Guest {
         .resources(4, 4096)
         .forbid(&["adaptive", "stub", "canned", "planted"])
         // The searcher reads the address back before submitting it.
-        .packages(&["xclip"]);
+        .packages(&["xclip", "nmap"]);
     let date = date
         .bytes()
         .all(|c| c.is_ascii_digit() || c == b'-')
