@@ -54,11 +54,18 @@ export function createServices(transport, theme, importModule = (url) => import(
   const watches = createWatchHub(transport);
   let graph;
   const selection = createSelection();
+  const packetFilter = store('conversations');
+  try {
+    if (globalThis.localStorage?.getItem('fictionet-packet-filter') === 'every') packetFilter.set('every');
+  } catch { /* Storage may be disabled. */ }
+  packetFilter.subscribe((value) => {
+    try { globalThis.localStorage?.setItem('fictionet-packet-filter', value); } catch { /* Storage may be disabled. */ }
+  });
   const moments = new Set();
   const momentListeners = new Set();
   const clock = { t: 0, at: performance.now(), ended: true };
   const services = {
-    transport, selection, theme, format, dom, clock, run,
+    transport, selection, theme, format, dom, clock, run, packetFilter,
     command: (signal, changed) => createCommand(transport, signal, changed),
     // The page's one graph model (see state.mjs), on the page's watch. It
     // binds the first time a part of the page reads it.
@@ -468,7 +475,16 @@ export function appShell(root, services, page) {
   el('i', { 'aria-hidden': 'true', text: '▾' }, toggle);
   const pop = el('div', { id: 'world-menu', class: 'app-pop', role: 'group', 'aria-label': 'World' }, menu);
   pop.hidden = true;
-  services.worldMenu = pop;
+  services.worldMenu = el('div', { class: 'app-world-controls' }, pop);
+  const packetRow = el('div', { class: 'row app-packet-filter' }, pop);
+  el('span', { text: 'Packets' }, packetRow);
+  const packetSegment = el('div', { class: 'seg', role: 'group', 'aria-label': 'Packets' }, packetRow);
+  const packetCleanup = [];
+  for (const [value, text] of [['conversations', 'Conversations'], ['every', 'Every packet']]) {
+    const button = el('button', { type: 'button', text, 'aria-pressed': 'false' }, packetSegment);
+    packetCleanup.push(listen(button, 'click', () => services.packetFilter.set(value)));
+    packetCleanup.push(services.packetFilter.subscribe((choice) => button.setAttribute('aria-pressed', String(choice === value))));
+  }
   const live = el('span', { class: 'app-live', role: 'status', 'data-live': 'false', text: 'Connecting' }, right);
   const body = el('main', { class: 'app-body' }, root);
   const agent = el('section', { class: 'app-agent', 'aria-label': 'Agent' }, body);
@@ -505,7 +521,7 @@ export function appShell(root, services, page) {
   }
   const host = page.hosts[0];
   const kinds = ['screen', 'terminal'].filter((kind) => host?.[kind]);
-  const cleanup = [];
+  const cleanup = packetCleanup;
   let selected = kinds[0], stopConsole = () => {};
   const tabs = new Map();
   function open(focus = false) {

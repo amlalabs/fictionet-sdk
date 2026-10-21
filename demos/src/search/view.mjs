@@ -2,6 +2,7 @@ import { diff, rows } from './model.mjs';
 import { createMotion } from './motion.mjs';
 import { createWeb } from './web.mjs';
 
+const DESCRIPTIONS = { canned: 'Prepared pages answer first; the rest are made on the spot.', stub: 'New pages are made on the spot.', off: 'Only available pages are served.' };
 const NEW_PAGES = [['canned', 'Prepared'], ['stub', 'Improvised'], ['off', 'Off']];
 // Run time as minutes and seconds.
 const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
@@ -22,7 +23,7 @@ export function mount(root, services, options) {
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
   const controls = [];
-  let note, segment;
+  let note, segment, description;
   async function send(command) {
     if (!snapshot || request.busy) return false;
     note.textContent = '';
@@ -30,11 +31,11 @@ export function mount(root, services, options) {
     await request.send('/api/command/generation', command, snapshot.generator.generation_revision, {
       reply(reply) {
         if (reply.status === 'applied') ok = true;
-        else note.textContent = reply.status === 'pending' ? 'The world has not answered yet.' : reply.rejection?.message || 'Not applied.';
+        else note.textContent = reply.status === 'pending' ? 'The world has not answered yet.' : 'Check the values and try again.';
       },
       error(error) {
         const rejection = error.body?.rejection;
-        note.textContent = rejection?.reason === 'stale_revision' ? 'The world changed. Try again.' : rejection?.message || error.message;
+        note.textContent = rejection?.reason === 'stale_revision' ? 'The world changed. Try again.' : 'The request could not be completed.';
       },
     });
     return ok;
@@ -44,11 +45,11 @@ export function mount(root, services, options) {
     if (!segment || !snapshot?.generator) return;
     const g = snapshot.generator;
     const mode = !g.generate ? 'off' : g.canned ? 'canned' : 'stub';
+    description.textContent = DESCRIPTIONS[mode];
     for (const button of segment.children) button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
   }
   if (menu) {
     const { el: item } = services.dom.scoped(menu);
-    menu.replaceChildren();
     const row = item('div', { class: 'row' }, menu);
     item('span', { text: 'New pages' }, row);
     segment = item('div', { class: 'seg', role: 'group', 'aria-label': 'New pages' }, row);
@@ -58,6 +59,7 @@ export function mount(root, services, options) {
       controls.push(button);
       cleanup.push(listen(button, 'click', () => send({ command: 'set_new_pages', new_pages: mode })));
     }
+    description = item('p', { class: 'mode-description' }, menu);
     const field = (label, id) => {
       const box = item('div', { class: 'field' }, menu);
       item('label', { for: id, text: label }, box);
@@ -101,7 +103,9 @@ export function mount(root, services, options) {
         if (changes.length) motion.anim(line, [{ opacity: 0, transform: 'translateY(-10px)' }, { opacity: 1, transform: 'translateY(0)' }], { duration: 260, easing: 'cubic-bezier(.2,.7,.3,1)' });
         el('time', { text: clock(row.at) }, line);
         el('span', { text: row.who === 'Claude Code' ? '❯ Claude Code' : row.who, title: row.who === 'Claude Code' ? '❯ Claude Code' : row.who }, line);
-        el('b', { text: row.what, title: row.what }, line);
+        const what = el('b', { title: row.what }, line);
+        if (row.carries) el('i', { class: 'fact-dot', 'aria-label': 'Carries a planted fact' }, what);
+        el('span', { class: 'row-text', text: row.what }, what);
         if (row.badge) el('em', { class: row.tag, text: row.badge }, line);
       }
       if (list.children[index] !== line) list.insertBefore(line, list.children[index] || null);
@@ -116,7 +120,7 @@ export function mount(root, services, options) {
     else web.apply(changes, value);
     snapshot = value;
     render(reset ? [] : changes);
-  }, (error) => { if (!disposed) note.textContent = error.message; }));
+  }, () => { if (!disposed) note.textContent = 'The world could not be reached.'; }));
   return () => {
     disposed = true;
     controller.abort();

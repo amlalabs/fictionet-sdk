@@ -1342,3 +1342,7 @@ body.licenses {
 .app-packets .app-packet-route { width: 49%; }
 .app-packets .app-packet-protocol { width: 72px; color: var(--app-mute); }
 .app-packets tr:hover { background: var(--app-soft); }
+
+.app-pop .mode-description { margin: 0; padding: 0 10px 10px; color: var(--app-mute); font-size: 12px; white-space: nowrap; }
+.app-pop .app-packet-filter { border-top: 1px solid var(--app-rule); }
+.app-pop input::placeholder, .app-pop textarea::placeholder { color: var(--app-mute); opacity: 1; }

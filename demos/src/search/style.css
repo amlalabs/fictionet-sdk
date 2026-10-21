@@ -39,9 +39,9 @@
 .search-picture .diamond { fill: var(--accent); }
 .search-rows { flex: 1; border-top: 1px solid var(--app-rule); padding: 6px 0; }
 .search-row { display: grid; grid-template-columns: 48px 150px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 7px 18px; font: 12.5px var(--mono); }
-.search-row time, .search-row span { color: var(--app-mute); }
+.search-row time, .search-row > span { color: var(--app-mute); }
 .search-row span, .search-row b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.search-row b { font-weight: 500; }
+.search-row b { display: flex; align-items: center; gap: 6px; min-width: 0; font-weight: 500; }
 .search-row em { padding: 1px 8px; border-radius: 999px; font: 500 11.5px var(--sans); white-space: nowrap; }
 .search-row em.made { background: var(--app-made-soft); color: var(--app-made); }
 .search-row em.again { background: var(--app-mem-soft); color: var(--app-mem); }
@@ -62,3 +62,6 @@
 .search-picture .ring.refused { stroke: var(--app-bad); }
 .search-picture .thread { fill: none; stroke: var(--accent); stroke-width: 1.2; opacity: .7; }
 @media (prefers-reduced-motion: reduce) { .search-world * { transition: none; } }
+
+.search-row .fact-dot { flex: 0 0 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.search-row em.making { color: var(--app-mute); }

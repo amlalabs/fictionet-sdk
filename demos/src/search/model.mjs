@@ -21,7 +21,7 @@ export function queryTag(s, q) {
 const pageState = (p) => ({ stubbed: 'made', written_live: 'made', stored: 'stored', fixed: 'stored', planted: 'planted', missing: 'missing', not_made: 'refused' }[p.made] || 'asking');
 
 export function pageTag(p) {
-  return p.fetches > 1 ? 'again' : pageState(p);
+  return p.making ? 'making' : p.fetches > 1 ? 'again' : pageState(p);
 }
 
 const byTime = (a, b) => a.at_ms - b.at_ms || a.seq - b.seq;
@@ -113,12 +113,13 @@ const typed = (r) => !r.name.startsWith('_');
 // The newest rows first: searches, pages, refused names and plants.
 export function rows(s, limit = 6) {
   const path = (url) => { try { const u = new URL(url); return `${u.pathname}${u.search}`; } catch { return url; } };
-  const badge = (tag) => ({ made: 'made now', again: 'again', planted: 'planted', refused: 'refused' }[tag] || null);
+  const who = (item, fallback) => ['web_search', 'web_fetch'].includes(item.via) ? 'Claude Code' : fallback;
+  const badge = (tag) => ({ made: 'made now', again: 'again', planted: 'planted', refused: 'refused', making: 'making' }[tag] || null);
   return [
-    ...s.queries.map((q) => ({ at: q.at_ms, seq: q.seq ?? 0, who: q.via === 'web_search' ? 'Claude Code' : ENGINE_HOSTS[q.engine] || q.engine, what: q.search, tag: queryTag(s, q) })),
-    ...s.pages.map((p) => ({ at: pageTime(p), seq: p.seq ?? 0, who: p.via === 'web_fetch' ? 'Claude Code' : p.host, what: path(p.url), tag: pageTag(p) })),
-    ...s.refused.filter(typed).map((r) => ({ at: r.at_ms, seq: r.seq ?? 0, who: 'DNS', what: r.name, tag: 'refused' })),
-    ...(s.planted || []).map((p) => ({ at: p.at_ms, seq: p.seq ?? 0, who: 'fact', what: p.text, tag: 'planted' })),
+    ...s.queries.map((q) => ({ at: q.at_ms, seq: q.seq ?? 0, who: who(q, ENGINE_HOSTS[q.engine] || q.engine), what: q.search, tag: queryTag(s, q) })),
+    ...s.pages.map((p) => ({ at: pageTime(p), seq: p.seq ?? 0, who: who(p, p.host), what: path(p.url), tag: pageTag(p), ...(p.carries > 0 ? { carries: true } : {}) })),
+    ...s.refused.filter(typed).map((r) => ({ at: r.at_ms, seq: r.seq ?? 0, who: who(r, 'DNS'), what: r.name, tag: 'refused' })),
+    ...(s.planted || []).map((p) => ({ at: p.at_ms, seq: p.seq ?? 0, who: who(p, p.kind === 'page' ? hostOf(p.url) : 'fact'), what: p.text, tag: 'planted' })),
   ].sort((a, b) => b.at - a.at || b.seq - a.seq).slice(0, limit).map(({ seq, ...row }) => ({ ...row, badge: badge(row.tag) }));
 }
 

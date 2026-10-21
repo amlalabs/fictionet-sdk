@@ -1,10 +1,64 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServices, divider } from './page.mjs';
+import { createServices, divider, appShell } from './page.mjs';
 import { createStateHub, createWatchHub } from './streams.mjs';
 import { createDocument, Element } from './test-dom.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test('packet choices persist per viewer and remain after page controls are disposed', async (t) => {
+  const values = new Map();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value) } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, 'localStorage', previous); else delete globalThis.localStorage; });
+  const h = harness(t);
+  const services = createServices({ watch: () => h.stream('watch') }, {});
+  const seen = [];
+  const off = services.packetFilter.subscribe((value) => seen.push(value));
+  assert.equal(services.packetFilter.get(), 'conversations');
+  const stop = appShell(h.root, services, { title: 'Search', hosts: [], panels: [{ id: 'world', title: 'Web', area: 'workspace', kind: 'custom', module: '/world.mjs' }] });
+  await settle();
+  const menu = h.root.querySelector('#world-menu');
+  const toggle = h.root.querySelector('.app-menu-button'); toggle.click();
+  assert.equal(menu.hidden, false);
+  const segment = menu.querySelector('.app-packet-filter').querySelector('.seg');
+  assert.deepEqual(segment.children.map((b) => b.textContent), ['Conversations', 'Every packet']);
+  assert.deepEqual(segment.children.map((b) => b.getAttribute('aria-pressed')), ['true', 'false']);
+  segment.children[1].click();
+  assert.equal(services.packetFilter.get(), 'every');
+  assert.equal(values.get('fictionet-packet-filter'), 'every');
+  assert.deepEqual(segment.children.map((b) => b.getAttribute('aria-pressed')), ['false', 'true']);
+  assert.equal(createServices({}, {}).packetFilter.get(), 'every');
+  const { mount: search } = await import('../demos/src/search/view.mjs');
+  const state = services.state; services.state = () => () => {};
+  const disposePage = search(h.root.querySelector('#app-world-panel'), services, { state: '/api/state/search' });
+  assert.match(services.worldMenu.textContent, /New pages/);
+  assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
+  disposePage(); services.state = state;
+  assert.equal(services.worldMenu.children.length, 0);
+  assert.equal(segment.parentNode.parentNode, menu);
+  assert.equal(services.packetFilter.get(), 'every');
+  segment.children[0].click();
+  assert.equal(values.get('fictionet-packet-filter'), 'conversations');
+  assert.deepEqual(seen, ['conversations', 'every', 'conversations']);
+  assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
+  off(); stop(); services.dispose();
+  assert.ok(segment.children.every((button) => button.listenerCount === 0));
+});
+
+test('packet choices work when browser storage is unavailable', () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  try {
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('Storage unavailable'); } });
+    const services = createServices({}, {});
+    assert.equal(services.packetFilter.get(), 'conversations');
+    services.packetFilter.set('every');
+    assert.equal(services.packetFilter.get(), 'every');
+    services.dispose();
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous); else delete globalThis.localStorage;
+  }
+});
 
 class Source extends Element {
   constructor(kind, args) { super(kind); this.args = args; }
@@ -717,7 +771,7 @@ test('an app page shows its agent tabs and world panel, with a World menu and no
   assert.equal(world.querySelector('#app-world-panel').hidden, false);
   assert.equal(world.querySelector('#app-packets-panel').hidden, true);
   const menu = h.root.querySelector('#world-menu');
-  assert.equal(mounted, menu, 'the world panel fills the World menu');
+  assert.equal(mounted, menu.querySelector('.app-world-controls'), 'the world panel fills its own controls');
   const button = h.root.querySelector('.app-menu-button');
   assert.equal(menu.hidden, true);
   button.click();

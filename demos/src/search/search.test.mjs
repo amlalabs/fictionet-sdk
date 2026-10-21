@@ -246,7 +246,94 @@ test('ticker identifies both Claude Code tools and uses public badges', () => {
   const s = snapshot({ queries: [query(1, { via: 'web_search', cache: 'generated' })], pages: [servedPage('https://a.com/a?q=b', { via: 'web_fetch', made: 'written_live' })] });
   assert.deepEqual(rows(s).map((r) => [r.who, r.what, r.badge]), [['Claude Code', '/a?q=b', 'made now'], ['Claude Code', 'halvard gateway vulnerability', 'made now']]);
   assert.equal(rows(snapshot({ pages: [servedPage('https://a.com/')] }))[0].badge, null);
-  assert.equal(rows(snapshot({ planted: [{ kind: 'page', url: 'https://a.com/', text: 'A fact', at_ms: 1 }] }))[0].who, 'fact');
+  assert.equal(rows(snapshot({ planted: [{ kind: 'page', url: 'https://a.com/', text: 'A fact', at_ms: 1 }] }))[0].who, 'a.com');
+});
+
+test('mixed ticker rows keep their time, identity, path and badge', () => {
+  const s = snapshot({
+    generator: fixture().generator,
+    queries: [query(1, { cache: 'generated' }), query(2), query(3, { engine: 'bing', key: 'other', cache: 'fixed' }), query(4, { engine: 'duckduckgo', key: 'third', cache: 'prefetched' }), query(5, { via: 'web_search', cache: 'generated' })],
+    pages: [page('https://www.example.com/old?q=yes', { at_ms: 6000 }), page('https://new.example.com/new', { at_ms: 7000, made: 'written_live', carries: 1 }), page('https://again.example.com/a', { at_ms: 8000, fetches: 2 }), page('https://tool.example.com/a?q=b', { at_ms: 9000, via: 'web_fetch', made: 'stubbed' }), page('https://wait.example.com/pending', { at_ms: 62000, making: true, status: null, made: 'not_made', fetches: 0 })],
+    refused: [{ name: 'wiki.corp', at_ms: 10000 }],
+    planted: [{ kind: 'fact', text: 'A fact', at_ms: 11000 }, { kind: 'page', text: 'A planted page', url: 'https://www.plant.example.com/a', at_ms: 12000 }],
+  });
+  const all = rows(s, 20);
+  assert.deepEqual(all.map((r) => [r.at, r.who, r.what, r.badge]), [
+    [62000, 'wait.example.com', '/pending', 'making'],
+    [12000, 'www.plant.example.com', 'A planted page', 'planted'],
+    [11000, 'fact', 'A fact', 'planted'],
+    [10000, 'DNS', 'wiki.corp', 'refused'],
+    [9000, 'Claude Code', '/a?q=b', 'made now'],
+    [8000, 'again.example.com', '/a', 'again'],
+    [7000, 'new.example.com', '/new', 'made now'],
+    [6000, 'www.example.com', '/old?q=yes', null],
+    [5000, 'Claude Code', 'halvard gateway vulnerability', 'made now'],
+    [4000, 'duckduckgo.com', 'halvard gateway vulnerability', 'made now'],
+    [3000, 'bing.com', 'halvard gateway vulnerability', null],
+    [2000, 'google.com', 'halvard gateway vulnerability', 'again'],
+    [1000, 'google.com', 'halvard gateway vulnerability', 'made now'],
+  ]);
+  const h = harness(); h.publish(s);
+  const lines = h.root.querySelectorAll('.search-row');
+  assert.equal(lines.length, 6);
+  assert.equal(lines[0].querySelector('time').textContent, '1:02');
+  assert.match(lines[4].textContent, /❯ Claude Code/);
+  assert.equal(lines[4].querySelector('b').getAttribute('title'), '/a?q=b');
+  h.publish({ ...s, pages: s.pages.filter((p) => p.at_ms < 9000), queries: [], refused: [], planted: [] });
+  const made = h.root.querySelectorAll('.search-row')[1];
+  assert.equal(made.querySelector('em').textContent, 'made now');
+  assert.ok(made.querySelector('b').querySelector('.fact-dot'));
+  h.publish({ ...s, pages: [{ ...s.pages.at(-1), making: false, status: 200, made: 'written_live', fetches: 1 }] });
+  assert.equal(h.root.querySelector('.search-row').querySelector('em').textContent, 'made now');
+  h.dispose();
+});
+
+test('each page mode posts its wire value and describes the snapshot choice', async () => {
+  const h = harness(), s = fixture(); h.publish(s);
+  const menu = h.services.worldMenu;
+  const buttons = menu.querySelector('.seg').children;
+  const descriptions = ['Prepared pages answer first; the rest are made on the spot.', 'New pages are made on the spot.', 'Only available pages are served.'];
+  for (const [i, mode] of ['canned', 'stub', 'off'].entries()) {
+    buttons[i].click(); await settle();
+    assert.deepEqual(h.posts[i].body.command, { command: 'set_new_pages', new_pages: mode, expected_revision: 3 });
+    h.publish({ ...s, generator: { ...s.generator, generate: mode !== 'off', canned: mode === 'canned' } });
+    assert.deepEqual(buttons.map((b) => b.getAttribute('aria-pressed')), buttons.map((_, j) => String(i === j)));
+    assert.equal(menu.querySelector('.mode-description').textContent, descriptions[i]);
+    assert.ok(descriptions[i].length < 60);
+    assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
+  }
+  h.dispose();
+});
+
+test('the menu gives short status messages without exposing command internals', async () => {
+  const h = harness(); h.publish(fixture());
+  const menu = h.services.worldMenu, button = menu.querySelector('.seg').children[0];
+  for (const reply of [
+    { status: 'pending' },
+    { status: 'rejected', rejection: { reason: 'invalid', message: 'This world has no canned pages' } },
+  ]) {
+    h.services.transport.post = async () => reply;
+    button.click(); await settle();
+    assert.ok(menu.querySelector('.note').textContent);
+    assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
+  }
+  h.services.transport.post = async () => { throw Object.assign(new Error('generator unavailable'), { body: { rejection: { reason: 'stale_revision' } } }); };
+  button.click(); await settle();
+  assert.equal(menu.querySelector('.note').textContent, 'The world changed. Try again.');
+  h.services.transport.post = async () => { throw new Error('generator unavailable'); };
+  button.click(); await settle();
+  assert.equal(menu.querySelector('.note').textContent, 'The request could not be completed.');
+  assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
+  h.dispose();
+});
+
+test('long ticker values retain their full tooltip', () => {
+  const h = harness(), text = 'A long question '.repeat(20);
+  h.publish(snapshot({ queries: [query(1, { search: text })] }));
+  const what = h.root.querySelector('.search-row').querySelector('b');
+  assert.equal(what.textContent, text);
+  assert.equal(what.getAttribute('title'), text);
+  h.dispose();
 });
 
 test('slots fill from the middle in the prototype order and keep labels inside the view', () => {
