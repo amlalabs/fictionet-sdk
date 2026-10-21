@@ -219,7 +219,16 @@ impl Run {
             ready.to_string(),
         );
         let page = tokio::task::spawn_blocking(move || {
-            shot::capture(&url, &path, &ready, timeout).map(|_| path)
+            shot::capture(
+                &url,
+                &[shot::Step {
+                    ready: &ready,
+                    out: Some(&path),
+                    ..Default::default()
+                }],
+                timeout,
+            )
+            .map(|()| path)
         })
         .await
         .map_err(io::Error::other)??;

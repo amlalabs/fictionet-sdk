@@ -226,7 +226,16 @@ async fn world_menu_buttons_use_the_world_revision() {
         let url = server.url().replace("/#", &format!("/?theme={theme}#"));
         let path = dir.join(format!("{name}.png"));
         let captured = tokio::task::spawn_blocking(move || {
-            kit::shot::capture(&url, &path, &condition, Duration::from_secs(20))
+            kit::shot::capture(
+                &url,
+                &[kit::shot::Step {
+                    ready: &condition,
+                    out: Some(&path),
+                    ..Default::default()
+                }],
+                Duration::from_secs(20),
+            )?;
+            Ok::<_, std::io::Error>(path.display().to_string())
         })
         .await
         .unwrap()

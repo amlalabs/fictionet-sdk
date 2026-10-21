@@ -44,10 +44,20 @@ pub fn desktop_painted(host: &str) -> String {
     ))
 }
 
-/// Captures a 1440 by 900 viewport after condition evaluates to true.
+/// One page action and optional capture after a readiness condition.
+#[derive(Default)]
+pub struct Step<'a> {
+    pub ready: &'a str,
+    pub action: Option<&'a str>,
+    pub color_scheme: Option<&'a str>,
+    pub out: Option<&'a Path>,
+}
+
+/// Runs steps in one 1440 by 900 Chromium viewport.
 /// The timeout bounds navigation and readiness. Errors include the condition,
 /// Chromium's stderr tail, and collected JavaScript exceptions.
-pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io::Result<String> {
+pub fn capture(url: &str, steps: &[Step<'_>], timeout: Duration) -> io::Result<()> {
+    let mut condition = "";
     let profile_dir = super::util::RunDir::new(&std::env::temp_dir(), "chrome")?;
     let profile = profile_dir.path();
     let stderr_log = profile.join("chromium.stderr");
@@ -101,8 +111,12 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
         {
             Some(target) => string_field(target, "targetId")?,
             None => {
-                let target =
-                    reader.call(&to_write, None, "Target.createTarget", json!({"url":url}))?;
+                let target = reader.call(
+                    &to_write,
+                    None,
+                    "Target.createTarget",
+                    json!({"url":"about:blank"}),
+                )?;
                 string_field(&target, "targetId")?
             }
         };
@@ -126,52 +140,81 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
             json!({"width":1440,"height":900,"deviceScaleFactor":1,"mobile":false}),
         )?;
         reader.call(&to_write, Some(&session), "Runtime.enable", json!({}))?;
-        reader.deadline = Some(Instant::now() + timeout);
-        loop {
-            let value = match reader.call(
-                &to_write,
-                Some(&session),
-                "Runtime.evaluate",
-                json!({"expression":condition,"returnByValue":true}),
-            ) {
-                // The page is between documents; the condition is evaluated
-                // again once the new document's context exists.
-                Err(error) if navigating(&error) => Value::Null,
-                result => result?,
-            };
-            if let Some(exception) = value.get("exceptionDetails") {
-                reader.exception(exception);
-            }
-            if value.pointer("/result/value") == Some(&Value::Bool(true)) {
-                break;
-            }
-            let left = reader
-                .deadline
-                .unwrap()
-                .saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "page readiness timed out",
-                ));
-            }
-            std::thread::sleep(left.min(Duration::from_millis(100)));
-        }
-        reader.deadline = None;
-        let shot = reader.call(
+        reader.call(
             &to_write,
             Some(&session),
-            "Page.captureScreenshot",
-            json!({"format":"png"}),
+            "Page.navigate",
+            json!({"url":url}),
         )?;
-        let data = string_field(&shot, "data")?;
-        let bytes = base64::decode(data.as_bytes(), base64::Padding::Required)
-            .ok_or_else(|| io::Error::other("invalid screenshot base64"))?;
-        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            return Err(io::Error::other("Chromium returned no PNG"));
+        for step in steps {
+            condition = step.ready;
+            if let Some(scheme) = step.color_scheme {
+                reader.call(
+                    &to_write,
+                    Some(&session),
+                    "Emulation.setEmulatedMedia",
+                    json!({"features":[{"name":"prefers-color-scheme","value":scheme}]}),
+                )?;
+            }
+            reader.deadline = Some(Instant::now() + timeout);
+            loop {
+                let value = match reader.call(
+                    &to_write,
+                    Some(&session),
+                    "Runtime.evaluate",
+                    json!({"expression":condition,"returnByValue":true}),
+                ) {
+                    // The page is between documents; the condition is evaluated
+                    // again once the new document's context exists.
+                    Err(error) if navigating(&error) => Value::Null,
+                    result => result?,
+                };
+                if let Some(exception) = value.get("exceptionDetails") {
+                    return Err(io::Error::other(format!("page readiness: {exception}")));
+                }
+                if value.pointer("/result/value") == Some(&Value::Bool(true)) {
+                    break;
+                }
+                let left = reader
+                    .deadline
+                    .unwrap()
+                    .saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "page readiness timed out",
+                    ));
+                }
+                std::thread::sleep(left.min(Duration::from_millis(100)));
+            }
+            reader.deadline = None;
+            if let Some(action) = step.action {
+                let value = reader.call(
+                    &to_write,
+                    Some(&session),
+                    "Runtime.evaluate",
+                    json!({"expression":action,"returnByValue":true,"awaitPromise":true}),
+                )?;
+                if let Some(exception) = value.get("exceptionDetails") {
+                    return Err(io::Error::other(format!("page action: {exception}")));
+                }
+            }
+            let Some(out) = step.out else { continue };
+            let shot = reader.call(
+                &to_write,
+                Some(&session),
+                "Page.captureScreenshot",
+                json!({"format":"png"}),
+            )?;
+            let data = string_field(&shot, "data")?;
+            let bytes = base64::decode(data.as_bytes(), base64::Padding::Required)
+                .ok_or_else(|| io::Error::other("invalid screenshot base64"))?;
+            if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                return Err(io::Error::other("Chromium returned no PNG"));
+            }
+            std::fs::write(out, &bytes)?;
         }
-        std::fs::write(out, &bytes)?;
-        Ok(out.display().to_string())
+        Ok(())
     })();
     // Closing over CDP lets Chromium reap its helpers before removing the profile.
     let _ = write_all(&to_write, b"{\"id\":0,\"method\":\"Browser.close\"}");
@@ -512,16 +555,54 @@ mod tests {
                 "window.painted && ({})",
                 canvas_painted("document.querySelector('canvas')")
             );
-            capture(&url, &out, &condition, Duration::from_secs(10)).unwrap();
+            capture(
+                &url,
+                &[Step {
+                    ready: &condition,
+                    out: Some(&out),
+                    ..Default::default()
+                }],
+                Duration::from_secs(10),
+            )
+            .unwrap();
             assert!(
                 std::fs::read(&out)
                     .unwrap()
                     .starts_with(b"\x89PNG\r\n\x1a\n")
             );
+            let dark = dir.path().join("dark.png");
             let error = capture(
                 &url,
-                &out,
-                "window.neverReady === true",
+                &[
+                    Step {
+                        ready: "window.painted === true",
+                        action: Some("if (!matchMedia('(prefers-color-scheme: light)').matches) throw new Error('light scheme'); window.steps = 1"),
+                        color_scheme: Some("light"),
+                        out: Some(&out),
+                    },
+                    Step {
+                        ready: "window.steps === 1 && matchMedia('(prefers-color-scheme: dark)').matches",
+                        action: Some("if (innerWidth !== 1440 || innerHeight !== 900) throw new Error('viewport'); window.steps++"),
+                        color_scheme: Some("dark"),
+                        out: Some(&dark),
+                    },
+                    Step {
+                        ready: "window.steps === 2",
+                        action: Some("throw new Error('action diagnostic')"),
+                        ..Default::default()
+                    },
+                ],
+                Duration::from_secs(10),
+            ).unwrap_err();
+            assert!(error.to_string().contains("action diagnostic"), "{error}");
+            assert!(std::fs::read(&dark).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+            let error = capture(
+                &url,
+                &[Step {
+                    ready: "window.neverReady === true",
+                    out: Some(&out),
+                    ..Default::default()
+                }],
                 Duration::from_secs(2),
             )
             .unwrap_err();

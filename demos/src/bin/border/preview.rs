@@ -188,8 +188,11 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             fictionet_demo::kit::shot::capture(
                 &url,
-                &shot,
-                super::super::story::HIJACKED_PAGE,
+                &[fictionet_demo::kit::shot::Step {
+                    ready: super::super::story::HIJACKED_PAGE,
+                    out: Some(&shot),
+                    ..Default::default()
+                }],
                 std::time::Duration::from_secs(30),
             )
         })

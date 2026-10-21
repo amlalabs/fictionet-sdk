@@ -11,6 +11,7 @@ use fictionet_demo::kit::{
     Run,
     checks::{self, STEP_PAUSE, check},
     client::{Capability, PageClient},
+    shot,
     ssh::quote,
 };
 use fictionet_extras::search::Engine;
@@ -177,6 +178,166 @@ async fn guest(run: &Run, command: &str) -> Result<String> {
     Ok(output.stdout)
 }
 
+const PAGE_WORDS: &str =
+    r"\b(canned|stub|stubbed|seed|splice|store|stored|generator|generated|cache)\b";
+
+fn visible_words() -> String {
+    format!(
+        r#"(() => {{
+        const inspect = (where, text) => {{
+            const word = text.match(/{PAGE_WORDS}/i)?.[0];
+            if (word) throw new Error(`Visible word '${{word}}' in ${{where}}`);
+        }};
+        const tab = document.querySelector('.app-world [role="tab"][aria-selected="true"]').innerText;
+        inspect(tab + ' tab', document.body.innerText);
+        for (const node of document.querySelectorAll('.app-world svg text')) {{
+            if (node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden')
+                inspect(tab + ' map', node.textContent);
+        }}
+        const button = document.querySelector('.app-menu-button');
+        button.click();
+        try {{ inspect('open World menu', document.querySelector('#world-menu').innerText); }}
+        finally {{ button.click(); }}
+    }})()"#
+    )
+}
+
+async fn world_shots(run: &Run, output: &Path, hosts: &[String], full: bool) -> Result {
+    let url = run.page_url().to_string();
+    let output = output.to_path_buf();
+    let hosts = json!(hosts);
+    tokio::task::spawn_blocking(move || {
+        let web = format!(
+            r#"(() => {{
+            const panel = document.querySelector('#app-world-panel');
+            return panel && !panel.hidden && {hosts}.every(host =>
+                [...panel.querySelectorAll('.site-group')].some(site => site.dataset.host === host))
+                && panel.querySelector('.search-picture')?.getBoundingClientRect().height > 200
+                && panel.querySelectorAll('.page-group').length > 0
+                && panel.querySelectorAll('.search-row').length >= {}
+                && panel.getAnimations({{subtree: true}}).every(a => a.playState !== 'running' || a.effect.getTiming().iterations === Infinity);
+        }})()"#,
+            if full { 6 } else { 1 }
+        );
+        let packets = format!(
+            r#"(() => {{
+            const panel = document.querySelector('#app-packets-panel');
+            return panel && !panel.hidden && panel.querySelector('.packet-lane')
+                && [...panel.querySelectorAll('tr[data-seq]')].some(row =>
+                    /^(DNS|HTTP)/.test(row.querySelector('.packet-proto')?.innerText || '')
+                    && {hosts}.some(host => row.innerText.includes(host.replace(/^www\./, ''))))
+                && panel.getAnimations({{subtree: true}}).every(a => a.playState !== 'running' || a.effect.getTiming().iterations === Infinity);
+        }})()"#
+        );
+        let words = visible_words();
+        let web_light = output.join("web-light.png");
+        let web_dark = output.join("web-dark.png");
+        let packets_light = output.join("packets-light.png");
+        let packets_dark = output.join("packets-dark.png");
+        let mut steps = vec![
+            shot::Step {
+                ready: &web,
+                action: Some(&words),
+                color_scheme: Some("light"),
+                out: full.then_some(web_light.as_path()),
+            },
+            shot::Step {
+                ready: &web,
+                action: Some("document.querySelector('#app-packets-tab').click()"),
+                ..Default::default()
+            },
+            shot::Step {
+                ready: &packets,
+                action: Some(&words),
+                out: Some(&packets_light),
+                ..Default::default()
+            },
+            shot::Step {
+                ready: &packets,
+                action: Some("document.querySelector('#app-world-tab').click()"),
+                ..Default::default()
+            },
+        ];
+        if full {
+            steps.extend([
+                shot::Step {
+                    ready: &web,
+                    action: Some(&words),
+                    color_scheme: Some("dark"),
+                    out: Some(&web_dark),
+                },
+                shot::Step {
+                    ready: &web,
+                    action: Some("document.querySelector('#app-packets-tab').click()"),
+                    ..Default::default()
+                },
+                shot::Step {
+                    ready: &packets,
+                    action: Some(&words),
+                    out: Some(&packets_dark),
+                    ..Default::default()
+                },
+                shot::Step {
+                    ready: &packets,
+                    action: Some("document.querySelector('#app-world-tab').click()"),
+                    ..Default::default()
+                },
+            ]);
+        }
+        steps.push(shot::Step {
+            ready: &web,
+            ..Default::default()
+        });
+        shot::capture(&url, &steps, Duration::from_secs(45))?;
+        for step in steps {
+            if let Some(path) = step.out {
+                println!("page in Chromium: {}", path.display());
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+fn snapshot_fields(value: &Value) -> Result {
+    for (kind, fields) in [
+        ("pages", &["via", "making", "carries"][..]),
+        ("queries", &["via", "carries"][..]),
+    ] {
+        let rows = value[kind]
+            .as_array()
+            .ok_or_else(|| format!("missing {kind}"))?;
+        check(&format!("the story produced {kind}"), !rows.is_empty())?;
+        for row in rows {
+            if kind == "queries" && row["outcome"]["status"] != "served" {
+                continue;
+            }
+            let name = row[if kind == "pages" { "url" } else { "search" }]
+                .as_str()
+                .unwrap_or("unknown");
+            for field in fields {
+                check(
+                    &format!("{kind} {name} has {field}"),
+                    row.get(*field).is_some(),
+                )?;
+            }
+            check(
+                &format!("{kind} {name} has no tool source"),
+                row["via"].is_null(),
+            )?;
+            check(
+                &format!("{kind} {name} reports a fact count"),
+                row["carries"].as_u64().is_some(),
+            )?;
+            if kind == "pages" {
+                check(&format!("{name} is finished"), row["making"] == false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Runs the story. `visited` collects the hosts the searcher opened as it
 /// goes, so the background check can run after a failed story too.
 pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<String>) -> Result {
@@ -270,7 +431,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     visited.insert(first.host.clone());
     let reason = canned_reason(&canned, &first.url)?;
     navigate(run, &first.url).await?;
-    wait(
+    let opened = wait(
         &client,
         "opened result is the canned page, with the reason it was made",
         |s| {
@@ -280,6 +441,18 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         },
     )
     .await?;
+    let state = client.get_json("/api/state/web").await?;
+    snapshot_fields(&state["value"])?;
+    check(
+        "before planting, pages and answers carry no fact",
+        opened.pages.iter().all(|p| p.carries == Some(0))
+            && opened
+                .queries
+                .iter()
+                .filter(|q| q.outcome == Outcome::Served)
+                .all(|q| q.carries == Some(0)),
+    )?;
+    world_shots(run, output, std::slice::from_ref(&first.host), false).await?;
     let (snapshot, bing) = search(run, &client, Engine::Bing, words, google.id, held).await?;
     run.settled_screen(HOST, &output.join("bing.png")).await?;
     check(
@@ -398,6 +571,13 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         "the canned advisory now says 7.2.5",
         advisory.contains("7.2.5") && !advisory.contains("7.2.4"),
     )?;
+    wait(&client, "the later advisory carries the correction", |s| {
+        s.pages.iter().any(|p| {
+            p.url == "https://www.halvardsystems.com/security/advisories/HSA-2026-014"
+                && p.carries.is_some_and(|count| count >= 1)
+        })
+    })
+    .await?;
     let results = guest(
         run,
         &format!(
@@ -569,14 +749,17 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     run.containment().await?;
     run.screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
         .await?;
-    run.page_shot(
-        &output.join("world.png"),
-        r#"(() => {
-            const rows = document.querySelectorAll('.search-row');
-            const picture = document.querySelector('.search-picture');
-            return rows.length >= 6 && picture && picture.getBoundingClientRect().height > 200;
-        })()"#,
-        Duration::from_secs(30),
+    let state = client.get_json("/api/state/web").await?;
+    snapshot_fields(&state["value"])?;
+    world_shots(
+        run,
+        output,
+        &[
+            first.host,
+            "docs.python.org".into(),
+            "en.wikipedia.org".into(),
+        ],
+        true,
     )
     .await?;
     Ok(())
@@ -654,6 +837,103 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn visible_words_checks_tabs_and_open_menu_in_chromium() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(stream.read_u8().await.unwrap());
+                    }
+                    let body = r#"<div class="app-world"><button role="tab" aria-selected="true">Web</button></div>
+                        <p id="tab-text">Prepared pages</p>
+                        <button class="app-menu-button" onclick="document.querySelector('#world-menu').hidden = !document.querySelector('#world-menu').hidden">World</button>
+                        <div id="world-menu" hidden>Improvised</div>"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let action = format!(
+            r#"(() => {{
+            const scan = () => {scan};
+            const tab = document.querySelector('[role="tab"]');
+            const text = document.querySelector('#tab-text');
+            const menu = document.querySelector('#world-menu');
+            for (const name of ['Web', 'Packets']) {{
+                tab.innerText = name;
+                for (const word of ['canned','stub','stubbed','seed','splice','store','stored','generator','generated','cache']) {{
+                    for (const where of [name + ' tab', 'open World menu']) {{
+                        text.innerText = where.endsWith('tab') ? word.toUpperCase() : 'Prepared pages';
+                        menu.innerText = where.endsWith('menu') ? word.toUpperCase() : 'Improvised';
+                        let failure;
+                        try {{ scan(); }} catch (error) {{ failure = error.message; }}
+                        if (!failure?.includes(word.toUpperCase()) || !failure.includes(where))
+                            throw new Error(`Missing word or location: ${{word}} ${{where}} ${{failure}}`);
+                        if (!menu.hidden) throw new Error('World menu stayed open');
+                    }}
+                }}
+            }}
+            text.innerText = 'bookstore seedling cached generation';
+            menu.innerText = 'Prepared';
+            scan();
+        }})()"#,
+            scan = visible_words()
+        );
+        let result = tokio::task::spawn_blocking(move || {
+            shot::capture(
+                &url,
+                &[shot::Step {
+                    ready: "!!document.querySelector('.app-menu-button')",
+                    action: Some(&action),
+                    ..Default::default()
+                }],
+                Duration::from_secs(10),
+            )
+        })
+        .await;
+        server.abort();
+        result.unwrap().unwrap();
+    }
+
+    #[test]
+    fn story_rows_require_snapshot_fields_and_browser_sources() {
+        let state = json!({
+            "pages": [{"url":"https://example.com/", "via":null, "making":false, "carries":1}],
+            "queries": [{"search":"example", "outcome":{"status":"served"}, "via":null, "carries":0}]
+        });
+        snapshot_fields(&state).unwrap();
+        for (kind, fields) in [
+            ("pages", &["via", "making", "carries"][..]),
+            ("queries", &["via", "carries"][..]),
+        ] {
+            for field in fields {
+                let mut missing = state.clone();
+                missing[kind][0].as_object_mut().unwrap().remove(*field);
+                assert!(snapshot_fields(&missing).is_err(), "{kind}.{field}");
+            }
+            let mut tool = state.clone();
+            tool[kind][0]["via"] = json!("web_fetch");
+            assert!(snapshot_fields(&tool).is_err());
+            let mut missing_count = state.clone();
+            missing_count[kind][0]["carries"] = Value::Null;
+            assert!(snapshot_fields(&missing_count).is_err());
+        }
+        let mut making = state.clone();
+        making["pages"][0]["making"] = json!(true);
+        assert!(snapshot_fields(&making).is_err());
+    }
 
     #[test]
     fn bundled_search_pages_pass_the_guest_content_audit() {
