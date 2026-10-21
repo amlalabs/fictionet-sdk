@@ -44,7 +44,7 @@ async fn fetch(cx: &Cx, machine: &Machine, host: &str, path: &str, start: std::t
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_reads_searches_and_commands_change_the_running_generator() {
-    let seed = Seed::builtin("halvard-cve").unwrap();
+    let seed = Seed::builtin("web").unwrap();
     let searches = Arc::new(Searches::from_seed(&seed));
     let topics = page::Topics::new();
     let dashboard = DashboardObserver::new(DashboardOptions {
@@ -81,7 +81,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                 &cx,
                 &machine,
                 "www.google.com",
-                "/search?q=halvard+gateway+vulnerability",
+                "/search?q=example+gateway+vulnerability",
                 start,
             )
             .await;
@@ -120,7 +120,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                 .unwrap();
             assert_eq!(
                 opened["reason"],
-                json!({"via":"search", "query":"halvard gateway vulnerability", "rank":first.rank})
+                json!({"via":"search", "query":"example gateway vulnerability", "rank":first.rank})
             );
             assert_eq!(opened["made"], "stubbed");
             assert_eq!(opened["via"], serde_json::Value::Null);
@@ -142,7 +142,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             fictionet_extras::models::Engine::search(
                 world.pages.clone(),
                 cx.clone(),
-                "halvard gateway vulnerability".into(),
+                "example gateway vulnerability".into(),
             )
             .await?;
             fictionet_extras::models::Engine::fetch(
@@ -177,7 +177,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             assert_eq!(tool_page["making"], false);
             assert_eq!(tool_page["carries"], 0);
             let tool_query = queries.iter().find(|q| q["via"] == "web_search").unwrap();
-            assert_eq!(tool_query["search"], "halvard gateway vulnerability");
+            assert_eq!(tool_query["search"], "example gateway vulnerability");
             assert_eq!(tool_query["engine"], "google");
             assert_eq!(tool_query["outcome"]["status"], "served");
             assert_eq!(tool_query["carries"], 0);
@@ -370,11 +370,11 @@ async fn a_live_page_stays_making_until_the_model_answers() {
             })
         }
     }
-    let seed = Seed::builtin("halvard-cve").unwrap();
+    let seed = Seed::builtin("web").unwrap();
     let pages = Arc::new(
         Pages::canned_with_model(
             seed,
-            &store::canned_root("halvard-cve"),
+            &store::canned_root("web"),
             Model::new(
                 Provider::OpenRouter,
                 "",
@@ -432,7 +432,7 @@ async fn a_live_page_stays_making_until_the_model_answers() {
                     // A prepared page can answer while the model is still writing.
                     assert_eq!(
                         pages
-                            .handle(&cx, "GET", "www.halvardsystems.com", "/", None)
+                            .handle(&cx, "GET", "www.example.com", "/", None)
                             .await
                             .status,
                         200
@@ -478,7 +478,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
     use crate::kit::{checks::non_public_address, mirror};
     use fictionet::stdlib::protocols::x509::Certificate;
     use fictionet_extras::models::{Credential, Model, Provider, Secret};
-    let seed = Seed::builtin("halvard-cve").unwrap();
+    let seed = Seed::builtin("web").unwrap();
     let searches = Arc::new(Searches::from_seed(&seed));
     let observed = searches.clone();
     fictionet::run(

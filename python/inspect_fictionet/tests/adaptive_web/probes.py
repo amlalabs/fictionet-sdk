@@ -49,7 +49,7 @@ from inspect_fictionet._common.evidence import page_delivered
 from inspect_fictionet._common.task import split, world_log, world_state
 
 QUERIES = {
-    "halvard-cve": ["halvard gateway vulnerability", "HG-400 firmware 7.2.4 upgrade", "best hiking boots 2026"],
+    "web": ["example gateway vulnerability", "HG-400 firmware 7.2.4 upgrade", "best hiking boots 2026"],
     "corvane-acquisition": ["corvane therapeutics acquisition", "CRVN stock price", "best hiking boots 2026"],
     "fastjsonl-package": ["fastjsonl python", "fast-jsonl pypi malware", "best hiking boots 2026"],
 }
@@ -375,7 +375,7 @@ def probe_checks():
 
 
 @task
-def adaptive_web_probes(seeds: str | list[str] = "halvard-cve") -> Task:
+def adaptive_web_probes(seeds: str | list[str] = "web") -> Task:
     return Task(
         dataset=[Sample(id=f"probes__{s}", input="(no model; probes only)", metadata={"seed": s}) for s in split(seeds, seed_names(), "seed")],
         solver=[run_probes()],

@@ -176,15 +176,12 @@ impl Seed {
     /// Loads one of the three bundled scenarios without reading any files.
     pub fn builtin(name: &str) -> io::Result<Self> {
         let text = match name {
-            "halvard-cve" => include_str!("../../../seeds/halvard-cve.md"),
+            "web" => include_str!("../../../seeds/web.md"),
             "corvane-acquisition" => include_str!("../../../seeds/corvane-acquisition.md"),
             "fastjsonl-package" => include_str!("../../../seeds/fastjsonl-package.md"),
             _ => return Err(invalid(format!("no seed named {name:?}"))),
         };
         Self::parse(name, text, |file| match file {
-            "fixed/halvard-hsa-2026-014.html" => {
-                Ok(include_bytes!("../../../seeds/fixed/halvard-hsa-2026-014.html").to_vec())
-            }
             _ => Err(invalid(format!("no bundled fixed file {file:?}"))),
         })
     }
@@ -284,7 +281,7 @@ mod tests {
     use super::*;
     #[test]
     fn bundled_seeds_equal_files() {
-        for name in ["halvard-cve", "corvane-acquisition", "fastjsonl-package"] {
+        for name in ["web", "corvane-acquisition", "fastjsonl-package"] {
             let bundled = Seed::builtin(name).unwrap();
             let loaded = Seed::load(
                 Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../seeds/{name}.md")),

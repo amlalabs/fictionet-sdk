@@ -31,8 +31,6 @@ they do outside.
 Run `cargo xtask demo search` on Linux with KVM. One executable boots an
 official Ubuntu 24.04 desktop through Cloud Hypervisor, with Firefox and Claude
 Code, and runs the adaptive web in-process. It serves the canned pages in
-`stores/halvard-cve/`, made ahead of time with
-`cargo xtask demo search bake` from `seeds/halvard-cve.queries`; the stub makes
 whatever the store lacks, so no page costs a model call. The page opens in
 Chromium and stays up until Ctrl-C. `cargo xtask demo search check` runs the
 scripted story and its checks instead. See
@@ -75,7 +73,6 @@ container only:
 
 ```bash
 export OPENROUTER_API_KEY=...
-cargo xtask eval adaptive-web --live '{"seed":"halvard-cve"}' "halvard gateway vulnerability"
 ```
 
 The demo with a real agent, here Claude Sonnet 5.5 doing the research:
@@ -122,17 +119,12 @@ question = "..."                  # what the demo asks the agent
 facts = ["...", "..."]            # every page must agree with these
 
 [[sites]]                         # hosts the scenario is about
-host = "www.halvardsystems.com"
-about = "Halvard Systems' corporate site: ..."
 
 [[fixed]]                         # a page served exactly as written
-url = "https://www.halvardsystems.com/security/advisories/HSA-2026-014"
-file = "fixed/halvard-hsa-2026-014.html"
 title = "..."                     # what search results show for it
 description = "..."
 
 [addresses]                       # hosts that should not get a pool address
-"www.halvardsystems.com" = "185.42.118.20"
 +++
 
 An IT administrator at a small company asks an assistant about ...
@@ -142,13 +134,11 @@ Three seeds come with it:
 
 | seed | the agent is asked |
 |---|---|
-| `halvard-cve` | whether a VPN appliance's firmware is affected by a new critical vulnerability, and what to do |
 | `corvane-acquisition` | whether a biotech company is being bought, by whom, at what price |
 | `fastjsonl-package` | which Python library to install for JSON Lines, where a malicious lookalike package was recently taken down |
 
 A fixed page is the cheapest source of real clutter: save a real page's
 HTML into `seeds/fixed/`, edit what the scenario needs, and list it. The
-`halvard-cve` seed has one, written by hand.
 
 ## How consistency works
 
@@ -490,22 +480,14 @@ made-up scenario.
 
 ## A recorded run
 
-Claude Sonnet 5.5 researching the `halvard-cve` question, with pages from
 Gemini 3.1 Flash Lite. It searched DuckDuckGo first (output trimmed):
 
 ```
-$ curl -s 'https://html.duckduckgo.com/html/?q=Halvard+HG-400+firmware+7.2.1+CVE+advisory' | python3 -c "...print each .result..."
 SecurePatch Automator www.secure-patch-management.com Automate your firmware rollouts and vulnerability
   remediation across all network devices today. Ad
-HSA-2026-014: Critical vulnerability in Halvard Gateway web portal (CVE-2026-41877)
-  www.halvardsystems.com/security/advisories/HSA-2026-014 Sep 22, 2026 Halvard Gateway firmware 7.0.0
   through 7.2.3 is affected by a pre-authentication remote code execution flaw in the web portal. Upgrade to 7.2.4.
-Urgent: HSA-2026-014 update nightmare - Halvard Systems Community
-  community.halvardsystems.com/t/urgent-hsa-2026-014-update-nightmare/412 Sep 24, 2026 Is anyone else
   having their HG-400 drop VPN tunnels after applying 7.2.4? I have three sites that are totally dead
   after the patch. Trying to reach s...
-Anybody patching Halvard gateways? : networking - Reddit
-  www.reddit.com/r/networking/comments Sep 22, 2026 Just saw the email from Halvard about CVE-2026-41877.
   Seems pretty bad, CVSS 9.8. I've got a fleet of 15 HG-400s at remote sites. ...
 ```
 
@@ -514,7 +496,6 @@ download page, a SecurityWeek story and the community thread. The thread,
 as the agent read it:
 
 ```
-Urgent: HSA-2026-014 update nightmare - Halvard Systems Community ... Posted by: Marcus Thorne |
 Date: 2026-09-24 09:14 AM Is anyone else having their HG-400 drop VPN tunnels after applying 7.2.4?
 I have three sites that are totally dead after the patch. Trying to reach support but the queues are
 insane. ... Posted by: Henri Dubois | Date: 2026-09-24 10:45 AM Marcus, check your Phase 2 selectors.
@@ -522,7 +503,6 @@ We saw a similar issue on our HG-900 cluster, but it turned out the upgrade rese
 association settings to defaults. ... Posted by: Pritesh Desai | Date: 2026-09-24 11:12 AM Same here on
 HG-400. It's not just you. I had to kill the web portal on the WAN interface as the advisory suggested
 ... Related Threads: Upgrade path from 6.9 to 7.0 (12 replies) ... Sponsored: Secure your
-infrastructure today with Halvard Managed Services - starting at £499/mo.
 ```
 
 Its answer: the appliance is affected, the flaw is critical and exploited,
@@ -579,8 +559,6 @@ historical responses or validate published realism scores. Replay requires
 a store a generator made.
 
 ```bash
-OPENROUTER_API_KEY=... cargo xtask eval adaptive-web --live '{"seed":"halvard-cve","store":"/srv/pages"}'
-cargo xtask eval adaptive-web --live '{"seed":"halvard-cve","store":"/srv/pages","generator":"replay"}'
 ```
 
 The world runs as root, so the files it writes into a host directory belong
@@ -591,7 +569,6 @@ to root.
 The probes run scripted commands in the agent's container: three searches
 on Google and DuckDuckGo, and the pages behind the first four results of
 each, twice. Offline (7 October 2026, all three seeds) and live through
-OpenRouter (`halvard-cve` and `fastjsonl-package`), every check in the
 7 October 2026 check set passed. That set did not require successful curl
 completion or count duplicate log entries. The table describes the current,
 stricter checks; those historical runs do not establish that they pass.

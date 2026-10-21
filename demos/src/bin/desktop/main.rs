@@ -397,7 +397,7 @@ async fn agent_tls_checks(
         call.is_some(),
     )?;
     let search = guest_cmd(session,
-        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --max-turns 3 --allowedTools WebSearch,WebFetch < /dev/null 2>&1"
+        "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for python json lines library. Report the first two result titles and URLs.' --max-turns 3 --allowedTools WebSearch,WebFetch < /dev/null 2>&1"
     ).await?;
     if search.code != 0 {
         let mut cursor = 0;
@@ -410,7 +410,7 @@ async fn agent_tls_checks(
     }
     check(
         "Claude Code searches the world",
-        search.code == 0 && search.stdout.to_lowercase().contains("halvard"),
+        search.code == 0 && search.stdout.to_lowercase().contains("json"),
     )?;
     let search_event = page
         .find_event(&mut 0, |event| {
@@ -450,13 +450,13 @@ async fn codex_checks(session: &ssh::Session, page: &PageClient) -> Result<(), E
     let codex = guest_cmd(
         session,
         "cd /home/analyst && timeout 180 codex exec --skip-git-repo-check 'Use web search once \
-         to find the halvard gateway vulnerability. Report the first two result titles and \
+         to find the python json lines library. Report the first two result titles and \
          URLs.' < /dev/null 2>&1",
     )
     .await?;
     check(
         "Codex completes a search through the model site",
-        codex.code == 0 && codex.stdout.to_lowercase().contains("halvard"),
+        codex.code == 0 && codex.stdout.to_lowercase().contains("json"),
     )?;
     let openai = |event: &Value| {
         event["source"] == "model"

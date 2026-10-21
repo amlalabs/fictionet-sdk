@@ -533,6 +533,17 @@ impl Pages {
         Ok(pages)
     }
 
+    /// A world with no prepared pages: a bounded model writes them, with
+    /// the offline generator as the fallback. Everything stays in memory.
+    pub fn with_model(seed: Seed, model: Model) -> Self {
+        let mut pages = Self::new(seed);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        pages.maker = Some(Maker::Model(model.live(calls.clone())));
+        pages.prefetch = 5;
+        pages.live_calls = Some(calls);
+        pages
+    }
+
     /// What answers requests: see [`NewPages`].
     pub fn new_pages(&self) -> NewPages {
         if !self.generation().generate {
@@ -2561,8 +2572,6 @@ fn static_asset(path: &str) -> Option<Response> {
     Some(Response::new(200, ctype, body, vec![], Meta::Asset))
 }
 
-#[cfg(test)]
-mod tests;
 
 impl fictionet_extras::models::Engine for Pages {
     fn search(

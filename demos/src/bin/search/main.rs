@@ -1,5 +1,5 @@
 //! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
-//! adaptive web, with the canned pages for the halvard-cve seed.
+//! plain adaptive web: no scenario, nothing planted.
 //!
 //! - `search <downloads>` is the app: it boots, opens the page and stays up
 //!   until Ctrl-C. Prepared pages answer first. A model fills the gaps
@@ -27,7 +27,7 @@ use std::{collections::BTreeSet, fs::File, path::PathBuf, sync::Arc, time::Insta
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// The seed the app shows, and whose canned pages it serves.
-const SEED: &str = "halvard-cve";
+const SEED: &str = "web";
 
 /// What to run: the app or its checks with the downloads folder, the
 /// preview without a VM and whether it spends the generation budget, or
@@ -95,16 +95,14 @@ fn app_pages(seed: Seed, check: bool) -> Result<Pages> {
 
 fn pages_for_key(seed: Seed, key: Option<fictionet_extras::models::Key>) -> Result<Pages> {
     use adaptive_web_world::pages::model::{Model, Provider};
-    let root = store::canned_root(&seed.name);
     if let Some(key) = key {
         let provider = Provider::OpenRouter;
-        Ok(Pages::canned_with_model(
+        Ok(Pages::with_model(
             seed,
-            &root,
             Model::new(provider, "", "", key, Arc::new(OpenRouter)),
-        )?)
+        ))
     } else {
-        Ok(Pages::canned(seed, &root)?)
+        Ok(Pages::new(seed))
     }
 }
 

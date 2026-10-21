@@ -446,10 +446,10 @@ mod tests {
 
     #[test]
     fn snippet_pieces_split_on_sentences_fields_and_ellipses() {
-        let mention = "Oct 3, 2026 — Halvard has released firmware 7.2.4, which fixes ...";
+        let mention = "Oct 3, 2026 — Example has released firmware 7.2.4, which fixes ...";
         assert_eq!(
             snippet_pieces(mention),
-            ["halvard has released firmware 7.2.4, which fixes"]
+            ["example has released firmware 7.2.4, which fixes"]
         );
         assert_eq!(
             snippet_pieces(
@@ -476,17 +476,17 @@ mod tests {
     fn every_piece_of_a_snippet_must_be_on_the_page() {
         let check =
             |snippet: &str, page: &str| check_snippets(page, "text/plain", &[search(snippet)]);
-        let date = "Oct 3, 2026 — Halvard has released firmware 7.2.4, which fixes ...";
+        let date = "Oct 3, 2026 — Example has released firmware 7.2.4, which fixes ...";
         let ok = (vec![], vec![]);
         assert_eq!(
             check(
                 date,
-                "Today Halvard has released  firmware 7.2.4, which fixes it"
+                "Today Example has released  firmware 7.2.4, which fixes it"
             ),
             ok
         );
         assert_eq!(
-            check(date, "Halvard released 7.2.4"),
+            check(date, "Example released 7.2.4"),
             (vec![date.into()], vec![])
         );
         // A snippet stitched from a thread's header and its first post.
@@ -496,7 +496,7 @@ mod tests {
                     Any issues with the 7.2.4 release so far? 12 replies";
         assert_eq!(check(stitched, page), ok);
         // Finding half of the pieces is not enough.
-        let present = "Halvard released firmware 7.2.4 for the gateway.";
+        let present = "Example released firmware 7.2.4 for the gateway.";
         let half = format!("{present} The release also fixes the remote access vulnerability.");
         assert_eq!(check(&half, present), (vec![half.clone()], vec![]));
         // One letter or digit is substantive; there is no length cutoff.
@@ -504,7 +504,7 @@ mod tests {
             assert_eq!(check(short, ""), (vec![short.into()], vec![]));
         }
         // The whole piece must match, past its sixtieth character.
-        let prefix = "The vendor's advisory for the affected Halvard gateways confirms that ";
+        let prefix = "The vendor's advisory for the affected Example gateways confirms that ";
         let snippet = format!("{prefix}firmware 7.2.4 fixes the vulnerability.");
         let page = format!("{prefix}firmware 7.2.4 does not fix the vulnerability.");
         assert_eq!(check(&snippet, &page), (vec![snippet.clone()], vec![]));

@@ -668,19 +668,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
     };
     let advisory = super::make::advisory(host, target, &record.title, &record.date);
     let record = advisory.as_ref().unwrap_or(record);
-    let vendor = host == "www.halvardsystems.com" || host == "halvardsystems.com";
-    let mut canonical;
-    let profile = if vendor {
-        canonical = super::make::site_profile(host);
-        if advisory.is_some() {
-            canonical.kind = "advisory".into();
-        } else if profile.kind == "news" {
-            canonical.kind = "news".into();
-        }
-        &canonical
-    } else {
-        profile
-    };
+    let profile = profile;;
     let question;
     let record = if profile.kind == "qa" {
         question = Page {
@@ -921,17 +909,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         1 => format!("Copyright © {year} {name}"),
         _ => format!("© {name} {year}"),
     };
-    let main = if vendor {
-        let source = include_str!("../../../seeds/fixed/halvard-hsa-2026-014.html");
-        let start = source.find("<header").unwrap();
-        let end = source[start..].find("</header>").unwrap() + start + "</header>".len();
-        let header = &source[start..end];
-        let start = main.find("<header").unwrap();
-        let end = main[start..].find("</header>").unwrap() + start + "</header>".len();
-        format!("{}{header}{}", &main[..start], &main[end..])
-    } else {
-        main
-    };
+    let main = main;
     let main = if sidebar.is_empty() {
         let main = main.replace(
             &format!(

@@ -23,7 +23,6 @@ pub const NAMES: &[&str] = &[
     "border-world",
     "scan-world",
     "web_world",
-    "halvard-cve",
     "corvane-acquisition",
     "fastjsonl-package",
     "altered_one",
@@ -621,7 +620,7 @@ mod tests {
         }
         for origin in [
             None,
-            Some("https://halvardsystems.com"),
+            Some("https://example.com"),
             Some("https://openrouter.ai.example.org"),
         ] {
             let audit = Audit::default();

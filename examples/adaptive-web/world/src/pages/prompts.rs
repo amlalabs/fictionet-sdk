@@ -805,7 +805,7 @@ mod tests {
     use serde_json::json;
 
     fn seed() -> Seed {
-        Seed::builtin("halvard-cve").unwrap()
+        Seed::builtin("web").unwrap()
     }
 
     #[test]
@@ -875,8 +875,8 @@ mod tests {
         for fixed in &seed.fixed {
             assert!(!user.contains(&fixed.url));
         }
-        assert!(!system.contains("Halvard"));
-        assert!(!user.contains("Halvard"));
+        assert!(!system.contains("Example"));
+        assert!(!user.contains("Example"));
         assert!(user.contains("An unrelated query has no scenario results"));
     }
 
@@ -985,11 +985,11 @@ mod tests {
     fn a_page_answer() {
         let text = "STATUS: 200
 CONTENT_TYPE: text/html
-TITLE: Halvard patches gateway flaw | The Register
-DESCRIPTION: Halvard has fixed a critical flaw.
+TITLE: Example patches gateway flaw | The Register
+DESCRIPTION: Example has fixed a critical flaw.
 DATE: 2026-09-23
 CLAIMS:
-- Halvard fixed CVE-2026-41877 in 7.2.4.
+- Example fixed CVE-2026-41877 in 7.2.4.
 SITE_NAME: The Register
 SITE_TAGLINE: Biting the hand that feeds IT
 SITE_NAV: Security|/security/, Software|/software/
@@ -998,11 +998,11 @@ SIDEBAR:
 - Printer firmware bricks fleet | /2026/10/01/printer/
 AD: none
 BODY:
-<h1>Halvard patches gateway flaw</h1>
+<h1>Example patches gateway flaw</h1>
 <p>Text.</p>";
         let page = read_page(text, None, false).unwrap();
-        assert_eq!(page.title, "Halvard patches gateway flaw | The Register");
-        assert_eq!(page.claims, ["Halvard fixed CVE-2026-41877 in 7.2.4."]);
+        assert_eq!(page.title, "Example patches gateway flaw | The Register");
+        assert_eq!(page.claims, ["Example fixed CVE-2026-41877 in 7.2.4."]);
         assert_eq!(
             page.sidebar,
             [(
@@ -1088,7 +1088,7 @@ AD: https://ad.example-shop.de/ | Buy | Now 20% off";
     #[test]
     fn a_cast_answer() {
         let people = read_cast(
-            "- Tomasz Wierzbicki | CEO | Halvard Systems\n`Amara Nwosu | analyst | Brightline`\n\
+            "- Tomasz Wierzbicki | CEO | Example Corp\n`Amara Nwosu | analyst | Brightline`\n\
             Not a person\nKeiko Arai | reporter | The Register",
         )
         .unwrap();
@@ -1109,13 +1109,13 @@ AD: https://ad.example-shop.de/ | Buy | Now 20% off";
         let cast = vec![Person {
             name: "Tomasz Wierzbicki".into(),
             role: "CEO".into(),
-            organization: "Halvard Systems".into(),
+            organization: "Example Corp".into(),
         }];
-        let (system, user) = search(&seed, &cast, "halvard flaw", &[], &[]);
+        let (system, user) = search(&seed, &cast, "example flaw", &[], &[]);
         assert!(system.contains(&format!("Today is {}.", seed.date)));
         assert!(system.contains(&seed.facts[0]));
-        assert!(system.contains("- Tomasz Wierzbicki, CEO, Halvard Systems"));
-        assert!(user.starts_with("Someone searched for: halvard flaw\n"));
+        assert!(system.contains("- Tomasz Wierzbicki, CEO, Example Corp"));
+        assert!(user.starts_with("Someone searched for: example flaw\n"));
         assert!(user.contains("(none)") && user.contains("(nothing yet)"));
         let profile = Profile {
             name: "Krant".into(),

@@ -214,7 +214,7 @@ pub async fn start(
     let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys)?;
     let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys)?;
     world.trust("zscaler", z.root_pem())?;
-    let seed = adaptive_web_world::pages::Seed::builtin("halvard-cve")?;
+    let seed = adaptive_web_world::pages::Seed::builtin("web")?;
     let addresses = Arc::new(adaptive_web_world::Addresses::new(
         seed.fixed_addresses(),
         None,

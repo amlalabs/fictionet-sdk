@@ -263,7 +263,7 @@ mod tests {
     fn the_seeds_query_list_has_forty_searches_on_every_engine() {
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../examples/adaptive-web/seeds/halvard-cve.queries"),
+                .join("../examples/adaptive-web/seeds/web.queries"),
         )
         .unwrap();
         let list = lines(&text).unwrap();

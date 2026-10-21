@@ -206,7 +206,7 @@ fn live(args: &[String]) -> Result {
         serde_json::from_str(args.first().map_or("{}", String::as_str))?;
     let seed = config
         .remove("seed")
-        .unwrap_or_else(|| "halvard-cve".into());
+        .unwrap_or_else(|| "web".into());
     let generator = config
         .remove("generator")
         .unwrap_or_else(|| "openrouter".into());

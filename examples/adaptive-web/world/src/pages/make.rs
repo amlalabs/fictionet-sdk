@@ -266,7 +266,7 @@ pub(super) fn prepared_cast(seed: &Seed) -> Vec<super::prompts::Person> {
 }
 
 fn proper(text: &str) -> String {
-    let names = "Lisbon Naples London Leeds Dublin Edinburgh Bath Porto Bristol Glasgow Manchester Tokyo Netgear Python Rust JavaScript Halvard Gateway Vitamin Nikon HG-200 HG-400 HG-900 BBC CISA SSL VPN NHS USB CPU GPU API HTTP HTTPS DNS SQL HTML CSS RAM SSD AI UK US TLS TCP UDP JSON XML URL URI SDK IDE BIOS UEFI OS CVE-2026-41877";
+    let names = "Lisbon Naples London Leeds Dublin Edinburgh Bath Porto Bristol Glasgow Manchester Tokyo Netgear Python Rust JavaScript Vitamin Nikon BBC CISA SSL VPN NHS USB CPU GPU API HTTP HTTPS DNS SQL HTML CSS RAM SSD AI UK US TLS TCP UDP JSON XML URL URI SDK IDE BIOS UEFI OS CVE-2026-41877";
     static NAME: OnceLock<Regex> = OnceLock::new();
     let mut out = NAME
         .get_or_init(|| {
@@ -622,7 +622,6 @@ fn intent(query: &str) -> &'static str {
         "review"
     } else if [
         "news",
-        "halvard",
         "cve-",
         "announced",
         "launch",
@@ -716,8 +715,6 @@ fn subreddit(query: &str) -> String {
         "oceanography".into()
     } else if q.contains("router") {
         "HomeNetworking".into()
-    } else if q.contains("halvard") {
-        "sysadmin".into()
     } else {
         "AskReddit".into()
     }
@@ -1249,27 +1246,7 @@ fn title_pattern(seed: &Seed, query: &str, host: &str, angle: usize, original: &
         ][angle % 13])
             .to_owned();
     }
-    if ["halvard", "hg-400", "gateway", "41877"]
-        .iter()
-        .any(|w| q.contains(w))
-    {
-        return ([
-            "Halvard fixes critical Gateway flaw in firmware 7.2.4",
-            "Halvard Gateway patch: what appliance owners need to know",
-            "How are other Halvard Gateway admins scheduling this update?",
-            "Halvard Gateway’s web portal flaw puts firmware upgrades in focus",
-            "Halvard Gateway admins plan upgrades after exploited portal flaw",
-            "The Halvard Gateway firmware advisory: affected releases and mitigation",
-            "Is an older Halvard Gateway firmware release safe to use?",
-            "Halvard Gateway: a guide to the September security fix",
-            "Halvard Gateway portal vulnerability and firmware update notes",
-            "Updating a Halvard Gateway: questions from administrators",
-            "Halvard Gateway patch closes a critical pre-authentication flaw",
-            "Halvard Gateway owners review firmware maintenance plans",
-            "What the Halvard Gateway portal fix means for VPN administrators",
-        ][angle % 13])
-            .to_owned();
-    }
+
     if matches!(site_profile(host).kind.as_str(), "qa" | "forum")
         && let Some((question, _)) = heading(original).split_once('?')
     {
@@ -2607,26 +2584,7 @@ fn list_lead(subject: &str, angle: usize) -> Option<String> {
     if matches!(intent(subject), "service" | "problem" | "question") {
         return None;
     }
-    let lines: &[&str] = if ["halvard", "hg-400", "gateway", "41877"]
-        .iter()
-        .any(|w| q.contains(w))
-    {
-        &[
-            "Halvard’s fixed firmware, 7.2.4, closes a critical web portal flaw that can be exploited without signing in to the affected appliance.",
-            "The Halvard advisory lists firmware 7.0.0 through 7.2.3 as affected, with the September 22 release fixing the vulnerable web portal code.",
-            "I need to schedule an update for our Halvard appliance and want to check the affected firmware range before choosing a maintenance window.",
-            "CISA added the Halvard portal flaw to its exploited vulnerabilities catalog on September 26, following the vendor’s firmware release four days earlier.",
-            "Administrators running Halvard appliances can disable the web portal on the WAN interface as an interim measure while arranging the firmware upgrade.",
-            "The critical Halvard vulnerability concerns the appliance’s web portal rather than a VPN client, with the advisory identifying release 7.2.4 as fixed.",
-            "Is a Halvard firmware rollback safe after this update? The advisory identifies older affected releases, so a working VPN tunnel does not settle that question.",
-            "Halvard’s September 22 advisory covers the HG-200, HG-400 and HG-900 appliance line, with a firmware fix for the pre-authentication portal flaw.",
-            "A severity score of 9.8 puts the Halvard web portal flaw among the critical issues, and the advisory describes an upgrade and an interim mitigation.",
-            "Halvard Gateway owners planning a maintenance window should check their installed release against the affected range before downloading a firmware image.",
-            "The Halvard patch addresses an unauthenticated attack against the portal, closing the vulnerable code path in the fixed firmware release.",
-            "Turning off the Halvard portal on the WAN blocks the described attack, but the advisory still identifies the firmware upgrade as the fix.",
-            "The Halvard firmware advisory separates affected releases from the fixed version, helping administrators choose an update rather than an unverified rollback.",
-        ]
-    } else if q.contains("banana") && q.contains("bread") {
+    let lines: &[&str] = if q.contains("banana") && q.contains("bread") {
         &[
             "Dense banana bread often starts with too much flour; weigh it before mixing, then fold only until the dry streaks disappear from the batter.",
             "A tender banana loaf needs a light hand with the flour and a gentle fold, leaving a few small lumps rather than beating the batter smooth.",
@@ -2889,14 +2847,6 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
                 "Router firmware controls packet forwarding and the management interface",
                 "Router recovery procedures differ between models and hardware revisions",
             ])
-        } else if lower.contains("halvard") || lower.contains("hg-400") {
-            Some([
-                "Halvard Gateway HG-400 is a network security appliance with a web management portal",
-                "Halvard Gateway firmware release 7.2.4 addresses a portal vulnerability",
-                "Halvard Gateway releases 7.0.0 through 7.2.3 contain the affected portal code",
-                "Halvard Gateway uses firmware to provide its routing and security functions",
-                "Halvard Gateway firmware updates replace the software running on the appliance",
-            ])
         } else {
             subject_facts(subject)
         };
@@ -2921,9 +2871,7 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     if matches!(intent(subject), "problem" | "question" | "service") {
         return topic_article(seed, subject, host, angle);
     }
-    let scenario = ["halvard", "hg-400", "gateway", "41877"]
-        .iter()
-        .any(|w| lower.contains(w));
+    let scenario = false;
     if !scenario
         && ![
             "pizza",
@@ -2955,57 +2903,7 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
         example,
         question,
         reply,
-    } = if scenario {
-        Draft {
-            title: if kind == "forum" || kind == "qa" {
-                if lower.contains("downgrade") {
-                    "Has anyone rolled back a Halvard Gateway HG-400 after the security update?"
-                        .into()
-                } else {
-                    "Has anyone installed the Halvard Gateway security update?".into()
-                }
-            } else if kind == "company" || kind == "docs" {
-                "Halvard Gateway vulnerability: firmware and security updates".into()
-            } else if lower.contains("downgrade") {
-                "Halvard admins weigh firmware downgrade risks after critical flaw".into()
-            } else {
-                "Halvard fixes critical Gateway flaw in firmware 7.2.4".into()
-            },
-            leads: &[
-                "Halvard has released a firmware fix for its VPN appliances after a critical flaw was found in the web portal.",
-                "A critical web portal flaw has put Halvard appliance administrators under pressure to upgrade their firmware.",
-                "Halvard Gateway owners face an urgent firmware decision after a remotely exploitable flaw was disclosed.",
-                "The latest Halvard firmware closes a web portal flaw that attackers can reach without signing in.",
-                "Halvard administrators are reviewing older firmware releases after the disclosure of a critical portal flaw.",
-                "A firmware release from Halvard addresses a critical flaw across three VPN appliance models.",
-                "Security teams running Halvard appliances are checking their firmware after a critical vulnerability disclosure.",
-                "Halvard has published a firmware update for a flaw affecting its Gateway VPN and firewall appliances.",
-                "An unauthenticated web portal attack is the focus of Halvard’s latest firmware advisory.",
-                "Halvard’s firmware advisory sets out which appliance releases are affected by a critical web portal flaw.",
-            ],
-            detail: "The affected firmware releases run from 7.0.0 through 7.2.3. The fixed release is 7.2.4, issued on September 22. The HG-200, HG-400 and HG-900 are part of the appliance line.",
-            steps: vec![
-                "Check the appliance model and installed firmware release in the management console.",
-                "Read the advisory before choosing a target release; an older image may reintroduce the vulnerability.",
-                "Turning off the web portal on the WAN interface blocks the attack until the upgrade is complete.",
-            ],
-            tips: &[
-                "A firmware downgrade is a separate operation from a reset; the advisory does not establish that an older release is safe.",
-                "Keeping the portal off the WAN interface is an interim measure while the firmware upgrade is arranged.",
-                "The firmware fix was published before CISA added the flaw to its exploited vulnerabilities catalog.",
-                "The firmware advisory lists 7.2.4 as the fixed release; earlier affected releases remain vulnerable.",
-                "The firmware update addresses a flaw in the portal, rather than in a VPN client.",
-                "The affected firmware range includes 7.2.1, the release running on the office appliance.",
-                "The firmware flaw can be reached before authentication; a strong portal password does not remove it.",
-                "The firmware advisory describes disabling the WAN portal as an interim measure.",
-                "A firmware rollback needs its own compatibility assessment before a maintenance window.",
-                "The firmware fix covers a critical issue with a CVSS base score of 9.8.",
-            ],
-            example: "",
-            question: "I have an HG-400 on 7.2.1. I need to schedule the upgrade, but can I roll back if our VPN clients have trouble?",
-            reply: "I would not treat a working VPN tunnel as proof that the portal is safe. I can help with the maintenance window, but I have not tried a rollback on this model.",
-        }
-    } else if lower.contains("groupby") || lower.contains("itertools") {
+    } = if lower.contains("groupby") || lower.contains("itertools") {
         Draft {
             title: if kind == "qa" {
                 "How do I use itertools.groupby() with a key function?".into()
@@ -3368,20 +3266,7 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     } else {
         return topic_article(seed, subject, host, angle);
     };
-    let first = if scenario && matches!(kind, "forum" | "qa") {
-        choose(&[
-            "I run a Halvard HG-400 on firmware 7.2.1 and need to plan the security upgrade.",
-            "I need to update the firmware on our Halvard appliance without interrupting the VPN users.",
-            "I have a Halvard HG-400 on older firmware and am trying to choose a maintenance window.",
-            "I am checking the Halvard firmware advisory before making changes to our VPN appliance.",
-            "I need a fallback plan for the Halvard firmware upgrade in case our VPN clients have trouble.",
-            "I can take the Halvard portal off the WAN, but I still need to schedule the firmware update.",
-            "I am comparing our installed Halvard firmware with the affected range in the advisory.",
-            "I have been asked to update a Halvard appliance and want to check the firmware requirements first.",
-            "I am reviewing our Halvard firmware after the portal flaw appeared in CISA’s catalog.",
-            "I have read the Halvard firmware advisory and want to hear how other admins handled the upgrade.",
-        ])
-    } else if kind == "news" && lower.contains("sourdough") {
+    let first = if kind == "news" && lower.contains("sourdough") {
         "Bakers point to cool kitchens and irregular feeding as common reasons a sourdough culture fails to rise.".to_owned()
     } else if lower.contains("rust") && !scenario {
         choose(&[
@@ -3426,20 +3311,7 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     } else {
         choose(leads)
     };
-    let seconds: &[&str] = if scenario {
-        &[
-            "The fixed release is 7.2.4.",
-            "The advisory covers releases through 7.2.3.",
-            "The fix was released on September 22.",
-            "The flaw has a severity score of 9.8.",
-            "CISA added the flaw to its catalog on September 26.",
-            "The web portal is the point of entry.",
-            "The issue affects releases from 7.0.0 through 7.2.3.",
-            "Turning off the WAN portal blocks the attack.",
-            "The patch closes a pre-authentication flaw.",
-            "An upgrade closes the vulnerable portal code path.",
-        ]
-    } else if lower.contains("groupby") {
+    let seconds: &[&str] = if lower.contains("groupby") {
         &[
             "Sort by the same key when matching values should form a single group.",
             "The key function is called for each input value.",
@@ -3556,8 +3428,6 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     };
     let second = if !scenario && angle >= 10 {
         seconds[(n + 5) % seconds.len()]
-    } else if scenario {
-        "The fixed release is 7.2.4, released on September 22."
     } else if lower.contains("flight") || lower.contains("airfare") || lower.contains("airline") {
         [
             "Compare flights with bags, seats and airport transfers included.",
@@ -3574,17 +3444,7 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     } else {
         seconds[n % seconds.len()]
     };
-    let lead = if scenario {
-        std::iter::once(second)
-            .chain([
-                "The fixed firmware is 7.2.4.",
-                "The fixed release, 7.2.4, was issued on September 22.",
-            ])
-            .chain(seconds.iter().copied())
-            .map(|end| format!("{first} {end}"))
-            .find(|lead| (120..=160).contains(&lead.chars().count()))
-            .unwrap_or_else(|| format!("{first} {second}"))
-    } else {
+    let lead = {
         let extra = seconds[(n + 3) % seconds.len()];
         let mut lead = format!(
             "{}; {}",
@@ -3679,17 +3539,7 @@ fn result_path(seed: &Seed, host: &str, slug: &str, kind: &str) -> String {
         "www.kayak.co.uk" | "www.momondo.co.uk" => format!("flights/{slug}/flexible"),
         "www.britishairways.com" => format!("content/flights/{slug}"),
         "www.easyjet.com" | "www.ryanair.com" | "www.flytap.com" => format!("en/flights/{slug}"),
-        "www.halvardsystems.com" => {
-            let section = if slug.contains("firmware") || slug.contains("downgrade") {
-                "support/kb"
-            } else if slug.contains("vulnerability") || slug.contains("cve") {
-                "security/advisories"
-            } else {
-                "products"
-            };
-            format!("{section}/{slug}")
-        }
-        "community.halvardsystems.com" => format!("t/{slug}/{id}"),
+
         "developer.mozilla.org" => format!("en-US/docs/Web/JavaScript/Reference/{slug}"),
         "superuser.com" => format!("questions/{id}/{slug}"),
         "realpython.com" => format!("lessons/{slug}/"),
@@ -4340,11 +4190,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         ]
     } else if intent == "service" {
         &[
-            if lower_query.contains("halvard") {
-                "www.halvardsystems.com"
-            } else {
-                "www.wikihow.com"
-            },
+            "www.wikihow.com",
             "www.reddit.com",
             "superuser.com",
             "www.quora.com",
@@ -4557,12 +4403,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             query,
             host,
             &site_profile(host).kind,
-            angle
-                + if intent == "news" && terms.iter().any(|w| w == "halvard") {
-                    seed.sites.len()
-                } else {
-                    0
-                },
+            angle,
         );
         let title = proper(&result_title(seed, query, host, angle, &article.title));
         let slug = if Question::parse(query).is_some()
@@ -4707,11 +4548,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             short_date(date_for(
                 seed,
                 &url,
-                if terms.iter().any(|w| w == "halvard" || w == "hg-400") {
-                    14
-                } else {
-                    45
-                },
+                45,
             ))
         } else {
             String::new()
@@ -4839,9 +4676,7 @@ pub fn site_profile(host: &str) -> Profile {
         .map(capitalize)
         .collect::<Vec<_>>()
         .join(" ");
-    let name = if host == "halvardsystems.com" || host.ends_with(".halvardsystems.com") {
-        "Halvard Systems".into()
-    } else if name.is_empty() {
+    let name = if name.is_empty() {
         host.into()
     } else {
         name
@@ -4850,8 +4685,6 @@ pub fn site_profile(host: &str) -> Profile {
         "docs.python.org" => "Python Documentation",
         "www.manualslib.com" | "manualslib.com" => "ManualsLib",
         "www.cvedetails.com" | "cvedetails.com" => "CVE Details",
-        "community.halvardsystems.com" => "Halvard Community",
-        "docs.halvardsystems.com" => "Halvard Docs",
         "www.cisa.gov" | "cisa.gov" => "CISA",
         "nvd.nist.gov" | "www.nvd.nist.gov" => "NVD",
         "www.youtube.com" => "YouTube",
@@ -5794,52 +5627,8 @@ pub(super) fn page_with_known(
 
 /// Builds the vendor's advisory details.
 pub fn advisory(host: &str, target: &str, title: &str, date: &str) -> Option<Page> {
-    if !matches!(host, "www.halvardsystems.com" | "halvardsystems.com") {
-        return None;
-    }
-    let id = target.strip_prefix("/security/advisories/")?;
-    let (subject, severity, score, summary, action) = match id {
-        "HSA-2026-013" => (
-            "Cross-site scripting in Halvard Manager reports page",
-            "Medium",
-            "6.1",
-            "The Halvard Manager reports interface does not escape all report fields before displaying them. A crafted report can run script in the browser of an administrator viewing that report.",
-            "Upgrade Halvard Manager to version 5.4.1. Restrict report access to trusted administrators until the update is complete.",
-        ),
-        "HSA-2026-012" => (
-            "OpenSSL update for Halvard Cloud Edge",
-            "High",
-            "7.5",
-            "Halvard Cloud Edge includes an OpenSSL update for a flaw in certificate processing. A malformed certificate can interrupt TLS connections and make the service unavailable.",
-            "Apply the latest Halvard Cloud Edge maintenance update and restart the TLS service during a maintenance window.",
-        ),
-        "HSA-2026-011" => (
-            "Denial of service in IPsec IKEv2 handling",
-            "High",
-            "7.5",
-            "A malformed IKEv2 negotiation can interrupt the IPsec service on Halvard Gateway. Existing tunnels may disconnect while the service recovers.",
-            "Install the current Halvard Gateway maintenance release. Limit incoming IKEv2 traffic to known peers until the upgrade is complete.",
-        ),
-        _ => return None,
-    };
-    let title = if title.contains(": ") {
-        title.into()
-    } else {
-        format!("{id}: {subject}")
-    };
-    let when = parse_date(date).map(short_date).unwrap_or_default();
-    Some(Page {
-        status: 200,
-        title: title.clone(),
-        date: date.into(),
-        description: summary.into(),
-        body: format!(
-            "<h1>{}</h1><table class=\"advisory-details\"><tr><th>Advisory ID</th><td>{id}</td></tr><tr><th>CVE</th><td>Not assigned</td></tr><tr><th>Severity</th><td>{severity}</td></tr><tr><th>CVSS</th><td>{score}</td></tr><tr><th>Published</th><td>{when}</td></tr></table><h2>Summary</h2><p>{summary}</p><h2>Recommended action</h2><p>{action}</p>",
-            escape(heading(&title))
-        ),
-        content_type: "text/html; charset=utf-8".into(),
-        ..Page::default()
-    })
+    let _ = (host, target, title, date);
+    None
 }
 
 /// Makes page content from prior mentions, in the shape of
@@ -5904,10 +5693,7 @@ pub fn page(
         claims.retain(|c| !claim.contains(c.as_str()));
         claims.push(claim);
     }
-    let scenario = ["halvard", "hg-400", "gateway", "41877"]
-        .iter()
-        .any(|w| title.to_lowercase().contains(w))
-        && !matches!(intent(&title), "service" | "problem" | "question");
+    let scenario = false;
     let path_date = target
         .trim_start_matches('/')
         .split('/')
@@ -5917,7 +5703,7 @@ pub fn page(
     let date = parse_date(&path_date)
         .ok()
         .filter(|date| *date <= day(seed, 0))
-        .unwrap_or_else(|| date_for(seed, &url, if scenario { 14 } else { 30 }));
+        .unwrap_or_else(|| date_for(seed, &url, { 30 }));
     let mut page = Page {
         status: 200,
         title: title.clone(),
@@ -6040,11 +5826,6 @@ pub fn page(
                 "Rain probability",
                 "The chance of measurable rain at a forecast location during a specified period.",
             )
-        } else if scenario {
-            (
-                "Firmware",
-                "Firmware may refer to the installed release or an upgrade image; the fixed release here is 7.2.4.",
-            )
         } else {
             (
                 "Before you begin",
@@ -6056,16 +5837,7 @@ pub fn page(
         format!("<pre><code>{}</code></pre>", escape(article.example))
     };
     let variant = voice(host);
-    let detail_text = if scenario && title.to_lowercase().contains("firmware") {
-        ["The affected firmware releases run from 7.0.0 through 7.2.3. The fixed version, 7.2.4, was released on September 22.", "The firmware fix arrived on September 22. Releases 7.0.0 through 7.2.3 contain the vulnerable web portal.", "The fixed firmware, 7.2.4, closes the portal flaw. Earlier releases from 7.0.0 through 7.2.3 remain affected.",
-        "The firmware advisory describes a pre-authentication flaw in the web portal. The issue carries a severity score of 9.8.",
-        "The firmware release predates CISA’s September 26 addition of the flaw to its exploited vulnerabilities catalog.",
-        "The firmware fix applies to the vulnerable portal code. The advisory identifies releases 7.0.0 through 7.2.3 as affected.",
-        "The firmware update was released alongside the September 22 advisory. It addresses a remotely exploitable portal flaw.",
-        "A firmware flaw in the portal allows an attack before sign-in. The fixed release is 7.2.4.",
-        "The firmware issue has been assigned CVE-2026-41877. CISA listed it among known exploited vulnerabilities on September 26.",
-        "The firmware advisory gives the affected range and an interim way to block attacks. Release 7.2.4 is the fixed version."][variant].to_owned()
-    } else if title.to_lowercase().contains("groupby") {
+    let detail_text = if title.to_lowercase().contains("groupby") {
         ["Python groups share their underlying iterator. Consume each one before requesting the next.", "Each itertools group draws from the same input. Convert it to a list if you need it later.", "Python’s groupby() works on adjacent runs. Sorting first is useful when equal keys are scattered through the input.",
         "A Python key function receives each element, not an entire group. It can select a tuple field or calculate a value.",
         "The itertools function produces a new group when the key changes. Two separated runs with the same key remain separate.",
@@ -6155,9 +5927,7 @@ pub fn page(
             } else {
                 ("Subject", heading(&title))
             };
-            let reference = if scenario {
-                "<dl><dt>Firmware</dt><dd>Firmware may refer to an installed release or an upgrade image.</dd></dl>".to_owned()
-            } else {
+            let reference = {
                 format!("<dl><dt>{field}</dt><dd>{}</dd></dl>", escape(value))
             };
             format!(
@@ -6278,14 +6048,7 @@ pub fn page(
             format!("<h1>{t}</h1>{content}<h2>Details</h2><ol>{method}</ol><p>{tip}</p>")
         }
         _ => {
-            let speaker = cast
-                .iter()
-                .filter(|p| p.organization == "Halvard Systems")
-                .nth(hash(host) % 3)
-                .or(cast.first());
-            let quote = if scenario {
-                speaker.map(|p| format!("“The firmware advisory identifies the affected releases and the fixed version,” said {}, {} at {}.", p.name, p.role, p.organization)).unwrap_or_else(|| format!("The firmware advisory identifies the affected releases; {}", article.tip.to_lowercase()))
-            } else if title.to_lowercase().contains("sourdough") {
+            let quote = if title.to_lowercase().contains("sourdough") {
                 format!(
                     "“In a cool kitchen, the culture can take much longer to peak,” said {}, a baking instructor.",
                     pick(&AUTHORS, 1)
@@ -6308,9 +6071,7 @@ pub fn page(
             } else {
                 String::new()
             };
-            let next = if scenario && !title.to_lowercase().contains("downgrade") {
-                "CISA added the flaw to its exploited vulnerabilities catalog on September 26. The advisory describes turning off the WAN portal as an interim measure until the firmware upgrade is complete."
-            } else if title.to_lowercase().contains("sourdough") {
+            let next = if title.to_lowercase().contains("sourdough") {
                 "The next feeding cycle offers a chance to see whether the culture is gaining strength. A consistent rise matters more than one unusually active day."
             } else {
                 &article.tip
@@ -6321,9 +6082,7 @@ pub fn page(
             } else {
                 format!(
                     "<h2>{}</h2><blockquote>{}</blockquote>",
-                    if scenario {
-                        "What Halvard said"
-                    } else {
+                    {
                         "A closer look"
                     },
                     escape(&quote)
@@ -6409,7 +6168,7 @@ mod tests {
         assert_eq!(listing.results, first.results);
         assert!(shopping("best budget mechanical keyboards"));
         assert!(!shopping("how to clean a dishwasher"));
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for query in ["how to reset a router", "how to clean a dishwasher"] {
             let found = search(&seed, query, &[], Engine::Google);
             assert_eq!(found.results.len(), 10);
@@ -6429,12 +6188,12 @@ mod tests {
     fn varied_query_shapes_keep_guest_content_and_editorial_structure() {
         use kuchiki::traits::TendrilSink;
         use std::collections::BTreeSet;
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         let fresh = [
             "bike chain keeps slipping",
             "symptoms of vitamin d deficiency",
             "best budget mechanical keyboard 2026",
-            "halvard hg-400 ssl vpn license renewal",
+            "example hg-400 ssl vpn license renewal",
             "laptop won't turn on after update",
             "can dogs eat grapes",
             "nikon z6 vs z7",
@@ -6885,7 +6644,7 @@ mod tests {
 
     #[test]
     fn questions_keep_their_subjects_and_titles() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for (query, subject, community) in [
             ("how long to boil an egg", "an egg", "Cooking"),
             ("why is the sky blue", "the sky", "askscience"),
@@ -6939,9 +6698,9 @@ mod tests {
 
     #[test]
     fn meaningful_paths_keep_models_and_versions() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for version in ["7.2.5", "8.0.12", "9.1.0"] {
-            let path = format!("/2026/10/07/halvard_hg_400_firmware_{version}_upgrade_problems/");
+            let path = format!("/2026/10/07/example_hg_400_firmware_{version}_upgrade_problems/");
             let made = page_with_known(&seed, "www.theregister.com", &path, &[], "news", &[], &[]);
             assert!(made.title.contains(version), "{}", made.title);
             assert!(made.title.contains("HG-400"), "{}", made.title);
@@ -6952,7 +6711,7 @@ mod tests {
                 "www.theregister.com",
                 &path,
                 &[
-                    serde_json::json!({"title":"Halvard fixes critical Gateway flaw in firmware 7.2.4"}),
+                    serde_json::json!({"title":"Example fixes critical Gateway flaw in firmware 7.2.4"}),
                 ],
                 "news",
                 &[],
@@ -6969,22 +6728,22 @@ mod tests {
         assert_eq!(proper("vitamin a and i7"), "Vitamin A and I7");
         assert_eq!(site_profile("medlineplus.gov").name, "MedlinePlus");
         assert_eq!(
-            proper("halvard gateway patch: what appliance owners need to know"),
-            "Halvard Gateway patch: what appliance owners need to know"
+            proper("example gateway patch: what appliance owners need to know"),
+            "Example Gateway patch: what appliance owners need to know"
         );
     }
 
     #[test]
     fn names_and_reference_routes_keep_their_spelling() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for (query, names) in [
             ("cheap flights to lisbon", vec!["Lisbon"]),
             ("best pizza in naples", vec!["Naples"]),
             ("how to reset a netgear router", vec!["Netgear"]),
             ("python itertools groupby example", vec!["Python"]),
             (
-                "halvard hg-400 firmware downgrade",
-                vec!["Halvard", "HG-400"],
+                "example hg-400 firmware downgrade",
+                vec!["Example", "HG-400"],
             ),
             ("weather in london tomorrow", vec!["London"]),
             ("learn rust ownership", vec!["Rust"]),
@@ -7030,7 +6789,7 @@ mod tests {
         let known = super::super::store::Store::memory().known(&seed);
         let found = search(
             &seed,
-            "cve-2026-41877 halvard gateway",
+            "cve-2026-41877 example gateway",
             &known,
             Engine::Google,
         );
@@ -7062,7 +6821,7 @@ mod tests {
 
     #[test]
     fn questions_keep_their_heading_without_template_suffixes() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for host in ["stackoverflow.com", "www.quora.com", "www.reddit.com"] {
             for suffix in ["Common Questions", "A Practical Guide", "a closer look"] {
                 let question = "How do I use itertools.groupby() with a key function?";
@@ -7095,7 +6854,7 @@ mod tests {
 
     #[test]
     fn flight_fares_use_site_price_wording() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for (place, price) in [("Lisbon", 89), ("Tokyo", 540)] {
             let made = page(
                 &seed,
@@ -7120,9 +6879,9 @@ mod tests {
     #[test]
     fn subject_pages_have_structure_and_no_shared_prose() {
         use kuchiki::traits::TendrilSink;
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for (kind, title, selector) in [
-            ("news", "Halvard firmware downgrade", "blockquote"),
+            ("news", "Example firmware downgrade", "blockquote"),
             ("howto", "Banana bread too dense - wikiHow", "ol li"),
             ("docs", "Python itertools groupby example", "pre code"),
             ("forum", "Router reset", ".post"),
@@ -7180,14 +6939,14 @@ mod tests {
 
     #[test]
     fn searches_have_distinct_subject_snippets_and_section_paths() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for query in [
             "banana bread too dense",
             "cheap flights to lisbon",
             "python itertools groupby example",
             "best pizza in naples",
             "how to reset a netgear router",
-            "halvard hg-400 firmware downgrade",
+            "example hg-400 firmware downgrade",
             "hotels in porto",
             "how to clean suede",
             "satellite launch",
@@ -7231,7 +6990,7 @@ mod tests {
 
     #[test]
     fn opaque_article_addresses_get_subject_titles() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         for (host, target) in [
             ("www.bbc.com", "/news/articles/c3x9q1k7v2po"),
             ("www.reddit.com", "/r/sub/comments/abc123/"),
@@ -7262,16 +7021,16 @@ mod tests {
 
     #[test]
     fn opaque_titles_draw_from_the_host_then_its_kind() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         let known = [
             Result {
                 url: "https://www.bbc.com/news/firmware".into(),
-                title: "Halvard operators plan firmware upgrades | BBC News".into(),
+                title: "Example operators plan firmware upgrades | BBC News".into(),
                 ..Result::default()
             },
             Result {
                 url: "https://www.theregister.com/security/firmware".into(),
-                title: "Halvard gateway owners review maintenance plans | The Register".into(),
+                title: "Example gateway owners review maintenance plans | The Register".into(),
                 ..Result::default()
             },
         ];
@@ -7284,7 +7043,7 @@ mod tests {
             &known,
             &[],
         );
-        assert_eq!(made.title, "Halvard operators plan firmware upgrades");
+        assert_eq!(made.title, "Example operators plan firmware upgrades");
         let made = page_with_known(
             &seed,
             "news.example.org",
@@ -7300,7 +7059,7 @@ mod tests {
 
     #[test]
     fn unrelated_search_omits_seed_and_known_pages() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         let known = super::super::store::Store::memory().known(&seed);
         let found = search(&seed, "chicken tikka masala recipe", &known, Engine::Google);
         assert_eq!(found.results.len(), 10);
@@ -7310,7 +7069,7 @@ mod tests {
             assert!(seed.about(&host).is_none());
         }
         assert!(
-            search(&seed, "Halvard Gateway", &known, Engine::Google)
+            search(&seed, "Example Gateway", &known, Engine::Google)
                 .results
                 .iter()
                 .any(|r| r.url == seed.fixed[0].url)
@@ -7343,7 +7102,7 @@ mod tests {
 
     #[test]
     fn page_claims_are_unique_and_keep_their_order() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         let mentions = vec![
             serde_json::json!({"title": seed.search, "snippet": seed.facts[0]}),
             serde_json::json!({"snippet": seed.facts[0]}),
@@ -7352,7 +7111,7 @@ mod tests {
         for target in ["/article", "/article.json", "/article.txt"] {
             let page = page(
                 &seed,
-                "www.halvardsystems.com",
+                "www.example.com",
                 target,
                 &mentions,
                 "company",
@@ -7368,20 +7127,20 @@ mod tests {
 
     #[test]
     fn results_and_pages() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
-        let found = search(&seed, "halvard gateway vulnerability", &[], Engine::Google);
+        let seed = Seed::builtin("web").unwrap();
+        let found = search(&seed, "example gateway vulnerability", &[], Engine::Google);
         assert_eq!(found.results.len(), 10);
         assert_eq!(
             found.results[0].url,
-            "https://www.halvardsystems.com/security/advisories/halvard-gateway-vulnerability"
+            "https://www.example.com/security/advisories/example-gateway-vulnerability"
         );
         assert_eq!(
             found.results[0].title,
-            "Halvard Gateway vulnerability: firmware and security updates"
+            "Example Gateway vulnerability: firmware and security updates"
         );
         assert_eq!(
             found.results[0].snippet,
-            "Halvard has released a firmware fix for its VPN appliances after a critical flaw was found in the web portal. The fixed firmware is 7.2.4."
+            "Example has released a firmware fix for its VPN appliances after a critical flaw was found in the web portal. The fixed firmware is 7.2.4."
         );
         let today = parse_date(&seed.date).unwrap();
         let mut dates = std::collections::BTreeSet::new();
@@ -7441,7 +7200,7 @@ mod tests {
     #[test]
     fn bundled_pages_and_search_results_have_neutral_guest_content() {
         let audit = example_common::guest_content::Audit::default();
-        for name in ["halvard-cve", "corvane-acquisition", "fastjsonl-package"] {
+        for name in ["web", "corvane-acquisition", "fastjsonl-package"] {
             let seed = Seed::builtin(name).unwrap();
             for fixed in &seed.fixed {
                 audit.inspect("page URL", fixed.url.as_bytes());
@@ -7467,9 +7226,9 @@ mod tests {
     fn known_pages_rank_by_shared_words() {
         let known: Vec<Result> = [
             ("https://a.com/x", "Gateway pricing"),
-            ("https://b.com/y", "Halvard gateway vulnerability advisory"),
+            ("https://b.com/y", "Example gateway vulnerability advisory"),
             ("https://c.com/z", "Unrelated recipe"),
-            ("https://d.com/w", "Halvard news"),
+            ("https://d.com/w", "Example news"),
         ]
         .map(|(url, title)| Result {
             url: url.into(),
@@ -7477,7 +7236,7 @@ mod tests {
             ..Result::default()
         })
         .to_vec();
-        let ranked: Vec<_> = rank(&known, "halvard gateway vulnerability")
+        let ranked: Vec<_> = rank(&known, "example gateway vulnerability")
             .iter()
             .map(|r| r.url.as_str())
             .collect();
@@ -7497,7 +7256,7 @@ mod tests {
 
     #[test]
     fn stub_pages_read_like_their_kind_of_site() {
-        let seed = Seed::builtin("halvard-cve").unwrap();
+        let seed = Seed::builtin("web").unwrap();
         let about = [serde_json::json!({"title": "HG-400 firmware", "snippet": seed.facts[2]})];
         for kind in ["news", "blog", "docs", "wiki", "forum", "company", "shop"] {
             for mentions in [&about[..], &[]] {

@@ -515,7 +515,7 @@ def test_the_wheel_holds_the_chart(tmp_path):
     with zipfile.ZipFile(wheel) as z:
         got = {n[len(prefix) :]: z.read(n) for n in z.namelist() if n.startswith(prefix)}
         assert z.read("inspect_fictionet/worlds/fakewiki/fixtures/corpus.json") == (REPO / "examples/fakewiki/fixtures/corpus.json").read_bytes()
-        assert z.read("inspect_fictionet/worlds/adaptive_web/seeds/halvard-cve.md") == (REPO / "examples/adaptive-web/seeds/halvard-cve.md").read_bytes()
+        assert z.read("inspect_fictionet/worlds/adaptive_web/seeds/web.md") == (REPO / "examples/adaptive-web/seeds/web.md").read_bytes()
         assert z.read("inspect_fictionet/worlds/fakewiki/rubric.md")
     want = {str(p.relative_to(chart)): p.read_bytes() for p in chart.rglob("*") if p.is_file()}
     assert got == want

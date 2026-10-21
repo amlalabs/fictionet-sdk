@@ -221,7 +221,7 @@ mod tests {
         use fictionet::events::Fanout;
         use fictionet_observe::Memory;
 
-        let pages = Pages::new(Seed::builtin("halvard-cve").unwrap());
+        let pages = Pages::new(Seed::builtin("web").unwrap());
         let searches = Arc::new(Searches::of(&pages));
         let memory = Arc::new(Memory::default());
         let initial = searches.snapshot();

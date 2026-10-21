@@ -2,7 +2,7 @@
 //! a certificate, and every page is made the first time it is asked for.
 //!
 //! ```text
-//! adaptive-web-world --seed halvard-cve --socket /run/fictionet/sock/world.sock \
+//! adaptive-web-world --seed web --socket /run/fictionet/sock/world.sock \
 //!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready
 //! ```
 //!
@@ -43,7 +43,7 @@
 //! use fictionet::events::Fanout;
 //!
 //! # fn main() -> fictionet::Result {
-//! let seed = Seed::builtin("halvard-cve")?;
+//! let seed = Seed::builtin("web")?;
 //! let start = world_start(&seed.date)?;
 //! let searches = Arc::new(Searches::from_seed(&seed));
 //! let log = Arc::new(Log::new(Box::new(std::io::stdout()), &[], |s| s));
@@ -837,7 +837,7 @@ mod tests {
                     start,
                 });
                 let (attacher, attachments) = fictionet::attachments();
-                let seed = pages::Seed::builtin("halvard-cve")?;
+                let seed = pages::Seed::builtin("web")?;
                 serve(
                     &fcx,
                     addresses.clone(),
@@ -881,7 +881,7 @@ mod tests {
     fn names_that_could_be_on_the_internet_get_a_site() {
         for name in [
             "example.com",
-            "www.halvardsystems.com",
+            "www.example.com",
             "a-b.co.uk",
             "xn--bcher-kva.xn--p1ai",
             "x.io",
@@ -992,7 +992,7 @@ mod spelling {
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             |cx| async move {
-                let seed = pages::Seed::builtin("halvard-cve")?;
+                let seed = pages::Seed::builtin("web")?;
                 let start = world_start(&seed.date)?;
                 let world = World::new(&cx, seed, start)?;
                 let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
@@ -1028,6 +1028,6 @@ mod spelling {
             assert!(super::admit(host).is_err(), "{host}");
         }
         assert!(super::admit("www.google.com").is_ok());
-        assert!(super::admit("community.halvardsystems.com").is_ok());
+        assert!(super::admit("community.example.com").is_ok());
     }
 }

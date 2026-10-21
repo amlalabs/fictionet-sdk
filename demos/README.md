@@ -72,7 +72,6 @@ the checks have run both version commands. The Anthropic model API is forwarded 
 `ANTHROPIC_API_KEY` or OpenRouter’s compatible Messages endpoint with
 `OPENROUTER_API_KEY`. Claude Code writes and runs a small Python program. The guest
 receives only a placeholder key. WebSearch and WebFetch use the same adaptive pages
-and search results as the browser. The checks run a real WebSearch for Halvard
 Gateway advisories and require a world search event. The World menu pauses calls
 or changes the default limits of twelve calls for Claude Code and eight for Codex.
 
@@ -185,7 +184,6 @@ Terminal on the left and the newest search, its engines and the sites it named
 on the right. The World menu switches new pages between Canned, Stub and Off,
 plants a fact or a page, and restarts the run.
 
-- Pages come from the canned store in `examples/adaptive-web/stores/halvard-cve/`.
   A search it does not hold lists the canned pages that share its words first;
   the stub makes the rest. Nothing calls a model for pages.
 - Claude Code's own calls are the only billed ones: Claude Sonnet 5.5 through
@@ -195,7 +193,6 @@ plants a fact or a page, and restarts the run.
 - `cargo xtask demo search check` runs the scripted story and its checks, with
   screenshots in `downloads/cloudimage/runs/search-<time>/`.
 - `cargo xtask demo search bake` remakes the canned store from
-  `examples/adaptive-web/seeds/halvard-cve.queries` with `OPENROUTER_API_KEY`,
   in at most 300 model calls.
 - `cargo xtask demo search preview` shows the page with an in-world client and
   no VM.

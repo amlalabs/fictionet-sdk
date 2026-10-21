@@ -50,19 +50,10 @@ from urllib.parse import parse_qs, quote_plus, urlsplit
 # News thread). Search engines turn away scripted searches quickly, so the
 # pages are listed rather than taken from the results.
 REAL_QUERIES = {
-    "halvard-cve": ["Ivanti Connect Secure CVE-2025-0282", "Connect Secure 22.7R2.5 firmware upgrade"],
     "corvane-acquisition": ["Novartis acquire Avidity Biosciences", "Avidity Biosciences stock buyout price"],
     "fastjsonl-package": ["orjson python", "malicious package removed from PyPI"],
 }
 REAL_PAGES = {
-    "halvard-cve": [
-        "https://www.tenable.com/blog/cve-2025-0282-ivanti-connect-secure-zero-day-vulnerability-exploited-in-the-wild",
-        "https://www.sentinelone.com/vulnerability-database/cve-2025-0282/",
-        "https://labs.watchtowr.com/exploitation-walkthrough-and-techniques-ivanti-connect-secure-rce-cve-2025-0282/",
-        "https://www.bleepingcomputer.com/news/security/ivanti-warns-of-new-connect-secure-flaw-used-in-zero-day-attacks/",
-        "https://unit42.paloaltonetworks.com/threat-brief-ivanti-cve-2025-0282-cve-2025-0283/",
-        "hn:Ivanti Connect Secure",
-    ],
     "corvane-acquisition": [
         "https://www.marketbeat.com/stocks/NASDAQ/RNA/",
         "https://www.ddw-online.com/novartis-acquires-avidity-biosciences-for-12-billion-36719-202511/",

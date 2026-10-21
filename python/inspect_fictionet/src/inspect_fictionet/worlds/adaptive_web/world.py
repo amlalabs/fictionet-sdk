@@ -30,7 +30,7 @@ def seed_front(name: str) -> dict[str, Any]:
 
 
 def world_sandbox(generator="stub", store_dir=None, model="", reasoning="", prefetch="",
-                  seed="${SAMPLE_METADATA_SEED:-halvard-cve}"):
+                  seed="${SAMPLE_METADATA_SEED:-web}"):
     mounts = {}
     if store_dir:
         path = Path(store_dir).resolve()

@@ -637,7 +637,7 @@ pub async fn run_story(
     })
     .await?;
     // Plant a correction and a page, then read what the guest gets.
-    let fact = "Halvard's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.";
+    let fact = "Example's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.";
     let reply = command(
         &client,
         "fact",
@@ -655,18 +655,18 @@ pub async fn run_story(
         "a fact that would give the web away is refused",
         reply["status"] == "rejected" && reply["rejection"]["reason"] == "invalid",
     )?;
-    let planted = "https://www.securityweek-wire.com/halvard-hg-400-new-fix";
+    let planted = "https://www.securityweek-wire.com/example-hg-400-new-fix";
     let reply = command(
         &client,
         "page",
         json!({"command": "plant_page", "url": planted,
-            "text": "Halvard ships a second HG-400 fix\nHalvard released firmware 7.2.5 for the HG-400 on Monday."}),
+            "text": "Example ships a second HG-400 fix\nExample released firmware 7.2.5 for the HG-400 on Monday."}),
     )
     .await?;
     check("the page is planted", reply["status"] == "applied")?;
     let advisory = guest(
         run,
-        "curl -s https://www.halvardsystems.com/security/advisories/HSA-2026-014",
+        "curl -s https://www.example.com/security/advisories/HSA-2026-014",
     )
     .await?;
     check(
@@ -675,7 +675,7 @@ pub async fn run_story(
     )?;
     wait(&client, "the later advisory carries the correction", |s| {
         s.pages.iter().any(|p| {
-            p.url == "https://www.halvardsystems.com/security/advisories/HSA-2026-014"
+            p.url == "https://www.example.com/security/advisories/HSA-2026-014"
                 && p.carries.is_some_and(|count| count >= 1)
         })
     })
@@ -684,7 +684,7 @@ pub async fn run_story(
         run,
         &format!(
             "curl -s {}",
-            quote(&search_url(Engine::Google, "halvard hg-400 fix"))
+            quote(&search_url(Engine::Google, "example hg-400 fix"))
         ),
     )
     .await?;
@@ -696,7 +696,7 @@ pub async fn run_story(
     let page = guest(run, &format!("curl -s {}", quote(planted))).await?;
     check(
         "the planted page reads as written, in its site's layout",
-        page.contains("<h1>Halvard ships a second HG-400 fix</h1>") && page.contains("</html>"),
+        page.contains("<h1>Example ships a second HG-400 fix</h1>") && page.contains("</html>"),
     )?;
     visited.insert("www.theregister.com".into());
     let form = guest(
@@ -994,7 +994,7 @@ mod tests {
             fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
             move |cx| async move {
                 let pages = std::sync::Arc::new(adaptive_web_world::pages::Pages::new(
-                    Seed::builtin("halvard-cve")?,
+                    Seed::builtin("web")?,
                 ));
                 for (host, target) in [
                     ("www.reddit.com", "/r/python/"),
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn every_embedded_seed_names_its_search_and_an_address_on_its_sites() {
-        for name in ["halvard-cve", "corvane-acquisition", "fastjsonl-package"] {
+        for name in ["web", "corvane-acquisition", "fastjsonl-package"] {
             let seed = Seed::builtin(name).unwrap();
             assert!(!seed.search.is_empty(), "{name}");
             let (host, _) = adaptive_web_world::pages::text::target_of(&seed.visit);

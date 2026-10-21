@@ -156,8 +156,6 @@ export function siteKey(host) {
 // Display names arrive with the world's rows.
 export function short(site) {
   const name = {
-    'Halvard Systems Community': 'Halvard Community',
-    'Halvard Systems Documentation': 'Halvard Docs',
     'Cybersecurity and Infrastructure Security Agency': 'CISA',
     'National Vulnerability Database': 'NVD',
   }[site] || site;
