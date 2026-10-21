@@ -4,9 +4,7 @@ use base64::Engine;
 use regex::Regex;
 
 pub(super) fn directory() -> PathBuf {
-    std::env::var_os("FICTIONET_VM_DIR")
-        .map(|path| crate::root().join(path))
-        .unwrap_or_else(|| crate::root().join(".vm"))
+    crate::root().join(".vm")
 }
 
 pub(super) fn prepared() -> PathBuf {

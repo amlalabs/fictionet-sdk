@@ -185,7 +185,7 @@ fn clients(compose: &Compose, checks: &mut Checks) -> Result {
             "git -c http.proxy=\"$SOCKS\" ls-remote https://example.test/repo.git",
         ]),
     )?;
-    checks.ok("python requests through socks5h", "^hello from https example.test 443 over HTTP/1.1 $", &mut compose.agent(&["sh", "-c", "python3 -c \"import os, requests; print(requests.get(\\\"https://example.test/\\\", proxies={\\\"https\\\": os.environ[\\\"SOCKS\\\"]}).text.strip())\""]))?;
+    checks.ok("python requests through socks5h", "^hello from https example.test 443 over HTTP/1.1 $", &mut compose.agent(&["sh", "-c", "python3 -c \"import sys, requests; print(requests.get(\\\"https://example.test/\\\", proxies={\\\"https\\\": sys.argv[1]}).text.strip())\" \"$SOCKS\""]))?;
     checks.ok(
         "go net/http through socks5 (HTTPS_PROXY=socks5://)",
         "^200 hello from https example.test 443 over HTTP/2.0 $",

@@ -88,13 +88,6 @@ several test binaries or benchmarks use are in `tests/support`, the
 $ cargo nextest run --locked --test host
 ```
 
-Randomized and large-input tests size their loops with
-`stdlib::test_support::rounds`. For a deep run, scale them up:
-
-```console
-$ FICTIONET_TEST_SCALE=100 cargo nextest run --locked
-```
-
 The Python package's tests run with uv, and need Docker and helm:
 
 ```console

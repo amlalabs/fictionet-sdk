@@ -54,13 +54,10 @@ fn goldens_and_determinism() {
                 .source
         );
         let path = root.join(format!("golden/{name}.rs"));
-        if std::env::var_os("BLESS_CODEGEN").is_some() {
-            std::fs::write(&path, &source).unwrap();
-        }
         assert_eq!(
             source,
             std::fs::read_to_string(&path).unwrap(),
-            "golden {name}; set BLESS_CODEGEN=1 to update"
+            "golden {name}; run cargo xtask bless to update"
         );
         let mut renamed = input.clone();
         renamed.name = format!("C:\\other\\{name}.{extension}");
@@ -77,9 +74,6 @@ fn goldens_and_determinism() {
             )
             .unwrap();
             let target_path = root.join("../../fuzz/fuzz_targets/codegen_ir.rs");
-            if std::env::var_os("BLESS_CODEGEN").is_some() {
-                std::fs::write(&target_path, &target).unwrap();
-            }
             assert_eq!(target, std::fs::read_to_string(target_path).unwrap());
         }
     }

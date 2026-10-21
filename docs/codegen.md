@@ -378,7 +378,7 @@ A test checks that `mod.rs` still starts with the generator's output. To
 regenerate the generated part and keep the hand-written tail:
 
 ```sh
-BLESS_CODEGEN=1 cargo test --test it sbe_codegen::module_is
+cargo xtask bless
 ```
 
 ## Rust identifiers
@@ -498,7 +498,7 @@ and the SDK test target runs the integration checks in `tests/it/codegen.rs`. Ad
 work budgets, long identifiers, and maximum-sized stream headers. To update:
 
 ```sh
-BLESS_CODEGEN=1 cargo test -p fictionet-codegen --test golden goldens_and_determinism
+cargo xtask bless
 cargo test --workspace --tests
 ```
 

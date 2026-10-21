@@ -1,3 +1,4 @@
+mod bless;
 mod copy_check;
 mod demo;
 mod docker;
@@ -13,17 +14,7 @@ use process::Result;
 use std::path::Path;
 
 fn root() -> &'static Path {
-    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    ROOT.get_or_init(|| {
-        std::env::var_os("FICTIONET_ROOT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .unwrap()
-                    .to_path_buf()
-            })
-    })
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
 }
 
 fn main() {
@@ -39,6 +30,7 @@ fn main_result() -> Result {
         .split_first()
         .map_or(("help", &[][..]), |(c, a)| (c.as_str(), a));
     match command {
+        "bless" if args.is_empty() => bless::run(),
         "images" => images::run(args),
         "docker" => docker::run(args),
         "eval" => eval::run(args),
@@ -56,7 +48,8 @@ fn main_result() -> Result {
         "h2spec" => h2spec::run(args),
         "help" | "--help" | "-h" if args.is_empty() => {
             println!(
-                "cargo xtask images [artifactory|hosted]\n\
+                "cargo xtask bless\n\
+                      cargo xtask images [artifactory|hosted]\n\
                       cargo xtask docker <ping|tcpudp|proxy|web>\n\
                       cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [options]\n\
                       cargo xtask k8s [tun|proxy]\n\

@@ -8,12 +8,7 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        let cache = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
-            });
-        let p = cache.join(format!(
+        let p = std::env::temp_dir().join(format!(
             "fictionet-codegen-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)

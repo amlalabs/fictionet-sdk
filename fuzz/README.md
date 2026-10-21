@@ -84,13 +84,7 @@ entry directly when adding a target.
 `cargo xtask fuzz --check` checks the sources and `[[bin]]` records against
 each other.
 
-The `tcp` target never sleeps by default, which keeps it fast. To reach
-the timers too (delayed ACKs, TIME-WAIT), let each input sleep up to some
-milliseconds in all:
-
-```sh
-FICTIONET_FUZZ_SLEEP_MS=30 cargo +nightly fuzz run -O -a tcp
-```
+The `tcp` target processes each input without sleeping.
 
 Each bug a target found has a regression test in the SDK's own tests, so
 `cargo test` keeps it fixed without a fuzzer.

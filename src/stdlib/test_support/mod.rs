@@ -259,34 +259,9 @@ impl<'a> Iterator for RandomChunks<'a, '_> {
     }
 }
 
-/// The environment variable that scales [`rounds`]: a positive integer,
-/// read once per process. Unset, empty or invalid means 1.
-pub const SCALE_VAR: &str = "FICTIONET_TEST_SCALE";
-
-/// The scale [`rounds`] multiplies by: [`SCALE_VAR`] if it holds a positive
-/// integer, otherwise 1.
-pub fn scale() -> usize {
-    static SCALE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var(SCALE_VAR)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(1)
-    })
-}
-
-/// Returns `n` times [`scale`]: the iteration count or input size for a
-/// randomized or large-input test. Tests pass the count that keeps a default
-/// run fast; `FICTIONET_TEST_SCALE=100 cargo test` runs a hundred times as
-/// many rounds.
-///
-/// ```
-/// use fictionet::stdlib::test_support::{rounds, scale};
-/// assert_eq!(rounds(500), 500 * scale());
-/// ```
+/// Returns the iteration count for a randomized or large-input test.
 pub fn rounds(n: usize) -> usize {
-    n.saturating_mul(scale())
+    n
 }
 
 /// Checks that `run(size)` takes time linear in `size`, not quadratic.

@@ -25,3 +25,7 @@ fictionet::cfg_std! {
 fictionet::cfg_std! {
     pub mod bench;
 }
+
+fictionet::cfg_std! {
+    pub mod web_fixture;
+}

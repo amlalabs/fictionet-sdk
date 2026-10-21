@@ -1150,18 +1150,22 @@ dependencies = [
 name = "fictionet-test-support"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bytes",
  "divan",
  "example-common",
  "fictionet",
+ "fictionet-host",
  "fictionet-observe",
  "http",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "libc",
  "rustls",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tower-service",
 ]
 
@@ -4234,6 +4238,9 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "fictionet",
+ "fictionet-codegen",
+ "fictionet-test-support",
  "libc",
  "regex",
  "serde_json",

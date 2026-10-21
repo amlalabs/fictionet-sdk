@@ -176,7 +176,7 @@ pub fn run(fetch_images: bool) -> Result {
         )?;
         fs::write(
             work.join("user-data"),
-            "#cloud-config\nruncmd:\n  - [sh, -c, 'mkdir -p /mnt/assets /mnt/run && mount -o ro LABEL=FNASSETS /mnt/assets && mount -o ro LABEL=FNRUN /mnt/run && FICTIONET_ROOT=/mnt/run /mnt/run/xtask vm nested-guest > /dev/ttyS1 2>&1; poweroff']\n",
+            "#cloud-config\nruncmd:\n  - [sh, -c, 'mkdir -p /mnt/assets /mnt/run && mount -o ro LABEL=FNASSETS /mnt/assets && mount -o ro LABEL=FNRUN /mnt/run && /mnt/run/xtask vm nested-guest > /dev/ttyS1 2>&1; poweroff']\n",
         )?;
         fs::write(
             work.join("meta-data"),
