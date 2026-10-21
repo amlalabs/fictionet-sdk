@@ -127,11 +127,34 @@ export function hostOf(url) {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
-// A host as the picture labels it: without www. and its last label.
+export function hostMark(host) {
+  const key = host.toLowerCase().replace(/^www\./, '');
+  let hash = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(key)) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+  const brand = {
+    'google.com': ['G', '#4285f4'], 'bing.com': ['B', '#00809d'],
+    'duckduckgo.com': ['D', '#de5833'], 'html.duckduckgo.com': ['D', '#de5833'],
+    'lite.duckduckgo.com': ['D', '#de5833'], 'reddit.com': ['R', '#ff4500'],
+    'youtube.com': ['▶', '#ff0000'], 'github.com': ['G', '#181717'],
+  }[key] || ((key === 'wikipedia.org' || key.endsWith('.wikipedia.org')) ? ['W', '#333333'] : null);
+  const hue = hash % 360 / 60;
+  const chroma = (1 - Math.abs(2 * .36 - 1)) * .52;
+  const x = chroma * (1 - Math.abs(hue % 2 - 1));
+  const channels = [[chroma, x, 0], [x, chroma, 0], [0, chroma, x], [0, x, chroma], [x, 0, chroma], [chroma, 0, x]][Math.floor(hue)];
+  const color = '#' + channels.map((c) => Math.round((c + .36 - chroma / 2) * 255).toString(16).padStart(2, '0')).join('');
+  return { key, hash, color: brand?.[1] || color, letter: brand?.[0] || key.charAt(0).toUpperCase() };
+}
+
+// Names used on the map.
 export function short(host) {
-  const name = host.replace(/^www\./, '');
+  const name = host.toLowerCase().replace(/^www\./, '');
+  const display = {
+    'halvardsystems.com': 'Halvard Systems', 'community.halvardsystems.com': 'Halvard Community',
+    'docs.halvardsystems.com': 'Halvard Docs', 'cisa.gov': 'CISA',
+    'nvd.nist.gov': 'NVD', 'en.wikipedia.org': 'Wikipedia',
+  }[name];
   const parts = name.split('.');
   const label = parts.length > 2 && parts.at(-2).length <= 3 ? parts.slice(0, -2).join('.') : parts.slice(0, -1).join('.');
-  const text = label || name;
-  return text.length > 16 ? `${text.slice(0, 15)}…` : text;
+  const text = display || label || name;
+  return text.length > 18 ? `${text.slice(0, 17)}…` : text;
 }

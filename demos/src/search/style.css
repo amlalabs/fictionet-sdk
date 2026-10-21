@@ -11,24 +11,24 @@
 .search-picture .ask.idle { stroke-dasharray: 4 5; opacity: .22; }
 .search-picture .result { stroke: var(--app-ink); stroke-width: 1.25; opacity: .28; }
 .search-picture .link, .search-picture .arrowhead { fill: none; stroke: var(--app-ink); stroke-width: 1.6; opacity: .55; }
-.search-picture .engine { fill: var(--app-pane); stroke: var(--app-ink); stroke-width: 2; }
-.search-picture .engine.idle { opacity: .35; }
+.search-picture .engine { fill: var(--app-pane); stroke: var(--app-host-color); stroke-width: 2; }
+.search-picture .engine-group.answered .engine { fill: var(--app-host-color); }
 .search-picture .engine.asking, .search-picture .making { stroke-dasharray: 3 3; }
-.search-picture .engine.stored, .search-picture .page.stored { fill: var(--app-seed); stroke: var(--app-seed); }
-.search-picture .engine.made, .search-picture .page.made { fill: var(--app-made); stroke: var(--app-made); }
-.search-picture .engine.again { fill: var(--app-mem); stroke: var(--app-mem); }
-.search-picture .engine.planted, .search-picture .page.planted { fill: var(--accent); stroke: var(--accent); }
+.search-picture .page.stored { fill: var(--app-seed); stroke: var(--app-seed); }
+.search-picture .page.made { fill: var(--app-made); stroke: var(--app-made); }
+.search-picture .page.planted { fill: var(--accent); stroke: var(--accent); }
 .search-picture .label { fill: var(--app-ink); font: 13px var(--sans); }
-.search-picture .label.small { paint-order: stroke; stroke: var(--app-pane); stroke-width: 5px; stroke-linejoin: round; fill: var(--app-mute); font: 11.5px var(--mono); }
+.search-picture .label.small { paint-order: stroke; stroke: var(--app-pane); stroke-width: 5px; stroke-linejoin: round; fill: var(--app-ink); font: 12.5px var(--sans); }
 .search-picture .label.refused { fill: var(--app-bad); font-weight: 600; }
-.search-picture .label.planted { fill: var(--accent-text); font: 500 12px var(--mono); }
+.search-picture .label.planted { fill: var(--accent-text); font: 500 12.5px var(--sans); }
 .search-picture .site { fill: var(--app-pane); stroke: var(--app-mute); stroke-width: 2; }
-.search-picture .site.listed { opacity: .6; }
-.search-picture .site.scenario { stroke: var(--app-seed); stroke-width: 2.5; }
-.search-picture .site.stored { fill: var(--app-seed-soft); stroke: var(--app-seed); }
-.search-picture .site.made { fill: var(--app-made-soft); stroke: var(--app-made); }
-.search-picture .site.again { fill: var(--app-mem-soft); stroke: var(--app-mem); }
-.search-picture .site.planted { fill: var(--accent-soft); stroke: var(--accent); }
+.search-picture .site.listed { stroke-dasharray: 2 2; opacity: .55; }
+.search-picture .site-group.listed .label { fill: var(--app-mute); }
+.search-picture .site-group.listed .mark { opacity: .75; }
+.search-picture .site.stored { stroke: var(--app-seed); }
+.search-picture .site.made { stroke: var(--app-made); }
+.search-picture .site.again { stroke: var(--app-mem); }
+.search-picture .site.planted { stroke: var(--accent); }
 .search-picture .page { stroke-width: 1.5; }
 .search-picture .page.again { fill: var(--app-pane); stroke: var(--app-mem); stroke-width: 2; }
 .search-picture .page.making { fill: var(--app-pane); stroke: var(--app-made); }
@@ -67,3 +67,9 @@
 
 .search-row .fact-dot { flex: 0 0 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 .search-row em.making { color: var(--app-mute); }
+
+.search-picture .site-group.opened .site { fill: var(--app-host-color); }
+.search-picture .site.scenario { stroke: var(--app-seed); stroke-width: 2.5; }
+.search-picture .mark { fill: var(--app-host-color); font-family: var(--sans); font-weight: 700; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.search-picture .engine-group .mark { font-size: 16px; }
+.search-picture .site-group.opened .mark, .search-picture .engine-group.answered .mark { fill: var(--app-mark-ink); }

@@ -1275,6 +1275,7 @@ body.licenses {
   --accent-soft: light-dark(#fbe7df, #3d1f14);
   --app-term-bg: #0d1114;
   --app-term-ink: #dbe3e8;
+  --app-mark-ink: #ffffff;
   --app-shadow: light-dark(rgba(22, 27, 24, 0.12), rgba(0, 0, 0, 0.5));
   position: relative;
   grid-template-rows: 48px minmax(0, 1fr);
@@ -1303,7 +1304,7 @@ body.licenses {
 .app-controls { display: flex; align-items: center; gap: 6px; margin-left: auto; color: var(--app-mute); font-size: 13px; }
 .app-controls .text-size { min-width: 32px; min-height: 30px; border: 1px solid var(--app-rule); border-radius: 7px; background: transparent; font-family: var(--mono); cursor: pointer; }
 .app-controls .button { height: 30px; }
-.app-stage { position: relative; display: flex; min-width: 0; min-height: 0; border: 1px solid var(--app-rule); border-radius: 10px; overflow: hidden; box-shadow: 0 14px 34px var(--app-shadow); background: #000; }
+.app-stage { position: relative; display: flex; min-width: 0; min-height: 0; border: 1px solid var(--app-rule); border-radius: 10px; overflow: hidden; box-shadow: 0 14px 34px light-dark(var(--app-shadow), transparent); background: #000; }
 .app-stage[data-kind='terminal'] { background: var(--app-term-bg); }
 .app-stage .console-stage { background: transparent; }
 .app-stage .terminal-display { padding: 18px 20px; background: var(--app-term-bg); color: var(--app-term-ink); }
@@ -1350,7 +1351,7 @@ body.licenses {
 .packet-lane-head { display: flex; flex-direction: column; min-width: 0; line-height: 1.15; }
 .packet-lane-head b { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .packet-lane-head span { font: 10.5px var(--mono); color: var(--app-mute); }
-.packet-chips { display: flex; justify-content: flex-end; gap: 4px; overflow: hidden; min-width: 0; padding: 2px 0; mask-image: linear-gradient(to right, transparent, var(--app-ink) 28px); }
+.packet-chips { position: relative; display: flex; justify-content: flex-end; gap: 4px; overflow: hidden; min-width: 0; padding: 2px 0; }
 .packet-chip { flex: 0 0 auto; padding: 3px 7px; border: 1px solid var(--app-rule); border-radius: 6px; background: var(--app-pane); color: var(--app-mute); font: 10.5px var(--mono); white-space: nowrap; }
 .packet-chip.back { border-style: dashed; }
 .packet-chip-count { margin-left: 5px; font-size: 9px; }
@@ -1363,6 +1364,5 @@ body.licenses {
 .packet-chip.quiet, .app-packets tr.quiet .packet-proto { border-color: var(--app-rule); background: var(--app-soft); color: var(--app-mute); }
 .app-packets .packet-unlock { width: 11px; height: 11px; margin-right: 5px; vertical-align: -1px; color: var(--app-made); }
 
-.app-pop .mode-description { margin: 0; padding: 0 10px 10px; color: var(--app-mute); font-size: 12px; white-space: nowrap; }
 .app-pop .app-packet-filter { border-top: 1px solid var(--app-rule); }
 .app-pop input::placeholder, .app-pop textarea::placeholder { color: var(--app-mute); opacity: 1; }

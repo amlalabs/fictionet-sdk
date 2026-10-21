@@ -1,5 +1,5 @@
 import { createMotion } from './motion.mjs';
-import { ENGINES, engine, queryTag, pageTag, short, hostOf, layout } from './model.mjs';
+import { ENGINES, engine, queryTag, pageTag, short, hostOf, hostMark, layout } from './model.mjs';
 
 const cut = (text, size) => text.length > size ? `${text.slice(0, size - 1)}…` : text;
 
@@ -37,7 +37,10 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     const x = [110, 260, 410][index];
     const edge = add('line', { x1: 260, y1: 52, x2: x, y2: 94 }, layers.edges);
     const group = add('g', { class: 'engine-group', 'data-engine': name }, layers.engines);
+    const mark = hostMark(`${name}.com`);
+    group.style.setProperty('--app-host-color', mark.color);
     const node = add('circle', { cx: x, cy: 108, r: 12 }, group);
+    add('text', { class: 'mark', x, y: 108, 'aria-hidden': 'true', text: mark.letter }, group);
     add('text', { class: 'label', x, y: 84, 'text-anchor': 'middle', text: engine(name) }, group);
     const halo = add('circle', { class: 'halo', cx: x, cy: 108, r: 17 }, group);
     return { name, x, edge, node, halo };
@@ -82,16 +85,25 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       attrs(g.children[1], { ...pos, r: 6.5, visibility: page.carries > 0 ? 'visible' : 'hidden' });
       g.children[2].textContent = page.url;
     });
+    add('text', { class: 'mark', 'aria-hidden': 'true' }, group);
     return group;
   }, (g, { host, x, y, pages, scenario }) => {
-    const r = 8 + Math.min(pages.filter((p) => p.fetches > 0).length, 4) * 1.5;
+    const count = pages.filter((p) => p.fetches > 0).length;
+    const r = count ? 9 + Math.min(count - 1, 4) * 1.25 : 8;
+    const mark = hostMark(host);
     const latest = [...pages].sort((a, b) => a.at_ms - b.at_ms || (a.seq ?? 0) - (b.seq ?? 0)).at(-1);
     const state = latest ? pageTag(latest) : 'listed';
-    attrs(g, { 'data-host': host });
+    attrs(g, { 'data-host': host, class: `site-group ${count ? 'opened' : 'listed'}` });
+    g.style.setProperty('--app-host-color', mark.color);
+    attrs(g.children[4], { x, y, 'font-size': count ? Math.min(r * 1.3, 17) : 10 });
+    g.children[4].textContent = mark.letter;
     g.style.transformOrigin = `${x}px ${y}px`;
     attrs(g.children[0], { class: `site ${state}${scenario ? ' scenario' : ''}${pages.some((p) => p.making) ? ' making' : ''}`, cx: x, cy: y, r });
     attrs(g.children[1], { x, y: y + r + 18 });
     g.children[1].textContent = short(host);
+    while (g.children[1].textContent.length > 1 && g.children[1].getComputedTextLength?.() > 116) {
+      g.children[1].textContent = `${g.children[1].textContent.replace(/…$/, '').slice(0, -1)}…`;
+    }
     g.children[2].textContent = host;
     g.dots(pages.map((page, index) => [page.url, { page, index, r, x, y }]));
   });
@@ -106,11 +118,25 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
   const fact = add('text', { class: 'label planted', x: 472, y: 544, 'text-anchor': 'end' }, planted);
   const factTitle = add('title', {}, planted);
   function fitFact() {
-    fact.textContent = cut(factTitle.textContent, 40);
-    if (!fact.getComputedTextLength?.()) return;
-    fact.textContent = factTitle.textContent;
-    while (fact.textContent.length > 1 && fact.getComputedTextLength() > 252) {
-      fact.textContent = `${fact.textContent.replace(/…$/, '').slice(0, -1)}…`;
+    const split = refused.getAttribute('visibility') === 'visible';
+    const text = split ? factTitle.textContent : cut(factTitle.textContent, 70);
+    fact.replaceChildren();
+    const width = split ? 220 : 448;
+    const lines = split ? 2 : 1;
+    let rest = text;
+    for (let i = 0; i < lines && rest; i++) {
+      const line = add('tspan', { x: 472, y: split ? 532 + i * 16 : 544, text: rest }, fact);
+      let end = rest.length;
+      while (end > 1 && (line.getComputedTextLength?.() ?? line.textContent.length * 6) > width) {
+        end--;
+        line.textContent = rest.slice(0, end) + (i === lines - 1 ? '…' : '');
+      }
+      if (end < rest.length && i < lines - 1) {
+        const space = rest.lastIndexOf(' ', end);
+        if (space > 0) end = space + 1;
+        line.textContent = rest.slice(0, end);
+      }
+      rest = rest.slice(end).trimStart();
     }
   }
   const ResizeObserver = svg.ownerDocument.defaultView?.ResizeObserver;
@@ -127,7 +153,9 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     attrs(caret, { visibility: query ? 'hidden' : 'visible' });
     for (const e of engines) {
       const asked = query && snapshot.queries.findLast((q) => q.engine === e.name && q.key === query.key);
-      attrs(e.node, { class: `engine ${asked ? queryTag(snapshot, asked) : 'idle'}` });
+      const state = asked ? queryTag(snapshot, asked) : 'idle';
+      attrs(e.node, { class: `engine ${state}` });
+      attrs(e.node.parentNode, { class: `engine-group ${asked?.outcome.status === 'served' ? 'answered' : 'idle'}` });
       attrs(e.edge, { class: `ask ${query?.engine === e.name ? 'live' : 'idle'}` });
       attrs(e.halo, { visibility: asked?.carries > 0 ? 'visible' : 'hidden' });
     }
@@ -148,10 +176,10 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     const asked = engines.find((e) => e.name === query?.engine);
     results(asked ? listed.filter((r) => map.assignment.has(r.host)).map((r) => {
       const [x, y] = map.assignment.get(r.host);
-      return [`${query.id}:${r.rank}:${r.url}`, { x1: asked.x, y1: 121, x2: x, y2: y - 10 - Math.min(pages(r.host).filter((p) => p.fetches > 0).length, 4) * 1.5, 'data-rank': r.rank }];
+      return [`${query.id}:${r.rank}:${r.url}`, { x1: asked.x, y1: 121, x2: x, y2: y - (pages(r.host).some((p) => p.fetches > 0) ? 16 : 7), 'data-rank': r.rank }];
     }) : []);
     links(snapshot.pages.filter((p) => p.reason?.via === 'link' && hostOf(p.reason.from) !== p.host && map.assignment.has(hostOf(p.reason.from)) && map.assignment.has(p.host)).map((p) => [p.url, { url: p.url, from: map.assignment.get(hostOf(p.reason.from)), to: map.assignment.get(p.host) }]));
-    more.textContent = map.hidden ? `+${map.hidden}` : '';
+    more.textContent = map.hidden ? `+${map.hidden} more` : '';
     const refusal = snapshot.refused.filter((r) => !r.name.startsWith('_')).at(-1);
     attrs(refused, { visibility: refusal ? 'visible' : 'hidden' });
     refusedName.textContent = cut(refusal?.name || '', 22);

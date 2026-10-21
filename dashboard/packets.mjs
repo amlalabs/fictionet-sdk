@@ -41,6 +41,13 @@ export function createPackets({
         entry.node.classList.toggle('quiet', !!row.quiet);
         entry.node.children[1].textContent = `${endpointLabel(row.src)} → ${endpointLabel(row.dst)}`;
       }, compactRows);
+      let previousTime = null;
+      for (const row of recent) {
+        if (row.gap) { previousTime = null; continue; }
+        const time = row.t.toFixed(2);
+        compactRows.get(row.key).node.children[0].textContent = time === previousTime ? '' : time;
+        previousTime = time;
+      }
       const shown = new Set(visible);
       next.filter((row) => shown.has(row)).forEach((row) => {
         onRow(row);

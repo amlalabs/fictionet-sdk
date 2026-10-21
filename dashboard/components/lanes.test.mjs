@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createDocument, liveSubscriptions } from '../test-dom.mjs';
 import { createServices } from '../page.mjs';
 import { mount } from './packets.mjs';
-import { chipText, conversationRows, dnsRow, kindOf } from './lanes.mjs';
+import { chipText, conversationRows, dnsRow, kindOf, createLanes } from './lanes.mjs';
 
 const packets = JSON.parse(readFileSync(new URL('./fixtures/search-packets.json', import.meta.url)));
 
@@ -209,7 +209,6 @@ test('shell lanes use the declared host addresses for other apps and IPv6', (t) 
   assert.match(h.root.querySelectorAll('.packet-lane')[0].textContent, /2001:db8::2/);
 });
 
-
 test('model requests and responses use the same lane and decrypted rows as other sites', (t) => {
   const h = setup(t, { names: new Map([['160.79.104.10', 'api.anthropic.com']]) });
   const request = { ...packets[7], src: '10.0.0.2:40000', dst: '160.79.104.10:443', proto: 'HTTP/2', info: 'HEADERS[1]: POST /v1/messages (api.anthropic.com)' };
@@ -397,4 +396,69 @@ test('a long DATA run preserves DNS, TLS and GET chips with motion disabled', (t
   assert.equal(chips.at(-1).textContent, 'DATA 30.0k×20');
   assert.equal(h.root.querySelector('#prows').children.length, 28);
   assert.equal(h.animations.length, 0);
+});
+
+test('resets after a close are quiet only on the same connection', (t) => {
+  const h = setup(t);
+  const tcp = (info, t, extra = {}) => ({ ...packets[2], src: '10.0.0.2:40000', dst: '192.0.2.1:443', proto: 'TCP', tags: [], info, t, seq: 1000 + t, ...extra });
+  const send = (p) => { h.send([p]); return h.root.querySelector('.packet-lane').querySelectorAll('.packet-chip').at(-1); };
+  assert.equal(send(tcp('[SYN] Len=0', 1)).classList.contains('bad'), false);
+  let rst = send(tcp('[RST, ACK] Len=0', 2, { tags: ['reset'] }));
+  assert.equal(rst.classList.contains('quiet'), false);
+  assert.equal(rst.classList.contains('tcp'), true);
+  send(tcp('[FIN, ACK] Len=0', 3));
+  rst = send(tcp('[RST, ACK] Len=0', 4));
+  assert.equal(rst.classList.contains('quiet'), true);
+  rst = send(tcp('[RST, ACK] Len=0', 5, { src: '10.0.0.2:40001' }));
+  assert.equal(rst.classList.contains('quiet'), false);
+  send(tcp('Encrypted Alert', 6, { proto: 'TLSv1.3', src: '192.0.2.1:443', dst: '10.0.0.2:40001' }));
+  assert.equal(send(tcp('[RST, ACK] Len=0', 7, { src: '10.0.0.2:40001' })).classList.contains('quiet'), true);
+  send(tcp('[SYN] Len=0', 8));
+  assert.equal(send(tcp('[RST, ACK] Len=0', 9)).classList.contains('quiet'), false);
+  rst = send(tcp('[RST, ACK] Len=0', 10, { tags: ['malformed'] }));
+  assert.equal(rst.classList.contains('bad'), true);
+  assert.equal(rst.classList.contains('quiet'), false);
+  assert.equal(kindOf(tcp('[RST] Len=0', 11, { tags: ['reset'] })), 'tcp');
+});
+
+test('chips that cross the lane edge are hidden whole after insertion and resize', () => {
+  const document = createDocument(), root = document.createElement('div');
+  let resize, disconnected = false;
+  document.defaultView = { ResizeObserver: class {
+    constructor(fn) { resize = fn; }
+    observe() {}
+    disconnect() { disconnected = true; }
+  } };
+  const create = document.createElement;
+  document.createElement = (tag) => {
+    const node = create(tag);
+    Object.defineProperty(node, 'offsetLeft', { get() { return root.edge ?? (node.parent?.children.indexOf(node) === 0 ? -1 : 10); } });
+    return node;
+  };
+  const lanes = createLanes(root, { name: (value) => value, local: (value) => value.startsWith('10.0.0.2:'), addressFor: () => null, animate() {} });
+  lanes.add({ ...packets[2], link: 'wire' }, false);
+  lanes.add({ ...packets[3], link: 'wire' }, false);
+  const chips = root.querySelectorAll('.packet-chip');
+  assert.equal(chips[0].style.visibility, 'hidden');
+  assert.equal(chips[1].style.visibility, '');
+  root.edge = -10;
+  resize();
+  assert.ok(chips.every((chip) => chip.style.visibility === 'hidden'));
+  root.edge = 0;
+  resize();
+  assert.ok(chips.every((chip) => chip.style.visibility === ''));
+  lanes.dispose();
+  assert.equal(disconnected, true);
+});
+
+test('packet times are printed only when the displayed time changes', (t) => {
+  const h = setup(t);
+  const p = { ...packets[7], info: 'GET / HTTP/1.1' };
+  h.send([1, 1.001, 1.004, 2].map((time, i) => ({ ...p, seq: 1000 + i, t: time })));
+  const times = () => h.root.querySelector('#prows').children.map((row) => row.children[0].textContent);
+  assert.deepEqual(times(), ['2.00', '1.00', '', '']);
+  h.send([{ ...p, seq: 1004, t: 2.001 }]);
+  assert.deepEqual(times(), ['2.00', '', '1.00', '', '']);
+  h.services.packetFilter.set('every');
+  assert.deepEqual(times(), ['2.00', '', '1.00', '', '']);
 });

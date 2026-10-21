@@ -2,7 +2,6 @@ import { diff, rows } from './model.mjs';
 import { createMotion } from './motion.mjs';
 import { createWeb } from './web.mjs';
 
-const DESCRIPTIONS = { canned: 'Prepared pages answer first; the rest are made on the spot.', stub: 'New pages are made on the spot.', off: 'Only available pages are served.' };
 const NEW_PAGES = [['canned', 'Prepared'], ['stub', 'Improvised'], ['off', 'Off']];
 // Run time as minutes and seconds.
 const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
@@ -23,7 +22,7 @@ export function mount(root, services, options) {
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
   const controls = [];
-  let note, segment, description;
+  let note, segment;
   async function send(command) {
     if (!snapshot || request.busy) return false;
     note.textContent = '';
@@ -45,7 +44,6 @@ export function mount(root, services, options) {
     if (!segment || !snapshot?.generator) return;
     const g = snapshot.generator;
     const mode = !g.generate ? 'off' : g.canned ? 'canned' : 'stub';
-    description.textContent = DESCRIPTIONS[mode];
     for (const button of segment.children) button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
   }
   if (menu) {
@@ -59,7 +57,6 @@ export function mount(root, services, options) {
       controls.push(button);
       cleanup.push(listen(button, 'click', () => send({ command: 'set_new_pages', new_pages: mode })));
     }
-    description = item('p', { class: 'mode-description' }, menu);
     const field = (label, id) => {
       const box = item('div', { class: 'field' }, menu);
       item('label', { for: id, text: label }, box);

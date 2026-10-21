@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { createDocument } from '../../../dashboard/test-dom.mjs';
 import { createServices } from '../../../dashboard/page.mjs';
-import { diff, slots, layout, rows, queryTag, pageTag, short } from './model.mjs';
+import { diff, slots, layout, rows, queryTag, pageTag, short, hostMark } from './model.mjs';
 import { createWeb } from './web.mjs';
 import { createMotion } from './motion.mjs';
 import { mount } from './view.mjs';
@@ -50,7 +50,7 @@ test('searches and pages say whether they were stored, made now or served again'
   assert.deepEqual(s.pages.map(pageTag), ['stored', 'again']);
   assert.equal(pageTag(page('https://a.com/', { made: 'stubbed', latest: 'stored', fetches: 3 })), 'again');
   assert.equal(pageTag(page('https://a.com/', { made: 'planted' })), 'planted');
-  assert.equal(short('www.halvardsystems.com'), 'halvardsystems');
+  assert.equal(short('www.halvardsystems.com'), 'Halvard Systems');
   assert.equal(short('www.theregister.co.uk'), 'theregister');
 });
 
@@ -71,7 +71,7 @@ test('the map shows the newest search, its engines and all sites named', () => {
   h.publish(fixture());
   assert.equal(h.root.querySelector('.query-text').textContent, 'new words');
   assert.deepEqual(h.root.querySelectorAll('.engine').map((e) => e.getAttribute('class')), ['engine again', 'engine idle', 'engine made']);
-  assert.deepEqual(h.root.querySelectorAll('.site-group').map((g) => [g.children[1].textContent, g.querySelectorAll('.page').length, g.children[0].getAttribute('class').includes('scenario')]), [['halvardsystems', 1, true], ['reddit', 1, false], ['theregister', 0, false]]);
+  assert.deepEqual(h.root.querySelectorAll('.site-group').map((g) => [g.children[1].textContent, g.querySelectorAll('.page').length, g.children[0].getAttribute('class').includes('scenario')]), [['Halvard Systems', 1, true], ['reddit', 1, false], ['theregister', 0, false]]);
   assert.equal(h.root.querySelector('.refused-mark').querySelector('text').textContent, 'wiki.corp');
   assert.equal(h.root.querySelector('.planted-mark').querySelector('title').textContent, 'The fix is 7.2.5, not 7.2.4.');
   h.publish({ ...fixture(), queries: [], results: [], refused: [], planted: [] });
@@ -288,18 +288,16 @@ test('mixed ticker rows keep their time, identity, path and badge', () => {
   h.dispose();
 });
 
-test('each page mode posts its wire value and describes the snapshot choice', async () => {
+test('each page mode posts its wire value and selects the snapshot choice', async () => {
   const h = harness(), s = fixture(); h.publish(s);
   const menu = h.services.worldMenu;
   const buttons = menu.querySelector('.seg').children;
-  const descriptions = ['Prepared pages answer first; the rest are made on the spot.', 'New pages are made on the spot.', 'Only available pages are served.'];
   for (const [i, mode] of ['canned', 'stub', 'off'].entries()) {
     buttons[i].click(); await settle();
     assert.deepEqual(h.posts[i].body.command, { command: 'set_new_pages', new_pages: mode, expected_revision: 3 });
     h.publish({ ...s, generator: { ...s.generator, generate: mode !== 'off', canned: mode === 'canned' } });
     assert.deepEqual(buttons.map((b) => b.getAttribute('aria-pressed')), buttons.map((_, j) => String(i === j)));
-    assert.equal(menu.querySelector('.mode-description').textContent, descriptions[i]);
-    assert.ok(descriptions[i].length < 60);
+    assert.equal(menu.querySelector('.mode-description'), null);
     assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
   }
   h.dispose();
@@ -346,10 +344,13 @@ test('slots fill from the middle in the prototype order and keep labels inside t
   assert.deepEqual(slots(), expected);
   assert.equal(new Set(slots().map(String)).size, 21);
   for (const [x, y] of slots()) {
-    assert.ok(x - 16 * 7 / 2 >= 0 && x + 16 * 7 / 2 <= 520);
-    assert.ok(y + 22 - 11.5 >= 0 && y + 22 <= 560);
+    assert.ok(x - 58 >= 0 && x + 58 <= 520);
+    assert.ok(y + 32 - 12.5 >= 0 && y + 32 <= 560);
   }
-  assert.equal(short('www.abcdefghijklmnopq.com'), 'abcdefghijklmno…');
+  assert.equal(short('www.abcdefghijklmnopqrs.com'), 'abcdefghijklmnopq…');
+  for (const [i, [x, y]] of slots().entries()) for (const [tx, ty] of slots().slice(i + 1)) {
+    assert.ok(Math.abs(y - ty) >= 12.5 || Math.abs(x - tx) >= 124);
+  }
   assert.equal(short('abcdefghijklmnop'), 'abcdefghijklmnop');
 });
 
@@ -482,15 +483,16 @@ test('overflow counts hidden sites and retains the latest page and long tooltips
   const text = 'A long fact about the new firmware and how to apply the update safely.';
   h.publish(snapshot({ pages, refused: [{ name: 'a-very-long-private-host.example.corp', at_ms: 1 }], planted: [{ kind: 'fact', text, at_ms: 2 }] }));
   assert.equal(h.root.querySelectorAll('.site-group').length, 21);
-  assert.match(h.root.textContent, /\+4/);
+  assert.match(h.root.textContent, /\+4 more/);
   assert.ok(h.root.querySelectorAll('.site-group').some((g) => g.getAttribute('data-host') === 'site24.com'));
-  assert.equal(h.root.querySelector('.planted-mark').querySelector('text').textContent.length, 40);
+  assert.equal(h.root.querySelector('.planted-mark').querySelectorAll('tspan').length, 2);
+  assert.equal(h.root.querySelector('.planted-mark').querySelectorAll('tspan').map((line) => line.textContent).join(''), text);
   assert.equal(h.root.querySelector('.planted-mark').querySelector('title').textContent, text);
   assert.equal(h.root.querySelector('.refused-mark').querySelector('title').textContent, 'a-very-long-private-host.example.corp');
   h.dispose();
 });
 
-test('site growth stops at four pages and result lines retain rank order', () => {
+test('site growth reaches its limit at five pages and result lines retain rank order', () => {
   const h = harness();
   const s = recorded('first-search');
   h.publish({ ...s, pages: Array.from({ length: 5 }, (_, i) => servedPage(`https://www.halvardsystems.com/${i}`, { at_ms: i })) });
@@ -821,22 +823,23 @@ test('same-site links keep page arrival motion without a lasting arrow', async (
 });
 
 test('fact labels fit measured text at normal spacing and keep their full title', () => {
+  const widthOf = (text) => [...text].reduce((sum, c) => sum + (c === 'W' ? 12 : 6), 0);
   const window = animationWindow({ reduced: true });
   const create = window.document.createElement;
   window.document.createElement = (tag) => {
     const node = create(tag);
-    if (tag === 'text') node.getComputedTextLength = () => [...node.textContent].reduce((sum, c) => sum + (c === 'W' ? 12 : 6), 0);
+    if (tag === 'text' || tag === 'tspan') node.getComputedTextLength = () => widthOf(node.textContent);
     return node;
   };
   const h = harness(window);
   for (const text of ['W'.repeat(70), 'The fix is ready.', 'i'.repeat(60)]) {
     h.publish(snapshot({ planted: [{ kind: 'fact', text, at_ms: 2 }] }));
     const mark = h.root.querySelector('.planted-mark'), label = mark.querySelector('text');
-    assert.ok(label.getComputedTextLength() <= 252);
+    assert.ok(label.getComputedTextLength() <= 448);
     assert.equal(label.getAttribute('textLength'), null);
     assert.equal(label.getAttribute('lengthAdjust'), null);
     assert.equal(mark.querySelector('title').textContent, text);
-    if (text.length > 40) assert.match(label.textContent, /…$/);
+    if (widthOf(text) > 448) assert.match(label.textContent, /…$/);
     else assert.equal(label.textContent, text);
   }
   h.dispose();
@@ -853,18 +856,110 @@ test('fact labels refit when their tab becomes visible and stop observing on dis
   const create = window.document.createElement;
   window.document.createElement = (tag) => {
     const node = create(tag);
-    if (tag === 'text') node.getComputedTextLength = () => shown ? node.textContent.length * 9 : 0;
+    if (tag === 'text' || tag === 'tspan') node.getComputedTextLength = () => shown ? node.textContent.length * 9 : 0;
     return node;
   };
   const h = harness(window), text = 'A fact with enough text to need cutting when the tab becomes visible.';
   h.publish(snapshot({ planted: [{ kind: 'fact', text, at_ms: 1 }] }));
   const label = h.root.querySelector('.planted-mark').querySelector('text');
-  assert.equal(label.textContent.length, 40);
+  assert.equal(label.textContent, text);
   shown = true;
   resize();
-  assert.ok(label.getComputedTextLength() <= 252);
+  assert.ok(label.getComputedTextLength() <= 448);
   assert.match(label.textContent, /…$/);
   assert.equal(h.root.querySelector('.planted-mark').querySelector('title').textContent, text);
   h.dispose();
   assert.equal(disconnected, true);
+});
+
+test('host marks share the favicon hash, colors and letters', () => {
+  const vectors = [
+    ['halvardsystems.com', 3977212790, '#3c8c2c', 'H'],
+    ['community.halvardsystems.com', 2834142159, '#8c6a2c', 'C'],
+    ['securityweek.com', 746036644, '#8c322c', 'S'],
+    ['nvd.nist.gov', 3869253279, '#6a2c8c', 'N'],
+    ['theregister.com', 815285682, '#2c8c6f', 'T'],
+    ['bleepingcomputer.com', 3169656055, '#8c842c', 'B'],
+  ];
+  for (const [key, hash, color, letter] of vectors) {
+    assert.deepEqual(hostMark(key), { key, hash, color, letter });
+    assert.deepEqual(hostMark(`WWW.${key.toUpperCase()}`), hostMark(key));
+  }
+  assert.equal(hostMark('é.com').hash, 229022918);
+  for (const [hosts, letter, color] of [
+    [['google.com', 'www.google.com'], 'G', '#4285f4'],
+    [['bing.com'], 'B', '#00809d'],
+    [['duckduckgo.com', 'html.duckduckgo.com', 'lite.duckduckgo.com'], 'D', '#de5833'],
+    [['en.wikipedia.org', 'fr.wikipedia.org', 'www.wikipedia.org'], 'W', '#333333'],
+    [['reddit.com'], 'R', '#ff4500'], [['youtube.com'], '▶', '#ff0000'], [['github.com'], 'G', '#181717'],
+  ]) for (const host of hosts) assert.deepEqual([hostMark(host).letter, hostMark(host).color], [letter, color]);
+});
+
+test('story hosts have readable display names', () => {
+  for (const [host, name] of [
+    ['www.halvardsystems.com', 'Halvard Systems'], ['community.halvardsystems.com', 'Halvard Community'],
+    ['docs.halvardsystems.com', 'Halvard Docs'], ['www.cisa.gov', 'CISA'],
+    ['nvd.nist.gov', 'NVD'], ['en.wikipedia.org', 'Wikipedia'],
+  ]) assert.equal(short(host), name);
+});
+
+test('listed and opened sites carry marks while their rings keep the activity state', () => {
+  const h = harness(), s = fixture();
+  h.publish(s);
+  const sites = h.root.querySelectorAll('.site-group');
+  const listed = sites.find((g) => g.getAttribute('data-host') === 'www.theregister.co.uk');
+  const opened = sites.find((g) => g.getAttribute('data-host') === 'www.halvardsystems.com');
+  assert.equal(listed.getAttribute('class'), 'site-group listed');
+  assert.equal(listed.querySelector('.site').getAttribute('r'), '8');
+  assert.ok(Number(listed.querySelector('.site').getAttribute('r')) < Number(opened.querySelector('.site').getAttribute('r')));
+  assert.equal(opened.getAttribute('class'), 'site-group opened');
+  assert.equal(opened.querySelector('.site').getAttribute('r'), '9');
+  assert.match(opened.querySelector('.site').getAttribute('class'), /stored scenario/);
+  for (const g of sites) {
+    const mark = hostMark(g.getAttribute('data-host'));
+    assert.equal(g.style['--app-host-color'], mark.color);
+    assert.equal(g.querySelector('.mark').textContent, mark.letter);
+    assert.equal(g.querySelector('.mark').getAttribute('aria-hidden'), 'true');
+    assert.equal(g.querySelector('title').textContent, g.getAttribute('data-host'));
+  }
+  assert.deepEqual(h.root.querySelectorAll('.engine-group').map((g) => g.querySelector('.mark').textContent), ['G', 'B', 'D']);
+  assert.deepEqual(h.root.querySelectorAll('.engine-group').map((g) => g.getAttribute('class')), ['engine-group answered', 'engine-group idle', 'engine-group answered']);
+  h.dispose();
+});
+
+test('a fact without a refused name uses the full row and cuts at seventy characters', () => {
+  const h = harness(), text = 'i'.repeat(90);
+  h.publish(snapshot({ planted: [{ kind: 'fact', text, at_ms: 1 }] }));
+  const mark = h.root.querySelector('.planted-mark');
+  assert.equal(mark.querySelector('text').textContent, 'i'.repeat(69) + '…');
+  assert.equal(mark.querySelectorAll('tspan').length, 1);
+  assert.equal(mark.querySelector('tspan').getAttribute('y'), '544');
+  assert.equal(mark.querySelector('title').textContent, text);
+  h.dispose();
+});
+
+test('wide labels fit every slot without touching neighboring labels', () => {
+  const window = animationWindow({ reduced: true });
+  const create = window.document.createElement;
+  window.document.createElement = (tag) => {
+    const node = create(tag);
+    if (tag === 'text') node.getComputedTextLength = () => node.textContent.length * 11;
+    return node;
+  };
+  const h = harness(window);
+  h.publish(snapshot({ seed: { sites: [] }, pages: Array.from({ length: 21 }, (_, i) => servedPage(`https://${'w'.repeat(18)}${i}.com/`)) }));
+  const labels = h.root.querySelectorAll('.site-group').map((g) => g.querySelector('.label'));
+  assert.equal(labels.length, 21);
+  const boxes = labels.map((label) => {
+    const width = label.getComputedTextLength(), x = Number(label.getAttribute('x')), y = Number(label.getAttribute('y'));
+    assert.ok(width <= 116);
+    assert.ok(x - width / 2 >= 0 && x + width / 2 <= 520);
+    assert.ok(y - 12.5 >= 0 && y <= 560);
+    assert.match(label.textContent, /…$/);
+    return { left: x - width / 2, right: x + width / 2, top: y - 12.5, bottom: y };
+  });
+  for (const [i, a] of boxes.entries()) for (const b of boxes.slice(i + 1)) {
+    assert.ok(a.right < b.left || b.right < a.left || a.bottom < b.top || b.bottom < a.top);
+  }
+  h.dispose();
 });

@@ -53,10 +53,26 @@ export function chipText(p) {
 export function createLanes(root, { name, local, addressFor, animate }) {
   const { el } = scoped(root);
   const lanes = new Map();
+  const closes = new Map();
+  function trim(lane) {
+    for (const item of lane.items) {
+      const left = item.node.offsetLeft ?? item.node.getBoundingClientRect().left - lane.chips.getBoundingClientRect().left;
+      item.node.style.visibility = left < 0 ? 'hidden' : '';
+    }
+  }
+  const ResizeObserver = root.ownerDocument.defaultView?.ResizeObserver;
+  const size = ResizeObserver ? new ResizeObserver(() => lanes.forEach(trim)) : null;
   const quiet = () => el('div', { class: 'packet-lanes-quiet', text: '—' }, root);
   quiet();
-  function clear() { root.replaceChildren(); lanes.clear(); quiet(); }
+  function clear() { size?.disconnect(); root.replaceChildren(); lanes.clear(); closes.clear(); quiet(); }
   function add(p, motion = true) {
+    const connection = flow(p);
+    if (p.proto === 'TCP' && /\[(?:SYN|SYN, ACK)\]/.test(p.info)) closes.delete(connection);
+    const closing = p.proto === 'TCP' && /\[[^\]]*\bFIN\b/.test(p.info) || p.proto.startsWith('TLS') && p.info === 'Encrypted Alert';
+    if (closing) { closes.delete(connection); closes.set(connection, p.t); }
+    while (closes.size > 256) closes.delete(closes.keys().next().value);
+    const reset = p.proto === 'TCP' && /\[[^\]]*\bRST\b/.test(p.info);
+    const quietReset = reset && closes.has(connection) && closes.get(connection) <= p.t;
     const dns = dnsRow(p);
     const back = dns ? dns.back : !local(p.src);
     const remote = back ? p.src : p.dst;
@@ -75,6 +91,7 @@ export function createLanes(root, { name, local, addressFor, animate }) {
       const label = el('span', { text: address || 'no address' }, head);
       lane = { node, title, address: label, last: -Infinity, items: [], chips: el('div', { class: 'packet-chips' }, node) };
       lanes.set(key, lane);
+      size?.observe(lane.chips);
     } else if (dns?.answers.length) lane.address.textContent = dns.answers[0].address;
     lane.title.textContent = host;
     lane.title.setAttribute('title', host);
@@ -98,7 +115,7 @@ export function createLanes(root, { name, local, addressFor, animate }) {
       last.counter.textContent = `×${last.count}`;
       if (motion) animate(last.node, 'scale(.96)', 160);
     } else for (const text of texts) {
-      const chip = el('span', { class: `packet-chip ${kindOf(p)}${back ? ' back' : ''}${p.quiet ? ' quiet' : ''}`, title: p.info }, lane.chips);
+      const chip = el('span', { class: `packet-chip ${kindOf(p)}${back ? ' back' : ''}${(p.quiet || quietReset) && kindOf(p) !== 'bad' ? ' quiet' : ''}`, title: p.info }, lane.chips);
       const label = data ? el('span', { text }, chip) : chip;
       if (!data) chip.textContent = text;
       lane.items.push({ node: chip, t: p.t, data, back, bytes: p.len, count: 1, label });
@@ -109,11 +126,12 @@ export function createLanes(root, { name, local, addressFor, animate }) {
     lane.items.forEach((item, index) => {
       if (lane.chips.children[index] !== item.node) lane.chips.insertBefore(item.node, lane.chips.children[index] || null);
     });
+    trim(lane);
     while (lanes.size > 7) {
       const last = root.children[root.children.length - 1];
-      for (const [key, value] of lanes) if (value.node === last) lanes.delete(key);
+      for (const [key, value] of lanes) if (value.node === last) { size?.unobserve(value.chips); lanes.delete(key); }
       last.remove();
     }
   }
-  return { add, clear, replace(rows) { clear(); rows.forEach((p) => add(p, false)); } };
+  return { add, clear, dispose() { size?.disconnect(); }, replace(rows) { clear(); rows.forEach((p) => add(p, false)); } };
 }

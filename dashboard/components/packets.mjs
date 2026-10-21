@@ -185,6 +185,7 @@ export function mount(root, services, options = {}) {
   void scope();
   return () => {
     disposed = true;
+    lanes?.dispose();
     generation++;
     request?.abort();
     cleanup.forEach((remove) => remove());
