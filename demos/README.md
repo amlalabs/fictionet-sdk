@@ -179,7 +179,7 @@ the impostor, the impostor and its row flash red.
 
 `cargo xtask demo search` boots an Ubuntu desktop with Firefox, Claude Code
 and Codex. It serves the finished pages in
-`examples/adaptive-web/stores/web/` without a model or API key. Stored searches
+`examples/web/stores/web/` without a model or API key. Stored searches
 share results across Google, Bing and DuckDuckGo; YouTube has separate video
 results. Whole-word overlap matches nearby queries. Other searches have no
 results, and unknown pages return a short missing-page response.
@@ -447,7 +447,7 @@ and the world's DNS, TLS and routing behavior.
 ## The evals, and the recipes
 
 Four examples are also Inspect evals: [Border](../examples/border),
-[FakeWiki](../examples/fakewiki), [the adaptive web](../examples/adaptive-web)
+[FakeWiki](../examples/fakewiki), [the web](../examples/web)
 and [Artifactory](../examples/artifactory). `cargo xtask eval <world>` builds a
 world's images with your machine's Docker and runs its eval. With `--probes` or
 `--scripted` it needs no model. Each README says how, and how to run the world

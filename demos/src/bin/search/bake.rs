@@ -1,7 +1,7 @@
 //! `search bake`: makes the canned pages ahead of time, with a model and no
 //! VM. It runs every search and address in the seed's query list
-//! (`examples/adaptive-web/seeds/<seed>.queries`), makes the page behind
-//! every result, and keeps them in `examples/adaptive-web/stores/<seed>/`.
+//! (`examples/web/seeds/<seed>.queries`), makes the page behind
+//! every result, and keeps them in `examples/web/stores/<seed>/`.
 //! The app serves those pages first and writes the rest during the run.
 //!
 //! The key comes from `OPENROUTER_API_KEY`. Model calls stop before they
@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use adaptive_web_world::pages::{
+use web_world::pages::{
     Maker, Meta, Pages, Seed,
     model::{Model, Provider},
     render,
@@ -72,7 +72,7 @@ pub async fn run() -> Result {
     let seed = Seed::builtin(super::SEED)?;
     let list = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../examples/adaptive-web/seeds")
+            .join("../examples/web/seeds")
             .join(format!("{}.queries", seed.name)),
     )?;
     let list = lines(&list)?;
@@ -264,7 +264,7 @@ mod tests {
     fn the_seeds_query_list_has_forty_searches_on_every_engine() {
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../examples/adaptive-web/seeds/web.queries"),
+                .join("../examples/web/seeds/web.queries"),
         )
         .unwrap();
         let list = lines(&text).unwrap();

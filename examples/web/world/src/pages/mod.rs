@@ -836,7 +836,7 @@ impl Pages {
                 self.canned_active
                     .store(self.canned.is_some(), std::sync::atomic::Ordering::SeqCst);
                 *self.planted.lock().unwrap_or_else(|e| e.into_inner()) = Planted::default();
-                fcx.emit("adaptive", "restarted", |event| {
+                fcx.emit("web", "restarted", |event| {
                     event
                         .summary(format_args!("run restarted at revision {}", current + 1))
                         .field("revision", current + 1)
@@ -848,7 +848,7 @@ impl Pages {
         let canned = self.canned_active.load(std::sync::atomic::Ordering::SeqCst);
         drop(store);
         if let Some((kind, text, url)) = planted {
-            fcx.emit("adaptive", "planted", |event| {
+            fcx.emit("web", "planted", |event| {
                 event
                     .summary(format_args!("planted a {kind}: {text}"))
                     .field("plant", kind)
@@ -857,7 +857,7 @@ impl Pages {
                     .field("revision", generation.revision)
             });
         }
-        fcx.emit("adaptive", "generation", |event| {
+        fcx.emit("web", "generation", |event| {
             event
                 .summary(format_args!(
                     "generation {} at revision {}",
@@ -1397,7 +1397,7 @@ impl Pages {
         for row in rows {
             store.log_generation(row).map_err(Stop::store)?;
             if self.live_calls.is_some() && row["record"] == "attempt" {
-                cx.emit("adaptive", "model_call", |event| {
+                cx.emit("web", "model_call", |event| {
                     event.field("call", example_common::events::field(row))
                 });
             }
@@ -1892,7 +1892,7 @@ impl Pages {
             cx.spawn(move |cx| async move {
                 let started = cx.now().since_start();
                 let response = pages.page(&cx, &host, &target, true).await;
-                cx.emit("adaptive", "prefetch_finished", |e| {
+                cx.emit("web", "prefetch_finished", |e| {
                     e.field("url", format!("https://{host}{target}"))
                         .field("status", response.status as u64)
                 });
@@ -2195,7 +2195,7 @@ impl Pages {
     }
 
     pub(crate) fn making(&self, cx: &Cx, host: &str, target: &str) {
-        cx.emit("adaptive", "making", |e| {
+        cx.emit("web", "making", |e| {
             e.field("url", format!("https://{host}{target}"))
                 .field("host", host)
                 .field("site", self.site_name(host))
@@ -2209,7 +2209,7 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
-        cx.emit("adaptive", "making", |e| {
+        cx.emit("web", "making", |e| {
             e.field("url", format!("https://{host}{target}"))
                 .field("host", host)
                 .field("site", self.site_name(host))
@@ -2596,7 +2596,7 @@ impl fictionet_extras::models::Engine for Pages {
             // a Google search for the same words shows, and reports it as a
             // search of its own.
             let id = self.next_query_id();
-            cx.emit("adaptive", "query", |e| {
+            cx.emit("web", "query", |e| {
                 e.summary(format_args!("web search: {query}"))
                     .field("query_id", id)
                     .field("engine", names::name(&Engine::Google))
@@ -2609,7 +2609,7 @@ impl fictionet_extras::models::Engine for Pages {
             let Ok((mut search, cache, usage, carries)) =
                 self.listing(&cx, Engine::Google, &query, 0).await
             else {
-                cx.emit("adaptive", "query_failed", |e| {
+                cx.emit("web", "query_failed", |e| {
                     e.field("query_id", id).field("why", "error")
                 });
                 return Err(fictionet::Error::msg("Search is unavailable"));
@@ -2640,8 +2640,8 @@ impl fictionet_extras::models::Engine for Pages {
                 "serve_ms",
                 (cx.now().since_start() - started).as_millis() as u64,
             );
-            cx.emit("adaptive", "search_answer", |e| e.fields(fields));
-            cx.emit("adaptive", "search", |e| {
+            cx.emit("web", "search_answer", |e| e.fields(fields));
+            cx.emit("web", "search", |e| {
                 e.field("query_id", id)
                     .field("source", source)
                     .field("search", query.as_str())

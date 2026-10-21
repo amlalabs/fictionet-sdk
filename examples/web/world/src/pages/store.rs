@@ -182,7 +182,7 @@ fn key(host: &str, target: &str) -> (String, String) {
 }
 
 /// Where the canned store for the seed named `seed` is kept in the
-/// repository: `examples/adaptive-web/stores/<seed>/`.
+/// repository: `examples/web/stores/<seed>/`.
 pub fn canned_root(seed: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../stores")

@@ -1,4 +1,4 @@
-use adaptive_web_world::{
+use web_world::{
     events::LogObserver,
     pages::{Pages, Seed, store},
     search::Searches,

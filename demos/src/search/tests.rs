@@ -1,7 +1,7 @@
 use super::*;
 use crate::kit::client::PageClient;
 use crate::search as page;
-use adaptive_web_world::{World, pages::Seed};
+use web_world::{World, pages::Seed};
 use example_common::log::Log;
 use fictionet::{
     Cx,
@@ -63,7 +63,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
     fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
         move |cx| async move {
-            let start = adaptive_web_world::world_start(&seed.date)?;
+            let start = web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed.clone(), start)?;
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
             let (attacher, attachments) = fictionet::attachments();
@@ -104,10 +104,10 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                     .len(),
                 10
             );
-            let state: adaptive_web_world::search::Snapshot =
+            let state: web_world::search::Snapshot =
                 serde_json::from_value(snapshot["value"].clone()).unwrap();
             let first = first_generated(&seed, &state.results[0]).unwrap();
-            let (host, path) = adaptive_web_world::pages::text::target_of(&first.url);
+            let (host, path) = web_world::pages::text::target_of(&first.url);
             fetch(&cx, &machine, &host, &path, start).await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
             let snapshot = client.get_json("/api/state/web").await.unwrap();
@@ -255,7 +255,7 @@ async fn command(
 }
 fn first_generated<'a>(seed: &Seed, list: &'a search::Results) -> Option<&'a search::Listed> {
     list.listed.iter().find(|r| {
-        let (host, path) = adaptive_web_world::pages::text::target_of(&r.url);
+        let (host, path) = web_world::pages::text::target_of(&r.url);
         seed.fixed_for(&host, &path).is_none()
     })
 }
@@ -356,7 +356,7 @@ fn search_javascript() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_page_stays_making_until_the_model_answers() {
-    use adaptive_web_world::pages::{
+    use web_world::pages::{
         model::{Model, Provider},
         store,
     };
@@ -489,7 +489,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
     fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(searches),
         move |cx| async move {
-            let start = adaptive_web_world::world_start(&seed.date)?;
+            let start = web_world::world_start(&seed.date)?;
             let prepared = seed.sites[0].host.clone();
             let world = World::new(&cx, seed, start)?;
             let root = Certificate::from_pem(world.ca.cert_pem().as_bytes())?;
@@ -514,11 +514,11 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
                 "10.0.0.2".parse::<std::net::Ipv4Addr>()?,
             );
             let mut names = vec!["api.anthropic.com", &prepared, "alder-notebook.com"];
-            names.extend(adaptive_web_world::route::SEARCH_HOSTS);
+            names.extend(web_world::route::SEARCH_HOSTS);
             names.extend(FORWARDED.iter().map(|(host, _)| *host));
             for host in names {
                 let answer = machine
-                    .lookup(&cx, adaptive_web_world::GATEWAY.into(), host, RecordType::A)
+                    .lookup(&cx, web_world::GATEWAY.into(), host, RecordType::A)
                     .await?;
                 assert!(!answer.answers.is_empty(), "{host}");
                 let (assigned, _) = world.addresses.assign(host)?.unwrap();
@@ -536,7 +536,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
                 let answer = machine
                     .lookup(
                         &cx,
-                        adaptive_web_world::GATEWAY.into(),
+                        web_world::GATEWAY.into(),
                         host,
                         RecordType::AAAA,
                     )
@@ -582,7 +582,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
                 let answer = machine
                     .lookup(
                         &cx,
-                        adaptive_web_world::GATEWAY.into(),
+                        web_world::GATEWAY.into(),
                         host,
                         RecordType::PTR,
                     )

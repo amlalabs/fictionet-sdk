@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adaptive_web_world::{
+use web_world::{
     pages::{Applied, Command, Pages},
     search::{self, Searches},
 };
@@ -113,10 +113,10 @@ impl Topics {
                 Ok(pages
                     .apply(&cx, command.clone())
                     .map_err(|rejected| match rejected {
-                        adaptive_web_world::pages::Rejected::Stale { current } => {
+                        web_world::pages::Rejected::Stale { current } => {
                             Rejected::StaleRevision { current }
                         }
-                        adaptive_web_world::pages::Rejected::Invalid { message } => {
+                        web_world::pages::Rejected::Invalid { message } => {
                             Rejected::Invalid { message }
                         }
                     }))
@@ -158,12 +158,12 @@ impl Default for Topics {
     }
 }
 
-/// The world's network for the guest run and the preview: the adaptive web,
+/// The world's network for the guest run and the preview: the web,
 /// with the names in [`FORWARDED`] served from the kit's package mirror and,
 /// given one, Claude Code's model site at `api.anthropic.com`. Every HTTPS
 /// name has a certificate from the world's CA.
 pub fn network(
-    world: &adaptive_web_world::World,
+    world: &web_world::World,
     cx: &Cx,
     log: Arc<example_common::log::Log>,
     mirror: crate::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,

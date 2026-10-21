@@ -1,4 +1,4 @@
-# The adaptive web
+# The web
 
 Start with the [no-model quick start](#quick-start) to inspect searches, pages
 and the world's request log.
@@ -8,7 +8,7 @@ and the world's request log.
 > familiar URLs. They are shortened pages, not copies of live sites. Page
 > requests never reach a real website.
 
-The adaptive web is a Fictionet world that answers whatever an agent does
+The web is a Fictionet world that answers whatever an agent does
 on the web, as it does it. The agent can search Google, DuckDuckGo or Bing
 for anything, follow any result, and type any URL on any domain. Every name
 that could be a public host resolves; single-label and malformed names, and
@@ -30,7 +30,7 @@ they do outside.
 
 Run `cargo xtask demo search` on Linux with KVM. One executable boots an
 official Ubuntu 24.04 desktop through Cloud Hypervisor, with Firefox and Claude
-Code, and runs the adaptive web in-process. It serves finished pages from `stores/web/`, with empty results for unrelated
+Code, and runs the web in-process. It serves finished pages from `stores/web/`, with empty results for unrelated
 searches and short missing pages for unknown URLs. No page costs a model call. The page opens in
 Chromium and stays up until Ctrl-C. `cargo xtask demo search check` runs the
 scripted story and its checks instead. See
@@ -48,10 +48,10 @@ The deterministic stub generator needs no key. The runtime world has no
 network access after setup.
 
 ```bash
-cargo xtask eval adaptive-web --live '{"seed":"corvane-acquisition","generator":"stub"}'
+cargo xtask eval web --live '{"seed":"corvane-acquisition","generator":"stub"}'
 ```
 
-The demo keeps its pages in `examples/adaptive-web/store/<seed>/`, owned by
+The demo keeps its pages in `examples/web/store/<seed>/`, owned by
 root because the world runs as root. A later demo run of the same seed
 serves those pages again instead of making new ones. It must use the same
 generator, model and reasoning setting, or `"generator":"replay"`;
@@ -63,7 +63,7 @@ Run the probes to check the world's requests:
 
 ```bash
 uv sync --project python/inspect_fictionet --locked
-cargo xtask eval adaptive-web --probes --model mockllm/model --log-dir logs/probes
+cargo xtask eval web --probes --model mockllm/model --log-dir logs/probes
 uv run --project python/inspect_fictionet --locked inspect view --log-dir logs/probes
 ```
 
@@ -78,16 +78,16 @@ export OPENROUTER_API_KEY=...
 The demo with a real agent, here Claude Sonnet 5.5 doing the research:
 
 ```bash
-cargo xtask eval adaptive-web -T generator=openrouter --model openrouter/anthropic/claude-sonnet-5.5 --log-dir logs/live
+cargo xtask eval web -T generator=openrouter --model openrouter/anthropic/claude-sonnet-5.5 --log-dir logs/live
 uv run --project python/inspect_fictionet --locked inspect view --log-dir logs/live
 ```
 
-The first run builds the images (`fictionet-adaptive-web-*`), which takes a
+The first run builds the images (`fictionet-web-*`), which takes a
 few minutes. Each run takes its containers down when it ends.
 
 World settings are explicit arguments. Inspect task options use `-T`, such as
 `-T generator=openrouter` and `-T store_dir=/absolute/path`. Direct world
-commands and `cargo xtask eval adaptive-web --live` take a JSON object as their
+commands and `cargo xtask eval web --live` take a JSON object as their
 first argument. Its string fields are:
 
 | option | setting |
@@ -96,7 +96,7 @@ first argument. Its string fields are:
 | `model` | provider model; defaults to `google/gemini-3.1-flash-lite` or `claude-haiku-4-5-20251001` |
 | `prefetch` | pages to make ahead of time; default 3 with a model |
 | `reasoning` | OpenRouter reasoning effort |
-| `store` | absolute store directory; live browsing defaults to `examples/adaptive-web/store` |
+| `store` | absolute store directory; live browsing defaults to `examples/web/store` |
 
 Only `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY` come from the environment.
 The world has normal outbound networking with every generator, both in the
@@ -204,7 +204,7 @@ has said.
 
 Three containers, as in FakeWiki:
 
-* **`fictionet`, the world.** `adaptive-web-world` makes and keeps the pages
+* **`fictionet`, the world.** `web-world` makes and keeps the pages
   itself. It listens on the world socket and serves `web::Sites`:
   * **Names.** Every name that could be a host on the internet gets a site
     the first time it is looked up: two or more labels of letters, digits
@@ -318,7 +318,7 @@ generator, `mod.rs` routes requests and holds the consistency rules,
 lists, and `text.rs` checks snippets and finds what gives generated text
 away.
 
-The store, under `/var/lib/adaptive-web/<seed>/`, is plain JSON, one line
+The store, under `/var/lib/web/<seed>/`, is plain JSON, one line
 per thing made, so a person can find a page by searching for its URL:
 
 ```
@@ -418,7 +418,7 @@ database, stock pages, package pages, docs and Hacker News threads. The
 judge was told that one was written by a model and asked which. Each pair
 was shown in both orders. The table gives how often the judge picked the
 real one as the fake; 50% means it cannot tell them apart
-(`python -m inspect_fictionet.worlds.adaptive_web.realism`):
+(`python -m inspect_fictionet.worlds.web.realism`):
 
 | model | result lists | pages | pages not backing their snippet (earlier lenient rule) | pages with tells |
 |---|---|---|---|---|
@@ -525,7 +525,7 @@ as 503.
 ## Keep the generated pages and serve them again
 
 By default an Inspect run gets a fresh container store that goes
-away with the run, and `cargo xtask eval adaptive-web --live` keeps its store in `examples/adaptive-web/store`.
+away with the run, and `cargo xtask eval web --live` keeps its store in `examples/web/store`.
 Pass `store` to an absolute directory to keep the store
 there instead. A later run with the same seed and directory starts from
 everything the earlier one made: the same pages, results, cast and
@@ -603,7 +603,7 @@ or `missing` cache states fail the inventory check.
 
 ## Tests
 
-* `cargo test --locked -p adaptive-web-world` runs the world end to end
+* `cargo test --locked -p web-world` runs the world end to end
   with the offline generator on a fresh store, and compares its log with
   the recorded one (`tests/golden/`). It also checks that every result
   resolves to a page with its title, that URLs return the same bytes, and
@@ -619,14 +619,14 @@ or `missing` cache states fail the inventory check.
   `tests/model.rs` runs the model client over HTTP on 127.0.0.1. A key
   with characters outside printable ASCII (0x21-0x7E) is rejected at
   startup, before any request.
-* `uv run --project python/inspect_fictionet --locked pytest python/inspect_fictionet/tests/adaptive_web`
+* `uv run --project python/inspect_fictionet --locked pytest python/inspect_fictionet/tests/web`
   checks citation identity, complete delivery, checked preflights and probe
   diagnostics, request multiplicity and cache sequences. It needs no Docker.
 
 ## Layout
 
 ```
-examples/adaptive-web/
+examples/web/
   compose.yaml              # world, attach, default (the agent)
   docker/Dockerfile         # build, world, attach, agent
   seeds/                    # the seeds, and fixed/ pages they serve
@@ -642,8 +642,8 @@ examples/adaptive-web/
     tests/lab.rs            # the world and its budget without real I/O
     tests/model.rs          # the model client over HTTP
 python/inspect_fictionet/
-  src/inspect_fictionet/worlds/adaptive_web/  # task, scorer, timing populations and realism judge
-  tests/adaptive_web/                        # scorer tests and scripted probes
+  src/inspect_fictionet/worlds/web/  # task, scorer, timing populations and realism judge
+  tests/web/                        # scorer tests and scripted probes
 ```
 
 ## Limits

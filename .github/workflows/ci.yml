@@ -136,7 +136,7 @@ jobs:
             targets: fictionet container scanner
           - dockerfile: examples/fakewiki/docker/Dockerfile
             targets: world attach agent
-          - dockerfile: examples/adaptive-web/docker/Dockerfile
+          - dockerfile: examples/web/docker/Dockerfile
             targets: world attach agent
           - dockerfile: examples/artifactory/docker/Dockerfile
             targets: world attach agent

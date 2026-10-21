@@ -1,7 +1,7 @@
-"""Can a model tell the adaptive web from the real one?
+"""Can a model tell the web from the real one?
 
-    uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.adaptive_web.realism real REAL_DIR
-    OPENROUTER_API_KEY=... uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.adaptive_web.realism judge BENCH_DIR REAL_DIR JUDGE_MODEL
+    uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.web.realism real REAL_DIR
+    OPENROUTER_API_KEY=... uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.web.realism judge BENCH_DIR REAL_DIR JUDGE_MODEL
 
 `real` saves, in REAL_DIR, the text of real result lists and real pages on
 topics like each seed's (a real VPN vulnerability, a real biotech deal, a

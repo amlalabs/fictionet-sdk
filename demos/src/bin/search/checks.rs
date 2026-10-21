@@ -1,5 +1,5 @@
 use super::{Result, guest::HOST};
-use adaptive_web_world::{
+use web_world::{
     pages::{
         Seed,
         store::{self, Store},
@@ -90,7 +90,7 @@ pub(super) fn search_url(engine: Engine, words: &str) -> String {
     };
     format!(
         "{base}{}",
-        adaptive_web_world::pages::text::quote(words, "")
+        web_world::pages::text::quote(words, "")
     )
 }
 
@@ -423,7 +423,7 @@ pub async fn run_story(
             Engine::DuckDuckGo,
             Engine::YouTube,
         ] {
-            let key = adaptive_web_world::route::query_key(words, 0);
+            let key = web_world::route::query_key(words, 0);
             let key = if engine == Engine::YouTube {
                 format!("youtube {key}")
             } else {
@@ -443,7 +443,7 @@ pub async fn run_story(
             .await?;
             after = query.id;
             visited
-                .insert(adaptive_web_world::pages::text::target_of(&search_url(engine, words)).0);
+                .insert(web_world::pages::text::target_of(&search_url(engine, words)).0);
             check(
                 "task search reads the store without generation",
                 query.cache == Some(Cache::Cached) && query.model.is_empty(),
@@ -462,7 +462,7 @@ pub async fn run_story(
                     .map(|r| (&r.url, &r.title))),
             )?;
             for result in &expected.search.results {
-                let (host, target) = adaptive_web_world::pages::text::target_of(&result.url);
+                let (host, target) = web_world::pages::text::target_of(&result.url);
                 let record = canned
                     .page(&host, &target)
                     .ok_or("a result has no stored page")?;
@@ -473,7 +473,7 @@ pub async fn run_story(
                     &format!("{} serves its finished stored text", result.title),
                     body.as_bytes() == record.body && body.len() > 900,
                 )?;
-                adaptive_web_world::pages::text::validate_page(
+                web_world::pages::text::validate_page(
                     &record.content_type,
                     body.as_bytes(),
                 )?;
@@ -692,7 +692,7 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
             move |cx| async move {
-                let pages = std::sync::Arc::new(adaptive_web_world::pages::Pages::new(
+                let pages = std::sync::Arc::new(web_world::pages::Pages::new(
                     Seed::builtin("web")?,
                 ));
                 for (host, target) in [
@@ -739,7 +739,7 @@ mod tests {
         for name in ["web", "corvane-acquisition", "fastjsonl-package"] {
             let seed = Seed::builtin(name).unwrap();
             assert!(!seed.search.is_empty(), "{name}");
-            let (host, _) = adaptive_web_world::pages::text::target_of(&seed.visit);
+            let (host, _) = web_world::pages::text::target_of(&seed.visit);
             assert!(seed.visit.starts_with("https://"), "{name}");
             assert!(seed.sites.iter().any(|site| site.host == host), "{name}");
         }

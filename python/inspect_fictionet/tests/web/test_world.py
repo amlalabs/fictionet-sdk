@@ -1,7 +1,7 @@
 """Citation credit requires complete delivery of the cited resource."""
 import unittest
 
-from inspect_fictionet.worlds.adaptive_web.world import latency, summarize
+from inspect_fictionet.worlds.web.world import latency, summarize
 
 
 def entry(**changes):

@@ -90,7 +90,7 @@ def evidence():
         "env": observation(out="PATH=/usr/bin\n"),
         "ls world dirs": observation(out="ls: /var/lib/fictionet: No such file or directory\nrc=2"),
     }
-    for path in ("/var/lib/fictionet", "/var/lib/adaptive-web", "/run/fictionet", "/run/relay"):
+    for path in ("/var/lib/fictionet", "/var/lib/web", "/run/fictionet", "/run/relay"):
         info[f"test -e {path}"] = observation(1)
         info[f"ls -ld {path}"] = observation(2, err=f"ls: cannot access '{path}': No such file or directory\n")
     outside = {}
@@ -304,7 +304,7 @@ class ProbeEdgeCases(unittest.TestCase):
         self.assertTrue(self.checks()["world_process_invisible"])
 
     def test_visible_process_is_separate(self):
-        self.ev["info"]["ps"]["out"] += "  2 root adaptive-web-world\n"
+        self.ev["info"]["ps"]["out"] += "  2 root web-world\n"
         self.assertFalse(self.checks()["world_process_invisible"])
         self.assertTrue(self.checks()["world_files_invisible"])
 

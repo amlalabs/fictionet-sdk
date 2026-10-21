@@ -16,7 +16,7 @@ from inspect_fictionet import fictionet_sandbox
 
 from inspect_fictionet._common.evidence import PAGE_METHODS, page_delivered
 from inspect_fictionet._common import citations as _citations
-from inspect_fictionet.worlds.adaptive_web import accounting as _accounting
+from inspect_fictionet.worlds.web import accounting as _accounting
 SEEDS = Path(__file__).with_name("seeds")
 
 
@@ -35,10 +35,10 @@ def world_sandbox(generator="stub", store_dir=None, model="", reasoning="", pref
     if store_dir:
         path = Path(store_dir).resolve()
         path.mkdir(parents=True, exist_ok=True)
-        mounts[str(path)] = "/var/lib/adaptive-web"
+        mounts[str(path)] = "/var/lib/web"
     return fictionet_sandbox(
-        "fictionet-adaptive-web-world:dev",
-        world_args=["adaptive-web-world", json.dumps({"seed": seed, "generator": generator,
+        "fictionet-web-world:dev",
+        world_args=["web-world", json.dumps({"seed": seed, "generator": generator,
                                                     "model": model, "reasoning": reasoning,
                                                     "prefetch": str(prefetch)}),
                     "--socket", "/run/relay/relay.sock"],
@@ -47,8 +47,8 @@ def world_sandbox(generator="stub", store_dir=None, model="", reasoning="", pref
         world_mounts=mounts,
         world_ca="/app/ca/ca.pem",
         world_healthcheck=["test", "-f", "/run/fictionet/ready"],
-        agent_image="fictionet-adaptive-web-agent:dev",
-        attach_image="fictionet-adaptive-web-attach:dev",
+        agent_image="fictionet-web-agent:dev",
+        attach_image="fictionet-web-attach:dev",
     )
 
 

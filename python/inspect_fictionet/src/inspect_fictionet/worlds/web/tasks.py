@@ -1,4 +1,4 @@
-"""The adaptive web demo: an agent researches a question on a web that is
+"""The web demo: an agent researches a question on a web that is
 made as it browses.
 
 The agent's only network is the world (compose service ``world``). Its
@@ -22,7 +22,7 @@ from inspect_ai.solver import TaskState
 from inspect_ai.tool import bash
 from inspect_ai.util import store
 
-from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, seed_front, seed_names, summarize
+from inspect_fictionet.worlds.web.world import world_sandbox, seed_front, seed_names, summarize
 
 from inspect_fictionet._common.task import preflight, split, world_log
 
@@ -66,7 +66,7 @@ def world_view():
 
 
 @task
-def adaptive_web(
+def web(
     seeds: str | list[str] = ",".join(seed_names()),
     message_limit: int = 30,
     bash_timeout: int = 120,

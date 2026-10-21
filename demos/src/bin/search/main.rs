@@ -1,5 +1,5 @@
 //! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
-//! plain adaptive web: no scenario, nothing planted.
+//! plain web: no scenario, nothing planted.
 //!
 //! - `search <downloads>` is the app: it boots, opens the page and stays up
 //!   until Ctrl-C. Prepared pages answer searches and fetches without a model.
@@ -13,7 +13,7 @@ mod guest;
 mod preview;
 use fictionet_demo::search as page;
 
-use adaptive_web_world::{
+use web_world::{
     Addresses, Ca, World,
     events::LogObserver,
     pages::{Pages, Seed},
@@ -63,7 +63,7 @@ fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
 fn app_pages(seed: Seed) -> Result<Pages> {
     Ok(Pages::canned(
         seed,
-        &adaptive_web_world::pages::store::canned_root(SEED),
+        &web_world::pages::store::canned_root(SEED),
     )?)
 }
 
@@ -96,7 +96,7 @@ async fn main() -> Result {
         .observer(Arc::new(LogObserver { log: log.clone() }))
         .page(move |dashboard, hosts| view.page(dashboard, hosts.take(guest::HOST)))
         .world(move |cx, mut world| async move {
-            let start = adaptive_web_world::world_start(&seed.date)?;
+            let start = web_world::world_start(&seed.date)?;
             let web = World {
                 ca: Arc::new(Ca::in_memory(&cx, start)?),
                 addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn the_app_always_serves_prepared_pages_without_a_model() {
-        use adaptive_web_world::pages::{GeneratorKind, NewPages, Seed};
+        use web_world::pages::{GeneratorKind, NewPages, Seed};
         let pages = super::app_pages(Seed::builtin(super::SEED).unwrap()).unwrap();
         assert_eq!(pages.generator_kind(), GeneratorKind::Stub);
         assert_eq!(pages.prefetch(), 0);

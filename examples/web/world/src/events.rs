@@ -31,7 +31,7 @@ impl fictionet::events::Observer for LogObserver {
         let fictionet::events::Interest::Event(metadata, _) = interest else {
             return false;
         };
-        matches!(metadata.source, "net" | "dns" | "tls" | "http" | "adaptive")
+        matches!(metadata.source, "net" | "dns" | "tls" | "http" | "web")
     }
     fn lost(&self, loss: fictionet::events::Loss) {
         if loss.stream != fictionet::events::Stream::Events {
@@ -92,19 +92,19 @@ fn get(e: &Event, name: &str) -> Value {
 fn line(e: &Event) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
     match (e.source, e.kind) {
-        ("adaptive", "model_call") => {
+        ("web", "model_call") => {
             let mut call = get(e, "call");
             call["type"] = json!("model_call");
             Some(call)
         }
-        ("adaptive", "search") => Some(json!({"type":"search", "id":get(e,"query_id"),
+        ("web", "search") => Some(json!({"type":"search", "id":get(e,"query_id"),
             "source":get(e,"source"), "query":get(e,"search"),
             "results":e.str("returned").and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(Value::Null)})),
-        ("adaptive", "generation") => Some(json!({"type": "generation",
+        ("web", "generation") => Some(json!({"type": "generation",
             "generate": get(e, "generate"), "revision": get(e, "revision")})),
-        ("adaptive", "query") => Some(json!({"type": "query", "id": get(e, "query_id"),
+        ("web", "query") => Some(json!({"type": "query", "id": get(e, "query_id"),
             "engine": get(e, "engine"), "search": get(e, "search"), "start": get(e, "start")})),
-        ("adaptive", "search_answer") => {
+        ("web", "search_answer") => {
             let mut row = json!({"type": "search_answer",
                 "id": get(e, "query_id"), "cache": get(e, "cache"), "results": get(e, "results"),
                 "model": get(e, "model")});
@@ -115,7 +115,7 @@ fn line(e: &Event) -> Option<Value> {
             }
             Some(row)
         }
-        ("adaptive", "query_failed") => {
+        ("web", "query_failed") => {
             let mut line =
                 json!({"type": "query_failed", "id": get(e, "query_id"), "why": get(e, "why")});
             for name in ["error", "serve_ms"] {
@@ -133,16 +133,16 @@ fn line(e: &Event) -> Option<Value> {
             println!("detached {}", name.as_deref().unwrap_or(""));
             None
         }
-        ("adaptive", "site") => Some(json!({
+        ("web", "site") => Some(json!({
             "type": "site",
             "host": get(e, "host"),
             "addr": get(e, "addr"),
             "why": get(e, "why"),
         })),
-        ("adaptive", "refused") => {
+        ("web", "refused") => {
             Some(json!({"type": "refused", "host": get(e, "host"), "why": get(e, "why")}))
         }
-        ("adaptive", "cert") => Some(json!({
+        ("web", "cert") => Some(json!({
             "type": "cert",
             "host": get(e, "host"),
             "not_before": get(e, "not_before"),
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(
             (events[0].source, events[0].kind),
-            ("adaptive", "generation")
+            ("web", "generation")
         );
         assert_eq!(
             line(&events[0]),
@@ -327,7 +327,7 @@ mod tests {
     fn query_lines_and_http_context() {
         use fictionet::events::{Fanout, Observation, Observer, Stamp, Stream};
         use fictionet_observe::Memory;
-        let query = Event::new("adaptive", "query")
+        let query = Event::new("web", "query")
             .field("query_id", 3u64)
             .field("engine", "google")
             .field("search", "a")
@@ -337,7 +337,7 @@ mod tests {
             Some(json!({"type":"query","id":3,"engine":"google","search":"a","start":10}))
         );
         for why in ["error", "budget", "abandoned"] {
-            let failed = Event::new("adaptive", "query_failed")
+            let failed = Event::new("web", "query_failed")
                 .field("query_id", 3u64)
                 .field("why", why);
             assert_eq!(
@@ -428,12 +428,12 @@ mod live_tests {
     fn model_calls_keep_cost_time_and_outcome_in_the_run_log() {
         let call = json!({"record":"attempt", "kind":"page", "url":"https://example.com/a",
             "model":"writer", "cost":0.001, "gen_ms":3200, "outcome":"ok", "terminal":true});
-        let event = Event::new("adaptive", "model_call")
+        let event = Event::new("web", "model_call")
             .field("call", example_common::events::field(&call));
         let mut expected = call;
         expected["type"] = json!("model_call");
         assert_eq!(line(&event), Some(expected));
-        let event = Event::new("adaptive", "search_answer")
+        let event = Event::new("web", "search_answer")
             .field("gen_ms", 3800u64)
             .field("serve_ms", 3800u64)
             .field("cost", fictionet::events::float(0.002));

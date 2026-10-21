@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
-# The adaptive web on Fictionet. Build context: the fictionet-sdk root (see
+# The web on Fictionet. Build context: the fictionet-sdk root (see
 # ../compose.yaml), so the world and attach build from this crate.
 #
-#   build   - the Rust world in examples/adaptive-web/world, and the
+#   build   - the Rust world in examples/web/world, and the
 #             fictionet binary (fictionet attach) from the same target dir
 #   world   - compose service "world": the Rust world, which makes and
 #             keeps the pages itself
@@ -27,18 +27,18 @@ COPY examples examples
 # At most 8 jobs, so the build fits next to other work on the machine.
 ARG CARGO_BUILD_JOBS=8
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target,id=fictionet-adaptive-web-target \
-    cargo build --release --locked -p adaptive-web-world --bin adaptive-web-world \
+    --mount=type=cache,target=/src/target,id=fictionet-web-target \
+    cargo build --release --locked -p web-world --bin web-world \
     && cargo build --release --locked -p fictionet-cli --bin fictionet \
-    && cp target/release/adaptive-web-world target/release/fictionet /usr/local/bin/
+    && cp target/release/web-world target/release/fictionet /usr/local/bin/
 
 FROM debian:bookworm-slim AS world
 # iproute2 only so the probes can show `ss -lntup` from inside the world.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
-COPY --from=build /usr/local/bin/adaptive-web-world /usr/local/bin/
-COPY examples/adaptive-web/seeds /app/seeds
+COPY --from=build /usr/local/bin/web-world /usr/local/bin/
+COPY examples/web/seeds /app/seeds
 WORKDIR /app
-CMD ["adaptive-web-world"]
+CMD ["web-world"]
 
 FROM debian:bookworm-slim AS attach
 COPY --from=build /usr/local/bin/fictionet /fictionet

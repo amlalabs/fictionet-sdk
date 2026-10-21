@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from inspect_fictionet.worlds.adaptive_web import realism
+from inspect_fictionet.worlds.web import realism
 
 
 def evidence(url, text_length):

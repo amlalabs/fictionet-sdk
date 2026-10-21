@@ -1,5 +1,5 @@
-# The adaptive web on Fictionet under Docker Compose, which cargo xtask demo
-# adaptive-web runs in the VM.
+# The web on Fictionet under Docker Compose, which cargo xtask demo
+# web runs in the VM.
 #
 #   world     - the world: web::Sites in Rust for any name, which makes and
 #               keeps the pages. It has normal outbound networking for
@@ -12,30 +12,30 @@
 #
 # World options use command arguments. Provider API keys use the environment.
 
-name: fictionet-adaptive-web
+name: fictionet-web
 
 x-build: &build
   context: ../..
-  dockerfile: examples/adaptive-web/docker/Dockerfile
+  dockerfile: examples/web/docker/Dockerfile
 
 services:
   world:
     build:
       <<: *build
       target: world
-    image: fictionet-adaptive-web-world:dev
+    image: fictionet-web-world:dev
     init: true                      # passes SIGTERM on to the world
     # The world is trusted. NET_ADMIN lets it raise its socket buffers to
     # attach past the system limit, so a burst of packets is not lost.
     cap_add: [NET_ADMIN]
-    command: ["adaptive-web-world", '{"seed":"${SAMPLE_METADATA_SEED:-web}","generator":"stub"}' ]
+    command: ["web-world", '{"seed":"${SAMPLE_METADATA_SEED:-web}","generator":"stub"}' ]
     environment:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       - ca:/app/ca
       - sock:/run/fictionet/sock
-      - store:/var/lib/adaptive-web
+      - store:/var/lib/web
     healthcheck:
       test: ["CMD", "test", "-f", "/run/fictionet/ready"]
       interval: 1s
@@ -47,7 +47,7 @@ services:
     build:
       <<: *build
       target: attach
-    image: fictionet-adaptive-web-attach:dev
+    image: fictionet-web-attach:dev
     command:
       - fictionet
       - attach
@@ -88,7 +88,7 @@ services:
     build:
       <<: *build
       target: agent
-    image: fictionet-adaptive-web-agent:dev
+    image: fictionet-web-agent:dev
     network_mode: "service:attach"
     volumes:
       - ca:/app/ca:ro

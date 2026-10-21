@@ -1,7 +1,7 @@
 //! `search preview`: the search page with real world traffic, an in-world
 //! scripted client and a labeled preview console.
 
-use adaptive_web_world::{
+use web_world::{
     Addresses, Ca, World,
     pages::{self, Seed},
     search::Searches,
@@ -87,7 +87,7 @@ pub async fn run() -> Result {
         move |cx| async move {
             containment.publish(cx.now(), &Containment::default())?;
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
-            let start = adaptive_web_world::world_start(&seed.date)?;
+            let start = web_world::world_start(&seed.date)?;
             let world = World {
                 ca: Arc::new(Ca::in_memory(&cx, start)?),
                 addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),

@@ -2,10 +2,10 @@ use crate::process::{Checks, Cleanup, Result, capture, cmd, input, run as execut
 use serde_json::Value;
 use std::process::{Command, Stdio};
 
-const HELP: &str = "cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [--no-build] [Inspect arguments...]
+const HELP: &str = "cargo xtask eval <border|fakewiki|web|artifactory> [--no-build] [Inspect arguments...]
   --probes       Run containment and world probes without a model
   --scripted     Run Border or Artifactory's scripted scorer tests
-  --live [JSON] [query...]   Browse the adaptive web without an agent model
+  --live [JSON] [query...]   Browse the web without an agent model
 Images are built from this checkout unless --no-build is given.
 Inspect arguments, including --model, --epochs, --log-dir and -T, pass through.
 Logs default to logs/<world>. FakeWiki defaults to the three local Ollama models.";
@@ -29,7 +29,7 @@ pub fn run(args: &[String]) -> Result {
     }
     let module = match world.as_str() {
         "border" | "fakewiki" | "artifactory" => world.as_str(),
-        "adaptive-web" => "adaptive_web",
+        "web" => "web",
         _ => return Err(HELP.into()),
     };
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -196,7 +196,7 @@ fn task_path(module: &str, mode: &str) -> Result<String> {
         "--scripted" if matches!(module, "border" | "artifactory") => Ok(format!(
             "{package}/tests/{module}/probes.py@{module}_scripted"
         )),
-        "--live" if module == "adaptive_web" => Ok(String::new()),
+        "--live" if module == "web" => Ok(String::new()),
         _ => Err(format!("{mode} is not available for {module}\n{HELP}").into()),
     }
 }
@@ -210,7 +210,7 @@ fn live(args: &[String]) -> Result {
         .unwrap_or_else(|| "openrouter".into());
     let store = config.remove("store").unwrap_or_else(|| {
         crate::root()
-            .join("examples/adaptive-web/store")
+            .join("examples/web/store")
             .display()
             .to_string()
     });
@@ -233,7 +233,7 @@ fn live(args: &[String]) -> Result {
     let mut config = uv(&[
         "python",
         "-c",
-        "import json, sys; from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, seed_front; print(json.dumps([world_sandbox(seed=sys.argv[1], generator=sys.argv[2], store_dir=sys.argv[3], model=sys.argv[4], reasoning=sys.argv[5], prefetch=sys.argv[6]).config, seed_front(sys.argv[1])['question']]))",
+        "import json, sys; from inspect_fictionet.worlds.web.world import world_sandbox, seed_front; print(json.dumps([world_sandbox(seed=sys.argv[1], generator=sys.argv[2], store_dir=sys.argv[3], model=sys.argv[4], reasoning=sys.argv[5], prefetch=sys.argv[6]).config, seed_front(sys.argv[1])['question']]))",
         &seed,
         &generator,
         &store,
@@ -242,7 +242,7 @@ fn live(args: &[String]) -> Result {
         &prefetch,
     ]);
     let (file, question): (String, String) = serde_json::from_str(&capture(&mut config)?)?;
-    let project = format!("adaptive-web-{}", crate::process::token(6)?);
+    let project = format!("web-{}", crate::process::token(6)?);
     let compose = |args: &[&str]| {
         let mut command = cmd("docker", &["compose", "-f", &file, "-p", &project]);
         command.args(args);

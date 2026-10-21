@@ -1,8 +1,8 @@
 [package]
-name = "adaptive-web-world"
+name = "web-world"
 version = "0.0.0"
 edition = "2024"
-description = "The adaptive web on Fictionet: web::Sites for any name, with pages made on first request, by a model or offline, and kept."
+description = "The web on Fictionet: web::Sites for any name, with pages made on first request, by a model or offline, and kept."
 license = "MIT OR Apache-2.0"
 publish = false
 

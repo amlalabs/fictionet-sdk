@@ -3,30 +3,6 @@
 version = 4
 
 [[package]]
-name = "adaptive-web-world"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "example-common",
- "fictionet",
- "fictionet-extras",
- "fictionet-host",
- "fictionet-observe",
- "form_urlencoded",
- "http",
- "http-body-util",
- "kuchiki",
- "regex",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "toml",
- "tower-service",
- "url",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1051,7 +1027,6 @@ dependencies = [
 name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
- "adaptive-web-world",
  "arc-swap",
  "artifactory-world",
  "border-world",
@@ -1084,6 +1059,7 @@ dependencies = [
  "virtio-queue",
  "vm-memory",
  "vmm-sys-util 0.14.0",
+ "web-world",
 ]
 
 [[package]]
@@ -3883,6 +3859,30 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "web-world"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "example-common",
+ "fictionet",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "form_urlencoded",
+ "http",
+ "http-body-util",
+ "kuchiki",
+ "regex",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "toml",
+ "tower-service",
+ "url",
 ]
 
 [[package]]

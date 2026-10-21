@@ -214,13 +214,13 @@ pub async fn start(
     let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys)?;
     let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys)?;
     world.trust("zscaler", z.root_pem())?;
-    let seed = adaptive_web_world::pages::Seed::builtin("web")?;
-    let addresses = Arc::new(adaptive_web_world::Addresses::new(
+    let seed = web_world::pages::Seed::builtin("web")?;
+    let addresses = Arc::new(web_world::Addresses::new(
         seed.fixed_addresses(),
         None,
     )?);
-    let pages = Arc::new(adaptive_web_world::pages::Pages::new(seed));
-    let handler = adaptive_web_world::handler::Handler::new(&fcx, pages.clone());
+    let pages = Arc::new(web_world::pages::Pages::new(seed));
+    let handler = web_world::handler::Handler::new(&fcx, pages.clone());
     let codex_pages = pages.clone();
     let model_cfg = z.server_config(&fcx, &["api.anthropic.com"], now_sys)?;
     let oauth = if logins.claude == Login::Subscription {
@@ -380,7 +380,7 @@ pub async fn start(
         "downloads.claude.ai" => Some(web::Site::new(mirror.clone()).tls(claude_cfg.clone())),
         "releases.openai.com" => Some(web::Site::new(mirror.clone()).tls(openai_cfg.clone())),
         _ => {
-            if adaptive_web_world::admit(host).is_err() {
+            if web_world::admit(host).is_err() {
                 return None;
             }
             let (address, _) = addresses.assign(host).ok()??;

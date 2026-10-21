@@ -1,8 +1,8 @@
-//! The adaptive web on Fictionet: every name resolves, every HTTPS host has
+//! The web on Fictionet: every name resolves, every HTTPS host has
 //! a certificate, and every page is made the first time it is asked for.
 //!
 //! ```text
-//! adaptive-web-world --seed web --socket /run/fictionet/sock/world.sock \
+//! web-world --seed web --socket /run/fictionet/sock/world.sock \
 //!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready
 //! ```
 //!
@@ -36,9 +36,9 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use adaptive_web_world::{World, world_start};
-//! use adaptive_web_world::{events::LogObserver, search::Searches};
-//! use adaptive_web_world::pages::{Command, Seed};
+//! use web_world::{World, world_start};
+//! use web_world::{events::LogObserver, search::Searches};
+//! use web_world::pages::{Command, Seed};
 //! use example_common::log::Log;
 //! use fictionet::events::Fanout;
 //!
@@ -433,7 +433,7 @@ pub fn serve(
 }
 
 /// Builds an unstarted network, giving the caller first choice of each name.
-/// Claimed names use adaptive addresses and site events with their own TLS.
+/// Claimed names use assigned addresses and site events with their own TLS.
 pub fn net(
     fcx: &Cx,
     addresses: Arc<Addresses>,
@@ -449,7 +449,7 @@ pub fn net(
     let world = fcx.clone();
     let site_for = move |host: &str| {
         if let Err(why) = admit(host) {
-            world.emit("adaptive", "refused", |event| {
+            world.emit("web", "refused", |event| {
                 event
                     .summary(format_args!("{host}: {why}"))
                     .field("host", host)
@@ -460,7 +460,7 @@ pub fn net(
         let (addr, why) = match addresses.assign(host) {
             Ok(Some(assigned)) => assigned,
             Ok(None) => {
-                world.emit("adaptive", "refused", |event| {
+                world.emit("web", "refused", |event| {
                     event
                         .field("host", host)
                         .field("why", "address pool exhausted")
@@ -469,14 +469,14 @@ pub fn net(
             }
             Err(e) => {
                 let why = format!("cannot record the address: {e}");
-                world.emit("adaptive", "refused", |event| {
+                world.emit("web", "refused", |event| {
                     event.field("host", host).field("why", why.as_str())
                 });
                 log.fail(why);
                 return None;
             }
         };
-        world.emit("adaptive", "site", |event| {
+        world.emit("web", "site", |event| {
             event
                 .summary(format_args!("{host} at {addr} ({why})"))
                 .field("host", host)
@@ -499,7 +499,7 @@ pub fn net(
                             let (config, not_before, not_after) = ca
                                 .config(fcx, &name)
                                 .expect("a certificate for an admitted name");
-                            fcx.emit("adaptive", "cert", |event| {
+                            fcx.emit("web", "cert", |event| {
                                 event
                                     .summary(format_args!("a certificate for {name}"))
                                     .field("host", name.as_str())
@@ -581,7 +581,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("adaptive-web-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("web-{name}-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         dir
     }
@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn pool_addresses_are_distinct_and_recorded() {
-        let dir = std::env::temp_dir().join(format!("adaptive-web-addr-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("web-addr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("addresses.jsonl");
         let _ = std::fs::remove_file(&file);

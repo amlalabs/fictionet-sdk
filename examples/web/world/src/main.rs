@@ -1,4 +1,4 @@
-//! The adaptive web's world process. See the library ([`adaptive_web_world`])
+//! The web's world process. See the library ([`web_world`])
 //! for what it builds.
 //!
 //! The first argument is JSON with `seed` and optional `seeds`, `generator`,
@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use adaptive_web_world::pages::model::{self, Model};
-use adaptive_web_world::pages::store::Store;
-use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed};
-use adaptive_web_world::{Addresses, Ca, GATEWAY, serve, world_start};
+use web_world::pages::model::{self, Model};
+use web_world::pages::store::Store;
+use web_world::pages::{GeneratorKind, Maker, Pages, Seed};
+use web_world::{Addresses, Ca, GATEWAY, serve, world_start};
 use example_common::args::{Args, configuration, secs, unknown};
 use example_common::log::Log;
 use example_common::names;
@@ -21,7 +21,7 @@ use serde_json::json;
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("adaptive-web-world: {e}");
+        eprintln!("web-world: {e}");
         std::process::exit(1);
     }
 }
@@ -54,7 +54,7 @@ fn real_main() -> fictionet::Result {
         prefetch,
     } = configuration(&mut argv).map_err(fictionet::Error::msg)?;
     let seeds = seeds.unwrap_or_else(|| "/app/seeds".into());
-    let stores = store.unwrap_or_else(|| "/var/lib/adaptive-web".into());
+    let stores = store.unwrap_or_else(|| "/var/lib/web".into());
     let args = Args::default()
         .read(argv, unknown)
         .map_err(fictionet::Error::msg)?;
@@ -140,7 +140,7 @@ fn real_main() -> fictionet::Result {
     let (options, _observation) = fictionet_observe::serve_observation(
         fictionet::RunOptions::new(fictionet::Seed::random()),
         args.observation.clone(),
-        Some(Arc::new(adaptive_web_world::events::LogObserver {
+        Some(Arc::new(web_world::events::LogObserver {
             log: log.clone(),
         })),
     )?;

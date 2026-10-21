@@ -529,7 +529,7 @@ impl Observer for Searches {
         matches!(
             (m.source, m.kind),
             (
-                "adaptive",
+                "web",
                 "site"
                     | "refused"
                     | "query"
@@ -572,7 +572,7 @@ fn host(url: &str) -> String {
 impl Snapshot {
     fn apply(&mut self, e: &Event, seq: u64, ms: u64) -> bool {
         match (e.source, e.kind) {
-            ("adaptive", "model_call") => {
+            ("web", "model_call") => {
                 let Some(call) = e.get("call").map(|v| js(Some(v))) else {
                     return false;
                 };
@@ -587,7 +587,7 @@ impl Snapshot {
                 }
                 true
             }
-            ("adaptive", "generation") => {
+            ("web", "generation") => {
                 let (Some(generate), Some(revision)) = (parse(e, "generate"), e.u64("revision"))
                 else {
                     return false;
@@ -603,7 +603,7 @@ impl Snapshot {
                 }
                 true
             }
-            ("adaptive", "planted") => {
+            ("web", "planted") => {
                 let row = Plant {
                     kind: text(e, "plant"),
                     text: text(e, "text"),
@@ -618,7 +618,7 @@ impl Snapshot {
                 );
                 true
             }
-            ("adaptive", "restarted") => {
+            ("web", "restarted") => {
                 self.queries.clear();
                 self.results.clear();
                 self.pages.clear();
@@ -626,7 +626,7 @@ impl Snapshot {
                 self.planted.clear();
                 true
             }
-            ("adaptive", "query") => {
+            ("web", "query") => {
                 let (Some(id), Some(engine)) = (e.u64("query_id"), parse(e, "engine")) else {
                     return false;
                 };
@@ -663,7 +663,7 @@ impl Snapshot {
                 );
                 true
             }
-            ("adaptive", "query_failed") => {
+            ("web", "query_failed") => {
                 let Some(q) = self
                     .queries
                     .iter_mut()
@@ -685,7 +685,7 @@ impl Snapshot {
                 q.answer_at_ms = Some(ms);
                 true
             }
-            ("http", "request") | ("adaptive", "search_answer") => {
+            ("http", "request") | ("web", "search_answer") => {
                 let mut changed = false;
                 let id = e.u64("query_id");
                 if let Some(q) = self.queries.iter_mut().find(|q| Some(q.id) == id)
@@ -843,14 +843,14 @@ impl Snapshot {
                 }
                 changed
             }
-            ("adaptive", "prefetch_finished") => {
+            ("web", "prefetch_finished") => {
                 let url = text(e, "url");
                 let before = self.pages.len();
                 self.pages
                     .retain(|p| p.url != url || p.fetches > 0 || p.waiting);
                 before != self.pages.len()
             }
-            ("adaptive", "page_failed") => {
+            ("web", "page_failed") => {
                 let url = text(e, "url");
                 let Some(page) = self.pages.iter_mut().find(|p| p.url == url) else {
                     return false;
@@ -860,7 +860,7 @@ impl Snapshot {
                 page.status = e.u64("status");
                 true
             }
-            ("adaptive", "making") => {
+            ("web", "making") => {
                 let url = text(e, "url");
                 let waiting = !parse::<bool>(e, "prefetch").unwrap_or(false);
                 if let Some(page) = self.pages.iter_mut().find(|p| p.url == url) {
@@ -899,7 +899,7 @@ impl Snapshot {
                 }
                 true
             }
-            ("adaptive", "site") => {
+            ("web", "site") => {
                 let host = text(e, "host");
                 if self.sites.iter().any(|s| s.host == host) {
                     return false;
@@ -924,7 +924,7 @@ impl Snapshot {
                 });
                 true
             }
-            ("adaptive", "refused") => {
+            ("web", "refused") => {
                 let row = Refused {
                     name: text(e, "host"),
                     reason: text(e, "why"),
@@ -970,7 +970,7 @@ mod tests {
         assert!(searches.0.is_poisoned());
         assert_eq!(searches.snapshot().seed.name, "seed");
 
-        let event = Event::new("adaptive", "query")
+        let event = Event::new("web", "query")
             .field("query_id", 1u64)
             .field("engine", "google");
         searches.observe(

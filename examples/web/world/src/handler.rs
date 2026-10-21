@@ -46,7 +46,7 @@ impl QueryGuard {
         self.finished = true;
         self.fcx
             .emitter(&self.conn)
-            .emit("adaptive", "query_failed", |e| {
+            .emit("web", "query_failed", |e| {
                 let mut e = e
                     .summary(format_args!("query {}: {why}", self.id))
                     .field("query_id", self.id)
@@ -122,7 +122,7 @@ impl Handler {
                 id,
                 finished: false,
             });
-            self.fcx.emitter(&conn).emit("adaptive", "query", |e| {
+            self.fcx.emitter(&conn).emit("web", "query", |e| {
                 e.summary(format_args!("{} search: {search}", name(&engine)))
                     .field("query_id", id)
                     .field("engine", name(&engine))
@@ -144,7 +144,7 @@ impl Handler {
             .handle_route(&self.fcx, parts.method.as_str(), &target.host, path, action)
             .await;
         if let (Some(q), Meta::Search(list)) = (&query, &answer.meta) {
-            self.fcx.emitter(&conn).emit("adaptive", "search", |e| {
+            self.fcx.emitter(&conn).emit("web", "search", |e| {
                 e.field("query_id", q.id)
                     .field("source", source)
                     .field("search", list.search.as_str())

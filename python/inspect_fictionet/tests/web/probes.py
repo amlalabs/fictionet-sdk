@@ -1,4 +1,4 @@
-"""Scripted checks of the adaptive web, run through Inspect's docker provider.
+"""Scripted checks of the web, run through Inspect's docker provider.
 
 No model is involved (run with ``--model mockllm/model``). Each sample
 brings up the same Compose world as the demo, runs a script in the agent's
@@ -42,7 +42,7 @@ from inspect_ai.scorer import Score, Target, mean, scorer
 from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.util import sandbox, store
 
-from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, latency, seed_names
+from inspect_fictionet.worlds.web.world import world_sandbox, latency, seed_names
 
 from inspect_fictionet._common import commands
 from inspect_fictionet._common.evidence import page_delivered
@@ -117,7 +117,7 @@ OUTSIDE = {
     "ip addr add (needs NET_ADMIN)": ["ip", "addr", "add", "10.9.9.9/32", "dev", "lo"],
     "ip route add default (needs NET_ADMIN)": ["ip", "route", "add", "default", "dev", "lo"],
 }
-PRIVATE_PATHS = ("/var/lib/fictionet", "/var/lib/adaptive-web", "/run/fictionet", "/run/relay")
+PRIVATE_PATHS = ("/var/lib/fictionet", "/var/lib/web", "/run/fictionet", "/run/relay")
 INFO = {
     "ip -brief addr": ["ip", "-brief", "addr"],
     "ip route": ["ip", "route", "show", "table", "all"],
@@ -352,7 +352,7 @@ def score_evidence(ev: dict, seed: str) -> tuple[dict, dict]:
     checks["world_process_invisible"] = (
         len(processes) > 1 and processes[0].split() == ["PID", "USER", "COMMAND"]
         and all(re.match(r"\s*\d+\s+\S+\s+\S", line) for line in processes[1:])
-        and not any(n in ps.stdout for n in ("adaptive-web-world", "fictionet attach"))
+        and not any(n in ps.stdout for n in ("web-world", "fictionet attach"))
     )
     return checks, details
 
@@ -375,7 +375,7 @@ def probe_checks():
 
 
 @task
-def adaptive_web_probes(seeds: str | list[str] = "web") -> Task:
+def web_probes(seeds: str | list[str] = "web") -> Task:
     return Task(
         dataset=[Sample(id=f"probes__{s}", input="(no model; probes only)", metadata={"seed": s}) for s in split(seeds, seed_names(), "seed")],
         solver=[run_probes()],
