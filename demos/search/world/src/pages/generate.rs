@@ -41,7 +41,7 @@ impl Pages {
         self.maker.as_ref().expect("a world that is generating")
     }
 
-    /// Runs one generation with the maker's offline or model path and
+    /// Runs one generation with the maker's stored or model path and
     /// writes its rows. `context` names it in `generations.jsonl`.
     pub(super) async fn generate<T>(
         &self,
@@ -52,7 +52,7 @@ impl Pages {
         read: impl Fn(&str) -> Result<T, prompts::Unreadable>,
     ) -> Result<Made<T>, Stop> {
         match self.maker() {
-            Maker::Stored => self.offline(cx, context, stored),
+            Maker::Stored => self.stored(cx, context, stored),
             Maker::Model(model) => {
                 if self.live_calls.is_some() {
                     self.reserve()?;
@@ -86,7 +86,7 @@ impl Pages {
         }
     }
 
-    pub(super) fn offline<T>(
+    pub(super) fn stored<T>(
         &self,
         cx: &Cx,
         mut context: Value,
@@ -117,7 +117,7 @@ impl Pages {
         }
         if self.live_calls.is_some() {
             let cast = CastRecord {
-                people: make::prepared_cast(&self.seed),
+                people: Vec::new(),
                 usage: Usage::stored(0),
             };
             self.store().set_cast(cast.clone()).map_err(Stop::store)?;
@@ -128,7 +128,7 @@ impl Pages {
             .generate(
                 cx,
                 json!({"kind": "cast"}),
-                || make::prepared_cast(&self.seed),
+                Vec::new,
                 || {
                     let (system, user) = prompts::cast(&self.seed);
                     (system, user, CAST_TOKENS)

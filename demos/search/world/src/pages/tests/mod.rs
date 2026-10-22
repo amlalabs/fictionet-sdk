@@ -357,17 +357,10 @@ fn column(rows: &[Value], key: &str) -> Vec<Value> {
 
 // ---- canned pages, new pages and plants -----------------------------------
 
-/// A store in `dir` made by the offline generator: one search and its pages.
-mod styles;
-
-mod links;
-
-mod storage;
-
-mod generation;
-
-mod failures;
-
+mod answers;
+mod bylines;
 mod corrections;
-
-mod authors;
+mod generation;
+mod pages;
+mod routes;
+mod store;

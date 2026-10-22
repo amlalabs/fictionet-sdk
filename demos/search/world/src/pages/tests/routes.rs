@@ -1,4 +1,4 @@
-//! Retained behavioral coverage.
+//! Canonical redirects preserve distinct page addresses.
 
 use super::*;
 

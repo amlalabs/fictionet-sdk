@@ -1,4 +1,4 @@
-//! Retained behavioral coverage.
+//! Generation retries, shared titles and cost accounting.
 
 use super::*;
 

@@ -122,7 +122,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// One offline generation that took `ms`.
+    /// One stored response that took `ms`.
     pub fn stored(ms: u64) -> Self {
         Self {
             model: "stored".into(),

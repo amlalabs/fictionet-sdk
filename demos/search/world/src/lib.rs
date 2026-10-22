@@ -338,7 +338,7 @@ pub fn net(
 }
 
 /// A world kept in memory, made from one seed: a new CA, the seed's fixed
-/// addresses and its pages with the offline generator, dated from `start`,
+/// addresses and its fixed and stored pages, dated from `start`,
 /// usually [`world_start`] of the seed's date. The executable keeps a store
 /// and may use a model instead.
 pub struct World {

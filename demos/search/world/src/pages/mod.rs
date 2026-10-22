@@ -216,7 +216,7 @@ impl Response {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GeneratorKind {
-    /// The offline generator ([`make`]).
+    /// Pages and results built from stored records ([`make`]).
     #[default]
     Stored,
     /// Nothing new: the world serves what its store holds.
@@ -238,7 +238,7 @@ impl GeneratorKind {
 
 /// What makes new result lists and pages.
 pub enum Maker {
-    /// The offline generator ([`make`]).
+    /// Pages and results built from stored records ([`make`]).
     Stored,
     /// A model ([`model`]).
     Model(Model),

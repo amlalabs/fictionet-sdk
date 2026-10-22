@@ -1,7 +1,7 @@
 //! Shared text, branding and stored-page helpers for the model writer.
 
 use super::{Seed, seed::parse_date, text::*};
-use fictionet_extras::search::{Engine, Result, Search};
+use fictionet_extras::search::{Result, Search};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +14,7 @@ const STOP: &[&str] = &[
     "online", "news", "com", "www", "https", "http", "best", "example", "details", "safe",
     "owners", "version", "fixed", "fix", "latest",
 ];
-/// Bylines on articles the offline generator makes.
+/// Bylines assigned to stored articles.
 pub(super) const AUTHORS: [&str; 16] = [
     "Priya Raman",
     "Tomasz Wierzbicki",
@@ -236,25 +236,17 @@ pub fn excerpt(text: &str) -> String {
     out
 }
 
-pub(super) fn prepared_cast(_seed: &Seed) -> Vec<super::prompts::Person> {
-    Vec::new()
-}
-
-pub(super) fn finish_listing(_query: &str, search: &mut Search) {
+pub(super) fn finish_listing(search: &mut Search) {
     let mut urls = std::collections::HashSet::new();
     search.results.retain(|r| urls.insert(r.url.clone()));
 }
 
 /// Search only known page metadata when no model is configured.
-pub fn search(_seed: &Seed, query: &str, known: &[Result], _engine: Engine) -> Search {
+pub fn search(query: &str, known: &[Result]) -> Search {
     Search {
         results: rank(known, query).into_iter().take(10).cloned().collect(),
         ..Default::default()
     }
-}
-
-pub(super) fn for_engine(_seed: &Seed, _query: &str, canonical: Search, _engine: Engine) -> Search {
-    canonical
 }
 
 /// Video listings drawn from the world's stored video pages.
@@ -480,16 +472,9 @@ pub(super) fn page_with_known(
     let search = query.is_some() && directory(target);
     let directory = !article && directory(target) && mentions.iter().all(|m| m["via"] != "search");
     if !search && !directory {
-        let mut mentions = mentions.to_vec();
-        if mentions.iter().all(|m| m["title"].as_str().is_none())
-            && title_from(host, target).is_empty()
-        {
-            mentions.push(serde_json::json!({"title": title_from(host, target)}));
-        }
-        let made = page(seed, host, target, &mentions, kind);
-
-        return made;
+        return page(host, target, mentions);
     }
+
     let title = if let Some(query) = &query {
         format!("Search results for {query}")
     } else if path == "/" && kind == "forum" {
@@ -550,13 +535,8 @@ pub(super) fn page_with_known(
     }
 }
 
-/// No synthetic advisory details are supplied.
-pub fn advisory(_host: &str, _target: &str, _title: &str, _date: &str) -> Option<Page> {
-    None
-}
-
 /// Preserve prior mentions without inventing page content.
-pub fn page(_seed: &Seed, host: &str, target: &str, mentions: &[Value], _kind: &str) -> Page {
+pub fn page(host: &str, target: &str, mentions: &[Value]) -> Page {
     let title = mentions
         .iter()
         .find_map(|m| m["title"].as_str())

@@ -41,7 +41,7 @@ pub const MAX_SNAPSHOT_BYTES: usize = {
         + MAX_SITES * (89 + 3 * string)
         + MAX_REFUSED * (53 + 2 * string)
         // Planted rows with a comma each but the last, the list's name and
-        // brackets, the canned flag and the omitted count.
+        // brackets, the copied flag and the omitted count.
         + MAX_PLANTED * (60 + 3 * string)
         + 178
 };
@@ -450,8 +450,8 @@ impl Searches {
             ..Snapshot::default()
         }))
     }
-    /// Starts with the card of an in-memory world with the offline
-    /// generator ([`Pages::new`](crate::pages::Pages::new)).
+    /// Starts with the card of an in-memory world with stored
+    /// records ([`Pages::new`](crate::pages::Pages::new)).
     pub fn from_seed(seed: &crate::pages::Seed) -> Self {
         Self::of(&crate::pages::Pages::new(seed.clone()))
     }

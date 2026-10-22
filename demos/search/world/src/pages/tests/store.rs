@@ -1,4 +1,4 @@
-//! Retained behavioral coverage.
+//! Persistence, replay and fixed-file byte preservation.
 
 use super::*;
 

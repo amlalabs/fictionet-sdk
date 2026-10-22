@@ -3,7 +3,7 @@
 use super::*;
 
 impl Pages {
-    /// An in-memory world with the offline generator.
+    /// An in-memory page collection with fixed files and stored records.
     pub fn new(seed: Seed) -> Self {
         Self::open(seed, Store::memory(), Some(Maker::Stored), 0)
     }
@@ -141,12 +141,12 @@ impl Pages {
                 store.generation.generate = generate;
             }
             Command::SetNewPages { new_pages, .. } => {
-                let canned = match new_pages {
+                let copied = match new_pages {
                     NewPages::Copied => true,
                     NewPages::ModelWritten | NewPages::LiveSearch => false,
                     NewPages::Off => self.copied_active.load(std::sync::atomic::Ordering::SeqCst),
                 };
-                if self.copied.is_none() && canned {
+                if self.copied.is_none() && copied {
                     return Err(invalid("This world has no copied corpus"));
                 }
                 if new_pages == NewPages::ModelWritten
@@ -164,7 +164,7 @@ impl Pages {
                     );
                 }
                 self.copied_active
-                    .store(canned, std::sync::atomic::Ordering::SeqCst);
+                    .store(copied, std::sync::atomic::Ordering::SeqCst);
                 store.generation.generate = new_pages != NewPages::Off;
             }
             Command::PlantFact { text, .. } => {
@@ -216,7 +216,7 @@ impl Pages {
         }
         store.generation.revision = current + 1;
         let generation = store.generation;
-        let canned = self.copied_active.load(std::sync::atomic::Ordering::SeqCst);
+        let copied = self.copied_active.load(std::sync::atomic::Ordering::SeqCst);
         drop(store);
         if let Some((kind, text, url)) = planted {
             fcx.emit("web", "planted", |event| {
@@ -240,7 +240,7 @@ impl Pages {
                     generation.revision
                 ))
                 .field("generate", generation.generate)
-                .field("copied", canned)
+                .field("copied", copied)
                 .field("live_search", self.live_only())
                 .field("revision", generation.revision)
         });

@@ -101,28 +101,15 @@ impl Pages {
         }
         if record.is_some()
             && engine != Engine::Google
-            // A prepared list answers every engine as it was written; only
-            // lists made on the spot differ by engine.
             && (engine == Engine::YouTube
                 || record.as_ref().is_some_and(|r| r.usage.model == "stored"))
         {
-            let proposed = if engine == Engine::YouTube {
-                search.clone()
-            } else {
-                make::for_engine(
-                    &self.context(),
-                    &query_key(query, 0),
-                    search.clone(),
-                    engine,
-                )
-            };
-            let replayable = proposed.results.iter().all(|r| {
+            let replayable = search.results.iter().all(|r| {
                 let (host, target) = text::target_of(&r.url);
                 !self.store().mentions(&host, &target).is_empty()
                     || self.seed.fixed.iter().any(|f| f.url == r.url)
             });
             if self.generating() || replayable {
-                search = proposed;
                 for result in &mut search.results {
                     let (host, target) = text::target_of(&result.url);
                     let mention = if self.generating() {
@@ -196,7 +183,7 @@ impl Pages {
                 result.title = title;
             }
         }
-        make::finish_listing(query, &mut search);
+        make::finish_listing(&mut search);
         let mut reached = HashSet::new();
         for result in &mut search.results {
             if self
@@ -239,7 +226,7 @@ impl Pages {
             results: known,
             ..search::Search::default()
         };
-        make::finish_listing(query, &mut normalized);
+        make::finish_listing(&mut normalized);
         let known = normalized.results;
         let made = self
             .generate(
@@ -256,7 +243,7 @@ impl Pages {
                                 .map(|p| (&p.url, String::from_utf8_lossy(&p.body).into_owned())),
                         )
                     } else {
-                        make::search(&seed, query, &known, Engine::Google)
+                        make::search(query, &known)
                     }
                 },
                 || {
@@ -267,7 +254,7 @@ impl Pages {
             )
             .await?;
         let mut search = made.fields;
-        make::finish_listing(query, &mut search);
+        make::finish_listing(&mut search);
         let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
             let (host, target) = text::target_of(&r.url);

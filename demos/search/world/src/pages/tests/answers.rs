@@ -1,4 +1,4 @@
-//! Retained behavioral coverage.
+//! Model response parsing, usage accounting and credential redaction.
 
 use super::*;
 

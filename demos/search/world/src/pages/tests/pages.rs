@@ -1,4 +1,4 @@
-//! Retained behavioral coverage.
+//! Page assets, canonical links and concurrent request deduplication.
 
 use super::*;
 

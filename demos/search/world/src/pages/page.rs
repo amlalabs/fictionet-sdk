@@ -39,7 +39,7 @@ impl Pages {
                     results: vec![original.clone()],
                     ..search::Search::default()
                 };
-                make::finish_listing(&listing.query, &mut normalized);
+                make::finish_listing(&mut normalized);
                 let video = &normalized.results[0];
                 if text::target_of(&video.url).1 != target {
                     continue;
