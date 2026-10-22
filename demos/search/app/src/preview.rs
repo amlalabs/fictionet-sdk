@@ -23,7 +23,7 @@ use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{Containment, Host, HostState, HostStatus, Labels, StateLimits, StateTopic},
 };
-use fictionet_search_demo::{self as page, Topics};
+use fictionet_search_demo::{network, page::Topics};
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
@@ -104,7 +104,7 @@ pub async fn run() -> Result {
                 start,
             };
             let (attacher, attachments) = fictionet::attachments();
-            page::network(&world, &cx, log, kit::mirror::new(&cx)?)?.start(&cx, attachments)?;
+            network::build(&world, &cx, log, kit::mirror::new(&cx)?)?.start(&cx, attachments)?;
             topics.start(&cx, searches.clone(), world.pages.clone())?;
             let workstation = machine(
                 &cx,
@@ -226,7 +226,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         world,
         searches,
     } = *client;
-    let words = seed.search.as_str();
+    let words = "black hole";
     let pause = || cx.sleep(Duration::from_secs(3));
     // Give viewers a chance to see the empty world before the first request.
     cx.sleep(Duration::from_secs(8)).await?;
@@ -244,7 +244,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     let opened = [
         search_url(Engine::Bing, words),
         search_url(Engine::DuckDuckGo, &format!("{words} details")),
-        seed.visit.clone(),
+        "https://en.wikipedia.org/wiki/Astronomy".to_owned(),
     ];
     for url in opened.iter().chain(seed.fixed.iter().map(|f| &f.url)) {
         pause().await?;

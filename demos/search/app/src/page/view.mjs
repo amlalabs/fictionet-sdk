@@ -2,7 +2,7 @@ import { diff, rows } from './model.mjs';
 import { createMotion } from './motion.mjs';
 import { createWeb } from './web.mjs';
 
-const NEW_PAGES = [['copied', 'Copied'], ['model_written', 'Model-written'], ['live_search', 'Live search, copied in']];
+const NEW_PAGES = [['copied', 'Copied'], ['model_written', 'Model-written'], ['live_search', 'Live']];
 const relativeTime = (at, now) => {
   const seconds = Math.max(0, Math.floor((now - at) / 1000));
   return seconds < 60 ? 'now' : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago` : `${Math.floor(seconds / 3600)} hr ago`;
@@ -43,13 +43,19 @@ export function mount(root, services, options) {
     });
     return ok;
   }
+  let availability;
   function buttons() {
     for (const control of controls) control.disabled = !snapshot || request.busy;
     if (!segment || !snapshot?.generator) return;
     const g = snapshot.generator;
+    if (availability) availability.textContent = g.live_available ? '' : 'Live: EXA_API_KEY is not set.';
     const mode = g.live_search ? 'live_search' : g.copied ? 'copied' : 'model_written';
     for (const button of segment.children) {
       button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
+      if (button.dataset.mode === 'live_search') {
+        button.disabled = request.busy || !g.live_available;
+        button.title = g.live_available ? '' : 'EXA_API_KEY is not set';
+      }
     }
   }
   if (menu) {
@@ -63,6 +69,7 @@ export function mount(root, services, options) {
       controls.push(button);
       cleanup.push(listen(button, 'click', () => send({ command: 'set_new_pages', new_pages: mode })));
     }
+    availability = item('p', { class: 'note' }, menu);
     const restartRow = item('div', { class: 'row' }, menu);
     item('span', { text: 'Restart run' }, restartRow);
     const restart = item('button', { type: 'button', class: 'act quiet', text: 'Restart' }, restartRow);

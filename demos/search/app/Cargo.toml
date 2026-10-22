@@ -50,6 +50,3 @@ fictionet-demo = { path = "../../kit" }
 [[bin]]
 name = "search"
 path = "src/main.rs"
-
-[lib]
-path = "src/page/mod.rs"

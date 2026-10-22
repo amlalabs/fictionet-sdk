@@ -79,7 +79,7 @@ fn real_main() -> fictionet::Result {
         GeneratorKind::Model(provider) => {
             Some(Key::from_env(provider.into()).map_err(fictionet::Error::msg)?)
         }
-        GeneratorKind::Stub | GeneratorKind::Replay => None,
+        GeneratorKind::Stored | GeneratorKind::Replay => None,
     };
     let path = if Path::new(&name).is_file() {
         PathBuf::from(&name)
@@ -97,7 +97,7 @@ fn real_main() -> fictionet::Result {
             .map_err(|e| fictionet::Error::msg(format!("{}: {e}", path.display())))?,
     };
     let identity = match kind {
-        GeneratorKind::Stub => Some(Maker::Stub.identity()),
+        GeneratorKind::Stored => Some(Maker::Stored.identity()),
         GeneratorKind::Model(provider) => Some(model::identity(provider, &model, &reasoning)),
         GeneratorKind::Replay => None,
     };
@@ -146,7 +146,7 @@ fn real_main() -> fictionet::Result {
     )?;
     let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
         let maker = match (kind, key) {
-            (GeneratorKind::Stub, _) => Some(Maker::Stub),
+            (GeneratorKind::Stored, _) => Some(Maker::Stored),
             (GeneratorKind::Model(provider), Some(key)) => {
                 let https = Arc::new(Https::new(&fcx, provider.into())?);
                 Some(Maker::Model(Model::new(
@@ -166,7 +166,6 @@ fn real_main() -> fictionet::Result {
         let state = json!({
             "seed": seed.name,
             "date": seed.date,
-            "question": seed.question,
             "generator": pages.generator_kind(),
             "model": pages.model(),
             "prefetch": pages.prefetch(),

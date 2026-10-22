@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 
-import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +23,7 @@ def seed_names() -> list[str]:
     return sorted(p.stem for p in SEEDS.glob("*.md"))
 
 
-def seed_front(name: str) -> dict[str, Any]:
-    text = (SEEDS / f"{name}.md").read_text()
-    return tomllib.loads(text.split("+++", 2)[1])
-
-
-def world_sandbox(generator="stub", store_dir=None, model="", reasoning="", prefetch="",
+def world_sandbox(generator="stored", store_dir=None, model="", reasoning="", prefetch="",
                   seed="${SAMPLE_METADATA_SEED:-web}"):
     mounts = {}
     if store_dir:

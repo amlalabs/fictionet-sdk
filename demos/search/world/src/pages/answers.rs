@@ -1,0 +1,228 @@
+//! Parse result lists, people and page replies from the model.
+
+use super::make::{Page, Profile};
+use super::prompts::*;
+use fictionet_extras::search::{Ad, Result as Listed, Search};
+use regex::Regex;
+use serde_json::Value;
+use std::sync::OnceLock;
+
+pub fn read_cast(text: &str) -> Result<Vec<Person>, Unreadable> {
+    let people: Vec<_> = text
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<_> = line
+                .split('|')
+                .map(|p| p.trim_matches(|c: char| " -*`".contains(c)))
+                .collect();
+            match parts[..] {
+                [name, role, organization]
+                    if !name.is_empty() && !role.is_empty() && !organization.is_empty() =>
+                {
+                    Some(Person {
+                        name: name.into(),
+                        role: role.into(),
+                        organization: organization.into(),
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    if people.len() < 3 {
+        return Err(Unreadable(format!(
+            "fewer than three people in the cast answer: {:?}",
+            prefix(text, 200)
+        )));
+    }
+    Ok(people)
+}
+
+pub fn read_search(text: &str) -> Result<Search, Unreadable> {
+    let mut results: Vec<Listed> = Vec::new();
+    let mut search = Search::default();
+    for raw in text.trim().lines() {
+        let line = raw.trim().trim_matches('`');
+        let (key, value) = line.split_once(':').unwrap_or((line, ""));
+        let (key, value) = (key.trim().to_uppercase(), value.trim());
+        let split = |value: &str| -> Vec<String> {
+            value
+                .split(" | ")
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        if line.eq_ignore_ascii_case("RESULT") {
+            results.push(Listed::default());
+        } else if let Some(result) = results.last_mut()
+            && matches!(key.as_str(), "URL" | "TITLE" | "SNIPPET" | "DATE")
+        {
+            let value = value.to_owned();
+            match key.as_str() {
+                "URL" => result.url = value,
+                "TITLE" => result.title = value,
+                "SNIPPET" => result.snippet = value,
+                _ if value.eq_ignore_ascii_case("none") => result.date = String::new(),
+                _ => result.date = value,
+            }
+        } else if key == "RELATED" {
+            search.related = split(value);
+        } else if key == "QUESTIONS" {
+            search.questions = split(value);
+        } else if key == "AD" {
+            let parts: Vec<_> = value.split(" | ").map(str::trim).collect();
+            if let [url, title, text] = parts[..]
+                && url.starts_with("http")
+            {
+                search.ads.push(Ad {
+                    url: url.into(),
+                    title: title.into(),
+                    text: text.into(),
+                });
+            }
+        }
+    }
+    search.results = results
+        .into_iter()
+        .filter(|r| r.url.starts_with("http") && !r.title.is_empty())
+        .take(10)
+        .collect();
+    if search.results.is_empty() {
+        return Err(Unreadable(format!(
+            "no results in the search answer: {:?}",
+            prefix(text, 200)
+        )));
+    }
+    search.related.truncate(8);
+    search.questions.truncate(4);
+    search.ads.truncate(2);
+    Ok(search)
+}
+
+fn links(line: &str) -> Vec<String> {
+    line.split(',')
+        .map(str::trim)
+        .filter(|x| x.contains('|'))
+        .map(str::to_owned)
+        .collect()
+}
+
+pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result<Page, Unreadable> {
+    static FENCE: OnceLock<Regex> = OnceLock::new();
+    static CLOSE: OnceLock<Regex> = OnceLock::new();
+    let text = text.trim();
+    let text = FENCE
+        .get_or_init(|| Regex::new(r"^```[a-z]*\s*\n").unwrap())
+        .replace(text, "");
+    let Some((head, body)) = text.split_once("\nBODY:") else {
+        return Err(Unreadable(format!(
+            "no BODY: line in the page answer: {:?}",
+            prefix(&text, 200)
+        )));
+    };
+    let body = body.trim_start_matches('\n').trim_end();
+    let body = CLOSE
+        .get_or_init(|| Regex::new(r"\n```\s*$").unwrap())
+        .replace(body, "")
+        .into_owned();
+    let mut page = Page {
+        status: 200,
+        content_type: "text/html; charset=utf-8".into(),
+        body,
+        ..Page::default()
+    };
+    let mut site = Profile::default();
+    let mut section = "";
+    for raw in head.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(item) = line.strip_prefix("- ")
+            && matches!(section, "claims" | "sidebar")
+        {
+            let item = item.trim();
+            if section == "claims" {
+                page.claims.push(item.into());
+            } else if let Some((label, href)) = item.split_once('|') {
+                page.sidebar.push((label.trim().into(), href.trim().into()));
+            }
+            continue;
+        }
+        let (key, value) = line.split_once(':').unwrap_or((line, ""));
+        let (key, value) = (key.trim().to_uppercase(), value.trim());
+        let none = value.is_empty() || value.eq_ignore_ascii_case("none");
+        section = "";
+        match key.as_str() {
+            "STATUS" => {
+                let digits: String = value.chars().filter(char::is_ascii_digit).collect();
+                page.status = digits
+                    .parse()
+                    .unwrap_or(if digits.is_empty() { 200 } else { 0 });
+            }
+            "CONTENT_TYPE" => {
+                let ctype = value.split(';').next().unwrap().trim();
+                let ctype = if ctype.is_empty() { "text/html" } else { ctype };
+                let charset = ctype.starts_with("text/") || ctype.contains("json");
+                page.content_type =
+                    format!("{ctype}{}", if charset { "; charset=utf-8" } else { "" });
+            }
+            "TITLE" => page.title = value.into(),
+            "DESCRIPTION" => page.description = value.into(),
+            "DATE" => page.date = if none { String::new() } else { value.into() },
+            "CLAIMS" => section = "claims",
+            "SIDEBAR" => section = "sidebar",
+            "AD" => page.ad = if none { String::new() } else { value.into() },
+            "SITE_NAME" => site.name = value.into(),
+            "SITE_KIND" => site.kind = value.to_lowercase(),
+            "SITE_TAGLINE" => site.tagline = if none { String::new() } else { value.into() },
+            "SITE_NAV" => site.nav = links(value),
+            "SITE_FOOTER" => site.footer = links(value),
+            "SITE_CSS" => site.css = value.into(),
+            _ => {}
+        }
+    }
+    if page.title.is_empty() {
+        return Err(Unreadable(format!(
+            "no TITLE: line in the page answer: {:?}",
+            prefix(&text, 200)
+        )));
+    }
+    if let Some(expected) = expected {
+        let charset = if expected == "application/xml" {
+            ""
+        } else {
+            "; charset=utf-8"
+        };
+        page.content_type = format!("{expected}{charset}");
+    }
+    let ctype = page.content_type.split(';').next().unwrap().to_lowercase();
+    if (ctype == "application/json" || ctype.ends_with("+json"))
+        && let Err(error) = serde_json::from_str::<Value>(&page.body)
+    {
+        return Err(Unreadable(format!(
+            "the body of a JSON URL is not JSON ({error}): {:?}",
+            prefix(&page.body, 200)
+        )));
+    }
+    if !matches!(page.status, 200 | 404) {
+        return Err(Unreadable(format!(
+            "STATUS must be 200 or 404, got {}",
+            page.status
+        )));
+    }
+    if referenced && page.status == 404 {
+        return Err(Unreadable(
+            "a referenced page cannot have STATUS 404; a search result or link points here".into(),
+        ));
+    }
+    if !site.name.is_empty() || !site.css.is_empty() {
+        page.site = Some(site);
+    }
+    Ok(page)
+}
+
+fn prefix(text: &str, n: usize) -> String {
+    text.chars().take(n).collect()
+}

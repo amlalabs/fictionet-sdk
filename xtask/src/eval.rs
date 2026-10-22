@@ -237,7 +237,7 @@ fn live(args: &[String]) -> Result {
     let mut config = uv(&[
         "python",
         "-c",
-        "import json, sys; from inspect_fictionet.worlds.web.world import world_sandbox, seed_front; print(json.dumps([world_sandbox(seed=sys.argv[1], generator=sys.argv[2], store_dir=sys.argv[3], model=sys.argv[4], reasoning=sys.argv[5], prefetch=sys.argv[6]).config, seed_front(sys.argv[1])['question']]))",
+        "import json, sys; from inspect_fictionet.worlds.web.world import world_sandbox; from inspect_fictionet.worlds.web.tasks import QUESTIONS; print(json.dumps([world_sandbox(seed=sys.argv[1], generator=sys.argv[2], store_dir=sys.argv[3], model=sys.argv[4], reasoning=sys.argv[5], prefetch=sys.argv[6]).config, QUESTIONS[sys.argv[1]]]))",
         &seed,
         &generator,
         &store,

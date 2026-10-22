@@ -18,7 +18,7 @@ export function queryTag(s, q) {
   return 'failed';
 }
 
-const pageState = (p) => p.status === 404 ? 'missing' : ({ stubbed: 'made', written_live: 'made', stored: 'stored', fixed: 'stored', planted: 'planted', missing: 'missing', not_made: 'refused' }[p.made] || 'asking');
+const pageState = (p) => p.status === 404 ? 'missing' : ({ from_store: 'made', written_live: 'made', stored: 'stored', fixed: 'stored', planted: 'planted', missing: 'missing', not_made: 'refused' }[p.made] || 'asking');
 
 export function pageTag(p) {
   return p.making ? 'making' : p.made === 'missing' || p.status === 404 ? 'missing' : p.fetches > 1 ? 'again' : pageState(p);
@@ -80,7 +80,7 @@ export function slots() {
 
 // Assign active sites to the map's slots.
 export function layout(prev, hosts, context = {}) {
-  const all = new Set([...(context.seed?.sites || []), ...hosts]);
+  const all = new Set(hosts);
   const centers = slots();
   if (all.size > centers.length) {
     const rows = Math.ceil(all.size / 3.5);

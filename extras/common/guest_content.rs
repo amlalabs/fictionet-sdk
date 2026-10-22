@@ -243,6 +243,9 @@ impl Observer for Audit {
         }
     }
     fn content(&self, source: Content<'_>) -> Option<Box<dyn ContentSink>> {
+        if source.origin == Some("WARC capture") {
+            return None;
+        }
         Some(Box::new(self.sink(source)))
     }
 }
@@ -599,6 +602,11 @@ mod tests {
 
     #[test]
     fn provider_replies_and_local_pages_have_distinct_ownership() {
+        let captured = Audit::default();
+        assert!(captured.content(Content {
+            kind: "http", name: "response", encoding: "", origin: Some("WARC capture"),
+        }).is_none());
+        assert!(captured.check().is_ok());
         for origin in [
             "https://api.anthropic.com",
             "https://openrouter.ai",

@@ -14,30 +14,7 @@ use web_world::{
     search::{self, Searches},
 };
 
-/// The names the world forwards to the real internet, and why: the guest's
-/// packages and coding agents, installed at boot.
-pub const FORWARDED: &[(&str, &str)] = &[
-    ("archive.ubuntu.com", "Ubuntu packages installed at boot"),
-    (
-        "security.ubuntu.com",
-        "Ubuntu security packages installed at boot",
-    ),
-    ("packages.mozilla.org", "Firefox installed at boot"),
-    (
-        fictionet_demo::kit::desktop::CLAUDE_HOST,
-        "Claude Code installed at boot",
-    ),
-    ("releases.openai.com", "Codex installed at boot"),
-];
-
-/// Sign-in connections retain the providers' end-to-end TLS.
-pub const PASSED: &[&str] = &[
-    "claude.ai",
-    "console.anthropic.com",
-    "platform.claude.com",
-    "auth.openai.com",
-    "challenges.cloudflare.com",
-];
+use crate::network::FORWARDED;
 
 #[derive(Clone)]
 pub struct Topics {
@@ -59,7 +36,7 @@ impl Topics {
         Page::new("Search", dashboard)
             .host(host)
             .standard_panels()
-            .architecture(fictionet_demo::kit::architecture("adaptive"))
+            .architecture(fictionet_demo::kit::architecture("web"))
             .command("generation", self.commands.clone())
             .custom(
                 "Web",
@@ -154,102 +131,5 @@ impl Default for Topics {
     }
 }
 
-/// The world's network for the guest run and the preview: the adaptive web,
-/// with package downloads mirrored, sign-in relayed over raw TLS, and model
-/// search and fetch answered by the world using the guest’s own credentials.
-pub fn network(
-    world: &web_world::World,
-    cx: &Cx,
-    log: Arc<example_common::log::Log>,
-    mirror: fictionet_demo::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,
-) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
-    use fictionet::stdlib::web::Site;
-    let mozilla = world
-        .ca
-        .config(cx, fictionet_demo::kit::desktop::HOSTS[0])?
-        .0;
-    let claude = world
-        .ca
-        .config(cx, fictionet_demo::kit::desktop::CLAUDE_HOST)?
-        .0;
-    let openai = world.ca.config(cx, "releases.openai.com")?.0;
-    use fictionet_extras::models::{Model, Provider};
-    let models = [Provider::Anthropic, Provider::OpenAi, Provider::ChatGpt]
-        .into_iter()
-        .map(|provider| {
-            Ok((
-                provider.host(),
-                (
-                    Model::guest(cx, provider)?.search(world.pages.clone()),
-                    world.ca.config(cx, provider.host())?.0,
-                ),
-            ))
-        })
-        .collect::<fictionet::Result<Vec<_>>>()?;
-    Ok(world.net(cx, log, move |host| {
-        if let Some((_, (model, tls))) = models.iter().find(|(name, _)| *name == host) {
-            return Some(
-                Site::handler(model.clone())
-                    .tls(tls.clone())
-                    .into_host(host),
-            );
-        }
-        if PASSED.contains(&host) {
-            return Some(
-                fictionet::stdlib::world::net::Host::new(host)
-                    .dns_name(host)
-                    .port_server(443, Relay(format!("{host}:443"))),
-            );
-        }
-        FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
-            let site = Site::new(mirror.clone());
-            if fictionet_demo::kit::desktop::HOSTS.contains(&host) {
-                site.tls(mozilla.clone())
-            } else if host == fictionet_demo::kit::desktop::CLAUDE_HOST {
-                site.tls(claude.clone())
-            } else if host == "releases.openai.com" {
-                site.tls(openai.clone())
-            } else {
-                site
-            }
-            .into_host(host)
-        })
-    }))
-}
-
 #[cfg(test)]
 mod tests;
-
-/// One vendor connection, carrying only the guest's encrypted bytes.
-pub struct Relay(pub String);
-
-impl fictionet::stdlib::world::net::PortServer for Relay {
-    fn serve(
-        &self,
-        cx: Cx,
-        arrival: fictionet::stdlib::world::net::Arrival,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        use fictionet::tokio::ConnectionTokioExt;
-        let host = self.0.clone();
-        Box::pin(async move {
-            let work = async {
-                let mut upstream = tokio::net::TcpStream::connect(host.as_str()).await?;
-                cx.emitter(&arrival.info)
-                    .emit("signin", "connection", |event| {
-                        event.field("host", host.trim_end_matches(":443"))
-                    });
-                let mut guest = arrival.conn.into_tokio(&cx);
-                tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
-                Ok::<_, std::io::Error>(())
-            };
-            tokio::select! {
-                _ = cx.cancelled() => {},
-                result = work => {
-                    if let Err(error) = result {
-                        cx.emit("search", "relay_error", |event| event.field("host", host.as_str()).field("error", error.to_string()));
-                    }
-                }
-            }
-        })
-    }
-}

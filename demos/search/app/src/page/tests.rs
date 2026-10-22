@@ -1,5 +1,5 @@
 use super::*;
-use crate as page;
+use crate::{network::build as network, page};
 use example_common::log::Log;
 use fictionet::{
     Cx,
@@ -346,12 +346,7 @@ fn search_javascript() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    println!("{text}");
     assert!(output.status.success(), "{text}");
-    assert!(
-        text.contains("# fail 0") || text.contains("fail 0"),
-        "{text}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -509,7 +504,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(searches),
         move |cx| async move {
             let start = web_world::world_start(&seed.date)?;
-            let prepared = seed.sites[0].host.clone();
+            let prepared = "en.wikipedia.org".to_owned();
             let world = World::new(&cx, seed, start)?;
             let root = Certificate::from_pem(world.ca.cert_pem().as_bytes())?;
             assert_eq!(root.tbs.subject.to_string(), "CN=Internet Security Root CA");

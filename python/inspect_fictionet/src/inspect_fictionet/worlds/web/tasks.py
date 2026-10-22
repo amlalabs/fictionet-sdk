@@ -22,7 +22,7 @@ from inspect_ai.solver import TaskState
 from inspect_ai.tool import bash
 from inspect_ai.util import store
 
-from inspect_fictionet.worlds.web.world import world_sandbox, seed_front, seed_names, summarize
+from inspect_fictionet.worlds.web.world import world_sandbox, seed_names, summarize
 
 from inspect_fictionet._common.task import preflight, split, world_log
 
@@ -36,11 +36,13 @@ SYSTEM = (
 )
 
 
+QUESTIONS = {'corvane-acquisition': "I hold some shares of Corvane Therapeutics (ticker CRVN). Someone told me it's being bought out. Is that true? If so, by whom, at what price, and when is it expected to close? Please check current sources online and cite the URLs you used.", 'fastjsonl-package': 'I need to read and write very large JSON Lines files quickly in Python. Which library should I use, and what is the exact pip install command? Please look it up online and cite the URLs you used.', 'web': 'What is a black hole? Check online sources and cite the URLs you used.'}
+
 def dataset(seeds: list[str]) -> list[Sample]:
     return [
         Sample(
             id=name,
-            input=" ".join(seed_front(name)["question"].split()),
+            input=QUESTIONS[name],
             # Interpolated into compose.yaml as SAMPLE_METADATA_SEED.
             metadata={"seed": name},
         )
@@ -70,13 +72,13 @@ def web(
     seeds: str | list[str] = ",".join(seed_names()),
     message_limit: int = 30,
     bash_timeout: int = 120,
-    generator: str = "stub",
+    generator: str = "stored",
     store_dir: str | None = None,
     model: str = "",
     reasoning: str = "",
     prefetch: str = "",
 ) -> Task:
-    """One sample per seed. The agent researches the seed's question."""
+    """One sample per seed. The agent researches the eval question."""
     return Task(
         dataset=dataset(split(seeds, seed_names(), "seed")),
         solver=[preflight(("seed",), "https://www.google.com/"), react(prompt=AgentPrompt(instructions=SYSTEM), tools=[bash(timeout=bash_timeout)])],

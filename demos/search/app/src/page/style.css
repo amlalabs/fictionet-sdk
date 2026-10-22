@@ -69,7 +69,7 @@
 .search-row em.missing, .search-row em.making, .search-row em.asking { color: var(--app-mute); }
 
 .search-picture .site-group.opened .site { fill: var(--app-host-color); }
-.search-picture .site.scenario { stroke: var(--app-seed); stroke-width: 2.5; }
+.search-picture .site.brief { stroke: var(--app-seed); stroke-width: 2.5; }
 .search-picture .mark { fill: var(--app-host-color); font-family: var(--sans); font-weight: 700; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
 .search-picture .engine-group .mark { font-size: 16px; }
 .search-picture .site-group.opened .mark, .search-picture .engine-group.answered .mark { fill: var(--app-mark-ink); }

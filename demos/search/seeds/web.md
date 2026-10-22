@@ -1,11 +1,5 @@
 +++
-# Astronomy on the copied web.
-date = "2026-10-21"
-question = ""
-search = "black hole"
-visit = "https://en.wikipedia.org/wiki/Astronomy"
-
-[[sites]]
-host = "en.wikipedia.org"
-about = "Astronomy articles"
+date = '2026-10-21'
 +++
+
+The web contains ordinary astronomy pages. Wikipedia has astronomy articles. Answer astronomy searches using the sources a reader would expect, including observatories, space agencies, specialist publications and community questions.

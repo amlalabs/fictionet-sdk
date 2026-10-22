@@ -1,19 +1,9 @@
 //! Seeds and fixed pages, loaded together or embedded in the executable.
 
-use super::text::{normalize_space, target_of};
+use super::text::target_of;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::HashMap, io, net::Ipv4Addr, path::Path};
-
-/// A site described by the scenario.
-#[derive(Clone, Debug, Deserialize)]
-pub struct Site {
-    /// Hostname used for matching search text.
-    pub host: String,
-    /// Description used to generate search results.
-    #[serde(default)]
-    pub about: String,
-}
 
 /// A page whose bytes come from the seed's files.
 #[derive(Clone, Debug)]
@@ -36,26 +26,15 @@ pub struct Fixed {
     pub body: Vec<u8>,
 }
 
-/// A scenario and its fixed pages and addresses.
+/// A prose brief, world date and optional fixed pages.
 #[derive(Clone, Debug)]
 pub struct Seed {
-    /// Scenario name.
+    /// Brief name.
     pub name: String,
     /// World date in year-month-day form.
     pub date: String,
-    /// Initial search question with normalized whitespace.
-    pub question: String,
-    /// What a reader searches for first, or empty when the seed names none.
-    pub search: String,
-    /// An address on a scenario site that a reader types, or empty when the
-    /// seed names none.
-    pub visit: String,
-    /// Markdown body after the front matter.
-    pub scenario: String,
-    /// Statements available to generated pages and snippets.
-    pub facts: Vec<String>,
-    /// Sites described in the front matter.
-    pub sites: Vec<Site>,
+    /// The complete prose brief for the page writer.
+    pub instructions: String,
     /// Pages served from captured file bytes.
     pub fixed: Vec<Fixed>,
     /// Explicit hostname assignments from the seed.
@@ -66,11 +45,6 @@ pub struct Seed {
 #[serde(default)]
 struct Front {
     date: Option<toml::Value>,
-    question: String,
-    search: String,
-    visit: String,
-    facts: Vec<String>,
-    sites: Vec<Site>,
     fixed: Vec<FixedFile>,
     addresses: HashMap<String, String>,
 }
@@ -142,19 +116,7 @@ impl Seed {
         Ok(Self {
             name: name.into(),
             date,
-            question: normalize_space(&front.question),
-            search: normalize_space(&front.search),
-            visit: front.visit,
-            scenario: body.trim().into(),
-            facts: front.facts,
-            sites: front
-                .sites
-                .into_iter()
-                .map(|s| Site {
-                    host: s.host.to_lowercase(),
-                    ..s
-                })
-                .collect(),
+            instructions: body.trim().into(),
             fixed,
             addresses,
         })
@@ -173,7 +135,7 @@ impl Seed {
         })
     }
 
-    /// Loads one of the three bundled scenarios without reading any files.
+    /// Loads one of the three bundled briefs without reading any files.
     pub fn builtin(name: &str) -> io::Result<Self> {
         let text = match name {
             "web" => include_str!("../../../seeds/web.md"),
@@ -194,11 +156,6 @@ impl Seed {
             .iter()
             .map(|(host, addr)| (host.clone(), addr.to_string()))
             .collect();
-        let sites: Vec<_> = self
-            .sites
-            .iter()
-            .map(|s| json!({"host": s.host, "about": s.about}))
-            .collect();
         let fixed: Vec<_> = self
             .fixed
             .iter()
@@ -215,10 +172,7 @@ impl Seed {
         json!({
             "name": self.name,
             "date": self.date,
-            "question": self.question,
-            "scenario": self.scenario,
-            "facts": self.facts,
-            "sites": sites,
+            "instructions": self.instructions,
             "fixed": fixed,
             "addresses": addresses,
         })
@@ -229,14 +183,6 @@ impl Seed {
         self.fixed
             .iter()
             .find(|f| f.host == host && f.target == target)
-    }
-
-    /// Returns the scenario's description of a host.
-    pub fn about(&self, host: &str) -> Option<&str> {
-        self.sites
-            .iter()
-            .find(|s| s.host == host)
-            .map(|s| s.about.as_str())
     }
 
     /// Addresses in the same shape as the world's `fixed_addresses` function.
@@ -281,14 +227,13 @@ mod tests {
     use super::*;
     #[test]
     fn parsing_captures_bytes_and_normalizes_targets() {
-        let text = "+++\ndate = 2026-10-07\nquestion = ' one  two '\n[[fixed]]\nurl = 'https://EXAMPLE.com/a/../é?q=x#frag'\nfile = 'a'\n[addresses]\n'GOOGLE.COM' = '1.2.3.4'\n+++\n body \n";
+        let text = "+++\ndate = 2026-10-07\n[[fixed]]\nurl = 'https://EXAMPLE.com/a/../é?q=x#frag'\nfile = 'a'\n[addresses]\n'GOOGLE.COM' = '1.2.3.4'\n+++\n body \n";
         let s = Seed::parse("test", text, |f| {
             assert_eq!(f, "a");
             Ok(vec![0, 255])
         })
         .unwrap();
-        assert_eq!(s.question, "one two");
-        assert_eq!(s.scenario, "body");
+        assert_eq!(s.instructions, "body");
         assert_eq!(s.fixed[0].host, "example.com");
         assert_eq!(s.fixed[0].target, "/%C3%A9?q=x");
         assert_eq!(s.fixed[0].body, [0, 255]);

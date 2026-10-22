@@ -8,7 +8,7 @@
 //! ```text
 //! store.json         format version, the seed's declaration, the generator
 //! world.jsonl        everything made, one object per line, in order
-//! generations.jsonl  every model attempt, stub call and prefetch error
+//! generations.jsonl  every model attempt, stored call and prefetch error
 //! addresses.jsonl    every pool address given out (see `Addresses`)
 //! store.lock         held while a world checks or writes these files
 //! locks/             one lock file per page, result list and the cast

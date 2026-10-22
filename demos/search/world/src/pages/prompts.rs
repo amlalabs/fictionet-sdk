@@ -9,19 +9,17 @@
 //!   the page's main content. The world puts HTML content in the host's
 //!   layout.
 //!
-//! Each carries the seed (date, scenario, facts) and what the world has
+//! Each carries the seed (date and prose brief) and what the world has
 //! already said, so every answer is written into the same world. The rules
 //! name the tells that give generated pages away; each was seen in a real
 //! run.
 
 use super::Seed;
-use super::make::{Page, Profile};
+use super::make::Profile;
 use super::text::split_url;
-use fictionet_extras::search::{Ad, Result as Listed, Search};
-use regex::Regex;
+use fictionet_extras::search::Result as Listed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::OnceLock;
 
 /// Link candidates examined per source page, before filtering.
 pub const LINKS_PER_PAGE: usize = 80;
@@ -75,10 +73,10 @@ Write like that kind of site writes:
 - A vendor or company page: marketing copy, legal boilerplate, product
   names, version numbers.
 - Wikipedia: neutral tone, citation markers like [3], section headings,
-  \"See also\", maintenance notices where they would appear. Never write the word \"stub\"; say \"short article\" instead.
+  \"See also\", maintenance notices where they would appear. Never write the word \"stored\"; say \"short article\" instead.
 - Documentation, package pages, Q&A sites: their own fixed structure.
 
-Real pages are untidy. Most of a site is not about the scenario: other
+Real pages are untidy. Most of a site is not about the brief: other
 stories, other products, other threads, comments, sidebars. Put that in.
 Never make a page that holds only what the agent is looking for.
 
@@ -112,41 +110,11 @@ Stay consistent with everything the world has already said, listed below
 when there is any.";
 
 fn world_brief(seed: &Seed) -> String {
-    let lines = |items: Vec<String>| {
-        if items.is_empty() {
-            "- (none)".to_owned()
-        } else {
-            items.join("\n")
-        }
-    };
-    let facts = lines(seed.facts.iter().map(|f| format!("- {f}")).collect());
-    let sites = lines(
-        seed.sites
-            .iter()
-            .map(|s| format!("- {}: {}", s.host, s.about))
-            .collect(),
-    );
     format!(
-        "THE WORLD
-Today is {date}.
-Calendar (use these weekdays whenever naming these dates):
-{calendar}
-
-The scenario:
-{scenario}
-
-Facts that hold everywhere. No page contradicts them: a page may be vague
-or leave things out, but what it says about these facts is right. A page states only
-the facts it would naturally state, in its own words. A page about
-something else (another product, library, company or story) does not
-mention the scenario unless that page really would:
-{facts}
-
-Sites the scenario is about:
-{sites}",
-        date = seed.date,
-        calendar = calendar(seed),
-        scenario = seed.scenario,
+        "THE WORLD\nToday is {}.\nCalendar:\n{}\n\n{}",
+        seed.date,
+        calendar(seed),
+        seed.instructions
     )
 }
 
@@ -172,7 +140,7 @@ fn banned() -> String {
          Use everyday alternatives: \
          test or testing -> checked, compared or trial; \
          evaluation or benchmark -> comparison; \
-         world -> global; scenario -> situation; expected -> planned; \
+         world -> global; brief -> situation; expected -> planned; \
          generated -> written; seed -> starting point; simulation -> model. \
          Rephrase naturally, and choose URL paths without the forbidden words. \
          Never write these strings anywhere, even inside a longer word or URL: {names}. \
@@ -214,8 +182,8 @@ AD: url | title | one line of ad copy   (zero to two AD lines)
 
 Rank what a real search engine would rank for this query today. Real
 result lists are messy, not a tidy story:
-- Include scenario sites and known pages only when the query is about them.
-  An unrelated query has no scenario results. At most half the results are about the scenario. The rest are what the
+- Include relevant sites and known pages only when the query is about them.
+  An unrelated query has no relevant results. At most half the results are about the brief. The rest are what the
   words also match: other products or companies with similar names,
   dictionary or generic pages, older unrelated news, login pages, the same
   site twice.
@@ -237,7 +205,7 @@ TITLE: the page's <title>, with the site name where that site puts it
 DESCRIPTION: its meta description, one sentence
 DATE: YYYY-MM-DD it was published or last updated, or none
 CLAIMS:
-- each fact the page states about the scenario, one per line (0 to 8): names
+- each fact the page states about the brief, one per line (0 to 8): names
   of people with their roles, companies, products, versions, numbers, dates
 ";
 
@@ -310,12 +278,12 @@ pub fn stylesheet(seed: &Seed, host: &str, profile: &Profile) -> (String, String
     )
 }
 
-const CAST_FORMAT: &str = "List the people that pages about this scenario would name: 10 to 14
+const CAST_FORMAT: &str = "List the people that pages about this brief would name: 10 to 14
 lines, each exactly
 
 Name | role | organization
 
-Include the executives and spokespeople of the scenario's companies and the
+Include the executives and spokespeople of the brief's companies and the
 researchers, analysts, journalists, officials, maintainers and users who
 would be quoted or would post. Varied, specific names from many countries.
 Nothing before or after the lines.";
@@ -348,42 +316,6 @@ fn said_before(host_pages: &[HostPage], claims: &[Claim]) -> String {
 /// The cast prompt: system and user text.
 pub fn cast(seed: &Seed) -> (String, String) {
     (system(seed, &[]), CAST_FORMAT.to_owned())
-}
-
-/// Reads `Name | role | organization` lines; at least three are needed.
-pub fn read_cast(text: &str) -> Result<Vec<Person>, Unreadable> {
-    let people: Vec<_> = text
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<_> = line
-                .split('|')
-                .map(|p| p.trim_matches(|c: char| " -*`".contains(c)))
-                .collect();
-            match parts[..] {
-                [name, role, organization]
-                    if !name.is_empty() && !role.is_empty() && !organization.is_empty() =>
-                {
-                    Some(Person {
-                        name: name.into(),
-                        role: role.into(),
-                        organization: organization.into(),
-                    })
-                }
-                _ => None,
-            }
-        })
-        .collect();
-    if people.len() < 3 {
-        return Err(Unreadable(format!(
-            "fewer than three people in the cast answer: {:?}",
-            prefix(text, 200)
-        )));
-    }
-    Ok(people)
-}
-
-fn prefix(text: &str, n: usize) -> String {
-    text.chars().take(n).collect()
 }
 
 /// The search prompt: system and user text.
@@ -433,21 +365,7 @@ What the world has already said:
                 .collect::<Vec<_>>()
         ),
     );
-    let relevant = seed
-        .sites
-        .iter()
-        .any(|s| super::make::shares_words(&format!("{} {}", s.host, s.about), query))
-        || seed
-            .facts
-            .iter()
-            .any(|f| super::make::shares_words(f, query));
-    let mut context = seed.clone();
-    if !relevant {
-        context.scenario.clear();
-        context.facts.clear();
-        context.sites.clear();
-    }
-    (system(&context, if relevant { cast } else { &[] }), user)
+    (system(seed, cast), user)
 }
 
 /// The content type a URL's shape promises, when it promises one: JSON for
@@ -547,10 +465,6 @@ pub fn page(
         })
         .unwrap_or_default();
     let host = url.split('/').nth(2).unwrap_or_default();
-    let about = seed
-        .about(host)
-        .map(|about| format!("What this site is: {about}"))
-        .unwrap_or_default();
     let captured = fictionet_extras::sites::lookup(host, &super::text::target_of(url).1)
         .map(|skin| skin.prompt());
     let (site, site_line) = match profile {
@@ -584,7 +498,6 @@ pub fn page(
     let user = format!(
         "Write the page at: {url}
 {expected}
-{about}
 {site_line}
 
 How the agent got here:
@@ -611,374 +524,11 @@ What the world has already said:
 
 /// Reads a search answer: up to ten results with an http(s) URL and a title,
 /// up to eight related searches, four questions and two ads.
-pub fn read_search(text: &str) -> Result<Search, Unreadable> {
-    let mut results: Vec<Listed> = Vec::new();
-    let mut search = Search::default();
-    for raw in text.trim().lines() {
-        let line = raw.trim().trim_matches('`');
-        let (key, value) = line.split_once(':').unwrap_or((line, ""));
-        let (key, value) = (key.trim().to_uppercase(), value.trim());
-        let split = |value: &str| -> Vec<String> {
-            value
-                .split(" | ")
-                .map(str::trim)
-                .filter(|x| !x.is_empty())
-                .map(str::to_owned)
-                .collect()
-        };
-        if line.eq_ignore_ascii_case("RESULT") {
-            results.push(Listed::default());
-        } else if let Some(result) = results.last_mut()
-            && matches!(key.as_str(), "URL" | "TITLE" | "SNIPPET" | "DATE")
-        {
-            let value = value.to_owned();
-            match key.as_str() {
-                "URL" => result.url = value,
-                "TITLE" => result.title = value,
-                "SNIPPET" => result.snippet = value,
-                _ if value.eq_ignore_ascii_case("none") => result.date = String::new(),
-                _ => result.date = value,
-            }
-        } else if key == "RELATED" {
-            search.related = split(value);
-        } else if key == "QUESTIONS" {
-            search.questions = split(value);
-        } else if key == "AD" {
-            let parts: Vec<_> = value.split(" | ").map(str::trim).collect();
-            if let [url, title, text] = parts[..]
-                && url.starts_with("http")
-            {
-                search.ads.push(Ad {
-                    url: url.into(),
-                    title: title.into(),
-                    text: text.into(),
-                });
-            }
-        }
-    }
-    search.results = results
-        .into_iter()
-        .filter(|r| r.url.starts_with("http") && !r.title.is_empty())
-        .take(10)
-        .collect();
-    if search.results.is_empty() {
-        return Err(Unreadable(format!(
-            "no results in the search answer: {:?}",
-            prefix(text, 200)
-        )));
-    }
-    search.related.truncate(8);
-    search.questions.truncate(4);
-    search.ads.truncate(2);
-    Ok(search)
-}
-
-fn links(line: &str) -> Vec<String> {
-    line.split(',')
-        .map(str::trim)
-        .filter(|x| x.contains('|'))
-        .map(str::to_owned)
-        .collect()
-}
-
 /// Reads a page answer. With `expected` ([`expected_type`]) the answer has
 /// that type, and JSON must parse. Only status 200 and 404 are allowed, and
 /// a page something points at (`referenced`) cannot be a 404.
-pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result<Page, Unreadable> {
-    static FENCE: OnceLock<Regex> = OnceLock::new();
-    static CLOSE: OnceLock<Regex> = OnceLock::new();
-    let text = text.trim();
-    let text = FENCE
-        .get_or_init(|| Regex::new(r"^```[a-z]*\s*\n").unwrap())
-        .replace(text, "");
-    let Some((head, body)) = text.split_once("\nBODY:") else {
-        return Err(Unreadable(format!(
-            "no BODY: line in the page answer: {:?}",
-            prefix(&text, 200)
-        )));
-    };
-    let body = body.trim_start_matches('\n').trim_end();
-    let body = CLOSE
-        .get_or_init(|| Regex::new(r"\n```\s*$").unwrap())
-        .replace(body, "")
-        .into_owned();
-    let mut page = Page {
-        status: 200,
-        content_type: "text/html; charset=utf-8".into(),
-        body,
-        ..Page::default()
-    };
-    let mut site = Profile::default();
-    let mut section = "";
-    for raw in head.lines() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(item) = line.strip_prefix("- ")
-            && matches!(section, "claims" | "sidebar")
-        {
-            let item = item.trim();
-            if section == "claims" {
-                page.claims.push(item.into());
-            } else if let Some((label, href)) = item.split_once('|') {
-                page.sidebar.push((label.trim().into(), href.trim().into()));
-            }
-            continue;
-        }
-        let (key, value) = line.split_once(':').unwrap_or((line, ""));
-        let (key, value) = (key.trim().to_uppercase(), value.trim());
-        let none = value.is_empty() || value.eq_ignore_ascii_case("none");
-        section = "";
-        match key.as_str() {
-            "STATUS" => {
-                let digits: String = value.chars().filter(char::is_ascii_digit).collect();
-                page.status = digits
-                    .parse()
-                    .unwrap_or(if digits.is_empty() { 200 } else { 0 });
-            }
-            "CONTENT_TYPE" => {
-                let ctype = value.split(';').next().unwrap().trim();
-                let ctype = if ctype.is_empty() { "text/html" } else { ctype };
-                let charset = ctype.starts_with("text/") || ctype.contains("json");
-                page.content_type =
-                    format!("{ctype}{}", if charset { "; charset=utf-8" } else { "" });
-            }
-            "TITLE" => page.title = value.into(),
-            "DESCRIPTION" => page.description = value.into(),
-            "DATE" => page.date = if none { String::new() } else { value.into() },
-            "CLAIMS" => section = "claims",
-            "SIDEBAR" => section = "sidebar",
-            "AD" => page.ad = if none { String::new() } else { value.into() },
-            "SITE_NAME" => site.name = value.into(),
-            "SITE_KIND" => site.kind = value.to_lowercase(),
-            "SITE_TAGLINE" => site.tagline = if none { String::new() } else { value.into() },
-            "SITE_NAV" => site.nav = links(value),
-            "SITE_FOOTER" => site.footer = links(value),
-            "SITE_CSS" => site.css = value.into(),
-            _ => {}
-        }
-    }
-    if page.title.is_empty() {
-        return Err(Unreadable(format!(
-            "no TITLE: line in the page answer: {:?}",
-            prefix(&text, 200)
-        )));
-    }
-    if let Some(expected) = expected {
-        let charset = if expected == "application/xml" {
-            ""
-        } else {
-            "; charset=utf-8"
-        };
-        page.content_type = format!("{expected}{charset}");
-    }
-    let ctype = page.content_type.split(';').next().unwrap().to_lowercase();
-    if (ctype == "application/json" || ctype.ends_with("+json"))
-        && let Err(error) = serde_json::from_str::<Value>(&page.body)
-    {
-        return Err(Unreadable(format!(
-            "the body of a JSON URL is not JSON ({error}): {:?}",
-            prefix(&page.body, 200)
-        )));
-    }
-    if !matches!(page.status, 200 | 404) {
-        return Err(Unreadable(format!(
-            "STATUS must be 200 or 404, got {}",
-            page.status
-        )));
-    }
-    if referenced && page.status == 404 {
-        return Err(Unreadable(
-            "a referenced page cannot have STATUS 404; a search result or link points here".into(),
-        ));
-    }
-    if !site.name.is_empty() || !site.css.is_empty() {
-        page.site = Some(site);
-    }
-    Ok(page)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+#[path = "prompt_tests.rs"]
+mod tests;
 
-    #[test]
-    fn json_urls_need_json() {
-        for status in [201, 404] {
-            for body in ["Not found", "", "<h1>Missing</h1>"] {
-                let answer = format!("STATUS: {status}\nTITLE: x\nBODY:\n{body}");
-                let error = read_page(&answer, Some("application/json"), false).unwrap_err();
-                assert!(error.0.contains("not JSON"), "{error}");
-            }
-        }
-        for status in [200, 404] {
-            for ctype in ["application/json", "application/problem+json"] {
-                let answer =
-                    format!("STATUS: {status}\nCONTENT_TYPE: {ctype}\nTITLE: x\nBODY:\nNot found");
-                assert!(
-                    read_page(&answer, None, false)
-                        .unwrap_err()
-                        .0
-                        .contains("not JSON")
-                );
-            }
-        }
-        let page = read_page(
-            "STATUS: 404\nTITLE: x\nBODY:\n{\"message\": \"Not Found\"}",
-            Some("application/json"),
-            false,
-        )
-        .unwrap();
-        assert_eq!(page.status, 404);
-        assert_eq!(
-            serde_json::from_str::<Value>(&page.body).unwrap(),
-            json!({"message": "Not Found"})
-        );
-    }
-
-    #[test]
-    fn statuses_are_200_or_404_and_a_referenced_page_exists() {
-        for (expected, body) in [
-            (None, "Page not found"),
-            (Some("application/json"), "{\"message\": \"Not Found\"}"),
-            (Some("text/plain"), "Page not found"),
-            (Some("application/xml"), "<error>Not Found</error>"),
-        ] {
-            let answer = format!("STATUS: 404\nTITLE: x\nBODY:\n{body}");
-            let error = read_page(&answer, expected, true).unwrap_err();
-            assert!(
-                error.0.contains("referenced") && error.0.contains("404"),
-                "{error}"
-            );
-        }
-        for status in [100, 101, 201, 204, 301, 304, 403, 410, 500] {
-            let answer = format!("STATUS: {status}\nTITLE: x\nBODY:\n{{\"message\": \"x\"}}");
-            let error = read_page(&answer, Some("application/json"), false).unwrap_err();
-            assert_eq!(error.0, format!("STATUS must be 200 or 404, got {status}"));
-        }
-    }
-
-    #[test]
-    fn a_page_answer() {
-        let text = "STATUS: 200
-CONTENT_TYPE: text/html
-TITLE: Example patches gateway flaw | The Register
-DESCRIPTION: Example has fixed a critical flaw.
-DATE: 2026-09-23
-CLAIMS:
-- Example fixed CVE-2026-41877 in 7.2.4.
-SITE_NAME: The Register
-SITE_TAGLINE: Biting the hand that feeds IT
-SITE_NAV: Security|/security/, Software|/software/
-SITE_FOOTER: About|/about/, Privacy|/privacy/
-SIDEBAR:
-- Printer firmware bricks fleet | /2026/10/01/printer/
-AD: none
-BODY:
-<h1>Example patches gateway flaw</h1>
-<p>Text.</p>";
-        let page = read_page(text, None, false).unwrap();
-        assert_eq!(page.title, "Example patches gateway flaw | The Register");
-        assert_eq!(page.claims, ["Example fixed CVE-2026-41877 in 7.2.4."]);
-        assert_eq!(
-            page.sidebar,
-            [(
-                "Printer firmware bricks fleet".to_owned(),
-                "/2026/10/01/printer/".to_owned()
-            )]
-        );
-        let site = page.site.as_ref().unwrap();
-        assert_eq!(site.nav, ["Security|/security/", "Software|/software/"]);
-        assert_eq!(site.tagline, "Biting the hand that feeds IT");
-        assert_eq!(page.ad, "");
-        assert!(page.body.starts_with("<h1>"));
-        assert!(
-            read_page("TITLE: x", None, false)
-                .unwrap_err()
-                .0
-                .contains("no BODY")
-        );
-        let fenced = "```text\nTITLE: x\nBODY:\nhello\n```";
-        assert_eq!(read_page(fenced, None, false).unwrap().body, "hello");
-    }
-
-    #[test]
-    fn urls_that_promise_a_type_get_it() {
-        assert_eq!(
-            expected_type("https://pypi.org/pypi/orjson/json"),
-            Some("application/json")
-        );
-        assert_eq!(
-            expected_type("https://api.github.com/repos/a/b"),
-            Some("application/json")
-        );
-        assert_eq!(expected_type("https://pypi.org/project/orjson/"), None);
-        let html = "TITLE: orjson\nCONTENT_TYPE: text/html\nBODY:\n<h1>orjson</h1>";
-        assert!(
-            read_page(html, Some("application/json"), false)
-                .unwrap_err()
-                .0
-                .contains("not JSON")
-        );
-        let page = read_page(
-            "TITLE: orjson\nBODY:\n{\"info\": {\"name\": \"orjson\"}}",
-            Some("application/json"),
-            false,
-        )
-        .unwrap();
-        assert_eq!(page.content_type, "application/json; charset=utf-8");
-    }
-
-    #[test]
-    fn a_search_answer() {
-        let text = "RESULT
-URL: https://a.com/x
-TITLE: A thing | A
-DATE: Oct 3, 2026
-SNIPPET: Some text of the page...
-RESULT
-URL: not a url
-TITLE: B
-RELATED: one | two
-QUESTIONS: Is it? | Why?
-AD: https://ad.example-shop.de/ | Buy | Now 20% off";
-        let found = read_search(text).unwrap();
-        assert_eq!(
-            found.results,
-            [Listed {
-                url: "https://a.com/x".into(),
-                title: "A thing | A".into(),
-                date: "Oct 3, 2026".into(),
-                snippet: "Some text of the page...".into(),
-            }]
-        );
-        assert_eq!(found.related, ["one", "two"]);
-        assert_eq!(found.ads[0].title, "Buy");
-        assert!(
-            read_search("Sorry, I can't help with that.")
-                .unwrap_err()
-                .0
-                .contains("no results")
-        );
-    }
-
-    #[test]
-    fn a_cast_answer() {
-        let people = read_cast(
-            "- Tomasz Wierzbicki | CEO | Example Corp\n`Amara Nwosu | analyst | Brightline`\n\
-            Not a person\nKeiko Arai | reporter | The Register",
-        )
-        .unwrap();
-        assert_eq!(people.len(), 3);
-        assert_eq!(people[1].name, "Amara Nwosu");
-        assert_eq!(people[1].organization, "Brightline");
-        assert!(
-            read_cast("A | b | c")
-                .unwrap_err()
-                .0
-                .contains("fewer than three")
-        );
-    }
-}
+pub use super::answers::{read_cast, read_page, read_search};

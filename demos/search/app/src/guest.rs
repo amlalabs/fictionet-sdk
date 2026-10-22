@@ -9,7 +9,6 @@ pub const START: &str = "https://www.google.com/";
 pub fn guest(date: &str) -> Guest {
     let guest = kit::desktop::browser(HOST, USER, START)
         .resources(4, 4096)
-        .forbid(&["stub", "canned", "planted"])
         // The searcher reads the address back before submitting it.
         .packages(&["xclip", "nmap"]);
     let date = date

@@ -123,9 +123,9 @@ pub struct Usage {
 
 impl Usage {
     /// One offline generation that took `ms`.
-    pub fn stub(ms: u64) -> Self {
+    pub fn stored(ms: u64) -> Self {
         Self {
-            model: "stub".into(),
+            model: "stored".into(),
             gen_ms: ms,
             input_tokens: None,
             output_tokens: None,
@@ -251,23 +251,8 @@ pub struct Answer<T> {
     pub raw: String,
 }
 
-struct OpenRouter;
-
-impl Transport for OpenRouter {
-    fn post<'a>(
-        &'a self,
-        cx: &'a Cx,
-        headers: Vec<(&'static str, String)>,
-        body: Vec<u8>,
-    ) -> fictionet_extras::models::Post<'a> {
-        Box::pin(async move {
-            fictionet_extras::models::Https::new(cx, fictionet_extras::models::Provider::OpenRouter)
-                .map_err(|e| e.to_string())?
-                .post(cx, headers, body)
-                .await
-        })
-    }
-}
+mod transport;
+use transport::OpenRouter;
 
 impl Model {
     /// The default page writer, using the existing OpenRouter credential.

@@ -95,7 +95,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     });
     add('text', { class: 'mark', 'aria-hidden': 'true' }, group);
     return group;
-  }, (g, { host, site, x, y, pages, scenario, visit }) => {
+  }, (g, { host, site, x, y, pages, visit }) => {
     const count = pages.filter((p) => p.fetches > 0).length + (visit?.outcome.status === 'served' ? 1 : 0);
     const r = count ? 9 + Math.min(count - 1, 4) * 1.25 : 8;
     const mark = hostMark(siteKey(host));
@@ -106,7 +106,7 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
     attrs(g.children[4], { x, y, 'font-size': count ? Math.min(r * 1.3, 17) : 10 });
     g.children[4].textContent = mark.letter;
     g.style.transformOrigin = `${x}px ${y}px`;
-    attrs(g.children[0], { class: `site ${state}${scenario ? ' scenario' : ''}${pages.some((p) => p.making) || making.has(siteKey(host)) ? ' making' : ''}`, cx: x, cy: y, r });
+    attrs(g.children[0], { class: `site ${state}${pages.some((p) => p.making) || making.has(siteKey(host)) ? ' making' : ''}`, cx: x, cy: y, r });
     attrs(g.children[1], { x, y: y + r + 18 });
     const label = g.children[1];
     label.replaceChildren();
@@ -202,13 +202,12 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       if (site) names.set(key, site);
       return key;
     };
-    for (const row of snapshot.seed.sites) remember(row.host, row.site);
     const offMap = snapshot.queries.filter((q) => !ENGINES.includes(q.engine));
     for (const q of offMap) remember(ENGINE_HOSTS[q.engine] || q.engine, engine(q.engine));
     for (const row of snapshot.sites || []) remember(row.host, row.site);
     for (const list of snapshot.results) for (const row of list.listed) remember(row.host, row.site);
     for (const row of snapshot.pages) remember(row.host, row.site);
-    const hosts = new Set(snapshot.seed.sites.map((row) => remember(row.host, row.site)));
+    const hosts = new Set();
     for (const q of offMap) {
       const host = remember(ENGINE_HOSTS[q.engine] || q.engine);
       if (q.outcome.status === 'served') openedHosts.add(host);
@@ -225,15 +224,14 @@ export function createWeb(svg, { el, motion = createMotion(svg.ownerDocument.def
       if (p.reason?.via === 'link') openedHosts.add(remember(hostOf(p.reason.from)));
     }
     for (const host of openedHosts) hosts.add(host);
-    const scenario = snapshot.seed.sites.map((row) => siteKey(row.host));
-    const map = layout(previous, [...hosts], { seed: { sites: scenario } });
+    const map = layout(previous, [...hosts]);
     if (changes && motion.active && query && (query.outcome.status === 'pending' || changes.some((c) => c.type === 'search_answered' && c.query.id === query.id))) {
       for (const host of map.assignment.keys()) if (!previous?.assignment.has(host) && !offMap.some((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine) === host)) waitingSites.add(host);
     }
     for (const host of waitingSites) if (!map.assignment.has(host)) waitingSites.delete(host);
     previous = map;
     const pages = (host) => snapshot.pages.filter((p) => siteKey(p.host) === host).sort((a, b) => (a.first_serve_ms ?? a.at_ms) - (b.first_serve_ms ?? b.at_ms) || a.url.localeCompare(b.url));
-    sites([...map.assignment].map(([host, [x, y]]) => [host, { host: representatives.get(host) || host, site: names.get(host) || host, x, y, pages: pages(host), scenario: scenario.includes(host), visit: offMap.findLast((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine) === host) }]));
+    sites([...map.assignment].map(([host, [x, y]]) => [host, { host: representatives.get(host) || host, site: names.get(host) || host, x, y, pages: pages(host), visit: offMap.findLast((q) => siteKey(ENGINE_HOSTS[q.engine] || q.engine) === host) }]));
     if (!motion.active) waitingSites.clear();
     for (const group of layers.sites.children) {
       group.style.opacity = waitingSites.has(siteKey(group.getAttribute('data-host'))) ? '0' : '';

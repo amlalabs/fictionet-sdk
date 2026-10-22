@@ -1,113 +1,69 @@
-# The web world
+# Search
 
-The [Search demo](../../demos/README.md#search) serves an astronomy corpus from
-compressed WARC archives. Its World menu chooses **Pages: Copied**,
-**Pages: Model-written** or **Pages: Live search, copied in**. Copied pages are the default; changing the menu affects
-new requests without restarting the VM.
+Run `cargo xtask demo search` on Linux with KVM, or
+`cargo xtask demo search preview` without a VM. Agents sign in inside the guest.
+The terminal uses ghostty-web.
 
-Run `cargo xtask demo corpus` to complete the retained NASA and ESA archive to
-about 500 HTML pages through Wikimedia's Action API, with a descriptive User-Agent
-and contact address. The copied article content sits in Wikipedia's real desktop
-skin, with scripts removed for static replay and CSS, fonts and images captured
-at their real URLs. Reruns complete missing assets without growing the article
-count beyond the target. Archives stay in `demos/downloads/astronomy/`, outside
-git. Capture errors fail the command; retained files still need browser checks.
+[app/src/main.rs](app/src/main.rs) assembles the workstation, copied web,
+search observer and page. [app/src/network.rs](app/src/network.rs) connects the
+model gateway, sign-in relay and package mirror. The web world supplies DNS,
+certificates, page sources and engine layouts. Model calls retain the guest's
+credentials; search and fetch tools use the same active page source as Firefox.
+The gateway emits `model.tool` observations for Architecture.
 
-Run `cargo xtask demo search` on Linux with KVM to start Firefox, Claude Code
-and Codex. `cargo xtask demo search preview` uses an in-world client without a VM.
-The Search demo has no check or bake mode.
+## Page sources
 
-The world scans each gzip member once to build an in-memory URL-to-record
-index. Responses are served by seeking to a member and decompressing it, with
-revisit references and redirects preserved. The reusable reader lives in
-[`fictionet-extras`](../../extras/src/warc.rs). It never unpacks the archive.
+- **Copied** replays WARC responses at their real URLs. A crawler builds one
+  BM25 index from their titles and text. Google, Bing and DuckDuckGo render that
+  index in their own layouts. Missing URLs return 404.
+- **Model-written** uses `OPENROUTER_API_KEY` to write pages from a prose brief,
+  prior mentions and stored claims. Failed calls do not invent fallback articles.
+- **Live** uses `EXA_API_KEY` for [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml).
+  Results retain their order, titles, URLs and snippets in each engine's skin.
+  Without the key, the World menu identifies the missing configuration and the
+  other sources remain usable.
 
-At startup the search crawler follows links from the starting URLs through
-the copied-site response handler. It stays within the captured URL set, extracts
-page titles and text, and builds a BM25 inverted index. Startup prints scan and
-crawl/index times and the number of indexed pages. Google, Bing and DuckDuckGo
-use that one index and their existing layouts. Snippets are excerpts of matching
-page text. Unknown URLs return 404; unmatched queries show no results.
+Live downloads result pages and requisites, following navigation to depth five
+within each result's site. Redirects and cross-host assets are retained at their
+real URLs. Every outgoing query is logged and displayed. The crawler ignores
+robots.txt and limits requests per host. Unknown URLs do not start downloads.
+The log records `real_search`, `downloaded`, `copy_served` and `download_failed`.
 
-Every public hostname resolves to an address assigned by the world. TLS
-certificates are signed by its CA. Claude retains its own sign-in; its server
-search and fetch tools are answered locally, with one search log entry recording
-the source, query and returned results. The model request itself still goes to
-the provider.
+The content audit applies to text the world writes. Replayed WARC responses carry
+capture provenance and are outside that scope; their words are not allowlisted.
 
-## Live search, copied in
+## Briefs
 
-Set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_ENGINE_ID` in the host environment
-before starting, then select the mode in the World menu. Browser engine searches
-and intercepted Claude and Codex tools call Google's Programmable Search JSON API
-on the host. Every outgoing query is visible in the Web pane and logs. Ordered
-results appear in the selected engine's existing skin while downloads continue.
+A file in [seeds/](seeds) has a world date and free-text instructions:
 
-The host downloads result URLs and dependencies, and follows navigation links
-on each result's hostname through depth five. It preserves redirects and can fetch
-cross-host CSS, fonts, images and scripts named by the copied documents. It uses
-an ordinary browser identity, robots.txt permissions and per-host delays. Unknown
-URLs never trigger a download. Reached URLs can wait up to 45 seconds for their
-copy; failures and timeouts get a normal not-found response. Requests generated
-only by scripts, with no URL discovered in HTML or CSS, remain unavailable.
+```toml
++++
+date = "2026-10-21"
++++
+```
 
-Copies use the same WARC writer and replay as the astronomy corpus. They remain
-for the run, including mode changes, and are retained as
-`demos/downloads/live-search-*.warc.gz`. `Pages::with_live_search` configures this
-source for a host application; it never changes guest network forwarding.
-The run log records `real_search`, `downloaded`, `copy_served` and `download_failed`.
-The Web pane shows recent matching events, and the event log retains the history.
-Host API credentials never enter guest pages or log messages.
+Write the world's full brief after the closing marker: what is true, what the
+sites contain and which sources matter. Optional `[[fixed]]` entries retain
+`url`, `file`, `title`, `description` and `content_type`; their files are served
+verbatim. The date controls pages, HTTP dates and certificate validity.
+Search ranking receives the prose without special treatment for named sites.
+Eval questions live in the Python task's `QUESTIONS` mapping.
 
-## Model-written pages
+## Corpus
 
-Set `OPENROUTER_API_KEY` before starting the demo to enable the menu's
-Model-written option. The existing model writer creates search results and
-pages when requested, using the seed's date, facts, prior mentions and stored
-claims. Its store remains in memory. Failed model calls return an error and do
-not fall back to invented keyword pages.
+`cargo xtask demo corpus` completes the NASA, ESA and Wikipedia capture.
+`cargo xtask demo corpus sites` captures the additional astronomy sources listed
+in [corpus/new-sites.urls](corpus/new-sites.urls), with `wget -e robots=off
+--page-requisites`, a browser identity and request delays. An optional URL limits
+that command to one source. `cargo xtask demo corpus report` reports actual HTML
+counts and index coverage. Captures are stored in `demos/downloads/astronomy/`.
+Capture failures are reported rather than replaced with authored pages.
 
-The same writer is available to other worlds as `Pages::with_model`, and
-`Pages::open` supports a persistent store for evaluation workloads. Store files
-record pages, searches, model attempts and address assignments. Worlds sharing a
-store coordinate writes with file locks. Replay mode serves only stored content.
-The lightweight offline helper can preserve known metadata and mentions; it no
-longer contains query catalogs or fabricated articles.
+## Code
 
-A seed in `seeds/` describes a date, question, sites and facts. Other evaluation
-workloads can use the existing standalone world configuration and
-[`inspect_fictionet.worlds.web`](../../python/inspect_fictionet/src/inspect_fictionet/worlds/web).
-For example, `cargo xtask eval web --live '{"seed":"corvane-acquisition","generator":"openrouter"}'`
-uses the OpenRouter writer. Anthropic generation continues to support
-`ANTHROPIC_API_KEY`. These evaluation settings are separate from the Search
-demo's menu.
-
-## Validation
-
-Unit fixtures exercise WARC member seeking, stored headers and bodies,
-redirects, revisits, crawler boundaries and BM25 ranking. The model integration
-fixture uses a local upstream to ensure that Claude's API-key and bearer-token
-requests have their search and fetch tools answered from the same archive,
-without external search requests, and log one search entry.
-
-The retained local archive has 500 HTML pages, including 288 Wikipedia pages,
-and 6,600 URL records in 381,013,296 compressed bytes. The seed-link crawl indexes
-386 reachable pages. Twenty astronomy articles were loaded in headless Chromium
-with `--password-store=basic --use-mock-keychain`, the browser cache disabled and
-all document images requested eagerly. Their 699 requests had no failed CSS,
-font or image requests, broken images or missing stylesheets. The complete sample
-log, which also includes one discarded non-astronomy page, is retained at
-`demos/downloads/search-report/wikipedia-browser.log`. Archives and browser output
-remain outside git.
-
-Wikimedia returns 404 for two obsolete Kartographer cursor resources. Those
-responses remain recorded, and the corpus command continues to report resource
-failure rather than fabricate replacements. Neither URL was requested by the
-sampled pages. NASA and ESA asset completeness has not been reverified.
-
-The shared guest-content audit still rejects ordinary terminology in authentic
-copied articles, so the preview can serve its story and then fail its shutdown
-audit. No audit exception has been added. A provenance exception needs approval
-under the repository rules. A real Google sample also remains unverified until
-host search credentials are supplied; API and crawl integration tests use local
-HTTP fixtures.
+The world's page modules separate routing, generation, listings, stored pages,
+corrections and model tools. Prompt construction and answer parsing are separate.
+The WARC reader, crawler, BM25 index, model gateway and sign-in relay live in
+`fictionet-extras`. The shared demo kit owns VM lifetime, the observation page,
+terminal, screen and package cache. Browser libraries are fetched with
+`cargo xtask demo libraries`.

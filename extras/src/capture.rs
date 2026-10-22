@@ -13,16 +13,10 @@ use url::Url;
 /// An ordinary desktop browser identity for host side live copies.
 pub const BROWSER: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
-struct Host {
-    robots: String,
-    next: Instant,
-    delay: Duration,
-}
-
 /// A serial host downloader. Redirects are returned for archival and discovery.
 pub struct Fetcher {
     client: reqwest::blocking::Client,
-    hosts: HashMap<String, Host>,
+    hosts: HashMap<String, Instant>,
     api_times: std::sync::Mutex<HashMap<String, Instant>>,
 }
 
@@ -58,6 +52,10 @@ impl Fetcher {
             .header("accept-encoding", "identity")
             .send()
             .map_err(io::Error::other)?;
+        Self::capture(response)
+    }
+
+    fn capture(response: reqwest::blocking::Response) -> io::Result<warc::Response> {
         let status = response.status();
         let headers = response.headers().clone();
         let mut body = Vec::new();
@@ -72,82 +70,37 @@ impl Fetcher {
         })
     }
 
-    /// Fetch only when robots permits Mozilla, at most twice per second per host.
-    /// Unavailable robots fails closed; a missing robots file permits crawling.
+    /// Fetch at most twice per second per host, independent of robots.txt.
     pub fn fetch(&mut self, url: &str) -> io::Result<warc::Response> {
         let parsed = Url::parse(url).map_err(io::Error::other)?;
-        let origin = parsed.origin().ascii_serialization();
-        let host_key = parsed
+        let host = parsed
             .host_str()
-            .ok_or_else(|| io::Error::other("missing host"))?
-            .to_owned();
-        if !self.hosts.contains_key(&host_key) {
-            let mut robots_url = format!("{origin}/robots.txt");
-            let mut robots = None;
-            for _ in 0..6 {
-                let response = self.api(&robots_url)?;
-                if response.status.is_redirection() {
-                    robots_url = Url::parse(&robots_url)
-                        .unwrap()
-                        .join(
-                            response
-                                .headers
-                                .get("location")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or(""),
-                        )
-                        .map_err(io::Error::other)?
-                        .into();
-                    std::thread::sleep(Duration::from_millis(500));
-                } else {
-                    robots = Some(if response.status.is_success() {
-                        String::from_utf8_lossy(&response.decoded()?).into_owned()
-                    } else if response.status.as_u16() == 404 || response.status.as_u16() == 410 {
-                        String::new()
-                    } else {
-                        "User-agent: *\nDisallow: /".into()
-                    });
-                    break;
-                }
-            }
-            let robots = robots.ok_or_else(|| io::Error::other("robots redirect limit"))?;
-            let delay = robots
-                .lines()
-                .filter_map(|line| {
-                    let (name, value) = line.split('#').next()?.split_once(':')?;
-                    name.trim()
-                        .eq_ignore_ascii_case("crawl-delay")
-                        .then(|| value.trim().parse::<f64>().ok())
-                        .flatten()
-                        .filter(|n| n.is_finite() && *n >= 0.0 && *n < 86400.0)
-                        .map(Duration::from_secs_f64)
-                })
-                .max()
-                .unwrap_or_default()
-                .max(Duration::from_millis(500));
-            self.hosts.insert(
-                host_key.clone(),
-                Host {
-                    robots,
-                    next: Instant::now() + delay,
-                    delay,
-                },
-            );
-        }
-        let host = self.hosts.get_mut(&host_key).unwrap();
-        if !robotstxt::DefaultMatcher::default().one_agent_allowed_by_robots(
-            &host.robots,
-            "Mozilla",
-            url,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "robots.txt disallows this URL",
-            ));
-        }
-        std::thread::sleep(host.next.saturating_duration_since(Instant::now()));
-        host.next = Instant::now() + host.delay;
+            .ok_or_else(|| io::Error::other("missing host"))?;
+        let next = self
+            .hosts
+            .entry(host.to_owned())
+            .or_insert_with(Instant::now);
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        *next = Instant::now() + Duration::from_millis(500);
         self.api(url)
+    }
+
+    /// Send a JSON search request with an API key in its header.
+    pub fn search(
+        &self,
+        url: &str,
+        key: &str,
+        body: &serde_json::Value,
+    ) -> io::Result<warc::Response> {
+        let response = self
+            .client
+            .post(url)
+            .header("x-api-key", key)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .map_err(io::Error::other)?;
+        Self::capture(response)
     }
 }
 
@@ -382,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn robots_and_host_rate_limit_apply_before_pages() {
+    fn requests_ignore_robots_and_remain_rate_limited() {
         use std::{
             io::{BufRead, BufReader, Write},
             net::TcpListener,
@@ -391,7 +344,7 @@ mod tests {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut times = Vec::new();
-            for path in ["/robots.txt", "/allowed", "/another"] {
+            for path in ["/denied", "/allowed", "/another"] {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -408,11 +361,7 @@ mod tests {
                     }
                 }
                 times.push(Instant::now());
-                let body = if path == "/robots.txt" {
-                    "User-agent: *\nDisallow: /denied\n"
-                } else {
-                    "copied"
-                };
+                let body = "copied";
                 write!(
                     socket,
                     "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
@@ -425,11 +374,8 @@ mod tests {
         });
         let mut fetcher = Fetcher::new(BROWSER).unwrap();
         assert_eq!(
-            fetcher
-                .fetch(&format!("{origin}/denied"))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::PermissionDenied
+            fetcher.fetch(&format!("{origin}/denied")).unwrap().body,
+            "copied"
         );
         assert_eq!(
             fetcher.fetch(&format!("{origin}/allowed")).unwrap().body,

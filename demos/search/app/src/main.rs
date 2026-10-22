@@ -7,7 +7,7 @@
 
 mod guest;
 mod preview;
-use fictionet_search_demo as page;
+use fictionet_search_demo::{network, page};
 
 use example_common::log::Log;
 use fictionet_demo::kit::{self, Kit};
@@ -50,18 +50,26 @@ fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
 }
 
 fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
-    let model = std::env::var_os("OPENROUTER_API_KEY")
+    let model = std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
         .map(|_| web_world::pages::model::Model::openrouter())
         .transpose()?;
     let seeds = include_str!("../../corpus/astronomy.urls")
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let pages = Pages::copied(seed, &downloads.join("astronomy"), &seeds, model)?;
+    let pages = Pages::copied(
+        seed,
+        &downloads
+            .parent()
+            .ok_or("downloads folder has no parent")?
+            .join("astronomy"),
+        &seeds,
+        model,
+    )?;
     Ok(
-        if std::env::var_os("GOOGLE_SEARCH_API_KEY").is_some()
-            || std::env::var_os("GOOGLE_SEARCH_ENGINE_ID").is_some()
-        {
+        if std::env::var("EXA_API_KEY").is_ok_and(|key| !key.is_empty()) {
             pages.with_live_search(downloads)?
         } else {
             pages
@@ -106,7 +114,7 @@ async fn main() -> Result {
             // Claude Code and Codex sign in inside the guest themselves; the
             // world passes their model and sign-in traffic straight through.
             topics.start(&cx, searches, pages)?;
-            page::network(&web, &cx, world_log, world.mirror(&cx)?)?
+            network::build(&web, &cx, world_log, world.mirror(&cx)?)?
                 .route(kit::JUMP, kit::jump_prefix())
                 .start(&cx, world.into_attachments())
         });
