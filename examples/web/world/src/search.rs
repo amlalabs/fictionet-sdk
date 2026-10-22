@@ -25,14 +25,14 @@ pub const MAX_REFUSED: usize = 64;
 pub const MAX_SEED_ITEMS: usize = 32;
 /// Most recent planted facts and pages retained.
 pub const MAX_PLANTED: usize = 16;
-/// Maximum compact snapshot JSON size: 5,447,653 bytes at these limits.
+/// Maximum compact snapshot JSON size at these limits.
 /// Each string byte can need six JSON bytes. Counts use twenty digits;
 /// costs use up to twenty-three bytes.
 /// Fixed costs include field names, punctuation and the longest enum values.
 pub const MAX_SNAPSHOT_BYTES: usize = {
     let string = 6 * STRING_BYTES;
     // Snapshot, seed, generator and omitted counts, with four strings.
-    619 + 4 * string
+    639 + 4 * string
         // Facts and named sites, including array commas.
         + MAX_SEED_ITEMS * (3 + string) + MAX_SEED_ITEMS * (22 + 2 * string)
         // Query rows, including failure text and a comma per row.
@@ -118,6 +118,9 @@ pub struct Generator {
     /// Whether new requests use the copied corpus.
     #[serde(default)]
     pub copied: bool,
+    /// Whether host Google searches and downloaded copies answer requests.
+    #[serde(default)]
+    pub live_search: bool,
 }
 impl Default for Generator {
     fn default() -> Self {
@@ -132,6 +135,7 @@ impl Default for Generator {
             generation_revision: 0,
             generation_at_ms: 0,
             copied: false,
+            live_search: false,
         }
     }
 }
@@ -500,6 +504,7 @@ impl Searches {
                 prefetch: pages.prefetch() as u64,
                 generate: pages.generation().generate,
                 copied: pages.new_pages() == crate::pages::NewPages::Copied,
+                live_search: pages.new_pages() == crate::pages::NewPages::LiveSearch,
                 ..Generator::default()
             },
         )
@@ -597,6 +602,9 @@ impl Snapshot {
                 self.generator.generate = generate;
                 self.generator.generation_revision = revision;
                 self.generator.generation_at_ms = ms;
+                if let Some(live) = parse(e, "live_search") {
+                    self.generator.live_search = live;
+                }
                 if let Some(copied) = parse(e, "copied") {
                     self.generator.copied = copied;
                 }

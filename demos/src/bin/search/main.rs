@@ -57,12 +57,16 @@ fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    Ok(Pages::copied(
-        seed,
-        &downloads.join("astronomy"),
-        &seeds,
-        model,
-    )?)
+    let pages = Pages::copied(seed, &downloads.join("astronomy"), &seeds, model)?;
+    Ok(
+        if std::env::var_os("GOOGLE_SEARCH_API_KEY").is_some()
+            || std::env::var_os("GOOGLE_SEARCH_ENGINE_ID").is_some()
+        {
+            pages.with_live_search(downloads)?
+        } else {
+            pages
+        },
+    )
 }
 
 #[tokio::main]

@@ -62,7 +62,7 @@ export function diff(prev, next) {
   const refused = new Set((prev?.refused || []).map((r) => JSON.stringify([r.name, r.at_ms])));
   for (const row of next.refused || []) if (typed(row) && !refused.has(JSON.stringify([row.name, row.at_ms]))) add('refused', { name: row.name }, row.at_ms, row.seq);
   const g = next.generator;
-  if (prev && g && (g.generate !== prev.generator?.generate || g.copied !== prev.generator?.copied)) add('generation', { generate: g.generate, copied: g.copied }, g.generation_at_ms ?? next.at_ms, g.generation_revision);
+  if (prev && g && (g.generate !== prev.generator?.generate || g.copied !== prev.generator?.copied || g.live_search !== prev.generator?.live_search)) add('generation', { generate: g.generate, copied: g.copied, live_search: g.live_search }, g.generation_at_ms ?? next.at_ms, g.generation_revision);
   changes.sort(byTime);
   if (restart) changes.unshift({ type: 'restart', at_ms: next.at_ms, seq: 0 });
   return changes;

@@ -41,6 +41,7 @@
 //! shares its words.
 
 mod copied;
+mod live;
 pub mod make;
 pub mod meta;
 pub mod model;
@@ -138,6 +139,7 @@ impl Command {
 pub enum NewPages {
     Copied,
     ModelWritten,
+    LiveSearch,
     Off,
 }
 
@@ -458,6 +460,8 @@ pub struct Pages {
     store: Mutex<Store>,
     copied: Option<copied::Corpus>,
     copied_active: std::sync::atomic::AtomicBool,
+    live: Option<Arc<live::Live>>,
+    live_active: std::sync::atomic::AtomicBool,
     planted: Mutex<Planted>,
     /// The id of the next search, shared by every way a search arrives.
     queries: std::sync::atomic::AtomicU64,
@@ -487,6 +491,8 @@ impl Pages {
             store: Mutex::new(store),
             copied: None,
             copied_active: Default::default(),
+            live: None,
+            live_active: Default::default(),
             planted: Mutex::default(),
             queries: std::sync::atomic::AtomicU64::new(1),
             locks,
@@ -513,6 +519,8 @@ impl Pages {
     pub fn new_pages(&self) -> NewPages {
         if !self.generation().generate {
             NewPages::Off
+        } else if self.live_only() {
+            NewPages::LiveSearch
         } else if self.copied_active.load(std::sync::atomic::Ordering::SeqCst) {
             NewPages::Copied
         } else {
@@ -738,7 +746,7 @@ impl Pages {
             Command::SetNewPages { new_pages, .. } => {
                 let canned = match new_pages {
                     NewPages::Copied => true,
-                    NewPages::ModelWritten => false,
+                    NewPages::ModelWritten | NewPages::LiveSearch => false,
                     NewPages::Off => self.copied_active.load(std::sync::atomic::Ordering::SeqCst),
                 };
                 if self.copied.is_none() && canned {
@@ -748,6 +756,17 @@ impl Pages {
                     && !matches!(self.maker, Some(Maker::Model(_)))
                 {
                     return Err(invalid("Model-written pages need OPENROUTER_API_KEY"));
+                }
+                if new_pages == NewPages::LiveSearch && self.live.is_none() {
+                    return Err(invalid(
+                        "Live search needs GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID on the host",
+                    ));
+                }
+                if new_pages != NewPages::Off {
+                    self.live_active.store(
+                        new_pages == NewPages::LiveSearch,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
                 }
                 self.copied_active
                     .store(canned, std::sync::atomic::Ordering::SeqCst);
@@ -788,6 +807,8 @@ impl Pages {
                     generate: self.copied.is_some() || self.maker.is_some(),
                     ..generation
                 };
+                self.live_active
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 self.copied_active
                     .store(self.copied.is_some(), std::sync::atomic::Ordering::SeqCst);
                 *self.planted.lock().unwrap_or_else(|e| e.into_inner()) = Planted::default();
@@ -825,6 +846,7 @@ impl Pages {
                 ))
                 .field("generate", generation.generate)
                 .field("copied", canned)
+                .field("live_search", self.live_only())
                 .field("revision", generation.revision)
         });
         Ok(Applied {
@@ -1010,6 +1032,18 @@ impl Pages {
         ))
     }
 
+    pub(crate) fn search_asset(host: &str, target: &str) -> Option<Response> {
+        if !crate::route::SEARCH_HOSTS.contains(&host) && host != "www.youtube.com" {
+            return None;
+        }
+        let path = target.split('?').next().unwrap_or(target);
+        if path == "/search.css" {
+            return static_asset(path);
+        }
+        fictionet_extras::sites::asset(host, path)
+            .map(|(mime, bytes)| Response::new(200, mime, bytes, vec![], Meta::Asset))
+    }
+
     /// Answers an already routed request; `serve_ms` is measured on the
     /// run's clock.
     pub(crate) async fn handle_route(
@@ -1020,6 +1054,12 @@ impl Pages {
         target: &str,
         route: Route,
     ) -> Response {
+        if let Some(asset) = Self::search_asset(host, target) {
+            return asset;
+        }
+        if self.live_only() && route == Route::Page {
+            return self.live_url(cx, &format!("https://{host}{target}")).await;
+        }
         if self.copied_only() && route == Route::Page {
             return self.copied_page(host, target);
         }
@@ -1050,7 +1090,7 @@ impl Pages {
             route
         };
         let mut response = self.answer(cx, &host_lower, target, route).await;
-        if self.copied_only() {
+        if self.copied_only() || self.live_only() {
             response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
             return response;
         }
@@ -1537,6 +1577,9 @@ impl Pages {
         query: &str,
         start: u64,
     ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
+        if self.live_only() {
+            return self.live_listing(cx, engine, query, start).await;
+        }
         if self.copied_only() {
             return Ok(self.copied_listing(query, start));
         }
@@ -2618,7 +2661,9 @@ impl fictionet_extras::models::Engine for Pages {
             let response = loop {
                 let parsed = url::Url::parse(&url)?;
                 let (host, target) = text::target_of(&url);
-                let response = if self.copied_only() {
+                let response = if self.live_only() {
+                    self.live_url(&cx, &url).await
+                } else if self.copied_only() {
                     self.copied_url(&url)
                 } else {
                     self.handle(&cx, "GET", &host, &target, None).await

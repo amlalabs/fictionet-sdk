@@ -139,7 +139,16 @@ impl Handler {
                     .field("via", source)
             });
         }
-        let answer = if self.pages.copied_only() && action == Route::Page {
+        let answer = if let Some(asset) = Pages::search_asset(&target.host, path) {
+            asset
+        } else if self.pages.live_only() && action == Route::Page {
+            self.pages
+                .live_url(
+                    &self.fcx,
+                    &format!("{}://{}{path}", target.scheme, target.host),
+                )
+                .await
+        } else if self.pages.copied_only() && action == Route::Page {
             self.pages
                 .copied_url(&format!("{}://{}{path}", target.scheme, target.host))
         } else {

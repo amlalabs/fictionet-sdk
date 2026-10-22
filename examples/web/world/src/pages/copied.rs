@@ -126,89 +126,94 @@ impl Pages {
     }
 
     pub(crate) fn copied_url(&self, url: &str) -> Response {
-        let corpus = self.copied.as_ref().unwrap();
-        let host = url::Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .unwrap_or_default();
-        match corpus.response(url) {
-            Ok(Some(page)) => {
-                let content_type = page
-                    .headers
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("application/octet-stream")
-                    .to_owned();
-                let meta = if page.status.is_redirection() {
-                    Meta::Redirect {
-                        location: page
-                            .headers
-                            .get("location")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("/")
-                            .to_owned(),
-                    }
-                } else if content_type.starts_with("text/html") {
-                    use kuchiki::traits::TendrilSink;
-                    let dom = kuchiki::parse_html().one(
-                        String::from_utf8_lossy(&page.decoded().unwrap_or_default()).into_owned(),
-                    );
-                    let title = dom
-                        .select_first("title")
-                        .ok()
-                        .map(|n| n.text_contents())
-                        .unwrap_or_default();
-                    Meta::Fixed { title }
-                } else {
-                    Meta::Asset
-                };
-                let mut answer = Response::new(
-                    page.status.as_u16(),
-                    content_type,
-                    page.body.to_vec(),
-                    vec![],
-                    meta,
-                );
-                let mut headers = page.headers;
-                if let Some(connection) = headers
-                    .get("connection")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned)
-                {
-                    for name in connection.split(',').map(str::trim) {
-                        headers.remove(name);
-                    }
+        replay(url, self.copied.as_ref().unwrap().response(url))
+    }
+}
+
+pub(super) fn replay(
+    url: &str,
+    response: std::io::Result<Option<fictionet_extras::warc::Response>>,
+) -> Response {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    match response {
+        Ok(Some(page)) => {
+            let content_type = page
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_owned();
+            let meta = if page.status.is_redirection() {
+                Meta::Redirect {
+                    location: page
+                        .headers
+                        .get("location")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("/")
+                        .to_owned(),
                 }
-                for name in [
-                    "connection",
-                    "keep-alive",
-                    "transfer-encoding",
-                    "proxy-connection",
-                ] {
+            } else if content_type.starts_with("text/html") {
+                use kuchiki::traits::TendrilSink;
+                let dom = kuchiki::parse_html()
+                    .one(String::from_utf8_lossy(&page.decoded().unwrap_or_default()).into_owned());
+                let title = dom
+                    .select_first("title")
+                    .ok()
+                    .map(|n| n.text_contents())
+                    .unwrap_or_default();
+                Meta::Fixed { title }
+            } else {
+                Meta::Asset
+            };
+            let mut answer = Response::new(
+                page.status.as_u16(),
+                content_type,
+                page.body.to_vec(),
+                vec![],
+                meta,
+            );
+            let mut headers = page.headers;
+            if let Some(connection) = headers
+                .get("connection")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+            {
+                for name in connection.split(',').map(str::trim) {
                     headers.remove(name);
                 }
-                answer.stored_headers = Some(headers);
-                answer
             }
-            Ok(None) => Response::html(
-                format!(
-                    "<!doctype html><title>Page not found</title><h1>Page not found</h1><p>The requested page is unavailable on {}.</p>",
-                    text::escape(&host)
-                ),
-                Meta::Missing,
-                404,
-                "nginx",
-            ),
-            Err(error) => Response::html(
-                format!(
-                    "<!doctype html><title>Server error</title><h1>Server error</h1><p>{}</p>",
-                    text::escape(&error.to_string())
-                ),
-                Meta::Missing,
-                500,
-                "nginx",
-            ),
+            for name in [
+                "connection",
+                "keep-alive",
+                "transfer-encoding",
+                "proxy-connection",
+            ] {
+                headers.remove(name);
+            }
+            answer.stored_headers = Some(headers);
+            answer
         }
+        Ok(None) => Response::html(
+            format!(
+                "<!doctype html><title>Page not found</title><h1>Page not found</h1><p>The requested page is unavailable on {}.</p>",
+                text::escape(&host)
+            ),
+            Meta::Missing,
+            404,
+            "nginx",
+        ),
+        Err(error) => Response::html(
+            format!(
+                "<!doctype html><title>Server error</title><h1>Server error</h1><p>{}</p>",
+                text::escape(&error.to_string())
+            ),
+            Meta::Missing,
+            500,
+            "nginx",
+        ),
     }
 }
 

@@ -92,6 +92,12 @@ fn get(e: &Event, name: &str) -> Value {
 fn line(e: &Event) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
     match (e.source, e.kind) {
+        ("web", "real_search") => Some(
+            json!({"type":"real_search", "search": get(e, "search"), "engine": get(e, "engine"), "start": get(e, "start")}),
+        ),
+        ("web", "downloaded" | "copy_served" | "download_failed") => Some(
+            json!({"type":e.kind, "url":get(e, "url"), "status":get(e, "status"), "elapsed_ms":get(e, "elapsed_ms")}),
+        ),
         ("web", "model_call") => {
             let mut call = get(e, "call");
             call["type"] = json!("model_call");

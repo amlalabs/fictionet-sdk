@@ -177,15 +177,14 @@ the impostor, the impostor and its row flash red.
 
 ### Search
 
-`cargo xtask demo corpus` captures the astronomy URLs in
-[`corpus/astronomy.urls`](corpus/astronomy.urls) with wget mirror mode and
-page requisites. Response records stay in compressed WARC files under
-`demos/downloads/astronomy/`, outside git. Capture follows robots.txt, waits
-between requests, identifies itself, and has pinned depth and byte limits.
-A resource error makes the fetch command fail; retained archives must not be
-mistaken for a completed, validated corpus. Wikipedia currently forbids wget
-in robots.txt and Astronomy Stack Exchange currently returns 403. Those
-restrictions need resolving before the requested source mix can be delivered.
+`cargo xtask demo corpus` completes the retained NASA and ESA archive to about
+500 HTML pages with astronomy articles from Wikimedia's Action API. Each article
+keeps the real desktop skin, navigation, CSS and images at its original URL.
+Wikipedia scripts are removed for static replay. The command resumes missing
+assets without adding articles after the target is reached. It identifies itself
+with a contact address and paces requests. WARC files stay in
+`demos/downloads/astronomy/`, outside git. Resource errors fail the command;
+retained archives still need browser verification.
 
 `cargo xtask demo search` boots Firefox, Claude Code and Codex on the copied
 sites. The world scans WARC members into an in-memory URL index, then crawls
@@ -195,16 +194,35 @@ matches using their existing skins. Titles, URLs and snippets come from the
 indexed pages. Unknown URLs return 404; unrelated queries get no results.
 Startup prints WARC scan time, crawl/index time and the number of indexed pages.
 
-The World menu has **Pages: Copied** (the default) and **Pages: Model-written**.
+The World menu has **Pages: Copied** (the default), **Pages: Model-written**
+and **Pages: Live search, copied in**.
 Switching affects new requests without restarting the VM. Model-written pages
 use the existing writer and `OPENROUTER_API_KEY`, keeping their generated store
 in memory. Model failures do not fall back to keyword-written pages.
 
 Claude keeps its own sign-in. Its model API handler replaces server search and
 fetch tools with local calls and restores the provider's result envelopes.
-Search and fetch never go to an external search service. Each completed search
+Both tools follow the selected page mode. Each completed search
 writes one `search` log record with its source, query and actual returned results.
-Browser and command-line requests use the same index and have their own source labels.
+Browser and command-line requests use the same page mode and have their own source labels.
+
+For live search, set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_ENGINE_ID` in
+the host environment before starting. The host calls Google's Programmable
+Search JSON API for every query and renders its ordered results in the requested
+engine's skin. Results return before page downloads complete. The host downloads
+result pages and their CSS, fonts, images and static scripts, following navigation
+links on the same hostname through depth five. Redirects and cross-host assets
+are copied too. Downloads use a browser User-Agent, honor robots.txt and wait at
+least half a second between requests to a host. No guest request is forwarded
+to a result site. A request for a reached URL waits up to 45 seconds; an unknown,
+failed or timed-out URL gets a normal not-found page. Dynamic requests that are
+absent from the captured markup or CSS remain unavailable.
+
+Copies remain available throughout the run and are written to
+`demos/downloads/live-search-*.warc.gz`. The Web pane shows recent host activity;
+the event log and run JSON Lines log record `real_search` (query, engine, offset),
+`downloaded`, `copy_served` and `download_failed` (URL, status, elapsed time).
+Google credentials are used only by the host and never included in those logs.
 
 Try “black hole accretion”, “exoplanet transit” and “stellar evolution”.
 `cargo xtask demo search preview` runs an in-world client without a VM.

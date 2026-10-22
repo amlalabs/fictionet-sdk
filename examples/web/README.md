@@ -1,18 +1,17 @@
 # The web world
 
 The [Search demo](../../demos/README.md#search) serves an astronomy corpus from
-compressed WARC archives. Its World menu chooses **Pages: Copied** or
-**Pages: Model-written**. Copied pages are the default; changing the menu affects
+compressed WARC archives. Its World menu chooses **Pages: Copied**,
+**Pages: Model-written** or **Pages: Live search, copied in**. Copied pages are the default; changing the menu affects
 new requests without restarting the VM.
 
-Run `cargo xtask demo corpus` to capture the pinned starting URLs with wget.
-The fetch uses mirror mode, page requisites, robots handling, request delays,
-a descriptive user agent, and depth and byte limits. It writes original
-responses into `demos/downloads/astronomy/`, outside git. It never rewrites links.
-Capture errors fail the command. A retained WARC from a failed capture is
-incomplete; its presence does not establish corpus size or asset completeness.
-Wikipedia currently blocks wget in robots.txt, and Astronomy Stack Exchange
-returns 403. Approved captures or crawl permission are needed for those sources.
+Run `cargo xtask demo corpus` to complete the retained NASA and ESA archive to
+about 500 HTML pages through Wikimedia's Action API, with a descriptive User-Agent
+and contact address. The copied article content sits in Wikipedia's real desktop
+skin, with scripts removed for static replay and CSS, fonts and images captured
+at their real URLs. Reruns complete missing assets without growing the article
+count beyond the target. Archives stay in `demos/downloads/astronomy/`, outside
+git. Capture errors fail the command; retained files still need browser checks.
 
 Run `cargo xtask demo search` on Linux with KVM to start Firefox, Claude Code
 and Codex. `cargo xtask demo search preview` uses an in-world client without a VM.
@@ -35,6 +34,30 @@ certificates are signed by its CA. Claude retains its own sign-in; its server
 search and fetch tools are answered locally, with one search log entry recording
 the source, query and returned results. The model request itself still goes to
 the provider.
+
+## Live search, copied in
+
+Set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_ENGINE_ID` in the host environment
+before starting, then select the mode in the World menu. Browser engine searches
+and intercepted Claude and Codex tools call Google's Programmable Search JSON API
+on the host. Every outgoing query is visible in the Web pane and logs. Ordered
+results appear in the selected engine's existing skin while downloads continue.
+
+The host downloads result URLs and dependencies, and follows navigation links
+on each result's hostname through depth five. It preserves redirects and can fetch
+cross-host CSS, fonts, images and scripts named by the copied documents. It uses
+an ordinary browser identity, robots.txt permissions and per-host delays. Unknown
+URLs never trigger a download. Reached URLs can wait up to 45 seconds for their
+copy; failures and timeouts get a normal not-found response. Requests generated
+only by scripts, with no URL discovered in HTML or CSS, remain unavailable.
+
+Copies use the same WARC writer and replay as the astronomy corpus. They remain
+for the run, including mode changes, and are retained as
+`demos/downloads/live-search-*.warc.gz`. `Pages::with_live_search` configures this
+source for a host application; it never changes guest network forwarding.
+The run log records `real_search`, `downloaded`, `copy_served` and `download_failed`.
+The Web pane shows recent matching events, and the event log retains the history.
+Host API credentials never enter guest pages or log messages.
 
 ## Model-written pages
 
