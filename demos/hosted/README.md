@@ -12,7 +12,7 @@ for the isolation rules.
 
 On local Docker or Kubernetes, [`python/inspect_fictionet`](../../python/inspect_fictionet)
 writes the deployment for you. Its
-[`web_eval.py`](../../python/inspect_fictionet/demos/search_eval.py) uses one call
+[`web_eval.py`](../../python/inspect_fictionet/demos/web_eval.py) uses one call
 in place of this example's `compose.yaml`.
 
 ## Files
