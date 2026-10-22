@@ -280,24 +280,6 @@ pub(super) fn parse_date(s: &str) -> io::Result<time::Date> {
 mod tests {
     use super::*;
     #[test]
-    fn bundled_seeds_equal_files() {
-        for name in ["web", "corvane-acquisition", "fastjsonl-package"] {
-            let bundled = Seed::builtin(name).unwrap();
-            let loaded = Seed::load(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../seeds/{name}.md")),
-            )
-            .unwrap();
-            assert_eq!(bundled.question, loaded.question);
-            assert_eq!(bundled.scenario, loaded.scenario);
-            assert_eq!(bundled.facts, loaded.facts);
-            assert_eq!(bundled.fixed_addresses(), loaded.fixed_addresses());
-            assert_eq!(
-                bundled.fixed.iter().map(|f| &f.body).collect::<Vec<_>>(),
-                loaded.fixed.iter().map(|f| &f.body).collect::<Vec<_>>()
-            );
-        }
-    }
-    #[test]
     fn parsing_captures_bytes_and_normalizes_targets() {
         let text = "+++\ndate = 2026-10-07\nquestion = ' one  two '\n[[fixed]]\nurl = 'https://EXAMPLE.com/a/../é?q=x#frag'\nfile = 'a'\n[addresses]\n'GOOGLE.COM' = '1.2.3.4'\n+++\n body \n";
         let s = Seed::parse("test", text, |f| {

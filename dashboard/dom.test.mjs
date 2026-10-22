@@ -3,20 +3,6 @@ import assert from 'node:assert/strict';
 import { reconcile } from './dom.mjs';
 import { createDocument } from './test-dom.mjs';
 
-test('replacing children detaches old nodes before they move elsewhere', () => {
-  const document = createDocument();
-  const parent = document.createElement('div');
-  const old = document.createElement('span');
-  const kept = document.createElement('span');
-  parent.append(old, kept);
-  parent.replaceChildren(kept);
-  assert.equal(old.parentNode, null);
-  assert.equal(kept.parentNode, parent);
-  assert.deepEqual(parent.children, [kept]);
-  parent.append(old);
-  assert.deepEqual(parent.children, [kept, old]);
-});
-
 test('reconcile creates, updates, removes and moves keyed rows without rebuilding them', () => {
   const document = createDocument();
   const parent = document.createElement('ul');

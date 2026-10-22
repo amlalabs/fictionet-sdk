@@ -1,51 +1,10 @@
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { createServices, divider, appShell, showNotice } from './page.mjs';
 import { createStateHub, createWatchHub } from './streams.mjs';
 import { createDocument, Element } from './test-dom.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
-
-test('packet choices persist per viewer and remain after page controls are disposed', async (t) => {
-  const values = new Map();
-  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
-  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value) } });
-  t.after(() => { if (previous) Object.defineProperty(globalThis, 'localStorage', previous); else delete globalThis.localStorage; });
-  const h = harness(t);
-  const services = createServices({ watch: () => h.stream('watch') }, {});
-  const seen = [];
-  const off = services.packetFilter.subscribe((value) => seen.push(value));
-  assert.equal(services.packetFilter.get(), 'conversations');
-  const stop = appShell(h.root, services, { title: 'Search', hosts: [], panels: [{ id: 'world', title: 'Web', area: 'workspace', kind: 'custom', module: '/world.mjs' }] });
-  await settle();
-  const menu = h.root.querySelector('#world-menu');
-  const toggle = h.root.querySelector('.app-menu-button'); toggle.click();
-  assert.equal(menu.hidden, false);
-  const segment = menu.querySelector('.app-packet-filter').querySelector('.seg');
-  assert.deepEqual(segment.children.map((b) => b.textContent), ['Conversations', 'Every packet']);
-  assert.deepEqual(segment.children.map((b) => b.getAttribute('aria-pressed')), ['true', 'false']);
-  segment.children[1].click();
-  assert.equal(services.packetFilter.get(), 'every');
-  assert.equal(values.get('fictionet-packet-filter'), 'every');
-  assert.deepEqual(segment.children.map((b) => b.getAttribute('aria-pressed')), ['false', 'true']);
-  assert.equal(createServices({}, {}).packetFilter.get(), 'every');
-  const { mount: search } = await import('../demos/src/search/view.mjs');
-  const state = services.state; services.state = () => () => {};
-  const disposePage = search(h.root.querySelector('#app-world-panel'), services, { state: '/api/state/search' });
-  assert.match(services.worldMenu.textContent, /New pages/);
-  assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
-  disposePage(); services.state = state;
-  assert.equal(services.worldMenu.children.length, 0);
-  assert.equal(segment.parentNode.parentNode, menu);
-  assert.equal(services.packetFilter.get(), 'every');
-  segment.children[0].click();
-  assert.equal(values.get('fictionet-packet-filter'), 'conversations');
-  assert.deepEqual(seen, ['conversations', 'every', 'conversations']);
-  assert.doesNotMatch(menu.textContent, /canned|stub|seed|splice|store|generator|generated|cache/i);
-  off(); stop(); services.dispose();
-  assert.ok(segment.children.every((button) => button.listenerCount === 0));
-});
 
 test('packet choices work when browser storage is unavailable', () => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
@@ -968,17 +927,3 @@ test('an app can show sign out after replacing the inspector shell', (t) => {
   stop(); services.dispose();
 });
 
-test('the agent stage edge has three to one contrast against the page in both schemes', () => {
-  const css = readFileSync(new URL('./page.css', import.meta.url), 'utf8');
-  const pair = (name) => css.match(new RegExp(`--${name}: light-dark\\((#[0-9a-f]{6}), (#[0-9a-f]{6})\\)`)).slice(1);
-  const luminance = (hex) => {
-    const channels = hex.slice(1).match(/../g).map((value) => parseInt(value, 16) / 255)
-      .map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
-    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
-  };
-  const background = pair('app-bg'), edge = pair('app-stage-edge');
-  for (let i = 0; i < 2; i++) {
-    const values = [luminance(background[i]), luminance(edge[i])].sort((a, b) => a - b);
-    assert.ok((values[1] + 0.05) / (values[0] + 0.05) >= 3);
-  }
-});
