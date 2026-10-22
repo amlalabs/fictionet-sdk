@@ -204,9 +204,7 @@ fn task_path(module: &str, mode: &str) -> Result<String> {
 fn live(args: &[String]) -> Result {
     let mut config: std::collections::BTreeMap<String, String> =
         serde_json::from_str(args.first().map_or("{}", String::as_str))?;
-    let seed = config
-        .remove("seed")
-        .unwrap_or_else(|| "web".into());
+    let seed = config.remove("seed").unwrap_or_else(|| "web".into());
     let generator = config
         .remove("generator")
         .unwrap_or_else(|| "openrouter".into());

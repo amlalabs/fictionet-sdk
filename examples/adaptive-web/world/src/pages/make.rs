@@ -4398,13 +4398,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             .iter()
             .position(|h| *h == host)
             .unwrap_or_else(|| 10 + alternatives.iter().position(|h| *h == host).unwrap());
-        let article = article(
-            seed,
-            query,
-            host,
-            &site_profile(host).kind,
-            angle,
-        );
+        let article = article(seed, query, host, &site_profile(host).kind, angle);
         let title = proper(&result_title(seed, query, host, angle, &article.title));
         let slug = if Question::parse(query).is_some()
             || lower_query.ends_with(" acquisition")
@@ -4545,11 +4539,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         ]
         .contains(&host)
         {
-            short_date(date_for(
-                seed,
-                &url,
-                45,
-            ))
+            short_date(date_for(seed, &url, 45))
         } else {
             String::new()
         };
@@ -4676,11 +4666,7 @@ pub fn site_profile(host: &str) -> Profile {
         .map(capitalize)
         .collect::<Vec<_>>()
         .join(" ");
-    let name = if name.is_empty() {
-        host.into()
-    } else {
-        name
-    };
+    let name = if name.is_empty() { host.into() } else { name };
     let name = match host {
         "docs.python.org" => "Python Documentation",
         "www.manualslib.com" | "manualslib.com" => "ManualsLib",
@@ -5927,9 +5913,7 @@ pub fn page(
             } else {
                 ("Subject", heading(&title))
             };
-            let reference = {
-                format!("<dl><dt>{field}</dt><dd>{}</dd></dl>", escape(value))
-            };
+            let reference = { format!("<dl><dt>{field}</dt><dd>{}</dd></dl>", escape(value)) };
             format!(
                 "<h1>{t}</h1>{lead_html}<table class=\"infobox\"><caption>At a glance</caption><tr><th scope=\"row\">{field}</th><td>{}</td></tr></table><h2>Overview</h2><p>{}</p><h2>Effects</h2><p>{}</p><h2>Terminology</h2>{reference}",
                 escape(value),
@@ -6082,9 +6066,7 @@ pub fn page(
             } else {
                 format!(
                     "<h2>{}</h2><blockquote>{}</blockquote>",
-                    {
-                        "A closer look"
-                    },
+                    { "A closer look" },
                     escape(&quote)
                 )
             };
@@ -7109,14 +7091,7 @@ mod tests {
             serde_json::json!({"snippet": "Additional context."}),
         ];
         for target in ["/article", "/article.json", "/article.txt"] {
-            let page = page(
-                &seed,
-                "www.example.com",
-                target,
-                &mentions,
-                "company",
-                &[],
-            );
+            let page = page(&seed, "www.example.com", target, &mentions, "company", &[]);
             let unique: std::collections::BTreeSet<_> = page.claims.iter().collect();
             assert_eq!(page.claims.len(), unique.len());
             assert_eq!(page.claims[0], seed.facts[0]);

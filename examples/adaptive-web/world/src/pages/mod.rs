@@ -2572,7 +2572,6 @@ fn static_asset(path: &str) -> Option<Response> {
     Some(Response::new(200, ctype, body, vec![], Meta::Asset))
 }
 
-
 impl fictionet_extras::models::Engine for Pages {
     fn search(
         self: Arc<Self>,
