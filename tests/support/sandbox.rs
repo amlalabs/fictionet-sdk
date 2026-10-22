@@ -3,7 +3,9 @@
 //! [`machine`] splits a cable into TCP, UDP, and ICMP. DNS queries and
 //! TLS handshakes use the run's clock and randomness.
 
-use super::super::services::tls::output::Output;
+#[path = "../../src/stdlib/services/tls/output.rs"]
+mod output;
+use output::Output;
 
 use fictionet::stdlib::codec::{Stream, Wire};
 use fictionet::stdlib::protocols::dns::op::{Message, Query};

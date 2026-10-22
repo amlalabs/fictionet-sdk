@@ -3,7 +3,7 @@
 #   world     - the world: web::Sites in Rust for any name, which makes and
 #               keeps the pages. It has normal outbound networking for
 #               every generator.
-#   attach    - fictionet attach --type tun: makes tun0 in its own network
+#   attach    - fictionet attach tun: makes tun0 in its own network
 #               namespace and relays its packets to the world socket.
 #   default   - the agent. It joins attach's network namespace, so its only
 #               interface is tun0. It has no extra capabilities and does not
@@ -50,21 +50,17 @@ services:
     command:
       - fictionet
       - attach
+      - tun
       - --world
       - unix:/run/fictionet/sock/world.sock
       - --name
       - agent
-      - --type
-      - tun
       - --ip-addr
       - 10.0.0.2/24
       - --gateway
       - 10.0.0.1
       - --dns
       - 10.0.0.1
-      - --no-ip-addr-v6
-      - --no-gateway-v6
-      - --no-dns-v6
       - --ready-file
       - /run/attach-ready
     network_mode: none

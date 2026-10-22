@@ -43,7 +43,7 @@ one call.
 
 The world runs as its own process and listens on a Unix socket. `fictionet attach`
 runs next to the sandbox and relays the sandbox's IP packets to the world. With
-`--type tun`, attach puts a `tun` device in the sandbox's network namespace and
+`attach tun`, attach puts a `tun` device in the sandbox's network namespace and
 routes the sandbox's traffic through it. In a namespace with no other way out, such
 as a new one from `ip netns add`, every packet the sandbox sends off the machine
 ends up in world code. The sandbox needs no proxy settings and no special software.
@@ -69,14 +69,12 @@ External I/O and opt-in axum upgrades have separate timing limits; see
 
 ## Install
 
-Add `fictionet` to your Cargo dependencies. The default feature is
-`std`, which does not need tokio. Set `default-features = false`
-for a closed simulated-time world, or enable `std` for host integration,
-HTTP/1.1 and HTTP/2. Enable `tokio` for the tokio adapters (`into_tokio`)
-and axum WebSocket upgrades. Enable `web-proxy` and inject a transport from
-`fictionet-host` for upstream HTTP/1.1 requests over host sockets and rustls; it requires `std` and works without
-tokio. See the [feature table](src/lib.rs) for the feature relationships.
-The crate still links Rust's standard library.
+Add `fictionet` to your Cargo dependencies. It always uses Rust's standard
+library and builds without tokio. Enable `tokio` for the tokio adapters
+(`into_tokio`) and axum WebSocket upgrades. Enable `web-proxy` and inject a
+transport from `fictionet-host` for upstream HTTP requests over host sockets.
+Host I/O works in real and simulated clock modes; repeatable tests control
+external inputs themselves. See the [feature table](src/lib.rs).
 
 The `fictionet` command is the `fictionet-cli` package in `cli/`. Install it
 from a checkout with `cargo install --locked --path cli`.

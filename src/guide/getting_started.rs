@@ -97,13 +97,13 @@
 //! ```
 //!
 //! Then attach it to the world. `--world` is the world's socket, `--name`
-//! the sandbox's name, and `--type tun` asks for a network device in the
+//! the sandbox's name, and `attach tun` asks for a network device in the
 //! sandbox. `--netns` says where its namespace is. Attach runs no DHCP for
 //! `tun`, so the last six flags give the sandbox an address, a gateway and
 //! a DNS server for each of IPv4 and IPv6:
 //!
 //! ```text
-//! $ sudo target/release/fictionet attach --world unix:/run/fictionet/world.sock --name agent --type tun \
+//! $ sudo target/release/fictionet attach tun --world unix:/run/fictionet/world.sock --name agent \
 //!     --netns /run/netns/agent \
 //!     --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
 //!     --ip-addr-v6 2001:db8::2/64 --gateway-v6 2001:db8::1 --dns-v6 2001:db8::1
@@ -116,8 +116,7 @@
 //! told the world the sandbox's name, `agent`. Then it wrote both DNS
 //! servers to `/etc/netns/agent/resolv.conf`. The world is dual-stack, as
 //! most of the real internet is, so the sandbox gets both families. For a
-//! sandbox with IPv4 only, give `--no-ip-addr-v6 --no-gateway-v6
-//! --no-dns-v6` instead of the three IPv6 flags.
+//! sandbox with IPv4 only, omit the three IPv6 flags.
 //!
 //! Leave it running. It moves packets between `tun0` and the world until
 //! you stop it.
@@ -360,7 +359,7 @@
 //! | `curl: (35) TLS connect error: error:0A000458:SSL routines::tlsv1 unrecognized name` | The world has no HTTPS site under that name. Here, `https://shared.test/` (a plain HTTP site) and `https://203.0.113.10/` (an address, so curl sends no name) both fail this way. | Use a name that has an HTTPS site. [`Sites`](crate::stdlib::web::Sites) picks the certificate by the name the client sends, and refuses the handshake for a name with no TLS. A certificate that does not cover the name, from a world's own TLS setup, fails differently: `openssl s_client` reports `Verification error: hostname mismatch`. Add the name to the certificate. |
 //! | `curl: (6) Could not resolve host: nope.test` | `sudo ip netns exec agent dig nope.test` shows `status: NXDOMAIN` from `SERVER: 10.0.0.1#53`: the world has no site with that name. | Fix the name, or add a site for it to the world. |
 //! | `curl: (7) Failed to connect to plain.test:443 after 3 ms: Could not connect to server` | `dig +short plain.test` answers an address, such as `104.18.0.1`, and `curl http://plain.test/` works. The site exists, but has no TLS, so port 443 is closed. | Use `http://`, or give the site a certificate with [`Site::tls`](crate::stdlib::web::Site::tls). |
-//! | With the HTTP proxy type (`--type http_proxy`), curl says `Could not resolve host: example.test`, or Node says `getaddrinfo ENOTFOUND example.test` | The client did not use the proxy, and looked the name up on the host. `curl -sv https://example.test/ 2>&1 \| grep -E 'proxy tunnel\|NO_PROXY'` prints `Establishing HTTP proxy tunnel to example.test:443` when curl uses it. | Set `https_proxy` (and `http_proxy`) to `http://relay:<token>@<host>:<port>`, with the host and port that attach listens on (`--listen`): such as `attach:8080` in Docker Compose or `127.0.0.1:8080` in a pod. Take the world's names out of `NO_PROXY`. Node's built-in `fetch` ignores these variables unless `NODE_USE_ENV_PROXY=1` is set. |
+//! | With the HTTP proxy type (`attach http-proxy`), curl says `Could not resolve host: example.test`, or Node says `getaddrinfo ENOTFOUND example.test` | The client did not use the proxy, and looked the name up on the host. `curl -sv https://example.test/ 2>&1 \| grep -E 'proxy tunnel\|NO_PROXY'` prints `Establishing HTTP proxy tunnel to example.test:443` when curl uses it. | Set `https_proxy` (and `http_proxy`) to `http://relay:<token>@<host>:<port>`, with the host and port that attach listens on (`--listen`): such as `attach:8080` in Docker Compose or `127.0.0.1:8080` in a pod. Take the world's names out of `NO_PROXY`. Node's built-in `fetch` ignores these variables unless `NODE_USE_ENV_PROXY=1` is set. |
 //! | The ready file exists, but requests fail or time out | The ready file does not mean the world serves requests yet. Make one end-to-end request. | See [Readiness](#readiness) below. |
 //!
 //! ## When `dig` works but programs cannot resolve names

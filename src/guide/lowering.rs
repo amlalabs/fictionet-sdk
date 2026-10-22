@@ -236,7 +236,7 @@
 //! being asked: one as soon as it starts relaying, and then one every 10
 //! minutes. With a gateway, they make attach's link-local address the VM's
 //! default router for 30 minutes, so the VM never loses its route. With
-//! `--no-gateway-v6`, the router lifetime is 0.
+//! no `--gateway-v6`, the router lifetime is 0.
 //!
 //! **Why attach answers some questions itself.** An `Attachment` carries IP
 //! packets, so the Ethernet link ends at attach. ARP and neighbor
@@ -486,7 +486,7 @@
 //! Attach runs on the host as an HTTP proxy, and curl uses it. `$TOKEN` holds the contents of the token file:
 //!
 //! ```text
-//! $ fictionet attach --world unix:/run/fictionet/world.sock --name agent --type http_proxy \
+//! $ fictionet attach http-proxy --world unix:/run/fictionet/world.sock --name agent \
 //!     --listen 127.0.0.1:8080 --token-file /run/fictionet/token --ip-addr 10.0.0.2 --dns 10.0.0.1
 //! $ curl -sS --cacert /run/fictionet/ca.pem -x http://relay:$TOKEN@127.0.0.1:8080 https://example.test/
 //! hello from https example.test 443 over HTTP/2.0
@@ -536,7 +536,7 @@
 //!
 //! ## `socks5`
 //!
-//! The same, with `--type socks5` and `curl -x socks5h://...`. The `h`
+//! The same, with `attach socks5` and `curl -x socks5h://...`. The `h`
 //! makes curl send the name to attach in the SOCKS5 request, so the
 //! lookup happens in the world. `socks5::serve` reads the request and
 //! calls the same `Stack::connect`, so the world saw the same packets: one

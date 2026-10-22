@@ -16,7 +16,7 @@ pub type UpstreamFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response<Body>, Error>> + Send>>;
 
 /// A handler that forwards each request to the real site, over the world's
-/// own network. Needs the `web-proxy` feature, which enables `std`.
+/// own network. Needs the `web-proxy` feature.
 /// The supplied transport owns DNS, sockets, TLS and connection pooling.
 /// `fictionet_host::Client` supplies the host HTTP/1.1 transport.
 ///
@@ -47,9 +47,7 @@ pub type UpstreamFuture =
 /// Every request it sends upstream, answered or not, has a `forwarded`
 /// field in its `http.request` event: the origin it went to, such as
 /// `https://github.com`.
-/// Returns an error in a lab before using the transport.
-pub fn proxy(fcx: &Cx, client: Arc<dyn Upstream>) -> Result<Proxy, Error> {
-    fcx.require_real_io()?;
+pub fn proxy(_fcx: &Cx, client: Arc<dyn Upstream>) -> Result<Proxy, Error> {
     Ok(Proxy { client })
 }
 
@@ -214,11 +212,10 @@ async fn dispatch(
 /// This handler requires real host I/O and works with any executor.
 /// It uses the supplied transport, and its
 /// requests' events carry the same `forwarded` field.
-/// Returns an error in a lab before using the transport, and for an
+/// Returns an error for an
 /// upstream without such a scheme or without an authority.
-pub fn forward(fcx: &Cx, upstream: http::Uri, client: Arc<dyn Upstream>) -> Result<Forward, Error> {
+pub fn forward(_fcx: &Cx, upstream: http::Uri, client: Arc<dyn Upstream>) -> Result<Forward, Error> {
     use http::uri::Scheme;
-    fcx.require_real_io()?;
     let parts = upstream.into_parts();
     match (parts.scheme, parts.authority) {
         (Some(scheme), Some(authority)) if scheme == Scheme::HTTP || scheme == Scheme::HTTPS => {

@@ -179,7 +179,7 @@
 //! The request's path, query, body, and original `Host` header are kept,
 //! so the Gmail clone sees `Host: gmail.googleapis.com`. Hop-by-hop headers
 //! are dropped both ways. An unreachable upstream gives `502 Bad Gateway`.
-//! It works with any executor and needs a run with real I/O:
+//! It works with any executor and can use host I/O in either clock mode:
 //! use [`fictionet::run`]. In a lab, `web::forward` returns an error.
 //!
 //! `web::proxy(&fcx, client)?` goes to the real site for the name; `web::forward`
@@ -190,7 +190,8 @@
 //!
 //! ```
 //! # fictionet::cfg_web_proxy! {
-//! # use fictionet::stdlib::{codec::Wire, services::ca::Ca, web, world::sandbox};
+//! # use fictionet::stdlib::{codec::Wire, services::ca::Ca, web};
+//! # use fictionet_test_support::sandbox;
 //! # use fictionet::stdlib::protocols::{dns::rr::{RData, RecordType}, http1, x509::{Time, Validity}};
 //! # use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc, time::{Duration, UNIX_EPOCH}};
 //! # tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?
@@ -279,7 +280,7 @@
 //!   the gateway and the DNS server at `2001:db8::1`.
 //!   [`subnet`](Sites::subnet) changes either one. A DHCP server hands out
 //!   IPv4 addresses to sandboxes that ask for one, such as a test, or a VM
-//!   attached with `fictionet attach --type tap` and no IPv4 address flags,
+//!   attached with `fictionet attach tap` and no IPv4 address flags,
 //!   whose DHCP then goes to the world. Attach sets a `tun` sandbox's
 //!   addresses itself, from `--ip-addr` and `--ip-addr-v6`, and runs no
 //!   DHCP client. A sandbox with a fixed address is known by the source
@@ -387,7 +388,7 @@
 //! These are its attach flags:
 //!
 //! ```text
-//! fictionet attach --world unix:/run/fictionet/world.sock --name agent --type tun \
+//! fictionet attach tun --world unix:/run/fictionet/world.sock --name agent \
 //!     --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
 //!     --ip-addr-v6 2001:db8::2/64 --gateway-v6 2001:db8::1 --dns-v6 2001:db8::1
 //! ```
@@ -455,8 +456,7 @@
 //!   the sender left the checksum out, and the datagram is accepted.
 //!
 //! [`Sites::ipv4_only`] turns IPv6 off for a world that models an IPv4-only
-//! network. Sandboxes for such a world attach with `--no-ip-addr-v6
-//! --no-gateway-v6 --no-dns-v6`.
+//! network. Sandboxes for such a world attach with the IPv6 flags omitted.
 //!
 //! # Events
 //!
@@ -598,26 +598,12 @@
 //!
 //! # Changing the network around the sites
 //!
-//! `start` takes the world's [`fictionet::Attachments`], so it serves every sandbox
-//! that attaches. To change the path between the sandboxes and the sites,
-//! wrap each sandbox before `start` sees it, with
-//! [`Attachments::map`](fictionet::Attachments::map). Here every sandbox gets a
-//! 200 ms delay each way, in front of everything `Sites` builds:
-//!
-//! ```
-//! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
-//! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::network::delay(fcx, ms(200), sandbox));
-//! web::Sites::new(site_for).start(&fcx, far)?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! `Sites` sees each sandbox through its delay, under the same name, and
-//! binds its addresses and reports its events as usual. The same works with
-//! [`bottleneck`](fictionet::stdlib::network::bottleneck) for a slow link, and with
-//! [`filter`](fictionet::stdlib::network::filter) to watch or drop packets.
+//! `start` takes the world's [`fictionet::Attachments`], so it serves every
+//! sandbox that attaches. To compose a path by hand, take each attachment
+//! with [`Attachments::next`](fictionet::Attachments::next) and wrap its
+//! interface with [`delay`](fictionet::stdlib::network::delay),
+//! [`bottleneck`](fictionet::stdlib::network::bottleneck), or
+//! [`filter`](fictionet::stdlib::network::filter).
 //!
 //! [`Sites::into_net`] gives the [`fictionet::stdlib::world::net::Net`] before
 //! it starts, to add hosts with other services next to the websites.

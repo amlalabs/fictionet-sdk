@@ -8,28 +8,6 @@ use std::path::PathBuf;
 
 use fictionet::stdlib::network::ethernet::{Cidr, Family};
 
-/// One address setting: a value (`--dns 10.0.0.1`), turned off
-/// (`--no-dns`), or left out.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Setting<T> {
-    /// Set by attach.
-    Value(T),
-    /// Turned off with the flag's `--no-` form.
-    Off,
-    /// Left out: the world should supply it, by DHCP or router
-    /// advertisements.
-    FromWorld,
-}
-
-impl<T> Setting<T> {
-    pub(crate) fn value(&self) -> Option<&T> {
-        match self {
-            Setting::Value(v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
 /// Where attach writes the DNS servers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvConf {
@@ -48,12 +26,12 @@ pub(crate) struct AttachArgs {
     pub(crate) world: String,
     pub(crate) name: String,
     pub(crate) netns: Option<PathBuf>,
-    pub(crate) ip_addr: Setting<Cidr<Ipv4Addr>>,
-    pub(crate) gateway: Setting<Ipv4Addr>,
-    pub(crate) dns: Setting<Ipv4Addr>,
-    pub(crate) ip_addr_v6: Setting<Cidr<Ipv6Addr>>,
-    pub(crate) gateway_v6: Setting<Ipv6Addr>,
-    pub(crate) dns_v6: Setting<Ipv6Addr>,
+    pub(crate) ip_addr: Option<Cidr<Ipv4Addr>>,
+    pub(crate) gateway: Option<Ipv4Addr>,
+    pub(crate) dns: Option<Ipv4Addr>,
+    pub(crate) ip_addr_v6: Option<Cidr<Ipv6Addr>>,
+    pub(crate) gateway_v6: Option<Ipv6Addr>,
+    pub(crate) dns_v6: Option<Ipv6Addr>,
     pub(crate) mtu: u16,
     pub(crate) ready_file: Option<PathBuf>,
     pub(crate) resolv_conf: ResolvConf,
@@ -74,7 +52,7 @@ pub(crate) enum ProxyKind {
 }
 
 impl ProxyKind {
-    /// The type's name, as `--type` takes it and `hello` carries it.
+    /// The type's name in the relay handshake.
     pub(crate) fn name(self) -> &'static str {
         match self {
             ProxyKind::Http => "http_proxy",
@@ -83,7 +61,7 @@ impl ProxyKind {
     }
 }
 
-/// The flags of `--type http_proxy` and `--type socks5`.
+/// The flags of `attach http-proxy` and `attach socks5`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ProxyArgs {
     pub(crate) kind: ProxyKind,
@@ -112,7 +90,7 @@ pub(crate) enum VmLink {
     Tap(String),
 }
 
-/// The flags of `--type tap`.
+/// The flags of `attach tap`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TapArgs {
     /// The path of the world's Unix socket.
@@ -132,10 +110,10 @@ impl AttachArgs {
     /// The DNS servers to write to `resolv.conf`, IPv4 first.
     pub(crate) fn dns_servers(&self) -> Vec<IpAddr> {
         let mut out = Vec::new();
-        if let Some(a) = self.dns.value() {
+        if let Some(a) = self.dns.as_ref() {
             out.push(IpAddr::V4(*a));
         }
-        if let Some(a) = self.dns_v6.value() {
+        if let Some(a) = self.dns_v6.as_ref() {
             out.push(IpAddr::V6(*a));
         }
         out

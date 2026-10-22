@@ -9,7 +9,7 @@ use fictionet_test_support::certs;
 use hyper_io::{Exec, Io};
 
 use crate::common::world as run_world;
-use fictionet::stdlib::world::sandbox::{TlsClient, TlsError};
+use fictionet_test_support::sandbox::{TlsClient, TlsError};
 use fictionet_test_support::{Done, timeout};
 
 mod admission;
@@ -21,8 +21,8 @@ mod ipv6;
 mod sites;
 
 use certs::certs;
-use fictionet::stdlib::world::sandbox::Machine;
-use fictionet::stdlib::world::sandbox::machine;
+use fictionet_test_support::sandbox::Machine;
+use fictionet_test_support::sandbox::machine;
 use fictionet_test_support::within;
 use fixture::{
     BIG, BOTH_ADDR, Client, DEFAULT_ADDR, DUAL_ADDR, DUAL_ADDR6, EVENTS_ADDR, Env, GATEWAY, Plain,

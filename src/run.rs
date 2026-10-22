@@ -147,14 +147,12 @@ impl RunOptions {
 /// the pool to the world. It uses tokio, because the database client does:
 ///
 /// ```no_run
-/// # #[cfg(feature = "std")]
 /// # mod sqlx {
 /// #     pub struct PgPool;
 /// #     impl PgPool {
 /// #         pub async fn connect(_: &str) -> fictionet::Result<PgPool> { Ok(PgPool) }
 /// #     }
 /// # }
-/// # #[cfg(feature = "std")]
 /// #[tokio::main]
 /// async fn main() -> fictionet::Result {
 ///     let db = sqlx::PgPool::connect("postgres://...").await?;
@@ -167,10 +165,7 @@ impl RunOptions {
 ///         Ok(())
 ///     }).await
 /// }
-/// # #[cfg(not(feature = "std"))]
-/// # fn main() {}
 /// ```
-#[cfg(feature = "std")]
 pub async fn run<F, Fut>(options: RunOptions, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
@@ -207,10 +202,8 @@ where
 /// The test plays the sandboxes as tasks of the lab, through
 /// [`attachments`](crate::attachments). A lab whose tasks all wait with no
 /// deadline ends with an error that says so; a wait with no deadline at all
-/// never moves the clock. Attachments fed by [`listen`](crate::listen) fail
-/// the lab on their first `get`, `next` or `map`, before handing out an
-/// attachment, and `get` and `next` return [`Cancelled`](crate::Cancelled).
-/// `web::proxy` and `web::forward` refuse a lab too.
+/// never moves the clock. Host I/O, including [`listen`](crate::listen) and
+/// web upstreams, is allowed. Its timing and inputs are up to the world author.
 pub async fn lab<F, Fut>(options: RunOptions, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,

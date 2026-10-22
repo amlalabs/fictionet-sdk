@@ -7,6 +7,7 @@ mod logged;
 mod pattern;
 pub mod poll;
 mod response;
+pub mod sandbox;
 pub mod temp;
 mod timeout;
 mod within;

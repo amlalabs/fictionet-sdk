@@ -7,15 +7,10 @@ mod service_fixture;
 
 pub mod alloc;
 pub mod echo_service;
-#[cfg(feature = "std")]
 pub mod http_observer;
-#[cfg(feature = "std")]
 pub mod io;
-#[cfg(feature = "std")]
 pub mod rustls_client;
-#[cfg(feature = "std")]
 pub mod threads;
-#[cfg(feature = "std")]
 pub mod world;
 
 /// Runs the test `name` alone in a child process of this binary, and fails

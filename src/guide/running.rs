@@ -19,11 +19,8 @@
 //! `main`:
 //!
 //! ```no_run
-//! # #[cfg(feature = "std")]
 //! # use fictionet::{Attachments, Cx, Result};
-//! # #[cfg(feature = "std")]
 //! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-//! # #[cfg(feature = "std")]
 //! fn main() -> fictionet::Result {
 //!     // 1. A channel for sandboxes.
 //!     let (attacher, attachments) = fictionet::attachments();
@@ -39,8 +36,6 @@
 //!     // 4. Poll that future on this thread until the world ends.
 //!     fictionet::block_on(world)
 //! }
-//! # #[cfg(not(feature = "std"))]
-//! # fn main() {}
 //! ```
 //!
 #![doc = include_str!("../../docs/diagrams/running.svg")]
@@ -232,18 +227,13 @@
 //! 1 to 3 stay the same. The `web_fixture` example does this:
 //!
 //! ```no_run
-//! # #[cfg(feature = "std")]
 //! # use fictionet::{Attachments, Cx, Result};
-//! # #[cfg(feature = "std")]
 //! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-//! # #[cfg(feature = "std")]
 //! # fn main() -> Result {
 //! # let (_attacher, attachments) = fictionet::attachments();
 //! let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 //! runtime.block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), move |fcx| world(fcx, attachments)))
 //! # }
-//! # #[cfg(not(feature = "std"))]
-//! # fn main() {}
 //! ```
 //!
 //! # In a test
@@ -332,12 +322,10 @@
 //!   milliseconds, and "a 1 Mbit/s link with a 10-packet queue drops the
 //!   11th packet of a burst" holds exactly.
 //! - **Randomness comes from the seed,** as in `run`.
-//! - **A lab run is closed.** The test plays the sandboxes through
-//!   [`attachments`](crate::attachments), as above, and fakes play other
-//!   services. Attachments that a [`listen`](crate::listen) socket feeds,
-//!   `web::proxy` and `web::forward` refuse to work in a
-//!   lab. Fictionet cannot stop world code from using `std::net`, tokio timers
-//!   or other real I/O, so keeping the rest of a lab world closed is up to its author.
+//! - **The test controls external inputs.** It can play the sandboxes through
+//!   [`attachments`](crate::attachments), as above, and fake other services.
+//!   Real listeners, proxies and other host I/O are also allowed; the author
+//!   controls whether those inputs repeat.
 //! - **The test runs inside the lab too.** The code that plays the
 //!   sandboxes is a task of the run, so time cannot jump past a timeout
 //!   before the test has had its turn.

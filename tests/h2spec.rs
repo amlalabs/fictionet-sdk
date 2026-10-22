@@ -26,8 +26,9 @@ use fictionet::InterfaceExt;
 use fictionet::stdlib::network::tcp;
 use fictionet::stdlib::protocols::x509::{Time, Validity};
 use fictionet::stdlib::world::net::{Net, Sni};
-use fictionet::stdlib::{services::ca::Ca, web::httpd, world::sandbox};
+use fictionet::stdlib::{services::ca::Ca, web::httpd};
 use fictionet::tokio::ConnectionTokioExt;
+use fictionet_test_support::sandbox;
 
 const VERSION: &str = "v2.6.0";
 const ARCHIVE: &str = "h2spec_linux_amd64.tar.gz";

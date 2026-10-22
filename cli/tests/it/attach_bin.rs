@@ -8,22 +8,11 @@ use std::process::{Command, Stdio};
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 
 #[test]
-fn left_out_flags_exit_2_and_say_dhcp_is_missing() {
-    let out = Command::new(BIN)
-        .args([
-            "attach",
-            "--world",
-            "unix:/nowhere",
-            "--name",
-            "a",
-            "--type",
-            "tun",
-        ])
-        .output()
-        .unwrap();
+fn a_missing_attachment_type_is_a_usage_error() {
+    let out = Command::new(BIN).args(["attach"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("DHCP is not implemented yet"), "{err}");
+    assert!(err.contains("<COMMAND>"), "{err}");
 }
 
 #[test]
@@ -36,10 +25,13 @@ fn no_subcommand_is_a_usage_error() {
 #[test]
 fn attach_help_goes_to_stdout_and_exits_0() {
     for flag in ["--help", "-h"] {
-        let out = Command::new(BIN).args(["attach", flag]).output().unwrap();
+        let out = Command::new(BIN)
+            .args(["attach", "tun", flag])
+            .output()
+            .unwrap();
         assert_eq!(out.status.code(), Some(0), "{flag}");
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(text.contains("usage: fictionet attach"), "{text}");
+        assert!(text.contains("Usage: fictionet attach tun"), "{text}");
         assert!(text.contains("--resolv-conf"), "{text}");
         assert!(
             out.stderr.is_empty(),
@@ -54,12 +46,11 @@ fn a_flag_after_a_value_flag_is_a_usage_error() {
     let out = Command::new(BIN)
         .args([
             "attach",
+            "tun",
             "--world",
             "unix:/nowhere",
             "--name",
             "a",
-            "--type",
-            "tun",
             "--resolv-conf",
             "--no-resolv-conf",
         ])
@@ -67,7 +58,10 @@ fn a_flag_after_a_value_flag_is_a_usage_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--resolv-conf needs a value"), "{err}");
+    assert!(
+        err.contains("a value is required for '--resolv-conf <RESOLV_CONF>'"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -108,12 +102,11 @@ fn a_failed_ready_file_write_does_not_leave_a_successful_probe() {
         command
             .args([
                 "attach",
+                "http-proxy",
                 "--world",
                 &format!("unix:{}", sock.display()),
                 "--name",
                 &format!("agent-{limit}"),
-                "--type",
-                "http_proxy",
                 "--listen",
                 "127.0.0.1:0",
                 "--ip-addr",

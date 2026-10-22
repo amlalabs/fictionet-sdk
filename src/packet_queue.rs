@@ -37,7 +37,7 @@ impl PacketQueue {
     }
 }
 
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl PacketQueue {
     /// The total charge of the queued packets, including [`PACKET_COST`].
     pub fn bytes(&self) -> usize {
@@ -66,7 +66,7 @@ impl PacketQueue {
     }
 }
 
-#[cfg(all(test, feature = "std", not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

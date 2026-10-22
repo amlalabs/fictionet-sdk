@@ -1,4 +1,4 @@
-//! `fictionet attach --type tap`: a virtual machine's network card.
+//! `fictionet attach tap`: a virtual machine's network card.
 //!
 //! The VM's Ethernet frames reach attach in one of two ways:
 //!

@@ -132,7 +132,7 @@ pub(crate) use model::Origin;
 pub use model::{ConnInfo, Event, EventValue, Fields, Level, Sandbox, Transport, float, opt};
 pub use observer::{Dispatch, Emitter, Fanout, Metadata, Observation, Observer, Stamp};
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

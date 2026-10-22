@@ -1,4 +1,4 @@
-//! The SOCKS5 door, `--type socks5` (RFC 1928, with RFC 1929's
+//! The SOCKS5 door, `attach socks5` (RFC 1928, with RFC 1929's
 //! username/password method).
 //!
 //! Only `CONNECT` is served. A target given as a name (`socks5h://` in

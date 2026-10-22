@@ -10,7 +10,6 @@ use fictionet::{
             dns::rr::{RData, RecordType},
             http1,
         },
-        world::sandbox::{self, Machine, machine},
     },
 };
 use fictionet_demo::kit::{
@@ -24,6 +23,7 @@ use fictionet_observe::{
     page::{Containment, Host, HostState, HostStatus, Labels, StateLimits, StateTopic},
 };
 use fictionet_search_demo::{network, page::Topics};
+use fictionet_test_support::sandbox::{self, Machine, machine};
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},

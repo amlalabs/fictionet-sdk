@@ -233,10 +233,8 @@ fn a_record_without_its_newline_is_corrupt() {
 
 #[test]
 fn serve_latches_a_failed_record() {
-    use fictionet::stdlib::{
-        protocols::dns::{op::ResponseCode, rr::RecordType},
-        world::sandbox::machine,
-    };
+    use fictionet::stdlib::protocols::dns::{op::ResponseCode, rr::RecordType};
+    use fictionet_test_support::sandbox::machine;
 
     let dir = test_dir("serve-failed-record");
     let path = dir.join("log.jsonl");

@@ -1,4 +1,4 @@
-//! The SOCKS5 door, `--type socks5`, served over a client's TCP
+//! The SOCKS5 door, `attach socks5`, served over a client's TCP
 //! connection. The handshake is [`fictionet_cli::attach_proxy::socks5_handshake`].
 
 use std::net::IpAddr;

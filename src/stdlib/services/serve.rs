@@ -3977,7 +3977,6 @@ mod observation_tests {
         }
     }
 
-    #[cfg(feature = "std")]
     #[test]
     fn served_connections_bind_to_the_nearest_host() {
         use fictionet::events::{

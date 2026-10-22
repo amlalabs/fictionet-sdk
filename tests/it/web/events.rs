@@ -556,7 +556,7 @@ fn events_for_tls_handshakes() {
         let mut tcp = m.tcp.connect(&fcx, to(EVENTS_ADDR)).await.unwrap();
         let mut tls = tls::with_context(&fcx, || {
             ClientConnection::new(
-                fictionet::stdlib::world::sandbox::client_config(
+                fictionet_test_support::sandbox::client_config(
                     &fcx,
                     std::time::UNIX_EPOCH + Duration::from_secs(1_893_456_000),
                     Some(&env.roots),

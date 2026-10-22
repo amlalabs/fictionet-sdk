@@ -94,7 +94,7 @@ impl Drop for Timer {
     }
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::block_on;

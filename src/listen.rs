@@ -167,7 +167,6 @@ pub(crate) fn listen_with_ops(
     attacher: Attacher,
     ops: ListenOps,
 ) -> io::Result<Listening> {
-    attacher.mark_listener()?;
     let WorldSocket::UnixSocket(path) = socket;
     let listener = bind(&path)?;
     // SAFETY: plain syscalls; each fd is owned from here.
@@ -650,14 +649,6 @@ impl SocketLink {
     /// Whether attach is known to have closed the connection.
     pub(crate) fn peer_gone(&self) -> bool {
         self.closed || self.slot.name.lock().is_none()
-    }
-
-    /// A check for [`peer_gone`](SocketLink::peer_gone) that works without
-    /// this link. It does not keep the connection open: once the link is
-    /// dropped, it says gone.
-    pub(crate) fn peer_gone_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {
-        let slot = Arc::downgrade(&self.slot);
-        move || slot.upgrade().is_none_or(|s| s.name.lock().is_none())
     }
 
     fn close(&mut self) {

@@ -658,94 +658,25 @@ fn a_world_that_only_sends_gets_its_queue_written_out() {
     assert_eq!(client.recv(), None);
 }
 
-/// `Attachments::map` keeps a socket attachment's name and MTU, and skips
-/// one whose sandbox detached after the map task passed it on but before
-/// the world took it. The skipped one is never wrapped.
 #[test]
-fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
-    let path = socket_path("map");
-    let (attacher, attachments) = attachments();
-    let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
-    let (wrapped_tx, wrapped_rx) = mpsc::channel();
-    let (mut go_tx, mut go_rx) = fictionet::pair();
-    let (queued_tx, queued_rx) = mpsc::channel();
-    let world = std::thread::spawn(move || {
-        block_on(run(
-            RunOptions::new(fictionet::Seed::random()),
-            move |fcx| async move {
-                let mut mapped = attachments.map(&fcx, move |fcx, sandbox| {
-                    let _ = wrapped_tx.send(sandbox.mtu());
-                    fictionet::stdlib::network::filter(fcx, sandbox, |_, _, _| true)
-                });
-                let barrier = mapped.get(&fcx, "barrier").await?;
-                queued_tx.send(()).unwrap();
-                drop(barrier);
-                // Wait for the test thread without blocking the run's thread,
-                // so the map task can pass sandboxes on meanwhile.
-                go_rx.recv(&fcx).await?;
-                let mut a = mapped.get(&fcx, "agent").await?;
-                assert_eq!(a.mtu(), 1400);
-                assert_eq!(a.recv(&fcx).await?, Packet(vec![6]));
-                Ok(())
-            },
-        ))
-    });
-    let first = Client::attach(&path, "agent");
-    // The map task passes the first sandbox on while it is attached. Only
-    // then does it detach.
-    let barrier = Client::attach(&path, "barrier");
-    queued_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the map did not pass the barrier");
-    drop(barrier);
-    drop(first);
-    let mut client = None;
-    poll::until(
-        Duration::from_secs(5),
-        "detached sandbox name to be released",
-        || {
-            let c = Client::connect(&path);
-            c.hello("agent", 1400);
-            if c.recv() == Some(vec![relay::ACCEPT]) {
-                client = Some(c);
-                true
-            } else {
-                false
-            }
-        },
-    );
-    let client = client.unwrap();
-    client.send(&Message::Packet(&[6]));
-    go_tx.send(Packet(Vec::new()));
-    world.join().unwrap().map_err(|e| e.to_string()).unwrap();
-    // Only the barrier and the sandbox the world took were wrapped.
-    assert_eq!(wrapped_rx.try_iter().collect::<Vec<_>>(), [1500, 1400]);
-}
-
-#[test]
-fn a_listened_hub_is_refused_by_a_lab_before_handing_out_an_attachment() {
+fn real_listeners_can_feed_a_lab() {
     let path = socket_path("lab");
     let (attacher, mut attachments) = attachments();
-    let sandbox = attacher.attach("agent").unwrap();
+    let mut sandbox = attacher.attach("agent").unwrap();
+    sandbox.send(Packet(vec![7]));
     let listening = listen(WorldSocket::UnixSocket(path.into()), attacher).unwrap();
-    let error = block_on(fictionet::lab(
+    block_on(fictionet::lab(
         RunOptions::new(fictionet::Seed::from_u64(0)),
         move |fcx| async move {
-            assert!(matches!(
-                attachments.next(&fcx).await,
-                Err(fictionet::Cancelled)
-            ));
-            assert!(fcx.is_cancelled());
+            let mut agent = attachments.next(&fcx).await?;
+            assert_eq!(agent.name(), "agent");
+            assert_eq!(agent.recv(&fcx).await?, Packet(vec![7]));
             Ok(())
         },
     ))
-    .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "attachments fed by a real listener cannot be used in a lab"
-    );
-    drop(listening);
+    .unwrap();
     drop(sandbox);
+    drop(listening);
 }
 
 #[test]

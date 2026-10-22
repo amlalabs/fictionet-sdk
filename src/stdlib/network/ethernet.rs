@@ -7,7 +7,7 @@
 //! discovery, and DHCP when it was given addresses to hand out), passes the
 //! IP packets on, and puts an Ethernet header on each packet for the VM.
 //! It does no I/O: whatever carries the frames, such as
-//! `fictionet attach --type tap` or an embedded VM, reads and writes them
+//! `fictionet attach tap` or an embedded VM, reads and writes them
 //! and calls the link. [`stream`] splits the length-prefixed frame stream
 //! that QEMU, libkrun and passt use.
 //!

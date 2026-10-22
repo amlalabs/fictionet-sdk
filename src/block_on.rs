@@ -28,14 +28,14 @@ use std::task::{Context, Poll, Wake, Waker};
 /// The [Running a world](crate#running-a-world) example shows a complete `main`.
 /// It uses this executor to run the world.
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     return park_on(future);
-    #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
+    #[cfg(target_arch = "wasm32")]
     return spin_on(future);
 }
 
 /// Sleeps the thread while `future` waits.
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn park_on<F: Future>(future: F) -> F::Output {
     struct Unpark(std::thread::Thread);
     impl Wake for Unpark {
@@ -60,7 +60,7 @@ fn park_on<F: Future>(future: F) -> F::Output {
 }
 
 /// Fires the run's timers while `future` waits.
-#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 fn spin_on<F: Future>(future: F) -> F::Output {
     use std::sync::atomic::{AtomicBool, Ordering};
 

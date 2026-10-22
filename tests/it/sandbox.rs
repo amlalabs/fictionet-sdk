@@ -8,8 +8,8 @@ use fictionet::stdlib::{
     },
     services::ca::Ca,
     web,
-    world::sandbox,
 };
+use fictionet_test_support::sandbox;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};

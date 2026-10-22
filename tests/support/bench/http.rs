@@ -5,7 +5,7 @@ use bytes::Bytes;
 use fictionet_extras::hyper_io::{Exec, Io};
 use fictionet::stdlib::protocols::dns::op::{MessageType, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
-use fictionet::stdlib::world::sandbox::{self, Machine, TlsClient};
+use crate::sandbox::{self, Machine, TlsClient};
 use fictionet::stdlib::{network::Connection, services::tls, web};
 use fictionet::{Attacher, Cx};
 use http::{Request, Response, StatusCode, Version};

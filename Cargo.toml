@@ -48,10 +48,8 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["std"]
-std = ["dep:libc", "dep:http", "dep:http-body", "dep:tower-service"]
-tokio = ["std", "dep:tokio", "dep:hyper"]
-web-proxy = ["std"]
+tokio = ["dep:tokio", "dep:hyper"]
+web-proxy = []
 
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing`, which adds `fictionet::fuzzing`.
@@ -60,8 +58,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 [dependencies]
 bytes = "1"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
-http = { version = "1.5.0", optional = true }
-http-body = { version = "1.1.0", optional = true }
+http = { version = "1.5.0" }
+http-body = { version = "1.1.0" }
 hyper = { version = "1.11.1", optional = true, default-features = false, features = ["http1", "server"] }
 rand_chacha = "0.9.0"
 ring = "0.17"
@@ -72,11 +70,11 @@ rsa = { version = "0.9.10", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 smoltcp = { path = "smoltcp", default-features = false }
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
-tower-service = { version = "0.3.3", optional = true }
+tower-service = { version = "0.3.3" }
 
 # The host side: real sockets, threads, the relay and the listener.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-libc = { version = "0.2.189", optional = true }
+libc = { version = "0.2.189" }
 
 # The browser (wasm32-unknown-unknown): random bytes and the clocks come
 # from JavaScript through wasm-bindgen, and timers from setTimeout. ring's
@@ -121,12 +119,10 @@ test = true
 [[bench]]
 name = "network"
 harness = false
-required-features = ["std"]
 
 [[bench]]
 name = "runtime"
 harness = false
-required-features = ["std"]
 
 [[bench]]
 name = "decoders"

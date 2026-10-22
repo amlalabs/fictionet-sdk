@@ -256,7 +256,7 @@ impl Drop for End {
 
 impl End {
     /// The bytes waiting for this end to read, counted as for a limit.
-    #[cfg(all(test, feature = "std"))]
+    #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
         self.cable.dirs[self.side].lock().queue.bytes()
     }
@@ -264,15 +264,6 @@ impl End {
     /// Whether the other end is gone.
     pub(crate) fn peer_gone(&self) -> bool {
         self.cable.dirs[self.side].lock().closed
-    }
-
-    /// A check for [`peer_gone`](End::peer_gone) that works without this
-    /// end, and holds nothing alive. Once both ends are dropped, it says
-    /// gone.
-    pub(crate) fn peer_gone_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {
-        let cable = Arc::downgrade(&self.cable);
-        let side = self.side;
-        move || cable.upgrade().is_none_or(|c| c.dirs[side].lock().closed)
     }
 
     /// The counters and packet stream of this end's pair.
@@ -314,7 +305,7 @@ impl std::fmt::Debug for End {
     }
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::{InterfaceExt, block_on, run};

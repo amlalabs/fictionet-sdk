@@ -16,7 +16,7 @@ mod network;
 mod tls;
 
 use echo_service::{Echo, Ticker};
-use fictionet::stdlib::world::sandbox::{Machine, machine};
+use fictionet_test_support::sandbox::{Machine, machine};
 use io::read_some;
 use world::world;
 

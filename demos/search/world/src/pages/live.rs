@@ -247,7 +247,6 @@ impl Live {
         query: &str,
         start: u64,
     ) -> Result<search::Search, String> {
-        cx.require_real_io().map_err(|e| e.to_string())?;
         if start > 90 {
             return Ok(search::Search::default());
         }

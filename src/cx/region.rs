@@ -211,7 +211,7 @@ impl Region {
     }
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::time::ms;

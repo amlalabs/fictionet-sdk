@@ -1,3 +1,4 @@
+use fictionet_test_support::sandbox;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -8,14 +9,14 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::http2::{self, Frame};
 use fictionet::stdlib::services::serve::Harness;
 use fictionet::stdlib::web::httpd::{self, Http2, Router};
-use fictionet::stdlib::world::sandbox::TlsClient;
 use fictionet::stdlib::{
     network::{Connection, ConnectionExt, filter},
     protocols::hpack,
     services::tls,
-    world::{net, sandbox},
+    world::net,
 };
 use fictionet::{Cx, RunOptions, Seed};
+use fictionet_test_support::sandbox::TlsClient;
 
 const SITE: Ipv4Addr = Ipv4Addr::new(104, 18, 0, 1);
 const DATE: u64 = 1_893_456_000;

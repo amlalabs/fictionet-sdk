@@ -1,7 +1,7 @@
 //! Just enough rtnetlink to set up one device: bring it up with an MTU, add
 //! addresses, add a default route. And to take another link out of the
 //! way: list its routes and addresses, delete them, and set it down. For
-//! `--type tap --vm tap:<name>`, also traffic control: an ingress qdisc and
+//! `attach tap --vm tap:<name>`, also traffic control: an ingress qdisc and
 //! a filter that redirects every frame to another device.
 //! Written by hand on `libc`, with no netlink crate. Each change asks for
 //! an ack, and a kernel error comes back as an `io::Error`.

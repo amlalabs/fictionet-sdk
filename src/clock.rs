@@ -7,10 +7,10 @@ use std::task::{Wake, Waker};
 
 use crate::time::{Duration, Instant};
 
-/// The clock and I/O policy of a world.
+/// The clock mode of a world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunMode {
-    /// Time follows the host's monotonic clock, and real I/O is available.
+    /// Time follows the host's monotonic clock.
     Real,
     /// Time starts at zero and advances when all runnable work has drained.
     Lab,

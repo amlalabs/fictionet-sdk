@@ -1,4 +1,4 @@
-//! `fictionet attach --type tun`: a TUN device in the sandbox's network
+//! `fictionet attach tun`: a TUN device in the sandbox's network
 //! namespace, relayed to the world over its Unix socket.
 
 use std::fs;
@@ -133,7 +133,7 @@ fn take_down(link: &str) -> io::Result<()> {
 fn configure(args: &AttachArgs, dev: &str) -> io::Result<()> {
     let index = index_of(dev)?;
     let nl = Netlink::open()?;
-    let no_v6 = args.ip_addr_v6.value().is_none() && args.gateway_v6.value().is_none();
+    let no_v6 = args.ip_addr_v6.as_ref().is_none() && args.gateway_v6.as_ref().is_none();
     if no_v6 {
         // Without IPv6 the kernel may refuse this (IPv6 turned off on the
         // device), and then there is no link-local address anyway.
@@ -141,20 +141,20 @@ fn configure(args: &AttachArgs, dev: &str) -> io::Result<()> {
     }
     nl.call(netlink::link_up(index, args.mtu as u32))
         .map_err(|e| context(e, "bringing the device up"))?;
-    if let Some(a) = args.ip_addr.value() {
+    if let Some(a) = args.ip_addr.as_ref() {
         nl.call(netlink::add_address(index, IpAddr::V4(a.addr), a.prefix))
             .map_err(|e| context(e, "adding the IPv4 address"))?;
     }
-    if let Some(a) = args.ip_addr_v6.value() {
+    if let Some(a) = args.ip_addr_v6.as_ref() {
         nl.call(netlink::add_address(index, IpAddr::V6(a.addr), a.prefix)).map_err(|e| {
             context(e, "adding the IPv6 address (is IPv6 turned off? set the sysctl net.ipv6.conf.default.disable_ipv6=0)")
         })?;
     }
-    if let Some(gw) = args.gateway.value() {
+    if let Some(gw) = args.gateway.as_ref() {
         nl.call(netlink::add_default_route(index, IpAddr::V4(*gw)))
             .map_err(|e| default_route_error(e, "IPv4"))?;
     }
-    if let Some(gw) = args.gateway_v6.value() {
+    if let Some(gw) = args.gateway_v6.as_ref() {
         nl.call(netlink::add_default_route(index, IpAddr::V6(*gw)))
             .map_err(|e| default_route_error(e, "IPv6"))?;
     }
@@ -218,7 +218,7 @@ pub(crate) fn resolv_conf(servers: &[IpAddr]) -> String {
 /// `/etc/resolv.conf`, so a new file could not take its place. A container
 /// that joins attach's network with `network_mode: "service:..."` has the
 /// same host file mounted, so it sees the change too.
-/// With both `--no-dns` and `--no-dns-v6`, the file lists no servers.
+/// Without `--dns` or `--dns-v6`, the file lists no servers.
 /// Attach runs as root, so it never writes through a symlink or a hard
 /// link at `path` (see [`lifecycle::open_own_file`]).
 fn write_resolv_conf(path: &Path, servers: &[IpAddr]) -> io::Result<()> {
@@ -375,8 +375,7 @@ mod tests {
 
     #[test]
     fn resolv_conf_goes_under_etc_netns_with_netns() {
-        let line = "--world unix:/w --name a --type tun --no-ip-addr --no-gateway --no-dns \
-                    --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6";
+        let line = "tun --world unix:/w --name a";
         let mut v: Vec<String> = line.split_whitespace().map(String::from).collect();
         let a = parse_run(&v);
         assert_eq!(
@@ -414,8 +413,7 @@ mod tests {
 
     #[test]
     fn unnamed_netns_requires_explicit_resolver_policy() {
-        let line = "--world unix:/w --name a --type tun --no-ip-addr --no-gateway --no-dns \
-                    --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6 --netns /proc/1234/ns/net";
+        let line = "tun --world unix:/w --name a --netns /proc/1234/ns/net";
         let v: Vec<String> = line.split_whitespace().map(String::from).collect();
         let a = parse_run(&v);
         let error = resolv_conf_path(&a).unwrap_err();
