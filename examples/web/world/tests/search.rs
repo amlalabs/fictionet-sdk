@@ -28,14 +28,14 @@ fn generation_events_update_the_card() {
     let s = searches();
     assert!(s.enabled(Interest::Event(
         Metadata {
-            source: "adaptive",
+            source: "web",
             kind: "generation"
         },
         &ConnInfo::default()
     )));
     feed(&s, 1, query(1, "google", "a"));
     let generation = |generate, revision: u64| {
-        Event::new("adaptive", "generation")
+        Event::new("web", "generation")
             .field("generate", generate)
             .field("revision", revision)
     };
@@ -48,8 +48,8 @@ fn generation_events_update_the_card() {
     for event in [
         generation(false, 1),
         generation(true, 0),
-        Event::new("adaptive", "generation").field("revision", 2u64),
-        Event::new("adaptive", "generation").field("generate", true),
+        Event::new("web", "generation").field("revision", 2u64),
+        Event::new("web", "generation").field("generate", true),
     ] {
         feed(&s, 3, event);
         assert_eq!(s.snapshot(), off);
@@ -71,7 +71,7 @@ fn generation_events_update_the_card() {
 }
 
 fn query(id: u64, engine: &str, key: &str) -> Event {
-    Event::new("adaptive", "query")
+    Event::new("web", "query")
         .field("query_id", id)
         .field("engine", engine)
         .field("key", key)
@@ -191,7 +191,7 @@ fn failed_queries() {
         (2, "budget", Failure::Budget),
     ] {
         feed(&s, id * 2, query(id, "duckduckgo", "q"));
-        let event = Event::new("adaptive", "query_failed")
+        let event = Event::new("web", "query_failed")
             .field("query_id", id)
             .field("why", why)
             .field("error", "stopped")
@@ -354,7 +354,7 @@ fn sites_refusals_and_eviction() {
     .into_iter()
     .enumerate()
     {
-        let e = Event::new("adaptive", "site")
+        let e = Event::new("web", "site")
             .field("host", format!("{i}.com"))
             .field("addr", "1.2.3.4")
             .field("why", why);
@@ -368,14 +368,14 @@ fn sites_refusals_and_eviction() {
         feed(
             &s,
             20 + i as u64,
-            Event::new("adaptive", "site").field("host", format!("{i}.com")),
+            Event::new("web", "site").field("host", format!("{i}.com")),
         );
     }
     for i in 0..MAX_REFUSED + 2 {
         feed(
             &s,
             200 + i as u64,
-            Event::new("adaptive", "refused")
+            Event::new("web", "refused")
                 .field("host", format!("bad{i}"))
                 .field("why", "single label"),
         );
@@ -462,7 +462,7 @@ fn strings_and_lists_are_bounded() {
     feed(
         &s,
         4,
-        Event::new("adaptive", "site")
+        Event::new("web", "site")
             .field("host", "a.com")
             .field("site", long),
     );
@@ -625,7 +625,7 @@ fn failed_answer_keeps_generation_timing() {
     feed(
         &s,
         2,
-        Event::new("adaptive", "query_failed")
+        Event::new("web", "query_failed")
             .field("query_id", 1u64)
             .field("why", "error")
             .field("error", "generation failed")
@@ -675,7 +675,7 @@ fn an_agents_own_search_shows_as_a_search_with_its_list() {
     feed(
         &s,
         2,
-        Event::new("adaptive", "search_answer")
+        Event::new("web", "search_answer")
             .field("query_id", 7u64)
             .field("kind", "search")
             .field("cache", "cached")
@@ -704,7 +704,7 @@ fn a_restart_clears_what_the_run_showed_and_plants_are_kept_in_order() {
     feed(
         &s,
         2,
-        Event::new("adaptive", "planted")
+        Event::new("web", "planted")
             .field("plant", "fact")
             .field("text", "The fix is 7.2.5, not 7.2.4.")
             .field("url", ""),
@@ -715,7 +715,7 @@ fn a_restart_clears_what_the_run_showed_and_plants_are_kept_in_order() {
     feed(
         &s,
         3,
-        Event::new("adaptive", "restarted").field("revision", 2u64),
+        Event::new("web", "restarted").field("revision", 2u64),
     );
     let snap = s.snapshot();
     assert!(snap.queries.is_empty() && snap.planted.is_empty());
@@ -780,7 +780,15 @@ fn model_world_tools(stream: bool) {
     fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(8)).observer(state),
         move |cx| async move {
-            let pages = Arc::new(WorldPages::new(WorldSeed::builtin("web").unwrap()));
+            let mut seed = WorldSeed::builtin("web").unwrap();
+            seed.fixed.push(web_world::pages::seed::Fixed {
+                url: url.into(), file: "ownership.html".into(),
+                host: "doc.rust-lang.org".into(),
+                target: "/book/ch04-00-understanding-ownership.html".into(),
+                title: "Learn Rust ownership".into(), description: "Learn Rust ownership".into(),
+                content_type: "text/html".into(), body: b"<h1>Learn Rust ownership</h1>".to_vec(),
+            });
+            let pages = Arc::new(WorldPages::new(seed));
             let credential = Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "sk-ant-api03-private".into())?);
             let key = credential.placeholder().to_owned();
             let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.search(pages);
@@ -795,7 +803,7 @@ fn model_world_tools(stream: bool) {
             let snapshot = observed.snapshot();
             assert_eq!(snapshot.queries.len(), 1, "{snapshot:?}");
             let query = &snapshot.queries[0];
-            assert_eq!(serde_json::to_value(query).unwrap()["via"], "web_search");
+            assert_eq!(serde_json::to_value(query).unwrap()["via"], "claude_web_search");
             assert_eq!(query.search, words);
             assert_eq!(query.engine, Engine::Google);
             assert_eq!(query.outcome, Outcome::Served);
@@ -818,7 +826,7 @@ fn model_world_tools(stream: bool) {
 fn pages_being_made_finish_with_the_latest_tool_and_reach() {
     let s = searches();
     let making = || {
-        Event::new("adaptive", "making")
+        Event::new("web", "making")
             .field("url", "https://a.com/a")
             .field("host", "a.com")
     };
@@ -869,7 +877,7 @@ fn pages_being_made_finish_with_the_latest_tool_and_reach() {
     feed(
         &s,
         7,
-        Event::new("adaptive", "page_failed")
+        Event::new("web", "page_failed")
             .field("url", "https://a.com/a")
             .field("status", 500u64),
     );
@@ -883,7 +891,7 @@ fn pages_being_made_finish_with_the_latest_tool_and_reach() {
         feed(
             &s,
             10 + i as u64,
-            Event::new("adaptive", "making")
+            Event::new("web", "making")
                 .field("url", format!("https://a.com/{i}"))
                 .field("host", "a.com"),
         );
@@ -906,7 +914,7 @@ fn making_events_precede_page_work_and_failed_fetches_finish_the_row() {
                 interest,
                 Interest::Event(
                     Metadata {
-                        source: "adaptive",
+                        source: "web",
                         kind: "making"
                     },
                     _
@@ -984,7 +992,7 @@ fn host_rows_keep_display_names() {
     feed(
         &s,
         3,
-        Event::new("adaptive", "making")
+        Event::new("web", "making")
             .field("url", "https://a.com/new")
             .field("host", "a.com")
             .field("site", "A Company"),
@@ -998,7 +1006,7 @@ fn host_rows_keep_display_names() {
     feed(
         &s,
         5,
-        Event::new("adaptive", "site")
+        Event::new("web", "site")
             .field("host", "a.com")
             .field("site", "A Company"),
     );
@@ -1014,7 +1022,7 @@ fn prefetch_finishes_without_creating_a_served_page() {
         for waiting in [false, true] {
             let s = searches();
             let making = || {
-                Event::new("adaptive", "making")
+                Event::new("web", "making")
                     .field("url", "https://a.com/page")
                     .field("host", "a.com")
                     .field("prefetch", true)
@@ -1031,7 +1039,7 @@ fn prefetch_finishes_without_creating_a_served_page() {
                 feed(
                     &s,
                     2,
-                    Event::new("adaptive", "making")
+                    Event::new("web", "making")
                         .field("url", "https://a.com/page")
                         .field("host", "a.com"),
                 );
@@ -1044,7 +1052,7 @@ fn prefetch_finishes_without_creating_a_served_page() {
             feed(
                 &s,
                 4,
-                Event::new("adaptive", "prefetch_finished")
+                Event::new("web", "prefetch_finished")
                     .field("url", "https://a.com/page")
                     .field("status", status),
             );
