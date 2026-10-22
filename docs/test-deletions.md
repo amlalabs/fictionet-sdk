@@ -158,3 +158,5 @@ active modes are covered by copied corpus and model transport integration tests.
 
 - `tests/web_fixture/world.rs::the_client_report_is_the_recorded_one` and `tests/web_fixture/golden.txt`: compare a formatted report with regenerated output. Actual proxy, DNS, TLS and upload integration tests remain. Removed the unused report driver and its clients from `tests/support/web_fixture.rs`, and its regeneration from xtask.
 - `tests/it/codegen.rs::differential_fixture_matches_programmatic_ir`: regenerates Rust source and compares it to generated Rust source. The generated module remains because differential codec tests compile it and compare behavior on real bytes.
+
+- `python/inspect_fictionet/tests/test_world_sandboxes.py::test_web_world_has_outbound_networking_with_every_generator`: four cases assert static compose network fields, including a removed generator name, without opening a connection. Actual Docker context and sandbox integration coverage remains.

@@ -71,12 +71,3 @@ def test_invalid_world_options(options, tmp_path):
         fictionet_sandbox("world", cache_dir=tmp_path, **options)
 
 
-@pytest.mark.parametrize("generator", ["stub", "replay", "openrouter", "anthropic"])
-def test_web_world_has_outbound_networking_with_every_generator(generator, monkeypatch, tmp_path):
-    from inspect_fictionet.worlds.web.world import world_sandbox
-
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    config = yaml.safe_load(Path(world_sandbox(generator=generator).config).read_text())["services"]
-    assert config["world"]["network_mode"] == "bridge"
-    assert config["attach"]["network_mode"] == "none"
-    assert config["default"]["network_mode"] == "service:attach"
