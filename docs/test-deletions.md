@@ -137,3 +137,10 @@ active modes are covered by copied corpus and model transport integration tests.
 - `codegen/tests/layout.rs`: checks formatting and repeated generation; the layouts crate still compiles generated schemas and exercises their codecs on bytes.
 - `codegen/tests/support/mod.rs`: unused rustfmt helper after deleting formatting-only tests.
 - `codegen/tests/cli.rs::sbe_format_matches_its_golden_and_reports_xml_errors`: removed its regenerated-source comparison and retained successful CLI invocation and XML error handling as `sbe_format_reports_xml_errors`.
+
+- `demos/artifactory/world/tests/golden.rs`: repeats the same four traffic scripts as `facts.rs` and compares regenerated output. Python scoring fixtures remain in use.
+- `demos/scan/world/tests/golden.rs`: compares the scanner's formatted report to regenerated text; real port observation and protocol tests remain.
+- `demos/scan/world/tests/golden.txt`: unused after deleting its snapshot test.
+- `demos/border/world/tests/golden.rs`: removed log snapshots and their flush sleeps; kept real DNS, HTTP, TLS, ping and refused-connection assertions in `traffic.rs`.
+- `demos/fakewiki/world/tests/golden.rs`: removed the regenerated log comparison; kept real requests, HEAD delivery and redirect evidence in `requests.rs`.
+- `demos/fakewiki/world/tests/golden/altered_one.jsonl`: unused after removing the output comparison.

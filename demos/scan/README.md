@@ -56,7 +56,6 @@ cargo run -p scan-world -- /run/fictionet/world.sock
 ```
 
 Integration tests live in `world/tests/`. Run all tests with `cargo test -p scan-world`.
-The golden report is in `world/tests/golden.txt`.
 
 ## Attaching a real server
 
