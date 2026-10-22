@@ -36,7 +36,7 @@ pub(super) fn run(only: Option<&str>) -> Result {
         }
         let document =
             kuchiki::parse_html().one(String::from_utf8_lossy(&discovery.stdout).into_owned());
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::from([url.to_string()]);
         let mut pages = vec![start.to_owned()];
         let articles = document.select("article a[href]").unwrap();
         let all = document.select("a[href]").unwrap();
