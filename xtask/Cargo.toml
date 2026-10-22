@@ -4,15 +4,3 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
-
-[dependencies]
-fictionet-extras = { path = "../extras" }
-url = "2"
-kuchiki = "0.8"
-base64 = "0.22"
-libc = "0.2"
-regex = "1"
-serde_json = "1"
-
-fictionet-codegen = { path = "../codegen" }
-fictionet = { path = "..", features = ["web-proxy", "tokio"] }

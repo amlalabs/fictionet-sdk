@@ -4322,17 +4322,6 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "fictionet",
- "fictionet-codegen",
- "fictionet-extras",
- "kuchiki",
- "libc",
- "regex",
- "serde_json",
- "url",
-]
 
 [[package]]
 name = "xz2"

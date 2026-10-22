@@ -262,8 +262,7 @@ Start at the crate root, which explains the main ideas, then read in this order:
 ## Building and testing
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the commands to build, test and
-benchmark in each feature set, and the `cargo xtask` commands for the Docker,
-Kubernetes and VM tests.
+benchmark in each feature set.
 
 ## License
 

@@ -119,22 +119,8 @@ chunks. Divan reports timings, rates and allocation counts; no benchmark has a
 pass or fail threshold. Compare two commits on the same machine. CI compiles
 the benchmarks and does not run them.
 
-## cargo xtask
+## h2spec
 
-Jobs that need Docker, Kubernetes, a VM or other tools are `cargo xtask`
-commands. `cargo xtask --help` lists them.
-
-| Command | What it does |
-| --- | --- |
-| `cargo xtask images [artifactory\|hosted]` | Builds the Artifactory images and the hosted example's binaries. |
-| `cargo xtask docker <ping\|tcpudp\|proxy\|web>` | Runs a Docker Compose test of `fictionet attach`. |
-| `cargo xtask k8s [tun\|proxy]` | Runs the Helm chart on kind. |
-| `cargo xtask vm ...` | Boots the development VM and runs test suites in it ([vm/README.md](vm/README.md)). |
-| `cargo xtask demo [name \| assets]` | Runs an in-process demo on this machine, or a demo’s `guest.sh` in the VM. [demos/README.md](demos/README.md) lists them. |
-| `cargo xtask eval <border\|fakewiki\|web\|artifactory>` | Builds a world's images and runs its Inspect eval. |
-| `cargo xtask copy-check` | Copies `src/stdlib` and the companion's conversation, HTTP/2, protocol and TLS capture adapters into a separate crate. Builds with no SDK features and all SDK features, each with and without `decode`. |
-| `cargo xtask fuzz [--check \| <target> \| <seconds>]` | Runs the fuzz targets ([fuzz/README.md](fuzz/README.md)). |
-| `cargo xtask h2spec [section]` | Runs the h2spec conformance suite against the native HTTP/2 server, over TLS and h2c. |
-
-A change to `fictionet attach` or to how a world is reached should also pass
-`cargo xtask docker`, and a change to the Helm chart `cargo xtask k8s`.
+`cargo test --features web-proxy,tokio --test h2spec` runs the h2spec
+conformance suite against the native HTTP/2 server, over TLS and h2c. It
+downloads h2spec, so plain `cargo test` leaves it out.
