@@ -33,6 +33,7 @@ struct State {
 pub(super) struct Live {
     key: Key,
     engine: Key,
+    endpoint: url::Url,
     path: PathBuf,
     state: Mutex<State>,
     fetcher: Mutex<Option<Fetcher>>,
@@ -56,6 +57,8 @@ impl Live {
         Ok(Arc::new(Self {
             key,
             engine,
+            endpoint: url::Url::parse("https://customsearch.googleapis.com/customsearch/v1")
+                .unwrap(),
             path: root.join(format!(
                 "live-search-{}-{stamp}.warc.gz",
                 std::process::id()
@@ -269,8 +272,7 @@ impl Live {
         std::thread::spawn(move || {
             let result = (|| {
                 let fetcher = Fetcher::new(capture::BROWSER).map_err(|e| e.to_string())?;
-                let mut endpoint =
-                    url::Url::parse("https://www.googleapis.com/customsearch/v1").unwrap();
+                let mut endpoint = live.endpoint.clone();
                 let (_, key) = live.key.header(ModelProvider::Gemini);
                 let (_, engine_id) = live.engine.header(ModelProvider::Gemini);
                 endpoint.query_pairs_mut().extend_pairs([
@@ -278,7 +280,7 @@ impl Live {
                     ("cx", engine_id.as_str()),
                     ("q", query.as_str()),
                     ("start", &(start + 1).to_string()),
-                    ("num", "10"),
+                    ("num", &(99 - start).min(10).to_string()),
                 ]);
                 cx_thread.emit("web", "real_search", |event| {
                     event
@@ -440,6 +442,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let result_url = format!("{origin}/result");
+        let returned_url = result_url.clone();
+        let server = std::thread::spawn(move || {
+            let mut queries = 0;
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let target = line.split_whitespace().nth(1).unwrap().to_owned();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let (mime, body) = if target.starts_with("/customsearch/v1?") {
+                    let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+                    let params: HashMap<_, _> = url.query_pairs().collect();
+                    assert_eq!(params["key"], "host-only-key");
+                    assert_eq!(params["cx"], "host-only-engine");
+                    assert_eq!(params["q"], "stellar & gas");
+                    assert_eq!(params["start"], "1");
+                    assert_eq!(params["num"], "10");
+                    queries += 1;
+                    ("application/json", json!({"searchInformation":{"totalResults":"1"}, "items":[{"title":"Stellar gas", "link":returned_url, "snippet":"Stellar gas"}]}).to_string())
+                } else if target == "/robots.txt" {
+                    ("text/plain", "User-agent: *\nAllow: /\n".to_owned())
+                } else {
+                    assert_eq!(target, "/result");
+                    (
+                        "text/html",
+                        "<title>Stellar gas</title><p>Stellar gas</p>".to_owned(),
+                    )
+                };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            assert_eq!(queries, 4);
+        });
+        let path = std::env::temp_dir().join(format!(
+            "fictionet-live-engines-{}.warc.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let live = Arc::new(Live {
+            key: Key::new("GOOGLE_SEARCH_API_KEY", Some("host-only-key".into())).unwrap(),
+            engine: Key::new("GOOGLE_SEARCH_ENGINE_ID", Some("host-only-engine".into())).unwrap(),
+            endpoint: format!("{origin}/customsearch/v1").parse().unwrap(),
+            path: path.clone(),
+            state: Mutex::default(),
+            fetcher: Mutex::default(),
+        });
+        let mut pages = Pages::new(Seed::builtin("web").unwrap());
+        pages.live = Some(live);
+        pages
+            .live_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pages = Arc::new(pages);
+        let memory = Arc::new(fictionet_observe::Memory::default());
+        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)).observer(memory.clone()), |cx| async move {
+            for (host, target) in [
+                ("www.google.com", "/search?q=stellar+%26+gas"),
+                ("www.bing.com", "/search?q=stellar+%26+gas"),
+                ("html.duckduckgo.com", "/html/?q=stellar+%26+gas"),
+                ("www.youtube.com", "/results?search_query=stellar+%26+gas"),
+            ] {
+                let response = pages.handle(&cx, "GET", host, target, None).await;
+                assert_eq!(response.status, 200);
+                let Meta::Search(list) = response.meta else { panic!("search response expected") };
+                assert_eq!(list.listed.len(), 1);
+                assert_eq!(list.listed[0].0, result_url);
+                assert_eq!(list.carries, 0);
+                assert_eq!(pages.live_url(&cx, &result_url).await.status, 200);
+            }
+            pages.apply(&cx, Command::SetNewPages { new_pages: NewPages::Off, expected_revision: 0 }).unwrap();
+            let response = pages.handle(&cx, "GET", "www.google.com", "/search?q=stellar+%26+gas", None).await;
+            assert!(matches!(response.meta, Meta::Search(list) if list.cache == Cache::Cached && list.listed.len() == 1));
+            Ok(())
+        })).unwrap();
+        server.join().unwrap();
+        let events = memory.checked_all().unwrap();
+        for (kind, count) in [("real_search", 4), ("downloaded", 1), ("copy_served", 4)] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.source == "web" && e.kind == kind)
+                    .count(),
+                count
+            );
+        }
+        let text = format!("{events:?}");
+        assert!(!text.contains("host-only-key"));
+        assert!(!text.contains("host-only-engine"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn copies_dependencies_and_same_host_links_through_five_levels() {
         use std::{
             io::{BufRead, BufReader, Write},
@@ -507,6 +617,8 @@ mod tests {
         let live = Arc::new(Live {
             key: Key::new("GOOGLE_SEARCH_API_KEY", Some("private".into())).unwrap(),
             engine: Key::new("GOOGLE_SEARCH_ENGINE_ID", Some("engine".into())).unwrap(),
+            endpoint: url::Url::parse("https://customsearch.googleapis.com/customsearch/v1")
+                .unwrap(),
             path: path.clone(),
             state: Mutex::default(),
             fetcher: Mutex::default(),
@@ -612,6 +724,8 @@ mod tests {
         let live = Arc::new(Live {
             key: Key::new("GOOGLE_SEARCH_API_KEY", Some("private-key".into())).unwrap(),
             engine: Key::new("GOOGLE_SEARCH_ENGINE_ID", Some("private-engine".into())).unwrap(),
+            endpoint: url::Url::parse("https://customsearch.googleapis.com/customsearch/v1")
+                .unwrap(),
             path: path.clone(),
             state: Mutex::default(),
             fetcher: Mutex::default(),
