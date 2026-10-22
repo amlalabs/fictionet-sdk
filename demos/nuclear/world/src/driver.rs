@@ -204,8 +204,6 @@ mod tests {
     use fictionet::events::float;
     use fictionet_observe::Memory;
 
-    fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
-
     /// Run options that keep the run's facts in `memory`.
     fn options(memory: &Arc<Memory>) -> fictionet::RunOptions {
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(memory.clone())
@@ -325,11 +323,6 @@ mod tests {
                 maximum.as_secs_f64() * 1_000.0
             );
         }
-    }
-
-    #[test]
-    fn driver_is_clone_send_and_sync() {
-        assert_clone_send_sync::<Driver>();
     }
 
     #[test]

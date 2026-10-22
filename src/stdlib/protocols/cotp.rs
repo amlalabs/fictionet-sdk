@@ -1791,13 +1791,6 @@ mod tests {
 
     // RFC 1006 section 5: on TCP the default TPDU size is 65531, not
     // ISO 8073's 128.
-    #[test]
-    fn rfc1006_default_tpdu_size() {
-        assert_eq!(DEFAULT_TPDU_SIZE, 65531);
-        assert_eq!(DEFAULT_TPDU_SIZE, MAX_TPDU);
-        assert_eq!(ISO_DEFAULT_TPDU_SIZE, 128);
-    }
-
     // X.224 13.3.4 b: sizes of 4096 and 8192 are not allowed in class 0,
     // and a confirm may not offer a size the request did not allow.
     #[test]

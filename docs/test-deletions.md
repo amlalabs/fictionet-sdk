@@ -126,3 +126,9 @@ active modes are covered by copied corpus and model transport integration tests.
 - `demos/search/app/src/page/fixtures/planted.json`: unused after removing its copy or obsolete-mode tests.
 - `demos/search/app/src/page/fixtures/restart.json`: unused after removing its copy or obsolete-mode tests.
 - `python/inspect_fictionet/tests/border/fixtures/prompts.json`: unused after removing its copy or obsolete-mode tests.
+
+- `demos/nuclear/world/src/driver.rs::driver_is_clone_send_and_sync`: pins constants or a compile-time trait already required by callers; real packet layouts and driver transitions remain covered.
+- `src/stdlib/protocols/cotp.rs::rfc1006_default_tpdu_size`: pins constants or a compile-time trait already required by callers; real packet layouts and driver transitions remain covered.
+- `src/stdlib/protocols/dcerpc.rs::status_codes_match_c706_appendix_e`: pins constants or a compile-time trait already required by callers; real packet layouts and driver transitions remain covered.
+- `src/stdlib/protocols/wake_on_lan.rs::constants`: pins constants or a compile-time trait already required by callers; real packet layouts and driver transitions remain covered.
+- `src/stdlib/protocols/wireguard.rs::sizes_match_the_paper`: pins constants or a compile-time trait already required by callers; real packet layouts and driver transitions remain covered.

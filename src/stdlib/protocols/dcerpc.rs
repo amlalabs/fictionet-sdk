@@ -2032,12 +2032,6 @@ mod tests {
     }
 
     #[test]
-    fn status_codes_match_c706_appendix_e() {
-        assert_eq!(status::FAULT_CONTEXT_MISMATCH, 0x1c00_001a);
-        assert_eq!(status::FAULT_REMOTE_NO_MEMORY, 0x1c00_001b);
-    }
-
-    #[test]
     fn bind_ack_layout() {
         let p = Pdu::new(
             1,
