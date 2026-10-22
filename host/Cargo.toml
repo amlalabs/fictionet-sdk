@@ -11,17 +11,22 @@ publish = false
 default = ["proxy"]
 proxy = ["fictionet/web-proxy"]
 
-[dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fictionet = { path = "..", default-features = false }
 bytes = "1"
 http = "1"
 http-body = "1"
-libc = "0.2"
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
+http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1"
+tower-service = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"] }
+tokio-util = { version = "0.7", default-features = false }
 
 [dev-dependencies]
 fictionet-observe = { path = "../observe", features = ["native"] }
-http-body-util = "0.1"
-tower-service = "0.3"
-tokio = { version = "1", features = ["sync"] }
+libc = "0.2"
+futures-util = { version = "0.3", default-features = false }

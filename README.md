@@ -72,9 +72,11 @@ External I/O and opt-in axum upgrades have separate timing limits; see
 Add `fictionet` to your Cargo dependencies. It always uses Rust's standard
 library and builds without tokio. Enable `tokio` for the tokio adapters
 (`into_tokio`) and axum WebSocket upgrades. Enable `web-proxy` and inject a
-transport from `fictionet-host` for upstream HTTP requests over host sockets.
-Host I/O works in real and simulated clock modes; repeatable tests control
-external inputs themselves. See the [feature table](src/lib.rs).
+transport from `fictionet-host` for upstream HTTP/1.1 requests over host
+sockets and rustls. The transport owns a Tokio runtime; callers can use any
+executor without enabling the core's `tokio` feature. Host I/O works in real
+and simulated clock modes; repeatable tests control external inputs
+themselves. See the [feature table](src/lib.rs).
 
 The `fictionet` command is the `fictionet-cli` package in `cli/`. Install it
 from a checkout with `cargo install --locked --path cli`.
