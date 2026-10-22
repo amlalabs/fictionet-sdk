@@ -4,7 +4,7 @@
 //! abrupt exit can truncate the pcap.
 //!
 //! ```text
-//! cargo run --example capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap /run/fictionet/observation.sock
+//! cargo run -p fictionet-capture-sites-demo --bin capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap /run/fictionet/observation.sock
 //! ```
 //!
 //! The optional third argument opens a Unix observation socket. Watch it

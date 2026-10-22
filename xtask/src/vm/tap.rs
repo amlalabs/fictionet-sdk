@@ -280,11 +280,17 @@ pub(super) fn build(release: bool) -> Result<PathBuf> {
             "--locked",
             "--features",
             "web-proxy,tokio",
-            "--bin",
+            "-p",
             "fictionet",
             "--example",
             "web_fixture",
-            "--example",
+            "-p",
+            "fictionet-cli",
+            "--bin",
+            "fictionet",
+            "-p",
+            "fictionet-ping-world-demo",
+            "--bin",
             "ping_world",
         ],
     );
@@ -317,7 +323,7 @@ pub fn run(fetch: bool) -> Result {
             let name = if dual { "dual" } else { "web" };
             let world_log = work.join("world.log");
             let mut world_cmd = Command::new(target.join(if dual {
-                "examples/ping_world"
+                "ping_world"
             } else {
                 "examples/web_fixture"
             }));

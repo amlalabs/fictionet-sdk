@@ -2,7 +2,7 @@
 //! `web::Sites`, with `Attachments::map`.
 //!
 //! ```text
-//! cargo run --example delayed_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
+//! cargo run -p fictionet-delayed-sites-demo --bin delayed_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
 //! ```
 //!
 //! The optional second argument opens a Unix observation socket. Watch it

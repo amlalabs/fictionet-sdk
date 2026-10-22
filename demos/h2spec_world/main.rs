@@ -7,7 +7,7 @@
 //! HTTP/2 server refuses them.
 //!
 //! ```text
-//! cargo run --example h2spec_world
+//! cargo run -p fictionet-h2spec-world-demo --bin h2spec_world
 //! ```
 //!
 //! It prints `tls <port>` and `h2c <port>`, then serves until its standard

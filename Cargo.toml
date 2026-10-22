@@ -118,25 +118,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-ut
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 divan = "0.1.21"
 
-# Example targets. `cargo test` also runs those marked with `test = true`.
-[[example]]
-name = "web_world"
-path = "demos/web/main.rs"
-required-features = ["std"]
-test = false
-
-# The web test world adds bulk transfers and a real upstream.
+# The web test fixture adds bulk transfers and a real upstream.
 [[example]]
 name = "web_fixture"
 path = "tests/web_fixture/world.rs"
 required-features = ["web-proxy", "tokio"]
 test = true
-
-[[example]]
-name = "custom_protocol"
-path = "demos/custom_protocol/main.rs"
-test = false
-required-features = ["std"]
 
 [[bench]]
 name = "network"
@@ -180,51 +167,7 @@ debug = 1
 [profile.release.package.nuclear-world]
 debug = 1
 
-[[example]]
-name = "bottleneck_sites"
-path = "demos/bottleneck_sites/main.rs"
-required-features = ["std"]
-
-[[example]]
-name = "capture_sites"
-path = "demos/capture_sites/main.rs"
-test = false
-required-features = ["std"]
-
-[[example]]
-name = "delayed_sites"
-path = "demos/delayed_sites/main.rs"
-required-features = ["std"]
-
-[[example]]
-name = "lossy_sites"
-path = "demos/lossy_sites/main.rs"
-required-features = ["std"]
-
-[[example]]
-name = "ping_world"
-path = "demos/ping_world/main.rs"
-required-features = ["std"]
-
-[[example]]
-name = "route_change"
-path = "demos/route_change/main.rs"
-test = false
-required-features = ["std"]
-
-[[example]]
-name = "goad"
-path = "demos/goad/main.rs"
-required-features = ["std"]
-
-# The world `cargo xtask h2spec` tests.
-[[example]]
-name = "h2spec_world"
-path = "demos/h2spec_world/main.rs"
-required-features = ["tokio"]
-
-# Tests that need user namespaces, root or a tun device. They run only when
-# named: `cargo nextest run --test host`.
+# Tests that need user namespaces, root or a tun device run when named.
 [[test]]
 name = "host"
 test = false

@@ -176,7 +176,7 @@ To change a protocol, see
 [the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
 [`custom_protocol`](demos/custom_protocol) serves a Modbus gateway that
 accepts nonzero protocol identifiers.
-`cargo run --example custom_protocol` needs no network or root. To show a
+`cargo run -p fictionet-custom-protocol-demo --bin custom_protocol` needs no network or root. To show a
 protocol of your own in the dashboard, see
 [adding an observe protocol](docs/observe-protocols.md).
 

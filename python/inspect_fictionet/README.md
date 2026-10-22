@@ -223,7 +223,7 @@ here = Path(__file__).parent
 fictionet_sandbox(Build(here / "world.Dockerfile", context=here), agent_image=...)
 
 # A cargo example: built with musl on rust:1.99-alpine, and run alone on scratch.
-fictionet_sandbox(CargoExample("web_world", crate=here / "..", features=["tokio"]),
+fictionet_sandbox(CargoExample("world", crate=here / "my-world", features=["tokio"]),
                   world_args=["/run/relay/relay.sock", "/run/ca/ca.pem"], ...)
 ```
 

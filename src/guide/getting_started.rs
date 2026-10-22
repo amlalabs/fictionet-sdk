@@ -36,13 +36,13 @@
 //! From the top directory of the repository:
 //!
 //! ```text
-//! $ cargo build --locked --release -p fictionet --example web_world -p fictionet-cli --bin fictionet
+//! $ cargo build --locked --release -p fictionet-web-world-demo --bin web_world -p fictionet-cli --bin fictionet
 //! ```
 //!
 //! This builds two programs. These paths assume the default target directory;
 //! if `CARGO_TARGET_DIR` is set, use that directory in place of `target`:
 //!
-//! - `target/release/examples/web_world`, the world. It runs its local
+//! - `target/release/web_world`, the world. It runs its local
 //!   sites on a tokio runtime and makes no upstream requests.
 //! - `target/release/fictionet`, which has the `fictionet attach` and
 //!   `fictionet observe` commands.
@@ -69,7 +69,7 @@
 //! serves its handle. Without it, this program installs no observer:
 //!
 //! ```text
-//! $ target/release/examples/web_world /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observe.sock
+//! $ target/release/web_world /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observe.sock
 //! listening on /run/fictionet/world.sock, CA in /run/fictionet/ca.pem
 //! ```
 //!

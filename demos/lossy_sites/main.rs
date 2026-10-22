@@ -2,7 +2,7 @@
 //! packets in each direction, at random.
 //!
 //! ```text
-//! cargo run --example lossy_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
+//! cargo run -p fictionet-lossy-sites-demo --bin lossy_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
 //! ```
 //!
 //! The optional second argument opens a Unix observation socket. Watch it

@@ -27,11 +27,11 @@
 //! root. Use the target directory set for your build:
 //!
 //! ```sh
-//! cargo build --locked -p fictionet --example web_world -p fictionet-cli --bin fictionet
+//! cargo build --locked -p fictionet-web-world-demo --bin web_world -p fictionet-cli --bin fictionet
 //! bin="${CARGO_TARGET_DIR:-target}/debug"
 //! work=$(mktemp -d /tmp/fictionet-observe.XXXXXX)
 //! (umask 077; openssl rand -hex 32 > "$work/proxy-token")
-//! "$bin/examples/web_world" "$work/world.sock" "$work/ca.pem" "$work/observe.sock" > "$work/world.log" 2>&1 &
+//! "$bin/web_world" "$work/world.sock" "$work/ca.pem" "$work/observe.sock" > "$work/world.log" 2>&1 &
 //! world_pid=$!
 //! ```
 //!

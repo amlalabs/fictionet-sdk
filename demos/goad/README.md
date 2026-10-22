@@ -75,9 +75,9 @@ Build Fictionet and the world, create a private run directory, and start the
 world:
 
 ```console
-$ cargo build --release --bin fictionet --example goad
+$ cargo build --release -p fictionet-cli --bin fictionet -p fictionet-goad-demo --bin goad
 $ mkdir -p /run/user/$(id -u)/fictionet-goad
-$ target/release/examples/goad /run/user/$(id -u)/fictionet-goad/world.sock 192.168.56 /run/user/$(id -u)/fictionet-goad/observation.sock
+$ target/release/goad /run/user/$(id -u)/fictionet-goad/world.sock 192.168.56 /run/user/$(id -u)/fictionet-goad/observation.sock
 ```
 
 Use another three-octet prefix as the second argument when the guests were

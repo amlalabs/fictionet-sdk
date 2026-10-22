@@ -32,10 +32,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-musl-target-${TARGETARCH} \
     # Copied files may keep old times, and cargo would then take the
     # cached build for current. Touch them so it compares contents anew.
-    find src cli examples -type f -exec touch {} + \
-    && cargo build --release --locked --bin fictionet --example web_world \
+    find src cli demos extras observe -type f -exec touch {} + \
+    && cargo build --release --locked -p fictionet-cli --bin fictionet -p fictionet-web-world-demo --bin web_world \
     && mkdir /out \
-    && cp target/release/fictionet target/release/examples/web_world /out/
+    && cp target/release/fictionet target/release/web_world /out/
 
 # `fictionet attach`, and `fictionet ready` for its probe. Attach runs as
 # root in its container, with only the capabilities it is given: in the

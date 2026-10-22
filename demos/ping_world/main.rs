@@ -2,7 +2,7 @@
 //! sandbox, at any address, and drops every other packet.
 //!
 //! ```text
-//! cargo run --example ping_world -- /run/fictionet/world.sock /run/fictionet/observation.sock
+//! cargo run -p fictionet-ping-world-demo --bin ping_world -- /run/fictionet/world.sock /run/fictionet/observation.sock
 //! ```
 //!
 //! Each sandbox's interface is split by protocol with

@@ -25,8 +25,8 @@ COPY tests tests
 COPY extras extras
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-artifactory-attach-target \
-    find src cli examples -type f -exec touch {} + \
-    && cargo build --release --locked -j 8 --bin fictionet \
+    find src cli demos extras observe -type f -exec touch {} + \
+    && cargo build --release --locked -j 8 -p fictionet-cli --bin fictionet \
     && cp target/release/fictionet /fictionet
 
 # musl makes this binary runnable without a shell or shared libraries.

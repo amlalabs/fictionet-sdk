@@ -7,7 +7,7 @@
 //! and serves its handle with `fictionet_observe::serve`:
 //!
 //! ```sh
-//! cargo run --example web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
+//! cargo run -p fictionet-web-world-demo --bin web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
 //! fictionet observe --observation unix:/run/fictionet/observation.sock watch
 //! ```
 //!

@@ -18,8 +18,8 @@ COPY tests tests
 COPY extras extras
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-proxy-target \
-    find src cli examples tests/web_fixture -type f -exec touch {} + \
-    && cargo build --release --locked --features web-proxy,tokio --bin fictionet --example web_fixture \
+    find src cli demos extras observe tests/web_fixture -type f -exec touch {} + \
+    && cargo build --release --locked --features web-proxy,tokio -p fictionet-cli --bin fictionet -p fictionet --example web_fixture \
     && cp target/release/fictionet target/release/examples/web_fixture /usr/local/bin/
 
 # A Go client tested and built with the standard library only.

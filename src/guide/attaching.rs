@@ -190,8 +190,8 @@
 //! root's `PATH`:
 //!
 //! ```sh
-//! cargo build --release --bin fictionet --example web_world
-//! install target/release/fictionet target/release/examples/web_world /usr/local/bin/
+//! cargo build --release -p fictionet-cli --bin fictionet -p fictionet-web-world-demo --bin web_world
+//! install target/release/fictionet target/release/web_world /usr/local/bin/
 //! ```
 //!
 //! **2. Start the world,** and add the user the agent runs as.

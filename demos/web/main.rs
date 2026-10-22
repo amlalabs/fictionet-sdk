@@ -1,7 +1,7 @@
 //! A small world of websites, written with `web::Sites`.
 //!
 //! ```text
-//! cargo run --example web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
+//! cargo run -p fictionet-web-world-demo --bin web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
 //! ```
 //!
 //! It makes a certificate authority for the world when it starts and

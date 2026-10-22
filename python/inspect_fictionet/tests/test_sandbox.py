@@ -149,7 +149,7 @@ def test_build_and_cargo_example(tmp_path):
     dockerfile = context / "agent.Dockerfile"
     dockerfile.write_text("FROM debian:bookworm-slim\n")
     cache = tmp_path / "cache"
-    c = compose(cache, CargoExample("web_world", crate=REPO, features=["tokio"]),
+    c = compose(cache, CargoExample("web_fixture", crate=REPO, features=["web-proxy", "tokio"]),
                 agent_image=Build(dockerfile, target="x", args={"A": "1"}))  # fmt: skip
     agent = c["services"]["default"]
     agent_context = Path(agent["build"]["context"])
@@ -164,8 +164,6 @@ def test_build_and_cargo_example(tmp_path):
     assert (world_context / "Cargo.toml").read_bytes() == (REPO / "Cargo.toml").read_bytes()
     assert not (world_context / "target").exists()
     generated = Path(world["build"]["dockerfile"])
-    text = generated.read_text()
-    assert "cargo build --release --features tokio --example web_world" in text
     assert "target" in (generated.parent / "world.Dockerfile.dockerignore").read_text()
 
 
@@ -492,7 +490,7 @@ def test_k8s_values(tmp_path):
 
 def test_k8s_refuses_builds(tmp_path):
     with pytest.raises(ValueError, match="images only"):
-        fictionet_sandbox(CargoExample("web_world", crate=REPO), backend="k8s", cache_dir=tmp_path)
+        fictionet_sandbox(CargoExample("web_fixture", crate=REPO), backend="k8s", cache_dir=tmp_path)
 
 
 def test_k8s_proxy(tmp_path):

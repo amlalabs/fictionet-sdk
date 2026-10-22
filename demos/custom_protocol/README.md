@@ -10,7 +10,7 @@ handle and connect with `fictionet observe --observation unix:PATH`.
 Run it without external networking:
 
 ```sh
-cargo run --locked --example custom_protocol
+cargo run --locked -p fictionet-custom-protocol-demo --bin custom_protocol
 ```
 
 The teaching change is in the parser: the copy accepts nonzero protocol

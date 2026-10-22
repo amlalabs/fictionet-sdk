@@ -2,7 +2,7 @@
 //! with a count of the packets its queues drop.
 //!
 //! ```text
-//! cargo run --example bottleneck_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
+//! cargo run -p fictionet-bottleneck-sites-demo --bin bottleneck_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
 //! ```
 //!
 //! The optional second argument opens a Unix observation socket. Watch it

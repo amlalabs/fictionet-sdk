@@ -3,7 +3,7 @@
 //! hijack, which demos/border plays out in full.
 //!
 //! ```text
-//! cargo run --example route_change -- /run/fictionet/world.sock 20 /run/fictionet/observation.sock
+//! cargo run -p fictionet-route-change-demo --bin route_change -- /run/fictionet/world.sock 20 /run/fictionet/observation.sock
 //! ```
 //!
 //! The optional third argument opens a Unix observation socket. Watch it

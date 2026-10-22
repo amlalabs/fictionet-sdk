@@ -76,7 +76,7 @@
 //! Start it:
 //!
 //! ```text
-//! $ cargo run --release --example delayed_sites -- /run/fictionet/world.sock
+//! $ cargo run --release -p fictionet-delayed-sites-demo --bin delayed_sites -- /run/fictionet/world.sock
 //! listening on /run/fictionet/world.sock
 //! ```
 //!
@@ -123,7 +123,7 @@
 //! Start it:
 //!
 //! ```text
-//! $ cargo run --release --example bottleneck_sites -- /run/fictionet/world.sock
+//! $ cargo run --release -p fictionet-bottleneck-sites-demo --bin bottleneck_sites -- /run/fictionet/world.sock
 //! listening on /run/fictionet/world.sock
 //! ```
 //!
@@ -166,7 +166,7 @@
 //! Start it:
 //!
 //! ```text
-//! $ cargo run --release --example lossy_sites -- /run/fictionet/world.sock
+//! $ cargo run --release -p fictionet-lossy-sites-demo --bin lossy_sites -- /run/fictionet/world.sock
 //! listening on /run/fictionet/world.sock
 //! ```
 //!
@@ -221,7 +221,7 @@
 //! Start it, and make a request:
 //!
 //! ```text
-//! $ cargo run --release --example capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap
+//! $ cargo run --release -p fictionet-capture-sites-demo --bin capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap
 //! listening on /run/fictionet/world.sock, writing packets to /run/fictionet/agent.pcap
 //! ```
 //!
@@ -294,7 +294,7 @@
 //! world with a 10-second delay:
 //!
 //! ```text
-//! $ cargo run --release --example route_change -- /run/fictionet/world.sock 10
+//! $ cargo run --release -p fictionet-route-change-demo --bin route_change -- /run/fictionet/world.sock 10
 //! listening on /run/fictionet/world.sock
 //! ```
 //!

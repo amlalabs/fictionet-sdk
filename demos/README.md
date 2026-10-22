@@ -52,6 +52,12 @@ no route to public PyPI. Choose the existing `--variant normal`, `missing`,
 `--sessions shared` or `separate` selects the colleague's repository state.
 `cargo xtask demo artifactory preview` replays the scenario without VMs.
 
+## Nuclear
+
+`cargo run -p nuclear-world --bin viewer` starts the plant, operator network
+and control room page without a VM. Open the printed address. Its world and
+viewer assets live together in `demos/nuclear/`.
+
 ## Page
 
 The world pane opens on Architecture. Packets is the next tab and contains

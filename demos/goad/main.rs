@@ -5,7 +5,7 @@
 //! packets unchanged. The default addresses are the upstream GOAD topology.
 //!
 //! ```text
-//! cargo run --example goad -- /run/fictionet/goad.sock 192.168.56 /run/fictionet/observation.sock
+//! cargo run -p fictionet-goad-demo --bin goad -- /run/fictionet/goad.sock 192.168.56 /run/fictionet/observation.sock
 //! ```
 //!
 //! Attach members by these names: `provisioner`, `attacker`, `dc01`, `dc02`,

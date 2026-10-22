@@ -3,8 +3,7 @@
 # tree at /src, as static musl executables. cargo xtask vm runs it; so can you,
 # with `cargo xtask vm build [sdk]`.
 #
-#   sdk       fictionet and every example in the crate's Cargo.toml: web_world,
-#             the web_fixture test world and the rest
+#   sdk       fictionet, the small demo binaries and the web test fixture
 #
 # Build output lives on the cache disk, so a build after a small change
 # takes seconds. The binaries go to /opt/fictionet/bin, and also to
@@ -33,13 +32,17 @@ put() {
 for what in "${@:-sdk}"; do
     case "$what" in
         sdk)
-            echo "Building fictionet and the examples"
-            build --features web-proxy,tokio --bin fictionet --examples
-            put "$out/fictionet"
-            for example in "$out"/examples/*; do
-                if [[ -f $example && -x $example ]]; then put "$example"; fi
+            echo "Building fictionet and the demo binaries"
+            build -p fictionet --features web-proxy,tokio --example web_fixture \
+                -p fictionet-cli -p fictionet-web-world-demo -p fictionet-ping-world-demo \
+                -p fictionet-bottleneck-sites-demo -p fictionet-capture-sites-demo \
+                -p fictionet-delayed-sites-demo -p fictionet-lossy-sites-demo \
+                -p fictionet-custom-protocol-demo -p fictionet-route-change-demo \
+                -p fictionet-goad-demo -p fictionet-h2spec-world-demo --bins
+            for executable in "$out"/* "$out/examples/web_fixture"; do
+                if [[ -f $executable && -x $executable ]]; then put "$executable"; fi
             done
-            install -m 0755 "$out/fictionet" "$out/examples/web_world" "$out/examples/web_fixture" "$pre/out/"
+            install -m 0755 "$out/fictionet" "$out/web_world" "$out/examples/web_fixture" "$pre/out/"
             ;;
         none) ;;
         *) echo "build.sh: unknown target $what" >&2; exit 2 ;;
