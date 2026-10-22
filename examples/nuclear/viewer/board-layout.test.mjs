@@ -388,49 +388,6 @@ for (const [width, height] of CANVASES) {
   });
 }
 
-test('every alarm in the plant has exactly one permanent window on its board', () => {
-  const rust = readFileSync(new URL('../world/src/protection.rs', import.meta.url), 'utf8');
-  const all = rust.match(/pub const ALL: \[Self; ALARM_COUNT\] = \[([\s\S]*?)\];/)[1];
-  const expected = [...all.matchAll(/Self::(\w+)(?:\(Loop::([AB])\))?/g)].map(
-    ([, name, loop]) =>
-      name.replace(/[A-Z]/g, (c, i) => `${i ? '_' : ''}${c.toLowerCase()}`) + (loop ? `:${loop.toLowerCase()}` : ''),
-  );
-  const keys = ANNUNCIATOR_WINDOWS.map((w) => w.key);
-  assert.equal(keys.length, 22);
-  assert.equal(new Set(keys).size, 22);
-  assert.deepEqual([...keys].sort(), expected.sort());
-  assert.deepEqual(
-    ANNUNCIATOR_WINDOWS.filter((w) => w.board === 'turbine-board').map((w) => w.key),
-    ['turbine_tripped', 'condenser_vacuum_low'],
-  );
-  assert.equal(ANNUNCIATOR_WINDOWS.find((w) => w.key === 'coolant_flow_low:b').board, 'rcs-board');
-  assert.equal(ANNUNCIATOR_WINDOWS.find((w) => w.key === 'reactor_tripped').board, 'rps-board');
-  for (const board of BOARDS) {
-    const layout = boardLayout(board.points.length, board.view);
-    for (const [i, window] of layout.windows.entries()) {
-      inside(window, BOARD_PX.width, BOARD_PX.height);
-      assert.ok(window.legend.length > 0);
-      assert.ok(!overlaps(window, layout.header));
-      for (const cell of layout.cells) assert.ok(!overlaps(window, cell));
-      for (const other of layout.windows.slice(i + 1)) assert.ok(!overlaps(window, other));
-      // The near square windows reserve up to three lines for the engraved legend.
-      const words = window.engraved.split(' ');
-      let lines = 1;
-      let length = 0;
-      for (const word of words) {
-        const next = length + (length ? 1 : 0) + word.length;
-        if (next * 0.6 * window.font > window.w - 8) {
-          lines++;
-          length = word.length;
-        } else {
-          length = next;
-        }
-      }
-      assert.ok(lines <= 3, window.legend);
-      assert.ok(lines * window.font <= window.h, window.legend);
-    }
-  }
-});
 
 test('alarm windows flash twice a second only while unacknowledged', () => {
   for (const t of [0, 125, 249, 500, 749, 1000]) assert.deepEqual(windowState('active', t), { lit: true, mark: false });

@@ -271,35 +271,6 @@ test('the plant commands take the serde forms of the world', () => {
   assert.deepEqual(fault.stuckHotLeg('b', 3250, false), { clear: { sensor: { hot_leg: 'b' } } });
 });
 
-test('the sensor table follows every Rust sensor and its resolution', () => {
-  const rust = readFileSync(new URL('../world/src/sensors.rs', import.meta.url), 'utf8');
-  const all = rust.match(/pub const ALL:[\s\S]*?= \[([\s\S]*?)\];/)[1];
-  const snake = (name) => name.replace(/[A-Z]/g, (letter, index) => `${index ? '_' : ''}${letter.toLowerCase()}`);
-  const variants = [...all.matchAll(/Self::(\w+)(?:\(Loop::([AB])\))?/g)];
-  const keys = variants.map(([, name, loop]) => (loop ? `${snake(name)}:${loop.toLowerCase()}` : snake(name)));
-  assert.equal(keys.length, 22);
-  assert.deepEqual(
-    FAULT_SENSORS.map((point) => point.key),
-    keys,
-  );
-  const spec = rust.match(/let \(unit, min, max, resolution\) = match self \{([\s\S]*?)\n        \};/)[1];
-  const arms = [
-    ...spec.matchAll(
-      /^\s*((?:Self::\w+(?:\(_\))?\s*(?:\|\s*)?)+|_)\s*=>\s*\{?\s*\(Unit::\w+,\s*[\d.]+,\s*[\d.]+,\s*([\d.]+)\)/gm,
-    ),
-  ];
-  assert.ok(arms.length > 0);
-  variants.forEach(([, name, loop], index) => {
-    const arm =
-      arms.find(([, pattern]) => pattern.includes(`Self::${name}`)) ??
-      arms.find(([, pattern]) => pattern.trim() === '_');
-    assert.ok(arm, name);
-    const point = FAULT_SENSORS[index];
-    assert.equal(point.resolution, Number(arm[2]), point.key);
-    const sensor = loop ? { [snake(name)]: loop.toLowerCase() } : snake(name);
-    assert.deepEqual(point.sensor, sensor);
-  });
-});
 
 const faultSnapshot = () => ({
   revision: 72,

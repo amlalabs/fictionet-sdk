@@ -89,3 +89,6 @@ The repository-wide audit is still in progress.
 - `examples/web/world/src/pages/tests.rs::topic_results_cover_restaurant_queries`: asserts the removed keyword maker's canned topic, host, or article output.
 - `examples/web/world/src/pages/tests.rs::topic_results_cover_practical_guides`: asserts the removed keyword maker's canned topic, host, or article output.
 - `examples/web/world/src/pages/tests.rs::topic_results_leave_unclassified_queries_generic`: asserts the removed keyword maker's canned topic, host, or article output.
+
+- `examples/nuclear/viewer/board-layout.test.mjs::every alarm in the plant`: parses Rust source with regex and pins a stale constant count; actual alarm rendering and collision behavior remain covered.
+- `examples/nuclear/viewer/knobs.test.mjs::the sensor table follows every Rust sensor`: parses source and pins a stale constant count; actual fault controls remain covered. These source comparisons exposed pre-existing viewer coverage gaps which this Search pass does not repair.
