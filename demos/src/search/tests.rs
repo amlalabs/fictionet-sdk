@@ -1,7 +1,6 @@
 use super::*;
 use crate::kit::client::PageClient;
 use crate::search as page;
-use adaptive_web_world::{World, pages::Seed};
 use example_common::log::Log;
 use fictionet::{
     Cx,
@@ -17,6 +16,7 @@ use fictionet::{
 };
 use fictionet_observe::{DashboardObserver, DashboardOptions, page::Host};
 use serde_json::json;
+use web_world::{World, pages::Seed};
 
 async fn fetch(cx: &Cx, machine: &Machine, host: &str, path: &str, start: std::time::SystemTime) {
     let dns = machine
@@ -63,8 +63,11 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
     fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
         move |cx| async move {
-            let start = adaptive_web_world::world_start(&seed.date)?;
-            let world = World::new(&cx, seed.clone(), start)?;
+            let start = web_world::world_start(&seed.date)?;
+            let world = World {
+                pages: Arc::new(fixture_pages(seed.clone(), None)),
+                ..World::new(&cx, seed.clone(), start)?
+            };
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
             let (attacher, attachments) = fictionet::attachments();
             world.serve(&cx, log, attachments)?;
@@ -81,7 +84,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                 &cx,
                 &machine,
                 "www.google.com",
-                "/search?q=example+gateway+vulnerability",
+                "/search?q=black+hole",
                 start,
             )
             .await;
@@ -102,12 +105,12 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                     .as_array()
                     .unwrap()
                     .len(),
-                10
+                1
             );
-            let state: adaptive_web_world::search::Snapshot =
+            let state: web_world::search::Snapshot =
                 serde_json::from_value(snapshot["value"].clone()).unwrap();
             let first = first_generated(&seed, &state.results[0]).unwrap();
-            let (host, path) = adaptive_web_world::pages::text::target_of(&first.url);
+            let (host, path) = web_world::pages::text::target_of(&first.url);
             fetch(&cx, &machine, &host, &path, start).await;
             cx.sleep(std::time::Duration::from_millis(100)).await?;
             let snapshot = client.get_json("/api/state/web").await.unwrap();
@@ -118,11 +121,8 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                 .iter()
                 .find(|p| p["url"] == first.url)
                 .unwrap();
-            assert_eq!(
-                opened["reason"],
-                json!({"via":"search", "query":"example gateway vulnerability", "rank":first.rank})
-            );
-            assert_eq!(opened["made"], "stubbed");
+            assert_eq!(opened["reason"], json!({"via":"fixed"}));
+            assert_eq!(opened["made"], "fixed");
             assert_eq!(opened["via"], serde_json::Value::Null);
             assert_eq!(opened["making"], false);
             assert_eq!(opened["carries"], 0);
@@ -142,7 +142,9 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             fictionet_extras::models::Engine::search(
                 world.pages.clone(),
                 cx.clone(),
-                "example gateway vulnerability".into(),
+                "black hole".into(),
+                "claude_web_search",
+                json!({}),
             )
             .await?;
             fictionet_extras::models::Engine::fetch(
@@ -176,8 +178,11 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             assert_eq!(tool_page["via"], "web_fetch");
             assert_eq!(tool_page["making"], false);
             assert_eq!(tool_page["carries"], 0);
-            let tool_query = queries.iter().find(|q| q["via"] == "web_search").unwrap();
-            assert_eq!(tool_query["search"], "example gateway vulnerability");
+            let tool_query = queries
+                .iter()
+                .find(|q| q["via"] == "claude_web_search")
+                .unwrap();
+            assert_eq!(tool_query["search"], "black hole");
             assert_eq!(tool_query["engine"], "google");
             assert_eq!(tool_query["outcome"]["status"], "served");
             assert_eq!(tool_query["carries"], 0);
@@ -250,7 +255,7 @@ async fn command(
 }
 fn first_generated<'a>(seed: &Seed, list: &'a search::Results) -> Option<&'a search::Listed> {
     list.listed.iter().find(|r| {
-        let (host, path) = adaptive_web_world::pages::text::target_of(&r.url);
+        let (host, path) = web_world::pages::text::target_of(&r.url);
         seed.fixed_for(&host, &path).is_none()
     })
 }
@@ -351,13 +356,9 @@ fn search_javascript() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_page_stays_making_until_the_model_answers() {
-    use adaptive_web_world::pages::{
-        Maker,
-        model::{Model, Provider},
-        store,
-    };
     use fictionet_extras::models::{Key, Post, Transport};
     use std::time::Duration;
+    use web_world::pages::model::{Model, Provider};
     struct Slow;
     impl Transport for Slow {
         fn post<'a>(&'a self, cx: &'a Cx, _: Vec<(&'static str, String)>, _: Vec<u8>) -> Post<'a> {
@@ -372,38 +373,16 @@ async fn a_live_page_stays_making_until_the_model_answers() {
         }
     }
     let seed = Seed::builtin("web").unwrap();
-    let root = std::env::temp_dir().join(format!("search-prepared-{}", crate::kit::random_uuid()));
-    let (saved, _) = store::Store::open(&root, &seed, Some(&Maker::Stub.identity())).unwrap();
-    let prepared = Arc::new(Pages::open(seed.clone(), saved, Some(Maker::Stub), 0));
-    fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
-        move |cx| async move {
-            assert_eq!(
-                prepared
-                    .handle(&cx, "GET", "www.example.com", "/", None)
-                    .await
-                    .status,
-                200
-            );
-            Ok(())
-        },
-    )
-    .await
-    .unwrap();
-    let pages = Arc::new(
-        Pages::canned_with_model(
-            seed,
-            &root,
-            Model::new(
-                Provider::OpenRouter,
-                "",
-                "",
-                Key::new("OPENROUTER_API_KEY", Some("test-key".into())).unwrap(),
-                Arc::new(Slow),
-            ),
-        )
-        .unwrap(),
-    );
+    let pages = Arc::new(fixture_pages(
+        seed,
+        Some(Model::new(
+            Provider::OpenRouter,
+            "",
+            "",
+            Key::new("OPENROUTER_API_KEY", Some("test-key".into())).unwrap(),
+            Arc::new(Slow),
+        )),
+    ));
     let searches = Arc::new(Searches::of(&pages));
     let topics = page::Topics::new();
     let dashboard = DashboardObserver::new(DashboardOptions::default());
@@ -420,6 +399,15 @@ async fn a_live_page_stays_making_until_the_model_answers() {
             fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
             move |cx| async move {
                 topics.start(&cx, searches, pages.clone())?;
+                pages
+                    .apply(
+                        &cx,
+                        web_world::pages::Command::SetNewPages {
+                            new_pages: web_world::pages::NewPages::ModelWritten,
+                            expected_revision: 0,
+                        },
+                    )
+                    .unwrap();
                 let writer = pages.clone();
                 let task = cx.spawn(move |cx| async move {
                     fictionet_extras::models::Engine::fetch(
@@ -448,14 +436,32 @@ async fn a_live_page_stays_making_until_the_model_answers() {
                     assert_eq!(row["making"], true);
                     assert_eq!(row["waiting"], true);
                     assert_eq!(row["fetches"], 0);
-                    // A prepared page can answer while the model is still writing.
+                    // Switching applies to new requests while the original writer runs.
+                    pages
+                        .apply(
+                            &cx,
+                            web_world::pages::Command::SetNewPages {
+                                new_pages: web_world::pages::NewPages::Copied,
+                                expected_revision: pages.generation().revision,
+                            },
+                        )
+                        .unwrap();
                     assert_eq!(
                         pages
-                            .handle(&cx, "GET", "www.example.com", "/", None)
+                            .handle(&cx, "GET", "sky.org", "/stars", None)
                             .await
                             .status,
                         200
                     );
+                    pages
+                        .apply(
+                            &cx,
+                            web_world::pages::Command::SetNewPages {
+                                new_pages: web_world::pages::NewPages::ModelWritten,
+                                expected_revision: pages.generation().revision,
+                            },
+                        )
+                        .unwrap();
                 }
                 task.join(&cx).await?;
                 cx.sleep(Duration::from_millis(100)).await?;
@@ -490,32 +496,21 @@ async fn a_live_page_stays_making_until_the_model_answers() {
     .unwrap()
     .unwrap();
     server.shutdown(Duration::from_secs(1)).await;
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
-    use crate::kit::mirror;
-    let non_public_address = |ip: std::net::IpAddr| match ip {
-        std::net::IpAddr::V4(ip) => {
-            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
-        }
-        std::net::IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-        }
-    };
+    use crate::kit::{checks::non_public_address, mirror};
     use fictionet::stdlib::protocols::x509::Certificate;
+    use fictionet_extras::models::{Credential, Model, Provider, Secret};
     let seed = Seed::builtin("web").unwrap();
     let searches = Arc::new(Searches::from_seed(&seed));
     let observed = searches.clone();
     fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(searches),
         move |cx| async move {
-            let start = adaptive_web_world::world_start(&seed.date)?;
-            let prepared = "docs.python.org".to_string();
+            let start = web_world::world_start(&seed.date)?;
+            let prepared = seed.sites[0].host.clone();
             let world = World::new(&cx, seed, start)?;
             let root = Certificate::from_pem(world.ca.cert_pem().as_bytes())?;
             assert_eq!(root.tbs.subject.to_string(), "CN=Internet Security Root CA");
@@ -523,8 +518,14 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(rustls::pki_types::CertificateDer::from(root.to_bytes()?))?;
             let roots = Arc::new(roots);
+            let model = Model::at(
+                &cx,
+                Provider::Anthropic,
+                Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "test-key".into())?),
+                "https://api.anthropic.com".parse()?,
+            )?;
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
-            let net = network(&world, &cx, log, mirror::new(&cx)?)?;
+            let net = network(&world, &cx, log, mirror::new(&cx)?, Some(model))?;
             let (attacher, attachments) = fictionet::attachments();
             net.start(&cx, attachments)?;
             let machine = machine(
@@ -532,19 +533,12 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
                 attacher.attach("workstation")?,
                 "10.0.0.2".parse::<std::net::Ipv4Addr>()?,
             );
-            let mut names = vec![
-                "api.anthropic.com",
-                "api.openai.com",
-                "chatgpt.com",
-                &prepared,
-                "alder-notebook.com",
-            ];
-            names.extend(PASSED);
-            names.extend(adaptive_web_world::route::SEARCH_HOSTS);
+            let mut names = vec!["api.anthropic.com", &prepared, "alder-notebook.com"];
+            names.extend(web_world::route::SEARCH_HOSTS);
             names.extend(FORWARDED.iter().map(|(host, _)| *host));
             for host in names {
                 let answer = machine
-                    .lookup(&cx, adaptive_web_world::GATEWAY.into(), host, RecordType::A)
+                    .lookup(&cx, web_world::GATEWAY.into(), host, RecordType::A)
                     .await?;
                 assert!(!answer.answers.is_empty(), "{host}");
                 let (assigned, _) = world.addresses.assign(host)?.unwrap();
@@ -560,12 +554,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
                     assert_eq!(address.0, assigned, "{host}");
                 }
                 let answer = machine
-                    .lookup(
-                        &cx,
-                        adaptive_web_world::GATEWAY.into(),
-                        host,
-                        RecordType::AAAA,
-                    )
+                    .lookup(&cx, web_world::GATEWAY.into(), host, RecordType::AAAA)
                     .await?;
                 assert!(answer.answers.is_empty(), "{host}: {:?}", answer.answers);
                 assert!(
@@ -576,9 +565,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
                         .any(|site| site.host == host && site.address == assigned.to_string()),
                     "{host}"
                 );
-                if !["archive.ubuntu.com", "security.ubuntu.com"].contains(&host)
-                    && !PASSED.contains(&host)
-                {
+                if !["archive.ubuntu.com", "security.ubuntu.com"].contains(&host) {
                     let connection = machine
                         .tls(&cx, (assigned, 443).into(), host, Some(&roots), start)
                         .await?;
@@ -608,12 +595,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
             }
             for host in ["1.0.0.10.in-addr.arpa", "20.5.10.10.in-addr.arpa"] {
                 let answer = machine
-                    .lookup(
-                        &cx,
-                        adaptive_web_world::GATEWAY.into(),
-                        host,
-                        RecordType::PTR,
-                    )
+                    .lookup(&cx, web_world::GATEWAY.into(), host, RecordType::PTR)
                     .await?;
                 assert!(answer.answers.is_empty(), "{host}: {:?}", answer.answers);
             }
@@ -625,50 +607,10 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sign_in_relay_preserves_bytes_and_half_closes() {
-    use fictionet::stdlib::world::net::{Host, Net};
-    use fictionet::tokio::ConnectionTokioExt;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let encrypted = vec![0x16, 0x03, 0x03, 0x00, 0x04, 0x90, 0x81, 0x72, 0x63];
-    let expected = encrypted.clone();
-    let upstream = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        socket.read_to_end(&mut bytes).await.unwrap();
-        assert_eq!(bytes, expected);
-        socket.write_all(&bytes).await.unwrap();
-    });
-    fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
-        move |cx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            Net::new()
-                .add_host(
-                    Host::new("login")
-                        .at("203.0.113.9".parse::<std::net::IpAddr>()?)
-                        .port_server(443, Relay(address.to_string())),
-                )
-                .start(&cx, attachments)?;
-            let client = machine(
-                &cx,
-                attacher.attach("workstation")?,
-                "10.0.0.2".parse::<std::net::Ipv4Addr>()?,
-            );
-            let connection = client.tcp.connect(&cx, "203.0.113.9:443".parse()?).await?;
-            let mut socket = connection.into_tokio(&cx);
-            socket.write_all(&encrypted).await?;
-            socket.shutdown().await?;
-            let mut echoed = Vec::new();
-            socket.read_to_end(&mut echoed).await?;
-            assert_eq!(echoed, encrypted);
-            cx.cancel();
-            Ok(())
-        },
-    )
-    .await
-    .unwrap();
-    upstream.await.unwrap();
+fn fixture_pages(
+    seed: Seed,
+    model: Option<web_world::pages::model::Model>,
+) -> web_world::pages::Pages {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../extras/tests/fixtures");
+    web_world::pages::Pages::copied(seed, &root, &["https://sky.org/".into()], model).unwrap()
 }

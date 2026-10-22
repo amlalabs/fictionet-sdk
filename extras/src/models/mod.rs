@@ -29,6 +29,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower_service::Service;
 
+mod signed_in;
+pub use signed_in::SignedIn;
 mod client;
 pub use client::{Https, Key, Post, Transport};
 pub mod oauth;
@@ -178,6 +180,7 @@ pub struct Credential {
     real: Secret,
     placeholder: String,
     oauth: Option<oauth::OAuth>,
+    bearer: bool,
 }
 impl Credential {
     /// Mints a placeholder preserving the provider prefix and key length.
@@ -216,10 +219,11 @@ impl Credential {
             real,
             placeholder,
             oauth: None,
+            bearer: false,
         }
     }
     fn header(&self, provider: Provider) -> &'static str {
-        if self.oauth.is_some() {
+        if self.oauth.is_some() || self.bearer {
             "authorization"
         } else {
             provider.header()
@@ -235,7 +239,7 @@ impl Credential {
         } else {
             &self.placeholder
         };
-        if self.oauth.is_some() || provider.header() == "authorization" {
+        if self.oauth.is_some() || self.bearer || provider.header() == "authorization" {
             format!("Bearer {value}")
         } else {
             value.clone()
@@ -410,6 +414,7 @@ impl Model {
             real: oauth.secret().await?,
             placeholder: oauth.placeholder(),
             oauth: Some(oauth),
+            bearer: true,
         };
         Self::at(
             cx,

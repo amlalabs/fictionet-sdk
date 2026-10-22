@@ -18,7 +18,6 @@ pub const NAMES: &[&str] = &[
     "fictionet",
     "amlalabs",
     "fakewiki",
-    "adaptive-web",
     "artifactory-world",
     "border-world",
     "scan-world",

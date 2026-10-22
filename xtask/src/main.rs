@@ -51,7 +51,7 @@ fn main_result() -> Result {
                 "cargo xtask bless\n\
                       cargo xtask images [artifactory|hosted]\n\
                       cargo xtask docker <ping|tcpudp|proxy|web>\n\
-                      cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [options]\n\
+                      cargo xtask eval <border|fakewiki|web|artifactory> [options]\n\
                       cargo xtask k8s [tun|proxy]\n\
                       cargo xtask vm [--fetch | nested [--fetch] | up | down | prepare | sync | build | test | ssh | status | clean]\n\
                       cargo xtask demo [name [preview] | assets | libraries]  (no arguments lists demos)\n\

@@ -13,7 +13,7 @@ fictionet-extras = { path = "../extras" }
 fictionet-host = { path = "../host" }
 artifactory-world = { path = "../examples/artifactory/world" }
 border-world = { path = "../examples/border/world" }
-adaptive-web-world = { path = "../examples/adaptive-web/world" }
+web-world = { path = "../examples/web/world" }
 fakewiki-world = { path = "../examples/fakewiki/world" }
 scan-world = { path = "../examples/scan/world" }
 quick-xml = { version = "0.38", features = ["serialize"] }

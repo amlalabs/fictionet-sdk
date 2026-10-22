@@ -1,14 +1,6 @@
 //! `search preview`: the search page with real world traffic, an in-world
 //! scripted client and a labeled preview console.
-//!
-//! `--spend-budget` ends the story by turning generation back on and making
-//! new searches until the world refuses one for its generation budget.
 
-use adaptive_web_world::{
-    Addresses, Ca, World,
-    pages::{self, Seed},
-    search::{Failure, Outcome, Searches},
-};
 use example_common::log::Log;
 use fictionet::{
     Cx,
@@ -25,7 +17,6 @@ use fictionet::{
 use fictionet_demo::{
     kit::{
         self,
-        client::PageClient,
         preview::{Input, Story},
     },
     search::{self as page, Topics},
@@ -39,15 +30,34 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
+use web_world::{
+    Addresses, Ca, World,
+    pages::{self, Seed},
+    search::Searches,
+};
 
-use super::{Result, search_url};
+use super::Result;
 
-fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
-    Ok(Arc::new(pages::Pages::new(seed)))
+fn search_url(engine: Engine, words: &str) -> String {
+    let host = match engine {
+        Engine::Google => "www.google.com/search?q=",
+        Engine::Bing => "www.bing.com/search?q=",
+        Engine::DuckDuckGo => "html.duckduckgo.com/html/?q=",
+        Engine::YouTube => "www.youtube.com/results?search_query=",
+    };
+    format!("https://{host}{}", pages::text::quote(words, ""))
 }
 
-pub async fn run(spend: bool) -> Result {
+fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
+    Ok(Arc::new(super::app_pages(
+        seed,
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("downloads"),
+    )?))
+}
+
+pub async fn run() -> Result {
     let seed = Seed::builtin(super::SEED)?;
+    let script = seed.clone();
     let pages = preview_pages(seed.clone())?;
     let searches = Arc::new(Searches::of(&pages));
     let topics = Topics::new();
@@ -76,7 +86,6 @@ pub async fn run(spend: bool) -> Result {
         "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
     );
     let mut input = Input::stdin(Story::Once, Some(console))?;
-    let page_client = PageClient::from_url(server.url())?;
     let audit = Arc::new(example_common::guest_content::Audit::default());
     let observer = Arc::new(Fanout::new(vec![
         audit.clone(),
@@ -89,7 +98,7 @@ pub async fn run(spend: bool) -> Result {
         move |cx| async move {
             containment.publish(cx.now(), &Containment::default())?;
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
-            let start = adaptive_web_world::world_start(&seed.date)?;
+            let start = web_world::world_start(&seed.date)?;
             let world = World {
                 ca: Arc::new(Ca::in_memory(&cx, start)?),
                 addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
@@ -97,7 +106,8 @@ pub async fn run(spend: bool) -> Result {
                 start,
             };
             let (attacher, attachments) = fictionet::attachments();
-            page::network(&world, &cx, log, kit::mirror::new(&cx)?)?.start(&cx, attachments)?;
+            page::network(&world, &cx, log, kit::mirror::new(&cx)?, None)?
+                .start(&cx, attachments)?;
             topics.start(&cx, searches.clone(), world.pages.clone())?;
             let workstation = machine(
                 &cx,
@@ -124,12 +134,8 @@ pub async fn run(spend: bool) -> Result {
                         machine: &workstation,
                         world: &world,
                         searches: &searches,
-                        page: &page_client,
                     };
-                    story(&client).await?;
-                    if spend {
-                        spend_budget(&client).await?;
-                    }
+                    story(&client, &script).await?;
                     Ok::<_, fictionet::Error>(())
                 }
                 .await;
@@ -213,57 +219,37 @@ struct Client<'a> {
     machine: &'a Machine,
     world: &'a World,
     searches: &'a Searches,
-    page: &'a PageClient,
 }
 
 /// The seed's searches and pages, in the order a reader would make them.
-async fn story(client: &Client<'_>) -> fictionet::Result {
+async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     let Client {
         cx,
         machine,
         world,
         searches,
-        page,
     } = *client;
-    let words = "Python itertools groupby example";
+    let words = seed.search.as_str();
     let pause = || cx.sleep(Duration::from_secs(3));
     // Give viewers a chance to see the empty world before the first request.
     cx.sleep(Duration::from_secs(8)).await?;
     fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
     pause().await?;
     let state = searches.snapshot();
-    let first = state
+    let list = state
         .results
         .first()
-        .and_then(|r| {
-            r.listed
-                .iter()
-                .find(|r| !state.seed.sites.iter().any(|s| s.host == r.host))
-        })
-        .ok_or_else(|| fictionet::Error::msg("search returned no generated result"))?;
-    let mut url = first.url.clone();
-    let mut html = fetch(cx, machine, &url, world.start).await?;
-    for _ in 0..2 {
+        .ok_or_else(|| fictionet::Error::msg("search returned no stored results"))?;
+    for result in list.listed.iter().take(3) {
         pause().await?;
-        let state = searches.snapshot();
-        let (host, path, _) = pages::links(&url, &html)
-            .into_iter()
-            .find(|(host, path, _)| {
-                !state
-                    .pages
-                    .iter()
-                    .any(|p| p.url == format!("https://{host}{path}"))
-            })
-            .ok_or_else(|| fictionet::Error::msg("page has no unvisited link"))?;
-        url = format!("https://{host}{path}");
-        html = fetch(cx, machine, &url, world.start).await?;
+        fetch(cx, machine, &result.url, world.start).await?;
     }
     let opened = [
         search_url(Engine::Bing, words),
         search_url(Engine::DuckDuckGo, &format!("{words} details")),
-        "https://docs.python.org/3/library/itertools.html".to_string(),
+        seed.visit.clone(),
     ];
-    for url in &opened {
+    for url in opened.iter().chain(seed.fixed.iter().map(|f| &f.url)) {
         pause().await?;
         fetch(cx, machine, url, world.start).await?;
     }
@@ -273,119 +259,9 @@ async fn story(client: &Client<'_>) -> fictionet::Result {
         .await?;
     println!("Scripted client asked for wiki.corp");
     pause().await?;
-    generation(page, searches, false).await?;
-    let new = format!("{words} new question");
-    fetch(cx, machine, &search_url(Engine::Google, &new), world.start).await?;
+    let new = "dishwasher repair";
+    fetch(cx, machine, &search_url(Engine::Google, new), world.start).await?;
     pause().await?;
     fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
     Ok(())
-}
-
-/// Sends the generation switch through the page, as a viewer's click would.
-async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> fictionet::Result {
-    let revision = searches.snapshot().generator.generation_revision;
-    let reply = page
-        .command(
-            "generation",
-            &format!("preview-generation-{revision}"),
-            serde_json::json!({"command": "set_generation", "generate": generate,
-                "expected_revision": revision}),
-        )
-        .await
-        .map_err(fictionet::Error::msg)?;
-    if reply["status"] != "applied" {
-        return Err(fictionet::Error::msg(format!(
-            "generation command: {reply}"
-        )));
-    }
-    println!(
-        "Generation {} at revision {}",
-        if generate { "on" } else { "off" },
-        reply["reply"]["revision"]
-    );
-    Ok(())
-}
-
-/// Makes new searches until the world refuses one for its generation budget.
-async fn spend_budget(client: &Client<'_>) -> fictionet::Result {
-    let Client {
-        cx,
-        machine,
-        world,
-        searches,
-        page,
-    } = *client;
-    cx.sleep(Duration::from_secs(3)).await?;
-    generation(page, searches, true).await?;
-    println!("Spending the generation budget with new searches");
-    // Every search with a new key takes one generation call. The bound is far
-    // above the stub's budget, so it only stops a story that cannot fail.
-    for n in 1..=1_000 {
-        let words = format!("telescope spectrum question {n}");
-        let (status, _) = get(
-            cx,
-            machine,
-            &search_url(Engine::Google, &words),
-            world.start,
-        )
-        .await?;
-        let failed = searches.snapshot().queries.iter().any(|q| {
-            q.search == words
-                && matches!(
-                    q.outcome,
-                    Outcome::Failed {
-                        why: Failure::Budget,
-                        ..
-                    }
-                )
-        });
-        if failed {
-            println!("Search {n} failed: the world answered HTTP {status} for its budget");
-            return Ok(());
-        }
-    }
-    Err(fictionet::Error::msg("the generation budget was not spent"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preview_supports_generation_and_refuses_absent_prepared_pages() {
-        fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
-            |cx| async move {
-                let seed = Seed::builtin(super::super::SEED)?;
-                let pages = preview_pages(seed).unwrap();
-                assert_eq!(pages.new_pages(), pages::NewPages::Stub);
-                let searches = Searches::of(&pages);
-                assert!(!searches.snapshot().generator.canned);
-                for new_pages in [pages::NewPages::Stub, pages::NewPages::Off] {
-                    pages
-                        .apply(
-                            &cx,
-                            pages::Command::SetNewPages {
-                                new_pages,
-                                expected_revision: pages.generation().revision,
-                            },
-                        )
-                        .unwrap();
-                    assert_eq!(pages.new_pages(), new_pages);
-                }
-                assert!(matches!(
-                    pages.apply(
-                        &cx,
-                        pages::Command::SetNewPages {
-                            new_pages: pages::NewPages::Canned,
-                            expected_revision: pages.generation().revision,
-                        }
-                    ),
-                    Err(pages::Rejected::Invalid { .. })
-                ));
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
 }

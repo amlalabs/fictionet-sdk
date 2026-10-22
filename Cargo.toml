@@ -152,7 +152,7 @@ opt-level = 2
 debug = "line-tables-only"
 opt-level = 1
 
-[profile.release.package.adaptive-web-world]
+[profile.release.package.web-world]
 debug = 1
 
 [profile.release.package.artifactory-world]

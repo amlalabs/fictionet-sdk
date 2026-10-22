@@ -2,7 +2,7 @@ import { diff, rows } from './model.mjs';
 import { createMotion } from './motion.mjs';
 import { createWeb } from './web.mjs';
 
-const NEW_PAGES = [['canned', 'Prepared first'], ['stub', 'Improvised'], ['off', 'Off']];
+const NEW_PAGES = [['copied', 'Copied'], ['model_written', 'Model-written'], ['live_search', 'Live search, copied in']];
 const relativeTime = (at, now) => {
   const seconds = Math.max(0, Math.floor((now - at) / 1000));
   return seconds < 60 ? 'now' : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago` : `${Math.floor(seconds / 3600)} hr ago`;
@@ -21,7 +21,7 @@ export function mount(root, services, options) {
   const controller = new AbortController();
   const cleanup = [motion.subscribe((disabled) => root.classList.toggle('no-motion', disabled))];
   const rowNodes = new Map();
-  let snapshot = null, disposed = false, closeTimer, timeTimer;
+  let snapshot = null, disposed = false, timeTimer;
   const window = root.ownerDocument.defaultView || globalThis;
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
@@ -38,56 +38,31 @@ export function mount(root, services, options) {
       },
       error(error) {
         const rejection = error.body?.rejection;
-        note.textContent = rejection?.reason === 'stale_revision' ? 'The world changed. Try again.' : 'The request could not be completed.';
+        note.textContent = rejection?.reason === 'stale_revision' ? 'The world changed. Try again.' : rejection?.message || 'The request could not be completed.';
       },
     });
-    if (!disposed && ok && ['plant_fact', 'plant_page'].includes(command.command)) {
-      window.clearTimeout(closeTimer);
-      closeTimer = window.setTimeout(() => services.closeWorldMenu?.(), 250);
-    }
     return ok;
   }
   function buttons() {
     for (const control of controls) control.disabled = !snapshot || request.busy;
     if (!segment || !snapshot?.generator) return;
     const g = snapshot.generator;
-    const mode = !g.generate ? 'off' : g.canned ? 'canned' : 'stub';
+    const mode = g.live_search ? 'live_search' : g.copied ? 'copied' : 'model_written';
     for (const button of segment.children) {
       button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
-      if (button.dataset.mode === 'stub') button.textContent = ['openrouter', 'anthropic'].includes(g.kind) ? 'Always live' : 'Improvised';
     }
   }
   if (menu) {
     const { el: item } = services.dom.scoped(menu);
     const row = item('div', { class: 'row' }, menu);
-    item('span', { text: 'New pages' }, row);
-    segment = item('div', { class: 'seg', role: 'group', 'aria-label': 'New pages' }, row);
+    item('span', { text: 'Pages' }, row);
+    segment = item('div', { class: 'seg', role: 'group', 'aria-label': 'Pages' }, row);
     for (const [mode, text] of NEW_PAGES) {
       const button = item('button', { type: 'button', text, 'aria-pressed': 'false' }, segment);
       button.dataset.mode = mode;
       controls.push(button);
       cleanup.push(listen(button, 'click', () => send({ command: 'set_new_pages', new_pages: mode })));
     }
-    const field = (label, id) => {
-      const box = item('div', { class: 'field' }, menu);
-      item('label', { for: id, text: label }, box);
-      return box;
-    };
-    const factBox = field('Plant a fact', 'plant-fact');
-    const fact = item('input', { id: 'plant-fact', type: 'text', autocomplete: 'off' }, factBox);
-    const plantFact = item('button', { type: 'button', class: 'act', text: 'Plant' }, factBox);
-    controls.push(plantFact);
-    cleanup.push(listen(plantFact, 'click', async () => {
-      if (await send({ command: 'plant_fact', text: fact.value })) fact.value = '';
-    }));
-    const pageBox = field('Plant a page', 'plant-url');
-    const url = item('input', { id: 'plant-url', type: 'url', placeholder: 'https://', autocomplete: 'off' }, pageBox);
-    const plantPage = item('button', { type: 'button', class: 'act', text: 'Plant' }, pageBox);
-    const text = item('textarea', { 'aria-label': 'Page text', placeholder: 'Title, then the text', rows: '3' }, pageBox);
-    controls.push(plantPage);
-    cleanup.push(listen(plantPage, 'click', async () => {
-      if (await send({ command: 'plant_page', url: url.value, text: text.value })) { url.value = ''; text.value = ''; }
-    }));
     const restartRow = item('div', { class: 'row' }, menu);
     item('span', { text: 'Restart run' }, restartRow);
     const restart = item('button', { type: 'button', class: 'act quiet', text: 'Restart' }, restartRow);
@@ -98,9 +73,35 @@ export function mount(root, services, options) {
     note = el('p', { class: 'note', role: 'status' }, null);
   }
   buttons();
+  const activity = el('section', { class: 'search-activity', 'aria-label': 'Live search activity' }, root);
+  el('h3', { text: 'Live search activity' }, activity);
+  el('p', { text: 'Queries sent to Google, pages downloaded by the host, and responses served from the copy. The event log retains the full record.' }, activity);
+  el('h4', { text: 'Queries sent to Google' }, activity);
+  const queryList = el('ol', {}, activity);
+  el('h4', { text: 'Recent copies' }, activity);
+  const activityList = el('ol', {}, activity);
+  const sentQueries = new Set();
+  const labels = { real_search: 'Sent to Google', downloaded: 'Downloaded', copy_served: 'Served from copy', download_failed: 'Download failed' };
+  function showActivity(events) {
+    const entries = events.filter((event) => event.source === 'web' && labels[event.kind]);
+    activity.hidden = entries.length === 0 && sentQueries.size === 0 && !snapshot?.generator?.live_search;
+    for (const event of entries.filter((event) => event.kind === 'real_search')) {
+      if (sentQueries.has(event.seq)) continue;
+      sentQueries.add(event.seq);
+      const fields = event.fields || {};
+      const line = el('li', { text: `${fields.search ?? ''} · ${fields.engine ?? ''} · offset ${fields.start ?? 0}` }, null);
+      queryList.prepend(line);
+    }
+    activityList.replaceChildren();
+    for (const event of entries.filter((event) => event.kind !== 'real_search').slice(-100).reverse()) {
+      const fields = event.fields || {};
+      el('li', { text: `${labels[event.kind]}: ${fields.search ?? fields.url ?? ''}${fields.status ? ` · ${fields.status}` : ''}${fields.elapsed_ms ? ` · ${fields.elapsed_ms} ms` : ''}` }, activityList);
+    }
+  }
   const graph = services.graph;
   web.setEvents(graph.state.events);
-  cleanup.push(graph.subscribe((name) => { if (name === 'event' || name === 'snapshot') web.setEvents(graph.state.events); }));
+  showActivity(graph.state.events);
+  cleanup.push(graph.subscribe((name) => { if (name === 'event' || name === 'snapshot') { web.setEvents(graph.state.events); showActivity(graph.state.events); } }));
 
   function render(changes = []) {
     window.clearTimeout(timeTimer);
@@ -128,6 +129,7 @@ export function mount(root, services, options) {
       if (list.children[index] !== line) list.insertBefore(line, list.children[index] || null);
     });
     buttons();
+    showActivity(graph.state.events);
     if (!services.clock.ended && entries.length) {
       const next = Math.min(...entries.map(([, row]) => 60000 - Math.max(0, now - row.at) % 60000));
       timeTimer = window.setTimeout(() => { if (!disposed) render(); }, next);
@@ -147,7 +149,6 @@ export function mount(root, services, options) {
   }, () => { if (!disposed) note.textContent = 'The world could not be reached.'; }));
   return () => {
     disposed = true;
-    window.clearTimeout(closeTimer);
     window.clearTimeout(timeTimer);
     controller.abort();
     web.dispose();

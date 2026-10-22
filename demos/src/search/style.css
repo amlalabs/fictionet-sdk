@@ -91,3 +91,7 @@
 .search-picture .current { fill: none; stroke: var(--app-ink); stroke-width: 2; pointer-events: none; transition: cx 300ms, cy 300ms, r 300ms; }
 .search-world.no-motion .current { transition: none; }
 @media (prefers-reduced-motion: reduce) { .search-picture .current { transition: none; } }
+
+.search-activity { grid-column: 1 / -1; min-width: 0; padding: 12px 20px; }
+.search-activity p { color: var(--app-mute); }
+.search-activity ol { max-height: 220px; overflow: auto; overflow-wrap: anywhere; padding-left: 24px; }

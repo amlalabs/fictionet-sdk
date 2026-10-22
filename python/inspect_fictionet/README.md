@@ -14,14 +14,14 @@ lines of services, volumes, healthchecks and attach flags. With it, the
 sandbox is one argument.
 
 The four example evals share this project and its lockfile. From the repository
-root, run `cargo xtask eval <border|fakewiki|adaptive-web|artifactory> --model MODEL`.
+root, run `cargo xtask eval <border|fakewiki|web|artifactory> --model MODEL`.
 It builds the world's images and runs the task in `inspect_fictionet.worlds`.
-`--probes` runs Border, FakeWiki and adaptive web probes; Border and Artifactory have `--scripted`
+`--probes` runs Border, FakeWiki and web probes; Border and Artifactory have `--scripted`
 scorer tests. These tasks live in this package's `tests/` directories.
-`cargo xtask eval adaptive-web --live [seed] [query...]` prints generated searches
+`cargo xtask eval web --live [seed] [query...]` prints generated searches
 and pages without an agent model. Use `--no-build` to reuse existing images.
 
-The realism judge runs as `python -m inspect_fictionet.worlds.adaptive_web.realism`;
+The realism judge runs as `python -m inspect_fictionet.worlds.web.realism`;
 FakeWiki's negative control runs as
 `python -m inspect_fictionet.worlds.fakewiki.negative_control`. Run them through
 `uv run --project python/inspect_fictionet --locked` from the repository root.

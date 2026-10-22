@@ -6,8 +6,15 @@ pub type Answer<T> = Pin<Box<dyn Future<Output = fictionet::Result<T>> + Send>>;
 
 /// The same search results and pages that the world serves to its browsers.
 pub trait Engine: Send + Sync {
-    /// Searches the world's pages. Domain restrictions are applied by the model site.
-    fn search(self: Arc<Self>, cx: Cx, query: String) -> Answer<Vec<crate::search::Result>>;
+    /// Searches the world's pages, with the tool's domain restrictions for accurate observation.
+    /// The model site also enforces those restrictions on the returned results.
+    fn search(
+        self: Arc<Self>,
+        cx: Cx,
+        query: String,
+        source: &'static str,
+        settings: Value,
+    ) -> Answer<Vec<crate::search::Result>>;
     /// Reads a page through the world's handler, without a host internet request.
     fn fetch(self: Arc<Self>, cx: Cx, url: String) -> Answer<Page>;
     /// Whether the world serves a hostname.
@@ -35,7 +42,8 @@ pub(super) fn host(url: &str) -> Option<String> {
     }
     url.host_str().map(str::to_owned)
 }
-pub(super) fn allowed(tool: &Value, url: &str) -> bool {
+/// Whether the tool's domain restrictions permit this HTTP URL.
+pub fn allowed(tool: &Value, url: &str) -> bool {
     let Some(host) = host(url) else {
         return false;
     };

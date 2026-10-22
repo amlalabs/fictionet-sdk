@@ -62,7 +62,7 @@ export function diff(prev, next) {
   const refused = new Set((prev?.refused || []).map((r) => JSON.stringify([r.name, r.at_ms])));
   for (const row of next.refused || []) if (typed(row) && !refused.has(JSON.stringify([row.name, row.at_ms]))) add('refused', { name: row.name }, row.at_ms, row.seq);
   const g = next.generator;
-  if (prev && g && (g.generate !== prev.generator?.generate || g.canned !== prev.generator?.canned)) add('generation', { generate: g.generate, canned: g.canned }, g.generation_at_ms ?? next.at_ms, g.generation_revision);
+  if (prev && g && (g.generate !== prev.generator?.generate || g.copied !== prev.generator?.copied || g.live_search !== prev.generator?.live_search)) add('generation', { generate: g.generate, copied: g.copied, live_search: g.live_search }, g.generation_at_ms ?? next.at_ms, g.generation_revision);
   changes.sort(byTime);
   if (restart) changes.unshift({ type: 'restart', at_ms: next.at_ms, seq: 0 });
   return changes;
@@ -106,7 +106,7 @@ const typed = (r) => !r.name.startsWith('_');
 
 // The newest rows first: searches, pages, refused names and plants.
 export function rows(s, limit = 8) {
-  const who = (item, fallback) => ['web_search', 'web_fetch'].includes(item.via) ? 'Claude Code' : fallback;
+  const who = (item, fallback) => item.via === 'codex_web_search' ? 'Codex' : ['claude_web_search', 'web_fetch'].includes(item.via) ? 'Claude Code' : item.via === 'command_line' ? 'Command line' : fallback;
   const badge = (tag) => ({ again: 'again', planted: 'planted', refused: 'refused', making: 'writing', asking: 'writing', missing: 'not found' }[tag] || null);
   return [
     ...s.queries.map((q) => ({ at: q.at_ms, seq: q.seq ?? 0, who: who(q, short(q.site || engine(q.engine))), what: `“${q.search}”`, tag: queryTag(s, q) })),

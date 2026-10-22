@@ -6,6 +6,10 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+fictionet-extras = { path = "../extras" }
+web-world = { path = "../examples/web/world" }
+url = "2"
+kuchiki = "0.8"
 base64 = "0.22"
 libc = "0.2"
 regex = "1"

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adaptive_web_world::{
+use web_world::{
     pages::{Applied, Command, Pages},
     search::{self, Searches},
 };
@@ -109,10 +109,10 @@ impl Topics {
                 Ok(pages
                     .apply(&cx, command.clone())
                     .map_err(|rejected| match rejected {
-                        adaptive_web_world::pages::Rejected::Stale { current } => {
+                        web_world::pages::Rejected::Stale { current } => {
                             Rejected::StaleRevision { current }
                         }
-                        adaptive_web_world::pages::Rejected::Invalid { message } => {
+                        web_world::pages::Rejected::Invalid { message } => {
                             Rejected::Invalid { message }
                         }
                     }))
@@ -158,7 +158,7 @@ impl Default for Topics {
 /// with package downloads mirrored, sign-in relayed over raw TLS, and model
 /// search and fetch answered by the world using the guest’s own credentials.
 pub fn network(
-    world: &adaptive_web_world::World,
+    world: &web_world::World,
     cx: &Cx,
     log: Arc<example_common::log::Log>,
     mirror: crate::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,
