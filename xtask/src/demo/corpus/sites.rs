@@ -39,8 +39,9 @@ pub(super) fn run(only: Option<&str>) -> Result {
         let mut seen = HashSet::from([url.to_string()]);
         let mut pages = vec![start.to_owned()];
         let articles = document.select("article a[href]").unwrap();
+        let main = document.select("main a[href]").unwrap();
         let all = document.select("a[href]").unwrap();
-        for link in articles.chain(all) {
+        for link in articles.chain(main).chain(all) {
             let attributes = link.attributes.borrow();
             let Some(parsed) = attributes.get("href").and_then(|href| url.join(href).ok()) else {
                 continue;
