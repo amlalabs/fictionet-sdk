@@ -16,7 +16,7 @@ export function pageGraph(state, hosts) {
   }
   const nodes = new Map([...state.nodes].filter(([, node]) => visible(node)));
   const edges = new Map([...state.edges].filter(([, edge]) => nodes.has(edge.a) && nodes.has(edge.b)));
-  const events = state.events.filter((event) => (!event.sandbox || declaredSandbox(hosts, event.sandbox.name || event.sandbox)) && (!event.node || nodes.has(event.node)));
+  const events = state.events.filter((event) => (!event.sandbox || declaredSandbox(hosts, event.sandbox.name || event.sandbox)) && (!event.node || nodes.has(event.node) || !!event.sandbox));
   const used = new Set([...nodes.values()].map((node) => node.group).filter(Boolean));
   for (const id of used) {
     const parent = state.groups.get(id)?.parent;

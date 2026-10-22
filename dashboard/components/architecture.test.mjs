@@ -48,6 +48,8 @@ test('architecture counts observed traffic and uses world service declarations',
   assert.equal(rows[5].column, 2);
   const renamed = architecture(model.state, hosts, [{ ...declarations[3], title: 'Searches', source: 'other' }]);
   assert.equal(renamed[1].count, 0);
+  model.addEvent({ ...recording.events[3], seq: 6, node: 'finished-request' });
+  assert.equal(architecture(model.state, hosts, declarations)[4].count, 2);
 });
 
 test('architecture is still without observations and pulses only for arriving traffic', (t) => {
