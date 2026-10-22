@@ -1,13 +1,17 @@
 //! Complete the bounded astronomy corpus through Wikimedia, retaining real URLs.
 
+mod sites;
+
 use crate::process::Result;
 
 pub(super) fn run(args: &[String]) -> Result {
     match args {
         [] => fetch(),
+        [action] if action == "sites" => sites::run(None),
+        [action, url] if action == "sites" => sites::run(Some(url)),
         [action] if action == "report" => report(&crate::root().join("demos/downloads/astronomy")),
         [action, path] if action == "report" => report(std::path::Path::new(path)),
-        _ => Err("usage: cargo xtask demo corpus [report [directory]]".into()),
+        _ => Err("usage: cargo xtask demo corpus [sites|report [directory]]".into()),
     }
 }
 
