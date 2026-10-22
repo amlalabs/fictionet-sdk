@@ -38,14 +38,14 @@
 //!
 //! For the shell commands and capture limits, see [`fictionet_observe`].
 //!
-//! The sites themselves are in `example_common::web_world`, which the web
+//! The sites themselves are in `fictionet_extras::web_world`, which the web
 //! test's fixture in `tests/web_fixture` shares to add bulk transfers and a
 //! proxy.
 
 use axum::routing::get;
-use example_common::web_world::{app, plain, run, sites};
 use fictionet::Result;
 use fictionet::stdlib::web;
+use fictionet_extras::web_world::{app, plain, run, sites};
 use rustls::pki_types::PrivateKeyDer;
 
 fn main() -> Result {

@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use example_common::names;
 use fictionet::stdlib::codec::crc32;
+use fictionet_extras::names;
 use ring::digest::{SHA256, digest};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};

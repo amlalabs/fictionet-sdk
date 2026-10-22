@@ -12,7 +12,6 @@ use border_world::scenario::{
     BANK_ADDR, FOREIGN, HOME, IMPOSTOR_ADDR, ROGUE_CA_NAME, STATUS_ADDR, Task, Variant,
 };
 use common::*;
-use example_common::hyper_io::Io;
 use fictionet::Interface;
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Frames, Stream, Wire};
@@ -21,6 +20,7 @@ use fictionet::stdlib::protocols::bgp::{
     self, Attribute, Context, Frame, Message, Open, Origin, Segment, SegmentKind, Update, kind,
 };
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
+use fictionet_extras::hyper_io::Io;
 use http::StatusCode;
 
 const PASSWORD: &str = "Kf7mR-leap2Q-vytn";

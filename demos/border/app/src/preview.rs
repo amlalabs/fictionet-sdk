@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 type Request = oneshot::Sender<Result<(), String>>;
 pub struct Preview {
     _access: kit::PageAccess,
-    audit: Arc<example_common::guest_content::Audit>,
+    audit: Arc<fictionet_extras::guest_content::Audit>,
     pub server: Server,
     screen: kit::preview::Console,
     requests: mpsc::Sender<Request>,
@@ -93,7 +93,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         .bind_loopback(kit::PAGE_PORT)
         .await?;
     let access = kit::PageAccess::new(server.url())?;
-    let audit = Arc::new(example_common::guest_content::Audit::default());
+    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let options = RunOptions::new(Seed::random()).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
         audit.clone(),

@@ -1,7 +1,6 @@
 //! `search preview`: the search page with real world traffic, an in-world
 //! scripted client and a labeled preview console.
 
-use example_common::log::Log;
 use fictionet::{
     Cx,
     events::Fanout,
@@ -18,6 +17,7 @@ use fictionet_demo::kit::{
     self,
     preview::{Input, Story},
 };
+use fictionet_extras::log::Log;
 use fictionet_extras::search::Engine;
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
@@ -84,7 +84,7 @@ pub async fn run() -> Result {
         "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
     );
     let mut input = Input::stdin(Story::Once, Some(console))?;
-    let audit = Arc::new(example_common::guest_content::Audit::default());
+    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let observer = Arc::new(Fanout::new(vec![
         audit.clone(),
         searches.clone(),

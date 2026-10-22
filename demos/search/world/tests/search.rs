@@ -1,8 +1,8 @@
-use example_common::events::field;
 use fictionet::events::{
     ConnInfo, Event, Interest, Metadata, Observation, Observer, Stamp, Stream, TopologyKind,
 };
 use fictionet::time::Instant;
+use fictionet_extras::events::field;
 use fictionet_extras::search::Engine;
 use serde_json::json;
 use web_world::pages::model::Provider;

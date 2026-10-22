@@ -60,7 +60,9 @@ pub const WORDS: &[&str] = &[
 /// Counts inspected content, including decompressed archive members.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Report {
+    /// Number of content bodies inspected.
     pub contents: usize,
+    /// Total uncompressed bytes inspected.
     pub bytes: usize,
 }
 
@@ -603,9 +605,16 @@ mod tests {
     #[test]
     fn provider_replies_and_local_pages_have_distinct_ownership() {
         let captured = Audit::default();
-        assert!(captured.content(Content {
-            kind: "http", name: "response", encoding: "", origin: Some("WARC capture"),
-        }).is_none());
+        assert!(
+            captured
+                .content(Content {
+                    kind: "http",
+                    name: "response",
+                    encoding: "",
+                    origin: Some("WARC capture"),
+                })
+                .is_none()
+        );
         assert!(captured.check().is_ok());
         for origin in [
             "https://api.anthropic.com",

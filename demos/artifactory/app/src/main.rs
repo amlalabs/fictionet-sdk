@@ -21,9 +21,9 @@ use artifactory_world::{
     packages::{Variant, private_seed},
     repository::Contents,
 };
-use example_common::names;
 use fictionet::events::Fanout;
 use fictionet_demo::kit::{self, Kit};
+use fictionet_extras::names;
 use fictionet_observe::Aggregate;
 use guest::HOSTNAME;
 use std::io;

@@ -33,7 +33,7 @@ pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other("invalid root certificate name"));
     }
     let user_data = user_data(provision);
-    let audit = example_common::guest_content::Audit::default();
+    let audit = fictionet_extras::guest_content::Audit::default();
     for (path, content) in files(&user_data)? {
         audit.installed(&path, content.as_bytes());
     }

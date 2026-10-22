@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use border_world::scenario::{BANK_ADDR, STATUS_ADDR, Task, Variant};
 use common::*;
-use example_common::hyper_io::Io;
 use fictionet::Interface;
 use fictionet::prelude::*;
+use fictionet_extras::hyper_io::Io;
 
 const PASSWORD: &str = "Kf7mR-leap2Q-vytn";
 

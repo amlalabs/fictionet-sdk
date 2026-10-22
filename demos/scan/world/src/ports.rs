@@ -41,11 +41,11 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use example_common::names::name;
 use fictionet::events::{Fields, Level, opt};
 use fictionet::stdlib::network::{Direction, ip};
 use fictionet::sync::Mutex;
 use fictionet::{Cx, Packet};
+use fictionet_extras::names::name;
 use serde::{Deserialize, Serialize};
 
 use crate::banners::{Banner, Banners, MAX_BANNERS, Offer};

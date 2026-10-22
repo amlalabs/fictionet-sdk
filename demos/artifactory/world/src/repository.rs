@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::inventory::{FolderAdded, Inventory};
 use bytes::Bytes;
-use example_common::names;
 use fictionet::events::Fields;
 use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::json::Value as J;
 use fictionet::stdlib::protocols::xml::{Event, Events};
 use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Reply};
 use fictionet::time::Instant;
+use fictionet_extras::names;
 use http::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

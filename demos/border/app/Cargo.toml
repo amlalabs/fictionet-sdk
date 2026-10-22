@@ -14,7 +14,6 @@ fictionet-host = { path = "../../../host" }
 border-world = { path = "../world" }
 quick-xml = { version = "0.38", features = ["serialize"] }
 fictionet-observe = { path = "../../../observe", features = ["page"] }
-example-common = { path = "../../../extras/common" }
 # `tokio` hands the jump host's TCP connection to the SSH client.
 fictionet = { path = "../../..", features = ["web-proxy", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync", "signal"] }

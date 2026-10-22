@@ -16,10 +16,10 @@ use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
-use example_common::events::js;
-use example_common::log::Log;
+use fictionet_extras::events::js;
+use fictionet_extras::log::Log;
 
-use example_common::headers;
+use fictionet_extras::headers;
 
 /// Projects run events into the world's JSON Lines format.
 pub struct LogObserver {
@@ -432,7 +432,7 @@ mod live_tests {
         let call = json!({"record":"attempt", "kind":"page", "url":"https://example.com/a",
             "model":"writer", "cost":0.001, "gen_ms":3200, "outcome":"ok", "terminal":true});
         let event =
-            Event::new("web", "model_call").field("call", example_common::events::field(&call));
+            Event::new("web", "model_call").field("call", fictionet_extras::events::field(&call));
         let mut expected = call;
         expected["type"] = json!("model_call");
         assert_eq!(line(&event), Some(expected));

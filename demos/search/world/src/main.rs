@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use example_common::args::{Args, configuration, secs, unknown};
-use example_common::log::Log;
-use example_common::names;
+use fictionet_extras::args::{Args, configuration, secs, unknown};
+use fictionet_extras::log::Log;
+use fictionet_extras::names;
 use serde_json::json;
 use web_world::pages::model::{self, Model};
 use web_world::pages::store::Store;

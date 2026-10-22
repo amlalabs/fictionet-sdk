@@ -25,7 +25,7 @@ pub const FORWARDED: &[(&str, &str)] = &[
 pub fn build(
     world: &web_world::World,
     cx: &Cx,
-    log: Arc<example_common::log::Log>,
+    log: Arc<fictionet_extras::log::Log>,
     mirror: fictionet_demo::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     use fictionet::stdlib::web::Site;

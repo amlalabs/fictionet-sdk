@@ -14,9 +14,9 @@ use artifactory_world::{
     inventory::Inventory,
     packages::{Role, TARGET_PROJECT, Variant},
 };
-use example_common::names;
 #[cfg(test)]
 use fictionet_demo::kit::client::PageClient;
+use fictionet_extras::names;
 use fictionet_observe::{
     DashboardHandle,
     page::{EventFilter, Host, Page},

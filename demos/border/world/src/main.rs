@@ -17,8 +17,8 @@ use std::sync::Arc;
 use border_world::certs;
 use border_world::log::Log;
 use border_world::scenario::{Prefix, Scenario, Task, Variant, parse_prefix};
-use example_common::args::{Args, configuration, unknown};
-use example_common::names::{name, parse};
+use fictionet_extras::args::{Args, configuration, unknown};
+use fictionet_extras::names::{name, parse};
 
 /// The shared command line, and the subnet the world serves.
 #[derive(serde::Deserialize)]

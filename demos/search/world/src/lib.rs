@@ -39,7 +39,7 @@
 //! use web_world::{World, world_start};
 //! use web_world::{events::LogObserver, search::Searches};
 //! use web_world::pages::{Command, Seed};
-//! use example_common::log::Log;
+//! use fictionet_extras::log::Log;
 //! use fictionet::events::Fanout;
 //!
 //! # fn main() -> fictionet::Result {
@@ -94,7 +94,7 @@ use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use serde::{Deserialize, Serialize};
 
-use example_common::log::Log;
+use fictionet_extras::log::Log;
 use files::{Appended, FileLock};
 use pages::Pages;
 

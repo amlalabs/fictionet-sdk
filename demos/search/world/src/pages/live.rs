@@ -3,7 +3,7 @@
 use super::*;
 use fictionet_extras::{
     capture::{self, Fetcher},
-    models::{Key, Provider as ModelProvider},
+    models::Key,
     warc::{self, Archive},
 };
 use std::{
@@ -258,17 +258,16 @@ impl Live {
         std::thread::spawn(move || {
             let result = (|| {
                 let fetcher = Fetcher::new(capture::BROWSER).map_err(|e| e.to_string())?;
-                let (_, key) = live.key.header(ModelProvider::Anthropic);
                 let request = json!({"query": query, "numResults": (start + 10).min(100), "contents": {"highlights": true}});
                 cx_thread.emit("web", "real_search", |event| {
                     event
                         .summary(format_args!("Query sent to Exa: {query}"))
                         .field("search", query.as_str())
-                        .field("engine", example_common::names::name(&engine))
+                        .field("engine", fictionet_extras::names::name(&engine))
                         .field("start", start)
                 });
                 let response = fetcher
-                    .search(live.endpoint.as_str(), &key, &request)
+                    .search(live.endpoint.as_str(), live.key.value(), &request)
                     .map_err(|_| "Exa search API request failed".to_owned())?;
                 if !response.status.is_success() {
                     return Err(format!("Exa search API returned {}", response.status));

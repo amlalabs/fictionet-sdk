@@ -47,7 +47,7 @@ where
     ));
     let log = Log::start(Box::new(buf.clone()), scenario.clone());
     let output = log.clone();
-    let audit = Arc::new(example_common::guest_content::Audit::default());
+    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let events = Arc::new(fictionet_observe::Memory::default());
     fictionet_test_support::harness::run(
         fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(

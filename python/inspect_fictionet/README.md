@@ -469,7 +469,7 @@ These are repository example helpers, not an `inspect_fictionet` package API.
 They require a separate world sandbox with `exec`, `touch`, `cat`, and a
 shell with `cp` and `wc`. The log directory must be writable and private to
 the world. The world must implement the
-[`extras/common/log.rs` finalization protocol](../../extras/common/log.rs),
+[`extras/src/log.rs` finalization protocol](../../extras/src/log.rs),
 clear stale control files at startup, and stay alive to serve file reads
 after acknowledgement. These helpers do not work unchanged in shell-free
 images. Serialize collection for a log: calls share its snapshot path.

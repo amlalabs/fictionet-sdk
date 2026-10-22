@@ -10,7 +10,6 @@ publish = false
 fictionet-extras = { path = "../../../extras" }
 fictionet-host = { path = "../../../host" }
 fictionet-observe = { path = "../../../observe", features = ["native"] }
-example-common = { path = "../../../extras/common" }
 bytes = "1"
 fictionet = { path = "../../..", features = ["web-proxy"] }
 http = "1"

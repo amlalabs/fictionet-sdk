@@ -11,11 +11,11 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use example_common::events::field;
-use example_common::names::name;
 use fictionet::Cx;
 use fictionet::stdlib::services::serve::WakeHandle;
 use fictionet::sync::Mutex;
+use fictionet_extras::events::field;
+use fictionet_extras::names::name;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

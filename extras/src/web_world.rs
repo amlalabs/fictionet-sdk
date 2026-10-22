@@ -64,14 +64,11 @@ pub fn run(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(fictionet::run(
-        options,
-        move |fcx| async move {
-            let (ca, leaf) = certificates(&fcx)?;
-            std::fs::write(&ca_path, ca.cert_pem())?;
-            start(&fcx, leaf.chain, leaf.key, attachments)
-        },
-    ))
+    runtime.block_on(fictionet::run(options, move |fcx| async move {
+        let (ca, leaf) = certificates(&fcx)?;
+        std::fs::write(&ca_path, ca.cert_pem())?;
+        start(&fcx, leaf.chain, leaf.key, attachments)
+    }))
 }
 
 /// The world's certificate authority, and the certificate it issues for

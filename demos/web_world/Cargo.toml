@@ -13,4 +13,4 @@ path = "main.rs"
 fictionet = { path = "../..", features = ["web-proxy", "tokio"] }
 axum = { version = "0.8", default-features = false, features = ["ws"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-example-common = { path = "../../extras/common" }
+fictionet-extras = { path = "../../extras" }

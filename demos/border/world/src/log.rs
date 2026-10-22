@@ -29,14 +29,14 @@ const FOLDED: &[&str] = &["blocked", "ttl_exceeded", "unreachable"];
 /// A handle for the world's JSON Lines log.
 #[derive(Clone)]
 pub struct Log {
-    inner: example_common::log::Log,
+    inner: fictionet_extras::log::Log,
     scenario: Arc<Scenario>,
 }
 impl Log {
     /// Prepares the output. Call `attach` before writing.
     pub fn start(out: Box<dyn Write + Send>, scenario: Arc<Scenario>) -> Self {
         Self {
-            inner: example_common::log::Log::new(out, FOLDED, transform),
+            inner: fictionet_extras::log::Log::new(out, FOLDED, transform),
             scenario,
         }
     }
@@ -44,7 +44,7 @@ impl Log {
     pub fn finalization(
         &self,
         directory: &std::path::Path,
-    ) -> std::io::Result<example_common::log::Finalization> {
+    ) -> std::io::Result<fictionet_extras::log::Finalization> {
         self.inner.finalization(directory)
     }
     /// Attaches the output to the run's lifetime.
@@ -116,7 +116,7 @@ fn transform(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use example_common::log::fold_key;
+    use fictionet_extras::log::fold_key;
     use serde_json::json;
 
     #[test]
@@ -173,6 +173,6 @@ mod tests {
 
     #[test]
     fn repeated_lines_fold_into_a_count() {
-        example_common::log::assert_repeated_lines_fold(FOLDED, transform);
+        fictionet_extras::log::assert_repeated_lines_fold(FOLDED, transform);
     }
 }

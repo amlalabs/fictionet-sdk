@@ -20,10 +20,10 @@ use fictionet::events::{Event, Fields, opt};
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
-use example_common::log::Log;
-use example_common::names::name;
+use fictionet_extras::log::Log;
+use fictionet_extras::names::name;
 
-use example_common::headers;
+use fictionet_extras::headers;
 
 /// What the handler tells the log about one response.
 #[derive(Clone, Debug)]

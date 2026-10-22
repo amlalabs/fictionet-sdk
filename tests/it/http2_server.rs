@@ -301,8 +301,8 @@ fn reset_late_frames_replay_on_lab_time_over_tls() {
 
 mod clients {
     use super::*;
-    use example_common::hyper_io::Io;
     use fictionet::InterfaceExt;
+    use fictionet_extras::hyper_io::Io;
     use hyper_util::rt::TokioIo;
     use std::path::PathBuf;
     use std::pin::Pin;

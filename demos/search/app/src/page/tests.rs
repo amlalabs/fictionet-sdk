@@ -1,6 +1,5 @@
 use super::*;
 use crate::{network::build as network, page};
-use example_common::log::Log;
 use fictionet::{
     Cx,
     events::Fanout,
@@ -14,6 +13,7 @@ use fictionet::{
     },
 };
 use fictionet_demo::kit::client::PageClient;
+use fictionet_extras::log::Log;
 use fictionet_observe::{DashboardObserver, DashboardOptions, page::Host};
 use serde_json::json;
 use web_world::{World, pages::Seed};

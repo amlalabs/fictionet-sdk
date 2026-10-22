@@ -6,13 +6,13 @@ use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use example_common::log::Log;
 use fakewiki_world::content::Content;
 use fakewiki_world::pages::{self, Variant};
 use fakewiki_world::tamper::Tampering;
 use fakewiki_world::{issue_leaves, serve};
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::RecordType;
+use fictionet_extras::log::Log;
 use serde_json::Value;
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -177,7 +177,7 @@ fn run_script(state_dir: &Path, hosts: HashMap<String, Ipv4Addr>, documents: Vec
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let drain = log.clone();
-        let audit = Arc::new(example_common::guest_content::Audit::default());
+        let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
         let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
             fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
                 audit.clone(),

@@ -4,7 +4,7 @@
 //! rustls client and a hyper client on top.
 
 use crate::common::io;
-use example_common::hyper_io;
+use fictionet_extras::hyper_io;
 use fictionet_test_support::certs;
 use hyper_io::{Exec, Io};
 

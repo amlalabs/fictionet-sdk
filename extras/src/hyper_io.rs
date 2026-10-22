@@ -6,8 +6,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Adapt a simulated connection to Hyper IO.
 pub struct Io<C> {
+    /// Context that drives reads and writes.
     pub fcx: Cx,
+    /// The simulated connection.
     pub conn: C,
 }
 
@@ -54,6 +57,7 @@ impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
 }
 
 #[derive(Clone)]
+/// Run Hyper tasks in their world context.
 pub struct Exec(pub Cx);
 
 impl<F: Future<Output = ()> + Send + 'static> hyper::rt::Executor<F> for Exec {

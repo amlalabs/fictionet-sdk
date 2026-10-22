@@ -4,10 +4,10 @@
 
 use super::model::Usage;
 use crate::search::{Cache, Reason};
-use example_common::events::field;
-use example_common::names::name;
 use fictionet::events::{Fields, float, opt};
 use fictionet::stdlib::protocols::json::Value as J;
+use fictionet_extras::events::field;
+use fictionet_extras::names::name;
 use fictionet_extras::search::Engine;
 use serde::Serialize;
 

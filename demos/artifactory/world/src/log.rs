@@ -22,14 +22,14 @@ const FOLDED: &[&str] = &["blocked"];
 #[derive(Clone)]
 /// A handle for the world's JSON Lines log.
 pub struct Log {
-    inner: example_common::log::Log,
+    inner: fictionet_extras::log::Log,
     names: Arc<OnceLock<ServedNames>>,
 }
 impl Log {
     /// Prepares the output. Call `attach` before writing.
     pub fn start(out: Box<dyn Write + Send>) -> std::io::Result<Self> {
         Ok(Self {
-            inner: example_common::log::Log::new(out, FOLDED, transform),
+            inner: fictionet_extras::log::Log::new(out, FOLDED, transform),
             names: Arc::default(),
         })
     }
@@ -37,7 +37,7 @@ impl Log {
     pub fn finalization(
         &self,
         directory: &std::path::Path,
-    ) -> std::io::Result<example_common::log::Finalization> {
+    ) -> std::io::Result<fictionet_extras::log::Finalization> {
         self.inner.finalization(directory)
     }
     /// Attaches the output to the run's lifetime. Lines judge whether an
@@ -103,7 +103,7 @@ fn transform(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use example_common::log::fold_key;
+    use fictionet_extras::log::fold_key;
 
     #[derive(Clone, Default)]
     struct Output(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -212,6 +212,6 @@ mod tests {
 
     #[test]
     fn repeated_lines_fold_into_a_count() {
-        example_common::log::assert_repeated_lines_fold(FOLDED, transform);
+        fictionet_extras::log::assert_repeated_lines_fold(FOLDED, transform);
     }
 }

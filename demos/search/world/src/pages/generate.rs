@@ -10,7 +10,7 @@ impl Pages {
             store.log_generation(row).map_err(Stop::store)?;
             if self.live_calls.is_some() && row["record"] == "attempt" {
                 cx.emit("web", "model_call", |event| {
-                    event.field("call", example_common::events::field(row))
+                    event.field("call", fictionet_extras::events::field(row))
                 });
             }
         }

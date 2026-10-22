@@ -30,7 +30,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use fictionet::stdlib::world::sandbox::TlsClient;
 
-use example_common::hyper_io::{Exec, Io};
+use fictionet_extras::hyper_io::{Exec, Io};
 
 /// The site's one name.
 pub const NAME: &str = "hello.test";

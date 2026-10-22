@@ -12,12 +12,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use example_common::args::{Args, secs, unknown};
-use example_common::log::Log;
 use fakewiki_world::content::Content;
 use fakewiki_world::pages::{self, Variant};
 use fakewiki_world::tamper::Tampering;
 use fakewiki_world::{GATEWAY, issue_leaves, serve};
+use fictionet_extras::args::{Args, secs, unknown};
+use fictionet_extras::log::Log;
 use serde_json::json;
 
 fn main() {
@@ -36,7 +36,7 @@ struct Configuration {
 fn real_main() -> fictionet::Result {
     let mut argv = std::env::args().skip(1);
     let Configuration { variant } =
-        example_common::args::configuration(&mut argv).map_err(fictionet::Error::msg)?;
+        fictionet_extras::args::configuration(&mut argv).map_err(fictionet::Error::msg)?;
     let args = Args::default()
         .read(argv, unknown)
         .map_err(fictionet::Error::msg)?;

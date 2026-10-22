@@ -14,7 +14,7 @@ name = "scan-world"
 path = "src/main.rs"
 
 [dependencies]
-example-common = { path = "../../../extras/common" }
+fictionet-extras = { path = "../../../extras" }
 fictionet = { path = "../../.." }
 fictionet-observe = { path = "../../../observe", features = ["native"] }
 http = "1"

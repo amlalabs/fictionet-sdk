@@ -123,8 +123,8 @@ name = "artifactory-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "fictionet-test-support",
  "http",
@@ -324,8 +324,8 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "fictionet-test-support",
  "flate2",
@@ -880,35 +880,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "example-common"
-version = "0.0.0"
-dependencies = [
- "axum",
- "brotli",
- "fictionet",
- "fictionet-observe",
- "flate2",
- "http",
- "hyper",
- "percent-encoding",
- "quick-xml",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "tar",
- "tokio",
- "xz2",
- "zip",
- "zstd",
-]
-
-[[package]]
 name = "fakewiki-world"
 version = "0.0.0"
 dependencies = [
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "form_urlencoded",
  "http",
@@ -953,9 +929,9 @@ dependencies = [
  "bytes",
  "divan",
  "etherparse",
- "example-common",
  "fictionet-codegen",
  "fictionet-codegen-golden",
+ "fictionet-extras",
  "fictionet-host",
  "fictionet-observe",
  "fictionet-test-support",
@@ -992,7 +968,6 @@ dependencies = [
  "artifactory-world",
  "bytes",
  "crc32fast",
- "example-common",
  "fictionet",
  "fictionet-demo",
  "fictionet-extras",
@@ -1021,7 +996,6 @@ dependencies = [
  "border-world",
  "bytes",
  "crc32fast",
- "example-common",
  "fictionet",
  "fictionet-demo",
  "fictionet-extras",
@@ -1131,7 +1105,6 @@ dependencies = [
  "border-world",
  "bytes",
  "crc32fast",
- "example-common",
  "fakewiki-world",
  "fatfs",
  "fictionet",
@@ -1167,7 +1140,6 @@ dependencies = [
  "arc-swap",
  "bytes",
  "crc32fast",
- "example-common",
  "fictionet",
  "fictionet-demo",
  "fictionet-extras",
@@ -1193,6 +1165,7 @@ dependencies = [
 name = "fictionet-extras"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "brotli",
  "bytes",
  "fictionet",
@@ -1203,19 +1176,25 @@ dependencies = [
  "http-body",
  "http-body-util",
  "httparse",
+ "hyper",
  "include_dir",
  "kuchiki",
  "percent-encoding",
+ "quick-xml",
  "redb",
  "regex",
  "reqwest",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
+ "tar",
  "time",
  "tokio",
  "tower-service",
  "url",
+ "xz2",
+ "zip",
  "zstd",
 ]
 
@@ -1226,7 +1205,6 @@ dependencies = [
  "arc-swap",
  "bytes",
  "crc32fast",
- "example-common",
  "fakewiki-world",
  "fictionet",
  "fictionet-demo",
@@ -1336,7 +1314,6 @@ dependencies = [
  "arc-swap",
  "bytes",
  "crc32fast",
- "example-common",
  "fictionet",
  "fictionet-demo",
  "fictionet-extras",
@@ -1365,7 +1342,6 @@ dependencies = [
  "arc-swap",
  "bytes",
  "crc32fast",
- "example-common",
  "fictionet",
  "fictionet-demo",
  "fictionet-extras",
@@ -1394,8 +1370,8 @@ dependencies = [
  "axum",
  "bytes",
  "divan",
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-host",
  "fictionet-observe",
  "http",
@@ -1415,8 +1391,8 @@ name = "fictionet-web-world-demo"
 version = "0.1.0"
 dependencies = [
  "axum",
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "rustls",
 ]
 
@@ -3310,8 +3286,8 @@ dependencies = [
 name = "scan-world"
 version = "0.0.0"
 dependencies = [
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "http",
  "serde",
@@ -4298,8 +4274,8 @@ name = "wasm-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "http",
  "http-body-util",
@@ -4336,7 +4312,6 @@ name = "web-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "example-common",
  "fictionet",
  "fictionet-extras",
  "fictionet-host",

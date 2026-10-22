@@ -84,7 +84,7 @@ pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> 
     );
     let _access = fictionet_demo::kit::PageAccess::new(page.url())?;
     let mut input = Input::stdin(Story::Once, Some(screen))?;
-    let audit = Arc::new(example_common::guest_content::Audit::default());
+    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
         audit.clone(),

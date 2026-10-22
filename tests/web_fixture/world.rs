@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use fictionet::Result;
 use fictionet_test_support::web_fixture::world;
 
-use example_common::web_world;
+use fictionet_extras::web_world;
 
 fn main() -> Result {
     let args: Vec<String> = std::env::args().collect();

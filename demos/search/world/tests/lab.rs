@@ -66,7 +66,7 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
             let start = web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed, start)?;
             let tls = world.ca.config(&cx, "forwarded.com")?.0;
-            let log = Arc::new(example_common::log::Log::new(
+            let log = Arc::new(fictionet_extras::log::Log::new(
                 Box::new(std::io::sink()),
                 &[],
                 |s| s,
@@ -183,7 +183,7 @@ fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
         move |cx| async move {
             let start = web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed, start)?;
-            let log = Arc::new(example_common::log::Log::new(
+            let log = Arc::new(fictionet_extras::log::Log::new(
                 Box::new(std::io::sink()),
                 &[],
                 |s| s,

@@ -195,7 +195,7 @@ from the checked-in lock file on this Linux build.
 | Direct dependency | Version |
 |---|---|
 | `bytes` | 1.12.1 |
-| `example-common` | 0.0.0, local path |
+| `fictionet-extras` | 0.0.0, local path |
 | `fictionet` | 0.1.0, local path |
 | `http` | 1.5.0 |
 | `ring` | 0.17.14 |

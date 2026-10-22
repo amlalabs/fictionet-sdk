@@ -10,9 +10,9 @@ use crate::{
     repository::{Label, Site},
     ssrf,
 };
-use example_common::names::parse;
 use fictionet::events::Event;
 use fictionet::stdlib::{codec::base64, protocols::json::Value as J};
+use fictionet_extras::names::parse;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -365,8 +365,8 @@ impl Request {
         };
         // The log's scan rule, including its fallback for answers before the handler.
         let mut scan = json!({
-            "ssrf": example_common::events::js(e.get("ssrf")),
-            "ssrf_scan": example_common::events::js(e.get("ssrf_scan")),
+            "ssrf": fictionet_extras::events::js(e.get("ssrf")),
+            "ssrf_scan": fictionet_extras::events::js(e.get("ssrf_scan")),
         });
         events::scan(e, &mut scan);
         Some(Self {

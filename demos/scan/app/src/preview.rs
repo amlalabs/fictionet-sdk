@@ -103,7 +103,7 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
     let mut input = kit::preview::Input::stdin(kit::preview::Story::Once, None)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
-    let audit = Arc::new(example_common::guest_content::Audit::default());
+    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let output = audit.clone();
     let world = std::thread::spawn(move || {
         fictionet::block_on(fictionet::run(

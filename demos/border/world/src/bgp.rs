@@ -11,7 +11,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use example_common::events::field;
 use fictionet::Cx;
 use fictionet::events::{ConnInfo, Event};
 use fictionet::stdlib::codec::{Fail, Frames, Wire};
@@ -23,6 +22,7 @@ use fictionet::stdlib::protocols::bgp::{
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::services::serve::{self, Driver, Flow, ServeOptions, Service, Timer};
 use fictionet::time::Duration;
+use fictionet_extras::events::field;
 use serde_json::json;
 use std::convert::Infallible;
 

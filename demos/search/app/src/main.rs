@@ -9,8 +9,8 @@ mod guest;
 mod preview;
 use fictionet_search_demo::{network, page};
 
-use example_common::log::Log;
 use fictionet_demo::kit::{self, Kit};
+use fictionet_extras::log::Log;
 use std::{fs::File, path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Addresses, Ca, World,

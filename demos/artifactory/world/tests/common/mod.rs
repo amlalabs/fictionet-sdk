@@ -63,7 +63,7 @@ where
     let buf = Buf::default();
     let log = Log::start(Box::new(buf.clone())).unwrap();
     let output = log.clone();
-    let audit = Arc::new(example_common::guest_content::Audit::default());
+    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let memory = Arc::new(fictionet_observe::Memory::default());
     fictionet_test_support::harness::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(

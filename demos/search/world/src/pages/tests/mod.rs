@@ -16,7 +16,7 @@ trait Logged {
 }
 impl Logged for Response {
     fn logged(&self) -> Value {
-        example_common::events::js(Some(&self.fields().to_json()))
+        fictionet_extras::events::js(Some(&self.fields().to_json()))
     }
 }
 

@@ -17,8 +17,8 @@ use artifactory_world::packages::{Variant, private_seed};
 use artifactory_world::repository::Contents;
 use artifactory_world::repository::Sessions;
 use artifactory_world::{Identity, Result};
-use example_common::args::{Args, configuration, unknown};
-use example_common::names::{name, parse};
+use fictionet_extras::args::{Args, configuration, unknown};
+use fictionet_extras::names::{name, parse};
 
 fn main() {
     if let Err(e) = serve() {

@@ -8,10 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The world's command line.
 pub struct Args {
+    /// Unix socket for guest attachments.
     pub socket: String,
+    /// Optional observation server socket.
     pub observation: Option<PathBuf>,
+    /// Directory for certificates trusted by guests.
     pub ca_dir: PathBuf,
+    /// Directory for durable world state and logs.
     pub state_dir: PathBuf,
+    /// File written when the world accepts attachments.
     pub ready: PathBuf,
 }
 

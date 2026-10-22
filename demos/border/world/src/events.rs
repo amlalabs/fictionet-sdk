@@ -33,7 +33,7 @@ use crate::scenario::{Scenario, public_address};
 /// The sources of the events [`line()`] makes lines of.
 pub const LOGGED: [&str; 7] = ["net", "dns", "tls", "http", "bgp", "path", "border"];
 
-use example_common::events::{js, sandbox};
+use fictionet_extras::events::{js, sandbox};
 
 /// The log line for `e`, if it gets one.
 pub fn line(scenario: &Scenario, e: &Event) -> Option<Value> {
@@ -47,7 +47,7 @@ pub fn line(scenario: &Scenario, e: &Event) -> Option<Value> {
         // The path's own facts, `unreachable` among them, keep the addresses
         // the packet named.
         ("path" | "border", _) => Some(world(e, json!({"type": e.kind}))),
-        _ => example_common::events::line(e),
+        _ => fictionet_extras::events::line(e),
     }?;
     if matches!(e.source, "tls" | "http" | "net") {
         public_addresses(&mut line);
@@ -104,12 +104,12 @@ fn tls(scenario: &Scenario, e: &Event) -> Value {
         "identity": identity,
     });
     let fields = line.as_object_mut().expect("an object");
-    example_common::events::tls_outcome(e, fields);
+    fictionet_extras::events::tls_outcome(e, fields);
     line
 }
 
 fn http(e: &Event) -> Value {
-    let (names, ua) = example_common::events::request_headers(e);
+    let (names, ua) = fictionet_extras::events::request_headers(e);
     let answer = e
         .str("answer")
         .filter(|a| {

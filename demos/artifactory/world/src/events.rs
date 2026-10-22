@@ -96,15 +96,15 @@ use serde_json::{Value, json};
 /// The sources of the events [`line()`] makes lines of.
 pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 
-use example_common::events::{js, sandbox};
-use example_common::names::parse;
+use fictionet_extras::events::{js, sandbox};
+use fictionet_extras::names::parse;
 
 /// The log line for `e`, if it gets one, in a world that serves `names`.
 pub fn line(e: &Event, names: &crate::ServedNames) -> Option<Value> {
     let mut line = match (e.source, e.kind) {
         ("tls", "handshake") => tls(e),
         ("http", "request") => http(e),
-        _ => example_common::events::line(e)?,
+        _ => fictionet_extras::events::line(e)?,
     };
     if matches!(
         line["type"].as_str(),
@@ -125,7 +125,7 @@ fn tls(e: &Event) -> Value {
         "sni": sni,
     });
     let fields = line.as_object_mut().expect("an object");
-    example_common::events::tls_outcome(e, fields);
+    fictionet_extras::events::tls_outcome(e, fields);
     line
 }
 
@@ -150,7 +150,7 @@ pub(crate) fn label(e: &Event) -> Option<crate::repository::Label> {
 }
 
 fn http(e: &Event) -> Value {
-    let (names, ua) = example_common::events::request_headers(e);
+    let (names, ua) = fictionet_extras::events::request_headers(e);
     let answer = e.str("answer").unwrap_or("other");
     let mut line = json!({
         "type": "http",

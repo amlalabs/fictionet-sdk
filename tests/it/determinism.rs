@@ -1,6 +1,6 @@
 //! The same closed world repeats its event bytes and every agent packet.
 
-use example_common::hyper_io::Io;
+use fictionet_extras::hyper_io::Io;
 
 use std::convert::Infallible;
 use std::future::Future;

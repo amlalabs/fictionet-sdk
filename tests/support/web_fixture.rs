@@ -1,7 +1,7 @@
 //! The web fixture and its recorded client report.
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use example_common::web_world;
+use fictionet_extras::web_world;
 use fictionet::Result;
 use fictionet::stdlib::web;
 use rustls::pki_types::PrivateKeyDer;

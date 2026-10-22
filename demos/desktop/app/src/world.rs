@@ -1,10 +1,10 @@
 //! The desktop sites and Firefox request observer.
-use example_common::web_world::SHARED;
-use example_common::zscaler::{DEFAULT_CLOUD, zscaler};
 use fictionet::stdlib::web;
 use fictionet::{Cx, Result};
 use fictionet_demo::kit;
 use fictionet_extras::models;
+use fictionet_extras::web_world::SHARED;
+use fictionet_extras::zscaler::{DEFAULT_CLOUD, zscaler};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 

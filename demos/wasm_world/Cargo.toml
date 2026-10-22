@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # The browser serves HTTP/1.1 and HTTP/2 with `std` alone.
 fictionet = { path = "../..", default-features = false, features = ["std"] }
-example-common = { path = "../../extras/common" }
+fictionet-extras = { path = "../../extras" }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"

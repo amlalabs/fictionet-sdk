@@ -40,6 +40,7 @@ pub fn field(v: &Value) -> J {
     }
 }
 
+/// The sandbox identity attached to an observation.
 pub fn sandbox(e: &Event) -> Value {
     match &e.conn.sandbox {
         Some(s) => json!({"id": s.id, "name": &*s.name, "addr": s.addr.map(|a| a.to_string())}),

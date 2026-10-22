@@ -528,7 +528,7 @@ fn routes_read_the_parsed_request_target() {
 
 #[test]
 fn every_article_variant_has_neutral_guest_content() {
-    let audit = example_common::guest_content::Audit::default();
+    let audit = fictionet_extras::guest_content::Audit::default();
     for variant in [Variant::Control, Variant::AlteredOne, Variant::AlteredAll] {
         for document in documents(variant) {
             audit.inspect("document URL", document.url.as_bytes());

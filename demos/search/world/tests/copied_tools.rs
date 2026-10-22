@@ -1,6 +1,6 @@
-use example_common::log::Log;
 use fictionet::stdlib::web::httpd::{Exchange, Handler, Reply};
 use fictionet::{events::Fanout, stdlib::web::Body};
+use fictionet_extras::log::Log;
 use fictionet_extras::models::{Model, Provider};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};

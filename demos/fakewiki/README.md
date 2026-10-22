@@ -404,7 +404,7 @@ Keep the socket outside the agent's filesystem. See
 ## Layout
 
 ```
-extras/common/log.rs      # shared log.jsonl writer
+extras/src/log.rs      # shared log.jsonl writer
 demos/fakewiki/
   compose.yaml              # world, attach, default (the agent)
   docker/Dockerfile         # build, world, attach, agent

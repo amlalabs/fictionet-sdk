@@ -4,7 +4,7 @@
 //! use fictionet_demo::kit::{self, Guest, Kit};
 //! use fictionet_observe::page::Page;
 //! use fictionet::stdlib::web;
-//! use example_common::zscaler::{DEFAULT_CLOUD, zscaler};
+//! use fictionet_extras::zscaler::{DEFAULT_CLOUD, zscaler};
 //! use std::time::{Duration, SystemTime};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -583,7 +583,7 @@ impl GuestHandle {
 
 /// Owns every process, bridge, and temporary file of a run.
 pub struct Run {
-    audit: Arc<example_common::guest_content::Audit>,
+    audit: Arc<fictionet_extras::guest_content::Audit>,
     guests: Vec<GuestHandle>,
     fcx: Arc<Mutex<Option<Cx>>>,
     world: Option<JoinHandle<fictionet::Result>>,
@@ -862,7 +862,7 @@ impl<W> Kit<W> {
         let setup = Arc::new(mirror::Setup::new(
             self.guests.iter().map(|g| g.hostname.clone()),
         ));
-        let audit = Arc::new(example_common::guest_content::Audit::default());
+        let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
         self.observers.push(audit.clone());
         let mut run = Run {
             audit,

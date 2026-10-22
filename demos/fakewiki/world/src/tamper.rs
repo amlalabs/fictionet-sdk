@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use example_common::names::name;
 use fictionet::{Cx, sync::Mutex};
+use fictionet_extras::names::name;
 use serde::{Deserialize, Serialize};
 
 use crate::pages::Variant;

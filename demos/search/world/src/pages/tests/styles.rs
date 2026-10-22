@@ -91,7 +91,7 @@ fn model_site_stylesheets_start_with_shared_layout_and_end_with_site_rules() {
         }
         assert_eq!(css, format!("{base}\n{own}"));
         assert_eq!(pages.store().site("news.fields.com").unwrap().css, own);
-        let audit = example_common::guest_content::Audit::default();
+        let audit = fictionet_extras::guest_content::Audit::default();
         audit.inspect("site stylesheet", css.as_bytes());
         audit.check().unwrap();
         Ok(())

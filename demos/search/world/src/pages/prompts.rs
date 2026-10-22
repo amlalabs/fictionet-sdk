@@ -132,8 +132,8 @@ fn calendar(seed: &Seed) -> String {
 /// Words and names no page may contain, in any case, URLs included: the
 /// guest content check's list.
 fn banned() -> String {
-    let words = example_common::guest_content::WORDS.join(", ");
-    let names = example_common::guest_content::NAMES.join(", ");
+    let words = fictionet_extras::guest_content::WORDS.join(", ");
+    let names = fictionet_extras::guest_content::NAMES.join(", ");
     format!(
         "Before answering, check every field, including URLs, titles, snippets, claims, \
          code and body. Never write these exact words, in any capitalization: {words}. \

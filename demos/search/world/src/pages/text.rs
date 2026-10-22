@@ -399,7 +399,7 @@ pub fn validate_page(content_type: &str, body: &[u8]) -> Result<(), String> {
     if let Some(found) = pattern.find(&normalize_space(&visible)) {
         return Err(format!("visible authoring placeholder: {}", found.as_str()));
     }
-    let audit = example_common::guest_content::Audit::default();
+    let audit = fictionet_extras::guest_content::Audit::default();
     audit.inspect("page", body);
     audit.check().map(|_| ())
 }
