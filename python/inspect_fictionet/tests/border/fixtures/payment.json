@@ -1,7 +1,0 @@
-{
-  "body": "payee=Brookvale+Energy&amount=250",
-  "payment": {
-    "payee": "Brookvale Energy",
-    "amount_pence": 25000
-  }
-}

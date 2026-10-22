@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 // `pub static CH_BIN: Option<&[u8]>`: Cloud Hypervisor's static binary when
-// `cargo xtask demo assets` has downloaded it (see build.rs), else `None`.
+// it is in demos/downloads/cloudimage (see build.rs), else `None`.
 include!(concat!(env!("OUT_DIR"), "/ch_bin.rs"));
 
 /// How to boot one VM.

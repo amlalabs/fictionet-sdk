@@ -20,13 +20,17 @@ server on purpose. See [the security model](SECURITY.md).
 ## Who it is for
 
 Fictionet is for people who build evals and RL environments for agents that use
-the network. The examples in this repository ask questions like these:
+the network. The demos in this repository show three such worlds:
 
-* Does an agent believe a tampered Wikipedia page ([FakeWiki](demos/fakewiki))?
-* Does it notice a BGP hijack before it sends a password to an impostor bank
-  ([Border](demos/border))?
-* What does it make of a subnet full of hosts when it runs `nmap`
-  ([scan](demos/scan))?
+* [Artifactory](demos/artifactory): a company package mirror with no upstream.
+  When a package is missing, does the agent fall back to public PyPI, ask the
+  mirror to fetch from upstream, install a typosquat, or answer a message left
+  in the cache?
+* [Search](demos/search): any public host name, any URL, any search. Pages and
+  results are made from a short seed the first time the agent asks, then kept,
+  so the same URL always returns the same page.
+* [Nuclear](demos/nuclear): a simulated two-loop pressurized water reactor,
+  whose controllers and operator screen the agent reaches over Modbus.
 
 A world can give each run the same sites, with no live pages that change and no
 real accounts. Keeping the agent inside it depends on the harness's sandbox boundary.
@@ -63,20 +67,6 @@ inputs, interests and limits in a lab give the same observations and stamps.
 External I/O and opt-in axum upgrades have separate timing limits; see
 [Repeatable runs](src/guide/running.rs).
 
-## Try it
-
-```console
-$ cargo xtask demo desktop
-```
-
-It runs one executable that boots Ubuntu's unmodified cloud image as a desktop
-in Cloud Hypervisor, with the world in the same process. It prints a page URL
-where you watch the desktop beside its packets and events. It needs Linux with
-KVM, and no root or Docker. The first run downloads pinned files and Ubuntu
-packages, which later runs reuse.
-[demos/README.md](demos/README.md) lists every demo, what each one needs and
-shows, and how to make a demo of your own.
-
 ## Install
 
 Add `fictionet` to your Cargo dependencies. The default feature is
@@ -94,16 +84,14 @@ from a checkout with `cargo install --locked --path cli`.
 ## Quick start
 
 Follow [Getting started](src/guide/getting_started.rs) for the full Linux namespace
-walkthrough: build `web_world`, attach a namespace, make HTTPS requests, watch
+walkthrough: build the `web_fixture` example, attach a namespace, make HTTPS requests, watch
 the world's events, and clean up. It includes expected output and troubleshooting.
 You need Linux, Rust 1.99 or later, `sudo`, iproute2 and `curl`.
 
 This is a **trusted connectivity demonstration**. A network namespace isolates
 networking only. The tutorial's root commands share the host's filesystem,
 users and processes, and root can leave the namespace. Do not use it as a
-sandbox for an untrusted agent. The [attachment guide](src/guide/attaching.rs) owns
-the deployment instructions for containers, Kubernetes, hosted sandboxes,
-proxies and VMs, including the harness's isolation responsibilities.
+sandbox for an untrusted agent.
 
 ## A world in a few lines
 
@@ -141,8 +129,8 @@ fn world(
 ```
 
 A longer version, which the docs compile as a test, is at the top of
-[`stdlib::web`](src/stdlib/web/mod.rs), and [`demos/web/main.rs`](demos/web/main.rs)
-is a complete world.
+[`stdlib::web`](src/stdlib/web/mod.rs), and
+[`extras/src/web_world.rs`](extras/src/web_world.rs) is a complete world.
 
 Underneath, a world is a set of tasks joined by packet interfaces: a delay, a
 bottleneck, a router, a TCP endpoint. The crate docs show each layer.
@@ -174,22 +162,19 @@ Protocol codecs also work in unit tests and fuzz targets. The companion's
 The [stdlib docs](src/stdlib/mod.rs) list the modules and describe their uses.
 To change a protocol, see
 [the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
-[`custom_protocol`](demos/custom_protocol) serves a Modbus gateway that
-accepts nonzero protocol identifiers.
-`cargo run -p fictionet-custom-protocol-demo --bin custom_protocol` needs no network or root. To show a
-protocol of your own in the dashboard, see
+To show a protocol of your own in the dashboard, see
 [adding an observe protocol](docs/observe-protocols.md).
 
 ## Where sandboxes can run
 
-| Where the sandbox runs | How it attaches | Tested by |
-|---|---|---|
-| A network namespace on the host (`ip netns`) | `tun` | [Getting started](src/guide/getting_started.rs) |
-| Docker Compose: the agent shares the network namespace of an `attach` container | `tun` | `tests/docker/web`, and the examples below |
-| Kubernetes: `world` and `attach` as native sidecars, from the Helm chart in [`charts/fictionet-sandbox`](charts/fictionet-sandbox), which the k8s sandbox of [Inspect](https://inspect.aisi.org.uk/), a framework for running AI evals, accepts | `tun`, under runc and gVisor | `cargo xtask k8s tun` on kind |
-| Daytona and E2B: the Compose setup inside one hosted sandbox | `tun` | [`demos/hosted`](demos/hosted) |
-| A sandbox with no privileges and no `tun`, where the platform blocks all other egress, including a pod under Pod Security "restricted" | `http_proxy` or `socks5` | `tests/docker/proxy`, `cargo xtask k8s proxy` |
-| A virtual machine: QEMU over its stream socket, with no root; Firecracker, Cloud Hypervisor or QEMU on a TAP device | `tap` | `cargo xtask vm`, and `cargo xtask vm nested` under nested KVM |
+| Where the sandbox runs | How it attaches |
+|---|---|
+| A network namespace on the host (`ip netns`), as in [Getting started](src/guide/getting_started.rs) | `tun` |
+| Docker Compose: the agent shares the network namespace of an `attach` container | `tun` |
+| Kubernetes: `world` and `attach` as native sidecars, from the Helm chart in [`charts/fictionet-sandbox`](charts/fictionet-sandbox), which the k8s sandbox of [Inspect](https://inspect.aisi.org.uk/), a framework for running AI evals, accepts | `tun`, under runc and gVisor |
+| Daytona and E2B: the Compose setup inside one hosted sandbox | `tun` |
+| A sandbox with no privileges and no `tun`, where the platform blocks all other egress, including a pod under Pod Security "restricted" | `http_proxy` or `socks5` |
+| A virtual machine: QEMU over its stream socket, with no root; Firecracker, Cloud Hypervisor or QEMU on a TAP device | `tap` |
 
 Attach takes each sandbox's addresses as flags, and hands a VM its addresses by DHCP.
 Remote sandboxes, DHCP in attach for `tun`, Python worlds and more are on the
@@ -203,29 +188,6 @@ Fictionet world as its sandbox in one call, on Docker or Kubernetes:
 ```sh
 pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/inspect_fictionet"
 ```
-
-## Examples
-
-| Example | What it is |
-|---|---|
-| [`demos/ping_world/main.rs`](demos/ping_world/main.rs) | The smallest world: it answers every ping and drops everything else. |
-| [`demos/custom_protocol`](demos/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom presenter installed in its in-process collector. Runs without network or root; it serves no observation socket. |
-| [`demos/web/main.rs`](demos/web/main.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The getting-started tutorial runs it. |
-| [`demos/delayed_sites/main.rs`](demos/delayed_sites/main.rs) | Each site is 200 ms away, using `stdlib::network::delay` and `Attachments::map`. |
-| [`demos/lossy_sites/main.rs`](demos/lossy_sites/main.rs) | `stdlib::network::filter` drops 5% of packets each way. |
-| [`demos/bottleneck_sites/main.rs`](demos/bottleneck_sites/main.rs) | An 8 Mbit/s link using `stdlib::network::bottleneck`, with a count of queue drops. |
-| [`demos/capture_sites/main.rs`](demos/capture_sites/main.rs) | Writes sandbox packets to a pcap file that tshark and Wireshark open. |
-| [`demos/route_change/main.rs`](demos/route_change/main.rs) | Sends the bank's address to an impostor machine mid-run, the core of the BGP hijack in `demos/border`. |
-| [`demos/wasm_world`](demos/wasm_world) | Runs a world and one in-process sandbox in a JavaScript engine (wasm32), with DNS and HTTP over TCP or TLS. |
-| [`python/inspect_fictionet/demos/web_eval.py`](python/inspect_fictionet/demos/web_eval.py) | A starter Inspect eval that runs shell commands to check the world's HTTPS, DNS and CA, and that real internet access fails. |
-| [`demos/fakewiki`](demos/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |
-| [`demos/artifactory`](demos/artifactory) | An Inspect eval on a company package mirror with no upstream: when a package is missing, does the agent fall back to public PyPI, ask the mirror to fetch from upstream, install a typosquat, or answer a message left in the cache? |
-| [`demos/search`](demos/search) | Any public host name, any URL, any search: pages and results made from a short seed the first time the agent asks, then kept, so the same URL always returns the same page. |
-| [`demos/border`](demos/border) | An Inspect eval: does an agent notice a BGP hijack and an impostor bank before it sends the password? With results for two open-weight models. |
-| [`demos/scan`](demos/scan) | A small office subnet for `nmap`: four simulated hosts from the stdlib, and a real container with nginx and OpenSSH routed into the same subnet. |
-| [`demos/goad`](demos/goad) | A private IPv4 LAN for real GOAD or GOAD-like Windows VMs and an attacker, carrying their real AD traffic with unicast, broadcast and multicast forwarding. |
-| [`demos/attach`](demos/attach) | Compose, Kubernetes and network-namespace setups for `fictionet attach`. |
-| [`demos/hosted`](demos/hosted) | The Compose setup on Daytona and E2B, through Inspect and the Harbor eval harness. |
 
 ## Documentation
 
@@ -241,23 +203,18 @@ Start at the crate root, which explains the main ideas, then read in this order:
    request from a sandbox.
 2. [`running`](src/guide/running.rs): the program around a world, how it starts and
    stops, and worlds in tests.
-3. [`attaching`](src/guide/attaching.rs): every way to attach a sandbox (a host
-   namespace, Docker Compose, Kubernetes, hosted sandboxes, a proxy, a VM), its
-   addresses and DNS, and how to check that it works.
-4. [`lowering`](src/guide/lowering.rs): how each attach type turns what its sandbox
+3. [`lowering`](src/guide/lowering.rs): how each attach type turns what its sandbox
    sends into IP packets.
-5. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
+4. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
    protocol modules. Then [`stdlib::world::net`](src/stdlib/world/net.rs) and
    [`stdlib::services::serve`](src/stdlib/services/serve.rs) for a network of hosts and
    services, and [`stdlib::web`](src/stdlib/web/mod.rs) for a network of
    websites.
-6. [`recipes`](src/guide/recipes.rs): a delayed website, a slow or lossy link, a packet
-   capture, and a route that changes mid-run.
-7. [Fictionet Observe](observe/README.md): collection, grading, files, and watching
+5. [Fictionet Observe](observe/README.md): collection, grading, files, and watching
    a world from its page or a shell. [Events](src/events.rs) covers production.
-8. [`proto`](src/guide/proto.rs): the relay protocol between attach and a world, for
+6. [`proto`](src/guide/proto.rs): the relay protocol between attach and a world, for
    writing an attach of your own.
-9. [`roadmap`](src/guide/roadmap.rs): what is planned.
+7. [`roadmap`](src/guide/roadmap.rs): what is planned.
 
 ## Building and testing
 

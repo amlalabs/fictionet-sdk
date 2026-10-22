@@ -280,8 +280,7 @@
 //!   [`subnet`](Sites::subnet) changes either one. A DHCP server hands out
 //!   IPv4 addresses to sandboxes that ask for one, such as a test, or a VM
 //!   attached with `fictionet attach --type tap` and no IPv4 address flags,
-//!   whose DHCP then goes to the world (see
-//!   [The VM's addresses](fictionet::guide::attaching#the-vms-addresses)). Attach sets a `tun` sandbox's
+//!   whose DHCP then goes to the world. Attach sets a `tun` sandbox's
 //!   addresses itself, from `--ip-addr` and `--ip-addr-v6`, and runs no
 //!   DHCP client. A sandbox with a fixed address is known by the source
 //!   address of its first packet. Either way, the router gets a `/32` or
@@ -385,8 +384,7 @@
 //!
 //! The network `Sites` builds is dual-stack, as most of the real internet
 //! is. A sandbox attached with IPv6 reaches every site over either family.
-//! These are its attach flags ([Addresses](fictionet::guide::attaching#addresses)
-//! explains each one):
+//! These are its attach flags:
 //!
 //! ```text
 //! fictionet attach --world unix:/run/fictionet/world.sock --name agent --type tun \
@@ -530,16 +528,11 @@
 //! A handler can add its own fields to its request's event. It puts
 //! [`Fields`](fictionet::events::Fields) in the extensions of the
 //! response it returns. Response extensions are never sent to the agent.
-//! The FakeWiki eval in `demos/fakewiki` puts the kind and stance of
-//! each page there, so one log line holds what the agent asked for and what
-//! it was shown.
 //!
 //! Events do not hold packets or bodies. A world that wants every packet
 //! puts a [`filter`](fictionet::stdlib::network::filter) between each sandbox and
 //! `Sites`, as [Changing the network around the
-//! sites](#changing-the-network-around-the-sites) shows. The
-//! [packet capture recipe](fictionet::guide::recipes#packet-capture) writes them all
-//! to a pcap file.
+//! sites](#changing-the-network-around-the-sites) shows.
 //!
 //! # Details
 //!
@@ -624,9 +617,7 @@
 //! `Sites` sees each sandbox through its delay, under the same name, and
 //! binds its addresses and reports its events as usual. The same works with
 //! [`bottleneck`](fictionet::stdlib::network::bottleneck) for a slow link, and with
-//! [`filter`](fictionet::stdlib::network::filter) to watch or drop packets. The
-//! [recipes](fictionet::guide::recipes) run each of these, with a route that changes
-//! mid-run, and show what the sandbox sees.
+//! [`filter`](fictionet::stdlib::network::filter) to watch or drop packets.
 //!
 //! [`Sites::into_net`] gives the [`fictionet::stdlib::world::net::Net`] before
 //! it starts, to add hosts with other services next to the websites.

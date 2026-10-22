@@ -75,8 +75,7 @@ corednsImage: ""
 # fictionet attach, for every service. A service's own `attach` overrides
 # these, key by key.
 attach:
-  # An image with the static `fictionet` binary at /fictionet, built
-  # from deploy/Dockerfile (target attach). Required.
+  # An image with the static `fictionet` binary at /fictionet. Required.
   image: ""
   imagePullPolicy: IfNotPresent
   # tun, http_proxy or socks5. tun uses NET_ADMIN, MKNOD and DAC_OVERRIDE
@@ -105,8 +104,8 @@ attach:
   # 8080 for http_proxy, 1080 for socks5.
   port: 0
   # Proxy types: the user attach runs as. It must be allowed to open the
-  # world's socket, so the world's user: 65532 in the images that
-  # deploy/Dockerfile builds. 0 runs attach as root, for a world that runs
+  # world's socket, so the world's user: 65532 in the published
+  # images. 0 runs attach as root, for a world that runs
   # as root. Pod Security "restricted" refuses that.
   runAsUser: 65532
   extraArgs: []

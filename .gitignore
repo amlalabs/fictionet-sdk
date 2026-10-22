@@ -1,5 +1,4 @@
-# Build output, here and in the examples' own packages, and the images and
-# binaries `cargo xtask demo assets` downloads
+# Build output, and the images and binaries the demos download
 target/
 /demos/downloads/
 /observe/downloads/
@@ -11,4 +10,3 @@ logs/
 # Secrets and local state
 .env
 /.aws
-/.vm

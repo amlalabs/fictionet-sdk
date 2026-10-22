@@ -23,15 +23,15 @@
 //! With no request it prints the graph once. `watch` follows graph changes
 //! and events. `fictionet observe --help` lists the requests.
 //!
-//! To try `web_world` without root, build both programs from the workspace
+//! To try `web_fixture` without root, build both programs from the workspace
 //! root. Use the target directory set for your build:
 //!
 //! ```sh
-//! cargo build --locked -p fictionet-web-world-demo --bin web_world -p fictionet-cli --bin fictionet
+//! cargo build --locked -p fictionet --features fictionet/web-proxy,fictionet/tokio --example web_fixture -p fictionet-cli --bin fictionet
 //! bin="${CARGO_TARGET_DIR:-target}/debug"
 //! work=$(mktemp -d /tmp/fictionet-observe.XXXXXX)
 //! (umask 077; openssl rand -hex 32 > "$work/proxy-token")
-//! "$bin/web_world" "$work/world.sock" "$work/ca.pem" "$work/observe.sock" > "$work/world.log" 2>&1 &
+//! "$bin/examples/web_fixture" "$work/world.sock" "$work/ca.pem" "$work/observe.sock" > "$work/world.log" 2>&1 &
 //! world_pid=$!
 //! ```
 //!
@@ -48,7 +48,7 @@
 //! ```
 //!
 //! Find the edge whose `b` node is the `agent` sandbox. In this run it was
-//! `e13`. Start its packet stream before making requests: `web_world` uses
+//! `e13`. Start its packet stream before making requests: `web_fixture` uses
 //! [`DashboardOptions::default()`], which captures links on demand.
 //!
 //! ```sh
@@ -72,8 +72,7 @@
 //! "$bin/fictionet" observe --observation "unix:$work/observe.sock" pcap e13 > "$work/agent.pcapng"
 //! ```
 //!
-//! The [proxy guide](fictionet::guide::attaching#behind-a-proxy-http_proxy-and-socks5)
-//! describes authentication and client settings. Stop only the processes
+//! Stop only the processes
 //! started in this shell, using their saved PIDs:
 //!
 //! ```sh
@@ -98,7 +97,7 @@
 //!
 //! # What the drawing shows
 //!
-//! This drawing shows `web_world` with one sandbox, `agent`, fetching pages:
+//! This drawing shows `web_fixture` with one sandbox, `agent`, fetching pages:
 //!
 #![doc = include_str!("../../docs/diagrams/dashboard.svg")]
 //!

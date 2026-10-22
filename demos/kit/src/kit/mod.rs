@@ -838,9 +838,8 @@ impl<W> Kit<W> {
         ] {
             if !downloads.join(file).is_file() {
                 return Err(io::Error::other(format!(
-                    "missing {}; run cargo xtask demo {}",
-                    downloads.join(file).display(),
-                    self.name
+                    "missing {}",
+                    downloads.join(file).display()
                 )));
             }
         }
@@ -936,7 +935,7 @@ where
     F: Future<Output = fictionet::Result> + Send + 'static,
 {
     /// Boots all guests and returns once every SSH session is ready.
-    /// Missing downloads report the corresponding `cargo xtask demo` command.
+    /// A missing download is reported by its path.
     pub async fn boot(mut self, downloads: impl AsRef<Path>) -> io::Result<Run> {
         let downloads = downloads.as_ref();
         self.check_downloads(downloads)?;

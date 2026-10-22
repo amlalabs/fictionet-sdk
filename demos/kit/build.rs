@@ -1,5 +1,4 @@
-//! Embeds the files `cargo xtask demo assets` downloads to
-//! `downloads/cloudimage` when they are there, so a workspace build without
+//! Embeds the files in `downloads/cloudimage` when they are there, so a workspace build without
 //! them still compiles.
 //! Cloud Hypervisor's static binary becomes `OUT_DIR/ch_bin.rs`, `None`
 //! without it, so the shared kit can run it from memory with nothing
@@ -21,7 +20,7 @@ fn main() {
              pub static CH_BIN: Option<&[u8]> = Some(include_bytes!({ch:?}));\n"
         )
     } else {
-        "/// Set once `cargo xtask demo assets` has downloaded the binary.\n\
+        "/// Set once the binary is in demos/downloads/cloudimage.\n\
          pub static CH_BIN: Option<&[u8]> = None;\n"
             .to_string()
     };

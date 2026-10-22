@@ -1,13 +1,12 @@
-//! The sites and startup of the quick-start world, `demos/web/main.rs`.
-//! The web test's fixture, `tests/web_fixture`, serves the same world with
-//! routes of its own added.
+//! The sites and startup of the quick-start world. The web test's fixture,
+//! `tests/web_fixture`, serves it with routes of its own added.
 //!
 //! `run` takes the attachment socket, CA output and optional observation
 //! socket after the executable name. The third path installs a collector
 //! and serves its handle with `fictionet_observe::serve`:
 //!
 //! ```sh
-//! cargo run -p fictionet-web-world-demo --bin web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
+//! cargo run -p fictionet --features web-proxy,tokio --example web_fixture -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
 //! fictionet observe --observation unix:/run/fictionet/observation.sock watch
 //! ```
 //!

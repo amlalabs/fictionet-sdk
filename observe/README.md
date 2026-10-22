@@ -81,8 +81,8 @@ use the selected host or links. Services name protocols on connections;
 `Page::protocols` installs their presenters before the first watch. Unclaimed
 flows still use port and prefix matching.
 Screen and terminal consoles share the page's bearer and single-use ticket
-boundary; browser screen input also needs a host lease. Browser libraries
-are pinned and embedded by `cargo xtask demo libraries`.
+boundary; browser screen input also needs a host lease. The browser
+libraries pinned in `libraries.json` are embedded from `downloads/vendor`.
 
 The [builder example in `fictionet_observe::page`](src/page/mod.rs) is compiled
 by `cargo test --doc --all-features`. It shows hosts, state, tables, event

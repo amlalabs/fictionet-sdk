@@ -9,7 +9,7 @@ import yaml
 from inspect_fictionet import fictionet_sandbox
 
 
-@pytest.mark.parametrize("name", ["border", "fakewiki", "web", "artifactory"])
+@pytest.mark.parametrize("name", ["web", "artifactory"])
 def test_tasks_use_isolated_shared_sandbox(name, monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     tasks = importlib.import_module(f"inspect_fictionet.worlds.{name}.tasks")
@@ -24,21 +24,6 @@ def test_tasks_use_isolated_shared_sandbox(name, monkeypatch, tmp_path):
     assert "unix:/run/relay/relay.sock" in attach["command"]
     assert not any(mount["target"] in ("/run/relay", "/var/lib/fictionet") for mount in agent.get("volumes", []))
     assert task.dataset
-
-
-def test_border_home_configuration(monkeypatch, tmp_path):
-    from inspect_fictionet.worlds.border.world import world_sandbox
-
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    config = yaml.safe_load(Path(world_sandbox("home").config).read_text())["services"]
-    assert config["world"]["image"] == "fictionet-border-world:home"
-    assert config["default"]["image"] == "fictionet-border-home:dev"
-    assert config["attach"]["hostname"] == "rw-desktop"
-    assert "--ip-addr=192.168.1.23/24" in config["attach"]["command"]
-    assert "--dns=192.168.1.1" in config["attach"]["command"]
-    assert config["attach"]["sysctls"] == {
-        f"net.ipv6.conf.{name}.disable_ipv6": 1 for name in ("all", "default", "lo")
-    }
 
 
 def test_web_model_access_and_store_are_world_only(monkeypatch, tmp_path):

@@ -2,7 +2,6 @@
 //! in this process, with the test playing QEMU: it connects to attach's
 //! socket and speaks QEMU's stream framing (a 32-bit big-endian length,
 //! then an Ethernet frame). No VM, KVM or privileges are needed.
-//! cargo xtask vm does the same with a real VM.
 
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;

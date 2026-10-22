@@ -67,22 +67,8 @@ On a system whose default target is not `x86_64-unknown-linux-gnu`, add
 `--target x86_64-unknown-linux-gnu`: the sanitizer does not work with
 musl's static libc.
 
-To build and run every target in turn for some seconds each:
-
-```sh
-cargo xtask fuzz 60 -timeout=20 -rss_limit_mb=4096
-```
-
-Run one target by hand with `cargo xtask fuzz tcp`, adding libFuzzer arguments
-after the target name.
-
-It goes on past a target that fails and lists the failures at the end.
-It fails without running any targets if `cargo fuzz list` fails or
-lists no targets.
 Every target needs a `[[bin]]` in `fuzz/Cargo.toml`. Add the `[[bin]]`
 entry directly when adding a target.
-`cargo xtask fuzz --check` checks the sources and `[[bin]]` records against
-each other.
 
 The `tcp` target processes each input without sleeping.
 

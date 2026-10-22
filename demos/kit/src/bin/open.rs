@@ -1,5 +1,5 @@
 //! Opens a demo's page in a Chromium app window: `open <file>`, with the
-//! file a run prints after `Open:`. `cargo xtask demo open <file>` runs it.
+//! file a run prints after `Open:`.
 //! It returns when the window is closed, and Ctrl-C closes the window.
 
 use std::time::Duration;

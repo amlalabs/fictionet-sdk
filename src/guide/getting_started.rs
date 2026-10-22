@@ -1,11 +1,9 @@
 //! Getting started: from `cargo build` to an HTTPS request from a sandbox.
 //!
-//! This page runs the crate's `web_world` example, a small world of websites,
+//! This page runs the crate's `web_fixture` example, a small world of websites,
 //! and attaches one sandbox to it. Everything runs on one Linux machine.
 //! Commands show the manual namespace setup. Outputs illustrate a run;
-//! timings, task ids and generated addresses can differ. The
-//! [attachment guide](crate::guide::attaching) covers deployment and a
-//! scripted namespace recipe.
+//! timings, task ids and generated addresses can differ.
 //!
 //! You need:
 //!
@@ -19,31 +17,23 @@
 //! networking only. Inside it, the only interfaces are loopback and the
 //! one attach makes, but programs still share the host's filesystem, users and processes.
 //! That is enough to show a world working. A real sandbox, such as a
-//! container (see [In Docker Compose](crate::guide::attaching#in-docker-compose)),
-//! a Kubernetes pod (see [On Kubernetes](crate::guide::attaching#on-kubernetes))
-//! or a VM, isolates the rest too. Fictionet supplies the sandbox's
+//! container, a Kubernetes pod or a VM, isolates the rest too. Fictionet supplies the sandbox's
 //! network. The harness that runs the agent supplies the rest of the
 //! sandbox, and decides what the agent may do.
-//!
-//! To try this without `sudo` on your own machine, run `cargo xtask demo web` from the
-//! repository. It boots a small Debian VM under QEMU, builds Fictionet
-//! inside it, and runs the same world and sandbox as this page there, with
-//! root inside the VM only. It needs QEMU, KVM and the host tools listed
-//! in `vm/README.md`. It needs no Docker or Rust on the host.
 //!
 //! # 1. Build
 //!
 //! From the top directory of the repository:
 //!
 //! ```text
-//! $ cargo build --locked --release -p fictionet-web-world-demo --bin web_world -p fictionet-cli --bin fictionet
+//! $ cargo build --locked --release -p fictionet --features fictionet/web-proxy,fictionet/tokio --example web_fixture -p fictionet-cli --bin fictionet
 //! ```
 //!
 //! This builds two programs. These paths assume the default target directory;
 //! if `CARGO_TARGET_DIR` is set, use that directory in place of `target`:
 //!
-//! - `target/release/web_world`, the world. It runs its local
-//!   sites on a tokio runtime and makes no upstream requests.
+//! - `target/release/examples/web_fixture`, the world. It runs its local
+//!   sites on a tokio runtime.
 //! - `target/release/fictionet`, which has the `fictionet attach` and
 //!   `fictionet observe` commands.
 //!
@@ -69,7 +59,7 @@
 //! serves its handle. Without it, this program installs no observer:
 //!
 //! ```text
-//! $ target/release/web_world /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observe.sock
+//! $ target/release/examples/web_fixture /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observe.sock
 //! listening on /run/fictionet/world.sock, CA in /run/fictionet/ca.pem
 //! ```
 //!
@@ -78,7 +68,7 @@
 //! `example.test` and `www.example.test`, with a certificate from that CA,
 //! at two addresses: `203.0.113.10` for IPv4 and `2001:db8:113::10` for
 //! IPv6. It also serves a few more sites, listed at the top of
-//! `demos/web/main.rs`: `plain.test` and `shared.test` serve plain HTTP
+//! `extras/src/web_world.rs`: `plain.test` and `shared.test` serve plain HTTP
 //! only, and `v4only.test` and `v6only.test` have only one address family. It answers every other name with "no such name" (NXDOMAIN).
 //!
 //! Leave it running. It prints `lookup <name>` the first time a sandbox
@@ -127,8 +117,7 @@
 //! servers to `/etc/netns/agent/resolv.conf`. The world is dual-stack, as
 //! most of the real internet is, so the sandbox gets both families. For a
 //! sandbox with IPv4 only, give `--no-ip-addr-v6 --no-gateway-v6
-//! --no-dns-v6` instead of the three IPv6 flags (see
-//! [Addresses](crate::guide::attaching#addresses)).
+//! --no-dns-v6` instead of the three IPv6 flags.
 //!
 //! Leave it running. It moves packets between `tun0` and the world until
 //! you stop it.
@@ -306,7 +295,7 @@
 //! Location: https://example.test/
 //! ```
 //!
-//! The observer shows the world's side. With the third argument, `web_world`
+//! The observer shows the world's side. With the third argument, `web_fixture`
 //! installs a companion observer with repeat aggregation and bounded retention.
 //! Its policy selects events, tapped packets and keys before work, with separate
 //! class budgets and one loss ledger. Sites emit DNS queries, TLS handshakes and
@@ -329,7 +318,7 @@
 //! read retained rings for the selected scope, even without an active watch.
 //! A custom presenter joins its service by protocol name; other flows use ports
 //! and byte prefixes.
-//! `web_world` serves none; `cargo xtask demo desktop` runs a world that does.
+//! `web_fixture` serves none.
 //! See [Fictionet Observe](../../../fictionet_observe/index.html) for the page,
 //! resource limits and the observation protocol.
 //!
@@ -362,16 +351,16 @@
 //! |---|---|---|
 //! | `fictionet attach: connecting to the world at /run/fictionet/world.sock: No such file or directory (os error 2)` | `ls -l /run/fictionet/world.sock` finds no socket. | The world is not running, or it listens on another path. Start the world first, or give attach `--world-wait 30` so it keeps trying while the world starts. |
 //! | `fictionet attach: connecting to the world at /run/fictionet/world.sock: Connection refused (os error 111)` | The socket file exists, but no world listens on it. A world that was killed can leave it behind. | Start the world. It removes the old socket file when it starts. |
-//! | `fictionet attach: connecting to the world at /run/fictionet/world.sock: Permission denied (os error 13). The socket belongs to the world's user, and attach may not write to it: run both as the same user, or give attach CAP_DAC_OVERRIDE` | `ls -l /run/fictionet/world.sock` shows another owner, such as `root` when the world was started with `sudo`. This happens to an attach that runs without root, such as one of the [proxy types](crate::guide::attaching#behind-a-proxy-http_proxy-and-socks5). | Run the world and attach as the same user, as the message says. |
+//! | `fictionet attach: connecting to the world at /run/fictionet/world.sock: Permission denied (os error 13). The socket belongs to the world's user, and attach may not write to it: run both as the same user, or give attach CAP_DAC_OVERRIDE` | `ls -l /run/fictionet/world.sock` shows another owner, such as `root` when the world was started with `sudo`. This happens to an attach that runs without root, such as one of the proxy types. | Run the world and attach as the same user, as the message says. |
 //! | `fictionet attach: entering the network namespace /run/netns/agent: No such file or directory (os error 2)` | `ip netns list` does not list `agent`. | Make the namespace first: `sudo ip netns add agent`. Attach run without root fails at this step too, or at `creating the tun device`, with a permission error. Run it with `sudo`. |
 //! | `fictionet attach: the world refused: agent is already attached`, with exit status 3 | Another attach with `--name agent` is still running: `pgrep -af 'name agent'`. | Stop the other attach, or give each sandbox its own `--name`. A name is free again as soon as its attach exits. |
-//! | `fictionet attach: configuring tun1: adding the IPv4 default route: another link already has one (File exists (os error 17)). Give --down-link <ifname> for that link ...` | `sudo ip netns exec agent ip route` shows a default route on another link: a second attach in the same namespace, or a container's own `eth0`. | Attach once per namespace. For a container's link, give `--down-link eth0`, as the message says: attach then removes that link's routes and addresses and sets it down before it adds its own (see [How `tun` works](crate::guide::attaching#how-tun-works)). |
+//! | `fictionet attach: configuring tun1: adding the IPv4 default route: another link already has one (File exists (os error 17)). Give --down-link <ifname> for that link ...` | `sudo ip netns exec agent ip route` shows a default route on another link: a second attach in the same namespace, or a container's own `eth0`. | Attach once per namespace. For a container's link, give `--down-link eth0`, as the message says: attach then removes that link's routes and addresses and sets it down before it adds its own. |
 //! | `dig` answers, but `curl` says `Could not resolve host: example.test` | Ask for the name the way most programs do, through the C library: `getent hosts example.test` inside the sandbox. Then `cat /etc/resolv.conf` and `grep '^hosts' /etc/nsswitch.conf` inside the sandbox. | See [When `dig` works but programs cannot resolve names](#when-dig-works-but-programs-cannot-resolve-names) below. |
 //! | `curl: (60) SSL certificate OpenSSL verify result: unable to get local issuer certificate (20)` | The client does not trust the world's CA. | Give it the CA: `curl --cacert /run/fictionet/ca.pem`, `SSL_CERT_FILE` for programs that read it, `NODE_EXTRA_CA_CERTS` for Node, or install the CA in the sandbox's image (see [step 6](#6-trust-the-worlds-ca-and-make-an-https-request)). |
 //! | `curl: (35) TLS connect error: error:0A000458:SSL routines::tlsv1 unrecognized name` | The world has no HTTPS site under that name. Here, `https://shared.test/` (a plain HTTP site) and `https://203.0.113.10/` (an address, so curl sends no name) both fail this way. | Use a name that has an HTTPS site. [`Sites`](crate::stdlib::web::Sites) picks the certificate by the name the client sends, and refuses the handshake for a name with no TLS. A certificate that does not cover the name, from a world's own TLS setup, fails differently: `openssl s_client` reports `Verification error: hostname mismatch`. Add the name to the certificate. |
 //! | `curl: (6) Could not resolve host: nope.test` | `sudo ip netns exec agent dig nope.test` shows `status: NXDOMAIN` from `SERVER: 10.0.0.1#53`: the world has no site with that name. | Fix the name, or add a site for it to the world. |
 //! | `curl: (7) Failed to connect to plain.test:443 after 3 ms: Could not connect to server` | `dig +short plain.test` answers an address, such as `104.18.0.1`, and `curl http://plain.test/` works. The site exists, but has no TLS, so port 443 is closed. | Use `http://`, or give the site a certificate with [`Site::tls`](crate::stdlib::web::Site::tls). |
-//! | With the [HTTP proxy type](crate::guide::attaching#behind-a-proxy-http_proxy-and-socks5) (`--type http_proxy`), curl says `Could not resolve host: example.test`, or Node says `getaddrinfo ENOTFOUND example.test` | The client did not use the proxy, and looked the name up on the host. `curl -sv https://example.test/ 2>&1 \| grep -E 'proxy tunnel\|NO_PROXY'` prints `Establishing HTTP proxy tunnel to example.test:443` when curl uses it. | Set `https_proxy` (and `http_proxy`) to `http://relay:<token>@<host>:<port>`, with the host and port that attach listens on (`--listen`): `attach:8080` in the [Compose setup](crate::guide::attaching#the-proxy-in-docker-compose), `127.0.0.1:8080` in a [pod](crate::guide::attaching#the-proxy-on-kubernetes). Take the world's names out of `NO_PROXY`. Node's built-in `fetch` ignores these variables unless `NODE_USE_ENV_PROXY=1` is set. |
+//! | With the HTTP proxy type (`--type http_proxy`), curl says `Could not resolve host: example.test`, or Node says `getaddrinfo ENOTFOUND example.test` | The client did not use the proxy, and looked the name up on the host. `curl -sv https://example.test/ 2>&1 \| grep -E 'proxy tunnel\|NO_PROXY'` prints `Establishing HTTP proxy tunnel to example.test:443` when curl uses it. | Set `https_proxy` (and `http_proxy`) to `http://relay:<token>@<host>:<port>`, with the host and port that attach listens on (`--listen`): such as `attach:8080` in Docker Compose or `127.0.0.1:8080` in a pod. Take the world's names out of `NO_PROXY`. Node's built-in `fetch` ignores these variables unless `NODE_USE_ENV_PROXY=1` is set. |
 //! | The ready file exists, but requests fail or time out | The ready file does not mean the world serves requests yet. Make one end-to-end request. | See [Readiness](#readiness) below. |
 //!
 //! ## When `dig` works but programs cannot resolve names
@@ -441,7 +430,7 @@
 //! sandboxes from [`Attachments`](crate::Attachments) does not answer the
 //! sandbox until it does, and the sandbox's clients time out meanwhile.
 //!
-//! To show this, `web_world` was changed to wait 20 seconds before it
+//! To show this, `web_fixture` was changed to wait 20 seconds before it
 //! serves its sandboxes, and attach was given
 //! `--ready-file /run/fictionet/agent.ready`. The ready file appears
 //! immediately, but the first request times out:
@@ -467,7 +456,7 @@
 //! 200
 //! ```
 //!
-//! Start the agent once this check passes. With the unchanged `web_world`,
+//! Start the agent once this check passes. With the unchanged `web_fixture`,
 //! the same command prints `200` on the first try.
 //!
 //! # Next
@@ -476,9 +465,5 @@
 //!   what a world looks like in Rust.
 //! - [`running`](crate::guide::running): the program around a world, how it stops,
 //!   and how to run one in a test.
-//! - [`attaching`](crate::guide::attaching): every way to attach a sandbox. Its
-//!   [host namespace section](crate::guide::attaching#on-a-host-with-ip-netns) has
-//!   a script that attaches a namespace, starts the agent in it and cleans
-//!   up afterwards, the way a test harness would.
-//! - [`stdlib::web`](crate::stdlib::web): how `web_world` builds its
+//! - [`stdlib::web`](crate::stdlib::web): how `web_fixture` builds its
 //!   websites.

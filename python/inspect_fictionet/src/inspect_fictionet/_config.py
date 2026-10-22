@@ -200,8 +200,8 @@ class _Config:
         if self.proxy:
             if self.attach_image == ATTACH_IMAGE:
                 raise ValueError(
-                    f"attach={self.attach!r} needs an attach image built from this repository "
-                    f"(deploy/Dockerfile, target attach): {ATTACH_IMAGE} has tun only. "
+                    f"attach={self.attach!r} needs an attach image with the proxy types: "
+                    f"{ATTACH_IMAGE} has tun only. "
                     "Pass it as attach_image."
                 )
             if not self.ip_addr or not self.dns:

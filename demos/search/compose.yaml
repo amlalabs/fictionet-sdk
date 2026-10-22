@@ -1,5 +1,4 @@
-# The web on Fictionet under Docker Compose, which cargo xtask demo
-# web runs in the VM.
+# The web on Fictionet under Docker Compose.
 #
 #   world     - the world: web::Sites in Rust for any name, which makes and
 #               keeps the pages. It has normal outbound networking for

@@ -2,7 +2,7 @@
 //! `tun`, `tap`, `http_proxy` and `socks5`; `ready`, a probe for attach's ready
 //! file; `wait-blocked`, which waits until a pod's NetworkPolicy blocks its
 //! direct traffic; and `observe`, the observe API from a shell. See the crate
-//! docs, `fictionet::guide::attaching` and `fictionet_observe`.
+//! docs, `fictionet::guide` and `fictionet_observe`.
 //!
 //! Exit status of `attach`: 0 when the world closed the connection (or,
 //! for `tap`, when QEMU closed its connection) or after `--help`, 1 on an error, 2 on bad arguments, 3 when the world

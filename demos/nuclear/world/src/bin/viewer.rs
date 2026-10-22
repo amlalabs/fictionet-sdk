@@ -12,8 +12,9 @@
 //! Post a start command to `/api/command/scenario` to start a scenario, or use
 //! the page's Scenarios group once available. A start stops the scripted story.
 //!
-//! The page loads Three.js from the browser libraries. Run
-//! `cargo xtask demo libraries` before building, or the 3D boards report it.
+//! The page loads Three.js from the browser libraries in observe/libraries.json,
+//! unpacked into observe/downloads/vendor before building, or the 3D boards
+//! report it.
 
 use fictionet::sync::Mutex;
 use nuclear_world::pace::{Pace, Reply as ScenarioReply, ScenarioCommand};

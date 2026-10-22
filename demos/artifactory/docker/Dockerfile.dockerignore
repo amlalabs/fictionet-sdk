@@ -12,7 +12,8 @@
 !smoltcp
 !demos
 !tests
-!examples
+!extras
+!host
 **/target
 **/.venv
 **/__pycache__

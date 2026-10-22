@@ -262,7 +262,7 @@ async fn failed_world_start_cleans_up_before_boot() {
 }
 
 #[tokio::test]
-async fn missing_download_names_the_command() {
+async fn missing_download_names_the_file() {
     let downloads = util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
     let error = Kit::new("desktop")
         .guest(Guest::ubuntu("station", "analyst"))
@@ -271,7 +271,8 @@ async fn missing_download_names_the_command() {
         .await
         .err()
         .unwrap();
-    assert!(error.to_string().contains("run cargo xtask demo desktop"));
+    let missing = downloads.path().join("cloud-hypervisor");
+    assert_eq!(error.to_string(), format!("missing {}", missing.display()));
 }
 
 #[tokio::test]

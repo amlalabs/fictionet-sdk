@@ -27,7 +27,7 @@ test-group = "heavy"
 
 [[profile.default.overrides]]
 filter = """
-binary(host) | binary(route_change) | (binary(it) & test(
+binary(host) | (binary(it) & test(
   /^(web|listen|tcpudp|core|e2e|attach_bin|tap_bin|proxy|tls|observe|observe_bin|observe_tls)::/
 ))
 """

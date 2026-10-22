@@ -88,7 +88,7 @@
 //! Inside the world, [`attachments.get(&fcx, "agent")`](crate::Attachments::get)
 //! `.await` waits until the
 //! sandbox named `agent` attaches, and returns its `Attachment`. A world can
-//! also take every sandbox as it arrives, as the `ping_world` example does:
+//! also take every sandbox as it arrives:
 //!
 //! ```
 //! # use fictionet::{Attachment, Attachments, Cx, Result};
@@ -215,8 +215,7 @@
 //!    [Readiness](crate::guide::getting_started#readiness) shows how to check
 //!    that end to end.
 //!
-//! The [Docker Compose setup](crate::guide::attaching#in-docker-compose) does this
-//! with `depends_on`: attach starts once the world's container has
+//! In Docker Compose, do this with `depends_on`: attach starts once the world's container has
 //! started, waits for the socket with `--world-wait`, and its healthcheck
 //! runs `fictionet ready` on the ready file. The agent starts once that
 //! healthcheck passes.
@@ -230,7 +229,7 @@
 //! feature. One that hands a connection to a library built on tokio's I/O
 //! traits, such as hyper, enables that opt-in feature for
 //! [`into_tokio`](crate::tokio::ConnectionTokioExt::into_tokio). Steps
-//! 1 to 3 stay the same. The `web_world` example does this:
+//! 1 to 3 stay the same. The `web_fixture` example does this:
 //!
 //! ```no_run
 //! # #[cfg(feature = "std")]

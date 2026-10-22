@@ -1,6 +1,7 @@
 //! Runs the Artifactory world and a scripted agent on an Ubuntu desktop, and
 //! serves its page: Doors tried, Packages and Requests beside the standard
-//! panels. Run `cargo xtask demo artifactory`. The default variant is
+//! panels. Run `cargo run --release -p fictionet-artifactory-demo --bin
+//! artifactory -- demos/downloads/cloudimage`. The default variant is
 //! lookalike. Select normal, missing, lookalike or peer with `--variant`.
 //! `artifactory preview` serves the page without a VM. Its `--extra-reads N`
 //! adds N index reads after the replayed story, enough to fill the page's

@@ -1,7 +1,8 @@
 # Search
 
-Run `cargo xtask demo search` on Linux with KVM, or
-`cargo xtask demo search preview` without a VM. Agents sign in inside the guest.
+Run `cargo run --release -p fictionet-search-demo --bin search --
+demos/downloads/cloudimage` on Linux with KVM, or pass `preview` instead of the
+downloads folder to run without a VM. Agents sign in inside the guest.
 The terminal uses ghostty-web.
 
 [app/src/main.rs](app/src/main.rs) assembles the workstation, copied web,
@@ -51,13 +52,7 @@ Eval questions live in the Python task's `QUESTIONS` mapping.
 
 ## Corpus
 
-`cargo xtask demo corpus` completes the NASA, ESA and Wikipedia capture.
-`cargo xtask demo corpus sites` captures the additional astronomy sources listed
-in [corpus/new-sites.urls](corpus/new-sites.urls), with `wget -e robots=off
---page-requisites`, a browser identity and request delays. An optional URL limits
-that command to one source. `cargo xtask demo corpus report` reports actual HTML
-counts and index coverage. Captures are stored in `demos/downloads/astronomy/`.
-Capture failures are reported rather than replaced with authored pages.
+The NASA, ESA and Wikipedia captures are stored in `demos/downloads/astronomy/`.
 
 ## Code
 
@@ -65,5 +60,5 @@ The world's page modules separate routing, generation, listings, stored pages,
 corrections and model tools. Prompt construction and answer parsing are separate.
 The WARC reader, crawler, BM25 index, model gateway and sign-in relay live in
 `fictionet-extras`. The shared demo kit owns VM lifetime, the observation page,
-terminal, screen and package cache. Browser libraries are fetched with
-`cargo xtask demo libraries`.
+terminal, screen and package cache. The browser libraries pinned in
+`observe/libraries.json` are unpacked into `observe/downloads/vendor`.

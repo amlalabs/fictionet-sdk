@@ -54,8 +54,7 @@
 //! reads it with [`Attachment::mtu`](crate::Attachment::mtu). The type is
 //! the attach type, such as `tun`, `tap`, `http_proxy`, or `socks5`.
 //!
-//! For example, attach started with `--name agent --type tun` (see
-//! [`attaching`](crate::guide::attaching)) on a sandbox with an MTU of 1500 sends
+//! For example, attach started with `--name agent --type tun` on a sandbox with an MTU of 1500 sends
 //! this 15-byte `hello`:
 //!
 //! ```text

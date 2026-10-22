@@ -375,11 +375,7 @@ tail that declares the hand-written packet framing in
 `src/stdlib/protocols/cme_mdp3/framing.rs`: the binary packet header and the
 two-byte message size. The module docs are in `src/stdlib/protocols/cme_mdp3/docs.md`.
 Differential codec tests compare decoded values and encoded bytes with the
-runtime SBE decoder. To regenerate the generated part and keep the hand-written tail:
-
-```sh
-cargo xtask bless
-```
+runtime SBE decoder.
 
 ## Rust identifiers
 
@@ -431,9 +427,7 @@ script is needed.
 Generated modules use public `fictionet::stdlib::codec` APIs. Each file
 invokes `fictionet::stdlib::codec::generated_runtime!` with its own names
 and limits to define its error type and file-local support code. The same
-file compiles in SDK integration tests and outside the SDK: `cargo xtask
-copy-check` builds the generated `stdlib::protocols::cme_mdp3` in a crate of
-its own. Parsing is exact. Writing is strict and transactional. Count and
+file compiles in SDK integration tests and outside the SDK. Parsing is exact. Writing is strict and transactional. Count and
 range arithmetic is checked; reads
 use checked slicing. Resource and depth checks precede allocation and
 recursive descent. Work is linear in visited fields, bytes, and entries,
@@ -495,16 +489,10 @@ offsets, blocks, block groups, unions, ranges, constants, and enum nulls;
 `fictionet-codegen-golden` crate, which compiles the goldens against the
 SDK and runs their emitted tests. The codegen tests check them through it,
 and the SDK test target runs the integration checks in `tests/it/codegen.rs`. Additional fixtures check small allocation and
-work budgets, long identifiers, and maximum-sized stream headers. To update:
-
-```sh
-cargo xtask bless
-cargo test --workspace --tests
-```
-
-The bless command also updates the checked-in example fuzz target.
+work budgets, long identifiers, and maximum-sized stream headers.
+`cargo test --workspace --tests` runs these checks.
 Review changes to both the schema and its golden before accepting them.
-To emit another target:
+To emit a fuzz target:
 
 ```sh
 cargo run -p fictionet-codegen -- ir schema.json -o src/protocol.rs \

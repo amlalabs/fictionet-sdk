@@ -17,7 +17,7 @@ export function mount(root, services, options) {
           if (!disposed) status.textContent = 'The run has stopped, so this panel can no longer be loaded.';
           return;
         }
-        throw new Error(`${error.message}. A panel that imports three.js needs it in the build: run \`cargo xtask demo libraries\`, then rebuild`);
+        throw new Error(`${error.message}. A panel that imports three.js needs it in the build: unpack the libraries in observe/libraries.json into observe/downloads/vendor, then rebuild`);
       }
       if (disposed) return;
       const mounted = await module.mount(content, services, options);

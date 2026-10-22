@@ -165,8 +165,7 @@ pub enum Direction {
 /// `keep` runs inside the task, once per packet, so it must return quickly
 /// and must not block. Every task of a world shares one thread, so a slow
 /// `keep` slows the whole world. To write packets to a file, hand them to
-/// a channel that never waits, and write them on another thread. The
-/// [packet capture recipe](fictionet::guide::recipes#packet-capture) does this.
+/// a channel that never waits, and write them on another thread.
 ///
 /// The task stops when either interface closes, or when the caller's
 /// [region](Cx#regions) is cancelled.

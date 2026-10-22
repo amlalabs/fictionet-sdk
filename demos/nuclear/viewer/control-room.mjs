@@ -74,7 +74,7 @@ export function paletteReady(values) {
   );
 }
 
-const LOAD_FAILURE = 'Run `cargo xtask demo libraries`, then rebuild.';
+const LOAD_FAILURE = 'Unpack the libraries in observe/libraries.json into observe/downloads/vendor, then rebuild.';
 
 /** Knobs in the order they appear on the page and the console. */
 export const KNOBS = Object.freeze([

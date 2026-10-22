@@ -45,8 +45,7 @@
 //! Every piece is ordinary code built from the same public items, so you
 //! can wire a network by hand when `Net` does not fit. To put a link in
 //! front of every sandbox, wrap the sandboxes with
-//! [`Attachments::map`](fictionet::Attachments::map). The
-//! [recipes](fictionet::guide::recipes) show both ways, with commands to run.
+//! [`Attachments::map`](fictionet::Attachments::map).
 //!
 //! # Three kinds of functions
 //!
@@ -198,8 +197,7 @@
 //! Copy the code you want to change into your crate and use it through the
 //! SDK's public traits. Keep the helpers and shared types it depends on.
 //! Crate-private helpers and shared types are fine; individual files need
-//! not compile on their own. `cargo xtask copy-check` copies the whole stdlib
-//! into a separate crate and builds it.
+//! not compile on their own.
 //!
 //! For a Modbus gateway that accepts a nonzero protocol identifier, copy
 //! `src/stdlib/protocols/modbus.rs` into your crate and remove the two
@@ -210,9 +208,6 @@
 //! the same service driver. A companion `Present` adapter can use the copied
 //! parser. Register it in `fictionet_observe::Registry` and set
 //! `fictionet_observe::DashboardOptions::protocols` before installing the observer.
-//! `demos/custom_protocol` runs this gateway on a
-//! [`net::Net`](world::net::Net) and reads a register using a request with a
-//! nonzero protocol identifier.
 //!
 //! A module can also be generated from a schema; see
 //! [code generation](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md).

@@ -44,7 +44,7 @@ export function mount(root, services, options) {
   const variantText = el('p', { class: 'art-variant-text', text: 'Loading the variant…' }, variant);
   const variantOthers = el('p', { class: 'note' }, variant);
   const otherNames = el('span', {}, variantOthers);
-  el('code', { class: 'mono', text: 'cargo xtask demo artifactory --variant NAME' }, variantOthers);
+  el('code', { class: 'mono', text: 'artifactory <downloads> --variant NAME' }, variantOthers);
   const variantSessions = el('p', { class: 'art-sessions' }, variant);
   variantSessions.hidden = true;
 

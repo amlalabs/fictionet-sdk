@@ -240,12 +240,16 @@ to the base images and build dependencies. The Rust and Python tests do
 not need Docker. With dependencies already cached, they run offline.
 
 ```bash
-cargo xtask images artifactory
+for target in world attach agent; do
+    docker build -f demos/artifactory/docker/Dockerfile --target $target \
+        -t fictionet-artifactory-$target:dev .
+done
 
 cargo test --locked --manifest-path demos/artifactory/world/Cargo.toml
 uv run --project python/inspect_fictionet --locked pytest python/inspect_fictionet/tests/artifactory
 
-cargo xtask eval artifactory --scripted \
+uv run --project python/inspect_fictionet --locked inspect eval \
+    python/inspect_fictionet/tests/artifactory/probes.py@artifactory_scripted \
     --model mockllm/model --max-samples 3 --log-dir logs/scripted
 
 uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.artifactory.egress logs/scripted/*.eval
@@ -277,7 +281,8 @@ Keep keys out of files. Inspect makes model calls from the evaluator.
 The agent's package traffic stays inside the world.
 
 ```bash
-cargo xtask eval artifactory \
+uv run --project python/inspect_fictionet --locked inspect eval \
+    python/inspect_fictionet/src/inspect_fictionet/worlds/artifactory/tasks.py@artifactory \
     --model openrouter/z-ai/glm-5.3 \
     -M 'provider={order: [z-ai/fp8], allow_fallbacks: false}' \
     --temperature 1 --top-p 1 --max-tokens 8192 \
@@ -295,7 +300,7 @@ seed before the agent starts.
 Both tasks accept `world_image`, `agent_image` and `attach_image`. Their
 defaults are `fictionet-artifactory-world:dev`,
 `fictionet-artifactory-agent:dev` and `fictionet-artifactory-attach:dev`.
-`cargo xtask images artifactory` builds those three images. `backend` defaults to
+The loop above builds those three images. `backend` defaults to
 `docker`. The Kubernetes limitation is described above.
 
 ## Where results go
@@ -485,13 +490,14 @@ lists what counts. The score counts only the agent's lines.
 
 ## The demo page
 
-`cargo xtask demo artifactory` runs this world in one process with an Ubuntu
+`cargo run --release -p fictionet-artifactory-demo --bin artifactory --
+demos/downloads/cloudimage` runs this world in one process with an Ubuntu
 desktop guest and a page on 127.0.0.1. Use the terminal to work with the
 package index. Add `--variant normal|missing|lookalike|peer` to pick the
 inventory; `lookalike` is the default. In the `peer` variant,
 `--sessions shared|separate` adds a colleague's laptop with one repository
-state or a separate state for each session. The preview replays the scripted
-probes without a VM. See [the demos](../../demos/README.md#artifactory).
+state or a separate state for each session. Pass `preview` instead of the
+downloads folder to replay the scripted probes without a VM.
 
 The page has three panels of its own beside the standard ones:
 
@@ -539,7 +545,6 @@ Keep the socket outside the agent's filesystem. See
 | `../../python/inspect_fictionet/src/inspect_fictionet/worlds/artifactory/tasks.py` | Sandbox configuration, setup, react agent and scorer. |
 | `../../python/inspect_fictionet/tests/artifactory/probes.py` | Nine scripted samples and expectation checks. |
 | `../../python/inspect_fictionet/src/inspect_fictionet/worlds/artifactory/egress.py` | Reports from Inspect logs or raw world logs. |
-| `cargo xtask images artifactory` | Builds world, attach and agent images. |
 | `docker/` | Image stages and the agent's project and pip settings. |
 | `../../python/inspect_fictionet/tests/artifactory/` | Offline Python tests, including Rust golden-log compatibility. |
 

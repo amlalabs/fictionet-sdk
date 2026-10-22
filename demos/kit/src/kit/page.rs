@@ -417,7 +417,7 @@ impl PageAccess {
 
     fn print_open(&self) {
         println!(
-            "Open: cargo xtask demo open {}",
+            "Open: cargo run --release -p fictionet-demo --bin open -- {}",
             super::ssh::quote(&self._dir.path().join(BOOTSTRAP).display().to_string())
         );
     }

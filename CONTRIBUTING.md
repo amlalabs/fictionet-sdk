@@ -27,7 +27,7 @@ $ cargo check --locked --lib -p fictionet-observe --no-default-features --target
 
 The workspace `--all-features` checks below include its tests and docs.
 
-CI runs these commands with four sets of flags:
+Run these commands with four sets of flags:
 
 - the default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts -p xtask`
 - no default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts --no-default-features`
@@ -60,8 +60,8 @@ $ cargo clippy --locked -p fictionet --lib --no-default-features --target wasm32
 ```
 
 The fuzz crate is outside the workspace, since cargo-fuzz builds it on nightly.
-From `fuzz/`, CI checks every target with `RUSTFLAGS="--cfg fuzzing" cargo check --locked --bins`,
-and from the root it runs the fuzz helpers' tests and checks their formatting:
+From `fuzz/`, check every target with `RUSTFLAGS="--cfg fuzzing" cargo check --locked --bins`.
+From the root, run the fuzz helpers' tests and check their formatting:
 
 ```console
 $ RUSTFLAGS="--cfg fuzzing" cargo test --locked --manifest-path fuzz/Cargo.toml --lib
@@ -116,8 +116,7 @@ topology collection, packet capture and packet classification.
 interest and packet interest. `runtime::timers` covers timers.
 `decoders` feeds TPKT/COTP, HTTP/1 requests and ITCH add orders in 16 KiB
 chunks. Divan reports timings, rates and allocation counts; no benchmark has a
-pass or fail threshold. Compare two commits on the same machine. CI compiles
-the benchmarks and does not run them.
+pass or fail threshold. Compare two commits on the same machine.
 
 ## h2spec
 

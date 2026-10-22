@@ -10,11 +10,7 @@
 //!
 //! Use it to build evals, RL environments and tests where the network is part
 //! of the task: a tampered website, a slow or lossy link, a hijacked route, an
-//! impostor service. The repository's examples include an eval that serves
-//! agents tampered Wikipedia, gov.uk and BBC pages, and one with a BGP hijack
-//! and an impostor bank. [`recipes`](guide::recipes) shows the pieces they are
-//! built from, with commands to run: a delayed website, a slow or lossy link, a
-//! packet capture and a route that changes mid-run.
+//! impostor service.
 //!
 //! A world's time and randomness come from its [`Cx`]. Randomness starts
 //! from a seed. With real sandboxes it runs on real time ([`run`]).
@@ -49,8 +45,7 @@
 //! as it was. So `tun0` is the sandbox's only way out when the namespace
 //! has no other interface, such as a new one from `ip netns add`. In a
 //! namespace that already has one, such as a Kubernetes pod's `eth0`,
-//! attach can take that interface down first: [How `tun`
-//! works](guide::attaching#how-tun-works) explains this.
+//! attach can take that interface down first (`--down-link`).
 //!
 //! <style>.fn-attach > svg {display:block;width:100%;max-width:696px;min-width:480px;height:auto}</style>
 //! <div class="fn-attach" style="overflow-x:auto;margin:1.25em 0">
@@ -76,9 +71,7 @@
 //! has a name, and the world receives it as an [`Attachment`]. A virtual
 //! machine attaches through its network card instead (`--type tap`). A sandbox
 //! that cannot have a network device, because it has no privileges at all, can
-//! attach through a proxy (`--type http_proxy` or `--type socks5`).
-//! [`attaching`](guide::attaching) covers every setup: a namespace on the host,
-//! Docker Compose, Kubernetes, hosted sandboxes, the proxy and VMs. Whatever
+//! attach through a proxy (`--type http_proxy` or `--type socks5`). Whatever
 //! the type, the world receives IP packets: [`lowering`](guide::lowering) shows
 //! how each type turns what its sandbox sends into them.
 //!
@@ -268,21 +261,17 @@
 //! 1. [`getting_started`](guide::getting_started): from `cargo build` to an
 //!    HTTPS request from a sandbox, with every command and its output.
 //! 2. [`running`](guide::running): the program around a world, and worlds in tests.
-//! 3. [`attaching`](guide::attaching): every way to attach a sandbox, its
-//!    addresses and DNS, and how to check that it works.
-//! 4. [`lowering`](guide::lowering): how each attach type turns what its
+//! 3. [`lowering`](guide::lowering): how each attach type turns what its
 //!    sandbox sends into IP packets, and what the world sees from each.
-//! 5. [`stdlib`], then [`stdlib::world::net`] and [`stdlib::services::serve`]: the
+//! 4. [`stdlib`], then [`stdlib::world::net`] and [`stdlib::services::serve`]: the
 //!    networking pieces a world is built from, and a network of hosts and
 //!    services in a few lines. [`stdlib::web`] does the same for websites.
-//! 6. [`recipes`](guide::recipes): a delayed website, a slow or lossy link, a
-//!    packet capture, and a route that changes mid-run.
-//! 7. [Fictionet Observe](../fictionet_observe/index.html): collection, grading,
+//! 5. [Fictionet Observe](../fictionet_observe/index.html): collection, grading,
 //!    files, the dashboard and the observation protocol. [`events`] covers
 //!    producing observations from world code.
-//! 8. [`proto`](guide::proto): the protocol between attach and a world, if you
+//! 6. [`proto`](guide::proto): the protocol between attach and a world, if you
 //!    want to write your own attach.
-//! 9. [`roadmap`](guide::roadmap): what is planned, such as attaching remote
+//! 7. [`roadmap`](guide::roadmap): what is planned, such as attaching remote
 //!    sandboxes.
 //!
 //! # Features and dependencies
@@ -320,8 +309,7 @@
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
 //! timers. Opt-in axum upgrades still use hyper, whose internal clock is
 //! unavailable on this target. [`httpd`](stdlib::web::httpd) says how the
-//! native HTTP/2 server keeps time. `demos/wasm_world` runs DNS,
-//! HTTP/1.1, HTTP/2 and HTTPS through a world in Node.js.
+//! native HTTP/2 server keeps time.
 
 #![warn(missing_docs)]
 #![cfg_attr(

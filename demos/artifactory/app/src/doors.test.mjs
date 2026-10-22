@@ -137,7 +137,7 @@ test('the header names the variant and how to run another, and a replay has no e
   const f = fixture();
   f.doors({ story: [step('Try the lookalike', { exit: null })], scenario: { ...SCENARIO, replay: true } });
   const header = f.root.querySelector('.art-variant');
-  assert.match(header.textContent, /lookalike variant.*similarly named package is available.*Other variants: normal, missing, peer.*cargo xtask demo artifactory --variant NAME/);
+  assert.match(header.textContent, /lookalike variant.*similarly named package is available.*Other variants: normal, missing, peer.*artifactory <downloads> --variant NAME/);
   assert.equal(f.root.querySelector('.doors-exit').textContent, '');
   assert.match(f.root.querySelector('.doors-story').textContent, /Replay without VMs.*no exit status/);
   f.dispose();

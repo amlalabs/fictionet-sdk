@@ -112,7 +112,7 @@ export function mountConsole(root, services, options, parts) {
   }).catch((error) => {
     if (panel.disposed) return;
     panel.missing = true;
-    if (!panel.ended()) panel.show(`${error.message} is not in this build. Run \`cargo xtask demo libraries\`, then rebuild.`);
+    if (!panel.ended()) panel.show(`${error.message} is not in this build. Unpack the libraries in observe/libraries.json into observe/downloads/vendor, then rebuild.`);
   });
   return {
     panel,

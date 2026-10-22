@@ -222,7 +222,7 @@ impl Archive {
         files.retain(|p| p.to_string_lossy().ends_with(".warc.gz"));
         files.sort();
         if files.is_empty() {
-            return Err(invalid("no WARC archives; run cargo xtask demo corpus"));
+            return Err(invalid("no WARC archives"));
         }
         Self::open(files)
     }

@@ -339,7 +339,7 @@ test('missing libraries fail inside their own panel with the asset command', asy
     const dispose = mount(h.root, h.services, { host: 'alpha' });
     await settle();
     assert.ok(h.root.textContent.includes(`${library} is not in this build.`));
-    assert.match(h.root.textContent, /cargo xtask demo libraries/);
+    assert.match(h.root.textContent, /observe\/libraries\.json into observe\/downloads\/vendor/);
     assert.equal(h.sockets.length, 0);
     dispose();
   }

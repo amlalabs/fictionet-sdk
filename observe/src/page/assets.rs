@@ -112,7 +112,8 @@ pub(super) fn licenses() -> String {
     if VENDOR.is_empty() {
         html.push_str(concat!(
             "<p>No browser libraries in this build. ",
-            "Run <code>cargo xtask demo libraries</code>, then rebuild.</p>",
+            "Unpack the libraries in <code>observe/libraries.json</code> into ",
+            "<code>observe/downloads/vendor</code>, then rebuild.</p>",
         ));
     }
     html.push_str("<p><a href=\"/\">Back to the demo</a></p></main></body></html>");
@@ -235,8 +236,8 @@ mod tests {
         &source[start..end]
     }
 
-    /// Whether a `/vendor/` path is a member of a library that
-    /// `cargo xtask demo libraries` pins in `observe/libraries.json`.
+    /// Whether a `/vendor/` path is a member of a library pinned in
+    /// `observe/libraries.json`.
     fn pinned(path: &str) -> bool {
         let Some(path) = path.strip_prefix("/vendor/") else {
             return false;

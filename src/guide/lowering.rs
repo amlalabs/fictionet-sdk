@@ -13,9 +13,8 @@
 //! Read this page when you want to know exactly what the world receives
 //! from a sandbox, and what it does not: which TCP options a world's site
 //! sees, whether ARP or DHCP ever reach world code, why `ping` works with
-//! one type and not another. [`attaching`](crate::guide::attaching) says how to
-//! set each type up. The [relay protocol](crate::guide::proto) describes the
-//! messages on the world socket. This page sits between the two.
+//! one type and not another. The [relay protocol](crate::guide::proto)
+//! describes the messages on the world socket.
 //!
 #![doc = include_str!("../../docs/diagrams/lowering.svg")]
 //!
@@ -72,12 +71,11 @@
 //! **What the sandbox sends.** A `tun` sandbox is a network namespace in
 //! which attach makes a TUN device, usually `tun0`, with the default
 //! routes through it. (Attach can also take other links down first, with
-//! `--down-link`: see [How `tun` works](crate::guide::attaching#how-tun-works).)
+//! `--down-link`.)
 //! Programs in the sandbox use ordinary sockets. The sandbox's own kernel
 //! runs TCP, UDP and ICMP, the C library's resolver sends DNS queries
 //! over UDP, and the kernel routes every packet bound off the machine out
-//! of `tun0`, as long as the namespace has no other way out (see
-//! [How `tun` works](crate::guide::attaching#how-tun-works)).
+//! of `tun0`, as long as the namespace has no other way out.
 //!
 //! **Where attach picks it up.** `open_tun` opens `/dev/net/tun` and makes
 //! the device with `TUNSETIFF`, with the flags `IFF_TUN` and `IFF_NO_PI`.
@@ -112,8 +110,7 @@
 //! # `tap`: Ethernet frames, with the Ethernet taken off
 //!
 //! The address flags (`--ip-addr`, `--gateway`, `--dns` and their IPv6
-//! forms) decide some of what happens below. [The VM's
-//! addresses](crate::guide::attaching#the-vms-addresses) explains them.
+//! forms) decide some of what happens below.
 //! [`Link::new`](crate::stdlib::network::ethernet::Link::new) checks the leases
 //! before any frames arrive. It rejects invalid prefixes and IPv4 leases
 //! with no address for the DHCP server.
@@ -378,7 +375,7 @@
 //!
 //! These traces follow `curl https://example.test/` from the agent's
 //! program to [`Sites`](crate::stdlib::web::Sites) and back, once for
-//! each type. The world is the `web_world` example from
+//! each type. The world is the `web_fixture` example from
 //! [`getting_started`](crate::guide::getting_started). The packet lists are what
 //! the world saw on the sandbox's `Attachment`, from
 //! `fictionet observe --observation unix:PATH packets <link>` (see
@@ -432,8 +429,7 @@
 //!
 //! The sandbox is a Debian 13 VM under QEMU, attached with
 //! `--vm qemu:<path> --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns
-//! 10.0.0.1 --no-ip-addr-v6`, as in
-//! [`attaching`](crate::guide::attaching#with-qemu-over-a-socket). The capture
+//! 10.0.0.1 --no-ip-addr-v6`. The capture
 //! ran from before QEMU started until it exited.
 //!
 //! 1. While the VM boots, its DHCP client broadcasts a DISCOVER.
@@ -487,9 +483,7 @@
 //!
 //! ## `http_proxy`
 //!
-//! Attach runs on the host as an HTTP proxy, as
-//! [`attaching`](crate::guide::attaching#running-the-proxy) shows, and curl uses
-//! it. `$TOKEN` holds the contents of the token file:
+//! Attach runs on the host as an HTTP proxy, and curl uses it. `$TOKEN` holds the contents of the token file:
 //!
 //! ```text
 //! $ fictionet attach --world unix:/run/fictionet/world.sock --name agent --type http_proxy \

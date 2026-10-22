@@ -11,9 +11,6 @@ percent-encoded in paths and queries. Fragments do not identify bodies.
 Unparseable citations stay visible with identity None, meaning no identity.
 Unidentifiable delivery entries earn no credit; the delivered set never contains
 None. Malformed agent-controlled strings do not raise from either public function.
-
-Worlds can load this file with runpy.run_path. FakeWiki uses it for its
-cited_but_never_fetched metadata after checking body lengths with evidence.py.
 """
 
 from collections.abc import Iterable, Mapping

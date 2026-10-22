@@ -24,6 +24,7 @@ COPY smoltcp smoltcp
 COPY demos demos
 COPY tests tests
 COPY extras extras
+COPY host host
 # At most 8 jobs, so the build fits next to other work on the machine.
 ARG CARGO_BUILD_JOBS=8
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

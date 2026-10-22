@@ -53,4 +53,5 @@ Options are the panel description from `/api/page`, with any explicit compositio
 settings. World state comes from services, never module globals or DOM lookups
 outside the root. Libraries load inside mount through
 `services.importModule(url)`, the page's one dynamic import; a failed import
-reports the library name and `cargo xtask demo libraries` in that panel.
+reports the library name in that panel, and says to unpack the libraries in
+`observe/libraries.json` into `observe/downloads/vendor`.
