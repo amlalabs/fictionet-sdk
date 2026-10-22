@@ -53,12 +53,15 @@ pub async fn start(
             .tls(tls)
             .into_host(provider.host()),
     );
-    for (index, host) in fictionet_search_demo::PASSED.iter().enumerate() {
+    for (index, host) in fictionet_extras::models::signin::HOSTS.iter().enumerate() {
         extra = extra.host(
             address(10 + index as u8),
             fictionet::stdlib::world::net::Host::new(host)
                 .dns_name(host)
-                .port_server(443, fictionet_search_demo::Relay(format!("{host}:443"))),
+                .port_server(
+                    443,
+                    fictionet_extras::models::signin::Relay(format!("{host}:443")),
+                ),
         );
     }
     let routing = border_world::start_with(&cx, scenario, ids, world.into_attachments(), extra)?;

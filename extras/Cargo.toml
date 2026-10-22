@@ -23,9 +23,8 @@ percent-encoding = "2"
 redb = "4.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-robotstxt = "0.3"
 ring = "0.17"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "net", "macros", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = "0.3"

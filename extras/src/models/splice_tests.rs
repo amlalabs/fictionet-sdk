@@ -381,7 +381,7 @@ fn continuation_refusal(stream: bool, source: Refusal) {
             ))?;
             let authority = oauth::OAuth::at(&cx, oauth::Login::Claude, store, format!("http://{address}").parse()?)?;
             let expected = authority.stop();
-            credential = Credential { real: authority.secret().await?, placeholder: authority.placeholder(), oauth: Some(authority), bearer: true };
+            credential = Credential { real: authority.secret().await?, placeholder: authority.placeholder(), oauth: Some(authority) };
             expected
         } else if matches!(source, Refusal::Budget) {
             Provider::Anthropic.stop()

@@ -73,10 +73,12 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
     .date(now_sys)
     .into_net()
     .route(kit::JUMP, kit::jump_prefix());
-    for host in fictionet_search_demo::PASSED {
+    for host in fictionet_extras::models::signin::HOSTS {
         net = net.host(host, |node| {
-            node.dns_name(host)
-                .port_server(443, fictionet_search_demo::Relay(format!("{host}:443")))
+            node.dns_name(host).port_server(
+                443,
+                fictionet_extras::models::signin::Relay(format!("{host}:443")),
+            )
         });
     }
     net.start(&fcx, world.into_attachments())

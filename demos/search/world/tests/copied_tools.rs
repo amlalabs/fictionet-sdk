@@ -1,7 +1,7 @@
 use example_common::log::Log;
 use fictionet::stdlib::web::httpd::{Exchange, Handler, Reply};
 use fictionet::{events::Fanout, stdlib::web::Body};
-use fictionet_extras::models::{Provider, SignedIn};
+use fictionet_extras::models::{Model, Provider};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::{
@@ -131,7 +131,7 @@ fn intercepted_search(bearer: bool) {
             } else {
                 ("x-api-key", "local-only")
             };
-            let model = SignedIn::at(&cx, Provider::Anthropic, pages, origin)?;
+            let model = Model::guest_at(&cx, Provider::Anthropic, origin)?.search(pages);
             let request = http::Request::post("/v1/messages")
                 .header(header, key)
                 .header("anthropic-version", "2023-06-01")

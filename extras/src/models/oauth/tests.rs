@@ -384,7 +384,6 @@ fn chatgpt_login_swaps_the_bearer_adds_the_account_and_stops_like_codex_limits()
                 real: authority.secret().await?,
                 placeholder: authority.placeholder(),
                 oauth: Some(authority.clone()),
-                bearer: true,
             };
             let guest = format!("Bearer {}", authority.placeholder());
             let model = Model::at(&cx, Provider::ChatGpt, credential, origin)?

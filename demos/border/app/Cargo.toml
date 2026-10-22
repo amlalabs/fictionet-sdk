@@ -46,7 +46,6 @@ vhost-user-backend = "0.18"
 
 
 fictionet-demo = { path = "../../kit" }
-fictionet-search-demo = { path = "../../search/app" }
 
 [[bin]]
 name = "border"
