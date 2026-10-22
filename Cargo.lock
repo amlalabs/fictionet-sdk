@@ -1027,7 +1027,6 @@ dependencies = [
  "fictionet-extras",
  "fictionet-host",
  "fictionet-observe",
- "fictionet-search-demo",
  "flate2",
  "http",
  "http-body",
@@ -1041,6 +1040,24 @@ dependencies = [
  "tokio-util",
  "tower-service",
  "vhost-user-backend",
+]
+
+[[package]]
+name = "fictionet-bottleneck-sites-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
+name = "fictionet-capture-sites-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-observe",
 ]
 
 [[package]]
@@ -1086,6 +1103,23 @@ version = "0.0.0"
 dependencies = [
  "fictionet",
  "fictionet-codegen",
+]
+
+[[package]]
+name = "fictionet-custom-protocol-demo"
+version = "0.1.0"
+dependencies = [
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
+name = "fictionet-delayed-sites-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-observe",
 ]
 
 [[package]]
@@ -1139,7 +1173,6 @@ dependencies = [
  "fictionet-extras",
  "fictionet-host",
  "fictionet-observe",
- "fictionet-search-demo",
  "flate2",
  "http",
  "http-body",
@@ -1177,7 +1210,6 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
- "robotstxt",
  "serde",
  "serde_json",
  "time",
@@ -1217,6 +1249,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-goad-demo"
+version = "0.1.0"
+dependencies = [
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
+name = "fictionet-h2spec-world-demo"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fictionet",
+ "http",
+ "tokio",
+]
+
+[[package]]
 name = "fictionet-host"
 version = "0.1.0"
 dependencies = [
@@ -1231,6 +1281,15 @@ dependencies = [
  "tokio",
  "tower-service",
  "webpki-roots",
+]
+
+[[package]]
+name = "fictionet-lossy-sites-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-observe",
 ]
 
 [[package]]
@@ -1249,6 +1308,25 @@ dependencies = [
  "serde_path_to_error",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "fictionet-ping-world-demo"
+version = "0.1.0"
+dependencies = [
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
+name = "fictionet-route-change-demo"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fictionet",
+ "fictionet-observe",
+ "fictionet-test-support",
+ "http",
 ]
 
 [[package]]
@@ -1330,6 +1408,16 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+]
+
+[[package]]
+name = "fictionet-web-world-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "example-common",
+ "fictionet",
+ "rustls",
 ]
 
 [[package]]
@@ -3015,12 +3103,6 @@ dependencies = [
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
-
-[[package]]
-name = "robotstxt"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc52377db80e3fec3a2c748ca603b8b6cacdd34ff89ff4b742a635361d4b4a7"
 
 [[package]]
 name = "rsa"

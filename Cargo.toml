@@ -9,6 +9,17 @@ members = [
     "codegen/tests/golden",
     "codegen/tests/layouts",
     "demos/kit",
+    "demos/bottleneck_sites",
+    "demos/capture_sites",
+    "demos/custom_protocol",
+    "demos/delayed_sites",
+    "demos/goad",
+    "demos/h2spec_world",
+    "demos/lossy_sites",
+    "demos/ping_world",
+    "demos/route_change",
+    "demos/web_world",
+
     "demos/*/app",
     "extras/common",
     "demos/*/world",
@@ -125,7 +136,7 @@ test = true
 [[example]]
 name = "custom_protocol"
 path = "demos/custom_protocol/main.rs"
-test = true
+test = false
 required-features = ["std"]
 
 [[bench]]
@@ -178,7 +189,7 @@ required-features = ["std"]
 [[example]]
 name = "capture_sites"
 path = "demos/capture_sites/main.rs"
-test = true
+test = false
 required-features = ["std"]
 
 [[example]]
@@ -199,7 +210,7 @@ required-features = ["std"]
 [[example]]
 name = "route_change"
 path = "demos/route_change/main.rs"
-test = true
+test = false
 required-features = ["std"]
 
 [[example]]
