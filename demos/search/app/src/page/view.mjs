@@ -1,28 +1,18 @@
-import { diff, rows } from './model.mjs';
-import { createMotion } from './motion.mjs';
+import { diff } from './model.mjs';
 import { createWeb } from './web.mjs';
 
 const NEW_PAGES = [['copied', 'Copied'], ['model_written', 'Model-written'], ['live_search', 'Live']];
-const relativeTime = (at, now) => {
-  const seconds = Math.max(0, Math.floor((now - at) / 1000));
-  return seconds < 60 ? 'now' : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago` : `${Math.floor(seconds / 3600)} hr ago`;
-};
-
 export function mount(root, services, options) {
   services.forwardedHosts.set(new Set(options.forwardedHosts || []));
   const { el } = services.dom.scoped(root);
   const { listen } = services.dom;
   el('link', { rel: 'stylesheet', href: '/assets/search/style.css' }, root);
   root.classList.add('search-world');
-  const svg = el('svg:svg', { class: 'search-picture', viewBox: '0 0 520 560', role: 'img', 'aria-label': 'Searches and the sites they named' }, root);
-  const list = el('div', { class: 'search-rows', role: 'list', 'aria-label': 'What the world served' }, root);
-  const motion = createMotion(root.ownerDocument.defaultView || globalThis);
-  const web = createWeb(svg, { el, motion });
+  const stage = el('div', { class: 'web-map' }, root);
+  const web = createWeb(stage, services);
   const controller = new AbortController();
-  const cleanup = [motion.subscribe((disabled) => root.classList.toggle('no-motion', disabled))];
-  const rowNodes = new Map();
-  let snapshot = null, disposed = false, timeTimer;
-  const window = root.ownerDocument.defaultView || globalThis;
+  const cleanup = [];
+  let snapshot = null, disposed = false;
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());
   const controls = [];
@@ -34,11 +24,11 @@ export function mount(root, services, options) {
     await request.send('/api/command/generation', command, snapshot.generator.generation_revision, {
       reply(reply) {
         if (reply.status === 'applied') ok = true;
-        else note.textContent = reply.status === 'pending' ? 'The world has not answered yet.' : 'Check the values and try again.';
+        else note.textContent = reply.status === 'pending' ? 'Pending' : 'Try again';
       },
       error(error) {
         const rejection = error.body?.rejection;
-        note.textContent = rejection?.reason === 'stale_revision' ? 'The world changed. Try again.' : rejection?.message || 'The request could not be completed.';
+        note.textContent = rejection?.reason === 'stale_revision' ? 'World changed' : 'Request failed';
       },
     });
     return ok;
@@ -48,13 +38,13 @@ export function mount(root, services, options) {
     for (const control of controls) control.disabled = !snapshot || request.busy;
     if (!segment || !snapshot?.generator) return;
     const g = snapshot.generator;
-    if (availability) availability.textContent = g.live_available ? '' : 'Live: EXA_API_KEY is not set.';
+    if (availability) availability.textContent = g.live_available ? '' : 'Live unavailable';
     const mode = g.live_search ? 'live_search' : g.copied ? 'copied' : 'model_written';
     for (const button of segment.children) {
       button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
       if (button.dataset.mode === 'live_search') {
         button.disabled = request.busy || !g.live_available;
-        button.title = g.live_available ? '' : 'EXA_API_KEY is not set';
+        button.title = g.live_available ? '' : 'Live unavailable';
       }
     }
   }
@@ -80,68 +70,11 @@ export function mount(root, services, options) {
     note = el('p', { class: 'note', role: 'status' }, null);
   }
   buttons();
-  const activity = el('section', { class: 'search-activity', 'aria-label': 'Live search activity' }, root);
-  el('h3', { text: 'Live search activity' }, activity);
-  el('p', { text: 'Queries sent to Google, pages downloaded by the host, and responses served from the copy. The event log retains the full record.' }, activity);
-  el('h4', { text: 'Queries sent to Google' }, activity);
-  const queryList = el('ol', {}, activity);
-  el('h4', { text: 'Recent copies' }, activity);
-  const activityList = el('ol', {}, activity);
-  const sentQueries = new Set();
-  const labels = { real_search: 'Sent to Google', downloaded: 'Downloaded', copy_served: 'Served from copy', download_failed: 'Download failed' };
-  function showActivity(events) {
-    const entries = events.filter((event) => event.source === 'web' && labels[event.kind]);
-    activity.hidden = entries.length === 0 && sentQueries.size === 0 && !snapshot?.generator?.live_search;
-    for (const event of entries.filter((event) => event.kind === 'real_search')) {
-      if (sentQueries.has(event.seq)) continue;
-      sentQueries.add(event.seq);
-      const fields = event.fields || {};
-      const line = el('li', { text: `${fields.search ?? ''} · ${fields.engine ?? ''} · offset ${fields.start ?? 0}` }, null);
-      queryList.prepend(line);
-    }
-    activityList.replaceChildren();
-    for (const event of entries.filter((event) => event.kind !== 'real_search').slice(-100).reverse()) {
-      const fields = event.fields || {};
-      el('li', { text: `${labels[event.kind]}: ${fields.search ?? fields.url ?? ''}${fields.status ? ` · ${fields.status}` : ''}${fields.elapsed_ms ? ` · ${fields.elapsed_ms} ms` : ''}` }, activityList);
-    }
-  }
   const graph = services.graph;
-  web.setEvents(graph.state.events);
-  showActivity(graph.state.events);
-  cleanup.push(graph.subscribe((name) => { if (name === 'event' || name === 'snapshot') { web.setEvents(graph.state.events); showActivity(graph.state.events); } }));
+  cleanup.push(graph.subscribe((name) => {
+    if (name === 'event' || name === 'snapshot') web.setEvents(graph.state.events);
+  }));
 
-  function render(changes = []) {
-    window.clearTimeout(timeTimer);
-    const now = Math.max(snapshot.at_ms || 0, services.runTime() * 1000);
-    const entries = rows(snapshot).map((row) => [JSON.stringify(row), row]);
-    const keys = new Set(entries.map(([key]) => key));
-    for (const [key, node] of rowNodes) if (!keys.has(key)) { node.remove(); rowNodes.delete(key); }
-    entries.forEach(([key, row], index) => {
-      let line = rowNodes.get(key);
-      if (!line) {
-        line = el('div', { class: 'search-row', role: 'listitem' }, list);
-        rowNodes.set(key, line);
-        if (changes.length) motion.anim(line, [{ opacity: 0, transform: 'translateY(-10px)' }, { opacity: 1, transform: 'translateY(0)' }], { duration: 260, easing: 'cubic-bezier(.2,.7,.3,1)' });
-        el('time', {}, line);
-        el('span', { text: row.who === 'Claude Code' ? '❯ Claude Code' : row.who, title: row.who === 'Claude Code' ? '❯ Claude Code' : row.who }, line);
-        const what = el('b', { title: row.title || row.what }, line);
-        if (row.carries) el('i', { class: 'fact-dot', 'aria-label': 'Carries a planted fact' }, what);
-        el('span', { class: 'row-text', text: row.what }, what);
-        if (row.tag === 'made') el('i', { class: 'made-dot', role: 'img', 'aria-label': 'Made now', title: 'Made now' }, line);
-        if (row.badge) el('em', { class: row.tag, text: row.badge }, line);
-      }
-      const time = relativeTime(row.at, now);
-      line.querySelector('time').textContent = time;
-      line.setAttribute('title', `${time} · ${row.who === 'Claude Code' ? '❯ Claude Code' : row.who} · ${row.what}${row.badge ? ` · ${row.badge}` : ''}`);
-      if (list.children[index] !== line) list.insertBefore(line, list.children[index] || null);
-    });
-    buttons();
-    showActivity(graph.state.events);
-    if (!services.clock.ended && entries.length) {
-      const next = Math.min(...entries.map(([, row]) => 60000 - Math.max(0, now - row.at) % 60000));
-      timeTimer = window.setTimeout(() => { if (!disposed) render(); }, next);
-    }
-  }
   cleanup.push(services.state(options.state, ({ value }) => {
     if (disposed || !value) return;
     const names = new Map((value.sites || []).map(({ address, host }) => [address, host]));
@@ -152,17 +85,15 @@ export function mount(root, services, options) {
     if (reset) web.reset(value);
     else web.apply(changes, value);
     snapshot = value;
-    render(reset ? [] : changes);
-  }, () => { if (!disposed) note.textContent = 'The world could not be reached.'; }));
+    buttons();
+  }, () => { if (!disposed) note.textContent = 'World unavailable'; }));
   return () => {
     disposed = true;
-    window.clearTimeout(timeTimer);
     controller.abort();
     web.dispose();
     cleanup.forEach((off) => off());
     menu?.replaceChildren();
     root.classList.remove('search-world');
-    root.classList.remove('no-motion');
     root.replaceChildren();
   };
 }
