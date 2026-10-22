@@ -90,7 +90,24 @@ fixture uses a local upstream to ensure that Claude's API-key and bearer-token
 requests have their search and fetch tools answered from the same archive,
 without external search requests, and log one search entry.
 
-A real corpus additionally needs at least twenty Chromium page samples per
-site, with every request recorded and zero failed stylesheet, font or image
-requests. Unit fixtures do not establish that result. No complete corpus or
-successful asset sample is committed here.
+The retained local archive has 500 HTML pages, including 288 Wikipedia pages,
+and 6,600 URL records in 381,013,296 compressed bytes. The seed-link crawl indexes
+386 reachable pages. Twenty astronomy articles were loaded in headless Chromium
+with `--password-store=basic --use-mock-keychain`, the browser cache disabled and
+all document images requested eagerly. Their 699 requests had no failed CSS,
+font or image requests, broken images or missing stylesheets. The complete sample
+log, which also includes one discarded non-astronomy page, is retained at
+`demos/downloads/search-report/wikipedia-browser.log`. Archives and browser output
+remain outside git.
+
+Wikimedia returns 404 for two obsolete Kartographer cursor resources. Those
+responses remain recorded, and the corpus command continues to report resource
+failure rather than fabricate replacements. Neither URL was requested by the
+sampled pages. NASA and ESA asset completeness has not been reverified.
+
+The shared guest-content audit still rejects ordinary terminology in authentic
+copied articles, so the preview can serve its story and then fail its shutdown
+audit. No audit exception has been added. A provenance exception needs approval
+under the repository rules. A real Google sample also remains unverified until
+host search credentials are supplied; API and crawl integration tests use local
+HTTP fixtures.

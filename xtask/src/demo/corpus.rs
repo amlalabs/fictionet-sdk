@@ -118,6 +118,7 @@ fn fetch() -> Result {
             ("action", "parse"),
             ("page", &title),
             ("prop", "text"),
+            ("redirects", "1"),
             ("format", "json"),
             ("formatversion", "2"),
         ]);
@@ -167,7 +168,66 @@ fn fetch() -> Result {
         .map(str::to_owned)
         .collect::<Vec<_>>()
     {
-        if let Some(response) = archive.get(&url)? {
+        if let Some(mut response) = archive.get(&url)? {
+            if response.status.is_success()
+                && response
+                    .headers
+                    .get("content-type")
+                    .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
+            {
+                let dom = kuchiki::parse_html().one(String::from_utf8(response.decoded()?)?);
+                let mut changed = false;
+                if let Ok(redirect) = dom.select_first(".redirectText a[title]") {
+                    let title = redirect
+                        .attributes
+                        .borrow()
+                        .get("title")
+                        .unwrap()
+                        .to_owned();
+                    let mut api = url::Url::parse("https://en.wikipedia.org/w/api.php")?;
+                    api.query_pairs_mut().extend_pairs([
+                        ("action", "parse"),
+                        ("page", title.as_str()),
+                        ("redirects", "1"),
+                        ("prop", "text"),
+                        ("format", "json"),
+                        ("formatversion", "2"),
+                    ]);
+                    let parsed = fetcher.api(api.as_str())?;
+                    let value: serde_json::Value = serde_json::from_slice(&parsed.decoded()?)?;
+                    let article = value["parse"]["text"]
+                        .as_str()
+                        .ok_or("missing redirect target content")?;
+                    let content = dom
+                        .select_first("#mw-content-text")
+                        .map_err(|_| "missing desktop article container")?;
+                    for node in content.as_node().children().collect::<Vec<_>>() {
+                        node.detach();
+                    }
+                    let parsed = kuchiki::parse_html().one(article);
+                    for node in parsed
+                        .select_first("body")
+                        .unwrap()
+                        .as_node()
+                        .children()
+                        .collect::<Vec<_>>()
+                    {
+                        content.as_node().append(node);
+                    }
+                    changed = true;
+                    println!("Resolved copied redirect body: {url}");
+                }
+                for node in dom.select("script").unwrap().collect::<Vec<_>>() {
+                    node.as_node().detach();
+                    changed = true;
+                }
+                if changed {
+                    response.body = dom.to_string().into_bytes().into();
+                    response.headers.remove("content-encoding");
+                    response.headers.remove("etag");
+                    archive.append(&path, &url, &response)?;
+                }
+            }
             assets.extend(links(&url, &response)?.assets);
         }
     }
@@ -178,15 +238,17 @@ fn fetch() -> Result {
         if !seen_assets.insert(url.clone()) {
             continue;
         }
-        if let Some(response) = archive.get(&url)? {
-            if response.status.is_success() || response.status.is_redirection() {
-                let discovered = links(&url, &response)?;
-                assets.extend(discovered.assets);
-                if response.status.is_redirection() {
-                    assets.extend(discovered.pages);
+        if let Some(response) = archive.get(&url)?
+            && (response.status.is_success() || response.status.is_redirection())
+        {
+            let discovered = links(&url, &response)?;
+            assets.extend(discovered.assets);
+            if response.status.is_redirection() {
+                for target in discovered.pages.into_iter().rev() {
+                    assets.push_front(target);
                 }
-                continue;
             }
+            continue;
         }
         let response = (|| {
             let mut response = fetcher.api(&url)?;
@@ -212,7 +274,9 @@ fn fetch() -> Result {
                 let discovered = links(&url, &response)?;
                 assets.extend(discovered.assets);
                 if response.status.is_redirection() {
-                    assets.extend(discovered.pages);
+                    for target in discovered.pages.into_iter().rev() {
+                        assets.push_front(target);
+                    }
                 }
                 if !response.status.is_success() && !response.status.is_redirection() {
                     failures.push(format!("{} {url}", response.status));

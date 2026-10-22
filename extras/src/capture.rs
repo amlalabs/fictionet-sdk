@@ -166,14 +166,35 @@ fn css(text: &str, base: &Url, out: &mut Vec<String>) {
         Regex::new(r#"(?i)url\(\s*["']?([^\s\)"']+)|@import\s+["']([^"']+)"#).unwrap()
     });
     for captures in regex.captures_iter(text) {
-        if let Some(value) = captures.get(1).or_else(|| captures.get(2)) {
-            if let Some(url) = base
+        if let Some(value) = captures.get(1).or_else(|| captures.get(2))
+            && let Some(url) = base
                 .join(value.as_str())
                 .ok()
                 .and_then(|u| warc::key(u.as_str()))
-            {
-                out.push(url);
-            }
+        {
+            out.push(url);
+        }
+    }
+}
+
+fn srcset(mut input: &str, base: &Url, out: &mut Vec<String>) {
+    while !input.is_empty() {
+        input = input.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        if input.is_empty() {
+            break;
+        }
+        let end = input.find(char::is_whitespace).unwrap_or(input.len());
+        let candidate = &input[..end];
+        input = &input[end..];
+        if !candidate.ends_with(',') {
+            input = input.split_once(',').map_or("", |(_, rest)| rest);
+        }
+        if let Some(url) = base
+            .join(candidate.trim_end_matches(','))
+            .ok()
+            .and_then(|u| warc::key(u.as_str()))
+        {
+            out.push(url);
         }
     }
 }
@@ -233,9 +254,17 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         }
     }
     for node in dom
-        .select("[src], [srcset], link[href], [style], style, object[data]")
+        .select("[src], [srcset], [poster], link[href], [style], style, object[data]")
         .unwrap()
     {
+        let attrs = node.attributes.borrow();
+        if let Some(url) = attrs
+            .get("poster")
+            .and_then(|v| base.join(v).ok())
+            .and_then(|u| warc::key(u.as_str()))
+        {
+            links.assets.push(url);
+        }
         if matches!(
             node.name.local.as_ref(),
             "audio" | "video" | "track" | "iframe"
@@ -247,7 +276,6 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         {
             continue;
         }
-        let attrs = node.attributes.borrow();
         for name in ["src", "data"] {
             if let Some(url) = attrs
                 .get(name)
@@ -258,28 +286,19 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
             }
         }
         if let Some(srcset) = attrs.get("srcset") {
-            for src in srcset
-                .split(',')
-                .filter_map(|s| s.split_whitespace().next())
-            {
-                if let Some(url) = base.join(src).ok().and_then(|u| warc::key(u.as_str())) {
-                    links.assets.push(url);
-                }
-            }
+            self::srcset(srcset, &base, &mut links.assets);
         }
         if node.name.local.as_ref() == "link"
             && attrs.get("rel").is_some_and(|r| {
                 r.split_whitespace()
                     .any(|v| matches!(v, "stylesheet" | "icon" | "preload" | "modulepreload"))
             })
-        {
-            if let Some(url) = attrs
+            && let Some(url) = attrs
                 .get("href")
                 .and_then(|v| base.join(v).ok())
                 .and_then(|u| warc::key(u.as_str()))
-            {
-                links.assets.push(url);
-            }
+        {
+            links.assets.push(url);
         }
         if let Some(style) = attrs.get("style") {
             css(style, &base, &mut links.assets);
@@ -306,6 +325,22 @@ mod tests {
             )]),
             body: body.into(),
         }
+    }
+
+    #[test]
+    fn keeps_commas_in_image_urls_and_copies_video_posters_without_media_streams() {
+        let links = links("https://sky.org/article", &response("text/html", r#"
+            <img srcset="https://maps.sky.org/osm,9,30,40/250.png 1x, https://maps.sky.org/osm,9,30,40/500.png 2x">
+            <video poster="poster.jpg" src="movie.webm"><source src="movie.mp4"></video>
+        "#)).unwrap();
+        assert_eq!(
+            links.assets,
+            [
+                "https://maps.sky.org/osm,9,30,40/250.png",
+                "https://maps.sky.org/osm,9,30,40/500.png",
+                "https://sky.org/poster.jpg"
+            ]
+        );
     }
 
     #[test]

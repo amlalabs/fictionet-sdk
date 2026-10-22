@@ -189,17 +189,10 @@ impl Live {
                             }
                             if response.status.is_redirection() && job.redirects < 10 {
                                 for url in links.pages {
-                                    let navigation =
-                                        job.navigation.as_ref().and_then(|(_, depth)| {
-                                            url::Url::parse(&url)
-                                                .ok()?
-                                                .host_str()
-                                                .map(|host| (host.to_owned(), *depth))
-                                        });
                                     self.enqueue(
                                         Job {
                                             url,
-                                            navigation,
+                                            navigation: job.navigation.clone(),
                                             redirects: job.redirects + 1,
                                             cx: job.cx.clone(),
                                         },
@@ -210,9 +203,12 @@ impl Live {
                                 && *depth < 5
                             {
                                 for url in links.pages.into_iter().filter(|u| {
-                                    url::Url::parse(u)
-                                        .ok()
-                                        .is_some_and(|u| u.host_str() == Some(site))
+                                    url::Url::parse(u).ok().is_some_and(|u| {
+                                        u.host_str().is_some_and(|host| {
+                                            host.trim_start_matches("www.")
+                                                == site.trim_start_matches("www.")
+                                        })
+                                    })
                                 }) {
                                     self.enqueue(
                                         Job {
@@ -440,6 +436,102 @@ impl Pages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_redirects_do_not_grant_a_crawl_of_another_site() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}/");
+        let landing = format!("http://localhost:{port}/landing");
+        let location = landing.clone();
+        let (send, receive) = oneshot::channel();
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let target = line.split_whitespace().nth(1).unwrap().to_owned();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let (status, extra, body) = match target.as_str() {
+                    "/robots.txt" => (200, String::new(), "User-agent: *\nAllow: /\n"),
+                    "/" => (302, format!("Location: {location}\r\n"), ""),
+                    "/landing" => (
+                        200,
+                        String::new(),
+                        "<title>Landing</title><a href='/escape'>Another site page</a>",
+                    ),
+                    _ => panic!("only the result redirect and landing page are reached"),
+                };
+                write!(socket, "HTTP/1.1 {status} OK\r\n{extra}Content-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            let _ = send.send(());
+        });
+        let path = std::env::temp_dir().join(format!(
+            "fictionet-live-redirect-{}.warc.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let live = Arc::new(Live {
+            key: Key::new("GOOGLE_SEARCH_API_KEY", Some("private".into())).unwrap(),
+            engine: Key::new("GOOGLE_SEARCH_ENGINE_ID", Some("engine".into())).unwrap(),
+            endpoint: "https://customsearch.googleapis.com/customsearch/v1"
+                .parse()
+                .unwrap(),
+            path: path.clone(),
+            state: Mutex::default(),
+            fetcher: Mutex::default(),
+        });
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(6)),
+            |cx| async move {
+                live.enqueue(
+                    Job {
+                        url: origin.clone(),
+                        navigation: Some(("127.0.0.1".into(), 0)),
+                        redirects: 0,
+                        cx: cx.clone(),
+                    },
+                    true,
+                );
+                cx.race(Some(cx.now() + Duration::from_secs(10)), receive)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    live.response(&cx, &origin).await.unwrap().status.as_u16(),
+                    302
+                );
+                assert_eq!(
+                    live.response(&cx, &landing).await.unwrap().status.as_u16(),
+                    200
+                );
+                assert!(
+                    live.response(&cx, &format!("http://localhost:{port}/escape"))
+                        .await
+                        .is_none()
+                );
+                assert_eq!(live.state().archive.urls().count(), 2);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
