@@ -199,6 +199,13 @@ impl Response {
     /// `serve_ms`.
     pub fn fields(&self) -> Fields {
         let mut fields = self.meta.fields();
+        if fields.get("kind").and_then(|value| value.as_str()) == Some("page")
+            && self.content_type.starts_with("text/html")
+        {
+            let html = String::from_utf8_lossy(&self.body);
+            let end = html.floor_char_boundary(html.len().min(32768));
+            fields.set("preview", &html[..end]);
+        }
         if self.stored_headers.is_some() {
             fields.set("served_by", "WARC capture");
         }
