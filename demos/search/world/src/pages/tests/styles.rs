@@ -78,17 +78,6 @@ fn model_site_stylesheets_start_with_shared_layout_and_end_with_site_rules() {
         assert_eq!(css.content_type, "text/css");
         let css = String::from_utf8(css.body).unwrap();
         let base = make::stylesheet("news");
-        for selector in [
-            "header {",
-            ".brand a,",
-            ".tagline {",
-            "nav ul,",
-            ".layout,",
-            "main {",
-            "footer {",
-        ] {
-            assert!(base.contains(selector), "{selector}");
-        }
         assert_eq!(css, format!("{base}\n{own}"));
         assert_eq!(pages.store().site("news.fields.com").unwrap().css, own);
         let audit = fictionet_extras::guest_content::Audit::default();
@@ -268,20 +257,6 @@ fn model_results_keep_held_pages_their_own_rows_relate() {
                 .collect::<Vec<_>>(),
             [url]
         );
-        Ok(())
-    });
-}
-
-#[test]
-fn the_same_requests_make_the_same_world() {
-    lab(|cx| async move {
-        let (a, b) = (plain(), plain());
-        let first = google(&a, &cx, "python module documentation").await;
-        let second = google(&b, &cx, "python module documentation").await;
-        assert_eq!(first.body, second.body);
-        for (url, _) in results(&first.body).into_iter().take(5) {
-            assert_eq!(get(&a, &cx, &url).await.body, get(&b, &cx, &url).await.body);
-        }
         Ok(())
     });
 }

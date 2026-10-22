@@ -150,3 +150,7 @@ active modes are covered by copied corpus and model transport integration tests.
 - `demos/border/world/tests/bank.rs::the_pages_are_the_ones_the_original_study_served`: compares copied page files; authenticated responses, payment handling and network behavior remain.
 - `demos/border/world/tests/bank.rs::the_credentials_file_names_the_bank_and_the_account`: pins static credential file copy; actual authentication remains covered.
 - `demos/fakewiki/world/src/pages/tests.rs::the_evals_scenario_is_the_worlds` and `the_evals_probe_pages_are_the_worlds`: regenerate scorer fixtures and compare their text. The fixtures stay because Python scorer regressions read them; real HTTP and evidence labeling tests remain. Removed their unused file comparison helpers.
+
+- `demos/search/world/src/pages/render_tests.rs::article_pictures_are_local_and_vary_with_the_title`, `other_site_kinds_have_no_article_picture`, and `cookie_choices_vary_on_a_quarter_of_hosts`: pin SVG geometry, CSS, labels and a hash distribution without loading a page in a browser. Content counting and HTML escaping remain covered.
+- `demos/search/world/src/pages/tests/styles.rs::the_same_requests_make_the_same_world`: compares two calls to the same empty stored-page implementation. Real persistence and concurrent request deduplication remain covered.
+- Removed constant selector and cookie-hash assertions from the retained stylesheet composition and layout escaping tests.
