@@ -318,6 +318,7 @@ impl Meter {
     }
 
     /// Counts a packet that end `side` sent.
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     pub(crate) fn sent(&self, side: usize, packet: &Packet) {
         let c = &self.counts[side];
