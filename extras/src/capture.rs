@@ -81,8 +81,10 @@ impl Fetcher {
             .entry(host.to_owned())
             .or_insert_with(Instant::now);
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
-        *next = Instant::now() + Duration::from_millis(500);
-        self.api(url)
+        let response = self.api(url);
+        self.hosts
+            .insert(host.to_owned(), Instant::now() + Duration::from_millis(500));
+        response
     }
 
     /// Send a JSON search request with an API key in its header.
