@@ -8,9 +8,7 @@
 //! Attach and the world talk over a Unix socket on the same machine, such
 //! as `/run/fictionet/world.sock`. The connection starts with a short
 //! handshake, in which attach names the sandbox, and then carries IP
-//! packets both ways until either side closes it. Observation uses a separate
-//! socket and protocol, specified in
-//! [Fictionet Observe](../../../fictionet_observe/index.html#observation-protocol-reference).
+//! packets both ways until either side closes it.
 //!
 //! # The socket
 //!

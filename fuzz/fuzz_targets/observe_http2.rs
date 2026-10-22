@@ -4,7 +4,7 @@
 //! the connection preface, then the server's. Nothing may panic, and the
 //! time must stay in proportion to the input.
 #![no_main]
-use fictionet_observe::{Conversation, Decoded, Place, Registry};
+use fictionet::stdlib::dissect::{Conversation, Decoded, Place, Registry};
 use libfuzzer_sys::fuzz_target;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

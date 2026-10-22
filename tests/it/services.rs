@@ -34,6 +34,7 @@ use bytes::Bytes;
 use fictionet::events::{ConnInfo, Event, Fields, Level};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines, Wire};
+use fictionet::stdlib::dissect::{Dissector, Registry};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::op::{Message, Query};
@@ -49,7 +50,6 @@ use fictionet::stdlib::services::serve::{
 use fictionet::stdlib::web::httpd::{self, Http1};
 use fictionet::stdlib::world::net::{Arrival, Host, Net, PortServer, PreparedShare, Sni};
 use fictionet::{Cx, block_on, lab, pair};
-use fictionet_observe::{Dissector, Registry};
 
 // ---------------------------------------------------------------------------
 // Running a world in a test

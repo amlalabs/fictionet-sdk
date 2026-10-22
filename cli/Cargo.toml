@@ -19,7 +19,6 @@ web-proxy = ["fictionet/web-proxy"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-fictionet-observe = { path = "../observe", features = ["native"] }
 fictionet = { path = "..", default-features = false, features = ["tokio"] }
 libc = "0.2.189"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }

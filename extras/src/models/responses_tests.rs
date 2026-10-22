@@ -296,10 +296,10 @@ fn page_actions_read_world_pages_and_keep_the_client_tools() {
         let text = json!({"type":"message","id":"msg_final","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Read it","annotations":[]}]});
         answer(&mut socket, vec![text], true);
     });
-    let memory = Arc::new(fictionet_observe::Memory::default());
+    let memory = Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(12))
-            .observer(Arc::new(fictionet_observe::Aggregate::new(memory.clone()))),
+            .observer(memory.clone()),
         |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
@@ -356,7 +356,7 @@ fn page_actions_read_world_pages_and_keep_the_client_tools() {
     ))
     .unwrap();
     server.join().unwrap();
-    let tools = memory.checked_of("model", "tool").unwrap();
+    let tools = memory.of("model", "tool");
     let logged: Vec<_> = tools
         .iter()
         .map(|e| (e.str("tool").unwrap(), e.u64("results").unwrap()))

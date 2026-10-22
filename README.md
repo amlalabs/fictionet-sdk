@@ -151,19 +151,15 @@ service emits structured events. Core produces four streams through
 The integrator installs one observer through `RunOptions` before the run.
 `Fanout` combines observers. With no observer, core skips observation work.
 
-The companion crate owns consumption and retention: `Memory` for grading,
-`Aggregate` to combine repeats, `Jsonl` for files, and `DashboardObserver` for
-watching a world. Graders check that retained events are complete. See
-[Fictionet Observe](observe/README.md) for watching a running world, setup and
-limits, and [services](docs/services.md) for a small world.
+Each world owns its observation types, views, and page. The stdlib offers
+opt-in pieces: `dissect` turns caller-supplied packets into protocol layers,
+`pcap` writes pcapng, and the `page` feature streams one concrete state type
+with an ordinary axum route. No collector or dashboard is installed for you.
 
-Protocol codecs also work in unit tests and fuzz targets. The companion's
-`decode` feature supplies presenters that use those codecs for captured traffic.
-The [stdlib docs](src/stdlib/mod.rs) list the modules and describe their uses.
-To change a protocol, see
-[the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
-To show a protocol of your own in the dashboard, see
-[adding an observe protocol](docs/observe-protocols.md).
+Protocol codecs also work in unit tests and fuzz targets. The dissectors use
+those same codecs. The [stdlib docs](src/stdlib/mod.rs) list the modules and
+describe how to copy and change a protocol. See
+[adding a packet presenter](docs/observe-protocols.md) for custom dissection.
 
 ## Where sandboxes can run
 
@@ -194,7 +190,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 The crate docs are the guide. Build them with:
 
 ```console
-$ cargo doc --no-deps -p fictionet -p fictionet-observe --all-features --open
+$ cargo doc --no-deps -p fictionet --all-features --open
 ```
 
 Start at the crate root, which explains the main ideas, then read in this order:
@@ -210,8 +206,7 @@ Start at the crate root, which explains the main ideas, then read in this order:
    [`stdlib::services::serve`](src/stdlib/services/serve.rs) for a network of hosts and
    services, and [`stdlib::web`](src/stdlib/web/mod.rs) for a network of
    websites.
-5. [Fictionet Observe](observe/README.md): collection, grading, files, and watching
-   a world from its page or a shell. [Events](src/events.rs) covers production.
+5. [Packet dissection](src/stdlib/dissect/mod.rs): opt-in protocol layers and packet summaries.
 6. [`proto`](src/guide/proto.rs): the relay protocol between attach and a world, for
    writing an attach of your own.
 7. [`roadmap`](src/guide/roadmap.rs): what is planned.

@@ -1,14 +1,14 @@
-# Add an observe protocol
+# Add a packet presenter
 
-Implement `fictionet::stdlib::codec::Decode` and `fictionet_observe::Present`
+Implement `fictionet::stdlib::codec::Decode` and `fictionet::stdlib::dissect::Present`
 on your decoder. You can copy a protocol file from `src/stdlib/protocols/`
 into your crate and edit it, or write a decoder from scratch. `Present::summary`
 describes one item. `Present::fields` adds fields to a `Layer`, with ranges
 relative to the item's raw bytes. `Layer::note` adds text without a range.
-The [`Present` rustdoc](../observe/src/decode/present.rs)
+The [`Present` rustdoc](../src/stdlib/dissect/present.rs)
 includes a complete decoder and registration example.
 
-Use [`Registry`](../observe/src/decode/registry.rs) to register a name, a matcher,
+Use [`Registry`](../src/stdlib/dissect/registry.rs) to register a name, a matcher,
 and a factory for the two direction decoders. Its contract covers defaults,
 selection precedence, TCP prefix limits, UDP handling and explicit choice.
 Built-ins use the same registration methods.
@@ -16,15 +16,15 @@ Built-ins use the same registration methods.
 `Registry::names()` lists the registered names in registration order, oldest
 first. Each name appears once. Replacing a name moves it to the end.
 `Registry::default()` includes the built-ins. The registry, matchers, factories
-and presenters are available with the companion's `decode` feature.
+and presenters are ordinary stdlib pieces.
 
 Each built-in adapter owns its matcher, factory, and input read-ahead.
 Use `Http1::register`, `Dns::register`, `Dhcp::register`, or
-`ModbusSession::register` from `fictionet_observe::protocols`,
-`fictionet_observe::http2::Capture::register`, or `fictionet_observe::tls::TlsSession::register`
+`ModbusSession::register` from `fictionet::stdlib::dissect::protocols`,
+`fictionet::stdlib::dissect::http2::Capture::register`, or `fictionet::stdlib::dissect::tls::TlsSession::register`
 to add just that protocol. These methods use the built-in name and replace
 any earlier registration with that name. The default composition in
-`observe/src/decode/app.rs` registers HTTP/1, HTTP/2, TLS, Modbus, DHCP, then DNS.
+`src/stdlib/dissect/app.rs` registers HTTP/1, HTTP/2, TLS, Modbus, DHCP, then DNS.
 Later registrations take precedence, so port-based DNS and Modbus matching
 still win over HTTP prefixes. HTTP/2 waits for a partial preface on TCP.
 
@@ -33,7 +33,7 @@ one budget for all its connections and registry clones, including TLS
 plaintext. Keep that budget outside the per-connection factory:
 
 ```rust
-use fictionet_observe::{Registry, http2, protocols::Http1, tls::TlsSession};
+use fictionet::stdlib::dissect::{Registry, http2, protocols::Http1, tls::TlsSession};
 
 let mut registry = Registry::new();
 Http1::register(&mut registry);
@@ -47,30 +47,20 @@ and call `decode(packet, keys)` in capture order. `packet` is a raw IPv4 or
 IPv6 packet. A reader for Ethernet captures must first extract the IP
 payload. Supply TLS key log entries when decryption is wanted, or `&[]`.
 The returned `Decoded` exposes layers, fields, tags, and summaries.
-`write_layers` and `write_buffers` use the dashboard's JSON format.
+`write_layers` and `write_buffers` encode the result as JSON.
 
-Set `DashboardOptions::protocols` before constructing the `DashboardObserver`
-and install its observer in `RunOptions`. Serve its handle on an observation
-socket with `fictionet_observe::serve`. The `fictionet observe` command
-connects with `--observation unix:<path>` and shows the custom protocol, as
-does a world's page over the same handle.
+The caller owns capture, retention, TLS keys, and presentation. No observer or
+socket is needed. Call `Dissector::lost` after a capture gap so stream decoders
+cannot join bytes across missing packets. Use `stdlib::pcap` to export the
+same packets to Wireshark, with an optional caller-supplied TLS key log.
 
-The endpoint uses protocol name `fictionet-observe`, version 2. Other names
-or versions receive a refusal reason. It does not fall back to the world
-socket. See the companion's
-[protocol reference](../observe/src/lib.rs)
-for requests, packet fields and loss reports, and
-[decoding and decryption](../observe/src/lib.rs)
-for capture policy and key retention. Clients should ignore fields and
-events they do not recognize.
-
-`Observed<D>` drives ordered bytes directly. Its [placement contract](../observe/src/decode/present.rs)
+`Observed<D>` drives ordered bytes directly. Its [placement contract](../src/stdlib/dissect/present.rs)
 covers exact spans, hop limits, live updates, resets and reassembly buffers.
 For a removed outer header, record `Spans::skip`, then record its unchanged
 payload with `Spans::push_exact`. Follow the documented order when recording
 payload spans and calling `data` or `reset`.
 
-[`Conversation`](../observe/src/decode/conversation.rs) supplies the TCP selection
+[`Conversation`](../src/stdlib/dissect/conversation.rs) supplies the TCP selection
 and flush driver, including ordered input, gaps, waiting status and ALPN.
 
 TLS and Modbus sessions use `Registry::register_protocol` when
@@ -106,7 +96,7 @@ policy. The adapter and registry require cloneable decoder errors so `Stream`
 can retain a terminal error while reporting it once.
 
 HTTP/2's `Capture::register` uses `register_with_buffer` with
-`fictionet_observe::http2::CAPTURE_READ_AHEAD`. Copy `observe/src/decode/http2.rs` to
+`fictionet::stdlib::dissect::http2::CAPTURE_READ_AHEAD`. Copy `src/stdlib/dissect/http2.rs` to
 customize presentation; it uses only public SDK APIs. It reads frames with
 `stdlib::protocols::http2::Inputs::for_observation` and header blocks with
 `stdlib::protocols::http2::HeaderBlocks::for_observation`, the same frame parser and
@@ -129,7 +119,7 @@ frame boundary.
 values. Match those variants rather than field labels or sentences. They
 report continuation state, promised stream IDs, interruptions, invalid
 fragments and byte limits. Strict assembly also reports continuation and
-promised-stream facts. `fictionet_observe::http2::Capture` renders these
+promised-stream facts. `fictionet::stdlib::dissect::http2::Capture` renders these
 values as labels and sentences.
 
 Capture policy keeps complete frames already present in bounded read-ahead.
@@ -141,4 +131,4 @@ clones, including nested TLS streams, through `Capture::pair_in`.
 Message layers point at payload bytes when one
 contiguous range is available; otherwise they use a reassembly buffer.
 To show a copied `src/stdlib/protocols/grpc.rs` in HTTP/2 display, also copy
-`observe/src/decode/http2.rs` and change its `grpc` import to the copied module.
+`src/stdlib/dissect/http2.rs` and change its `grpc` import to the copied module.

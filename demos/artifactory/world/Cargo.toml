@@ -15,7 +15,6 @@ path = "src/main.rs"
 
 # The default features serve HTTP/2 without the optional web-proxy client.
 [dependencies]
-fictionet-observe = { path = "../../../observe", features = ["native"] }
 fictionet-extras = { path = "../../../extras" }
 bytes = "1"
 fictionet = { path = "../../.." }

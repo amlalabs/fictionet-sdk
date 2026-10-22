@@ -66,7 +66,7 @@
 //!    Pass [`RunOptions`](crate::RunOptions) to install one observer before execution.
 //!    It receives events, packets, TLS keys and topology according to interest.
 //!    Use [`Fanout`](crate::events::Fanout) to combine consumers from
-//!    [Fictionet Observe](../../../fictionet_observe/index.html).
+//!    Consumers own their storage and presentation.
 //!    `run` and `lab` emit `run.start` once at zero when interested.
 //!    [`events`](crate::events#interest-identity-and-order) says what
 //!    observation skips without an observer. Every task the world starts
@@ -334,7 +334,6 @@
 //!
 //! With those conditions, a lab run with fixed interests and limits repeats
 //! all four observation streams with the same stamps and packet bytes.
-//! Synchronous `fictionet_observe::Memory` keeps events for grading.
 //! Interactive capture and worker queue overflow depend on external scheduling.
 //! The seed alone is not enough. Keep the world code,
 //! configuration and ordered inputs fixed. Use `Cx` for time, randomness

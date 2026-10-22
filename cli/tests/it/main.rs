@@ -4,6 +4,5 @@
 mod common;
 
 mod attach_bin;
-mod observe_bin;
 mod proxy;
 mod tap_bin;

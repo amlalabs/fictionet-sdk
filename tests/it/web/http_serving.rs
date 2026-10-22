@@ -503,7 +503,7 @@ async fn the_proxy_refuses_hosts_routed_by_default_host() {
     let port = listener.local_addr().unwrap().port();
     let (seen_tx, seen) = mpsc::channel();
     let server = tokio::spawn(test_upstream(listener, seen_tx));
-    let events = Arc::new(Memory::default());
+    let events = Arc::new(EventLog::default());
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         run(

@@ -269,7 +269,10 @@ mod tests {
         assert_eq!(Alpha::<4>::right_padded("ab").unwrap().as_bytes(), b"ab  ");
         assert_eq!(Alpha::<2>::left_padded("abc"), Err(Error::Length));
         assert_eq!(Alpha::<2>::right_padded("\u{e9}"), Err(Error::Printable));
-        assert_eq!(Alpha::<0>::right_padded("").unwrap().as_bytes(), &[]);
+        assert_eq!(
+            Alpha::<0>::right_padded("").unwrap().as_bytes(),
+            &[] as &[u8]
+        );
         for byte in 0..=u8::MAX {
             let bytes = [b' ', byte, b'~'];
             assert_eq!(Alpha::from(bytes).as_bytes(), &bytes);
@@ -377,7 +380,10 @@ mod tests {
             assert_eq!(Alpha::<4>::left_padded(text).unwrap().as_bytes(), &left);
             assert_eq!(Alpha::<4>::right_padded(text).unwrap().as_bytes(), &right);
         }
-        assert_eq!(Alpha::<0>::left_padded("").unwrap().as_bytes(), &[]);
+        assert_eq!(
+            Alpha::<0>::left_padded("").unwrap().as_bytes(),
+            &[] as &[u8]
+        );
         assert_eq!(Alpha::<0>::right_padded("A"), Err(Error::Length));
         assert_eq!(Alpha::<4>::left_padded("ABCDE"), Err(Error::Length));
         for text in ["\0", "\t", "\n", "\u{1f}", "\u{7f}", "é", "🦀"] {

@@ -69,7 +69,7 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
                     |event| event.conn(&conn).field("owner", "edge"),
                 );
             }
-            assert_eq!(log.checked_of("test", "drop").unwrap().len(), 6);
+            assert_eq!(log.of("test", "drop").len(), 6);
             *saved.lock().unwrap() = Some(log);
             Ok(())
         },
@@ -77,7 +77,7 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
     .unwrap();
 
     let log = kept.lock().unwrap().take().unwrap();
-    let events = log.checked_of("test", "drop").unwrap();
+    let events = log.of("test", "drop");
     assert_eq!(events.len(), 6);
     let expected = [
         (
@@ -1716,7 +1716,7 @@ fn lan_drop_identity_comes_from_ingress_registration() {
                 .wait(&fcx, 0, 2, Duration::from_secs(10), |e| e.is("lan", "drop"))
                 .await?;
             assert_eq!(drops.len(), 2);
-            assert!(log.checked_of("net", "blocked").unwrap().is_empty());
+            assert!(log.of("net", "blocked").is_empty());
             for event in &drops {
                 assert_eq!(event.conn.sandbox.as_ref(), Some(&identity));
                 assert_eq!(event.str("lan"), Some("test"));

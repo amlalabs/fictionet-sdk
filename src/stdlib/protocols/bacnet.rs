@@ -2448,7 +2448,7 @@ mod tests {
         let all = WhoIs::parse(&[]).unwrap();
         assert_eq!(all, WhoIs { range: None });
         assert!(all.matches(0) && all.matches(MAX_INSTANCE));
-        assert_eq!(all.to_bytes().unwrap(), []);
+        assert_eq!(all.to_bytes().unwrap(), [] as [u8; 0]);
         let some = WhoIs {
             range: Some((3, 300)),
         };

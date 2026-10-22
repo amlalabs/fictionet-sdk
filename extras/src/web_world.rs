@@ -1,17 +1,11 @@
 //! The sites and startup of the quick-start world. The web test's fixture,
 //! `tests/web_fixture`, serves it with routes of its own added.
 //!
-//! `run` takes the attachment socket, CA output and optional observation
-//! socket after the executable name. The third path installs a collector
-//! and serves its handle with `fictionet_observe::serve`:
+//! `run` takes the attachment socket and CA output after the executable name.
 //!
 //! ```sh
-//! cargo run -p fictionet --features web-proxy,tokio --example web_fixture -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
-//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! cargo run -p fictionet --features web-proxy,tokio --example web_fixture -- /run/fictionet/world.sock /run/fictionet/ca.pem
 //! ```
-//!
-//! Run the watch command in another terminal. See `fictionet_observe` for
-//! the shell commands and capture limits.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -51,11 +45,7 @@ pub fn run(
         .cloned()
         .unwrap_or_else(|| "/run/fictionet/ca.pem".into());
 
-    let (options, _observation) = fictionet_observe::serve_observation(
-        fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.get(3).map(Into::into),
-        None,
-    )?;
+    let options = fictionet::RunOptions::new(fictionet::Seed::random());
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}, CA in {ca_path}");

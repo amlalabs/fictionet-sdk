@@ -27,6 +27,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"] }
 tokio-util = { version = "0.7", default-features = false }
 
 [dev-dependencies]
-fictionet-observe = { path = "../observe", features = ["native"] }
+fictionet-test-support = { path = "../tests/support" }
 libc = "0.2"
 futures-util = { version = "0.3", default-features = false }

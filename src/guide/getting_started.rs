@@ -35,7 +35,7 @@
 //! - `target/release/examples/web_fixture`, the world. It runs its local
 //!   sites on a tokio runtime.
 //! - `target/release/fictionet`, which has the `fictionet attach` and
-//!   `fictionet observe` commands.
+//!   `fictionet attach` command.
 //!
 //! # 2. Make the socket's directory
 //!
@@ -54,12 +54,10 @@
 //! # 3. Start the world
 //!
 //! In a first terminal, start the world. Its arguments are the attachment
-//! socket, the certificate authority file, and the optional observation socket.
-//! The third argument installs `DashboardObserver` wrapped in `Aggregate` and
-//! serves its handle. Without it, this program installs no observer:
+//! socket and the certificate authority file:
 //!
 //! ```text
-//! $ target/release/examples/web_fixture /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observe.sock
+//! $ target/release/examples/web_fixture /run/fictionet/world.sock /run/fictionet/ca.pem
 //! listening on /run/fictionet/world.sock, CA in /run/fictionet/ca.pem
 //! ```
 //!
@@ -274,56 +272,15 @@
 //! curl: (6) Could not resolve host: example.test
 //! ```
 //!
-//! ## Watch the world's events
+//! ## Observation chosen by the world
 //!
-//! In another terminal, start watching the world's HTTP requests:
-//!
-//! ```text
-//! $ target/release/fictionet observe --observation unix:/run/fictionet/observe.sock watch | grep '"kind":"request"'
-//! ```
-//!
-//! Back in the third terminal, repeat these two requests:
-//!
-//! ```text
-//! $ sudo ip netns exec agent curl -sS --cacert /run/fictionet/ca.pem -w '%{remote_ip}\n' https://example.test/
-//! hello from https example.test 443 over HTTP/2.0
-//! 2001:db8:113::10
-//! $ sudo ip netns exec agent curl -sS -i http://example.test/ | head -3
-//! HTTP/1.1 301 Moved Permanently
-//! Content-Type: text/plain; charset=utf-8
-//! Location: https://example.test/
-//! ```
-//!
-//! The observer shows the world's side. With the third argument, `web_fixture`
-//! installs a companion observer with repeat aggregation and bounded retention.
-//! Its policy selects events, tapped packets and keys before work, with separate
-//! class budgets and one loss ledger. Sites emit DNS queries, TLS handshakes and
-//! HTTP requests; services name their protocols on connections. Core retains no
-//! history. Use `Cx::tap` to make another link observable.
-//! `fictionet observe` prints each event as a line of JSON while it watches.
-//! These lines come from a separate run of the same two requests (cut short
-//! here):
-//!
-//! ```text
-//! {"event":"event","data":{...,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 200","sandbox":{"id":1,"name":"agent","addr":"10.0.0.2","addr_v6":"2001:db8::2"},"conn":3,...,"fields":{"scheme":"https","host":"example.test","method":"GET","path":"/","status":200,...},"node":"t32",...}}
-//! {"event":"event","data":{...,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 301","sandbox":{"id":1,"name":"agent",...},"conn":4,...,"fields":{"scheme":"http","host":"example.test","method":"GET","path":"/","status":301,...},"node":"t33",...}}
-//! ```
-//!
-//! ## Watch a world in a browser
-//!
-//! A world can serve its own page with `fictionet_observe::page::Page`, over
-//! the same `DashboardObserver` handle, and print a loopback address to open.
-//! Its event and packet lists share loss reporting. JSONL and pcapng exports
-//! read retained rings for the selected scope, even without an active watch.
-//! A custom presenter joins its service by protocol name; other flows use ports
-//! and byte prefixes.
-//! `web_fixture` serves none.
-//! See [Fictionet Observe](../../../fictionet_observe/index.html) for the page,
-//! resource limits and the observation protocol.
+//! A world can inspect packets with [`dissect`](crate::stdlib::dissect),
+//! export them with [`pcap`](crate::stdlib::pcap), or serve its own typed
+//! page with the `page` feature. The world chooses what to record.
 //!
 //! # 7. Stop
 //!
-//! Press Ctrl-C in the observe terminal, then in the attach terminal. Attach
+//! Press Ctrl-C in the attach terminal. Attach
 //! exits and removes `tun0` as it goes:
 //!
 //! ```text

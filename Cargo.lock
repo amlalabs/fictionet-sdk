@@ -171,7 +171,6 @@ dependencies = [
  "bytes",
  "fictionet",
  "fictionet-extras",
- "fictionet-observe",
  "fictionet-test-support",
  "http",
  "http-body-util",
@@ -242,6 +241,8 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
+ "serde_json",
+ "serde_path_to_error",
  "sha1 0.10.7",
  "sync_wrapper",
  "tokio",
@@ -1124,7 +1125,6 @@ dependencies = [
  "fictionet-codegen-golden",
  "fictionet-extras",
  "fictionet-host",
- "fictionet-observe",
  "fictionet-test-support",
  "getrandom 0.4.3",
  "h2",
@@ -1142,9 +1142,11 @@ dependencies = [
  "rsa 0.9.10",
  "rustls",
  "rustls-pki-types",
+ "serde",
  "smoltcp",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "tower-service",
  "wasm-bindgen",
  "web-time",
@@ -1163,7 +1165,6 @@ dependencies = [
  "fictionet-demo",
  "fictionet-extras",
  "fictionet-host",
- "fictionet-observe",
  "flate2",
  "http",
  "http-body",
@@ -1190,7 +1191,6 @@ dependencies = [
  "etherparse",
  "fictionet",
  "fictionet-host",
- "fictionet-observe",
  "fictionet-test-support",
  "http",
  "http-body-util",
@@ -1235,7 +1235,6 @@ dependencies = [
  "fictionet",
  "fictionet-extras",
  "fictionet-host",
- "fictionet-observe",
  "flate2",
  "http",
  "http-body",
@@ -1266,7 +1265,7 @@ dependencies = [
  "bytes",
  "fictionet",
  "fictionet-host",
- "fictionet-observe",
+ "fictionet-test-support",
  "flate2",
  "http",
  "http-body",
@@ -1300,7 +1299,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "fictionet",
- "fictionet-observe",
+ "fictionet-test-support",
  "futures-util",
  "http",
  "http-body",
@@ -1317,24 +1316,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fictionet-observe"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "divan",
- "fictionet",
- "getrandom 0.4.3",
- "hickory-proto",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "fictionet-search-demo"
 version = "0.1.0"
 dependencies = [
@@ -1345,7 +1326,6 @@ dependencies = [
  "fictionet-demo",
  "fictionet-extras",
  "fictionet-host",
- "fictionet-observe",
  "fictionet-test-support",
  "flate2",
  "http",
@@ -1373,7 +1353,6 @@ dependencies = [
  "fictionet",
  "fictionet-extras",
  "fictionet-host",
- "fictionet-observe",
  "http",
  "http-body-util",
  "hyper",
@@ -2373,7 +2352,6 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "fictionet",
- "fictionet-observe",
  "http",
  "serde",
  "serde_json",
@@ -4128,6 +4106,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-stream"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "tokio-tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4555,7 +4545,6 @@ dependencies = [
  "fictionet",
  "fictionet-extras",
  "fictionet-host",
- "fictionet-observe",
  "fictionet-test-support",
  "form_urlencoded",
  "http",

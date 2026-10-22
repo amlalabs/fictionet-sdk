@@ -165,11 +165,11 @@ fn upload(size: usize) -> Request<Body> {
     request
 }
 
-fn run<F>(test: impl FnOnce(Cx, Arc<fictionet_observe::Memory>) -> F + Send)
+fn run<F>(test: impl FnOnce(Cx, Arc<fictionet_test_support::EventLog>) -> F + Send)
 where
     F: std::future::Future<Output = Result<(), Error>> + Send + 'static,
 {
-    let log = Arc::new(fictionet_observe::Memory::default());
+    let log = Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(Seed::from_u64(1)).observer(log.clone()),
         move |fcx| test(fcx, log),
@@ -734,7 +734,7 @@ async fn serve_one(fcx: &Cx, forward: fictionet::stdlib::web::Forward) -> String
 /// recorded the error and the origin it tried, and returns the answer.
 async fn bad_gateway(
     fcx: &Cx,
-    log: &fictionet_observe::Memory,
+    log: &fictionet_test_support::EventLog,
     forward: fictionet::stdlib::web::Forward,
     origin: &str,
 ) -> String {
@@ -743,7 +743,7 @@ async fn bad_gateway(
         output.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
         "{output}"
     );
-    let events = log.checked_of("http", "request").unwrap();
+    let events = log.of("http", "request");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].str("answer"), Some("error"));
     assert_eq!(events[0].u64("status"), Some(502));
@@ -763,7 +763,7 @@ fn a_forwarded_request_names_the_origin_in_its_event() {
 
             let output = serve_one(&fcx, forward).await;
             assert!(output.starts_with("HTTP/1.1 200 OK\r\n"), "{output}");
-            let events = log.checked_of("http", "request").unwrap();
+            let events = log.of("http", "request");
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].str("answer"), Some("handler"));
             assert_eq!(events[0].u64("status"), Some(200));
@@ -957,7 +957,7 @@ fn a_client_reset_before_the_upstream_answers_keeps_the_origin() {
             &httpd::HttpOptions::default(),
         )
         .await?;
-        let requests = events.checked_of("http", "request").unwrap();
+        let requests = events.of("http", "request");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].str("answer"), Some("cancelled"));
         assert_eq!(requests[0].u64("status"), None);

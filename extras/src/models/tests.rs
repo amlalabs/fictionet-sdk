@@ -132,10 +132,9 @@ fn swap_stream_and_budget_against_upstream() {
             socket.write_all(&[byte]).unwrap();
         }
     });
-    let memory = Arc::new(fictionet_observe::Memory::default());
+    let memory = Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
-            .observer(Arc::new(fictionet_observe::Aggregate::new(memory.clone()))),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(memory.clone()),
         |cx| async move {
             let credential = Credential::api_key(
                 &cx,
@@ -194,12 +193,12 @@ fn swap_stream_and_budget_against_upstream() {
     ))
     .unwrap();
     upstream.join().unwrap();
-    let calls = memory.checked_of("model", "call").unwrap();
+    let calls = memory.of("model", "call");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].u64("input_tokens"), Some(7));
     assert_eq!(calls[0].u64("output_tokens"), Some(3));
     assert_eq!(calls[0].str("credential"), Some("placeholder"));
-    let bodies = memory.checked_of("model", "body").unwrap();
+    let bodies = memory.of("model", "body");
     assert!(!bodies.is_empty());
     let mut response = Vec::new();
     for event in bodies
@@ -217,7 +216,7 @@ fn swap_stream_and_budget_against_upstream() {
     let response = String::from_utf8(response).unwrap();
     assert!(response.contains("<ANTHROPIC_API_KEY>"));
     assert!(!response.contains("sk-ant-api03-private"));
-    for event in memory.checked_all().unwrap() {
+    for event in memory.all() {
         assert!(!event.to_line().unwrap().contains("sk-ant-api03-private"));
     }
 }
@@ -348,10 +347,9 @@ fn cached_input_counts_once_toward_budget() {
             listener.set_nonblocking(true).unwrap();
             listener
         });
-        let memory = Arc::new(fictionet_observe::Memory::default());
+        let memory = Arc::new(fictionet_test_support::EventLog::default());
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(12))
-                .observer(Arc::new(fictionet_observe::Aggregate::new(memory.clone()))),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(12)).observer(memory.clone()),
             |cx| async move {
                 let credential =
                     Credential::api_key(&cx, Secret::new("key", "private-key".into())?);
@@ -389,7 +387,7 @@ fn cached_input_counts_once_toward_budget() {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        let calls = memory.checked_of("model", "call").unwrap();
+        let calls = memory.of("model", "call");
         assert_eq!(calls.len(), 1);
         if provider == Provider::Anthropic {
             assert_eq!(calls[0].u64("input_tokens"), Some(1));

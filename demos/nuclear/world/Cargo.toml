@@ -17,7 +17,6 @@ bytes = "1"
 http = "1"
 
 # The viewer and integration tests serve the control room page.
-fictionet-observe = { path = "../../../observe", features = ["page"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 
 [[bin]]

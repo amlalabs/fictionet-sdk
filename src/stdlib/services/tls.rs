@@ -11,9 +11,8 @@
 //! The world supplies a rustls [`ServerConfig`], using certificate files
 //! or certificates issued by [`ca`](fictionet::stdlib::services::ca). This module
 //! handles the TLS connection. Its rustls key adapter emits borrowed secrets
-//! to interested observers. Core retains no keys. The companion's `Collector`
-//! keeps bounded keys for decryption and export; see
-//! [Fictionet Observe](../../../../fictionet_observe/index.html#decoding-and-decryption).
+//! to interested observers. Core retains no keys. A caller can pass its own
+//! key log entries to [`dissect`](fictionet::stdlib::dissect) for decryption.
 //!
 //! The handshake has two steps, so the world can decide how to answer after
 //! it sees what the client asked for. [`server`] reads the client's hello,

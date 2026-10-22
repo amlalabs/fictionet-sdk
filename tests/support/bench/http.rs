@@ -1,5 +1,3 @@
-mod observer;
-
 use super::World;
 use bytes::Bytes;
 use fictionet_extras::hyper_io::{Exec, Io};
@@ -10,12 +8,11 @@ use fictionet::stdlib::{network::Connection, services::tls, web};
 use fictionet::{Attacher, Cx};
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
-use observer::ObserverStatus;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
@@ -47,99 +44,12 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
     sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)] as f64 / 1000.0
 }
 
-/// What a Sites run watches, through a real observer session.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Watch {
-    None,
-    /// A `watch` request: the graph and its changes.
-    Graph,
-    /// The graph, and a `packets` stream on every sandbox link.
-    Packets,
-    /// Packet streams with separate agent and bulk class budgets.
-    Policy,
-}
-
-impl Watch {
-    fn enabled(self) -> bool {
-        self != Self::None
-    }
-}
-
-struct LinkPolicy;
-impl fictionet_observe::Policy for LinkPolicy {
-    fn classes(&self) -> &[fictionet_observe::Class] {
-        use fictionet_observe::Class;
-        const CLASSES: &[Class] = &[
-            Class::new("events").count(50_000).bytes(16 << 20).rank(3),
-            Class::new("noise")
-                .count(5_000)
-                .bytes(2 << 20)
-                .burst(64)
-                .rank(1),
-            Class::new("keys").count(20_000).bytes(8 << 20).rank(4),
-            Class::new("agent").count(8_192).bytes(32 << 20).rank(2),
-            Class::new("bulk")
-                .watched()
-                .count(4_096)
-                .bytes(1 << 20)
-                .snap(96)
-                .burst(64),
-        ];
-        CLASSES
-    }
-    fn admit(&self, interest: fictionet::events::Interest<'_>) -> fictionet_observe::Admit {
-        use fictionet::events::Interest;
-        use fictionet::stdlib::network::ip;
-        use fictionet_observe::Admit;
-        match interest {
-            Interest::Event(_, conn)
-                if conn.sandbox.as_ref().is_some_and(|s| &*s.name == "jump") =>
-            {
-                Admit::Skip
-            }
-            Interest::Event(meta, _) if meta.source == "net" && meta.kind == "blocked" => {
-                Admit::Class(1)
-            }
-            Interest::Event(..) | Interest::Topology(_) => Admit::Build,
-            Interest::TlsKey(_) => Admit::Class(2),
-            Interest::Packet(p) if p.sandbox == Some("jump") => Admit::Skip,
-            Interest::Packet(p) if p.sandbox.is_some() => {
-                match ip::Header::parse_truncated(p.bytes) {
-                    Some(h)
-                        if h.src == Ipv4Addr::new(10, 10, 5, 20)
-                            || h.dst == Ipv4Addr::new(10, 10, 5, 20) =>
-                    {
-                        Admit::Skip
-                    }
-                    Some(h)
-                        if h.src == Ipv4Addr::new(10, 10, 5, 30)
-                            || h.dst == Ipv4Addr::new(10, 10, 5, 30) =>
-                    {
-                        Admit::Class(4)
-                    }
-                    _ => Admit::Class(3),
-                }
-            }
-            Interest::Packet(_) => Admit::Class(4),
-        }
-    }
-    fn sort(&self, observation: &fictionet::events::Observation<'_>) -> Option<usize> {
-        match observation {
-            fictionet::events::Observation::Event(event) => {
-                Some(usize::from(event.repeat_fields().is_some()))
-            }
-            _ => None,
-        }
-    }
-}
-
 struct HttpRun {
     rps: f64,
     p50: f64,
     p99: f64,
     max: f64,
     cpu_per_request: f64,
-    rows: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -149,10 +59,6 @@ pub struct HttpCase {
     pub requests: usize,
     pub body: usize,
     pub sites: usize,
-    pub watch: Watch,
-    /// Whether the world installs an observer that does nothing.
-    pub hooks: bool,
-    pub writer: bool,
 }
 
 #[derive(Clone)]
@@ -178,8 +84,8 @@ pub fn bench(bencher: divan::Bencher, case: HttpCase) {
         .bench_local_values(World::measure);
     if let Some(r) = result.lock().unwrap().take() {
         eprintln!(
-            "last HTTP run: requests/s={:.0}, p50={:.1} us, p99={:.1} us, max={:.1} us, CPU={:.2} us/request, observer rows={}",
-            r.rps, r.p50, r.p99, r.max, r.cpu_per_request, r.rows
+            "last HTTP run: requests/s={:.0}, p50={:.1} us, p99={:.1} us, max={:.1} us, CPU={:.2} us/request",
+            r.rps, r.p50, r.p99, r.max, r.cpu_per_request
         );
     }
 }
@@ -238,59 +144,7 @@ fn certs(
 /// requests on it, one at a time.
 fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
     let (attacher, attachments) = fictionet::attachments();
-    // The observer reaches the world through an observation socket, as the
-    // dashboard does.
-    let path = socket_path("sites");
-    let dashboard = case.watch.enabled().then(|| {
-        let mut options = fictionet_observe::DashboardOptions::default();
-        if case.watch == Watch::Policy {
-            options.collector.policy = Arc::new(LinkPolicy);
-        }
-        fictionet_observe::DashboardObserver::new(options)
-    });
-    let listening = dashboard
-        .as_ref()
-        .map(|dashboard| fictionet_observe::serve(dashboard.handle(), &path).unwrap());
-    let stop = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(Mutex::new(ObserverStatus::Waiting));
-    let measuring = Arc::new(AtomicBool::new(false));
-    let observer = Arc::new(Mutex::new(None));
-    let watching = observer.clone();
-    let watch_path = path.clone();
-    let timing = measuring.clone();
-    let stop_after = stop.clone();
-    let wait_for = ready.clone();
-    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
-    struct Hook;
-    impl fictionet::events::Observer for Hook {
-        fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-            let fictionet::events::Interest::Event(_, _) = interest else {
-                return false;
-            };
-            true
-        }
-        fn observe(&self, _: fictionet::events::Stamp, _: fictionet::events::Observation<'_>) {}
-    }
-    let writer = case.writer.then(|| {
-        Arc::new(
-            fictionet_observe::Jsonl::new(std::io::sink(), fictionet_observe::Limits::default())
-                .unwrap(),
-        )
-    });
-    let mut destinations: Vec<Arc<dyn fictionet::events::Observer>> = Vec::new();
-    if let Some(dashboard) = &dashboard {
-        destinations.push(dashboard.observer());
-    }
-    if let Some(writer) = &writer {
-        destinations.push(writer.clone());
-    }
-    if case.hooks {
-        destinations.push(Arc::new(Hook));
-    }
-    if !destinations.is_empty() {
-        options = options.observer(Arc::new(fictionet::events::Fanout::new(destinations)));
-    }
-    let mut world = World::with_options(options, move |fcx, checkpoint| async move {
+    World::new(move |fcx, checkpoint| async move {
         let (roots, chain, key) = certs(&fcx);
         let roots = Arc::new(roots);
         let config = Arc::new(
@@ -317,27 +171,6 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
         for i in 1..case.sites {
             lookup(&fcx, &machines[0], &format!("site{i}.test")).await;
         }
-        // The DNS lookup has run the world and attached its graph.
-        if case.watch.enabled() {
-            *watching.lock().unwrap() = Some(std::thread::spawn(move || {
-                let result = (|| {
-                    let mut client = fictionet_observe::Client::connect(&watch_path)?;
-                    client.set_timeout(Some(Duration::from_millis(100)))?;
-                    observer::watch_world(
-                        &mut client,
-                        matches!(case.watch, Watch::Packets | Watch::Policy),
-                        case.sandboxes,
-                        &stop,
-                        &ready,
-                        &measuring,
-                    )
-                })();
-                if let Err(error) = &result {
-                    *ready.lock().unwrap() = ObserverStatus::Failed(error.to_string());
-                }
-                result
-            }));
-        }
         let mut clients = Vec::new();
         for m in &machines {
             let conn = m
@@ -363,18 +196,11 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
             }
             clients.push(c);
         }
-        // Wait until the observer is watching, while the world runs.
-        if case.watch.enabled() {
-            while !wait_for.lock().unwrap().ready()? {
-                fcx.sleep(fictionet::time::ms(5)).await?;
-            }
-        }
         let each = case.requests / case.sandboxes;
         let lat = Arc::new(Mutex::new(Vec::with_capacity(case.requests)));
         checkpoint.wait().await;
         let cpu0 = cpu_us();
         let start = Instant::now();
-        timing.store(true, Ordering::Release);
         let mut tasks = Vec::new();
         for mut c in clients {
             let lat = lat.clone();
@@ -405,10 +231,6 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
         let secs = start.elapsed().as_secs_f64();
         let cpu1 = cpu_us() - cpu0;
         checkpoint.wait().await;
-        // Rows still on their way belong to the timed requests.
-        fcx.sleep(fictionet::time::ms(150)).await?;
-        timing.store(false, Ordering::Release);
-        stop_after.store(true, Ordering::Release);
         let mut l = lat.lock().unwrap();
         l.sort_unstable();
         let total = l.len();
@@ -418,27 +240,11 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
             p99: percentile(&l, 0.99),
             max: percentile(&l, 1.0),
             cpu_per_request: cpu1 as f64 / total as f64,
-            rows: 0,
         });
         drop(l);
-        let observer = observer.lock().unwrap().take();
-        let rows = observer
-            .map_or(Ok(0), |o| o.join().expect("observer thread"))
-            .expect("observer outlived the measurement");
-        result.lock().unwrap().as_mut().unwrap().rows = rows;
-        drop(listening);
         fcx.cancel();
         Ok(())
-    });
-    let future = std::mem::replace(&mut world.future, Box::pin(async { Ok(()) }));
-    world.future = Box::pin(async move {
-        let result = future.await;
-        if let Some(writer) = writer {
-            writer.finish()?;
-        }
-        result
-    });
-    world
+    })
 }
 
 // A hyper client over a `Connection`.

@@ -26,14 +26,14 @@ fn idle_drains_spawned_and_woken_work_before_advancing_time() {
             });
             cx.idle().await?;
             assert_eq!(cx.now(), Instant::ZERO);
-            assert_eq!(log.checked_of("test", "ready").unwrap().len(), 1);
-            assert!(log.checked_of("test", "later").unwrap().is_empty());
+            assert_eq!(log.of("test", "ready").len(), 1);
+            assert!(log.of("test", "later").is_empty());
             task.join(&cx).await?;
             cx.idle().await?;
             assert_eq!(cx.now(), Instant::ZERO);
             cx.sleep(ms(1)).await?;
             cx.idle().await?;
-            assert_eq!(log.checked_of("test", "later").unwrap().len(), 1);
+            assert_eq!(log.of("test", "later").len(), 1);
             assert_eq!(cx.now(), Instant::ZERO + ms(1));
             cx.cancel();
             assert_eq!(cx.idle().await, Err(Cancelled));
@@ -504,13 +504,13 @@ fn real_upstreams_can_be_used_in_a_lab() {
 }
 
 fn recorded_world() -> Vec<u8> {
-    let log = Arc::new(fictionet_observe::Memory::default());
+    let log = Arc::new(fictionet_test_support::EventLog::default());
     let out = log.clone();
     block_on(lab(
         RunOptions::new(Seed::from_u64(7)).observer(out.clone()),
         move |cx| async move {
             assert!(matches!(
-                out.checked_of("run", "start").unwrap()[0].get("wall"),
+                out.of("run", "start")[0].get("wall"),
                 Some(fictionet::stdlib::protocols::json::Value::Null)
             ));
             for i in 0..4 {

@@ -186,7 +186,7 @@ service_fixture! {
 
 #[test]
 fn the_harness_resumes_after_starttls() {
-    let memory = Arc::new(fictionet_observe::Memory::default());
+    let memory = Arc::new(fictionet_test_support::EventLog::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Mail { tls: false }, ())
         .observer(memory.clone());
     assert_eq!(h.open().unwrap(), b"220 mail ready\r\n");
@@ -205,7 +205,7 @@ fn the_harness_resumes_after_starttls() {
         h.push(b"EHLO\r\n").unwrap(),
         b"250 hello tls=true sni=mail.test\r\n"
     );
-    let commands = memory.checked_of("mail", "command").unwrap();
+    let commands = memory.of("mail", "command");
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[1].str("line"), Some("EHLO"));
     assert!(commands[1].conn.tls);

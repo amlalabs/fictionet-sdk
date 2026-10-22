@@ -12,7 +12,6 @@ path = "lib.rs"
 doctest = false
 
 [dependencies]
-fictionet-observe = { path = "../../observe", features = ["native"] }
 # No default features, so each test build keeps the SDK features it chose.
 fictionet = { path = "../..", default-features = false }
 bytes = "1"

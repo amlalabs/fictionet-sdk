@@ -163,7 +163,7 @@ fn event_wait_predicate_can_read_same_log() {
                 let got = log
                     .wait(&fcx, 0, 2, ms(10), |event| {
                         assert_eq!(other.last(), 4);
-                        assert_eq!(other.checked_of("test", "tick").unwrap().len(), 2);
+                        assert_eq!(other.of("test", "tick").len(), 2);
                         seen.lock().unwrap().push(event.seq);
                         event.is("test", "tick")
                     })

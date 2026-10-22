@@ -4,13 +4,12 @@ This guide builds a small world step by step: a service, a test for it,
 a network of hosts that serve it, and a log a grader reads. Every piece is
 a public module of `fictionet::stdlib`, so each file can be copied into a world's crate and
 changed there. Each piece emits structured facts through `fictionet::events`
-to the run's installed observer. The [companion](../observe/README.md) owns
-collection and retention.
+to the run's installed observer. Consumers own retention and presentation.
 
 | Module | What it gives |
 |---|---|
 | `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests |
-| `fictionet::events` | Core's four observation streams and observer contract. The companion owns retention; no observer means no observation work. |
+| `fictionet::events` | Core's four observation streams and observer contract. Consumers own retention; no observer means no observation work. |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Handler`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
@@ -451,13 +450,10 @@ reply.
 ```rust
 use fictionet::stdlib::services::serve::Harness;
 
-let grader = std::sync::Arc::new(fictionet_observe::Memory::default());
-let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt, "hunter2".to_owned())
-    .observer(grader.clone());
+let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt, "hunter2".to_owned());
 assert_eq!(h.open()?, b"password: ");
 assert_eq!(h.push(b"hunter2\n")?, b"welcome\n");
 assert!(h.closed());
-assert_eq!(grader.checked_all()?[0].kind, "login");
 ```
 
 The harness runs the same state machine as the driver: `advance` moves
@@ -572,7 +568,7 @@ TLS ownership and reproducibility are split across these files:
   using the run's randomness and world-supplied leaf validity.
 - [`tls_keys.rs`](../src/tls_keys.rs) emits TLS keys to interested run observers.
   The adapter holds a weak dispatch reference. Capture, key retention, export
-  and decryption belong to `fictionet-observe`.
+  and decryption belong to `fictionet::stdlib::dissect`.
 - [`tls/output.rs`](../src/stdlib/services/tls/output.rs) drains ciphertext for both
   the server and the simulated client.
 
@@ -804,58 +800,18 @@ closure runs only when an installed observer wants that event. With no
 observer, emission does no allocation, formatting, clock read, task lookup
 or numbering.
 
-The integrator installs observers in `RunOptions` before the run starts.
-`fictionet::events::Fanout` combines destinations. The companion crate supplies
-`Memory` for bounded grading history, `Aggregate` for repeated facts, and
-`Jsonl` for a native writer worker. Its `Collector` retains all four streams;
-`DashboardObserver` adds the dashboard request service to a collector.
-
-```rust
-use std::sync::Arc;
-use fictionet::{RunOptions, Seed, block_on, lab};
-use fictionet_observe::{Aggregate, Memory};
-
-let grader = Arc::new(Memory::default());
-let options = RunOptions::new(Seed::from_u64(7))
-    .observer(Arc::new(Aggregate::new(grader.clone())));
-block_on(lab(options, |fcx| async move {
-    fcx.emit("prompt", "login", |event| event.field("right", true));
-    Ok(())
-}))?;
-let logins = grader.checked_of("prompt", "login")?;
-```
-
-`Memory::wait` waits for matching complete results on the run's clock,
-bounded by a deadline. At the deadline it returns matches so far.
-Retention loss and cancellation are errors. Reads do not flush aggregation
-or change history. Use `checked_of` or `checked_all` for grading; `after`
-supplies bounded display batches without certifying completeness.
-
-Task identities belong to one run. Events emitted through another run's
-`Cx`, or outside a world task, have no task metadata. A nested lab has its
-own world root with no parent. Tasks spawned through another run's `Cx`
-also have no parent in their run. Link owners and creators belong to that
-link's run.
-
-The run emits `run.start` at time zero to interested observers. Its `wall`
-field gives a real run's Unix epoch time; a lab uses `null`. Its `seed` is
-the 32-byte run seed as 64 lowercase hexadecimal digits. Its `rng` is
-`chacha20-v1`: ChaCha20 with contiguous byte consumption, little-endian
-integers and the high 53 bits for fractions. Event field names are fixed
-by the emitting code. Names from the wire, such as LDAP attributes, belong
-in an object under one field.
-
-The [events module](../src/events.rs) describes production and delivery.
-The [companion crate docs](../observe/src/lib.rs)
-describe retention, event JSON, loss reports and grading.
+Worlds own storage and views. Packet inspection is an independent function in
+[`stdlib::dissect`](../src/stdlib/dissect/mod.rs); packets and TLS keys are
+supplied by its caller. [`stdlib::pcap`](../src/stdlib/pcap.rs) writes those
+packets to pcapng without retention or subscriptions.
 
 ## 6. A world's page
 
-A world's page draws a run's tasks and groups and lists its events and
-captured packets through an installed `DashboardObserver`. See the
-[companion README](../observe/README.md) for setup and the
-[crate walkthrough](../observe/src/lib.rs)
-for the drawing, capture and observation requests.
+Each world writes its own page. With the `page` feature,
+[`stdlib::page`](../src/stdlib/page.rs) streams one concrete state type from a
+watch channel at `/state`. Compose that axum route with the world's HTML,
+commands, assets, and access rules. The terminal and screen modules accept
+caller-supplied sockets and browser libraries.
 
 ## Changing framing between items
 

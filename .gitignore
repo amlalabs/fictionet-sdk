@@ -1,7 +1,6 @@
 # Build output, and the images and binaries the demos download
 target/
 /demos/downloads/
-/observe/downloads/
 # Python environments, caches and eval logs
 .venv/
 __pycache__/

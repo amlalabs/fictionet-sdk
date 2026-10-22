@@ -2937,7 +2937,7 @@ mod tests {
         assert_eq!(&bytes[offsets[1]..], b"p\0w\r\n");
         assert_eq!(
             Command::continuation_offsets(b"a NOOP\r\n").unwrap(),
-            vec![]
+            Vec::<usize>::new()
         );
         let big = fixture_value_literal(vec![b'y'; MAX_LITERAL], false);
         assert_eq!(

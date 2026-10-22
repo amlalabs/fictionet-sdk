@@ -1,5 +1,5 @@
 #![no_main]
-use fictionet_observe::protocols::Modbus;
+use fictionet::stdlib::dissect::protocols::Modbus;
 use fictionet::stdlib::test_support::contract::check_decode;
 use libfuzzer_sys::fuzz_target;
 

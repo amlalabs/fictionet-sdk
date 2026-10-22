@@ -486,8 +486,7 @@
 //! - `net.blocked`: the packets `Sites` itself drops or refuses, with
 //!   `why` (see [`BlockedWhy`](fictionet::stdlib::world::net::BlockedWhy)),
 //!   `protocol`, `src`, `dst`, `dst_port` and `count`. These are
-//!   repeatable facts: an optional `fictionet_observe::Aggregate`
-//!   counts a scan or flood within bounded run-time windows.
+//!   repeatable facts that a consumer can count or combine.
 //!
 //! Every event names the sandbox it came from; events about a connection
 //! carry its number, from 1, on both ports. A connection's `tls.handshake`
@@ -499,29 +498,6 @@
 //! its events:
 //!
 #![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
-//!
-//! Install the observer in `RunOptions` before running the world. With no
-//! observer, services skip event construction. The companion's `Memory` and
-//! `Aggregate` retain events for grading; `Jsonl` exports files. See
-//! [Fictionet Observe](../../../fictionet_observe/index.html) for consumption.
-//! A grader can install bounded memory and repeat aggregation:
-//!
-//! ```
-//! use std::sync::Arc;
-//! use fictionet::{RunOptions, Seed, block_on, lab};
-//! use fictionet_observe::{Aggregate, Memory};
-//! let grader = Arc::new(Memory::default());
-//! let options = RunOptions::new(Seed::from_u64(7))
-//!     .observer(Arc::new(Aggregate::new(grader.clone())));
-//! block_on(lab(options, |fcx| async move {
-//!     // Start the sites and simulated clients here.
-//!     fcx.emit("shop", "order", |event| event.field("item", "pump"));
-//!     Ok(())
-//! }))?;
-//! let events = grader.checked_all()?;
-//! assert!(events.iter().any(|event| event.is("shop", "order")));
-//! # Ok::<(), fictionet::Error>(())
-//! ```
 //!
 //! A handler can add its own fields to its request's event. It puts
 //! [`Fields`](fictionet::events::Fields) in the extensions of the

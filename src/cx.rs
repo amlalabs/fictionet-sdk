@@ -84,7 +84,7 @@ pub use timer::Timer;
 /// Observers can bind connections to the nearest enclosing host.
 /// Both calls allocate group state even without topology interest; see their
 /// method docs for costs. Core publishes topology changes. The
-/// [companion crate](../fictionet_observe/index.html) collects them for display.
+/// consumer chooses how to store and display them.
 ///
 /// # Waiting
 ///

@@ -249,7 +249,7 @@ struct Trace {
 fn replay() -> Trace {
     let trace: Arc<Mutex<Trace>> = Arc::default();
     let packets = trace.clone();
-    let log = Arc::new(fictionet_observe::Memory::default());
+    let log = Arc::new(fictionet_test_support::EventLog::default());
     let recorded = log.clone();
     fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(71)).observer(recorded.clone()), move |cx| async move {
         let cert = rustls::pki_types::CertificateDer::from(include_bytes!("fixtures/tls/ed25519.cert.der").to_vec());
@@ -295,7 +295,7 @@ fn replay() -> Trace {
                 break;
             }
         }
-        let events = recorded.checked_of("http", "request").unwrap();
+        let events = recorded.of("http", "request");
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| e.str("version") == Some("HTTP/2.0")));
         cx.emit("test", "complete", |event| event.fields(Fields::new().with("requests", events.len() as u64)));
@@ -370,7 +370,7 @@ mod clients {
         dir: PathBuf,
         stop: Option<fictionet::End>,
         thread: Option<std::thread::JoinHandle<()>>,
-        events: Arc<fictionet_observe::Memory>,
+        events: Arc<fictionet_test_support::EventLog>,
     }
 
     impl World {
@@ -381,7 +381,7 @@ mod clients {
             let dir = fictionet_test_support::temp::dir();
             let ca_path = dir.join("ca.pem");
             let (stop, mut stopped) = fictionet::pair();
-            let events: Arc<fictionet_observe::Memory> = Arc::default();
+            let events: Arc<fictionet_test_support::EventLog> = Arc::default();
             let observed = events.clone();
             let (ready, started) = std::sync::mpsc::channel();
             let thread = std::thread::spawn(move || {
@@ -585,7 +585,7 @@ Reply::Now(http::Response::builder().status(404).body(Body::empty()).unwrap())
                 "{page}\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let events = world.events.checked_of("http", "request").unwrap();
+            let events = world.events.of("http", "request");
             assert!(events.iter().all(|e| e.str("version") == Some("HTTP/2.0")));
             let large: Vec<_> = events
                 .iter()
@@ -1645,7 +1645,7 @@ fn deferred_response_budget_refusal_preserves_other_streams() {
 fn observation_does_not_change_http2_streams() {
     let run = |observed| {
         let heads = Arc::new(crate::common::http_observer::CountHeads::default());
-        let memory = Arc::new(fictionet_observe::Memory::default());
+        let memory = Arc::new(fictionet_test_support::EventLog::default());
         let router = fictionet_test_support::handler(
             move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
                   request: http::Request<bytes::Bytes>| {
@@ -1674,7 +1674,7 @@ fn observation_does_not_change_http2_streams() {
             if observed { 3 } else { 0 }
         );
         assert_eq!(
-            memory.checked_of("http", "request").unwrap().len(),
+            memory.of("http", "request").len(),
             if observed { 3 } else { 0 }
         );
         assert_eq!(

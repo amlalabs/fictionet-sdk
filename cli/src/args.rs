@@ -286,26 +286,6 @@ fn parse_v6(s: &str) -> Result<Cidr<Ipv6Addr>, String> {
     parse_cidr(s, 128)
 }
 
-/// Splits `--observation <w>` (or `--observation=<w>`) from the other words.
-pub(crate) fn take_observation(args: &[String]) -> Result<(String, Vec<String>), String> {
-    let mut observation = None;
-    let mut rest = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--observation" {
-            observation = Some(it.next().ok_or("--observation needs a value")?.clone());
-        } else if let Some(w) = a.strip_prefix("--observation=") {
-            observation = Some(w.to_owned());
-        } else {
-            rest.push(a.clone());
-        }
-    }
-    Ok((
-        observation.ok_or("--observation unix:<path> is required")?,
-        rest,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

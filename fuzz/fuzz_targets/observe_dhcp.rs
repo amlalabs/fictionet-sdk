@@ -1,5 +1,5 @@
 #![no_main]
-use fictionet_observe::protocols::Dhcp;
+use fictionet::stdlib::dissect::protocols::Dhcp;
 use fictionet::stdlib::test_support::contract::check_decode;
 use libfuzzer_sys::fuzz_target;
 

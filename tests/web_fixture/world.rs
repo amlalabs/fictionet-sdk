@@ -1,6 +1,6 @@
 //! The quick-start world with bulk transfers and a real upstream for tests.
 //!
-//! `web_fixture <socket> <ca path> [observation.sock]` serves the world.
+//! `web_fixture <socket> <ca path>` serves the world.
 //! `--upstream <port>` instead runs a real HTTP server on the host's network
 //! for the proxy.
 

@@ -52,7 +52,7 @@ use fictionet::stdlib::{
     web,
 };
 use fictionet::{Attacher, Cx, End, Interface, Packet, Seed, block_on, lab, run};
-use fictionet_observe::Memory;
+use fictionet_test_support::EventLog;
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use rustls::pki_types::ServerName;

@@ -8,9 +8,8 @@
 //! here, fuzzes with the codec's contract tools, and a world copies its
 //! file to change it. It has the shape of a FIX session: items in, bytes
 //! and events and timers out. The observer installed in `RunOptions` receives
-//! interested events. [Fictionet Observe](../../../../fictionet_observe/index.html)
-//! supplies retention, aggregation and export. A standalone `Harness` accepts
-//! its own observer, as in the example below.
+//! interested events; consumers own storage. A standalone `Harness` also
+//! accepts a caller-supplied observer.
 //!
 //! [`connection`] is the one driver that joins a service to a
 //! [`Connection`]: it reads, decodes, calls the
@@ -47,12 +46,10 @@
 //!     }
 //! }
 //!
-//! let grader = std::sync::Arc::new(fictionet_observe::Memory::default());
-//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(grader.clone());
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
 //! assert_eq!(h.push(b"hello\nwor")?, b"hello\n");
 //! assert_eq!(h.push(b"ld\nquit\n")?, b"world\n");
 //! assert!(h.closed());
-//! assert_eq!(grader.checked_all()?.len(), 2);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!

@@ -78,34 +78,8 @@
 //! Core keeps dispatch, bounded event construction, run clocks, identity,
 //! producer hooks and the rustls key adapter. It keeps no history, topology
 //! graph, retained keys, packet collection or decoders.
-//! [Fictionet Observe](../../fictionet_observe/index.html) owns those consumers:
-//! `Policy` selects events, packets and keys before work, then assigns retained
-//! observations to classes with separate budgets. `Memory` supports grading,
-//! `Aggregate` combines repeats, and `Jsonl` writes interested events. `Collector`
-//! shares retention and loss accounting across typed stores; `DashboardObserver`
-//! supplies page requests. Logging remains an installed observer.
-//! A world's page reads its handle in process; serve the handle on an
-//! observation socket for `fictionet observe`. Late clients see what the
-//! installed consumer kept. Services name their protocol through
-//! [`Cx::connection_opened`](crate::Cx::connection_opened); presenters and
-//! protocol selection stay in the companion.
-//!
-//! ```
-//! use std::sync::Arc;
-//! use fictionet::{RunOptions, Seed, block_on, lab};
-//! use fictionet_observe::{Aggregate, Memory};
-//! let grader = Arc::new(Memory::default());
-//! let options = RunOptions::new(Seed::from_u64(7))
-//!     .observer(Arc::new(Aggregate::new(grader.clone())));
-//! block_on(lab(options, |fcx| async move {
-//!     fcx.emit("modbus", "write_register", |event| event
-//!         .summary("register 40001 = 900")
-//!         .field("register", 40001u32).field("value", 900u32));
-//!     Ok(())
-//! }))?;
-//! assert_eq!(grader.checked_of("modbus", "write_register")?[0].u64("value"), Some(900));
-//! # Ok::<(), fictionet::Error>(())
-//! ```
+//! Consumers choose their own storage and presentation. Packet inspection
+//! is available separately in [`stdlib::dissect`](crate::stdlib::dissect).
 //!
 //! Services can also offer plaintext output through [`Observer::content`].
 //! This opt-in callback is separate from the numbered streams and has no core
@@ -118,10 +92,7 @@
 //! # Repeats
 //!
 //! Services emit every occurrence. [`Event::repeat`] marks repeatable facts
-//! and their variable detail. The companion's `Aggregate` can combine them
-//! within bounded run-time windows. Its `Memory::checked_of` and
-//! `Memory::checked_all` reject incomplete history. See the
-//! [companion crate](../../fictionet_observe/index.html) for limits and export.
+//! and their variable detail. Consumers choose how to combine them.
 
 pub use observer::{Content, ContentSink};
 
