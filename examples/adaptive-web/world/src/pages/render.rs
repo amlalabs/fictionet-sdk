@@ -668,7 +668,6 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
     };
     let advisory = super::make::advisory(host, target, &record.title, &record.date);
     let record = advisory.as_ref().unwrap_or(record);
-    let profile = profile;;
     let question;
     let record = if profile.kind == "qa" {
         question = Page {
@@ -909,7 +908,6 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         1 => format!("Copyright © {year} {name}"),
         _ => format!("© {name} {year}"),
     };
-    let main = main;
     let main = if sidebar.is_empty() {
         let main = main.replace(
             &format!(
