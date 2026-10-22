@@ -1,4 +1,4 @@
-//! Regenerates the code generator outputs and the web fixture report.
+//! Regenerates the code generator modules used by codec regressions.
 use crate::process::Result;
 use fictionet_codegen::{FrontEnd, Input, IrFrontEnd, Limits, emit_fuzz, generate, validate};
 use std::fs;
@@ -80,10 +80,6 @@ pub fn run() -> Result {
             &module[..header(&module)],
             &generated[header(&generated)..]
         ),
-    )?;
-    fs::write(
-        root.join("tests/web_fixture/golden.txt"),
-        fictionet_test_support::web_fixture::recorded_report(),
     )?;
     Ok(())
 }

@@ -50,11 +50,3 @@ fn upstream(port: u16) -> Result {
     }
     Ok(())
 }
-
-#[test]
-fn the_client_report_is_the_recorded_one() {
-    assert_eq!(
-        fictionet_test_support::web_fixture::recorded_report(),
-        include_str!("golden.txt")
-    );
-}

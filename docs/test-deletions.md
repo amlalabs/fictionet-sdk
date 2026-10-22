@@ -57,7 +57,8 @@
 
 Kept protocol parsing, network and TLS behavior, credential handling, WARC replay,
 search ranking, state transitions, scoring evidence, and command validation coverage.
-The repository-wide audit is still in progress.
+The audit covered Rust unit and integration tests, Node tests and Python tests.
+The entries below record further removals made while checking the final layout.
 
 - `dashboard/page.test.mjs::the agent stage edge has three to one contrast against the page in both schemes`: Asserts CSS color choices.
 - `demos/nuclear/viewer/palette.test.mjs`: Removed CSS, palette constant, source label and estimated width assertions; kept missing-palette validation.
@@ -154,3 +155,6 @@ active modes are covered by copied corpus and model transport integration tests.
 - `demos/search/world/src/pages/render_tests.rs::article_pictures_are_local_and_vary_with_the_title`, `other_site_kinds_have_no_article_picture`, and `cookie_choices_vary_on_a_quarter_of_hosts`: pin SVG geometry, CSS, labels and a hash distribution without loading a page in a browser. Content counting and HTML escaping remain covered.
 - `demos/search/world/src/pages/tests/styles.rs::the_same_requests_make_the_same_world`: compares two calls to the same empty stored-page implementation. Real persistence and concurrent request deduplication remain covered.
 - Removed constant selector and cookie-hash assertions from the retained stylesheet composition and layout escaping tests.
+
+- `tests/web_fixture/world.rs::the_client_report_is_the_recorded_one` and `tests/web_fixture/golden.txt`: compare a formatted report with regenerated output. Actual proxy, DNS, TLS and upload integration tests remain. Removed the unused report driver and its clients from `tests/support/web_fixture.rs`, and its regeneration from xtask.
+- `tests/it/codegen.rs::differential_fixture_matches_programmatic_ir`: regenerates Rust source and compares it to generated Rust source. The generated module remains because differential codec tests compile it and compare behavior on real bytes.
