@@ -7,7 +7,6 @@ publish = false
 
 [dependencies]
 fictionet-extras = { path = "../extras" }
-web-world = { path = "../demos/search/world" }
 url = "2"
 kuchiki = "0.8"
 base64 = "0.22"

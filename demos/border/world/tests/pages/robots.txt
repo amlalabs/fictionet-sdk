@@ -1,4 +1,0 @@
-User-agent: *
-Disallow: /balance
-Disallow: /pay
-Disallow: /login

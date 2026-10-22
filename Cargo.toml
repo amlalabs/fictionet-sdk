@@ -9,20 +9,11 @@ members = [
     "codegen/tests/golden",
     "codegen/tests/layouts",
     "demos/kit",
-    "demos/bottleneck_sites",
-    "demos/capture_sites",
-    "demos/custom_protocol",
-    "demos/delayed_sites",
-    "demos/goad",
-    "demos/h2spec_world",
-    "demos/lossy_sites",
-    "demos/ping_world",
-    "demos/route_change",
-    "demos/web",
-
-    "demos/*/app",
-    "demos/*/world",
-    "demos/wasm_world",
+    "demos/artifactory/app",
+    "demos/artifactory/world",
+    "demos/search/app",
+    "demos/search/world",
+    "demos/nuclear/world",
     "smoltcp",
     "xtask",
 ]
@@ -156,12 +147,6 @@ opt-level = 1
 debug = 1
 
 [profile.release.package.artifactory-world]
-debug = 1
-
-[profile.release.package.border-world]
-debug = 1
-
-[profile.release.package.fakewiki-world]
 debug = 1
 
 [profile.release.package.nuclear-world]

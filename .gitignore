@@ -12,4 +12,3 @@ logs/
 .env
 /.aws
 /.vm
-/demos/scan/recording/
