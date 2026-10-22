@@ -244,7 +244,7 @@ export function createGraph({ $, el, state, view, reducedMotion, isGroup, where,
     const sandbox = n.kind === 'sandbox';
     const g = el('svg:g', { class: `node ${n.kind}`, 'data-id': n.id, tabindex: '0', role: 'button' });
     if (state.selected && state.selected.kind === 'node' && state.selected.id === n.id) g.classList.add('selected');
-    g.setAttribute('aria-label', sandbox ? `Sandbox ${n.name}` : `Task ${n.name}, spawned at ${where(n)}`);
+    g.setAttribute('aria-label', n.label || (sandbox ? `Sandbox ${n.name}` : `Task ${n.name}, spawned at ${where(n)}`));
     el('svg:rect', { class: 'box', width: n.w, height: n.h, rx: sandbox ? 9 : 7 }, g);
     const left = sandbox ? 28 : 13;
     if (sandbox) el('svg:rect', { class: 'mark', x: 12, y: n.h / 2 - 4, width: 8, height: 8, rx: 1 }, g);
@@ -398,6 +398,7 @@ export function createGraph({ $, el, state, view, reducedMotion, isGroup, where,
       if (!n.g) {
         // A new drawing has no place yet, wherever the item is.
         drawNode(n);
+        if (n.display && !reducedMotion.matches) n.g.animate?.([{ opacity: 0 }, { opacity: 1 }], { duration: 260 });
         n.placed = false;
       }
       if (currentDrag()?.items.includes(n)) {

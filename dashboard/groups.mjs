@@ -25,7 +25,7 @@ const FictionetGroups = (() => {
 
   /// A task or sandbox that is drawn: a sandbox, or a task with links.
   /// `edges` is the set of its links.
-  const shown = (n) => n.kind === 'sandbox' || n.edges.size > 0;
+  const shown = (n) => n.display || n.kind === 'sandbox' || n.edges.size > 0;
 
   /// For each group: its key (its path of names, which stays the same
   /// from run to run), its depth, and how many tasks, sandboxes and drawn

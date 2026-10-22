@@ -11,6 +11,7 @@ import { fmtDuration, fmtBytes, fmtCount, fmtRate, plural } from '../format.mjs'
 export function mount(root, services) {
   const { $, el } = scoped(root);
   structure(root, el);
+  const adapter = services.map;
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
   const view = {
     items: new Map(), // display id -> a task, a sandbox, or a closed group
@@ -23,12 +24,13 @@ export function mount(root, services) {
   };
 
   const { runTime } = services.graph;
-  const state = pageGraph(services.graph.state, services.hosts);
-  Object.defineProperty(state, 'selected', {
+  const state = adapter ? services.graph.state : pageGraph(services.graph.state, services.hosts);
+  if (!adapter) Object.defineProperty(state, 'selected', {
     get: () => services.graph.state.selected,
     set: (value) => { services.graph.state.selected = value; },
   });
   function update() {
+    if (adapter) return;
     const next = pageGraph(services.graph.state, services.hosts);
     state.nodes = next.nodes;
     state.edges = next.edges;
@@ -47,7 +49,7 @@ export function mount(root, services) {
   undraw();
   state.layoutDirty = state.sideDirty = true;
   const shortFile = (f) => (f ? f.split('/').pop() : '');
-  const where = (n) => (n.file ? `${shortFile(n.file)}:${n.line}` : '');
+  const where = (n) => n.subtitle ?? (n.file ? `${shortFile(n.file)}:${n.line}` : '');
   const nodeLabel = (n) => (n ? n.name : '?');
   const isGroup = (n) => n && n.kind === 'group';
 
@@ -83,7 +85,16 @@ export function mount(root, services) {
   // ---------------------------------------------------------------------------
   // Tables (see tables.mjs): tooltips, the breadcrumb and the side panel.
 
-  const { nodeTip, groupTip, edgeTip, renderSide, refresh } = createTables({
+  const { nodeTip, groupTip, edgeTip, renderSide, refresh } = adapter ? {
+    nodeTip: (node) => [el('span', { text: node.name })], groupTip: () => [], edgeTip: () => [el('span', { text: 'Connection' })],
+    renderSide: () => adapter.details($('side'), state.selected),
+    refresh: () => {
+      $('empty').hidden = !!state.nodes.size;
+      $('empty-title').textContent = 'Waiting';
+      $('empty-text').hidden = true;
+      if (state.sideDirty) { adapter.details($('side'), state.selected); state.sideDirty = false; }
+    },
+  } : createTables({
     $, el, state, view, runTime, fmtDuration, fmtBytes, fmtCount, fmtRate, plural, where, nodeLabel,
     tone, drawnSource, liveRate, dRate, dCounts, dBytesRate, ends, dEdgesOf, groupChain, parentOf, isOpen,
     select, toggleGroup, applySearch, focusNode, focusGroup, openPackets, openLinks,
@@ -125,10 +136,12 @@ export function mount(root, services) {
     pendingSelection = null;
   }
   function openPackets(id) {
+    if (adapter) return;
     const edge = view.dedges.get(id);
     if (edge) openLinks('', '', edge.members);
   }
   function onSelect(selected) {
+    if (adapter) { state.sideDirty = true; return; }
     if (syncingSelection) return;
     services.packetPair.set(null);
     const node = state.nodes.get(selected?.id);
@@ -160,12 +173,17 @@ export function mount(root, services) {
   });
   const stop = services.graph.subscribe((name, data) => {
     update();
-    if (name === 'event' && state.events.includes(data)) pulse(data);
+    if (name === 'event' && (adapter || state.events.includes(data))) pulse(data);
     if (name === 'group_end') {
       view.gviews.get(data.id)?.g?.remove();
       view.gviews.delete(data.id);
     }
   });
+  if (adapter) {
+    $('search').placeholder = 'Find nodes';
+    $('search').setAttribute('aria-label', 'Find nodes');
+    $('graph').setAttribute('aria-label', 'Web graph');
+  }
   renderSide();
   animation = requestAnimationFrame(frame);
   return () => {
