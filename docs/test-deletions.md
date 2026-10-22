@@ -160,3 +160,5 @@ active modes are covered by copied corpus and model transport integration tests.
 - `tests/it/codegen.rs::differential_fixture_matches_programmatic_ir`: regenerates Rust source and compares it to generated Rust source. The generated module remains because differential codec tests compile it and compare behavior on real bytes.
 
 - `python/inspect_fictionet/tests/test_world_sandboxes.py::test_web_world_has_outbound_networking_with_every_generator`: four cases assert static compose network fields, including a removed generator name, without opening a connection. Actual Docker context and sandbox integration coverage remains.
+
+- `tests/it/sbe_codegen.rs::module_is_generator_output_plus_hand_written_framing`: compares regenerated Rust source with generated Rust source. Removed its unused source parsing helpers; independent SBE encoding, runtime decoding and mutation checks remain.
