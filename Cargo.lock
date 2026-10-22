@@ -1061,7 +1061,6 @@ version = "0.1.0"
 dependencies = [
  "fictionet",
  "fictionet-codegen-golden",
- "fictionet-codegen-layouts",
 ]
 
 [[package]]
@@ -4682,7 +4681,6 @@ dependencies = [
  "fictionet",
  "fictionet-codegen",
  "fictionet-extras",
- "fictionet-test-support",
  "kuchiki",
  "libc",
  "regex",

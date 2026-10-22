@@ -1,4 +1,4 @@
-"""The Python reader must agree with the fixed Rust golden scripts."""
+"""Score recorded package repository traffic."""
 
 from pathlib import Path
 
