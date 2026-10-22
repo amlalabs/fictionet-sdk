@@ -2,7 +2,7 @@
 name = "web-world"
 version = "0.0.0"
 edition = "2024"
-description = "The web on Fictionet: web::Sites for any name, with pages made on first request, by a model or offline, and kept."
+description = "A web world with copied captures, model-written pages and one search index."
 license = "MIT OR Apache-2.0"
 publish = false
 

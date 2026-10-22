@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-fictionet = { path = "..", features = ["web-proxy"] }
+fictionet = { path = "..", features = ["web-proxy", "tokio"] }
 fictionet-observe = { path = "../observe", features = ["native"] }
 axum = { version = "0.8", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
@@ -37,7 +37,7 @@ redb = "4.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 ring = "0.17"
-tokio = { version = "1", features = ["sync", "net", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "io-util"] }
 time = "0.3"
 tower-service = "0.3"
 url = "2"
