@@ -9,8 +9,8 @@
 
 use fictionet_test_support::timeout;
 
-use fictionet::stdlib::world::sandbox::Machine;
-use fictionet::stdlib::world::sandbox::machine;
+use fictionet_test_support::sandbox::Machine;
+use fictionet_test_support::sandbox::machine;
 
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};

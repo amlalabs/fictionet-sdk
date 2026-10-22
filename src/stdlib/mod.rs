@@ -44,8 +44,8 @@
 //!
 //! Every piece is ordinary code built from the same public items, so you
 //! can wire a network by hand when `Net` does not fit. To put a link in
-//! front of every sandbox, wrap the sandboxes with
-//! [`Attachments::map`](fictionet::Attachments::map).
+//! front of a sandbox, take it with
+//! [`Attachments::next`](fictionet::Attachments::next), then wrap its interface.
 //!
 //! # Three kinds of functions
 //!
@@ -382,7 +382,6 @@
 //! | Module | Description |
 //! | --- | --- |
 //! | [`world::net`] | Networks of hosts, DNS names, addresses, routes and services. |
-//! | [`world::sandbox`] | Simulated clients with DNS, TLS and HTTP requests. |
 
 pub mod codec;
 pub mod network;

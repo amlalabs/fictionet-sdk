@@ -54,8 +54,7 @@
 //! can run rustls, OpenSSL, or anything else over a connection itself,
 //! since [`Connection`] is an open trait.
 
-// The sandbox's TLS client shares the ciphertext buffer.
-pub(crate) mod output;
+mod output;
 mod provider;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider, with_context};

@@ -306,12 +306,11 @@ impl Proxy {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fictionet"))
             .args([
                 "attach",
+                "http-proxy",
                 "--world",
                 &format!("unix:{}", path.display()),
                 "--name",
                 "agent",
-                "--type",
-                "http_proxy",
             ])
             .args([
                 "--listen",

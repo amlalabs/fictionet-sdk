@@ -1,5 +1,5 @@
 use super::*;
-use fictionet::stdlib::world::sandbox::TlsClient;
+use fictionet_test_support::sandbox::TlsClient;
 
 // ---------------------------------------------------------------------------
 // TLS by name

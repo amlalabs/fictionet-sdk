@@ -608,7 +608,7 @@ impl<I: Interface> Router<I> {
 /// [`net::Net`](fictionet::stdlib::world::net::Net) uses to name the LAN.
 /// Attachment identity comes from the ingress registration.
 ///
-/// This is how virtual machines attached with `fictionet attach --type tap`
+/// This is how virtual machines attached with `fictionet attach tap`
 /// share a subnet. Attach answers each VM's ARP itself and hands the LAN
 /// its IP packets, so machines configured for the same subnet reach each
 /// other although every VM has a point-to-point attachment. IP broadcasts

@@ -234,7 +234,7 @@ impl rustls::time_provider::TimeProvider for FixedTime {
 }
 
 fn client_config(fcx: &Cx, ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
-    fictionet::stdlib::world::sandbox::client_config(
+    fictionet_test_support::sandbox::client_config(
         fcx,
         date(2030, 1, 1),
         Some(&Arc::new(roots(ca))),
@@ -820,7 +820,7 @@ fn sandbox_client_returns_invalid_server_name() {
     block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
         let (_, conn) = mem_pair();
         let roots = Arc::new(RootCertStore::empty());
-        let result = fictionet::stdlib::world::sandbox::TlsClient::new(
+        let result = fictionet_test_support::sandbox::TlsClient::new(
             &fcx,
             conn,
             &roots,

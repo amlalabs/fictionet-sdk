@@ -490,39 +490,14 @@ fn a_lab_moves_between_host_threads() {
         .unwrap();
 }
 
+#[cfg(feature = "web-proxy")]
 #[test]
-fn real_io_is_refused_before_opening_resources() {
+fn real_upstreams_can_be_used_in_a_lab() {
     block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
-        assert!(
-            fcx.require_real_io()
-                .unwrap_err()
-                .to_string()
-                .contains("lab")
-        );
-        #[cfg(feature = "web-proxy")]
-        {
-            assert!(
-                fictionet::stdlib::web::proxy(
-                    &fcx,
-                    std::sync::Arc::new(fictionet_host::Client::new())
-                )
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("lab")
-            );
-            assert!(
-                fictionet::stdlib::web::forward(
-                    &fcx,
-                    "http://127.0.0.1:8080".parse()?,
-                    std::sync::Arc::new(fictionet_host::Client::new())
-                )
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("lab")
-            );
-        }
+        let upstream = std::sync::Arc::new(fictionet_host::Client::new());
+        let _proxy = fictionet::stdlib::web::proxy(&fcx, upstream.clone())?;
+        let _forward =
+            fictionet::stdlib::web::forward(&fcx, "http://127.0.0.1:8080".parse()?, upstream)?;
         Ok(())
     }))
     .unwrap();

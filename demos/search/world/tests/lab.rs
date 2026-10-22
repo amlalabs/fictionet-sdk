@@ -10,10 +10,10 @@ use fictionet::{
             http1,
         },
         web::httpd,
-        world::sandbox::{self, Machine, machine},
     },
 };
 use fictionet_observe::Memory;
+use fictionet_test_support::sandbox::{self, Machine, machine};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,

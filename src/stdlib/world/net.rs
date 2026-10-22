@@ -212,6 +212,32 @@ impl Default for Limits {
 /// Turns a name into a host, or `None`. Runs once per name.
 type Resolver = dyn Fn(&str) -> Option<Host> + Send + Sync;
 
+/// A LAN definition shared by a network, its hosts and attached members.
+///
+/// ```
+/// use fictionet::stdlib::world::net::{Lan, Net};
+/// let office = Lan::new("office", "192.168.56.0/24".parse()?);
+/// let net = Net::new().lan(&office)
+///     .host("directory", |host| host.on(&office))
+///     .member("workstation", &office, "192.168.56.20".parse()?);
+/// # Ok::<(), fictionet::Error>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct Lan {
+    name: String,
+    prefix: Prefix,
+}
+
+impl Lan {
+    /// Defines a named IP subnet. Add it to a network with [`Net::lan`].
+    pub fn new(name: &str, prefix: Prefix) -> Self {
+        Self {
+            name: name.to_owned(),
+            prefix: prefix.canonical(),
+        }
+    }
+}
+
 /// A network of hosts and services, and the sandboxes' side of it. See the
 /// [module docs](self).
 pub struct Net {
@@ -224,8 +250,8 @@ pub struct Net {
     routes: Vec<(String, Prefix)>,
     group: String,
     limits: Limits,
-    lans: Vec<(String, Prefix)>,
-    members: Vec<(String, String, IpAddr)>,
+    lans: Vec<Lan>,
+    members: Vec<(String, Lan, IpAddr)>,
 }
 
 impl Default for Net {
@@ -324,7 +350,7 @@ impl Net {
         self
     }
 
-    /// Adds an IP LAN called `name` on `prefix` ([`route::lan`]). Hosts
+    /// Adds an IP LAN ([`route::lan`]). Hosts
     /// placed on it with [`Host::on`] and sandboxes attached to it with
     /// [`Net::member`] share the subnet as machines on one Ethernet do,
     /// broadcast and multicast included. The router sends `prefix` to the
@@ -335,22 +361,21 @@ impl Net {
     /// `lan.drop` [repeats](fictionet::events#repeats), with the reason in `why`
     /// and the LAN name in `lan`.
     ///
-    /// [`start`](Net::start) fails if `prefix` overlaps the sandboxes'
+    /// [`start`](Net::start) fails if the LAN prefix overlaps the sandboxes'
     /// subnets, the automatic address pools (`104.18.0.0/15` and
     /// `2606:4700:100::/48`), or another LAN, or leaves no room for members.
-    pub fn lan(mut self, name: &str, prefix: Prefix) -> Net {
-        self.lans.push((name.to_owned(), prefix.canonical()));
+    pub fn lan(mut self, lan: &Lan) -> Net {
+        self.lans.push(lan.clone());
         self
     }
 
     /// Attaches the sandbox called `name` to the LAN `lan` at `addr`, with
     /// no filter, no address binding and no DHCP: a trusted member, such
-    /// as a GOAD virtual machine attached with `fictionet attach --type
-    /// tap`. Events name it as a sandbox. [`start`](Net::start)
+    /// as a GOAD virtual machine attached with `fictionet attach tap`. Events name it as a sandbox. [`start`](Net::start)
     /// fails if there is no such LAN, `addr` is not a member address of it,
     /// or another member has it.
-    pub fn member(mut self, name: &str, lan: &str, addr: IpAddr) -> Net {
-        self.members.push((name.to_owned(), lan.to_owned(), addr));
+    pub fn member(mut self, name: &str, lan: &Lan, addr: IpAddr) -> Net {
+        self.members.push((name.to_owned(), lan.clone(), addr));
         self
     }
 
@@ -471,8 +496,8 @@ impl Net {
                 if let Some((name, lan, addr)) =
                     members.iter().find(|(n, _, _)| n == sandbox.name())
                 {
-                    if let Some(seg) = shared.lans.get(lan) {
-                        context.join_lan(&fcx, name, lan, &seg.lan, *addr, sandbox);
+                    if let Some(seg) = shared.lans.get(&lan.name) {
+                        context.join_lan(&fcx, name, &lan.name, &seg.lan, *addr, sandbox);
                     }
                     continue;
                 }
@@ -598,11 +623,11 @@ fn make_lans(
     hooks: &Arc<Hooks>,
     subnet: &Subnet,
     subnet6: Option<&Subnet6>,
-    lans: Vec<(String, Prefix)>,
-    members: &[(String, String, IpAddr)],
+    lans: Vec<Lan>,
+    members: &[(String, Lan, IpAddr)],
 ) -> Result<BTreeMap<String, LanSeg>, Error> {
     let mut made: BTreeMap<String, LanSeg> = BTreeMap::new();
-    for (name, prefix) in lans {
+    for Lan { name, prefix } in lans {
         if prefix.overlaps(AUTO) || prefix.overlaps(AUTO6) {
             return Err(fictionet::Error::msg(format!(
                 "LAN {name}: {}/{} overlaps the automatic address pool",
@@ -664,9 +689,13 @@ fn make_lans(
         );
     }
     for (member, lan, addr) in members {
-        let Some(seg) = made.get_mut(lan) else {
+        let name = &lan.name;
+        let Some(seg) = made
+            .get_mut(&lan.name)
+            .filter(|seg| seg.prefix == lan.prefix)
+        else {
             return Err(fictionet::Error::msg(format!(
-                "member {member}: there is no LAN called {lan}"
+                "member {member}: LAN {name} is not configured in this network"
             )));
         };
         let broadcast = seg.prefix.broadcast().map(IpAddr::V4);
@@ -676,12 +705,12 @@ fn make_lans(
             || Some(*addr) == broadcast
         {
             return Err(fictionet::Error::msg(format!(
-                "member {member}: {addr} is not a member address of LAN {lan}"
+                "member {member}: {addr} is not a member address of LAN {name}"
             )));
         }
         if !seg.members.insert(*addr) {
             return Err(fictionet::Error::msg(format!(
-                "member {member}: another member of LAN {lan} has {addr}"
+                "member {member}: another member of LAN {name} has {addr}"
             )));
         }
     }
@@ -768,7 +797,7 @@ mod tests {
                         ("a", "10.0.3.0/24"),
                         ("m", "10.0.2.0/24"),
                     ]
-                    .map(|(name, prefix)| (name.to_owned(), prefix.parse().unwrap()))
+                    .map(|(name, prefix)| Lan::new(name, prefix.parse().unwrap()))
                     .into(),
                     &[],
                 )?;

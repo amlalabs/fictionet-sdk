@@ -518,7 +518,7 @@ one-day lease and its link MTU. INFORM has no lease times, and NAK has
 only message type and server ID. NAK and requests with no client address
 get broadcast replies; other replies go to the request's client address.
 
-With `fictionet attach --type http_proxy` or `--type socks5`, attach looks
+With `fictionet attach http-proxy` or `attach socks5`, attach looks
 names up in the world's DNS. It follows at most 16 CNAME aliases from the
 queried name and uses an A record for the final name. It ignores unrelated
 answers and rejects cycles or longer chains. The cache keeps the address
@@ -709,16 +709,15 @@ request gets `421 Misdirected Request` before any upstream I/O, even if
 the proxy's site has `default_host()`. Its request event carries
 `answer: misdirected`. For catch-all forwarding, use
 `web::forward(&fcx, upstream, client)?`: the injected `Upstream` transport connects to that fixed origin and
-preserves the requested `Host`. Both `web::proxy` and `web::forward` require
-a real run's context and return an error in a lab before constructing a
-client. The feature requires `std` and works without tokio. Host helper
+preserves the requested `Host`. Both `web::proxy` and `web::forward` work in real and lab runs. The feature
+works without tokio. Host helper
 threads handle upstream HTTP/1.1 and rustls, reusing completed connections.
 Both tower services return streaming `httpd::Body` responses. `Proxy` can
 also answer with a local rejection.
 
 `Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. `Http2`
 serves HTTP/2 on the stdlib's `http2` frames and HPACK, behind the same
-`Handler` trait. Both need only `std`. Both versions share one set of
+`Handler` trait. Neither needs tokio. Both versions share one set of
 `httpd::Limits`: body size, body and write timers, and 100 streams at once
 on an HTTP/2 connection.
 Both charge retained request heads, request events and bodies to the sandbox's

@@ -1601,7 +1601,7 @@ fn peer_admission_is_shared_by_machines_and_dns() {
                     .tcp(7, Arc::new(()), || Loud { size: 1 })
             })
             .start(&fcx, attachments)?;
-        let m = fictionet::stdlib::world::sandbox::machine(
+        let m = fictionet_test_support::sandbox::machine(
             &fcx,
             attacher.attach("a")?,
             Ipv4Addr::new(10, 0, 0, 2),
@@ -1646,7 +1646,7 @@ fn dns_tcp_uses_the_sandbox_service_budget() {
                 ..Default::default()
             })
             .start(&fcx, attachments)?;
-        let m = fictionet::stdlib::world::sandbox::machine(
+        let m = fictionet_test_support::sandbox::machine(
             &fcx,
             attacher.attach("a")?,
             Ipv4Addr::new(10, 0, 0, 2),

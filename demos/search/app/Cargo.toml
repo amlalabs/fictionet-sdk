@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+fictionet-test-support = { path = "../../../tests/support" }
 arc-swap = "1.9.3"
 fictionet-extras = { path = "../../../extras" }
 fictionet-host = { path = "../../../host" }

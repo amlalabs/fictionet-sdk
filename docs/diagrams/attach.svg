@@ -27,7 +27,7 @@
 <text x="420" y="65" text-anchor="middle">TUN device</text>
 <text x="275" y="53" text-anchor="middle" font-size="11.5">IP packets</text>
 <text x="420" y="140" text-anchor="middle">fictionet attach</text>
-<text x="420" y="158" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">--name agent --type tun</text>
+<text x="420" y="158" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">attach tun --name agent</text>
 <text x="300" y="136" text-anchor="end" font-size="12">one per sandbox, wherever it</text>
 <text x="300" y="152" text-anchor="end" font-size="12">can get the sandbox’s packets</text>
 <text x="380" y="214" text-anchor="end" font-size="12">a Unix SOCK_SEQPACKET</text>

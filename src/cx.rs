@@ -146,14 +146,9 @@ impl Cx {
         self.run.environment.clock.now()
     }
 
-    /// Returns the run's clock and real-I/O policy.
+    /// Returns the run's clock mode.
     pub fn mode(&self) -> crate::RunMode {
         self.run.environment.clock.mode()
-    }
-
-    /// Returns an error if this run is a lab and cannot use host I/O.
-    pub fn require_real_io(&self) -> std::io::Result<()> {
-        self.run.environment.require_real_io()
     }
 
     /// Waits until the run's clock reaches `deadline`.
@@ -540,7 +535,6 @@ impl Cx {
     /// [`std::future::poll_fn`]: the first one ready gives the output.
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
     /// # {
     /// # fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
     /// use fictionet::RaceError;

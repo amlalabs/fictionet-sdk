@@ -1,6 +1,5 @@
 //! Feature-specific runtime contracts.
 
-#[cfg(feature = "std")]
 #[test]
 fn http_alpn_matches_transport_features() {
     use fictionet::stdlib::{web::httpd, world::net::PortServer};
@@ -23,7 +22,6 @@ fn mutex_guard_excludes_another_lock() {
     assert_eq!(*mutex.try_lock().unwrap(), 9);
 }
 
-#[cfg(feature = "std")]
 mod http {
     use fictionet::stdlib::{
         network::{ConnectionExt, ip, tcp},

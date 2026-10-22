@@ -270,11 +270,9 @@ pub fn rounds(n: usize) -> usize {
 /// 4 times the size, quadratic work about 16 times. The check fails when the
 /// ratio exceeds 10.
 ///
-/// On Unix, [`thread_cpu_time`] uses the calling thread's CPU clock with
-/// the `std` feature or in this crate's unit tests. Time spent running other
-/// threads does not count. Wall time is the fallback if the clock fails,
-/// on other targets, or for other callers built without `std`, such as
-/// integration tests. Pick `n` so that `run(n)` takes at least a millisecond,
+/// On Unix, [`thread_cpu_time`] uses the calling thread's CPU clock. Time
+/// spent running other threads does not count. Wall time is the fallback
+/// if the clock fails or on other targets. Pick `n` so that `run(n)` takes at least a millisecond,
 /// or timer noise decides the ratio.
 ///
 /// Every dimension multiplied by the guarded cost must grow with `size`.
@@ -368,12 +366,7 @@ pub fn thread_cpu_time() -> core::time::Duration {
             }
         };
     }
-    // Select the SDK's feature so this module stays copyable.
-    fictionet::cfg_std!({
-        read_clock!(unix);
-    } else {
-        read_clock!(all(unix, test));
-    });
+    read_clock!(unix);
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed()
 }

@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::time::Duration;
 
-#[cfg(feature = "std")]
 use fictionet::run;
 use fictionet::{Cx, RunOptions, block_on, lab};
 
@@ -32,7 +31,6 @@ where
 }
 
 /// Runs a world on real time within the host limit and requires Done.
-#[cfg(feature = "std")]
 pub fn real_world<F, Fut>(limit: Duration, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
@@ -42,7 +40,6 @@ where
 }
 
 /// Runs a seeded real-time world within the host limit and requires Done.
-#[cfg(feature = "std")]
 pub fn seeded_real_world<F, Fut>(options: fictionet::RunOptions, limit: Duration, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,

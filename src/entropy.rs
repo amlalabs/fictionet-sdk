@@ -9,7 +9,6 @@ pub struct Seed(pub [u8; 32]);
 
 impl Seed {
     /// Draws a fresh seed from the operating system.
-    #[cfg(feature = "std")]
     pub fn random() -> Self {
         let mut bytes = [0; 32];
         crate::sys::random_bytes(&mut bytes).expect("operating system entropy unavailable");

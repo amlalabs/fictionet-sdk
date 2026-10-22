@@ -120,9 +120,9 @@ fn reconnects_reclaim_pending_sockets_without_world_polling() {
     }
     let _restore = RestoreLimit(limit);
 
-    for mapped in [false, true] {
+    {
         let path = format!(
-            "{}/fictionet-test-{}-churn-{mapped}.sock",
+            "{}/fictionet-test-{}-churn.sock",
             std::env::temp_dir().display(),
             std::process::id()
         );
@@ -134,14 +134,7 @@ fn reconnects_reclaim_pending_sockets_without_world_polling() {
             block_on(run(
                 RunOptions::new(Seed::from_u64(0)),
                 move |fcx| async move {
-                    let mut attachments = if mapped {
-                        attachments.map(&fcx, |_, a| {
-                            assert_eq!(a.name(), "barrier", "pending agents must not be wrapped");
-                            a
-                        })
-                    } else {
-                        attachments
-                    };
+                    let mut attachments = attachments;
                     for _ in 0..128 {
                         drop(attachments.get(&fcx, "barrier").await?);
                         ready_tx.send(()).unwrap();

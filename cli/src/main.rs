@@ -31,7 +31,7 @@ mod world;
 use lifecycle::exit_on_signals;
 
 const USAGE: &str = "\
-usage: fictionet attach --world unix:<path> --name <name> --type tun|tap|http_proxy|socks5 [flags]
+usage: fictionet attach <tun|tap|http-proxy|socks5> [flags]
        fictionet --version
        fictionet ready <path>
        fictionet wait-blocked [--api-server] [--timeout <seconds>] [<ip:port>...]
@@ -54,8 +54,8 @@ fn main() {
     match argv.first().map(String::as_str) {
         Some("attach") => {
             let parsed = match args::parse_attach(&argv[1..]) {
-                Ok(args::Parsed::Help) => {
-                    println!("{}", args::ATTACH_USAGE);
+                Ok(args::Parsed::Help(help)) => {
+                    print!("{help}");
                     return;
                 }
                 Err(msg) => {
@@ -79,7 +79,7 @@ fn main() {
                     exit_on_signals(None);
                     tap::run(t)
                 }
-                args::Parsed::Help => unreachable!("handled above"),
+                args::Parsed::Help(_) => unreachable!("handled above"),
             };
             if let Err(failure) = result {
                 match &failure {

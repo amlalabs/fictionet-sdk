@@ -1,4 +1,4 @@
-//! `fictionet attach --type http_proxy` and `--type socks5`: the binary
+//! `fictionet attach http-proxy` and `attach socks5`: the binary
 //! against a `web::Sites` world in this process, with clients that speak
 //! the proxy protocols by hand, and curl.
 //!
@@ -324,12 +324,11 @@ impl Attach {
         let mut child = Command::new(BIN)
             .args([
                 "attach",
+                kind,
                 "--world",
                 &format!("unix:{}", world.sock),
                 "--name",
                 name,
-                "--type",
-                kind,
             ])
             .args([
                 "--listen",
@@ -544,7 +543,7 @@ fn socks_connect(a: &Attach, name: &str, port: u16) -> (TcpStream, [u8; 10]) {
 #[test]
 fn http_door_connects_and_forwards() {
     let world = World::start();
-    let a = Attach::start(&world, "http_proxy", "h1", "10.0.0.2");
+    let a = Attach::start(&world, "http-proxy", "h1", "10.0.0.2");
 
     // CONNECT, then HTTP inside the tunnel.
     let (mut s, head) = connect(&a, "plain.test:80", Some(BASIC));
@@ -589,7 +588,7 @@ fn upstream_truncates_after_headers() {
         download: true,
         reset: Mutex::new(Some(when)),
     }));
-    let a = Attach::start(&world, "http_proxy", "truncated", "10.0.0.2");
+    let a = Attach::start(&world, "http-proxy", "truncated", "10.0.0.2");
     let mut s = a.connect();
     write!(
         s,
@@ -629,7 +628,7 @@ fn upload_fails_after_prefix() {
         download: false,
         reset: Mutex::new(Some(when)),
     }));
-    let a = Attach::start(&world, "http_proxy", "upload", "10.0.0.2");
+    let a = Attach::start(&world, "http-proxy", "upload", "10.0.0.2");
     let mut s = a.connect();
     write!(
         s,
@@ -672,7 +671,7 @@ fn upload_fails_after_prefix() {
 #[test]
 fn https_through_both_doors_with_curl() {
     let world = World::start();
-    let h = Attach::start(&world, "http_proxy", "c1", "10.0.0.2");
+    let h = Attach::start(&world, "http-proxy", "c1", "10.0.0.2");
     let s = Attach::start(&world, "socks5", "c2", "10.0.0.3");
     let ca = world.ca();
     let run = |proxy: String, url: &str, ca: Option<&Path>| {
@@ -728,7 +727,7 @@ fn websockets_pass_through_the_http_door() {
     use fictionet::stdlib::codec::{Stream, Wire};
     use fictionet::stdlib::protocols::websocket::{Message, Messages};
     let world = World::start();
-    let a = Attach::start(&world, "http_proxy", "ws1", "10.0.0.2");
+    let a = Attach::start(&world, "http-proxy", "ws1", "10.0.0.2");
     let mut s = a.connect();
     write!(
         s,
@@ -766,7 +765,7 @@ fn websockets_pass_through_the_http_door() {
 #[test]
 fn tokens_are_checked() {
     let world = World::start();
-    let a = Attach::start(&world, "http_proxy", "t1", "10.0.0.2");
+    let a = Attach::start(&world, "http-proxy", "t1", "10.0.0.2");
     for auth in [
         None,
         Some("Basic cmVsYXk6d3Jvbmc="),
@@ -877,7 +876,7 @@ fn an_icmp_error_fails_only_one_proxy_connect_to_the_same_destination() {
             &reply,
         )]
     });
-    let a = Attach::start(&world, "http_proxy", "icmp", "10.0.0.2");
+    let a = Attach::start(&world, "http-proxy", "icmp", "10.0.0.2");
     let mut clients = [a.connect(), a.connect()];
     for client in &mut clients {
         write!(client, "CONNECT 192.0.2.7:443 HTTP/1.1\r\nHost: 192.0.2.7:443\r\nProxy-Authorization: {BASIC}\r\n\r\n").unwrap();
@@ -892,7 +891,7 @@ fn an_icmp_error_fails_only_one_proxy_connect_to_the_same_destination() {
 #[test]
 fn failures_get_proxy_answers() {
     let world = World::start();
-    let a = Attach::start(&world, "http_proxy", "f1", "10.0.0.2");
+    let a = Attach::start(&world, "http-proxy", "f1", "10.0.0.2");
     let cases = [
         (
             "nope.test:443",
@@ -991,7 +990,7 @@ fn post_upload(s: &mut TcpStream, n: usize, absolute: bool) -> String {
 #[test]
 fn big_uploads_and_many_downloads_at_once() {
     let world = World::start();
-    let a = Attach::start(&world, "http_proxy", "u1", "10.0.0.2");
+    let a = Attach::start(&world, "http-proxy", "u1", "10.0.0.2");
     let n = 8 << 20;
     let (mut s, head) = connect(&a, "plain.test:80", Some(BASIC));
     assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
@@ -1040,7 +1039,7 @@ fn big_uploads_and_many_downloads_at_once() {
 #[test]
 fn the_world_closing_ends_attach_and_closes_the_port() {
     let mut world = World::start();
-    let mut a = Attach::start(&world, "http_proxy", "w1", "10.0.0.2");
+    let mut a = Attach::start(&world, "http-proxy", "w1", "10.0.0.2");
     let (_, head) = connect(&a, "plain.test:80", Some(BASIC));
     assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
     world.stop();
@@ -1063,12 +1062,11 @@ fn a_second_attach_under_the_same_name_is_refused() {
     let out = Command::new(BIN)
         .args([
             "attach",
+            "http-proxy",
             "--world",
             &format!("unix:{}", world.sock),
             "--name",
             "dup",
-            "--type",
-            "http_proxy",
         ])
         .args([
             "--listen",
@@ -1092,12 +1090,11 @@ fn a_second_attach_under_the_same_name_is_refused() {
 fn proxy_types_refuse_tun_flags_and_need_a_token() {
     let base = [
         "attach",
+        "http-proxy",
         "--world",
         "unix:/nowhere",
         "--name",
         "a",
-        "--type",
-        "http_proxy",
         "--listen",
         "127.0.0.1:0",
     ];
@@ -1117,10 +1114,7 @@ fn proxy_types_refuse_tun_flags_and_need_a_token() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("--type http_proxy takes no --gateway: attach makes the packets itself"),
-        "{err}"
-    );
+    assert!(err.contains("unexpected argument '--gateway'"), "{err}");
 
     let out = Command::new(BIN)
         .args(base)
@@ -1128,7 +1122,7 @@ fn proxy_types_refuse_tun_flags_and_need_a_token() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("needs --token-file"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--token-file <TOKEN_FILE>"));
 
     // A token file that is missing or empty stops attach before it
     // connects to the world.
@@ -1161,7 +1155,7 @@ fn proxy_types_refuse_tun_flags_and_need_a_token() {
 #[test]
 fn clients_waiting_for_a_connection_hear_that_the_world_is_gone() {
     let mut world = World::black_hole();
-    let mut h = Attach::start(&world, "http_proxy", "g1", "10.0.0.2");
+    let mut h = Attach::start(&world, "http-proxy", "g1", "10.0.0.2");
     let mut s = Attach::start(&world, "socks5", "g2", "10.0.0.3");
     // Clients on both doors, each waiting for an answer to its SYN. Each
     // goes to an address of its own, so the world can tell when every one
@@ -1266,12 +1260,11 @@ fn an_oversized_answer_to_hello_is_an_error_not_a_refusal() {
         Command::new(BIN)
             .args([
                 "attach",
+                "http-proxy",
                 "--world",
                 &format!("unix:{}", sock.display()),
                 "--name",
                 "big",
-                "--type",
-                "http_proxy",
             ])
             .args([
                 "--listen",
@@ -1316,7 +1309,7 @@ fn an_oversized_answer_to_hello_is_an_error_not_a_refusal() {
 #[test]
 fn lookups_of_one_name_are_shared_and_misses_remembered() {
     let world = World::start();
-    let attach = Attach::start(&world, "http_proxy", "dns-share", "10.0.0.2");
+    let attach = Attach::start(&world, "http-proxy", "dns-share", "10.0.0.2");
     let gate = Arc::new(std::sync::Barrier::new(16));
     let clients: Vec<_> = (0..16)
         .map(|_| {

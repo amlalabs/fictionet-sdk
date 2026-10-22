@@ -40,8 +40,8 @@
 //! ready file before sending traffic:
 //!
 //! ```sh
-//! "$bin/fictionet" attach --world "unix:$work/world.sock" --name agent \
-//!     --type http_proxy --listen 127.0.0.1:18781 --token-file "$work/proxy-token" \
+//! "$bin/fictionet" attach http-proxy --world "unix:$work/world.sock" --name agent \
+//!     --listen 127.0.0.1:18781 --token-file "$work/proxy-token" \
 //!     --ip-addr 10.0.0.2 --dns 10.0.0.1 --ready-file "$work/ready" > "$work/attach.log" 2>&1 &
 //! attach_pid=$!
 //! "$bin/fictionet" observe --observation "unix:$work/observe.sock" graph

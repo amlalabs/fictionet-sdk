@@ -2,5 +2,4 @@
 //! They fail when it does not. `cargo test` and `cargo nextest run` leave them
 //! out; `cargo nextest run --test host` runs them.
 
-#[cfg(feature = "std")]
 mod tun_linux;

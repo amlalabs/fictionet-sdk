@@ -269,10 +269,8 @@ mod spelling {
     #[test]
     fn misspelled_hosts_answer_nxdomain_over_dns() {
         use super::*;
-        use fictionet::stdlib::{
-            protocols::dns::{op::ResponseCode, rr::RecordType},
-            world::sandbox::machine,
-        };
+        use fictionet::stdlib::protocols::dns::{op::ResponseCode, rr::RecordType};
+        use fictionet_test_support::sandbox::machine;
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             |cx| async move {

@@ -122,8 +122,8 @@ def test_rendered_services(configurations, kind, port, ca):
 
     args = attach["args"]
     docker_args = services["attach"]["command"]
-    assert args[:7] == docker_args[:7] == [
-        "attach", "--world", "unix:/run/relay/relay.sock", "--name", "contract-agent", "--type", kind,
+    assert args[:6] == docker_args[:6] == [
+        "attach", "http-proxy" if kind == "http_proxy" else kind, "--world", "unix:/run/relay/relay.sock", "--name", "contract-agent",
     ]
     if kind == "tun":
         # The chart sets DNS on the pod and takes the CNI interface down.
@@ -194,7 +194,10 @@ def test_tun_addresses(configurations, addresses, nameservers):
                     ip_addr_v6=None, gateway_v6=None, dns_v6=None)
     for key, value in (defaults | addresses).items():
         flag = key.replace("_", "-")
-        assert (f"--{flag}={value}" if value else f"--no-{flag}") in args
+        if value:
+            assert f"--{flag}={value}" in args
+        else:
+            assert not any(arg.startswith(f"--{flag}=") for arg in args)
 
 
 @pytest.mark.parametrize("options,expected", [

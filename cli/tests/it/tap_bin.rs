@@ -1,4 +1,4 @@
-//! `fictionet attach --type tap --vm qemu:<path>` against a real `listen`
+//! `fictionet attach tap --vm qemu:<path>` against a real `listen`
 //! in this process, with the test playing QEMU: it connects to attach's
 //! socket and speaks QEMU's stream framing (a 32-bit big-endian length,
 //! then an Ethernet frame). No VM, KVM or privileges are needed.
@@ -98,12 +98,11 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
     let attach = Command::new(BIN)
         .args([
             "attach",
+            "tap",
             "--world",
             &format!("unix:{world}"),
             "--name",
             "vm1",
-            "--type",
-            "tap",
         ])
         .arg(format!("--vm=qemu:{}", vm_sock.display()))
         .args([
@@ -252,12 +251,11 @@ fn a_fake_qemu_gets_dhcpv6_after_malformed_requests() {
     let attach = Command::new(BIN)
         .args([
             "attach",
+            "tap",
             "--world",
             &format!("unix:{}", world.display()),
             "--name",
             "vm6",
-            "--type",
-            "tap",
         ])
         .arg(format!("--vm=qemu:{}", vm_sock.display()))
         .args([
@@ -402,12 +400,11 @@ fn a_live_socket_is_refused_and_a_stale_one_replaced() {
         Command::new(BIN)
             .args([
                 "attach",
+                "tap",
                 "--world",
                 "unix:/nonexistent/w.sock",
                 "--name",
                 "vm1",
-                "--type",
-                "tap",
             ])
             .arg(format!("--vm=qemu:{}", path.display()))
             .output()
@@ -447,12 +444,11 @@ fn a_second_attach_leaves_the_waiting_one_alone() {
         Command::new(BIN)
             .args([
                 "attach",
+                "tap",
                 "--world",
                 &format!("unix:{world}"),
                 "--name",
                 name,
-                "--type",
-                "tap",
             ])
             .arg(format!("--vm=qemu:{}", vm_sock.display()))
             .arg(format!("--ready-file={}", ready.display()))
@@ -474,12 +470,11 @@ fn a_second_attach_leaves_the_waiting_one_alone() {
         .current_dir(&dir)
         .args([
             "attach",
+            "tap",
             "--world",
             &format!("unix:{world}"),
             "--name",
             "vm3",
-            "--type",
-            "tap",
         ])
         .arg("--vm=qemu:./vm one.sock")
         .arg(format!("--ready-file={}", ready.display()))
@@ -584,12 +579,11 @@ fn messages_from_the_world_are_checked_while_waiting_for_qemu() {
         let mut attach = Command::new(BIN)
             .args([
                 "attach",
+                "tap",
                 "--world",
                 &format!("unix:{}", world.display()),
                 "--name",
                 "vm1",
-                "--type",
-                "tap",
             ])
             .arg(format!("--vm=qemu:{}", vm_sock.display()))
             .arg(format!("--ready-file={}", ready.display()))

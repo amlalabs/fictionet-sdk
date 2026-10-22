@@ -2,7 +2,6 @@
 //! Core publishes topology and counters to the observer; consumers build graphs.
 
 use fictionet::sync::{Mutex, MutexGuard};
-#[cfg(feature = "std")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -24,7 +23,6 @@ pub(crate) struct Meter {
     registration: Mutex<Option<Registration>>,
     packets: OnceLock<Arc<PacketStream>>,
     /// What end `s` sent, for an attachment.
-    #[cfg(feature = "std")]
     counts: [Count; 2],
     /// What holds the counts of a pair.
     counted: OnceLock<Weak<dyn Counted>>,
@@ -126,7 +124,6 @@ impl Drop for Meter {
 }
 
 #[derive(Default)]
-#[cfg(feature = "std")]
 struct Count {
     packets: AtomicU64,
     bytes: AtomicU64,
@@ -137,7 +134,6 @@ impl Meter {
         Arc::new(Meter {
             registration: Mutex::new(None),
             packets: OnceLock::new(),
-            #[cfg(feature = "std")]
             counts: Default::default(),
             counted: OnceLock::new(),
             creator: crate::run::RunTask::current(),
@@ -322,8 +318,8 @@ impl Meter {
     }
 
     /// Counts a packet that end `side` sent.
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline]
-    #[cfg(feature = "std")]
     pub(crate) fn sent(&self, side: usize, packet: &Packet) {
         let c = &self.counts[side];
         c.packets.fetch_add(1, Ordering::Relaxed);
@@ -336,11 +332,6 @@ impl Meter {
         if let Some(counted) = self.counted.get() {
             return counted.upgrade().map_or([0; 4], |c| c.totals());
         }
-        #[cfg(not(feature = "std"))]
-        {
-            [0; 4]
-        }
-        #[cfg(feature = "std")]
         [
             self.counts[0].packets.load(Ordering::Relaxed),
             self.counts[0].bytes.load(Ordering::Relaxed),
@@ -357,7 +348,7 @@ pub(crate) trait Counted: Send + Sync {
     fn observe_packets(&self, packets: Arc<PacketStream>);
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};

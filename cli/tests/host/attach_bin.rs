@@ -38,9 +38,9 @@ fn spawn_attach(
     let resolv = dir.join(resolv);
     std::fs::write(&resolv, "nameserver 192.0.2.1\n").unwrap();
     let script = format!(
-        "exec {BIN} attach --world unix:{sock} --name {name} --type tun --resolv-conf {resolv} \
+        "exec {BIN} attach tun --world unix:{sock} --name {name} --resolv-conf {resolv} \
          --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
-         --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6 --mtu 1400",
+          --mtu 1400",
         resolv = resolv.display()
     );
     Command::new("unshare")
@@ -226,9 +226,9 @@ fn resolv_conf_flag_picks_the_file_and_a_failed_write_names_it() {
     .unwrap();
     let attach = |name: &str, path: &str| {
         let script = format!(
-            "exec {BIN} attach --world unix:{sock} --name {name} --type tun \
+            "exec {BIN} attach tun --world unix:{sock} --name {name} \
              --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
-             --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6 --resolv-conf {path}"
+              --resolv-conf {path}"
         );
         Command::new("unshare")
             .args(["-rnm", "sh", "-c", &script])
@@ -288,7 +288,7 @@ fn unshare(flags: &str, script: &str) -> std::process::Child {
 }
 
 const V4_ONLY: &str = "--ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
-                       --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6 --no-resolv-conf";
+                        --no-resolv-conf";
 
 /// A world that takes the attachment `name`, keeps it until the file
 /// `done` exists, then closes it. Fails if `done` does not appear within 10 s.
@@ -333,11 +333,11 @@ fn down_link_clears_a_pods_eth0_before_tun0_takes_the_default_route() {
         ip route add default via 192.0.2.1 dev eth0
         ip -6 route add default via 2001:db8::1 dev eth0
         set +e
-        {BIN} attach --world unix:{sock} --name abc --type tun {V4_ONLY} 2> {d}/plain.err
+        {BIN} attach tun --world unix:{sock} --name abc {V4_ONLY} 2> {d}/plain.err
         echo $? > {d}/plain.status
-        {BIN} attach --world unix:{sock} --name abc --type tun \
+        {BIN} attach tun --world unix:{sock} --name abc \
             --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
-            --ip-addr-v6 fd00::2/64 --gateway-v6 fd00::1 --no-dns-v6 --no-resolv-conf \
+            --ip-addr-v6 fd00::2/64 --gateway-v6 fd00::1 --no-resolv-conf \
             --down-link eth0 --ready-file {d}/ready &
         attach=$!
         i=0
@@ -404,9 +404,8 @@ fn down_link_clears_a_pods_eth0_before_tun0_takes_the_default_route() {
 #[test]
 fn down_link_with_no_such_link_fails() {
     assert!(userns_works(), "unshare -rnm is not allowed here");
-    let script = format!(
-        "exec {BIN} attach --world unix:/nowhere --name a --type tun {V4_ONLY} --down-link eth9"
-    );
+    let script =
+        format!("exec {BIN} attach tun --world unix:/nowhere --name a {V4_ONLY} --down-link eth9");
     let out = unshare("-rn", &script).wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
@@ -422,15 +421,13 @@ fn world_wait_waits_for_a_late_world() {
     let sock = dir.join("w.sock").to_str().unwrap().to_owned();
     let mut late = unshare(
         "-rn",
-        &format!(
-            "exec {BIN} attach --world unix:{sock} --name late --type tun {V4_ONLY} --world-wait 20"
-        ),
+        &format!("exec {BIN} attach tun --world unix:{sock} --name late {V4_ONLY} --world-wait 20"),
     );
     let started = std::time::Instant::now();
     let never = unshare(
         "-rn",
         &format!(
-            "exec {BIN} attach --world unix:{}/none.sock --name n --type tun {V4_ONLY} --world-wait 1",
+            "exec {BIN} attach tun --world unix:{}/none.sock --name n {V4_ONLY} --world-wait 1",
             dir.display()
         ),
     );
@@ -471,7 +468,7 @@ fn world_wait_waits_for_a_late_world() {
 fn a_missing_tun_node_that_cannot_be_made_says_why() {
     assert!(userns_works(), "unshare -rnm is not allowed here");
     let script = format!(
-        "mount -t tmpfs tmpfs /dev/net && exec {BIN} attach --world unix:/nowhere --name a --type tun {V4_ONLY}"
+        "mount -t tmpfs tmpfs /dev/net && exec {BIN} attach tun --world unix:/nowhere --name a {V4_ONLY}"
     );
     let out = unshare("-rnm", &script).wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);

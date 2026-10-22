@@ -54,14 +54,14 @@
 //!
 //! This command, run as root on the host, attaches the network namespace
 //! `/run/netns/agent` as a sandbox named `agent`. `--world` names the
-//! world's socket, `--name` the sandbox, and `--type tun` asks for a
+//! world's socket, `--name` the sandbox, and `attach tun` asks for a
 //! `tun0` device. `--netns` is the namespace to put it in. The last six
 //! flags give the sandbox an address, a gateway and a DNS server inside
 //! the world, for both IPv4 and IPv6, because attach runs no DHCP for
 //! `tun`:
 //!
 //! ```text
-//! fictionet attach --world unix:/run/fictionet/world.sock --name agent --type tun \
+//! fictionet attach tun --world unix:/run/fictionet/world.sock --name agent \
 //!     --netns /run/netns/agent \
 //!     --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
 //!     --ip-addr-v6 2001:db8::2/64 --gateway-v6 2001:db8::1 --dns-v6 2001:db8::1
@@ -69,9 +69,9 @@
 //!
 //! Sandboxes can attach and detach at any time while the world runs. Each one
 //! has a name, and the world receives it as an [`Attachment`]. A virtual
-//! machine attaches through its network card instead (`--type tap`). A sandbox
+//! machine attaches through its network card instead (`attach tap`). A sandbox
 //! that cannot have a network device, because it has no privileges at all, can
-//! attach through a proxy (`--type http_proxy` or `--type socks5`). Whatever
+//! attach through a proxy (`attach http-proxy` or `attach socks5`). Whatever
 //! the type, the world receives IP packets: [`lowering`](guide::lowering) shows
 //! how each type turns what its sandbox sends into them.
 //!
@@ -137,19 +137,14 @@
 //! ordinary program, and this is the whole of `main`:
 //!
 //! ```no_run
-//! # #[cfg(feature = "std")]
 //! # use fictionet::{Attachments, Cx, Result};
-//! # #[cfg(feature = "std")]
 //! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-//! # #[cfg(feature = "std")]
 //! fn main() -> fictionet::Result {
 //!     let (attacher, attachments) = fictionet::attachments();
 //!     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 //!     let _listening = fictionet::listen(socket, attacher)?;
 //!     fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| world(fcx, attachments)))
 //! }
-//! # #[cfg(not(feature = "std"))]
-//! # fn main() {}
 //! ```
 //!
 //! [`attachments`] makes the channel that sandboxes arrive through. [`listen`]
@@ -185,7 +180,6 @@
 //! retain their events:
 //!
 //! ```
-//! # #[cfg(feature = "std")]
 //! # {
 //! use std::sync::Arc;
 //! use fictionet::{Attachments, Cx, Result};
@@ -279,22 +273,18 @@
 //!
 //! | Feature | What it gates | Implies | Default |
 //! |---|---|---|---|
-//! | `std` | Real clocks, OS entropy, real-time timers, HTTP/1 and HTTP/2 servers; world sockets and relay on native targets | — | Yes |
-//! | `tokio` | Tokio adapters and axum upgrades | `std` | No |
-//! | `web-proxy` | `web::proxy` and `web::forward`, with an injected `Upstream` transport | `std` | No |
+//! | `tokio` | Tokio adapters and axum upgrades | — | No |
+//! | `web-proxy` | `web::proxy` and `web::forward`, with an injected `Upstream` transport | — | No |
 //!
-//! The default features build without tokio, hyper or h2. File export belongs
-//! to the companion's `native` feature, not core's `std` feature.
-//! Disabling default features leaves the simulated-time executor, seeded
-//! randomness, packet links, and protocol codecs. The crate still links
-//! the Rust standard library; this is not a `no_std` build. Mutexes use a
-//! spin lock without the `std` feature and the standard mutex with it
-//! ([`sync::Mutex`]).
+//! Fictionet always uses the Rust standard library and its mutexes
+//! ([`sync::Mutex`]). Real clocks, OS entropy, HTTP servers and native world
+//! sockets are available without features. The default build has no tokio,
+//! hyper or h2 dependency. File export belongs to the companion's `native` feature.
 //!
 //! # In a browser
 //!
 //! The library also builds for `wasm32-unknown-unknown`, with
-//! `default-features = false, features = ["std"]` for HTTP/1.1 and HTTP/2. A world
+//! no features needed for HTTP/1.1 and HTTP/2. A world
 //! then runs inside a page: [`run`],
 //! [`Cx`] and its timers, [`block_on`], [`pair`], [`attachments`], the
 //! [`stdlib`] with smoltcp, DNS, `web::Sites` and TLS (rustls with the
@@ -314,7 +304,7 @@
 
 #![warn(missing_docs)]
 #![cfg_attr(
-    not(all(feature = "std", feature = "tokio", feature = "web-proxy")),
+    not(all(feature = "tokio", feature = "web-proxy")),
     allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -335,10 +325,10 @@ pub mod events;
 pub mod fuzzing;
 pub mod guide;
 mod interface;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 mod listen;
 mod packet_queue;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod relay;
 pub use entropy::{Entropy, Seed, SeededEntropy};
@@ -374,13 +364,11 @@ pub use clock::RunMode;
 pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
 pub use interface::{Interface, InterfaceExt, LinkHandle, Packet, Recv, RecvError};
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
-#[cfg(feature = "std")]
 pub use run::run;
 pub use run::{RunOptions, lab};
 mod clock;
-#[cfg(feature = "std")]
 pub use sys::random_bytes;
 
 /// The result type of a world, and of most Fictionet functions that can
@@ -388,7 +376,7 @@ pub use sys::random_bytes;
 /// `Sync` converts into [`Error`] with `?`.
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
-#[cfg(all(doctest, feature = "std"))]
+#[cfg(doctest)]
 #[doc(hidden)]
 #[doc = include_str!("../README.md")]
 mod readme {}
@@ -414,25 +402,12 @@ macro_rules! cfg_tokio {
     ($($enabled:tt)*) => {};
 }
 
-/// Includes tokens when the SDK's `std` feature is enabled.
-///
-/// An optional `else` block supplies the tokens for builds without the
-/// feature. Prefix the branches with `items` to select item definitions.
-#[cfg(feature = "std")]
+/// Includes the standard library branch. Fictionet always uses `std`.
 #[macro_export]
 macro_rules! cfg_std {
     (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($enabled)* };
     ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($enabled)* }};
     ($($enabled:tt)*) => { $($enabled)* };
-}
-
-/// Includes tokens selected by the SDK's `std` feature.
-#[cfg(not(feature = "std"))]
-#[macro_export]
-macro_rules! cfg_std {
-    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
-    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
-    ($($enabled:tt)*) => {};
 }
 
 /// Includes tokens when the SDK's `web-proxy` feature is enabled.

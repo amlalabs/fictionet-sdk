@@ -18,13 +18,13 @@ use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query}
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::services::serve::{Flow, ServeOptions};
 use fictionet::stdlib::world::net::Net;
-use fictionet::stdlib::world::sandbox::TlsClient;
 use fictionet::stdlib::{
     network::{Connection, delay, filter},
     services::tls,
     web::httpd,
 };
 use fictionet::{Cx, RunOptions, Seed, block_on, lab};
+use fictionet_test_support::sandbox::TlsClient;
 use http::{Request, Response};
 use http_body::Frame;
 use hyper_util::rt::TokioIo;
@@ -150,12 +150,14 @@ async fn episode(
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let config = Arc::new(config);
     let (attacher, attachments) = fictionet::attachments();
+    let office = fictionet::stdlib::world::net::Lan::new("office", "192.168.10.0/24".parse()?);
+    let web_lan = fictionet::stdlib::world::net::Lan::new("web", "192.168.20.0/24".parse()?);
     Net::new()
         .ipv4_only()
-        .lan("office", "192.168.10.0/24".parse()?)
-        .lan("web", "192.168.20.0/24".parse()?)
+        .lan(&office)
+        .lan(&web_lan)
         .host("echo", |h| {
-            h.on("office").at(ECHO).dns_name("echo.test").tcp_with(
+            h.on(&office).at(ECHO).dns_name("echo.test").tcp_with(
                 7,
                 Arc::new(()),
                 || Echo,
@@ -163,7 +165,7 @@ async fn episode(
             )
         })
         .host("https", |h| {
-            h.on("web").at(HTTPS).dns_name("localhost").tls_accept(
+            h.on(&web_lan).at(HTTPS).dns_name("localhost").tls_accept(
                 443,
                 "localhost",
                 move |_| config.clone(),
@@ -195,8 +197,7 @@ async fn episode(
         keep
     });
     let agent = delay(&cx, Duration::from_millis(2), agent);
-    let machine =
-        fictionet::stdlib::world::sandbox::machine(&cx, agent, Ipv4Addr::new(10, 0, 0, 2));
+    let machine = fictionet_test_support::sandbox::machine(&cx, agent, Ipv4Addr::new(10, 0, 0, 2));
     let mut dns = machine.udp.bind(40000)?;
     for (name, expected) in [("echo.test", ECHO), ("localhost", HTTPS)] {
         let mut query = Message::new(cx.random_u64() as u16, MessageType::Query, OpCode::Query);
@@ -331,8 +332,8 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
         protocols::{http1, x509},
         services::ca::Ca,
         web,
-        world::sandbox,
     };
+    use fictionet_test_support::sandbox;
 
     let episode = |seed| {
         let log = Arc::new(fictionet_observe::Memory::default());

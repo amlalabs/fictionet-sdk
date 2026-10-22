@@ -11,7 +11,7 @@ use crate::world::{Failure, err};
 
 static READY_FILE: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 
-/// A socket file to remove on a signal: `--type tap`'s, while it listens.
+/// A socket file to remove on a signal: `attach tap`'s, while it listens.
 static SOCKET_FILE: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 static SOCKET_FILE_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -39,7 +39,7 @@ pub(crate) fn remove_on_signal(path: &std::path::Path, id: (u64, u64)) {
     }
 }
 
-/// Has the signal handler remove the ready file at `path`. `--type tap`
+/// Has the signal handler remove the ready file at `path`. `attach tap`
 /// calls it once it owns its VM link, so that a second attach, refused,
 /// leaves the first one's ready file alone. Only one path is ever set.
 pub(crate) fn remove_ready_on_signal(path: &std::path::Path) {
@@ -81,7 +81,7 @@ impl NetlinkCleanup {
     }
 }
 
-/// The cleanup the signal handler sends before exiting: `--type tap
+/// The cleanup the signal handler sends before exiting: `attach tap
 /// --vm tap:<name>` sets the VM's device down and removes its redirect.
 static NETLINK_ON_SIGNAL: std::sync::OnceLock<NetlinkCleanup> = std::sync::OnceLock::new();
 

@@ -6,7 +6,7 @@
 #             fictionet binary (fictionet attach) from the same target dir
 #   world   - compose service "world": the Rust world, which makes and
 #             keeps the pages itself
-#   attach  - compose service "attach": fictionet attach --type tun
+#   attach  - compose service "attach": fictionet attach tun
 #   agent   - compose service "default": the agent's box, which trusts the CA
 
 FROM rust:1.99-slim-bookworm AS build

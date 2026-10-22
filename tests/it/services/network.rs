@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::stdlib::world::net::Lan;
 use fictionet_test_support::ended_with_done;
 
 // ---------------------------------------------------------------------------
@@ -219,9 +220,10 @@ fn failed_lan_join_or_missing_tls_names_does_not_commit_services() {
                         Echo
                     });
             let net = if lan {
+                let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
                 Net::new()
-                    .lan("corp", "192.168.56.0/24".parse()?)
-                    .add_host(host.on("corp").at(Ipv4Addr::new(192, 168, 56, 255)))
+                    .lan(&corp)
+                    .add_host(host.on(&corp).at(Ipv4Addr::new(192, 168, 56, 255)))
             } else {
                 Net::new().add_host(host.tls_accept(
                     443,
@@ -352,7 +354,7 @@ fn a_rejected_host_does_not_install_http_names_or_a_default() {
                 format!("GET / HTTP/1.1\r\nHost: {name}\r\n\r\n").as_bytes(),
             )?;
             assert_eq!(
-                fictionet::stdlib::world::sandbox::request(&fcx, &mut conn, &request)
+                fictionet_test_support::sandbox::request(&fcx, &mut conn, &request)
                     .await?
                     .head
                     .status,
@@ -385,14 +387,6 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         // dashboard's decoder below.
         let packets: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let (attacher, attachments) = fictionet::attachments();
-        let captured = packets.clone();
-        let attachments = attachments.map(&fcx, move |fcx, sandbox| {
-            let captured = captured.clone();
-            fictionet::stdlib::network::filter(fcx, sandbox, move |_, _, p| {
-                captured.lock().unwrap().push(p.0.clone());
-                true
-            })
-        });
         Net::new()
             .ipv4_only()
             .host("plc", |h| {
@@ -406,7 +400,16 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             })
             .start(&fcx, attachments)?;
 
-        let s = machine(&fcx, attacher.attach("operator")?, ME);
+        let captured = packets.clone();
+        let end = fictionet::stdlib::network::filter(
+            &fcx,
+            attacher.attach("operator")?,
+            move |_, _, p| {
+                captured.lock().unwrap().push(p.0.clone());
+                true
+            },
+        );
+        let s = fictionet_test_support::sandbox::machine(&fcx, end, ME);
         assert_eq!(lookup(&fcx, &s, "plc1.plant.test").await, Some(PLC_ADDR));
         let hmi_addr = lookup(&fcx, &s, "hmi.plant.test")
             .await
@@ -813,25 +816,25 @@ fn hosts_and_members_share_a_lan_on_the_net() {
     }
     crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (attacher, attachments) = fictionet::attachments();
-        let lan: Prefix = "192.168.56.0/24".parse()?;
+        let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
         let ws: Ipv4Addr = "192.168.56.31".parse()?;
         let group = SocketAddr::new(Ipv4Addr::new(239, 1, 1, 1).into(), 30001);
         Net::new()
             .ipv4_only()
-            .lan("corp", lan)
+            .lan(&corp)
             .host("dc01", |h| {
-                h.on("corp")
+                h.on(&corp)
                     .at(dc)
                     .dns_name("dc01.corp.test")
                     .tcp(389, Arc::new(()), || Echo)
             })
             .host("feed", |h| {
-                h.on("corp")
+                h.on(&corp)
                     .dns_name("feed.corp.test")
                     .udp(30000, Arc::new(group), || Feed)
             })
-            .member("ws01", "corp", ws.into())
+            .member("ws01", &corp, ws.into())
             .start(&fcx, attachments)?;
 
         // The VM: its own stack at its LAN address, no DHCP.
@@ -1018,20 +1021,21 @@ fn net_refuses_lans_that_overlap() {
         };
         let p = |s: &str| s.parse::<Prefix>().unwrap();
         assert!(
-            fail(Net::new().lan("a", p("10.0.0.0/16"))).is_some_and(|e| e.contains("sandboxes"))
+            fail(Net::new().lan(&Lan::new("a", p("10.0.0.0/16"))))
+                .is_some_and(|e| e.contains("sandboxes"))
         );
         assert!(
             fail(
                 Net::new()
-                    .lan("a", p("192.168.0.0/16"))
-                    .lan("b", p("192.168.56.0/24"))
+                    .lan(&Lan::new("a", p("192.168.0.0/16")))
+                    .lan(&Lan::new("b", p("192.168.56.0/24")))
             )
             .is_some_and(|e| e.contains("overlaps LAN a"))
         );
         assert!(
-            fail(Net::new().lan("a", p("192.168.56.0/24")).member(
+            fail(Net::new().lan(&Lan::new("a", p("192.168.56.0/24"))).member(
                 "vm",
-                "a",
+                &Lan::new("a", p("192.168.56.0/24")),
                 "192.168.56.1".parse().unwrap()
             ))
             .is_some()
@@ -1039,7 +1043,7 @@ fn net_refuses_lans_that_overlap() {
         assert!(
             fail(
                 Net::new()
-                    .lan("a", p("192.168.56.0/24"))
+                    .lan(&Lan::new("a", p("192.168.56.0/24")))
                     .host("x", |h| h.at(Ipv4Addr::new(192, 168, 56, 5)))
             )
             .is_some_and(|e| e.contains("Host::on"))
@@ -1182,14 +1186,17 @@ fn a_lan_member_detaches_like_any_sandbox() {
         let (attacher, attachments) = fictionet::attachments();
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
         let ws: Ipv4Addr = "192.168.56.31".parse()?;
-        Net::new()
-            .ipv4_only()
-            .lan("corp", "192.168.56.0/24".parse()?)
-            .host("dc01", |h| {
-                h.on("corp").at(dc).tcp(389, Arc::new(()), || Echo)
-            })
-            .member("ws01", "corp", ws.into())
-            .start(&fcx, attachments)?;
+        {
+            let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
+            Net::new()
+                .ipv4_only()
+                .lan(&corp)
+                .host("dc01", |h| {
+                    h.on(&corp).at(dc).tcp(389, Arc::new(()), || Echo)
+                })
+                .member("ws01", &corp, ws.into())
+                .start(&fcx, attachments)?;
+        }
 
         let to = SocketAddr::new(dc.into(), 389);
         let first_attacher = &attacher;
@@ -1243,7 +1250,7 @@ fn lan_cannot_overlap_the_automatic_address_pool() {
         let (_, attachments) = fictionet::attachments();
         let error = Net::new()
             .ipv4_only()
-            .lan("lab", "104.18.0.0/24".parse()?)
+            .lan(&Lan::new("lab", "104.18.0.0/24".parse()?))
             .start(&fcx, attachments)
             .expect_err("overlapping LAN is refused");
         assert!(error.to_string().contains("automatic address pool"));
@@ -1256,7 +1263,7 @@ fn ipv6_lan_cannot_overlap_the_automatic_address_pool() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_, attachments) = fictionet::attachments();
         let error = Net::new()
-            .lan("lab", "2606:4700:100::/64".parse()?)
+            .lan(&Lan::new("lab", "2606:4700:100::/64".parse()?))
             .start(&fcx, attachments)
             .expect_err("overlapping LAN is refused");
         assert!(error.to_string().contains("automatic address pool"));

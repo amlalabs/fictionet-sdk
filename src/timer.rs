@@ -9,7 +9,7 @@
 use fictionet::sync::Mutex;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Condvar;
 use std::sync::OnceLock;
 use std::task::Waker;
@@ -18,7 +18,7 @@ use crate::sys::Instant;
 
 pub(crate) struct Timers {
     state: Mutex<State>,
-    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     changed: Condvar,
 }
 
@@ -40,10 +40,10 @@ pub(crate) fn timers() -> &'static Timers {
                 entries: HashMap::new(),
                 next_id: 0,
             }),
-            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+            #[cfg(not(target_arch = "wasm32"))]
             changed: Condvar::new(),
         }));
-        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         std::thread::Builder::new()
             .name("fictionet-timers".into())
             .spawn(move || timers.thread())
@@ -53,9 +53,6 @@ pub(crate) fn timers() -> &'static Timers {
 }
 
 impl Timers {
-    #[cfg(all(not(feature = "std"), not(target_arch = "wasm32")))]
-    fn earlier(&self, _deadline: Instant) {}
-
     /// Wakes `waker` at `deadline`. Returns an id for `update` and `remove`.
     pub(crate) fn add(&self, deadline: Instant, waker: Waker) -> u64 {
         let mut state = self.state.lock();
@@ -123,7 +120,7 @@ impl Timers {
     }
 
     /// Moves the wakeup earlier, to `deadline`.
-    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     fn earlier(&self, _deadline: Instant) {
         self.changed.notify_one();
     }
@@ -136,7 +133,7 @@ impl Timers {
 
     /// Wakes every timer that is due now. Returns the next deadline, if
     /// any timer is left.
-    #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn fire(&self) -> Option<Instant> {
         loop {
             let mut due = Vec::new();
@@ -151,7 +148,7 @@ impl Timers {
         }
     }
 
-    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     fn thread(&self) {
         let mut state = self.state.lock();
         loop {
@@ -241,7 +238,7 @@ mod browser {
     }
 }
 
-#[cfg(all(test, feature = "std", not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use std::sync::Arc;

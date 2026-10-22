@@ -215,7 +215,7 @@ pub struct Host {
     at_v6: Option<Ipv6Addr>,
     family: Family,
     pub(super) ports: Vec<(u16, PortSpec)>,
-    lan: Option<String>,
+    lan: Option<super::Lan>,
 }
 
 impl Host {
@@ -258,9 +258,9 @@ impl Host {
     /// address, of the LAN's family, inside the LAN's prefix (the one given
     /// with [`at`](Self::at), or a free one), and shares the subnet with
     /// the LAN's other hosts and members.
-    pub fn on(self, lan: &str) -> Host {
+    pub fn on(self, lan: &super::Lan) -> Host {
         Host {
-            lan: Some(lan.to_owned()),
+            lan: Some(lan.clone()),
             ..self
         }
     }
@@ -619,11 +619,18 @@ impl Installation<'_> {
 
     /// Places `host` on the LAN `name`, at its `at` address of the LAN's
     /// family or the first free one from the LAN's second address up.
-    fn place_on_lan(&self, world: &mut World, name: &str, host: &Host) -> Result<Placed, String> {
+    fn place_on_lan(
+        &self,
+        world: &mut World,
+        lan: &super::Lan,
+        host: &Host,
+    ) -> Result<Placed, String> {
+        let name = &lan.name;
         let seg = self
             .lans
             .get(name)
-            .ok_or_else(|| format!("there is no LAN called {name}"))?;
+            .filter(|seg| seg.prefix == lan.prefix)
+            .ok_or_else(|| format!("LAN {name} is not configured in this network"))?;
         let v4 = seg.prefix.addr.is_ipv4();
         let given = if v4 {
             host.at.map(IpAddr::V4)

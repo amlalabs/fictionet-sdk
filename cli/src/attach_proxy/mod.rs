@@ -1,5 +1,5 @@
-//! The protocol side of `fictionet attach --type http_proxy` and
-//! `--type socks5`: reading what a proxy client sends, and what the door
+//! The protocol side of `fictionet attach http-proxy` and
+//! `attach socks5`: reading what a proxy client sends, and what the door
 //! answers, with no sockets. The binary runs these over its connections;
 //! the fuzz targets call them directly.
 //!

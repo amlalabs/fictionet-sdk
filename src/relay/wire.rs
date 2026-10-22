@@ -4,7 +4,6 @@ use std::time::Duration;
 pub const VERSION: u16 = 1;
 
 /// Message kinds: the first byte of each message.
-pub const AUTH: u8 = 0;
 pub const HELLO: u8 = 1;
 pub const ACCEPT: u8 = 2;
 pub const REFUSE: u8 = 3;
@@ -54,7 +53,6 @@ impl std::error::Error for DecodeError {}
 /// One message of the protocol.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message<'a> {
-    Auth(&'a [u8]),
     Hello(Hello),
     Accept,
     Refuse(String),
@@ -65,7 +63,6 @@ impl Message<'_> {
     /// The message as bytes: its kind, then its body.
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Message::Auth(token) => [&[AUTH][..], token].concat(),
             Message::Hello(hello) => {
                 let mut out = Vec::with_capacity(7 + hello.kind.len() + hello.name.len());
                 out.push(HELLO);
@@ -95,7 +92,6 @@ pub fn decode(message: &[u8]) -> Result<Message<'_>, DecodeError> {
     }
     let (&kind, body) = message.split_first().ok_or(DecodeError::Empty)?;
     match kind {
-        AUTH => Ok(Message::Auth(body)),
         HELLO => decode_hello(body).map(Message::Hello),
         ACCEPT if body.is_empty() => Ok(Message::Accept),
         ACCEPT => Err(DecodeError::BadBody),
@@ -146,7 +142,7 @@ mod tests {
 
     #[test]
     fn decode_enforces_the_message_limit() {
-        for kind in [AUTH, REFUSE, PACKET] {
+        for kind in [REFUSE, PACKET] {
             let mut frame = vec![b'x'; MAX_MESSAGE];
             frame[0] = kind;
             assert!(decode(&frame).is_ok());
@@ -182,7 +178,7 @@ mod tests {
             decode(&Message::Packet(&[1, 2, 3]).encode()),
             Ok(Message::Packet(&[1, 2, 3]))
         );
-        for kind in [5, 6, 9] {
+        for kind in [0, 5, 6, 9] {
             assert_eq!(decode(&[kind]), Err(DecodeError::UnknownKind(kind)));
         }
         assert_eq!(decode(&[7]), Err(DecodeError::UnknownKind(7)));

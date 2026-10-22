@@ -128,7 +128,7 @@ fn dechunk(mut body: &[u8]) -> Vec<u8> {
 async fn a_chunked_upstream_answer_reaches_the_agent_chunked() {
     use fictionet::prelude::*;
     use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
-    use fictionet::stdlib::world::sandbox;
+    use fictionet_test_support::sandbox;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::time::Duration;
 

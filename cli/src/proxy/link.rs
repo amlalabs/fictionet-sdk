@@ -301,7 +301,6 @@ mod tests {
             ));
         }
         for message in [
-            Message::Auth(b"token"),
             Message::Hello(Hello {
                 version: relay::VERSION,
                 mtu: 1500,

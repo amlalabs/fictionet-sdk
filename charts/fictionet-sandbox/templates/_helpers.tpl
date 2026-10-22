@@ -45,12 +45,11 @@ dict with "attach" (the config) and "service" (the service's name).
 {{- define "fictionet.attachArgs" -}}
 {{- $a := .attach -}}
 - attach
+- {{ replace "_" "-" $a.type | quote }}
 - --world
 - unix:/run/relay/relay.sock
 - --name
 - {{ default .service $a.name | quote }}
-- --type
-- {{ $a.type | quote }}
 {{- if ne $a.type "tun" }}
 - {{ printf "--listen=127.0.0.1:%s" (include "fictionet.proxyPort" $a) | quote }}
 - --token-file=/run/relay-token/token
@@ -65,8 +64,6 @@ dict with "attach" (the config) and "service" (the service's name).
 {{- $value := index $a (last $parts) }}
 {{- if $value }}
 - {{ printf "%s=%v" $flag $value | quote }}
-{{- else }}
-- {{ printf "--no-%s" (trimPrefix "--" $flag) | quote }}
 {{- end }}
 {{- end }}
 - {{ printf "--mtu=%v" (int $a.mtu) | quote }}

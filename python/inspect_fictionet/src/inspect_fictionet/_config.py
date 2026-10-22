@@ -217,7 +217,8 @@ class _Config:
 
     def attach_args(self) -> list[str]:
         """The arguments of `fictionet attach`."""
-        args = ["attach", "--world", f"unix:{WORLD_SOCKET}", "--name", self.name, "--type", self.attach]
+        command = "http-proxy" if self.attach == "http_proxy" else self.attach
+        args = ["attach", command, "--world", f"unix:{WORLD_SOCKET}", "--name", self.name]
         if self.proxy:
             assert self.ip_addr and self.dns
             args += [
@@ -235,7 +236,8 @@ class _Config:
                 ("gateway-v6", self.gateway_v6),
                 ("dns-v6", self.dns_v6),
             ):
-                args.append(f"--{flag}={value}" if value else f"--no-{flag}")
+                if value:
+                    args.append(f"--{flag}={value}")
             if self.mtu is not None:
                 args.append(f"--mtu={self.mtu}")
         args += [f"--ready-file={_READY_FILE}", f"--world-wait={self.world_wait}"]
