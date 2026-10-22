@@ -1,15 +1,8 @@
-//! The request log for a fixed script of agent actions, compared line for
-//! line with a recorded log (`tests/golden/`).
-//!
-//! FakeWiki's eval reads `log.jsonl` after the run, so the same lines mean
-//! the same report. The world runs the script in a lab with its embedded
-//! pages and a CA made for the test. `ts` is dropped and the lines are
-//! compared as sorted sets.
-//!
+//! Exercise HTTP, TLS, HEAD delivery and redirects against the world.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -105,15 +98,14 @@ async fn tls(
 }
 
 #[test]
-fn the_log_is_the_recorded_one() {
-    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let state_dir = std::env::temp_dir().join(format!("fakewiki-golden-{}", std::process::id()));
+fn requests_log_head_delivery_and_redirects() {
+    let state_dir = std::env::temp_dir().join(format!("fakewiki-requests-{}", std::process::id()));
     std::fs::create_dir_all(&state_dir).unwrap();
     let documents = pages::documents(Variant::AlteredOne)
         .into_iter()
         .map(|d| d.url)
         .collect();
-    run_script(&here, &state_dir, pages::host_ips(), documents);
+    run_script(&state_dir, pages::host_ips(), documents);
 }
 
 async fn script(
@@ -175,12 +167,7 @@ async fn script(
     Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
 }
 
-fn run_script(
-    here: &Path,
-    state_dir: &Path,
-    hosts: HashMap<String, Ipv4Addr>,
-    documents: Vec<String>,
-) {
+fn run_script(state_dir: &Path, hosts: HashMap<String, Ipv4Addr>, documents: Vec<String>) {
     let log_path = state_dir.join("log.jsonl");
     let log = Arc::new(Log::new(
         Box::new(std::fs::File::create(&log_path).unwrap()),

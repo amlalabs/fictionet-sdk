@@ -554,4 +554,3 @@ pub fn check_atomic<T, R, E, S: PartialEq + core::fmt::Debug>(
     }
     result
 }
-
