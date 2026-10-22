@@ -500,9 +500,8 @@ async fn a_live_page_stays_making_until_the_model_answers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
-    use crate::kit::{checks::non_public_address, mirror};
+    use crate::kit::mirror;
     use fictionet::stdlib::protocols::x509::Certificate;
-    use fictionet_extras::models::{Credential, Model, Provider, Secret};
     let seed = Seed::builtin("web").unwrap();
     let searches = Arc::new(Searches::from_seed(&seed));
     let observed = searches.clone();
@@ -518,14 +517,8 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(rustls::pki_types::CertificateDer::from(root.to_bytes()?))?;
             let roots = Arc::new(roots);
-            let model = Model::at(
-                &cx,
-                Provider::Anthropic,
-                Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "test-key".into())?),
-                "https://api.anthropic.com".parse()?,
-            )?;
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
-            let net = network(&world, &cx, log, mirror::new(&cx)?, Some(model))?;
+            let net = network(&world, &cx, log, mirror::new(&cx)?)?;
             let (attacher, attachments) = fictionet::attachments();
             net.start(&cx, attachments)?;
             let machine = machine(
@@ -547,7 +540,7 @@ async fn guest_network_names_have_public_addresses_and_no_ipv6_answers() {
                         panic!("unexpected answer for {host}")
                     };
                     assert!(
-                        !non_public_address(address.0.into()),
+                        !fictionet::stdlib::network::ip::non_public_address(address.0.into()),
                         "{host}: {}",
                         address.0
                     );

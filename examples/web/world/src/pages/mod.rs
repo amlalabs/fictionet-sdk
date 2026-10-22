@@ -976,7 +976,6 @@ impl Pages {
             target,
             &[serde_json::json!({"title":page.title})],
             "news",
-            &[],
         );
         use kuchiki::traits::TendrilSink;
         let dom = kuchiki::parse_html().one(article.body);
@@ -2322,7 +2321,7 @@ impl Pages {
                             mentions.push(json!({"snippet": fact}));
                         }
                     }
-                    make::page_with_known(&seed, host, target, &mentions, &kind, &known, &ask.cast)
+                    make::page_with_known(&seed, host, target, &mentions, &kind, &known)
                 },
                 || {
                     let (system, user) = prompts::page(

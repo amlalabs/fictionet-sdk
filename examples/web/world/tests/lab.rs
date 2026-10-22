@@ -1,6 +1,6 @@
 //! The whole world, with its offline generator, runs in a lab: no sockets
 //! or files.
-use adaptive_web_world::{
+use web_world::{
     World,
     pages::{Seed, text::target_of},
     search::Searches,
@@ -61,7 +61,7 @@ async fn fetch(
     let response = sandbox::request(cx, &mut conn, &request).await.unwrap();
     (response.head.status, response.body)
 }
-fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
+fn run(exhaust: bool) -> (Vec<Value>, web_world::search::Snapshot) {
     let events = Arc::new(Memory::default());
     let seed = Seed::builtin("web").unwrap();
     let searches = Arc::new(Searches::from_seed(&seed));
@@ -74,7 +74,7 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
     let observer = Arc::new(Fanout::new(vec![
         events.clone(),
         searches.clone(),
-        Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() }),
+        Arc::new(web_world::events::LogObserver { log: log.clone() }),
     ]));
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
@@ -160,7 +160,7 @@ fn seeded_lab_runs_match() {
     assert_eq!(first.1.queries.len(), 1);
     assert_eq!(
         first.1.queries[0].outcome,
-        adaptive_web_world::search::Outcome::Served
+        web_world::search::Outcome::Served
     );
     assert_eq!(first.1.queries[0].gen_ms, Some(0));
     assert_eq!(first.1.results[0].listed.len(), 10);
@@ -173,8 +173,8 @@ fn exhausted_search_emits_query_failed() {
     assert_eq!(snapshot.queries.len(), 1);
     assert_eq!(
         snapshot.queries[0].outcome,
-        adaptive_web_world::search::Outcome::Failed {
-            why: adaptive_web_world::search::Failure::Budget,
+        web_world::search::Outcome::Failed {
+            why: web_world::search::Failure::Budget,
             error: None
         }
     );
@@ -201,7 +201,7 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(events.clone()),
         move |cx| async move {
             let seed = Seed::builtin("web")?;
-            let start = adaptive_web_world::world_start(&seed.date)?;
+            let start = web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed, start)?;
             let tls = world.ca.config(&cx, "forwarded.com")?.0;
             let log = Arc::new(example_common::log::Log::new(
@@ -319,7 +319,7 @@ fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
         move |cx| async move {
-            let start = adaptive_web_world::world_start(&seed.date)?;
+            let start = web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed, start)?;
             let log = Arc::new(example_common::log::Log::new(
                 Box::new(std::io::sink()),
@@ -429,7 +429,7 @@ fn result_icons_only_contact_the_search_engine() {
                     assert_eq!(status, 200);
                     assert_eq!(
                         body,
-                        adaptive_web_world::pages::render::favicon(&result.host).as_bytes()
+                        web_world::pages::render::favicon(&result.host).as_bytes()
                     );
                 }
                 assert!(observed.snapshot().pages.is_empty());

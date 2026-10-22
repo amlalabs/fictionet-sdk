@@ -1092,7 +1092,6 @@ pub(super) fn page_with_known(
     mentions: &[Value],
     kind: &str,
     known: &[Result],
-    cast: &[super::prompts::Person],
 ) -> Page {
     if host == "www.youtube.com" && target == "/" {
         let mut body = String::from("<h1>Recommended</h1><div class=\"video-grid\">");
@@ -1128,7 +1127,7 @@ pub(super) fn page_with_known(
         {
             mentions.push(serde_json::json!({"title": title_from(host, target)}));
         }
-        let made = page(seed, host, target, &mentions, kind, cast);
+        let made = page(seed, host, target, &mentions, kind);
 
         return made;
     }
@@ -1204,7 +1203,6 @@ pub fn page(
     target: &str,
     mentions: &[Value],
     _kind: &str,
-    _cast: &[super::prompts::Person],
 ) -> Page {
     let title = mentions
         .iter()

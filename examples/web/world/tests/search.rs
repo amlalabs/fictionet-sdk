@@ -1,6 +1,6 @@
-use adaptive_web_world::pages::model::Provider;
-use adaptive_web_world::pages::{GeneratorKind, Pages, Seed, store::Store};
-use adaptive_web_world::search::*;
+use web_world::pages::model::Provider;
+use web_world::pages::{GeneratorKind, Pages, Seed, store::Store};
+use web_world::search::*;
 use example_common::events::field;
 use fictionet::events::{
     ConnInfo, Event, Interest, Metadata, Observation, Observer, Stamp, Stream, TopologyKind,
@@ -580,7 +580,8 @@ fn worst_case_snapshot_fits() {
             generate: false,
             generation_revision: n,
             generation_at_ms: n,
-            canned: false,
+            copied: false,
+            live_search: false,
         },
         queries: vec![q; MAX_QUERIES],
         results: vec![list; MAX_RESULTS],
@@ -728,7 +729,7 @@ fn model_server_tools_publish_the_world_search_and_fetch() {
 }
 
 fn model_world_tools(stream: bool) {
-    use adaptive_web_world::pages::{Pages as WorldPages, Seed as WorldSeed};
+    use web_world::pages::{Pages as WorldPages, Seed as WorldSeed};
     use fictionet::stdlib::web::{Body, httpd};
     use fictionet_extras::models::{Credential, Model, Provider, Secret};
     use http_body_util::BodyExt;
@@ -940,7 +941,7 @@ fn making_events_precede_page_work_and_failed_fetches_finish_the_row() {
             assert_eq!(snapshot.pages[0].url, url);
             assert!(!snapshot.pages[0].making);
             assert_eq!(snapshot.pages[0].status, Some(200));
-            for i in 0..adaptive_web_world::pages::GENERATION_BUDGET {
+            for i in 0..web_world::pages::GENERATION_BUDGET {
                 let _ = pages
                     .clone()
                     .fetch(
