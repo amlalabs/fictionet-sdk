@@ -132,3 +132,8 @@ active modes are covered by copied corpus and model transport integration tests.
 - `src/stdlib/protocols/dcerpc.rs::status_codes_match_c706_appendix_e`: pins constants or a compile-time trait already required by callers; real packet layouts and driver transitions remain covered.
 - `src/stdlib/protocols/wake_on_lan.rs::constants`: pins constants or a compile-time trait already required by callers; real packet layouts and driver transitions remain covered.
 - `src/stdlib/protocols/wireguard.rs::sizes_match_the_paper`: pins constants or a compile-time trait already required by callers; real packet layouts and driver transitions remain covered.
+
+- `python/inspect_fictionet/tests/common/test_commands.py::test_direct_curl_prefix`: compares a command constant with its literal definition; real command execution remains covered.
+- `codegen/tests/layout.rs`: checks formatting and repeated generation; the layouts crate still compiles generated schemas and exercises their codecs on bytes.
+- `codegen/tests/support/mod.rs`: unused rustfmt helper after deleting formatting-only tests.
+- `codegen/tests/cli.rs::sbe_format_matches_its_golden_and_reports_xml_errors`: removed its regenerated-source comparison and retained successful CLI invocation and XML error handling as `sbe_format_reports_xml_errors`.
