@@ -1,79 +1,28 @@
-//! Shared guests, networking, provisioning, and run lifetime.
-//!
-//! ```no_run
-//! use fictionet_demo::kit::{self, Guest, Kit};
-//! use fictionet_observe::page::Page;
-//! use fictionet::stdlib::web;
-//! use fictionet_extras::zscaler::{DEFAULT_CLOUD, zscaler};
-//! use std::time::{Duration, SystemTime};
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let kit = Kit::new("office")
-//!     .guest(kit::desktop::browser("workstation", "analyst", "http://archive.ubuntu.com"))
-//!     .guest(Guest::ubuntu("server", "operator"))
-//!     .page(|dashboard, hosts| Page::new("Office", dashboard)
-//!         .host(hosts.take("workstation")).host(hosts.take("server")).standard_panels())
-//!     .world(|fcx, mut world| async move {
-//!         let now = world.now_unix();
-//!         let date = SystemTime::UNIX_EPOCH + Duration::from_secs(now as u64);
-//!         let ca = zscaler(&fcx, DEFAULT_CLOUD, now)?;
-//!         let tls = ca.server_config(&fcx, kit::desktop::HOSTS, date)?;
-//!         world.trust("office", ca.root_pem())?;
-//!         let mirror = world.mirror(&fcx)?;
-//!         web::Sites::new(move |host: &str| match host {
-//!             "archive.ubuntu.com" | "security.ubuntu.com" => Some(web::Site::new(mirror.clone())),
-//!             h if kit::desktop::HOSTS.contains(&h) => Some(web::Site::new(mirror.clone()).tls(tls.clone())),
-//!             _ => None,
-//!         }).date(date).into_net().route(kit::JUMP, kit::jump_prefix())
-//!             .start(&fcx, world.into_attachments())
-//!     });
-//! let run = kit.boot("demos/downloads/cloudimage").await?;
-//! let workstation = run.guest("workstation");
-//! workstation.wait_cloud_init(Duration::from_secs(300)).await?;
-//! workstation.wait_desktop(Duration::from_secs(300)).await?;
-//! run.shutdown().await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! `Kit::page` adds the dashboard observer, containment probes and panel, labels
-//! task and panel, and each host's status; for a browser guest, the world must
-//! serve `kit::desktop::HOSTS` through `World::mirror`.
-
+//! Guest provisioning, networking and process lifetime. Each app owns its page.
 pub mod bridge;
-pub mod client;
-mod page;
-pub use page::{Hosts, PAGE_PORT, PageAccess, answer_command, open_bootstrap, serve_commands};
-pub mod containment;
 pub mod desktop;
 pub mod jump;
 pub mod mirror;
 pub mod net;
+pub mod page;
 pub mod preview;
 pub mod seed;
 pub mod shot;
 pub mod ssh;
 mod util;
 pub mod vm;
-
-pub use util::random_uuid;
-
+use fictionet::stdlib::network::ethernet::Family;
+use fictionet::{Attachments, Cx, RunOptions, Seed};
+pub use page::{PAGE_PORT, PageAccess};
 use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use fictionet_observe::page::{Containment, Labels, Page, Server, StateLimits, StateTopic};
-use fictionet_observe::{DashboardHandle, DashboardObserver, DashboardOptions};
-
-use fictionet::events::{Fanout, Interest, Observation, Observer, Stamp};
-use fictionet::stdlib::network::ethernet::Family;
-use fictionet::{Attachments, Cx, RunOptions, Seed};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-
+pub use util::{RunDir, random_uuid};
 /// The admin attachment and route.
 pub const JUMP: &str = "jump";
 /// The largest IP packet a guest's card carries.
@@ -418,92 +367,6 @@ impl World {
     }
 }
 
-type PageBuilder = Box<dyn FnOnce(DashboardHandle, &mut Hosts) -> Page + Send>;
-
-/// Declares guests and observers before starting the world.
-pub struct Kit<W = ()> {
-    name: String,
-    guests: Vec<Guest>,
-    observers: Vec<Arc<dyn Observer>>,
-    world: W,
-    page: Option<PageBuilder>,
-    policy: Option<Arc<dyn fictionet_observe::Policy>>,
-    pub(crate) run_parent: PathBuf,
-    /// Opens the page in Chromium once it is bound, in place of printing
-    /// how to open it.
-    open: bool,
-}
-
-impl Kit {
-    /// Creates a named kit with no guests or observers and temporary run storage.
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.into(),
-            guests: Vec::new(),
-            observers: Vec::new(),
-            world: (),
-            page: None,
-            policy: None,
-            run_parent: std::env::temp_dir(),
-            open: false,
-        }
-    }
-}
-
-impl<W> Kit<W> {
-    /// Adds a guest with its world attachment.
-    pub fn guest(mut self, guest: Guest) -> Self {
-        self.guests.push(guest);
-        self
-    }
-    /// Adds an observer to the fanout installed before the world starts.
-    pub fn observer(mut self, observer: Arc<dyn Observer>) -> Self {
-        self.observers.push(observer);
-        self
-    }
-    /// Selects observations after the kit excludes its console traffic.
-    pub fn policy(mut self, policy: Arc<dyn fictionet_observe::Policy>) -> Self {
-        self.policy = Some(policy);
-        self
-    }
-    /// Opens the page in a Chromium app window as soon as it is served,
-    /// for a demo someone drives by hand.
-    pub fn open_page(mut self) -> Self {
-        self.open = true;
-        self
-    }
-    /// Builds a page before the world starts and before any guest boots.
-    /// The kit adds containment results and labels and runs their world tasks.
-    /// Do not call Page::containment or Page::labels in the builder; duplicate
-    /// panels are rejected at bind. Guests need not all be taken by the page.
-    pub fn page(
-        mut self,
-        build: impl FnOnce(DashboardHandle, &mut Hosts) -> Page + Send + 'static,
-    ) -> Self {
-        self.page = Some(Box::new(build));
-        self
-    }
-    /// Sets the closure that starts the world services.
-    /// It must return once services are started, as `Net::start` does, because
-    /// boot waits for it before writing the guest seeds.
-    pub fn world<F, Fut>(self, world: F) -> Kit<F>
-    where
-        F: FnOnce(Cx, World) -> Fut + Send + 'static,
-        Fut: Future<Output = fictionet::Result> + Send + 'static,
-    {
-        Kit {
-            name: self.name,
-            guests: self.guests,
-            observers: self.observers,
-            world,
-            page: self.page,
-            policy: self.policy,
-            run_parent: self.run_parent,
-            open: self.open,
-        }
-    }
-}
-
 struct Resources {
     dir: PathBuf,
     socket: PathBuf,
@@ -561,6 +424,10 @@ impl GuestHandle {
     pub fn addr(&self) -> Option<Ipv4Addr> {
         *self.addr.borrow()
     }
+    /// The console and status for the app's own routes.
+    pub fn console(&self) -> page::GuestConsole {
+        self.console.clone()
+    }
     /// Returns the SSH session connected through the jump host.
     pub fn ssh(&self) -> &Arc<ssh::Session> {
         self.ssh.as_ref().expect("boot completed")
@@ -569,7 +436,7 @@ impl GuestHandle {
     pub fn vm(&self) -> &vm::Vm {
         self.vm.as_ref().expect("boot completed")
     }
-    /// Waits up to timeout for the guest's desktop, with or without Kit::page.
+    /// Waits up to timeout for the guest's desktop, even before an app opens its page.
     /// Returns elapsed time from VM startup. A timeout names the guest,
     /// readiness command, and the last attempt's exit code and stderr tail.
     pub async fn wait_desktop(&self, timeout: Duration) -> io::Result<Duration> {
@@ -591,39 +458,17 @@ pub struct Run {
     bridges: Vec<JoinHandle<()>>,
     dir: Option<util::RunDir>,
     boot: Instant,
-    page: Option<Server>,
-    access: Option<PageAccess>,
-    /// Whether the page opens in Chromium once it is bound.
-    open: bool,
-    dashboard: Option<DashboardHandle>,
-    labels: Option<Labels>,
-    containment: StateTopic<Containment>,
-    probes: Arc<Mutex<Containment>>,
     setup: Arc<mirror::Setup>,
     mirror: Arc<Mutex<Option<mirror::Cache<fictionet::stdlib::web::Proxy>>>>,
 }
 
 impl Run {
-    /// Returns the signed page URL. Panics unless Kit::page was declared.
-    pub fn page_url(&self) -> &str {
-        self.page
-            .as_ref()
-            .expect("declare Kit::page before requesting its URL")
-            .url()
-    }
-    /// Returns the page dashboard. Panics unless Kit::page was declared.
-    pub fn dashboard(&self) -> DashboardHandle {
-        self.dashboard
-            .as_ref()
-            .expect("declare Kit::page before requesting its dashboard")
-            .clone()
-    }
     /// Returns the named guest, panicking if it was not declared.
     pub fn guest(&self, name: &str) -> &GuestHandle {
         self.guests
             .iter()
             .find(|g| g.name() == name)
-            .unwrap_or_else(|| panic!("guest {name} is not declared; add it with Kit::guest"))
+            .unwrap_or_else(|| panic!("guest {name} is not declared"))
     }
     /// Returns all guests in declaration order.
     pub fn guests(&self) -> &[GuestHandle] {
@@ -716,9 +561,6 @@ impl Run {
                 failures.push(format!("Cloud Hypervisor process {pid} remains"));
             }
         }
-        if let Some(page) = self.page.take() {
-            page.shutdown(Duration::from_secs(2)).await;
-        }
         if failures.is_empty() {
             Ok(())
         } else {
@@ -734,7 +576,7 @@ impl Run {
     /// Waits until `host` shows its desktop and every guest has finished
     /// setting up. The package mirror stops forwarding setup traffic when
     /// this returns, ready or not, or when it is dropped unfinished.
-    async fn app_ready(&self, host: &str) -> io::Result<()> {
+    pub async fn app_ready(&self, host: &str) -> io::Result<()> {
         struct CloseSetup<'a>(&'a mirror::Setup);
         impl Drop for CloseSetup<'_> {
             fn drop(&mut self) {
@@ -783,32 +625,6 @@ impl Drop for Run {
     }
 }
 
-struct Lease {
-    name: String,
-    addr: watch::Sender<Option<Ipv4Addr>>,
-}
-
-impl Observer for Lease {
-    fn enabled(&self, interest: Interest<'_>) -> bool {
-        matches!(interest, Interest::Event(m, c)
-            if m.source == "net" && m.kind == "bound"
-                && c.sandbox.as_ref().is_some_and(|s| *s.name == self.name))
-    }
-    fn observe(&self, _: Stamp, item: Observation<'_>) {
-        if let Observation::Event(event) = item
-            && event.get("by_dhcp").and_then(|v| v.as_bool()) == Some(true)
-            && let Some(addr) = event
-                .conn
-                .sandbox
-                .as_ref()
-                .filter(|s| *s.name == self.name)
-                .and_then(|s| s.addr)
-        {
-            self.addr.send_replace(Some(addr));
-        }
-    }
-}
-
 type BackendInput = (tokio::sync::mpsc::Sender<Vec<u8>>, net::RxQueue);
 
 struct Bridge {
@@ -816,412 +632,148 @@ struct Bridge {
     queue: net::RxQueue,
     link: fictionet::End,
     family: Family<Ipv4Addr>,
+    address: watch::Sender<Option<Ipv4Addr>>,
 }
 
 struct Prepared {
     mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
-    policy: Option<Arc<dyn fictionet_observe::Policy>>,
     attachments: Attachments,
     jump_link: fictionet::End,
     bridges: Vec<Bridge>,
     backends: Vec<BackendInput>,
-    observers: Vec<Arc<dyn Observer>>,
 }
 
-impl<W> Kit<W> {
-    fn check_downloads(&self, downloads: &Path) -> io::Result<()> {
-        for file in [
-            "cloud-hypervisor",
-            "ubuntu-24.04-server-cloudimg-amd64.img",
-            "ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
-            "ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
-        ] {
-            if !downloads.join(file).is_file() {
-                return Err(io::Error::other(format!(
-                    "missing {}",
-                    downloads.join(file).display()
-                )));
-            }
+fn check_downloads(downloads: &Path) -> io::Result<()> {
+    for file in [
+        "cloud-hypervisor",
+        "ubuntu-24.04-server-cloudimg-amd64.img",
+        "ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
+        "ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
+    ] {
+        if !downloads.join(file).is_file() {
+            return Err(io::Error::other(format!(
+                "missing {}",
+                downloads.join(file).display()
+            )));
         }
-        Ok(())
     }
+    Ok(())
+}
 
-    fn prepare(&mut self) -> io::Result<(Run, Prepared)> {
-        if self.guests.is_empty() {
-            return Err(io::Error::other("declare at least one guest"));
+fn prepare(name: &str, guests: Vec<Guest>) -> io::Result<(Run, Prepared)> {
+    if guests.is_empty() {
+        return Err(io::Error::other("declare at least one guest"));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut attachments = std::collections::HashSet::new();
+    for guest in &guests {
+        guest.validate()?;
+        if !names.insert(&guest.hostname) || !attachments.insert(&guest.attachment) {
+            return Err(io::Error::other("duplicate guest hostname or attachment"));
         }
-        let mut names = std::collections::HashSet::new();
-        let mut attachments = std::collections::HashSet::new();
-        for guest in &self.guests {
-            guest.validate()?;
-            if !names.insert(&guest.hostname) || !attachments.insert(&guest.attachment) {
-                return Err(io::Error::other("duplicate guest hostname or attachment"));
-            }
-        }
-        let setup = Arc::new(mirror::Setup::new(
-            self.guests.iter().map(|g| g.hostname.clone()),
-        ));
-        let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
-        self.observers.push(audit.clone());
-        let mut run = Run {
-            audit,
-            guests: Vec::new(),
+    }
+    let setup = Arc::new(mirror::Setup::new(
+        guests.iter().map(|g| g.hostname.clone()),
+    ));
+    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
+    let mut run = Run {
+        audit,
+        guests: Vec::new(),
+        setup: setup.clone(),
+        mirror: Arc::default(),
+        fcx: Arc::new(Mutex::new(None)),
+        world: None,
+        jump: None,
+        bridges: Vec::new(),
+        dir: Some(util::RunDir::new(&std::env::temp_dir(), name)?),
+        boot: Instant::now(),
+    };
+    let (attacher, attachments) = fictionet::attachments();
+    let mut prepared = Prepared {
+        mirror_addresses: Default::default(),
+        attachments,
+        jump_link: attacher.attach(JUMP).map_err(io::Error::other)?,
+        bridges: Vec::new(),
+        backends: Vec::new(),
+    };
+    for guest in guests.into_iter() {
+        let resources = Resources::new(run.path(), &guest)?;
+        let link = attacher
+            .attach(&guest.attachment)
+            .map_err(io::Error::other)?;
+        let (tx, frames) = tokio::sync::mpsc::channel(net::QUEUE_LIMIT);
+        let queue = net::RxQueue::new()?;
+        prepared.backends.push((tx, queue.clone()));
+        let (tx_addr, addr) = watch::channel(guest.initial_addr());
+        prepared.bridges.push(Bridge {
+            frames,
+            queue,
+            link,
+            family: guest.family.clone(),
+            address: tx_addr,
+        });
+        let console = page::GuestConsole::new(&guest);
+        run.guests.push(GuestHandle {
             setup: setup.clone(),
-            mirror: Arc::default(),
-            fcx: Arc::new(Mutex::new(None)),
-            world: None,
-            jump: None,
-            bridges: Vec::new(),
-            dir: Some(util::RunDir::new(&self.run_parent, &self.name)?),
+            console,
+            guest,
+            resources,
+            addr,
+            vm: None,
+            ssh: None,
+            backend: None,
             boot: Instant::now(),
-            page: None,
-            access: None,
-            open: false,
-            dashboard: None,
-            labels: None,
-            containment: StateTopic::new(StateLimits::default()),
-            probes: Arc::new(Mutex::new(Containment::default())),
-        };
-        let (attacher, attachments) = fictionet::attachments();
-        let mut prepared = Prepared {
-            mirror_addresses: Default::default(),
-            policy: self.policy.take(),
-            attachments,
-            jump_link: attacher.attach(JUMP).map_err(io::Error::other)?,
-            bridges: Vec::new(),
-            backends: Vec::new(),
-            observers: std::mem::take(&mut self.observers),
-        };
-        for guest in self.guests.drain(..) {
-            let resources = Resources::new(run.path(), &guest)?;
-            let link = attacher
-                .attach(&guest.attachment)
-                .map_err(io::Error::other)?;
-            let (tx, frames) = tokio::sync::mpsc::channel(net::QUEUE_LIMIT);
-            let queue = net::RxQueue::new()?;
-            prepared.backends.push((tx, queue.clone()));
-            prepared.bridges.push(Bridge {
-                frames,
-                queue,
-                link,
-                family: guest.family.clone(),
-            });
-            let (tx, addr) = watch::channel(guest.initial_addr());
-            prepared.observers.push(Arc::new(Lease {
-                name: guest.attachment.clone(),
-                addr: tx,
-            }));
-            let console = page::GuestConsole::new(&guest);
-            run.guests.push(GuestHandle {
-                setup: setup.clone(),
-                console,
-                guest,
-                resources,
-                addr,
-                vm: None,
-                ssh: None,
-                backend: None,
-                boot: Instant::now(),
-                ssh_ready: Duration::ZERO,
-            });
-        }
-        Ok((run, prepared))
+            ssh_ready: Duration::ZERO,
+        });
     }
+    Ok((run, prepared))
 }
 
-impl<W, F> Kit<W>
+/// Boots guests after the app has connected their consoles to its own page.
+pub async fn boot<W, F>(
+    name: &str,
+    guests: Vec<Guest>,
+    downloads: impl AsRef<Path>,
+    ready: impl FnOnce(Vec<page::GuestConsole>),
+    start: W,
+) -> io::Result<Run>
 where
     W: FnOnce(Cx, World) -> F + Send + 'static,
     F: Future<Output = fictionet::Result> + Send + 'static,
 {
-    /// Boots all guests and returns once every SSH session is ready.
-    /// A missing download is reported by its path.
-    pub async fn boot(mut self, downloads: impl AsRef<Path>) -> io::Result<Run> {
-        let downloads = downloads.as_ref();
-        self.check_downloads(downloads)?;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/kvm")
-            .map_err(|error| io::Error::other(format!("/dev/kvm is not usable: {error}")))?;
-        let identity = Arc::new(ssh::Identity::generate()?);
-        let (mut run, mut prepared) = self.prepare()?;
-        if let Some(build) = self.page.take() {
-            run.open = self.open;
-            run.bind_page(&self.name, build, &mut prepared).await?;
-        }
-        let backends = std::mem::take(&mut prepared.backends);
-        let result = async {
-            let ca = run.start_world(self.world, prepared).await?;
-            let ca = ca.as_ref().map(|(name, pem)| (name.as_str(), pem.as_str()));
-            let image = downloads.join("ubuntu-24.04-server-cloudimg-amd64.img");
-            run.provision(&image, &identity.authorized_key, ca)?;
-            run.start_guests(downloads, backends)?;
-            run.connect_guests(identity).await
-        }
-        .await;
-        match result {
-            Ok(()) => Ok(run),
-            Err(error) => {
-                for guest in run.guests() {
-                    eprint!("{}", guest.diagnostics().await);
-                }
-                let _ = run.shutdown().await;
-                Err(error)
+    let downloads = downloads.as_ref();
+    check_downloads(downloads)?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .map_err(|error| io::Error::other(format!("/dev/kvm is not usable: {error}")))?;
+    let identity = Arc::new(ssh::Identity::generate()?);
+    let (mut run, mut prepared) = prepare(name, guests)?;
+    ready(run.guests.iter().map(GuestHandle::console).collect());
+    let backends = std::mem::take(&mut prepared.backends);
+    let result = async {
+        let ca = run.start_world(start, prepared).await?;
+        let ca = ca.as_ref().map(|(name, pem)| (name.as_str(), pem.as_str()));
+        let image = downloads.join("ubuntu-24.04-server-cloudimg-amd64.img");
+        run.provision(&image, &identity.authorized_key, ca)?;
+        run.start_guests(downloads, backends)?;
+        run.connect_guests(identity).await
+    }
+    .await;
+    match result {
+        Ok(()) => Ok(run),
+        Err(error) => {
+            for guest in run.guests() {
+                eprint!("{}", guest.diagnostics().await);
             }
+            let _ = run.shutdown().await;
+            Err(error)
         }
-    }
-}
-
-impl<W, F> Kit<W>
-where
-    W: FnOnce(Cx, World) -> F + Send + 'static,
-    F: Future<Output = fictionet::Result> + Send + 'static,
-{
-    /// Runs the kit as an app someone drives by hand: opens the page,
-    /// boots, says when the guest `host` has its desktop and has finished
-    /// setting up, and stays up until Ctrl-C, which also stops a boot. It
-    /// shuts the run down before it returns.
-    pub async fn run_app(self, downloads: impl AsRef<Path>, host: &str) -> io::Result<()> {
-        let mut interrupt =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        let run = tokio::select! {
-            run = self.open_page().boot(downloads) => run?,
-            _ = interrupt.recv() => {
-                println!("Stopped while booting.");
-                return Ok(());
-            }
-        };
-        println!(
-            "boot to SSH-ready: {} ms",
-            run.guest(host).ssh_ready().as_millis()
-        );
-        let result = tokio::select! {
-            ready = run.app_ready(host) => match ready {
-                Ok(()) => {
-                    println!("The page stays open until Ctrl-C.");
-                    interrupt.recv().await;
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            },
-            _ = interrupt.recv() => Ok(()),
-        };
-        if result.is_err() {
-            eprint!("{}", run.guest(host).diagnostics().await);
-        }
-        let shutdown = run.shutdown().await;
-        result.and(shutdown)
-    }
-}
-
-const EVENTS: usize = 0;
-const NOISE: usize = 1;
-const KEYS: usize = 2;
-const AGENT: usize = 3;
-const BULK: usize = 4;
-
-/// Whether a crossing carries the kit's SSH or screen sessions.
-pub fn console_packet(packet: fictionet::events::PacketRef<'_>) -> bool {
-    use fictionet::stdlib::network::ip;
-    if packet.sandbox == Some(JUMP) {
-        return true;
-    }
-    let Some(header) = ip::Header::parse_truncated(packet.bytes) else {
-        return false;
-    };
-    if header.protocol != ip::protocol::TCP
-        || header.fragment.is_some_and(|fragment| fragment.offset != 0)
-    {
-        return false;
-    }
-    let Some(ports) = header.payload(packet.bytes).get(..4) else {
-        return false;
-    };
-    let src = u16::from_be_bytes([ports[0], ports[1]]);
-    let dst = u16::from_be_bytes([ports[2], ports[3]]);
-    (header.src == jump::JUMP_ADDR && matches!(dst, 22 | 5900))
-        || (header.dst == jump::JUMP_ADDR && matches!(src, 22 | 5900))
-}
-
-struct KitPolicy {
-    mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
-    classes: Vec<fictionet_observe::Class>,
-    world: Option<Arc<dyn fictionet_observe::Policy>>,
-}
-
-impl KitPolicy {
-    fn new(world: Option<Arc<dyn fictionet_observe::Policy>>) -> Self {
-        use fictionet_observe::Class;
-        let mut classes = vec![
-            Class::new("events").count(50_000).bytes(16 << 20).rank(3),
-            Class::new("noise")
-                .count(5_000)
-                .bytes(2 << 20)
-                .burst(64)
-                .rank(1),
-            Class::new("keys").count(20_000).bytes(8 << 20).rank(4),
-            Class::new("agent").count(8_192).bytes(32 << 20).rank(2),
-            Class::new("bulk")
-                .watched()
-                .count(4_096)
-                .bytes(1 << 20)
-                .snap(96)
-                .burst(64)
-                .rank(0),
-        ];
-        if let Some(world) = &world {
-            classes.extend_from_slice(world.classes());
-        }
-        Self {
-            classes,
-            world,
-            mirror_addresses: Default::default(),
-        }
-    }
-}
-
-impl fictionet_observe::Policy for KitPolicy {
-    fn classes(&self) -> &[fictionet_observe::Class] {
-        &self.classes
-    }
-
-    fn admit(&self, interest: fictionet::events::Interest<'_>) -> fictionet_observe::Admit {
-        use fictionet::events::Interest;
-        use fictionet::stdlib::network::ip;
-        use fictionet_observe::Admit;
-        match interest {
-            Interest::Event(_, conn) if conn.sandbox.as_ref().is_some_and(|s| &*s.name == JUMP) => {
-                return Admit::Skip;
-            }
-            Interest::Packet(p) => {
-                if console_packet(p) {
-                    return Admit::Skip;
-                }
-                if let Some(h) = ip::Header::parse_truncated(p.bytes) {
-                    let addresses = self.mirror_addresses.load();
-                    if addresses.contains(&h.src) || addresses.contains(&h.dst) {
-                        return Admit::Class(BULK);
-                    }
-                }
-            }
-            Interest::Event(meta, _) if meta.source == "net" && meta.kind == "blocked" => {
-                return Admit::Class(NOISE);
-            }
-            _ => {}
-        }
-        if let Some(world) = &self.world {
-            return match world.admit(interest) {
-                Admit::Class(index) => Admit::Class(index + BULK + 1),
-                other => other,
-            };
-        }
-        match interest {
-            Interest::Event(..) | Interest::Topology(_) => Admit::Build,
-            Interest::TlsKey(_) => Admit::Class(KEYS),
-            Interest::Packet(p) => Admit::Class(if p.sandbox.is_some() { AGENT } else { BULK }),
-        }
-    }
-
-    fn sort(&self, observation: &fictionet::events::Observation<'_>) -> Option<usize> {
-        if let Some(world) = &self.world {
-            return world.sort(observation).map(|index| index + BULK + 1);
-        }
-        match observation {
-            fictionet::events::Observation::Event(e) => Some(if e.repeat_fields().is_some() {
-                NOISE
-            } else {
-                EVENTS
-            }),
-            _ => None,
-        }
-    }
-
-    fn topology(&self, kind: fictionet::events::TopologyKind) -> bool {
-        self.world.as_ref().is_none_or(|world| world.topology(kind))
-    }
-}
-
-struct PageObserver {
-    policy: Arc<dyn fictionet_observe::Policy>,
-    inner: Arc<dyn Observer>,
-}
-
-impl Observer for PageObserver {
-    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        let admitted = match interest {
-            Interest::Topology(kind) => self.policy.topology(kind),
-            _ => self.policy.admit(interest) != fictionet_observe::Admit::Skip,
-        };
-        admitted && self.inner.enabled(interest)
-    }
-    fn observe(&self, stamp: fictionet::events::Stamp, item: fictionet::events::Observation<'_>) {
-        self.inner.observe(stamp, item);
-    }
-    fn lost(&self, loss: fictionet::events::Loss) {
-        self.inner.lost(loss);
-    }
-    fn end(&self, at: fictionet::time::Instant) {
-        self.inner.end(at);
     }
 }
 
 impl Run {
-    async fn bind_page(
-        &mut self,
-        _name: &str,
-        build: PageBuilder,
-        prepared: &mut Prepared,
-    ) -> io::Result<()> {
-        let mut policy = KitPolicy::new(prepared.policy.take());
-        policy.mirror_addresses = prepared.mirror_addresses.clone();
-        let policy: Arc<dyn fictionet_observe::Policy> = Arc::new(policy);
-        let observer = DashboardObserver::new(DashboardOptions {
-            collector: fictionet_observe::Options {
-                policy: policy.clone(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        let dashboard = observer.handle();
-        prepared.observers.push(Arc::new(PageObserver {
-            policy,
-            inner: observer.observer(),
-        }));
-        let mut hosts = Hosts(
-            self.guests
-                .iter()
-                .map(|g| (g.name().to_string(), Some(g.console.clone())))
-                .collect(),
-        );
-        let labels = Labels::default();
-        let page = build(dashboard.clone(), &mut hosts)
-            .containment(self.containment.clone())
-            .labels(labels.clone());
-        self.page = Some(page.bind_loopback(PAGE_PORT).await.map_err(|error| {
-            let text = error.to_string();
-            if text == "labels called twice" || text.contains("(\"Containment\")") {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{text}; Kit::page adds containment and labels; remove any \
-                         Page::containment or Page::labels calls from its builder"
-                    ),
-                )
-            } else {
-                error
-            }
-        })?);
-        self.dashboard = Some(dashboard);
-        self.labels = Some(labels);
-        self.access = Some(if self.open {
-            PageAccess::open(self.page_url())?
-        } else {
-            PageAccess::new(self.page_url())?
-        });
-        Ok(())
-    }
-
     async fn start_world<W, F>(
         &mut self,
         start: W,
@@ -1246,9 +798,7 @@ impl Run {
         let fcx_slot = self.fcx.clone();
         let (ready, receive) = oneshot::channel();
         let (bridge_tx, bridge_rx) = oneshot::channel();
-        let options =
-            RunOptions::new(Seed::random()).observer(Arc::new(Fanout::new(prepared.observers)));
-        let labels = self.labels.clone();
+        let options = RunOptions::new(Seed::random());
         let consoles: Vec<_> = self
             .guests
             .iter()
@@ -1261,12 +811,6 @@ impl Run {
                 for (console, address) in consoles {
                     console.booting(&fcx, address);
                 }
-                if let Some(labels) = labels {
-                    fcx.spawn(move |cx| async move {
-                        labels.run(&cx).await?;
-                        Ok(())
-                    });
-                }
                 let jump = jump::Jump::new(&fcx, prepared.jump_link);
                 let tasks = prepared
                     .bridges
@@ -1278,6 +822,7 @@ impl Run {
                             b.link,
                             fcx.clone(),
                             b.family,
+                            b.address,
                         ))
                     })
                     .collect::<Vec<_>>();
@@ -1428,79 +973,8 @@ impl Run {
         guest
             .console
             .connected(&cx, session.clone(), guest.addr().unwrap(), self.boot);
-        if let Some(dashboard) = self.dashboard.clone() {
-            let name = guest.guest.attachment.clone();
-            let topic = self.containment.clone();
-            let probes = self.probes.clone();
-            cx.spawn(move |cx| async move {
-                let Ok(result) = cx
-                    .race(None, containment::run(&session, &name, &dashboard))
-                    .await
-                else {
-                    return Ok(());
-                };
-                let mut all = probes.lock().unwrap();
-                all.probes.extend(result.probes);
-                if let Err(error) = topic.publish(cx.now(), &all) {
-                    eprintln!("containment: {error}");
-                }
-                Ok(())
-            });
-        }
     }
 }
-
-/// Declares the services exposed by a demo world and its web observation source.
-pub fn architecture(web_source: &str) -> Vec<fictionet_observe::page::ArchitectureService> {
-    vec![
-        fictionet_observe::page::ArchitectureService {
-            title: "DNS".into(),
-            source: "dns".into(),
-            kinds: vec![],
-            detail: "name".into(),
-            outside: false,
-        },
-        fictionet_observe::page::ArchitectureService {
-            title: "Simulated web".into(),
-            source: web_source.into(),
-            kinds: vec!["request".into()],
-            detail: "path".into(),
-            outside: false,
-        },
-        fictionet_observe::page::ArchitectureService {
-            title: "Package mirror".into(),
-            source: "mirror".into(),
-            kinds: vec![],
-            detail: "path".into(),
-            outside: false,
-        },
-        fictionet_observe::page::ArchitectureService {
-            title: "Model gateway".into(),
-            source: "model".into(),
-            kinds: vec!["tool".into()],
-            detail: "query".into(),
-            outside: false,
-        },
-        fictionet_observe::page::ArchitectureService {
-            title: "Model calls".into(),
-            source: "model".into(),
-            kinds: vec!["call".into()],
-            detail: "provider".into(),
-            outside: true,
-        },
-        fictionet_observe::page::ArchitectureService {
-            title: "Sign-in".into(),
-            source: "signin".into(),
-            kinds: vec!["connection".into()],
-            detail: "host".into(),
-            outside: true,
-        },
-    ]
-}
-
-#[cfg(test)]
-mod tests;
-
 impl GuestHandle {
     /// Waits up to `timeout` for cloud-init to finish on the guest, and
     /// returns the time from VM startup. Fails with cloud-init's exit code
@@ -1587,3 +1061,6 @@ const DESKTOP_DIAGNOSTICS: &[&str] = &[
 /// Each diagnostic command's time and output bounds.
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(3);
 const DIAGNOSTIC_BYTES: usize = 16 << 10;
+
+#[cfg(test)]
+mod tests;

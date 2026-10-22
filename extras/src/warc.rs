@@ -16,6 +16,7 @@ struct Record {
     offset: u64,
     length: u64,
     refers: Option<String>,
+    captured: Option<String>,
 }
 
 /// An in memory URL index. Payloads stay in the original archives.
@@ -168,6 +169,7 @@ impl Archive {
                 offset,
                 length: file.metadata()?.len() - offset,
                 refers: None,
+                captured: Some(date),
             },
         );
         Ok(())
@@ -200,6 +202,7 @@ impl Archive {
                     file: file.clone(),
                     offset,
                     length,
+                    captured: fields.get("warc-date").cloned(),
                     refers: fields
                         .get("warc-refers-to")
                         .or_else(|| fields.get("warc-refers-to-target-uri"))
@@ -235,6 +238,13 @@ impl Archive {
     /// Whether a URL belongs to this corpus.
     pub fn contains(&self, url: &str) -> bool {
         key(url).is_some_and(|key| self.urls.contains_key(&key))
+    }
+
+    /// The record's WARC capture time, when the archive supplied one.
+    pub fn captured(&self, url: &str) -> Option<&str> {
+        self.urls
+            .get(&key(url)?)
+            .and_then(|record| record.captured.as_deref())
     }
 
     /// Seek and decompress only the requested record and any revisit payload.

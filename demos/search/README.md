@@ -2,15 +2,31 @@
 
 Run `cargo run --release -p fictionet-search-demo --bin search --
 demos/downloads/cloudimage` on Linux with KVM, or pass `preview` instead of the
-downloads folder to run without a VM. Agents sign in inside the guest.
-The terminal uses ghostty-web.
+downloads folder to run without a VM. Agents sign in inside the guest. The terminal uses ghostty-web and a persistent
+tmux session; Screen shows the Firefox desktop. Input starts off and can be
+enabled beside the console.
 
-[app/src/main.rs](app/src/main.rs) assembles the workstation, copied web,
-search observer and page. [app/src/network.rs](app/src/network.rs) connects the
-model gateway, sign-in relay and package mirror. The web world supplies DNS,
-certificates, page sources and engine layouts. Model calls retain the guest's
-credentials; search and fetch tools use the same active page source as Firefox.
-The gateway emits `model.tool` observations for Architecture.
+`preview` needs no downloads or API keys. It uses the astronomy corpus when
+available, otherwise a small embedded sky.org capture. Its labeled client makes
+real requests inside the world. Model calls appear when an agent uses the
+gateway; preview does not invent provider traffic.
+
+[app/src/main.rs](app/src/main.rs) assembles the workstation and its owned page.
+[app/src/network.rs](app/src/network.rs) connects the model gateway, sign-in relay
+and package mirror. Search explicitly reports typed facts from its request and
+tool handlers, plus a Search-owned link reader for DNS replies and route refusals.
+No SDK observer is installed by the app.
+
+[app/src/page/](app/src/page/) projects those facts into the map, site details,
+model calls and recent activity. Selecting a site or gateway expands the map
+beside its details. The scrubber replays the retained observation history; the
+agent stays live. The World menu chooses the page source or restarts world pages.
+The last 1024 observations are kept for rewind. The app writes its typed facts to
+`<downloads>/search/log.jsonl`.
+
+The page prints a loopback URL with its run token. Browser libraries are served
+locally. Recorded page previews are inert and cannot run scripts or contact
+sites. Capture dates are shown only when the archive records them.
 
 ## Page sources
 
@@ -26,9 +42,9 @@ The gateway emits `model.tool` observations for Architecture.
 
 Live downloads result pages and requisites, following navigation to depth five
 within each result's site. Redirects and cross-host assets are retained at their
-real URLs. Every outgoing query is logged and displayed. The crawler ignores
+real URLs. Search queries and served pages are logged and displayed. The crawler ignores
 robots.txt and limits requests per host. Unknown URLs do not start downloads.
-The log records `real_search`, `downloaded`, `copy_served` and `download_failed`.
+The page reports the source that answered each request.
 
 The content audit applies to text the world writes. Replayed WARC responses carry
 capture provenance and are outside that scope; their words are not allowlisted.
@@ -59,6 +75,7 @@ The NASA, ESA and Wikipedia captures are stored in `demos/downloads/astronomy/`.
 The world's page modules separate routing, generation, listings, stored pages,
 corrections and model tools. Prompt construction and answer parsing are separate.
 The WARC reader, crawler, BM25 index, model gateway and sign-in relay live in
-`fictionet-extras`. The shared demo kit owns VM lifetime, the observation page,
-terminal, screen and package cache. The browser libraries pinned in
-`observe/libraries.json` are unpacked into `observe/downloads/vendor`.
+`fictionet-extras`. The shared demo kit supplies VM lifetime, SSH console sockets and the package
+cache. Search owns its HTML, styles and JavaScript, including copies of the
+terminal and screen pieces. ghostty-web 0.4.0 and noVNC 1.7.0, with their
+licenses, live in `demos/kit/assets`.

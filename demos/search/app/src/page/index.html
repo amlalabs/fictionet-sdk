@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Search · Fictionet</title>
+<link rel="stylesheet" href="/style.css">
+<script type="module" src="/search.mjs"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="mark"></span><strong>Fictionet</strong><span class="slash">/</span><span>Search</span></div>
+  <div class="toolbar"><span id="preview-label" hidden>Preview · no VM</span><button id="agent-toggle" aria-pressed="true">Agent</button><span class="run-clock"><i id="connection"></i><span id="clock">00:00</span></span><button id="world-toggle" aria-expanded="false" aria-controls="world-menu">World</button></div>
+</header>
+<main>
+  <section id="agent" class="agent panel" aria-label="Workstation">
+    <div class="windowbar"><span class="dots">● ● ●</span><span>workstation</span><div class="segments"><button id="terminal-tab" aria-pressed="true">Terminal</button><button id="screen-tab" aria-pressed="false">Screen</button></div></div>
+    <div id="console-status" role="status">Waiting for the workstation…</div>
+    <div id="terminal" class="console"></div><div id="screen" class="console" hidden></div>
+    <div id="preview-console" hidden><span class="preview-star">✻</span> <strong>Search preview</strong><p>No VM is running.</p><p>An in-world client is searching and opening pages. Select a site or the model gateway to inspect what the world reports.</p><pre id="preview-output"></pre><button id="story">Run story again</button></div>
+    <div class="agent-footer"><span id="host-status">Booting</span><span id="input-status">Input off</span><button id="input-toggle">Enable input</button></div>
+  </section>
+  <section id="world" class="world panel" aria-label="Search network">
+    <div class="network-column">
+      <div class="map-wrap"><svg id="map" viewBox="0 0 1000 660" aria-label="Workstation, world services and internet" role="img"></svg><div id="empty" class="empty">The world is ready.<br><span>Sites appear as the workstation uses them.</span></div><span id="rewind-label" hidden>Recorded observation · agent stays live</span></div>
+      <div id="activity" class="activity" aria-label="Recent activity"></div>
+      <div class="timeline"><button id="play" aria-label="Pause observation">Ⅱ</button><span id="cursor-time">00:00</span><input id="scrubber" type="range" min="0" max="0" value="0" aria-label="Rewind observation"><button id="live" class="live active">Live</button><div class="timeline-labels"><span id="oldest">00:00 boot</span><span id="end-time">00:00</span></div></div>
+    </div>
+    <aside id="details" hidden aria-label="Details"><div class="detail-heading"><div><h1 id="detail-title"></h1><p id="detail-subtitle"></p></div><button id="close-details" aria-label="Close details">×</button></div><div id="detail-body"></div><div id="detail-actions"></div></aside>
+  </section>
+</main>
+<div id="world-menu" class="world-menu" hidden><h2>World</h2><p id="world-date"></p><label for="source">Pages served from</label><select id="source"><option value="copied">Copied pages</option><option value="model_written">Model-written pages</option><option value="live">Live search</option></select><p id="source-help"></p><details><summary>World brief</summary><p id="brief"></p></details><button id="restart">Restart world pages</button><p id="world-error" role="alert"></p></div>
+<dialog id="page-dialog"><div><strong id="page-title">Page</strong><button id="close-page" aria-label="Close page">×</button></div><iframe id="page-preview" sandbox="" referrerpolicy="no-referrer" title="Recorded page"></iframe></dialog>
+<div id="notice" role="status" hidden></div>
+</body>
+</html>

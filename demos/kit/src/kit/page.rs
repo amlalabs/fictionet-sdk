@@ -1,85 +1,58 @@
-//! Page hosts backed by the kit's admin SSH sessions, and the loop that
-//! serves a page control.
-
-use std::collections::HashMap;
-use std::io;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use fictionet::Cx;
-use fictionet_observe::page::{
-    BoxFuture, Command, CommandPort, Console, Duplex, Host, HostState, HostStatus, Pty, Rejected,
-    StateLimits, StateTopic,
-};
-use serde::Serialize;
-use tokio::sync::watch;
-
+//! Console pieces an app can compose into its own page routes.
 use super::{Guest, ssh};
-
-/// Serves the page control `port` until the page closes it. `decide` makes
-/// each command's reply or its rejection; its error ends the loop.
-pub async fn serve_commands<C, R: Serialize>(
-    cx: &Cx,
-    port: &CommandPort<C, R>,
-    mut decide: impl FnMut(&C) -> fictionet::Result<Result<R, Rejected>>,
-) -> fictionet::Result {
-    while let Some(command) = cx.race(None, port.recv()).await? {
-        answer_command(cx, command, &mut decide)?;
-    }
-    Ok(())
+use fictionet::Cx;
+use futures_util::SinkExt;
+use serde::Serialize;
+use std::{
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::sync::watch;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Duplex for T {}
+pub trait Pty: Send {
+    fn read(&mut self) -> BoxFuture<'_, io::Result<Option<Vec<u8>>>>;
+    fn write<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, io::Result<()>>;
+    fn resize(&self, cols: u16, rows: u16) -> BoxFuture<'_, io::Result<()>>;
+    fn close(&self) -> BoxFuture<'_, io::Result<()>>;
 }
-
-/// Answers one page command with the reply or the rejection `decide` makes.
-pub fn answer_command<C, R: Serialize>(
-    cx: &Cx,
-    command: Command<C, R>,
-    decide: impl FnOnce(&C) -> fictionet::Result<Result<R, Rejected>>,
-) -> fictionet::Result {
-    match decide(&command.command)? {
-        Ok(reply) => command.reply(cx, reply),
-        Err(rejection) => command.reject(cx, rejection),
-    }
-    Ok(())
+pub trait Console: Send + Sync + 'static {
+    fn screen(&self) -> Option<BoxFuture<'static, io::Result<Box<dyn Duplex>>>>;
+    fn terminal(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> Option<BoxFuture<'static, io::Result<Box<dyn Pty>>>>;
 }
-
-/// Declared guests available to a page builder. Each host can be taken once.
-pub struct Hosts(pub(super) HashMap<String, Option<GuestConsole>>);
-
-impl Hosts {
-    /// Takes a declared guest's console and status topic.
-    /// Panics for an unknown guest or a host already taken by the builder.
-    pub fn take(&mut self, name: &str) -> Host {
-        let console = self
-            .0
-            .get_mut(name)
-            .unwrap_or_else(|| {
-                panic!("guest {name} is not declared; add it with Kit::guest before Kit::page")
-            })
-            .take()
-            .unwrap_or_else(|| {
-                panic!("guest {name} was already taken; call Hosts::take only once per guest")
-            });
-        Host::new(name)
-            .claude_code(console.claude_code)
-            .codex(console.codex)
-            .firefox(console.firefox)
-            .sandbox(console.attachment.clone())
-            .status(console.status.clone())
-            .console(console)
-    }
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostState {
+    #[default]
+    Booting,
+    NetworkUp,
+    SshUp,
+    DesktopUp,
+    Stopped,
+    Failed,
 }
-
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HostStatus {
+    pub state: HostState,
+    pub addresses: Vec<String>,
+    pub screen: bool,
+    pub terminal: bool,
+}
 #[derive(Clone)]
-pub(super) struct GuestConsole {
-    claude_code: bool,
-    codex: bool,
-    firefox: bool,
+pub struct GuestConsole {
     name: String,
-    attachment: String,
     desktop: Option<(u16, String)>,
     terminal: Option<String>,
     session: Arc<Mutex<SessionState>>,
-    pub(super) status: StateTopic<HostStatus>,
+    pub status: watch::Sender<HostStatus>,
     ready: watch::Sender<Readiness>,
 }
 
@@ -101,21 +74,11 @@ enum Readiness {
 impl GuestConsole {
     pub(super) fn new(guest: &Guest) -> Self {
         Self {
-            firefox: guest.packages.iter().any(|package| package == "firefox"),
-            codex: guest
-                .files
-                .iter()
-                .any(|file| file.path == "/opt/install-codex.sh"),
-            claude_code: guest
-                .files
-                .iter()
-                .any(|file| file.path == "/opt/install-claude.sh"),
             name: guest.hostname.clone(),
-            attachment: guest.attachment.clone(),
             desktop: guest.desktop.clone(),
             terminal: guest.terminal.clone(),
             session: Arc::new(Mutex::new(SessionState::default())),
-            status: StateTopic::new(StateLimits::default()),
+            status: watch::channel(HostStatus::default()).0,
             ready: watch::channel(Readiness::Waiting(
                 "no completed attempt; exit code unavailable; stderr: empty".into(),
             ))
@@ -171,23 +134,18 @@ impl GuestConsole {
 
     fn publish(
         &self,
-        cx: &Cx,
+        _cx: &Cx,
         state: HostState,
         addresses: Vec<String>,
         screen: bool,
         terminal: bool,
     ) {
-        self.status
-            .publish(
-                cx.now(),
-                &HostStatus {
-                    state,
-                    addresses,
-                    screen,
-                    terminal,
-                },
-            )
-            .expect("small host status");
+        self.status.send_replace(HostStatus {
+            state,
+            addresses,
+            screen,
+            terminal,
+        });
     }
 
     pub(super) fn connected(
@@ -358,118 +316,143 @@ impl Pty for ssh::Pty {
     }
 }
 
-/// The loopback port a demo's page binds, the same on every run so a port
-/// forward to it keeps working. A run whose port another holds binds a free
-/// one and prints that.
 pub const PAGE_PORT: u16 = 38877;
-
-/// A private file holding the page's address and token, removed when its
-/// run ends, and the app window the run opened, if any.
+/// Prints the page URL and opens an app window when a display is available.
 pub struct PageAccess {
-    _dir: super::util::RunDir,
     _window: Option<super::shot::AppWindow>,
 }
-
 impl PageAccess {
-    /// Prints the page's address with its token, and the command that
-    /// opens the page.
     pub fn new(url: &str) -> io::Result<Self> {
-        let access = Self::bootstrap(url)?;
-        access.print_open();
-        Ok(access)
+        println!("Page: {url}");
+        let window = if std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        {
+            match super::shot::AppWindow::open(url) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    eprintln!("Could not open Chromium: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self { _window: window })
     }
+}
 
-    /// Opens the authenticated page in a Chromium app window, or prints how
-    /// to open it where there is no display to open it on.
-    pub fn open(url: &str) -> io::Result<Self> {
-        let mut access = Self::bootstrap(url)?;
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            access.print_open();
-            return Ok(access);
-        }
-        match super::shot::AppWindow::open(url) {
-            Ok(window) => access._window = Some(window),
+/// Opens one of the app's authenticated console sockets.
+pub async fn upgrade(
+    upgrade: axum::extract::ws::WebSocketUpgrade,
+    console: Arc<dyn Console>,
+    screen: bool,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if screen {
+        let Some(connect) = console.screen() else {
+            return http::StatusCode::NOT_FOUND.into_response();
+        };
+        match connect.await {
+            Ok(stream) => upgrade
+                .on_upgrade(move |socket| screen_socket(socket, stream))
+                .into_response(),
             Err(error) => {
-                println!("Chromium did not open the page: {error}");
-                access.print_open();
+                (http::StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()
             }
         }
-        Ok(access)
-    }
-
-    fn bootstrap(url: &str) -> io::Result<Self> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        super::client::PageClient::from_url(url)?;
-        let dir = super::util::RunDir::new(&std::env::temp_dir(), "page")?;
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(dir.path().join(BOOTSTRAP))?;
-        writeln!(file, "{url}")?;
-        println!("Page: {url}");
-        Ok(Self {
-            _dir: dir,
-            _window: None,
-        })
-    }
-
-    fn print_open(&self) {
-        println!(
-            "Open: cargo run --release -p fictionet-demo --bin open -- {}",
-            super::ssh::quote(&self._dir.path().join(BOOTSTRAP).display().to_string())
-        );
+    } else {
+        let Some(connect) = console.terminal(80, 24) else {
+            return http::StatusCode::NOT_FOUND.into_response();
+        };
+        match connect.await {
+            Ok(pty) => upgrade
+                .on_upgrade(move |socket| terminal_socket(socket, pty))
+                .into_response(),
+            Err(error) => {
+                (http::StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()
+            }
+        }
     }
 }
 
-/// The file in a [`PageAccess`] directory that holds the page's address.
-const BOOTSTRAP: &str = "page-address";
-
-/// Opens the page whose address the file at `path` holds, as [`PageAccess`]
-/// writes it, in a Chromium app window over DevTools. Opened this way, the
-/// page's address and token never appear on a command line, and the page
-/// sees a navigation the browser started itself, which its origin check
-/// admits.
-pub fn open_bootstrap(path: &std::path::Path) -> io::Result<super::shot::AppWindow> {
-    let url = std::fs::read_to_string(path)?;
-    let url = url.trim();
-    super::client::PageClient::from_url(url)?;
-    super::shot::AppWindow::open(url)
+async fn screen_socket(mut socket: axum::extract::ws::WebSocket, mut stream: Box<dyn Duplex>) {
+    use axum::extract::ws::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buffer = vec![0; 64 << 10];
+    loop {
+        tokio::select! {
+            read = stream.read(&mut buffer) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(n) => if socket.send(Message::Binary(buffer[..n].to_vec().into())).await.is_err() { break; },
+            },
+            message = socket.recv() => match message {
+                Some(Ok(Message::Binary(bytes))) => if stream.write_all(&bytes).await.is_err() { break; },
+                Some(Ok(Message::Ping(bytes))) => if socket.send(Message::Pong(bytes)).await.is_err() { break; },
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {},
+            },
+        }
+    }
+    let _ = stream.shutdown().await;
+    let _ = socket.close().await;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::PageAccess;
-    use std::os::unix::fs::PermissionsExt;
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TerminalInput {
+    Ack { bytes: usize },
+    Resize { cols: u16, rows: u16 },
+}
 
-    #[test]
-    fn consoles_report_whether_claude_code_is_installed() {
-        let guest = super::Guest::ubuntu("workstation", "analyst");
-        assert!(!super::GuestConsole::new(&guest).claude_code);
-        let guest = crate::kit::desktop::claude_code(guest);
-        assert!(super::GuestConsole::new(&guest).claude_code);
+async fn terminal_socket(mut socket: axum::extract::ws::WebSocket, mut pty: Box<dyn Pty>) {
+    use axum::extract::ws::Message;
+    let mut outstanding = 0usize;
+    loop {
+        tokio::select! {
+            read = pty.read(), if outstanding < 64 << 10 => match read {
+                Ok(Some(bytes)) => {
+                    outstanding += bytes.len();
+                    if socket.send(Message::Binary(bytes.into())).await.is_err() { break; }
+                },
+                _ => break,
+            },
+            message = socket.recv() => match message {
+                Some(Ok(Message::Binary(bytes))) => if pty.write(&bytes).await.is_err() { break; },
+                Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+                    Ok(TerminalInput::Ack { bytes }) if bytes <= outstanding => outstanding -= bytes,
+                    Ok(TerminalInput::Resize { cols, rows }) if cols > 0 && rows > 0 && cols <= 1000 && rows <= 1000 => {
+                        if pty.resize(cols, rows).await.is_err() { break; }
+                    },
+                    _ => break,
+                },
+                Some(Ok(Message::Ping(bytes))) => if socket.send(Message::Pong(bytes)).await.is_err() { break; },
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {},
+            },
+        }
     }
+    let _ = pty.close().await;
+    let _ = socket.close().await;
+}
 
-    #[test]
-    fn bootstrap_is_private_and_removed_with_its_owner() {
-        let token = "ab".repeat(32);
-        let access = PageAccess::new(&format!("http://127.0.0.1:8080/#token={token}")).unwrap();
-        let dir = access._dir.path().to_path_buf();
-        let file = dir.join(super::BOOTSTRAP);
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            format!("http://127.0.0.1:8080/#token={token}\n")
-        );
-        drop(access);
-        assert!(!dir.exists());
-    }
+/// Browser libraries copied with the screen and terminal pieces, served locally.
+pub fn libraries() -> axum::Router {
+    use axum::{extract::Path, response::IntoResponse, routing::get};
+    static ASSETS: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/assets");
+    axum::Router::new().route(
+        "/vendor/{*path}",
+        get(|Path(path): Path<String>| async move {
+            let Some(file) = ASSETS.get_file(&path) else {
+                return http::StatusCode::NOT_FOUND.into_response();
+            };
+            let mime = if path.ends_with(".js") {
+                "text/javascript"
+            } else if path.ends_with(".wasm") {
+                "application/wasm"
+            } else {
+                "text/plain"
+            };
+            ([(http::header::CONTENT_TYPE, mime)], file.contents()).into_response()
+        }),
+    )
 }

@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 /// A private run directory, removed when dropped.
-pub(crate) struct RunDir(PathBuf);
+pub struct RunDir(PathBuf);
 
 impl RunDir {
-    pub(crate) fn new(parent: &Path, name: &str) -> std::io::Result<RunDir> {
+    pub fn new(parent: &Path, name: &str) -> std::io::Result<RunDir> {
         use std::os::unix::fs::DirBuilderExt;
         if name.is_empty()
             || !name
@@ -19,7 +19,7 @@ impl RunDir {
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(RunDir(path))
     }
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.0
     }
 }

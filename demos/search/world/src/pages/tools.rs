@@ -66,6 +66,21 @@ impl fictionet_extras::models::Engine for Pages {
                     .field("search", query.as_str())
                     .field("returned", json!(search.results).to_string())
             });
+            self.report(
+                &cx,
+                crate::observation::SearchObs::Search {
+                    engine: crate::observation::Engine::WebSearch,
+                    query,
+                    results: search
+                        .results
+                        .iter()
+                        .map(|hit| crate::observation::Hit {
+                            url: hit.url.clone(),
+                            title: hit.title.clone(),
+                        })
+                        .collect(),
+                },
+            );
             Ok(search.results)
         })
     }
@@ -80,6 +95,7 @@ impl fictionet_extras::models::Engine for Pages {
             let response = loop {
                 let parsed = url::Url::parse(&url)?;
                 let (host, target) = text::target_of(&url);
+                let page_source = self.source();
                 let response = if self.live_only() {
                     self.live_url(&cx, &url).await
                 } else if self.copied_only() {
@@ -87,6 +103,17 @@ impl fictionet_extras::models::Engine for Pages {
                 } else {
                     self.handle(&cx, "GET", &host, &target, None).await
                 };
+                self.report_response(
+                    &cx,
+                    crate::observation::RequestContext {
+                        host: &host,
+                        method: "GET",
+                        path: &target,
+                        source: page_source,
+                        headers: Vec::new(),
+                    },
+                    &response,
+                );
                 let mut fields = response.fields();
                 if !matches!(response.meta, Meta::Redirect { .. }) {
                     fields.set("kind", "page");

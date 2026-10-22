@@ -148,6 +148,7 @@ impl Handler {
                     .field("via", source)
             });
         }
+        let page_source = self.pages.source();
         let answer = if let Some(asset) = Pages::search_asset(&target.host, path) {
             asset
         } else if self.pages.live_only() && action == Route::Page {
@@ -189,6 +190,26 @@ impl Handler {
                 _ => q.finished = true,
             }
         }
+        self.pages.report_response(
+            &self.fcx,
+            crate::observation::RequestContext {
+                host: &target.host,
+                method: parts.method.as_str(),
+                path,
+                source: page_source,
+                headers: parts
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        ["user-agent", "accept", "content-type"].contains(&name.as_str())
+                    })
+                    .map(|(name, value)| {
+                        (name.to_string(), value.to_str().unwrap_or("").to_string())
+                    })
+                    .collect(),
+            },
+            &answer,
+        );
         let fields = observing.then(|| {
             let mut fields = answer.fields();
             fields.set("site", self.pages.site_name(&target.host));

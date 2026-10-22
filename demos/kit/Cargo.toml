@@ -8,6 +8,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+include_dir = "0.7"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+
 arc-swap = "1.9.3"
 fictionet-extras = { path = "../../extras" }
 fictionet-host = { path = "../../host" }
@@ -47,8 +51,3 @@ vhost-user-backend = "0.18"
 virtio-queue = "0.14"
 vm-memory = { version = "0.16.2", features = ["backend-mmap", "backend-atomic"] }
 vmm-sys-util = "0.14"
-
-
-[[bin]]
-name = "open"
-path = "src/bin/open.rs"

@@ -801,6 +801,12 @@ impl Model {
                 ));
             }
         };
+        if parts.method == http::Method::POST {
+            parts.headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+        }
         // A searched response continues from the upstream turn that holds it.
         let last = body["previous_response_id"].as_str().and_then(|id| {
             let continued = self.continued.lock().unwrap();

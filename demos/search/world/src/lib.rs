@@ -58,6 +58,7 @@ mod dns;
 pub mod events;
 mod files;
 pub mod handler;
+pub mod observation;
 pub mod pages;
 pub mod route;
 pub mod search;

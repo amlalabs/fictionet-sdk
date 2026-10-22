@@ -12,7 +12,7 @@ use fictionet::{
         web::httpd,
     },
 };
-use fictionet_observe::Memory;
+use fictionet_test_support::EventLog as Memory;
 use fictionet_test_support::sandbox::{self, Machine, machine};
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -118,7 +118,7 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
             ));
             assert_eq!(answer.answers.len(), 1);
             assert!(matches!(&answer.answers[0].data, RData::A(a) if a.0 == assigned));
-            let sites = events.checked_of("web", "site").unwrap();
+            let sites = events.of("web", "site");
             let forwarded: Vec<_> = sites
                 .iter()
                 .filter(|e| e.str("host") == Some("forwarded.com"))
@@ -151,7 +151,7 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
         },
     ))
     .unwrap();
-    let sites = observed.checked_of("web", "site").unwrap();
+    let sites = observed.of("web", "site");
     assert!(sites.iter().any(|e| e.str("host") == Some("freshnews.com")));
     assert_eq!(
         sites
@@ -162,15 +162,13 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
     );
     assert!(
         !observed
-            .checked_of("web", "cert")
-            .unwrap()
+            .of("web", "cert")
             .iter()
             .any(|e| e.str("host") == Some("forwarded.com"))
     );
     assert!(
         observed
-            .checked_of("web", "refused")
-            .unwrap()
+            .of("web", "refused")
             .iter()
             .any(|e| e.str("host") == Some("wiki.corp"))
     );
@@ -217,7 +215,7 @@ fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
                 )
                 .await;
                 assert_eq!(status, 200);
-                let requests = observed.checked_of("http", "request").unwrap();
+                let requests = observed.of("http", "request");
                 let request = requests.last().unwrap();
                 assert_eq!(request.str("via"), via);
                 let snapshot = projection.snapshot();

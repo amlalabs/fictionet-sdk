@@ -155,6 +155,12 @@ impl Client {
                     return;
                 }
             };
+            if response.headers().contains_key(http::header::TRANSFER_ENCODING)
+                && response.headers().contains_key(http::header::CONTENT_LENGTH)
+            {
+                let _ = head.send(Err(Error::msg("the upstream response has both transfer encoding and content length")));
+                return;
+            }
             if response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
                 let _ = head.send(Err(Error::msg(
                     "upstream protocol upgrades are unsupported",

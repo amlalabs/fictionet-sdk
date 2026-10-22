@@ -8,7 +8,7 @@
 //! the screen's open connections, as a lost guest connection would. The end
 //! of input or Ctrl-C stops the preview.
 
-use fictionet_observe::page::{BoxFuture, Duplex, Pty};
+use crate::kit::page::{BoxFuture, Duplex, Pty};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -136,7 +136,7 @@ impl Default for Console {
         Self::new()
     }
 }
-impl fictionet_observe::page::Console for Console {
+impl crate::kit::page::Console for Console {
     fn terminal(&self, _: u16, _: u16) -> Option<BoxFuture<'static, io::Result<Box<dyn Pty>>>> {
         None
     }
@@ -266,7 +266,7 @@ async fn screen(mut stream: DuplexStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet_observe::page::Console as _;
+    use crate::kit::page::Console as _;
 
     #[test]
     fn replies_follow_what_the_preview_offers() {

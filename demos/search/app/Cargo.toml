@@ -3,11 +3,13 @@ name = "fictionet-search-demo"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
-description = "Shared microVM kit and demos: Ubuntu's official cloud image in an embedded Cloud Hypervisor, networked by a world in the same process."
+description = "A Search world, Ubuntu workstation and owned observation page."
 license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
+
 fictionet-test-support = { path = "../../../tests/support" }
 arc-swap = "1.9.3"
 fictionet-extras = { path = "../../../extras" }
@@ -15,7 +17,7 @@ fictionet-host = { path = "../../../host" }
 web-world = { path = "../world" }
 quick-xml = { version = "0.38", features = ["serialize"] }
 # `tokio` hands the jump host's TCP connection to the SSH client.
-fictionet = { path = "../../..", features = ["web-proxy", "tokio"] }
+fictionet = { path = "../../..", features = ["web-proxy", "tokio", "page"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 bytes = "1"

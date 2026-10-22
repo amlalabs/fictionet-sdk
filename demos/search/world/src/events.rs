@@ -228,7 +228,7 @@ mod tests {
         use crate::pages::{Applied, Command, Generation, Pages, Rejected, Seed};
         use crate::search::Searches;
         use fictionet::events::Fanout;
-        use fictionet_observe::Memory;
+        use fictionet_test_support::EventLog as Memory;
 
         let pages = Pages::new(Seed::builtin("web").unwrap());
         let searches = Arc::new(Searches::of(&pages));
@@ -303,7 +303,7 @@ mod tests {
             },
         ))
         .unwrap();
-        let all = memory.checked_all().unwrap();
+        let all = memory.all();
         let (start, events) = all.split_first().unwrap();
         assert_eq!((start.source, start.kind), ("run", "start"));
         assert_eq!(events.len(), 1);
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn query_lines_and_http_context() {
         use fictionet::events::{Fanout, Observation, Observer, Stamp, Stream};
-        use fictionet_observe::Memory;
+        use fictionet_test_support::EventLog as Memory;
         let query = Event::new("web", "query")
             .field("query_id", 3u64)
             .field("engine", "google")
@@ -369,7 +369,7 @@ mod tests {
             at: fictionet::time::Instant::ZERO,
         };
         observer.observe(stamp, Observation::Event(&event));
-        let events = memory.checked_of("http", "request").unwrap();
+        let events = memory.of("http", "request");
         assert_eq!(events[0].u64("query_id"), Some(3));
         assert_eq!(events[0].str("query"), Some("q=a"));
         assert_eq!(events[0].fields, event.fields);

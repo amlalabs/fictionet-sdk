@@ -169,7 +169,7 @@ fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
         .live_active
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let pages = Arc::new(pages);
-    let memory = Arc::new(fictionet_observe::Memory::default());
+    let memory = Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)).observer(memory.clone()), |cx| async move {
             for (host, target) in [
                 ("www.google.com", "/search?q=stellar+%26+gas"),
@@ -191,7 +191,7 @@ fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
             Ok(())
         })).unwrap();
     server.join().unwrap();
-    let events = memory.checked_all().unwrap();
+    let events = memory.all();
     for (kind, count) in [("real_search", 4), ("downloaded", 1), ("copy_served", 4)] {
         assert_eq!(
             events

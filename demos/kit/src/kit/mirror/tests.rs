@@ -1666,67 +1666,6 @@ async fn closing_stops_forwarding_on_clones_made_before_closing() {
 }
 
 #[tokio::test]
-async fn served_addresses_feed_the_kit_bulk_policy() {
-    use fictionet::events::{Interest, LinkType, PacketRef, Side};
-    use fictionet_observe::{Admit, Policy};
-    run(|fcx| async move {
-        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "mirror").unwrap();
-        let upstream = Upstream::new().await;
-        let cache = upstream.cache(&fcx, dir.path());
-        let mut request = request(PACKAGE);
-        request.extensions_mut().insert(ConnInfo {
-            local: Some("127.0.0.1:80".parse().unwrap()),
-            ..Default::default()
-        });
-        let response = send(&fcx, &cache, request).await.unwrap();
-        assert_eq!(bytes(response).await, "package");
-        assert_eq!(
-            **cache.addresses.load(),
-            vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
-        );
-        let mut policy = crate::kit::KitPolicy::new(None);
-        policy.mirror_addresses = cache.addresses.clone();
-        let collector = Arc::new(fictionet_observe::Collector::default());
-        fictionet::lab(
-            RunOptions::new(Seed::from_u64(2)).observer(collector.clone()),
-            |cx| async move {
-                let (a, _b) = fictionet::pair();
-                let _a = cx.tap("guest", a);
-                cx.yield_now().await?;
-                let link = *collector.topology().links.keys().next().unwrap();
-                for (src, dst, class) in [
-                    ([10, 0, 0, 1], [127, 0, 0, 1], crate::kit::BULK),
-                    ([127, 0, 0, 1], [10, 0, 0, 1], crate::kit::BULK),
-                    ([10, 0, 0, 1], [104, 18, 0, 9], crate::kit::AGENT),
-                ] {
-                    let mut data = vec![0; 20];
-                    data[0] = 0x45;
-                    data[2..4].copy_from_slice(&20u16.to_be_bytes());
-                    data[12..16].copy_from_slice(&src);
-                    data[16..20].copy_from_slice(&dst);
-                    assert_eq!(
-                        policy.admit(Interest::Packet(PacketRef {
-                            link,
-                            tap: "guest",
-                            sandbox: Some("guest"),
-                            side: Side::A,
-                            len: data.len(),
-                            link_type: LinkType::Ip,
-                            bytes: &data
-                        })),
-                        Admit::Class(class)
-                    );
-                }
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn setup_completion_closes_cached_and_uncached_requests() {
     run(|fcx| async move {
         let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
@@ -1766,10 +1705,12 @@ use std::sync::atomic::AtomicBool;
 /// A kit run of one guest with a desktop, its world started and its SSH
 /// session on an in-process peer that answers `ready`.
 async fn app_run(ready: bool) -> (crate::kit::Run, crate::kit::ssh::tests::Peer) {
-    use crate::kit::{Guest, Kit};
-    let mut kit = Kit::new("app")
-        .guest(Guest::ubuntu("workstation", "analyst").desktop(5901, "desktop-ready"));
-    let (mut run, prepared) = kit.prepare().unwrap();
+    use crate::kit::Guest;
+    let (mut run, prepared) = crate::kit::prepare(
+        "app",
+        vec![Guest::ubuntu("workstation", "analyst").desktop(5901, "desktop-ready")],
+    )
+    .unwrap();
     run.start_world(
         |cx: Cx, world: crate::kit::World| async move {
             cx.spawn(move |cx| async move {

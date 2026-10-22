@@ -137,13 +137,9 @@ fn real_main() -> fictionet::Result {
     let state_path = args.state_dir.join("state.json");
     let ready = args.ready.clone();
 
-    let (options, _observation) = fictionet_observe::serve_observation(
-        fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.observation.clone(),
-        Some(Arc::new(web_world::events::LogObserver {
-            log: log.clone(),
-        })),
-    )?;
+    let options = fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
+        web_world::events::LogObserver { log: log.clone() },
+    ));
     let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
         let maker = match (kind, key) {
             (GeneratorKind::Stored, _) => Some(Maker::Stored),

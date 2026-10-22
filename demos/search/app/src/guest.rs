@@ -10,7 +10,8 @@ pub fn guest(date: &str) -> Guest {
     let guest = kit::desktop::browser(HOST, USER, START)
         .resources(4, 4096)
         // The searcher reads the address back before submitting it.
-        .packages(&["xclip", "nmap"]);
+        .packages(&["xclip", "nmap", "tmux"])
+        .terminal("tmux new-session -A -s main");
     let date = date
         .bytes()
         .all(|c| c.is_ascii_digit() || c == b'-')

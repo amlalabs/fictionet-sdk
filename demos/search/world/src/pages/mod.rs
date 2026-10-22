@@ -437,6 +437,8 @@ struct Planted {
 
 /// The world's pages: its seed, its store and what makes new pages.
 pub struct Pages {
+    pub(crate) observation:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::observation::Observation>>>,
     seed: Seed,
     maker: Option<Maker>,
     prefetch: usize,

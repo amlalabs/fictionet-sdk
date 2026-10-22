@@ -1,9 +1,8 @@
-//! `search preview`: the search page with real world traffic, an in-world
-//! scripted client and a labeled preview console.
+//! A VM-free page backed by requests made inside the Search world.
 
+use super::Result;
 use fictionet::{
     Cx,
-    events::Fanout,
     stdlib::{
         codec::Wire,
         protocols::{
@@ -12,138 +11,86 @@ use fictionet::{
         },
     },
 };
-use fictionet_demo::kit::{
-    self,
-    preview::{Input, Story},
-};
-use fictionet_extras::log::Log;
-use fictionet_extras::search::Engine;
-use fictionet_observe::{
-    DashboardObserver, DashboardOptions,
-    page::{Containment, Host, HostState, HostStatus, Labels, StateLimits, StateTopic},
-};
-use fictionet_search_demo::{network, page::Topics};
+use fictionet_demo::kit;
+use fictionet_search_demo::{network, page};
 use fictionet_test_support::sandbox::{self, Machine, machine};
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
 use web_world::{
-    Addresses, Ca, World,
+    World,
     pages::{self, Seed},
-    search::Searches,
 };
-
-use super::Result;
-
-fn search_url(engine: Engine, words: &str) -> String {
-    let host = match engine {
-        Engine::Google => "www.google.com/search?q=",
-        Engine::Bing => "www.bing.com/search?q=",
-        Engine::DuckDuckGo => "html.duckduckgo.com/html/?q=",
-        Engine::YouTube => "www.youtube.com/results?search_query=",
-    };
-    format!("https://{host}{}", pages::text::quote(words, ""))
-}
-
-fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
-    Ok(Arc::new(super::app_pages(
-        seed,
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../downloads/cloudimage"),
-    )?))
-}
 
 pub async fn run() -> Result {
     let seed = Seed::builtin(super::SEED)?;
-    let script = seed.clone();
-    let pages = preview_pages(seed.clone())?;
-    let searches = Arc::new(Searches::of(&pages));
-    let topics = Topics::new();
-    let dashboard = DashboardObserver::new(DashboardOptions {
-        collector: fictionet_observe::Options::default(),
-        ..Default::default()
-    });
-    let status = StateTopic::new(StateLimits::default());
-    let labels = Labels::default();
-    let containment = StateTopic::new(StateLimits::default());
-    let console = kit::preview::Console::new();
-    let server = topics
-        .page(
-            dashboard.handle(),
-            Host::new("workstation")
-                .sandbox("workstation")
-                .console(console.clone())
-                .status(status.clone()),
-        )
-        .labels(labels.clone())
-        .containment(containment.clone())
-        .bind_loopback(kit::PAGE_PORT)
-        .await?;
-    let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
-    println!(
-        "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
+    let downloads =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../downloads/cloudimage");
+    let sample = kit::RunDir::new(&std::env::temp_dir(), "search-preview")?;
+    let pages = if downloads.parent().unwrap().join("astronomy").is_dir() {
+        Arc::new(super::app_pages(seed.clone(), &downloads)?)
+    } else {
+        println!("No astronomy downloads found. Preview uses the small bundled sky.org capture.");
+        std::fs::write(
+            sample.path().join("sky.warc.gz"),
+            include_bytes!("../../../../extras/tests/fixtures/sky.warc.gz"),
+        )?;
+        Arc::new(pages::Pages::copied(
+            seed.clone(),
+            sample.path(),
+            &["https://sky.org/".into()],
+            None,
+        )?)
+    };
+    let (page, (observations, commands)) = page::Page::new(&pages, true);
+    let (stories, mut story_requests) = tokio::sync::mpsc::channel::<()>(1);
+    let route = stories.clone();
+    let router = page.router().route(
+        "/story",
+        axum::routing::post(move || {
+            let route = route.clone();
+            async move {
+                match route.try_send(()) {
+                    Ok(()) => http::StatusCode::ACCEPTED,
+                    Err(_) => http::StatusCode::CONFLICT,
+                }
+            }
+        }),
     );
-    let mut input = Input::stdin(Story::Once, Some(console))?;
-    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
-    let observer = Arc::new(Fanout::new(vec![
-        audit.clone(),
-        searches.clone(),
-        dashboard.observer(),
-    ]));
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
+    let server = page::serve(router, kit::PAGE_PORT).await?;
+    let _access = kit::PageAccess::new(&server.url)?;
+    let view = page.clone();
+    let observe = tokio::spawn(async move { view.observe(observations).await });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let mut task = tokio::spawn(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
         move |cx| async move {
-            containment.publish(cx.now(), &Containment::default())?;
-            let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
             let start = web_world::world_start(&seed.date)?;
-            let world = World {
-                ca: Arc::new(Ca::in_memory(&cx, start)?),
-                addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
-                pages,
-                start,
-            };
+            let world = World::new(&cx, seed, start)?;
+            let world = World { pages, ..world };
             let (attacher, attachments) = fictionet::attachments();
-            network::build(&world, &cx, log, kit::mirror::new(&cx)?)?.start(&cx, attachments)?;
-            topics.start(&cx, searches.clone(), world.pages.clone())?;
+            let log = Arc::new(fictionet_extras::log::Log::new(
+                Box::new(std::io::sink()),
+                &[],
+                |s| s,
+            ));
+            let net = network::build(&world, &cx, log, kit::mirror::new(&cx)?)?;
+            network::start(&cx, net, attachments, world.pages.clone())?;
+            page.run_commands(&cx, world.pages.clone(), commands);
             let workstation = machine(
                 &cx,
                 attacher.attach("workstation")?,
                 "10.0.0.2".parse::<std::net::Ipv4Addr>()?,
             );
-            status.publish(
-                cx.now(),
-                &HostStatus {
-                    state: HostState::DesktopUp,
-                    addresses: vec!["10.0.0.2".into()],
-                    screen: true,
-                    terminal: false,
-                },
-            )?;
             cx.spawn(move |cx| async move {
-                labels.run(&cx).await?;
-                Ok(())
-            });
-            cx.spawn(move |cx| async move {
-                let result = async {
-                    let client = Client {
-                        cx: &cx,
-                        machine: &workstation,
-                        world: &world,
-                        searches: &searches,
-                    };
-                    story(&client, &script).await?;
-                    Ok::<_, fictionet::Error>(())
-                }
-                .await;
-                if let Err(error) = result {
-                    // Stopping the preview mid-story cancels the run.
-                    if !cx.is_cancelled() {
-                        eprintln!("Preview story failed: {error}");
+                loop {
+                    story(&cx, &workstation, &world).await?;
+                    println!("Preview story complete. Use Run story again on the page.");
+                    if cx.race(None, story_requests.recv()).await?.is_none() {
+                        break;
                     }
-                    return Err(error);
                 }
-                println!("Preview story complete.");
                 Ok(())
             });
             let _ = cx.race(None, stopped).await;
@@ -151,114 +98,98 @@ pub async fn run() -> Result {
             Ok(())
         },
     ));
-    input.closed().await;
-    let _ = stop.send(());
-    task.await??;
-    audit.check()?;
-    drop(server);
+    println!(
+        "No VM. The preview client searches and opens pages inside the world. Press Ctrl-C to stop."
+    );
+    let result = tokio::select! {
+        result = tokio::signal::ctrl_c() => { result?; let _=stop.send(()); task.await },
+        result = &mut task => result,
+    };
+    server.shutdown().await;
+    observe.abort();
+    result??;
     Ok(())
 }
-
-/// Opens a page and requires HTTP 200.
 async fn fetch(
     cx: &Cx,
     machine: &Machine,
-    url: &str,
+    host: &str,
+    path: &str,
     start: SystemTime,
-) -> fictionet::Result<String> {
-    let (status, body) = get(cx, machine, url, start).await?;
-    if status != 200 {
-        return Err(fictionet::Error::msg(format!("{url}: HTTP {status}")));
-    }
-    Ok(body)
-}
-
-async fn get(
-    cx: &Cx,
-    machine: &Machine,
-    url: &str,
-    start: SystemTime,
-) -> fictionet::Result<(u16, String)> {
-    let (host, path) = pages::text::target_of(url);
+) -> fictionet::Result {
     let answer = machine
-        .lookup(cx, "10.0.0.1".parse()?, &host, RecordType::A)
+        .lookup(cx, "10.0.0.1".parse()?, host, RecordType::A)
         .await?;
     let addr = answer
         .answers
         .iter()
-        .find_map(|r| {
-            if let RData::A(a) = r.data {
-                Some(a.0)
-            } else {
-                None
-            }
+        .find_map(|record| match record.data {
+            RData::A(addr) => Some(addr.0),
+            _ => None,
         })
         .ok_or_else(|| fictionet::Error::msg("name has no address"))?;
     let mut conn = machine
-        .tls(cx, (addr, 443).into(), &host, None, start)
+        .tls(cx, (addr, 443).into(), host, None, start)
         .await?;
     let request =
         http1::Request::parse(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())?;
     let response = sandbox::request(cx, &mut conn, &request).await?;
-    println!(
-        "Scripted client opened {url} (HTTP {})",
-        response.head.status
-    );
-    Ok((
-        response.head.status,
-        String::from_utf8_lossy(&response.body).into_owned(),
-    ))
+    if response.head.status != 200 {
+        return Err(fictionet::Error::msg(format!(
+            "{host}{path}: HTTP {}",
+            response.head.status
+        )));
+    }
+    println!("Preview opened https://{host}{path}");
+    Ok(())
 }
-
-/// The scripted client in the world, and the page it reports to.
-struct Client<'a> {
-    cx: &'a Cx,
-    machine: &'a Machine,
-    world: &'a World,
-    searches: &'a Searches,
-}
-
-/// The seed's searches and pages, in the order a reader would make them.
-async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
-    let Client {
+async fn story(cx: &Cx, machine: &Machine, world: &World) -> fictionet::Result {
+    use fictionet_extras::models::Engine;
+    // These pauses pace the presentation; tests drive the same services without them.
+    cx.sleep(Duration::from_secs(1)).await?;
+    fetch(
         cx,
         machine,
-        world,
-        searches,
-    } = *client;
-    let words = "black hole";
-    let pause = || cx.sleep(Duration::from_secs(3));
-    // Give viewers a chance to see the empty world before the first request.
-    cx.sleep(Duration::from_secs(8)).await?;
-    fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
-    pause().await?;
-    let state = searches.snapshot();
-    let list = state
-        .results
-        .first()
-        .ok_or_else(|| fictionet::Error::msg("search returned no stored results"))?;
-    for result in list.listed.iter().take(3) {
-        pause().await?;
-        fetch(cx, machine, &result.url, world.start).await?;
+        "www.google.com",
+        "/search?q=black+hole",
+        world.start,
+    )
+    .await?;
+    cx.sleep(Duration::from_millis(800)).await?;
+    let hits = world
+        .pages
+        .clone()
+        .search(
+            cx.clone(),
+            "black hole".into(),
+            "claude_web_search",
+            serde_json::json!({}),
+        )
+        .await?;
+    for hit in hits.iter().take(3) {
+        let (host, path) = pages::text::target_of(&hit.url);
+        fetch(cx, machine, &host, &path, world.start).await?;
+        cx.sleep(Duration::from_millis(800)).await?;
     }
-    let opened = [
-        search_url(Engine::Bing, words),
-        search_url(Engine::DuckDuckGo, &format!("{words} details")),
-        "https://en.wikipedia.org/wiki/Astronomy".to_owned(),
-    ];
-    for url in opened.iter().chain(seed.fixed.iter().map(|f| &f.url)) {
-        pause().await?;
-        fetch(cx, machine, url, world.start).await?;
-    }
-    pause().await?;
+    fetch(
+        cx,
+        machine,
+        "www.bing.com",
+        "/search?q=black+hole",
+        world.start,
+    )
+    .await?;
+    fetch(
+        cx,
+        machine,
+        "html.duckduckgo.com",
+        "/html/?q=black+hole",
+        world.start,
+    )
+    .await?;
     machine
         .lookup(cx, "10.0.0.1".parse()?, "wiki.corp", RecordType::A)
         .await?;
-    println!("Scripted client asked for wiki.corp");
-    pause().await?;
-    let new = "dishwasher repair";
-    fetch(cx, machine, &search_url(Engine::Google, new), world.start).await?;
-    pause().await?;
-    fetch(cx, machine, &search_url(Engine::Google, words), world.start).await?;
+    let _ = machine.tcp.connect(cx, "1.1.1.1:443".parse()?).await;
     Ok(())
 }

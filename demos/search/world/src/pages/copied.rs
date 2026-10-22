@@ -59,6 +59,17 @@ impl Corpus {
 }
 
 impl Pages {
+    pub(crate) fn capture_date(&self, url: &str) -> Option<String> {
+        self.copied
+            .as_ref()?
+            .archive
+            .captured(url)
+            .map(str::to_owned)
+    }
+    pub fn has_copied(&self) -> bool {
+        self.copied.is_some()
+    }
+
     /// Open the copied sites and crawl them from their starting URLs.
     /// The crawler and HTTP replay use the same response handler.
     pub fn copied(
