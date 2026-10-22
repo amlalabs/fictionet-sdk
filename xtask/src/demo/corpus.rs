@@ -1,7 +1,6 @@
-//! Capture astronomy sites with wget, retaining responses at original URLs.
+//! Complete the bounded astronomy corpus through Wikimedia, retaining real URLs.
 
 use crate::process::Result;
-use std::process::Command;
 
 pub(super) fn run(args: &[String]) -> Result {
     match args {
@@ -13,63 +12,240 @@ pub(super) fn run(args: &[String]) -> Result {
 }
 
 fn fetch() -> Result {
+    use fictionet_extras::{
+        capture::{Fetcher, links},
+        warc::Archive,
+    };
+    use kuchiki::traits::TendrilSink;
+    use std::{
+        collections::{HashSet, VecDeque},
+        time::Instant,
+    };
     let destination = crate::root().join("demos/downloads/astronomy");
-    if destination.exists() {
-        return Err("astronomy already exists; run cargo xtask demo corpus report to inspect it, or move it aside before recapturing".into());
+    let incomplete = crate::root().join("demos/downloads/astronomy-incomplete");
+    if !destination.exists() && incomplete.exists() {
+        // Validate the interrupted gzip members before adopting the capture.
+        Archive::directory(&incomplete)?;
+        std::fs::rename(incomplete, &destination)?;
     }
-    let root = crate::root().join("demos/downloads/astronomy-capture");
-    std::fs::create_dir_all(&root)?;
-    let seeds = crate::root().join("demos/corpus/astronomy.urls");
-    let stem = root.join("astronomy");
-    if stem.with_extension("warc.gz").exists() {
-        return Err(
-            "astronomy.warc.gz already exists; move the archive aside before recapturing".into(),
+    let mut archive = Archive::directory(&destination)?;
+    let mut count = archive
+        .urls()
+        .filter(|url| {
+            archive.get(url).ok().flatten().is_some_and(|r| {
+                r.status.is_success()
+                    && r.headers
+                        .get("content-type")
+                        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
+            })
+        })
+        .count();
+    if count >= 500 {
+        println!("Corpus already has {count} HTML pages; no articles will be added");
+    }
+    let started = Instant::now();
+    let fetcher = Fetcher::new(
+        "FictionetAstronomyArchive/1.0 (offline astronomy demo; contact: souvik@amlalabs.com)",
+    )?;
+    let path = destination.join("wikipedia.warc.gz");
+    let mut candidates =
+        VecDeque::from(["Solar System", "Star", "Galaxy", "Exoplanet"].map(str::to_owned));
+    let mut categories = VecDeque::from(
+        [
+            "Astronomy",
+            "Astrophysics",
+            "Stars",
+            "Galaxies",
+            "Nebulae",
+            "Cosmology",
+            "Planets",
+            "Exoplanets",
+        ]
+        .map(|c| (format!("Category:{c}"), 0)),
+    );
+    let mut seen_categories = HashSet::new();
+    let mut seen_pages = HashSet::new();
+    let mut assets = VecDeque::new();
+    while count < 500 {
+        crate::process::interrupted()?;
+        let Some(title) = candidates.pop_front() else {
+            let (category, depth) = categories
+                .pop_front()
+                .ok_or("astronomy categories exhausted")?;
+            if !seen_categories.insert(category.clone()) {
+                continue;
+            }
+            let mut api = url::Url::parse("https://en.wikipedia.org/w/api.php")?;
+            api.query_pairs_mut().extend_pairs([
+                ("action", "query"),
+                ("list", "categorymembers"),
+                ("cmtitle", &category),
+                ("cmlimit", "500"),
+                ("format", "json"),
+            ]);
+            let response = fetcher.api(api.as_str())?;
+            let value: serde_json::Value = serde_json::from_slice(&response.decoded()?)?;
+            for member in value["query"]["categorymembers"]
+                .as_array()
+                .ok_or("missing category members")?
+            {
+                if let Some(title) = member["title"].as_str() {
+                    if member["ns"] == 0 {
+                        candidates.push_back(title.to_owned());
+                    } else if member["ns"] == 14 && depth < 2 {
+                        categories.push_back((title.to_owned(), depth + 1));
+                    }
+                }
+            }
+            continue;
+        };
+        if !seen_pages.insert(title.clone()) {
+            continue;
+        }
+        let mut real = url::Url::parse("https://en.wikipedia.org/wiki/")?;
+        real.path_segments_mut()
+            .unwrap()
+            .pop_if_empty()
+            .push(&title.replace(' ', "_"));
+        if archive
+            .get(real.as_str())?
+            .is_some_and(|r| r.status.is_success())
+        {
+            continue;
+        }
+        let mut api = url::Url::parse("https://en.wikipedia.org/w/api.php")?;
+        api.query_pairs_mut().extend_pairs([
+            ("action", "parse"),
+            ("page", &title),
+            ("prop", "text"),
+            ("format", "json"),
+            ("formatversion", "2"),
+        ]);
+        let response = fetcher.api(api.as_str())?;
+        let value: serde_json::Value = serde_json::from_slice(&response.decoded()?)?;
+        let article = value["parse"]["text"]
+            .as_str()
+            .ok_or("missing parsed article")?;
+        // Keep the actual desktop skin, navigation, headings and license. The
+        // article body comes from the Action API, not a hand written summary.
+        let mut desktop = fetcher.api(real.as_str())?;
+        if !desktop.status.is_success() {
+            return Err(format!("desktop capture failed: {real} {}", desktop.status).into());
+        }
+        let dom = kuchiki::parse_html().one(String::from_utf8(desktop.decoded()?)?);
+        let content = dom
+            .select_first("#mw-content-text")
+            .map_err(|_| "missing desktop article container")?;
+        for node in content.as_node().children().collect::<Vec<_>>() {
+            node.detach();
+        }
+        let parsed = kuchiki::parse_html().one(article);
+        let body = parsed.select_first("body").unwrap();
+        for node in body.as_node().children().collect::<Vec<_>>() {
+            content.as_node().append(node);
+        }
+        // Static desktop pages use Wikipedia's no-JavaScript skin. Avoid
+        // resource loader requests that cannot be discovered from markup.
+        for node in dom.select("script").unwrap().collect::<Vec<_>>() {
+            node.as_node().detach();
+        }
+        desktop.body = dom.to_string().into_bytes().into();
+        desktop.headers.remove("content-encoding");
+        desktop.headers.remove("etag");
+        assets.extend(links(real.as_str(), &desktop)?.assets);
+        archive.append(&path, real.as_str(), &desktop)?;
+        count += 1;
+        println!(
+            "{count}/500 {real} ({:.1}s)",
+            started.elapsed().as_secs_f64()
         );
     }
-    let scratch = root.join("capture");
-    std::fs::create_dir_all(&scratch)?;
-    // One wget traversal shares downloaded requisites between every page.
-    // The byte and depth limits bound the capture; page counts must be measured.
-    let status = Command::new("wget")
-        .args(["--mirror", "--page-requisites", "--level=2", "--span-hosts",
-            "--wait=0.5", "--random-wait", "--limit-rate=2m", "--quota=12g",
-            "--timeout=30", "--tries=2", "--execute=robots=on",
-            "--user-agent=FictionetAstronomyArchive/1.0 wget (offline astronomy research demo; respects robots.txt)",
-            "--warc-compression", "--no-warc-keep-log"])
-        .arg(format!("--input-file={}", seeds.display()))
-        .arg(format!("--warc-file={}", stem.display()))
-        .arg(format!("--directory-prefix={}", scratch.display()))
-        .arg(format!("--output-file={}", stem.with_extension("log").display()))
-        .status()?;
-    // Wget uses temporary files for discovery. The world reads only WARCs.
-    std::fs::remove_dir_all(scratch)?;
-    if !status.success() {
-        return Err(format!("wget capture failed ({status}); incomplete WARC retained in {}; inspect astronomy.log before using it", root.display()).into());
-    }
-    let archive = fictionet_extras::warc::Archive::directory(&root)?;
-    let mut pages = 0;
-    for url in archive.urls() {
-        if archive.get(url)?.is_some_and(|response| {
-            response.status.is_success()
-                && response
-                    .headers
-                    .get("content-type")
-                    .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
-        }) {
-            pages += 1;
+    // Resume asset completion too: a stopped run must never add extra articles.
+    for url in archive
+        .urls()
+        .filter(|u| u.starts_with("https://en.wikipedia.org/wiki/"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    {
+        if let Some(response) = archive.get(&url)? {
+            assets.extend(links(&url, &response)?.assets);
         }
     }
-    if !(9_000..=11_000).contains(&pages) {
+    let mut seen_assets = HashSet::new();
+    let mut failures = Vec::new();
+    while let Some(url) = assets.pop_front() {
+        crate::process::interrupted()?;
+        if !seen_assets.insert(url.clone()) {
+            continue;
+        }
+        if let Some(response) = archive.get(&url)? {
+            if response.status.is_success() || response.status.is_redirection() {
+                let discovered = links(&url, &response)?;
+                assets.extend(discovered.assets);
+                if response.status.is_redirection() {
+                    assets.extend(discovered.pages);
+                }
+                continue;
+            }
+        }
+        let response = (|| {
+            let mut response = fetcher.api(&url)?;
+            for _ in 0..3 {
+                if response.status.as_u16() != 429 && response.status.as_u16() != 503 {
+                    break;
+                }
+                let delay = response
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(60);
+                eprintln!("Server rate limit; retrying {url} after {delay}s");
+                std::thread::sleep(std::time::Duration::from_secs(delay));
+                crate::process::interrupted().map_err(|e| std::io::Error::other(e.to_string()))?;
+                response = fetcher.api(&url)?;
+            }
+            Ok::<_, std::io::Error>(response)
+        })();
+        match response {
+            Ok(response) => {
+                let discovered = links(&url, &response)?;
+                assets.extend(discovered.assets);
+                if response.status.is_redirection() {
+                    assets.extend(discovered.pages);
+                }
+                if !response.status.is_success() && !response.status.is_redirection() {
+                    failures.push(format!("{} {url}", response.status));
+                }
+                archive.append(&path, &url, &response)?;
+            }
+            Err(error) => failures.push(format!("{url}: {error}")),
+        }
+        if seen_assets.len() % 100 == 0 {
+            println!(
+                "{} assets visited, {} remaining ({:.1}s)",
+                seen_assets.len(),
+                assets.len(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    println!(
+        "{count} HTML pages; {} asset URLs; {:.1}s",
+        seen_assets.len(),
+        started.elapsed().as_secs_f64()
+    );
+    for failure in &failures {
+        eprintln!("Asset unavailable: {failure}");
+    }
+    if !failures.is_empty() {
         return Err(format!(
-            "capture has {pages} HTML pages, not about 10000; retained at {} for inspection",
-            root.display()
+            "{} unavailable assets; archive retained for inspection",
+            failures.len()
         )
         .into());
     }
-    drop(archive);
-    std::fs::rename(&root, &destination)?;
-    println!("astronomy archives: {}", destination.display());
-    Ok(())
+    report(&destination)
 }
 
 fn report(root: &std::path::Path) -> Result {

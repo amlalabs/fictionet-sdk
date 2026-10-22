@@ -6,7 +6,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -114,6 +114,65 @@ pub fn key(url: &str) -> Option<String> {
 }
 
 impl Archive {
+    /// Append one record compressed HTTP response and publish it for replay.
+    /// Callers serialize writes to each file. Failed writes are rolled back.
+    pub fn append(&mut self, path: &Path, url: &str, response: &Response) -> io::Result<()> {
+        let url = key(url).ok_or_else(|| invalid("not an HTTP URL"))?;
+        let mut block = format!("HTTP/1.1 {}\r\n", response.status).into_bytes();
+        for (name, value) in &response.headers {
+            if name != http::header::TRANSFER_ENCODING && name != http::header::CONTENT_LENGTH {
+                write!(block, "{name}: ")?;
+                block.extend_from_slice(value.as_bytes());
+                block.extend_from_slice(b"\r\n");
+            }
+        }
+        write!(block, "Content-Length: {}\r\n\r\n", response.body.len())?;
+        block.extend_from_slice(&response.body);
+        let now = time::OffsetDateTime::now_utc();
+        let date = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let offset = file.metadata()?.len();
+        let written = (|| {
+            let mut member =
+                flate2::write::GzEncoder::new(&mut file, flate2::Compression::default());
+            write!(
+                member,
+                "WARC/1.1\r\nWARC-Type: response\r\nWARC-Target-URI: {url}\r\nWARC-Date: {date}\r\nWARC-Record-ID: <urn:fictionet:{}:{}:{offset}>\r\nContent-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+                std::process::id(),
+                now.unix_timestamp_nanos(),
+                block.len()
+            )?;
+            member.write_all(&block)?;
+            member.write_all(b"\r\n\r\n")?;
+            member.finish()?.flush()
+        })();
+        if let Err(error) = written {
+            file.set_len(offset)?;
+            return Err(error);
+        }
+        self.urls.insert(
+            url,
+            Record {
+                file: path.to_owned(),
+                offset,
+                length: file.metadata()?.len() - offset,
+                refers: None,
+            },
+        );
+        Ok(())
+    }
+
     /// Scan every gzip member once, retaining only URL and record locations.
     /// Revisit references are resolved after all archives have been scanned.
     pub fn open(files: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
@@ -273,6 +332,41 @@ fn http_response(block: &[u8]) -> io::Result<Response> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn appended_responses_are_immediately_replayable_and_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("fictionet-append-{}.warc.gz", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut archive = Archive::default();
+        for (url, body) in [
+            ("https://sky.org/", &b"<title>Sky</title>"[..]),
+            ("https://sky.org/image", &b"\x00\xff\x01"[..]),
+        ] {
+            let response = Response {
+                status: StatusCode::OK,
+                headers: HeaderMap::from_iter([(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                )]),
+                body: Bytes::copy_from_slice(body),
+            };
+            archive.append(&path, url, &response).unwrap();
+            assert_eq!(archive.get(url).unwrap().unwrap().body.as_ref(), body);
+        }
+        let reopened = Archive::open([path.clone()]).unwrap();
+        assert_eq!(reopened.urls().count(), 2);
+        assert_eq!(
+            reopened
+                .get("https://sky.org/image")
+                .unwrap()
+                .unwrap()
+                .body
+                .as_ref(),
+            b"\x00\xff\x01"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn seeks_members_and_replays_redirects_and_revisits() {

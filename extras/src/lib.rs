@@ -34,5 +34,6 @@ pub mod search;
 pub mod sites;
 mod text;
 
+pub mod capture;
 pub mod crawl;
 pub mod warc;
