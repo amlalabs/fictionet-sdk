@@ -1,7 +1,8 @@
 //! Capture a varied set of astronomy sites and their page requisites.
 
 use crate::process::Result;
-use fictionet_extras::capture::{BROWSER, Fetcher, links};
+use fictionet_extras::capture::BROWSER;
+use kuchiki::traits::TendrilSink;
 use std::{
     collections::HashSet,
     io::Write,
@@ -11,7 +12,6 @@ use std::{
 pub(super) fn run(only: Option<&str>) -> Result {
     let destination = crate::root().join("demos/downloads/astronomy");
     std::fs::create_dir_all(&destination)?;
-    let mut fetcher = Fetcher::new(BROWSER)?;
     let mut failures = Vec::new();
     let starts = only.map_or_else(
         || {
@@ -25,22 +25,32 @@ pub(super) fn run(only: Option<&str>) -> Result {
         crate::process::interrupted()?;
         let url = url::Url::parse(start)?;
         let host = url.host_str().ok_or("capture URL has no host")?;
-        let response = match fetcher.fetch(start) {
-            Ok(response) if response.status.is_success() => response,
-            Ok(response) => {
-                eprintln!("{host}: discovery returned {}", response.status);
-                failures.push(format!("{host}: discovery returned {}", response.status));
-                continue;
-            }
-            Err(error) => {
-                failures.push(format!("{host}: {error}"));
-                continue;
-            }
-        };
+        let discovery = wget().args(["--output-document=-", start]).output()?;
+        if !discovery.status.success() {
+            failures.push(format!(
+                "{host}: discovery {}\n{}",
+                discovery.status,
+                String::from_utf8_lossy(&discovery.stderr)
+            ));
+            continue;
+        }
+        let document =
+            kuchiki::parse_html().one(String::from_utf8_lossy(&discovery.stdout).into_owned());
         let mut seen = HashSet::new();
         let mut pages = vec![start.to_owned()];
-        for page in links(start, &response)?.pages {
-            let parsed = url::Url::parse(&page)?;
+        let articles = document.select("article a[href]").unwrap();
+        let all = document.select("a[href]").unwrap();
+        for link in articles.chain(all) {
+            let attributes = link.attributes.borrow();
+            let Some(parsed) = attributes.get("href").and_then(|href| url.join(href).ok()) else {
+                continue;
+            };
+            if !matches!(parsed.scheme(), "http" | "https") {
+                continue;
+            }
+            let mut parsed = parsed;
+            parsed.set_fragment(None);
+            let page = parsed.to_string();
             if parsed.host_str() == Some(host) && seen.insert(page.clone()) {
                 pages.push(page);
                 if pages.len() == 40 {
@@ -56,22 +66,13 @@ pub(super) fn run(only: Option<&str>) -> Result {
         }
         let capture = destination.join(format!(".capture-{host}-{}", std::process::id()));
         std::fs::create_dir_all(&capture)?;
-        let mut child = Command::new("wget")
+        let mut child = wget()
             .args([
-                "-e",
-                "robots=off",
                 "--page-requisites",
                 "--span-hosts",
                 "--delete-after",
-                "--wait=1",
-                "--random-wait",
-                "--limit-rate=512k",
-                "--timeout=20",
-                "--tries=1",
                 "--no-warc-keep-log",
                 "--quota=512m",
-                "--user-agent",
-                BROWSER,
                 "--input-file=-",
                 "--directory-prefix",
             ])
@@ -114,4 +115,20 @@ pub(super) fn run(only: Option<&str>) -> Result {
     } else {
         Err(format!("{} site captures need attention", failures.len()).into())
     }
+}
+
+fn wget() -> Command {
+    let mut command = Command::new("wget");
+    command.args([
+        "-e",
+        "robots=off",
+        "--wait=1",
+        "--random-wait",
+        "--limit-rate=512k",
+        "--timeout=20",
+        "--tries=1",
+        "--user-agent",
+        BROWSER,
+    ]);
+    command
 }
