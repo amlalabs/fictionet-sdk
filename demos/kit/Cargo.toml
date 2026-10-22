@@ -38,7 +38,7 @@ crc32fast = "1"
 # prepare and reach an unmodified distro image whatever hypervisor boots it.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
-russh = "0.54"
+russh = "0.64"
 libc = "0.2"
 # The vhost-user-net backend that joins Cloud Hypervisor's guest to the
 # world. Versions track vhost-user-backend 0.18's own, so the virtio-queue,

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use russh::ChannelStream;
 use russh::client::{self, Handle, Handler, Msg};
-use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// How long one connection attempt may take, from dialing to logging in.
@@ -232,38 +232,37 @@ struct Client;
 impl Handler for Client {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, _key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        _key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }
 
-/// A `rand_core` 0.6 source over the OS, for ssh-key's generator.
+/// A `rand_core` source over the OS, for ssh-key's generator.
 struct OsRng;
 
-impl russh::keys::ssh_key::rand_core::RngCore for OsRng {
-    fn next_u32(&mut self) -> u32 {
+impl russh::keys::ssh_key::rand_core::TryRng for OsRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         let mut b = [0u8; 4];
-        self.fill_bytes(&mut b);
-        u32::from_ne_bytes(b)
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_ne_bytes(b))
     }
-    fn next_u64(&mut self) -> u64 {
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
         let mut b = [0u8; 8];
-        self.fill_bytes(&mut b);
-        u64::from_ne_bytes(b)
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_ne_bytes(b))
     }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         fictionet::random_bytes(dest).expect("the system random source");
-    }
-    fn try_fill_bytes(
-        &mut self,
-        dest: &mut [u8],
-    ) -> Result<(), russh::keys::ssh_key::rand_core::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }
 
-impl russh::keys::ssh_key::rand_core::CryptoRng for OsRng {}
+impl russh::keys::ssh_key::rand_core::TryCryptoRng for OsRng {}
 
 /// A shell channel whose reads apply backpressure through russh's bounded channel and window.
 pub struct Pty {

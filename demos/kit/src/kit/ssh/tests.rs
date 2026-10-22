@@ -1,6 +1,8 @@
 use super::*;
+use bytes::Bytes;
+use russh::keys::PublicKey;
 use russh::server::{self, Auth};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId};
 use tokio::sync::mpsc;
 
 use std::collections::HashSet;
@@ -58,13 +60,13 @@ fn other_messages_before_the_reply_are_errors() {
     let messages = [
         (
             ChannelMsg::Data {
-                data: CryptoVec::from_slice(b"prompt"),
+                data: Bytes::from_static(b"prompt"),
             },
             "Data",
         ),
         (
             ChannelMsg::ExtendedData {
-                data: CryptoVec::from_slice(b"error"),
+                data: Bytes::from_static(b"error"),
                 ext: 1,
             },
             "ExtendedData",
@@ -174,9 +176,11 @@ impl server::Handler for Server {
     async fn channel_open_session(
         &mut self,
         _: Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
         _: &mut server::Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
     async fn pty_request(
         &mut self,
@@ -202,7 +206,7 @@ impl server::Handler for Server {
     ) -> Result<(), Self::Error> {
         self.events.send("shell".into()).unwrap();
         session.channel_success(id)?;
-        session.data(id, CryptoVec::from_slice(b"ready"))?;
+        session.data(id, Bytes::from_static(b"ready"))?;
         Ok(())
     }
     async fn data(
@@ -214,13 +218,13 @@ impl server::Handler for Server {
         if !self.forwards.contains(&id) {
             if data == b"large-output\r" {
                 let output: Vec<u8> = (0..512 * 1024).map(|n| (n % 251) as u8).collect();
-                session.data(id, CryptoVec::from_slice(&output))?;
+                session.data(id, Bytes::from(output))?;
             } else if data == b"printf 'name:%s:end\\n' \"$(hostname)\"\r" {
                 // The shell prints the workstation hostname.
-                session.data(id, CryptoVec::from_slice(data))?;
-                session.data(id, CryptoVec::from_slice(b"name:workstation:end\r\n"))?;
+                session.data(id, Bytes::copy_from_slice(data))?;
+                session.data(id, Bytes::from_static(b"name:workstation:end\r\n"))?;
             } else {
-                session.data(id, CryptoVec::from_slice(data))?;
+                session.data(id, Bytes::copy_from_slice(data))?;
             }
         }
         Ok(())
@@ -232,13 +236,15 @@ impl server::Handler for Server {
         port: u32,
         _: &str,
         _: u32,
+        reply: server::ChannelOpenHandle,
         _: &mut server::Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         assert_eq!((host, port), ("127.0.0.1", 5901));
         self.forwards.insert(channel.id());
+        reply.accept().await;
         let messages = self.rfb.clone();
         self.tasks.spawn(fake_rfb(channel.into_stream(), messages));
-        Ok(true)
+        Ok(())
     }
     async fn exec_request(
         &mut self,
@@ -250,11 +256,7 @@ impl server::Handler for Server {
         let ready = self.ready.load(Ordering::SeqCst);
         session.channel_success(id)?;
         if !ready {
-            session.extended_data(
-                id,
-                1,
-                CryptoVec::from_slice(b"window manager is not running"),
-            )?;
+            session.extended_data(id, 1, Bytes::from_static(b"window manager is not running"))?;
         }
         session.exit_status_request(id, if ready { 0 } else { 7 })?;
         session.eof(id)?;
