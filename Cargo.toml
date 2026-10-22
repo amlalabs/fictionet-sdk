@@ -50,7 +50,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["std"]
 std = ["dep:libc", "dep:http", "dep:http-body", "dep:tower-service"]
-tokio = ["std", "dep:tokio", "dep:hyper"]
+tokio = ["std", "dep:tokio"]
 web-proxy = ["std"]
 
 [lints.rust]
@@ -62,7 +62,6 @@ bytes = "1"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 http = { version = "1.5.0", optional = true }
 http-body = { version = "1.1.0", optional = true }
-hyper = { version = "1.11.1", optional = true, default-features = false, features = ["http1", "server"] }
 rand_chacha = "0.9.0"
 ring = "0.17"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }

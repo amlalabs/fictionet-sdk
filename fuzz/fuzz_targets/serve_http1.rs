@@ -1,4 +1,4 @@
-//! HTTP/1 as a service (`httpd::Http1` with a router), driven by
+//! HTTP/1 as a service (`httpd::Http1` with a handler), driven by
 //! `serve::Harness` with no runtime. The fuzzer's bytes are the client's,
 //! cut into two chunks at a point the first byte picks; the replies must
 //! not depend on where the cut falls, the service must never panic, and
@@ -7,18 +7,39 @@
 
 use bytes::Bytes;
 use fictionet::stdlib::services::serve::Harness;
-use fictionet::stdlib::web::httpd::{Http1, Router};
+use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
 use libfuzzer_sys::fuzz_target;
 
-fn router() -> Router {
-    Router::new()
-        .get("/", |_, _| http::Response::new(Bytes::from("home\n")))
-        .post("/echo", |_, r: http::Request<Bytes>| {
-            http::Response::new(r.into_body())
-        })
-        .get("/files/*", |_, r| {
-            http::Response::new(Bytes::from(r.uri().path().to_owned()))
-        })
+struct Pages;
+impl Handler for Pages {
+    fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        let (parts, body) = request.into_parts();
+        let Some(body) = body.bytes() else {
+            return Reply::Now(
+                http::Response::builder()
+                    .status(400)
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+        };
+        let request = http::Request::from_parts(parts, body);
+        let response = match (request.method().as_str(), request.uri().path()) {
+            ("GET" | "HEAD", "/") => http::Response::new(Bytes::from("home\n")),
+            ("POST", "/echo") => http::Response::new(request.into_body()),
+            ("GET" | "HEAD", path) if path == "/files" || path.starts_with("/files/") => {
+                http::Response::new(Bytes::from(path.to_owned()))
+            }
+            (_, "/" | "/echo") => http::Response::builder()
+                .status(405)
+                .body(Bytes::new())
+                .unwrap(),
+            _ => http::Response::builder()
+                .status(404)
+                .body(Bytes::new())
+                .unwrap(),
+        };
+        Reply::Now(response.map(Body::from))
+    }
 }
 
 #[derive(Default)]
@@ -39,8 +60,8 @@ impl fictionet::events::Observer for Count {
 
 fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
     let events = std::sync::Arc::new(Count::default());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ())
-        .observer(events.clone());
+    let mut h =
+        Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages), ()).observer(events.clone());
     for chunk in chunks {
         if h.push(chunk).is_err() {
             break;

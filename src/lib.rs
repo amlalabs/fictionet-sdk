@@ -190,7 +190,7 @@
 //! use std::sync::Arc;
 //! use fictionet::{Attachments, Cx, Result};
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
-//! use fictionet::stdlib::web::httpd::{Router, Server};
+//! use fictionet::stdlib::web::httpd::{tower, Server};
 //! use fictionet::events::Event;
 //! use fictionet::stdlib::world::net::Net;
 //! use fictionet::stdlib::services::serve::{Flow, Driver, Service};
@@ -199,13 +199,14 @@
 //! struct Echo;
 //!
 //! impl Service for Echo {
+//!     type Timer = ();
 //!     type Decoder = Lines;
 //!     type State = ();
 //!     type Error = std::convert::Infallible;
 //!     fn decoder(&self) -> Lines {
 //!         Lines::new(1024, Ending::LfOrCrlf)
 //!     }
-//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder>) -> std::result::Result<Flow, Self::Error> {
+//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder, Self::Timer>) -> std::result::Result<Flow, Self::Error> {
 //!         let line = line.unwrap_or_default();
 //!         driver.emit("echo", "line", |event| event.field("bytes", line.len() as u64));
 //!         driver.reply().extend_from_slice(&line);
@@ -215,7 +216,7 @@
 //! }
 //!
 //! async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//!     let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
+//!     let site = tower(axum::Router::new().route("/", axum::routing::get(|| async { "hello\n" })));
 //!     Net::new()
 //!         .host("www", |h| h.dns_name("www.example.test").port_server(80, Server::new(site)))
 //!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))

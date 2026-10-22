@@ -158,8 +158,31 @@ fn serve(
             let config = leaf.server_config(&fcx, start)?;
             let answer =
                 |_: &mut httpd::Exchange<'_>, _| http::Response::new(Bytes::from_static(BODY));
-            let handler: Arc<dyn httpd::Handler> =
-                Arc::new(httpd::Router::new().get("/", answer).post("/", answer));
+            let handler: Arc<dyn httpd::Handler> = Arc::new({
+                let route_0 = answer;
+                let route_1 = answer;
+                fictionet_test_support::handler(move |ex, request| {
+                    if request.uri().path() == "/"
+                        && (request.method() == http::Method::GET
+                            || request.method() == http::Method::HEAD)
+                    {
+                        return route_0(ex, request);
+                    }
+                    if request.uri().path() == "/" && (request.method() == http::Method::POST) {
+                        return route_1(ex, request);
+                    }
+                    if (request.uri().path() == "/") || (request.uri().path() == "/") {
+                        return http::Response::builder()
+                            .status(405)
+                            .body(bytes::Bytes::new())
+                            .unwrap();
+                    }
+                    http::Response::builder()
+                        .status(404)
+                        .body(bytes::Bytes::new())
+                        .unwrap()
+                })
+            });
             let server = httpd::Server::shared(handler.clone()).default_host();
             let (attacher, attachments) = fictionet::attachments();
             Net::new()

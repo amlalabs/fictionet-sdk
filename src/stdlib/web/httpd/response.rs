@@ -410,36 +410,6 @@ pub fn http_date(secs: u64) -> String {
     )
 }
 
-fictionet::cfg_tokio! {
-use fictionet::Cx;
-use fictionet::stdlib::services::serve::{Charge, PanicNote};
-
-/// One request's event, sent when it is dropped.
-pub(super) struct Track {
-    pub(super) tracker: Tracker,
-    pub(super) _charge: Option<Charge>,
-    pub(super) fcx: Cx,
-    pub(super) info: Arc<ConnInfo>,
-    pub(super) extra: Option<Fields>,
-    pub(super) status: Option<StatusCode>,
-    pub(super) sent: u64,
-    pub(super) complete: bool,
-    /// Names the connection if the handler or its body panics.
-    pub(super) _note: PanicNote,
-}
-
-impl Drop for Track {
-    fn drop(&mut self) {
-        if let Some(e) =
-            self.tracker
-                .finish(|| self.extra.take(), self.status, self.sent, self.complete)
-        {
-            self.fcx.emitter(&self.info).emit("http", "request", |_| e);
-        }
-    }
-}
-}
-
 /// Observes the response headers and body without changing their framing.
 pub(super) fn inspect(fcx: Option<&fictionet::Cx>, response: Response<Body>) -> Response<Body> {
     let Some(fcx) = fcx else {

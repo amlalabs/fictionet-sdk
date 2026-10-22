@@ -268,7 +268,7 @@ pub fn request_host<B>(request: &Request<B>) -> Option<String> {
 ///
 /// ```
 /// # use fictionet::stdlib::{web::httpd, world::net::Host};
-/// let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
+/// let page = httpd::tower(axum::Router::new().route("/", axum::routing::get(|| async { "hello\n" })));
 /// let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
 /// # drop(host);
 /// ```

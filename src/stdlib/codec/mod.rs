@@ -27,10 +27,6 @@
 //! the payloads of an outer decoder into an inner one, and [`Spans`] maps
 //! the inner bytes back to where they came from. [`Demux`] runs one stream
 //! per key, such as one per HTTP/2 stream, under one shared budget.
-//! [`Interceptor`] lets a caller drop, replace or repeat each item's bytes.
-//! [`Recorder`] keeps each item with the bytes it came from. [`Faults`]
-//! applies a plan of byte and item faults. All three work with any decoder.
-//!
 //! [`reserve_bytes`] grows a byte vector under an explicit total limit and
 //! returns neutral [`ReserveError`] reasons. It leaves contents unchanged.
 //! [`append_bounded`] also appends bytes and clamps to [`Buffer::MAX_LIMIT`].
@@ -131,7 +127,7 @@
 //!   `<Unit>ParseError`, `<Unit>Error`, `<Module>Error` or `Malformed`.
 //! - **E5.** The wrappers are this module's: [`Fail`], [`PumpError`],
 //!   [`CollectError`], [`AssembleError`], [`PipeError`], [`LineError`],
-//!   [`InterceptError`], [`RewriteError`] and [`FaultError`]. A protocol
+//!   [`RewriteError`]. A protocol
 //!   module adds none. An error that wraps another returns it from
 //!   [`source`](core::error::Error::source), and its `Display` says only its own
 //!   context, never the inner error's text, so
@@ -254,12 +250,10 @@ mod declarations;
 mod demux;
 pub mod dot_body;
 pub use fictionet::{codec_from, error_display, fixed_fields, open_enum, prefixed, text_wire};
-mod faults;
 pub mod field;
 mod frames;
 mod generated;
 pub mod head_body;
-mod interceptor;
 pub mod json_syntax;
 mod layout;
 mod lcg;
@@ -268,10 +262,9 @@ mod pipe;
 mod reader;
 mod work;
 pub use fictionet::{generated_runtime, layout};
-mod recorder;
 mod stream;
 
-pub use bounded::{ReserveError, reserve_bytes};
+pub use bounded::{ReserveError, RewriteError, append_bounded, reserve_bytes, write_bounded};
 pub use buffer::Buffer;
 pub use checked::write_checked;
 pub use combinators::{
@@ -280,16 +273,11 @@ pub use combinators::{
 };
 pub use crc32::crc32;
 pub use demux::Demux;
-pub use faults::{ByteFault, FaultDelay, FaultError, Faults, ItemFault, Rule, Trigger};
 pub use frames::{Frames, Prefixed, signed_frame_prefix};
-pub use interceptor::{
-    InterceptError, Interceptor, Rewrite, RewriteError, SkipPolicy, append_bounded, write_bounded,
-};
 pub use lcg::Lcg;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
 pub use reader::{Reader, Trailing, Truncated, be16, be24, be32, be64, le16, le24, le32, le64};
-pub use recorder::{Record, RecordKind, Recorder, Side};
-pub use stream::{Fail, PumpError, Stream, StreamEvent, finish, pump, try_pump};
+pub use stream::{Fail, PumpError, Stream, finish, pump, try_pump};
 pub use work::Work;
 
 /// A refused codec operation.
@@ -453,3 +441,22 @@ where
 
 #[cfg(test)]
 mod tests;
+
+/// One side of a protocol connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// The client.
+    Client,
+    /// The server.
+    Server,
+}
+
+impl Side {
+    /// The other side of the connection.
+    pub const fn peer(self) -> Self {
+        match self {
+            Self::Client => Self::Server,
+            Self::Server => Self::Client,
+        }
+    }
+}

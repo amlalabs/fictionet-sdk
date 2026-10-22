@@ -2,8 +2,7 @@ use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderValue, Request, Response, StatusCode};
 
 use fictionet::events::ConnInfo;
 use fictionet::stdlib::network::Connection;
@@ -63,10 +62,7 @@ pub enum Reply {
     Now(Response<Body>),
     /// Work that makes the response.
     Later(Later),
-    /// Hand this HTTP/1.1 upgrade request to hyper's HTTP/1 server, which reads
-    /// it again and supplies hyper's upgrade extension. [`tower`] returns it for
-    /// axum's `WebSocketUpgrade`. HTTP/2 answers it with `500`.
-    Handoff(Request<Body>),
+
 }
 
 /// Answers HTTP requests. See the [module docs](super).
@@ -95,146 +91,6 @@ impl std::fmt::Display for BadGateway {
 }
 
 impl std::error::Error for BadGateway {}
-
-type SyncRoute = Arc<dyn Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync>;
-type AsyncRoute = Arc<
-    dyn Fn(Cx, Request<Bytes>) -> Pin<Box<dyn Future<Output = Response<Bytes>> + Send>>
-        + Send
-        + Sync,
->;
-
-#[derive(Clone)]
-enum Route {
-    Sync(SyncRoute),
-    Async(AsyncRoute),
-}
-
-/// Routes requests by method and path to plain functions with byte
-/// bodies.
-///
-/// A path matches exactly, or, if it ends in `/*`, every path under it. The
-/// first route added that matches wins. A path that no route has gets the
-/// fallback, `404 Not Found` unless set; a path some route has, with
-/// another method, gets `405 Method Not Allowed`.
-///
-/// Callbacks receive only bodies held in full, including valid empty
-/// bodies. Any other body gets `400 Bad Request` before route selection.
-/// To inspect partial HTTP/1 bodies as a stream ending in an error, use a
-/// custom [`Handler`] or [`tower`] service. See [`Body`].
-#[derive(Clone, Default)]
-pub struct Router {
-    routes: Vec<(Option<Method>, String, Route)>,
-    fallback: Option<Route>,
-}
-
-impl Router {
-    /// No routes.
-    pub fn new() -> Router {
-        Router::default()
-    }
-
-    /// Answers `method` on `path` with `f`. `None` for any method.
-    pub fn route<F>(mut self, method: Option<Method>, path: &str, f: F) -> Router
-    where
-        F: Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync + 'static,
-    {
-        self.routes
-            .push((method, path.to_owned(), Route::Sync(Arc::new(f))));
-        self
-    }
-
-    /// Answers `GET` (and `HEAD`) on `path`.
-    pub fn get<F>(self, path: &str, f: F) -> Router
-    where
-        F: Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync + 'static,
-    {
-        self.route(Some(Method::GET), path, f)
-    }
-
-    /// Answers `POST` on `path`.
-    pub fn post<F>(self, path: &str, f: F) -> Router
-    where
-        F: Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync + 'static,
-    {
-        self.route(Some(Method::POST), path, f)
-    }
-
-    /// Answers `method` on `path` with async work that gets the
-    /// connection's [`Cx`].
-    pub fn route_async<F, Fut>(mut self, method: Option<Method>, path: &str, f: F) -> Router
-    where
-        F: Fn(Cx, Request<Bytes>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Response<Bytes>> + Send + 'static,
-    {
-        let f: AsyncRoute = Arc::new(move |fcx, r| Box::pin(f(fcx, r)));
-        self.routes.push((method, path.to_owned(), Route::Async(f)));
-        self
-    }
-
-    /// Answers every request no route matches.
-    pub fn fallback<F>(mut self, f: F) -> Router
-    where
-        F: Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync + 'static,
-    {
-        self.fallback = Some(Route::Sync(Arc::new(f)));
-        self
-    }
-
-    fn find(&self, method: &Method, path: &str) -> Result<&Route, bool> {
-        let mut path_known = false;
-        for (m, pattern, route) in &self.routes {
-            let matches = match pattern.strip_suffix("/*") {
-                Some(prefix) => path
-                    .strip_prefix(prefix)
-                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('/')),
-                None => path == pattern,
-            };
-            if !matches {
-                continue;
-            }
-            path_known = true;
-            let method_ok = match m {
-                None => true,
-                Some(m) => m == method || (m == Method::GET && method == Method::HEAD),
-            };
-            if method_ok {
-                return Ok(route);
-            }
-        }
-        if path_known {
-            Err(true)
-        } else {
-            self.fallback.as_ref().ok_or(false)
-        }
-    }
-}
-
-impl Handler for Router {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
-        let (parts, body) = request.into_parts();
-        let Some(body) = body.bytes() else {
-            return Reply::Now(status_only(StatusCode::BAD_REQUEST));
-        };
-        let request = Request::from_parts(parts, body);
-        let route = match self.find(request.method(), request.uri().path()) {
-            Ok(route) => route.clone(),
-            Err(known) => {
-                let status = if known {
-                    StatusCode::METHOD_NOT_ALLOWED
-                } else {
-                    StatusCode::NOT_FOUND
-                };
-                return Reply::Now(status_only(status));
-            }
-        };
-        match route {
-            Route::Sync(f) => Reply::Now(f(ex, request).map(Body::from)),
-            Route::Async(f) => Reply::Later(Box::new(move |fcx| {
-                Box::pin(async move { Ok(f(fcx, request).await.map(Body::from)) })
-            })),
-        }
-    }
-}
 
 pub(super) fn status_only(status: StatusCode) -> Response<Body> {
     let mut r = Response::new(Body::empty());
@@ -286,11 +142,6 @@ where
     B::Error: Into<Error>,
 {
     fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
-        fictionet::cfg_tokio! {
-            if needs_hyper_upgrade(&request) {
-                return Reply::Handoff(request);
-            }
-        }
         let mut service = self.service.lock().clone();
         Reply::Later(Box::new(move |_fcx| {
             Box::pin(async move {
@@ -302,31 +153,6 @@ where
             })
         }))
     }
-}
-
-fictionet::cfg_tokio! {
-/// Whether an HTTP/1.1 request asks to switch protocols (RFC 9110 section
-/// 7.8) without hyper's upgrade extension, which axum's `WebSocketUpgrade`
-/// needs and only hyper's HTTP/1 server supplies.
-fn needs_hyper_upgrade(request: &Request<Body>) -> bool {
-    let connection_upgrade = request
-        .headers()
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .any(|v| {
-            v.as_bytes()
-                .split(|b| *b == b',')
-                .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
-        });
-    request.version() == http::Version::HTTP_11
-        && request.method() != Method::CONNECT
-        && request.headers().contains_key(http::header::UPGRADE)
-        && connection_upgrade
-        && request
-            .extensions()
-            .get::<hyper::upgrade::OnUpgrade>()
-            .is_none()
-}
 }
 
 /// Runs a protocol after an HTTP/1 switching-protocols response is written.
@@ -357,24 +183,5 @@ impl UpgradeHandler {
         if let Some(work) = work {
             work(fcx, conn).await;
         }
-    }
-}
-
-#[cfg(test)]
-mod router_tests {
-    use super::*;
-
-    #[test]
-    fn wildcard_prefixes_keep_slash_boundaries_and_method_precedence() {
-        let router = Router::new().get("/files/*", |_, _| Response::new(Bytes::new()));
-        assert!(router.find(&Method::GET, "/files").is_ok());
-        assert!(router.find(&Method::GET, "/files/").is_ok());
-        assert!(router.find(&Method::GET, "/files/a/b").is_ok());
-        assert!(matches!(router.find(&Method::GET, "/filesx"), Err(false)));
-        assert!(matches!(router.find(&Method::POST, "/files/a"), Err(true)));
-        let root = Router::new().get("/*", |_, _| Response::new(Bytes::new()));
-        assert!(root.find(&Method::GET, "").is_ok());
-        assert!(root.find(&Method::GET, "/a").is_ok());
-        assert!(matches!(root.find(&Method::GET, "a"), Err(false)));
     }
 }

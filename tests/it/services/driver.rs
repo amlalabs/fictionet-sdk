@@ -68,9 +68,11 @@ fn replies_do_not_depend_on_chunk_boundaries() {
     }
     // The same for HTTP/1 with a router.
     let router = || {
-        Router::new().post("/e", |_, r: http::Request<Bytes>| {
-            http::Response::new(r.into_body())
-        })
+        fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, r: http::Request<Bytes>| {
+                http::Response::new(r.into_body())
+            },
+        )
     };
     let input = b"POST /e HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabcPOST /e HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nxy\r\n0\r\n\r\n";
     let whole = {
@@ -90,11 +92,10 @@ fn replies_do_not_depend_on_chunk_boundaries() {
 // The driver, over TCP
 
 #[test]
-fn listen_serves_each_connection_and_records_it() {
+fn listen_serves_each_connection() {
     crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        let transcript = Transcript::new(100, 1 << 16);
-        let opts = ServeOptions::default().record(transcript.clone());
+        let opts = ServeOptions::default();
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, opts);
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
@@ -138,26 +139,6 @@ fn listen_serves_each_connection_and_records_it() {
         assert_eq!(
             all[6].get("end").and_then(json::Value::as_str),
             Some("closed")
-        );
-        // Both directions, with their exact bytes.
-        let records = transcript.records();
-        let from_client: Vec<u8> = records
-            .iter()
-            .filter(|r| r.sender == Side::Client)
-            .flat_map(|r| r.bytes.clone())
-            .collect();
-        let to_client: Vec<u8> = records
-            .iter()
-            .filter(|r| r.sender == Side::Server)
-            .flat_map(|r| r.bytes.clone())
-            .collect();
-        assert_eq!(from_client, b"one\nlater\ntwo\nquit\n");
-        assert_eq!(to_client, b"hello\none\nlater\ntwo\nbye\n");
-        assert!(
-            records
-                .iter()
-                .filter(|r| r.sender == Side::Client)
-                .all(|r| matches!(r.kind, RecordKind::Item(())))
         );
         Ok(())
     });
@@ -230,54 +211,6 @@ fn a_handoff_returns_the_connection_with_its_unread_bytes() {
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             b"\x16\x03\x01"
         );
-        Ok(())
-    });
-}
-
-#[test]
-fn fault_plans_change_bytes_and_items_both_ways() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let (server, _su, client, _cu) = two_machines(&fcx);
-        // The first item from the client is dropped, and every write to it
-        // has its first byte replaced.
-        let plan = FaultPlan::new(Plan {
-            items: vec![Rule {
-                when: Trigger::At(1),
-                fault: ItemFault::Action {
-                    delay: None,
-                    rewrite: Rewrite::Drop,
-                },
-            }],
-            outbound: vec![Rule {
-                when: Trigger::After(2),
-                fault: ByteFault::Corrupt {
-                    offset: Some(0),
-                    xor: 0x20,
-                },
-            }],
-            ..Plan::default()
-        });
-        let opts = ServeOptions::default().faults(plan.clone());
-        serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, opts);
-        let mut conn = client
-            .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
-            .await?;
-        assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
-        conn.write_all(&fcx, b"dropped\nkept\n").await?;
-        assert_eq!(read_some(&fcx, &mut conn, 5).await, b"Kept\n");
-        // The plan changes while the connection runs: a delay on the way
-        // in.
-        plan.set(Plan {
-            inbound: vec![Rule {
-                when: Trigger::Always,
-                fault: ByteFault::Delay(Duration::from_millis(150)),
-            }],
-            ..Plan::default()
-        });
-        let before = fcx.now();
-        conn.write_all(&fcx, b"slow\n").await?;
-        assert_eq!(read_some(&fcx, &mut conn, 5).await, b"slow\n");
-        assert!(fcx.now().since_start() - before.since_start() >= Duration::from_millis(150));
         Ok(())
     });
 }
@@ -569,6 +502,12 @@ fn another_connection_wakes_a_service_to_push_a_fill() {
 
 /// A FIX-like session with named timers: a heartbeat every 10 ms and a
 /// logon deadline, and a count of the client's lines.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionTimer {
+    Heartbeat,
+    Logon,
+}
+
 struct Session {
     lines: u64,
     beats: u64,
@@ -576,12 +515,13 @@ struct Session {
 
 service_fixture! {
     Session => (Lines, (), Infallible);
+    timer(SessionTimer);
     decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
     on_open(self; _, driver) -> Flow {
-        driver.set_timer("heartbeat", Duration::from_millis(10));
-        driver.set_timer("logon", Duration::from_millis(25));
+        driver.set_timer(SessionTimer::Heartbeat, Duration::from_millis(10));
+        driver.set_timer(SessionTimer::Logon, Duration::from_millis(25));
         Ok(Flow::Continue)
     }
     on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
@@ -594,7 +534,7 @@ service_fixture! {
             {}
         }
         if line.as_deref() == Ok(b"logon") {
-            driver.cancel_timer("logon");
+            driver.cancel_timer(SessionTimer::Logon);
             driver.reply().extend_from_slice(b"logged on\n");
         }
         if line.as_deref() == Ok(b"end") {
@@ -605,18 +545,17 @@ service_fixture! {
         }
         Ok(Flow::Continue)
     }
-    on_timer(self, timer: Timer; _, driver) -> Flow {
+    on_timer(self, timer: SessionTimer; _, driver) -> Flow {
         match timer {
-            "heartbeat" => {
+            SessionTimer::Heartbeat => {
                 self.beats += 1;
-                driver.set_timer("heartbeat", Duration::from_millis(10));
+                driver.set_timer(SessionTimer::Heartbeat, Duration::from_millis(10));
                 Ok(Flow::Continue)
             }
-            "logon" => {
+            SessionTimer::Logon => {
                 driver.reply().extend_from_slice(b"logon timed out\n");
                 Ok(Flow::Close)
             }
-            _ => Ok(Flow::Continue),
         }
     }
 }
@@ -630,13 +569,13 @@ fn named_timers_run_side_by_side() {
     );
     h.open().unwrap();
     assert_eq!(
-        h.timer("logon"),
+        h.timer(SessionTimer::Logon),
         Some(fictionet::time::Instant::ZERO + Duration::from_millis(25))
     );
     h.advance(Duration::from_millis(20)).unwrap();
     assert_eq!(h.service().beats, 2);
     h.push(b"logon\n").unwrap();
-    assert_eq!(h.timer("logon"), None);
+    assert_eq!(h.timer(SessionTimer::Logon), None);
     h.advance(Duration::from_millis(30)).unwrap();
     assert!(!h.closed());
     assert_eq!(h.service().beats, 5);
@@ -860,7 +799,7 @@ fn datagram_services_send_several_datagrams_and_tick() {
             Lines::new(64, Ending::LfOrCrlf)
         }
         on_open(self; _, driver) -> Flow {
-            driver.set_timer("heartbeat", Duration::from_millis(20));
+            driver.set_timer((), Duration::from_millis(20));
             Ok(Flow::Continue)
         }
         on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
@@ -878,9 +817,9 @@ fn datagram_services_send_several_datagrams_and_tick() {
             }
             Ok(Flow::Continue)
         }
-        on_timer(self, _: Timer; subscriber, driver) -> Flow {
+        on_timer(self, _: (); subscriber, driver) -> Flow {
             driver.send_to(*subscriber, b"heartbeat".to_vec());
-            driver.set_timer("heartbeat", Duration::from_millis(20));
+            driver.set_timer((), Duration::from_millis(20));
             Ok(Flow::Continue)
         }
     }
@@ -1145,7 +1084,12 @@ fn every_serving_wait_reports_a_cancel() {
             .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
             .await?;
         let conn = listener.accept(&fcx).await?;
-        let handler: Arc<dyn httpd::Handler> = Arc::new(Router::new());
+        let handler: Arc<dyn httpd::Handler> = Arc::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        }));
         let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
         let got = after_a_cancel(&fcx, |region_fcx| async move {
             httpd::serve_connection(
@@ -1207,7 +1151,7 @@ fn every_serving_wait_reports_a_cancel() {
 }
 
 #[test]
-fn harness_service_http_and_faults_share_the_context_stream() {
+fn harness_service_and_http_share_the_context_stream() {
     use fictionet::{Entropy, Seed, SeededEntropy};
     let seed = Seed::from_u64(42);
     world::seeded_world(
@@ -1222,28 +1166,15 @@ fn harness_service_http_and_faults_share_the_context_stream() {
                 format!("{}\n", oracle.random_u64()).as_bytes()
             );
 
-            let mut faults = fictionet::stdlib::codec::Faults::new(64, 0);
-            let plan = [Rule {
-                when: Trigger::Chance { take: 1, out_of: 2 },
-                fault: ByteFault::Corrupt {
-                    offset: None,
-                    xor: 1,
-                },
-            }];
-            let mut bytes = Vec::new();
-            faults.bytes(&fcx, &plan, b"abc", &mut bytes).unwrap();
-            let mut expected = b"abc".to_vec();
-            if oracle.random_below(2) == 0 {
-                expected[oracle.random_below(3) as usize] ^= 1;
-            }
-            assert_eq!(bytes, expected);
-
             let stamp = Arc::new(Mutex::new(None));
             let seen = stamp.clone();
-            let router = Router::new().get("/", move |ex, _| {
-                *seen.lock().unwrap() = Some(ex.now());
-                http::Response::new(Bytes::from(ex.random_u64().to_le_bytes().to_vec()))
-            });
+            let router = fictionet_test_support::handler(
+                move |ex: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                      _: http::Request<bytes::Bytes>| {
+                    *seen.lock().unwrap() = Some(ex.now());
+                    http::Response::new(Bytes::from(ex.random_u64().to_le_bytes().to_vec()))
+                },
+            );
             let mut http =
                 Harness::new(Seed::from_u64(999), Http1::new(router), ()).with_fcx(fcx.clone());
             fcx.sleep(Duration::from_millis(1)).await?;

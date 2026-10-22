@@ -25,9 +25,7 @@
 //! the datagram's source address to [`answer_binding`], and sends the
 //! reply's bytes back. Over TCP, [`Stream<Frames<Frame>>`](fictionet::stdlib::codec::Stream)
 //! splits the byte stream into [`Frame`] values. Each frame's `.0` holds its
-//! exact bytes, including padding. Frames compose directly with
-//! [`codec::Interceptor`] and [`codec::Faults`]. Integrity values stay as raw bytes. World code
-//! computes HMACs over those original bytes, including their padding.
+//! exact bytes, including padding. World code computes HMACs over those original bytes, including their padding.
 //! Writing a [`Frame`] preserves those bytes. Writing a [`Message`] uses zero
 //! padding and recomputes FINGERPRINT.
 //! The message writer rejects invalid fields and leaves the destination unchanged.

@@ -1,4 +1,4 @@
-use fictionet::stdlib::codec::{Lcg, Stream, StreamEvent, Wire, finish};
+use fictionet::stdlib::codec::{Lcg, Stream, Wire, finish};
 use fictionet::stdlib::protocols::sse::{Event, Events, Limits, Line, RawLines};
 use fictionet::stdlib::test_support::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value, check_written,
@@ -103,18 +103,14 @@ fn raw_proxy_retains_comments_and_rewrites_data() {
         for chunk in chunks(input, sizes) {
             assert_eq!(stream.push(chunk), chunk.len());
             loop {
-                let mut skipped = Vec::new();
-                let result = stream.with_next_observed(
-                    |line, raw, _| (line, raw.to_vec()),
-                    |event| {
-                        if let StreamEvent::Skipped { bytes, .. } = event {
-                            skipped.extend_from_slice(bytes);
-                        }
-                    },
-                );
-                out.extend_from_slice(&skipped);
-                let Some(result) = result else { break };
-                let (line, raw) = result.unwrap();
+                let start = stream.offset() as usize;
+                let result = stream.with_next(|line, raw, range| (line, raw.to_vec(), range));
+                let Some(result) = result else {
+                    out.extend_from_slice(&input[start..stream.offset() as usize]);
+                    break;
+                };
+                let (line, raw, range) = result.unwrap();
+                out.extend_from_slice(&input[start..range.start as usize]);
                 if matches!(line, Line::Data(_)) {
                     let content = raw.trim_ascii_end();
                     let mut new = Vec::new();

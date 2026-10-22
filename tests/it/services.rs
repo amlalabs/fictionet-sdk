@@ -1,5 +1,5 @@
 //! The service layer: `serve` (the Service trait, the driver, the
-//! harness, transcripts and faults), events, `httpd` and `net`, each
+//! harness), events, `httpd` and `net`, each
 //! tested on its own and together in one world: a PLC
 //! that speaks Modbus/TCP and a web server, on one `Net`, with the
 //! dashboard's decoder reading both from the packets.
@@ -33,9 +33,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Event, Fields, Level};
 use fictionet::prelude::*;
-use fictionet::stdlib::codec::{
-    ByteFault, Ending, ItemFault, LineError, Lines, RecordKind, Rewrite, Rule, Side, Trigger, Wire,
-};
+use fictionet::stdlib::codec::{Ending, LineError, Lines, Wire};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::op::{Message, Query};
@@ -45,10 +43,10 @@ use fictionet::stdlib::protocols::modbus::{
     self, Exception, Frame, Request as MbRequest, Response as MbResponse,
 };
 use fictionet::stdlib::services::serve::{
-    self, Budget, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan,
-    ServeOptions, Served, Timer, Transcript, Upgrade,
+    self, Budget, Flow, Harness, HarnessError, Pending, PendingDriver, ServeOptions, Served,
+    Upgrade,
 };
-use fictionet::stdlib::web::httpd::{self, Http1, Router};
+use fictionet::stdlib::web::httpd::{self, Http1};
 use fictionet::stdlib::world::net::{Arrival, Host, Net, PortServer, PreparedShare, Sni};
 use fictionet::{Cx, block_on, lab, pair};
 use fictionet_observe::{Dissector, Registry};

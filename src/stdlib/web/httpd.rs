@@ -1,21 +1,13 @@
-//! HTTP as a service: a router whose handlers get plain byte bodies, an
-//! adapter that runs any tower service (axum included), and name-based
-//! virtual hosting, all on [`serve`].
+//! HTTP as a service: plain handlers, an adapter for tower services (axum
+//! included), and name-based virtual hosting, all on [`serve`].
 //!
 //! `Http1` is a caller-driven `Service` on the `http1` decoder.
 //! [`Http2`] uses the shared HTTP/2 frame layer and HPACK. Both servers run
 //! with `std` alone. `serve_connection` runs them over a live connection. TLS comes from
 //! `fictionet::stdlib::services::tls`. This module supplies no HTTP client.
 //!
-//! A [`Handler`] answers one request. Three kinds come ready:
+//! A [`Handler`] answers one request. Adapters and virtual hosting:
 //!
-//! - [`Router`]: routes by method and path to plain functions. A handler
-//!   gets an [`Exchange`] (the clock reading, randomness, the connection)
-//!   and an `http::Request<Bytes>`, and returns an `http::Response<Bytes>`.
-//!   No runtime is involved, so it unit-tests with
-//!   [`serve::Harness`]. An async route gets
-//!   a [`Cx`] instead. Callbacks run only with bodies held in full;
-//!   incomplete bodies get `400 Bad Request`.
 //! - [`tower`]: any `tower_service::Service<http::Request<Body>>`, such as an
 //!   `axum::Router`, run as deferred work of the connection.
 //! - [`VirtualHosts`]: picks a handler by the request's host, as a web server
@@ -43,7 +35,6 @@
 //! `Content-Length`, or uses the body's known length when none was set.
 //! Native HTTP/1 omits lengths for bodyless statuses and otherwise writes
 //! the body's known length or chooses framing for an unknown length.
-//! The hyper adapter leaves supplied lengths to hyper's framing rules.
 //! Native HTTP/1 writes its own `Connection` header. It closes the
 //! connection after a response, other than `101`, whose handler's
 //! `Connection` header names `close`, and drops the handler's other tokens.
@@ -55,11 +46,6 @@
 //! returns `101` with an [`UpgradeHandler`] extension to receive the connection
 //! after the response is written, including unread bytes. The stdlib's
 //! [`websocket`](fictionet::stdlib::protocols::websocket) codec can serve it directly.
-//! With the opt-in `tokio` feature, tower handlers use hyper's HTTP/1 upgrade
-//! extension so axum's `WebSocketUpgrade` continues to work: the tower adapter
-//! returns [`Reply::Handoff`], and the native server replays the request, body
-//! included, on hyper's HTTP/1 server.
-//!
 //! # Dates
 //!
 //! The world owns its dates. A response carries a `Date` header only when
@@ -87,14 +73,20 @@
 //! graceful shutdown drains admitted streams.
 //!
 //! ```
-//! use bytes::Bytes;
-//! use fictionet::stdlib::web::httpd::{Http1, Router};
+//! use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
 //! use fictionet::stdlib::services::serve::Harness;
 //!
-//! let router = Router::new()
-//!     .get("/hello", |_, _| http::Response::new(Bytes::from("hi\n")))
-//!     .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
-//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+//! struct Pages;
+//! impl Handler for Pages {
+//!     fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+//!         let body = match request.uri().path() {
+//!             "/hello" => Body::from("hi\n"),
+//!             _ => request.into_body(),
+//!         };
+//!         Reply::Now(http::Response::new(body))
+//!     }
+//! }
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages), ());
 //! let reply = h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
 //! assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
 //! assert!(reply.ends_with(b"\r\n\r\nhi\n"));
@@ -152,9 +144,6 @@
 //! an upgrade handoff are outside HTTP observation. A missing handler label
 //! does not show that nothing was exposed; consumers need complete receipt or
 //! an observer verdict to judge safety.
-//! If hyper's body read reports region cancellation, `received` is `cut_off`;
-//! its response still uses `answer: timeout` and status `408`. Consumers must
-//! use `received` to distinguish this from a body deadline.
 //! A connection that ends in an error is one `http.error` event, with
 //! `local`, `cause` (`protocol`, `timeout` or `transport`) and `detail`.
 
@@ -177,18 +166,13 @@ mod native;
 mod response;
 mod sites;
 
-fictionet::cfg_tokio! {
-/// The opt-in tower HTTP/1 upgrade adapter.
-mod upgrade;
-}
-
 pub use body::Body;
 pub use handlers::{
-    BadGateway, Exchange, Handler, Later, Reply, Router, Tower, UpgradeHandler, text, tower,
+    BadGateway, Exchange, Handler, Later, Reply, Tower, UpgradeHandler, text, tower,
 };
 
-pub use http2::Http2;
-pub use native::Http1;
+pub use http2::{Http2, Timer as Http2Timer};
+pub use native::{Http1, Timer as Http1Timer};
 pub use response::{date_header, http_date};
 pub use sites::{Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
 
@@ -335,19 +319,16 @@ pub struct Limits {
     pub head: http1::Limits,
     /// The largest request body held. An oversized body gets `413`
     /// without calling the handler. Native HTTP/1 drains the request
-    /// before answering and closes the connection. Hyper's HTTP/1
-    /// upgrade path and HTTP/2 reject it during collection.
+    /// before answering and closes the connection. HTTP/2 rejects it during collection.
     /// Default 64 MiB.
     pub body: usize,
     /// HTTP/1: how long a request's head may take to arrive, counted from
     /// when the service starts waiting for it, which includes the wait
-    /// between requests. This also applies to hyper's HTTP/1 upgrade
-    /// path. HTTP/2 has no request-head deadline. Default 30 seconds.
+    /// between requests. HTTP/2 has no request-head deadline. Default 30 seconds.
     pub header_timeout: Duration,
     /// How long a request's body may take to arrive, counted from its
     /// head, so a client that trickles a body cannot hold the connection
-    /// for ever. Native HTTP/1 closes the connection. Hyper's HTTP/1
-    /// upgrade path and HTTP/2 answer `408` when collection times out,
+    /// for ever. Native HTTP/1 closes the connection. HTTP/2 answers `408` when collection times out,
     /// or `400` on a body read error, without calling the handler.
     /// All these deadlines use the Fictionet clock. Default 30 seconds.
     pub body_timeout: Duration,
@@ -410,7 +391,7 @@ use fictionet::stdlib::protocols::http2::PREFACE;
 
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
-/// otherwise. Both versions work with `std`; hyper upgrades require `tokio`.
+/// otherwise. Both versions work with `std`.
 /// `info` names the connection in events.
 /// An empty half-close is silent. EOF within an HTTP/2 preface goes through
 /// HTTP/1's truncated-head handling: `http.error` with cause `protocol` and 400.
@@ -501,14 +482,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
                     Ok(())
                 };
             }
-            fictionet::cfg_tokio! {
-                // Hyper reads the request again and carries out its upgrade.
-                if let Some((head, tracker)) = service.handoff.take() {
-                    return upgrade::serve_upgrade(
-                        fcx, Prefixed::new(head, rest), handler, info, opts, tracker,
-                    ).await;
-                }
-            }
+
             Ok(())
         }
         Err(serve::ServeError::Cancelled) => Err(Cancelled),

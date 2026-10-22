@@ -94,9 +94,12 @@ fn installing_cloned_servers_keeps_virtual_hosts_separate() {
     fictionet::block_on(fictionet::lab(
         RunOptions::new(fictionet::Seed::from_u64(10)),
         |fcx| async move {
-            let server = httpd::Server::new(
-                httpd::Router::new().get("/", |_, _| http::Response::new("hello".into())),
-            );
+            let server = httpd::Server::new(fictionet_test_support::handler(
+                |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                 _: http::Request<bytes::Bytes>| {
+                    http::Response::new("hello".into())
+                },
+            ));
             let (attacher, attachments) = fictionet::attachments();
             Net::new()
                 .add_host(

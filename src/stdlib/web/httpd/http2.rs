@@ -18,7 +18,7 @@ use fictionet::stdlib::codec::{Fail, Wire};
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
 use fictionet::stdlib::services::serve::{
-    self, Done, Driver, Ended, Flow, Pending, PendingDriver, Timer,
+    self, Done, Driver, Ended, Flow, Pending, PendingDriver,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -29,7 +29,12 @@ use super::response::{
 };
 use super::{Body, BodyClassifier, Exchange, Handler, Later, Limits, Received, Reply, text};
 
-const DEADLINE: Timer = "http2 deadline";
+/// HTTP/2 stream deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Timer {
+    /// The next stream head or body deadline.
+    Deadline,
+}
 const RESET_LIFETIME: Duration = Duration::from_secs(1);
 const RESET_MAX: usize = 50;
 const PENDING_RESET_MAX: usize = 20;
@@ -147,7 +152,7 @@ impl Http2 {
         self.shutdown_requested = true;
     }
 
-    fn arm(&self, driver: &mut Driver<'_, Inputs>) {
+    fn arm(&self, driver: &mut Driver<'_, Inputs, Timer>) {
         let deadline = self
             .streams
             .values()
@@ -157,15 +162,15 @@ impl Http2 {
             .min();
         if let Some(at) = deadline {
             driver.set_timer(
-                DEADLINE,
+                Timer::Deadline,
                 at.since_start().saturating_sub(driver.now().since_start()),
             );
         } else {
-            driver.cancel_timer(DEADLINE);
+            driver.cancel_timer(Timer::Deadline);
         }
     }
 
-    fn goaway(&mut self, code: ErrorCode, last: u32, driver: &mut Driver<'_, Inputs>) {
+    fn goaway(&mut self, code: ErrorCode, last: u32, driver: &mut Driver<'_, Inputs, Timer>) {
         let last = last.min(self.goaway_last.unwrap_or(wire::MAX_WINDOW));
         self.goaway_last = Some(last);
         write(
@@ -179,7 +184,7 @@ impl Http2 {
         );
     }
 
-    fn fail(&mut self, error: wire::Error, driver: &mut Driver<'_, Inputs>) -> Flow {
+    fn fail(&mut self, error: wire::Error, driver: &mut Driver<'_, Inputs, Timer>) -> Flow {
         driver.emit("http", "error", |_| {
             error_event(driver.conn(), "protocol", error)
         });
@@ -187,7 +192,7 @@ impl Http2 {
         Flow::Close
     }
 
-    fn cancel(&mut self, id: u32, driver: &mut Driver<'_, Inputs>) {
+    fn cancel(&mut self, id: u32, driver: &mut Driver<'_, Inputs, Timer>) {
         driver.cancel_keyed(u64::from(id));
         self.send.lock().streams.remove(&id);
         if let Some(mut stream) = self.streams.remove(&id)
@@ -204,7 +209,7 @@ impl Http2 {
     }
 
     /// Resets stream `id` and ignores its late frames for a while.
-    fn write_reset(&mut self, id: u32, code: ErrorCode, driver: &mut Driver<'_, Inputs>) {
+    fn write_reset(&mut self, id: u32, code: ErrorCode, driver: &mut Driver<'_, Inputs, Timer>) {
         self.cancel(id, driver);
         write(
             &wire::Reset {
@@ -225,7 +230,7 @@ impl Http2 {
         &mut self,
         id: u32,
         code: ErrorCode,
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<(), wire::Error> {
         self.write_reset(id, code, driver);
         self.error_resets += 1;
@@ -250,7 +255,7 @@ impl Http2 {
         id: u32,
         received: Received,
         charged: usize,
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) {
         let stream = self.streams.get_mut(&id).expect("an admitted stream");
         stream.deadline = None;
@@ -308,13 +313,7 @@ impl Http2 {
                 (None, Some(response))
             }
             Reply::Later(work) => (Some(work), None),
-            Reply::Handoff(_) => (
-                None,
-                Some(error_response(
-                    &Error::msg("only HTTP/1.1 requests can be handed off"),
-                    driver.event_enabled("http", "request"),
-                )),
-            ),
+
         };
         driver.defer_keyed(
             u64::from(id),
@@ -346,7 +345,7 @@ impl Http2 {
     fn headers(
         &mut self,
         read: wire::BlockRead,
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<(), wire::Error> {
         let Some(block) = read.block else {
             return Ok(());
@@ -496,7 +495,7 @@ impl Http2 {
     fn data(
         &mut self,
         data: wire::Data,
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<(), wire::Error> {
         let id = data.stream;
         let size = data.data.len() + data.padding.as_ref().map_or(0, |p| p.len() + 1);
@@ -567,7 +566,7 @@ impl Http2 {
         Ok(())
     }
 
-    fn frame(&mut self, frame: Frame, driver: &mut Driver<'_, Inputs>) -> Result<(), wire::Error> {
+    fn frame(&mut self, frame: Frame, driver: &mut Driver<'_, Inputs, Timer>) -> Result<(), wire::Error> {
         if !self.received_settings && !matches!(&frame, Frame::Settings(s) if s.flags & 1 == 0) {
             return Err(problem(
                 ErrorCode::ProtocolError,
@@ -727,7 +726,7 @@ impl Http2 {
         Ok(())
     }
 
-    fn flow(&mut self, driver: &mut Driver<'_, Inputs>) -> Flow {
+    fn flow(&mut self, driver: &mut Driver<'_, Inputs, Timer>) -> Flow {
         if self.shutdown_requested && self.shutdown_ping.is_none() && !self.draining {
             self.shutdown_requested = false;
             let opaque = driver.random_u64().to_be_bytes();
@@ -745,6 +744,7 @@ impl Http2 {
 }
 
 impl serve::Service for Http2 {
+    type Timer = Timer;
     type Decoder = Inputs;
     type State = ();
     type Error = Infallible;
@@ -753,7 +753,7 @@ impl serve::Service for Http2 {
         Inputs::for_server(wire::DEFAULT_FRAME_SIZE)
     }
 
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_, Inputs>) -> Result<Flow, Infallible> {
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_, Inputs, Timer>) -> Result<Flow, Infallible> {
         write(
             &wire::Settings {
                 flags: 0,
@@ -778,7 +778,7 @@ impl serve::Service for Http2 {
         &mut self,
         item: Input,
         _: &(),
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<Flow, Infallible> {
         let result = match item {
             Input::Frame(frame) => self.frame(frame, driver),
@@ -814,7 +814,7 @@ impl serve::Service for Http2 {
         &mut self,
         _: Timer,
         _: &(),
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<Flow, Infallible> {
         let now = driver.now();
         if self.settings_deadline.is_some_and(|at| at <= now) {
@@ -842,7 +842,7 @@ impl serve::Service for Http2 {
         Ok(self.flow(driver))
     }
 
-    fn on_wake(&mut self, _: &(), driver: &mut Driver<'_, Inputs>) -> Result<Flow, Infallible> {
+    fn on_wake(&mut self, _: &(), driver: &mut Driver<'_, Inputs, Timer>) -> Result<Flow, Infallible> {
         Ok(self.flow(driver))
     }
 
@@ -851,7 +851,7 @@ impl serve::Service for Http2 {
         key: u64,
         done: Done,
         _: &(),
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<Flow, Infallible> {
         let id = key as u32;
         if id == 0 {
@@ -881,7 +881,7 @@ impl serve::Service for Http2 {
         &mut self,
         error: &Fail<wire::Error>,
         _: &(),
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<(), Infallible> {
         let error = match error {
             Fail::Protocol(error) => *error,
@@ -895,7 +895,7 @@ impl serve::Service for Http2 {
         &mut self,
         end: Ended,
         _: &(),
-        driver: &mut Driver<'_, Inputs>,
+        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<(), Infallible> {
         if end == Ended::Budget {
             // Tell the client why its streams stop, rather than just closing.
@@ -1402,7 +1402,7 @@ impl Pending for Sending {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{HttpOptions, PREFACE, Router};
+    use super::super::{HttpOptions, PREFACE};
     use super::*;
     use fictionet::events::ConnInfo;
     use fictionet::stdlib::network::{ConnError, Connection};
@@ -1465,9 +1465,13 @@ mod tests {
                     },
                     ..HttpOptions::default()
                 };
-                let handler = Router::new().post("/", |_, _| {
-                    panic!("a stalled body cannot reach the handler")
-                });
+                struct Reject;
+                impl Handler for Reject {
+                    fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+                        panic!("a stalled body cannot reach the handler")
+                    }
+                }
+                let handler = Reject;
                 let mut served = pin!(super::super::serve_connection(
                     &fcx,
                     conn,

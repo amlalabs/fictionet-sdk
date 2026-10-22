@@ -11,11 +11,11 @@ use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Versi
 use http_body::{Body as _, Frame};
 
 use fictionet::events::Fields;
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::network::ConnError;
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::services::serve::{
-    self, Driver, Ended, Flow, Pending, PendingDriver, Timer,
+    self, Driver, Ended, Flow, Pending, PendingDriver,
 };
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
@@ -34,10 +34,14 @@ use super::{
 // ---------------------------------------------------------------------------
 // HTTP/1 as a service
 
-/// [`Http1`]'s timer for a request's head.
-const HEAD: Timer = "head";
-/// [`Http1`]'s timer for a request's body.
-const BODY: Timer = "body";
+/// HTTP/1 request deadlines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Timer {
+    /// Waiting for the request head.
+    Head,
+    /// Waiting for the request body.
+    Body,
+}
 
 /// HTTP/1.0 and 1.1 for one connection, answering with a [`Handler`].
 pub struct Http1 {
@@ -47,10 +51,6 @@ pub struct Http1 {
     opts: Limits,
     /// The world's date at the start of the run, for `Date` headers.
     pub(super) date: Option<SystemTime>,
-    /// A request handed to hyper ([`Reply::Handoff`]), as bytes, once the
-    /// connection is handed over for it, with the tracker that has already
-    /// observed its head and body.
-    pub(super) handoff: Option<(Vec<u8>, Tracker)>,
     pub(super) upgrade: Option<UpgradeHandler>,
     head: Option<RequestHead>,
     body: Vec<u8>,
@@ -73,7 +73,6 @@ impl Http1 {
             tracker: None,
             opts,
             date: None,
-            handoff: None,
             upgrade: None,
             head: None,
             body: Vec::new(),
@@ -81,16 +80,6 @@ impl Http1 {
             started: Instant::ZERO,
             first_head_deadline: None,
         }
-    }
-
-    /// The request a handler handed off ([`Reply::Handoff`]), such as a
-    /// WebSocket handshake for axum, after the service handed the connection
-    /// back for it ([`Upgrade::Handoff`](serve::Upgrade::Handoff)): its head
-    /// and body as bytes, to be read again in front of the connection's unread ones.
-    /// [`serve_connection`](super::serve_connection) serves such a
-    /// connection on hyper's HTTP/1, which carries out the upgrade.
-    pub fn take_handoff(&mut self) -> Option<Vec<u8>> {
-        self.handoff.take().map(|(bytes, _)| bytes)
     }
 
     /// Sends a `Date` header with each response: `start`, the world's date
@@ -107,7 +96,7 @@ impl Http1 {
         self
     }
 
-    fn track(&mut self, head: &RequestHead, driver: &Driver<'_, http1::RequestEvents>) {
+    fn track(&mut self, head: &RequestHead, driver: &Driver<'_, http1::RequestEvents, Timer>) {
         let enabled = driver.event_enabled("http", "request");
         if !enabled || self.observe.is_none() {
             self.tracker = Some(Tracker::tracking(enabled));
@@ -125,7 +114,7 @@ impl Http1 {
 
     fn finish_receipt(
         &mut self,
-        driver: &mut Driver<'_, http1::RequestEvents>,
+        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
         received: Received,
     ) {
         if let Some(mut tracker) = self.tracker.take() {
@@ -148,7 +137,7 @@ impl Http1 {
         self.head = None;
     }
 
-    fn respond(&mut self, driver: &mut Driver<'_, http1::RequestEvents>) -> Flow {
+    fn respond(&mut self, driver: &mut Driver<'_, http1::RequestEvents, Timer>) -> Flow {
         let held = self.body.capacity();
         let body = Body::from(std::mem::take(&mut self.body));
         let close = self.too_big;
@@ -166,7 +155,7 @@ impl Http1 {
     /// `close` closes the connection after the answer.
     fn dispatch(
         &mut self,
-        driver: &mut Driver<'_, http1::RequestEvents>,
+        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
         body: Body,
         close: bool,
         held: usize,
@@ -207,6 +196,14 @@ impl Http1 {
             ))
         } else if lacks_host {
             Reply::Now(no_host(driver.event_enabled("http", "request")))
+        } else if request.headers().contains_key(http::header::UPGRADE)
+            && matches!(&request.body().0, Inner::Stream(_))
+        {
+            Reply::Now(answered(
+                status_only(StatusCode::BAD_REQUEST),
+                "cut_off",
+                driver.event_enabled("http", "request"),
+            ))
         } else {
             self.handler
                 .call(request, &mut Exchange::new(now, driver.entropy(), &conn))
@@ -223,30 +220,7 @@ impl Http1 {
         let (work, response) = match reply {
             Reply::Now(response) => (None, Some(response)),
             Reply::Later(work) => (Some(work), None),
-            Reply::Handoff(request) => {
-                // Hyper reads the request again, body included, in front of
-                // the bytes still unread.
-                if let Some(body) = request.body().bytes() {
-                    self.handoff = http1::Request {
-                        head,
-                        body: body.to_vec(),
-                    }
-                    .to_bytes()
-                    .ok()
-                    .map(|bytes| (bytes, tracker));
-                    driver.cancel_timer(BODY);
-                    return Flow::Upgrade(serve::Upgrade::Handoff);
-                }
-                // A body that was cut off cannot be read again.
-                (
-                    None,
-                    Some(answered(
-                        status_only(StatusCode::BAD_REQUEST),
-                        "cut_off",
-                        driver.event_enabled("http", "request"),
-                    )),
-                )
-            }
+
         };
         driver.defer(
             Streaming::new(work, response, version, head_only, close, tracker)
@@ -254,19 +228,19 @@ impl Http1 {
                 .holding_request(held),
         );
         if self.upgrade.is_some() {
-            driver.cancel_timer(BODY);
+            driver.cancel_timer(Timer::Body);
             Flow::Upgrade(serve::Upgrade::Handoff)
         } else {
             self.after(driver, close)
         }
     }
 
-    fn after(&mut self, driver: &mut Driver<'_, http1::RequestEvents>, close: bool) -> Flow {
-        driver.cancel_timer(BODY);
+    fn after(&mut self, driver: &mut Driver<'_, http1::RequestEvents, Timer>, close: bool) -> Flow {
+        driver.cancel_timer(Timer::Body);
         if close {
             return Flow::Close;
         }
-        driver.set_timer(HEAD, self.opts.header_timeout);
+        driver.set_timer(Timer::Head, self.opts.header_timeout);
         Flow::Continue
     }
 }
@@ -424,6 +398,7 @@ fn write_simple(
 }
 
 impl serve::Service for Http1 {
+    type Timer = Timer;
     type Decoder = http1::RequestEvents;
     type State = ();
     type Error = Infallible;
@@ -435,7 +410,7 @@ impl serve::Service for Http1 {
     fn on_open(
         &mut self,
         _: &(),
-        driver: &mut Driver<'_, http1::RequestEvents>,
+        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
     ) -> Result<Flow, Infallible> {
         let timeout = self
             .first_head_deadline
@@ -443,7 +418,7 @@ impl serve::Service for Http1 {
             .map_or(self.opts.header_timeout, |at| {
                 at.since_start().saturating_sub(driver.now().since_start())
             });
-        driver.set_timer(HEAD, timeout);
+        driver.set_timer(Timer::Head, timeout);
         Ok(Flow::Continue)
     }
 
@@ -451,12 +426,12 @@ impl serve::Service for Http1 {
         &mut self,
         item: H1<RequestHead>,
         _: &(),
-        driver: &mut Driver<'_, http1::RequestEvents>,
+        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
     ) -> Result<Flow, Infallible> {
         match item {
             H1::Head(head) => {
-                driver.cancel_timer(HEAD);
-                driver.set_timer(BODY, self.opts.body_timeout);
+                driver.cancel_timer(Timer::Head);
+                driver.set_timer(Timer::Body, self.opts.body_timeout);
                 if head.expects_continue() {
                     driver
                         .reply()
@@ -487,7 +462,7 @@ impl serve::Service for Http1 {
         &mut self,
         _: Timer,
         _: &(),
-        driver: &mut Driver<'_, http1::RequestEvents>,
+        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
     ) -> Result<Flow, Infallible> {
         let detail = if self.head.is_some() {
             Some("request body timed out")
@@ -522,7 +497,7 @@ impl serve::Service for Http1 {
         &mut self,
         error: &serve_fail::Fail,
         _: &(),
-        driver: &mut Driver<'_, http1::RequestEvents>,
+        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
     ) -> Result<(), Infallible> {
         if self.head.is_some() {
             let buffered = driver.unread().len();
@@ -605,7 +580,7 @@ impl serve::Service for Http1 {
         &mut self,
         end: Ended,
         _: &(),
-        driver: &mut Driver<'_, http1::RequestEvents>,
+        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
     ) -> Result<(), Infallible> {
         // The client broke off inside a request head, as by a reset. A head
         // cut off by the end of input fails the decoder and is logged there.
@@ -925,6 +900,7 @@ mod router_tests {
         }
         struct Start(Option<Checked>);
         impl Service for Start {
+    type Timer = ();
             type Decoder = Lines;
             type State = ();
             type Error = Infallible;

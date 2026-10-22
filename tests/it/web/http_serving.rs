@@ -570,24 +570,10 @@ async fn the_proxy_refuses_hosts_routed_by_default_host() {
     assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
 }
 
-/// An axum handler that echoes WebSocket text messages.
+/// A native handler that echoes WebSocket text messages.
 #[cfg(feature = "tokio")]
-fn echo_socket() -> axum::Router {
-    use axum::extract::ws::{Message as Ws, WebSocketUpgrade};
-    axum::Router::new().route(
-        "/echo",
-        axum::routing::get(|ws: WebSocketUpgrade| async move {
-            ws.on_upgrade(|mut socket| async move {
-                while let Some(Ok(message)) = socket.recv().await {
-                    if let Ws::Text(t) = message {
-                        let _ = socket
-                            .send(Ws::Text(format!("echo: {}", t.as_str()).into()))
-                            .await;
-                    }
-                }
-            })
-        }),
-    )
+fn echo_socket() -> fictionet_test_support::EchoSocket {
+    fictionet_test_support::EchoSocket
 }
 
 /// Makes a client's WebSocket handshake on `conn` for `host`, then sends
@@ -646,7 +632,7 @@ async fn websocket_echo<C: Connection>(
     }
 }
 
-/// An axum `WebSocketUpgrade` handler on `web::Sites`: the handshake, then
+/// A native WebSocket handler on `web::Sites`: the handshake, then
 /// messages both ways.
 #[cfg(feature = "tokio")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -657,7 +643,7 @@ async fn websockets_work_through_sites() {
             RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
-                web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket())))
+                web::Sites::new(|h| (h == "ws.test").then(|| web::Site::handler(echo_socket())))
                     .start(&fcx, attachments)?;
                 let m = default_machine(&fcx, &attacher);
                 let addr = lookup(&fcx, &m, "ws.test").await;

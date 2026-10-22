@@ -242,65 +242,6 @@ fn stun_frame_wire_checks_only_framing_and_is_transactional() {
     assert_eq!(contract::check_written(&frame), invalid_attribute);
 }
 
-#[test]
-fn stun_frames_compose_with_interception_and_fault_writing() {
-    use fictionet::stdlib::codec::{Faults, Interceptor, ItemFault, Rewrite, Rule, Trigger};
-
-    let bytes = stun_padded_request();
-    let input = bytes.repeat(2);
-    let mut stream = Stream::new(Frames::<stun::Frame>::new());
-    assert_eq!(stream.push(&input), input.len());
-    stream.end();
-    let proxy = Interceptor::new(input.len());
-    let mut intercepted = Vec::new();
-    while let Some(result) = proxy.next(&mut stream, &mut intercepted, |frame, raw, span| {
-        assert_eq!(frame.0, raw);
-        assert_eq!(raw, bytes);
-        assert_eq!(span.end - span.start, bytes.len() as u64);
-        Rewrite::Replace(vec![frame.clone()])
-    }) {
-        result.unwrap();
-    }
-    assert!(stream.is_done());
-    assert_eq!(intercepted, input);
-
-    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
-    let mut faults = Faults::new(3 * bytes.len(), 0);
-    let plan = [
-        Rule {
-            when: Trigger::At(1),
-            fault: ItemFault::Action {
-                delay: None,
-                rewrite: Rewrite::Replace(vec![stun::Frame::parse(&bytes).unwrap()]),
-            },
-        },
-        Rule {
-            when: Trigger::At(2),
-            fault: ItemFault::Action {
-                delay: None,
-                rewrite: Rewrite::Repeat(2),
-            },
-        },
-    ];
-    let mut stream = Stream::new(Frames::<stun::Frame>::new());
-    let mut output = Vec::new();
-    for chunk in intercepted.chunks(3) {
-        assert_eq!(stream.push(chunk), chunk.len());
-        while let Some(result) = faults.next(&entropy, &mut stream, &mut output, &plan) {
-            assert_eq!(result.unwrap(), None);
-        }
-    }
-    stream.end();
-    assert!(
-        faults
-            .next(&entropy, &mut stream, &mut output, &plan)
-            .is_none()
-    );
-    faults.flush(&mut output).unwrap();
-    assert!(stream.is_done());
-    assert_eq!(output, bytes.repeat(3));
-}
-
 fn media_packet() -> rtp::Packet {
     rtp::Packet {
         marker: true,

@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::services::serve::{Ended, Flow, Pending, PendingDriver, Timer, Upgrade};
+use fictionet::stdlib::services::serve::{Ended, Flow, Pending, PendingDriver, Upgrade};
 
 /// Echoes each line, closes on `quit`, hands over on `handoff`, and on
 /// `later` answers through deferred work.
@@ -100,7 +100,7 @@ service_fixture! {
     }
 
     on_open(self; _, driver) -> Flow {
-        driver.set_timer("tick", Duration::from_millis(30));
+        driver.set_timer((), Duration::from_millis(30));
         Ok(Flow::Continue)
     }
 
@@ -108,13 +108,13 @@ service_fixture! {
         Ok(Flow::Continue)
     }
 
-    on_timer(self, _: Timer; _, driver) -> Flow {
+    on_timer(self, _: (); _, driver) -> Flow {
         self.ticks += 1;
         driver.reply().extend_from_slice(b"tick\n");
         if self.ticks == 3 {
             return Ok(Flow::Close);
         }
-        driver.set_timer("tick", Duration::from_millis(30));
+        driver.set_timer((), Duration::from_millis(30));
         Ok(Flow::Continue)
     }
 }

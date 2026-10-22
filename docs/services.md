@@ -9,10 +9,10 @@ collection and retention.
 
 | Module | What it gives |
 |---|---|
-| `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests, transcripts and fault plans |
+| `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests |
 | `fictionet::events` | Core's four observation streams and observer contract. The companion owns retention; no observer means no observation work. |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
-| `httpd` | HTTP as a service: `Router`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
+| `httpd` | HTTP as a service: `Handler`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
 
 UDP sockets and Net's DHCP server read only the declared UDP datagram.
@@ -138,6 +138,7 @@ use fictionet::stdlib::services::serve::{Flow, Driver, Service};
 struct Prompt;
 
 impl Service for Prompt {
+    type Timer = ();
     type Decoder = Lines;
     type State = String; // the right password, shared by every connection
     type Error = std::convert::Infallible;
@@ -146,12 +147,12 @@ impl Service for Prompt {
         Lines::new(256, Ending::LfOrCrlf)
     }
 
-    fn on_open(&mut self, _: &String, driver: &mut Driver<'_, Self::Decoder>) -> Result<Flow, Self::Error> {
+    fn on_open(&mut self, _: &String, driver: &mut Driver<'_, Self::Decoder, Self::Timer>) -> Result<Flow, Self::Error> {
         driver.reply().extend_from_slice(b"password: ");
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_, Self::Decoder>) -> Result<Flow, Self::Error> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_, Self::Decoder, Self::Timer>) -> Result<Flow, Self::Error> {
         let line = line.unwrap_or_default();
         let right = line == password.as_bytes();
         driver.emit("prompt", "login", |event| event
@@ -171,7 +172,7 @@ is made fresh for each connection.
 
 A service can also:
 
-- **Run timers.** `driver.set_timer("heartbeat", d)` arms a named timer and
+- **Run timers.** `driver.set_timer(Timer::Heartbeat, d)` arms a timer from the service's `type Timer` enum and
   `on_timer` hears which one went off. A FIX session has four (heartbeat,
   TestRequest, logon, logout), each armed and cancelled on its own. A due
   timer is handled before more input is read, so a client that never
@@ -216,7 +217,7 @@ The final shutdown waits at most five seconds. Its failure adds a `shutdown`
 field to `conn.close`, such as `cancelled`, `timed_out`, `reset` or `closed`.
 The `end` field keeps the primary cause. A shutdown cancellation returns
 `ServeError::Cancelled`; other shutdown failures keep `Served::Closed(end)`.
-An earlier service, deferred-work or fault-plan failure stays primary.
+An earlier service or deferred-work failure stays primary.
 
 A task spawned in the connection's child region can fail and cancel that
 region. Its original error is recorded once as `conn.error`, with kind `task`
@@ -312,9 +313,7 @@ smaller connection-header limit before parsing COTP.
 
 STUN stream framing uses `codec::Frames<stun::Frame>`. It yields
 `stun::Frame` values, not `Vec<u8>`; read a frame's bytes through `.0`.
-The frame implements `Wire`, so it can pass directly through
-`codec::Interceptor::next` and `codec::Faults::next`, including replacement
-writing. Framing still checks only the header and length. Reading and
+The frame implements `Wire`, so a caller can write it directly. Framing still checks only the header and length. Reading and
 writing a frame preserves the original attributes and nonzero padding.
 Use `stun::Message::parse(&frame.0)` to interpret attributes. Writing that
 message uses zero padding and recomputes FINGERPRINT.
@@ -542,7 +541,7 @@ body framing, so a clean FIN short of Content-Length is not detected.
 Other kinds of port:
 
 - `tcp_with(port, world, make, opts)`: the same, with `ServeOptions` for
-  a connection cap, an idle limit, a fault plan or a STARTTLS config.
+  a connection cap, an idle limit or a STARTTLS config.
   Setting `opts.connection_events` to false turns the `conn.open` and
   `conn.close` events off.
 - `udp(port, world, make)`: one service for the port, which gets every
@@ -579,7 +578,7 @@ TLS ownership and reproducibility are split across these files:
 
 [Repeatable runs](../src/guide/running.rs) describes external I/O and clock
 limits. [`httpd.rs`](../src/stdlib/web/httpd.rs) says how the native HTTP/2
-server keeps time. Only opt-in axum upgrades use hyper's own time.
+server keeps time.
 
 Each peer address may hold 256 connections at once across all machines
 and gateway DNS listeners in the network. Bytes held by the service layer
@@ -591,8 +590,7 @@ replies, and what the service and its deferred work report holding.
 Memory outside those counts, such as hyper's own buffers, is not charged.
 `Net::limits` changes these limits and the TLS handshake and DNS timers.
 Its handshake timer also applies to STARTTLS. Tests set small ones.
-`fictionet::run(fictionet::RunOptions::new(seed), world)` gives TCP, UDP, services, HTTP exchanges and
-fault decisions one ChaCha20 byte stream through `Cx`. The same seed and
+`fictionet::run(fictionet::RunOptions::new(seed), world)` gives TCP, UDP, services, HTTP exchanges one ChaCha20 byte stream through `Cx`. The same seed and
 ordered draws produce the same numbers. HTTP/2 handlers also draw from
 this run stream, so their execution order matters.
 
@@ -636,25 +634,20 @@ A write with different starting bytes reports only its own bytes.
 
 ## 4. HTTP
 
-HTTP is a service like the others. A `Router`'s handlers get the request
-with its body as bytes, and return a response:
+HTTP is a service like the others. Implement `httpd::Handler` for a
+custom handler, or use axum through the tower adapter:
 
 ```rust
-use bytes::Bytes;
-use fictionet::stdlib::web::httpd::Router;
-
-let api = Router::new()
-    .get("/status", |_, _| http::Response::new(Bytes::from("ok\n")))
-    .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
+use fictionet::stdlib::web::httpd;
+let api = httpd::tower(axum::Router::new()
+    .route("/status", axum::routing::get(|| async { "ok\n" })));
 ```
 
-`Router` calls byte callbacks only with bodies held in full. An incomplete
-body gets `400 Bad Request` before routing, so it never reaches a route or
-the fallback, and never gets the usual `404` or `405`. A valid empty body
-still reaches the callback. On native HTTP/1, a custom `httpd::Handler` or tower service
-can read a cut-off body frame by frame: it gets the bytes received, then
-an error. HTTP/2 and hyper's HTTP/1 upgrade path reject body collection
-errors before calling any handler.
+On native HTTP/1, a handler can read a cut-off body frame by frame:
+it gets the bytes received, then an error. HTTP/2 rejects body collection
+errors before calling a handler. Protocol upgrades use a `101` response
+with an `httpd::UpgradeHandler` extension, which receives the connection
+and its unread bytes after the response is written.
 
 An axum `Router`, or any tower service over `http::Request<web::Body>`,
 runs with `httpd::tower(service)`. A handler adds facts to its request's
@@ -669,8 +662,7 @@ All backends suppress response bodies for `HEAD`, informational statuses,
 `204` and `304`. For other statuses, `HEAD` uses a supplied `Content-Length`
 to describe the body a GET would have, or the known body length. Native
 HTTP/1 omits lengths for bodyless statuses and uses the body's length for
-other responses. The hyper adapter leaves supplied lengths to hyper's framing
-rules. All backends keep a supplied `Date`; otherwise they use the world's
+other responses. Both versions keep a supplied `Date`; otherwise they use the world's
 date, when set.
 
 On a network, `httpd::Server` is the `PortServer` that serves a handler on a
@@ -704,9 +696,8 @@ or the reverse. The first default at each endpoint keeps the role. Names
 are matched without case or a trailing dot. `Net` itself knows nothing of
 HTTP, so a copy of `httpd` with its own handlers plugs in the same way.
 Copy `src/stdlib/web/httpd.rs` together with `src/stdlib/web/httpd/`, keeping the
-relative paths. Each serving engine has its own file there: `http1.rs` for
-native HTTP/1, `http2.rs` for native HTTP/2, and `hyper.rs` for the tower
-upgrades that the opt-in `tokio` feature hands to hyper.
+relative paths. Each serving engine has its own file there: `native.rs` for
+HTTP/1 and `http2.rs` for HTTP/2.
 
 Each routed request carries an `httpd::Target`. Its `routing` field is
 `Routing::Exact` when the requested host matches a registered name, or
@@ -754,12 +745,12 @@ and never reach the handler.
 
 An oversized request body gets `413` without calling the handler. Native
 HTTP/1 drains the request before answering and closes the connection.
-Hyper's HTTP/1 upgrade path and HTTP/2 reject it during body collection.
-Native HTTP/1 closes on a body deadline. Both hyper paths answer `408` when
+HTTP/2 rejects it during body collection.
+Native HTTP/1 closes on a body deadline. HTTP/2 answers `408` when
 body collection times out and `400` when reading the body fails, before
 calling the handler. A transport failure may prevent that answer reaching
-the client. HTTP/1 head deadlines include the wait between requests, also
-after handoff to hyper. HTTP/2 has no request-head deadline. Body deadlines
+the client. HTTP/1 head deadlines include the wait between requests.
+HTTP/2 has no request-head deadline. Body deadlines
 and write stall deadlines use the Fictionet clock on every backend.
 
 An empty half-close before the first request makes no HTTP error event.
@@ -880,6 +871,7 @@ struct Mailbox {
 }
 
 impl Service for Mailbox {
+    type Timer = ();
     type Decoder = smtp::Inputs;
     type State = ();
     type Error = smtp::Error;
@@ -892,7 +884,7 @@ impl Service for Mailbox {
         &mut self,
         item: Result<smtp::Input, smtp::Error>,
         _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
+        driver: &mut Driver<'_, Self::Decoder, Self::Timer>,
     ) -> Result<Flow, Self::Error> {
         match item? {
             smtp::Input::Command(command) if command.verb == "DATA" => {
@@ -940,18 +932,6 @@ Source compatibility: exhaustive matches on `smtp::Input` must handle the
 new `Line` variant. Raw responses are emitted only when the caller selects
 them. Existing command and DATA parsing keeps its grammar and limits.
 
-Calling `Driver::decoder()` or upgrading the connection stops item faults and
-emits the `conn.faults` event with a `stopped` field. `Driver::peek_decoder()`
-reads decoder state without stopping item faults. Byte faults continue. Over
-UDP, decoder access applies to the current datagram; each new datagram starts
-with a fresh decoder.
-
-A fault rule that cannot be applied is a world configuration error. Byte,
-item and held-item flush errors close the connection with `Ended::Closed`
-and return `ServeError::Faults` or `HarnessError::Faults`. The failed
-operation forwards no bytes. Deferred work is cancelled, with its written
-byte count preserved. No more output is queued. A running service receives
-`on_end(Ended::Closed)` instead of `on_fail`. If `on_end` itself triggers the
-fault error, it is not called again.
-`connection` records a Notice-level `conn.error` with `kind: faults`,
-`direction: inbound`, `outbound` or `items`, and the error chain in `error`.
+`Driver::decoder()` changes the active decoder between items.
+`Driver::peek_decoder()` reads its state. Over UDP, decoder access applies
+to the current datagram; each new datagram starts with a fresh decoder.

@@ -928,6 +928,7 @@ fn a_named_service_selects_its_presenter_without_a_matcher() {
     }
     struct Server;
     impl Service for Server {
+        type Timer = ();
         type Decoder = Echo;
         type State = ();
         type Error = std::convert::Infallible;

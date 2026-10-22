@@ -17,8 +17,8 @@ type Boxed = Pin<Box<dyn http_body::Body<Data = Bytes, Error = Error> + Send>>;
 /// The service reads a request's body before calling the handler. On
 /// native HTTP/1, a cut-off body reaches a custom [`Handler`](super::Handler) or tower
 /// service as a stream of the bytes received, followed by an error.
-/// [`Router`](super::Router) rejects it. HTTP/2 and hyper's HTTP/1 upgrade path reject
-/// body collection errors before calling any handler.
+/// HTTP/1 upgrade requests and HTTP/2 requests with body collection errors
+/// are rejected before calling any handler.
 /// A response's body may stream, as a tower service's does; one whose
 /// length is known goes out with `content-length`.
 pub struct Body(pub(super) Inner);

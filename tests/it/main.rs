@@ -7,7 +7,6 @@ mod common;
 mod asn1_codec;
 mod bodies_codec;
 mod cme_unknown_enum;
-mod codec_tools;
 mod codegen;
 #[cfg(feature = "std")]
 mod compose;

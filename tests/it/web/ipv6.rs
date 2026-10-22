@@ -377,6 +377,7 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
 
     struct Quiet;
     impl Service for Quiet {
+        type Timer = ();
         type Decoder = Lines;
         type State = ();
         type Error = Infallible;
@@ -409,9 +410,10 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
         );
         let site = |label: &'static str, default| {
             let config = config.clone();
-            let server = httpd::Server::new(
-                httpd::Router::new().get("/", move |_, _| Response::new(label.into())),
-            )
+            let server = httpd::Server::new(fictionet_test_support::handler(
+                move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                      _: http::Request<bytes::Bytes>| Response::new(label.into()),
+            ))
             .tls_with(move |_| config.clone())
             .plain_http();
             if default {

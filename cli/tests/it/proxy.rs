@@ -115,24 +115,9 @@ impl World {
                         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
                     let secure = axum::Router::new().route("/", get(|| async { "secure site\n" }));
 
-                    let ws = axum::Router::new().route(
-                        "/echo",
-                        get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
-                            ws.on_upgrade(|mut socket| async move {
-                                while let Some(Ok(axum::extract::ws::Message::Text(t))) =
-                                    socket.recv().await
-                                {
-                                    let reply = format!("echo: {}", t.as_str());
-                                    let _ = socket
-                                        .send(axum::extract::ws::Message::Text(reply.into()))
-                                        .await;
-                                }
-                            })
-                        }),
-                    );
                     let mut net = web::Sites::new(move |host: &str| match host {
                         "plain.test" => Some(web::Site::new(app.clone())),
-                        "ws.test" => Some(web::Site::new(ws.clone())),
+                        "ws.test" => Some(web::Site::handler(fictionet_test_support::EchoSocket)),
                         "secure.test" => Some(
                             web::Site::new(secure.clone())
                                 .at(SECURE)
@@ -1393,12 +1378,15 @@ mod routing {
 
     #[test]
     fn virtual_hosts_report_exact_and_fallback_matches() {
-        let site = VHost::new(httpd::Router::new().fallback(|_, request| {
-            let target = request.extensions().get::<Target>().unwrap().clone();
-            let mut response = Response::new(bytes::Bytes::new());
-            response.extensions_mut().insert(target);
-            response
-        }));
+        let site = VHost::new(fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             request: http::Request<bytes::Bytes>| {
+                let target = request.extensions().get::<Target>().unwrap().clone();
+                let mut response = Response::new(bytes::Bytes::new());
+                response.extensions_mut().insert(target);
+                response
+            },
+        ));
         let vhosts = VirtualHosts::new();
         vhosts.insert("allowed.test", site.clone());
         vhosts.set_default(site);
@@ -1446,7 +1434,6 @@ mod upstream {
         match reply {
             httpd::Reply::Now(response) => response,
             httpd::Reply::Later(work) => work(fcx.clone()).await.unwrap(),
-            httpd::Reply::Handoff(_) => panic!("ordinary request asked for an upgrade handoff"),
         }
     }
 

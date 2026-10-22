@@ -4,7 +4,12 @@
 #[test]
 fn http_alpn_matches_transport_features() {
     use fictionet::stdlib::{web::httpd, world::net::PortServer};
-    let server = httpd::Server::new(httpd::Router::new());
+    let server = httpd::Server::new(fictionet_test_support::handler(|_, _| {
+        ::http::Response::builder()
+            .status(404)
+            .body(bytes::Bytes::new())
+            .unwrap()
+    }));
     assert_eq!(server.alpn(), [b"h2".to_vec(), b"http/1.1".to_vec()]);
 }
 
@@ -68,8 +73,12 @@ mod http {
         fictionet::block_on(fictionet::lab(
             RunOptions::new(Seed::from_u64(1)),
             |fcx| async move {
-                let router = httpd::Router::new()
-                    .get("/", |_, _| http::Response::new("hello over h2".into()));
+                let router = fictionet_test_support::handler(
+                    |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                     _: http::Request<bytes::Bytes>| {
+                        http::Response::new("hello over h2".into())
+                    },
+                );
                 let mut conn = client(&fcx, router).await;
                 let mut input = http2::PREFACE.to_vec();
                 http2::Settings {
@@ -166,7 +175,7 @@ mod http {
                 self.0.call(request, ex)
             }
         }
-        // Only a request replayed on hyper, body included, carries OnUpgrade.
+        // The tower service receives the native request body.
         async fn echo(request: axum::extract::Request) -> String {
             let upgradable = request
                 .extensions()
@@ -186,14 +195,14 @@ mod http {
                 input.extend_from_slice(body);
                 conn.write_all(&fcx, &input).await?;
                 assert!(head(&fcx, &mut conn).await.starts_with("http/1.1 200"));
-                let mut bytes = [0; 9];
+                let mut bytes = [0; 10];
                 let mut at = 0;
                 while at < bytes.len() {
                     let n = conn.read(&fcx, &mut bytes[at..]).await?;
                     assert_ne!(n, 0);
                     at += n;
                 }
-                assert_eq!(&bytes, b"true body");
+                assert_eq!(&bytes, b"false body");
                 fcx.cancel();
                 Ok(())
             })).unwrap();
@@ -223,7 +232,7 @@ mod http {
     #[test]
     fn upgrade_request_can_receive_an_ordinary_response() {
         fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(2)), |fcx| async move {
-            let router = httpd::Router::new().get("/", |_, _| http::Response::new("route response".into()));
+            let router = fictionet_test_support::handler(|_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| http::Response::new("route response".into()));
             let mut conn = client(&fcx, router).await;
             conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n").await?;
             assert!(head(&fcx, &mut conn).await.starts_with("http/1.1 200"));
@@ -259,11 +268,11 @@ mod http {
             }
         }
         fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(3)), |fcx| async move {
-            let router = httpd::Router::new().get("/", |_, request| {
+            let router = fictionet_test_support::handler(|_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, request: http::Request<bytes::Bytes>| {
                 let headers: Vec<_> = request.headers().iter().map(|(n, v)| (n.as_str(), v.to_str().unwrap())).collect();
                 let upgrade = websocket::check_request(&headers).unwrap();
                 let info = request.extensions().get::<fictionet::events::ConnInfo>().unwrap().clone();
-                let mut response = http::Response::builder().status(101);
+                let mut response = ::http::Response::builder().status(101);
                 for (name, value) in upgrade.response_headers(None).unwrap() { response = response.header(name, value); }
                 let mut response = response.body(bytes::Bytes::new()).unwrap();
                 response.extensions_mut().insert(httpd::UpgradeHandler::new(move |fcx, conn| async move {

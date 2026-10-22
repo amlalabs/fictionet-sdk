@@ -25,15 +25,16 @@
 //! # struct Ldap; struct Plc; struct Directory; struct Plant;
 //! # macro_rules! svc { ($t:ty, $w:ty) => {
 //! # impl serve::Service for $t {
+//!     type Timer = ();
 //! #     type Decoder = fictionet::stdlib::codec::Lines; type State = $w; type Error = std::convert::Infallible;
 //! #     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
-//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_, Self::Decoder>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
+//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_, Self::Decoder, Self::Timer>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
 //! # } } }
 //! # svc!(Ldap, Directory); svc!(Plc, Plant);
 //! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! let directory = Arc::new(Directory);
 //! let plant = Arc::new(Plant);
-//! let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
+//! let intranet = httpd::tower(axum::Router::new().route("/", axum::routing::get(|| async { "intranet\n" })));
 //! Net::new()
 //!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
 //!     .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))

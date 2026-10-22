@@ -13,11 +13,10 @@ use std::time::{Duration, UNIX_EPOCH};
 use bytes::Bytes;
 use fictionet::events::{Event, Fields};
 use fictionet::prelude::*;
-use fictionet::stdlib::codec::{ByteFault, Rule, Trigger};
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::services::serve::{FaultPlan, Flow, Plan, ServeOptions};
+use fictionet::stdlib::services::serve::{Flow, ServeOptions};
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::world::sandbox::TlsClient;
 use fictionet::stdlib::{
@@ -69,40 +68,7 @@ impl http_body::Body for BrokenBody {
     }
 }
 
-/// Switches `/upgrade` to a protocol that sends `upgraded\n`: through
-/// hyper's upgrade with the `tokio` feature.
-#[cfg(feature = "tokio")]
-fn upgrade(mut request: Request<httpd::Body>) -> httpd::Reply {
-    if request
-        .extensions()
-        .get::<hyper::upgrade::OnUpgrade>()
-        .is_none()
-    {
-        return httpd::Reply::Handoff(request);
-    }
-    let upgrade = hyper::upgrade::on(&mut request);
-    httpd::Reply::Later(Box::new(move |cx| {
-        Box::pin(async move {
-            cx.spawn(move |_| async move {
-                let mut io = upgrade.await?;
-                std::future::poll_fn(|cx| {
-                    hyper::rt::Write::poll_write(Pin::new(&mut io), cx, b"upgraded\n")
-                })
-                .await?;
-                Ok(())
-            });
-            Ok(Response::builder()
-                .status(101)
-                .header("connection", "upgrade")
-                .header("upgrade", "echo")
-                .body(httpd::Body::empty())?)
-        })
-    }))
-}
-
-/// Switches `/upgrade` to a protocol that sends `upgraded\n`: through the
-/// native server's upgrade without the `tokio` feature.
-#[cfg(not(feature = "tokio"))]
+/// Switches `/upgrade` to a protocol that sends `upgraded\n`.
 fn upgrade(_: Request<httpd::Body>) -> httpd::Reply {
     let mut response = Response::builder()
         .status(101)
@@ -193,15 +159,7 @@ async fn episode(
                 7,
                 Arc::new(()),
                 || Echo,
-                ServeOptions::default()
-                    .idle(Some(Duration::from_secs(120)))
-                    .faults(FaultPlan::new(Plan {
-                        outbound: vec![Rule {
-                            when: Trigger::Chance { take: 1, out_of: 2 },
-                            fault: ByteFault::Delay(Duration::from_millis(3)),
-                        }],
-                        ..Plan::default()
-                    })),
+                ServeOptions::default().idle(Some(Duration::from_secs(120))),
             )
         })
         .host("https", |h| {

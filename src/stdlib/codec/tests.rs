@@ -1434,15 +1434,6 @@ fn wrappers_chain_to_their_source_and_display_only_their_own_context() {
     assert!(chained(&PumpError::<_, TestError>::Decode(fail.clone())));
     assert!(chained(&PumpError::<TestError, _>::Handler(TestError)));
     assert!(chained(&RewriteError::Write(TestError)));
-    assert!(chained(&FaultError::Rewrite(RewriteError::Write(
-        TestError
-    ))));
-    assert!(chained(&InterceptError::<_, TestError>::Decode(
-        fail.clone()
-    )));
-    assert!(chained(&InterceptError::<TestError, _>::Rewrite(
-        RewriteError::Write(TestError)
-    )));
     assert!(!fail.to_string().contains(&TestError.to_string()));
     for verdict in [
         Fail::<TestError>::Truncated { unread: 2 },

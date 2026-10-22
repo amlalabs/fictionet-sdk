@@ -239,7 +239,13 @@ struct Dns {
     tcp: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryTimer {
+    Idle,
+}
+
 impl Service for Dns {
+    type Timer = QueryTimer;
     type Decoder = DnsQueries;
     type State = State;
     type Error = core::convert::Infallible;
@@ -254,10 +260,10 @@ impl Service for Dns {
     fn on_open(
         &mut self,
         state: &State,
-        driver: &mut serve::Driver<'_, DnsQueries>,
+        driver: &mut serve::Driver<'_, DnsQueries, QueryTimer>,
     ) -> Result<serve::Flow, Self::Error> {
         if self.tcp {
-            driver.set_timer("query", state.tcp_idle);
+            driver.set_timer(QueryTimer::Idle, state.tcp_idle);
         }
         Ok(serve::Flow::Continue)
     }
@@ -266,7 +272,7 @@ impl Service for Dns {
         &mut self,
         query: Vec<u8>,
         state: &State,
-        driver: &mut serve::Driver<'_, DnsQueries>,
+        driver: &mut serve::Driver<'_, DnsQueries, QueryTimer>,
     ) -> Result<serve::Flow, Self::Error> {
         let answered = answer(&*state.lookup, &query);
         driver.emit("dns", "query", |_| answered.event(self.tcp));
@@ -285,9 +291,9 @@ impl Service for Dns {
 
     fn on_timer(
         &mut self,
-        _: serve::Timer,
+        _: QueryTimer,
         _: &State,
-        _: &mut serve::Driver<'_, DnsQueries>,
+        _: &mut serve::Driver<'_, DnsQueries, QueryTimer>,
     ) -> Result<serve::Flow, Self::Error> {
         Ok(serve::Flow::Close)
     }

@@ -22,13 +22,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Event};
-use fictionet::stdlib::codec::{Ending, ItemFault, LineError, Lines, Rewrite, Rule, Trigger, Wire};
+use fictionet::stdlib::codec::{Ending, LineError, Lines, Wire};
 use fictionet::stdlib::protocols::json;
-use fictionet::stdlib::services::serve::{
-    self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeOptions,
-};
+use fictionet::stdlib::services::serve::{self, Budget, Ended, Flow, Harness, ServeOptions};
 use fictionet::stdlib::web::httpd::{
-    self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply, Router,
+    self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply,
 };
 use fictionet::stdlib::{
     network::{Connection, ConnectionExt, ip, tcp},
@@ -52,14 +50,17 @@ async fn hyper_exposure(
 ) -> fictionet::Result {
     let (server, client) = two_machines(&fcx);
     let observer = Arc::new(Exposure::default());
-    let router = Router::new().post("/login", move |_, _| {
-        assert_eq!(
-            received,
-            httpd::Received::Complete,
-            "rejected body reached handler"
-        );
-        http::Response::new(Bytes::new())
-    });
+    let router = fictionet_test_support::handler(
+        move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+              _: http::Request<bytes::Bytes>| {
+            assert_eq!(
+                received,
+                httpd::Received::Complete,
+                "rejected body reached handler"
+            );
+            http::Response::new(Bytes::new())
+        },
+    );
     let budget = Budget::new(H2_INPUT + 8000);
     let opts = HttpOptions {
         limits: Limits {
@@ -155,9 +156,12 @@ fn observer_sees_no_host_body() {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
         let hosts = httpd::VirtualHosts::new();
-        hosts.set_default(httpd::VHost::new(Router::new().post("/login", |_, _| {
-            panic!("request without a host reached handler")
-        })));
+        hosts.set_default(httpd::VHost::new(fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| {
+                panic!("request without a host reached handler")
+            },
+        )));
         serve_http(
             &fcx,
             &server,
@@ -266,7 +270,10 @@ fn observer_sees_metadata_budget_rejection() {
     crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
-        let router = Router::new().get("/", |_, _| panic!("metadata was not admitted"));
+        let router = fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| panic!("metadata was not admitted"),
+        );
         serve_http(
             &fcx,
             &server,
@@ -312,7 +319,10 @@ fn observer_keeps_concurrent_request_identity() {
     crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
-        let router = Router::new().post("/clean", |_, _| http::Response::new(Bytes::new()));
+        let router = fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| http::Response::new(Bytes::new()),
+        );
         serve_http(
             &fcx,
             &server,
@@ -378,7 +388,10 @@ fn observer_sees_upgrade_path_body_limit() {
     crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
-        let router = Router::new().post("/", |_, _| panic!("oversized body reached handler"));
+        let router = fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| panic!("oversized body reached handler"),
+        );
         serve_http(
             &fcx,
             &server,
@@ -411,70 +424,6 @@ fn observer_sees_upgrade_path_body_limit() {
             *observer.ends.lock().unwrap(),
             [("/".into(), 20, httpd::Received::TooLarge)]
         );
-        Ok(())
-    });
-}
-
-#[cfg(feature = "tokio")]
-#[test]
-fn observer_sees_a_handed_off_request_once() {
-    struct Echo;
-    impl Handler for Echo {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
-            if request
-                .extensions()
-                .get::<hyper::upgrade::OnUpgrade>()
-                .is_none()
-            {
-                return Reply::Handoff(request);
-            }
-            Reply::Now(http::Response::new(request.into_body()))
-        }
-    }
-    crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
-        let (server, client) = two_machines(&fcx);
-        let observer = Arc::new(Exposure::default());
-        serve_http(
-            &fcx,
-            &server,
-            80,
-            Arc::new(Echo),
-            HttpOptions {
-                observe: Some(observer.clone()),
-                ..HttpOptions::default()
-            },
-        )?;
-        let mut conn = client
-            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
-            .await?;
-        let mut request = format!(
-            "POST /login HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nContent-Length: {}\r\n\r\n",
-            SECRET.len()
-        )
-        .into_bytes();
-        request.extend_from_slice(SECRET);
-        conn.write_all(&fcx, &request).await?;
-        let response = keep_alive_response(&fcx, &mut conn).await;
-        assert_eq!(response.head.status, 200);
-        assert_eq!(response.body, SECRET);
-        log.wait(&fcx, 0, 1, Duration::from_secs(1), |e| {
-            e.is("http", "request")
-        })
-        .await?;
-        assert_eq!(observer.heads.lock().unwrap().len(), 1);
-        assert_eq!(
-            *observer.ends.lock().unwrap(),
-            [("/login".into(), SECRET.len(), httpd::Received::Complete)]
-        );
-        let events = log.checked_of("http", "request").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].str("received"), Some("complete"));
-        assert_eq!(
-            field_u64(&events[0], "observed_bytes"),
-            Some(SECRET.len() as u64)
-        );
-        assert_eq!(field_bool(&events[0], "classified"), Some(true));
-        assert_redacted(&events[0]);
         Ok(())
     });
 }
@@ -546,10 +495,13 @@ service_fixture! {
     }
 }
 
-fn page(size: usize) -> Router {
-    Router::new().get("/", move |_, _| {
-        http::Response::new(Bytes::from(vec![b'x'; size]))
-    })
+fn page(size: usize) -> impl Handler {
+    fictionet_test_support::handler(
+        move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+              _: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from(vec![b'x'; size]))
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -648,35 +600,6 @@ fn a_client_that_stops_reading_times_out() {
     });
 }
 
-/// Item faults that stop, because the client's bytes did not decode, say
-/// so. Before, they stopped without a word.
-#[test]
-fn item_faults_that_stop_record_why() {
-    let plan = FaultPlan::new(Plan {
-        items: vec![Rule {
-            when: Trigger::At(1000),
-            fault: ItemFault::Action {
-                delay: None,
-                rewrite: Rewrite::Drop,
-            },
-        }],
-        ..Plan::default()
-    });
-    let opts = ServeOptions::default().idle(None).faults(plan);
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
-    let mut h = Harness::with_options(fictionet::Seed::from_u64(0), Http1::new(page(2)), (), opts)
-        .observer(log.clone());
-    let _ = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n\x00\x01 not http\r\n\r\n");
-    let stopped = log
-        .checked_all()
-        .unwrap()
-        .iter()
-        .find(|e| e.is("conn", "faults"))
-        .expect("a conn.faults event")
-        .clone();
-    assert_eq!(stopped.str("stopped"), Some("failed"));
-}
-
 // ---------------------------------------------------------------------------
 // HTTP/1 events and closes
 
@@ -705,19 +628,11 @@ impl Handler for Streams {
 }
 
 #[test]
-fn response_policy_agrees_across_native_and_hyper() {
+fn response_policy_agrees_across_http_versions() {
     struct Responses;
 
     impl Handler for Responses {
         fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
-            if request.headers().contains_key("upgrade")
-                && request
-                    .extensions()
-                    .get::<hyper::upgrade::OnUpgrade>()
-                    .is_none()
-            {
-                return Reply::Handoff(request);
-            }
             let status: u16 = request.uri().path()[1..].parse().unwrap();
             let bytes = Bytes::from_static(b"body");
             let body = if request.headers().contains_key("x-unknown") {
@@ -751,34 +666,29 @@ fn response_policy_agrees_across_native_and_hyper() {
                     ..HttpOptions::default()
                 },
             )?;
-            // Only the `tokio` feature hands upgrade requests to hyper.
-            let backends: &[&str] = if cfg!(feature = "tokio") {
-                &["native", "upgrade", "h2"]
-            } else {
-                &["native", "h2"]
-            };
+            let backends = &[http::Version::HTTP_11, http::Version::HTTP_2];
             for &backend in backends {
                 // Method, status, unknown size, supplied length, wire lengths
-                // (native HTTP/1, hyper HTTP/1, HTTP/2), and received body.
+                // (HTTP/1, HTTP/2), and received body.
                 for (method, status, unknown, given, lengths, body) in [
-                    ("GET", 200, false, None, [Some("4"); 3], "body"),
-                    ("GET", 200, true, None, [None; 3], "body"),
+                    ("GET", 200, false, None, [Some("4"); 2], "body"),
+                    ("GET", 200, true, None, [None; 2], "body"),
                     (
                         "GET",
                         200,
                         false,
                         Some("004"),
-                        [Some("4"), Some("004"), Some("004")],
+                        [Some("4"), Some("004")],
                         "body",
                     ),
-                    ("HEAD", 200, false, None, [Some("4"); 3], ""),
-                    ("HEAD", 200, false, Some("7"), [Some("7"); 3], ""),
-                    ("HEAD", 200, true, None, [None; 3], ""),
-                    ("HEAD", 200, true, Some("7"), [Some("7"); 3], ""),
-                    ("GET", 204, false, None, [None; 3], ""),
-                    ("GET", 304, false, None, [None; 3], ""),
-                    ("HEAD", 304, false, None, [None; 3], ""),
-                    ("GET", 304, false, Some("7"), [None, None, Some("7")], ""),
+                    ("HEAD", 200, false, None, [Some("4"); 2], ""),
+                    ("HEAD", 200, false, Some("7"), [Some("7"); 2], ""),
+                    ("HEAD", 200, true, None, [None; 2], ""),
+                    ("HEAD", 200, true, Some("7"), [Some("7"); 2], ""),
+                    ("GET", 204, false, None, [None; 2], ""),
+                    ("GET", 304, false, None, [None; 2], ""),
+                    ("HEAD", 304, false, None, [None; 2], ""),
+                    ("GET", 304, false, Some("7"), [None, Some("7")], ""),
                 ] {
                     for supplied_date in [false, true] {
                         let mut request = http::Request::builder()
@@ -794,11 +704,6 @@ fn response_policy_agrees_across_native_and_hyper() {
                         if supplied_date {
                             request = request.header("x-date", own_date);
                         }
-                        if backend == "upgrade" {
-                            request = request
-                                .header("connection", "upgrade")
-                                .header("upgrade", "websocket");
-                        }
                         let request = request.body(Full::new(Bytes::new()))?;
                         let conn = client
                             .connect(&fcx, SocketAddr::new(SERVER.into(), port))
@@ -808,7 +713,7 @@ fn response_policy_agrees_across_native_and_hyper() {
                             conn,
                         };
                         let before = fcx.now();
-                        let response = if backend == "h2" {
+                        let response = if backend == http::Version::HTTP_2 {
                             let (mut send, driving) =
                                 hyper::client::conn::http2::handshake(Exec(fcx.clone()), io)
                                     .await?;
@@ -827,14 +732,10 @@ fn response_policy_agrees_across_native_and_hyper() {
                             send.send_request(request).await?
                         };
                         let case = format!(
-                            "{backend} {method} {status} unknown={unknown} length={given:?} date={date:?} supplied_date={supplied_date}"
+                            "{backend:?} {method} {status} unknown={unknown} length={given:?} date={date:?} supplied_date={supplied_date}"
                         );
                         assert_eq!(response.status(), status, "{case}");
-                        let index = match backend {
-                            "native" => 0,
-                            "upgrade" => 1,
-                            _ => 2,
-                        };
+                        let index = usize::from(backend == http::Version::HTTP_2);
                         assert_eq!(
                             response
                                 .headers()
@@ -845,7 +746,7 @@ fn response_policy_agrees_across_native_and_hyper() {
                         );
                         assert_eq!(
                             response.headers().contains_key("transfer-encoding"),
-                            unknown && method == "GET" && backend != "h2",
+                            unknown && method == "GET" && backend != http::Version::HTTP_2,
                             "{case}"
                         );
                         let dates: Vec<_> = response.headers().get_all("date").iter().collect();
@@ -1015,13 +916,37 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
         Duration::from_secs(60),
         move |fcx| async move {
             let (server, client) = two_machines(&fcx);
-            let router = Router::new()
-                .get("/dice", |ex, _| {
+            let router = {
+                let route_0 = |ex: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                               _: http::Request<bytes::Bytes>| {
                     http::Response::new(Bytes::from(ex.random_u64().to_string()))
-                })
-                .post("/echo", |_, request: http::Request<Bytes>| {
+                };
+                let route_1 = |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                               request: http::Request<Bytes>| {
                     http::Response::new(request.into_body())
-                });
+                };
+                fictionet_test_support::handler(move |ex, request| {
+                    if request.uri().path() == "/dice"
+                        && (request.method() == http::Method::GET
+                            || request.method() == http::Method::HEAD)
+                    {
+                        return route_0(ex, request);
+                    }
+                    if request.uri().path() == "/echo" && (request.method() == http::Method::POST) {
+                        return route_1(ex, request);
+                    }
+                    if request.uri().path() == "/dice" || request.uri().path() == "/echo" {
+                        return http::Response::builder()
+                            .status(405)
+                            .body(bytes::Bytes::new())
+                            .unwrap();
+                    }
+                    http::Response::builder()
+                        .status(404)
+                        .body(bytes::Bytes::new())
+                        .unwrap()
+                })
+            };
             let opts = HttpOptions {
                 limits: Limits {
                     body: 9000,
@@ -1098,11 +1023,13 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
 fn pending_http1_requests_keep_their_body_charge() {
     world(Duration::from_secs(10), |fcx| async move {
         let budget = Budget::new(1 << 20);
-        let router = Router::new().route_async(None, "/", |fcx, request| async move {
-            fcx.sleep(Duration::from_secs(1)).await.unwrap();
-            assert_eq!(request.body().len(), 8192);
-            http::Response::new(Bytes::new())
-        });
+        let router = fictionet_test_support::async_handler(
+            |fcx: fictionet::Cx, request: http::Request<bytes::Bytes>| async move {
+                fcx.sleep(Duration::from_secs(1)).await.unwrap();
+                assert_eq!(request.body().len(), 8192);
+                http::Response::new(Bytes::new())
+            },
+        );
         let mut h = Harness::with_options(
             fictionet::Seed::from_u64(0),
             Http1::new(router),
@@ -1168,11 +1095,13 @@ fn truncated_http1_requests_keep_their_body_charge() {
 fn http1_charges_heads_while_reading_and_metadata_while_waiting() {
     world(Duration::from_secs(10), |fcx| async move {
         let budget = Budget::new(1 << 20);
-        let router = Router::new().route_async(None, "/", |fcx, request| async move {
-            fcx.sleep(Duration::from_secs(1)).await.unwrap();
-            assert_eq!(request.headers()["x-large"].as_bytes().len(), 4096);
-            http::Response::new(Bytes::new())
-        });
+        let router = fictionet_test_support::async_handler(
+            |fcx: fictionet::Cx, request: http::Request<bytes::Bytes>| async move {
+                fcx.sleep(Duration::from_secs(1)).await.unwrap();
+                assert_eq!(request.headers()["x-large"].as_bytes().len(), 4096);
+                http::Response::new(Bytes::new())
+            },
+        );
         let mut h = Harness::with_options(
             fictionet::Seed::from_u64(0),
             Http1::new(router),
@@ -1238,7 +1167,10 @@ fn http2_rejects_metadata_before_calling_the_handler() {
     crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
         let (server, client) = two_machines(&fcx);
         let budget = Budget::new(H2_INPUT + 1024);
-        let router = Router::new().get("/", |_, _| panic!("metadata was not admitted"));
+        let router = fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| panic!("metadata was not admitted"),
+        );
         serve_http(
             &fcx,
             &server,
@@ -1551,92 +1483,6 @@ async fn keep_alive_response(fcx: &Cx, conn: &mut impl Connection) -> http1::Res
 
 /// Requires a successful keep-alive request before rejecting an over-long
 /// header, on hyper's upgrade path.
-#[cfg(feature = "tokio")]
-async fn upgrade_keep_alive_line_limit(
-    fcx: &Cx,
-    log: &fictionet_observe::Memory,
-) -> fictionet::Result {
-    let (server, client) = two_machines(fcx);
-    let opts = HttpOptions {
-        limits: Limits {
-            head: fictionet::stdlib::protocols::http1::Limits {
-                header_line: 32,
-                ..Default::default()
-            },
-            ..Limits::default()
-        },
-        ..HttpOptions::default()
-    };
-    struct UpgradePage;
-    impl Handler for UpgradePage {
-        fn call(&self, request: http::Request<Body>, ex: &mut Exchange<'_>) -> Reply {
-            if request.headers().contains_key("upgrade")
-                && request
-                    .extensions()
-                    .get::<hyper::upgrade::OnUpgrade>()
-                    .is_none()
-            {
-                return Reply::Handoff(request);
-            }
-            page(4).call(request, ex)
-        }
-    }
-    serve_http(fcx, &server, 80, Arc::new(UpgradePage), opts)?;
-    let mut conn = client
-        .connect(fcx, SocketAddr::new(SERVER.into(), 80))
-        .await?;
-    conn.write_all(
-        fcx,
-        b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
-    )
-    .await?;
-    let response = keep_alive_response(fcx, &mut conn).await;
-    assert_eq!(response.head.status, 200);
-    assert_eq!(response.body, b"xxxx");
-    conn.write_all(
-        fcx,
-        b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Long: short\r\n\r\n",
-    )
-    .await?;
-    let response = keep_alive_response(fcx, &mut conn).await;
-    assert_eq!(response.head.status, 200);
-    assert_eq!(response.body, b"xxxx");
-    conn.write_all(
-        fcx,
-        b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Long: abcdefghijklmnopqrstuvwxyz0123456789\r\n\r\n",
-    )
-    .await?;
-    let result = fcx
-        .race(
-            Some(fcx.now() + Duration::from_secs(1)),
-            conn.read(fcx, &mut [0; 1]),
-        )
-        .await;
-    // The upgrade path rejects the head by closing without a status response.
-    assert_eq!(result, Ok(Ok(0)));
-    assert_eq!(log.checked_of("http", "request").unwrap().len(), 2);
-    Ok(())
-}
-
-#[cfg(feature = "tokio")]
-#[test]
-fn upgrade_keep_alive_preserves_line_limits() {
-    crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
-        upgrade_keep_alive_line_limit(&fcx, &log).await
-    });
-}
-
-#[cfg(feature = "tokio")]
-#[test]
-fn upgrade_keep_alive_line_limit_rejection_records_protocol_error() {
-    crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
-        upgrade_keep_alive_line_limit(&fcx, &log).await?;
-        let errors = log.checked_of("http", "error").unwrap();
-        assert_eq!(errors.len(), 1, "missing limit rejection event");
-        assert_eq!(errors[0].str("cause"), Some("protocol"));
-        Ok(())
-    });
-}
 
 #[test]
 fn upgrade_keep_alive_preserves_header_timeout() {

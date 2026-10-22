@@ -121,9 +121,7 @@
 //! `axum::Router` is one. So is a plain async function wrapped in
 //! `tower::service_fn`. So is `web::proxy(&fcx, client)?` (feature `web-proxy`, off by
 //! default), which forwards to the real site. [`Site::handler`] takes an
-//! [`httpd::Handler`] instead, such as an
-//! [`httpd::Router`], whose handlers get plain
-//! byte bodies and no runtime. A request's body is read whole before the
+//! [`httpd::Handler`] instead. A request's body is read whole before the
 //! handler is called, up to 64 MiB; past that the answer is `413`.
 //!
 //! # Passing a site through to the real one
@@ -765,8 +763,7 @@ impl Site {
         Site::handler(httpd::tower(service))
     }
 
-    /// A site served by an [`httpd::Handler`], such as an
-    /// [`httpd::Router`].
+    /// A site served by a custom [`httpd::Handler`].
     pub fn handler(handler: impl Handler) -> Site {
         Site {
             server: Server::new(handler),

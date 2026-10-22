@@ -7,7 +7,7 @@ use fictionet::events::Fields;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::http2::{self, Frame};
 use fictionet::stdlib::services::serve::Harness;
-use fictionet::stdlib::web::httpd::{self, Http2, Router};
+use fictionet::stdlib::web::httpd::{self, Http2};
 use fictionet::stdlib::world::sandbox::TlsClient;
 use fictionet::stdlib::{
     network::{Connection, ConnectionExt, filter},
@@ -89,9 +89,11 @@ async fn read_frame(cx: &Cx, connection: &mut impl Connection) -> Frame {
 
 #[test]
 fn windows_settings_and_concurrent_streams() {
-    let router = Router::new().post("/", |_, _| {
-        http::Response::new(Bytes::from(vec![b'x'; 100_000]))
-    });
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from(vec![b'x'; 100_000]))
+        },
+    );
     let mut harness = Harness::new(Seed::from_u64(1), Http2::new(router), ());
     let mut input = preface();
     http2::Settings {
@@ -158,7 +160,12 @@ fn windows_settings_and_concurrent_streams() {
 
 #[test]
 fn resets_and_continuations_are_bounded() {
-    let router = Router::new();
+    let router = fictionet_test_support::handler(|_, _| {
+        http::Response::builder()
+            .status(404)
+            .body(bytes::Bytes::new())
+            .unwrap()
+    });
     let mut harness = Harness::new(Seed::from_u64(1), Http2::new(router), ());
     harness.push(&preface()).unwrap();
     let first = http2::Headers {
@@ -212,7 +219,16 @@ fn settings_acknowledgment_and_idle_stream_errors() {
         .to_bytes()
         .unwrap(),
     ] {
-        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        let mut harness = Harness::new(
+            Seed::from_u64(1),
+            Http2::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
+            (),
+        );
         harness.push(&preface()).unwrap();
         assert!(
             frames(&harness.push(&invalid).unwrap())
@@ -241,7 +257,7 @@ fn replay() -> Trace {
         roots.add(cert.clone())?;
         let date = UNIX_EPOCH + Duration::from_secs(DATE);
         let config = Arc::new(tls::config_builder(&cx, date).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(vec![cert], key)?);
-        let router = Router::new().post("/", |ex, _| http::Response::new(Bytes::from(ex.random_u64().to_be_bytes().to_vec())));
+        let router = fictionet_test_support::handler(|ex: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| http::Response::new(Bytes::from(ex.random_u64().to_be_bytes().to_vec())));
         let (attach, arrivals) = fictionet::attachments();
         net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(router).https())).start(&cx, arrivals)?;
         let cable = filter(&cx, attach.attach("client")?, move |_, direction, packet| {
@@ -327,7 +343,7 @@ mod clients {
         }
     }
 
-    struct Site(Router);
+    struct Site(Arc<dyn httpd::Handler>);
     impl httpd::Handler for Site {
         fn call(
             &self,
@@ -391,23 +407,36 @@ window.addEventListener('load', () => {
                         let body = format!("/*{}*/completed++;", "x".repeat(1 << 20));
                         http::Response::builder().header("content-type", "application/javascript").body(Bytes::from(body)).unwrap()
                     };
-                    let router = Router::new()
-                        .get("/", move |_, _| http::Response::builder().header("content-type", "text/html").body(Bytes::from_static(page.as_bytes())).unwrap())
-                        .get("/large/curl", move |_, _| large())
-                        .route_async(Some(http::Method::GET), "/large/*", move |_, _| {
+                    let router = {
+let route_0 = std::sync::Arc::new(move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| http::Response::builder().header("content-type", "text/html").body(Bytes::from_static(page.as_bytes())).unwrap());
+let route_1 = std::sync::Arc::new(move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| large());
+let route_2 = std::sync::Arc::new(move |_: fictionet::Cx, _: http::Request<bytes::Bytes>| {
                             let downloads = downloads.clone();
                             async move {
                                 // Start all browser streams before sending any response.
                                 downloads.wait().await;
                                 large()
                             }
-                        })
-                        .route_async(Some(http::Method::GET), "/gate", move |cx, _| { let log = observed.clone(); async move {
+                        });
+let route_3 = std::sync::Arc::new(move |cx: fictionet::Cx, _: http::Request<bytes::Bytes>| { let log = observed.clone(); async move {
                             log.wait(&cx, 0, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();
                             http::Response::builder().header("content-type", "application/javascript").body(Bytes::new()).unwrap()
                         }});
+fictionet_test_support::reply_handler(move |ex, request| {
+use fictionet::stdlib::web::httpd::{Body, Reply};
+let (parts, body) = request.into_parts();
+let Some(body) = body.bytes() else { return Reply::Now(http::Response::builder().status(400).body(Body::empty()).unwrap()); };
+let request = http::Request::from_parts(parts, body);
+if request.uri().path() == "/" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return Reply::Now(route_0(ex, request).map(Body::from)); }
+if request.uri().path() == "/large/curl" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return Reply::Now(route_1(ex, request).map(Body::from)); }
+if (request.uri().path() == "/large" || request.uri().path().starts_with("/large/")) && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return { let route = route_2.clone(); Reply::Later(Box::new(move |cx| Box::pin(async move { Ok(route(cx, request).await.map(Body::from)) }))) }; }
+if request.uri().path() == "/gate" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return { let route = route_3.clone(); Reply::Later(Box::new(move |cx| Box::pin(async move { Ok(route(cx, request).await.map(Body::from)) }))) }; }
+if request.uri().path() == "/" || request.uri().path() == "/large/curl" || (request.uri().path() == "/large" || request.uri().path().starts_with("/large/")) || request.uri().path() == "/gate" { return Reply::Now(http::Response::builder().status(405).body(Body::empty()).unwrap()); }
+Reply::Now(http::Response::builder().status(404).body(Body::empty()).unwrap())
+})
+};
                     let (attach, arrivals) = fictionet::attachments();
-                    net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site(router)).limits(httpd::Limits { body: 1024, ..Default::default() }).https())).start(&cx, arrivals)?;
+                    net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site(Arc::new(router))).limits(httpd::Limits { body: 1024, ..Default::default() }).https())).start(&cx, arrivals)?;
                     let machine = sandbox::machine(&cx, attach.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
                     let listener = tokio::net::TcpListener::from_std(listener)?;
                     cx.spawn(move |cx| async move {
@@ -601,7 +630,16 @@ fn rapid_reset_limits_pending_accepts_but_releases_drained_counts() {
         .write(&mut burst)
         .unwrap();
     }
-    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    );
     let reply = frames(&harness.push(&burst).unwrap());
     assert!(
         reply
@@ -610,7 +648,16 @@ fn rapid_reset_limits_pending_accepts_but_releases_drained_counts() {
     );
     assert!(harness.closed());
 
-    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    );
     harness.push(&preface()).unwrap();
     for id in (1..=81).step_by(2) {
         harness.push(&headers(id, "/", false)).unwrap();
@@ -631,7 +678,16 @@ fn rapid_reset_limits_pending_accepts_but_releases_drained_counts() {
 
 #[test]
 fn local_protocol_resets_eventually_close_the_connection() {
-    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    );
     harness.push(&preface()).unwrap();
     for n in 0..1025 {
         let malformed = http2::Headers {
@@ -669,7 +725,11 @@ fn zero_stream_window_is_a_stream_error_and_large_headers_get_431() {
         },
         ..Default::default()
     };
-    let router = Router::new().post("/", |_, _| http::Response::new(Bytes::from_static(b"ok")));
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from_static(b"ok"))
+        },
+    );
     let mut harness = Harness::new(Seed::from_u64(1), Http2::with(Arc::new(router), limits), ());
     harness.push(&preface()).unwrap();
     harness.push(&headers(1, "/", false)).unwrap();
@@ -709,8 +769,11 @@ fn zero_stream_window_is_a_stream_error_and_large_headers_get_431() {
 
 #[test]
 fn graceful_goaway_drains_streams_after_the_ping_round_trip() {
-    let mut service =
-        Http2::new(Router::new().post("/", |_, _| http::Response::new(Bytes::from_static(b"ok"))));
+    let mut service = Http2::new(fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from_static(b"ok"))
+        },
+    ));
     service.graceful_shutdown();
     let mut harness = Harness::new(Seed::from_u64(1), service, ());
     let mut input = preface();
@@ -797,7 +860,10 @@ pub(crate) const H2_INPUT: usize = http2::DEFAULT_FRAME_SIZE
 
 #[test]
 fn immediate_echo_releases_the_request_charge() {
-    let router = Router::new().post("/", |_, request| http::Response::new(request.into_body()));
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+         request: http::Request<bytes::Bytes>| http::Response::new(request.into_body()),
+    );
     let budget = fictionet::stdlib::services::serve::Budget::new(H2_INPUT + 8000);
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
@@ -829,7 +895,12 @@ fn split_echo_releases_the_charged_body() {
     // The budget already holds the body from earlier frames, and an echo
     // moves those bytes into the response, so they count once.
     for parts in [1, 2, 4] {
-        let router = Router::new().post("/", |_, request| http::Response::new(request.into_body()));
+        let router = fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             request: http::Request<bytes::Bytes>| {
+                http::Response::new(request.into_body())
+            },
+        );
         let budget = fictionet::stdlib::services::serve::Budget::new(H2_INPUT + 8000);
         let mut harness = Harness::with_options(
             Seed::from_u64(1),
@@ -867,13 +938,34 @@ fn split_echo_releases_the_charged_body() {
 
 #[test]
 fn oversized_response_refuses_only_its_stream() {
-    let router = Router::new()
-        .post("/small", |_, _| {
+    let router = {
+        let route_0 = |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                       _: http::Request<bytes::Bytes>| {
             http::Response::new(Bytes::from_static(b"ok"))
-        })
-        .post("/large", |_, _| {
+        };
+        let route_1 = |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                       _: http::Request<bytes::Bytes>| {
             http::Response::new(Bytes::from(vec![b'x'; 200_000]))
-        });
+        };
+        fictionet_test_support::handler(move |ex, request| {
+            if request.uri().path() == "/small" && (request.method() == http::Method::POST) {
+                return route_0(ex, request);
+            }
+            if request.uri().path() == "/large" && (request.method() == http::Method::POST) {
+                return route_1(ex, request);
+            }
+            if request.uri().path() == "/small" || request.uri().path() == "/large" {
+                return http::Response::builder()
+                    .status(405)
+                    .body(bytes::Bytes::new())
+                    .unwrap();
+            }
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })
+    };
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
         Http2::new(router),
@@ -916,7 +1008,15 @@ fn early_response_ends_with_a_successful_reset() {
     };
     let mut harness = Harness::new(
         Seed::from_u64(1),
-        Http2::with(Arc::new(Router::new()), limits),
+        Http2::with(
+            Arc::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
+            limits,
+        ),
         (),
     );
     let mut input = preface();
@@ -938,7 +1038,16 @@ fn early_response_ends_with_a_successful_reset() {
 
 #[test]
 fn connection_receive_window_rejects_a_data_burst() {
-    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    );
     let mut input = preface();
     input.extend(headers(1, "/", false));
     for _ in 0..8 {
@@ -955,7 +1064,16 @@ fn connection_receive_window_rejects_a_data_burst() {
 
 #[test]
 fn stream_receive_window_rejects_only_the_overflowing_stream() {
-    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    );
     let mut input = preface();
     for id in [1, 3] {
         input.extend(headers(id, "/", false));
@@ -994,10 +1112,12 @@ fn tiny_data_frames_release_capacity_in_batches() {
         body: 2 << 20,
         ..Default::default()
     };
-    let router = Router::new().post("/", |_, r| {
-        assert_eq!(r.body().len(), 1 << 20);
-        http::Response::new(Bytes::new())
-    });
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, r: http::Request<bytes::Bytes>| {
+            assert_eq!(r.body().len(), 1 << 20);
+            http::Response::new(Bytes::new())
+        },
+    );
     let mut harness = Harness::new(Seed::from_u64(1), Http2::with(Arc::new(router), limits), ());
     let mut input = preface();
     input.extend(headers(1, "/", false));
@@ -1023,7 +1143,16 @@ fn tiny_data_frames_release_capacity_in_batches() {
 
 #[test]
 fn trailers_after_end_stream_reset_only_that_stream() {
-    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    );
     let mut input = preface();
     input.extend(headers(1, "/", true));
     input.extend(headers(1, "/", true));
@@ -1043,7 +1172,16 @@ fn headers_on_a_closed_stream_end_the_connection() {
     // HEADERS on a stream that has ended, and on a stream below one already
     // opened (RFC 9113 sections 5.1 and 5.1.1).
     for (open, again) in [(1, 1), (5, 3)] {
-        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        let mut harness = Harness::new(
+            Seed::from_u64(1),
+            Http2::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
+            (),
+        );
         harness.push(&preface()).unwrap();
         let output = frames(&harness.push(&headers(open, "/", true)).unwrap());
         assert_eq!(statuses(&output), [(open, b"404".to_vec())]);
@@ -1074,7 +1212,16 @@ fn invalid_priority_is_a_stream_error() {
             1,
         ),
     ] {
-        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        let mut harness = Harness::new(
+            Seed::from_u64(1),
+            Http2::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
+            (),
+        );
         let mut input = preface();
         if open {
             input.extend(headers(1, "/", false));
@@ -1103,7 +1250,16 @@ fn invalid_priority_on_an_idle_stream_is_a_connection_error() {
         // PRIORITY on stream 1 that depends on stream 1: PROTOCOL_ERROR.
         (&[0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0], 1),
     ] {
-        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        let mut harness = Harness::new(
+            Seed::from_u64(1),
+            Http2::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
+            (),
+        );
         let mut input = preface();
         input.extend(invalid);
         input.extend(headers(1, "/", true));
@@ -1120,15 +1276,18 @@ fn invalid_priority_on_an_idle_stream_is_a_connection_error() {
 
 #[test]
 fn cookie_crumbs_reach_the_handler_as_one_header() {
-    let router = Router::new().get("/", |_, request| {
-        let cookies: Vec<&[u8]> = request
-            .headers()
-            .get_all("cookie")
-            .iter()
-            .map(|v| v.as_bytes())
-            .collect();
-        http::Response::new(Bytes::from(cookies.join(b"\n".as_slice())))
-    });
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+         request: http::Request<bytes::Bytes>| {
+            let cookies: Vec<&[u8]> = request
+                .headers()
+                .get_all("cookie")
+                .iter()
+                .map(|v| v.as_bytes())
+                .collect();
+            http::Response::new(Bytes::from(cookies.join(b"\n".as_slice())))
+        },
+    );
     let mut harness = Harness::new(Seed::from_u64(1), Http2::new(router), ());
     let mut fragment = Vec::new();
     for (name, value) in [
@@ -1206,7 +1365,15 @@ fn repeated_header_refusals_exhaust_the_local_reset_limit() {
     };
     let mut harness = Harness::new(
         Seed::from_u64(1),
-        Http2::with(Arc::new(Router::new()), limits),
+        Http2::with(
+            Arc::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
+            limits,
+        ),
         (),
     );
     harness.push(&preface()).unwrap();
@@ -1241,7 +1408,15 @@ fn concurrency_refusals_do_not_exhaust_the_local_reset_limit() {
     };
     let mut harness = Harness::new(
         Seed::from_u64(1),
-        Http2::with(Arc::new(Router::new()), limits),
+        Http2::with(
+            Arc::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
+            limits,
+        ),
         (),
     );
     let mut input = preface();
@@ -1312,7 +1487,12 @@ fn connection_budget_exhaustion_sends_goaway() {
     let budget = fictionet::stdlib::services::serve::Budget::new(H2_INPUT + 1000);
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
-        Http2::new(Router::new()),
+        Http2::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
         (),
         fictionet::stdlib::services::serve::ServeOptions::default().budget(budget.clone()),
     );
@@ -1343,7 +1523,12 @@ fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
     let budget = fictionet::stdlib::services::serve::Budget::new(H2_INPUT + 1024);
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
-        Http2::new(Router::new()),
+        Http2::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
         (),
         fictionet::stdlib::services::serve::ServeOptions::default().budget(budget),
     );
@@ -1377,13 +1562,60 @@ fn deferred_response_budget_refusal_preserves_other_streams() {
     fictionet::block_on(fictionet::lab(
         RunOptions::new(Seed::from_u64(1)),
         |cx| async move {
-            let router = Router::new()
-                .post("/small", |_, _| {
-                    http::Response::new(Bytes::from_static(b"ok"))
+            let router = {
+                let route_0 = std::sync::Arc::new(
+                    |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                     _: http::Request<bytes::Bytes>| {
+                        http::Response::new(Bytes::from_static(b"ok"))
+                    },
+                );
+                let route_1 =
+                    std::sync::Arc::new(|_: fictionet::Cx, _: http::Request<bytes::Bytes>| async {
+                        http::Response::new(Bytes::from(vec![b'x'; 200_000]))
+                    });
+                fictionet_test_support::reply_handler(move |ex, request| {
+                    use fictionet::stdlib::web::httpd::{Body, Reply};
+                    let (parts, body) = request.into_parts();
+                    let Some(body) = body.bytes() else {
+                        return Reply::Now(
+                            http::Response::builder()
+                                .status(400)
+                                .body(Body::empty())
+                                .unwrap(),
+                        );
+                    };
+                    let request = http::Request::from_parts(parts, body);
+                    if request.uri().path() == "/small" && (request.method() == http::Method::POST)
+                    {
+                        return Reply::Now(route_0(ex, request).map(Body::from));
+                    }
+                    if request.uri().path() == "/large" && (request.method() == http::Method::POST)
+                    {
+                        return {
+                            let route = route_1.clone();
+                            Reply::Later(Box::new(move |cx| {
+                                Box::pin(
+                                    async move { Ok(route(cx, request).await.map(Body::from)) },
+                                )
+                            }))
+                        };
+                    }
+                    if request.uri().path() == "/small" || request.uri().path() == "/large" {
+                        return Reply::Now(
+                            http::Response::builder()
+                                .status(405)
+                                .body(Body::empty())
+                                .unwrap(),
+                        );
+                    }
+                    Reply::Now(
+                        http::Response::builder()
+                            .status(404)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
                 })
-                .route_async(Some(http::Method::POST), "/large", |_, _| async {
-                    http::Response::new(Bytes::from(vec![b'x'; 200_000]))
-                });
+            };
             let mut harness = Harness::with_options(
                 Seed::from_u64(1),
                 Http2::new(router),
@@ -1413,13 +1645,16 @@ fn observation_does_not_change_http2_streams() {
     let run = |observed| {
         let heads = Arc::new(crate::common::http_observer::CountHeads::default());
         let memory = Arc::new(fictionet_observe::Memory::default());
-        let router = Router::new().post("/", move |_, request| {
-            assert_eq!(
-                request.extensions().get::<httpd::EventInterest>().is_some(),
-                observed
-            );
-            http::Response::new(Bytes::from_static(b"hello"))
-        });
+        let router = fictionet_test_support::handler(
+            move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                  request: http::Request<bytes::Bytes>| {
+                assert_eq!(
+                    request.extensions().get::<httpd::EventInterest>().is_some(),
+                    observed
+                );
+                http::Response::new(Bytes::from_static(b"hello"))
+            },
+        );
         let mut harness = Harness::new(
             Seed::from_u64(1),
             Http2::new(router).observe(heads.clone()),

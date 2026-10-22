@@ -6,10 +6,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Fields};
-use fictionet::stdlib::codec::{Fail, ItemFault, Rewrite, Rule, Trigger};
 use fictionet::stdlib::protocols::json;
-use fictionet::stdlib::services::serve::{FaultPlan, Harness, HarnessError, Plan, ServeOptions};
-use fictionet::stdlib::web::httpd::{self, Http1, Router};
+use fictionet::stdlib::services::serve::{Harness, ServeOptions};
+use fictionet::stdlib::web::httpd::{self, Http1};
 
 use crate::common::http_observer;
 use crate::common::world;
@@ -68,7 +67,11 @@ fn observer_sees_no_host_body() {
 #[test]
 fn body_limit_exposure() {
     let observer = Arc::new(Exposure::default());
-    let router = Router::new().post("/", |_, _| panic!("oversized body reached handler"));
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            panic!("oversized body reached handler")
+        },
+    );
     let service = Http1::with(
         Arc::new(router),
         httpd::Limits {
@@ -115,7 +118,10 @@ fn partial_timeout_exposure() {
         ),
     ] {
         let observer = Arc::new(Exposure::default());
-        let router = Router::new().post("/", |_, _| panic!("timed out body reached handler"));
+        let router = fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| panic!("timed out body reached handler"),
+        );
         let service = Http1::new(router).observe(observer.clone());
         let log = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(log.clone());
@@ -157,129 +163,20 @@ fn partial_timeout_exposure() {
 }
 
 #[test]
-fn body_timeout_preserves_item_faults() {
-    // The fault decoder sees a whole body; the service receives only a prefix.
-    for observe in [false, true] {
-        let observer = Arc::new(Exposure::default());
-        let mut service = Http1::new(Router::new());
-        if observe {
-            service = service.observe(observer.clone());
-        }
-        let opts = ServeOptions::default()
-            .idle(None)
-            .faults(FaultPlan::new(Plan {
-                items: vec![Rule {
-                    when: Trigger::At(2),
-                    fault: ItemFault::Action {
-                        delay: None,
-                        rewrite: Rewrite::Raw(b"x".to_vec()),
-                    },
-                }],
-                ..Plan::default()
-            }));
-        let log = std::sync::Arc::new(fictionet_observe::Memory::default());
-        let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts)
-            .observer(log.clone());
-        h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nxy")
-            .unwrap();
-        assert!(log.checked_all().unwrap().is_empty());
-        h.advance(Duration::from_secs(30)).unwrap();
-        assert!(h.closed());
-        let event = log
-            .checked_all()
-            .unwrap()
-            .iter()
-            .find(|e| e.is("http", "request"))
-            .unwrap()
-            .clone();
-        assert_eq!(event.str("answer"), Some("timeout"));
-        assert_eq!(event.str("received"), Some("timeout"));
-        assert!(
-            !log.checked_all()
-                .unwrap()
-                .iter()
-                .any(|e| e.is("conn", "faults") && e.str("stopped") == Some("decoder")),
-            "observing a body timeout must not stop item faults"
-        );
-        if observe {
-            assert_eq!(
-                *observer.ends.lock().unwrap(),
-                [("/".into(), 1, httpd::Received::Timeout)]
-            );
-        }
-    }
-}
-
-#[test]
-fn body_decode_failure_preserves_item_faults() {
-    // Corrupt the chunk ending while the fault decoder remains active.
-    for observe in [false, true] {
-        let observer = Arc::new(Exposure::default());
-        let mut service = Http1::new(Router::new());
-        if observe {
-            service = service.observe(observer.clone());
-        }
-        let opts = ServeOptions::default()
-            .idle(None)
-            .faults(FaultPlan::new(Plan {
-                items: vec![Rule {
-                    when: Trigger::At(2),
-                    fault: ItemFault::Action {
-                        delay: None,
-                        rewrite: Rewrite::Raw(b"x!!".to_vec()),
-                    },
-                }],
-                ..Plan::default()
-            }));
-        let log = std::sync::Arc::new(fictionet_observe::Memory::default());
-        let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts)
-            .observer(log.clone());
-        assert!(matches!(
-            h.push(
-                b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n"
-            ),
-            Err(HarnessError::Decode(Fail::Protocol(
-                fictionet::stdlib::protocols::http1::Error::ChunkEnding
-            )))
-        ));
-        assert!(h.closed());
-        let event = log
-            .checked_all()
-            .unwrap()
-            .iter()
-            .find(|e| e.is("http", "request"))
-            .unwrap()
-            .clone();
-        assert_eq!(event.str("received"), Some("cut_off"));
-        assert!(
-            !log.checked_all()
-                .unwrap()
-                .iter()
-                .any(|e| e.is("conn", "faults") && e.str("stopped") == Some("decoder")),
-            "observing a body decode failure must not stop item faults"
-        );
-        if observe {
-            assert_eq!(
-                *observer.ends.lock().unwrap(),
-                [("/".into(), 1, httpd::Received::CutOff)]
-            );
-        }
-    }
-}
-
-#[test]
 fn hook_redacts_before_log() {
     let observer = Arc::new(Exposure::default());
-    let router = Router::new().post("/login", |_, _| {
-        let mut response = http::Response::new(Bytes::new());
-        response.extensions_mut().insert(
-            Fields::new()
-                .with("source", "handler")
-                .with("method", "wrong")
-                .with("received", "wrong"),
-        );
-        response
-    });
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            let mut response = http::Response::new(Bytes::new());
+            response.extensions_mut().insert(
+                Fields::new()
+                    .with("source", "handler")
+                    .with("method", "wrong")
+                    .with("received", "wrong"),
+            );
+            response
+        },
+    );
     let log = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(
         fictionet::Seed::from_u64(0),
@@ -320,7 +217,12 @@ fn hook_redacts_before_log() {
 fn observer_sees_cut_off_body_without_framing() {
     for tail in [SECRET, b"64\r\nprivate-credential!!".as_slice()] {
         let observer = Arc::new(Exposure::default());
-        let router = Router::new().post("/", |_, _| panic!("partial body reached byte handler"));
+        let router = fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| {
+                panic!("partial body reached byte handler")
+            },
+        );
         let log = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(
             fictionet::Seed::from_u64(0),
@@ -356,7 +258,12 @@ fn observer_sees_cut_off_body_without_framing() {
 fn received_does_not_require_an_observer() {
     for (length, received) in [(20, "too_large"), (100, "timeout")] {
         let service = Http1::with(
-            Arc::new(Router::new()),
+            Arc::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
             httpd::Limits {
                 body: 10,
                 ..httpd::Limits::default()
@@ -498,8 +405,9 @@ fn http1_streams_chunks_once_and_keeps_alive() {
 
 #[test]
 fn http1_answers_routes_head_errors_and_keep_alive() {
-    let router = Router::new()
-        .get("/hi", |ex, _| {
+    let router = {
+        let route_0 = |ex: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                       _: http::Request<bytes::Bytes>| {
             let mut r = http::Response::new(Bytes::from("hi\n"));
             r.extensions_mut().insert(
                 Fields::new()
@@ -507,13 +415,44 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
                     .with("conn", ex.conn().id.unwrap_or(0)),
             );
             r
-        })
-        .post("/echo", |_, r: http::Request<Bytes>| {
+        };
+        let route_1 = |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                       r: http::Request<Bytes>| {
             http::Response::new(r.into_body())
-        })
-        .get("/files/*", |_, r| {
+        };
+        let route_2 = |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                       r: http::Request<bytes::Bytes>| {
             http::Response::new(Bytes::from(r.uri().path().to_owned()))
-        });
+        };
+        fictionet_test_support::handler(move |ex, request| {
+            if request.uri().path() == "/hi"
+                && (request.method() == http::Method::GET || request.method() == http::Method::HEAD)
+            {
+                return route_0(ex, request);
+            }
+            if request.uri().path() == "/echo" && (request.method() == http::Method::POST) {
+                return route_1(ex, request);
+            }
+            if (request.uri().path() == "/files" || request.uri().path().starts_with("/files/"))
+                && (request.method() == http::Method::GET || request.method() == http::Method::HEAD)
+            {
+                return route_2(ex, request);
+            }
+            if request.uri().path() == "/hi"
+                || request.uri().path() == "/echo"
+                || (request.uri().path() == "/files" || request.uri().path().starts_with("/files/"))
+            {
+                return http::Response::builder()
+                    .status(405)
+                    .body(bytes::Bytes::new())
+                    .unwrap();
+            }
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })
+    };
     let log = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h =
         Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ()).observer(log.clone());
@@ -582,13 +521,16 @@ fn http1_response_policy_preserves_native_framing() {
         ("HEAD", 200, "invalid", Some("4"), ""),
         ("GET", 200, "7", Some("4"), "body"),
     ] {
-        let router = Router::new().route(None, "/", move |_, _| {
-            http::Response::builder()
-                .status(status)
-                .header("content-length", given)
-                .body(Bytes::from_static(b"body"))
-                .unwrap()
-        });
+        let router = fictionet_test_support::handler(
+            move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                  _: http::Request<bytes::Bytes>| {
+                http::Response::builder()
+                    .status(status)
+                    .header("content-length", given)
+                    .body(Bytes::from_static(b"body"))
+                    .unwrap()
+            },
+        );
         let log = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
             .observer(log.clone());
@@ -745,10 +687,13 @@ fn an_http11_absolute_request_with_no_host_gets_400_from_the_service() {
     let vhosts = httpd::VirtualHosts::new();
     vhosts.insert(
         "a.test",
-        httpd::VHost::new(Router::new().get("/", move |_, _| {
-            count.fetch_add(1, Ordering::SeqCst);
-            http::Response::new(Bytes::from("ok"))
-        })),
+        httpd::VHost::new(fictionet_test_support::handler(
+            move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                  _: http::Request<bytes::Bytes>| {
+                count.fetch_add(1, Ordering::SeqCst);
+                http::Response::new(Bytes::from("ok"))
+            },
+        )),
     );
     let log = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h =
@@ -786,10 +731,13 @@ fn an_http11_absolute_request_with_no_host_gets_400_from_the_service() {
 fn a_router_receives_no_host_requests_only_for_http10() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    let router = Router::new().get("/x", move |_, _| {
-        count.fetch_add(1, Ordering::SeqCst);
-        http::Response::new(Bytes::from("ok"))
-    });
+    let router = fictionet_test_support::handler(
+        move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+              _: http::Request<bytes::Bytes>| {
+            count.fetch_add(1, Ordering::SeqCst);
+            http::Response::new(Bytes::from("ok"))
+        },
+    );
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
     assert!(h.push(b"GET /x HTTP/1.1\r\n\r\n").is_err());
     assert!(
@@ -808,7 +756,11 @@ fn a_router_receives_no_host_requests_only_for_http10() {
 
 #[test]
 fn http1_closes_when_asked_and_on_http10() {
-    let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("x")));
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from("x"))
+        },
+    );
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
     h.push(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
         .unwrap();
@@ -829,12 +781,15 @@ fn http1_closes_when_asked_and_on_http10() {
 #[test]
 fn http1_handler_connection_close() {
     for connection in ["close", "keep-alive, Close", "keep-alive, \tClose \t"] {
-        let router = Router::new().get("/", move |_, _| {
-            http::Response::builder()
-                .header("connection", connection)
-                .body(Bytes::from("first"))
-                .unwrap()
-        });
+        let router = fictionet_test_support::handler(
+            move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                  _: http::Request<bytes::Bytes>| {
+                http::Response::builder()
+                    .header("connection", connection)
+                    .body(Bytes::from("first"))
+                    .unwrap()
+            },
+        );
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
         h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
         assert!(
@@ -850,13 +805,16 @@ fn http1_handler_connection_close() {
 fn http1_handler_connection_close_stops_pipeline() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    let router = Router::new().get("/", move |_, _| {
-        count.fetch_add(1, Ordering::SeqCst);
-        http::Response::builder()
-            .header("connection", "close")
-            .body(Bytes::from("first"))
-            .unwrap()
-    });
+    let router = fictionet_test_support::handler(
+        move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+              _: http::Request<bytes::Bytes>| {
+            count.fetch_add(1, Ordering::SeqCst);
+            http::Response::builder()
+                .header("connection", "close")
+                .body(Bytes::from("first"))
+                .unwrap()
+        },
+    );
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
     h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n")
         .unwrap();
@@ -868,12 +826,14 @@ fn http1_handler_connection_close_stops_pipeline() {
 
 #[test]
 fn http1_handler_connection_keep_alive_is_stripped() {
-    let router = Router::new().get("/", |_, _| {
-        http::Response::builder()
-            .header("connection", "keep-alive")
-            .body(Bytes::from("ok"))
-            .unwrap()
-    });
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            http::Response::builder()
+                .header("connection", "keep-alive")
+                .body(Bytes::from("ok"))
+                .unwrap()
+        },
+    );
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
     h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
     assert!(http_text(&h).starts_with("HTTP/1.1 200 OK\r\n"));
@@ -884,12 +844,14 @@ fn http1_handler_connection_keep_alive_is_stripped() {
 #[test]
 fn http1_handler_connection_close_async() {
     world(Duration::from_secs(10), |fcx| async move {
-        let router = Router::new().route_async(None, "/", |_, _| async {
-            http::Response::builder()
-                .header("connection", "close")
-                .body(Bytes::from("first"))
-                .unwrap()
-        });
+        let router = fictionet_test_support::async_handler(
+            |_: fictionet::Cx, _: http::Request<bytes::Bytes>| async {
+                http::Response::builder()
+                    .header("connection", "close")
+                    .body(Bytes::from("first"))
+                    .unwrap()
+            },
+        );
         let mut h =
             Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ()).with_fcx(fcx);
         h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n")
@@ -910,10 +872,13 @@ fn http1_rejects_unsupported_transfer_codings_before_dispatch() {
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
-        let router = Router::new().post("/u", move |_, _| {
-            count.fetch_add(1, Ordering::SeqCst);
-            http::Response::new(Bytes::new())
-        });
+        let router = fictionet_test_support::handler(
+            move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                  _: http::Request<bytes::Bytes>| {
+                count.fetch_add(1, Ordering::SeqCst);
+                http::Response::new(Bytes::new())
+            },
+        );
         let log = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
             .observer(log.clone());
@@ -938,8 +903,17 @@ fn http1_rejects_unsupported_transfer_codings_before_dispatch() {
 #[test]
 fn http1_answers_bytes_that_are_not_http_with_400_and_an_error_event() {
     let log = std::sync::Arc::new(fictionet_observe::Memory::default());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
-        .observer(log.clone());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    )
+    .observer(log.clone());
     assert!(h.push(b"\x16\x03\x01\x00\x05hello\r\n\r\n").is_err());
     assert!(http_text(&h).starts_with("HTTP/1.1 400 Bad Request"));
     assert!(h.closed());
@@ -956,10 +930,12 @@ fn http1_answers_bytes_that_are_not_http_with_400_and_an_error_event() {
 fn http1_sends_100_continue_and_rejects_a_cut_off_body_before_the_router_callback() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let keep = seen.clone();
-    let router = Router::new().post("/u", move |_, r: http::Request<Bytes>| {
-        keep.lock().unwrap().push(r.body().len());
-        http::Response::new(Bytes::new())
-    });
+    let router = fictionet_test_support::handler(
+        move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, r: http::Request<Bytes>| {
+            keep.lock().unwrap().push(r.body().len());
+            http::Response::new(Bytes::new())
+        },
+    );
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
     h.push(b"POST /u HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n")
         .unwrap();
@@ -976,51 +952,17 @@ fn http1_sends_100_continue_and_rejects_a_cut_off_body_before_the_router_callbac
 }
 
 #[test]
-fn http1_router_rejects_incomplete_bodies_before_route_selection() {
-    let router = Router::new()
-        .post("/u", |_, _| {
-            panic!("incomplete body reached a byte callback")
-        })
-        .route_async(Some(http::Method::POST), "/async", |_, _| async {
-            panic!("incomplete body reached an async byte callback")
-        });
-    for router in [
-        router.clone(),
-        router.fallback(|_, _| panic!("incomplete body reached the fallback")),
-    ] {
-        for target in ["POST /u", "POST /async", "POST /missing", "GET /u"] {
-            for body in [
-                "Content-Length: 10\r\n\r\nabc",
-                "Content-Length: 10\r\n\r\n",
-                "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
-                "Transfer-Encoding: chunked\r\n\r\nz\r\n",
-            ] {
-                let mut h =
-                    Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
-                let request = format!("{target} HTTP/1.1\r\nHost: a\r\n{body}");
-                let _ = h.push(request.as_bytes());
-                let _ = h.end();
-                assert!(
-                    http_text(&h).starts_with("HTTP/1.1 400 Bad Request\r\n"),
-                    "{request:?}: {}",
-                    http_text(&h)
-                );
-                assert_eq!(h.pending(), (0, 0));
-                assert!(h.closed());
-            }
-        }
-    }
-}
-
-#[test]
 fn http1_router_accepts_valid_empty_post_bodies() {
     let seen = Arc::new(AtomicUsize::new(0));
     let keep = seen.clone();
-    let router = Router::new().post("/u", move |_, request| {
-        assert!(request.body().is_empty());
-        keep.fetch_add(1, Ordering::Relaxed);
-        http::Response::new(Bytes::new())
-    });
+    let router = fictionet_test_support::handler(
+        move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+              request: http::Request<bytes::Bytes>| {
+            assert!(request.body().is_empty());
+            keep.fetch_add(1, Ordering::Relaxed);
+            http::Response::new(Bytes::new())
+        },
+    );
     for body in [
         "\r\n",
         "Content-Length: 0\r\n\r\n",
@@ -1080,7 +1022,16 @@ fn http1_custom_handler_receives_partial_body_then_error() {
 
 #[test]
 fn http1_closes_after_its_header_timeout() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    );
     h.open().unwrap();
     assert_eq!(h.advance(Duration::from_secs(29)).unwrap(), b"");
     assert!(!h.closed());
@@ -1105,7 +1056,15 @@ fn world_host_names_match_http_sites_and_tls_names() {
         assert_eq!(httpd::normalize(name), expected);
         assert_eq!(Sni::from(name), Sni::Name(expected.to_owned()));
         let vhosts = httpd::VirtualHosts::new();
-        vhosts.insert(name, httpd::VHost::new(Router::new()));
+        vhosts.insert(
+            name,
+            httpd::VHost::new(fictionet_test_support::handler(|_, _| {
+                http::Response::builder()
+                    .status(404)
+                    .body(bytes::Bytes::new())
+                    .unwrap()
+            })),
+        );
         assert!(vhosts.get(expected).is_some(), "{name:?}");
     }
 
@@ -1129,13 +1088,19 @@ fn virtual_hosts_pick_a_site_by_host() {
     let vhosts = httpd::VirtualHosts::new();
     vhosts.insert(
         "a.test",
-        httpd::VHost::new(Router::new().fallback(|_, r| {
-            let t = r.extensions().get::<httpd::Target>().cloned().unwrap();
-            http::Response::new(Bytes::from(format!("a {} {}", t.host, t.port)))
-        })),
+        httpd::VHost::new(fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             r: http::Request<bytes::Bytes>| {
+                let t = r.extensions().get::<httpd::Target>().cloned().unwrap();
+                http::Response::new(Bytes::from(format!("a {} {}", t.host, t.port)))
+            },
+        )),
     );
-    let mut secure =
-        httpd::VHost::new(Router::new().fallback(|_, _| http::Response::new(Bytes::from("b"))));
+    let mut secure = httpd::VHost::new(fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from("b"))
+        },
+    ));
     secure.https = true;
     vhosts.insert("b.test", secure);
     let conn = ConnInfo::new(
@@ -1188,14 +1153,45 @@ fn http1_survives_mixed_and_random_input() {
         b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
     ];
     let router = || {
-        Router::new()
-            .get("/", |_, _| http::Response::new(Bytes::from("home\n")))
-            .post("/echo", |_, r: http::Request<Bytes>| {
-                http::Response::new(r.into_body())
-            })
-            .get("/files/*", |_, r| {
-                http::Response::new(Bytes::from(r.uri().path().to_owned()))
-            })
+        let route_0 =
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| http::Response::new(Bytes::from("home\n"));
+        let route_1 = |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                       r: http::Request<Bytes>| {
+            http::Response::new(r.into_body())
+        };
+        let route_2 = |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                       r: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from(r.uri().path().to_owned()))
+        };
+        fictionet_test_support::handler(move |ex, request| {
+            if request.uri().path() == "/"
+                && (request.method() == http::Method::GET || request.method() == http::Method::HEAD)
+            {
+                return route_0(ex, request);
+            }
+            if request.uri().path() == "/echo" && (request.method() == http::Method::POST) {
+                return route_1(ex, request);
+            }
+            if (request.uri().path() == "/files" || request.uri().path().starts_with("/files/"))
+                && (request.method() == http::Method::GET || request.method() == http::Method::HEAD)
+            {
+                return route_2(ex, request);
+            }
+            if request.uri().path() == "/"
+                || request.uri().path() == "/echo"
+                || (request.uri().path() == "/files" || request.uri().path().starts_with("/files/"))
+            {
+                return http::Response::builder()
+                    .status(405)
+                    .body(bytes::Bytes::new())
+                    .unwrap();
+            }
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })
     };
     let run = |chunks: &[&[u8]]| {
         let log = std::sync::Arc::new(fictionet_observe::Memory::default());
@@ -1239,7 +1235,16 @@ fn http1_survives_mixed_and_random_input() {
 /// timer was cancelled on the head and nothing replaced it.
 #[test]
 fn http1_closes_a_request_whose_body_never_finishes() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    );
     h.push(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc")
         .unwrap();
     assert_eq!(h.advance(Duration::from_secs(29)).unwrap(), b"");
@@ -1255,10 +1260,12 @@ fn http1_closes_a_request_whose_body_never_finishes() {
 fn http1_oversized_body_returns_413_without_calling_handler() {
     let seen = Arc::new(Mutex::new(None));
     let s = seen.clone();
-    let router = Router::new().post("/up", move |_, r: http::Request<Bytes>| {
-        *s.lock().unwrap() = Some(r.body().len());
-        http::Response::new(Bytes::from("ok\n"))
-    });
+    let router = fictionet_test_support::handler(
+        move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, r: http::Request<Bytes>| {
+            *s.lock().unwrap() = Some(r.body().len());
+            http::Response::new(Bytes::from("ok\n"))
+        },
+    );
     let limits = httpd::Limits {
         body: 10,
         ..Default::default()
@@ -1280,8 +1287,17 @@ fn http1_oversized_body_returns_413_without_calling_handler() {
 #[test]
 fn http1_header_timeout_records_an_error() {
     let log = std::sync::Arc::new(fictionet_observe::Memory::default());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
-        .observer(log.clone());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    )
+    .observer(log.clone());
     h.open().unwrap();
     let _ = h.push(b"GET / HTTP/1.1\r\n");
     let _ = h.advance(Duration::from_secs(31));
@@ -1299,7 +1315,11 @@ fn http1_header_timeout_records_an_error() {
 
 #[test]
 fn http1_idle_keep_alive_timeout_closes_without_an_error() {
-    let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("ok")));
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from("ok"))
+        },
+    );
     let log = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h =
         Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ()).observer(log.clone());
@@ -1318,7 +1338,11 @@ fn http1_idle_keep_alive_timeout_closes_without_an_error() {
 
 #[test]
 fn http1_pipelined_partial_head_timeout_records_an_error() {
-    let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("ok")));
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            http::Response::new(Bytes::from("ok"))
+        },
+    );
     let log = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h =
         Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ()).observer(log.clone());
@@ -1340,24 +1364,21 @@ fn http1_pipelined_partial_head_timeout_records_an_error() {
 }
 
 /// A known path takes precedence over the fallback.
-#[test]
-fn router_known_path_returns_405_before_fallback() {
-    let router = Router::new()
-        .get("/a", |_, _| http::Response::new(Bytes::from("a\n")))
-        .fallback(|_, _| http::Response::new(Bytes::from("fallback\n")));
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
-    let reply = h
-        .push(b"POST /a HTTP/1.1\r\nHost: a.test\r\nContent-Length: 0\r\n\r\n")
-        .unwrap();
-    let reply = String::from_utf8_lossy(&reply).into_owned();
-    assert!(reply.starts_with("HTTP/1.1 405"), "{reply:?}");
-}
 
 #[test]
 fn http1_body_timeout_records_an_error() {
     let log = std::sync::Arc::new(fictionet_observe::Memory::default());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
-        .observer(log.clone());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        })),
+        (),
+    )
+    .observer(log.clone());
     h.open().unwrap();
     h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 20\r\n\r\na")
         .unwrap();
@@ -1380,13 +1401,16 @@ fn observation_does_not_change_http_responses_or_protocol_budgets() {
             let heads = Arc::new(crate::common::http_observer::CountHeads::default());
             let memory = Arc::new(fictionet_observe::Memory::default());
             let service = Http1::with(
-                Arc::new(Router::new().get("/", move |_, request| {
-                    assert_eq!(
-                        request.extensions().get::<httpd::EventInterest>().is_some(),
-                        observed
-                    );
-                    http::Response::new(Bytes::from_static(b"hello"))
-                })),
+                Arc::new(fictionet_test_support::handler(
+                    move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                          request: http::Request<bytes::Bytes>| {
+                        assert_eq!(
+                            request.extensions().get::<httpd::EventInterest>().is_some(),
+                            observed
+                        );
+                        http::Response::new(Bytes::from_static(b"hello"))
+                    },
+                )),
                 httpd::Limits {
                     head: fictionet::stdlib::protocols::http1::Limits {
                         head: 8192,
@@ -1437,9 +1461,11 @@ fn accepted_large_requests_keep_fields_and_classification() {
         let path = format!("/{}", "p".repeat(path_len - 1));
         let observer = Arc::new(Exposure::default());
         let memory = Arc::new(fictionet_observe::Memory::default());
-        let service =
-            Http1::new(Router::new().fallback(|_, _| http::Response::new(Bytes::from("ok"))))
-                .observe(observer.clone());
+        let service = Http1::new(fictionet_test_support::handler(
+            |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+             _: http::Request<bytes::Bytes>| http::Response::new(Bytes::from("ok")),
+        ))
+        .observe(observer.clone());
         let mut harness =
             Harness::new(fictionet::Seed::from_u64(1), service, ()).observer(memory.clone());
         let mut request = format!(
@@ -1494,7 +1520,13 @@ fn interrupted_large_requests_keep_fields_and_classification() {
     for timeout in [false, true] {
         let observer = Arc::new(Exposure::default());
         let memory = Arc::new(fictionet_observe::Memory::default());
-        let service = Http1::new(Router::new()).observe(observer.clone());
+        let service = Http1::new(fictionet_test_support::handler(|_, _| {
+            http::Response::builder()
+                .status(404)
+                .body(bytes::Bytes::new())
+                .unwrap()
+        }))
+        .observe(observer.clone());
         let mut harness =
             Harness::new(fictionet::Seed::from_u64(1), service, ()).observer(memory.clone());
         let mut request =
@@ -1535,20 +1567,23 @@ fn interrupted_large_requests_keep_fields_and_classification() {
 #[test]
 fn response_metadata_cannot_displace_http_facts() {
     let memory = Arc::new(fictionet_observe::Memory::default());
-    let router = Router::new().get("/", |_, _| {
-        let mut fields = fictionet::events::Fields::new();
-        for name in [
-            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
-            "r", "s", "t", "u", "v", "w", "x", "y", "z", "aa", "bb", "cc", "dd", "ee", "ff",
-        ] {
-            fields.set(name, "x".repeat(4096));
-        }
-        fields.set("method", "wrong");
-        fields.set("status", 999u64);
-        let mut response = http::Response::new(Bytes::from_static(b"ok"));
-        response.extensions_mut().insert(fields);
-        response
-    });
+    let router = fictionet_test_support::handler(
+        |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+            let mut fields = fictionet::events::Fields::new();
+            for name in [
+                "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+                "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "aa", "bb", "cc", "dd", "ee",
+                "ff",
+            ] {
+                fields.set(name, "x".repeat(4096));
+            }
+            fields.set("method", "wrong");
+            fields.set("status", 999u64);
+            let mut response = http::Response::new(Bytes::from_static(b"ok"));
+            response.extensions_mut().insert(fields);
+            response
+        },
+    );
     let mut harness =
         Harness::new(fictionet::Seed::from_u64(1), Http1::new(router), ()).observer(memory.clone());
     let reply = harness

@@ -313,7 +313,12 @@ fn a_rejected_host_does_not_install_http_names_or_a_default() {
     world(Duration::from_secs(60), |fcx| async move {
         let addr = Ipv4Addr::new(203, 0, 113, 8);
         let server = || {
-            httpd::Server::new(Router::new().get("/", |_, _| http::Response::new("hello".into())))
+            httpd::Server::new(fictionet_test_support::handler(
+                |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                 _: http::Request<bytes::Bytes>| {
+                    http::Response::new("hello".into())
+                },
+            ))
         };
         let first = Host::new("first")
             .dns_name("first.test")
@@ -366,9 +371,10 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             ..Plant::default()
         });
         plant.registers.lock().unwrap()[3] = 451;
-        let hmi = Router::new().get("/", {
+        let hmi = fictionet_test_support::handler({
             let plant = plant.clone();
-            move |_, _| {
+            move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                  _: http::Request<bytes::Bytes>| {
                 http::Response::new(Bytes::from(format!(
                     "setpoint {}\n",
                     plant.registers.lock().unwrap()[0]
@@ -793,15 +799,15 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             Lines::new(64, Ending::LfOrCrlf)
         }
         on_open(self; _, driver) -> Flow {
-            driver.set_timer("tick", Duration::from_millis(20));
+            driver.set_timer((), Duration::from_millis(20));
             Ok(Flow::Continue)
         }
         on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
             Ok(Flow::Continue)
         }
-        on_timer(self, _: Timer; group, driver) -> Flow {
+        on_timer(self, _: (); group, driver) -> Flow {
             driver.send_to(*group, b"tick".to_vec());
-            driver.set_timer("tick", Duration::from_millis(20));
+            driver.set_timer((), Duration::from_millis(20));
             Ok(Flow::Continue)
         }
     }
