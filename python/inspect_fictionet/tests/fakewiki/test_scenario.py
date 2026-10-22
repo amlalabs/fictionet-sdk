@@ -16,7 +16,7 @@ from inspect_fictionet.worlds.fakewiki import scenario, tasks
 from inspect_fictionet.worlds.fakewiki.scenario import MARKERS
 
 # The probe pages as the world renders them for each variant. The world's
-# test the_evals_probe_pages_are_the_worlds (examples/fakewiki/world/src/pages/tests.rs)
+# test the_evals_probe_pages_are_the_worlds (demos/fakewiki/world/src/pages/tests.rs)
 # renders the URLs listed here and keeps the file current.
 PAGES = Path(__file__).with_name("pages.json")
 

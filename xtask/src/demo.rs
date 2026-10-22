@@ -12,7 +12,7 @@ use std::time::Instant;
 pub fn run(args: &[String]) -> Result {
     let dir = crate::root().join("demos/guest");
     let demos = demos(&dir)?;
-    let binaries = binaries(&crate::root().join("demos/src/bin"))?;
+    let binaries = binaries(&crate::root().join("demos"))?;
     if args.is_empty() {
         println!("in-process demos: {}", binaries.join(", "));
         println!("VM scripts: {}", demos.join(", "));
@@ -135,7 +135,7 @@ fn binaries(dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.join("main.rs").is_file() {
+        if path.join("app/src/main.rs").is_file() {
             names.push(
                 path.file_name()
                     .ok_or("a binary without a name")?

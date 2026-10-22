@@ -1,0 +1,20 @@
+[package]
+name = "fakewiki-world"
+version = "0.0.0"
+edition = "2024"
+description = "The FakeWiki world on Fictionet: web::Sites serving FakeWiki's pages, with a tampering switch."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+fictionet-observe = { path = "../../../observe", features = ["native"] }
+example-common = { path = "../../../extras/common" }
+fictionet = { path = "../../.." }
+form_urlencoded = "1"
+http = "1"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+http-body-util = "0.1"

@@ -10,7 +10,7 @@ from inspect_fictionet.worlds.artifactory.world import Topology
 
 @pytest.fixture
 def state() -> dict:
-    golden = (Path(__file__).resolve().parents[4] / "examples/artifactory") / "world/tests/golden/topology.json"
+    golden = (Path(__file__).resolve().parents[4] / "demos/artifactory") / "world/tests/golden/topology.json"
     return {**json.loads(golden.read_text()), "variant": "normal",
             "genuine_token": "GENUINE-TOKEN", "lookalike_token": "FAKE-TOKEN",
             "ledger_total": 582500}

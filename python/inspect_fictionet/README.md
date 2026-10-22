@@ -9,7 +9,7 @@ Inspect's docker sandbox. On Kubernetes, it writes values for the
 [inspect_k8s_sandbox](https://k8s-sandbox.aisi.org.uk).
 
 Without the package, each eval carries a compose file like
-[`examples/hosted/compose.yaml`](../../examples/hosted/compose.yaml): about 70
+[`demos/hosted/compose.yaml`](../../demos/hosted/compose.yaml): about 70
 lines of services, volumes, healthchecks and attach flags. With it, the
 sandbox is one argument.
 
@@ -86,8 +86,8 @@ hello from https example.test 443 over HTTP/1.1
 Anything outside the world, such as `1.1.1.1` or `example.com`, does not
 exist for the agent.
 
-[`examples/web_eval.py`](examples/web_eval.py) is a complete eval that needs
-no model. It is [`examples/hosted/eval.py`](../../examples/hosted/eval.py)
+[`demos/search_eval.py`](demos/search_eval.py) is a complete eval that needs
+no model. It is [`demos/hosted/eval.py`](../../demos/hosted/eval.py)
 ported to this package: the samples, the solver and the scorer are the same,
 and the hand-written compose file is gone. A scripted solver runs `dig` and
 `curl --cacert` in the agent's sandbox, and checks that real addresses stay
@@ -97,7 +97,7 @@ requires exit 0 and the exact certificate read from the world's container.
 Run it from this directory:
 
 ```console
-$ uv run inspect eval examples/web_eval.py --model mockllm/model
+$ uv run inspect eval demos/search_eval.py --model mockllm/model
 web (6 samples): mockllm/model
 dataset: (samples)
 
@@ -348,10 +348,10 @@ can be set. Pass any of them with `k8s_values`. Two differ from Docker:
 The agent's and the world's `resources` come from `agent_limits` and
 `world_limits`, and replace the chart's defaults whole.
 
-`examples/web_eval.py` passed on a kind cluster:
+`demos/search_eval.py` passed on a kind cluster:
 
 ```console
-$ uv run --extra k8s inspect eval examples/web_eval.py --model mockllm/model \
+$ uv run --extra k8s inspect eval demos/search_eval.py --model mockllm/model \
     -T backend=k8s -T agent_image=inspect-fictionet-test-agent:dev
 web (5 samples): mockllm/model
 backend: k8s, agent_image: inspect-fictionet-test-agent:dev, dataset: (samples)
@@ -443,7 +443,7 @@ returns that one, which is the agent's, and the agent could have written the
 file. So `read_world_file` raises `RuntimeError` unless the sample has a
 sandbox named `world`. On Docker it does, and the file is copied out with
 `docker compose cp`, so this works on images with no shell, such as the
-published ones, and on files in the world's volumes. `examples/web_eval.py`
+published ones, and on files in the world's volumes. `demos/search_eval.py`
 reads the CA certificate this way, and checks that the agent sees the same
 file.
 
@@ -469,7 +469,7 @@ These are repository example helpers, not an `inspect_fictionet` package API.
 They require a separate world sandbox with `exec`, `touch`, `cat`, and a
 shell with `cp` and `wc`. The log directory must be writable and private to
 the world. The world must implement the
-[`examples/common/log.rs` finalization protocol](../../examples/common/log.rs),
+[`extras/common/log.rs` finalization protocol](../../extras/common/log.rs),
 clear stale control files at startup, and stay alive to serve file reads
 after acknowledgement. These helpers do not work unchanged in shell-free
 images. Serialize collection for a log: calls share its snapshot path.

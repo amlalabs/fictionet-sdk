@@ -1,0 +1,33 @@
+[package]
+name = "artifactory-world"
+version = "0.0.0"
+edition = "2024"
+description = "The Artifactory world on Fictionet: a company package mirror with no upstream."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "artifactory-world"
+path = "src/main.rs"
+
+# The default features serve HTTP/2 without the optional web-proxy client.
+[dependencies]
+fictionet-observe = { path = "../../../observe", features = ["native"] }
+example-common = { path = "../../../extras/common" }
+bytes = "1"
+fictionet = { path = "../../.." }
+http = "1"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+fictionet-test-support = { path = "../../../tests/support" }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }

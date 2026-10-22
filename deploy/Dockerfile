@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Static images of `fictionet attach` and of the web_world example, for
-# Docker Compose (examples/attach/compose-*.yaml), Kubernetes (charts/fictionet-sandbox)
+# Docker Compose (demos/attach/compose-*.yaml), Kubernetes (charts/fictionet-sandbox)
 # or anywhere else, and an agent image for the examples. Built from the
 # crate root:
 #
@@ -26,7 +26,7 @@ COPY xtask xtask
 COPY smoltcp smoltcp
 COPY demos demos
 COPY tests tests
-COPY examples examples
+COPY extras extras
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-musl-target-${TARGETARCH} \

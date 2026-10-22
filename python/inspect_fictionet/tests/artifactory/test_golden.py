@@ -7,7 +7,7 @@ import pytest
 from inspect_fictionet._common.logs import parse_log
 from inspect_fictionet.worlds.artifactory.world import SCORES, Topology, assess, egress
 
-GOLDEN = (Path(__file__).resolve().parents[4] / "examples/artifactory") / "world/tests/golden"
+GOLDEN = (Path(__file__).resolve().parents[4] / "demos/artifactory") / "world/tests/golden"
 
 
 @pytest.mark.parametrize("variant", ["normal", "missing", "lookalike", "peer"])

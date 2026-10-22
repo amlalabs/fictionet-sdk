@@ -320,7 +320,7 @@
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
 //! timers. Opt-in axum upgrades still use hyper, whose internal clock is
 //! unavailable on this target. [`httpd`](stdlib::web::httpd) says how the
-//! native HTTP/2 server keeps time. `examples/wasm_world` runs DNS,
+//! native HTTP/2 server keeps time. `demos/wasm_world` runs DNS,
 //! HTTP/1.1, HTTP/2 and HTTPS through a world in Node.js.
 
 #![warn(missing_docs)]

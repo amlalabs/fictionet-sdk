@@ -43,7 +43,7 @@ case "$name" in
         if [[ $name == k8s ]]; then cargo xtask k8s tun; else cargo xtask k8s proxy; fi
         ;;
     border-world)
-        cd /src/examples/border/world
+        cd /src/demos/border/world
         CARGO_TARGET_DIR=/cache/target/border-test cargo test
         ;;
     border-scripted)

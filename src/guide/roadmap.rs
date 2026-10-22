@@ -219,10 +219,10 @@
 //! whether the sandbox can still reach the provider's own DNS server with
 //! egress blocked, and whether it has a metadata address.
 //!
-//! The [hosted example README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md)
+//! The [hosted example README](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md)
 //! keeps the provider measurements and limitations from 2 October 2026,
-//! including the [egress checks](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#the-sandboxs-own-network)
-//! and [open questions](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#still-unknown).
+//! including the [egress checks](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#the-sandboxs-own-network)
+//! and [open questions](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#still-unknown).
 //! Use that record when planning further provider tests.
 //!
 //! # `fictionet --world`

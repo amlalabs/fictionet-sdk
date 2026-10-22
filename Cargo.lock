@@ -985,6 +985,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-artifactory-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "artifactory-world",
+ "bytes",
+ "crc32fast",
+ "example-common",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+]
+
+[[package]]
+name = "fictionet-border-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "border-world",
+ "bytes",
+ "crc32fast",
+ "example-common",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "fictionet-search-demo",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+]
+
+[[package]]
 name = "fictionet-cli"
 version = "0.1.0"
 dependencies = [
@@ -1065,6 +1124,35 @@ dependencies = [
  "virtio-queue",
  "vm-memory",
  "vmm-sys-util 0.14.0",
+]
+
+[[package]]
+name = "fictionet-desktop-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "example-common",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "fictionet-search-demo",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
  "web-world",
 ]
 
@@ -1100,6 +1188,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-fakewiki-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "example-common",
+ "fakewiki-world",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+]
+
+[[package]]
 name = "fictionet-host"
 version = "0.1.0"
 dependencies = [
@@ -1132,6 +1249,64 @@ dependencies = [
  "serde_path_to_error",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "fictionet-scan-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "example-common",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "scan-world",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+]
+
+[[package]]
+name = "fictionet-search-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "example-common",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+ "web-world",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 //! Recipes: slow links, lost packets, packet captures and hijacked routes.
 //!
 //! Each recipe on this page is a complete world in the crate's
-//! `examples/` directory, with the commands that run it and what they
+//! `demos/` directory, with the commands that run it and what they
 //! printed when they were run. Read this page when you have a world of
 //! websites running, as in [`getting_started`](crate::guide::getting_started),
 //! and want to change the network the agent sees.
@@ -71,7 +71,7 @@
 //! This world puts a 200 ms delay in front of every sandbox, each way, so
 //! every round trip takes 400 ms longer:
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/delayed_sites.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../demos/delayed_sites/main.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -118,7 +118,7 @@
 //! side and never came out of the other was dropped by the queue. Once the
 //! packets have stopped for a second, the world prints the counts:
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/bottleneck_sites.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../demos/bottleneck_sites/main.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -161,7 +161,7 @@
 //! [`filter`](crate::stdlib::network::filter) decides for each packet with
 //! [`Cx::random_f64`](crate::Cx::random_f64):
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/lossy_sites.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../demos/lossy_sites/main.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -216,7 +216,7 @@
 //! does not always print the final loss count before it exits. A quiet world
 //! log therefore does not prove the file is complete.
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/capture_sites.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../demos/capture_sites/main.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it, and make a request:
 //!
@@ -285,7 +285,7 @@
 //! [`ServeOptions::idle`](crate::stdlib::services::serve::ServeOptions::idle)
 //! closes connections after 10 seconds without input while the service waits:
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/route_change/main.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../demos/route_change/main.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! The world has IPv4 only, so attach the sandbox with `--no-ip-addr-v6
 //! --no-gateway-v6 --no-dns-v6` in place of the three IPv6 flags (see
@@ -317,16 +317,16 @@
 //! 10 s later: 203.0.113.10/32 leads to the impostor
 //! ```
 //!
-//! The Border eval in `examples/border` builds a full hijack on the same
+//! The Border eval in `demos/border` builds a full hijack on the same
 //! idea: a BGP speaker the agent can query, `traceroute` hops that show the
 //! longer path, and an impostor bank with its own certificate authority.
 //!
 //! # A subnet for a port scanner
 //!
-//! `examples/scan` is a five-host subnet that `nmap` scans from a sandbox:
+//! `demos/scan` is a five-host subnet that `nmap` scans from a sandbox:
 //! four simulated machines and one real server, wired with a router and
 //! [grouped](crate::Cx#groups) for topology observers. The companion's
 //! `DashboardObserver` collects that topology for the dashboard. See
 //! [Fictionet Observe](../../../fictionet_observe/index.html) for setup. The scan
-//! [README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/scan/README.md)
+//! [README](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/scan/README.md)
 //! runs it under Docker Compose and shows the scan.

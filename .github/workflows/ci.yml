@@ -132,15 +132,15 @@ jobs:
             targets: attach web-world agent
           - dockerfile: tests/docker/proxy/Dockerfile
             targets: runtime agent
-          - dockerfile: examples/scan/docker/Dockerfile
+          - dockerfile: demos/scan/docker/Dockerfile
             targets: fictionet container scanner
-          - dockerfile: examples/fakewiki/docker/Dockerfile
+          - dockerfile: demos/fakewiki/docker/Dockerfile
             targets: world attach agent
-          - dockerfile: examples/web/docker/Dockerfile
+          - dockerfile: demos/search/docker/Dockerfile
             targets: world attach agent
-          - dockerfile: examples/artifactory/docker/Dockerfile
+          - dockerfile: demos/artifactory/docker/Dockerfile
             targets: world attach agent
-          - dockerfile: examples/border/docker/Dockerfile
+          - dockerfile: demos/border/docker/Dockerfile
             targets: world world-home attach agent home
     steps:
       - uses: actions/checkout@v4
@@ -187,7 +187,7 @@ jobs:
           uv run --project python/inspect_fictionet --locked --extra k8s
           --no-editable --reinstall-package inspect-fictionet pytest
           python/inspect_fictionet/tests
-          examples/hosted/tests
+          demos/hosted/tests
           tests/k8s
 
   wasm:
@@ -213,5 +213,5 @@ jobs:
       - name: Check the browser example
         run: cargo check --locked --all-targets -p wasm-world --target wasm32-unknown-unknown
       - name: The browser example, in Node.js
-        working-directory: examples/wasm_world
+        working-directory: demos/wasm_world
         run: wasm-pack test --node -- --locked

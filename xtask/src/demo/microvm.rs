@@ -58,6 +58,11 @@ pub fn assets() -> Result {
 }
 
 pub fn build(name: &str) -> Result {
+    let package = if name == "open" {
+        "fictionet-demo".to_owned()
+    } else {
+        format!("fictionet-{name}-demo")
+    };
     execute(&mut cmd(
         "cargo",
         &[
@@ -65,7 +70,7 @@ pub fn build(name: &str) -> Result {
             "--locked",
             "--release",
             "-p",
-            "fictionet-demo",
+            &package,
             "--bin",
             name,
         ],

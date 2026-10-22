@@ -14,7 +14,7 @@ from typing import Any
 
 from inspect_fictionet.worlds.border.world import assess
 
-GOLDEN = Path(__file__).resolve().parents[4] / "examples/border/world/tests/golden"
+GOLDEN = Path(__file__).resolve().parents[4] / "demos/border/world/tests/golden"
 
 
 def state(hijacked: bool) -> dict[str, Any]:

@@ -18,7 +18,7 @@ COPY xtask xtask
 COPY smoltcp smoltcp
 COPY demos demos
 COPY tests tests
-COPY examples examples
+COPY extras extras
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-tcpudp-target \
     cargo test --locked --release -p fictionet --test host --no-run \

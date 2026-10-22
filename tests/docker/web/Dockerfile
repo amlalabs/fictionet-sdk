@@ -15,7 +15,7 @@ COPY xtask xtask
 COPY smoltcp smoltcp
 COPY demos demos
 COPY tests tests
-COPY examples examples
+COPY extras extras
 # The hosted example also copies web_world out of this image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-web-target \

@@ -74,7 +74,7 @@ host carries those sessions and is omitted from the page.
 ## Development
 
 Run `cargo test --workspace`, the Node tests under `dashboard/` and
-`demos/src/search/`, and the Python package's tests. Demo launches are
+`demos/search/app/src/page/`, and the Python package's tests. Demo launches are
 interactive applications.
 
 The shared kit handles guests, provisioning, networking and run lifetime.

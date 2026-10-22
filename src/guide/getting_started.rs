@@ -78,7 +78,7 @@
 //! `example.test` and `www.example.test`, with a certificate from that CA,
 //! at two addresses: `203.0.113.10` for IPv4 and `2001:db8:113::10` for
 //! IPv6. It also serves a few more sites, listed at the top of
-//! `examples/web_world.rs`: `plain.test` and `shared.test` serve plain HTTP
+//! `demos/web_world/main.rs`: `plain.test` and `shared.test` serve plain HTTP
 //! only, and `v4only.test` and `v6only.test` have only one address family. It answers every other name with "no such name" (NXDOMAIN).
 //!
 //! Leave it running. It prints `lookup <name>` the first time a sandbox

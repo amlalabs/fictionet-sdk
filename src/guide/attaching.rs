@@ -11,7 +11,7 @@
 //! not attached a sandbox before, walk through
 //! [`getting_started`](crate::guide::getting_started) first. This page owns the
 //! deployment procedures. The recipe files below are included directly from
-//! `examples/attach`, so the instructions and runnable examples use the same files.
+//! `demos/attach`, so the instructions and runnable examples use the same files.
 //!
 //! `fictionet attach` is a relay. You run one next to each sandbox,
 //! wherever it can get at the sandbox's packets. It connects to the world's
@@ -145,7 +145,7 @@
 //! one do. Fictionet supplies the sandbox's network. The harness supplies
 //! the rest of the sandbox, and decides what the agent may do.
 //!
-//! The script `examples/attach/netns.sh` does what
+//! The script `demos/attach/netns.sh` does what
 //! [`getting_started`](crate::guide::getting_started) does, in one go, the way a
 //! test harness would. It makes the namespace and gives it its own
 //! `nsswitch.conf` (see
@@ -154,7 +154,7 @@
 //! ends, or the script is stopped, it stops attach and removes the
 //! namespace. This is the whole file:
 //!
-#![cfg_attr(doc, doc = concat!("```sh\n", include_str!("../../examples/attach/netns.sh"), "```"))]
+#![cfg_attr(doc, doc = concat!("```sh\n", include_str!("../../demos/attach/netns.sh"), "```"))]
 //!
 //! The loop in the middle waits for attach's ready file, so the agent never
 //! starts without a network. `--world-wait 5` lets attach wait up to 5
@@ -210,18 +210,18 @@
 //! it again:
 //!
 //! ```text
-//! # examples/attach/netns.sh curl -sS --cacert /run/fictionet/ca.pem https://example.test/
+//! # demos/attach/netns.sh curl -sS --cacert /run/fictionet/ca.pem https://example.test/
 //! fictionet attach: agent attached as tun0
 //! lookup example.test
 //! hello from https example.test 443 over HTTP/2.0
-//! # examples/attach/netns.sh ip -br addr
+//! # demos/attach/netns.sh ip -br addr
 //! fictionet attach: agent attached as tun0
 //! lo               UNKNOWN        127.0.0.1/8 ::1/128
 //! tun0             UNKNOWN        10.0.0.2/24 2001:db8::2/64 fe80::9f59:abb7:ab11:68f8/64
-//! # examples/attach/netns.sh id
+//! # demos/attach/netns.sh id
 //! fictionet attach: agent attached as tun0
 //! uid=999(agent) gid=999(agent) groups=999(agent)
-//! # examples/attach/netns.sh curl -sS -m 5 https://1.1.1.1/
+//! # demos/attach/netns.sh curl -sS -m 5 https://1.1.1.1/
 //! fictionet attach: agent attached as tun0
 //! curl: (7) Failed to connect to 1.1.1.1 port 443 after 0 ms: Couldn't connect to server
 //! ```
@@ -291,7 +291,7 @@
 //! the world socket through a volume. The agent gets the world's CA
 //! certificate through another volume, and nothing else of the world.
 //!
-//! The file is `examples/attach/compose-tun.yaml` in the crate's
+//! The file is `demos/attach/compose-tun.yaml` in the crate's
 //! repository, shown here whole. Notice the start order. The world starts
 //! first. Attach waits up to 30 seconds for the world's socket
 //! (`--world-wait`), and its healthcheck passes once the world has
@@ -299,7 +299,7 @@
 //! (`depends_on` with `service_healthy`), so it never runs without a
 //! network.
 //!
-#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../examples/attach/compose-tun.yaml"), "```"))]
+#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../demos/attach/compose-tun.yaml"), "```"))]
 //!
 //! ## The images
 //!
@@ -333,17 +333,17 @@
 //! 6 s, and removing it all took 0.7 to 1.1 s.
 //!
 //! ```text
-//! $ docker compose -f examples/attach/compose-tun.yaml build
-//! $ docker compose -f examples/attach/compose-tun.yaml up -d --wait
-//! $ docker compose -f examples/attach/compose-tun.yaml exec agent curl -sS --cacert /run/ca/ca.pem https://example.test/
+//! $ docker compose -f demos/attach/compose-tun.yaml build
+//! $ docker compose -f demos/attach/compose-tun.yaml up -d --wait
+//! $ docker compose -f demos/attach/compose-tun.yaml exec agent curl -sS --cacert /run/ca/ca.pem https://example.test/
 //! hello from https example.test 443 over HTTP/2.0
-//! $ docker compose -f examples/attach/compose-tun.yaml down -v
+//! $ docker compose -f demos/attach/compose-tun.yaml down -v
 //! ```
 //!
 #![doc = include_str!("../../docs/diagrams/attach-tun-compose.svg")]
 //!
 //! From inside the agent's container
-//! (`docker compose -f examples/attach/compose-tun.yaml exec agent ...`),
+//! (`docker compose -f demos/attach/compose-tun.yaml exec agent ...`),
 //! the network looks like this:
 //!
 //! ```text
@@ -488,11 +488,11 @@
 //! ## Values
 //!
 //! The chart takes its settings from a values file.
-//! `examples/attach/k8s-tun.yaml` is the one the crate's own test
+//! `demos/attach/k8s-tun.yaml` is the one the crate's own test
 //! installs, shown here whole. The world is `web_world`, and the agent is
 //! the Debian image from [The images](#the-images), run as uid 1000:
 //!
-#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../examples/attach/k8s-tun.yaml"), "```"))]
+#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../demos/attach/k8s-tun.yaml"), "```"))]
 //!
 //! The [chart's values reference](https://github.com/amlalabs/fictionet-sdk/blob/main/charts/fictionet-sandbox/values.yaml)
 //! describes every setting and its default. Use `attach` for settings shared
@@ -523,7 +523,7 @@
 //! $ docker build -f deploy/Dockerfile --target agent -t fictionet-agent:dev .
 //! $ kind create cluster --name fictionet
 //! $ kind load docker-image --name fictionet fictionet-attach:dev fictionet-web-world:dev fictionet-agent:dev
-//! $ helm install demo charts/fictionet-sandbox -f examples/attach/k8s-tun.yaml --wait
+//! $ helm install demo charts/fictionet-sandbox -f demos/attach/k8s-tun.yaml --wait
 //! $ kubectl exec fictionet-sandbox-demo-default-0 -c default -- curl -sS --cacert /run/ca/ca.pem https://example.test/
 //! hello from https example.test 443 over HTTP/2.0
 //! $ kubectl exec fictionet-sandbox-demo-default-0 -c default -- ip -br addr
@@ -556,7 +556,7 @@
 //!     ...,
 //!     sandbox=("k8s", K8sSandboxEnvironmentConfig(
 //!         chart="charts/fictionet-sandbox",
-//!         values=Path("examples/attach/k8s-tun.yaml"))),
+//!         values=Path("demos/attach/k8s-tun.yaml"))),
 //! )
 //! ```
 //!
@@ -673,13 +673,13 @@
 //! besides loopback, is still `tun0`, and it still has no `NET_ADMIN`. The sandbox itself can
 //! reach the provider's network, but the agent cannot.
 //!
-//! `examples/hosted` in the crate's repository has a tested copy: two small
+//! `demos/hosted` in the crate's repository has a tested copy: two small
 //! Dockerfiles, a compose file, a `check.sh`, a script that runs it on
 //! either provider, a tiny Inspect eval and a Harbor task. Run
 //! `cargo xtask images hosted` first. It builds `fictionet` and `web_world`
 //! for Debian, so nothing is compiled in the sandbox.
 //!
-//! The [hosted example README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md)
+//! The [hosted example README](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md)
 //! lists provider results: SDK versions, measurements, failures and
 //! limitations from 2 October 2026. Those results describe that run, not a
 //! promise about every provider account or version. The commands below are
@@ -691,21 +691,21 @@
 //! to check a change before you pay for a sandbox. You need Linux with
 //! `/dev/net/tun`, and Docker Engine with Compose v2. Run these from the
 //! repository's top directory. `cargo xtask images hosted` builds `fictionet` and `web_world` in Docker
-//! and copies them into `examples/hosted/bin`. Then Compose starts the
+//! and copies them into `demos/hosted/bin`. Then Compose starts the
 //! three containers, `check.sh` runs 19 checks from outside them, and
 //! Compose removes them:
 //!
 //! ```sh
 //! cargo xtask images hosted
 //! (
-//!   cd examples/hosted || exit
+//!   cd demos/hosted || exit
 //!   trap 'docker compose down -v' EXIT
 //!   docker compose up -d --build --wait && ./check.sh
 //! )
 //! ```
 //!
 //! Expect `ALL PASSED` from `check.sh`. The hosted README keeps the
-//! [full check output and timings](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-was-run-2-october-2026).
+//! [full check output and timings](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#what-was-run-2-october-2026).
 //!
 //! ## Directly, with each provider's SDK
 //!
@@ -715,8 +715,8 @@
 //! ```sh
 //! cargo xtask images hosted
 //! pip install daytona e2b
-//! DAYTONA_API_KEY=... python examples/hosted/run_hosted.py daytona
-//! E2B_API_KEY=... python examples/hosted/run_hosted.py e2b
+//! DAYTONA_API_KEY=... python demos/hosted/run_hosted.py daytona
+//! E2B_API_KEY=... python demos/hosted/run_hosted.py e2b
 //! ```
 //!
 //! The script does every other step itself. It makes one sandbox, uploads
@@ -725,8 +725,8 @@
 //! `docker:28.3.3-dind` with 2 vCPU and 4 GiB, and starts dockerd. On E2B
 //! it first builds a template, `fictionet-dind`: Ubuntu 24.04 with
 //! `docker.io` and `docker-compose-v2`. See the hosted README for
-//! [provider capabilities](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-the-sandboxes-gave-docker)
-//! and [upload and image limitations](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#things-that-broke-on-the-way).
+//! [provider capabilities](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#what-the-sandboxes-gave-docker)
+//! and [upload and image limitations](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#things-that-broke-on-the-way).
 //!
 //! ## Through Inspect
 //!
@@ -736,14 +736,14 @@
 //!
 //! ```sh
 //! pip install inspect-ai inspect-sandboxes
-//! inspect eval examples/hosted/eval.py --model mockllm/model -T provider=daytona
-//! inspect eval examples/hosted/eval.py --model mockllm/model -T provider=e2b --max-samples 1
+//! inspect eval demos/hosted/eval.py --model mockllm/model -T provider=daytona
+//! inspect eval demos/hosted/eval.py --model mockllm/model -T provider=e2b --max-samples 1
 //! ```
 //!
 //! The eval needs no model: a scripted solver runs five commands in the
 //! agent's container, and the scorer checks the output. The hosted README
-//! records the [results](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-was-run-2-october-2026)
-//! and [Compose restrictions and E2B template race](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#things-that-broke-on-the-way)
+//! records the [results](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#what-was-run-2-october-2026)
+//! and [Compose restrictions and E2B template race](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#things-that-broke-on-the-way)
 //! behind the command's `--max-samples 1` setting.
 //!
 //! ## Through Harbor
@@ -756,14 +756,14 @@
 //!
 //! ```sh
 //! pip install 'harbor[daytona]'
-//! harbor run -p examples/hosted/harbor/fictionet-web -a oracle -e daytona
+//! harbor run -p demos/hosted/harbor/fictionet-web -a oracle -e daytona
 //! ```
 //!
 //! For the local Harbor oracle run, after building the binaries:
 //!
 //! ```sh
 //! pip install harbor
-//! harbor run -p examples/hosted/harbor/fictionet-web -a oracle -e docker
+//! harbor run -p demos/hosted/harbor/fictionet-web -a oracle -e docker
 //! ```
 //!
 //! The `oracle` agent runs the task's `solution/solve.sh`, so no model is
@@ -771,15 +771,15 @@
 //! The verifier fetches that world's nonce again and compares the whole body,
 //! then checks isolation. Harbor runs the verifier in `main`, so these checks
 //! trust the container's tools. See the hosted README for the
-//! [tested result](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-was-run-2-october-2026)
-//! and [E2B backend limitation](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#things-that-broke-on-the-way).
+//! [tested result](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#what-was-run-2-october-2026)
+//! and [E2B backend limitation](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#things-that-broke-on-the-way).
 //!
 //! ## The provider's network
 //!
 //! The agent cannot reach the sandbox's network, whatever the provider
 //! allows. Docker inside the sandbox can, and it needs that network to pull
 //! images. The hosted README records the
-//! [egress rules observed for each account](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#the-sandboxs-own-network).
+//! [egress rules observed for each account](https://github.com/amlalabs/fictionet-sdk/blob/main/demos/hosted/README.md#the-sandboxs-own-network).
 //! Check those limitations when choosing how to build and start the sandbox.
 //!
 //! # Behind a proxy: `http_proxy` and `socks5`
@@ -1037,7 +1037,7 @@
 //!
 //! - **Docker.** The sandbox's only network is an `internal: true` network
 //!   shared with attach, so it has no route out. Give that network the
-//!   `isolated` gateway modes as well, as `examples/attach/compose-proxy.yaml`
+//!   `isolated` gateway modes as well, as `demos/attach/compose-proxy.yaml`
 //!   does. Without them, the host has an address on the network, and the
 //!   agent can connect to any service on the host that listens on all
 //!   addresses. (In a test with Docker Engine 29.8, the agent reached the
@@ -1080,7 +1080,7 @@
 //!
 //! ## The proxy in Docker Compose
 //!
-//! The file is `examples/attach/compose-proxy.yaml` in the crate's
+//! The file is `demos/attach/compose-proxy.yaml` in the crate's
 //! repository, shown here whole. It uses the images from
 //! [The images](#the-images). The world has no network at all. The
 //! sandbox's only network, `sandbox`, is internal, and attach is the only
@@ -1090,7 +1090,7 @@
 //! environment variable `RELAY_TOKEN`. Compose gives it to attach as a
 //! file, `/run/secrets/token`, and puts it in the agent's proxy URLs.
 //!
-#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../examples/attach/compose-proxy.yaml"), "```"))]
+#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../demos/attach/compose-proxy.yaml"), "```"))]
 //!
 //! For `socks5`, change attach's `--type` and port, and give the agent
 //! `ALL_PROXY=socks5h://relay:${RELAY_TOKEN}@attach:1080` instead
@@ -1106,21 +1106,21 @@
 //!
 //! ```text
 //! $ export RELAY_TOKEN=$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')
-//! $ docker compose -f examples/attach/compose-proxy.yaml build
-//! $ docker compose -f examples/attach/compose-proxy.yaml up -d --wait
-//! $ docker compose -f examples/attach/compose-proxy.yaml exec agent curl -sS https://example.test/
+//! $ docker compose -f demos/attach/compose-proxy.yaml build
+//! $ docker compose -f demos/attach/compose-proxy.yaml up -d --wait
+//! $ docker compose -f demos/attach/compose-proxy.yaml exec agent curl -sS https://example.test/
 //! hello from https example.test 443 over HTTP/2.0
-//! $ docker compose -f examples/attach/compose-proxy.yaml exec agent curl -sS --noproxy '*' -m 5 https://example.test/
+//! $ docker compose -f demos/attach/compose-proxy.yaml exec agent curl -sS --noproxy '*' -m 5 https://example.test/
 //! curl: (6) Could not resolve host: example.test
-//! $ docker compose -f examples/attach/compose-proxy.yaml exec agent curl -sS --noproxy '*' -m 5 https://1.1.1.1/
+//! $ docker compose -f demos/attach/compose-proxy.yaml exec agent curl -sS --noproxy '*' -m 5 https://1.1.1.1/
 //! curl: (7) Failed to connect to 1.1.1.1 port 443 after 0 ms: Couldn't connect to server
-//! $ docker compose -f examples/attach/compose-proxy.yaml exec agent curl -sS https://example.com/
+//! $ docker compose -f demos/attach/compose-proxy.yaml exec agent curl -sS https://example.com/
 //! curl: (56) CONNECT tunnel failed, response 502
-//! $ docker compose -f examples/attach/compose-proxy.yaml logs attach
+//! $ docker compose -f demos/attach/compose-proxy.yaml logs attach
 //! attach-1  | fictionet attach: agent attached; HTTP proxy on 0.0.0.0:8080, as 10.0.0.2 with DNS at 10.0.0.1
 //! attach-1  | fictionet attach: CONNECT example.test:443 (203.0.113.10) 200, 774 bytes up, 1218 down, 0.003 s
 //! attach-1  | fictionet attach: CONNECT example.com:443 502 no such name in the world
-//! $ docker compose -f examples/attach/compose-proxy.yaml down -v
+//! $ docker compose -f demos/attach/compose-proxy.yaml down -v
 //! ```
 //!
 //! With the images already built, starting took 2.8 s and removing it all
@@ -1175,10 +1175,10 @@
 //!   holds: see [Waiting until the policy holds](#waiting-until-the-policy-holds)
 //!   below.
 //!
-//! `examples/attach/k8s-proxy.yaml` has two sandboxes, one with each proxy
+//! `demos/attach/k8s-proxy.yaml` has two sandboxes, one with each proxy
 //! type. The crate's test installs it, and it is shown here whole:
 //!
-#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../examples/attach/k8s-proxy.yaml"), "```"))]
+#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../demos/attach/k8s-proxy.yaml"), "```"))]
 //!
 //! ### Run it on kind
 //!
@@ -1193,7 +1193,7 @@
 //! $ kind load docker-image --name fictionet fictionet-attach:dev fictionet-web-world:dev fictionet-agent:dev
 //! $ kubectl create namespace sandboxes
 //! $ kubectl label namespace sandboxes pod-security.kubernetes.io/enforce=restricted
-//! $ helm install demo charts/fictionet-sandbox -n sandboxes -f examples/attach/k8s-proxy.yaml --wait
+//! $ helm install demo charts/fictionet-sandbox -n sandboxes -f demos/attach/k8s-proxy.yaml --wait
 //! $ kubectl -n sandboxes exec fictionet-sandbox-demo-default-0 -c default -- curl -sS https://example.test/
 //! hello from https example.test 443 over HTTP/2.0
 //! $ kubectl -n sandboxes exec fictionet-sandbox-demo-socks-0 -c socks -- curl -sS https://example.test/
@@ -1298,7 +1298,7 @@
 //! applied by hand, and the agent started:
 //!
 //! ```text
-//! $ helm install demo charts/fictionet-sandbox -n sandboxes -f examples/attach/k8s-proxy.yaml --set networkPolicy.enabled=false
+//! $ helm install demo charts/fictionet-sandbox -n sandboxes -f demos/attach/k8s-proxy.yaml --set networkPolicy.enabled=false
 //! ...
 //! $ kubectl -n sandboxes get pod fictionet-sandbox-demo-default-0
 //! NAME                               READY   STATUS     RESTARTS   AGE
@@ -1874,8 +1874,8 @@
 //! Follow getting started's [network checks](crate::guide::getting_started#5-look-around-inside-the-sandbox)
 //! and [HTTPS check](crate::guide::getting_started#6-trust-the-worlds-ca-and-make-an-https-request)
 //! with `web_world` running. Run them inside the sandbox with
-//! `ip netns exec agent` or `examples/attach/netns.sh` on a host, or
-//! `docker compose -f examples/attach/compose-tun.yaml exec agent` in Compose.
+//! `ip netns exec agent` or `demos/attach/netns.sh` on a host, or
+//! `docker compose -f demos/attach/compose-tun.yaml exec agent` in Compose.
 //! If the device or routes are missing, read attach's messages. If those work
 //! but DNS fails, check which resolver file the sandbox reads:
 //! see [DNS and `resolv.conf`](#dns-and-resolvconf).

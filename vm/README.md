@@ -77,7 +77,7 @@ in `.vm/test-<name>.log`.
 | `docker-ping`, `docker-tcpudp` | `cargo xtask docker ping` and `cargo xtask docker tcpudp`. |
 | `k8s` | `cargo xtask k8s tun`: the Helm chart on kind, attached with `--type tun`. |
 | `k8s-proxy` | `cargo xtask k8s proxy`: the Helm chart on kind with the proxy types, under Pod Security "restricted". |
-| `border-world` | `cargo test` in `examples/border/world`. |
+| `border-world` | `cargo test` in `demos/border/world`. |
 | `border-scripted` | Border's `border_scripted` task, lab and home settings, with Inspect's mock model. |
 | `border-probes` | Border's `border_probes` task, lab and home settings. |
 | `fakewiki-probes` | FakeWiki's `fakewiki_probes` task, and its leak checker's negative control. |

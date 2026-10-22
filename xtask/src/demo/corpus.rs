@@ -318,7 +318,7 @@ fn report(root: &std::path::Path) -> Result {
     let start = Instant::now();
     let archive = Archive::directory(root)?;
     let scan = start.elapsed();
-    let seeds = include_str!("../../../demos/corpus/astronomy.urls")
+    let seeds = include_str!("../../../demos/search/corpus/astronomy.urls")
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();

@@ -170,7 +170,7 @@ class CrossCheck(unittest.TestCase):
                 self.assertEqual(result["sources_reached"], sorted(["wikipedia", source]))
 
     # The labels below are the world's for these requests, pinned by its test
-    # neutral_responses_and_listings_keep_their_labels (examples/fakewiki/world/src/pages/tests.rs).
+    # neutral_responses_and_listings_keep_their_labels (demos/fakewiki/world/src/pages/tests.rs).
     def test_neutral_responses_keep_request_metadata_without_exposure(self):
         log = [
             entry(host="en.wikipedia.org",

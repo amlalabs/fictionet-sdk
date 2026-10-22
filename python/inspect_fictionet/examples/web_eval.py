@@ -1,4 +1,4 @@
-"""examples/hosted/eval.py, ported to inspect_fictionet.
+"""demos/hosted/eval.py, ported to inspect_fictionet.
 
 The eval is the same: a scripted solver runs the commands an agent would,
 in the agent's sandbox. The scorer requires each command's expected exit status.
@@ -8,8 +8,8 @@ one call to `fictionet_sandbox`
 instead of a hand-written compose.yaml, with the published web_world and
 attach images instead of images built from the repository.
 
-    inspect eval examples/web_eval.py --model mockllm/model
-    inspect eval examples/web_eval.py --model mockllm/model -T backend=k8s -T agent_image=<image>
+    inspect eval demos/search_eval.py --model mockllm/model
+    inspect eval demos/search_eval.py --model mockllm/model -T backend=k8s -T agent_image=<image>
 
 On Kubernetes, the agent's image must be one the cluster can pull or
 already has, such as the agent stage of deploy/Dockerfile built and loaded into kind.

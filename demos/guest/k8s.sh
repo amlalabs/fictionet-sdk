@@ -33,10 +33,10 @@ sed 's/^/    /' /run/kind.log
 vm "kind load docker-image --name $cluster fictionet-attach:dev fictionet-web-world:dev fictionet-agent:dev 2>&1 | { grep -v '^Image:' || true; }"
 
 step "Install the chart"
-note "examples/attach/k8s-tun.yaml runs the web_world example as the world and the Debian image as"
+note "demos/attach/k8s-tun.yaml runs the web_world example as the world and the Debian image as"
 note "the agent, as uid 1000 with no capabilities. The world and attach run as native sidecars"
 note "in the agent's pod; attach takes the pod's eth0 down and puts tun0 in its place."
-vm "helm install $release /src/charts/fictionet-sandbox -f /src/examples/attach/k8s-tun.yaml --wait --timeout 180s | sed -n 1,6p"
+vm "helm install $release /src/charts/fictionet-sandbox -f /src/demos/attach/k8s-tun.yaml --wait --timeout 180s | sed -n 1,6p"
 vm "kubectl get pod $pod -o jsonpath='{range .spec.initContainers[*]}{.name}{\" (sidecar)\\n\"}{end}{range .spec.containers[*]}{.name}{\" (the agent)\\n\"}{end}'"
 vm "kubectl logs $pod -c attach"
 

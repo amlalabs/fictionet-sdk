@@ -51,7 +51,10 @@ pub fn run(args: &[String]) -> Result {
     if build {
         for target in ["world", "attach", "agent"] {
             crate::images::build(
-                &format!("examples/{world}/docker/Dockerfile"),
+                &format!(
+                    "demos/{}/docker/Dockerfile",
+                    if world == "web" { "search" } else { world }
+                ),
                 target,
                 &format!("fictionet-{world}-{target}:dev"),
             )?;
@@ -61,7 +64,7 @@ pub fn run(args: &[String]) -> Result {
                 ("world-home", "fictionet-border-world:home"),
                 ("home", "fictionet-border-home:dev"),
             ] {
-                crate::images::build("examples/border/docker/Dockerfile", target, tag)?;
+                crate::images::build("demos/border/docker/Dockerfile", target, tag)?;
             }
         }
     }
@@ -211,7 +214,7 @@ fn live(args: &[String]) -> Result {
         .unwrap_or_else(|| "openrouter".into());
     let store = config.remove("store").unwrap_or_else(|| {
         crate::root()
-            .join("examples/web/store")
+            .join("demos/search/store")
             .display()
             .to_string()
     });
