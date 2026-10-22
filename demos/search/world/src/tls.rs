@@ -6,8 +6,8 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 /// The world's certificate authority, which signs a certificate for each
 /// host at its first handshake.
 pub struct Ca {
-    issuer: fictionet::stdlib::services::ca::Ca,
-    start: SystemTime,
+    pub(super) issuer: fictionet::stdlib::services::ca::Ca,
+    pub(super) start: SystemTime,
 }
 
 impl Ca {
