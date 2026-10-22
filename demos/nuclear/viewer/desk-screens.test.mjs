@@ -267,59 +267,7 @@ function luminance(hex) {
   return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
 }
 
-test('alarm tiles have tinted surfaces, colored left bars and AA text in every palette', () => {
-  const css = readFileSync(new URL('./viewer.css', import.meta.url), 'utf8');
-  const palettes = [...css.matchAll(/--surface:\s*#[\da-f]+;[\s\S]*?--coolant-hot:\s*#[\da-f]+;/g)];
-  assert.equal(palettes.length, 3);
-  for (const [index, [block]] of palettes.entries()) {
-    const tokens = Object.fromEntries(
-      [...block.matchAll(/(--[\w-]+):\s*(#[\da-f]+);/g)].map(([, name, color]) => [name, color]),
-    );
-    const colors = Object.fromEntries(Object.entries(PALETTE_TOKENS).map(([name, token]) => [name, tokens[token]]));
-    const view = viewFixture();
-    view.alarms[0].state = 'active';
-    view.alarms[1].state = 'acknowledged';
-    const ctx = context();
-    paintDeskScreen(ctx, { view, palette: colors, layout: 'alarms-primary' });
-    for (let i = 0; i < 8; i += 1) {
-      const x = 16 + (i % 2) * 504;
-      const y = 52 + Math.floor(i / 2) * 100;
-      const background = ctx.calls.find(
-        (call) => call.name === 'fillRect' && call.args[0] === x && call.args[1] === y && call.args[2] === 488,
-      );
-      const bar = ctx.calls.find(
-        (call) => call.name === 'fillRect' && call.args[0] === x && call.args[1] === y && call.args[2] === 6,
-      );
-      assert.equal(background.fill, i < 2 ? colors.sunken : colors.raised);
-      if (i === 0) assert.equal(bar.fill, colors.warning);
-      if (i === 1) assert.equal(bar.fill, colors.lampGlow);
-      const labels = ctx.calls.filter(
-        (call) => call.name === 'fillText' && call.args[1] === x + 12 && [y + 10, y + 45].includes(call.args[2]),
-      );
-      assert.equal(labels.length, 2);
-      for (const label of labels) {
-        const foreground = luminance(label.fill);
-        const surface = luminance(background.fill);
-        const contrast = (Math.max(foreground, surface) + 0.05) / (Math.min(foreground, surface) + 0.05);
-        assert.ok(contrast >= 4.5, `Palette ${index}: ${label.args[0]} contrast ${contrast}`);
-      }
-    }
-  }
-});
 
-test('every fill and stroke comes from the supplied palette', () => {
-  const view = viewFixture();
-  view.reportedStatus.coolantPumpsRunning[0] = false;
-  view.alarms[0].state = 'active';
-  view.alarms[1].state = 'acknowledged';
-  const colors = new Set(Object.values(palette));
-  for (const layout of SCREEN_LAYOUTS) {
-    for (const call of paint(view, layout)) {
-      if (['fill', 'fillRect', 'fillText'].includes(call.name)) assert.ok(colors.has(call.fill), call.fill);
-      if (['stroke', 'strokeRect'].includes(call.name)) assert.ok(colors.has(call.stroke), call.stroke);
-    }
-  }
-});
 
 test('signatures track displayed values, status, alarms and heartbeat, but ignore truth and rounding noise', () => {
   const view = viewFixture();

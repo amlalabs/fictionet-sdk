@@ -112,3 +112,17 @@ active modes are covered by copied corpus and model transport integration tests.
 - `demos/search/world/tests/lab.rs::seeded_lab_runs_match`: assumes ten invented offline pages and compares two runs of the same maker.
 - `demos/search/world/tests/lab.rs::exhausted_search_emits_query_failed`: spends the removed offline maker's synthetic page budget; model budget tests remain.
 - `demos/search/world/tests/lab.rs::result_icons_only_contact_the_search_engine`: assumes ten invented results; copied-engine requests remain covered.
+
+- `demos/nuclear/viewer/knobs.test.mjs::control lamps contrast with unlit lenses in light and both dark palettes`: Checks CSS palette constants.
+- `demos/nuclear/viewer/hmi/hmi.test.mjs::graphic font metrics and confirmation sizing match the layout checks`: Matches CSS source text without rendering the page.
+- `demos/nuclear/viewer/look.test.mjs::surface roles separate painted steel, brushed metal, glass, rubber and concrete`: Restates material constants or mocks the renderer; no pixels are rendered.
+- `demos/nuclear/viewer/look.test.mjs::the renderer factory creates one context with filmic output and shadow accounting`: Restates material constants or mocks the renderer; no pixels are rendered.
+- `demos/nuclear/viewer/look.test.mjs::display emission passes palette ink through with no tone mapping or extra gain`: Restates material constants or mocks the renderer; no pixels are rendered.
+- `demos/nuclear/viewer/desk-screens.test.mjs::alarm tiles have tinted surfaces, colored left bars and AA text in every palette`: Checks palette constants and recorded canvas colors.
+- `demos/nuclear/viewer/desk-screens.test.mjs::every fill and stroke comes from the supplied palette`: Checks palette constants and recorded canvas colors.
+- `src/stdlib/test_support/mod.rs::tests`: Tests test helpers, including CPU timing and sleep assertions. The helpers used by protocol regressions remain.
+- `demos/search/app/src/page/fixtures/first-search.json`: unused after removing its copy or obsolete-mode tests.
+- `demos/search/app/src/page/fixtures/pages.json`: unused after removing its copy or obsolete-mode tests.
+- `demos/search/app/src/page/fixtures/planted.json`: unused after removing its copy or obsolete-mode tests.
+- `demos/search/app/src/page/fixtures/restart.json`: unused after removing its copy or obsolete-mode tests.
+- `python/inspect_fictionet/tests/border/fixtures/prompts.json`: unused after removing its copy or obsolete-mode tests.

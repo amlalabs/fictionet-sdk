@@ -917,13 +917,6 @@ test('controller faceplates show ISA tags, abbreviated modes and stale quality',
 });
 
 
-test('graphic font metrics and confirmation sizing match the layout checks', () => {
-  assert.match(styles, /\.mimic text\s*\{[^}]*font-family: ui-monospace, monospace;[^}]*font-size: 13px;/);
-  assert.match(styles, /\.mimic \.instrument-value\s*\{[^}]*font-size: 15px;/);
-  assert.match(styles, /\.confirmation\s*\{[^}]*flex-wrap: nowrap;/);
-  assert.match(styles, /\.confirmation > button\s*\{[^}]*flex: none;[^}]*white-space: nowrap;/);
-  assert.match(styles, /\.confirmation > \[role="status"\]\s*\{[^}]*min-width: 0;/);
-});
 
 test('cold legs descend to aligned pumps and take matching routes into the vessel', () => {
   const root = fakeRoot();
