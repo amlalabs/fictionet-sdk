@@ -139,17 +139,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-trait"
-version = "0.1.92"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -319,27 +308,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "border-world"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "fictionet",
- "fictionet-extras",
- "fictionet-observe",
- "fictionet-test-support",
- "flate2",
- "http",
- "http-body-util",
- "hyper",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tower-service",
-]
-
-[[package]]
 name = "brotli"
 version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -377,12 +345,6 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
-
-[[package]]
-name = "cast"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cbc"
@@ -880,21 +842,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fakewiki-world"
-version = "0.0.0"
-dependencies = [
- "fictionet",
- "fictionet-extras",
- "fictionet-observe",
- "form_urlencoded",
- "http",
- "http-body-util",
- "percent-encoding",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "fatfs"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -989,52 +936,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fictionet-border-demo"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "border-world",
- "bytes",
- "crc32fast",
- "fictionet",
- "fictionet-demo",
- "fictionet-extras",
- "fictionet-host",
- "fictionet-observe",
- "flate2",
- "http",
- "http-body",
- "http-body-util",
- "httpdate",
- "quick-xml",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower-service",
- "vhost-user-backend",
-]
-
-[[package]]
-name = "fictionet-bottleneck-sites-demo"
-version = "0.1.0"
-dependencies = [
- "axum",
- "fictionet",
- "fictionet-observe",
-]
-
-[[package]]
-name = "fictionet-capture-sites-demo"
-version = "0.1.0"
-dependencies = [
- "axum",
- "fictionet",
- "fictionet-observe",
-]
-
-[[package]]
 name = "fictionet-cli"
 version = "0.1.0"
 dependencies = [
@@ -1079,23 +980,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fictionet-custom-protocol-demo"
-version = "0.1.0"
-dependencies = [
- "fictionet",
- "fictionet-observe",
-]
-
-[[package]]
-name = "fictionet-delayed-sites-demo"
-version = "0.1.0"
-dependencies = [
- "axum",
- "fictionet",
- "fictionet-observe",
-]
-
-[[package]]
 name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
@@ -1126,34 +1010,6 @@ dependencies = [
  "virtio-queue",
  "vm-memory",
  "vmm-sys-util 0.14.0",
-]
-
-[[package]]
-name = "fictionet-desktop-demo"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "bytes",
- "crc32fast",
- "fictionet",
- "fictionet-demo",
- "fictionet-extras",
- "fictionet-host",
- "fictionet-observe",
- "flate2",
- "http",
- "http-body",
- "http-body-util",
- "httpdate",
- "quick-xml",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower-service",
- "vhost-user-backend",
- "web-world",
 ]
 
 [[package]]
@@ -1194,52 +1050,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fictionet-fakewiki-demo"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "bytes",
- "crc32fast",
- "fakewiki-world",
- "fictionet",
- "fictionet-demo",
- "fictionet-extras",
- "fictionet-host",
- "fictionet-observe",
- "flate2",
- "http",
- "http-body",
- "http-body-util",
- "httpdate",
- "quick-xml",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower-service",
- "vhost-user-backend",
-]
-
-[[package]]
-name = "fictionet-goad-demo"
-version = "0.1.0"
-dependencies = [
- "fictionet",
- "fictionet-observe",
-]
-
-[[package]]
-name = "fictionet-h2spec-world-demo"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "fictionet",
- "http",
- "tokio",
-]
-
-[[package]]
 name = "fictionet-host"
 version = "0.1.0"
 dependencies = [
@@ -1254,15 +1064,6 @@ dependencies = [
  "tokio",
  "tower-service",
  "webpki-roots",
-]
-
-[[package]]
-name = "fictionet-lossy-sites-demo"
-version = "0.1.0"
-dependencies = [
- "axum",
- "fictionet",
- "fictionet-observe",
 ]
 
 [[package]]
@@ -1281,53 +1082,6 @@ dependencies = [
  "serde_path_to_error",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "fictionet-ping-world-demo"
-version = "0.1.0"
-dependencies = [
- "fictionet",
- "fictionet-observe",
-]
-
-[[package]]
-name = "fictionet-route-change-demo"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "fictionet",
- "fictionet-observe",
- "fictionet-test-support",
- "http",
-]
-
-[[package]]
-name = "fictionet-scan-demo"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "bytes",
- "crc32fast",
- "fictionet",
- "fictionet-demo",
- "fictionet-extras",
- "fictionet-host",
- "fictionet-observe",
- "flate2",
- "http",
- "http-body",
- "http-body-util",
- "httpdate",
- "quick-xml",
- "rustls",
- "scan-world",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower-service",
- "vhost-user-backend",
 ]
 
 [[package]]
@@ -1379,16 +1133,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
-]
-
-[[package]]
-name = "fictionet-web-world-demo"
-version = "0.1.0"
-dependencies = [
- "axum",
- "fictionet",
- "fictionet-extras",
- "rustls",
 ]
 
 [[package]]
@@ -2255,16 +1999,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "minicov"
-version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4869b6a491569605d66d3952bcdf03df789e5b536e5f0cf7758a7f08a55ae24d"
-dependencies = [
- "cc",
- "walkdir",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2308,15 +2042,6 @@ name = "nodrop"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72ef4a56884ca558e5ddb05a1d1e7e1bfd9a68d9ed024c21704cc98872dae1bb"
-
-[[package]]
-name = "nu-ansi-term"
-version = "0.50.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
-dependencies = [
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "nuclear-world"
@@ -2402,12 +2127,6 @@ dependencies = [
  "critical-section",
  "portable-atomic",
 ]
-
-[[package]]
-name = "oorandom"
-version = "11.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "opaque-debug"
@@ -3275,18 +2994,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "scan-world"
-version = "0.0.0"
-dependencies = [
- "fictionet",
- "fictionet-extras",
- "fictionet-observe",
- "http",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -4226,63 +3933,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-bindgen-test"
-version = "0.3.79"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae7499dfd45780a0a91d7ee6bb9ac51970a4479a41a89da443fdda5a39547d42"
-dependencies = [
- "async-trait",
- "cast",
- "js-sys",
- "libm",
- "minicov",
- "nu-ansi-term",
- "num-traits",
- "oorandom",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test-macro",
- "wasm-bindgen-test-shared",
-]
-
-[[package]]
-name = "wasm-bindgen-test-macro"
-version = "0.3.79"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b84b5ac638bfb168196a1a461fcc8f46a294a18b1b6be52133b4e0db122cc9f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
-]
-
-[[package]]
-name = "wasm-bindgen-test-shared"
-version = "0.2.129"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f692aa943ccd88363733b77063f32cfed5bc6cbea8e6e8b251b302f881606fe"
-
-[[package]]
-name = "wasm-world"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "fictionet",
- "fictionet-extras",
- "fictionet-observe",
- "http",
- "http-body-util",
- "hyper",
- "rustls",
- "tower-service",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
-]
-
-[[package]]
 name = "web-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4682,7 +4332,6 @@ dependencies = [
  "regex",
  "serde_json",
  "url",
- "web-world",
 ]
 
 [[package]]
