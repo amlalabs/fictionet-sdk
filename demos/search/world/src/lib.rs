@@ -61,6 +61,7 @@ pub mod handler;
 pub mod pages;
 pub mod route;
 pub mod search;
+mod tls;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -81,65 +82,8 @@ use pages::Pages;
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-/// Top-level domains that never resolve on the internet: reserved by RFC
-/// 2606 and 6761, used for mDNS, or used only inside private networks.
-const NOT_ON_THE_INTERNET: [&str; 12] = [
-    "test",
-    "example",
-    "invalid",
-    "localhost",
-    "local",
-    "internal",
-    "lan",
-    "home",
-    "corp",
-    "intranet",
-    "private",
-    "arpa",
-];
-
-/// Whether `name` gets a site. `Err` says why not, for the log.
-///
-/// A name gets a site when it could be a host on the internet: at least two
-/// labels, each 1 to 63 letters, digits or hyphens, not starting or ending
-/// with a hyphen, at most 253 characters in all, and a top-level domain of
-/// two or more letters (or an `xn--` one) that is not reserved or private.
-pub fn admit(name: &str) -> Result<(), &'static str> {
-    if !name.contains('.') {
-        return Err("single label");
-    }
-    if name.len() > 253 {
-        return Err("too long");
-    }
-    let labels: Vec<&str> = name.split('.').collect();
-    for label in &labels {
-        let ok = !label.is_empty()
-            && label.len() <= 63
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            && !label.starts_with('-')
-            && !label.ends_with('-');
-        if !ok {
-            return Err("not a host name");
-        }
-    }
-    let tld = labels[labels.len() - 1];
-    if !(tld.starts_with("xn--")
-        || (tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic())))
-    {
-        return Err("not a top-level domain");
-    }
-    if NOT_ON_THE_INTERNET.contains(&tld) {
-        return Err("reserved or private top-level domain");
-    }
-    if pages::misspelled_host(&name.to_ascii_lowercase()) {
-        return Err("unregistered host spelling");
-    }
-    Ok(())
-}
-
-pub use dns::Addresses;
+pub use dns::{Addresses, admit};
+pub use tls::Ca;
 
 /// The world's date at the start of the run: the seed's day (`YYYY-MM-DD`,
 /// UTC) at the host's time of day, so the clock reads like an ordinary day.
@@ -160,73 +104,6 @@ pub fn world_start(date: &str) -> fictionet::Result<SystemTime> {
         .map_err(|e| bad(e.to_string()))?;
     let now = time::OffsetDateTime::now_utc();
     Ok(day.with_time(now.time()).assume_utc().into())
-}
-
-/// The world's certificate authority, which signs a certificate for each
-/// host at its first handshake.
-pub struct Ca {
-    issuer: fictionet::stdlib::services::ca::Ca,
-    start: SystemTime,
-}
-
-impl Ca {
-    /// Makes a seeded CA and writes its public certificate for the agent.
-    pub fn new(fcx: &Cx, dir: &Path, start: SystemTime) -> fictionet::Result<Ca> {
-        let ca = Self::in_memory(fcx, start)?;
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("ca.pem"), ca.cert_pem())?;
-        Ok(ca)
-    }
-
-    /// Makes a seeded CA without writing files, for an in-process world.
-    pub fn in_memory(fcx: &Cx, start: SystemTime) -> fictionet::Result<Ca> {
-        Ok(Ca {
-            issuer: fictionet::stdlib::services::ca::Ca::new(fcx, "Internet Security Root CA")?,
-            start,
-        })
-    }
-
-    /// Returns the public root certificate in PEM format for a guest to trust.
-    pub fn cert_pem(&self) -> String {
-        self.issuer.cert_pem()
-    }
-
-    /// A certificate for `host`: the host as CN and SAN, for server auth,
-    /// issued 30 days before the world's date. The chain sent is the leaf,
-    /// then the CA. Returns the TLS config and the validity, for the log.
-    ///
-    /// A client checks the certificate against its own clock, which is the
-    /// host's, not the world's. So the validity covers both: it starts 30
-    /// days before the earlier of the two, and lasts 90 days, or longer if
-    /// that would end within 30 days of the later one.
-    pub fn config(
-        &self,
-        fcx: &Cx,
-        host: &str,
-    ) -> fictionet::Result<(Arc<ServerConfig>, String, String)> {
-        let world_now = time::OffsetDateTime::from(self.start + fcx.now().since_start());
-        let host_now = time::OffsetDateTime::now_utc();
-        let not_before = world_now.min(host_now) - time::Duration::days(30);
-        let not_after = (not_before + time::Duration::days(90))
-            .max(world_now.max(host_now) + time::Duration::days(30));
-        let leaf = self.issuer.issue(
-            fcx,
-            &[host],
-            fictionet::stdlib::protocols::x509::Validity {
-                not_before: fictionet::stdlib::protocols::x509::Time::from_unix(
-                    not_before.unix_timestamp(),
-                )?,
-                not_after: fictionet::stdlib::protocols::x509::Time::from_unix(
-                    not_after.unix_timestamp(),
-                )?,
-            },
-        )?;
-        let config = leaf.server_config(fcx, self.start)?;
-        let day = |t: time::OffsetDateTime| {
-            format!("{:04}-{:02}-{:02}", t.year(), t.month() as u8, t.day())
-        };
-        Ok((config, day(not_before), day(not_after)))
-    }
 }
 
 /// Builds the network: a site for every name [`admit`] lets in, at its
