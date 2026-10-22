@@ -149,7 +149,7 @@ impl std::error::Error for ParseWorldSocketError {}
 /// let (attacher, attachments) = fictionet::attachments();
 /// let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 /// let _listening = fictionet::listen(socket, attacher)?;
-/// fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| world(fcx, attachments)))
+/// fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
 /// # }
 /// ```
 pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listening> {
@@ -711,14 +711,7 @@ impl SocketLink {
     }
 
     /// Writes a packet to attach, or queues it while the connection is full.
-    /// `accepted` counts and publishes the packet, and runs only if the
-    /// packet is written or fits in the queue and the connection is open.
-    /// For an `observed` packet it runs with no connection lock held. The
-    /// caller's per-link publication lock stays held until the packet is
-    /// queued, so packets are published in the order they enter the link.
-    /// The helper thread can only drain the queue meanwhile; if attach goes
-    /// away first, the packet is lost as queued packets are.
-    pub(crate) fn send(&mut self, packet: Packet, observed: bool, accepted: impl FnOnce(&Packet)) {
+    pub(crate) fn send(&mut self, packet: Packet) {
         if self.closed {
             return;
         }
@@ -737,7 +730,6 @@ impl SocketLink {
             ) {
                 Ok(()) => {
                     drop(out);
-                    accepted(&packet);
                     return;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -751,16 +743,6 @@ impl SocketLink {
         if !out.queue.fits(packet.0.len(), Some(QUEUE_LIMIT)) {
             out.dropped += 1;
             return;
-        }
-        if observed {
-            drop(out);
-            accepted(&packet);
-            out = self.slot.out.lock();
-            if out.closed {
-                return;
-            }
-        } else {
-            accepted(&packet);
         }
         assert!(out.queue.try_push(packet, Some(QUEUE_LIMIT)).is_ok());
         if self.slot.watch_out(&mut out, &self.listen, true).is_err() {
@@ -877,75 +859,6 @@ mod tests {
     }
 
     #[test]
-    fn socket_crossings_publish_both_sides_and_skip_full_queues() {
-        use crate::cable::tests::PacketSink;
-        use crate::events::Side;
-        let sink = Arc::new(PacketSink::new(true, true));
-        let (attacher, mut attachments) = attachments();
-        let listening = listen(socket("packet-observer"), attacher).unwrap();
-        let client = Client::hello(&listening.path, "agent");
-        assert_eq!(client.recv(), [relay::ACCEPT]);
-        unix::send(client.0.as_raw_fd(), &[relay::PACKET, 1, 2, 3], false).unwrap();
-        let observer = sink.clone();
-        let shared = listening.shared.clone();
-        block_on(run(
-            crate::RunOptions::new(Seed::from_u64(1)).observer(observer),
-            move |cx| async move {
-                let mut agent = attachments.get(&cx, "agent").await?;
-                assert_eq!(agent.recv(&cx).await?, Packet(vec![1, 2, 3]));
-                agent.send(Packet(vec![4, 5]));
-                assert_eq!(client.recv(), [relay::PACKET, 4, 5]);
-                let slot = shared.conns.lock().get(&2).unwrap().clone();
-                // An oversized queued packet cannot fit after the socket fills.
-                loop {
-                    match unix::send_parts(
-                        slot.fd.as_raw_fd(),
-                        &[&[relay::PACKET], &[0; 1400]],
-                        true,
-                    ) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) => panic!("fill socket: {error}"),
-                    }
-                }
-                {
-                    let mut out = slot.out.lock();
-                    assert!(
-                        out.queue
-                            .try_push(Packet(vec![0; 1400]), Some(QUEUE_LIMIT))
-                            .is_ok()
-                    );
-                    let remaining = QUEUE_LIMIT - out.queue.bytes() - crate::PACKET_COST;
-                    assert!(
-                        out.queue
-                            .try_push(Packet(vec![0; remaining]), Some(QUEUE_LIMIT))
-                            .is_ok()
-                    );
-                }
-                agent.send(Packet(vec![9]));
-                assert_eq!(slot.out.lock().dropped, 1);
-                Ok(())
-            },
-        ))
-        .unwrap();
-        let packets = sink.packets.lock();
-        assert_eq!(packets.len(), 2);
-        assert!(
-            packets
-                .iter()
-                .all(|p| p.tap == "agent" && p.sandbox.as_deref() == Some("agent"))
-        );
-        assert_eq!(
-            (packets[0].stamp.seq, packets[0].side, &packets[0].bytes),
-            (1, Side::B, &vec![1, 2, 3])
-        );
-        assert_eq!(
-            (packets[1].stamp.seq, packets[1].side, &packets[1].bytes),
-            (2, Side::A, &vec![4, 5])
-        );
-    }
-
-    #[test]
     fn accepts_resume_after_accept_and_registration_resource_errors() {
         static ACCEPTS: AtomicUsize = AtomicUsize::new(0);
         static ADDS: AtomicUsize = AtomicUsize::new(0);
@@ -1009,25 +922,22 @@ mod tests {
         let shared = listening.shared.clone();
         let (done_tx, done_rx) = mpsc::channel();
         let world = std::thread::spawn(move || {
-            let result = block_on(run(
-                fictionet::RunOptions::new(Seed::from_u64(0)),
-                move |fcx| async move {
-                    let mut agent = attachments.get(&fcx, "agent").await?;
-                    let slot = shared.conns.lock().get(&2).unwrap().clone();
-                    // The client does not drain the burst, so it exceeds even
-                    // the raised socket buffer and needs EPOLLOUT.
-                    for _ in 0..10_000 {
-                        agent.send(Packet(vec![0; 1400]));
-                    }
-                    assert_eq!(agent.recv(&fcx).await, Err(RecvError::Closed));
-                    let out = slot.out.lock();
-                    assert!(out.closed);
-                    assert!(!out.want_out);
-                    assert!(out.queue.is_empty());
-                    assert_eq!(out.dropped, 1);
-                    Ok(())
-                },
-            ));
+            let result = block_on(run(Seed::from_u64(0), move |fcx| async move {
+                let mut agent = attachments.get(&fcx, "agent").await?;
+                let slot = shared.conns.lock().get(&2).unwrap().clone();
+                // The client does not drain the burst, so it exceeds even
+                // the raised socket buffer and needs EPOLLOUT.
+                for _ in 0..10_000 {
+                    agent.send(Packet(vec![0; 1400]));
+                }
+                assert_eq!(agent.recv(&fcx).await, Err(RecvError::Closed));
+                let out = slot.out.lock();
+                assert!(out.closed);
+                assert!(!out.want_out);
+                assert!(out.queue.is_empty());
+                assert_eq!(out.dropped, 1);
+                Ok(())
+            }));
             done_tx.send(result).unwrap();
         });
         done_rx
@@ -1065,21 +975,18 @@ mod tests {
         assert_eq!(FAILURES.load(Ordering::SeqCst), 1);
         assert!(listening.shared.conns.lock().is_empty());
         assert!(attacher.reserve("agent").is_ok(), "name must be released");
-        block_on(run(
-            fictionet::RunOptions::new(Seed::from_u64(0)),
-            move |fcx| async move {
-                let mut next = std::pin::pin!(attachments.next(&fcx));
-                poll_fn(|cx| {
-                    assert!(
-                        next.as_mut().poll(cx).is_pending(),
-                        "no attachment delivered"
-                    );
-                    Poll::Ready(())
-                })
-                .await;
-                Ok(())
-            },
-        ))
+        block_on(run(Seed::from_u64(0), move |fcx| async move {
+            let mut next = std::pin::pin!(attachments.next(&fcx));
+            poll_fn(|cx| {
+                assert!(
+                    next.as_mut().poll(cx).is_pending(),
+                    "no attachment delivered"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            Ok(())
+        }))
         .unwrap();
     }
 
@@ -1102,23 +1009,20 @@ mod tests {
         let client = Client::hello(&listening.path, "agent");
         assert_eq!(client.recv(), [relay::ACCEPT]);
         let shared = listening.shared.clone();
-        block_on(run(
-            fictionet::RunOptions::new(Seed::from_u64(0)),
-            move |fcx| async move {
-                let _agent = attachments.get(&fcx, "agent").await?;
-                let slot = shared.conns.lock().get(&2).unwrap().clone();
-                let mut out = slot.out.lock();
-                slot.watch_out(&mut out, &shared, true).unwrap();
-                slot.flush(&mut out, &shared);
-                assert!(out.want_out);
-                assert!(!out.closed);
-                assert_eq!(MODS.load(Ordering::SeqCst), 3);
-                slot.watch_out(&mut out, &shared, false).unwrap();
-                assert!(!out.want_out);
-                assert_eq!(MODS.load(Ordering::SeqCst), 4);
-                Ok(())
-            },
-        ))
+        block_on(run(Seed::from_u64(0), move |fcx| async move {
+            let _agent = attachments.get(&fcx, "agent").await?;
+            let slot = shared.conns.lock().get(&2).unwrap().clone();
+            let mut out = slot.out.lock();
+            slot.watch_out(&mut out, &shared, true).unwrap();
+            slot.flush(&mut out, &shared);
+            assert!(out.want_out);
+            assert!(!out.closed);
+            assert_eq!(MODS.load(Ordering::SeqCst), 3);
+            slot.watch_out(&mut out, &shared, false).unwrap();
+            assert!(!out.want_out);
+            assert_eq!(MODS.load(Ordering::SeqCst), 4);
+            Ok(())
+        }))
         .unwrap();
     }
 }

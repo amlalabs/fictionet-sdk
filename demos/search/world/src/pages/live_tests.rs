@@ -56,7 +56,7 @@ fn external_redirects_do_not_grant_a_crawl_of_another_site() {
         fetcher: Mutex::default(),
     });
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(6)),
+        fictionet::Seed::from_u64(6),
         |cx| async move {
             live.enqueue(
                 Job {
@@ -169,8 +169,7 @@ fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
         .live_active
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let pages = Arc::new(pages);
-    let memory = Arc::new(fictionet_test_support::EventLog::default());
-    fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)).observer(memory.clone()), |cx| async move {
+    fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(8), |cx| async move {
             for (host, target) in [
                 ("www.google.com", "/search?q=stellar+%26+gas"),
                 ("www.bing.com", "/search?q=stellar+%26+gas"),
@@ -191,19 +190,6 @@ fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
             Ok(())
         })).unwrap();
     server.join().unwrap();
-    let events = memory.all();
-    for (kind, count) in [("real_search", 4), ("downloaded", 1), ("copy_served", 4)] {
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| e.source == "web" && e.kind == kind)
-                .count(),
-            count
-        );
-    }
-    let text = format!("{events:?}");
-    assert!(!text.contains("host-only-key"));
-    assert!(!text.contains("host-only-engine"));
     std::fs::remove_file(path).unwrap();
 }
 
@@ -281,7 +267,7 @@ fn copies_dependencies_and_same_host_links_through_five_levels() {
     });
     let copy = live.clone();
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+        fictionet::Seed::from_u64(7),
         |cx| async move {
             assert!(
                 live.response(&cx, &format!("{origin}/unreached"))
@@ -405,7 +391,7 @@ fn unknown_urls_do_not_fetch_and_completed_copies_survive_mode_changes() {
     pages.live = Some(live);
     let pages = Arc::new(pages);
     fictionet::block_on(fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(9)),
+        fictionet::Seed::from_u64(9),
         |cx| async move {
             for revision in [0, 2] {
                 pages

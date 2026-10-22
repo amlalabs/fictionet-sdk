@@ -367,7 +367,7 @@ fn a_rejected_host_does_not_install_http_names_or_a_default() {
 
 #[test]
 fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let plant = Arc::new(Plant {
             limit: 1000,
             ..Plant::default()
@@ -470,40 +470,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             Some(ConnError::Refused)
         );
 
-        let alarm = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.level == Level::Alarm
-            })
-            .await?;
-        assert_eq!(alarm[0].kind, "write_register");
-        let sandbox_name = |e: &Event| e.conn.sandbox.as_ref().map(|s| s.name.to_string());
-        assert_eq!(sandbox_name(&alarm[0]).as_deref(), Some("operator"));
-        assert_eq!(
-            alarm[0].conn.local,
-            Some(SocketAddr::new(PLC_ADDR.into(), 502))
-        );
-        kept.wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-            e.is("http", "request")
-        })
-        .await?;
-        let kinds: BTreeSet<String> = kept
-            .all()
-            .iter()
-            .map(|e| format!("{}.{}", e.source, e.kind))
-            .collect();
-        for want in [
-            "net.attached",
-            "net.bound",
-            "dns.query",
-            "modbus.read",
-            "modbus.write_register",
-            "http.request",
-            "net.blocked",
-        ] {
-            assert!(kinds.contains(want), "no {want} in {kinds:?}");
-        }
-        let blocked = kept.of("net", "blocked");
-        assert_eq!(blocked[0].u64("dst_port"), Some(102));
+        assert_eq!(plant.unsafe_writes.load(Ordering::SeqCst), 1);
 
         // The dashboard's decoder reads both protocols from the packets.
         let mut dissector = Dissector::with_registry(Registry::default());
@@ -539,7 +506,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
 
 #[test]
 fn net_serves_udp_services_and_trusted_sandboxes() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let counter = Arc::new(AtomicUsize::new(0));
         /// Counts datagrams.
         struct Udp;
@@ -549,7 +516,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
                 Lines::new(64, Ending::LfOrCrlf)
             }
             on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> Flow {
-                driver.emit("udp", "datagram", |event| event);
+
                 driver.reply().extend_from_slice(
                     format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes(),
                 );
@@ -584,26 +551,6 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
             SocketAddr::new(Ipv4Addr::new(10, 40, 0, 1).into(), 9),
         );
         assert_eq!(u.recv(&fcx).await?.0, b"1\n");
-        // A datagram's events name its sandbox, as a connection's do.
-        let datagram = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("udp", "datagram")
-            })
-            .await?;
-        assert_eq!(
-            datagram[0]
-                .conn
-                .sandbox
-                .as_ref()
-                .map(|s| s.name.to_string())
-                .as_deref(),
-            Some("agent")
-        );
-        assert_eq!(
-            datagram[0].conn.transport,
-            fictionet::events::Transport::Udp
-        );
-
         // The trusted sandbox at its fixed address, reached from the agent.
         let boxed = machine(&fcx, attacher.attach("box")?, Ipv4Addr::new(10, 50, 0, 7));
         let mut l = boxed.tcp.listen(22)?;
@@ -621,17 +568,8 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
             .await?;
         assert_eq!(read_some(&fcx, &mut ssh, 14).await, b"SSH-2.0-real\r\n");
 
-        // The service's own events carry the connection, numbered by Net.
-        assert!(
-            kept.all().iter().all(|e| e.source != "echo"),
-            "no line was sent yet"
-        );
         conn.write_all(&fcx, b"hi\n").await?;
-        let lines = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| e.is("echo", "line"))
-            .await?;
-        assert_eq!(lines[0].conn.id, Some(1));
-        assert_eq!(lines[0].conn.sandbox.as_ref().map(|s| s.id), Some(1));
+        assert_eq!(read_some(&fcx, &mut conn, 3).await, b"hi\n");
         Ok(())
     });
 }
@@ -659,16 +597,14 @@ service_fixture! {
 /// read neither.
 #[test]
 fn net_caps_connections_per_service_and_bytes_per_sandbox() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 3);
         let limits = fictionet::stdlib::world::net::Limits {
             sandbox_budget: 100 << 10,
             ..Default::default()
         };
-        let capped = ServeOptions::default()
-            .max_conns(1)
-            .connection_events(false);
+        let capped = ServeOptions::default().max_conns(1);
         let wide = ServeOptions::default();
         Net::new()
             .ipv4_only()
@@ -688,13 +624,6 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
             .await
             .expect("an answer");
         assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
-        let blocked = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("net", "blocked")
-            })
-            .await?;
-        assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
-
         // Two 40 KiB decoders fit the 100 KiB budget; a third does not.
         let to = SocketAddr::new(addr.into(), 8);
         let mut c = s.tcp.connect(&fcx, to).await?;
@@ -703,12 +632,6 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
         assert_eq!(read_some(&fcx, &mut d, 6).await, b"hello\n");
         let mut e = s.tcp.connect(&fcx, to).await?;
         assert_eq!(read_some(&fcx, &mut e, 6).await, b"");
-        let closed = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("conn", "close")
-            })
-            .await?;
-        assert_eq!(closed[0].str("end"), Some("budget"));
         Ok(())
     });
 }
@@ -810,7 +733,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             Ok(Flow::Continue)
         }
     }
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
@@ -884,65 +807,13 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
         conn.write_all(&fcx, b"hi\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 3).await, b"hi\n");
-        // An address on the LAN with no member: the LAN drops it, and the
-        // events say so.
-        let mut u = agent.udp.bind(5000)?;
-        u.send_to(
-            b"anyone?",
-            SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7),
-        );
-        let drops = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("lan", "drop") && e.str("lan") == Some("corp")
-            })
-            .await?;
-        assert_eq!(drops[0].str("why"), Some("no member at that address"));
-        assert_eq!(
-            drops[0].conn.sandbox.as_ref().map(|s| &*s.name),
-            Some("agent")
-        );
-        assert!(
-            kept.of("net", "blocked")
-                .iter()
-                .all(|e| e.str("why") != Some("Lan"))
-        );
-        socket.send_to(
-            b"anyone?",
-            SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7),
-        );
-        let drops = kept
-            .wait(&fcx, 0, 2, Duration::from_secs(2), |e| {
-                e.is("lan", "drop") && e.str("lan") == Some("corp")
-            })
-            .await?;
-        assert_eq!(
-            drops[1].conn.sandbox.as_ref().map(|s| &*s.name),
-            Some("ws01")
-        );
-        assert!(drops[1].get("count").is_none());
-        assert_eq!(drops[1].str("why"), Some("no member at that address"));
-        // The VM is named in events like any sandbox.
-        let joined = kept.of("net", "attached");
-        assert!(
-            joined
-                .iter()
-                .any(|e| e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01"))
-        );
-        let vm_lines: Vec<Event> = kept
-            .all()
-            .into_iter()
-            .filter(|e| {
-                e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01") && e.is("dns", "query")
-            })
-            .collect();
-        assert!(!vm_lines.is_empty());
         Ok(())
     });
 }
 
 #[test]
 fn trusted_routes_attribute_requests_and_refusals() {
-    crate::common::world::observed_world(Duration::from_secs(10), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(10), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let address: Ipv4Addr = "192.168.56.50".parse()?;
         Net::new()
@@ -957,13 +828,6 @@ fn trusted_routes_attribute_requests_and_refusals() {
             lookup(&fcx, &server, "office.internal").await,
             Some(PLC_ADDR)
         );
-        let queries = kept.of("dns", "query");
-        assert!(queries.iter().any(|event| {
-            event.str("name") == Some("office.internal")
-                && event.conn.sandbox.as_ref().is_some_and(|sandbox| {
-                    sandbox.name.as_ref() == "server" && sandbox.addr == Some(address)
-                })
-        }));
         let guest = machine(&fcx, attacher.attach("agent")?, ME);
         assert_eq!(
             lookup(&fcx, &guest, "office.internal").await,
@@ -977,27 +841,8 @@ fn trusted_routes_attribute_requests_and_refusals() {
         });
         let mut connection = server.tcp.connect(&fcx, (ME, 390).into()).await?;
         assert_eq!(read_some(&fcx, &mut connection, 6).await, b"hello\n");
-        assert!(
-            kept.of("net", "blocked")
-                .iter()
-                .all(|event| { event.str("dst") != Some(ME.to_string().as_str()) })
-        );
         let mut socket = server.udp.bind(40001)?;
         socket.send_to(b"query", "8.8.8.8:53".parse()?);
-        let refused = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |event| {
-                event.is("net", "blocked") && event.str("dst") == Some("8.8.8.8")
-            })
-            .await?;
-        assert_eq!(refused[0].str("why"), Some("NoRoute"));
-        assert_eq!(
-            refused[0]
-                .conn
-                .sandbox
-                .as_ref()
-                .map(|sandbox| &*sandbox.name),
-            Some("server")
-        );
         Ok(())
     });
 }
@@ -1095,7 +940,7 @@ fn early_region_error_is_failure() {
 /// budget after its sandbox detached.
 #[test]
 fn net_keeps_one_budget_per_attachment() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let (addr, addr6) = (
             Ipv4Addr::new(10, 40, 0, 3),
@@ -1146,10 +991,6 @@ fn net_keeps_one_budget_per_attachment() {
             })
             .await,
         )?;
-        kept.wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-            e.is("net", "detached")
-        })
-        .await?;
         let a = budgets.lock().unwrap()[0].clone().expect("a budget");
 
         // Another sandbox at the same address: its own budget.
@@ -1175,7 +1016,7 @@ fn net_keeps_one_budget_per_attachment() {
 /// member was never detached.
 #[test]
 fn a_lan_member_detaches_like_any_sandbox() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
         let ws: Ipv4Addr = "192.168.56.31".parse()?;
@@ -1204,34 +1045,10 @@ fn a_lan_member_detaches_like_any_sandbox() {
             })
             .await,
         )?;
-        let detached = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("net", "detached")
-            })
-            .await?;
-        let first = detached[0].conn.sandbox.clone().expect("a sandbox");
-        assert_eq!((&*first.name, first.addr), ("ws01", Some(ws)));
-        // The server's side of the connection was reset.
-        let closed = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("conn", "close")
-            })
-            .await?;
-        assert_eq!(
-            closed[0].conn.sandbox.as_ref().map(|s| s.id),
-            Some(first.id)
-        );
-
         // The member attaches again, as a new sandbox.
         let vm = machine(&fcx, attacher.attach("ws01")?, ws);
         let mut conn = vm.tcp.connect(&fcx, to).await?;
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
-        let attached = kept.of("net", "attached");
-        assert_eq!(attached.len(), 2, "{attached:?}");
-        assert_ne!(
-            attached[1].conn.sandbox.as_ref().map(|s| s.id),
-            Some(first.id)
-        );
         Ok(())
     });
 }

@@ -9,8 +9,7 @@ use fictionet::stdlib::services::serve::{Ended, Flow, Harness, HarnessError};
 
 #[test]
 fn the_harness_runs_a_service_with_no_runtime() {
-    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(log.clone());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
     assert_eq!(h.open().unwrap(), b"hello\n");
     assert_eq!(h.push(b"one\ntw").unwrap(), b"one\n");
     assert_eq!(h.push(b"o\n").unwrap(), b"two\n");
@@ -21,8 +20,6 @@ fn the_harness_runs_a_service_with_no_runtime() {
     assert!(h.closed());
     assert_eq!(h.end_reason(), Some(Ended::Closed));
     assert!(matches!(h.push(b"more\n"), Err(HarnessError::Closed)));
-    let lines: Vec<String> = log.all().into_iter().map(|e| e.summary).collect();
-    assert_eq!(lines, ["one", "two", "three", "quit"]);
     assert_eq!(h.output(), b"hello\none\ntwo\ntoo long\nthree\nbye\n");
 }
 
@@ -77,45 +74,4 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
     assert_eq!(h.output(), b"no");
     assert_eq!(h.service().unread, bad);
     assert_eq!(h.end_reason(), Some(Ended::Failed));
-}
-
-#[test]
-fn resuming_an_upgrade_keeps_the_observer_and_sequence() {
-    use fictionet::events::ConnInfo;
-    use fictionet::stdlib::codec::{Ending, LineError, Lines};
-    use fictionet::stdlib::services::serve::Upgrade;
-    use fictionet_test_support::EventLog;
-    use std::sync::Arc;
-
-    struct Switch;
-    service_fixture! {
-        Switch => (Lines, (), LineError);
-        decoder(self) { Lines::new(64, Ending::LfOrCrlf) }
-        on_item(self, item: Result<Vec<u8>, LineError>; _, driver) -> Flow {
-            let line = item?;
-            driver.emit("test", "line", |event| event.field("bytes", line.len() as u64));
-            Ok(if line == b"tls" { Flow::Upgrade(Upgrade::Tls) } else { Flow::Continue })
-        }
-    }
-    let log = Arc::new(EventLog::default());
-    let mut harness = Harness::new(fictionet::Seed::from_u64(1), Switch, ()).observer(log.clone());
-    assert!(matches!(
-        harness.push(b"tls\n"),
-        Err(HarnessError::Upgraded(Upgrade::Tls))
-    ));
-    harness
-        .resume(ConnInfo {
-            tls: true,
-            ..ConnInfo::default()
-        })
-        .unwrap();
-    harness.push(b"hello\n").unwrap();
-    let events = log.of("test", "line");
-    assert_eq!(
-        events
-            .iter()
-            .map(|e| (e.seq, e.conn.tls, e.u64("bytes")))
-            .collect::<Vec<_>>(),
-        [(1, false, Some(3)), (2, true, Some(5))]
-    );
 }

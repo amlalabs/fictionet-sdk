@@ -401,6 +401,54 @@ impl ServerCertVerifier for AcceptAll {
     }
 }
 
+/// Counts the DNS questions a proxy puts on its sandbox link.
+pub fn watch_dns(
+    cx: &Cx,
+    mut attachments: fictionet::Attachments,
+    question: impl Fn(Name, RecordType) + Send + Sync + 'static,
+) -> fictionet::Attachments {
+    let question = Arc::new(question);
+    let (attacher, destination) = fictionet::attachments();
+    cx.spawn(move |cx| async move {
+        loop {
+            let mut sandbox = attachments.next(&cx).await?;
+            let mut network = attacher.attach(sandbox.name())?;
+            let question = question.clone();
+            cx.spawn(move |cx| async move {
+                loop {
+                    let (from_sandbox, packet) = poll_fn(|task| {
+                        if let Poll::Ready(packet) = sandbox.poll_recv(&cx, task) {
+                            return Poll::Ready((true, packet));
+                        }
+                        network.poll_recv(&cx, task).map(|packet| (false, packet))
+                    })
+                    .await;
+                    let Ok(packet) = packet else {
+                        break;
+                    };
+                    if from_sandbox {
+                        if let Some(header) = ip::Header::parse(&packet.0)
+                            && header.protocol == ip::protocol::UDP
+                            && let Some(datagram) = udp::Datagram::parse(header.payload(&packet.0))
+                            && datagram.destination_port() == 53
+                            && let Ok(message) = Message::from_vec(datagram.payload())
+                        {
+                            for query in message.queries {
+                                question(query.name().clone(), query.query_type());
+                            }
+                        }
+                        network.send(packet);
+                    } else {
+                        sandbox.send(packet);
+                    }
+                }
+                Ok(())
+            });
+        }
+    });
+    destination
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +497,7 @@ mod tests {
         let result = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
         let out = result.clone();
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+            fictionet::Seed::from_u64(7),
             move |fcx| async move {
                 let conn = Writes {
                     bytes: Vec::new(),

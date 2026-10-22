@@ -79,9 +79,6 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Response {
-        if !prefetch && self.store().page(host, target).is_none() {
-            self.making(cx, host, target);
-        }
         let lock = match self.locks.lock(cx, page_key(host, target)).await {
             Ok(lock) => lock,
             Err(error) => return Stop::store(error).response(Asked::Page),
@@ -170,14 +167,6 @@ impl Pages {
         );
         response.carries = carries;
         response
-    }
-
-    pub(crate) fn making(&self, cx: &Cx, host: &str, target: &str) {
-        cx.emit("web", "making", |e| {
-            e.field("url", format!("https://{host}{target}"))
-                .field("host", host)
-                .field("site", self.site_name(host))
-        });
     }
 
     /// Records the links of a page just made as mentions of the pages

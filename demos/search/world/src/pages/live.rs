@@ -9,7 +9,7 @@ use fictionet_extras::{
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -110,7 +110,6 @@ impl Live {
             Err(_) => {
                 let mut state = self.state();
                 for job in state.queue.drain(..).collect::<Vec<_>>() {
-                    Self::activity(&job.cx, "download_failed", &job.url, None, 0);
                     if let Some(done) = state.reached.get(&job.url) {
                         done.send_replace(true);
                     }
@@ -139,90 +138,67 @@ impl Live {
                 state.running = false;
                 return;
             }
-            let started = Instant::now();
             let existing = self.state().archive.get(&job.url);
             let result = match existing {
                 Ok(Some(response)) => Ok((response, false)),
                 Ok(None) => fetcher.fetch(&job.url).map(|response| (response, true)),
                 Err(error) => Err(error),
             };
-            match result {
-                Ok((response, downloaded)) => {
-                    let saved = !downloaded
-                        || self
-                            .state()
-                            .archive
-                            .append(&self.path, &job.url, &response)
-                            .is_ok();
-                    if saved {
-                        if downloaded {
-                            Self::activity(
-                                &job.cx,
-                                "downloaded",
-                                &job.url,
-                                Some(response.status.as_u16()),
-                                started.elapsed().as_millis() as u64,
-                            );
-                        }
-                        if let Ok(links) = capture::links(&job.url, &response) {
-                            // Dependencies get priority over the next navigation page.
-                            for url in links.assets.into_iter().rev() {
-                                self.enqueue(
-                                    Job {
-                                        url,
-                                        navigation: None,
-                                        redirects: 0,
-                                        cx: job.cx.clone(),
-                                    },
-                                    true,
-                                );
-                            }
-                            if response.status.is_redirection() && job.redirects < 10 {
-                                for url in links.pages {
-                                    self.enqueue(
-                                        Job {
-                                            url,
-                                            navigation: job.navigation.clone(),
-                                            redirects: job.redirects + 1,
-                                            cx: job.cx.clone(),
-                                        },
-                                        true,
-                                    );
-                                }
-                            } else if let Some((site, depth)) = &job.navigation
-                                && *depth < 5
-                            {
-                                for url in links.pages.into_iter().filter(|u| {
-                                    url::Url::parse(u).ok().is_some_and(|u| {
-                                        u.host_str().is_some_and(|host| {
-                                            host.trim_start_matches("www.")
-                                                == site.trim_start_matches("www.")
-                                        })
-                                    })
-                                }) {
-                                    self.enqueue(
-                                        Job {
-                                            url,
-                                            navigation: Some((site.clone(), depth + 1)),
-                                            redirects: 0,
-                                            cx: job.cx.clone(),
-                                        },
-                                        false,
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        Self::activity(
-                            &job.cx,
-                            "download_failed",
-                            &job.url,
-                            None,
-                            started.elapsed().as_millis() as u64,
+            if let Ok((response, downloaded)) = result {
+                let saved = !downloaded
+                    || self
+                        .state()
+                        .archive
+                        .append(&self.path, &job.url, &response)
+                        .is_ok();
+                if saved && let Ok(links) = capture::links(&job.url, &response) {
+                    // Dependencies get priority over the next navigation page.
+                    for url in links.assets.into_iter().rev() {
+                        self.enqueue(
+                            Job {
+                                url,
+                                navigation: None,
+                                redirects: 0,
+                                cx: job.cx.clone(),
+                            },
+                            true,
                         );
                     }
+                    if response.status.is_redirection() && job.redirects < 10 {
+                        for url in links.pages {
+                            self.enqueue(
+                                Job {
+                                    url,
+                                    navigation: job.navigation.clone(),
+                                    redirects: job.redirects + 1,
+                                    cx: job.cx.clone(),
+                                },
+                                true,
+                            );
+                        }
+                    } else if let Some((site, depth)) = &job.navigation
+                        && *depth < 5
+                    {
+                        for url in links.pages.into_iter().filter(|u| {
+                            url::Url::parse(u).ok().is_some_and(|u| {
+                                u.host_str().is_some_and(|host| {
+                                    host.trim_start_matches("www.")
+                                        == site.trim_start_matches("www.")
+                                })
+                            })
+                        }) {
+                            self.enqueue(
+                                Job {
+                                    url,
+                                    navigation: Some((site.clone(), depth + 1)),
+                                    redirects: 0,
+                                    cx: job.cx.clone(),
+                                },
+                                false,
+                            );
+                        }
+                    }
                 }
-                Err(_) => Self::activity(&job.cx, "download_failed", &job.url, None, 0),
             }
             if let Some(done) = self.state().reached.get(&job.url) {
                 done.send_replace(true);
@@ -230,20 +206,10 @@ impl Live {
         }
     }
 
-    fn activity(cx: &Cx, kind: &'static str, url: &str, status: Option<u16>, elapsed_ms: u64) {
-        cx.emit("web", kind, |event| {
-            event
-                .summary(format_args!("{kind}: {url}"))
-                .field("url", url)
-                .field("status", status.unwrap_or(0) as u64)
-                .field("elapsed_ms", elapsed_ms)
-        });
-    }
-
     async fn search(
         self: &Arc<Self>,
         cx: &Cx,
-        engine: Engine,
+        _engine: Engine,
         query: &str,
         start: u64,
     ) -> Result<search::Search, String> {
@@ -258,13 +224,7 @@ impl Live {
             let result = (|| {
                 let fetcher = Fetcher::new(capture::BROWSER).map_err(|e| e.to_string())?;
                 let request = json!({"query": query, "numResults": (start + 10).min(100), "contents": {"highlights": true}});
-                cx_thread.emit("web", "real_search", |event| {
-                    event
-                        .summary(format_args!("Query sent to Exa: {query}"))
-                        .field("search", query.as_str())
-                        .field("engine", fictionet_extras::names::name(&engine))
-                        .field("start", start)
-                });
+
                 let response = fetcher
                     .search(live.endpoint.as_str(), live.key.value(), &request)
                     .map_err(|_| "Exa search API request failed".to_owned())?;
@@ -334,11 +294,8 @@ impl Live {
         let _ = cx
             .race(Some(cx.now() + Duration::from_secs(45)), ready)
             .await;
-        let response = self.state().archive.get(&url).ok().flatten();
-        if let Some(response) = &response {
-            Self::activity(cx, "copy_served", &url, Some(response.status.as_u16()), 0);
-        }
-        response
+
+        self.state().archive.get(&url).ok().flatten()
     }
 }
 

@@ -69,8 +69,7 @@ fn dst(to: u8) -> Ipv4Addr {
 
 fuzz_target!(|steps: Vec<Step>| {
     let cert = fictionet_fuzz::cert();
-    let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(0))
-        .observer(std::sync::Arc::new(fictionet_fuzz::web::EventFormatting));
+    let options = fictionet::Seed::from_u64(0);
     world_with_options(options, move |fcx| async move {
         let attacher = serve(&fcx, cert);
         let mut end = attacher.attach("agent").unwrap();

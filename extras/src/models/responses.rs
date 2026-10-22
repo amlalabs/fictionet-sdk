@@ -174,7 +174,7 @@ pub(super) async fn serve(
         let (tx, rx) = mpsc::channel(8);
         output.tx = Some(tx.clone());
         let cx = model.cx.clone();
-        cx.spawn(move |cx| async move {
+        cx.spawn(move |_| async move {
             let result = run(model, engine, parts, body, settings, response, &mut output).await;
             let result = match result {
                 Ok(None) => Ok(()),
@@ -182,9 +182,6 @@ pub(super) async fn serve(
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
-                cx.emit("model", "splice_error", |e| {
-                    e.field("message", error.to_string())
-                });
                 let _ = tx.send(Err(error)).await;
             }
             Ok(())
@@ -470,8 +467,7 @@ async fn run(
                 continue;
             };
             used += 1;
-            let start = Instant::now();
-            let (action, text, count) = if used > limit {
+            let (action, text, _count) = if used > limit {
                 (
                     json!({"type":"search"}),
                     json!({"error":"max_tool_calls"}).to_string(),
@@ -487,18 +483,7 @@ async fn run(
                 .encrypt(&model.cx, &json!({"id":id,"call":call,"result":result}));
             let item = json!({"type":"web_search_call","id":id,"status":"completed","action":action,"encrypted_content":token});
             output.items[offset + index] = item.clone();
-            model
-                .cx
-                .emitter(&model.connection)
-                .emit("model", "tool", |e| {
-                    e.field("provider", model.provider.host())
-                        .field("tool", call["name"].as_str().unwrap_or(""))
-                        .field("query", action["query"].as_str().unwrap_or(""))
-                        .field("url", action["url"].as_str().unwrap_or(""))
-                        .field("results", count)
-                        .field("source", "world")
-                        .field("ms", start.elapsed().as_millis() as u64)
-                });
+
             output
                 .emit(json!({"type":"response.web_search_call.completed","item_id":id,"output_index":offset+index}))
                 .await?;

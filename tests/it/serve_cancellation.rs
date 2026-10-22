@@ -1,4 +1,3 @@
-use fictionet::RunOptions;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -8,7 +7,6 @@ use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::network::tcp;
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::stdlib::services::serve::{self, Flow, Pending, PendingDriver};
-use fictionet::time::ms;
 
 /// Work that never finishes.
 struct Forever(bool);
@@ -50,9 +48,9 @@ service_fixture! {
 fn cancelling_deferred_end_work_keeps_the_world_running() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let r = fictionet::block_on(crate::common::observed_lab(
+        let r = fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(1),
-            |fcx, log| async move {
+            |fcx| async move {
                 let (a, b) = fictionet::pair();
                 let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
                 let server = tcp::endpoint(&fcx, b, "10.0.0.1".parse()?);
@@ -65,15 +63,7 @@ fn cancelling_deferred_end_work_keeps_the_world_running() {
                 );
                 let mut conn = client.connect(&fcx, "10.0.0.1:7".parse()?).await?;
                 conn.write_all(&fcx, b"bye\n").await?;
-                log.wait(&fcx, 0, 1, ms(100), |e| {
-                    e.is("conn", "close") && e.str("end") == Some("cancelled")
-                })
-                .await?;
-                assert!(
-                    log.all()
-                        .iter()
-                        .any(|e| e.is("conn", "close") && e.str("end") == Some("cancelled"))
-                );
+                assert_eq!(conn.read(&fcx, &mut [0; 1]).await?, 0);
                 fcx.cancel();
                 Ok(())
             },
@@ -119,7 +109,7 @@ service_fixture! {
 #[test]
 fn finishing_a_connection_cancels_and_joins_its_spawned_work() {
     fictionet::block_on(fictionet::lab(
-        RunOptions::new(fictionet::Seed::from_u64(2)),
+        fictionet::Seed::from_u64(2),
         |fcx| async move {
             let (a, b) = fictionet::pair();
             let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
@@ -132,7 +122,11 @@ fn finishing_a_connection_cancels_and_joins_its_spawned_work() {
                 Ok(())
             });
             let conn = listener.accept(&fcx).await?;
-            let info = fictionet::events::ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+            let info = fictionet::stdlib::services::serve::ConnInfo::new(
+                1,
+                conn.local_addr(),
+                conn.peer_addr(),
+            );
             let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             serve::connection(
                 &fcx,
@@ -259,16 +253,15 @@ fn service_error_stays_primary_when_background_work_fails() {
 }
 
 fn background_failure(fail: bool) {
-    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::lab(
-        RunOptions::new(fictionet::Seed::from_u64(3)).observer(log.clone()),
+        fictionet::Seed::from_u64(3),
         |fcx| async move {
             let mut service = TerminalSvc {
                 background: true,
                 fail,
                 ..TerminalSvc::default()
             };
-            let info = fictionet::events::ConnInfo::new(
+            let info = fictionet::stdlib::services::serve::ConnInfo::new(
                 42,
                 "10.0.0.1:7".parse()?,
                 "10.0.0.2:1234".parse()?,
@@ -302,18 +295,6 @@ fn background_failure(fail: bool) {
                 assert!(fictionet::ErrorChain(&error).to_string().contains("boom"));
                 assert_eq!(service.ended, [serve::Ended::Cancelled]);
             }
-            let errors = log.of("conn", "error");
-            assert_eq!(errors.len(), if fail { 2 } else { 1 });
-            if fail {
-                assert_eq!(errors[0].str("kind"), Some("service"));
-            }
-            let task = errors.last().unwrap();
-            assert_eq!(task.str("kind"), Some("task"));
-            assert_eq!(task.str("error"), Some("boom"));
-            assert_eq!(task.conn.id, Some(42));
-            let closes = log.of("conn", "close");
-            assert_eq!(closes.len(), 1);
-            assert!(closes[0].seq < task.seq, "the region ends after the run");
             assert!(!fcx.is_cancelled());
             Ok(())
         },
@@ -323,16 +304,15 @@ fn background_failure(fail: bool) {
 
 fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Option<&'static str>) {
     use std::future::{Future, poll_fn};
-    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::lab(
-        RunOptions::new(fictionet::Seed::from_u64(4)).observer(log.clone()),
+        fictionet::Seed::from_u64(4),
         |fcx| async move {
             let polled = Arc::new(std::sync::Mutex::new(None));
             let mut service = TerminalSvc {
                 fail,
                 ..TerminalSvc::default()
             };
-            let opts = serve::ServeOptions::default().connection_events(true);
+            let opts = serve::ServeOptions::default();
             let started = fcx.now();
             let result = {
                 let mut served = std::pin::pin!(serve::connection(
@@ -341,7 +321,7 @@ fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Opt
                         shutdown,
                         polled: polled.clone(),
                     },
-                    fictionet::events::ConnInfo::default(),
+                    fictionet::stdlib::services::serve::ConnInfo::default(),
                     &mut service,
                     &(),
                     &opts,
@@ -376,11 +356,6 @@ fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Opt
                 [end],
                 "on_end runs once with the primary cause"
             );
-            let closes = log.of("conn", "close");
-            assert_eq!(closes.len(), 1);
-            assert_eq!(closes[0].str("end"), Some(end.as_str()));
-            assert_eq!(closes[0].str("shutdown"), secondary);
-            assert_eq!(log.of("conn", "error").len(), usize::from(fail));
             assert!(!fcx.is_cancelled());
             Ok(())
         },

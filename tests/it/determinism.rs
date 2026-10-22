@@ -11,7 +11,6 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
-use fictionet::events::{Event, Fields};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query};
@@ -23,7 +22,7 @@ use fictionet::stdlib::{
     services::tls,
     web::httpd,
 };
-use fictionet::{Cx, RunOptions, Seed, block_on, lab};
+use fictionet::{Cx, Seed, block_on, lab};
 use fictionet_test_support::sandbox::TlsClient;
 use http::{Request, Response};
 use http_body::Frame;
@@ -36,7 +35,6 @@ const HTTPS: Ipv4Addr = Ipv4Addr::new(192, 168, 20, 10);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Trace {
-    events: Vec<u8>,
     packets: Vec<(bool, Vec<u8>)>,
     losses: [usize; 2],
 }
@@ -49,7 +47,6 @@ service_fixture! {
     }
     on_item(self, line: Result<Vec<u8>, LineError>; _, d) -> Flow {
         let line = line.unwrap();
-        d.emit("echo", "line", |event| event.field("bytes", line.len() as u64));
         d.reply().extend_from_slice(&line);
         d.reply().push(b'\n');
         Ok(Flow::Continue)
@@ -111,22 +108,11 @@ async fn read_until(cx: &Cx, conn: &mut impl Connection, needle: &[u8]) -> Vec<u
     result
 }
 
-fn world(seed: Seed, trace: Arc<Mutex<Trace>>) -> impl Future<Output = fictionet::Result> {
-    let log = Arc::new(fictionet_test_support::EventLog::default());
-    let output = log.clone();
-    async move {
-        let packets = trace.clone();
-        let loss_trace = trace.clone();
-        lab(
-            RunOptions::new(seed)
-                .observer(output)
-                .fields(Fields::new().with("world_date", "2030-01-01")),
-            move |cx| episode(cx, packets, loss_trace),
-        )
-        .await?;
-        trace.lock().unwrap().events = crate::common::log_bytes(&log);
-        Ok(())
-    }
+async fn world(seed: Seed, trace: Arc<Mutex<Trace>>) -> fictionet::Result {
+    let packets = trace.clone();
+    let loss_trace = trace.clone();
+    lab(seed, move |cx| episode(cx, packets, loss_trace)).await?;
+    Ok(())
 }
 
 async fn episode(
@@ -187,12 +173,6 @@ async fn episode(
         if !keep {
             loss_trace.lock().unwrap().losses
                 [usize::from(direction == fictionet::stdlib::network::Direction::ToInner)] += 1;
-            cx.emit("link", "loss", |event| {
-                event.field(
-                    "inbound",
-                    direction == fictionet::stdlib::network::Direction::ToInner,
-                )
-            });
         }
         keep
     });
@@ -281,8 +261,6 @@ async fn episode(
                         bytes.extend_from_slice(&chunk?);
                     }
                     assert!(bytes.starts_with(path.as_bytes()));
-                    let body = String::from_utf8(bytes)?;
-                    cx.emit("client", "reply", |event| event.field("body", body));
                 }
             }
         } else {
@@ -336,79 +314,71 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
     use fictionet_test_support::sandbox;
 
     let episode = |seed| {
-        let log = Arc::new(fictionet_test_support::EventLog::default());
-        let output = log.clone();
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let replies = bodies.clone();
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(seed)).observer(output),
-            move |cx| async move {
-                let date = UNIX_EPOCH + Duration::from_secs(DATE);
-                let ca = Ca::new(&cx, "Lab CA")?;
-                let leaf = ca.issue(
-                    &cx,
-                    &["site.test"],
-                    x509::Validity {
-                        not_before: x509::Time::from_unix(DATE as i64 - 86400)?,
-                        not_after: x509::Time::from_unix(DATE as i64 + 86400)?,
-                    },
-                )?;
-                let mut roots = rustls::RootCertStore::empty();
-                roots.add(ca.cert_der())?;
-                let roots = Arc::new(roots);
-                let mut config = leaf.server_config(&cx, date)?;
-                Arc::get_mut(&mut config).unwrap().alpn_protocols = vec![b"http/1.1".to_vec()];
-                let handler_cx = cx.clone();
-                let app = axum::Router::new().fallback(move || {
-                    let draw = handler_cx.random_u64();
-                    async move { format!("hello {draw}") }
-                });
-                let (attacher, attachments) = fictionet::attachments();
-                web::Sites::new(move |name| {
-                    (name == "site.test").then(|| web::Site::new(app.clone()).tls(config.clone()))
+        block_on(lab(Seed::from_u64(seed), move |cx| async move {
+            let date = UNIX_EPOCH + Duration::from_secs(DATE);
+            let ca = Ca::new(&cx, "Lab CA")?;
+            let leaf = ca.issue(
+                &cx,
+                &["site.test"],
+                x509::Validity {
+                    not_before: x509::Time::from_unix(DATE as i64 - 86400)?,
+                    not_after: x509::Time::from_unix(DATE as i64 + 86400)?,
+                },
+            )?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.cert_der())?;
+            let roots = Arc::new(roots);
+            let mut config = leaf.server_config(&cx, date)?;
+            Arc::get_mut(&mut config).unwrap().alpn_protocols = vec![b"http/1.1".to_vec()];
+            let handler_cx = cx.clone();
+            let app = axum::Router::new().fallback(move || {
+                let draw = handler_cx.random_u64();
+                async move { format!("hello {draw}") }
+            });
+            let (attacher, attachments) = fictionet::attachments();
+            web::Sites::new(move |name| {
+                (name == "site.test").then(|| web::Site::new(app.clone()).tls(config.clone()))
+            })
+            .date(date)
+            .start(&cx, attachments)?;
+            let machine =
+                sandbox::machine(&cx, attacher.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
+            let answer = machine
+                .lookup(&cx, "10.0.0.1".parse()?, "site.test", RecordType::A)
+                .await?;
+            let address = answer
+                .answers
+                .iter()
+                .find_map(|r| match r.data {
+                    RData::A(a) => Some(a.0),
+                    _ => None,
                 })
-                .date(date)
-                .start(&cx, attachments)?;
-                let machine =
-                    sandbox::machine(&cx, attacher.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
-                let answer = machine
-                    .lookup(&cx, "10.0.0.1".parse()?, "site.test", RecordType::A)
-                    .await?;
-                let address = answer
-                    .answers
-                    .iter()
-                    .find_map(|r| match r.data {
-                        RData::A(a) => Some(a.0),
-                        _ => None,
-                    })
-                    .unwrap();
-                let mut conn = machine
-                    .tls(&cx, (address, 443).into(), "site.test", Some(&roots), date)
-                    .await?;
-                assert_eq!(conn.tls.alpn_protocol(), Some(b"http/1.1".as_slice()));
-                let request = http1::Request::parse(b"GET / HTTP/1.1\r\nHost: site.test\r\n\r\n")?;
-                for _ in 0..2 {
-                    let response = sandbox::request(&cx, &mut conn, &request).await?;
-                    assert_eq!(response.head.status, 200);
-                    assert!(response.body.starts_with(b"hello "));
-                    replies.lock().unwrap().push(response.body);
-                }
-                cx.cancel();
-                Ok(())
-            },
-        ))
+                .unwrap();
+            let mut conn = machine
+                .tls(&cx, (address, 443).into(), "site.test", Some(&roots), date)
+                .await?;
+            assert_eq!(conn.tls.alpn_protocol(), Some(b"http/1.1".as_slice()));
+            let request = http1::Request::parse(b"GET / HTTP/1.1\r\nHost: site.test\r\n\r\n")?;
+            for _ in 0..2 {
+                let response = sandbox::request(&cx, &mut conn, &request).await?;
+                assert_eq!(response.head.status, 200);
+                assert!(response.body.starts_with(b"hello "));
+                replies.lock().unwrap().push(response.body);
+            }
+            cx.cancel();
+            Ok(())
+        }))
         .unwrap();
-        let events = crate::common::log_bytes(&log);
-        let bodies = bodies.lock().unwrap().clone();
-        (events, bodies)
+
+        bodies.lock().unwrap().clone()
     };
     let first = episode(41);
-    assert!(!first.0.is_empty());
-    assert_eq!(first.1.len(), 2);
+    assert_eq!(first.len(), 2);
     assert_eq!(first, episode(41));
     let other = episode(42);
-    assert_ne!(first.0, other.0);
-    assert_ne!(first.1, other.1);
+    assert_ne!(first, other);
 }
 
 #[test]
@@ -416,20 +386,9 @@ fn sequential_labs_repeat_every_event_and_packet() {
     let first = replay(41);
     assert!(!first.packets.is_empty());
     assert!(first.losses.iter().all(|n| *n > 0), "{:?}", first.losses);
-    assert!(String::from_utf8_lossy(&first.events).contains(r#""kind":"loss""#));
     assert_eq!(first, replay(41));
     let other = replay(42);
     assert_ne!(first.packets, other.packets);
-    // Only the different-seed check excludes run.start, whose seed must differ.
-    let behavior = |trace: &Trace| {
-        String::from_utf8(trace.events.clone())
-            .unwrap()
-            .lines()
-            .filter(|l| !l.contains(r#""source":"run","kind":"start""#))
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
-    assert_ne!(behavior(&first), behavior(&other));
 }
 
 #[test]
@@ -459,153 +418,4 @@ fn interleaved_labs_repeat_every_event_and_packet() {
         "both labs must stay live across outer polls"
     );
     assert_eq!(*a.lock().unwrap(), *b.lock().unwrap());
-}
-
-#[test]
-fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
-    let episode = || {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let out = logs.clone();
-        block_on(crate::common::observed_lab(
-            Seed::from_u64(1),
-            move |fcx, log| async move {
-                out.lock().unwrap().push(log.clone());
-                crate::common::observed_lab(Seed::from_u64(2), move |fcx, log| async move {
-                    out.lock().unwrap().push(log.clone());
-                    fcx.emit("test", "inner", |event| event);
-                    fcx.yield_now().await?;
-                    fcx.emit("test", "inner_again", |event| event);
-                    Ok(())
-                })
-                .await?;
-                fcx.emit("test", "outer", |event| event);
-                fcx.spawn(|fcx| async move {
-                    fcx.emit("test", "child", |event| event);
-                    Ok(())
-                })
-                .join(&fcx)
-                .await?;
-                Ok(())
-            },
-        ))
-        .unwrap();
-        let logs = logs.lock().unwrap();
-        let outer = logs[0]
-            .all()
-            .into_iter()
-            .filter(|e| e.source == "test")
-            .collect::<Vec<_>>();
-        let inner = logs[1]
-            .all()
-            .into_iter()
-            .filter(|e| e.source == "test")
-            .collect::<Vec<_>>();
-        assert_eq!(outer.len(), 2);
-        assert_eq!(inner.len(), 2);
-        assert_task(&outer[0], "t1", None);
-        assert_task(&outer[1], "t2", Some("t1"));
-        for event in &inner {
-            assert_task(event, "t1", None);
-        }
-        logs.iter()
-            .map(|log| {
-                log.all()
-                    .iter()
-                    .map(|e| e.to_line().unwrap())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(episode(), episode());
-}
-
-#[test]
-fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
-    let kept = Arc::new(Mutex::new(None));
-    let out = kept.clone();
-    block_on(crate::common::observed_lab(
-        Seed::from_u64(1),
-        move |fcx, log| async move {
-            *out.lock().unwrap() = Some(log.clone());
-            let foreign = fcx.clone();
-            lab(RunOptions::new(Seed::from_u64(2)), move |_fcx| async move {
-                foreign.emit("test", "record", |event| event);
-                foreign.emit("test", "foreign_emission", |event| event);
-                foreign.emit("test", "repeat", |event| event);
-                foreign.spawn(|fcx| async move {
-                    fcx.emit("test", "foreign_spawn", |event| event);
-                    Ok(())
-                });
-                Ok(())
-            })
-            .await?;
-            let events = log
-                .all()
-                .into_iter()
-                .filter(|e| e.source == "test")
-                .collect::<Vec<_>>();
-            assert_eq!(events.len(), 3);
-            for event in events {
-                let json = event.to_json();
-                assert!(json.get("node").is_none(), "{}", event.to_line().unwrap());
-                assert!(json.get("parent").is_none(), "{}", event.to_line().unwrap());
-            }
-            Ok(())
-        },
-    ))
-    .unwrap();
-    let events = kept
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap()
-        .all()
-        .into_iter()
-        .filter(|e| e.source == "test")
-        .collect::<Vec<_>>();
-    assert_eq!(events.len(), 4);
-    assert_task(&events[3], "t2", None);
-}
-
-#[test]
-fn a_nested_panic_restores_the_outer_task() {
-    block_on(crate::common::observed_lab(
-        Seed::from_u64(1),
-        |fcx, log| async move {
-            let result = std::panic::catch_unwind(|| {
-                block_on(lab(RunOptions::new(Seed::from_u64(2)), |_fcx| async move {
-                    panic!("inner world failed");
-                }))
-            });
-            assert!(result.is_err());
-            fcx.emit("test", "outer", |event| event);
-            fcx.spawn(|fcx| async move {
-                fcx.emit("test", "child", |event| event);
-                Ok(())
-            })
-            .join(&fcx)
-            .await?;
-            let events = log
-                .all()
-                .into_iter()
-                .filter(|e| e.source == "test")
-                .collect::<Vec<_>>();
-            assert_task(&events[0], "t1", None);
-            assert_task(&events[1], "t2", Some("t1"));
-            Ok(())
-        },
-    ))
-    .unwrap();
-}
-
-fn assert_task(event: &Event, task: &str, parent: Option<&str>) {
-    let json = event.to_json();
-    assert_eq!(json.get("node").and_then(|v| v.as_str()), Some(task));
-    assert_eq!(
-        json.get("parent"),
-        Some(
-            &parent.map_or(fictionet::stdlib::protocols::json::Value::Null, |id| id
-                .into())
-        )
-    );
 }

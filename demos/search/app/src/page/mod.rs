@@ -101,7 +101,8 @@ impl Views {
             match &observation.fact {
                 SearchObs::Resolved { name, address } => {
                     if address.is_some() {
-                        site(&mut view.sites, name, observation.at_ms).address = *address;
+                        site(&mut view.sites, &name.to_ascii(), observation.at_ms).address =
+                            *address;
                     }
                 }
                 SearchObs::Request {
@@ -116,18 +117,26 @@ impl Views {
                     headers,
                     preview,
                 } => {
-                    site(&mut view.sites, host, observation.at_ms)
+                    site(&mut view.sites, &host.to_ascii(), observation.at_ms)
                         .requests
                         .push(Request {
                             at_ms: observation.at_ms,
-                            method: method.clone(),
-                            path: path.clone(),
-                            status: *status,
+                            method: method.to_string(),
+                            path: path.to_string(),
+                            status: status.as_u16(),
                             bytes: *bytes,
                             content_type: content_type.clone(),
                             source: source.clone(),
                             elapsed_ms: *elapsed_ms,
-                            headers: headers.clone(),
+                            headers: headers
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.to_string(),
+                                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                    )
+                                })
+                                .collect(),
                             has_preview: preview.is_some(),
                         });
                 }
@@ -141,7 +150,6 @@ impl Views {
                         web_world::observation::Engine::Bing => "www.bing.com",
                         web_world::observation::Engine::DuckDuckGo => "html.duckduckgo.com",
                         web_world::observation::Engine::YouTube => "www.youtube.com",
-                        web_world::observation::Engine::WebSearch => "World search",
                     };
                     site(&mut view.sites, host, observation.at_ms)
                         .searches
@@ -161,16 +169,16 @@ impl Views {
                     phase,
                 } => {
                     if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
-                        row.status = *status;
+                        row.status = status.map(|status| status.as_u16());
                         row.phase = *phase;
                     } else {
                         view.calls.push(Call {
                             call: *call,
                             at_ms: observation.at_ms,
-                            host: host.clone(),
-                            path: path.clone(),
-                            status: *status,
-                            method: method.clone(),
+                            host: host.to_ascii(),
+                            path: path.to_string(),
+                            status: status.map(|status| status.as_u16()),
+                            method: method.to_string(),
                             phase: *phase,
                             tools: Vec::new(),
                         });
@@ -210,7 +218,9 @@ impl Views {
                     path: target,
                     preview,
                     ..
-                } if site == host && target == path => preview.clone(),
+                } if site.to_ascii().trim_end_matches('.') == host && target.as_str() == path => {
+                    preview.clone()
+                }
                 _ => None,
             })
     }
@@ -249,7 +259,7 @@ pub struct WorldState {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
-    Source { source: Source },
+    SetSource { source: Source },
     Restart,
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -320,7 +330,7 @@ impl Page {
                 let restart = matches!(command, Command::Restart);
                 let expected_revision = pages.generation().revision;
                 let command = match command {
-                    Command::Source { source } => web_world::pages::Command::SetNewPages {
+                    Command::SetSource { source } => web_world::pages::Command::SetNewPages {
                         new_pages: match source {
                             Source::Copied => NewPages::Copied,
                             Source::ModelWritten => NewPages::ModelWritten,

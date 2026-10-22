@@ -2,7 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use fictionet::run;
-use fictionet::{Cx, RunOptions, block_on, lab};
+use fictionet::{Cx, block_on, lab};
 
 use fictionet_test_support::{Done, ended_with_done, within};
 
@@ -12,11 +12,11 @@ where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    seeded_world(RunOptions::new(fictionet::Seed::from_u64(1)), limit, f)
+    seeded_world(fictionet::Seed::from_u64(1), limit, f)
 }
 
 /// Runs a seeded lab world within the host limit and requires Done.
-pub fn seeded_world<F, Fut>(options: fictionet::RunOptions, limit: Duration, f: F)
+pub fn seeded_world<F, Fut>(options: fictionet::Seed, limit: Duration, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
@@ -36,11 +36,11 @@ where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    seeded_real_world(RunOptions::new(fictionet::Seed::random()), limit, f)
+    seeded_real_world(fictionet::Seed::random(), limit, f)
 }
 
 /// Runs a seeded real-time world within the host limit and requires Done.
-pub fn seeded_real_world<F, Fut>(options: fictionet::RunOptions, limit: Duration, f: F)
+pub fn seeded_real_world<F, Fut>(options: fictionet::Seed, limit: Duration, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
@@ -52,18 +52,4 @@ where
         }))
     });
     ended_with_done(result).unwrap_or_else(|e| panic!("the world failed: {e}"));
-}
-
-/// Runs a lab fixture with an event log installed.
-pub fn observed_world<F, Fut>(limit: Duration, f: F)
-where
-    F: FnOnce(Cx, std::sync::Arc<fictionet_test_support::EventLog>) -> Fut + Send + 'static,
-    Fut: Future<Output = fictionet::Result> + Send + 'static,
-{
-    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
-    seeded_world(
-        RunOptions::new(fictionet::Seed::from_u64(1)).observer(log.clone()),
-        limit,
-        move |cx| f(cx, log),
-    );
 }

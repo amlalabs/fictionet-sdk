@@ -49,9 +49,7 @@ pub(super) fn wanted(provider: Provider, request: &Request<Body>) -> bool {
 /// Answers the handshake: `101` with the socket served after it, or the
 /// refusal a wrong credential or a broken handshake gets.
 pub(super) fn accept(model: Model, request: Request<Body>) -> Response<Body> {
-    let path = request.uri().path().to_owned();
     if !model.authorized(request.headers()) {
-        model.refused(&path, "credential");
         return model.unauthorized();
     }
     let fields: Vec<(&str, &str)> = request
@@ -62,7 +60,6 @@ pub(super) fn accept(model: Model, request: Request<Body>) -> Response<Body> {
     let headers = match ws::check_request(&fields).and_then(|u| u.response_headers(None)) {
         Ok(headers) => headers,
         Err(error) => {
-            model.refused(&path, "handshake");
             let status = error.status_code();
             let mut response =
                 model
@@ -90,15 +87,7 @@ pub(super) fn accept(model: Model, request: Request<Body>) -> Response<Body> {
     if let Ok(id) = http::HeaderValue::try_from(format!("req_{}", hex(&model.cx, 16))) {
         response.headers_mut().insert("x-request-id", id);
     }
-    model
-        .cx
-        .emitter(&model.connection)
-        .emit("model", "transport", |e| {
-            e.field("provider", model.provider.host())
-                .field("path", path.as_str())
-                .field("transport", "websocket")
-                .field("status", 101u64)
-        });
+
     let (head, _) = request.into_parts();
     response
         .extensions_mut()
@@ -595,14 +584,7 @@ async fn relay(
             out,
         });
     };
-    let failed = |model: &Model, error: Error| {
-        model
-            .cx
-            .emitter(&model.connection)
-            .emit("model", "socket_error", |e| {
-                e.field("provider", model.provider.host())
-                    .field("message", error.to_string())
-            });
+    let failed = |_: &Model, _: Error| {
         let event = wrapped(500, &http::HeaderMap::new(), b"");
         Out::Event(event.to_string(), event)
     };
@@ -716,7 +698,6 @@ fn broken(fail: &Fail<AssembleError<ws::Error>>) -> u16 {
 /// Serves one socket until either side closes it or the world stops.
 async fn serve(model: Model, head: http::request::Parts, cx: Cx, mut conn: Box<dyn Connection>) {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let provider = model.provider.host();
     let mut session = Session {
         model: model.clone(),
         cx: cx.clone(),
@@ -782,20 +763,7 @@ async fn serve(model: Model, head: http::request::Parts, cx: Cx, mut conn: Box<d
             Ok(Wake::Read(_)) | Err(_) => break None,
         }
     };
-    let code = match &close {
-        Some(Message::Close(Some(frame))) => frame.code,
-        Some(_) => close_code::NO_STATUS,
-        None => close_code::ABNORMAL,
-    };
-    model
-        .cx
-        .emitter(&model.connection)
-        .emit("model", "transport", |e| {
-            e.field("provider", provider)
-                .field("transport", "websocket")
-                .field("closed", code as u64)
-                .field("responses", session.responses)
-        });
+
     if let Some(close) = close {
         session.outbox.push(close);
         if session.flush(&cx, &mut conn).await.is_ok() {

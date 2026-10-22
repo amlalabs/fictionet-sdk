@@ -227,11 +227,8 @@ pub(super) fn normalize(text: &str) -> String {
 
 /// The first word in `text` that would tell a reader the web is made up,
 /// by the guest content check's rules.
-pub(super) fn gives_away(text: &str) -> Option<String> {
-    let audit = fictionet_extras::guest_content::Audit::default();
-    audit.inspect("planted", text.as_bytes());
-    let error = audit.check().err()?;
-    Some(error.split('"').nth(1).unwrap_or("that word").to_owned())
+pub(super) fn gives_away(text: &str) -> Option<&'static str> {
+    fictionet_extras::guest_content::forbidden_word(text)
 }
 
 pub(super) fn sentences() -> &'static regex::Regex {

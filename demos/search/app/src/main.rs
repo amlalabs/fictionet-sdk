@@ -133,7 +133,7 @@ async fn main() -> Result {
             page.run_commands(&cx, pages.clone(), commands);
             let net = network::build(&web, &cx, world_log, run.mirror(&cx)?)?
                 .route(kit::JUMP, kit::jump_prefix());
-            network::start(&cx, net, run.into_attachments(), pages)
+            net.start(&cx, run.into_attachments())
         },
     );
     let run = tokio::select! {

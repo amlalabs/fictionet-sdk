@@ -45,7 +45,7 @@ pub fn run(
         .cloned()
         .unwrap_or_else(|| "/run/fictionet/ca.pem".into());
 
-    let options = fictionet::RunOptions::new(fictionet::Seed::random());
+    let options = fictionet::Seed::random();
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}, CA in {ca_path}");

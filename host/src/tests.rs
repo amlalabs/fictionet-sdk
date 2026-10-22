@@ -165,14 +165,13 @@ fn upload(size: usize) -> Request<Body> {
     request
 }
 
-fn run<F>(test: impl FnOnce(Cx, Arc<fictionet_test_support::EventLog>) -> F + Send)
+fn run<F>(test: impl FnOnce(Cx) -> F + Send)
 where
     F: std::future::Future<Output = Result<(), Error>> + Send + 'static,
 {
-    let log = Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(Seed::from_u64(1)).observer(log.clone()),
-        move |fcx| test(fcx, log),
+        Seed::from_u64(1),
+        test,
     ))
     .unwrap();
 }
@@ -184,7 +183,7 @@ async fn poll_once<F: Future + ?Sized>(mut future: Pin<&mut F>) -> Poll<F::Outpu
 #[test]
 fn content_length_and_chunked_responses_reuse_connections() {
     for tls in [false, true] {
-        run(async move |fcx, _log| {
+        run(async move |fcx| {
             let (mut forward, server, _origin) = upstream(&fcx, tls, |socket| {
                 for response in [
                     b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice(),
@@ -211,7 +210,7 @@ fn content_length_and_chunked_responses_reuse_connections() {
 
 #[test]
 fn empty_requests_declare_a_length_only_when_their_method_expects_content() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let methods = ["GET", "HEAD", "DELETE", "OPTIONS", "POST", "PUT", "PATCH"];
         let (mut forward, server, _origin) = upstream(&fcx, false, move |socket| {
             for method in methods {
@@ -240,7 +239,7 @@ fn empty_requests_declare_a_length_only_when_their_method_expects_content() {
 #[test]
 fn large_responses_stream_beyond_the_owned_codec_limit() {
     for tls in [false, true] {
-        run(async move |fcx, _log| {
+        run(async move |fcx| {
             let size = 12 << 20;
             let (mut forward, server, _origin) = upstream(&fcx, tls, move |socket| {
                 read_head(socket);
@@ -268,7 +267,7 @@ fn large_responses_stream_beyond_the_owned_codec_limit() {
 #[test]
 fn close_delimited_responses_and_redirects_are_passed_through() {
     for tls in [false, true] {
-        run(async move |fcx, _log| {
+        run(async move |fcx| {
             let (mut forward, server, _origin) = upstream(&fcx, tls, |socket| {
                 read_head(socket);
                 socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: /elsewhere?q=2\r\nConnection: close\r\n\r\nredirect body").unwrap();
@@ -291,7 +290,7 @@ fn close_delimited_responses_and_redirects_are_passed_through() {
 #[test]
 fn close_delimited_events_arrive_before_the_server_closes() {
     for tls in [false, true] {
-        run(async move |fcx, _log| {
+        run(async move |fcx| {
             let (received, receipt) = mpsc::channel();
             let (mut forward, server, _origin) = upstream(&fcx, tls, move |socket| {
                 read_head(socket);
@@ -328,7 +327,7 @@ fn close_delimited_events_arrive_before_the_server_closes() {
 
 #[test]
 fn tls_without_close_notify_uses_the_response_framing() {
-    run(async move |fcx, _log| {
+    run(async move |fcx| {
         for (response, complete) in [
             (
                 b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello".as_slice(),
@@ -371,7 +370,7 @@ fn tls_without_close_notify_uses_the_response_framing() {
 #[test]
 fn head_204_304_and_interim_responses_have_no_body() {
     for tls in [false, true] {
-        run(async move |fcx, _log| {
+        run(async move |fcx| {
             let (mut forward, server, _origin) = upstream(&fcx, tls, |socket| {
                 for (method, response) in [
                     ("head", b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".as_slice()),
@@ -408,7 +407,7 @@ fn head_204_304_and_interim_responses_have_no_body() {
 
 #[test]
 fn chunk_extensions_and_trailers_are_skipped() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let (mut forward, server, _origin) = upstream(&fcx, false, |socket| {
             for _ in 0..2 {
                 read_head(socket);
@@ -431,7 +430,7 @@ fn chunk_extensions_and_trailers_are_skipped() {
 
 #[test]
 fn connection_close_responses_are_not_reused() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let server = thread::spawn(move || {
@@ -456,7 +455,7 @@ fn connection_close_responses_are_not_reused() {
 #[test]
 fn a_pooled_connection_the_server_closed_is_replaced_for_idempotent_requests() {
     for tls in [false, true] {
-        run(async move |fcx, _log| {
+        run(async move |fcx| {
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let address = listener.local_addr()?;
             let mut client = Client::new();
@@ -536,7 +535,7 @@ fn a_pooled_connection_the_server_closed_is_replaced_for_idempotent_requests() {
 
 #[test]
 fn tls_sends_and_checks_the_dns_name() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let (trust, config) = certificates(&fcx, "localhost");
@@ -560,7 +559,7 @@ fn tls_sends_and_checks_the_dns_name() {
 
 #[test]
 fn tls_refuses_a_certificate_for_another_name_or_from_an_unknown_ca() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let (trust, wrong_name) = certificates(&fcx, "elsewhere.test");
         let (_, unknown_ca) = certificates(&fcx, "localhost");
         for config in [wrong_name, unknown_ca] {
@@ -591,7 +590,7 @@ fn tls_refuses_a_certificate_for_another_name_or_from_an_unknown_ca() {
 
 #[test]
 fn a_large_upload_streams_while_the_server_echoes_it() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let size = 64 << 20;
         let (mut forward, server, _origin) = upstream(&fcx, false, move |socket| {
             read_head(socket);
@@ -623,7 +622,7 @@ fn a_large_upload_streams_while_the_server_echoes_it() {
 fn an_early_answer_during_an_upload_reaches_the_world() {
     for tls in [false, true] {
         for linger in [false, true] {
-            run(async move |fcx, _log| {
+            run(async move |fcx| {
                 let size = 64 << 20;
                 let (mut forward, server, _origin) = upstream(&fcx, tls, move |socket| {
                     read_head(socket);
@@ -719,7 +718,7 @@ async fn serve_one(fcx: &Cx, forward: fictionet::stdlib::web::Forward) -> String
         httpd::serve_connection(
             fcx,
             conn,
-            fictionet::events::ConnInfo::default(),
+            fictionet::stdlib::services::serve::ConnInfo::default(),
             Arc::new(forward),
             &httpd::HttpOptions::default(),
         ),
@@ -734,27 +733,22 @@ async fn serve_one(fcx: &Cx, forward: fictionet::stdlib::web::Forward) -> String
 /// recorded the error and the origin it tried, and returns the answer.
 async fn bad_gateway(
     fcx: &Cx,
-    log: &fictionet_test_support::EventLog,
     forward: fictionet::stdlib::web::Forward,
-    origin: &str,
+    _origin: &str,
 ) -> String {
     let output = serve_one(fcx, forward).await;
     assert!(
         output.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
         "{output}"
     );
-    let events = log.of("http", "request");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].str("answer"), Some("error"));
-    assert_eq!(events[0].u64("status"), Some(502));
-    assert_eq!(events[0].str("forwarded"), Some(origin));
+
     output
 }
 
 #[test]
-fn a_forwarded_request_names_the_origin_in_its_event() {
+fn a_forwarded_request_serves_the_origin_response() {
     for tls in [false, true] {
-        run(async move |fcx, log| {
+        run(async move |fcx| {
             let (forward, server, _origin) = upstream(&fcx, tls, |socket| {
                 read_head(socket);
                 socket.write_all(OK_CLOSE).unwrap();
@@ -763,16 +757,6 @@ fn a_forwarded_request_names_the_origin_in_its_event() {
 
             let output = serve_one(&fcx, forward).await;
             assert!(output.starts_with("HTTP/1.1 200 OK\r\n"), "{output}");
-            let events = log.of("http", "request");
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].str("answer"), Some("handler"));
-            assert_eq!(events[0].u64("status"), Some(200));
-            assert_eq!(events[0].str("forwarded"), Some(_origin.as_str()));
-            assert!(_origin.starts_with(if tls {
-                "https://127.0.0.1:"
-            } else {
-                "http://127.0.0.1:"
-            }));
             server.join().unwrap();
             Ok(())
         });
@@ -782,13 +766,13 @@ fn a_forwarded_request_names_the_origin_in_its_event() {
 #[test]
 fn malformed_heads_record_bad_gateway_responses() {
     for tls in [false, true] {
-        run(async move |fcx, log| {
+        run(async move |fcx| {
             let (forward, server, _origin) = upstream(&fcx, tls, |socket| {
                 read_head(socket);
                 socket.write_all(b"HTTP/1.1 not-a-status\r\n\r\n").unwrap();
                 socket.flush().unwrap();
             });
-            let output = bad_gateway(&fcx, &log, forward, &_origin).await;
+            let output = bad_gateway(&fcx, forward, &_origin).await;
             assert!(
                 output.contains("the upstream response is malformed: invalid HTTP start line"),
                 "{output}"
@@ -805,11 +789,10 @@ fn stalled_connections_time_out_with_bad_gateway_responses() {
         let client = Client::with_timeout(Duration::from_millis(100));
         Arc::new(client)
     };
-    run(async move |fcx, log| {
+    run(async move |fcx| {
         let (_listener, _queued, address) = unanswered();
         let output = bad_gateway(
             &fcx,
-            &log,
             forward(&fcx, quick(), false, address),
             &format!("http://{address}"),
         )
@@ -817,7 +800,7 @@ fn stalled_connections_time_out_with_bad_gateway_responses() {
         assert!(output.contains("connecting timed out"), "{output}");
         Ok(())
     });
-    run(async move |fcx, log| {
+    run(async move |fcx| {
         // A server that takes the connection but never answers the TLS hello.
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
@@ -828,7 +811,6 @@ fn stalled_connections_time_out_with_bad_gateway_responses() {
         });
         let output = bad_gateway(
             &fcx,
-            &log,
             forward(&fcx, quick(), true, address),
             &format!("https://{address}"),
         )
@@ -841,7 +823,7 @@ fn stalled_connections_time_out_with_bad_gateway_responses() {
 
 #[test]
 fn dropping_a_streaming_response_interrupts_the_upstream_read() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let (mut forward, server, _origin) = upstream(&fcx, false, |socket| {
             read_head(socket);
             socket
@@ -858,7 +840,7 @@ fn dropping_a_streaming_response_interrupts_the_upstream_read() {
 
 #[test]
 fn dropping_a_request_while_it_connects_frees_its_slot() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let (_listener, _queued, hanging) = unanswered();
         let (_ok, server, _origin) = upstream(&fcx, false, |socket| {
             read_head(socket);
@@ -890,7 +872,7 @@ fn dropping_a_request_while_it_connects_frees_its_slot() {
 
 #[test]
 fn exchanges_past_the_cap_wait_for_a_slot() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let (arrived, both_arrived) = mpsc::channel();
@@ -934,8 +916,8 @@ fn exchanges_past_the_cap_wait_for_a_slot() {
 }
 
 #[test]
-fn a_client_reset_before_the_upstream_answers_keeps_the_origin() {
-    run(async move |fcx, events| {
+fn a_client_reset_stops_the_pending_upstream_response() {
+    run(async move |fcx| {
         let (reset, receive) = tokio::sync::oneshot::channel();
         let (finish, finished) = mpsc::channel();
         let (forward, server, _origin) = upstream(&fcx, false, move |socket| {
@@ -944,24 +926,21 @@ fn a_client_reset_before_the_upstream_answers_keeps_the_origin() {
             finished.recv_timeout(Duration::from_secs(5)).unwrap();
         });
 
+        let output = Arc::new(Mutex::new(Vec::new()));
         let conn = Downstream {
             input: Bytes::from_static(b"GET / HTTP/1.1\r\nHost: original.test\r\n\r\n"),
-            output: Arc::default(),
+            output: output.clone(),
             reset: Mutex::new(Some(receive)),
         };
         httpd::serve_connection(
             &fcx,
             conn,
-            fictionet::events::ConnInfo::default(),
+            fictionet::stdlib::services::serve::ConnInfo::default(),
             Arc::new(forward),
             &httpd::HttpOptions::default(),
         )
         .await?;
-        let requests = events.of("http", "request");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].str("answer"), Some("cancelled"));
-        assert_eq!(requests[0].u64("status"), None);
-        assert_eq!(requests[0].str("forwarded"), Some(_origin.as_str()));
+        assert!(output.lock().is_empty());
         finish.send(()).unwrap();
         server.join().unwrap();
         Ok(())
@@ -970,7 +949,7 @@ fn a_client_reset_before_the_upstream_answers_keeps_the_origin() {
 
 #[test]
 fn raw_paths_and_encoded_responses_pass_through() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let (mut forward, server, _origin) = upstream(&fcx, false, |socket| {
             let head = read_head(socket);
             assert!(
@@ -997,7 +976,7 @@ fn raw_paths_and_encoded_responses_pass_through() {
 
 #[test]
 fn a_response_keeps_its_runtime_after_the_handler_is_dropped() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let (release, released) = mpsc::channel();
         let (mut forward, server, _origin) = upstream(&fcx, false, move |socket| {
             read_head(socket);
@@ -1029,7 +1008,7 @@ fn a_client_can_be_dropped_inside_another_runtime() {
 
 #[test]
 fn request_bodies_of_unknown_length_stream_as_chunks() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let (mut forward, server, _origin) = upstream(&fcx, false, |socket| {
             let head = read_head(socket).to_ascii_lowercase();
             assert!(head.contains("transfer-encoding: chunked\r\n"), "{head}");
@@ -1076,7 +1055,7 @@ fn request_bodies_of_unknown_length_stream_as_chunks() {
 
 #[test]
 fn upstream_protocol_upgrades_are_rejected() {
-    run(async |fcx, _log| {
+    run(async |fcx| {
         let (mut forward, server, _origin) = upstream(&fcx, false, |socket| {
             read_head(socket);
             socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n").unwrap();

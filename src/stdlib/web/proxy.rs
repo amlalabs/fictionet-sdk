@@ -35,7 +35,6 @@ pub type UpstreamFuture =
 /// and pass the rest through, wrap it in tower or axum middleware.
 /// A target must have [`Routing::Exact`]. Requests routed through a
 /// default host get `421 Misdirected Request` before any upstream I/O.
-/// Their request events carry `answer: misdirected`.
 /// Use [`forward`] for a catch-all that forwards to one fixed origin.
 ///
 /// The transport must verify upstream certificates. Hop-by-hop headers (`Connection`, `Keep-Alive`,
@@ -44,9 +43,6 @@ pub type UpstreamFuture =
 /// real site as a plain `GET`. A world that wants WebSockets serves them
 /// itself, with a handler on the site (see [`httpd`'s upgrades](fictionet::stdlib::web::httpd)).
 /// If the real site cannot be reached, the agent gets `502 Bad Gateway`.
-/// Every request it sends upstream, answered or not, has a `forwarded`
-/// field in its `http.request` event: the origin it went to, such as
-/// `https://github.com`.
 pub fn proxy(_fcx: &Cx, client: Arc<dyn Upstream>) -> Result<Proxy, Error> {
     Ok(Proxy { client })
 }
@@ -122,13 +118,10 @@ async fn send_upstream(
             )
         })?;
     if target.routing != Routing::Exact {
-        let mut response = httpd::text(
+        let response = httpd::text(
             http::StatusCode::MISDIRECTED_REQUEST,
             "This proxy does not serve unregistered hosts.\n",
         );
-        response
-            .extensions_mut()
-            .insert(fictionet::events::Fields::new().with("answer", "misdirected"));
         return Ok(response);
     }
     let default_port = (target.scheme == Scheme::HTTP && target.port == 80)
@@ -144,7 +137,6 @@ async fn send_upstream(
         request,
         |path| Ok(format!("{origin}{path}").parse()?),
         Host::Replace(&authority),
-        &origin,
         Some(&target.host),
     )
     .await
@@ -160,15 +152,12 @@ enum Host<'a> {
 
 /// Sends one request upstream. `destination` makes the upstream URI from
 /// the request's path and query. A failed request is answered `502 Bad
-/// Gateway`, prefixed with `error_context` when there is one. Before sending, the
-/// request records a `forwarded` event field naming `origin`, so the
-/// request's event says it left the world.
+/// Gateway`, prefixed with `error_context` when there is one.
 async fn dispatch(
     client: Arc<dyn Upstream>,
     request: Request<Body>,
     destination: impl FnOnce(&str) -> Result<http::Uri, Error>,
     host: Host<'_>,
-    origin: &str,
     error_context: Option<&str>,
 ) -> Result<Response<Body>, Error> {
     let (mut parts, body) = request.into_parts();
@@ -180,9 +169,7 @@ async fn dispatch(
             .unwrap_or("/"),
     )?;
     parts.version = http::Version::HTTP_11;
-    if let Some(fields) = parts.extensions.get::<httpd::RequestFields>() {
-        fields.record_fields(fictionet::events::Fields::new().with("forwarded", origin));
-    }
+
     parts.extensions.clear();
     strip_hop_by_hop(&mut parts.headers);
     if let Host::Replace(authority) = host {
@@ -196,9 +183,6 @@ async fn dispatch(
         })
     })?;
     strip_hop_by_hop(response.headers_mut());
-    response
-        .extensions_mut()
-        .insert(fictionet::events::Fields::new().with("forwarded", origin));
     Ok(response)
 }
 
@@ -210,8 +194,7 @@ async fn dispatch(
 /// The origin does not depend on [`Target`], so default-host requests can
 /// be forwarded here even when their routing is [`Routing::Fallback`].
 /// This handler requires real host I/O and works with any executor.
-/// It uses the supplied transport, and its
-/// requests' events carry the same `forwarded` field.
+/// It uses the supplied transport.
 /// Returns an error for an
 /// upstream without such a scheme or without an authority.
 pub fn forward(_fcx: &Cx, upstream: http::Uri, client: Arc<dyn Upstream>) -> Result<Forward, Error> {
@@ -261,7 +244,6 @@ impl tower_service::Service<Request<Body>> for Forward {
         let scheme = self.scheme.clone();
         let authority = self.authority.clone();
         Box::pin(async move {
-            let origin = format!("{scheme}://{authority}");
             dispatch(
                 client,
                 request,
@@ -273,7 +255,6 @@ impl tower_service::Service<Request<Body>> for Forward {
                         .build()?)
                 },
                 Host::Preserve,
-                &origin,
                 None,
             )
             .await

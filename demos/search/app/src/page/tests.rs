@@ -57,14 +57,14 @@ async fn fetch(cx: &Cx, machine: &Machine, host: &str, path: &str, start: std::t
 async fn real_search_page_and_dns_facts_reach_the_owned_views_without_an_observer() {
     let pages = pages();
     let (_, (mut observations, _)) = Page::new(&pages, false);
-    fictionet::lab(fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),move |cx|async move {
+    fictionet::lab(fictionet::Seed::from_u64(7),move |cx|async move {
         let seed=pages.seed().clone();
         let start=web_world::world_start(&seed.date)?;
         let world=web_world::World {pages:pages.clone(),..web_world::World::new(&cx,seed,start)?};
         let (attacher,attachments)=fictionet::attachments();
         let log=Arc::new(fictionet_extras::log::Log::new(Box::new(std::io::sink()),&[],|s|s));
         let net=crate::network::build(&world,&cx,log,fictionet_demo::kit::mirror::new(&cx)?)?;
-        crate::network::start(&cx,net,attachments,pages.clone())?;
+        net.start(&cx,attachments)?;
         let client=machine(&cx,attacher.attach("workstation")?,"10.0.0.2".parse::<std::net::Ipv4Addr>()?);
         fetch(&cx,&client,"www.google.com","/search?q=black+hole",start).await;
         fetch(&cx,&client,"sky.org","/black-hole",start).await;
@@ -87,9 +87,9 @@ async fn real_search_page_and_dns_facts_reach_the_owned_views_without_an_observe
         assert!(request.has_preview);
         assert!(views.preview("sky.org","/black-hole",current.at_ms).unwrap().contains("bends spacetime"));
         assert!(matches!(request.source,PageSource::Copy { .. }));
-        assert_eq!(request.headers,vec![("user-agent".into(),"Firefox/1".into())]);
-        assert!(current.activity.iter().any(|row|matches!(&row.fact,SearchObs::Resolved {name,address:None} if name=="wiki.corp")));
-        assert!(current.activity.iter().any(|row|matches!(&row.fact,SearchObs::NoRoute {to} if to.to_string()=="1.1.1.1:443")));
+        assert_eq!(request.headers,vec![("host".into(),"sky.org".into()),("user-agent".into(),"Firefox/1".into())]);
+        assert!(current.activity.iter().any(|row|matches!(&row.fact,SearchObs::Resolved {name,address:None} if name.to_ascii()=="wiki.corp")));
+        assert!(current.activity.iter().any(|row|matches!(&row.fact,SearchObs::NoRoute {from,to} if *from == "10.0.0.2".parse::<std::net::IpAddr>().unwrap() && *to == "1.1.1.1".parse::<std::net::IpAddr>().unwrap())));
         cx.cancel();
         Ok(())
     }).await.unwrap();
@@ -100,10 +100,10 @@ fn rewind_keeps_the_original_call_and_tool_state_and_never_uses_future_events() 
     let mut views = Views::default();
     let call = |status, streaming, complete| SearchObs::ModelCall {
         call: 3,
-        host: "api.anthropic.com".into(),
-        path: "/v1/messages".into(),
+        host: "api.anthropic.com".parse().unwrap(),
+        path: http::uri::PathAndQuery::from_static("/v1/messages"),
         status,
-        method: "POST".into(),
+        method: http::Method::POST,
         phase: if complete {
             CallPhase::Complete
         } else if streaming {
@@ -114,7 +114,7 @@ fn rewind_keeps_the_original_call_and_tool_state_and_never_uses_future_events() 
     };
     for (at_ms, fact) in [
         (100, call(None, false, false)),
-        (200, call(Some(200), true, false)),
+        (200, call(Some(http::StatusCode::OK), true, false)),
         (
             300,
             SearchObs::Tool {
@@ -128,7 +128,7 @@ fn rewind_keeps_the_original_call_and_tool_state_and_never_uses_future_events() 
                 error: None,
             },
         ),
-        (400, call(Some(200), false, true)),
+        (400, call(Some(http::StatusCode::OK), false, true)),
     ] {
         views.push(Observation { at_ms, fact });
     }
@@ -153,7 +153,8 @@ fn retained_history_has_a_known_start_and_empty_histories_are_valid() {
         views.push(Observation {
             at_ms,
             fact: SearchObs::NoRoute {
-                to: "1.1.1.1:443".parse().unwrap(),
+                from: "10.0.0.2".parse().unwrap(),
+                to: "1.1.1.1".parse().unwrap(),
             },
         });
     }
@@ -171,40 +172,38 @@ async fn world_controls_report_errors_and_restart_the_visible_history() {
     let world = page.world.clone();
     let views = page.views.clone();
     let snapshots = page.snapshots.clone();
-    fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
-        move |cx| async move {
-            page.run_commands(&cx, pages.clone(), control);
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            commands
-                .send((
-                    Command::Source {
-                        source: Source::ModelWritten,
-                    },
-                    reply,
-                ))
-                .unwrap();
-            assert_eq!(
-                receive.await.unwrap().unwrap_err(),
-                "Model-written pages need OPENROUTER_API_KEY"
-            );
-            assert_eq!(pages.new_pages(), NewPages::Copied);
-            views.lock().unwrap().push(Observation {
-                at_ms: 20,
-                fact: SearchObs::NoRoute {
-                    to: "1.1.1.1:443".parse()?,
+    fictionet::lab(fictionet::Seed::from_u64(1), move |cx| async move {
+        page.run_commands(&cx, pages.clone(), control);
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        commands
+            .send((
+                Command::SetSource {
+                    source: Source::ModelWritten,
                 },
-            });
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            commands.send((Command::Restart, reply)).unwrap();
-            receive.await.unwrap().unwrap();
-            assert!(views.lock().unwrap().current().activity.is_empty());
-            assert!(snapshots.borrow().activity.is_empty());
-            assert!(matches!(world.borrow().source, PageSource::Copy { .. }));
-            cx.cancel();
-            Ok(())
-        },
-    )
+                reply,
+            ))
+            .unwrap();
+        assert_eq!(
+            receive.await.unwrap().unwrap_err(),
+            "Model-written pages need OPENROUTER_API_KEY"
+        );
+        assert_eq!(pages.new_pages(), NewPages::Copied);
+        views.lock().unwrap().push(Observation {
+            at_ms: 20,
+            fact: SearchObs::NoRoute {
+                from: "10.0.0.2".parse().unwrap(),
+                to: "1.1.1.1".parse()?,
+            },
+        });
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        commands.send((Command::Restart, reply)).unwrap();
+        receive.await.unwrap().unwrap();
+        assert!(views.lock().unwrap().current().activity.is_empty());
+        assert!(snapshots.borrow().activity.is_empty());
+        assert!(matches!(world.borrow().source, PageSource::Copy { .. }));
+        cx.cancel();
+        Ok(())
+    })
     .await
     .unwrap();
 }
@@ -253,15 +252,15 @@ async fn page_routes_serve_local_components_and_stream_current_state() {
     page.views.lock().unwrap().push(Observation {
         at_ms: 1,
         fact: SearchObs::Request {
-            host: "sky.org".into(),
-            method: "GET".into(),
-            path: "/article".into(),
-            status: 200,
+            host: "sky.org".parse().unwrap(),
+            method: http::Method::GET,
+            path: http::uri::PathAndQuery::from_static("/article"),
+            status: http::StatusCode::OK,
             bytes: 15,
             content_type: "text/html".into(),
             source: PageSource::Copy { captured: None },
             elapsed_ms: 1,
-            headers: Vec::new(),
+            headers: http::HeaderMap::new(),
             preview: Some(Arc::from("<p>Document</p>")),
         },
     });

@@ -2,14 +2,9 @@
 //! connection.
 //!
 //! A [`Service`] is the server side of one protocol for one connection.
-//! It gets decoded items, appends reply bytes, records facts in the
-//! run's [events](fictionet::events), and asks for timers. It reads no
-//! clock and touches no socket, so it unit-tests with the [`Harness`]
-//! here, fuzzes with the codec's contract tools, and a world copies its
-//! file to change it. It has the shape of a FIX session: items in, bytes
-//! and events and timers out. The observer installed in `RunOptions` receives
-//! interested events; consumers own storage. A standalone `Harness` also
-//! accepts a caller-supplied observer.
+//! It gets decoded items, appends reply bytes and asks for timers. A world
+//! can report typed facts directly through its service state. The [`Harness`]
+//! runs the same service without a socket.
 //!
 //! [`connection`] is the one driver that joins a service to a
 //! [`Connection`]: it reads, decodes, calls the
@@ -24,7 +19,6 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
-//! use fictionet::events::Event;
 //! use fictionet::stdlib::services::serve::{Flow, Harness, Service, Driver};
 //!
 //! struct Echo;
@@ -39,7 +33,7 @@
 //!         if line == b"quit" {
 //!             return Ok(Flow::Close);
 //!         }
-//!         driver.emit("echo", "line", |event| event.field("bytes", line.len() as u64));
+//!
 //!         driver.reply().extend_from_slice(&line);
 //!         driver.reply().push(b'\n');
 //!         Ok(Flow::Continue)
@@ -129,8 +123,7 @@
 //! - **Stops.** When the world stops, a running service hears [`Ended::Cancelled`].
 //!   [`connection`] returns [`ServeError::Cancelled`], also during a TLS
 //!   handshake or final shutdown, unless it has a failure to return. If
-//!   [`Service::on_end`] already ran, it is not called again. A shutdown
-//!   failure is secondary: `conn.close` keeps `end` and adds `shutdown`.
+//!   [`Service::on_end`] already ran, it is not called again.
 //! - **Upgrades.** A call that returns [`Flow::Upgrade`] says what comes
 //!   next: [`Upgrade::Tls`] shakes hands as a TLS server with
 //!   [`ServeOptions::starttls`] and calls [`Service::on_open`] again over
@@ -151,7 +144,95 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use fictionet::events::{ConnInfo, Event, Level, Sandbox, Transport, opt};
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+/// A sandbox attached to a network.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Sandbox {
+    /// The attachment, numbered from 1 in the order sandboxes attached. A
+    /// name and an address can be used again after a sandbox detaches; the
+    /// id never is.
+    pub id: u64,
+    /// Its attachment's name.
+    pub name: Arc<str>,
+    /// Its IPv4 address, once bound.
+    pub addr: Option<Ipv4Addr>,
+    /// Its IPv6 address, once bound.
+    pub addr_v6: Option<Ipv6Addr>,
+}
+
+/// How a connection's bytes travel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Transport {
+    /// A byte stream: TCP, or TLS over it.
+    #[default]
+    Tcp,
+    /// Datagrams: UDP.
+    Udp,
+}
+
+impl Transport {
+    /// `tcp` or `udp`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+        }
+    }
+}
+
+/// Connection metadata supplied to a service or handler.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ConnInfo {
+    /// The connection's number, from whoever accepted it. [`Net`]
+    /// numbers its connections from 1, on every port.
+    ///
+    /// [`Net`]: crate::stdlib::world::net::Net
+    pub id: Option<u64>,
+    /// The sandbox the connection came from, as it was when it arrived.
+    pub sandbox: Option<Sandbox>,
+    /// The world's side: the address and port the connection arrived on.
+    pub local: Option<SocketAddr>,
+    /// The other side.
+    pub peer: Option<SocketAddr>,
+    /// Whether the bytes arrived over TLS.
+    pub tls: bool,
+    /// The name the client sent in its TLS hello, in lowercase.
+    pub sni: Option<Arc<str>>,
+    /// The protocol the TLS handshake agreed on, such as `h2`.
+    pub alpn: Option<Arc<[u8]>>,
+    /// TCP or UDP. A service served both ways, such as a Kerberos KDC,
+    /// answers by it: a reply too big for a datagram asks the client to
+    /// use TCP.
+    pub transport: Transport,
+}
+
+impl ConnInfo {
+    /// A connection with this number between `local` and `peer`.
+    pub fn new(id: u64, local: SocketAddr, peer: SocketAddr) -> ConnInfo {
+        ConnInfo {
+            id: Some(id),
+            local: Some(local),
+            peer: Some(peer),
+            ..ConnInfo::default()
+        }
+    }
+
+    /// The same, from `sandbox`.
+    pub fn from_sandbox(mut self, sandbox: Option<Sandbox>) -> ConnInfo {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// The same, over TLS with this SNI and ALPN.
+    pub fn over_tls(mut self, sni: Option<&str>, alpn: Option<&[u8]>) -> ConnInfo {
+        self.tls = true;
+        self.sni = sni.map(Arc::from);
+        self.alpn = alpn.map(Arc::from);
+        self
+    }
+}
+
 use fictionet::stdlib::codec::{Decode, Fail, Stream};
 use fictionet::stdlib::network::{Accept, Accepted, DatagramSocket};
 use fictionet::stdlib::network::{ConnError, Connection, ConnectionExt};
@@ -181,8 +262,8 @@ pub trait Service: Send + 'static {
     type Decoder: Decode + Send + 'static;
     /// State shared by every connection, such as a directory or an order book.
     type State: Send + Sync + 'static;
-    /// Why the service gives up on a connection. The driver closes it,
-    /// records `conn.error`, and returns the error.
+    /// Why the service gives up on a connection. The driver closes it
+    /// and returns the error.
     type Error: core::error::Error + Send + Sync + 'static;
 
     /// A fresh decoder for a new connection, and after
@@ -354,9 +435,7 @@ impl Ended {
         )
     }
 
-    /// The name in a `conn.close` event: `eof`, `closed`, `failed`,
-    /// `idle`, `budget`, `reset`, `broken`, `timed_out` (a write took no
-    /// bytes for [`ServeOptions::write_timeout`]), `error` or `cancelled`.
+    /// A stable spelling of the connection's end reason.
     pub fn as_str(self) -> &'static str {
         match self {
             Ended::Eof => "eof",
@@ -416,7 +495,6 @@ pub trait Pending: Send + 'static {
 /// What deferred work sees while it runs.
 pub struct PendingDriver<'a> {
     fcx: Option<&'a Cx>,
-    events: &'a mut Staged,
     written: u64,
     conn: &'a ConnInfo,
     close: bool,
@@ -440,21 +518,6 @@ impl PendingDriver<'_> {
     /// written: an HTTP/1.0 response whose body ends with the connection.
     pub fn close(&mut self) {
         self.close = true;
-    }
-
-    /// Checks interest before constructing event-specific state.
-    pub fn event_enabled(&self, source: &'static str, kind: &'static str) -> bool {
-        self.events.enabled(self.conn, source, kind)
-    }
-
-    /// Builds and stages a connection event only when wanted and space remains.
-    pub fn emit(
-        &self,
-        source: &'static str,
-        kind: &'static str,
-        build: impl FnOnce(Event) -> Event,
-    ) {
-        self.events.emit(self.conn, source, kind, build);
     }
 
     /// The connection.
@@ -656,7 +719,7 @@ impl Drop for Charge {
 }
 
 /// The service's side of the driver, for one call: the reply, the clock
-/// reading the driver took, seeded randomness, the events to record, and
+/// reading the driver took, seeded randomness, and
 /// what the call asked for. Every [`Service`] method takes it as `driver`.
 pub struct Driver<'a, D, T = ()> {
     decoder: &'a mut D,
@@ -733,21 +796,6 @@ impl<D, T: Copy + Eq> Driver<'_, D, T> {
             .map(|(_, at)| *at)
     }
 
-    /// Checks interest before constructing event-specific state.
-    pub fn event_enabled(&self, source: &'static str, kind: &'static str) -> bool {
-        self.s.events.enabled(self.conn, source, kind)
-    }
-
-    /// Builds and stages a connection event only when wanted and space remains.
-    pub fn emit(
-        &self,
-        source: &'static str,
-        kind: &'static str,
-        build: impl FnOnce(Event) -> Event,
-    ) {
-        self.s.events.emit(self.conn, source, kind, build);
-    }
-
     /// The connection: its number, sandbox, addresses and transport.
     pub fn conn(&self) -> &ConnInfo {
         self.conn
@@ -801,100 +849,9 @@ impl<D, T: Copy + Eq> Driver<'_, D, T> {
     }
 }
 
-/// Event staging has its own bounds and never consumes protocol credit.
-#[derive(Default)]
-struct Staged {
-    fcx: Option<Cx>,
-    observer: Option<Arc<fictionet::events::Dispatch>>,
-    state: std::cell::RefCell<StagedState>,
-}
-
-#[derive(Default)]
-struct StagedState {
-    events: Vec<Event>,
-    bytes: usize,
-    lost: u64,
-}
-
-impl Staged {
-    fn enabled(&self, conn: &ConnInfo, source: &'static str, kind: &'static str) -> bool {
-        self.fcx
-            .as_ref()
-            .is_some_and(|cx| cx.emitter(conn).enabled(source, kind))
-            || self.observer.as_ref().is_some_and(|o| {
-                o.enabled(fictionet::events::Interest::Event(
-                    fictionet::events::Metadata { source, kind },
-                    conn,
-                ))
-            })
-    }
-
-    fn emit(
-        &self,
-        conn: &ConnInfo,
-        source: &'static str,
-        kind: &'static str,
-        build: impl FnOnce(Event) -> Event,
-    ) {
-        if !self.enabled(conn, source, kind) {
-            return;
-        }
-        let mut state = self.state.borrow_mut();
-        let reserve = (256usize << 10)
-            .saturating_add(conn.sandbox.as_ref().map_or(0, |s| s.name.len()))
-            .saturating_add(conn.sni.as_ref().map_or(0, |s| s.len()))
-            .saturating_add(conn.alpn.as_ref().map_or(0, |s| s.len()));
-        if state.events.len() >= 256 || reserve > (1 << 20) || state.bytes > (1 << 20) - reserve {
-            state.lost = state.lost.saturating_add(1);
-            return;
-        }
-        drop(state);
-        let event = build(Event::new(source, kind)).conn(conn);
-        let bytes = event.size();
-        let mut state = self.state.borrow_mut();
-        if state.events.len() >= 256 || bytes > (1 << 20) - state.bytes {
-            state.lost = state.lost.saturating_add(1);
-            return;
-        }
-        state.bytes += bytes;
-        state.events.push(event);
-    }
-
-    fn drain(&mut self, now: impl Fn() -> Instant) {
-        let state = std::mem::take(self.state.get_mut());
-        for event in state.events {
-            if let Some(cx) = &self.fcx {
-                cx.emitter(&event.conn)
-                    .emit(event.source, event.kind, |_| event.clone());
-            }
-            if let Some(observer) = &self.observer
-                && observer.enabled(fictionet::events::Interest::Event(
-                    fictionet::events::Metadata {
-                        source: event.source,
-                        kind: event.kind,
-                    },
-                    &event.conn,
-                ))
-            {
-                observer.emit(event, &now);
-            }
-        }
-        if let Some(cx) = &self.fcx {
-            cx.events_lost(state.lost);
-        }
-        if let Some(observer) = &self.observer {
-            observer.lost(fictionet::events::Loss::staged(
-                fictionet::events::Stream::Events,
-                state.lost,
-            ));
-        }
-    }
-}
-
 /// What the per-connection state looks like to a call.
 struct Scratch<T> {
     reply: Vec<u8>,
-    events: Staged,
     datagrams: Vec<(SocketAddr, Vec<u8>)>,
     entropy: Arc<dyn Entropy>,
     timers: Vec<(T, Option<Duration>)>,
@@ -909,7 +866,6 @@ impl<T> Scratch<T> {
     fn new(entropy: Arc<dyn Entropy>) -> Scratch<T> {
         Scratch {
             reply: Vec::new(),
-            events: Staged::default(),
             datagrams: Vec::new(),
             entropy,
             timers: Vec::new(),
@@ -1022,8 +978,6 @@ pub type TlsSelect = Arc<dyn Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> 
 /// How [`listen`] and [`connection`] run.
 #[derive(Clone)]
 pub struct ServeOptions {
-    /// Protocol name for observers. An empty name uses packet matching.
-    pub protocol: &'static str,
     /// Connections served at once; past this, a new one is reset as soon
     /// as it is accepted, and counts until its socket is gone. Default 64.
     pub max_conns: usize,
@@ -1038,13 +992,11 @@ pub struct ServeOptions {
     /// Shake hands first, with the config this picks.
     pub tls: Option<TlsSelect>,
     /// The config for [`Upgrade::Tls`]. Without one, a service that asks
-    /// for TLS is closed with a `conn.error` event.
+    /// for TLS is closed.
     pub starttls: Option<TlsSelect>,
     /// How long a client has from connecting (or from STARTTLS) to finish
     /// its TLS handshake. Default 10 seconds.
     pub handshake: Duration,
-    /// Record `conn.open` and `conn.close` events. Default on.
-    pub connection_events: bool,
     /// The read buffer's limit, at least the decoder's capacity. Larger
     /// lets the decoder see more at once. Default 0: the capacity.
     pub read_buffer: usize,
@@ -1059,14 +1011,12 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> ServeOptions {
         ServeOptions {
-            protocol: "",
             max_conns: 64,
             idle: Some(Duration::from_secs(10)),
             write_timeout: Some(Duration::from_secs(10)),
             tls: None,
             starttls: None,
             handshake: Duration::from_secs(10),
-            connection_events: true,
             read_buffer: 0,
             budget: None,
             sandbox: None,
@@ -1077,13 +1027,11 @@ impl Default for ServeOptions {
 impl std::fmt::Debug for ServeOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServeOptions")
-            .field("protocol", &self.protocol)
             .field("max_conns", &self.max_conns)
             .field("idle", &self.idle)
             .field("write_timeout", &self.write_timeout)
             .field("tls", &self.tls.is_some())
             .field("starttls", &self.starttls.is_some())
-            .field("connection_events", &self.connection_events)
             .field("budget", &self.budget)
             .finish()
     }
@@ -1143,21 +1091,12 @@ impl ServeOptions {
             ..self
         }
     }
-
-    /// Turns `conn.open` and `conn.close` events on or off.
-    pub fn connection_events(self, on: bool) -> ServeOptions {
-        ServeOptions {
-            connection_events: on,
-            ..self
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Handing back
 
-/// Why [`connection`] stopped early. The connection was closed. For a failure,
-/// the run's events have a `conn.error` event that says why.
+/// Why [`connection`] stopped early. The connection was closed.
 #[derive(Debug)]
 pub enum ServeError<E> {
     /// The service returned this error.
@@ -1168,8 +1107,8 @@ pub enum ServeError<E> {
     /// cancelled. A running service hears [`Ended::Cancelled`] in
     /// [`Service::on_end`]. Cancellation during the TLS handshake or while
     /// the service is already ending closes the connection immediately.
-    /// During final shutdown, `on_end` has already heard the primary cause;
-    /// `conn.close` records `shutdown: cancelled`. A service, deferred-work,
+    /// During final shutdown, `on_end` has already heard the primary cause.
+    /// A service, deferred-work,
     /// or child-task failure takes precedence over cancellation.
     Cancelled,
 }
@@ -1392,7 +1331,6 @@ where
         now: Instant,
     ) -> Core<S> {
         let mut s = Scratch::new(entropy);
-        s.events.fcx = fcx.clone();
         if let Some(w) = wake {
             s.wake = w;
         }
@@ -1572,7 +1510,6 @@ where
     fn cancel_work(&mut self, mut work: Work) {
         let mut driver = PendingDriver {
             fcx: self.fcx.as_ref(),
-            events: &mut self.s.events,
             written: work.written,
             conn: &self.info,
             close: false,
@@ -1924,7 +1861,6 @@ where
             let (polled, close) = {
                 let mut driver = PendingDriver {
                     fcx: self.fcx.as_ref(),
-                    events: &mut self.s.events,
                     written: work.written,
                     conn: &self.info,
                     close: false,
@@ -1963,7 +1899,6 @@ where
                 let (_, work) = &mut self.keyed[i];
                 let mut driver = PendingDriver {
                     fcx: self.fcx.as_ref(),
-                    events: &mut self.s.events,
                     written: work.written,
                     conn: &self.info,
                     close: false,
@@ -2087,16 +2022,14 @@ async fn write_all<C: Connection>(
 /// [region](fictionet::Cx#regions) is cancelled, also during a TLS
 /// handshake or final shutdown, unless a failure takes precedence.
 ///
-/// `info` names the connection in events; [`listen`] fills it in. The
+/// `info` identifies the connection to the service; [`listen`] fills it in. The
 /// connection ends as soon as the client resets it, even while deferred
 /// work runs and nothing reads ([`Connection::poll_gone`]). Deferred work
 /// receives a child region; cancelling it closes only this connection.
-/// A task failure in that region records `conn.error` with kind `task`
-/// after `conn.close`, once the region ends. It returns as [`ServeError::Pending`]
+/// A task failure in that region returns as [`ServeError::Pending`]
 /// unless the driver already has a service or deferred-work failure.
 ///
-/// Final shutdown waits at most five seconds. Its failure adds `shutdown`
-/// to `conn.close`, keeping `end` as the primary cause. Cancellation returns
+/// Final shutdown waits at most five seconds. Cancellation returns
 /// [`ServeError::Cancelled`] unless there is a primary failure. Other shutdown
 /// failures keep [`Served::Closed`]. [`Service::on_end`] is not called again.
 #[deny(clippy::let_underscore_must_use)]
@@ -2113,7 +2046,6 @@ where
     C: Connection,
     <S::Decoder as Decode>::Error: Clone + Send,
 {
-    fcx.connection_opened(opts.protocol, &info);
     let mut result = None;
     let region_result = {
         let slot = &mut result;
@@ -2147,22 +2079,11 @@ where
             })
             .any(|e| e.is::<Cancelled>());
         if !cancelled {
-            let chain = ErrorChain(&*e);
-            fcx.emitter(&info).emit("conn", "error", |event| {
-                event
-                    .level(Level::Notice)
-                    .summary(format_args!("a connection task failed: {chain}"))
-                    .display("error", chain)
-                    .field("kind", "task")
-            });
             result = match result {
                 Err(ServeError::Service(_) | ServeError::Pending(_)) => result,
                 _ => Err(ServeError::Pending(e)),
             };
         }
-    }
-    if !matches!(&result, Ok(Served::Upgraded(..))) {
-        fcx.connection_closed(&info);
     }
     result
 }
@@ -2215,12 +2136,6 @@ where
             other => return Ok(other),
         };
         let Some(select) = &opts.starttls else {
-            fcx.emitter(&info).emit("conn", "error", |event| {
-                event
-                    .level(Level::Notice)
-                    .summary("the service asked for TLS, and there is no TLS config")
-                    .field("error", "no TLS config for the upgrade")
-            });
             return Ok(Served::Closed(Ended::Failed));
         };
         let deadline = fcx.now() + opts.handshake;
@@ -2251,7 +2166,7 @@ async fn run<S, C>(
     service: &mut S,
     state: &S::State,
     opts: &ServeOptions,
-    first: bool,
+    _first: bool,
     wake: WakeHandle,
 ) -> Result<Served<C>, ServeError<S::Error>>
 where
@@ -2259,10 +2174,6 @@ where
     C: Connection,
     <S::Decoder as Decode>::Error: Clone + Send,
 {
-    if first && opts.connection_events {
-        fcx.emitter(&info)
-            .emit("conn", "open", |event| event.summary("connection opened"));
-    }
     let _note = PanicNote::new(std::any::type_name::<S>(), &info);
     let mut core: Core<S> = Core::new(
         Some(fcx.clone()),
@@ -2275,30 +2186,16 @@ where
     );
     core.open(service, state, fcx.now());
     let mut buf = vec![0u8; READ];
-    let mut content = (opts.protocol != "http1" && opts.protocol != "http2")
-        .then(|| {
-            fcx.content(crate::events::Content {
-                kind: "service",
-                name: opts.protocol,
-                encoding: "",
-                origin: None,
-            })
-        })
-        .flatten();
     let mut run = 0u32;
     loop {
         // What is out counts against the budget while it is written.
         core.recharge(service);
-        core.s.events.drain(|| fcx.now());
         // Write what is out.
         while let Some(out) = core.out.pop_front() {
             let Out(bytes, credit) = out;
             if bytes.is_empty() {
                 core.wrote(credit);
                 continue;
-            }
-            if let Some(sink) = &mut content {
-                sink.write(&bytes);
             }
             match write_all(fcx, &mut conn, &bytes, opts.write_timeout).await {
                 Ok(()) => core.wrote(credit),
@@ -2372,14 +2269,6 @@ where
                 }
             }
             Next::Upgrade(how) => {
-                core.s.events.drain(|| fcx.now());
-                if opts.connection_events {
-                    fcx.emitter(&core.info).emit("conn", "upgrade", |event| {
-                        event
-                            .summary(format_args!("connection upgraded: {}", how.as_str()))
-                            .field("to", how.as_str())
-                    });
-                }
                 let unread = core.unread();
                 // The service goes on after TLS, with the same handle.
                 if how != Upgrade::Tls {
@@ -2388,7 +2277,6 @@ where
                 return Ok(Served::Upgraded(how, Prefixed::new(unread, conn)));
             }
             Next::Closed(end) => {
-                core.s.events.drain(|| fcx.now());
                 let shutdown = if end.writable() {
                     match fcx
                         .race(Some(fcx.now() + Duration::from_secs(5)), conn.shutdown(fcx))
@@ -2402,52 +2290,7 @@ where
                 } else {
                     None
                 };
-                let info = core.info.clone();
                 let failure = core.failure.take();
-                match &failure {
-                    Some(Failure::Service(e)) => {
-                        let e = ErrorChain(e);
-                        fcx.emitter(&info).emit("conn", "error", |event| {
-                            event
-                                .level(Level::Notice)
-                                .summary(format_args!("the service failed: {e}"))
-                                .display("error", e)
-                                .field("kind", "service")
-                        });
-                    }
-                    Some(Failure::Pending(e)) => {
-                        let e = ErrorChain(&**e);
-                        fcx.emitter(&info).emit("conn", "error", |event| {
-                            event
-                                .level(Level::Notice)
-                                .summary(format_args!("deferred work failed: {e}"))
-                                .display("error", e)
-                                .field("kind", "deferred")
-                        });
-                    }
-
-                    None => {}
-                }
-                if opts.connection_events {
-                    fcx.emitter(&info).emit("conn", "close", |event| {
-                        let mut event = event
-                            .field("end", end.as_str())
-                            .summary(format_args!("connection closed: {}", end.as_str()));
-                        if let Some(e) = shutdown {
-                            let name = match e {
-                                ConnError::Refused => "refused",
-                                ConnError::Unreachable(_) => "unreachable",
-                                ConnError::Reset => "reset",
-                                ConnError::TimedOut => "timed_out",
-                                ConnError::Closed => "closed",
-                                ConnError::Broken => "broken",
-                                ConnError::Cancelled => "cancelled",
-                            };
-                            event = event.field("shutdown", name);
-                        }
-                        event
-                    });
-                }
                 drop(core);
                 return match failure {
                     Some(Failure::Service(e)) => Err(ServeError::Service(e)),
@@ -2465,70 +2308,8 @@ where
 // ---------------------------------------------------------------------------
 // TLS
 
-/// How a TLS handshake ended, as the `tls.handshake` event says.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TlsOutcome {
-    /// It finished, with this protocol agreed by ALPN.
-    Accepted {
-        /// The protocol, if one was agreed.
-        alpn: Option<Vec<u8>>,
-    },
-    /// Refused with `unrecognized_name`: no config for the SNI.
-    Rejected,
-    /// The client sent this alert, such as 48 (`unknown_ca`).
-    /// The event records its name as `alert` and its number as `alert_code`.
-    Alert(u8),
-    /// The bytes were not TLS, or broke the protocol.
-    Failed(String),
-    /// The client closed the connection first.
-    Closed,
-    /// It did not finish in time.
-    TimedOut,
-    /// The sandbox detached while it ran.
-    Detached,
-    /// The world stopped: the region was cancelled.
-    Cancelled,
-}
-
-impl TlsOutcome {
-    /// `accepted`, `rejected`, `alert`, `failed`, `closed`, `timed_out`,
-    /// `detached` or `cancelled`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TlsOutcome::Accepted { .. } => "accepted",
-            TlsOutcome::Rejected => "rejected",
-            TlsOutcome::Alert(_) => "alert",
-            TlsOutcome::Failed(_) => "failed",
-            TlsOutcome::Closed => "closed",
-            TlsOutcome::TimedOut => "timed_out",
-            TlsOutcome::Detached => "detached",
-            TlsOutcome::Cancelled => "cancelled",
-        }
-    }
-
-    /// The outcome of a handshake that failed with `e`. `detached` says
-    /// whether the sandbox detached, for a reset that came from the world.
-    fn of(e: &HandshakeError, detached: bool) -> TlsOutcome {
-        match e {
-            HandshakeError::Alert(a) => TlsOutcome::Alert(*a),
-            HandshakeError::Failed(why) => TlsOutcome::Failed(why.clone()),
-            HandshakeError::Conn(ConnError::Broken) => {
-                TlsOutcome::Failed("the connection broke".into())
-            }
-            HandshakeError::Rejected => TlsOutcome::Rejected,
-            HandshakeError::TimedOut => TlsOutcome::TimedOut,
-            HandshakeError::Cancelled => TlsOutcome::Cancelled,
-            HandshakeError::Conn(ConnError::Reset) if detached => TlsOutcome::Detached,
-            _ => TlsOutcome::Closed,
-        }
-    }
-}
-
 /// Shakes hands as a TLS server on `conn`, with the config `select` picks
-/// for the client's SNI, by `deadline`. Records a `tls.handshake` event
-/// with the outcome. A client alert has its name in `alert` and its number
-/// in `alert_code`. `detached` says whether the sandbox has detached, for
-/// a reset that came from the world.
+/// for the client's SNI, by `deadline`.
 ///
 /// Returns the TLS connection and `info` with its SNI and ALPN, or how the
 /// handshake failed: [`HandshakeError::Rejected`] when `select` has no
@@ -2541,7 +2322,7 @@ pub async fn accept_tls<C: Connection>(
     info: &ConnInfo,
     select: &TlsSelect,
     deadline: Instant,
-    detached: impl Fn() -> bool,
+    _detached: impl Fn() -> bool,
 ) -> Result<(TlsConnection<C>, ConnInfo), HandshakeError> {
     let mut sni: Option<String> = None;
     let handshake = async {
@@ -2553,52 +2334,14 @@ pub async fn accept_tls<C: Connection>(
             let _ = hello.reject(fcx).await;
             return Err(HandshakeError::Rejected);
         };
-        hello.finish_observed(fcx, config, Some(info)).await
+        hello.finish_detailed(fcx, config).await
     };
     let done = match fcx.race(Some(deadline), handshake).await {
         Ok(done) => done,
         Err(RaceError::Deadline) => Err(HandshakeError::TimedOut),
         Err(RaceError::Cancelled) => Err(HandshakeError::Cancelled),
     };
-    fcx.emitter(info).emit("tls", "handshake", |event| {
-        let outcome = match &done {
-            Ok(conn) => TlsOutcome::Accepted {
-                alpn: conn.alpn().map(<[u8]>::to_vec),
-            },
-            Err(e) => TlsOutcome::of(e, detached()),
-        };
-        let mut event = event
-            .summary(match &sni {
-                Some(n) => format!("TLS for {n}: {}", outcome.as_str()),
-                None => format!("TLS with no name: {}", outcome.as_str()),
-            })
-            .level(if matches!(outcome, TlsOutcome::Accepted { .. }) {
-                Level::Info
-            } else {
-                Level::Notice
-            })
-            .field("addr", opt(info.local.map(|a| a.ip().to_string())))
-            .field("sni", opt(sni.clone()))
-            .field("outcome", outcome.as_str());
-        match &outcome {
-            TlsOutcome::Accepted { alpn } => {
-                event = event.field(
-                    "alpn",
-                    opt(alpn
-                        .as_ref()
-                        .map(|a| String::from_utf8_lossy(a).into_owned())),
-                );
-            }
-            TlsOutcome::Alert(a) => {
-                event = event
-                    .field("alert", tls::alert_name(*a))
-                    .field("alert_code", u32::from(*a))
-            }
-            TlsOutcome::Failed(why) => event = event.field("detail", why.as_str()),
-            _ => {}
-        }
-        event
-    });
+
     let conn = done?;
     let info = info.clone().over_tls(sni.as_deref(), conn.alpn());
     Ok((conn, info))
@@ -2615,9 +2358,7 @@ pub async fn accept_tls<C: Connection>(
 /// finishes closing cannot open more. Connections are numbered from 1, in
 /// the order they are accepted. Returns the accepting task.
 ///
-/// A connection's failure is that connection's: the run's events record
-/// it as `conn.error`, and its task ends with `Ok`, so it does not fail
-/// the world.
+/// A connection's failure ends its task with `Ok`, so it does not fail the world.
 pub fn listen<S, M, A: Accept>(
     fcx: &Cx,
     mut listener: A,
@@ -2645,7 +2386,7 @@ where
                 .peer
                 .and_then(|peer| opts.sandbox.as_ref().and_then(|f| f(peer.ip())));
             let Some(guard) =
-                fictionet::stdlib::world::net::connection_limit(&fcx, &info, &open, opts.max_conns)
+                fictionet::stdlib::world::net::connection_limit(&open, opts.max_conns)
             else {
                 conn.reset();
                 continue;
@@ -2702,8 +2443,8 @@ type DatagramCall<'a, S> = dyn FnMut(
 /// timers and wakes work as over a connection (with no sender: use
 /// `send_to`), and a decoder failure is answered with
 /// [`Service::on_fail`]. [`Flow::Close`] drops the rest of a datagram.
-/// Deferred work is not run. A service error is recorded as `conn.error`
-/// and serving goes on. A panic is not caught: it ends the run, as it
+/// Deferred work is not run. Serving continues after a service error.
+/// A panic is not caught: it ends the run, as it
 /// does over a connection.
 ///
 /// Returns `Ok(())` once the socket closes, and [`Cancelled`] if `fcx`'s
@@ -2727,10 +2468,9 @@ where
     };
     let _note = PanicNote::new(std::any::type_name::<S>(), &base);
     let mut s = Scratch::new(Arc::new(fcx.clone()));
-    s.events.fcx = Some(fcx.clone());
     let mut timers: Vec<(S::Timer, Instant)> = Vec::new();
     let wake = s.wake.clone();
-    // One call, then its datagrams and events. The reply stays for the
+    // One call, then its datagrams. The reply stays for the
     // caller to send, or drop.
     let mut lifecycle_decoder = service.decoder();
     let called = |decoder: &mut S::Decoder,
@@ -2751,17 +2491,10 @@ where
             };
             f(&mut driver)
         };
-        s.events.drain(|| fcx.now());
         let flow = match result {
             Err(e) => {
-                let e = ErrorChain(&e);
-                fcx.emitter(info).emit("conn", "error", |event| {
-                    event
-                        .level(Level::Notice)
-                        .summary(format_args!("the service failed: {e}"))
-                        .display("error", e)
-                        .field("kind", "service")
-                });
+                let _e = ErrorChain(&e);
+
                 Flow::Close
             }
             Ok(flow) => flow,
@@ -2997,7 +2730,6 @@ pub struct Harness<S: Service> {
     opts: ServeOptions,
     now: Instant,
     opened: bool,
-    observer: Arc<fictionet::events::Dispatch>,
     output: Vec<u8>,
     upgraded: Option<Upgrade>,
     /// Whether a call returned the upgrade.
@@ -3021,8 +2753,7 @@ where
 
     /// The same with `opts`: an idle limit and a budget.
     /// The standalone entropy stream starts from `seed`. TLS and the
-    /// connection cap are not used. Event retention requires an explicit
-    /// observer installed with [`Harness::observer`].
+    /// connection cap are not used.
     pub fn with_options(seed: Seed, service: S, state: S::State, opts: ServeOptions) -> Harness<S> {
         let info = ConnInfo {
             id: Some(1),
@@ -3044,22 +2775,10 @@ where
             opts,
             now: Instant::ZERO,
             opened: false,
-            observer: Arc::new(fictionet::events::Dispatch::new(None)),
             output: Vec::new(),
             upgraded: None,
             reported: false,
         }
-    }
-
-    /// Installs a destination for staged service events before opening.
-    pub fn observer(mut self, observer: Arc<dyn fictionet::events::Observer>) -> Self {
-        assert!(
-            !self.opened,
-            "install the observer before opening the harness"
-        );
-        self.observer = Arc::new(fictionet::events::Dispatch::new(Some(observer)));
-        self.core.s.events.observer = Some(self.observer.clone());
-        self
     }
 
     /// The connection the service sees.
@@ -3075,7 +2794,6 @@ where
         self.now = fcx.now();
         self.core.idle_from = self.now;
         self.core.s.entropy = Arc::new(fcx.clone());
-        self.core.s.events.fcx = Some(fcx.clone());
         self.core.fcx = Some(fcx);
         self
     }
@@ -3140,7 +2858,6 @@ where
     /// does.
     fn drain(&mut self, reply: &mut Vec<u8>) {
         self.core.recharge(&self.service);
-        self.core.s.events.drain(|| self.now);
         while let Some(out) = self.core.out.pop_front() {
             let Out(b, credit) = out;
             self.output.extend_from_slice(&b);
@@ -3259,7 +2976,6 @@ where
             Some(wake),
             self.now,
         );
-        core.s.events.observer = self.core.s.events.observer.clone();
         core.s.bytes_in = self.core.s.bytes_in;
         if !unread.is_empty() {
             core.queue.push_back((unread, 0));
@@ -3328,218 +3044,5 @@ where
 }
 
 impl<S: Service> Drop for Harness<S> {
-    fn drop(&mut self) {
-        self.observer.end(|| self.now);
-    }
-}
-
-#[cfg(test)]
-mod observation_tests {
-    use super::*;
-    use crate::stdlib::codec::{Ending, LineError, Lines};
-    use fictionet::events::recorder::Recorder;
-
-    struct Echo {
-        builds: Arc<AtomicUsize>,
-        count: usize,
-    }
-    impl Service for Echo {
-        type Timer = ();
-        type Decoder = Lines;
-        type State = ();
-        type Error = LineError;
-        fn decoder(&self) -> Lines {
-            Lines::new(64, Ending::LfOrCrlf)
-        }
-        fn on_item(
-            &mut self,
-            item: Result<Vec<u8>, LineError>,
-            _: &(),
-            driver: &mut Driver<'_, Lines>,
-        ) -> Result<Flow, LineError> {
-            let line = item?;
-            for _ in 0..self.count {
-                driver.emit("echo", "line", |event| {
-                    self.builds.fetch_add(1, Ordering::Relaxed);
-                    event.field("bytes", line.len() as u64)
-                });
-            }
-            driver.reply().extend_from_slice(&line);
-            Ok(Flow::Close)
-        }
-    }
-
-    #[test]
-    fn served_connections_bind_to_the_nearest_host() {
-        use fictionet::events::{
-            HostId, Interest, Observation, Observer, Stamp, TaskId, TopologyRef,
-        };
-        use fictionet::stdlib::network::tcp;
-        use fictionet::sync::Mutex;
-
-        type Opened = (ConnInfo, Option<TaskId>, Option<HostId>);
-        struct Bindings {
-            topology: bool,
-            hosts: Mutex<Vec<(HostId, String)>>,
-            opened: Mutex<Vec<Opened>>,
-            closed: Mutex<Vec<ConnInfo>>,
-        }
-        impl Observer for Bindings {
-            fn enabled(&self, interest: Interest<'_>) -> bool {
-                match interest {
-                    Interest::Event(..) => true,
-                    Interest::Topology(_) => self.topology,
-                    Interest::Packet(_) | Interest::TlsKey(_) => false,
-                }
-            }
-            fn observe(&self, _: Stamp, item: Observation<'_>) {
-                match item {
-                    Observation::Topology(TopologyRef::HostAdded { host, name, .. }) => {
-                        self.hosts.lock().push((host, name.to_owned()))
-                    }
-                    Observation::Topology(TopologyRef::ConnectionOpened {
-                        conn,
-                        task,
-                        host,
-                        ..
-                    }) => self.opened.lock().push((conn.clone(), task, host)),
-                    Observation::Topology(TopologyRef::ConnectionClosed { conn }) => {
-                        self.closed.lock().push(conn.clone())
-                    }
-                    Observation::Topology(_) | Observation::Event(_) => {}
-                    _ => panic!("unexpected stream"),
-                }
-            }
-        }
-        for topology in [false, true] {
-            let sink = Arc::new(Bindings {
-                topology,
-                hosts: Mutex::new(Vec::new()),
-                opened: Mutex::new(Vec::new()),
-                closed: Mutex::new(Vec::new()),
-            });
-            fictionet::block_on(fictionet::lab(
-                fictionet::RunOptions::new(Seed::from_u64(1)).observer(sink.clone()),
-                |cx| async move {
-                    let server_cx = cx.host("outer").host("server").group("service");
-                    let (a, b) = fictionet::pair();
-                    let client = tcp::endpoint(&cx, a, "10.0.0.1".parse()?);
-                    let server = tcp::endpoint(&server_cx, b, "10.0.0.2".parse()?);
-                    let mut listener = server.listen(7)?;
-                    let task = server_cx.spawn(move |cx| async move {
-                        let conn = listener.accept(&cx).await?;
-                        let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
-                        let mut service = Echo {
-                            builds: Arc::new(AtomicUsize::new(0)),
-                            count: 0,
-                        };
-                        connection(&cx, conn, info, &mut service, &(), &ServeOptions::default())
-                            .await?;
-                        Ok(())
-                    });
-                    let mut conn = client.connect(&cx, "10.0.0.2:7".parse()?).await?;
-                    conn.write_all(&cx, b"hello\n").await?;
-                    let mut buf = [0; 5];
-                    let mut len = 0;
-                    while len < buf.len() {
-                        let n = conn.read(&cx, &mut buf[len..]).await?;
-                        assert!(n > 0);
-                        len += n;
-                    }
-                    assert_eq!(&buf, b"hello");
-                    task.join(&cx).await?;
-                    cx.cancel();
-                    Ok(())
-                },
-            ))
-            .unwrap();
-            let opened = sink.opened.lock();
-            let closed = sink.closed.lock();
-            assert_eq!(opened.len(), usize::from(topology));
-            assert_eq!(closed.len(), usize::from(topology));
-            if topology {
-                let host = sink
-                    .hosts
-                    .lock()
-                    .iter()
-                    .find(|(_, name)| name == "server")
-                    .unwrap()
-                    .0;
-                assert_eq!(opened[0].2, Some(host));
-                assert!(opened[0].1.is_some());
-                assert_eq!(opened[0].0, closed[0]);
-                assert_eq!(closed[0].local, Some("10.0.0.2:7".parse().unwrap()));
-                assert_eq!(
-                    closed[0].peer.unwrap().ip(),
-                    "10.0.0.1".parse::<std::net::IpAddr>().unwrap()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn observation_does_not_change_service_output_and_absence_skips_building() {
-        for observed in [false, true] {
-            let builds = Arc::new(AtomicUsize::new(0));
-            let memory = Arc::new(Recorder::default());
-            let mut harness = Harness::new(
-                Seed::from_u64(1),
-                Echo {
-                    builds: builds.clone(),
-                    count: 1,
-                },
-                (),
-            );
-            if observed {
-                harness = harness.observer(memory.clone());
-            }
-            assert_eq!(harness.push(b"hello\n").unwrap(), b"hello");
-            assert!(harness.closed());
-            assert_eq!(builds.load(Ordering::Relaxed), usize::from(observed));
-            assert_eq!(memory.of("echo", "line").len(), usize::from(observed));
-        }
-    }
-
-    #[test]
-    fn staged_builders_can_emit_nested_events() {
-        let memory = Arc::new(Recorder::default());
-        let mut staged = Staged {
-            observer: Some(Arc::new(fictionet::events::Dispatch::new(Some(
-                memory.clone(),
-            )))),
-            ..Staged::default()
-        };
-        let conn = ConnInfo::default();
-        staged.emit(&conn, "test", "outer", |event| {
-            staged.emit(&conn, "test", "inner", |event| event.field("value", 7u64));
-            event.field("value", 9u64)
-        });
-        staged.drain(|| Instant::ZERO);
-        let events = memory.all();
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| (event.kind, event.u64("value")))
-                .collect::<Vec<_>>(),
-            [("inner", Some(7)), ("outer", Some(9))]
-        );
-    }
-
-    #[test]
-    fn staging_stops_building_when_full_and_reports_loss() {
-        let builds = Arc::new(AtomicUsize::new(0));
-        let memory = Arc::new(Recorder::default());
-        let mut harness = Harness::new(
-            Seed::from_u64(1),
-            Echo {
-                builds: builds.clone(),
-                count: 1000,
-            },
-            (),
-        )
-        .observer(memory.clone());
-        assert_eq!(harness.push(b"hello\n").unwrap(), b"hello");
-        assert_eq!(builds.load(Ordering::Relaxed), 256);
-        assert_eq!(memory.dropped(), 744);
-    }
+    fn drop(&mut self) {}
 }

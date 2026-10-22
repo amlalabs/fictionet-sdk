@@ -127,7 +127,6 @@ impl Pages {
             );
         }
         if method == "POST" && route == Route::Page {
-            self.making(cx, host, target);
             return self.form(host, target);
         }
         let started = cx.now().since_start();
@@ -429,9 +428,6 @@ impl Pages {
             Ok(lock) => lock,
             Err(error) => return Stop::store(error).response(Asked::Page),
         };
-        if self.generating() && self.store().page(host, target).is_none() {
-            self.making(cx, host, target);
-        }
         if self.generating()
             && let Err(stop) = self.site_stylesheet(cx, host).await
         {

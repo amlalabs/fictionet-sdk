@@ -11,7 +11,6 @@ use fictionet_test_support::certs;
 use fictionet_test_support::{Done, timeout};
 
 mod driver;
-mod events;
 mod network;
 mod tls;
 
@@ -31,7 +30,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use fictionet::events::{ConnInfo, Event, Fields, Level};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines, Wire};
 use fictionet::stdlib::dissect::{Dissector, Registry};
@@ -39,10 +37,10 @@ use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::op::{Message, Query};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::protocols::json;
 use fictionet::stdlib::protocols::modbus::{
     self, Exception, Frame, Request as MbRequest, Response as MbResponse,
 };
+use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
     self, Budget, Flow, Harness, HarnessError, Pending, PendingDriver, ServeOptions, Served,
     Upgrade,
@@ -81,6 +79,7 @@ struct Plant {
     registers: Mutex<[u16; 16]>,
     /// Register 0 is the setpoint; above this is unsafe.
     limit: u16,
+    unsafe_writes: AtomicUsize,
 }
 
 /// A Modbus/TCP PLC, built from `stdlib::protocols::modbus`.
@@ -98,10 +97,7 @@ service_fixture! {
         let pdu = match MbRequest::parse(&frame.pdu) {
             Ok(MbRequest::ReadHoldingRegisters { address, quantity }) => {
                 let (a, n) = (usize::from(address), usize::from(quantity));
-                driver.emit("modbus", "read", |event| event
-                        .field("address", u32::from(address))
-                        .field("quantity", u32::from(quantity)),
-                );
+
                 match registers.get(a..a + n) {
                     Some(values) => MbResponse::Registers(values.to_vec()).to_pdu(3).unwrap(),
                     None => Exception::IllegalDataAddress.to_pdu(3),
@@ -111,17 +107,9 @@ service_fixture! {
                 match registers.get_mut(usize::from(address)) {
                     Some(r) => {
                         *r = value;
-                        let unsafe_write = address == 0 && value > plant.limit;
-                        driver.emit("modbus", "write_register", |event| event
-                                .summary(format!("register {address} = {value}"))
-                                .level(if unsafe_write {
-                                    Level::Alarm
-                                } else {
-                                    Level::Info
-                                })
-                                .field("address", u32::from(address))
-                                .field("value", u32::from(value)),
-                        );
+                        if address == 0 && value > plant.limit { plant.unsafe_writes.fetch_add(1, Ordering::SeqCst); }
+
+
                         MbResponse::WriteSingleRegister { address, value }
                             .to_pdu(6)
                             .unwrap()

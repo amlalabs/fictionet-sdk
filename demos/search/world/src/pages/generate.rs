@@ -4,15 +4,10 @@ use super::*;
 
 impl Pages {
     /// Writes a generation's ledger rows, or a stored generation's one row.
-    pub(super) fn log(&self, cx: &Cx, rows: &[Value]) -> Result<(), Stop> {
+    pub(super) fn log(&self, _cx: &Cx, rows: &[Value]) -> Result<(), Stop> {
         let mut store = self.store();
         for row in rows {
             store.log_generation(row).map_err(Stop::store)?;
-            if self.live_calls.is_some() && row["record"] == "attempt" {
-                cx.emit("web", "model_call", |event| {
-                    event.field("call", fictionet_extras::events::field(row))
-                });
-            }
         }
         Ok(())
     }
@@ -202,12 +197,6 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
-        cx.emit("web", "making", |e| {
-            e.field("url", format!("https://{host}{target}"))
-                .field("host", host)
-                .field("site", self.site_name(host))
-                .field("prefetch", prefetch)
-        });
         let site_lock = if self.live_calls.is_none() {
             Some(
                 self.locks

@@ -10,8 +10,7 @@
 //!
 //! The world supplies a rustls [`ServerConfig`], using certificate files
 //! or certificates issued by [`ca`](fictionet::stdlib::services::ca). This module
-//! handles the TLS connection. Its rustls key adapter emits borrowed secrets
-//! to interested observers. Core retains no keys. A caller can pass its own
+//! handles the TLS connection. A world can supply a rustls key logger and pass its own
 //! key log entries to [`dissect`](fictionet::stdlib::dissect) for decryption.
 //!
 //! The handshake has two steps, so the world can decide how to answer after
@@ -435,45 +434,11 @@ impl<C: Connection> ClientHello<C> {
         fcx: &Cx,
         config: Arc<ServerConfig>,
     ) -> Result<TlsConnection<C>, HandshakeError> {
-        self.finish_observed(fcx, config, None).await
-    }
-
-    /// [`finish_detailed`](ClientHello::finish_detailed), naming the
-    /// connection in the TLS key records the run's observer receives.
-    pub async fn finish_observed(
-        self,
-        fcx: &Cx,
-        config: Arc<ServerConfig>,
-        connection: Option<&fictionet::events::ConnInfo>,
-    ) -> Result<TlsConnection<C>, HandshakeError> {
         let mut io = Io {
             conn: self.conn,
             inbuf: self.inbuf,
             output: Output::default(),
             eof: false,
-        };
-        let config = match fcx.tls_key_log(connection) {
-            Some(key_log) => {
-                let mut logged = (*config).clone();
-                logged.key_log = key_log;
-                Arc::new(logged)
-            }
-            None => config,
-        };
-        let config = if let Some(sink) = fcx.content(crate::events::Content {
-            kind: "certificate",
-            name: "TLS chain",
-            encoding: "",
-            origin: None,
-        }) {
-            let mut observed = (*config).clone();
-            observed.cert_resolver = Arc::new(Certificates {
-                inner: observed.cert_resolver,
-                sink: std::sync::Mutex::new(sink),
-            });
-            Arc::new(observed)
-        } else {
-            config
         };
         let mut tls = match with_context(fcx, || self.accepted.into_connection(config)) {
             Ok(tls) => tls,
@@ -667,31 +632,6 @@ impl<C: Connection> Connection for TlsConnection<C> {
 
     fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.io.conn.poll_gone(cx)
-    }
-}
-
-struct Certificates {
-    inner: Arc<dyn rustls::server::ResolvesServerCert>,
-    sink: std::sync::Mutex<Box<dyn crate::events::ContentSink>>,
-}
-impl std::fmt::Debug for Certificates {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Certificates")
-    }
-}
-impl rustls::server::ResolvesServerCert for Certificates {
-    fn resolve(
-        &self,
-        hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let key = self.inner.resolve(hello)?;
-        let mut sink = self.sink.lock().unwrap();
-        for certificate in &key.cert {
-            sink.write(certificate);
-            sink.write(b"\n");
-        }
-        sink.finish();
-        Some(key)
     }
 }
 

@@ -55,7 +55,7 @@ async fn two_guests_have_separate_resources_and_shared_trust() {
         assert!(data.contains(&key.authorized_key));
         assert!(seed_file(&r.seed, "network-config").contains("dhcp4: true"));
     }
-    fictionet::lab(RunOptions::new(Seed::from_u64(1)), move |fcx| async move {
+    fictionet::lab(Seed::from_u64(1), move |fcx| async move {
         for name in [JUMP, "workstation", "server"] {
             assert_eq!(prepared.attachments.next(&fcx).await?.name(), name);
         }
@@ -246,12 +246,11 @@ fn the_whole_seed_holds_no_forbidden_word() {
 fn root_certificate_names_are_neutral() {
     let (_, attachments) = fictionet::attachments();
     let mut world = World {
-        setup: Arc::new(mirror::Setup::new([])),
+        setup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         attachments,
         ca: Arc::new(Mutex::new(None)),
         now_unix: 0,
         mirror: Arc::default(),
-        mirror_addresses: Default::default(),
     };
     assert!(world.ca.lock().unwrap().is_none());
     for name in [
@@ -302,7 +301,7 @@ async fn page_terminal_executes_the_declared_command_on_a_pty() {
         Guest::ubuntu("workstation", "analyst").terminal("tmux attach -r -t main; exec bash -l");
     guest.validate().unwrap();
     let console = page::GuestConsole::new(&guest);
-    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)), |cx| {
+    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |cx| {
         console.connected(
             &cx,
             peer.session.clone(),
@@ -425,21 +424,18 @@ async fn missing_download_names_the_file() {
 #[test]
 fn configured_address_does_not_claim_network_readiness() {
     let console = page::GuestConsole::new(&Guest::ubuntu("station", "analyst"));
-    fictionet::block_on(fictionet::lab(
-        RunOptions::new(Seed::from_u64(1)),
-        |cx| async move {
-            console.booting(&cx, Some(Ipv4Addr::new(10, 0, 0, 3)));
-            let value = serde_json::to_value(console.status.borrow().clone()).unwrap();
-            assert_eq!(value["state"], "booting");
-            assert_eq!(value["addresses"], serde_json::json!(["10.0.0.3"]));
-            console.failed(&cx, "process exited");
-            console.stopped(&cx);
-            assert_eq!(
-                serde_json::to_value(console.status.borrow().clone()).unwrap()["state"],
-                "failed"
-            );
-            Ok(())
-        },
-    ))
+    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |cx| async move {
+        console.booting(&cx, Some(Ipv4Addr::new(10, 0, 0, 3)));
+        let value = serde_json::to_value(console.status.borrow().clone()).unwrap();
+        assert_eq!(value["state"], "booting");
+        assert_eq!(value["addresses"], serde_json::json!(["10.0.0.3"]));
+        console.failed(&cx, "process exited");
+        console.stopped(&cx);
+        assert_eq!(
+            serde_json::to_value(console.status.borrow().clone()).unwrap()["state"],
+            "failed"
+        );
+        Ok(())
+    }))
     .unwrap();
 }

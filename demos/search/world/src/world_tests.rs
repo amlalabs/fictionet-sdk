@@ -1,5 +1,4 @@
 use super::*;
-use serde_json::Value;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -246,9 +245,9 @@ fn serve_latches_a_failed_record() {
         |s| s,
     ));
     let output = log.clone();
+    let (observations, mut facts) = tokio::sync::mpsc::unbounded_channel();
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
-            .observer(Arc::new(events::LogObserver { log: log.clone() })),
+        fictionet::Seed::from_u64(1),
         move |fcx| async move {
             let failing = FailingWriter(Arc::new(AtomicUsize::new(0)));
             let addresses = Arc::new(writing_to(HashMap::new(), &store, failing));
@@ -259,11 +258,13 @@ fn serve_latches_a_failed_record() {
             });
             let (attacher, attachments) = fictionet::attachments();
             let seed = pages::Seed::builtin("web")?;
+            let pages = Arc::new(Pages::new(seed));
+            pages.observe(observations);
             serve(
                 &fcx,
                 addresses.clone(),
                 ca,
-                Arc::new(Pages::new(seed)),
+                pages,
                 output.clone(),
                 start,
                 attachments,
@@ -286,15 +287,10 @@ fn serve_latches_a_failed_record() {
         "cannot record the address: injected address write failure"
     );
     assert!(log.finish().is_err());
-    let lines: Vec<Value> = std::fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert!(lines.iter().any(|line| line["type"] == "refused"
-        && line["host"] == "new.com"
-        && line["why"] == "cannot record the address: injected address write failure"));
-    assert!(lines.iter().all(|line| line["type"] != "site"));
+    assert!(matches!(facts.try_recv().unwrap().fact,
+        crate::observation::SearchObs::Resolved { name, address: None }
+            if name.to_ascii() == "new.com"));
+    assert!(facts.try_recv().is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
 

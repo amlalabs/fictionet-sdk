@@ -29,11 +29,8 @@
 #![warn(missing_docs)]
 
 pub mod args;
-pub mod events;
-pub mod headers;
 pub mod hyper_io;
 pub mod log;
-pub mod names;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod dom;

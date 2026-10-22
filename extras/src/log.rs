@@ -469,7 +469,7 @@ mod tests {
         let log = failing_log(false);
         let output = log.clone();
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 output.attach(&fcx);
                 output.write(json!({"type": "first"}));
@@ -495,7 +495,7 @@ mod tests {
         let finalization = Arc::new(log.finalization(&dir).unwrap());
         let shutdown = finalization.clone();
         let result = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 log.attach(&fcx);
                 log.write(json!({"type": "first"}));
@@ -519,7 +519,7 @@ mod tests {
         let shutdown = finalization.clone();
         std::fs::write(&finalization.request, b"").unwrap();
         let result = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 log.attach(&fcx);
                 log.fail("cannot record the address");
@@ -549,7 +549,7 @@ mod tests {
         let log = failing_log(true);
         let output = log.clone();
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 output.attach(&fcx);
                 output.write(json!({"type": "first"}));
@@ -575,7 +575,7 @@ mod tests {
         let shutdown = finalization.clone();
         std::fs::write(&finalization.request, b"").unwrap();
         let result = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 log.attach(&fcx);
                 log.write(json!({"type": "blocked"}));
@@ -634,7 +634,7 @@ mod tests {
             );
             let drain = log.clone();
             fictionet::block_on(fictionet::run(
-                fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+                fictionet::Seed::from_u64(1),
                 move |fcx| async move {
                     log.attach(&fcx);
                     log.write(serde_json::json!({"type": "http"}));
@@ -689,7 +689,7 @@ mod tests {
                 }
                 Err(fictionet::Error::msg("world failed"))
             };
-            let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1));
+            let options = fictionet::Seed::from_u64(1);
             let result = if lab {
                 fictionet::block_on(fictionet::lab(options, world))
             } else {
@@ -759,16 +759,12 @@ mod tests {
         let log = Log::new(Box::new(out), &["blocked"], |s| s);
         let drain = log.clone();
         let result = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 log.attach(&fcx);
                 log.write(json!({"type": "blocked", "dst_port": 1}));
                 waiting.recv_timeout(Duration::from_secs(5)).unwrap();
                 for port in 2..=65_535u32 {
-                    // Packet capture and TCP bookkeeping surround each blocked-port event.
-                    for kind in ["received", "sent", "decoded", "closed"] {
-                        fcx.emit("tcp", kind, |event| event.field("port", port));
-                    }
                     log.write(json!({"type": "blocked", "dst_port": port}));
                 }
                 release.send(()).unwrap();
@@ -805,10 +801,9 @@ mod tests {
         }
         let (sent, received) = mpsc::channel();
         let log = Log::new(Box::new(Lines(sent)), &["blocked"], |s| s);
-        let evidence = Arc::new(fictionet_test_support::EventLog::default());
         let drain = log.clone();
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
+            fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 log.attach(&fcx);
                 log.write(json!({"type": "blocked", "dst_port": 1}));
@@ -821,7 +816,6 @@ mod tests {
                         .unwrap();
                 assert_eq!(first["dst_port"], 1);
                 assert_eq!(summary["count"], 1);
-                assert!(evidence.all().iter().all(|event| event.source != "example"));
                 Ok(())
             },
         ))
@@ -834,15 +828,13 @@ mod tests {
         let output = Output(Arc::new(Mutex::new(Vec::new())));
         let out = output.clone();
         let log = Log::new(Box::new(out), &["blocked"], |s| s);
-        let evidence = Arc::new(fictionet_test_support::EventLog::default());
         let drain = log.clone();
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
+            fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 log.attach(&fcx);
                 log.write(json!({"type": "blocked", "dst_port": 1}));
                 log.write(json!({"type": "blocked", "dst_port": 2}));
-                assert!(evidence.all().iter().all(|event| event.source != "example"));
                 Ok(())
             },
         ))

@@ -4,58 +4,16 @@
 //! [`pages`] supplies copied WARC responses, model-written pages, or live
 //! captures. Google, Bing and DuckDuckGo render results over the same index.
 //! The world's clock comes from the brief's date; headers, pages and
-//! certificates use it together. [`events`] writes the request log and
-//! [`search`] projects those observations for the page.
+//! certificates use it together. [`observation`] defines this world's typed
+//! facts; the demo app projects them into its page.
 //!
 //! The demo app in `demos/search/app` adds the VM, guest credential model
 //! gateway, provider sign-in relay and package mirror. The standalone
 //! `web-world` binary accepts its configuration as JSON, followed by socket,
 //! certificate, state and ready-file arguments.
 //!
-//! An in-process world can also serve an attached guest:
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//! use web_world::{World, world_start};
-//! use web_world::{events::LogObserver, search::Searches};
-//! use web_world::pages::{Command, Seed};
-//! use fictionet_extras::log::Log;
-//! use fictionet::events::Fanout;
-//!
-//! # fn main() -> fictionet::Result {
-//! let seed = Seed::builtin("web")?;
-//! let start = world_start(&seed.date)?;
-//! let searches = Arc::new(Searches::from_seed(&seed));
-//! let log = Arc::new(Log::new(Box::new(std::io::stdout()), &[], |s| s));
-//! let observer = Arc::new(Fanout::new(vec![
-//!     searches.clone(),
-//!     Arc::new(LogObserver { log: log.clone() }),
-//! ]));
-//! let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(7))
-//!     .observer(observer);
-//! let output = log.clone();
-//! fictionet::block_on(fictionet::run(options, |cx| async move {
-//!     let world = World::new(&cx, seed, start)?;
-//!     let root_pem = world.ca.cert_pem();
-//!     let (attacher, attachments) = fictionet::attachments();
-//!     world.serve(&cx, log.clone(), attachments)?;
-//!     // Start a guest with root_pem and attacher here.
-//!     let pages = &world.pages;
-//!     let applied = pages.apply(&cx, Command::SetGeneration {
-//!         generate: false,
-//!         expected_revision: pages.generation().revision,
-//!     }).unwrap();
-//!     assert_eq!(applied.revision, 1);
-//!     cx.cancelled().await;
-//!     Ok(())
-//! }))?;
-//! output.finish()?;
-//! # Ok(())
-//! # }
-//! ```
 
 mod dns;
-pub mod events;
 mod files;
 pub mod handler;
 pub mod observation;
@@ -137,45 +95,36 @@ pub fn net(
 ) -> fictionet::stdlib::world::net::Net {
     let handler = handler::Handler::new(fcx, pages.clone());
     log.attach(fcx);
-    let names = addresses.fixed_names().to_vec();
     let world = fcx.clone();
+    let refused_pages = pages.clone();
     let site_for = move |host: &str| {
-        if let Err(why) = admit(host) {
-            world.emit("web", "refused", |event| {
-                event
-                    .summary(format_args!("{host}: {why}"))
-                    .field("host", host)
-                    .field("why", why)
-            });
+        let name: crate::observation::HostName = host.parse().ok()?;
+        let resolved = |address| {
+            refused_pages.report(
+                &world,
+                crate::observation::SearchObs::Resolved {
+                    name: name.clone(),
+                    address,
+                },
+            );
+        };
+        if admit(host).is_err() {
+            resolved(None);
             return None;
         }
-        let (addr, why) = match addresses.assign(host) {
+        let (addr, _) = match addresses.assign(host) {
             Ok(Some(assigned)) => assigned,
             Ok(None) => {
-                world.emit("web", "refused", |event| {
-                    event
-                        .field("host", host)
-                        .field("why", "address pool exhausted")
-                });
+                resolved(None);
                 return None;
             }
-            Err(e) => {
-                let why = format!("cannot record the address: {e}");
-                world.emit("web", "refused", |event| {
-                    event.field("host", host).field("why", why.as_str())
-                });
-                log.fail(why);
+            Err(error) => {
+                resolved(None);
+                log.fail(format!("cannot record the address: {error}"));
                 return None;
             }
         };
-        world.emit("web", "site", |event| {
-            event
-                .summary(format_args!("{host} at {addr} ({why})"))
-                .field("host", host)
-                .field("site", pages.site_name(host))
-                .field("addr", addr.to_string())
-                .field("why", why)
-        });
+        resolved(Some(addr.into()));
         if let Some(site) = forward(host) {
             return Some(site.at(addr));
         }
@@ -188,16 +137,9 @@ pub fn net(
                 .tls_with(move |fcx| {
                     config
                         .get_or_init(|| {
-                            let (config, not_before, not_after) = ca
+                            let (config, _, _) = ca
                                 .config(fcx, &name)
                                 .expect("a certificate for an admitted name");
-                            fcx.emit("web", "cert", |event| {
-                                event
-                                    .summary(format_args!("a certificate for {name}"))
-                                    .field("host", name.as_str())
-                                    .field("not_before", not_before)
-                                    .field("not_after", not_after)
-                            });
                             config
                         })
                         .clone()
@@ -205,14 +147,20 @@ pub fn net(
                 .into_host(host),
         )
     };
-    let hosts: Vec<_> = names.iter().filter_map(|name| site_for(name)).collect();
-    let mut net = fictionet::stdlib::world::net::Net::new()
+    let report_cx = fcx.clone();
+    let report_pages = pages.clone();
+    fictionet::stdlib::world::net::Net::new()
         .ipv4_only()
-        .resolve(site_for);
-    for host in hosts {
-        net = net.add_host(host);
-    }
-    net
+        .resolve(site_for)
+        .on_unreachable(move |unreachable| {
+            report_pages.report(
+                &report_cx,
+                crate::observation::SearchObs::NoRoute {
+                    from: unreachable.from,
+                    to: unreachable.to,
+                },
+            );
+        })
 }
 
 /// A world kept in memory, made from one seed: a new CA, the seed's fixed
@@ -273,7 +221,7 @@ mod spelling {
         use fictionet::stdlib::protocols::dns::{op::ResponseCode, rr::RecordType};
         use fictionet_test_support::sandbox::machine;
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             |cx| async move {
                 let seed = pages::Seed::builtin("web")?;
                 let start = world_start(&seed.date)?;

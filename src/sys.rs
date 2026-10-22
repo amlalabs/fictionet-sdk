@@ -8,9 +8,9 @@
 //! `crypto.getRandomValues` through the `getrandom` crate.
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use std::time::{Instant, SystemTime, UNIX_EPOCH};
+pub(crate) use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
-pub(crate) use web_time::{Instant, SystemTime, UNIX_EPOCH};
+pub(crate) use web_time::Instant;
 
 /// Fills `buf` with random bytes from the operating system, or from the
 /// browser's `crypto.getRandomValues`.

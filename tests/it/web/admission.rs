@@ -720,7 +720,7 @@ fn malformed_dns_does_not_break_the_server() {
 /// the next sandbox that takes its address: the connections are ended.
 #[test]
 fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
-    super::events::world_events(|fcx, attacher, _env, log| async move {
+    world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         // a looks plain.test up and opens a connection by hand.
@@ -755,13 +755,18 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
             ACK,
             request,
         ));
-        let sent = log
-            .events
-            .wait(&fcx, 0, 1, Duration::from_secs(10), |e| {
-                e.is("http", "request") && e.str("path") == Some("/secret")
-            })
-            .await?;
-        assert_eq!(sent.len(), 1, "the request was served before detaching");
+        loop {
+            let response = recv_within(&fcx, &mut a, Duration::from_secs(10))
+                .await
+                .expect("the response before detaching");
+            let (_, _, protocol, tcp) = parse(&response);
+            if protocol == 6 {
+                let data = &tcp[usize::from(tcp[12] >> 4) * 4..];
+                if data.starts_with(b"HTTP/1.1 200") {
+                    break;
+                }
+            }
+        }
         drop(a);
 
         // b takes the same address as soon as it is free.

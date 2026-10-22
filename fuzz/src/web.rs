@@ -207,25 +207,3 @@ pub fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Arc::new(c)
 }
-
-/// Exercises both event renderers while the web world handles fuzz input.
-pub struct EventFormatting;
-
-impl fictionet::events::Observer for EventFormatting {
-    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        let fictionet::events::Interest::Event(_, _) = interest else {
-            return false;
-        };
-        true
-    }
-    fn observe(
-        &self,
-        _: fictionet::events::Stamp,
-        observation: fictionet::events::Observation<'_>,
-    ) {
-        if let fictionet::events::Observation::Event(event) = observation {
-            let _ = format!("{event:?}");
-            let _ = fictionet::stdlib::codec::Wire::to_bytes(&event.to_json());
-        }
-    }
-}

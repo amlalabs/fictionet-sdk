@@ -252,7 +252,7 @@ mod tests {
             .unwrap()
             .unwrap();
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(11)),
+            fictionet::Seed::from_u64(11),
             |cx| async move {
                 let mut lists = Vec::new();
                 for (host, target) in [

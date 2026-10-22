@@ -118,7 +118,6 @@ struct Server {
 pub(crate) struct Peer {
     pub session: Arc<Session>,
     pub events: mpsc::UnboundedReceiver<String>,
-    pub ready: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Peer {
@@ -162,7 +161,6 @@ impl Peer {
         Self {
             session: Arc::new(session),
             events: rx,
-            ready,
             task,
         }
     }

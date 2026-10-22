@@ -111,8 +111,7 @@
 //!   it gets an address or a machine. The name is not kept, so looking it
 //!   up again runs the callback again.
 //!
-//! To see which names the agent tried, watch the `dns.query` events (see
-//! [Events](#events)).
+//! A world can report typed facts from its name-resolution callback.
 //!
 //! # Handlers
 //!
@@ -151,16 +150,13 @@
 //! Only an exact match to a registered host can be proxied. A request
 //! routed through [`default_host`](Site::default_host) gets `421 Misdirected
 //! Request` before any upstream I/O. Use `web::forward(&fcx, upstream, client)?` for a
-//! catch-all that forwards to one fixed origin. Both constructors refuse
-//! a lab before constructing a client.
+//! catch-all that forwards to one fixed origin.
 //!
 //! The certificate for `github.com` lists `github.com` and `*.github.com`
 //! as its names, so it covers `api.github.com` too. A name two levels
 //! deeper, such as `a.b.github.com`, needs a certificate of its own.
 //!
-//! The site's `http.request` events show the request the agent sent and
-//! the answer it got. If the real site cannot be reached, the agent gets
-//! `502 Bad Gateway`.
+//! If the real site cannot be reached, the agent gets `502 Bad Gateway`.
 //!
 //! # Serving an existing HTTP service at a real name
 //!
@@ -216,7 +212,7 @@
 //! #         });
 //! #     }
 //! # });
-//! fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
+//! fictionet::run(fictionet::Seed::random(), |fcx| async move {
 //! #     let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
 //! #     let ca = Ca::new(&fcx, "World CA")?;
 //! #     let leaf = ca.issue(&fcx, &["gmail.googleapis.com"], Validity {
@@ -414,8 +410,7 @@
 //!   from an address inside the subnet, other than the subnet's first
 //!   address and the gateway. After that, the rules are the same as for
 //!   IPv4: other sources are dropped, and the address is free again when
-//!   the sandbox detaches. A sandbox gets one `net.bound` event for each
-//!   family.
+//!   the sandbox detaches.
 //! - **The kernel's own packets do no harm.** A Linux sandbox sends router
 //!   solicitations and multicast listener reports from its link-local
 //!   address as soon as `tun0` comes up. Packets to multicast addresses are
@@ -456,57 +451,11 @@
 //! [`Sites::ipv4_only`] turns IPv6 off for a world that models an IPv4-only
 //! network. Sandboxes for such a world attach with the IPv6 flags omitted.
 //!
-//! # Events
+//! # Observation
 //!
-//! Much of what the agent does never reaches a handler. `Sites` answers DNS,
-//! rejects TLS handshakes, sends redirects and `421`s, and drops packets on
-//! its own. `Sites` records all of it in the run's
-//! [events](fictionet::events), one event for each of these, in the shape
-//! every service uses:
-//!
-//! - `net.attached`, `net.bound` (field `by_dhcp`, `addr`) and
-//!   `net.detached`: a sandbox attaches, gets an address, or detaches;
-//! - `dns.query`: every DNS message, over UDP or TCP, with its answer:
-//!   fields `tcp`, `name`, `qtype`, `answer` (`addr`, `nodata`, `nxdomain`,
-//!   `error` or `none`), `addr` and `rcode`;
-//! - `tls.handshake`: every TLS handshake on port 443, with `addr`, `sni`
-//!   and `outcome` (`accepted` with `alpn`, `rejected`, `alert` with
-//!   `alert` (name) and `alert_code` (number), `failed` with `detail`,
-//!   `closed`, `timed_out`, `detached`
-//!   or `cancelled`);
-//! - `http.request`: every HTTP request, with who answered it (`answer`:
-//!   `handler`, `error`, `redirect`, `misdirected`, `no_host` or
-//!   `cancelled`), its status, and how much of the body was sent, also
-//!   when the client gave up before the answer
-//!   ([`fictionet::stdlib::web::httpd`] lists the fields); a request that
-//!   `web::proxy` or `web::forward` sent on to the real site also has
-//!   `forwarded`, the origin it went to;
-//! - `http.error`: every connection on port 80 or 443 that ended in an HTTP
-//!   error (`cause`: `protocol`, `timeout` or `transport`);
-//! - `net.blocked`: the packets `Sites` itself drops or refuses, with
-//!   `why` (see [`BlockedWhy`](fictionet::stdlib::world::net::BlockedWhy)),
-//!   `protocol`, `src`, `dst`, `dst_port` and `count`. These are
-//!   repeatable facts that a consumer can count or combine.
-//!
-//! Every event names the sandbox it came from; events about a connection
-//! carry its number, from 1, on both ports. A connection's `tls.handshake`
-//! comes before its requests. An event is made when the thing it reports
-//! ends, so HTTP/2 requests on one connection can end in any order; the
-//! `started` field gives when each arrived.
-//!
-//! One HTTPS request to a site with [`tls`](Site::tls), from its lookup to
-//! its events:
-//!
-#![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
-//!
-//! A handler can add its own fields to its request's event. It puts
-//! [`Fields`](fictionet::events::Fields) in the extensions of the
-//! response it returns. Response extensions are never sent to the agent.
-//!
-//! Events do not hold packets or bodies. A world that wants every packet
-//! puts a [`filter`](fictionet::stdlib::network::filter) between each sandbox and
-//! `Sites`, as [Changing the network around the
-//! sites](#changing-the-network-around-the-sites) shows.
+//! A world reports its own typed facts from its handlers. To inspect packets,
+//! wrap an interface with [`network::tap`](crate::stdlib::network::tap) and use
+//! the stdlib dissectors on the copies.
 //!
 //! # Details
 //!
@@ -626,7 +575,7 @@ impl Sites {
     {
         Sites {
             site_for: Arc::new(site_for),
-            net: Net::new().group("web::Sites"),
+            net: Net::new(),
             date: None,
         }
     }
@@ -659,8 +608,7 @@ impl Sites {
     /// Each name the callback gives a site is kept for the whole run, with
     /// its machines. At the limit, a new name still runs the callback. If it
     /// returns a site, that site is dropped before it gets an address or a
-    /// machine, DNS answers SERVFAIL, and the `dns.query` event says
-    /// `error` with `rcode` 2. The name is not kept, so looking it up again
+    /// machine, and DNS answers SERVFAIL. The name is not kept, so looking it up again
     /// runs the callback again.
     pub fn max_sites(mut self, max_sites: usize) -> Sites {
         self.net = self.net.max_hosts(max_sites);
@@ -744,14 +692,6 @@ impl Site {
         }
     }
 
-    /// Observes requests before routing and admission, including rejected
-    /// requests. Sites sharing an endpoint use the first site's observer.
-    pub fn observe(self, observer: Arc<dyn httpd::BodyClassifier>) -> Site {
-        Site {
-            server: self.server.observe(observer),
-            ..self
-        }
-    }
 
     /// Serves the site at `addr`, for example the address it has on the
     /// real internet. `addr` may be an [`Ipv4Addr`], an [`Ipv6Addr`] or an

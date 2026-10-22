@@ -157,16 +157,9 @@ fn openai(cx: &Cx, address: SocketAddr) -> fictionet::Result<Model> {
     )
 }
 
-fn observed() -> (Arc<fictionet_test_support::EventLog>, fictionet::RunOptions) {
-    let memory = Arc::new(fictionet_test_support::EventLog::default());
-    let options =
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(21)).observer(memory.clone());
-    (memory, options)
-}
-
 #[test]
 fn the_handshake_and_socket_answer_like_openai() {
-    let (memory, options) = observed();
+    let options = fictionet::Seed::from_u64(21);
     fictionet::block_on(fictionet::run(options, |cx| async move {
         // Nothing listens there: no request may reach an upstream.
         let model = openai(&cx, "127.0.0.1:1".parse()?)?;
@@ -244,14 +237,6 @@ fn the_handshake_and_socket_answer_like_openai() {
         Ok(())
     }))
     .unwrap();
-    let opened = memory.of("model", "transport");
-    assert!(
-        opened
-            .iter()
-            .any(|e| e.u64("status") == Some(101) && e.str("transport") == Some("websocket"))
-    );
-    assert!(opened.iter().any(|e| e.u64("closed") == Some(1003)));
-    assert!(memory.of("model", "call").is_empty());
 }
 
 #[test]
@@ -304,7 +289,7 @@ fn a_codex_turn_runs_over_the_socket_with_a_world_search() {
     });
     let pages = Arc::new(Pages(AtomicUsize::new(0)));
     let engine = pages.clone();
-    let (memory, options) = observed();
+    let options = fictionet::Seed::from_u64(21);
     fictionet::block_on(fictionet::run(options, |cx| async move {
         let model = openai(&cx, address)?.search(engine);
         let mut client = Client::open(&cx, &model).await;
@@ -362,17 +347,6 @@ fn a_codex_turn_runs_over_the_socket_with_a_world_search() {
     .unwrap();
     upstream.join().unwrap();
     assert_eq!(pages.0.load(Ordering::SeqCst), 1);
-    let calls = memory.of("model", "call");
-    assert_eq!(calls.len(), 3);
-    for call in &calls {
-        assert_eq!(call.str("transport"), Some("websocket"));
-        assert_eq!(call.str("path"), Some("/v1/responses"));
-        assert_eq!(call.u64("status"), Some(200));
-    }
-    let tools = memory.of("model", "tool");
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].str("source"), Some("world"));
-    assert_eq!(tools[0].u64("results"), Some(1));
 }
 
 #[test]
@@ -390,7 +364,7 @@ fn a_budget_stop_reaches_the_socket_as_openai_sends_it() {
         assert!(listener.accept().is_err());
     });
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(22)),
+        fictionet::Seed::from_u64(22),
         |cx| async move {
             let model = openai(&cx, address)?
                 .search(Arc::new(Pages(AtomicUsize::new(0))))
@@ -471,7 +445,7 @@ fn an_interrupt_ends_a_running_response_with_its_finished_items() {
         released.recv().unwrap();
     });
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(23)),
+        fictionet::Seed::from_u64(23),
         |cx| async move {
             let model = openai(&cx, address)?;
             let mut client = Client::open(&cx, &model).await;

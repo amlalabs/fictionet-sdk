@@ -35,8 +35,8 @@
 //!   side of one protocol for one connection, written with no I/O.
 //!   [`serve::connection`](services::serve::connection) and
 //!   [`serve::listen`](services::serve::listen) run it over a connection or a
-//!   listener. HTTP is one ([`httpd`](web::httpd)). Services emit
-//!   [events](fictionet::events) to optional observers installed by the integrator.
+//!   listener. HTTP is one ([`httpd`](web::httpd)). Worlds report typed facts
+//!   through their own service state.
 //! - **Networks.** [`net::Net`](world::net::Net) builds all of the above for
 //!   you: the sandboxes' subnet, DNS, addresses, a router, one machine per
 //!   address, and each host's services. [`web::Sites`] is a preset on it for a

@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use fictionet::stdlib::network::{Connection, ConnectionExt, tcp};
 use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::time::ms;
-use fictionet::{Cx, Interface, InterfaceExt, Result, RunOptions};
+use fictionet::{Cx, Interface, InterfaceExt, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
@@ -89,7 +89,7 @@ fn scenario(use_write_all: bool) {
 
 fn scenario_mode(mode: u8) {
     let r = fictionet::block_on(fictionet::lab(
-        RunOptions::new(fictionet::Seed::from_u64(3)),
+        fictionet::Seed::from_u64(3),
         move |fcx| async move {
             let (server_cfg, client_cfg) = configs(&fcx);
             let (a, b) = fictionet::pair();
@@ -302,7 +302,7 @@ mod contract {
 
     fn write_waits_for_complete_ciphertext(server: bool) {
         fictionet::block_on(fictionet::lab(
-            RunOptions::new(fictionet::Seed::from_u64(4)),
+            fictionet::Seed::from_u64(4),
             move |fcx| async move {
                 let (mut client, peer) = connected(&fcx, server).await;
                 let data = b"hello";
@@ -339,7 +339,7 @@ mod contract {
 
     fn dropped_write_credits_only_matching_retries(server: bool) {
         fictionet::block_on(fictionet::lab(
-            RunOptions::new(fictionet::Seed::from_u64(5)),
+            fictionet::Seed::from_u64(5),
             move |fcx| async move {
                 let original = b"original";
                 let retries: &[&[u8]] = &[original, b"original plus", b"orig", b"other", b""];
@@ -384,7 +384,7 @@ mod contract {
 
     fn write_propagates_downstream_failures(server: bool) {
         fictionet::block_on(fictionet::lab(
-            RunOptions::new(fictionet::Seed::from_u64(6)),
+            fictionet::Seed::from_u64(6),
             move |fcx| async move {
                 for partial in [false, true] {
                     for (result, error) in [
@@ -419,7 +419,7 @@ mod contract {
         error: ConnError,
     ) {
         fictionet::block_on(fictionet::lab(
-            RunOptions::new(fictionet::Seed::from_u64(7)),
+            fictionet::Seed::from_u64(7),
             move |fcx| async move {
                 let (mut conn, peer) = connected(&fcx, server).await;
                 let mut cx = Context::from_waker(Waker::noop());
@@ -458,7 +458,7 @@ mod contract {
     #[test]
     fn server_tls_error_wins_over_output_failure() {
         fictionet::block_on(fictionet::lab(
-            RunOptions::new(fictionet::Seed::from_u64(8)),
+            fictionet::Seed::from_u64(8),
             |fcx| async move {
                 let (mut conn, peer) = connected(&fcx, true).await;
                 {

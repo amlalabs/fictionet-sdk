@@ -113,7 +113,8 @@ pub fn install_claude() -> String {
 }
 
 /// Adds Claude Code, pinned and checked, with its managed settings.
-pub fn claude_code(guest: Guest) -> Guest {
+pub fn claude_code(mut guest: Guest) -> Guest {
+    guest.features.claude_code = true;
     let script = format!(
         "#!/bin/bash\n\
          set -euo pipefail\n\
@@ -138,7 +139,8 @@ pub const CODEX_VERSION: &str = "0.163.0";
 const CODEX_SHA256: &str = "df22dac1f24b7927e817e8b113067fbe1caa586aba7554247fabd49464cf9c96";
 
 /// Adds Codex, pinned and checked.
-pub fn codex(guest: Guest) -> Guest {
+pub fn codex(mut guest: Guest) -> Guest {
+    guest.features.codex = true;
     let script = format!(
         "#!/bin/bash\n\
          set -euo pipefail\n\
@@ -228,7 +230,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
          for _ in $(seq 1 300); do wmctrl -x -r firefox -b add,maximized_vert,maximized_horz 2>/dev/null && break; sleep 0.2; done\n\
          wait\n"
     );
-    xvnc(
+    let mut guest = xvnc(
         hostname,
         user,
         (1280, 800),
@@ -348,7 +350,9 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
 "#,
     )
     .file("/opt/setup-desktop.sh", 0o755, setup_script(user))
-    .run("bash /opt/setup-desktop.sh")
+    .run("bash /opt/setup-desktop.sh");
+    guest.features.firefox = true;
+    guest
 }
 
 /// Locked preferences that keep Firefox from making requests no page asked

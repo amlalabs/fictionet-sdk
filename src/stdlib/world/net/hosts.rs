@@ -1,13 +1,10 @@
 use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_serve_v6};
 use super::attachments::answered_closed;
-use super::{
-    BlockedWhy, Hooks, LanSeg, PROTO_TCP, Resolver, blocked_event, connection_limit, link,
-    normalize, port_detail, sandbox_only,
-};
-use fictionet::events::{ConnInfo, Level};
+use super::{Hooks, LanSeg, PROTO_TCP, Resolver, connection_limit, link, normalize};
 use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
+use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{self, Budget, ServeOptions, Service, TlsSelect};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::sync::Mutex;
@@ -150,8 +147,7 @@ where
     <S::Decoder as Decode>::Error: Clone + Send,
 {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let Some(guard) = connection_limit(&fcx, &arrival.info, &self.open, self.opts.max_conns)
-        else {
+        let Some(guard) = connection_limit(&self.open, self.opts.max_conns) else {
             arrival.socket.reset();
             return Box::pin(async {});
         };
@@ -219,7 +215,7 @@ pub struct Host {
 }
 
 impl Host {
-    /// A host called `label` (for observers), with no names or services.
+    /// A host called `label`, with no names or services.
     pub fn new(label: &str) -> Host {
         Host {
             label: label.to_owned(),
@@ -291,8 +287,7 @@ impl Host {
 
     /// Serves TCP `port` with a [`Service`] made by `make` for each
     /// connection, sharing `world`, with the default [`ServeOptions`].
-    /// Connections are numbered, `conn.open` and `conn.close` events record
-    /// each, and the service's events name the sandbox each came from.
+    /// Connections are numbered and identify their sandbox in [`ConnInfo`].
     pub fn tcp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
     where
         S: Service,
@@ -491,35 +486,21 @@ impl LookupContext<'_> {
         let Some(resolver) = &self.resolver else {
             return Lookup::NoHost;
         };
-        let mut failure = None;
         let known = match resolver(name) {
             Some(_) if world.resolved >= world.max_hosts => return Lookup::Full,
             Some(mut host) => {
                 if !host.names.iter().any(|n| n == name) {
                     host.names.insert(0, name.to_owned());
                 }
-                let label = host.label.clone();
                 match self.installation.place(&mut world, host) {
                     Ok(p) => Known::Host(p),
-                    Err(e) => {
-                        failure = Some((label, e));
-                        Known::NoHost
-                    }
+                    Err(_) => Known::NoHost,
                 }
             }
             None => Known::NoHost,
         };
         world.remember(name, known);
         drop(world);
-        if let Some((label, error)) = failure {
-            self.installation.fcx.emit("net", "error", |event| {
-                event
-                    .level(Level::Notice)
-                    .summary(format_args!("host {label} for {name}: {error}"))
-                    .field("name", name)
-                    .field("error", error)
-            });
-        }
         match known {
             Known::Host(p) => Lookup::Host(p),
             Known::NoHost => Lookup::NoHost,
@@ -660,7 +641,7 @@ impl Installation<'_> {
         // Joining is the last fallible step. No service or task has started.
         if let Some(side) = machine.route.take() {
             seg.lan
-                .add(addr, Box::new(side), None)
+                .add(addr, Box::new(side))
                 .map_err(|e| e.to_string())?;
         }
         machine.commit(world, ports);
@@ -724,9 +705,8 @@ pub(super) struct Admission {
 }
 
 impl Admission {
-    pub(super) fn admit(&self, fcx: &Cx, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
+    pub(super) fn admit(&self, _fcx: &Cx, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
         let Some(guard) = self.peers.enter(conn.peer_addr().ip()) else {
-            too_many(fcx, &self.hooks, &conn);
             conn.reset();
             return None;
         };
@@ -911,7 +891,7 @@ impl Machine {
     fn stage(
         installation: &Installation<'_>,
         addr: IpAddr,
-        label: &str,
+        _label: &str,
         existing: Option<&Arc<Machine>>,
     ) -> PreparedMachine {
         if let Some(machine) = existing {
@@ -921,7 +901,7 @@ impl Machine {
                 start: None,
             };
         }
-        let fcx = installation.fcx.host(format!("{label} ({addr})"));
+        let fcx = installation.fcx.clone();
         let (router_side, side) = link();
         let ((tcp, udp, icmp, _other), split) = ip::prepare_split_protocols(&fcx, side);
         let (tcp, tcp_task) = tcp::prepare_endpoint(&fcx, tcp, addr, tcp::Options::default());
@@ -1166,24 +1146,6 @@ pub(super) fn host_prefix(addr: IpAddr) -> Prefix {
     }
 }
 
-/// Records that a connection was reset for being past its sandbox's
-/// limit.
-pub(super) fn too_many(fcx: &Cx, hooks: &Hooks, conn: &tcp::TcpConnection) {
-    let (peer, local) = (conn.peer_addr(), conn.local_addr());
-    fcx.emitter(&sandbox_only(hooks.sandbox_at(peer.ip())))
-        .emit("net", "blocked", |_| {
-            port_detail(
-                blocked_event(
-                    BlockedWhy::TooManyConnections,
-                    Some(PROTO_TCP),
-                    Some(peer.ip()),
-                    Some(local.ip()),
-                ),
-                Some(local.port()),
-            )
-        });
-}
-
 /// Accepts connections on one port of a machine. Each is served in its own
 /// region.
 async fn accept(
@@ -1326,7 +1288,7 @@ mod tests {
             }
         }
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()),
+            fictionet::Seed::random(),
             |fcx| async move {
                 let log = Arc::new(Mutex::new(Vec::new()));
                 let mut net = Net::new().ipv4_only();

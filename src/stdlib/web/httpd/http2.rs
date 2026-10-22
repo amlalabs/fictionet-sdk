@@ -13,7 +13,6 @@ use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::Body as _;
 
-use fictionet::events::Fields;
 use fictionet::stdlib::codec::{Fail, Wire};
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
@@ -25,9 +24,9 @@ use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
 use super::response::{
-    ResponsePolicy, Tracker, answered, error_event, error_response, request_held,
+    ResponsePolicy, error_response, request_held,
 };
-use super::{Body, BodyClassifier, Exchange, Handler, Later, Limits, Received, Reply, text};
+use super::{Body, Exchange, Handler, Later, Limits, Received, Reply, text};
 
 /// HTTP/2 stream deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +45,6 @@ const ERROR_RESET_MAX: usize = 1024;
 pub struct Http2 {
     handler: Arc<dyn Handler>,
     limits: Limits,
-    pub(super) observe: Option<Arc<dyn BodyClassifier>>,
     pub(super) date: Option<u64>,
     headers: wire::HeaderBlocks,
     streams: BTreeMap<u32, Stream>,
@@ -67,7 +65,6 @@ pub struct Http2 {
 struct Stream {
     request: Option<Request<Body>>,
     body: Vec<u8>,
-    tracker: Option<Tracker>,
     deadline: Option<Instant>,
     remaining: Option<u64>,
     recv_closed: bool,
@@ -108,7 +105,6 @@ impl Http2 {
         Self {
             handler,
             limits,
-            observe: None,
             date: None,
             headers: wire::HeaderBlocks::with_limits(wire::Limits {
                 header_list: limits.head.head,
@@ -139,11 +135,6 @@ impl Http2 {
         }
     }
 
-    /// Observes request heads, body chunks and receipt outcomes.
-    pub fn observe(mut self, observer: Arc<dyn BodyClassifier>) -> Self {
-        self.observe = Some(observer);
-        self
-    }
 
     /// Begins graceful shutdown on the next driver wake or input.
     /// A GOAWAY and PING round trip establishes which requests were in flight;
@@ -185,9 +176,6 @@ impl Http2 {
     }
 
     fn fail(&mut self, error: wire::Error, driver: &mut Driver<'_, Inputs, Timer>) -> Flow {
-        driver.emit("http", "error", |_| {
-            error_event(driver.conn(), "protocol", error)
-        });
         self.goaway(error.code, self.last_stream, driver);
         Flow::Close
     }
@@ -195,17 +183,7 @@ impl Http2 {
     fn cancel(&mut self, id: u32, driver: &mut Driver<'_, Inputs, Timer>) {
         driver.cancel_keyed(u64::from(id));
         self.send.lock().streams.remove(&id);
-        if let Some(mut stream) = self.streams.remove(&id)
-            && let Some(tracker) = &mut stream.tracker
-            && let Some(event) = tracker.finish(
-                || Some(Fields::new().with("answer", "cut_off")),
-                None,
-                0,
-                false,
-            )
-        {
-            driver.emit("http", "request", |_| event);
-        }
+        self.streams.remove(&id);
     }
 
     /// Resets stream `id` and ignores its late frames for a while.
@@ -261,8 +239,7 @@ impl Http2 {
         stream.deadline = None;
         let held = stream.request_held();
         let mut request = stream.request.take().expect("request dispatched once");
-        let mut tracker = stream.tracker.take().expect("request has a tracker");
-        tracker.received(received);
+
         *request.body_mut() = Body::from(std::mem::take(&mut stream.body));
         let head_only = request.method() == Method::HEAD;
         let reply = match received {
@@ -270,35 +247,19 @@ impl Http2 {
                 request,
                 &mut Exchange::new(driver.now(), driver.entropy(), driver.conn()),
             ),
-            Received::TooLarge => Reply::Now(answered(
-                text(
+            Received::TooLarge => Reply::Now(text(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "The request body is too large.\n",
-                ),
-                "too_large",
-                driver.event_enabled("http", "request"),
-            )),
-            Received::Budget => Reply::Now(answered(
-                text(
+                )),
+            Received::Budget => Reply::Now(text(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "The server cannot hold this request now.\n",
-                ),
-                "budget",
-                driver.event_enabled("http", "request"),
-            )),
-            Received::Timeout => Reply::Now(answered(
-                text(
+                )),
+            Received::Timeout => Reply::Now(text(
                     StatusCode::REQUEST_TIMEOUT,
                     "The request body took too long.\n",
-                ),
-                "timeout",
-                driver.event_enabled("http", "request"),
-            )),
-            Received::CutOff => Reply::Now(answered(
-                text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"),
-                "cut_off",
-                driver.event_enabled("http", "request"),
-            )),
+                )),
+            Received::CutOff => Reply::Now(text(StatusCode::BAD_REQUEST, "The request body was cut off.\n")),
         };
         let (work, response) = match reply {
             Reply::Now(response) => {
@@ -308,7 +269,7 @@ impl Http2 {
                 let response = if fits(driver.budget(), response_held(&response), charged) {
                     response
                 } else {
-                    over_budget(driver.event_enabled("http", "request"))
+                    over_budget()
                 };
                 (None, Some(response))
             }
@@ -329,14 +290,9 @@ impl Http2 {
                 body: None,
                 rest: Bytes::new(),
                 rest_held: 0,
-                tracker,
-                extra: None,
-                status: None,
                 head_only,
                 date: self.date,
                 asked: driver.now(),
-                sent: 0,
-                finished: false,
                 end_sent: false,
             },
         );
@@ -433,39 +389,22 @@ impl Http2 {
         if read.end && remaining.is_some_and(|n| n != 0) {
             return self.reset(id, ErrorCode::ProtocolError, driver);
         }
-        let mut tracker = Tracker::observing(
-            driver.event_enabled("http", "request"),
-            &request,
-            driver.conn(),
-            self.observe.clone(),
-        );
-        tracker.start(&mut request, driver.conn(), driver.now());
         if !fits(
             driver.budget(),
-            request_held(&request) + tracker.held() + std::mem::size_of::<Stream>(),
+            request_held(&request) + std::mem::size_of::<Stream>(),
             0,
         ) {
-            tracker.received(Received::Budget);
-            if let Some(event) = tracker.finish(
-                || Some(Fields::new().with("answer", "budget")),
-                None,
-                0,
-                false,
-            ) {
-                driver.emit("http", "request", |_| event);
-            }
+
+
             return self.reset(id, ErrorCode::RefusedStream, driver);
         }
         request.extensions_mut().insert(driver.conn().clone());
-        if driver.event_enabled("http", "request") {
-            request.extensions_mut().insert(super::EventInterest(true));
-        }
+
         self.streams.insert(
             id,
             Stream {
                 request: Some(request),
                 body: Vec::new(),
-                tracker: Some(tracker),
                 deadline: (!read.end).then_some(driver.now() + self.limits.body_timeout),
                 remaining,
                 recv_closed: read.end,
@@ -550,8 +489,7 @@ impl Http2 {
             }
         }
         stream.recv_closed = data.flags & 1 != 0;
-        if let Some(tracker) = &mut stream.tracker {
-            tracker.body(&data.data);
+        if stream.request.is_some() {
             if stream.body.len().saturating_add(data.data.len()) > self.limits.body {
                 self.dispatch(id, Received::TooLarge, charged, driver);
             } else if !room || stream.body.try_reserve_exact(data.data.len()).is_err() {
@@ -901,25 +839,10 @@ impl serve::Service for Http2 {
             // Tell the client why its streams stop, rather than just closing.
             self.goaway(ErrorCode::EnhanceYourCalm, self.last_stream, driver);
         }
-        for (_, mut stream) in std::mem::take(&mut self.streams) {
-            if let Some(tracker) = &mut stream.tracker {
-                tracker.received(if end == Ended::Budget {
-                    Received::Budget
-                } else {
-                    Received::CutOff
-                });
-                if let Some(event) = tracker.finish(|| None, None, 0, false) {
-                    driver.emit("http", "request", |_| event);
-                }
-            }
-        }
+        self.streams.clear();
         self.send.lock().streams.clear();
         self.resets = VecDeque::new();
-        if end == Ended::Conn(fictionet::stdlib::network::ConnError::Broken) {
-            driver.emit("http", "error", |_| {
-                error_event(driver.conn(), "transport", "a TLS record did not decrypt")
-            });
-        }
+
         Ok(())
     }
 
@@ -933,7 +856,6 @@ impl serve::Service for Http2 {
                     std::mem::size_of::<Stream>()
                         + s.body.capacity()
                         + s.request.as_ref().map_or(0, request_held)
-                        + s.tracker.as_ref().map_or(0, Tracker::held)
                 })
                 .sum::<usize>()
             + {
@@ -1136,15 +1058,11 @@ fn response_held(response: &Response<Body>) -> usize {
             .sum::<usize>()
 }
 
-fn over_budget(observing: bool) -> Response<Body> {
-    answered(
-        text(
+fn over_budget() -> Response<Body> {
+    text(
             StatusCode::SERVICE_UNAVAILABLE,
             "The server cannot hold this response now.\n",
-        ),
-        "budget",
-        observing,
-    )
+        )
 }
 
 type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
@@ -1160,29 +1078,14 @@ struct Sending {
     rest: Bytes,
     rest_held: usize,
     request_held: usize,
-    tracker: Tracker,
-    extra: Option<Fields>,
-    status: Option<StatusCode>,
     head_only: bool,
     date: Option<u64>,
     asked: Instant,
-    sent: u64,
-    finished: bool,
     end_sent: bool,
 }
 
 impl Sending {
-    fn end(&mut self, driver: &mut PendingDriver<'_>, complete: bool) {
-        if !self.finished {
-            self.finished = true;
-            if let Some(event) =
-                self.tracker
-                    .finish(|| self.extra.take(), self.status, self.sent, complete)
-            {
-                driver.emit("http", "request", |_| event);
-            }
-        }
-    }
+
 
     fn headers(&self, fields: &[hpack::Field], end: bool) -> Result<Vec<u8>, Error> {
         let mut block = Vec::new();
@@ -1236,7 +1139,7 @@ impl Pending for Sending {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(response)) => response,
                 Poll::Ready(Err(error)) => {
-                    error_response(&error, driver.event_enabled("http", "request"))
+                    error_response(&error)
                 }
             };
             self.making = None;
@@ -1251,11 +1154,11 @@ impl Pending for Sending {
             self.response = Some(if room {
                 response
             } else {
-                over_budget(driver.event_enabled("http", "request"))
+                over_budget()
             });
         }
         if let Some(response) = self.response.take() {
-            let (mut parts, body) = super::response::inspect(driver.fcx(), response).into_parts();
+            let (parts, body) = response.into_parts();
             let now = driver.fcx().map_or(self.asked, Cx::now);
             let date = self.date.and_then(|date| {
                 HeaderValue::from_str(&super::http_date(
@@ -1265,8 +1168,6 @@ impl Pending for Sending {
             });
             let policy =
                 ResponsePolicy::new(&parts, body.size_hint().exact(), self.head_only, date);
-            self.status = Some(parts.status);
-            self.extra = parts.extensions.remove::<Fields>();
             let mut fields = vec![hpack::Field::new(":status", parts.status.as_str())];
             for (name, value) in &parts.headers {
                 if matches!(
@@ -1321,7 +1222,6 @@ impl Pending for Sending {
                     self.rest = Bytes::new();
                     self.rest_held = 0;
                 }
-                self.sent += n as u64;
                 return Poll::Ready(Some(
                     wire::Data {
                         stream: self.id,
@@ -1334,7 +1234,7 @@ impl Pending for Sending {
                 ));
             }
             if self.end_sent {
-                self.end(driver, true);
+
                 return Poll::Ready(None);
             }
             let Some(body) = &mut self.body else {
@@ -1355,7 +1255,7 @@ impl Pending for Sending {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => self.body = None,
                 Poll::Ready(Some(Err(error))) => {
-                    self.end(driver, false);
+
                     return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
@@ -1363,7 +1263,7 @@ impl Pending for Sending {
                         // The headers are out, so a chunk the budget cannot
                         // hold resets this stream alone.
                         if !fits(self.budget.as_ref(), data.len(), held) {
-                            self.end(driver, false);
+
                             return Poll::Ready(Some(Err(Error::msg(
                                 "response body exceeds budget",
                             ))));
@@ -1387,13 +1287,12 @@ impl Pending for Sending {
         }
     }
 
-    fn cancel(&mut self, driver: &mut PendingDriver<'_>) {
-        self.end(driver, false);
+    fn cancel(&mut self, _driver: &mut PendingDriver<'_>) {
+
     }
 
     fn held(&self) -> usize {
         self.request_held
-            + self.tracker.held()
             + self.rest_held
             + self.body.as_ref().map_or(0, Body::full_len)
             + self.response.as_ref().map_or(0, response_held)
@@ -1404,13 +1303,13 @@ impl Pending for Sending {
 mod tests {
     use super::super::{HttpOptions, PREFACE};
     use super::*;
-    use fictionet::events::ConnInfo;
+    use fictionet::stdlib::services::serve::ConnInfo;
     use fictionet::stdlib::network::{ConnError, Connection};
-    use fictionet::stdlib::protocols::json::Value;
     use std::future::poll_fn;
     use std::pin::pin;
     struct StalledBody {
         input: Bytes,
+        output: Arc<Mutex<Vec<u8>>>,
     }
 
     impl Connection for StalledBody {
@@ -1434,6 +1333,7 @@ mod tests {
             _: &mut Context<'_>,
             data: &[u8],
         ) -> Poll<Result<usize, ConnError>> {
+            self.output.lock().extend_from_slice(data);
             Poll::Ready(Ok(data.len()))
         }
 
@@ -1444,9 +1344,8 @@ mod tests {
 
     #[test]
     fn http2_body_timeout_uses_the_fictionet_deadline() {
-        let log = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(log.clone()),
+            fictionet::Seed::from_u64(1),
             |fcx| async move {
                 let mut input = PREFACE.to_vec();
                 input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
@@ -1454,7 +1353,9 @@ mod tests {
                 let block = b"\x83\x86\x84\x01\x01a";
                 input.extend_from_slice(&[0, 0, block.len() as u8, 1, 4, 0, 0, 0, 1]);
                 input.extend_from_slice(block);
+                let output = Arc::new(Mutex::new(Vec::new()));
                 let conn = StalledBody {
+                    output: output.clone(),
                     input: Bytes::from(input),
                 };
                 let duration = Duration::from_millis(40);
@@ -1479,34 +1380,26 @@ mod tests {
                     Arc::new(handler),
                     &opts
                 ));
-                let wait = async {
-                    loop {
-                        if let Some(event) = log.of("http", "request").pop() {
-                            break event;
-                        }
-                        fcx.sleep(Duration::from_millis(1)).await.unwrap();
+                let mut blocks = wire::HeaderBlocks::with_limits(Default::default());
+                let mut consumed = 0;
+                let status = poll_fn(|cx| {
+                    assert!(served.as_mut().poll(cx).is_pending());
+                    let output = output.lock();
+                    while output.len() >= consumed + 9 {
+                        let header = wire::FrameHeader::parse(&output[consumed..consumed + 9]).unwrap();
+                        let end = consumed + 9 + header.length;
+                        if end > output.len() { break; }
+                        let frame = Frame::parse(&output[consumed..end]).unwrap();
+                        consumed = end;
+                        let read = blocks.read_frame(&frame).unwrap();
+                        if let Some(block) = read.block
+                            && let Some(status) = block.headers.into_iter().find(|header| header.name.as_deref() == Some(b":status"))
+                        { return Poll::Ready(status.value.unwrap()); }
                     }
-                };
-                let mut wait = pin!(wait);
-                let event = fcx
-                    .race(
-                        Some(fcx.now() + Duration::from_secs(2)),
-                        poll_fn(|cx| {
-                            assert!(served.as_mut().poll(cx).is_pending());
-                            wait.as_mut().poll(cx)
-                        }),
-                    )
-                    .await
-                    .unwrap();
-                let started = event.get("started").unwrap().as_f64().unwrap();
-                let elapsed = event.at.since_start().as_secs_f64() - started;
-                assert_eq!(elapsed, duration.as_secs_f64());
-                assert_eq!(event.str("answer"), Some("timeout"));
-                assert_eq!(event.u64("status"), Some(408));
-                assert_eq!(event.str("version"), Some("HTTP/2.0"));
-                assert_eq!(event.get("complete").and_then(Value::as_bool), Some(true));
-                assert_eq!(log.of("http", "request").len(), 1);
-                assert!(log.of("http", "error").is_empty());
+                    Poll::Pending
+                }).await;
+                assert_eq!(status, b"408");
+                assert_eq!(fcx.now().since_start(), duration);
                 Ok(())
             },
         ))

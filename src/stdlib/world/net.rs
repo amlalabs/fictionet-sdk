@@ -9,8 +9,7 @@
 //! name-based virtual hosting. Every sandbox that attaches is put on the
 //! sandboxes' subnet, given an address by DHCP or by its first packet, and
 //! kept from reaching the other sandboxes. A world then writes only its
-//! services. Services emit events lazily to the observer installed in
-//! [`RunOptions`](fictionet::RunOptions). Without one they skip construction.
+//! services. Each world reports its own typed observations from its services.
 //!
 //! An office: a domain controller that answers LDAP and Kerberos, a web
 //! server, and a PLC, with DNS names for each:
@@ -80,10 +79,10 @@
 //!   [`Host::on`] and attached virtual machines with [`Net::member`], as
 //!   machines on one Ethernet: broadcast and multicast reach every member.
 //!   The router sends the LAN's prefix to its gateway, the LAN's first
-//!   address answers DNS. Drops emit events to interested observers.
+//!   address answers DNS.
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". UDP delivery and closed-port
-//!   events use the declared UDP length. Invalid lengths are dropped;
+//!   replies use the declared UDP length. Invalid lengths are dropped;
 //!   trailing IP payload bytes are ignored when checking the checksum.
 //!   A peer address may have 256 connections open at once across the
 //!   network ([`Limits::connections_per_peer`]); past that, new ones are
@@ -92,21 +91,12 @@
 //!   that sandbox's [`Budget`], 256 MiB unless [`Limits::sandbox_budget`]
 //!   says otherwise. A connection that would pass it is closed. The service
 //!   driver charges its buffers and what the service reports holding, and
-//!   HTTP/2 charges retained request heads, events and bodies (see [`httpd`]).
+//!   HTTP/2 charges retained request heads and bodies (see [`httpd`]).
 //!   A [`PortServer`] of your own charges what it chooses. A sandbox has one
 //!   budget for both its addresses, from when it attaches until it
 //!   detaches. A trusted sandbox ([`Net::route`]) has none.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
-//! - **Events.** The network emits facts to interested installed
-//!   [observers](fictionet::events). The run emits `run.start`; `Net` emits `net` events for
-//!   sandboxes attaching,
-//!   binding, detaching and packets dropped (`net.blocked`, optionally counted as
-//!   [repeats](fictionet::events#repeats)), `dns.query`
-//!   for every DNS message, `tls.handshake` for every handshake on a TLS
-//!   port, and each service's own events. Every event names its sandbox
-//!   and, for a connection, its number (from 1, on every port of every
-//!   machine).
 //! - **Errors.** A host that cannot be served as declared, such as one at
 //!   an address a host cannot have, two services on one port (one with
 //!   TLS and one without count as two), or a port
@@ -144,8 +134,8 @@ mod hosts;
 mod names;
 
 use addresses::{AUTO, AUTO6, Leases, Subnet, Subnet6};
-pub use attachments::{BlockedWhy, connection_limit};
-use attachments::{Hooks, blocked_event, filter, port_detail, sandbox_only, udp_packet};
+pub use attachments::connection_limit;
+use attachments::{Hooks, filter, udp_packet};
 use dns::start_dns;
 use hosts::{
     Admission, Installation, Known, Lookup, LookupContext, Machines, Peers, World, host_prefix,
@@ -243,9 +233,9 @@ pub struct Net {
     ipv6: bool,
     hosts: Vec<Host>,
     resolver: Option<Arc<Resolver>>,
+    unreachable: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
     max_hosts: usize,
     routes: Vec<(String, Prefix)>,
-    group: String,
     limits: Limits,
     lans: Vec<Lan>,
     members: Vec<(String, Lan, IpAddr)>,
@@ -272,9 +262,9 @@ impl Net {
             ipv6: true,
             hosts: Vec::new(),
             resolver: None,
+            unreachable: None,
             max_hosts: MAX_HOSTS,
             routes: Vec::new(),
-            group: "net".to_owned(),
             limits: Limits::default(),
             lans: Vec::new(),
             members: Vec::new(),
@@ -322,13 +312,18 @@ impl Net {
     /// looked up. `Some(host)` creates it then, with that name as a DNS
     /// name; `None` gives NXDOMAIN. The answer is kept for the run.
     /// `resolve` must return quickly: it runs inside the DNS task. A host
-    /// that cannot be served is recorded as a `net.error` event, and its
-    /// name gets NXDOMAIN.
+    /// that cannot be served gets NXDOMAIN.
     pub fn resolve(self, resolve: impl Fn(&str) -> Option<Host> + Send + Sync + 'static) -> Net {
         Net {
             resolver: Some(Arc::new(resolve)),
             ..self
         }
+    }
+
+    /// Calls `report` when a packet has no route in this network.
+    pub fn on_unreachable(mut self, report: impl Fn(Unreachable) + Send + Sync + 'static) -> Self {
+        self.unreachable = Some(Arc::new(report));
+        self
     }
 
     /// Sets how many names may get a host from [`resolve`](Net::resolve).
@@ -354,9 +349,7 @@ impl Net {
     /// LAN's gateway, so sandboxes and the other hosts reach its members,
     /// and members reach everything else through it. The LAN's first
     /// address (`.1` of a `/24`) answers DNS as the network's gateway does,
-    /// for members to use. The packets the LAN drops are recorded as
-    /// `lan.drop` [repeats](fictionet::events#repeats), with the reason in `why`
-    /// and the LAN name in `lan`.
+    /// for members to use.
     ///
     /// [`start`](Net::start) fails if the LAN prefix overlaps the sandboxes'
     /// subnets, the automatic address pools (`104.18.0.0/15` and
@@ -374,14 +367,6 @@ impl Net {
     pub fn member(mut self, name: &str, lan: &Lan, addr: IpAddr) -> Net {
         self.members.push((name.to_owned(), lan.clone(), addr));
         self
-    }
-
-    /// Names the group observers see for the network's tasks.
-    pub fn group(self, name: &str) -> Net {
-        Net {
-            group: name.to_owned(),
-            ..self
-        }
     }
 
     /// Sets the network's limits and timers.
@@ -405,7 +390,6 @@ impl Net {
             None
         };
         let caller = fcx.clone();
-        let fcx = &fcx.group(self.group.clone());
         let router = route::router::<Box<dyn Interface>>(fcx, Vec::new());
         // Every host is one hop from the sandbox: the router is private.
         router.keep_ttl();
@@ -420,7 +404,8 @@ impl Net {
             Box::new(router_side),
         );
         let gateway = subnet.gateway;
-        fcx.spawn(move |fcx| unreachable(fcx, unreachable_side, gateway.into()));
+        let report = self.unreachable.clone();
+        fcx.spawn(move |fcx| unreachable(fcx, unreachable_side, gateway.into(), report));
         if let Some(subnet6) = subnet6 {
             let (router_side, unreachable_side) = link();
             router.add(
@@ -431,7 +416,8 @@ impl Net {
                 Box::new(router_side),
             );
             let gateway = subnet6.gateway;
-            fcx.spawn(move |fcx| unreachable(fcx, unreachable_side, gateway.into()));
+            let report = self.unreachable.clone();
+            fcx.spawn(move |fcx| unreachable(fcx, unreachable_side, gateway.into(), report));
         }
         let hooks = Arc::new(Hooks {
             by_addr: Mutex::default(),
@@ -617,7 +603,7 @@ struct LanSeg {
 fn make_lans(
     fcx: &Cx,
     router: &Router<Box<dyn Interface>>,
-    hooks: &Arc<Hooks>,
+    _hooks: &Arc<Hooks>,
     subnet: &Subnet,
     subnet6: Option<&Subnet6>,
     lans: Vec<Lan>,
@@ -653,22 +639,7 @@ fn make_lans(
                 prefix.addr, prefix.len
             )));
         }
-        let segment = name.clone();
-        let names = hooks.clone();
-        let lan = route::lan::<Box<dyn Interface>, _>(
-            &fcx.group(format!("lan {name}")),
-            prefix,
-            move |mut event| {
-                // A packet from the gateway has no member to name. Its source
-                // passed a sandbox filter's address check, so the address
-                // names the sandbox that sent it.
-                if event.conn.sandbox.is_none() {
-                    let src = event.str("src").and_then(|a| a.parse::<IpAddr>().ok());
-                    event.conn.sandbox = src.and_then(|a| names.by_addr.lock().get(&a).cloned());
-                }
-                event.field("lan", segment.clone())
-            },
-        );
+        let lan = route::lan::<Box<dyn Interface>>(fcx, prefix);
         let (lan_side, router_side) = link();
         lan.gateway(Box::new(lan_side))?;
         router.add(prefix, Box::new(router_side));
@@ -721,7 +692,7 @@ fn make_lans(
 fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
     let gateways = std::iter::once(IpAddr::V4(shared.subnet.gateway))
         .chain(shared.subnet6.map(|s| IpAddr::V6(s.gateway)));
-    let fcx = &shared.fcx.host("gateway");
+    let fcx = &shared.fcx.clone();
     for gateway in gateways {
         let (router_side, side) = link();
         shared
@@ -732,8 +703,8 @@ fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
     }
     for seg in shared.lans.values() {
         let (lan_side, side) = link();
-        seg.lan.add(seg.dns, Box::new(lan_side), None)?;
-        let tcp = start_dns(shared.dns(), &shared.fcx.host("lan gateway"), side, seg.dns)?;
+        seg.lan.add(seg.dns, Box::new(lan_side))?;
+        let tcp = start_dns(shared.dns(), &shared.fcx.clone(), side, seg.dns)?;
         shared.gateway_tcp.lock().push(tcp);
     }
     Ok(())
@@ -742,11 +713,32 @@ fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
 // ---------------------------------------------------------------------------
 // ICMP "host unreachable"
 
-/// Answers every packet with ICMP "host unreachable", or ICMPv6 "address
-/// unreachable", from the gateway's address of the same family.
-async fn unreachable(fcx: Cx, mut end: End, gateway: IpAddr) -> fictionet::Result {
+/// A packet whose destination has no route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unreachable {
+    /// Source address of the packet.
+    pub from: IpAddr,
+    /// Destination address of the packet.
+    pub to: IpAddr,
+}
+
+/// Answers with ICMP from the gateway's address of the same family.
+async fn unreachable(
+    fcx: Cx,
+    mut end: End,
+    gateway: IpAddr,
+    report: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
+) -> fictionet::Result {
     let mut run = 0;
     while let Ok(packet) = end.recv(&fcx).await {
+        if let Some(report) = &report
+            && let Some(header) = crate::stdlib::network::ip::Header::parse(&packet.0)
+        {
+            report(Unreachable {
+                from: header.src,
+                to: header.dst,
+            });
+        }
         let reply = match gateway {
             IpAddr::V4(g) => icmp::host_unreachable(&packet.0, g),
             IpAddr::V6(g) => icmp::address_unreachable(&packet.0, g),
@@ -774,7 +766,7 @@ mod tests {
     #[test]
     fn lan_dns_endpoints_start_in_name_order() {
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()),
+            fictionet::Seed::random(),
             |fcx| async move {
                 let subnet = Subnet::new("104.18.0.0/16".parse().unwrap()).unwrap();
                 let router = route::router::<Box<dyn Interface>>(&fcx, Vec::new());
@@ -914,4 +906,49 @@ mod tests {
 
 }
 
+}
+
+#[cfg(test)]
+mod unreachable_tests {
+    use super::*;
+    use crate::stdlib::network::ip;
+
+    #[test]
+    fn a_world_can_report_missing_routes_without_changing_icmp_replies() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                let facts = Arc::new(Mutex::new(Vec::new()));
+                let recorded = facts.clone();
+                let (attacher, attachments) = fictionet::attachments();
+                Net::new()
+                    .on_unreachable(move |fact| recorded.lock().push(fact))
+                    .start(&cx, attachments)?;
+                let mut guest = attacher.attach("guest")?;
+                let routes = [
+                    ("10.0.0.2", "203.0.113.9", "10.0.0.1"),
+                    ("2001:db8::2", "2001:db8:99::9", "2001:db8::1"),
+                ];
+                for (from, to, gateway) in routes {
+                    let from: IpAddr = from.parse()?;
+                    let to: IpAddr = to.parse()?;
+                    guest.send(ip::packet(from, to, 253, &[1, 2, 3]));
+                    let reply = guest.recv(&cx).await?;
+                    let header = ip::Header::parse(&reply.0).unwrap();
+                    assert_eq!(header.src, gateway.parse::<IpAddr>()?);
+                    assert_eq!(header.dst, from);
+                    let payload = header.payload(&reply.0);
+                    assert_eq!(
+                        &payload[..2],
+                        if from.is_ipv4() { &[3, 1] } else { &[1, 3] }
+                    );
+                    assert_eq!(facts.lock().last(), Some(&Unreachable { from, to }));
+                }
+                assert_eq!(facts.lock().len(), 2);
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 }

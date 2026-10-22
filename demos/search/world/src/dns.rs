@@ -67,7 +67,6 @@ pub fn admit(name: &str) -> Result<(), &'static str> {
 /// store assign under `store.lock`, after reading what the others
 /// recorded, so each address goes to one host.
 pub struct Addresses {
-    fixed: Vec<String>,
     inner: Mutex<Inner>,
 }
 
@@ -134,10 +133,6 @@ impl Inner {
 const POOLS: [[u8; 2]; 2] = [[104, 21], [172, 67]];
 
 impl Addresses {
-    pub(crate) fn fixed_names(&self) -> &[String] {
-        &self.fixed
-    }
-
     /// `fixed` maps hosts to addresses with the reason (`"search engine"`,
     /// `"seed"`). With `store`, the store's directory, its
     /// `addresses.jsonl` is read first, as `"recorded"`, and new
@@ -172,7 +167,6 @@ impl Addresses {
         inner.read_on()?;
         drop(held);
         Ok(Addresses {
-            fixed: names,
             inner: Mutex::new(inner),
         })
     }

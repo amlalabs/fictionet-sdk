@@ -14,8 +14,7 @@ gateway; preview does not invent provider traffic.
 [app/src/main.rs](app/src/main.rs) assembles the workstation and its owned page.
 [app/src/network.rs](app/src/network.rs) connects the model gateway, sign-in relay
 and package mirror. Search explicitly reports typed facts from its request and
-tool handlers, plus a Search-owned link reader for DNS replies and route refusals.
-No SDK observer is installed by the app.
+tool handlers, its name resolver and the typed no-route callback on its network.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway expands the map
@@ -76,6 +75,6 @@ The world's page modules separate routing, generation, listings, stored pages,
 corrections and model tools. Prompt construction and answer parsing are separate.
 The WARC reader, crawler, BM25 index, model gateway and sign-in relay live in
 `fictionet-extras`. The shared demo kit supplies VM lifetime, SSH console sockets and the package
-cache. Search owns its HTML, styles and JavaScript, including copies of the
+mirror. Search owns its HTML, styles and JavaScript, including copies of the
 terminal and screen pieces. ghostty-web 0.4.0 and noVNC 1.7.0, with their
 licenses, live in `demos/kit/assets`.

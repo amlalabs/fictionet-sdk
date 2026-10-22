@@ -43,10 +43,10 @@ impl World {
         F: FnOnce(Cx, Checkpoint) -> Fut + Send + 'static,
         Fut: Future<Output = fictionet::Result> + Send + 'static,
     {
-        Self::with_options(fictionet::RunOptions::new(fictionet::Seed::random()), work)
+        Self::with_options(fictionet::Seed::random(), work)
     }
 
-    pub fn with_options<F, Fut>(options: fictionet::RunOptions, work: F) -> Self
+    pub fn with_options<F, Fut>(options: fictionet::Seed, work: F) -> Self
     where
         F: FnOnce(Cx, Checkpoint) -> Fut + Send + 'static,
         Fut: Future<Output = fictionet::Result> + Send + 'static,

@@ -1,9 +1,5 @@
 use super::admission::{ACK, RST, SYN};
 use super::dns_dhcp::read_exact;
-use super::events::{
-    Log, addr, answer, blocked_seen, dns_seen, flag, http_seen, local, outcome, picked, sandbox_of,
-    seen, tls_seen, wait_for, world_events,
-};
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -506,7 +502,7 @@ fn shared_ipv6_keeps_defaults_local() {
 
 #[test]
 fn https_http2_and_plain_http_over_ipv6() {
-    world_events(|fcx, attacher, env, log| async move {
+    world(|fcx, attacher, env| async move {
         let m = machine(&fcx, attacher.attach("a").unwrap(), ME6);
         let (_, addrs) = dns_at(&fcx, &m, GATEWAY6.into(), "dual.test", RecordType::AAAA).await;
         assert_eq!(addrs, vec![IpAddr::V6(DUAL_ADDR6)]);
@@ -602,25 +598,6 @@ fn https_http2_and_plain_http_over_ipv6() {
         .unwrap();
         assert!(bare.handshake(&fcx).await.is_err());
 
-        // The events name the IPv6 addresses.
-        let tls = wait_for(&fcx, &log, 5, tls_seen).await;
-        assert_eq!(addr(&tls[0], "addr"), Some(IpAddr::V6(DUAL_ADDR6)));
-        assert_eq!(sandbox_of(&tls[0]).unwrap().addr_v6, Some(ME6));
-        assert_eq!(sandbox_of(&tls[0]).unwrap().addr, None);
-        assert_eq!(
-            (addr(&tls[4], "addr"), outcome(&tls[4])),
-            (Some(IpAddr::V6(DUAL_ADDR6)), "rejected".to_owned())
-        );
-        let http = wait_for(&fcx, &log, 7, http_seen).await;
-        assert_eq!(local(&http[0]), SocketAddr::new(DUAL_ADDR6.into(), 443));
-        assert_eq!(local(&http[2]), SocketAddr::new(DUAL_ADDR.into(), 443));
-        assert_eq!(
-            sandbox_of(&http[2]).unwrap().addr,
-            Some(Ipv4Addr::new(10, 0, 0, 2))
-        );
-        let dns = wait_for(&fcx, &log, 3, dns_seen).await;
-        assert_eq!(answer(&dns[0]), format!("addr {DUAL_ADDR6}"));
-        assert_eq!(dns[0].u64("qtype"), Some(28));
         Ok(())
     });
 }
@@ -720,7 +697,7 @@ fn ipv6_pings_closed_ports_and_unknown_addresses() {
 
 #[test]
 fn ipv6_addresses_are_bound_to_one_sandbox() {
-    world_events(|fcx, attacher, _env, log| async move {
+    world(|fcx, attacher, _env| async move {
         let me4 = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         // What a Linux sandbox sends first: a router solicitation from its
@@ -771,91 +748,7 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
         }
         assert!(recv_within(&fcx, &mut b, SHORT).await.is_none());
 
-        let got = wait_for(&fcx, &log, 9, blocked_seen).await;
-        let summary: Vec<_> = got
-            .iter()
-            .map(|b| {
-                (
-                    &*sandbox_of(b).unwrap().name,
-                    b.str("why").unwrap(),
-                    sandbox_of(b).unwrap().addr_v6,
-                    addr(b, "src"),
-                    addr(b, "dst"),
-                )
-            })
-            .collect();
-        let v6 = |a: Ipv6Addr| Some(IpAddr::V6(a));
-        assert_eq!(
-            summary,
-            vec![
-                (
-                    "a",
-                    "Broadcast",
-                    None,
-                    v6(link_local),
-                    v6("ff02::2".parse().unwrap())
-                ),
-                (
-                    "a",
-                    "NotItsAddress",
-                    Some(ME6),
-                    v6("2001:db8::9".parse().unwrap()),
-                    v6(GATEWAY6)
-                ),
-                (
-                    "a",
-                    "OtherSandbox",
-                    Some(ME6),
-                    v6(ME6),
-                    v6("2001:db8::3".parse().unwrap())
-                ),
-                (
-                    "a",
-                    "NotItsAddress",
-                    Some(ME6),
-                    v6(link_local),
-                    v6(GATEWAY6)
-                ),
-                ("a", "NoRoute", Some(ME6), v6(ME6), v6(NOWHERE6)),
-                ("b", "NotItsAddress", None, v6(ME6), v6(GATEWAY6)),
-                ("b", "NotItsAddress", None, v6(GATEWAY6), v6(GATEWAY6)),
-                (
-                    "b",
-                    "NotItsAddress",
-                    None,
-                    v6("2001:db8::".parse().unwrap()),
-                    v6(GATEWAY6)
-                ),
-                (
-                    "b",
-                    "NotItsAddress",
-                    None,
-                    v6("2001:db8:1::5".parse().unwrap()),
-                    v6(GATEWAY6)
-                ),
-            ]
-        );
-        assert_eq!(got.len(), 9, "{got:#?}");
-
-        // One `bound` for each family, and a `detached` that names both.
         drop(a);
-        wait_for(&fcx, &log, 1, seen("net", "detached")).await;
-        let a_events = picked(&log, |e| {
-            (e.source == "net" && e.kind != "blocked" && &*sandbox_of(e)?.name == "a")
-                .then(|| e.clone())
-        });
-        let kinds: Vec<_> = a_events.iter().map(|e| e.kind).collect();
-        assert_eq!(
-            kinds,
-            ["attached", "bound", "bound", "detached"],
-            "{a_events:#?}"
-        );
-        let at = |e: &Event| sandbox_of(e).map(|s| (s.addr, s.addr_v6));
-        assert!(!flag(&a_events[1], "by_dhcp"));
-        assert_eq!(at(&a_events[1]), Some((None, Some(ME6))));
-        assert_eq!(at(&a_events[2]), Some((Some(me4), Some(ME6))));
-        assert_eq!(at(&a_events[3]), Some((Some(me4), Some(ME6))));
-
         // Now the address is free, and the second sandbox can take it.
         b.send(ping6(ME6, GATEWAY6, 8));
         let (src, dst, _, icmp) = parse6(
@@ -871,14 +764,13 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
 /// Runs a world whose network `make` builds, with every event kept.
 fn world_of<F, Fut>(make: impl FnOnce() -> web::Sites + Send + 'static, f: F)
 where
-    F: FnOnce(Cx, Attacher, Log) -> Fut + Send + 'static,
+    F: FnOnce(Cx, Attacher) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    run_world::observed_world(Duration::from_secs(60), move |fcx, events| async move {
+    run_world::world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         make().start(&fcx, attachments)?;
-        let log = Log::new(events);
-        f(fcx, attacher, log).await?;
+        f(fcx, attacher).await?;
         Ok(())
     });
 }
@@ -894,7 +786,7 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
         })
         .ipv4_only()
     };
-    world_of(make, |fcx, attacher, log| async move {
+    world_of(make, |fcx, attacher| async move {
         let m = default_machine(&fcx, &attacher);
         let gw = IpAddr::V4(GATEWAY);
         // An IPv6 `at` is not used: the site gets an automatic IPv4 address.
@@ -918,11 +810,6 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
         let mut raw = attacher.attach("b").unwrap();
         raw.send(ping6(ME6, GATEWAY6, 1));
         assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none());
-        let got = wait_for(&fcx, &log, 1, blocked_seen).await;
-        assert_eq!(
-            (got[0].str("why"), addr(&got[0], "dst")),
-            (Some("Ipv6"), Some(IpAddr::V6(GATEWAY6)))
-        );
         Ok(())
     });
 }
@@ -937,7 +824,7 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
         })
         .subnet("2606:4700:100::/64".parse().unwrap())
     };
-    world_of(make, |fcx, attacher, _log| async move {
+    world_of(make, |fcx, attacher| async move {
         let (gw, me): (Ipv6Addr, Ipv6Addr) = (
             "2606:4700:100::1".parse().unwrap(),
             "2606:4700:100::2".parse().unwrap(),
@@ -979,7 +866,7 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
         })
         .subnet("2606::/16".parse().unwrap())
     };
-    world_of(make, |fcx, attacher, _log| async move {
+    world_of(make, |fcx, attacher| async move {
         let m = default_machine(&fcx, &attacher);
         let gw = IpAddr::V4(GATEWAY);
         assert_eq!(
@@ -1312,7 +1199,7 @@ fn dns_drops_a_zero_udp_checksum_over_ipv6() {
 fn dns_makes_no_more_sites_than_the_limit() {
     let make =
         || web::Sites::new(|_| Some(web::Site::new(Plain("wildcard")).ipv6_only())).max_sites(8);
-    world_of(make, |fcx, attacher, log| async move {
+    world_of(make, |fcx, attacher| async move {
         let mut raw = attacher.attach("a").unwrap();
         for i in 0..8 {
             // A questions make the site too, and get NODATA.
@@ -1334,13 +1221,6 @@ fn dns_makes_no_more_sites_than_the_limit() {
                 .unwrap();
             assert_eq!(answer, (ResponseCode::ServFail, vec![]), "{name}");
         }
-        assert_eq!(
-            picked(&log, dns_seen)
-                .iter()
-                .filter(|d| answer(d) == "error 2")
-                .count(),
-            3
-        );
         // The first eight still answer, and have machines.
         let site0 = Ipv6Addr::from(u128::from("2606:4700:100::".parse::<Ipv6Addr>().unwrap()) + 1);
         let answer = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, "n0.test", RecordType::AAAA)

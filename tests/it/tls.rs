@@ -12,7 +12,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::stdlib::services::ca::Ca;
 use fictionet::stdlib::services::tls::{self, ServerConfig};
-use fictionet::{Cx, RunOptions, Seed, block_on, lab};
+use fictionet::{Cx, Seed, block_on, lab};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
@@ -249,7 +249,7 @@ fn client_config(fcx: &Cx, ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
 #[test]
 fn handshake_with_sni_and_alpn() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[b"h2", b"http/1.1"]);
             let client_config = client_config(&fcx, &ca, &[b"h2", b"http/1.1"]);
@@ -292,7 +292,7 @@ fn handshake_with_sni_and_alpn() {
 #[test]
 fn the_world_picks_a_config_per_handshake() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let a = server_config(&fcx, &ca, "a.test", &[]);
             let b = server_config(&fcx, &ca, "b.test", &[]);
@@ -353,7 +353,7 @@ fn the_world_picks_a_config_per_handshake() {
 #[test]
 fn reject_sends_unrecognized_name() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let client_config = client_config(&fcx, &ca, &[]);
             let (server_side, client_side) = mem_pair();
@@ -385,7 +385,7 @@ fn reject_sends_unrecognized_name() {
 #[test]
 fn a_dropped_hello_closes_with_no_alert() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let client_config = client_config(&fcx, &ca, &[]);
             let (server_side, client_side) = mem_pair();
@@ -408,7 +408,7 @@ fn a_dropped_hello_closes_with_no_alert() {
 #[test]
 fn a_malformed_hello_gets_a_decode_error_alert() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (server_side, mut client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
                 assert_eq!(
@@ -439,7 +439,7 @@ fn a_malformed_hello_gets_a_decode_error_alert() {
 #[test]
 fn a_first_message_that_is_not_a_hello_is_broken() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (server_side, mut client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
                 assert_eq!(
@@ -481,82 +481,78 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
         let r = result.clone();
         let outcome = Arc::new(Mutex::new(None));
         let o = outcome.clone();
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                let ca = Ca::new(&fcx, "Test CA").unwrap();
-                // Valid only in 2019.
-                let (client_chain, client_key) =
-                    issue(&fcx, &ca, &["client.test"], 2019, 2020, true);
-                let (chain, key) = issue(&fcx, &ca, &["example.test"], 2000, 2100, false);
-                let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-                    Arc::new(roots(&ca)),
-                    Arc::new(provider()),
-                )
-                .build()
-                .unwrap();
-                let config = Arc::new(
-                    tls::config_builder(&fcx, start)
-                        .with_safe_default_protocol_versions()
-                        .unwrap()
-                        .with_client_cert_verifier(verifier)
-                        .with_single_cert(chain, key)
-                        .unwrap(),
-                );
-                // The client's clock says mid-2019, so it accepts the server.
-                let client_config = Arc::new(
-                    ClientConfig::builder_with_details(
-                        Arc::new(provider()),
-                        Arc::new(FixedTime(date(2019, 6, 1))),
-                    )
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
+            // Valid only in 2019.
+            let (client_chain, client_key) = issue(&fcx, &ca, &["client.test"], 2019, 2020, true);
+            let (chain, key) = issue(&fcx, &ca, &["example.test"], 2000, 2100, false);
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots(&ca)),
+                Arc::new(provider()),
+            )
+            .build()
+            .unwrap();
+            let config = Arc::new(
+                tls::config_builder(&fcx, start)
                     .with_safe_default_protocol_versions()
                     .unwrap()
-                    .with_root_certificates(roots(&ca))
-                    .with_client_auth_cert(client_chain, client_key)
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(chain, key)
                     .unwrap(),
-                );
+            );
+            // The client's clock says mid-2019, so it accepts the server.
+            let client_config = Arc::new(
+                ClientConfig::builder_with_details(
+                    Arc::new(provider()),
+                    Arc::new(FixedTime(date(2019, 6, 1))),
+                )
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots(&ca))
+                .with_client_auth_cert(client_chain, client_key)
+                .unwrap(),
+            );
 
-                let (server_side, client_side) = mem_pair();
-                let server = fcx.spawn(move |fcx| async move {
-                    let hello = tls::server(&fcx, server_side).await?;
-                    let finished = hello.finish(&fcx, config).await;
-                    let ok = finished.is_ok();
-                    if let Ok(mut conn) = finished {
-                        conn.write_all(&fcx, b"ok").await?;
-                    }
-                    *r.lock().unwrap() = Some(ok);
-                    Ok(())
-                });
-                let client = async {
-                    let mut c = Client::connect(&fcx, client_side, client_config, "example.test")
+            let (server_side, client_side) = mem_pair();
+            let server = fcx.spawn(move |fcx| async move {
+                let hello = tls::server(&fcx, server_side).await?;
+                let finished = hello.finish(&fcx, config).await;
+                let ok = finished.is_ok();
+                if let Ok(mut conn) = finished {
+                    conn.write_all(&fcx, b"ok").await?;
+                }
+                *r.lock().unwrap() = Some(ok);
+                Ok(())
+            });
+            let client = async {
+                let mut c = Client::connect(&fcx, client_side, client_config, "example.test")
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                // In TLS 1.3 the client finishes first; the server's verdict
+                // arrives with the first read.
+                let mut buf = [0; 2];
+                let mut got = 0;
+                while got < 2 {
+                    got += c
+                        .read(&fcx, &mut buf[got..])
                         .await
                         .map_err(|e| format!("{e:?}"))?;
-                    // In TLS 1.3 the client finishes first; the server's verdict
-                    // arrives with the first read.
-                    let mut buf = [0; 2];
-                    let mut got = 0;
-                    while got < 2 {
-                        got += c
-                            .read(&fcx, &mut buf[got..])
-                            .await
-                            .map_err(|e| format!("{e:?}"))?;
-                    }
-                    Ok::<_, String>(())
-                };
-                let client_result = client.await;
-                server.join(&fcx).await?;
-                let server_ok = result.lock().unwrap().unwrap();
-                *o.lock().unwrap() = Some((
-                    if server_ok {
-                        Ok(())
-                    } else {
-                        Err(ConnError::Broken)
-                    },
-                    client_result,
-                ));
-                Ok(())
-            },
-        ))
+                }
+                Ok::<_, String>(())
+            };
+            let client_result = client.await;
+            server.join(&fcx).await?;
+            let server_ok = result.lock().unwrap().unwrap();
+            *o.lock().unwrap() = Some((
+                if server_ok {
+                    Ok(())
+                } else {
+                    Err(ConnError::Broken)
+                },
+                client_result,
+            ));
+            Ok(())
+        }))
         .unwrap();
         outcome.lock().unwrap().take().unwrap()
     })
@@ -577,7 +573,7 @@ fn certificates_are_checked_against_the_worlds_date() {
 #[test]
 fn close_notify_both_ways() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&fcx, &ca, &[]);
@@ -637,60 +633,57 @@ fn pattern(i: usize) -> u8 {
 fn five_megabytes_each_way() {
     const SIZE: usize = 5 * 1024 * 1024;
     within(Duration::from_secs(120), || {
-        block_on(fictionet::lab(
-            RunOptions::new(Seed::from_u64(1)),
-            |fcx| async move {
-                let ca = Ca::new(&fcx, "Test CA").unwrap();
-                let config = server_config(&fcx, &ca, "example.test", &[]);
-                let client_config = client_config(&fcx, &ca, &[]);
-                let (server_side, client_side) = mem_pair();
-                let data: Arc<Vec<u8>> = Arc::new((0..SIZE).map(pattern).collect());
+        block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
+            let config = server_config(&fcx, &ca, "example.test", &[]);
+            let client_config = client_config(&fcx, &ca, &[]);
+            let (server_side, client_side) = mem_pair();
+            let data: Arc<Vec<u8>> = Arc::new((0..SIZE).map(pattern).collect());
 
-                let d = data.clone();
-                let server = fcx.spawn(move |fcx| async move {
-                    let mut conn = tls::server(&fcx, server_side)
-                        .await?
-                        .finish(&fcx, config)
-                        .await?;
-                    // Odd-sized writes, so records do not line up with them.
-                    for chunk in d.chunks(70_001) {
-                        conn.write_all(&fcx, chunk).await?;
-                    }
-                    let mut received = 0usize;
-                    let mut buf = vec![0; 50_000];
-                    loop {
-                        let n = conn.read(&fcx, &mut buf).await?;
-                        if n == 0 {
-                            break;
-                        }
-                        for (i, b) in buf[..n].iter().enumerate() {
-                            assert_eq!(*b, pattern(received + i));
-                        }
-                        received += n;
-                    }
-                    assert_eq!(received, SIZE);
-                    conn.shutdown(&fcx).await?;
-                    Ok(())
-                });
-
-                let mut client = Client::connect(&fcx, client_side, client_config, "example.test")
-                    .await
-                    .unwrap();
-                let mut received = Vec::with_capacity(SIZE);
-                let mut buf = vec![0; 40_000];
-                while received.len() < SIZE {
-                    let n = client.read(&fcx, &mut buf).await.unwrap();
-                    assert!(n > 0);
-                    received.extend_from_slice(&buf[..n]);
+            let d = data.clone();
+            let server = fcx.spawn(move |fcx| async move {
+                let mut conn = tls::server(&fcx, server_side)
+                    .await?
+                    .finish(&fcx, config)
+                    .await?;
+                // Odd-sized writes, so records do not line up with them.
+                for chunk in d.chunks(70_001) {
+                    conn.write_all(&fcx, chunk).await?;
                 }
-                assert!(received == *data);
-                client.write_all(&fcx, &data).await.unwrap();
-                client.close(&fcx).await.unwrap();
+                let mut received = 0usize;
+                let mut buf = vec![0; 50_000];
+                loop {
+                    let n = conn.read(&fcx, &mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    for (i, b) in buf[..n].iter().enumerate() {
+                        assert_eq!(*b, pattern(received + i));
+                    }
+                    received += n;
+                }
+                assert_eq!(received, SIZE);
+                conn.shutdown(&fcx).await?;
+                Ok(())
+            });
+
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test")
+                .await
+                .unwrap();
+            let mut received = Vec::with_capacity(SIZE);
+            let mut buf = vec![0; 40_000];
+            while received.len() < SIZE {
                 let n = client.read(&fcx, &mut buf).await.unwrap();
-                assert_eq!(n, 0);
-                Ok(server.join(&fcx).await?)
-            },
-        ))
+                assert!(n > 0);
+                received.extend_from_slice(&buf[..n]);
+            }
+            assert!(received == *data);
+            client.write_all(&fcx, &data).await.unwrap();
+            client.close(&fcx).await.unwrap();
+            let n = client.read(&fcx, &mut buf).await.unwrap();
+            assert_eq!(n, 0);
+            Ok(server.join(&fcx).await?)
+        }))
     })
     .unwrap();
 }
@@ -698,7 +691,7 @@ fn five_megabytes_each_way() {
 #[test]
 fn tls12_clients_work_too() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
             // The config draws random values through Fictionet, not ring.
@@ -756,7 +749,7 @@ fn tls12_clients_work_too() {
 #[test]
 fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&fcx, &ca, &[]);
@@ -791,7 +784,7 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     .unwrap();
 
     within(Duration::from_secs(20), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (server_side, _client_side) = mem_pair();
             fcx.region(|region_fcx| async move {
                 let stopper = region_fcx.clone();
@@ -817,7 +810,7 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
 
 #[test]
 fn sandbox_client_returns_invalid_server_name() {
-    block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
         let (_, conn) = mem_pair();
         let roots = Arc::new(RootCertStore::empty());
         let result = fictionet_test_support::sandbox::TlsClient::new(
@@ -837,111 +830,74 @@ fn sandbox_client_returns_invalid_server_name() {
 #[derive(Default)]
 struct KeyObserver(Mutex<Vec<ObservedKey>>);
 
-type ObservedKey = (fictionet::events::Stamp, String, Vec<u8>, Vec<u8>);
+type ObservedKey = (String, Vec<u8>, Vec<u8>);
 
 impl std::fmt::Debug for KeyObserver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("KeyObserver")
     }
 }
-impl fictionet::events::Observer for KeyObserver {
-    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        matches!(interest, fictionet::events::Interest::TlsKey(_))
-    }
-
-    fn observe(&self, stamp: fictionet::events::Stamp, item: fictionet::events::Observation<'_>) {
-        let fictionet::events::Observation::TlsKey(key) = item else {
-            panic!("unexpected stream")
-        };
-        self.0.lock().unwrap().push((
-            stamp,
-            key.label.to_owned(),
-            key.client_random.to_vec(),
-            key.secret().to_vec(),
-        ));
+impl rustls::KeyLog for KeyObserver {
+    fn log(&self, label: &str, random: &[u8], secret: &[u8]) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((label.to_owned(), random.to_vec(), secret.to_vec()));
     }
 }
 
 #[test]
-fn a_lab_tls_handshake_emits_borrowed_keys() {
+fn a_lab_tls_handshake_uses_the_worlds_key_log() {
     let observer = Arc::new(KeyObserver::default());
     let client_keys = Arc::new(KeyObserver::default());
-    let kept = Arc::new(Mutex::new(None));
-    let keep = kept.clone();
+    let server_log = observer.clone();
     let client_log = client_keys.clone();
-    #[derive(Debug)]
-    struct ClientLog(Arc<KeyObserver>);
-    impl rustls::KeyLog for ClientLog {
-        fn log(&self, label: &str, random: &[u8], secret: &[u8]) {
-            self.0.0.lock().unwrap().push((
-                fictionet::events::Stamp {
-                    stream: fictionet::events::Stream::Keys,
-                    seq: 0,
-                    at: fictionet::time::Instant::ZERO,
-                },
-                label.to_owned(),
-                random.to_vec(),
-                secret.to_vec(),
-            ));
-        }
-    }
-    block_on(lab(
-        RunOptions::new(Seed::from_u64(9)).observer(observer.clone()),
-        move |cx| async move {
-            let ca = Ca::new(&cx, "Test CA")?;
-            let config = server_config(&cx, &ca, "example.test", &[]);
-            let mut client_config = (*client_config(&cx, &ca, &[])).clone();
-            client_config.key_log = Arc::new(ClientLog(client_log));
-            let (server_side, client_side) = mem_pair();
-            *keep.lock().unwrap() = Some((cx.clone(), cx.tls_key_log(None).unwrap()));
-            let server = cx.spawn(move |cx| async move {
-                let mut conn = tls::server(&cx, server_side)
-                    .await?
-                    .finish(&cx, config)
-                    .await?;
-                conn.write_all(&cx, b"ok").await?;
-                conn.shutdown(&cx).await?;
-                Ok(())
-            });
-            let mut client =
-                Client::connect(&cx, client_side, Arc::new(client_config), "example.test").await?;
-            let mut bytes = Vec::new();
-            let mut buf = [0; 16];
-            loop {
-                let len = client.read(&cx, &mut buf).await?;
-                if len == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&buf[..len]);
-            }
-            assert_eq!(bytes, b"ok");
-            server.join(&cx).await?;
+    block_on(lab(Seed::from_u64(9), move |cx| async move {
+        let ca = Ca::new(&cx, "Test CA")?;
+        let mut config = (*server_config(&cx, &ca, "example.test", &[])).clone();
+        config.key_log = server_log;
+        let config = Arc::new(config);
+        let mut client_config = (*client_config(&cx, &ca, &[])).clone();
+        client_config.key_log = client_log;
+        let (server_side, client_side) = mem_pair();
+        let server = cx.spawn(move |cx| async move {
+            let mut conn = tls::server(&cx, server_side)
+                .await?
+                .finish(&cx, config)
+                .await?;
+            conn.write_all(&cx, b"ok").await?;
+            conn.shutdown(&cx).await?;
             Ok(())
-        },
-    ))
+        });
+        let mut client =
+            Client::connect(&cx, client_side, Arc::new(client_config), "example.test").await?;
+        let mut bytes = Vec::new();
+        let mut buf = [0; 16];
+        loop {
+            let len = client.read(&cx, &mut buf).await?;
+            if len == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..len]);
+        }
+        assert_eq!(bytes, b"ok");
+        server.join(&cx).await?;
+        Ok(())
+    }))
     .unwrap();
     let keys = observer.0.lock().unwrap();
     assert!(!keys.is_empty());
     let client = client_keys.0.lock().unwrap();
-    for (i, (stamp, label, random, secret)) in keys.iter().enumerate() {
-        assert_eq!(stamp.stream, fictionet::events::Stream::Keys);
-        assert_eq!(stamp.seq, i as u64 + 1);
+    for (label, random, secret) in keys.iter() {
         assert_eq!(random.len(), 32);
         assert!(
             client
                 .iter()
-                .any(|(_, l, r, s)| l == label && r == random && s == secret)
+                .any(|(l, r, s)| l == label && r == random && s == secret)
         );
     }
     assert!(
         keys.iter()
-            .any(|(_, label, _, _)| label == "SERVER_TRAFFIC_SECRET_0")
+            .any(|(label, _, _)| label == "SERVER_TRAFFIC_SECRET_0")
     );
-    let count = keys.len();
-    drop(keys);
-    let (cx, logger) = kept.lock().unwrap().take().unwrap();
-    assert!(!logger.will_log("CLIENT_RANDOM"));
-    logger.log("CLIENT_RANDOM", &[0; 32], &[1; 32]);
-    assert_eq!(observer.0.lock().unwrap().len(), count);
-    drop(cx);
 }

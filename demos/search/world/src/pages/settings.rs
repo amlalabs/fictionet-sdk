@@ -88,7 +88,7 @@ impl Pages {
     pub fn model(&self) -> String {
         match &self.maker {
             Some(Maker::Model(model)) => model.model.clone(),
-            _ => names::name(&self.generator_kind()),
+            _ => self.generator_kind().as_str().into(),
         }
     }
 
@@ -130,7 +130,6 @@ impl Pages {
         let invalid = |message: &str| Rejected::Invalid {
             message: message.into(),
         };
-        let mut planted = None;
         match command {
             Command::SetGeneration { generate, .. } => {
                 if generate == store.generation.generate {
@@ -181,7 +180,6 @@ impl Pages {
                     all.corrections.push(correction);
                 }
                 all.facts.insert(0, text.clone());
-                planted = Some(("fact", text, String::new()));
             }
             Command::PlantPage { url, text, .. } => {
                 let page = planted_page(&url, &text).map_err(|e| invalid(&e))?;
@@ -191,7 +189,6 @@ impl Pages {
                 let mut all = self.planted.lock().unwrap_or_else(|e| e.into_inner());
                 all.pages.retain(|p| p.url != page.url);
                 all.pages.insert(0, page.clone());
-                planted = Some(("page", page.title, page.url));
             }
             Command::Restart { .. } => {
                 if store.root().is_some() {
@@ -208,43 +205,12 @@ impl Pages {
                 self.copied_active
                     .store(self.copied.is_some(), std::sync::atomic::Ordering::SeqCst);
                 *self.planted.lock().unwrap_or_else(|e| e.into_inner()) = Planted::default();
-                fcx.emit("web", "restarted", |event| {
-                    event
-                        .summary(format_args!("run restarted at revision {}", current + 1))
-                        .field("revision", current + 1)
-                });
             }
         }
         store.generation.revision = current + 1;
         let generation = store.generation;
-        let copied = self.copied_active.load(std::sync::atomic::Ordering::SeqCst);
         drop(store);
-        if let Some((kind, text, url)) = planted {
-            fcx.emit("web", "planted", |event| {
-                event
-                    .summary(format_args!("planted a {kind}: {text}"))
-                    .field("plant", kind)
-                    .field("text", text.as_str())
-                    .field("url", url.as_str())
-                    .field("revision", generation.revision)
-            });
-        }
-        fcx.emit("web", "generation", |event| {
-            event
-                .summary(format_args!(
-                    "generation {} at revision {}",
-                    if generation.generate {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    generation.revision
-                ))
-                .field("generate", generation.generate)
-                .field("copied", copied)
-                .field("live_search", self.live_only())
-                .field("revision", generation.revision)
-        });
+
         Ok(Applied {
             revision: generation.revision,
             at_ms: fcx.now().since_start().as_millis() as u64,

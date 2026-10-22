@@ -1,34 +1,20 @@
+use fictionet::stdlib::web::Body;
 use fictionet::stdlib::web::httpd::{Exchange, Handler, Reply};
-use fictionet::{events::Fanout, stdlib::web::Body};
-use fictionet_extras::log::Log;
 use fictionet_extras::models::{Model, Provider};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use web_world::{
-    events::LogObserver,
+    observation::SearchObs,
     pages::{Pages, Seed},
-    search::Searches,
 };
 
-#[derive(Clone)]
-struct Output(Arc<Mutex<Vec<u8>>>);
-impl Write for Output {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[test]
-fn anthropic_tools_search_the_index_fetch_the_corpus_and_log_once() {
+fn anthropic_tools_search_the_index_and_report_the_corpus_fetch_once() {
     for bearer in [false, true] {
         intercepted_search(bearer);
     }
@@ -114,18 +100,11 @@ fn intercepted_search(bearer: bool) {
         )
         .unwrap(),
     );
-    let searches = Arc::new(Searches::of(&pages));
-    let output = Output(Arc::default());
-    let log = Arc::new(Log::new(Box::new(output.clone()), &[], |s| s));
-    let observer = Arc::new(Fanout::new(vec![
-        searches.clone(),
-        Arc::new(LogObserver { log: log.clone() }),
-    ]));
-    let run_log = log.clone();
+    let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
+    pages.observe(sender);
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(17)).observer(observer),
+        fictionet::Seed::from_u64(17),
         |cx| async move {
-            run_log.attach(&cx);
             let (header, key) = if bearer {
                 ("authorization", "Bearer local-only")
             } else {
@@ -171,24 +150,18 @@ fn intercepted_search(bearer: bool) {
     ))
     .unwrap();
     server.join().unwrap();
-    log.finish().unwrap();
-    let snapshot = searches.snapshot();
-    assert_eq!(snapshot.queries.len(), 1);
-    assert_eq!(
-        snapshot.queries[0].via.as_deref(),
-        Some("claude_web_search")
+    let mut requests = Vec::new();
+    while let Ok(observation) = observations.try_recv() {
+        requests.push(observation);
+    }
+    assert_eq!(requests.len(), 1);
+    assert!(
+        matches!(&requests[0].fact, SearchObs::Request { host, status, .. }
+        if host.to_ascii() == "sky.org" && *status == http::StatusCode::OK)
     );
-    assert_eq!(snapshot.queries[0].results, Some(1));
-    let bytes = output.0.lock().unwrap();
-    let rows: Vec<Value> = std::str::from_utf8(&bytes)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let entries: Vec<_> = rows.iter().filter(|r| r["type"] == "search").collect();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["source"], "claude_web_search");
-    assert_eq!(entries[0]["query"], "black hole");
-    assert_eq!(entries[0]["results"].as_array().unwrap().len(), 1);
-    assert!(!rows.iter().any(|r| r["type"] == "dns"));
+    assert!(
+        !serde_json::to_string(&requests)
+            .unwrap()
+            .contains("local-only")
+    );
 }

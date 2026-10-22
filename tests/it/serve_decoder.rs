@@ -1,10 +1,10 @@
 //! Services change protocol framing between items through the driver.
+use fictionet::Seed;
 use fictionet::stdlib::services::serve::{Flow, Harness, ServeOptions};
 use fictionet::stdlib::{
     codec::Wire,
     protocols::{imap, postgres, smtp},
 };
-use fictionet::{RunOptions, Seed};
 
 #[derive(Default)]
 struct Mail {
@@ -185,37 +185,34 @@ fn datagram_decoder_access_uses_the_current_datagram() {
             self.output.lock().unwrap().push(data.to_vec());
         }
     }
-    fictionet::block_on(fictionet::lab(
-        RunOptions::new(Seed::from_u64(1)),
-        |cx| async move {
-            let output = Arc::new(Mutex::new(vec![]));
-            let socket = Socket {
-                input: VecDeque::from([
-                    b"DATA\r\none\r\n.\r\n".to_vec(),
-                    b"DATA\r\ntwo\r\n.\r\n".to_vec(),
-                ]),
-                output: output.clone(),
-            };
-            let mut service = Mail::default();
-            fictionet::stdlib::services::serve::datagram(
-                &cx,
-                socket,
-                "192.0.2.1:25".parse().unwrap(),
-                &mut service,
-                &(),
-                &ServeOptions::default(),
-            )
-            .await?;
-            assert_eq!(service.messages, [b"one\r\n".to_vec(), b"two\r\n".to_vec()]);
-            assert_eq!(
-                *output.lock().unwrap(),
-                [
-                    b"354 Send data\r\n250 Queued\r\n".to_vec(),
-                    b"354 Send data\r\n250 Queued\r\n".to_vec()
-                ]
-            );
-            Ok(())
-        },
-    ))
+    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |cx| async move {
+        let output = Arc::new(Mutex::new(vec![]));
+        let socket = Socket {
+            input: VecDeque::from([
+                b"DATA\r\none\r\n.\r\n".to_vec(),
+                b"DATA\r\ntwo\r\n.\r\n".to_vec(),
+            ]),
+            output: output.clone(),
+        };
+        let mut service = Mail::default();
+        fictionet::stdlib::services::serve::datagram(
+            &cx,
+            socket,
+            "192.0.2.1:25".parse().unwrap(),
+            &mut service,
+            &(),
+            &ServeOptions::default(),
+        )
+        .await?;
+        assert_eq!(service.messages, [b"one\r\n".to_vec(), b"two\r\n".to_vec()]);
+        assert_eq!(
+            *output.lock().unwrap(),
+            [
+                b"354 Send data\r\n250 Queued\r\n".to_vec(),
+                b"354 Send data\r\n250 Queued\r\n".to_vec()
+            ]
+        );
+        Ok(())
+    }))
     .unwrap();
 }

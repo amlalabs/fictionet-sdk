@@ -3,13 +3,12 @@
 This guide builds a small world step by step: a service, a test for it,
 a network of hosts that serve it, and a log a grader reads. Every piece is
 a public module of `fictionet::stdlib`, so each file can be copied into a world's crate and
-changed there. Each piece emits structured facts through `fictionet::events`
-to the run's installed observer. Consumers own retention and presentation.
+changed there. Every world defines its own typed observations and decides
+where to send them.
 
 | Module | What it gives |
 |---|---|
 | `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests |
-| `fictionet::events` | Core's four observation streams and observer contract. Consumers own retention; no observer means no observation work. |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Handler`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
@@ -130,7 +129,6 @@ service appends its reply and records what it saw:
 
 ```rust
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::events::{Event, Level};
 use fictionet::stdlib::services::serve::{Flow, Driver, Service};
 
 /// A login prompt that takes one password and closes.
@@ -154,11 +152,6 @@ impl Service for Prompt {
     fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_, Self::Decoder, Self::Timer>) -> Result<Flow, Self::Error> {
         let line = line.unwrap_or_default();
         let right = line == password.as_bytes();
-        driver.emit("prompt", "login", |event| event
-                .summary(if right { "login" } else { "wrong password" })
-                .level(if right { Level::Alarm } else { Level::Info })
-                .field("right", right),
-        );
         driver.reply().extend_from_slice(if right { b"welcome\n" } else { b"no\n" });
         Ok(Flow::Close)
     }
@@ -212,19 +205,15 @@ handshake or the final shutdown, unless it has a failure to return. If the
 service was already ending, `on_end` has heard the original cause and is not
 called again. `datagram` returns `Err(Cancelled)`.
 
-The final shutdown waits at most five seconds. Its failure adds a `shutdown`
-field to `conn.close`, such as `cancelled`, `timed_out`, `reset` or `closed`.
-The `end` field keeps the primary cause. A shutdown cancellation returns
+The final shutdown waits at most five seconds. A shutdown cancellation returns
 `ServeError::Cancelled`; other shutdown failures keep `Served::Closed(end)`.
 An earlier service or deferred-work failure stays primary.
 
 A task spawned in the connection's child region can fail and cancel that
-region. Its original error is recorded once as `conn.error`, with kind `task`
-and the error chain. This event follows `conn.close`, because the region ends
-after the connection driver. It returns as `ServeError::Pending` unless the
+region. Its original error returns as `ServeError::Pending` unless the
 driver already has a failure to return. Cancellation itself is not a task
 failure. `listen` and `Net` serve each connection in a task of its own; a
-connection's failure is recorded and does not end the world.
+connection's failure does not end the world.
 
 A write that takes no bytes for `ServeOptions::write_timeout` (10
 seconds) ends the connection: a client that stops reading cannot hold a
@@ -428,11 +417,8 @@ Exhaustive matches on `tftp::Error` must handle the new
 `driver.now()` is the run's clock: time since the run started, with no
 date. A service that needs a date, such as for ticket lifetimes,
 certificate validity or a FIX `SendingTime`, takes it from its `State`,
-which decides what day it is in the world. Record the world's date in the
-run's first event (`RunOptions::fields` with a `world_date` field), so
-a reader can place every event. The `run.start` event's `wall` field
-holds the host's wall clock at the start of a real run, including in browsers.
-A lab records `null` for `wall`; its clock has no wall date.
+which decides what day it is in the world. Include that date in the world's
+own typed state when readers need to place its observations on a calendar.
 
 HTTP follows the same rule. `httpd` sends a `Date` header only when the
 world gave its date at the start of the run (`Sites::date`, `Server::date`,
@@ -538,8 +524,6 @@ Other kinds of port:
 
 - `tcp_with(port, world, make, opts)`: the same, with `ServeOptions` for
   a connection cap, an idle limit or a STARTTLS config.
-  Setting `opts.connection_events` to false turns the `conn.open` and
-  `conn.close` events off.
 - `udp(port, world, make)`: one service for the port, which gets every
   datagram, each decoded on its own as DNS and Modbus over UDP frame their
   messages. It can send several datagrams to anyone (`driver.send_to`) and
@@ -566,7 +550,7 @@ TLS ownership and reproducibility are split across these files:
 - [`tls.rs`](../src/stdlib/services/tls.rs) owns transport, handshakes, ALPN selection
   and installs the run's key recorder. [`ca.rs`](../src/stdlib/services/ca.rs) issues certificates
   using the run's randomness and world-supplied leaf validity.
-- [`tls_keys.rs`](../src/tls_keys.rs) emits TLS keys to interested run observers.
+- Supply a world-owned `rustls::KeyLog` to a TLS config when keys are needed.
   The adapter holds a weak dispatch reference. Capture, key retention, export
   and decryption belong to `fictionet::stdlib::dissect`.
 - [`tls/output.rs`](../src/stdlib/services/tls/output.rs) drains ciphertext for both
@@ -586,7 +570,7 @@ replies, and what the service and its deferred work report holding.
 Memory outside those counts, such as hyper's own buffers, is not charged.
 `Net::limits` changes these limits and the TLS handshake and DNS timers.
 Its handshake timer also applies to STARTTLS. Tests set small ones.
-`fictionet::run(fictionet::RunOptions::new(seed), world)` gives TCP, UDP, services, HTTP exchanges one ChaCha20 byte stream through `Cx`. The same seed and
+`fictionet::run(seed, world)` gives TCP, UDP, services, HTTP exchanges one ChaCha20 byte stream through `Cx`. The same seed and
 ordered draws produce the same numbers. HTTP/2 handlers also draw from
 this run stream, so their execution order matters.
 
@@ -646,8 +630,8 @@ with an `httpd::UpgradeHandler` extension, which receives the connection
 and its unread bytes after the response is written.
 
 An axum `Router`, or any tower service over `http::Request<web::Body>`,
-runs with `httpd::tower(service)`. A handler adds facts to its request's
-event by putting `events::Fields` in its response's extensions.
+runs with `httpd::tower(service)`. A handler reports typed facts directly
+through state supplied by its world.
 
 HTTP/1.1 responses with unknown-length bodies use chunked encoding. Pending
 polls and empty data frames do not end the response. The zero-size chunk is
@@ -702,8 +686,7 @@ the requested name in both cases.
 
 With `web-proxy`, `web::Proxy` forwards only exact matches. A fallback
 request gets `421 Misdirected Request` before any upstream I/O, even if
-the proxy's site has `default_host()`. Its request event carries
-`answer: misdirected`. For catch-all forwarding, use
+the proxy's site has `default_host()`. For catch-all forwarding, use
 `web::forward(&fcx, upstream, client)?`: the injected `Upstream` transport connects to that fixed origin and
 preserves the requested `Host`. Both `web::proxy` and `web::forward` work in real and lab runs. The feature
 works without tokio. Host helper
@@ -716,15 +699,12 @@ serves HTTP/2 on the stdlib's `http2` frames and HPACK, behind the same
 `Handler` trait. Neither needs tokio. Both versions share one set of
 `httpd::Limits`: body size, body and write timers, and 100 streams at once
 on an HTTP/2 connection.
-Both charge retained request heads, request events and bodies to the sandbox's
-budget. A pending handler keeps its request charge. The copied event metadata
-stays charged until the event is recorded, including while the response streams.
-Heads count method, URI and header bytes and header slots. Events use
-`Event::size()`. Hidden capacities in `http` types, request extensions,
-third-party allocation overhead and transport buffers are outside these counts.
-Hyper rejects a request whose metadata does not fit before calling its handler.
-It records `answer: budget` without a status and ends that stream. Both versions
-draw a handler's randomness from the run's stream.
+Both charge retained request heads and bodies to the sandbox's budget. A pending
+handler keeps its request charge. Heads count method, URI and header bytes and
+header slots. Hidden capacities in `http` types, request extensions, third-party
+allocation overhead and transport buffers are outside these counts. A request
+whose metadata does not fit is rejected before calling its handler. Both
+versions draw a handler's randomness from the run's stream.
 
 An HTTP/1.1 request without `Host` gets `400` with `answer: no_host`
 without calling the handler, and the connection closes (RFC 9112 section
@@ -748,39 +728,8 @@ the client. HTTP/1 head deadlines include the wait between requests.
 HTTP/2 has no request-head deadline. Body deadlines
 and write stall deadlines use the Fictionet clock on every backend.
 
-An empty half-close before the first request makes no HTTP error event.
-EOF partway through an HTTP/2 preface is a truncated HTTP/1 head: it records
-one `http.error` with cause `protocol` and answers `400 Bad Request`.
-
-An opt-in `httpd::BodyClassifier` sees the parsed request head before virtual hosting
-and admission, each decoded body chunk before it can be discarded, and the
-receipt outcome. Set it with `HttpOptions.observe`, `Http1::observe`,
-`Server::observe` or `web::Site::observe`. Shared endpoints use the first
-server's observer. Each request has separate observer state, including on
-concurrent HTTP/2 streams. Keep that state and returned fields bounded, and
-return redacted facts. Both are outside the service budget, like handler
-extensions.
-The hook does not change URI or header values in the ordinary event fields.
-Classifier fields are merged first, then handler fields, then service facts.
-
-Every request event has `received`: `complete`, `cut_off`, `too_large`,
-`timeout` or `budget`. This describes request receipt; `complete` still
-describes sending the response. Native HTTP/1 body timeouts produce a
-request event with `answer: timeout`, no status and `complete: false`, as well
-as the timeout error. Native oversized bodies carry `answer: too_large`.
-Only decoded body data is observed, not chunk framing, chunk extensions or
-trailers. Native HTTP/1 observes buffered partial body bytes on decode failure
-and timeout only, not on connection reset, budget end or cancellation.
-An HTTP/1.1 request without Host is answered from bytes buffered with its head;
-later body bytes are not observed, leaving `received: cut_off` unless already
-too large.
-Hyper stops reading at rejection. If its body read reports region cancellation,
-`received` is `cut_off`, but its response still uses `answer: timeout` and status
-`408`. Use `received` to distinguish cancellation from a body deadline.
-Neither backend raises a limit or logs body bytes for observation. Parse
-failures before a tracked head and bytes after protocol upgrade are outside
-this hook. Consumers must use complete receipt or an observer verdict before
-judging safety; no handler label does not mean no exposure.
+An empty half-close before the first request closes cleanly. EOF partway through
+an HTTP/2 preface is a truncated HTTP/1 head and answers `400 Bad Request`.
 
 In `http2::Session`, HPACK reductions wait for the corresponding SETTINGS
 ACK. A decrease followed by an unacknowledged rebound leaves the earlier
@@ -788,17 +737,13 @@ allowance in place. ACKs apply in announcement order. Later pending
 increases stay allowed, but do not cancel required minimum-size updates
 at the next header block.
 
-See [`httpd`'s event contract](../src/stdlib/web/httpd.rs) for `sent` and
-`complete`, including when HTTP/1 and HTTP/2 count bytes.
+## 5. Observation
 
-## 5. Events
-
-Services emit structured facts about sandbox attachments, address bindings,
-DNS queries, TLS handshakes, HTTP requests, packet drops and route changes.
-World code emits through `fcx.emit("source", "kind", |event| ...)`. The
-closure runs only when an installed observer wants that event. With no
-observer, emission does no allocation, formatting, clock read, task lookup
-or numbering.
+A service reports facts through its own typed state, and an HTTP handler can
+report directly when it answers a request. Nothing is emitted by default.
+The optional `network::tap` copies packets to a caller-owned bounded channel.
+`Net::on_unreachable` supplies typed source and destination addresses when a
+packet has no route.
 
 Worlds own storage and views. Packet inspection is an independent function in
 [`stdlib::dissect`](../src/stdlib/dissect/mod.rs); packets and TLS keys are

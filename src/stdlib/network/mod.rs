@@ -14,4 +14,4 @@ pub mod tcp;
 pub mod udp;
 
 pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, DatagramSocket};
-pub use link::{Direction, bottleneck, delay, filter};
+pub use link::{Direction, bottleneck, delay, filter, tap};

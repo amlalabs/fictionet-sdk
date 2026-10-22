@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use http::{HeaderValue, Request, Response, StatusCode};
 
-use fictionet::events::ConnInfo;
+use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::network::Connection;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;

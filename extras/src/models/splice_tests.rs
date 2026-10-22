@@ -191,7 +191,7 @@ fn search_splices_and_replays_exact_history_with_thinking() {
             });
             let pages = Arc::new(Pages(AtomicUsize::new(0)));
             let engine = pages.clone();
-            fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)), |cx| async move {
+            fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(8), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "sk-ant-api03-private".into())?);
             let key = credential.placeholder().to_owned();
             let model = if guest { Model::guest_at(&cx, Provider::Anthropic, format!("http://{address}").parse()?)? } else { Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)? }.search(engine);
@@ -275,7 +275,7 @@ fn token_counting_with_web_tools_and_history_returns_the_count() {
         count(&mut socket);
     });
     let pages = Arc::new(Pages(AtomicUsize::new(0)));
-    fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(10)), |cx| async move {
+    fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(10), |cx| async move {
         let credential = Credential::api_key(&cx, Secret::new("key", "sk-ant-api03-private".into())?);
         let key = credential.placeholder().to_owned();
         let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?
@@ -370,7 +370,7 @@ fn continuation_refusal(stream: bool, source: Refusal) {
         None
     };
     let directory_path = directory.clone();
-    fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(13)), |cx| async move {
+    fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(13), |cx| async move {
         let mut credential = Credential::api_key(&cx, Secret::new("key", "private-key".into())?);
         let expected = if let Some(directory) = directory_path {
             let store = oauth::Store::open(directory.join("credentials.redb"))?;
@@ -497,7 +497,7 @@ fn anthropic_openrouter_runs_world_tools_before_continuing() {
         });
         let pages = Arc::new(Pages(AtomicUsize::new(0)));
         let engine = pages.clone();
-        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(8)), |cx| async move {
+        fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(8), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "sk-ant-api03-private".into())?);
             let key = credential.placeholder().to_owned();
             let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.anthropic_openrouter().search(engine);

@@ -1,27 +1,35 @@
 //! Facts the Search world explicitly reports to its own page.
 
 use crate::pages::{Meta, NewPages, Pages, Response};
+pub use fictionet::stdlib::protocols::dns::rr::Name as HostName;
+use http::{HeaderMap, Method, StatusCode, uri::PathAndQuery};
 use serde::Serialize;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SearchObs {
     Resolved {
-        name: String,
+        #[serde(serialize_with = "display")]
+        name: HostName,
         address: Option<IpAddr>,
     },
     Request {
-        host: String,
-        method: String,
-        path: String,
-        status: u16,
+        #[serde(serialize_with = "display")]
+        host: HostName,
+        #[serde(serialize_with = "display")]
+        method: Method,
+        #[serde(serialize_with = "display")]
+        path: PathAndQuery,
+        #[serde(serialize_with = "crate::observation::status")]
+        status: StatusCode,
         bytes: usize,
         content_type: String,
         source: PageSource,
         elapsed_ms: u64,
-        headers: Vec<(String, String)>,
+        #[serde(serialize_with = "crate::observation::headers")]
+        headers: HeaderMap,
         #[serde(skip)]
         preview: Option<std::sync::Arc<str>>,
     },
@@ -32,10 +40,14 @@ pub enum SearchObs {
     },
     ModelCall {
         call: u64,
-        host: String,
-        path: String,
-        status: Option<u16>,
-        method: String,
+        #[serde(serialize_with = "display")]
+        host: HostName,
+        #[serde(serialize_with = "display")]
+        path: PathAndQuery,
+        #[serde(serialize_with = "optional_status")]
+        status: Option<StatusCode>,
+        #[serde(serialize_with = "display")]
+        method: Method,
         phase: CallPhase,
     },
     Tool {
@@ -46,7 +58,8 @@ pub enum SearchObs {
         error: Option<String>,
     },
     NoRoute {
-        to: SocketAddr,
+        from: IpAddr,
+        to: IpAddr,
     },
 }
 
@@ -63,7 +76,10 @@ pub enum CallPhase {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PageSource {
-    Copy { captured: Option<String> },
+    Copy {
+        #[serde(with = "time::serde::rfc3339::option")]
+        captured: Option<time::OffsetDateTime>,
+    },
     Written,
     Live,
 }
@@ -74,7 +90,6 @@ pub enum Engine {
     Bing,
     DuckDuckGo,
     YouTube,
-    WebSearch,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,11 +109,11 @@ pub struct Observation {
 }
 
 pub(crate) struct RequestContext<'a> {
-    pub host: &'a str,
-    pub method: &'a str,
-    pub path: &'a str,
+    pub host: &'a HostName,
+    pub method: &'a Method,
+    pub path: &'a PathAndQuery,
     pub source: PageSource,
-    pub headers: Vec<(String, String)>,
+    pub headers: HeaderMap,
 }
 
 impl Pages {
@@ -160,7 +175,18 @@ impl Pages {
             );
         }
         if let PageSource::Copy { captured } = &mut source {
-            *captured = self.capture_date(&format!("https://{host}{path}"));
+            *captured = self
+                .capture_date(&format!(
+                    "https://{}{path}",
+                    host.to_ascii().trim_end_matches('.')
+                ))
+                .and_then(|date| {
+                    time::OffsetDateTime::parse(
+                        &date,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .ok()
+                });
         }
         // Copied bytes retain their capture provenance; they are not called written pages.
         let preview = if response.content_type.starts_with("text/") {
@@ -184,10 +210,10 @@ impl Pages {
         self.report(
             cx,
             SearchObs::Request {
-                host: host.into(),
-                method: method.into(),
-                path: path.into(),
-                status: response.status,
+                host: host.clone(),
+                method: method.clone(),
+                path: path.clone(),
+                status: StatusCode::from_u16(response.status).expect("valid response status"),
                 bytes: response.body.len(),
                 content_type: response.content_type.clone(),
                 source,
@@ -199,86 +225,30 @@ impl Pages {
     }
 }
 
-/// A Search-owned link reader for DNS answers and router refusals only.
-/// It uses the same decoders as the network and keeps no packet history.
-pub struct Link<I> {
-    pub inner: I,
-    pub cx: fictionet::Cx,
-    pub pages: std::sync::Arc<Pages>,
+/// Serializes a protocol value as its wire spelling for the page.
+pub fn display<T: std::fmt::Display, S: serde::Serializer>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(value)
 }
-impl<I: fictionet::Interface> fictionet::Interface for Link<I> {
-    fn poll_recv(
-        &mut self,
-        cx: &fictionet::Cx,
-        task: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<fictionet::Packet, fictionet::RecvError>> {
-        self.inner.poll_recv(cx, task)
-    }
-    fn send(&mut self, packet: fictionet::Packet) {
-        inspect(&self.cx, &self.pages, &packet.0);
-        self.inner.send(packet);
-    }
+/// Serializes an HTTP status as its numeric code.
+pub fn status<S: serde::Serializer>(value: &StatusCode, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u16(value.as_u16())
 }
-fn inspect(cx: &fictionet::Cx, pages: &Pages, packet: &[u8]) {
-    use fictionet::stdlib::{
-        network::{ip, udp},
-        protocols::dns,
-    };
-    let Some(ip) = ip::Header::parse(packet) else {
-        return;
-    };
-    if ip
-        .fragment
-        .as_ref()
-        .is_some_and(|fragment| !fragment.is_atomic())
-    {
-        return;
+/// Serializes a response status that may not have arrived yet.
+pub fn optional_status<S: serde::Serializer>(
+    value: &Option<StatusCode>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    value.map(|status| status.as_u16()).serialize(serializer)
+}
+/// Serializes header names and losslessly preserves nontext header values.
+pub fn headers<S: serde::Serializer>(value: &HeaderMap, serializer: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut sequence = serializer.serialize_seq(Some(value.len()))?;
+    for (name, value) in value {
+        sequence.serialize_element(&(name.as_str(), value.as_bytes()))?;
     }
-    let payload = ip.payload(packet);
-    if ip.protocol == ip::protocol::UDP {
-        let Some(datagram) = udp::Datagram::parse(payload) else {
-            return;
-        };
-        if datagram.source_port() != 53 {
-            return;
-        }
-        let Ok(message) = dns::op::Message::from_vec(datagram.payload()) else {
-            return;
-        };
-        for question in &message.queries {
-            let name = question
-                .name()
-                .to_string()
-                .trim_end_matches('.')
-                .to_string();
-            let address = message.answers.iter().find_map(|record| match record.data {
-                dns::rr::RData::A(address) => Some(IpAddr::V4(address.0)),
-                dns::rr::RData::AAAA(address) => Some(IpAddr::V6(address.0)),
-                _ => None,
-            });
-            pages.report(cx, SearchObs::Resolved { name, address });
-        }
-    } else if ip.protocol == ip::protocol::ICMP && payload.starts_with(&[3, 1]) {
-        let Some(quoted) = payload.get(8..) else {
-            return;
-        };
-        let Some(header) = ip::Header::parse_truncated(quoted) else {
-            return;
-        };
-        let port = if [ip::protocol::TCP, ip::protocol::UDP].contains(&header.protocol) {
-            header
-                .payload(quoted)
-                .get(2..4)
-                .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        pages.report(
-            cx,
-            SearchObs::NoRoute {
-                to: SocketAddr::new(header.dst, port),
-            },
-        );
-    }
+    sequence.end()
 }

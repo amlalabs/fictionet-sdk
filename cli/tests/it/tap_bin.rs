@@ -189,7 +189,7 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let out = seen.clone();
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random()),
+        fictionet::Seed::random(),
         move |fcx| async move {
             let mut vm1 = attachments.get(&fcx, "vm1").await?;
             loop {
@@ -358,7 +358,7 @@ fn a_fake_qemu_gets_dhcpv6_after_malformed_requests() {
         assert_eq!(reply.ia_na().next(), Some(ia));
     });
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(6)),
+        fictionet::Seed::from_u64(6),
         move |fcx| async move {
             let mut vm = fcx
                 .race(

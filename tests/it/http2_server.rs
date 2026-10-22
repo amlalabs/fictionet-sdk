@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
-use fictionet::events::Fields;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::http2::{self, Frame};
 use fictionet::stdlib::services::serve::Harness;
@@ -15,7 +14,7 @@ use fictionet::stdlib::{
     services::tls,
     world::net,
 };
-use fictionet::{Cx, RunOptions, Seed};
+use fictionet::{Cx, Seed};
 use fictionet_test_support::sandbox::TlsClient;
 
 const SITE: Ipv4Addr = Ipv4Addr::new(104, 18, 0, 1);
@@ -242,16 +241,13 @@ fn settings_acknowledgment_and_idle_stream_errors() {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Trace {
-    events: Vec<u8>,
     packets: Vec<(bool, Vec<u8>)>,
 }
 
 fn replay() -> Trace {
     let trace: Arc<Mutex<Trace>> = Arc::default();
     let packets = trace.clone();
-    let log = Arc::new(fictionet_test_support::EventLog::default());
-    let recorded = log.clone();
-    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(71)).observer(recorded.clone()), move |cx| async move {
+    fictionet::block_on(fictionet::lab(Seed::from_u64(71), move |cx| async move {
         let cert = rustls::pki_types::CertificateDer::from(include_bytes!("fixtures/tls/ed25519.cert.der").to_vec());
         let key = rustls::pki_types::PrivateKeyDer::try_from(include_bytes!("fixtures/tls/ed25519.key.der").to_vec()).unwrap();
         let mut roots = rustls::RootCertStore::empty();
@@ -295,16 +291,10 @@ fn replay() -> Trace {
                 break;
             }
         }
-        let events = recorded.of("http", "request");
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|e| e.str("version") == Some("HTTP/2.0")));
-        cx.emit("test", "complete", |event| event.fields(Fields::new().with("requests", events.len() as u64)));
         cx.cancel();
         Ok(())
     })).unwrap();
-    let mut trace = std::mem::take(&mut *trace.lock().unwrap());
-    trace.events = crate::common::log_bytes(&log);
-    trace
+    std::mem::take(&mut *trace.lock().unwrap())
 }
 
 #[test]
@@ -312,7 +302,6 @@ fn reset_late_frames_replay_on_lab_time_over_tls() {
     let first = replay();
     let second = replay();
     assert!(!first.packets.is_empty());
-    assert!(!first.events.is_empty());
     assert_eq!(first, second);
 }
 
@@ -344,14 +333,89 @@ mod clients {
         }
     }
 
-    struct Site(Arc<dyn httpd::Handler>);
+    struct Site {
+        handler: Arc<dyn httpd::Handler>,
+        facts: Arc<Mutex<Vec<RequestFact>>>,
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+    struct RequestFact {
+        path: http::uri::PathAndQuery,
+        version: http::Version,
+        connection: Option<u64>,
+        started: fictionet::time::Instant,
+        ended: fictionet::time::Instant,
+        sent: usize,
+        complete: bool,
+    }
+    struct RecordedBody {
+        inner: httpd::Body,
+        cx: Cx,
+        fact: Option<RequestFact>,
+        facts: Arc<Mutex<Vec<RequestFact>>>,
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+    impl RecordedBody {
+        fn finish(&mut self, complete: bool) {
+            if let Some(mut fact) = self.fact.take() {
+                fact.ended = self.cx.now();
+                fact.complete = complete;
+                if fact.path.path() == "/cancel" {
+                    self.cancelled.notify_one();
+                }
+                self.facts.lock().unwrap().push(fact);
+            }
+        }
+    }
+    impl http_body::Body for RecordedBody {
+        type Data = Bytes;
+        type Error = fictionet::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            task: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            let result = Pin::new(&mut self.inner).poll_frame(task);
+            match &result {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(bytes) = frame.data_ref()
+                        && let Some(fact) = &mut self.fact
+                    {
+                        fact.sent += bytes.len();
+                    }
+                }
+                Poll::Ready(Some(Err(_))) => self.finish(false),
+                Poll::Ready(None) => self.finish(true),
+                _ => {}
+            }
+            result
+        }
+        fn size_hint(&self) -> http_body::SizeHint {
+            self.inner.size_hint()
+        }
+        fn is_end_stream(&self) -> bool {
+            self.inner.is_end_stream()
+        }
+    }
+    impl Drop for RecordedBody {
+        fn drop(&mut self) {
+            self.finish(http_body::Body::is_end_stream(&self.inner));
+        }
+    }
     impl httpd::Handler for Site {
         fn call(
             &self,
             request: http::Request<httpd::Body>,
             ex: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
-            if request.uri().path() == "/cancel" {
+            let fact = RequestFact {
+                path: request.uri().path_and_query().cloned().unwrap(),
+                version: request.version(),
+                connection: ex.conn().id,
+                started: ex.now(),
+                ended: ex.now(),
+                sent: 0,
+                complete: false,
+            };
+            let reply = if request.uri().path() == "/cancel" {
                 httpd::Reply::Now(
                     http::Response::builder()
                         .header("content-type", "application/octet-stream")
@@ -360,8 +424,27 @@ mod clients {
                         .unwrap(),
                 )
             } else {
-                self.0.call(request, ex)
-            }
+                self.handler.call(request, ex)
+            };
+            let facts = self.facts.clone();
+            let cancelled = self.cancelled.clone();
+            httpd::Reply::Later(Box::new(move |cx| {
+                Box::pin(async move {
+                    let response = match reply {
+                        httpd::Reply::Now(response) => response,
+                        httpd::Reply::Later(work) => work(cx.clone()).await?,
+                    };
+                    Ok(response.map(|inner| {
+                        httpd::Body::new(RecordedBody {
+                            inner,
+                            cx,
+                            fact: Some(fact),
+                            facts,
+                            cancelled,
+                        })
+                    }))
+                })
+            }))
         }
     }
 
@@ -370,7 +453,7 @@ mod clients {
         dir: PathBuf,
         stop: Option<fictionet::End>,
         thread: Option<std::thread::JoinHandle<()>>,
-        events: Arc<fictionet_test_support::EventLog>,
+        facts: Arc<Mutex<Vec<RequestFact>>>,
     }
 
     impl World {
@@ -381,8 +464,10 @@ mod clients {
             let dir = fictionet_test_support::temp::dir();
             let ca_path = dir.join("ca.pem");
             let (stop, mut stopped) = fictionet::pair();
-            let events: Arc<fictionet_test_support::EventLog> = Arc::default();
-            let observed = events.clone();
+            let facts: Arc<Mutex<Vec<RequestFact>>> = Arc::default();
+            let observed = facts.clone();
+            let cancelled = Arc::new(tokio::sync::Notify::new());
+            let gate = cancelled.clone();
             let (ready, started) = std::sync::mpsc::channel();
             let thread = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -390,7 +475,7 @@ mod clients {
                     .enable_all()
                     .build()
                     .unwrap();
-                runtime.block_on(fictionet::run(RunOptions::new(Seed::from_u64(20)).observer(observed.clone()), move |cx| async move {
+                runtime.block_on(fictionet::run(Seed::from_u64(20), move |cx| async move {
                     let (ca, leaf) = fictionet_test_support::certs::issue(&cx, "HTTP test CA", &["localhost"])?;
                     std::fs::write(ca_path, ca.cert_pem())?;
                     let config = Arc::new(tls::config_builder(&cx, std::time::SystemTime::now()).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(leaf.chain, leaf.key)?);
@@ -419,10 +504,13 @@ let route_2 = std::sync::Arc::new(move |_: fictionet::Cx, _: http::Request<bytes
                                 large()
                             }
                         });
-let route_3 = std::sync::Arc::new(move |cx: fictionet::Cx, _: http::Request<bytes::Bytes>| { let log = observed.clone(); async move {
-                            log.wait(&cx, 0, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();
-                            http::Response::builder().header("content-type", "application/javascript").body(Bytes::new()).unwrap()
-                        }});
+let route_3 = std::sync::Arc::new(move |_: fictionet::Cx, _: http::Request<bytes::Bytes>| {
+                            let gate = gate.clone();
+                            async move {
+                                gate.notified().await;
+                                http::Response::builder().header("content-type", "application/javascript").body(Bytes::new()).unwrap()
+                            }
+                        });
 fictionet_test_support::reply_handler(move |ex, request| {
 use fictionet::stdlib::web::httpd::{Body, Reply};
 let (parts, body) = request.into_parts();
@@ -437,7 +525,7 @@ Reply::Now(http::Response::builder().status(404).body(Body::empty()).unwrap())
 })
 };
                     let (attach, arrivals) = fictionet::attachments();
-                    net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site(Arc::new(router))).limits(httpd::Limits { body: 1024, ..Default::default() }).https())).start(&cx, arrivals)?;
+                    net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site { handler: Arc::new(router), facts: observed, cancelled }).limits(httpd::Limits { body: 1024, ..Default::default() }).https())).start(&cx, arrivals)?;
                     let machine = sandbox::machine(&cx, attach.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
                     let listener = tokio::net::TcpListener::from_std(listener)?;
                     cx.spawn(move |cx| async move {
@@ -465,7 +553,7 @@ Reply::Now(http::Response::builder().status(404).body(Body::empty()).unwrap())
                 dir,
                 stop: Some(stop),
                 thread: Some(thread),
-                events,
+                facts,
             }
         }
     }
@@ -585,35 +673,33 @@ Reply::Now(http::Response::builder().status(404).body(Body::empty()).unwrap())
                 "{page}\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let events = world.events.of("http", "request");
-            assert!(events.iter().all(|e| e.str("version") == Some("HTTP/2.0")));
-            let large: Vec<_> = events
+            let facts = world.facts.lock().unwrap();
+            assert!(
+                facts
+                    .iter()
+                    .all(|fact| fact.version == http::Version::HTTP_2)
+            );
+            let large: Vec<_> = facts
                 .iter()
-                .filter(|e| {
-                    e.str("path")
-                        .is_some_and(|p| p.starts_with("/large/") && p != "/large/curl")
+                .filter(|fact| {
+                    fact.path.path().starts_with("/large/") && fact.path.path() != "/large/curl"
                 })
                 .collect();
             assert_eq!(large.len(), 4);
-            assert!(large.iter().all(|e| e.u64("sent").unwrap() > 1 << 20));
-            assert!(large.iter().all(|e| e.conn.id == large[0].conn.id));
-            let latest_start = large
-                .iter()
-                .map(|e| e.get("started").unwrap().as_f64().unwrap())
-                .fold(0.0, f64::max);
-            let first_completion = large
-                .iter()
-                .map(|e| e.at.since_start().as_secs_f64())
-                .fold(f64::INFINITY, f64::min);
-            assert!(latest_start < first_completion);
-            let cancelled = events
-                .iter()
-                .find(|e| e.str("path") == Some("/cancel"))
-                .unwrap();
-            assert_eq!(
-                cancelled.get("complete").and_then(|v| v.as_bool()),
-                Some(false)
+            assert!(large.iter().all(|fact| fact.sent > 1 << 20));
+            assert!(
+                large
+                    .iter()
+                    .all(|fact| fact.connection == large[0].connection)
             );
+            let latest_start = large.iter().map(|fact| fact.started).max().unwrap();
+            let first_completion = large.iter().map(|fact| fact.ended).min().unwrap();
+            assert!(latest_start < first_completion);
+            let cancelled = facts
+                .iter()
+                .find(|fact| fact.path.path() == "/cancel")
+                .unwrap();
+            assert!(!cancelled.complete);
         });
     }
 }
@@ -1560,131 +1646,76 @@ fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
 
 #[test]
 fn deferred_response_budget_refusal_preserves_other_streams() {
-    fictionet::block_on(fictionet::lab(
-        RunOptions::new(Seed::from_u64(1)),
-        |cx| async move {
-            let router = {
-                let route_0 = std::sync::Arc::new(
-                    |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
-                     _: http::Request<bytes::Bytes>| {
-                        http::Response::new(Bytes::from_static(b"ok"))
-                    },
-                );
-                let route_1 =
-                    std::sync::Arc::new(|_: fictionet::Cx, _: http::Request<bytes::Bytes>| async {
-                        http::Response::new(Bytes::from(vec![b'x'; 200_000]))
-                    });
-                fictionet_test_support::reply_handler(move |ex, request| {
-                    use fictionet::stdlib::web::httpd::{Body, Reply};
-                    let (parts, body) = request.into_parts();
-                    let Some(body) = body.bytes() else {
-                        return Reply::Now(
-                            http::Response::builder()
-                                .status(400)
-                                .body(Body::empty())
-                                .unwrap(),
-                        );
-                    };
-                    let request = http::Request::from_parts(parts, body);
-                    if request.uri().path() == "/small" && (request.method() == http::Method::POST)
-                    {
-                        return Reply::Now(route_0(ex, request).map(Body::from));
-                    }
-                    if request.uri().path() == "/large" && (request.method() == http::Method::POST)
-                    {
-                        return {
-                            let route = route_1.clone();
-                            Reply::Later(Box::new(move |cx| {
-                                Box::pin(
-                                    async move { Ok(route(cx, request).await.map(Body::from)) },
-                                )
-                            }))
-                        };
-                    }
-                    if request.uri().path() == "/small" || request.uri().path() == "/large" {
-                        return Reply::Now(
-                            http::Response::builder()
-                                .status(405)
-                                .body(Body::empty())
-                                .unwrap(),
-                        );
-                    }
-                    Reply::Now(
+    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |cx| async move {
+        let router = {
+            let route_0 = std::sync::Arc::new(
+                |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                 _: http::Request<bytes::Bytes>| {
+                    http::Response::new(Bytes::from_static(b"ok"))
+                },
+            );
+            let route_1 =
+                std::sync::Arc::new(|_: fictionet::Cx, _: http::Request<bytes::Bytes>| async {
+                    http::Response::new(Bytes::from(vec![b'x'; 200_000]))
+                });
+            fictionet_test_support::reply_handler(move |ex, request| {
+                use fictionet::stdlib::web::httpd::{Body, Reply};
+                let (parts, body) = request.into_parts();
+                let Some(body) = body.bytes() else {
+                    return Reply::Now(
                         http::Response::builder()
-                            .status(404)
+                            .status(400)
                             .body(Body::empty())
                             .unwrap(),
-                    )
-                })
-            };
-            let mut harness = Harness::with_options(
-                Seed::from_u64(1),
-                Http2::new(router),
-                (),
-                fictionet::stdlib::services::serve::ServeOptions::default()
-                    .budget(fictionet::stdlib::services::serve::Budget::new(128 << 10)),
-            )
-            .with_fcx(cx.clone());
-            let mut input = preface();
-            input.extend(headers(1, "/small", true));
-            input.extend(headers(3, "/large", true));
-            let output = frames(&harness.push(&input).unwrap());
-            assert_eq!(
-                statuses(&output),
-                [(1, b"200".to_vec()), (3, b"503".to_vec())]
-            );
-            assert!(!harness.closed());
-            cx.cancel();
-            Ok(())
-        },
-    ))
-    .unwrap();
-}
-
-#[test]
-fn observation_does_not_change_http2_streams() {
-    let run = |observed| {
-        let heads = Arc::new(crate::common::http_observer::CountHeads::default());
-        let memory = Arc::new(fictionet_test_support::EventLog::default());
-        let router = fictionet_test_support::handler(
-            move |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
-                  request: http::Request<bytes::Bytes>| {
-                assert_eq!(
-                    request.extensions().get::<httpd::EventInterest>().is_some(),
-                    observed
-                );
-                http::Response::new(Bytes::from_static(b"hello"))
-            },
-        );
-        let mut harness = Harness::new(
+                    );
+                };
+                let request = http::Request::from_parts(parts, body);
+                if request.uri().path() == "/small" && (request.method() == http::Method::POST) {
+                    return Reply::Now(route_0(ex, request).map(Body::from));
+                }
+                if request.uri().path() == "/large" && (request.method() == http::Method::POST) {
+                    return {
+                        let route = route_1.clone();
+                        Reply::Later(Box::new(move |cx| {
+                            Box::pin(async move { Ok(route(cx, request).await.map(Body::from)) })
+                        }))
+                    };
+                }
+                if request.uri().path() == "/small" || request.uri().path() == "/large" {
+                    return Reply::Now(
+                        http::Response::builder()
+                            .status(405)
+                            .body(Body::empty())
+                            .unwrap(),
+                    );
+                }
+                Reply::Now(
+                    http::Response::builder()
+                        .status(404)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+            })
+        };
+        let mut harness = Harness::with_options(
             Seed::from_u64(1),
-            Http2::new(router).observe(heads.clone()),
+            Http2::new(router),
             (),
-        );
-        if observed {
-            harness = harness.observer(memory.clone());
-        }
+            fictionet::stdlib::services::serve::ServeOptions::default()
+                .budget(fictionet::stdlib::services::serve::Budget::new(128 << 10)),
+        )
+        .with_fcx(cx.clone());
         let mut input = preface();
-        for id in [1, 3, 5] {
-            input.extend(headers(id, "/", true));
-        }
-        let output = harness.push(&input).unwrap();
+        input.extend(headers(1, "/small", true));
+        input.extend(headers(3, "/large", true));
+        let output = frames(&harness.push(&input).unwrap());
         assert_eq!(
-            heads.0.load(std::sync::atomic::Ordering::Relaxed),
-            if observed { 3 } else { 0 }
+            statuses(&output),
+            [(1, b"200".to_vec()), (3, b"503".to_vec())]
         );
-        assert_eq!(
-            memory.of("http", "request").len(),
-            if observed { 3 } else { 0 }
-        );
-        assert_eq!(
-            frames(&output)
-                .iter()
-                .filter(|f| matches!(f, Frame::Data(data) if data.data == b"hello"))
-                .count(),
-            3
-        );
-        output
-    };
-    assert_eq!(run(false), run(true));
+        assert!(!harness.closed());
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
 }

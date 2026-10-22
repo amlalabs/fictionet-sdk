@@ -6,7 +6,6 @@ use std::task::{Context, Poll, Waker};
 
 use crate::cable::pair_with_guard;
 use crate::cx::CancelWait;
-use crate::link::Meter;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::listen::SocketLink;
 use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
@@ -34,16 +33,9 @@ use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 /// detach cancels nothing, so the world's other tasks keep running (see
 /// [What ends what](crate::guide::running#what-ends-what)).
 pub struct Attachment {
-    #[cfg(not(target_arch = "wasm32"))]
-    packets: Option<Arc<crate::link::PacketStream>>,
     name: Arc<str>,
     mtu: u16,
     link: Link,
-    /// Counters published to the observer. Side 0 is the world, side 1 the sandbox.
-    meter: Arc<Meter>,
-    /// The last task seen polling this attachment.
-    #[cfg(not(target_arch = "wasm32"))]
-    seen: Option<crate::run::RunTask>,
 }
 
 /// What carries an attachment's packets.
@@ -83,18 +75,10 @@ impl Attachment {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn from_socket(name: String, mtu: u16, link: SocketLink) -> Attachment {
         let name: Arc<str> = name.into();
-        let meter = Meter::new();
-        meter.set_sandbox(name.clone());
-        meter.register_current();
         Attachment {
             name,
             mtu,
             link: Link::Socket(link),
-            #[cfg(not(target_arch = "wasm32"))]
-            packets: meter.packets(),
-            meter,
-            #[cfg(not(target_arch = "wasm32"))]
-            seen: None,
         }
     }
 }
@@ -113,28 +97,7 @@ impl Interface for Attachment {
         match &mut self.link {
             Link::Cable(end) => end.poll_recv(fcx, cx),
             #[cfg(not(target_arch = "wasm32"))]
-            Link::Socket(link) => {
-                let current = crate::run::RunTask::current_in(fcx.run.id);
-                if current != self.seen
-                    && let Some(task) = current
-                {
-                    self.seen = current;
-                    self.meter.owner(fcx, 0, task.id);
-                    self.packets = self.meter.packets();
-                }
-                let polled = link.poll_recv(fcx, cx);
-                if let Poll::Ready(Ok(packet)) = &polled {
-                    let mut publication = self
-                        .packets
-                        .as_ref()
-                        .and_then(|stream| stream.packet(1, packet));
-                    self.meter.sent(1, packet);
-                    if let Some(publication) = &mut publication {
-                        publication.publish(packet);
-                    }
-                }
-                polled
-            }
+            Link::Socket(link) => link.poll_recv(fcx, cx),
         }
     }
 
@@ -142,31 +105,7 @@ impl Interface for Attachment {
         match &mut self.link {
             Link::Cable(end) => end.send(packet),
             #[cfg(not(target_arch = "wasm32"))]
-            Link::Socket(link) => {
-                let mut publication = self
-                    .packets
-                    .as_ref()
-                    .and_then(|stream| stream.packet(0, &packet));
-                link.send(packet, publication.is_some(), |packet| {
-                    self.meter.sent(0, packet);
-                    if let Some(publication) = &mut publication {
-                        publication.publish(packet);
-                    }
-                });
-            }
-        }
-    }
-
-    fn link(&self) -> Option<crate::LinkHandle> {
-        Some(crate::LinkHandle::new(self.meter.clone()))
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for Attachment {
-    fn drop(&mut self) {
-        if matches!(self.link, Link::Socket(_)) {
-            self.meter.close_attachment();
+            Link::Socket(link) => link.send(packet),
         }
     }
 }
@@ -188,7 +127,7 @@ impl Drop for Attachment {
 /// # fn main() -> Result {
 /// let (attacher, attachments) = fictionet::attachments();
 /// let agent = attacher.attach("agent")?; // the test holds the sandbox's end
-/// let world = fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| world(fcx, attachments));
+/// let world = fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments));
 /// // send packets on `agent` and check what comes back while `world` runs
 /// # drop(agent);
 /// # fictionet::block_on(world)
@@ -276,19 +215,11 @@ impl Attacher {
     pub fn attach(&self, name: &str) -> Result<End, AttachError> {
         let guard = self.reserve(name)?;
         let (world, sandbox) = pair_with_guard(Some(Box::new(guard)));
-        let meter = world.meter().clone();
         let name: Arc<str> = name.into();
-        meter.set_sandbox(name.clone());
-        meter.register_current();
         self.deliver(Attachment {
             name,
             mtu: 1500,
             link: Link::Cable(world),
-            #[cfg(not(target_arch = "wasm32"))]
-            packets: meter.packets(),
-            meter,
-            #[cfg(not(target_arch = "wasm32"))]
-            seen: None,
         });
         Ok(sandbox)
     }
@@ -437,15 +368,6 @@ impl Attachments {
             {
                 drop(state);
                 drop(gone);
-                if let Some(observer) = fcx.run.observer.shared() {
-                    found.meter.register_tapped(observer);
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                let found = {
-                    let mut found = found;
-                    found.packets = found.meter.packets();
-                    found
-                };
                 return Poll::Ready(Ok(found));
             }
             match &state.waker {

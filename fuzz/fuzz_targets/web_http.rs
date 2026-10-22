@@ -136,8 +136,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let cert = fictionet_fuzz::cert();
-    let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(0))
-        .observer(std::sync::Arc::new(fictionet_fuzz::web::EventFormatting));
+    let options = fictionet::Seed::from_u64(0);
     world_with_options(options, move |fcx| async move {
         let attacher = serve(&fcx, cert);
         let client = Client::new(&fcx, &attacher, "agent", Ipv4Addr::new(10, 0, 0, 2));

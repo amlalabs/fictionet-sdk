@@ -10,9 +10,7 @@ use std::time::{Duration, Instant};
 
 use fictionet::prelude::*;
 use fictionet::relay::{self, Hello, Message, unix};
-use fictionet::{
-    Interface, Packet, RecvError, RunOptions, WorldSocket, attachments, block_on, listen, run,
-};
+use fictionet::{Interface, Packet, RecvError, WorldSocket, attachments, block_on, listen, run};
 
 fn socket_path(tag: &str) -> String {
     static N: AtomicU32 = AtomicU32::new(0);
@@ -93,30 +91,27 @@ fn attach_echo_and_detach() {
     let (done_tx, done_rx) = mpsc::channel();
     let (echoed_tx, echoed_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let out = block_on(run(
-            RunOptions::new(fictionet::Seed::random()),
-            move |fcx| async move {
-                let mut abc = attachments.get(&fcx, "abc").await?;
-                assert_eq!(abc.name(), "abc");
-                assert_eq!(abc.mtu(), 9000);
-                let mut count = 0;
-                // Echo every packet back with its bytes reversed, until detach.
-                loop {
-                    match abc.recv(&fcx).await {
-                        Ok(Packet(mut bytes)) => {
-                            bytes.reverse();
-                            abc.send(Packet(bytes));
-                            count += 1;
-                            if count == 20_501 || count == 21_501 {
-                                echoed_tx.send(count).unwrap();
-                            }
+        let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            let mut abc = attachments.get(&fcx, "abc").await?;
+            assert_eq!(abc.name(), "abc");
+            assert_eq!(abc.mtu(), 9000);
+            let mut count = 0;
+            // Echo every packet back with its bytes reversed, until detach.
+            loop {
+                match abc.recv(&fcx).await {
+                    Ok(Packet(mut bytes)) => {
+                        bytes.reverse();
+                        abc.send(Packet(bytes));
+                        count += 1;
+                        if count == 20_501 || count == 21_501 {
+                            echoed_tx.send(count).unwrap();
                         }
-                        Err(RecvError::Closed) => return Ok(()),
-                        Err(e) => return Err(e.into()),
                     }
+                    Err(RecvError::Closed) => return Ok(()),
+                    Err(e) => return Err(e.into()),
                 }
-            },
-        ));
+            }
+        }));
         done_tx.send(out.map_err(|e| e.to_string())).unwrap();
     });
 
@@ -298,15 +293,12 @@ fn the_world_closing_detaches_attach() {
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     let client = Client::attach(&path, "abc");
 
-    let out = block_on(run(
-        RunOptions::new(fictionet::Seed::random()),
-        move |fcx| async move {
-            let mut abc = attachments.get(&fcx, "abc").await?;
-            abc.send(Packet(vec![42]));
-            drop(abc);
-            Ok(())
-        },
-    ));
+    let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        let mut abc = attachments.get(&fcx, "abc").await?;
+        abc.send(Packet(vec![42]));
+        drop(abc);
+        Ok(())
+    }));
     out.unwrap();
     assert_eq!(client.recv(), Some(vec![relay::PACKET, 42]));
     assert_eq!(client.recv(), None);
@@ -322,15 +314,12 @@ fn an_unknown_kind_closes_the_connection() {
     let client = Client::attach(&path, "abc");
     client.send(&Message::Packet(&[1]));
     unix::send(client.fd.as_raw_fd(), &[9, 9], false).unwrap();
-    let out = block_on(run(
-        RunOptions::new(fictionet::Seed::random()),
-        move |fcx| async move {
-            let mut abc = attachments.get(&fcx, "abc").await?;
-            assert_eq!(abc.recv(&fcx).await, Ok(Packet(vec![1])));
-            assert_eq!(abc.recv(&fcx).await, Err(RecvError::Closed));
-            Ok(())
-        },
-    ));
+    let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        let mut abc = attachments.get(&fcx, "abc").await?;
+        assert_eq!(abc.recv(&fcx).await, Ok(Packet(vec![1])));
+        assert_eq!(abc.recv(&fcx).await, Err(RecvError::Closed));
+        Ok(())
+    }));
     out.unwrap();
     assert_eq!(client.recv(), None);
 }
@@ -364,16 +353,13 @@ fn dropping_listening_closes_the_socket_but_keeps_attachments() {
     // still come from the helper thread.
     let (tx, rx) = mpsc::channel::<()>();
     let world = std::thread::spawn(move || {
-        block_on(run(
-            RunOptions::new(fictionet::Seed::random()),
-            move |fcx| async move {
-                let mut abc = attachments.get(&fcx, "abc").await?;
-                tx.send(()).unwrap();
-                let p = abc.recv(&fcx).await?;
-                abc.send(p);
-                Ok(())
-            },
-        ))
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            let mut abc = attachments.get(&fcx, "abc").await?;
+            tx.send(()).unwrap();
+            let p = abc.recv(&fcx).await?;
+            abc.send(p);
+            Ok(())
+        }))
     });
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
     client.send(&Message::Packet(&[5]));
@@ -425,21 +411,18 @@ fn many_idle_attachments_wake() {
         .collect();
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
     let world = std::thread::spawn(move || {
-        block_on(run(
-            RunOptions::new(fictionet::Seed::random()),
-            move |fcx| async move {
-                for _ in 0..20 {
-                    let mut a = attachments.next(&fcx).await.unwrap();
-                    fcx.spawn(move |fcx| async move {
-                        let p = a.recv(&fcx).await?;
-                        a.send(p);
-                        Ok(())
-                    });
-                }
-                ready_tx.send(()).unwrap();
-                Ok(())
-            },
-        ))
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            for _ in 0..20 {
+                let mut a = attachments.next(&fcx).await.unwrap();
+                fcx.spawn(move |fcx| async move {
+                    let p = a.recv(&fcx).await?;
+                    a.send(p);
+                    Ok(())
+                });
+            }
+            ready_tx.send(()).unwrap();
+            Ok(())
+        }))
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     for (i, c) in clients.iter().enumerate().rev() {
@@ -459,19 +442,16 @@ fn the_largest_packet_crosses_both_ways() {
     let (attacher, mut attachments) = attachments();
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     let world = std::thread::spawn(move || {
-        block_on(run(
-            RunOptions::new(fictionet::Seed::random()),
-            move |fcx| async move {
-                let mut a = attachments.get(&fcx, "big").await?;
-                assert_eq!(a.mtu(), 65_535);
-                let p = a.recv(&fcx).await?;
-                assert_eq!(p.0.len(), 65_535);
-                a.send(p);
-                // And one the world makes itself.
-                a.send(Packet(vec![7u8; 65_535]));
-                Ok(())
-            },
-        ))
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            let mut a = attachments.get(&fcx, "big").await?;
+            assert_eq!(a.mtu(), 65_535);
+            let p = a.recv(&fcx).await?;
+            assert_eq!(p.0.len(), 65_535);
+            a.send(p);
+            // And one the world makes itself.
+            a.send(Packet(vec![7u8; 65_535]));
+            Ok(())
+        }))
     });
     let client = Client::connect(&path);
     client.hello("big", 65_535);
@@ -495,22 +475,19 @@ fn an_oversized_message_closes_the_connection() {
     let (attacher, mut attachments) = attachments();
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     let world = std::thread::spawn(move || {
-        block_on(run(
-            RunOptions::new(fictionet::Seed::random()),
-            move |fcx| async move {
-                let mut a = attachments.get(&fcx, "o").await?;
-                let first = a.recv(&fcx).await?;
-                assert_eq!(first, Packet(vec![1]));
-                match a.recv(&fcx).await {
-                    Err(RecvError::Closed) => Ok(()),
-                    Ok(p) => Err(fictionet::Error::msg(format!(
-                        "got a packet of {} bytes",
-                        p.0.len()
-                    ))),
-                    Err(e) => Err(e.into()),
-                }
-            },
-        ))
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            let mut a = attachments.get(&fcx, "o").await?;
+            let first = a.recv(&fcx).await?;
+            assert_eq!(first, Packet(vec![1]));
+            match a.recv(&fcx).await {
+                Err(RecvError::Closed) => Ok(()),
+                Ok(p) => Err(fictionet::Error::msg(format!(
+                    "got a packet of {} bytes",
+                    p.0.len()
+                ))),
+                Err(e) => Err(e.into()),
+            }
+        }))
     });
     let client = Client::attach(&path, "o");
     client.send(&Message::Packet(&[1]));
@@ -546,14 +523,11 @@ fn reattaching_before_the_world_asks_gives_the_new_connection() {
     );
     let client = client.unwrap();
     client.send(&Message::Packet(&[5]));
-    let out = block_on(run(
-        RunOptions::new(fictionet::Seed::random()),
-        move |fcx| async move {
-            let mut a = attachments.get(&fcx, "abc").await?;
-            assert_eq!(a.recv(&fcx).await?, Packet(vec![5]));
-            Ok(())
-        },
-    ));
+    let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        let mut a = attachments.get(&fcx, "abc").await?;
+        assert_eq!(a.recv(&fcx).await?, Packet(vec![5]));
+        Ok(())
+    }));
     out.unwrap();
 }
 
@@ -565,22 +539,19 @@ fn a_taken_attachment_drains_packets_after_detach_and_reconnect() {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (go, mut wait) = fictionet::pair();
     let world = std::thread::spawn(move || {
-        block_on(run(
-            RunOptions::new(fictionet::Seed::from_u64(0)),
-            move |fcx| async move {
-                let mut first = attachments.get(&fcx, "agent").await?;
-                ready_tx.send(()).unwrap();
-                assert_eq!(wait.recv(&fcx).await, Err(RecvError::Closed));
-                for i in 0..100u8 {
-                    assert_eq!(first.recv(&fcx).await?, Packet(vec![i]));
-                }
-                assert_eq!(first.recv(&fcx).await, Err(RecvError::Closed));
-                drop(first);
-                let mut next = attachments.get(&fcx, "agent").await?;
-                assert_eq!(next.recv(&fcx).await?, Packet(vec![255]));
-                Ok(())
-            },
-        ))
+        block_on(run(fictionet::Seed::from_u64(0), move |fcx| async move {
+            let mut first = attachments.get(&fcx, "agent").await?;
+            ready_tx.send(()).unwrap();
+            assert_eq!(wait.recv(&fcx).await, Err(RecvError::Closed));
+            for i in 0..100u8 {
+                assert_eq!(first.recv(&fcx).await?, Packet(vec![i]));
+            }
+            assert_eq!(first.recv(&fcx).await, Err(RecvError::Closed));
+            drop(first);
+            let mut next = attachments.get(&fcx, "agent").await?;
+            assert_eq!(next.recv(&fcx).await?, Packet(vec![255]));
+            Ok(())
+        }))
     });
     let first = Client::attach(&path, "agent");
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -619,20 +590,17 @@ fn a_world_that_only_sends_gets_its_queue_written_out() {
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     let (stop, mut stopped) = fictionet::pair();
     let world = std::thread::spawn(move || {
-        block_on(run(
-            RunOptions::new(fictionet::Seed::random()),
-            move |fcx| async move {
-                let mut abc = attachments.get(&fcx, "abc").await?;
-                for i in 0..10_000u32 {
-                    let mut p = vec![0u8; 1400];
-                    p[..4].copy_from_slice(&i.to_be_bytes());
-                    abc.send(Packet(p));
-                }
-                assert_eq!(stopped.recv(&fcx).await, Err(RecvError::Closed));
-                drop(abc);
-                Ok(())
-            },
-        ))
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            let mut abc = attachments.get(&fcx, "abc").await?;
+            for i in 0..10_000u32 {
+                let mut p = vec![0u8; 1400];
+                p[..4].copy_from_slice(&i.to_be_bytes());
+                abc.send(Packet(p));
+            }
+            assert_eq!(stopped.recv(&fcx).await, Err(RecvError::Closed));
+            drop(abc);
+            Ok(())
+        }))
     });
     let client = Client::attach(&path, "abc");
     client.set_timeout(Duration::from_secs(15));
@@ -666,7 +634,7 @@ fn real_listeners_can_feed_a_lab() {
     sandbox.send(Packet(vec![7]));
     let listening = listen(WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     block_on(fictionet::lab(
-        RunOptions::new(fictionet::Seed::from_u64(0)),
+        fictionet::Seed::from_u64(0),
         move |fcx| async move {
             let mut agent = attachments.next(&fcx).await?;
             assert_eq!(agent.name(), "agent");

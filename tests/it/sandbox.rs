@@ -1,4 +1,3 @@
-use fictionet::RunOptions;
 use fictionet::stdlib::{
     codec::Wire,
     protocols::{
@@ -17,7 +16,7 @@ use std::time::{Duration, UNIX_EPOCH};
 #[test]
 fn sandbox_looks_up_connects_and_requests_with_optional_roots() {
     let result = fictionet::block_on(fictionet::lab(
-        RunOptions::new(fictionet::Seed::from_u64(9)),
+        fictionet::Seed::from_u64(9),
         |fcx| async move {
             let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
             let ca = Ca::new(&fcx, "Lab CA")?;
@@ -92,7 +91,7 @@ fn installing_cloned_servers_keeps_virtual_hosts_separate() {
         world::net::{Host, Net},
     };
     fictionet::block_on(fictionet::lab(
-        RunOptions::new(fictionet::Seed::from_u64(10)),
+        fictionet::Seed::from_u64(10),
         |fcx| async move {
             let server = httpd::Server::new(fictionet_test_support::handler(
                 |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,

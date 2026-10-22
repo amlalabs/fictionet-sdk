@@ -315,48 +315,45 @@ mod tests {
                 Some(format!("the world sent {message:?} after accept; closing")),
             ));
         }
-        fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(0)),
-            |fcx| async move {
-                for (message, expected_error) in cases {
-                    let (sock, peer) = pair();
-                    unix::raise_buffers(peer.as_raw_fd());
-                    unix::set_nonblocking(sock.as_raw_fd(), true).unwrap();
-                    unix::send(peer.as_raw_fd(), &message, false).unwrap();
-                    let mut buf = vec![0; relay::MAX_MESSAGE + 1];
-                    let mut received = None;
-                    let result = world::read_packets(sock.as_raw_fd(), &mut buf, Some(1), |p| {
-                        received = Some(p.to_vec());
-                        Ok(())
-                    });
-                    let error = match result {
-                        Ok(true) => None,
-                        Err(world::Failure::Error(why)) => Some(why),
-                        _ => panic!("packet-phase validation must not report EOF or refusal"),
-                    };
-                    assert_eq!(error, expected_error);
-                    if error.is_none() {
-                        assert_eq!(received.as_deref(), Some(&message[1..]));
-                    } else {
-                        assert!(received.is_none());
-                    }
-
-                    unix::send(peer.as_raw_fd(), &message, false).unwrap();
-                    let mut link = Link::new(sock).unwrap();
-                    let result = std::future::poll_fn(|cx| link.poll_recv(&fcx, cx)).await;
-                    match result {
-                        Ok(packet) => assert_eq!(Some(packet.0), received),
-                        Err(e) => {
-                            assert_eq!(e, RecvError::Closed);
-                            assert!(expected_error.is_some());
-                        }
-                    }
-                    assert_eq!(link.shared.error(), expected_error);
-                    link.shared.close(None);
+        fictionet::run(fictionet::Seed::from_u64(0), |fcx| async move {
+            for (message, expected_error) in cases {
+                let (sock, peer) = pair();
+                unix::raise_buffers(peer.as_raw_fd());
+                unix::set_nonblocking(sock.as_raw_fd(), true).unwrap();
+                unix::send(peer.as_raw_fd(), &message, false).unwrap();
+                let mut buf = vec![0; relay::MAX_MESSAGE + 1];
+                let mut received = None;
+                let result = world::read_packets(sock.as_raw_fd(), &mut buf, Some(1), |p| {
+                    received = Some(p.to_vec());
+                    Ok(())
+                });
+                let error = match result {
+                    Ok(true) => None,
+                    Err(world::Failure::Error(why)) => Some(why),
+                    _ => panic!("packet-phase validation must not report EOF or refusal"),
+                };
+                assert_eq!(error, expected_error);
+                if error.is_none() {
+                    assert_eq!(received.as_deref(), Some(&message[1..]));
+                } else {
+                    assert!(received.is_none());
                 }
-                Ok(())
-            },
-        )
+
+                unix::send(peer.as_raw_fd(), &message, false).unwrap();
+                let mut link = Link::new(sock).unwrap();
+                let result = std::future::poll_fn(|cx| link.poll_recv(&fcx, cx)).await;
+                match result {
+                    Ok(packet) => assert_eq!(Some(packet.0), received),
+                    Err(e) => {
+                        assert_eq!(e, RecvError::Closed);
+                        assert!(expected_error.is_some());
+                    }
+                }
+                assert_eq!(link.shared.error(), expected_error);
+                link.shared.close(None);
+            }
+            Ok(())
+        })
         .await
         .unwrap();
     }

@@ -65,7 +65,7 @@ fn both_logins_refresh_once_and_persist_rotated_tokens() {
             );
         });
         let stored = store.clone();
-        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(3)), |cx| async move {
+        fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(3), |cx| async move {
             let authority = OAuth::at(&cx, login, stored.clone(), format!("http://{address}").parse()?)?;
             let mut done = Vec::new();
             for _ in 0..12 {
@@ -182,7 +182,7 @@ fn rejected_refresh_preserves_tokens_and_requires_login_only_for_invalid_grant()
             answer(&mut socket, status, body);
         });
         let stored = store.clone();
-        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(4)), |cx| async move {
+        fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(4), |cx| async move {
             let authority = OAuth::at(&cx, login, stored.clone(), format!("http://{address}").parse()?)?;
             assert!(authority.ensure_fresh().await.is_err());
             assert!(authority.ensure_fresh().await.is_err());
@@ -228,7 +228,7 @@ fn a_login_during_refresh_wins_over_success_and_rejection() {
         });
         let stored = store.clone();
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(5)),
+            fictionet::Seed::from_u64(5),
             |cx| async move {
                 let authority = OAuth::at(
                     &cx,
@@ -300,7 +300,7 @@ fn codex_guest_login_keeps_identity_and_refresh_returns_the_current_token() {
     store.put(Login::Codex, login).unwrap();
     let stored = store.clone();
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(6)),
+        fictionet::Seed::from_u64(6),
         |cx| async move {
             let authority = OAuth::at(&cx, Login::Codex, stored, "http://127.0.0.1:1".parse()?)?;
             let files = authority.guest_files()?;
@@ -376,7 +376,7 @@ fn chatgpt_login_swaps_the_bearer_adds_the_account_and_stops_like_codex_limits()
     });
     let stored = store.clone();
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+        fictionet::Seed::from_u64(7),
         |cx| async move {
             let origin: http::Uri = format!("http://{address}").parse()?;
             let authority = OAuth::at(&cx, Login::Codex, stored, origin.clone())?;

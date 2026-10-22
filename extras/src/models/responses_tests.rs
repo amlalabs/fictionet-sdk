@@ -155,7 +155,7 @@ fn responses_search_preserves_reasoning_and_restores_function_pairs() {
             });
             let pages = Arc::new(Pages(AtomicUsize::new(0)));
             let engine = pages.clone();
-            fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(10)), |cx| async move {
+            fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(10), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
             let model = if guest { Model::guest_at(&cx, provider, format!("http://{address}").parse()?)? } else { Model::at(&cx, provider, credential, format!("http://{address}").parse()?)? }.search(engine);
@@ -191,7 +191,7 @@ fn zstd_requests_are_decoded_and_metered() {
         answer(&mut socket, vec![], true);
     });
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(11)),
+        fictionet::Seed::from_u64(11),
         |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
@@ -296,10 +296,10 @@ fn page_actions_read_world_pages_and_keep_the_client_tools() {
         let text = json!({"type":"message","id":"msg_final","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Read it","annotations":[]}]});
         answer(&mut socket, vec![text], true);
     });
-    let memory = Arc::new(fictionet_test_support::EventLog::default());
+
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(12))
-            .observer(memory.clone()),
+        fictionet::Seed::from_u64(12)
+            ,
         |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
@@ -356,15 +356,6 @@ fn page_actions_read_world_pages_and_keep_the_client_tools() {
     ))
     .unwrap();
     server.join().unwrap();
-    let tools = memory.of("model", "tool");
-    let logged: Vec<_> = tools
-        .iter()
-        .map(|e| (e.str("tool").unwrap(), e.u64("results").unwrap()))
-        .collect();
-    assert_eq!(
-        logged,
-        [("open_page", 1), ("find_in_page", 1), ("open_page", 0)]
-    );
 }
 #[test]
 fn a_budget_stop_during_a_search_fails_the_response_like_openai() {
@@ -380,7 +371,7 @@ fn a_budget_stop_during_a_search_fails_the_response_like_openai() {
         }
     });
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(13)),
+        fictionet::Seed::from_u64(13),
         |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
@@ -480,7 +471,7 @@ fn a_searched_response_continues_from_its_final_upstream_turn() {
             reply(&mut socket, "resp_last", vec![text], stream, &fourth);
         });
         let pages = Arc::new(Pages(AtomicUsize::new(0)));
-        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(14)), |cx| async move {
+        fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(14), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
             let model = Model::at(&cx, Provider::OpenAi, credential, format!("http://{address}").parse()?)?.search(pages);

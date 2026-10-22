@@ -275,16 +275,14 @@ fn a_failed_prefetch_is_recorded_and_made_again_on_request() {
     no_cast(&pages);
     let world = pages.clone();
     let task = script.clone();
-    let searches = Arc::new(crate::search::Searches::of(&pages));
-    let state = searches.clone();
     fictionet::block_on(fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(searches),
+        fictionet::Seed::from_u64(1),
         |cx| async move {
             let search = google(&world, &cx, "python flaw").await;
             let (url, _) = results(&search.body)[0].clone();
             task.bad.store(2, Ordering::SeqCst);
             cx.sleep(ms(1000)).await?;
-            assert!(state.snapshot().pages.is_empty());
+            assert!(world.store().pages().next().is_none());
             let page = get(&world, &cx, &url).await;
             assert_eq!(
                 (page.status, &page.logged()["cache"]),

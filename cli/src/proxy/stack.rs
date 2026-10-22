@@ -291,63 +291,60 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         for alias_ttl in [0, 1] {
-            fictionet::lab(
-                fictionet::RunOptions::new(fictionet::Seed::from_u64(8)),
-                move |fcx| async move {
-                    let (client, world) = fictionet::pair();
-                    let (tcp_end, udp_end, _, _) = ip::split_protocols(&fcx, client);
-                    let addr = Ipv4Addr::new(10, 0, 0, 2);
-                    let dns: SocketAddr = "10.0.0.1:53".parse().unwrap();
-                    let stack = Stack {
-                        fcx: fcx.clone(),
-                        tcp: tcp::endpoint(&fcx, tcp_end, addr.into()),
-                        udp: udp::endpoint(&fcx, udp_end, addr.into()),
-                        dns,
-                        cache: Arc::default(),
-                        pending: Arc::default(),
-                    };
-                    let mut server = udp::endpoint(&fcx, world, dns.ip()).bind(53)?;
-                    let queries = Arc::new(AtomicUsize::new(0));
-                    let count = queries.clone();
-                    fcx.spawn(move |fcx| async move {
-                        while let Ok((bytes, from)) = server.recv(&fcx).await {
-                            let n = count.fetch_add(1, Ordering::SeqCst);
-                            let query = Message::from_vec(&bytes).unwrap();
-                            let mut reply =
-                                Message::response(query.metadata.id, query.metadata.op_code);
-                            reply.queries = query.queries;
-                            let target =
-                                Name::from_ascii(if n == 0 { "old.test." } else { "new.test." })
-                                    .unwrap();
-                            reply.answers.push(Record::from_rdata(
-                                reply.queries[0].name().clone(),
-                                if n == 0 { alias_ttl } else { 60 },
-                                RData::CNAME(CNAME(target.clone())),
-                            ));
-                            reply.answers.push(Record::from_rdata(
-                                target,
-                                60,
-                                RData::A(A(Ipv4Addr::new(192, 0, 2, if n == 0 { 1 } else { 2 }))),
-                            ));
-                            server.send_to(&reply.to_vec().unwrap(), from);
-                        }
-                        Ok(())
-                    });
-                    let host = Host::Name("www.test".into());
-                    assert_eq!(stack.resolve(&host).await, Ok(Ipv4Addr::new(192, 0, 2, 1)));
-                    if alias_ttl != 0 {
-                        // Age the cached answer by two seconds without a wall-clock wait.
-                        stack.cache.lock().unwrap().get_mut("www.test").unwrap().1 -=
-                            Duration::from_secs(2);
+            fictionet::lab(fictionet::Seed::from_u64(8), move |fcx| async move {
+                let (client, world) = fictionet::pair();
+                let (tcp_end, udp_end, _, _) = ip::split_protocols(&fcx, client);
+                let addr = Ipv4Addr::new(10, 0, 0, 2);
+                let dns: SocketAddr = "10.0.0.1:53".parse().unwrap();
+                let stack = Stack {
+                    fcx: fcx.clone(),
+                    tcp: tcp::endpoint(&fcx, tcp_end, addr.into()),
+                    udp: udp::endpoint(&fcx, udp_end, addr.into()),
+                    dns,
+                    cache: Arc::default(),
+                    pending: Arc::default(),
+                };
+                let mut server = udp::endpoint(&fcx, world, dns.ip()).bind(53)?;
+                let queries = Arc::new(AtomicUsize::new(0));
+                let count = queries.clone();
+                fcx.spawn(move |fcx| async move {
+                    while let Ok((bytes, from)) = server.recv(&fcx).await {
+                        let n = count.fetch_add(1, Ordering::SeqCst);
+                        let query = Message::from_vec(&bytes).unwrap();
+                        let mut reply =
+                            Message::response(query.metadata.id, query.metadata.op_code);
+                        reply.queries = query.queries;
+                        let target =
+                            Name::from_ascii(if n == 0 { "old.test." } else { "new.test." })
+                                .unwrap();
+                        reply.answers.push(Record::from_rdata(
+                            reply.queries[0].name().clone(),
+                            if n == 0 { alias_ttl } else { 60 },
+                            RData::CNAME(CNAME(target.clone())),
+                        ));
+                        reply.answers.push(Record::from_rdata(
+                            target,
+                            60,
+                            RData::A(A(Ipv4Addr::new(192, 0, 2, if n == 0 { 1 } else { 2 }))),
+                        ));
+                        server.send_to(&reply.to_vec().unwrap(), from);
                     }
-                    assert_eq!(stack.resolve(&host).await, Ok(Ipv4Addr::new(192, 0, 2, 2)));
-                    assert_eq!(stack.resolve(&host).await, Ok(Ipv4Addr::new(192, 0, 2, 2)));
-                    assert_eq!(queries.load(Ordering::SeqCst), 2);
-                    assert!(stack.pending.lock().unwrap().is_empty());
-                    fcx.cancel();
                     Ok(())
-                },
-            )
+                });
+                let host = Host::Name("www.test".into());
+                assert_eq!(stack.resolve(&host).await, Ok(Ipv4Addr::new(192, 0, 2, 1)));
+                if alias_ttl != 0 {
+                    // Age the cached answer by two seconds without a wall-clock wait.
+                    stack.cache.lock().unwrap().get_mut("www.test").unwrap().1 -=
+                        Duration::from_secs(2);
+                }
+                assert_eq!(stack.resolve(&host).await, Ok(Ipv4Addr::new(192, 0, 2, 2)));
+                assert_eq!(stack.resolve(&host).await, Ok(Ipv4Addr::new(192, 0, 2, 2)));
+                assert_eq!(queries.load(Ordering::SeqCst), 2);
+                assert!(stack.pending.lock().unwrap().is_empty());
+                fcx.cancel();
+                Ok(())
+            })
             .await
             .unwrap();
         }

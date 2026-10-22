@@ -302,16 +302,13 @@ pub(super) async fn serve(
         let (tx, rx) = mpsc::channel(8);
         output.sender = Some(tx.clone());
         let cx = model.cx.clone();
-        cx.spawn(move |cx| async move {
+        cx.spawn(move |_| async move {
             let result = match run(model, engine, parts, body, tools, response, &mut output).await {
                 Ok(Some(refused)) => failed(refused, &mut output).await,
                 Ok(None) => Ok(()),
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
-                cx.emit("model", "splice_error", |e| {
-                    e.field("message", error.to_string())
-                });
                 let _ = tx.send(Err(error)).await;
             }
             Ok(())
@@ -572,23 +569,12 @@ async fn run(
             let (kind, settings) = &tools[name];
             let count = uses.entry(name.into()).or_default();
             *count += 1;
-            let start = Instant::now();
             let (content, text) =
                 answer(&model, engine.clone(), &body, block, kind, settings, *count).await;
             if *kind == "web_search" {
                 searches += 1;
             }
-            model
-                .cx
-                .emitter(&model.connection)
-                .emit("model", "tool", |e| {
-                    e.field("tool", *kind)
-                        .field("query", block["input"]["query"].as_str().unwrap_or(""))
-                        .field("url", block["input"]["url"].as_str().unwrap_or(""))
-                        .field("source", "world")
-                        .field("results", content.as_array().map_or(0, Vec::len) as u64)
-                        .field("ms", start.elapsed().as_millis() as u64)
-                });
+
             output.block(json!({"type":format!("{kind}_tool_result"),"tool_use_id":id,"content":content})).await?;
             results.push(json!({"type":"tool_result","tool_use_id":block["id"],"content":text}));
         }
@@ -731,7 +717,7 @@ mod tests {
     }
     #[test]
     fn fetch_uses_prior_context_and_limits_and_round_trips_history() {
-        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(9)), |cx| async move {
+        fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(9), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let model = Model::at(&cx, Provider::Anthropic, credential, "http://127.0.0.1:1".parse()?)?;
             let engine: Arc<dyn Engine> = Arc::new(Pages);

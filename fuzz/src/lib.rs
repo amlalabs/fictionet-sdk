@@ -65,13 +65,13 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     world_with_options(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(seed)),
+        fictionet::Seed::from_u64(seed),
         f,
     )
 }
 
 /// Runs a fuzz world with explicitly selected observation.
-pub fn world_with_options<F, Fut>(options: fictionet::RunOptions, f: F)
+pub fn world_with_options<F, Fut>(options: fictionet::Seed, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = ()> + Send + 'static,

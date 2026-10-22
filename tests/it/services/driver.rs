@@ -1,5 +1,5 @@
 use super::*;
-use fictionet::RunOptions;
+use fictionet::Seed;
 
 // ---------------------------------------------------------------------------
 // The harness
@@ -93,7 +93,7 @@ fn replies_do_not_depend_on_chunk_boundaries() {
 
 #[test]
 fn listen_serves_each_connection() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let opts = ServeOptions::default();
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, opts);
@@ -106,47 +106,13 @@ fn listen_serves_each_connection() {
         assert_eq!(read_some(&fcx, &mut conn, 14).await, b"one\nlater\ntwo\n");
         conn.write_all(&fcx, b"quit\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 100).await, b"bye\n");
-        let entries = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("conn", "close")
-            })
-            .await?;
-        assert_eq!(entries.len(), 1);
-        let events = kept.all();
-        let (start, all) = events.split_first().unwrap();
-        assert!(start.is("run", "start"));
-        assert_eq!(start.seq, 1);
-        assert_eq!(start.conn.id, None);
-        let kinds: Vec<String> = all
-            .iter()
-            .map(|e| format!("{}.{}", e.source, e.kind))
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                "conn.open",
-                "echo.line",
-                "echo.line",
-                "echo.later",
-                "echo.line",
-                "echo.line",
-                "conn.close"
-            ]
-        );
-        assert!(all.iter().all(|e| e.conn.id == Some(1)
-            && e.conn.peer.map(|p| p.ip()) == Some(Ipv4Addr::new(10, 9, 0, 2).into())));
-        assert_eq!(all[3].get("written").and_then(json::Value::as_u64), Some(2));
-        assert_eq!(
-            all[6].get("end").and_then(json::Value::as_str),
-            Some("closed")
-        );
         Ok(())
     });
 }
 
 #[test]
 fn timers_tick_and_idle_connections_close() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -167,12 +133,12 @@ fn timers_tick_and_idle_connections_close() {
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 2))
             .await?;
-        assert_eq!(read_some(&fcx, &mut conn, 100).await, b"hello\n");
-        let on_2 = |e: &Event| e.is("conn", "close") && e.conn.local.map(|a| a.port()) == Some(2);
-        let closed = kept.wait(&fcx, 0, 1, Duration::from_secs(2), on_2).await?;
+        assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
+        let started = fcx.now();
+        assert_eq!(conn.read(&fcx, &mut [0; 1]).await?, 0);
         assert_eq!(
-            closed[0].get("end").and_then(json::Value::as_str),
-            Some("idle")
+            fcx.now().since_start() - started.since_start(),
+            Duration::from_millis(100)
         );
         Ok(())
     });
@@ -217,7 +183,7 @@ fn a_handoff_returns_the_connection_with_its_unread_bytes() {
 
 #[test]
 fn a_connection_cap_resets_connections_past_it() {
-    crate::common::world::observed_world(Duration::from_secs(60), |fcx, events| async move {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -237,13 +203,6 @@ fn a_connection_cap_resets_connections_past_it() {
             .await
             .expect("an answer");
         assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
-        let blocked = events
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("net", "blocked")
-            })
-            .await?;
-        assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
-        assert_eq!(blocked[0].str("dst"), Some("10.9.0.1"));
         Ok(())
     });
 }
@@ -363,7 +322,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Short, ());
     assert_eq!(h.push(&input).unwrap(), b"long\nok\n");
     assert!(!h.closed());
-    crate::common::world::observed_world(Duration::from_secs(60), move |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), move |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -377,11 +336,6 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
             .await?;
         conn.write_all(&fcx, &input).await?;
         assert_eq!(read_some(&fcx, &mut conn, 8).await, b"long\nok\n");
-        assert!(
-            kept.of("conn", "close").is_empty(),
-            "{:?}",
-            kept.of("conn", "close")
-        );
         Ok(())
     });
 }
@@ -390,14 +344,12 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
 /// does. Before, it dropped the work and took an upgrade for a close.
 #[test]
 fn the_harness_runs_deferred_work_and_reports_upgrades() {
-    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(log.clone());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
     let got = h.push(b"one\nlater\ntwo\n");
     assert_eq!(
         got.as_deref().map(String::from_utf8_lossy).unwrap(),
         "hello\none\nlater\ntwo\n"
     );
-    assert!(log.all().iter().any(|e| e.is("echo", "later")));
     assert!(matches!(
         h.push(b"handoff\nrest"),
         Err(HarnessError::Upgraded(Upgrade::Handoff))
@@ -881,7 +833,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
 
     let addr = Ipv4Addr::new(10, 40, 0, 9);
     let to = SocketAddr::new(addr.into(), 7);
-    crate::common::world::observed_world(Duration::from_secs(60), move |fcx, kept| async move {
+    crate::common::world::world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         Net::new()
             .ipv4_only()
@@ -891,32 +843,22 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
         let mut b = s.tcp.connect(&fcx, to).await?;
         b.write_all(&fcx, b"hi\nfail\n").await?;
         assert_eq!(read_some(&fcx, &mut b, 10).await, b"fine\n");
-        let error = kept
-            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
-                e.is("conn", "error")
-            })
-            .await?;
-        assert_eq!(error[0].str("error"), Some("the service gave up"));
-        assert_eq!(error[0].conn.id, Some(1));
         Ok(())
     });
 
     let ran = std::thread::spawn(move || {
-        block_on(lab(
-            RunOptions::new(fictionet::Seed::from_u64(1)),
-            move |fcx| async move {
-                let (attacher, attachments) = fictionet::attachments();
-                Net::new()
-                    .ipv4_only()
-                    .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
-                    .start(&fcx, attachments)?;
-                let s = machine(&fcx, attacher.attach("agent")?, ME);
-                let mut a = s.tcp.connect(&fcx, to).await?;
-                a.write_all(&fcx, b"boom\n").await?;
-                fcx.idle().await?;
-                Ok(())
-            },
-        ))
+        block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            Net::new()
+                .ipv4_only()
+                .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
+                .start(&fcx, attachments)?;
+            let s = machine(&fcx, attacher.attach("agent")?, ME);
+            let mut a = s.tcp.connect(&fcx, to).await?;
+            a.write_all(&fcx, b"boom\n").await?;
+            fcx.idle().await?;
+            Ok(())
+        }))
     })
     .join();
     let panic = ran.expect_err("the run should end with the panic");
@@ -950,7 +892,7 @@ fn a_seeded_run_repeats_its_randomness() {
     let draws = |seed: u64| {
         let (tx, rx) = mpsc::channel();
         fictionet::block_on(fictionet::lab(
-            RunOptions::new(fictionet::Seed::from_u64(seed)),
+            fictionet::Seed::from_u64(seed),
             move |fcx| async move {
                 let (server, _su, client, _cu) = two_machines(&fcx);
                 serve::listen(
@@ -1147,39 +1089,35 @@ fn every_serving_wait_reports_a_cancel() {
 
 #[test]
 fn harness_service_and_http_share_the_context_stream() {
-    use fictionet::{Entropy, Seed, SeededEntropy};
+    use fictionet::{Entropy, SeededEntropy};
     let seed = Seed::from_u64(42);
-    world::seeded_world(
-        RunOptions::new(seed),
-        Duration::from_secs(10),
-        move |fcx| async move {
-            let oracle = SeededEntropy::new(seed);
-            assert_eq!(fcx.random_u64(), oracle.random_u64());
-            let mut dice = Harness::new(Seed::from_u64(999), Dice, ()).with_fcx(fcx.clone());
-            assert_eq!(
-                dice.open().unwrap(),
-                format!("{}\n", oracle.random_u64()).as_bytes()
-            );
+    world::seeded_world(seed, Duration::from_secs(10), move |fcx| async move {
+        let oracle = SeededEntropy::new(seed);
+        assert_eq!(fcx.random_u64(), oracle.random_u64());
+        let mut dice = Harness::new(Seed::from_u64(999), Dice, ()).with_fcx(fcx.clone());
+        assert_eq!(
+            dice.open().unwrap(),
+            format!("{}\n", oracle.random_u64()).as_bytes()
+        );
 
-            let stamp = Arc::new(Mutex::new(None));
-            let seen = stamp.clone();
-            let router = fictionet_test_support::handler(
-                move |ex: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
-                      _: http::Request<bytes::Bytes>| {
-                    *seen.lock().unwrap() = Some(ex.now());
-                    http::Response::new(Bytes::from(ex.random_u64().to_le_bytes().to_vec()))
-                },
-            );
-            let mut http =
-                Harness::new(Seed::from_u64(999), Http1::new(router), ()).with_fcx(fcx.clone());
-            fcx.sleep(Duration::from_millis(1)).await?;
-            let before = fcx.now();
-            let reply = http.push(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
-            assert!(reply.ends_with(&oracle.random_u64().to_le_bytes()));
-            let stamp = stamp.lock().unwrap().unwrap();
-            assert!(stamp >= before && stamp <= fcx.now());
-            assert_eq!(fcx.random_u64(), oracle.random_u64());
-            Ok(())
-        },
-    );
+        let stamp = Arc::new(Mutex::new(None));
+        let seen = stamp.clone();
+        let router = fictionet_test_support::handler(
+            move |ex: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
+                  _: http::Request<bytes::Bytes>| {
+                *seen.lock().unwrap() = Some(ex.now());
+                http::Response::new(Bytes::from(ex.random_u64().to_le_bytes().to_vec()))
+            },
+        );
+        let mut http =
+            Harness::new(Seed::from_u64(999), Http1::new(router), ()).with_fcx(fcx.clone());
+        fcx.sleep(Duration::from_millis(1)).await?;
+        let before = fcx.now();
+        let reply = http.push(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
+        assert!(reply.ends_with(&oracle.random_u64().to_le_bytes()));
+        let stamp = stamp.lock().unwrap().unwrap();
+        assert!(stamp >= before && stamp <= fcx.now());
+        assert_eq!(fcx.random_u64(), oracle.random_u64());
+        Ok(())
+    });
 }

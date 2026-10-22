@@ -103,7 +103,7 @@ function activityText(row) {
   switch (fact.kind) {
     case 'resolved': return [fact.name, 'DNS', `${fact.name} → ${fact.address || 'no answer'}`, `site:${fact.name}`];
     case 'request': return [fact.host, 'HTTP', `${fact.method} ${fact.path} · ${fact.status}`, `site:${fact.host}`];
-    case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com',web_search:'model gateway'}[fact.engine] || 'World search', 'Search', fact.query, fact.engine === 'web_search' ? 'calls' : 'sites'];
+    case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
     case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${fact.path} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
@@ -285,7 +285,7 @@ async function command(command) {
   if (!response.ok) throw new Error(await response.text());
   await loadWorld();
 }
-$('source').onchange = async () => { $('source').disabled = true; try { await command({ command: 'source', source: $('source').value }); } catch (error) { $('world-error').textContent = error.message; await loadWorld(); } finally { $('source').disabled = false; } };
+$('source').onchange = async () => { $('source').disabled = true; try { await command({ command: 'set_source', source: $('source').value }); } catch (error) { $('world-error').textContent = error.message; await loadWorld(); } finally { $('source').disabled = false; } };
 $('restart').onclick = async () => { $('restart').disabled = true; try { await command({ command: 'restart' }); select(null); goLive(); } catch (error) { $('world-error').textContent = error.message; } finally { $('restart').disabled = false; } };
 $('close-page').onclick = () => { $('page-dialog').close(); $('page-preview').srcdoc = ''; };
 $('story').onclick = async () => {

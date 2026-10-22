@@ -57,7 +57,6 @@ use fictionet::{Cx, End, Interface, Packet};
 pub fn delay(fcx: &Cx, by: Duration, inner: impl Interface) -> End {
     shape(
         fcx,
-        "delay",
         inner,
         move |queue: &Queue, now: Instant, _len: usize| {
             // Each packet waits `by` from when it arrived. The queue stays in
@@ -106,14 +105,11 @@ pub fn delay(fcx: &Cx, by: Duration, inner: impl Interface) -> End {
 /// being sent. A packet leaves when its last bit has been sent: a 1,000-byte
 /// packet on a 1 Mbit/s link leaves 8 ms after the link started sending it.
 /// So with `queue` 10, a burst of 11 packets loses the 11th. A rate of 0
-/// sends nothing: the queue fills and every later packet is dropped. The
-/// drops are recorded as `bottleneck.drop` [repeats](fictionet::events#repeats),
-/// with how many packets were waiting (`waiting`).
+/// sends nothing: the queue fills and every later packet is dropped.
 #[track_caller]
 pub fn bottleneck(fcx: &Cx, bits_per_second: u64, queue: usize, inner: impl Interface) -> End {
     shape(
         fcx,
-        "bottleneck",
         inner,
         move |waiting: &Queue, now: Instant, len: usize| {
             if waiting.packets.len() >= queue {
@@ -175,30 +171,27 @@ where
     F: FnMut(&Cx, Direction, &Packet) -> bool + Send + 'static,
 {
     let (outer, mine) = link_pair();
-    fcx.spawn_as(
-        || "filter",
-        move |fcx| async move {
-            // Port 0 is `inner`, port 1 our end of the new pair.
-            let mut ports =
-                ports::Ports::new(vec![Box::new(inner) as Box<dyn Interface>, Box::new(mine)]);
-            loop {
-                match ports.next(&fcx, None, |_| Poll::Pending).await? {
-                    ports::Event::Packet(i, packet) => {
-                        let direction = if i == 0 {
-                            Direction::FromInner
-                        } else {
-                            Direction::ToInner
-                        };
-                        if keep(&fcx, direction, &packet) {
-                            ports.send(1 - i, packet);
-                        }
+    fcx.spawn(move |fcx| async move {
+        // Port 0 is `inner`, port 1 our end of the new pair.
+        let mut ports =
+            ports::Ports::new(vec![Box::new(inner) as Box<dyn Interface>, Box::new(mine)]);
+        loop {
+            match ports.next(&fcx, None, |_| Poll::Pending).await? {
+                ports::Event::Packet(i, packet) => {
+                    let direction = if i == 0 {
+                        Direction::FromInner
+                    } else {
+                        Direction::ToInner
+                    };
+                    if keep(&fcx, direction, &packet) {
+                        ports.send(1 - i, packet);
                     }
-                    ports::Event::Timer => {}
-                    ports::Event::Closed(_) | ports::Event::Extra => return Ok(()),
                 }
+                ports::Event::Timer => {}
+                ports::Event::Closed(_) | ports::Event::Extra => return Ok(()),
             }
-        },
-    );
+        }
+    });
     outer
 }
 
@@ -254,69 +247,53 @@ fn link_pair() -> (End, End) {
 /// `admit(queue, now, len)` gives the time it leaves, or `None` to drop it.
 /// Leaving times must not go down within a direction.
 #[track_caller]
-fn shape<F>(fcx: &Cx, name: &'static str, inner: impl Interface, admit: F) -> End
+fn shape<F>(fcx: &Cx, inner: impl Interface, admit: F) -> End
 where
     F: Fn(&Queue, Instant, usize) -> Option<Instant> + Send + 'static,
 {
     let (outer, mine) = link_pair();
-    fcx.spawn_as(
-        move || name,
-        move |fcx| async move {
-            // Port 0 is `inner`, port 1 our end of the new pair. A packet from
-            // port `i` waits in `queues[i]`, then goes out on port `1 - i`.
-            let mut ports =
-                ports::Ports::new(vec![Box::new(inner) as Box<dyn Interface>, Box::new(mine)]);
-            let mut queues = [Queue::default(), Queue::default()];
-            loop {
-                let deadline = queues
-                    .iter()
-                    .filter_map(|q| q.packets.front().map(|(t, _)| *t))
-                    .min();
-                match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
-                    ports::Event::Packet(i, packet) => {
-                        let now = fcx.now();
-                        let cost = packet.0.len() + PACKET_COST;
-                        let fits = queues[i].bytes + cost <= LINK_STORE;
-                        if let Some(leaves) =
-                            admit(&queues[i], now, packet.0.len()).filter(|_| fits)
-                        {
-                            queues[i].bytes += cost;
-                            queues[i].packets.push_back((leaves, packet));
-                        } else {
-                            let waiting = queues[i].packets.len();
-                            fictionet::stdlib::network::ip::emit_drop(
-                                &fcx,
-                                &fictionet::events::ConnInfo::default(),
-                                name,
-                                &packet,
-                                "the queue was full",
-                                || fictionet::events::Fields::new().with("waiting", waiting as u64),
-                                |event| event,
-                            );
-                        }
+    fcx.spawn(move |fcx| async move {
+        // Port 0 is `inner`, port 1 our end of the new pair. A packet from
+        // port `i` waits in `queues[i]`, then goes out on port `1 - i`.
+        let mut ports =
+            ports::Ports::new(vec![Box::new(inner) as Box<dyn Interface>, Box::new(mine)]);
+        let mut queues = [Queue::default(), Queue::default()];
+        loop {
+            let deadline = queues
+                .iter()
+                .filter_map(|q| q.packets.front().map(|(t, _)| *t))
+                .min();
+            match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
+                ports::Event::Packet(i, packet) => {
+                    let now = fcx.now();
+                    let cost = packet.0.len() + PACKET_COST;
+                    let fits = queues[i].bytes + cost <= LINK_STORE;
+                    if let Some(leaves) = admit(&queues[i], now, packet.0.len()).filter(|_| fits) {
+                        queues[i].bytes += cost;
+                        queues[i].packets.push_back((leaves, packet));
                     }
-                    ports::Event::Timer => {
-                        let now = fcx.now();
-                        let mut sent = 0;
-                        for (i, queue) in queues.iter_mut().enumerate() {
-                            while sent < ports::BUDGET {
-                                match queue.packets.front() {
-                                    Some((t, _)) if *t <= now => {}
-                                    _ => break,
-                                }
-                                let (_, packet) = queue.packets.pop_front().unwrap();
-                                queue.bytes -= packet.0.len() + PACKET_COST;
-                                ports.send(1 - i, packet);
-                                sent += 1;
-                            }
-                        }
-                        ports.spend(sent);
-                    }
-                    ports::Event::Closed(_) | ports::Event::Extra => return Ok(()),
                 }
+                ports::Event::Timer => {
+                    let now = fcx.now();
+                    let mut sent = 0;
+                    for (i, queue) in queues.iter_mut().enumerate() {
+                        while sent < ports::BUDGET {
+                            match queue.packets.front() {
+                                Some((t, _)) if *t <= now => {}
+                                _ => break,
+                            }
+                            let (_, packet) = queue.packets.pop_front().unwrap();
+                            queue.bytes -= packet.0.len() + PACKET_COST;
+                            ports.send(1 - i, packet);
+                            sent += 1;
+                        }
+                    }
+                    ports.spend(sent);
+                }
+                ports::Event::Closed(_) | ports::Event::Extra => return Ok(()),
             }
-        },
-    );
+        }
+    });
     outer
 }
 
@@ -357,7 +334,7 @@ mod tests {
     #[test]
     fn a_delay_drops_what_does_not_fit() {
         block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(0)),
+            fictionet::Seed::from_u64(0),
             |fcx| async move {
                 let (mut sandbox, inner) = pair();
                 let mut far = delay(&fcx, Duration::from_secs(1), inner);
@@ -388,9 +365,8 @@ mod tests {
 
     #[test]
     fn a_ten_packet_queue_drops_the_eleventh_packet_of_a_burst() {
-        let log = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(0)).observer(log.clone()),
+            fictionet::Seed::from_u64(0),
             |fcx| async move {
                 let (mut sandbox, inner) = pair();
                 let mut far = bottleneck(&fcx, 1_000_000, 10, inner);
@@ -405,9 +381,6 @@ mod tests {
                     );
                 }
                 assert_eq!(drain(&fcx, &mut far).await, 0);
-                let drops = log.of("bottleneck", "drop");
-                assert_eq!(drops.len(), 1);
-                assert!(drops[0].get("count").is_none());
                 Ok(())
             },
         ))
@@ -416,7 +389,7 @@ mod tests {
 
     #[test]
     fn an_unread_bottleneck_output_stops_growing() {
-        block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (mut sandbox, inner) = pair();
             let mut far = bottleneck(&fcx, u64::MAX, 64, inner);
             flood(&fcx, &mut sandbox, FIT + 500).await?;
@@ -431,4 +404,78 @@ mod tests {
     }
 }
 
+}
+
+/// Copies packets in both directions to a bounded channel chosen by the world.
+/// A full or closed channel drops the copy and leaves forwarding unaffected.
+pub fn tap<I: Interface>(
+    inner: I,
+    packets: std::sync::mpsc::SyncSender<(Direction, Packet)>,
+) -> impl Interface {
+    Tap { inner, packets }
+}
+
+struct Tap<I> {
+    inner: I,
+    packets: std::sync::mpsc::SyncSender<(Direction, Packet)>,
+}
+
+impl<I: Interface> Interface for Tap<I> {
+    fn poll_recv(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Packet, crate::RecvError>> {
+        let result = self.inner.poll_recv(fcx, cx);
+        if let Poll::Ready(Ok(packet)) = &result {
+            let _ = self
+                .packets
+                .try_send((Direction::FromInner, packet.clone()));
+        }
+        result
+    }
+
+    fn send(&mut self, packet: Packet) {
+        let _ = self.packets.try_send((Direction::ToInner, packet.clone()));
+        self.inner.send(packet);
+    }
+}
+
+#[cfg(test)]
+mod tap_tests {
+    use super::*;
+    use fictionet::InterfaceExt;
+
+    #[test]
+    fn packet_copies_never_hold_up_forwarding() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                let (inner, mut peer) = fictionet::pair();
+                let (send, receive) = std::sync::mpsc::sync_channel(1);
+                let mut tapped = tap(inner, send);
+                let outbound = Packet(vec![1, 2, 3]);
+                peer.send(outbound.clone());
+                assert_eq!(tapped.recv(&cx).await?, outbound);
+                let inbound = Packet(vec![4, 5, 6]);
+                tapped.send(inbound.clone());
+                assert_eq!(peer.recv(&cx).await?, inbound);
+                assert_eq!(
+                    receive.try_recv().unwrap(),
+                    (Direction::FromInner, outbound)
+                );
+                tapped.send(inbound.clone());
+                assert_eq!(
+                    receive.try_recv().unwrap(),
+                    (Direction::ToInner, inbound.clone())
+                );
+                assert_eq!(peer.recv(&cx).await?, inbound);
+                drop(receive);
+                tapped.send(Packet(vec![7]));
+                assert_eq!(peer.recv(&cx).await?, Packet(vec![7]));
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 }

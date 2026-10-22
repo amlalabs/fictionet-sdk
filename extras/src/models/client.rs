@@ -227,7 +227,7 @@ mod tests {
             socket.write_all(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"result\":\"ok\"}").unwrap();
         });
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(31)),
+            fictionet::Seed::from_u64(31),
             |cx| async move {
                 let client = Https::at(
                     &cx,
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn https_rejects_unserved_path() {
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(32)),
+            fictionet::Seed::from_u64(32),
             |cx| async move {
                 let result = Https::at(&cx, "http://127.0.0.1:1".parse()?, "/v1/files");
                 let error = result.err().expect("unserved path must fail");
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn https_selects_provider_for_each_endpoint() {
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(33)),
+            fictionet::Seed::from_u64(33),
             |cx| async move {
                 for (provider, path) in [
                     (Provider::OpenRouter, "/api/v1/messages"),

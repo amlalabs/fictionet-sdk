@@ -4,18 +4,8 @@ use fictionet::stdlib::protocols::sse;
 use http_body::{Body as HttpBody, Frame};
 
 pub(super) struct Call {
-    cx: Cx,
-    connection: fictionet::events::ConnInfo,
-    id: u64,
     provider: Provider,
     path: String,
-    model: String,
-    stream: bool,
-    transport: &'static str,
-    request_bytes: usize,
-    response_bytes: usize,
-    start: Instant,
-    first: Option<u64>,
     pub status: u16,
     pub stop: String,
     input: u64,
@@ -30,31 +20,12 @@ pub(super) struct Call {
     ledger: Arc<Mutex<Ledger>>,
     prices: Option<Prices>,
     secret: Secret,
-    credential: &'static str,
 }
 impl Call {
-    pub fn new(
-        site: &Model,
-        path: String,
-        body: &Value,
-        request: &[u8],
-        free: bool,
-        transport: &'static str,
-        secret: &Secret,
-    ) -> Self {
-        let call = Self {
-            cx: site.cx.clone(),
-            connection: site.connection.clone(),
-            id: site.cx.random_u64(),
+    pub fn new(site: &Model, path: String, body: &Value, free: bool, secret: &Secret) -> Self {
+        Self {
             provider: site.provider,
             path,
-            model: secret.redact(body["model"].as_str().unwrap_or("")),
-            stream: body["stream"].as_bool().unwrap_or(false),
-            transport,
-            request_bytes: request.len(),
-            response_bytes: 0,
-            start: Instant::now(),
-            first: None,
             status: 0,
             stop: "cancelled".into(),
             input: 0,
@@ -71,32 +42,9 @@ impl Call {
                 (body["model"].as_str() == Some(model.as_str())).then_some(*prices)
             }),
             secret: secret.clone(),
-            credential: if site.credential.is_none() {
-                "guest"
-            } else {
-                "placeholder"
-            },
-        };
-        if call.cx.event_enabled("model", "body") {
-            call.transcript(
-                "request",
-                secret.redact(&String::from_utf8_lossy(request)).as_bytes(),
-            );
-        }
-        call
-    }
-    fn transcript(&self, direction: &str, data: &[u8]) {
-        for chunk in data.chunks(64 * 1024) {
-            self.cx
-                .emitter(&self.connection)
-                .emit("model", "body", |e| {
-                    e.field("call", self.id)
-                        .field("direction", direction)
-                        .field("encoding", "base64")
-                        .field("data", fictionet::stdlib::codec::base64::encode(chunk))
-                });
         }
     }
+
     fn read(&mut self, value: &Value) {
         if matches!(
             value["type"].as_str(),
@@ -201,28 +149,6 @@ impl Drop for Call {
             ledger.unknown |= self.status < 400 && (!self.complete || !self.usage);
             ledger.unknown_cost |= self.status < 400 && cost.is_none();
         }
-        self.cx
-            .emitter(&self.connection)
-            .emit("model", "call", |e| {
-                e.field("call", self.id)
-                    .field("provider", self.provider.host())
-                    .field("host", self.provider.host())
-                    .field("path", self.path.as_str())
-                    .field("model", self.model.as_str())
-                    .field("stream", self.stream)
-                    .field("transport", self.transport)
-                    .field("status", self.status as u64)
-                    .field("input_tokens", self.input)
-                    .field("output_tokens", self.output)
-                    .field("cache_read_input_tokens", self.cache_read)
-                    .field("cache_creation_input_tokens", self.cache_write)
-                    .field("request_bytes", self.request_bytes as u64)
-                    .field("response_bytes", self.response_bytes as u64)
-                    .field("first_byte_ms", self.first.unwrap_or(0))
-                    .field("total_ms", self.start.elapsed().as_millis() as u64)
-                    .field("stop_reason", self.stop.as_str())
-                    .field("credential", self.credential)
-            });
     }
 }
 
@@ -249,9 +175,6 @@ impl Metered {
     }
     fn consume(&mut self, bytes: &[u8]) {
         let call = self.call.as_mut().unwrap();
-        call.first
-            .get_or_insert_with(|| call.start.elapsed().as_millis() as u64);
-        call.response_bytes += bytes.len();
         if let Some(decoder) = &mut self.sse {
             if try_pump(decoder, bytes, |event| {
                 if event.data == "[DONE]" {
@@ -325,9 +248,6 @@ impl HttpBody for Metered {
                         self.pending.extend_from_slice(&bytes);
                         let safe = self.scrub(false);
                         if !safe.is_empty() {
-                            if let Some(call) = &self.call {
-                                call.transcript("response", &safe);
-                            }
                             return Poll::Ready(Some(Ok(Frame::data(safe.into()))));
                         }
                     }
@@ -346,9 +266,6 @@ impl HttpBody for Metered {
                 Poll::Ready(None) => {
                     self.done = true;
                     let tail = self.scrub(true);
-                    if let Some(call) = &self.call {
-                        call.transcript("response", &tail);
-                    }
                     self.finish();
                     return Poll::Ready((!tail.is_empty()).then(|| Ok(Frame::data(tail.into()))));
                 }

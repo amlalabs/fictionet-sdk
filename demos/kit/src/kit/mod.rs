@@ -12,7 +12,7 @@ pub mod ssh;
 mod util;
 pub mod vm;
 use fictionet::stdlib::network::ethernet::Family;
-use fictionet::{Attachments, Cx, RunOptions, Seed};
+use fictionet::{Attachments, Cx, Seed};
 pub use page::{PAGE_PORT, PageAccess};
 use std::future::Future;
 use std::io;
@@ -35,19 +35,6 @@ pub fn jump_prefix() -> fictionet::stdlib::network::route::Prefix {
     }
 }
 
-/// Words nothing in a guest may contain, in any case: in its names, its
-/// files, its packages or its commands. Any of them could tell an agent in
-/// the guest that its world is made up. [`Guest::forbid`] adds a demo's own.
-pub const FORBIDDEN: &[&str] = &[
-    "fictionet",
-    "eval",
-    "sandbox",
-    "world",
-    "scripted",
-    "demo",
-    "probe",
-];
-
 #[derive(Clone)]
 struct File {
     path: String,
@@ -55,9 +42,22 @@ struct File {
     content: String,
 }
 
+/// Software installed by the guest's setup pieces.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct Features {
+    /// Claude Code is installed.
+    pub claude_code: bool,
+    /// Codex is installed.
+    pub codex: bool,
+    /// Firefox is installed.
+    pub firefox: bool,
+}
+
 /// A guest's identity, resources, card, and cloud-init steps.
 #[derive(Clone)]
 pub struct Guest {
+    /// Software installed by this guest's setup.
+    pub features: Features,
     hostname: String,
     attachment: String,
     user: String,
@@ -80,6 +80,7 @@ impl Guest {
     /// Disables background refreshes and network time.
     pub fn ubuntu(hostname: &str, user: &str) -> Self {
         let mut guest = Self {
+            features: Features::default(),
             hostname: hostname.into(),
             attachment: hostname.into(),
             user: user.into(),
@@ -212,13 +213,13 @@ impl Guest {
         self.terminal = Some(command.into());
         self
     }
-    /// Adds words that nothing in this guest may contain, beside [`FORBIDDEN`].
+    /// Adds words that nothing in this guest may contain, beside the shared guest vocabulary.
     pub fn forbid(mut self, words: &[&str]) -> Self {
         self.forbidden
             .extend(words.iter().map(|w| w.to_ascii_lowercase()));
         self
     }
-    /// Returns the first word of [`FORBIDDEN`] or [`Guest::forbid`] that
+    /// Returns the first word of the shared guest vocabulary or [`Guest::forbid`] that
     /// `text` contains, ignoring case.
     pub fn reveals(&self, text: &str) -> Option<&str> {
         forbidden_in(text, &self.forbidden)
@@ -306,21 +307,26 @@ impl Guest {
 }
 
 fn valid_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
     !name.is_empty()
         && name
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-        && forbidden_in(name, &[]).is_none()
+        && !fictionet_extras::guest_content::NAMES
+            .iter()
+            .chain(fictionet_extras::guest_content::WORDS)
+            .any(|word| lower.contains(word))
 }
 
-/// The first word of [`FORBIDDEN`] or `extra` in `text`, ignoring case.
+/// The first word of the shared guest vocabulary or `extra` in `text`, ignoring case.
 fn forbidden_in<'a>(text: &str, extra: &'a [String]) -> Option<&'a str> {
     let lower = text.to_ascii_lowercase();
-    FORBIDDEN
-        .iter()
-        .copied()
-        .chain(extra.iter().map(String::as_str))
-        .find(|word| lower.contains(word))
+    fictionet_extras::guest_content::forbidden_installation_word(text).or_else(|| {
+        extra
+            .iter()
+            .map(String::as_str)
+            .find(|word| lower.contains(word))
+    })
 }
 
 /// Inputs available to a world author before any guest boots.
@@ -328,9 +334,8 @@ pub struct World {
     attachments: Attachments,
     ca: Arc<Mutex<Option<(String, String)>>>,
     now_unix: i64,
-    mirror: Arc<Mutex<Option<mirror::Cache<fictionet::stdlib::web::Proxy>>>>,
-    mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
-    setup: Arc<mirror::Setup>,
+    mirror: Arc<Mutex<Option<mirror::Mirror<fictionet::stdlib::web::Proxy>>>>,
+    setup: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl World {
@@ -351,12 +356,11 @@ impl World {
     pub fn mirror(
         &mut self,
         fcx: &Cx,
-    ) -> fictionet::Result<mirror::Cache<fictionet::stdlib::web::Proxy>> {
+    ) -> fictionet::Result<mirror::Mirror<fictionet::stdlib::web::Proxy>> {
         let mut mirror = self.mirror.lock().unwrap();
         if mirror.is_none() {
             let mut cache = mirror::new(fcx)?;
-            cache.addresses = self.mirror_addresses.clone();
-            cache.setup = Some(self.setup.clone());
+            cache.closed = self.setup.clone();
             *mirror = Some(cache);
         }
         Ok(mirror.as_ref().unwrap().clone())
@@ -412,7 +416,6 @@ pub struct GuestHandle {
     boot: Instant,
     ssh_ready: Duration,
     console: page::GuestConsole,
-    setup: Arc<mirror::Setup>,
 }
 
 impl GuestHandle {
@@ -458,8 +461,8 @@ pub struct Run {
     bridges: Vec<JoinHandle<()>>,
     dir: Option<util::RunDir>,
     boot: Instant,
-    setup: Arc<mirror::Setup>,
-    mirror: Arc<Mutex<Option<mirror::Cache<fictionet::stdlib::web::Proxy>>>>,
+    setup: Arc<std::sync::atomic::AtomicBool>,
+    mirror: Arc<Mutex<Option<mirror::Mirror<fictionet::stdlib::web::Proxy>>>>,
 }
 
 impl Run {
@@ -486,6 +489,7 @@ impl Run {
     /// files. Fails unless every guest powered off, no Cloud Hypervisor
     /// process is left, and the run directory is gone.
     pub async fn shutdown(mut self) -> io::Result<()> {
+        self.setup.store(true, std::sync::atomic::Ordering::Release);
         self.stop_status();
         let pids: Vec<u32> = self
             .guests
@@ -547,10 +551,7 @@ impl Run {
             ),
             Err(error) => failures.push(error),
         }
-        let mirror = self.mirror.lock().unwrap().take();
-        if let Some(mirror) = mirror {
-            mirror.close().await;
-        }
+        self.mirror.lock().unwrap().take();
         if let Some(dir) = self.dir.take()
             && let Err(error) = std::fs::remove_dir_all(dir.path())
         {
@@ -577,10 +578,10 @@ impl Run {
     /// setting up. The package mirror stops forwarding setup traffic when
     /// this returns, ready or not, or when it is dropped unfinished.
     pub async fn app_ready(&self, host: &str) -> io::Result<()> {
-        struct CloseSetup<'a>(&'a mirror::Setup);
+        struct CloseSetup<'a>(&'a std::sync::atomic::AtomicBool);
         impl Drop for CloseSetup<'_> {
             fn drop(&mut self) {
-                self.0.close();
+                self.0.store(true, std::sync::atomic::Ordering::Release);
             }
         }
         let _close = CloseSetup(&self.setup);
@@ -636,7 +637,6 @@ struct Bridge {
 }
 
 struct Prepared {
-    mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
     attachments: Attachments,
     jump_link: fictionet::End,
     bridges: Vec<Bridge>,
@@ -672,9 +672,7 @@ fn prepare(name: &str, guests: Vec<Guest>) -> io::Result<(Run, Prepared)> {
             return Err(io::Error::other("duplicate guest hostname or attachment"));
         }
     }
-    let setup = Arc::new(mirror::Setup::new(
-        guests.iter().map(|g| g.hostname.clone()),
-    ));
+    let setup = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let mut run = Run {
         audit,
@@ -690,7 +688,6 @@ fn prepare(name: &str, guests: Vec<Guest>) -> io::Result<(Run, Prepared)> {
     };
     let (attacher, attachments) = fictionet::attachments();
     let mut prepared = Prepared {
-        mirror_addresses: Default::default(),
         attachments,
         jump_link: attacher.attach(JUMP).map_err(io::Error::other)?,
         bridges: Vec::new(),
@@ -714,7 +711,6 @@ fn prepare(name: &str, guests: Vec<Guest>) -> io::Result<(Run, Prepared)> {
         });
         let console = page::GuestConsole::new(&guest);
         run.guests.push(GuestHandle {
-            setup: setup.clone(),
             console,
             guest,
             resources,
@@ -785,11 +781,10 @@ impl Run {
     {
         let ca = Arc::new(Mutex::new(None));
         let world = World {
+            setup: self.setup.clone(),
             attachments: prepared.attachments,
             ca: ca.clone(),
             mirror: self.mirror.clone(),
-            mirror_addresses: prepared.mirror_addresses,
-            setup: self.setup.clone(),
             now_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(io::Error::other)?
@@ -798,7 +793,7 @@ impl Run {
         let fcx_slot = self.fcx.clone();
         let (ready, receive) = oneshot::channel();
         let (bridge_tx, bridge_rx) = oneshot::channel();
-        let options = RunOptions::new(Seed::random());
+        let options = Seed::random();
         let consoles: Vec<_> = self
             .guests
             .iter()
@@ -997,7 +992,6 @@ impl GuestHandle {
                 ),
             )
         })??;
-        self.setup.done(self.name());
         if output.code != 0 {
             return Err(io::Error::other(format!(
                 "{}: cloud-init exit {}\n{}{}",

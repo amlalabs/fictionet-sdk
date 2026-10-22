@@ -12,7 +12,6 @@ use std::time::SystemTime;
 
 use fictionet_extras::args::{Args, configuration, secs, unknown};
 use fictionet_extras::log::Log;
-use fictionet_extras::names;
 use serde_json::json;
 use web_world::pages::model::{self, Model};
 use web_world::pages::store::Store;
@@ -67,13 +66,19 @@ fn real_main() -> fictionet::Result {
     }
     let kind = match generator.as_str() {
         "" => GeneratorKind::default(),
-        text => names::parse(text).ok_or_else(|| {
-            let kinds: Vec<_> = GeneratorKind::ALL.iter().map(names::name).collect();
-            fictionet::Error::msg(format!(
-                "generator must be one of {}, not {text:?}",
-                kinds.join(", ")
-            ))
-        })?,
+        text => GeneratorKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == text)
+            .ok_or_else(|| {
+                let kinds: Vec<_> = GeneratorKind::ALL
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect();
+                fictionet::Error::msg(format!(
+                    "generator must be one of {}, not {text:?}",
+                    kinds.join(", ")
+                ))
+            })?,
     };
     let key = match kind {
         GeneratorKind::Model(provider) => {
@@ -137,9 +142,7 @@ fn real_main() -> fictionet::Result {
     let state_path = args.state_dir.join("state.json");
     let ready = args.ready.clone();
 
-    let options = fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
-        web_world::events::LogObserver { log: log.clone() },
-    ));
+    let options = fictionet::Seed::random();
     let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
         let maker = match (kind, key) {
             (GeneratorKind::Stored, _) => Some(Maker::Stored),

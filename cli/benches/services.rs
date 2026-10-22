@@ -103,7 +103,7 @@ impl Echo {
         let listening = listen(WorldSocket::UnixSocket(path.clone()), attacher).unwrap();
         let world = std::thread::spawn(move || {
             finish(block_on(run(
-                fictionet::RunOptions::new(fictionet::Seed::random()),
+                fictionet::Seed::random(),
                 move |fcx| async move {
                     let mut agent = attachments.get(&fcx, "agent").await?;
                     loop {
@@ -231,27 +231,6 @@ const PROXY_AUTH: &str = "Basic cmVsYXk6YmVuY2gtdG9rZW4=";
 #[derive(Default)]
 struct Queries(Mutex<std::collections::HashMap<String, u64>>);
 
-impl fictionet::events::Observer for Queries {
-    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        let fictionet::events::Interest::Event(metadata, _) = interest else {
-            return false;
-        };
-        metadata.source == "dns" && metadata.kind == "query"
-    }
-    fn observe(
-        &self,
-        _: fictionet::events::Stamp,
-        observation: fictionet::events::Observation<'_>,
-    ) {
-        if let fictionet::events::Observation::Event(e) = observation
-            && e.u64("qtype") == Some(1)
-            && let Some(name) = e.str("name")
-        {
-            *self.0.lock().unwrap().entry(name.to_owned()).or_default() += 1;
-        }
-    }
-}
-
 struct Proxy {
     addr: SocketAddr,
     queries: Arc<Queries>,
@@ -277,8 +256,22 @@ impl Proxy {
             let (queries, stop) = (queries.clone(), stop.clone());
             std::thread::spawn(move || {
                 finish(block_on(run(
-                    fictionet::RunOptions::new(fictionet::Seed::random()).observer(queries),
+                    fictionet::Seed::random(),
                     move |fcx| async move {
+                        let attachments = fictionet_test_support::sandbox::watch_dns(
+                            &fcx,
+                            attachments,
+                            move |name, kind| {
+                                if kind == fictionet::stdlib::protocols::dns::rr::RecordType::A {
+                                    *queries
+                                        .0
+                                        .lock()
+                                        .unwrap()
+                                        .entry(name.to_ascii().trim_end_matches('.').to_owned())
+                                        .or_default() += 1;
+                                }
+                            },
+                        );
                         let page = Page(Bytes::from_static(b"plain site\n"));
 
                         web::Sites::new(move |host: &str| {

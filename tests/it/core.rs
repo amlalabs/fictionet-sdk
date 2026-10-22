@@ -9,8 +9,8 @@ use std::time::Duration;
 use fictionet::prelude::*;
 use fictionet::time::ms;
 use fictionet::{
-    AttachError, Cancelled, Interface, JoinError, Packet, RecvError, RunOptions, Seed, attachments,
-    block_on, lab, pair, run,
+    AttachError, Cancelled, Interface, JoinError, Packet, RecvError, Seed, attachments, block_on,
+    lab, pair, run,
 };
 
 #[derive(Debug)]
@@ -25,7 +25,7 @@ impl std::error::Error for Boom {}
 #[test]
 fn the_run_future_is_send() {
     fn assert_send<T: Send>(_: &T) {}
-    let future = run(RunOptions::new(Seed::random()), |_fcx| async { Ok(()) });
+    let future = run(Seed::random(), |_fcx| async { Ok(()) });
     assert_send(&future);
 }
 
@@ -34,21 +34,18 @@ fn sleeps_end_in_deadline_order() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let o = order.clone();
     within(Duration::from_secs(5), move || {
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                for d in [30u64, 10, 20] {
-                    let o = o.clone();
-                    fcx.spawn(move |fcx| async move {
-                        fcx.sleep(ms(d)).await?;
-                        assert_eq!(fcx.now().since_start(), ms(d));
-                        o.lock().unwrap().push(d);
-                        Ok(())
-                    });
-                }
-                Ok(())
-            },
-        ))
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            for d in [30u64, 10, 20] {
+                let o = o.clone();
+                fcx.spawn(move |fcx| async move {
+                    fcx.sleep(ms(d)).await?;
+                    assert_eq!(fcx.now().since_start(), ms(d));
+                    o.lock().unwrap().push(d);
+                    Ok(())
+                });
+            }
+            Ok(())
+        }))
     })
     .unwrap();
     assert_eq!(*order.lock().unwrap(), [10, 20, 30]);
@@ -57,7 +54,7 @@ fn sleeps_end_in_deadline_order() {
 #[test]
 fn now_follows_sleep() {
     within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let t0 = fcx.now();
             fcx.sleep(ms(20)).await?;
             let t1 = fcx.now();
@@ -73,7 +70,7 @@ fn now_follows_sleep() {
 #[test]
 fn real_sleep_uses_the_host_clock() {
     within(Duration::from_secs(5), || {
-        block_on(run(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(run(Seed::from_u64(1), |fcx| async move {
             let host = std::time::Instant::now();
             let start = fcx.now();
             fcx.sleep(ms(10)).await?;
@@ -88,7 +85,7 @@ fn real_sleep_uses_the_host_clock() {
 #[test]
 fn random_numbers_differ() {
     within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let a: Vec<u64> = (0..8).map(|_| fcx.random_u64()).collect();
             assert!(a.windows(2).any(|w| w[0] != w[1]));
             for _ in 0..1000 {
@@ -109,145 +106,20 @@ fn ok_does_not_cancel_and_the_run_waits_for_all_work() {
     let saw_cancel = Arc::new(AtomicBool::new(true));
     let (f, c) = (finished.clone(), saw_cancel.clone());
     within(Duration::from_secs(5), move || {
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                fcx.spawn(move |fcx| async move {
-                    fcx.sleep(ms(50)).await?;
-                    assert_eq!(fcx.now().since_start(), ms(50));
-                    c.store(fcx.is_cancelled(), Ordering::SeqCst);
-                    f.store(true, Ordering::SeqCst);
-                    Ok(())
-                });
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            fcx.spawn(move |fcx| async move {
+                fcx.sleep(ms(50)).await?;
+                assert_eq!(fcx.now().since_start(), ms(50));
+                c.store(fcx.is_cancelled(), Ordering::SeqCst);
+                f.store(true, Ordering::SeqCst);
                 Ok(())
-            },
-        ))
-    })
-    .unwrap();
-    assert!(finished.load(Ordering::SeqCst));
-    assert!(!saw_cancel.load(Ordering::SeqCst));
-}
-
-#[test]
-fn naming_callback_can_cancel() {
-    within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
-            fcx.spawn_as(
-                || {
-                    fcx.cancel();
-                    "cancelled task"
-                },
-                |fcx| async move {
-                    assert!(fcx.is_cancelled());
-                    Ok(())
-                },
-            );
-            assert!(fcx.is_cancelled());
+            });
             Ok(())
         }))
     })
     .unwrap();
-}
-
-#[test]
-fn event_wait_predicate_can_read_same_log() {
-    within(Duration::from_secs(5), || {
-        block_on(crate::common::observed_lab(
-            Seed::from_u64(1),
-            |fcx, log| async move {
-                fcx.emit("test", "tick", |event| event);
-                fcx.emit("test", "drop", |event| event);
-                fcx.emit("test", "tick", |event| event);
-                let other = log.clone();
-                let seen = std::sync::Mutex::new(Vec::new());
-                let got = log
-                    .wait(&fcx, 0, 2, ms(10), |event| {
-                        assert_eq!(other.last(), 4);
-                        assert_eq!(other.of("test", "tick").len(), 2);
-                        seen.lock().unwrap().push(event.seq);
-                        event.is("test", "tick")
-                    })
-                    .await?;
-                assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4]);
-                assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 4]);
-                assert_eq!(fcx.now().since_start(), Duration::ZERO);
-                Ok(())
-            },
-        ))
-    })
-    .unwrap();
-}
-
-#[test]
-fn event_wait_predicate_can_record_into_same_log() {
-    within(Duration::from_secs(5), || {
-        block_on(crate::common::observed_lab(
-            Seed::from_u64(1),
-            |fcx, log| async move {
-                fcx.emit("test", "tick", |event| event);
-                let recorded = std::sync::atomic::AtomicBool::new(false);
-                let seen = std::sync::Mutex::new(Vec::new());
-                let got = log
-                    .wait(&fcx, 0, 2, ms(20), |event| {
-                        seen.lock()
-                            .unwrap()
-                            .push((fcx.now().since_start(), event.seq));
-                        if !recorded.swap(true, Ordering::SeqCst) {
-                            fcx.emit("test", "tick", |event| event);
-                        }
-                        event.is("test", "tick")
-                    })
-                    .await?;
-                assert_eq!(*seen.lock().unwrap(), [(ms(0), 1), (ms(0), 2), (ms(0), 3)]);
-                assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 3]);
-                assert_eq!(fcx.now().since_start(), ms(0));
-                Ok(())
-            },
-        ))
-    })
-    .unwrap();
-}
-
-#[test]
-fn event_wait_checks_cancellation_before_inspecting_matches() {
-    for n in [0, 1] {
-        block_on(crate::common::observed_lab(
-            Seed::from_u64(1),
-            |fcx, log| async move {
-                fcx.emit("test", "tick", |event| event);
-                fcx.cancel();
-                let result = log
-                    .wait(&fcx, 0, n, ms(10), |_| {
-                        panic!("cancelled wait inspected events")
-                    })
-                    .await;
-                assert!(result.unwrap_err().downcast_ref::<Cancelled>().is_some());
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
-}
-
-#[test]
-fn event_wait_predicate_cancellation_wins_over_matches_and_timeout() {
-    for n in [1, 2] {
-        block_on(crate::common::observed_lab(
-            Seed::from_u64(1),
-            |fcx, log| async move {
-                fcx.emit("test", "tick", |event| event);
-                let result = log
-                    .wait(&fcx, 0, n, Duration::ZERO, |_| {
-                        fcx.cancel();
-                        true
-                    })
-                    .await;
-                assert!(result.unwrap_err().downcast_ref::<Cancelled>().is_some());
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
+    assert!(finished.load(Ordering::SeqCst));
+    assert!(!saw_cancel.load(Ordering::SeqCst));
 }
 
 /// Every kind of wait ends with `Cancelled` when the region fails.
@@ -256,97 +128,85 @@ fn cancellation_ends_every_wait() {
     let results = Arc::new(Mutex::new(Vec::<String>::new()));
     let r = results.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(crate::common::observed_lab(
-            Seed::from_u64(1),
-            move |fcx, log| async move {
-                let (mut a, b) = pair();
-                let r1 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    let res = fcx.sleep(Duration::from_secs(60)).await;
-                    r1.lock().unwrap().push(format!("sleep {res:?}"));
-                    Ok(())
-                });
-                let r2 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    let _b = b;
-                    let res = a.recv(&fcx).await;
-                    r2.lock().unwrap().push(format!("recv {res:?}"));
-                    Ok(())
-                });
-                let r3 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    fcx.cancelled().await;
-                    r3.lock().unwrap().push("cancelled".into());
-                    Ok(())
-                });
-                // Work that outlives the cancel until its joiner has seen it.
-                let joined = Arc::new(AtomicBool::new(false));
-                let j = joined.clone();
-                let forever = fcx.spawn(move |_fcx| async move {
-                    std::future::poll_fn(|cx| {
-                        if j.load(Ordering::SeqCst) {
-                            return std::task::Poll::Ready(Ok(()));
-                        }
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    })
-                    .await
-                });
-                let r4 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    let res = forever.join(&fcx).await;
-                    joined.store(true, Ordering::SeqCst);
-                    r4.lock().unwrap().push(format!("join {res:?}"));
-                    Ok(())
-                });
-                let (_attacher, mut attachments) = attachments();
-                let r5 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    let res = attachments.get(&fcx, "nope").await;
-                    r5.lock().unwrap().push(format!("get {:?}", res.err()));
-                    let res = attachments.next(&fcx).await;
-                    r5.lock().unwrap().push(format!("next {:?}", res.err()));
-                    Ok(())
-                });
-                let r7 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    let res = fcx.race(None, std::future::pending::<()>()).await;
-                    r7.lock().unwrap().push(format!("race {res:?}"));
-                    Ok(())
-                });
-                let (port, _other) = pair();
-                let r8 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    let mut ports =
-                        fictionet::stdlib::network::ports::Ports::new(vec![
-                            Box::new(port) as Box<dyn Interface>
-                        ]);
-                    let res = ports.next(&fcx, None, |_| std::task::Poll::Pending).await;
-                    r8.lock().unwrap().push(format!("ports {:?}", res.err()));
-                    Ok(())
-                });
-                let r9 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    let res = log
-                        .wait(&fcx, 0, 1, Duration::from_secs(60), |_| false)
-                        .await;
-                    r9.lock().unwrap().push(format!("events {:?}", res.err()));
-                    Ok(())
-                });
-                let r6 = r.clone();
-                fcx.spawn(move |fcx| async move {
-                    // Busy: yield_now itself reports the cancel.
-                    loop {
-                        if let Err(c) = fcx.yield_now().await {
-                            r6.lock().unwrap().push(format!("yield {c:?}"));
-                            return Ok(());
-                        }
+        block_on(fictionet::lab(Seed::from_u64(1), move |fcx| async move {
+            let (mut a, b) = pair();
+            let r1 = r.clone();
+            fcx.spawn(move |fcx| async move {
+                let res = fcx.sleep(Duration::from_secs(60)).await;
+                r1.lock().unwrap().push(format!("sleep {res:?}"));
+                Ok(())
+            });
+            let r2 = r.clone();
+            fcx.spawn(move |fcx| async move {
+                let _b = b;
+                let res = a.recv(&fcx).await;
+                r2.lock().unwrap().push(format!("recv {res:?}"));
+                Ok(())
+            });
+            let r3 = r.clone();
+            fcx.spawn(move |fcx| async move {
+                fcx.cancelled().await;
+                r3.lock().unwrap().push("cancelled".into());
+                Ok(())
+            });
+            // Work that outlives the cancel until its joiner has seen it.
+            let joined = Arc::new(AtomicBool::new(false));
+            let j = joined.clone();
+            let forever = fcx.spawn(move |_fcx| async move {
+                std::future::poll_fn(|cx| {
+                    if j.load(Ordering::SeqCst) {
+                        return std::task::Poll::Ready(Ok(()));
                     }
-                });
-                fcx.yield_now().await?;
-                Err(Boom("stop").into())
-            },
-        ))
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                })
+                .await
+            });
+            let r4 = r.clone();
+            fcx.spawn(move |fcx| async move {
+                let res = forever.join(&fcx).await;
+                joined.store(true, Ordering::SeqCst);
+                r4.lock().unwrap().push(format!("join {res:?}"));
+                Ok(())
+            });
+            let (_attacher, mut attachments) = attachments();
+            let r5 = r.clone();
+            fcx.spawn(move |fcx| async move {
+                let res = attachments.get(&fcx, "nope").await;
+                r5.lock().unwrap().push(format!("get {:?}", res.err()));
+                let res = attachments.next(&fcx).await;
+                r5.lock().unwrap().push(format!("next {:?}", res.err()));
+                Ok(())
+            });
+            let r7 = r.clone();
+            fcx.spawn(move |fcx| async move {
+                let res = fcx.race(None, std::future::pending::<()>()).await;
+                r7.lock().unwrap().push(format!("race {res:?}"));
+                Ok(())
+            });
+            let (port, _other) = pair();
+            let r8 = r.clone();
+            fcx.spawn(move |fcx| async move {
+                let mut ports = fictionet::stdlib::network::ports::Ports::new(vec![
+                    Box::new(port) as Box<dyn Interface>
+                ]);
+                let res = ports.next(&fcx, None, |_| std::task::Poll::Pending).await;
+                r8.lock().unwrap().push(format!("ports {:?}", res.err()));
+                Ok(())
+            });
+            let r6 = r.clone();
+            fcx.spawn(move |fcx| async move {
+                // Busy: yield_now itself reports the cancel.
+                loop {
+                    if let Err(c) = fcx.yield_now().await {
+                        r6.lock().unwrap().push(format!("yield {c:?}"));
+                        return Ok(());
+                    }
+                }
+            });
+            fcx.yield_now().await?;
+            Err(Boom("stop").into())
+        }))
     });
     assert_eq!(out.unwrap_err().to_string(), "stop");
     let mut results = results.lock().unwrap().clone();
@@ -355,7 +215,6 @@ fn cancellation_ends_every_wait() {
         results,
         [
             "cancelled",
-            "events Some(Cancelled)",
             "get Some(Cancelled)",
             "join Err(Cancelled)",
             "next Some(Cancelled)",
@@ -375,23 +234,20 @@ fn task_error_cancels_siblings_and_comes_out_of_run() {
     let sibling = Arc::new(Mutex::new(None));
     let s = sibling.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                fcx.spawn(move |fcx| async move {
-                    *s.lock().unwrap() = Some(fcx.sleep(Duration::from_secs(60)).await);
-                    Ok(())
-                });
-                fcx.spawn(|fcx| async move {
-                    fcx.sleep(ms(10)).await?;
-                    Err(Boom("task failed").into())
-                });
-                // The world waits too, and stops with `?` on Cancelled. The
-                // task's error is the one that comes out.
-                fcx.sleep(Duration::from_secs(60)).await?;
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            fcx.spawn(move |fcx| async move {
+                *s.lock().unwrap() = Some(fcx.sleep(Duration::from_secs(60)).await);
                 Ok(())
-            },
-        ))
+            });
+            fcx.spawn(|fcx| async move {
+                fcx.sleep(ms(10)).await?;
+                Err(Boom("task failed").into())
+            });
+            // The world waits too, and stops with `?` on Cancelled. The
+            // task's error is the one that comes out.
+            fcx.sleep(Duration::from_secs(60)).await?;
+            Ok(())
+        }))
     });
     let err = out.unwrap_err();
     assert!(err.downcast_ref::<Boom>().is_some(), "{err}");
@@ -401,7 +257,7 @@ fn task_error_cancels_siblings_and_comes_out_of_run() {
 #[test]
 fn join_returns_what_the_work_returned() {
     within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ok = fcx.spawn(|fcx| async move {
                 fcx.sleep(ms(5)).await?;
                 Ok(())
@@ -419,16 +275,13 @@ fn join_returns_what_the_work_returned() {
     let (out, joined) = within(Duration::from_secs(5), || {
         let joined = Arc::new(Mutex::new(None));
         let j = joined.clone();
-        let out = block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                let bad = fcx.spawn(|_fcx| async { Err(Boom("bad").into()) });
-                // The join gets the error, though the failure also cancels the
-                // region the joiner waits in.
-                *j.lock().unwrap() = Some(bad.join(&fcx).await);
-                Ok(())
-            },
-        ));
+        let out = block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            let bad = fcx.spawn(|_fcx| async { Err(Boom("bad").into()) });
+            // The join gets the error, though the failure also cancels the
+            // region the joiner waits in.
+            *j.lock().unwrap() = Some(bad.join(&fcx).await);
+            Ok(())
+        }));
         let joined = joined.lock().unwrap().take();
         (out, joined)
     });
@@ -456,38 +309,35 @@ fn a_busy_task_cannot_starve_another() {
     let spins = Arc::new(AtomicU64::new(0));
     let s = spins.clone();
     within(Duration::from_secs(5), move || {
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                let stop = Arc::new(AtomicBool::new(false));
-                let st = stop.clone();
-                fcx.spawn(move |fcx| async move {
-                    // A cable that loops back into itself: recv is always ready.
-                    let (mut a, mut b) = pair();
-                    b.send(Packet(vec![0]));
-                    let mut n = 0u32;
-                    while !st.load(Ordering::SeqCst) {
-                        let p = a.recv(&fcx).await?;
-                        a.send(p.clone());
-                        std::mem::swap(&mut a, &mut b);
-                        s.fetch_add(1, Ordering::SeqCst);
-                        n += 1;
-                        if n.is_multiple_of(64) {
-                            fcx.yield_now().await?;
-                        }
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            let stop = Arc::new(AtomicBool::new(false));
+            let st = stop.clone();
+            fcx.spawn(move |fcx| async move {
+                // A cable that loops back into itself: recv is always ready.
+                let (mut a, mut b) = pair();
+                b.send(Packet(vec![0]));
+                let mut n = 0u32;
+                while !st.load(Ordering::SeqCst) {
+                    let p = a.recv(&fcx).await?;
+                    a.send(p.clone());
+                    std::mem::swap(&mut a, &mut b);
+                    s.fetch_add(1, Ordering::SeqCst);
+                    n += 1;
+                    if n.is_multiple_of(64) {
+                        fcx.yield_now().await?;
                     }
-                    Ok(())
-                });
-                let mut turns = 0;
-                while turns < 100 {
-                    fcx.yield_now().await?;
-                    turns += 1;
                 }
-                fcx.yield_now().await?;
-                stop.store(true, Ordering::SeqCst);
                 Ok(())
-            },
-        ))
+            });
+            let mut turns = 0;
+            while turns < 100 {
+                fcx.yield_now().await?;
+                turns += 1;
+            }
+            fcx.yield_now().await?;
+            stop.store(true, Ordering::SeqCst);
+            Ok(())
+        }))
     })
     .unwrap();
     assert!(spins.load(Ordering::SeqCst) > 64);
@@ -496,7 +346,7 @@ fn a_busy_task_cannot_starve_another() {
 #[test]
 fn cable_delivers_in_order_then_closed() {
     within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (mut a, mut b) = pair();
             for i in 0..3u8 {
                 a.send(Packet(vec![i]));
@@ -528,17 +378,14 @@ fn cable_wakes_across_threads() {
                 acknowledged.recv_timeout(Duration::from_secs(5)).unwrap();
             }
         });
-        block_on(run(
-            RunOptions::new(Seed::random()),
-            move |fcx| async move {
-                for i in 0..100u8 {
-                    assert_eq!(a.recv(&fcx).await?, Packet(vec![i]));
-                    ack.send(()).unwrap();
-                }
-                assert_eq!(a.recv(&fcx).await, Err(RecvError::Closed));
-                Ok(())
-            },
-        ))
+        block_on(run(Seed::random(), move |fcx| async move {
+            for i in 0..100u8 {
+                assert_eq!(a.recv(&fcx).await?, Packet(vec![i]));
+                ack.send(()).unwrap();
+            }
+            assert_eq!(a.recv(&fcx).await, Err(RecvError::Closed));
+            Ok(())
+        }))
         .unwrap();
         sender.join().unwrap();
     });
@@ -547,7 +394,7 @@ fn cable_wakes_across_threads() {
 #[test]
 fn boxed_interfaces_work() {
     within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (a, mut b) = pair();
             let mut list: Vec<Box<dyn Interface>> = vec![Box::new(a)];
             list[0].send(Packet(vec![7]));
@@ -578,43 +425,40 @@ fn attacher_name_rules() {
     drop(long);
 
     within(Duration::from_secs(5), move || {
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                // `get` skips other names, and sandboxes that detached before
-                // they were handed out: the first "abc", and the long name.
-                let mut second = attachments.get(&fcx, "abc").await?;
-                assert_eq!(second.name(), "abc");
-                assert_eq!(second.mtu(), 1500);
-                let kept = attacher.attach("kept").unwrap();
-                let first = attachments.next(&fcx).await.unwrap();
-                assert_eq!(first.name(), "kept");
-                drop((first, kept));
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            // `get` skips other names, and sandboxes that detached before
+            // they were handed out: the first "abc", and the long name.
+            let mut second = attachments.get(&fcx, "abc").await?;
+            assert_eq!(second.name(), "abc");
+            assert_eq!(second.mtu(), 1500);
+            let kept = attacher.attach("kept").unwrap();
+            let first = attachments.next(&fcx).await.unwrap();
+            assert_eq!(first.name(), "kept");
+            drop((first, kept));
 
-                abc.send(Packet(vec![1]));
-                assert_eq!(second.recv(&fcx).await?, Packet(vec![1]));
-                second.send(Packet(vec![2]));
-                assert_eq!(abc.recv(&fcx).await?, Packet(vec![2]));
+            abc.send(Packet(vec![1]));
+            assert_eq!(second.recv(&fcx).await?, Packet(vec![1]));
+            second.send(Packet(vec![2]));
+            assert_eq!(abc.recv(&fcx).await?, Packet(vec![2]));
 
-                // Freed when the world's end closes, too.
-                assert_eq!(attacher.attach("abc").unwrap_err(), AttachError::Taken);
-                drop(second);
-                assert_eq!(abc.recv(&fcx).await, Err(RecvError::Closed));
-                let _again = attacher.attach("abc").unwrap();
+            // Freed when the world's end closes, too.
+            assert_eq!(attacher.attach("abc").unwrap_err(), AttachError::Taken);
+            drop(second);
+            assert_eq!(abc.recv(&fcx).await, Err(RecvError::Closed));
+            let _again = attacher.attach("abc").unwrap();
 
-                // A sandbox can attach while the world waits.
-                let a2 = attacher.clone();
-                fcx.spawn(move |fcx| async move {
-                    fcx.sleep(ms(10)).await?;
-                    let end = a2.attach("late").unwrap();
-                    std::mem::forget(end);
-                    Ok(())
-                });
-                let late = attachments.get(&fcx, "late").await?;
-                assert_eq!(late.name(), "late");
+            // A sandbox can attach while the world waits.
+            let a2 = attacher.clone();
+            fcx.spawn(move |fcx| async move {
+                fcx.sleep(ms(10)).await?;
+                let end = a2.attach("late").unwrap();
+                std::mem::forget(end);
                 Ok(())
-            },
-        ))
+            });
+            let late = attachments.get(&fcx, "late").await?;
+            assert_eq!(late.name(), "late");
+            Ok(())
+        }))
     })
     .unwrap();
 }
@@ -655,19 +499,16 @@ fn block_on_wakes_from_another_thread() {
 #[test]
 fn dropping_the_run_drops_everything() {
     let (world_end, mut outside) = pair();
-    let mut future = Box::pin(run(
-        RunOptions::new(Seed::random()),
-        move |fcx| async move {
-            fcx.spawn(move |fcx| async move {
-                let mut end = world_end;
-                loop {
-                    let p = end.recv(&fcx).await?;
-                    end.send(p);
-                }
-            });
-            Ok(())
-        },
-    ));
+    let mut future = Box::pin(run(Seed::random(), move |fcx| async move {
+        fcx.spawn(move |fcx| async move {
+            let mut end = world_end;
+            loop {
+                let p = end.recv(&fcx).await?;
+                end.send(p);
+            }
+        });
+        Ok(())
+    }));
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
     for _ in 0..3 {
@@ -675,13 +516,10 @@ fn dropping_the_run_drops_everything() {
     }
     drop(future);
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(
-            RunOptions::new(Seed::random()),
-            move |fcx| async move {
-                assert_eq!(outside.recv(&fcx).await, Err(RecvError::Closed));
-                Ok(())
-            },
-        ))
+        block_on(run(Seed::random(), move |fcx| async move {
+            assert_eq!(outside.recv(&fcx).await, Err(RecvError::Closed));
+            Ok(())
+        }))
     });
     out.unwrap();
 }
@@ -692,33 +530,30 @@ fn dropping_the_run_drops_everything() {
 fn cancellation_reaches_waits_outside_the_run() {
     let (tx, rx) = mpsc::channel();
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(
-            RunOptions::new(Seed::random()),
-            move |fcx| async move {
-                let outside = fcx.clone();
-                let (mut ready, mut started) = pair();
-                let (mut a, _b) = pair();
-                std::thread::spawn(move || {
-                    let res = block_on(async {
-                        let mut sleep = std::pin::pin!(outside.sleep(Duration::from_secs(60)));
-                        let mut notified = false;
-                        let slept = std::future::poll_fn(|cx| {
-                            let result = sleep.as_mut().poll(cx);
-                            if result.is_pending() && !notified {
-                                ready.send(Packet(Vec::new()));
-                                notified = true;
-                            }
-                            result
-                        })
-                        .await;
-                        (slept, a.recv(&outside).await)
-                    });
-                    tx.send(res).unwrap();
+        block_on(run(Seed::random(), move |fcx| async move {
+            let outside = fcx.clone();
+            let (mut ready, mut started) = pair();
+            let (mut a, _b) = pair();
+            std::thread::spawn(move || {
+                let res = block_on(async {
+                    let mut sleep = std::pin::pin!(outside.sleep(Duration::from_secs(60)));
+                    let mut notified = false;
+                    let slept = std::future::poll_fn(|cx| {
+                        let result = sleep.as_mut().poll(cx);
+                        if result.is_pending() && !notified {
+                            ready.send(Packet(Vec::new()));
+                            notified = true;
+                        }
+                        result
+                    })
+                    .await;
+                    (slept, a.recv(&outside).await)
                 });
-                started.recv(&fcx).await?;
-                Err(Boom("stop").into())
-            },
-        ))
+                tx.send(res).unwrap();
+            });
+            started.recv(&fcx).await?;
+            Err(Boom("stop").into())
+        }))
     });
     assert_eq!(out.unwrap_err().to_string(), "stop");
     let (sleep, recv) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -737,7 +572,7 @@ impl std::task::Wake for CancellationWake {
 
 #[test]
 fn cancellation_registration_moves_between_regions() {
-    block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
         let wake = Arc::new(CancellationWake::default());
         let waker = std::task::Waker::from(wake.clone());
         let mut wait = fictionet::CancelWait::default();
@@ -762,7 +597,7 @@ fn cancellation_registration_moves_between_regions() {
 
 #[test]
 fn cancellation_registration_replaces_wakers_and_unregisters_on_drop() {
-    block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
         let old = Arc::new(CancellationWake::default());
         let new = Arc::new(CancellationWake::default());
         let mut wait = fictionet::CancelWait::default();
@@ -784,7 +619,7 @@ fn cancellation_registration_replaces_wakers_and_unregisters_on_drop() {
 
 #[test]
 fn cancellation_registration_is_released_when_an_end_moves_into_the_run() {
-    block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
         let (mut end, _peer) = pair();
         let wake = Arc::new(CancellationWake::default());
         let waker = std::task::Waker::from(wake.clone());
@@ -818,31 +653,25 @@ fn runs_on_tokio() {
         .unwrap();
     rt.block_on(async {
         let (mut inside, mut outside) = pair();
-        let echo = tokio::spawn(run(
-            RunOptions::new(Seed::random()),
-            move |fcx| async move {
-                loop {
-                    match inside.recv(&fcx).await {
-                        Ok(p) => inside.send(p),
-                        Err(RecvError::Closed) => return Ok(()),
-                        Err(e) => return Err(e.into()),
-                    }
+        let echo = tokio::spawn(run(Seed::random(), move |fcx| async move {
+            loop {
+                match inside.recv(&fcx).await {
+                    Ok(p) => inside.send(p),
+                    Err(RecvError::Closed) => return Ok(()),
+                    Err(e) => return Err(e.into()),
                 }
-            },
-        ));
-        let client = tokio::spawn(run(
-            RunOptions::new(Seed::random()),
-            move |fcx| async move {
-                for i in 0..100u8 {
-                    outside.send(Packet(vec![i]));
-                    assert_eq!(outside.recv(&fcx).await?, Packet(vec![i]));
-                    if i % 25 == 0 {
-                        fcx.sleep(ms(1)).await?;
-                    }
+            }
+        }));
+        let client = tokio::spawn(run(Seed::random(), move |fcx| async move {
+            for i in 0..100u8 {
+                outside.send(Packet(vec![i]));
+                assert_eq!(outside.recv(&fcx).await?, Packet(vec![i]));
+                if i % 25 == 0 {
+                    fcx.sleep(ms(1)).await?;
                 }
-                Ok(())
-            },
-        ));
+            }
+            Ok(())
+        }));
         client.await.unwrap().unwrap();
         echo.await.unwrap().unwrap();
     });
@@ -853,7 +682,7 @@ fn runs_on_tokio() {
 #[test]
 fn a_sleep_without_end_waits_until_cancelled() {
     let res = within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             fcx.spawn(|fcx| async move {
                 assert_eq!(fcx.sleep(Duration::MAX).await, Err(Cancelled));
                 let far = fcx.now() + Duration::from_secs(u64::MAX / 2);
@@ -871,7 +700,7 @@ fn a_sleep_without_end_waits_until_cancelled() {
 #[test]
 fn many_waits_outside_the_run_stay_idle() {
     const WAITERS: usize = 1500;
-    block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
         let mut ends: Vec<_> = (0..WAITERS).map(|_| pair()).collect();
         let wake = Arc::new(CancellationWake::default());
         let waker = std::task::Waker::from(wake.clone());
@@ -911,37 +740,34 @@ fn many_waits_outside_the_run_stay_idle() {
 fn dropping_the_run_ends_waits_outside_it() {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
-    let mut future = Box::pin(run(
-        RunOptions::new(Seed::random()),
-        move |fcx| async move {
-            let task = fcx.spawn(|fcx| async move {
-                fcx.cancelled().await;
-                Ok(())
-            });
-            let outside = fcx.clone();
-            std::thread::spawn(move || {
-                let res = block_on(async {
-                    let mut join = std::pin::pin!(task.join(&outside));
-                    let mut ready_tx = Some(ready_tx);
-                    let joined = std::future::poll_fn(|cx| {
-                        let result = join.as_mut().poll(cx);
-                        if result.is_pending()
-                            && let Some(tx) = ready_tx.take()
-                        {
-                            tx.send(()).unwrap();
-                        }
-                        result
-                    })
-                    .await
-                    .map_err(|e| e.to_string());
-                    outside.cancelled().await;
-                    joined
-                });
-                tx.send(res).unwrap();
-            });
+    let mut future = Box::pin(run(Seed::random(), move |fcx| async move {
+        let task = fcx.spawn(|fcx| async move {
+            fcx.cancelled().await;
             Ok(())
-        },
-    ));
+        });
+        let outside = fcx.clone();
+        std::thread::spawn(move || {
+            let res = block_on(async {
+                let mut join = std::pin::pin!(task.join(&outside));
+                let mut ready_tx = Some(ready_tx);
+                let joined = std::future::poll_fn(|cx| {
+                    let result = join.as_mut().poll(cx);
+                    if result.is_pending()
+                        && let Some(tx) = ready_tx.take()
+                    {
+                        tx.send(()).unwrap();
+                    }
+                    result
+                })
+                .await
+                .map_err(|e| e.to_string());
+                outside.cancelled().await;
+                joined
+            });
+            tx.send(res).unwrap();
+        });
+        Ok(())
+    }));
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
     for _ in 0..3 {
@@ -958,94 +784,35 @@ fn dropping_the_run_ends_waits_outside_it() {
 }
 
 #[test]
-fn region_completion_and_concurrent_admission_have_one_boundary() {
-    for admitted_first in [false, true] {
-        let (child_tx, child_rx) = mpsc::channel::<fictionet::Cx>();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let child = child_rx.recv().unwrap();
-            child.spawn_as(
-                || {
-                    if admitted_first {
-                        // Admission counts the task before naming or enqueueing it.
-                        entered_tx.send(()).unwrap();
-                        release_rx.recv().unwrap();
-                    }
-                    "boundary task"
-                },
-                |_fcx| {
-                    if !admitted_first {
-                        // Future construction precedes admission.
-                        entered_tx.send(()).unwrap();
-                        release_rx.recv().unwrap();
-                    }
-                    async { Err(Boom("boundary failure").into()) }
-                },
-            )
-        });
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                let mut region = std::pin::pin!(fcx.region(move |child| {
-                    child_tx.send(child).unwrap();
-                    entered_rx.recv().unwrap();
-                    async { Ok(()) }
-                }));
-                let first =
-                    std::future::poll_fn(|cx| std::task::Poll::Ready(region.as_mut().poll(cx)))
-                        .await;
-                assert_eq!(first.is_pending(), admitted_first);
-                release_tx.send(()).unwrap();
-                let task = worker.join().unwrap();
-                if admitted_first {
-                    assert_eq!(region.await.unwrap_err().to_string(), "boundary failure");
-                    assert!(matches!(task.join(&fcx).await, Err(JoinError::Failed(_))));
-                } else {
-                    assert!(matches!(first, std::task::Poll::Ready(Ok(()))));
-                    assert!(matches!(task.join(&fcx).await, Err(JoinError::Cancelled)));
-                }
-                assert!(!fcx.is_cancelled());
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
-}
-
-#[test]
 fn cancel_stops_the_world_cleanly() {
     let (attacher, attachments) = attachments();
     let mut agent = attacher.attach("agent").unwrap();
     let ended = Arc::new(AtomicU64::new(0));
     let e = ended.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)),
-            move |fcx| async move {
-                // An echo world: it passes the cancel up with `?`.
-                fcx.spawn(move |fcx| async move {
-                    let mut attachments = attachments;
-                    let mut sandbox = attachments.get(&fcx, "agent").await?;
-                    loop {
-                        let packet = sandbox.recv(&fcx).await?;
-                        sandbox.send(packet);
-                    }
-                });
-                // A task that would sleep for a minute.
-                fcx.spawn(move |fcx| async move {
-                    let r = fcx.sleep(Duration::from_secs(60)).await;
-                    e.fetch_add(1, Ordering::SeqCst);
-                    r?;
-                    Ok(())
-                });
-                agent.send(Packet(vec![0x45, 0, 0, 20]));
-                assert_eq!(agent.recv(&fcx).await?, Packet(vec![0x45, 0, 0, 20]));
-                fcx.cancel();
-                assert!(fcx.is_cancelled());
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            // An echo world: it passes the cancel up with `?`.
+            fcx.spawn(move |fcx| async move {
+                let mut attachments = attachments;
+                let mut sandbox = attachments.get(&fcx, "agent").await?;
+                loop {
+                    let packet = sandbox.recv(&fcx).await?;
+                    sandbox.send(packet);
+                }
+            });
+            // A task that would sleep for a minute.
+            fcx.spawn(move |fcx| async move {
+                let r = fcx.sleep(Duration::from_secs(60)).await;
+                e.fetch_add(1, Ordering::SeqCst);
+                r?;
                 Ok(())
-            },
-        ))
+            });
+            agent.send(Packet(vec![0x45, 0, 0, 20]));
+            assert_eq!(agent.recv(&fcx).await?, Packet(vec![0x45, 0, 0, 20]));
+            fcx.cancel();
+            assert!(fcx.is_cancelled());
+            Ok(())
+        }))
     });
     out.unwrap();
     assert_eq!(ended.load(Ordering::SeqCst), 1);
@@ -1054,7 +821,7 @@ fn cancel_stops_the_world_cleanly() {
 #[test]
 fn an_error_before_cancel_is_still_reported() {
     let out = within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let failing = fcx.spawn(|_fcx| async { Err(Boom("first").into()) });
             assert!(failing.join(&fcx).await.is_err());
             fcx.cancel();
@@ -1067,7 +834,7 @@ fn an_error_before_cancel_is_still_reported() {
 #[test]
 fn errors_after_cancel_are_dropped_even_when_not_cancellations() {
     let out = within(Duration::from_secs(5), || {
-        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             fcx.spawn(|fcx| async move {
                 fcx.cancelled().await;
                 Err(Boom("after").into())
@@ -1087,14 +854,11 @@ fn cancel_from_another_thread_stops_the_run() {
         fcx.cancel();
     });
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(
-            RunOptions::new(Seed::random()),
-            move |fcx| async move {
-                tx.send(fcx.clone()).unwrap();
-                fcx.sleep(Duration::from_secs(60)).await?;
-                Ok(())
-            },
-        ))
+        block_on(run(Seed::random(), move |fcx| async move {
+            tx.send(fcx.clone()).unwrap();
+            fcx.sleep(Duration::from_secs(60)).await?;
+            Ok(())
+        }))
     });
     out.unwrap();
     stopper.join().unwrap();
@@ -1107,7 +871,7 @@ fn an_outside_wait_raced_against_cancelled_ends() {
         .build()
         .unwrap();
     let out = runtime.block_on(async {
-        let world = lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        let world = lab(Seed::from_u64(1), |fcx| async move {
             fcx.spawn(|fcx| async move {
                 // A wait Fictionet knows nothing about.
                 let never = std::future::pending::<()>();
@@ -1133,7 +897,7 @@ fn an_outside_wait_raced_against_cancelled_ends() {
 #[test]
 fn a_joiner_that_cancels_after_a_failure_keeps_the_error() {
     let out = within(Duration::from_secs(5), || {
-        block_on(run(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+        block_on(run(Seed::from_u64(1), |fcx| async move {
             let (ready, mut waiting) = pair();
             let task = fcx.spawn(move |fcx| async move {
                 assert_eq!(waiting.recv(&fcx).await, Err(RecvError::Closed));
@@ -1175,19 +939,16 @@ fn a_cancel_woken_by_dropping_a_failed_task_keeps_the_error() {
     let out = within(Duration::from_secs(5), || {
         let (inside, mut outside) = pair();
         let (tx, rx) = mpsc::channel();
-        let mut world = Box::pin(run(
-            RunOptions::new(Seed::random()),
-            move |fcx| async move {
-                tx.send(fcx.clone()).unwrap();
-                fcx.spawn(move |_| {
-                    std::future::poll_fn(move |_| {
-                        let _held = &inside;
-                        Poll::Ready(Err(Boom("failed while holding a link").into()))
-                    })
-                });
-                Ok(())
-            },
-        ));
+        let mut world = Box::pin(run(Seed::random(), move |fcx| async move {
+            tx.send(fcx.clone()).unwrap();
+            fcx.spawn(move |_| {
+                std::future::poll_fn(move |_| {
+                    let _held = &inside;
+                    Poll::Ready(Err(Boom("failed while holding a link").into()))
+                })
+            });
+            Ok(())
+        }));
         assert!(
             world
                 .as_mut()
@@ -1244,15 +1005,12 @@ fn a_joiner_outside_the_run_gets_the_message_of_a_failed_task() {
     }
     let (out, joined) = within(Duration::from_secs(5), || {
         let (tx, rx) = mpsc::channel();
-        let mut world = Box::pin(run(
-            RunOptions::new(Seed::random()),
-            move |fcx| async move {
-                let task = fcx.spawn(|_| async { Err(Boom("the worker failed").into()) });
-                tx.send((task, fcx.clone())).unwrap();
-                fcx.cancelled().await;
-                Ok(())
-            },
-        ));
+        let mut world = Box::pin(run(Seed::random(), move |fcx| async move {
+            let task = fcx.spawn(|_| async { Err(Boom("the worker failed").into()) });
+            tx.send((task, fcx.clone())).unwrap();
+            fcx.cancelled().await;
+            Ok(())
+        }));
         assert!(
             world
                 .as_mut()
@@ -1283,20 +1041,17 @@ fn dropping_the_run_drops_tasks_in_spawn_order() {
     }
     let log = Arc::new(Mutex::new(Vec::new()));
     let inside = log.clone();
-    let mut future = Box::pin(run(
-        RunOptions::new(Seed::random()),
-        move |fcx| async move {
-            for id in [8, 3, 12, 1, 9] {
-                let guard = RecordDrop(id, inside.clone());
-                fcx.spawn(move |_fcx| async move {
-                    let _guard = guard;
-                    std::future::pending::<()>().await;
-                    Ok(())
-                });
-            }
-            Ok(())
-        },
-    ));
+    let mut future = Box::pin(run(Seed::random(), move |fcx| async move {
+        for id in [8, 3, 12, 1, 9] {
+            let guard = RecordDrop(id, inside.clone());
+            fcx.spawn(move |_fcx| async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                Ok(())
+            });
+        }
+        Ok(())
+    }));
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(future.as_mut().poll(&mut cx).is_pending());
     assert!(future.as_mut().poll(&mut cx).is_pending());

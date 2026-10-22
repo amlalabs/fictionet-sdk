@@ -9,14 +9,46 @@ use std::time::Duration;
 
 const KEY: &str = "sk-or-test-key-must-not-be-stored";
 
-/// The event fields of an answer, as JSON: what the log and the search
-/// projection read.
+/// Typed response metadata projected for the existing storage assertions.
 trait Logged {
     fn logged(&self) -> Value;
 }
 impl Logged for Response {
     fn logged(&self) -> Value {
-        fictionet_extras::events::js(Some(&self.fields().to_json()))
+        let mut value = match &self.meta {
+            Meta::Search(list) => {
+                let mut value = serde_json::to_value(list).unwrap();
+                value["kind"] = json!("search");
+                value["results"] = json!(list.listed.len());
+                value["listed"] = json!(list.listed.iter().enumerate().map(|(i, (url, title, site))| json!({"rank":i+1,"url":url,"title":title,"site":site})).collect::<Vec<_>>());
+                value
+            }
+            Meta::Page(page) => {
+                let mut value = serde_json::to_value(page).unwrap();
+                value["kind"] = json!("page");
+                value
+            }
+            Meta::Fixed { title } => {
+                json!({"kind":"page","cache":"fixed","title":title,"reason":{"via":"fixed"}})
+            }
+            Meta::Planted { title } => {
+                json!({"kind":"page","cache":"planted","title":title,"reason":{"via":"planted"}})
+            }
+            Meta::Missing => json!({"kind":"page","cache":"missing"}),
+            Meta::Budget(asked) => json!({"kind":asked,"cache":"budget"}),
+            Meta::Error { error, usage } => json!({"kind":"error","error":error,"usage":usage}),
+            Meta::Asset => json!({"kind":"asset"}),
+            Meta::SearchHome => json!({"kind":"search_home"}),
+            Meta::Redirect { location } => json!({"kind":"redirect","location":location}),
+        };
+        if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()).cloned() {
+            value["model"] = usage["model"].clone();
+            value["gen_ms"] = usage["gen_ms"].clone();
+            value["cost"] = usage["cost"].clone();
+        }
+        value["carries"] = json!(self.carries);
+        value["serve_ms"] = json!(self.serve_ms);
+        value
     }
 }
 
@@ -25,11 +57,7 @@ where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    fictionet::block_on(fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
-        work,
-    ))
-    .unwrap();
+    fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), work)).unwrap();
 }
 
 const FIXED_SEED: &str = r#"+++

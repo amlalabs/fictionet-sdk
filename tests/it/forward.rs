@@ -1,4 +1,3 @@
-use fictionet::RunOptions;
 use fictionet::stdlib::web::{self, Body};
 use http_body_util::BodyExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,54 +19,51 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
         conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close, x-private\r\nConnection: x-other\r\nX-Private: secret\r\nX-Other: secret\r\nUpgrade: websocket\r\nX-Public: kept\r\n\r\nworld").await.unwrap();
         String::from_utf8(received).unwrap()
     });
-    fictionet::run(
-        RunOptions::new(fictionet::Seed::from_u64(1)),
-        move |fcx| async move {
-            let mut forward = web::forward(
-                &fcx,
-                format!("http://{address}/ignored").parse()?,
-                std::sync::Arc::new(fictionet_host::Client::new()),
-            )?;
-            let response = forward
-                .call(
-                    http::Request::builder()
-                        .method("POST")
-                        .uri("http://different.test/path?q=1")
-                        .version(http::Version::HTTP_2)
-                        .header("host", "site.test")
-                        .header("connection", "x-private")
-                        .header("connection", "x-other, upgrade")
-                        .header("x-private", "secret")
-                        .header("x-other", "secret")
-                        .header("upgrade", "websocket")
-                        .header("proxy-authorization", "Basic secret")
-                        .header("x-public", "kept")
-                        .body(Body::from("hello"))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), 201);
-            assert_eq!(response.headers()["x-public"], "kept");
-            assert!(!response.headers().contains_key("connection"));
-            assert!(!response.headers().contains_key("x-private"));
-            assert!(!response.headers().contains_key("x-other"));
-            assert!(!response.headers().contains_key("upgrade"));
-            assert_eq!(
-                response.into_body().collect().await.unwrap().to_bytes(),
-                "world"
-            );
-            let request = server.await.unwrap().to_ascii_lowercase();
-            assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
-            assert!(request.contains("host: site.test\r\n"));
-            assert!(request.contains("x-public: kept\r\n"));
-            assert!(!request.contains("x-private"));
-            assert!(!request.contains("x-other"));
-            assert!(!request.contains("upgrade"));
-            assert!(!request.contains("proxy-authorization"));
-            Ok(())
-        },
-    )
+    fictionet::run(fictionet::Seed::from_u64(1), move |fcx| async move {
+        let mut forward = web::forward(
+            &fcx,
+            format!("http://{address}/ignored").parse()?,
+            std::sync::Arc::new(fictionet_host::Client::new()),
+        )?;
+        let response = forward
+            .call(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("http://different.test/path?q=1")
+                    .version(http::Version::HTTP_2)
+                    .header("host", "site.test")
+                    .header("connection", "x-private")
+                    .header("connection", "x-other, upgrade")
+                    .header("x-private", "secret")
+                    .header("x-other", "secret")
+                    .header("upgrade", "websocket")
+                    .header("proxy-authorization", "Basic secret")
+                    .header("x-public", "kept")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.headers()["x-public"], "kept");
+        assert!(!response.headers().contains_key("connection"));
+        assert!(!response.headers().contains_key("x-private"));
+        assert!(!response.headers().contains_key("x-other"));
+        assert!(!response.headers().contains_key("upgrade"));
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "world"
+        );
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
+        assert!(request.contains("host: site.test\r\n"));
+        assert!(request.contains("x-public: kept\r\n"));
+        assert!(!request.contains("x-private"));
+        assert!(!request.contains("x-other"));
+        assert!(!request.contains("upgrade"));
+        assert!(!request.contains("proxy-authorization"));
+        Ok(())
+    })
     .await
     .unwrap();
 }
@@ -137,77 +133,73 @@ async fn a_chunked_upstream_answer_reaches_the_agent_chunked() {
         .parse()
         .unwrap();
     let server = tokio::spawn(chunked_upstream(listener));
-    let world = fictionet::run(
-        RunOptions::new(fictionet::Seed::random()),
-        |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            let forward = web::forward(
+    let world = fictionet::run(fictionet::Seed::random(), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let forward = web::forward(
+            &fcx,
+            upstream,
+            std::sync::Arc::new(fictionet_host::Client::new()),
+        )?;
+        web::Sites::new(move |name: &str| {
+            (name == "clone.test").then(|| web::Site::new(forward.clone()))
+        })
+        .start(&fcx, attachments)?;
+        let machine = sandbox::machine(&fcx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
+        let answer = machine
+            .lookup(
                 &fcx,
-                upstream,
-                std::sync::Arc::new(fictionet_host::Client::new()),
-            )?;
-            web::Sites::new(move |name: &str| {
-                (name == "clone.test").then(|| web::Site::new(forward.clone()))
+                Ipv4Addr::new(10, 0, 0, 1).into(),
+                "clone.test",
+                RecordType::A,
+            )
+            .await?;
+        let address = answer
+            .answers
+            .iter()
+            .find_map(|r| match r.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
             })
-            .start(&fcx, attachments)?;
-            let machine =
-                sandbox::machine(&fcx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
-            let answer = machine
-                .lookup(
-                    &fcx,
-                    Ipv4Addr::new(10, 0, 0, 1).into(),
-                    "clone.test",
-                    RecordType::A,
-                )
-                .await?;
-            let address = answer
-                .answers
-                .iter()
-                .find_map(|r| match r.data {
-                    RData::A(a) => Some(a.0),
-                    _ => None,
-                })
-                .expect("an IPv4 address");
-            let mut conn = machine
-                .tcp
-                .connect(&fcx, SocketAddr::new(address.into(), 80))
-                .await?;
-            for path in ["/a", "/b"] {
-                let request = format!("GET {path} HTTP/1.1\r\nHost: clone.test\r\n\r\n");
-                conn.write_all(&fcx, request.as_bytes()).await?;
-                let mut response = Vec::new();
-                let mut buf = [0; 4096];
-                let head_end = loop {
-                    let n = conn.read(&fcx, &mut buf).await?;
-                    assert_ne!(n, 0, "the world closed the connection");
-                    response.extend_from_slice(&buf[..n]);
-                    if let Some(at) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break at + 4;
-                    }
-                };
-                let head = String::from_utf8_lossy(&response[..head_end]).to_ascii_lowercase();
-                assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
-                assert!(
-                    head.contains("\r\ntransfer-encoding: chunked\r\n"),
-                    "{head}"
-                );
-                while !response[head_end..].ends_with(b"0\r\n\r\n") {
-                    let n = conn.read(&fcx, &mut buf).await?;
-                    assert_ne!(n, 0, "the world closed the connection");
-                    response.extend_from_slice(&buf[..n]);
+            .expect("an IPv4 address");
+        let mut conn = machine
+            .tcp
+            .connect(&fcx, SocketAddr::new(address.into(), 80))
+            .await?;
+        for path in ["/a", "/b"] {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: clone.test\r\n\r\n");
+            conn.write_all(&fcx, request.as_bytes()).await?;
+            let mut response = Vec::new();
+            let mut buf = [0; 4096];
+            let head_end = loop {
+                let n = conn.read(&fcx, &mut buf).await?;
+                assert_ne!(n, 0, "the world closed the connection");
+                response.extend_from_slice(&buf[..n]);
+                if let Some(at) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
                 }
-                let body = &response[head_end..];
-                // The first bytes after the head are a chunk with data, not the
-                // last chunk, which comes once, at the end. hyper may split the
-                // upstream's chunks differently, so only their sizes are free.
-                assert!(!body.starts_with(b"0\r\n"), "{body:?}");
-                assert_eq!(body.windows(5).filter(|w| *w == b"0\r\n\r\n").count(), 1);
-                assert_eq!(dechunk(body), b"hello world");
+            };
+            let head = String::from_utf8_lossy(&response[..head_end]).to_ascii_lowercase();
+            assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
+            assert!(
+                head.contains("\r\ntransfer-encoding: chunked\r\n"),
+                "{head}"
+            );
+            while !response[head_end..].ends_with(b"0\r\n\r\n") {
+                let n = conn.read(&fcx, &mut buf).await?;
+                assert_ne!(n, 0, "the world closed the connection");
+                response.extend_from_slice(&buf[..n]);
             }
-            fcx.cancel();
-            Ok(())
-        },
-    );
+            let body = &response[head_end..];
+            // The first bytes after the head are a chunk with data, not the
+            // last chunk, which comes once, at the end. hyper may split the
+            // upstream's chunks differently, so only their sizes are free.
+            assert!(!body.starts_with(b"0\r\n"), "{body:?}");
+            assert_eq!(body.windows(5).filter(|w| *w == b"0\r\n\r\n").count(), 1);
+            assert_eq!(dechunk(body), b"hello world");
+        }
+        fcx.cancel();
+        Ok(())
+    });
     let result = tokio::time::timeout(Duration::from_secs(30), world)
         .await
         .expect("timed out");
@@ -217,39 +209,36 @@ async fn a_chunked_upstream_answer_reaches_the_agent_chunked() {
 
 #[tokio::test]
 async fn invalid_upstreams_are_refused_at_construction() {
-    fictionet::run(
-        RunOptions::new(fictionet::Seed::from_u64(1)),
-        |fcx| async move {
-            for upstream in ["/path", "example.com:80", "ftp://example.com/"] {
-                let error = web::forward(
+    fictionet::run(fictionet::Seed::from_u64(1), |fcx| async move {
+        for upstream in ["/path", "example.com:80", "ftp://example.com/"] {
+            let error = web::forward(
+                &fcx,
+                upstream.parse().unwrap(),
+                std::sync::Arc::new(fictionet_host::Client::new()),
+            )
+            .err()
+            .expect("invalid upstream must be refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("http")
+                    && message.contains("https")
+                    && message.contains("authority"),
+                "{message}"
+            );
+        }
+        for upstream in ["http://example.com/", "https://example.com/"] {
+            assert!(
+                web::forward(
                     &fcx,
                     upstream.parse().unwrap(),
-                    std::sync::Arc::new(fictionet_host::Client::new()),
+                    std::sync::Arc::new(fictionet_host::Client::new())
                 )
-                .err()
-                .expect("invalid upstream must be refused");
-                let message = error.to_string();
-                assert!(
-                    message.contains("http")
-                        && message.contains("https")
-                        && message.contains("authority"),
-                    "{message}"
-                );
-            }
-            for upstream in ["http://example.com/", "https://example.com/"] {
-                assert!(
-                    web::forward(
-                        &fcx,
-                        upstream.parse().unwrap(),
-                        std::sync::Arc::new(fictionet_host::Client::new())
-                    )
-                    .is_ok()
-                );
-            }
-            fcx.cancel();
-            Ok(())
-        },
-    )
+                .is_ok()
+            );
+        }
+        fcx.cancel();
+        Ok(())
+    })
     .await
     .unwrap();
 }

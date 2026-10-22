@@ -32,12 +32,14 @@ impl Pages {
             usage,
         };
         let meta = Meta::Search(Box::new(listing));
-        Response::html(
+        let mut response = Response::html(
             body,
             meta,
             200,
             fictionet_extras::search::engine_server(engine),
-        )
+        );
+        response.carries = carries;
+        response
     }
 
     /// The result list a search shows: the stored or newly made list, with
@@ -342,10 +344,6 @@ impl Pages {
             cx.spawn(move |cx| async move {
                 let started = cx.now().since_start();
                 let response = pages.page(&cx, &host, &target, true).await;
-                cx.emit("web", "prefetch_finished", |e| {
-                    e.field("url", format!("https://{host}{target}"))
-                        .field("status", response.status as u64)
-                });
                 if let Meta::Error { error, usage } = &response.meta {
                     let mut row = json!({
                         "kind": "prefetch_error",

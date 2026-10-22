@@ -20,12 +20,8 @@
 //! runtime boundaries. [`running`](guide::running) is the guide;
 //! [`run`], [`lab`] and [`Cx`] document runtime operations.
 //!
-//! Core produces four typed streams: events, packets, TLS keys and topology.
-//! The integrator installs one observer in [`RunOptions`]. [`events`] defines
-//! the contract, including
-//! [what observation skips without an observer](events#interest-identity-and-order).
-//! `run.start` emits the seed to interested observers. Core retains no
-//! observation history.
+//! Every world defines and emits its own typed observations. Optional stdlib
+//! pieces provide packet decoding, capture files and page streaming.
 //!
 //! # How a sandbox connects to a world
 //!
@@ -140,7 +136,7 @@
 //!     let (attacher, attachments) = fictionet::attachments();
 //!     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 //!     let _listening = fictionet::listen(socket, attacher)?;
-//!     fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| world(fcx, attachments)))
+//!     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
 //! }
 //! ```
 //!
@@ -167,12 +163,10 @@
 //!   network around the [`Host`](stdlib::world::net::Host)s it is given: the
 //!   sandboxes' subnet with DHCP, DNS for every host's names, a router, one
 //!   machine per address, and each host's services on their ports.
-//! - [`events`]: structured facts emitted lazily to the run's observer.
 //!
 //! HTTP is a service too ([`stdlib::web::httpd`]): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
-//! server and a line-echo service run on two hosts; installed observers can
-//! retain their events:
+//! server and a line-echo service run on two hosts:
 //!
 //! ```
 //! # {
@@ -180,7 +174,6 @@
 //! use fictionet::{Attachments, Cx, Result};
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
 //! use fictionet::stdlib::web::httpd::{tower, Server};
-//! use fictionet::events::Event;
 //! use fictionet::stdlib::world::net::Net;
 //! use fictionet::stdlib::services::serve::{Flow, Driver, Service};
 //!
@@ -197,7 +190,7 @@
 //!     }
 //!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder, Self::Timer>) -> std::result::Result<Flow, Self::Error> {
 //!         let line = line.unwrap_or_default();
-//!         driver.emit("echo", "line", |event| event.field("bytes", line.len() as u64));
+//!
 //!         driver.reply().extend_from_slice(&line);
 //!         driver.reply().push(b'\n');
 //!         Ok(Flow::Continue)
@@ -215,7 +208,7 @@
 //! ```
 //!
 //! [`stdlib::web::Sites`] is a preset on `Net` for a world of websites. The
-//! guide in `docs/services.md` walks through services, `Net`, and events
+//! guide in `docs/services.md` walks through services and `Net`
 //! step by step.
 //!
 //! # Protocols
@@ -306,7 +299,6 @@ mod cx;
 mod entropy;
 mod environment;
 mod error;
-pub mod events;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
@@ -319,15 +311,12 @@ mod packet_queue;
 #[doc(hidden)]
 pub mod relay;
 pub use entropy::{Entropy, Seed, SeededEntropy};
-mod group;
-mod link;
 mod run;
 pub mod stdlib;
 pub mod sync;
 mod sys;
 pub mod time;
 mod timer;
-mod tls_keys;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 
@@ -350,11 +339,11 @@ pub use cable::{End, PACKET_COST, pair, pair_with_limit};
 pub use clock::RunMode;
 pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
-pub use interface::{Interface, InterfaceExt, LinkHandle, Packet, Recv, RecvError};
+pub use interface::{Interface, InterfaceExt, Packet, Recv, RecvError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
+pub use run::lab;
 pub use run::run;
-pub use run::{RunOptions, lab};
 mod clock;
 pub use sys::random_bytes;
 

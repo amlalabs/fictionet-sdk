@@ -1,11 +1,10 @@
 # Guest content checks
 
-`guest_content::Audit` checks service output, HTTP headers and bodies, DNS
-answers, certificate chains, and the kit's rendered configuration and decoded
-installed files. HTTP content encodings and ZIP, tar, Debian, gzip, xz and zstd
-archives are decoded recursively. Checks fail on inspection limits or invalid
-complete archives. Every VM run checks the collected content at shutdown; example
-world integration tests install the same observer.
+`guest_content::Audit` inspects bytes explicitly supplied by a world or the kit.
+It checks the kit's rendered configuration and decoded installed files. HTTP
+content encodings and ZIP, tar, Debian, gzip, xz and zstd archives are decoded
+recursively. Checks fail on inspection limits or invalid complete archives.
+A world that wants to inspect service output supplies those bytes itself.
 
 The vocabulary includes project names, scenario names and test terminology.
 Names are matched without regard to case; ordinary words use word boundaries.

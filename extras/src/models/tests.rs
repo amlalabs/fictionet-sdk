@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn claude_code_policy_limits_require_credentials() {
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+        fictionet::Seed::from_u64(1),
         |cx| async move {
             let credential =
                 Credential::api_key(&cx, Secret::new("ANTHROPIC_API_KEY", "private-key".into())?);
@@ -132,9 +132,9 @@ fn swap_stream_and_budget_against_upstream() {
             socket.write_all(&[byte]).unwrap();
         }
     });
-    let memory = Arc::new(fictionet_test_support::EventLog::default());
+
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(memory.clone()),
+        fictionet::Seed::from_u64(1),
         |cx| async move {
             let credential = Credential::api_key(
                 &cx,
@@ -193,32 +193,6 @@ fn swap_stream_and_budget_against_upstream() {
     ))
     .unwrap();
     upstream.join().unwrap();
-    let calls = memory.of("model", "call");
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].u64("input_tokens"), Some(7));
-    assert_eq!(calls[0].u64("output_tokens"), Some(3));
-    assert_eq!(calls[0].str("credential"), Some("placeholder"));
-    let bodies = memory.of("model", "body");
-    assert!(!bodies.is_empty());
-    let mut response = Vec::new();
-    for event in bodies
-        .iter()
-        .filter(|e| e.str("direction") == Some("response"))
-    {
-        response.extend(
-            fictionet::stdlib::codec::base64::decode(
-                event.str("data").unwrap().as_bytes(),
-                fictionet::stdlib::codec::base64::Padding::Canonical,
-            )
-            .unwrap(),
-        );
-    }
-    let response = String::from_utf8(response).unwrap();
-    assert!(response.contains("<ANTHROPIC_API_KEY>"));
-    assert!(!response.contains("sk-ant-api03-private"));
-    for event in memory.all() {
-        assert!(!event.to_line().unwrap().contains("sk-ant-api03-private"));
-    }
 }
 
 #[test]
@@ -272,7 +246,7 @@ fn bearer_and_google_keys_and_usage() {
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
         });
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(2)),
+            fictionet::Seed::from_u64(2),
             |cx| async move {
                 let credential = Credential::api_key(
                     &cx,
@@ -347,9 +321,9 @@ fn cached_input_counts_once_toward_budget() {
             listener.set_nonblocking(true).unwrap();
             listener
         });
-        let memory = Arc::new(fictionet_test_support::EventLog::default());
+
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(12)).observer(memory.clone()),
+            fictionet::Seed::from_u64(12),
             |cx| async move {
                 let credential =
                     Credential::api_key(&cx, Secret::new("key", "private-key".into())?);
@@ -387,13 +361,6 @@ fn cached_input_counts_once_toward_budget() {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        let calls = memory.of("model", "call");
-        assert_eq!(calls.len(), 1);
-        if provider == Provider::Anthropic {
-            assert_eq!(calls[0].u64("input_tokens"), Some(1));
-            assert_eq!(calls[0].u64("cache_read_input_tokens"), Some(1000));
-            assert_eq!(calls[0].u64("cache_creation_input_tokens"), Some(1000));
-        }
     }
 }
 
@@ -448,7 +415,7 @@ async fn catalog_request(cx: &Cx, site: Model, request: Request<Body>) -> Respon
 #[test]
 fn codex_catalog_openrouter_requires_supplied_catalog() {
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(34)),
+        fictionet::Seed::from_u64(34),
         |cx| async move {
             let key = "sk-or-v1-private";
             let mut credential = Credential::api_key(
@@ -500,39 +467,9 @@ fn codex_catalog_openrouter_requires_supplied_catalog() {
 }
 
 #[test]
-fn codex_catalog_forward_origin_without_fields() {
-    let origin = "https://chatgpt.com/backend-api/codex/models";
-    for existing in [false, true] {
-        let mut response = Response::new(Body::empty());
-        if existing {
-            response.extensions_mut().insert(
-                fictionet::events::Fields::new()
-                    .with("forwarded", "https://chatgpt.com")
-                    .with("other", "preserved"),
-            );
-        }
-        set_catalog_origin(&mut response, origin);
-        let fields = response
-            .extensions()
-            .get::<fictionet::events::Fields>()
-            .unwrap();
-        assert_eq!(
-            fields.get("forwarded").and_then(|v| v.as_str()),
-            Some(origin)
-        );
-        if existing {
-            assert_eq!(
-                fields.get("other").and_then(|v| v.as_str()),
-                Some("preserved")
-            );
-        }
-    }
-}
-
-#[test]
 fn codex_catalog_answer_checks_credentials_and_passes_a_pause() {
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(31)),
+        fictionet::Seed::from_u64(31),
         |cx| async move {
             let model = Model::at(
                 &cx,
@@ -631,7 +568,7 @@ fn codex_catalog_forward_swaps_key_and_preserves_response() {
         write!(socket, "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nETag: catalog-version\r\nX-Message: sk-private\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     });
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(32)),
+        fictionet::Seed::from_u64(32),
         |cx| async move {
             let model = Model::at(
                 &cx,
@@ -708,7 +645,7 @@ fn codex_catalog_forward_origin_is_separate_from_model_calls() {
         }
     }
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(33)),
+        fictionet::Seed::from_u64(33),
         |cx| async move {
             let origin: http::Uri = "https://chatgpt.com".parse()?;
             let credential =
@@ -740,18 +677,6 @@ fn codex_catalog_forward_origin_is_separate_from_model_calls() {
                         .body(Body::from(r#"{"model":"gpt-5","input":"Hello"}"#))?
                 };
                 let response = site.clone().send(request).await?;
-                let fields = response
-                    .extensions()
-                    .get::<fictionet::events::Fields>()
-                    .unwrap();
-                assert_eq!(
-                    fields.get("forwarded").and_then(|value| value.as_str()),
-                    Some(if catalog {
-                        "https://chatgpt.com/backend-api/codex/models"
-                    } else {
-                        "https://chatgpt.com"
-                    })
-                );
                 response.into_body().collect().await?;
             }
             Ok(())
@@ -780,7 +705,7 @@ fn guest_credentials_follow_each_request_without_replacement() {
             }
         });
         fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             |cx| async move {
                 let model = Model::guest_at(&cx, provider, format!("http://{address}").parse()?)?;
                 assert!(model.guest_env().is_empty());

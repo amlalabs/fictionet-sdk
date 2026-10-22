@@ -64,8 +64,6 @@
 //!   a protocol chooses its own checksum coverage.
 //! - [`packet`] and [`packet_with`] put an IP header in front of a payload.
 //!   [`hop`] lowers the TTL as a router does.
-//! - [`emit_drop`] emits a dropped-packet fact to interested observers, with
-//!   its addresses, protocol and reason.
 //!
 //! ```
 //! use fictionet::stdlib::network::ip::{self, Header, protocol};
@@ -87,7 +85,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::task::Poll;
 
-use fictionet::events::{self, Level, opt};
 use fictionet::stdlib::network::{
     icmp,
     ports::{Event, Ports},
@@ -222,23 +219,20 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
     let (v4, v4_mine) = capped();
     let (v6, v6_mine) = capped();
     let (other, other_mine) = capped();
-    fcx.spawn_as(
-        || "split_versions",
-        move |fcx| async move {
-            let ports = Ports::new(vec![
-                Box::new(inner) as Box<dyn Interface>,
-                Box::new(v4_mine),
-                Box::new(v6_mine),
-                Box::new(other_mine),
-            ]);
-            split(fcx, ports, None, |packet| match version(&packet.0) {
-                Some(4) => 1,
-                Some(6) => 2,
-                _ => 3,
-            })
-            .await
-        },
-    );
+    fcx.spawn(move |fcx| async move {
+        let ports = Ports::new(vec![
+            Box::new(inner) as Box<dyn Interface>,
+            Box::new(v4_mine),
+            Box::new(v6_mine),
+            Box::new(other_mine),
+        ]);
+        split(fcx, ports, None, |packet| match version(&packet.0) {
+            Some(4) => 1,
+            Some(6) => 2,
+            _ => 3,
+        })
+        .await
+    });
     (v4, v6, other)
 }
 
@@ -375,7 +369,7 @@ impl<F: Future<Output = fictionet::Result> + Send + 'static> Prepared<F> {
     /// Starts forwarding in the context used to prepare the split.
     #[track_caller]
     pub fn start(self, fcx: &Cx) {
-        fcx.spawn_as(|| "split_protocols", move |_| self.task);
+        fcx.spawn(move |_| self.task);
     }
 }
 
@@ -900,45 +894,6 @@ pub mod protocol {
     pub const NONE: u8 = 59;
     /// IPv6 Destination Options.
     pub const DEST_OPTIONS: u8 = 60;
-}
-
-/// Emits that `source` dropped `packet`, with its addresses, protocol and detail.
-/// Interest is checked with `conn` before parsing or invoking either closure.
-/// `enrich` may add attribution discovered from the parsed fields.
-pub fn emit_drop<F>(
-    fcx: &Cx,
-    conn: &events::ConnInfo,
-    source: &'static str,
-    packet: &Packet,
-    why: &'static str,
-    detail: impl FnOnce() -> events::Fields,
-    enrich: F,
-) where
-    F: FnOnce(events::Event) -> events::Event,
-{
-    if !fcx.emitter(conn).enabled(source, "drop") {
-        return;
-    }
-    let h = Header::parse_truncated(&packet.0);
-    let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
-    let (src, dst) = match &h {
-        Some(h) => (h.src.to_string(), h.dst.to_string()),
-        None => ("?".to_owned(), "?".to_owned()),
-    };
-    let event = events::Event::new(source, "drop")
-        .level(Level::Notice)
-        .summary(format_args!("{src} → {dst}: {why}"))
-        .field("src", opt(h.as_ref().map(|_| src)))
-        .field("dst", opt(h.as_ref().map(|_| dst)))
-        .field("protocol", opt(h.as_ref().map(|h| u32::from(h.protocol))))
-        .field("why", why);
-    let mut all = events::Fields::new()
-        .with("len", packet.0.len() as u64)
-        .with("dst_port", opt(port.map(u32::from)));
-    all.extend(detail());
-    let event = enrich(event.conn(conn)).repeat(all);
-    let connection = event.conn.clone();
-    fcx.emitter(&connection).emit(source, "drop", |_| event);
 }
 
 /// The IP version of a packet, from the top four bits of its first byte:
@@ -1982,7 +1937,7 @@ mod tests {
     #[test]
     fn an_interface_never_read_holds_at_most_its_queue() {
         let result = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()),
+            fictionet::Seed::random(),
             |fcx| async move {
                 let (mut raw, side) = fictionet::pair();
                 let (_tcp, _udp, _icmp, other) = split_protocols(&fcx, side);

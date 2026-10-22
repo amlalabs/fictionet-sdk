@@ -2,7 +2,6 @@
 //! or files.
 use fictionet::{
     Cx,
-    events::Fanout,
     stdlib::{
         codec::Wire,
         protocols::{
@@ -12,14 +11,13 @@ use fictionet::{
         web::httpd,
     },
 };
-use fictionet_test_support::EventLog as Memory;
 use fictionet_test_support::sandbox::{self, Machine, machine};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::SystemTime,
 };
-use web_world::{World, pages::Seed, search::Searches};
+use web_world::{World, observation::SearchObs, pages::Seed};
 
 /// The caller's own site: "caller content" on every path.
 struct CallerContent;
@@ -67,14 +65,14 @@ async fn fetch(
 }
 #[test]
 fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
-    let events = Arc::new(Memory::default());
-    let observed = events.clone();
+    let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
     fictionet::block_on(fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(events.clone()),
+        fictionet::Seed::from_u64(7),
         move |cx| async move {
             let seed = Seed::builtin("web")?;
             let start = web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed, start)?;
+            world.pages.observe(sender);
             let tls = world.ca.config(&cx, "forwarded.com")?.0;
             let log = Arc::new(fictionet_extras::log::Log::new(
                 Box::new(std::io::sink()),
@@ -118,17 +116,6 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
             ));
             assert_eq!(answer.answers.len(), 1);
             assert!(matches!(&answer.answers[0].data, RData::A(a) if a.0 == assigned));
-            let sites = events.of("web", "site");
-            let forwarded: Vec<_> = sites
-                .iter()
-                .filter(|e| e.str("host") == Some("forwarded.com"))
-                .collect();
-            assert_eq!(forwarded.len(), 1);
-            assert_eq!(
-                forwarded[0].str("addr"),
-                Some(assigned.to_string().as_str())
-            );
-            assert_eq!(forwarded[0].str("why"), Some("pool"));
             assert_eq!(
                 fetch(
                     &cx,
@@ -151,42 +138,25 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
         },
     ))
     .unwrap();
-    let sites = observed.of("web", "site");
-    assert!(sites.iter().any(|e| e.str("host") == Some("freshnews.com")));
-    assert_eq!(
-        sites
-            .iter()
-            .filter(|e| e.str("host") == Some("forwarded.com"))
-            .count(),
-        1
-    );
-    assert!(
-        !observed
-            .of("web", "cert")
-            .iter()
-            .any(|e| e.str("host") == Some("forwarded.com"))
-    );
-    assert!(
-        observed
-            .of("web", "refused")
-            .iter()
-            .any(|e| e.str("host") == Some("wiki.corp"))
-    );
+    let mut facts = Vec::new();
+    while let Ok(observation) = observations.try_recv() {
+        facts.push(observation.fact);
+    }
+    assert_eq!(facts.iter().filter(|fact| matches!(fact, SearchObs::Resolved { name, address: Some(_) } if name.to_ascii() == "forwarded.com")).count(), 1);
+    assert!(facts.iter().any(|fact| matches!(fact, SearchObs::Resolved { name, address: Some(_) } if name.to_ascii() == "freshnews.com")));
+    assert!(facts.iter().any(|fact| matches!(fact, SearchObs::Resolved { name, address: None } if name.to_ascii() == "wiki.corp")));
 }
 
 #[test]
-fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
-    let events = Arc::new(Memory::default());
+fn guest_fetches_keep_their_typed_request_headers() {
     let seed = Seed::builtin("web").unwrap();
-    let searches = Arc::new(Searches::from_seed(&seed));
-    let observed = events.clone();
-    let projection = searches.clone();
-    let observer = Arc::new(Fanout::new(vec![events, searches]));
+    let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
     fictionet::block_on(fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
+        fictionet::Seed::from_u64(7),
         move |cx| async move {
             let start = web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed, start)?;
+            world.pages.observe(sender);
             let log = Arc::new(fictionet_extras::log::Log::new(
                 Box::new(std::io::sink()),
                 &[],
@@ -195,15 +165,9 @@ fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
             let (attacher, attachments) = fictionet::attachments();
             world.serve(&cx, log, attachments)?;
             let m = machine(&cx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
-            for (user_agent, via) in [
-                (
-                    "Claude-User (claude-code/2.1.292; +https://support.anthropic.com/)",
-                    Some("web_fetch"),
-                ),
-                (
-                    "Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0",
-                    None,
-                ),
+            for user_agent in [
+                "Claude-User (claude-code/2.1.292; +https://support.anthropic.com/)",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0",
             ] {
                 let (status, _) = fetch(
                     &cx,
@@ -215,18 +179,42 @@ fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
                 )
                 .await;
                 assert_eq!(status, 200);
-                let requests = observed.of("http", "request");
-                let request = requests.last().unwrap();
-                assert_eq!(request.str("via"), via);
-                let snapshot = projection.snapshot();
-                assert_eq!(snapshot.pages.len(), 1);
-                assert_eq!(snapshot.pages[0].via.as_deref(), via);
-                assert_eq!(snapshot.pages[0].status, Some(200));
             }
-            assert_eq!(projection.snapshot().pages[0].fetches, 2);
+
             cx.cancel();
             Ok(())
         },
     ))
     .unwrap();
+    let mut requests = Vec::new();
+    while let Ok(observation) = observations.try_recv() {
+        if let SearchObs::Request {
+            host,
+            method,
+            path,
+            status,
+            headers,
+            ..
+        } = observation.fact
+        {
+            assert_eq!(host.to_ascii(), "docs.python.org");
+            assert_eq!(method, http::Method::GET);
+            assert_eq!(path, "/3/library/itertools.html");
+            assert_eq!(status, http::StatusCode::OK);
+            requests.push(headers);
+        }
+    }
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0][http::header::USER_AGENT]
+            .to_str()
+            .unwrap()
+            .starts_with("Claude-User")
+    );
+    assert!(
+        requests[1][http::header::USER_AGENT]
+            .to_str()
+            .unwrap()
+            .contains("Firefox/")
+    );
 }

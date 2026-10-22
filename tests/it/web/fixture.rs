@@ -54,7 +54,6 @@ pub(super) struct Env {
     pub(super) calls: Arc<AtomicUsize>,
     /// Requests the secure site has served.
     pub(super) served: Arc<AtomicUsize>,
-    pub(super) waiting: Arc<AtomicUsize>,
 }
 
 pub(super) struct TestSites {
@@ -82,12 +81,6 @@ pub(super) const DUAL_ADDR: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 50);
 pub(super) const DUAL_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x50, 0, 0, 0, 0, 0x10);
 pub(super) const V6ONLY_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x50, 0, 0, 0, 0, 0x20);
 
-/// What `events.test` adds to its request's event about a page, through the
-/// response's extensions.
-fn page(kind: &'static str) -> Fields {
-    Fields::new().with("page", kind)
-}
-
 /// The size of `events.test/big`.
 pub(super) const BIG: usize = 4 << 20;
 
@@ -96,7 +89,7 @@ fn events_site(waiting: Arc<AtomicUsize>) -> axum::Router {
         .route(
             "/page",
             axum::routing::get(|Extension(t): Extension<web::Target>| async move {
-                (Extension(page("article")), format!("page sni={:?}", t.sni))
+                format!("page sni={:?}", t.sni)
             }),
         )
         .route("/big", axum::routing::get(|| async { vec![b'x'; BIG] }))
@@ -170,7 +163,6 @@ pub(super) fn sites(fcx: &Cx) -> TestSites {
         roots: Arc::new(certs.roots),
         calls: calls.clone(),
         served: served.clone(),
-        waiting,
     };
 
     let secure = axum::Router::new().fallback(
@@ -556,3 +548,26 @@ pub(super) async fn bind_by_ping(
 }
 
 pub(super) const SHORT: Duration = Duration::from_millis(300);
+
+pub(super) async fn raw_http(
+    fcx: &Cx,
+    m: &Machine,
+    addr: Ipv4Addr,
+    request: &[u8],
+) -> Result<Vec<u8>, ConnError> {
+    let mut conn = m
+        .tcp
+        .connect(fcx, SocketAddr::new(addr.into(), 80))
+        .await
+        .unwrap();
+    conn.write_all(fcx, request).await.unwrap();
+    let mut output = Vec::new();
+    let mut bytes = [0; 4096];
+    loop {
+        let n = conn.read(fcx, &mut bytes).await?;
+        if n == 0 {
+            return Ok(output);
+        }
+        output.extend_from_slice(&bytes[..n]);
+    }
+}

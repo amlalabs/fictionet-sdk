@@ -27,7 +27,7 @@ pub fn build(
     world: &web_world::World,
     cx: &Cx,
     log: Arc<fictionet_extras::log::Log>,
-    mirror: fictionet_demo::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,
+    mirror: fictionet_demo::kit::mirror::Mirror<fictionet::stdlib::web::Proxy>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     use fictionet::stdlib::web::Site;
     let mozilla = world
@@ -49,7 +49,7 @@ pub fn build(
                     Gateway {
                         model: Model::guest(cx, provider)?,
                         pages: world.pages.clone(),
-                        host: provider.host().into(),
+                        host: provider.host().parse()?,
                     },
                     world.ca.config(cx, provider.host())?.0,
                 ),
@@ -90,36 +90,6 @@ pub fn build(
     }))
 }
 
-/// Starts Search's network with its own DNS and refusal reader on guest links.
-pub fn start(
-    cx: &Cx,
-    net: fictionet::stdlib::world::net::Net,
-    mut attachments: fictionet::Attachments,
-    pages: Arc<web_world::pages::Pages>,
-) -> fictionet::Result {
-    use fictionet::{Interface, InterfaceExt};
-    let (attacher, observed) = fictionet::attachments();
-    cx.spawn(move |cx| async move {
-        while let Ok(attachment) = attachments.next(&cx).await {
-            let name = attachment.name().to_owned();
-            let mut destination = attacher.attach(&name)?;
-            let pages = pages.clone();
-            cx.spawn(move |cx| async move {
-                let mut link = web_world::observation::Link { inner: attachment, cx:cx.clone(), pages };
-                loop {
-                    tokio::select! {
-                        packet = link.recv(&cx) => match packet { Ok(packet) => destination.send(packet), Err(_) => break },
-                        packet = destination.recv(&cx) => match packet { Ok(packet) => link.send(packet), Err(_) => break },
-                    }
-                }
-                Ok(())
-            });
-        }
-        Ok(())
-    });
-    net.start(cx, observed)
-}
-
 use fictionet::stdlib::web::{Body, httpd};
 use web_world::observation::{CallPhase, Hit, SearchObs, Tool};
 
@@ -127,7 +97,7 @@ use web_world::observation::{CallPhase, Hit, SearchObs, Tool};
 struct Gateway {
     model: fictionet_extras::models::Model,
     pages: Arc<web_world::pages::Pages>,
-    host: String,
+    host: web_world::observation::HostName,
 }
 impl httpd::Handler for Gateway {
     fn call(
@@ -136,8 +106,12 @@ impl httpd::Handler for Gateway {
         exchange: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
         let call = exchange.random_u64();
-        let path = request.uri().path().to_owned();
-        let method = request.method().to_string();
+        let path = request
+            .uri()
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        let method = request.method().clone();
         let pages = self.pages.clone();
         let host = self.host.clone();
         let model = self.model.clone().search(Arc::new(Tools {
@@ -164,7 +138,7 @@ impl httpd::Handler for Gateway {
                 };
                 match response {
                     Ok(response) => {
-                        let status = response.status().as_u16();
+                        let status = response.status();
                         let streaming = response
                             .headers()
                             .get(http::header::CONTENT_TYPE)
@@ -205,7 +179,7 @@ impl httpd::Handler for Gateway {
                                 call,
                                 host,
                                 path,
-                                status: Some(502),
+                                status: Some(http::StatusCode::BAD_GATEWAY),
                                 method,
                                 phase: CallPhase::Complete,
                             },
@@ -293,10 +267,10 @@ struct CallBody {
     cx: Cx,
     pages: Arc<web_world::pages::Pages>,
     call: u64,
-    host: String,
-    path: String,
-    status: u16,
-    method: String,
+    host: web_world::observation::HostName,
+    path: http::uri::PathAndQuery,
+    status: http::StatusCode,
+    method: http::Method,
     done: bool,
 }
 impl http_body::Body for CallBody {
@@ -360,7 +334,7 @@ mod tests {
     #[test]
     fn dropping_an_unread_model_body_reports_interruption() {
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             |cx| async move {
                 let pages = Arc::new(web_world::pages::Pages::new(
                     web_world::pages::Seed::builtin("web")?,
@@ -372,10 +346,10 @@ mod tests {
                     cx: cx.clone(),
                     pages,
                     call: 1,
-                    host: "api.anthropic.com".into(),
-                    path: "/v1/messages".into(),
-                    method: "POST".into(),
-                    status: 200,
+                    host: "api.anthropic.com".parse().unwrap(),
+                    path: http::uri::PathAndQuery::from_static("/v1/messages"),
+                    method: http::Method::POST,
+                    status: http::StatusCode::OK,
                     done: false,
                 });
                 let observation = observations.try_recv().unwrap();
@@ -427,53 +401,50 @@ mod tests {
             .unwrap(),
         );
         let (page, (mut observations, _)) = crate::page::Page::new(&pages, false);
-        fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
-            move |cx| async move {
-                let gateway = Gateway {
-                    model: fictionet_extras::models::Model::guest_at(
-                        &cx,
-                        fictionet_extras::models::Provider::Anthropic,
-                        origin,
-                    )?,
-                    pages,
-                    host: "api.anthropic.com".into(),
-                };
-                let request = http::Request::post("/v1/messages")
-                    .header("x-api-key", "local-only")
-                    .header("anthropic-version", "2023-06-01")
-                    .header("anthropic-beta", "web-fetch-2025-09-10")
-                    .body(Body::from(include_str!(
-                        "../../world/tests/anthropic-search.json"
-                    )))?;
-                let reply = gateway.call(
-                    request,
-                    &mut httpd::Exchange::new(cx.now(), &cx, &Default::default()),
-                );
-                let httpd::Reply::Later(work) = reply else {
-                    panic!("gateway work is deferred")
-                };
-                let response = work(cx.clone()).await?;
-                assert_eq!(response.status(), 200);
-                let bytes = response.into_body().collect().await?.to_bytes();
-                let body: Value = serde_json::from_slice(&bytes)?;
-                assert_eq!(body["stop_reason"], "end_turn");
-                while let Ok(row) = observations.try_recv() {
-                    page.publish(row);
-                }
-                let view = page.snapshots.borrow();
-                assert_eq!(view.calls.len(), 1);
-                let call = &view.calls[0];
-                assert_eq!(call.status, Some(200));
-                assert_eq!(call.phase, CallPhase::Complete);
-                assert_eq!(call.tools.len(), 2);
-                assert_eq!(call.tools[0].target, "black hole");
-                assert_eq!(call.tools[0].results[0].url, "https://sky.org/black-hole");
-                assert!(matches!(call.tools[1].tool, Tool::Fetch));
-                assert!(!serde_json::to_string(&*view)?.contains("local-only"));
-                Ok(())
-            },
-        )
+        fictionet::run(fictionet::Seed::from_u64(7), move |cx| async move {
+            let gateway = Gateway {
+                model: fictionet_extras::models::Model::guest_at(
+                    &cx,
+                    fictionet_extras::models::Provider::Anthropic,
+                    origin,
+                )?,
+                pages,
+                host: "api.anthropic.com".parse().unwrap(),
+            };
+            let request = http::Request::post("/v1/messages")
+                .header("x-api-key", "local-only")
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "web-fetch-2025-09-10")
+                .body(Body::from(include_str!(
+                    "../../world/tests/anthropic-search.json"
+                )))?;
+            let reply = gateway.call(
+                request,
+                &mut httpd::Exchange::new(cx.now(), &cx, &Default::default()),
+            );
+            let httpd::Reply::Later(work) = reply else {
+                panic!("gateway work is deferred")
+            };
+            let response = work(cx.clone()).await?;
+            assert_eq!(response.status(), 200);
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let body: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(body["stop_reason"], "end_turn");
+            while let Ok(row) = observations.try_recv() {
+                page.publish(row);
+            }
+            let view = page.snapshots.borrow();
+            assert_eq!(view.calls.len(), 1);
+            let call = &view.calls[0];
+            assert_eq!(call.status, Some(200));
+            assert_eq!(call.phase, CallPhase::Complete);
+            assert_eq!(call.tools.len(), 2);
+            assert_eq!(call.tools[0].target, "black hole");
+            assert_eq!(call.tools[0].results[0].url, "https://sky.org/black-hole");
+            assert!(matches!(call.tools[1].tool, Tool::Fetch));
+            assert!(!serde_json::to_string(&*view)?.contains("local-only"));
+            Ok(())
+        })
         .await
         .unwrap();
         assert_eq!(turns.load(Ordering::SeqCst), 3);

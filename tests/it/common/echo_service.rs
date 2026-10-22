@@ -26,10 +26,7 @@ service_fixture! {
             driver.reply().extend_from_slice(b"too long\n");
             return Ok(Flow::Continue);
         };
-        driver.emit("echo", "line", |event| event
-                .summary(String::from_utf8_lossy(&line))
-                .field("bytes", line.len() as u64),
-        );
+
         match line.as_slice() {
             b"quit" => {
                 driver.reply().extend_from_slice(b"bye\n");
@@ -64,7 +61,7 @@ struct Later {
 impl Pending for Later {
     fn poll_next(
         &mut self,
-        driver: &mut PendingDriver<'_>,
+        _driver: &mut PendingDriver<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
         if self.step == 0 {
@@ -76,12 +73,7 @@ impl Pending for Later {
         self.step += 1;
         match self.step {
             2 => Poll::Ready(Some(Ok(b"la".to_vec()))),
-            3 => {
-                driver.emit("echo", "later", |event| {
-                    event.field("written", driver.written())
-                });
-                Poll::Ready(Some(Ok(b"ter\n".to_vec())))
-            }
+            3 => Poll::Ready(Some(Ok(b"ter\n".to_vec()))),
             _ => Poll::Ready(None),
         }
     }

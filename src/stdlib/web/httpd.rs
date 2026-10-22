@@ -57,7 +57,7 @@
 //! set in 2019 never sends a date from the year it runs in. A `Date` the
 //! handler sets itself is sent as it is.
 //!
-//! HTTP/2 uses the same [`Handler`], events, [`Limits`] and seeded randomness.
+//! HTTP/2 uses the same [`Handler`], [`Limits`] and seeded randomness.
 //! The serve driver charges input and output storage, HPACK state, stream
 //! metadata, retained request heads and bodies, and pending responses to the
 //! connection's [`Budget`]. A head that does not fit is refused before its
@@ -95,63 +95,16 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! # Events
+//! # Observation
 //!
-//! Every request a handler or the service answered is one `http.request`
-//! event, also when the client gave up before the answer. Its fields:
-//! `scheme`, `sni`, `host` (the URI's authority or the `Host` header, in
-//! lowercase, without port or trailing dot, `null` if none), `method`,
-//! `uri`, `path`, `query`, `version` (`HTTP/1.1`, `HTTP/2.0`), `headers`
-//! (`[name, value]` pairs in the order of `http::HeaderMap`), `started`
-//! (seconds on the run's clock), `answer` (`handler`, `error`, `cancelled`,
-//! `no_host` for an HTTP/1.1 request without a `Host` field, which gets
-//! `400` without reaching the handler, what the handler set, such as
-//! `redirect`, or `too_large`, `timeout`, `cut_off` or `budget` for a
-//! request the service turned down; `too_large` wins over `no_host`),
-//! `received` (`complete`, `cut_off`, `too_large`, `timeout` or
-//! `budget` for request receipt), `status`, `sent` (response body bytes the
-//! connection took) and `complete`
-//! (whether it took the whole body). Over HTTP/1 a byte counts once it is
-//! written, and the event is made after the last one is; over HTTP/2 once
-//! the service queues it for the stream. A handler adds its own fields by putting
-//! [`Fields`] in its response's extensions, or using [`RequestFields`] before
-//! the response exists. Virtual host requests also carry
-//! `world_site`: the matched registered name, or `the default site` for a fallback.
-//! An opt-in [`BodyClassifier`] sees the
-//! head before virtual hosting and admission, body chunks before limits
-//! discard them, and the receipt outcome. Install it with [`Http1::observe`],
-//! [`HttpOptions::observe`], [`Server::observe`] or
-//! [`web::Site::observe`](fictionet::stdlib::web::Site::observe). Its request-local
-//! state can retain authority and classification across chunks without logging
-//! plaintext bodies. BodyClassifier fields come first, handler fields override them,
-//! response fields override recorded request fields, and service facts win last. `answer` comes from the response, never the
-//! observer. No body bytes are added to the event automatically.
-//!
-//! A native HTTP/1 body timeout also finishes the request event with
-//! `answer: timeout`, `received: timeout`, a null status and `complete: false`.
-//! Request receipt and response completion are separate: a successful error
-//! response can have `complete: true` with `received: too_large`.
-//! Native HTTP/1 observes decoded blocks and, on failure or timeout, any
-//! buffered partial body block. Buffered partial bytes are not observed on
-//! connection reset, budget end or cancellation. An HTTP/1.1 request without
-//! Host is answered from bytes buffered with its head; later body bytes are
-//! not observed, leaving `received: cut_off` unless already too large.
-//! HTTP/2 observes each data frame it admits and stops observing at rejection.
-//! Only decoded body data is observed, not chunk framing, chunk extensions
-//! or trailers.
-//! Neither backend relaxes its limits to observe more bytes. Requests rejected
-//! before a parsed head reaches the service have no request event. Bytes after
-//! an upgrade handoff are outside HTTP observation. A missing handler label
-//! does not show that nothing was exposed; consumers need complete receipt or
-//! an observer verdict to judge safety.
-//! A connection that ends in an error is one `http.error` event, with
-//! `local`, `cause` (`protocol`, `timeout` or `transport`) and `detail`.
+//! A world reports typed facts directly from its handlers. A body wrapper
+//! can report streaming progress and completion to that world's own stream.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fictionet::RaceError;
-use fictionet::events::{ConnInfo, Fields};
+use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::network::Connection;
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::protocols::http1;
@@ -176,9 +129,9 @@ pub use native::{Http1, Timer as Http1Timer};
 pub use response::{date_header, http_date};
 pub use sites::{Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
 
-use response::error_event;
 
-/// How much of a request body the service received and admitted.
+
+/// How receipt of a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Received {
     /// The whole body arrived within the limits.
@@ -191,125 +144,6 @@ pub enum Received {
     Timeout,
     /// The request could not fit in the service budget.
     Budget,
-}
-
-impl Received {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Complete => "complete",
-            Self::CutOff => "cut_off",
-            Self::TooLarge => "too_large",
-            Self::Timeout => "timeout",
-            Self::Budget => "budget",
-        }
-    }
-}
-
-/// Whether the run wants this request's event. Installed in request extensions
-/// before the handler runs, so response metadata can be constructed lazily.
-#[derive(Clone, Copy, Debug)]
-pub struct EventInterest(pub bool);
-
-impl EventInterest {
-    /// Checks the interest supplied by the HTTP server. Direct handler callers
-    /// opt in by inserting this extension.
-    pub fn of<B>(request: &http::Request<B>) -> bool {
-        request
-            .extensions()
-            .get::<Self>()
-            .is_some_and(|interest| interest.0)
-    }
-}
-
-/// Request-local event fields that survive cancellation and handler errors.
-/// The server installs this extension only when request events are enabled.
-/// Fields use the event's bounds; overflowing them marks the event truncated.
-/// Recorded handler fields override classifier fields. Response fields override
-/// recorded handler fields. Service facts, including the chosen site, win last.
-/// `answer` always comes from the service or response, never this store.
-#[derive(Clone)]
-pub struct RequestFields(
-    Arc<fictionet::sync::Mutex<(fictionet::events::Event, fictionet::events::Event)>>,
-);
-
-impl Default for RequestFields {
-    fn default() -> Self {
-        Self(Arc::new(fictionet::sync::Mutex::new((
-            fictionet::events::Event::new("http", "request"),
-            fictionet::events::Event::new("http", "request"),
-        ))))
-    }
-}
-
-impl RequestFields {
-    /// Records handler fields before a response exists. Does nothing when the
-    /// server is not observing this request. Build fields only when interested.
-    pub fn record<B>(request: &http::Request<B>, fields: Fields) {
-        if let Some(store) = request.extensions().get::<Self>() {
-            store.record_fields(fields);
-        }
-    }
-
-    /// Records handler fields directly on this request's store.
-    pub fn record_fields(&self, fields: Fields) {
-        self.extend(fields, false);
-    }
-
-    fn extend(&self, mut fields: Fields, service: bool) {
-        fields.remove("answer");
-        let mut stored = self.0.lock();
-        let event = if service {
-            &mut stored.1
-        } else {
-            &mut stored.0
-        };
-        *event = std::mem::replace(event, fictionet::events::Event::new("http", "request"))
-            .fields(fields);
-    }
-}
-
-/// Classifies arrivals before routing or admission, without retaining body bytes.
-///
-/// Callbacks run only when the run observer wants the request event.
-/// Each request has its own `state`, separate from handler extensions. Use it
-/// to carry identity and bounded classification state from `head` to `body`
-/// and `end`, including across concurrent HTTP/2 streams. Callbacks run on
-/// the world's path: use no host clock or entropy, and bound retained state.
-/// State and returned fields, like handler extensions, are outside the service
-/// budget. Keep both bounded.
-/// Return only redacted facts; returned fields are merged in callback order.
-/// Handler fields then override them, and service facts win last.
-/// The service never logs body bytes itself. Head fields keep their ordinary
-/// event representation; this hook does not redact URI or header values.
-pub trait BodyClassifier: Send + Sync + 'static {
-    /// A parsed head, including its original authority and connection identity.
-    /// Runs before virtual hosting, body limits and request budget admission.
-    fn head(
-        &self,
-        _head: &http::request::Parts,
-        _conn: &ConnInfo,
-        _state: &mut http::Extensions,
-    ) -> Option<Fields> {
-        None
-    }
-
-    /// Decoded body data as it arrives, before any limit discards it.
-    /// Chunk framing, chunk extensions and trailers are not observed.
-    /// Chunk boundaries follow the decoder, not network reads. Native HTTP/1
-    /// observes buffered partial bytes on decode failure and timeout only,
-    /// not on connection reset, budget end or cancellation. Hyper stops on
-    /// rejection; native HTTP/1 keeps observing while draining an oversized body.
-    /// An HTTP/1.1 request without Host is answered from bytes buffered with its
-    /// head; later body bytes are not observed, leaving `received: cut_off` unless
-    /// already too large.
-    fn body(&self, _bytes: &[u8], _state: &mut http::Extensions) -> Option<Fields> {
-        None
-    }
-
-    /// Receipt ended, even when no handler ran. Called once per observed head.
-    fn end(&self, _received: Received, _state: &mut http::Extensions) -> Option<Fields> {
-        None
-    }
 }
 
 /// HTTP's limits and timers, for both versions.
@@ -364,21 +198,19 @@ const PIECE: usize = 16 * 1024;
 /// How [`serve_connection`] serves a connection.
 #[derive(Clone, Default)]
 pub struct HttpOptions {
-    /// Observes parsed heads and body receipt before routing or admission.
-    pub observe: Option<Arc<dyn BodyClassifier>>,
     /// Limits and timers, for both versions.
     pub limits: Limits,
     /// On a connection without TLS, how long the client has from
     /// connecting to send its first bytes. Past it, the connection closes
-    /// with an `http.error` event, cause `timeout`. `None` waits as long as
+    /// if no bytes arrived. `None` waits as long as
     /// the HTTP/1 head limit allows.
     pub first_bytes: Option<Duration>,
     /// What connections are charged to ([`ServeOptions::budget`]): over
     /// HTTP/1 and HTTP/2 what the driver and service hold, including each request's head and body,
-    /// its event metadata, and each response frame until its last slice is
+    /// and each response frame until its last slice is
     /// dropped. Heads count method, URI and header bytes, plus header slots;
     /// hidden capacities, extensions and third-party overhead are excluded.
-    /// Events use [`Event::size`](fictionet::events::Event::size). Transport buffers are excluded.
+    /// Transport buffers are excluded.
     /// Response storage is charged by its original byte length; spare capacity
     /// and backing storage outside a supplied slice are not exposed by `Bytes`.
     pub budget: Option<Budget>,
@@ -392,13 +224,12 @@ use fictionet::stdlib::protocols::http2::PREFACE;
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
 /// otherwise. Both versions work with `std`.
-/// `info` names the connection in events.
+/// `info` supplies connection metadata to the handler.
 /// An empty half-close is silent. EOF within an HTTP/2 preface goes through
-/// HTTP/1's truncated-head handling: `http.error` with cause `protocol` and 400.
+/// HTTP/1's truncated-head handling and answers 400.
 ///
 /// Returns `Ok(())` when the connection ended, however it ended: a
-/// connection's failure is the connection's, and the run's events say what
-/// it was. Returns [`Cancelled`] if `fcx`'s
+/// connection's failure ends that connection. Returns [`Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled first.
 #[deny(clippy::let_underscore_must_use)]
 pub async fn serve_connection<C: Connection + Unpin>(
@@ -431,15 +262,6 @@ pub async fn serve_connection<C: Connection + Unpin>(
             Ok(()) => {}
             Err(RaceError::Cancelled) => return Err(Cancelled),
             Err(RaceError::Deadline) => {
-                let secs = first_timeout.as_secs();
-                fcx.emitter(&info).emit("http", "error", |_| {
-                    error_event(
-                        &info,
-                        "timeout",
-                        format!("no bytes within {secs} seconds of connecting"),
-                    )
-                    .conn(&info)
-                });
                 return Ok(());
             }
         }
@@ -447,16 +269,13 @@ pub async fn serve_connection<C: Connection + Unpin>(
     };
     let conn = Prefixed::new(first, conn);
     let serve_opts = ServeOptions {
-        protocol: if h2 { "http2" } else { "http1" },
         idle: None,
         write_timeout: Some(opts.limits.write_timeout),
-        connection_events: false,
         budget: opts.budget.clone(),
         ..ServeOptions::default()
     };
     if h2 {
         let mut service = Http2::with(handler, opts.limits);
-        service.observe = opts.observe.clone();
         service.date = opts
             .date
             .and_then(|date| date.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -468,7 +287,6 @@ pub async fn serve_connection<C: Connection + Unpin>(
     }
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
-    service.observe = opts.observe.clone();
     if !info.tls && opts.first_bytes.is_none() {
         service.first_head_deadline = Some(head_deadline);
     }
@@ -482,11 +300,9 @@ pub async fn serve_connection<C: Connection + Unpin>(
                     Ok(())
                 };
             }
-
             Ok(())
         }
         Err(serve::ServeError::Cancelled) => Err(Cancelled),
-        // The driver recorded the failure as a `conn.error` event.
         Ok(_) | Err(_) => Ok(()),
     }
 }

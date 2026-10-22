@@ -86,14 +86,6 @@ pub trait Interface: Send + 'static {
     /// waiting packet counts its own length plus 64 bytes. A packet that
     /// would take the queue past that budget is dropped. See [`listen`](crate::listen).
     fn send(&mut self, packet: Packet);
-
-    /// Lightweight identity for this interface's link, when it has one.
-    /// [`End`](crate::End) and [`Attachment`](crate::Attachment) provide handles.
-    /// Wrappers may forward them. [`Cx::tap`] names the link for observation.
-    /// Core does not materialize a graph.
-    fn link(&self) -> Option<crate::LinkHandle> {
-        None
-    }
 }
 
 impl Interface for Box<dyn Interface> {
@@ -103,10 +95,6 @@ impl Interface for Box<dyn Interface> {
 
     fn send(&mut self, packet: Packet) {
         (**self).send(packet)
-    }
-
-    fn link(&self) -> Option<crate::LinkHandle> {
-        (**self).link()
     }
 }
 
@@ -167,26 +155,5 @@ impl std::error::Error for RecvError {
 impl From<Cancelled> for RecvError {
     fn from(_: Cancelled) -> Self {
         RecvError::Cancelled
-    }
-}
-
-/// Lightweight identity for the link an [`Interface`] belongs to.
-/// Clones share link state; they do not own a topology graph.
-/// The link gets a run-scoped id when it registers with a run.
-/// Use [`Cx::tap`] to name it for observation.
-#[derive(Clone)]
-pub struct LinkHandle(pub(crate) std::sync::Arc<crate::link::Meter>);
-
-impl LinkHandle {
-    pub(crate) fn new(meter: std::sync::Arc<crate::link::Meter>) -> Self {
-        Self(meter)
-    }
-}
-
-impl std::fmt::Debug for LinkHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("LinkHandle")
-            .field(&self.0.link_id())
-            .finish()
     }
 }

@@ -330,7 +330,7 @@
 //! [`TcpConnection`](crate::stdlib::network::tcp::TcpConnection). A side that
 //! closes its sending half closes the other's too. Attach's stack decides
 //! how those bytes become segments: up to 1,460 bytes each, with a 256 KiB
-//! window (a window scale shift of 3, which Wireshark and the observer
+//! window (a window scale shift of 3, which Wireshark
 //! show as `WS=8`), as [`tcp::endpoint`](crate::stdlib::network::tcp::endpoint)
 //! describes.
 //!

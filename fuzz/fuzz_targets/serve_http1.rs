@@ -2,7 +2,7 @@
 //! `serve::Harness` with no runtime. The fuzzer's bytes are the client's,
 //! cut into two chunks at a point the first byte picks; the replies must
 //! not depend on where the cut falls, the service must never panic, and
-//! every answered request is one event.
+//! handler calls do not depend on chunk boundaries.
 #![no_main]
 
 use bytes::Bytes;
@@ -10,9 +10,10 @@ use fictionet::stdlib::services::serve::Harness;
 use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
 use libfuzzer_sys::fuzz_target;
 
-struct Pages;
+struct Pages(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl Handler for Pages {
     fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (parts, body) = request.into_parts();
         let Some(body) = body.bytes() else {
             return Reply::Now(
@@ -42,26 +43,10 @@ impl Handler for Pages {
     }
 }
 
-#[derive(Default)]
-struct Count(std::sync::atomic::AtomicUsize);
-
-impl fictionet::events::Observer for Count {
-    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        let fictionet::events::Interest::Event(_, _) = interest else {
-            return false;
-        };
-        true
-    }
-
-    fn observe(&self, _: fictionet::events::Stamp, _: fictionet::events::Observation<'_>) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
-    let events = std::sync::Arc::new(Count::default());
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut h =
-        Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages), ()).observer(events.clone());
+        Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages(calls.clone())), ());
     for chunk in chunks {
         if h.push(chunk).is_err() {
             break;
@@ -70,7 +55,7 @@ fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
     let _ = h.end();
     (
         h.output().to_vec(),
-        events.0.load(std::sync::atomic::Ordering::Relaxed),
+        calls.load(std::sync::atomic::Ordering::Relaxed),
         h.closed(),
     )
 }

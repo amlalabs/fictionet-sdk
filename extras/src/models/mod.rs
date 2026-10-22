@@ -359,7 +359,7 @@ impl Ledger {
 #[derive(Clone)]
 pub struct Model {
     cx: Cx,
-    connection: fictionet::events::ConnInfo,
+    connection: fictionet::stdlib::services::serve::ConnInfo,
     provider: Provider,
     credential: Option<Credential>,
     forward: web::Forward,
@@ -375,8 +375,8 @@ pub struct Model {
 }
 #[derive(Clone)]
 enum Catalog {
-    Forward(String),
-    Answer { origin: String, body: Bytes },
+    Forward,
+    Answer { body: Bytes },
 }
 
 /// Searched Responses ids: the id a client saw, and the final upstream turn
@@ -518,11 +518,8 @@ impl Model {
         )?;
         site.ledger = self.ledger.clone();
         site.catalog = Some(match answer {
-            Some((origin, body)) => Catalog::Answer { origin, body },
-            None => Catalog::Forward(format!(
-                "{}/backend-api/codex/models",
-                origin.to_string().trim_end_matches('/'),
-            )),
+            Some((_, body)) => Catalog::Answer { body },
+            None => Catalog::Forward,
         });
         Ok(site)
     }
@@ -565,15 +562,6 @@ impl Model {
             return Vec::new();
         }
         vec![(self.provider.key_variable(), credential.placeholder.clone())]
-    }
-    fn refused(&self, path: &str, reason: &'static str) {
-        self.cx
-            .emitter(&self.connection)
-            .emit("model", "refused", |e| {
-                e.field("provider", self.provider.host())
-                    .field("path", path)
-                    .field("reason", reason)
-            });
     }
     /// Whether the request carries exactly the guest's credential.
     fn authorized(&self, headers: &http::HeaderMap) -> bool {
@@ -627,16 +615,9 @@ impl Model {
     }
     /// The provider's stop response when the budget is spent. Otherwise
     /// `None`, and an admitted call is counted when `count` is set.
-    fn admit(&self, path: &str, count: bool) -> Option<Response<Body>> {
+    fn admit(&self, _path: &str, count: bool) -> Option<Response<Body>> {
         let mut ledger = self.ledger.lock().unwrap();
-        if let Some(kind) = ledger.exhausted() {
-            self.cx
-                .emitter(&self.connection)
-                .emit("model", "budget", |e| {
-                    e.field("provider", self.provider.host())
-                        .field("kind", kind)
-                });
-            self.refused(path, "budget");
+        if ledger.exhausted().is_some() {
             return Some(
                 self.credential
                     .as_ref()
@@ -661,7 +642,6 @@ impl Model {
         if self.catalog.is_some()
             && (request.method() != http::Method::GET || path != "/backend-api/codex/models")
         {
-            self.refused(&path, "path");
             return Ok(self.provider.error(404, "not_found_error", "Not found"));
         }
 
@@ -723,11 +703,9 @@ impl Model {
         if (request.method() != http::Method::POST && !listing && !policy_limits)
             || !(self.provider.allows(&path) || listing || policy_limits)
         {
-            self.refused(&path, "path");
             return Ok(self.provider.error(404, "not_found_error", "Not found"));
         }
         if !self.authorized(request.headers()) {
-            self.refused(&path, "credential");
             return Ok(self.unauthorized());
         }
         if policy_limits && self.credential.is_some() {
@@ -735,9 +713,8 @@ impl Model {
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"restrictions":{}}"#))?);
         }
-        if let Some(Catalog::Answer { origin, body }) = &self.catalog {
+        if let Some(Catalog::Answer { body, .. }) = &self.catalog {
             return Ok(Response::builder()
-                .extension(fictionet::events::Fields::new().with("served_by", origin.clone()))
                 .header("content-type", "application/json")
                 .body(Body::from(body.clone()))?);
         }
@@ -851,7 +828,6 @@ impl Model {
                 .as_str()
                 .is_some_and(|model| model.ends_with(":online") || model.contains("-search-"))
         {
-            self.refused(&path, "tool");
             return Ok(self.provider.error(
                 400,
                 "invalid_request_error",
@@ -872,16 +848,11 @@ impl Model {
                     .insert("chatgpt-account-id", oauth.account()?.parse()?);
             }
         }
-        let transport = if parts.extensions.get::<websocket::Upgraded>().is_some() {
-            "websocket"
-        } else {
-            "http"
-        };
         let secret = match &self.credential {
             Some(credential) => credential.real.clone(),
             None => self.guest_secret(&parts.headers)?,
         };
-        let mut call = response::Call::new(&self, path, &body, &bytes, free, transport, &secret);
+        let mut call = response::Call::new(&self, path, &body, free, &secret);
         if let Some(credential) = &self.credential {
             for name in [
                 "authorization",
@@ -915,9 +886,6 @@ impl Model {
         let result = self.forward.clone().call(request).await;
         match result {
             Ok(mut response) => {
-                if let Some(Catalog::Forward(origin)) = &self.catalog {
-                    set_catalog_origin(&mut response, origin);
-                }
                 call.status = response.status().as_u16();
                 let sse = response
                     .headers()
@@ -937,12 +905,6 @@ impl Model {
             }
         }
     }
-}
-fn set_catalog_origin(response: &mut Response<Body>, origin: &str) {
-    response
-        .extensions_mut()
-        .get_or_insert_default::<fictionet::events::Fields>()
-        .set("forwarded", origin.to_owned());
 }
 
 /// The site's requests: a Responses WebSocket handshake gets its `101`

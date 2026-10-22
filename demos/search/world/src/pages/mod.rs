@@ -32,8 +32,6 @@ use crate::files::FileLock;
 use crate::route::{Route, query_key, route};
 use crate::search::{Cache, Reason};
 use fictionet::Cx;
-use fictionet::events::Fields;
-use fictionet_extras::names;
 use fictionet_extras::search::{self, Engine};
 use meta::{Asked, Listing, Shown};
 use model::{Failure, Ledger, Model, Provider, Usage};
@@ -194,29 +192,6 @@ impl Response {
         let body = body.into().into_bytes();
         Self::new(status, "text/html; charset=utf-8", body, headers, meta)
     }
-
-    /// The answer as fields of its request's event: [`Meta::fields`] and
-    /// `serve_ms`.
-    pub fn fields(&self) -> Fields {
-        let mut fields = self.meta.fields();
-        if fields.get("kind").and_then(|value| value.as_str()) == Some("page")
-            && self.content_type.starts_with("text/html")
-        {
-            let html = String::from_utf8_lossy(&self.body);
-            let end = html.floor_char_boundary(html.len().min(32768));
-            fields.set("preview", &html[..end]);
-        }
-        if self.stored_headers.is_some() {
-            fields.set("served_by", "WARC capture");
-        }
-        if !matches!(self.meta, Meta::Search(_)) {
-            fields.set("carries", self.carries);
-        }
-        if let Some(ms) = self.serve_ms {
-            fields.set("serve_ms", ms);
-        }
-        fields
-    }
 }
 
 /// What makes new pages, as `--generator` names it.
@@ -234,6 +209,16 @@ pub enum GeneratorKind {
 }
 
 impl GeneratorKind {
+    /// The spelling used by configuration and the command line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::Replay => "replay",
+            Self::Model(Provider::Anthropic) => "anthropic",
+            Self::Model(Provider::OpenRouter) => "openrouter",
+        }
+    }
+
     /// Every kind.
     pub const ALL: [Self; 4] = [
         Self::Stored,

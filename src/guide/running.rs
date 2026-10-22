@@ -10,7 +10,7 @@
 //! This module is the running guide. The [`run`](crate::run) and
 //! [`lab`](crate::lab) functions own scheduling and the run's lifetime;
 //! [`Cx`](crate::Cx) and [`Task`](crate::Task) describe regions and waits.
-//! [`events`](crate::events) describes recording and retention.
+//! Each world defines its own recording and retention.
 //!
 //! # The program
 //!
@@ -31,7 +31,7 @@
 //!     let _listening = fictionet::listen(socket, attacher)?;
 //!
 //!     // 3. The world, as one future. Nothing runs yet.
-//!     let world = fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), move |fcx| world(fcx, attachments));
+//!     let world = fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments));
 //!
 //!     // 4. Poll that future on this thread until the world ends.
 //!     fictionet::block_on(world)
@@ -58,18 +58,12 @@
 //!    [`Attachment`](crate::Attachment). Keep the returned
 //!    [`Listening`](crate::Listening) in a named variable. Dropping it
 //!    closes the socket, and `let _ = listen(...)` drops it on the spot.
-//! 3. **[`run(fictionet::RunOptions::new(seed), f)`](crate::run)** returns a future and does nothing else.
+//! 3. **[`run(seed, f)`](crate::run)** returns a future and does nothing else.
 //!    When the future is first polled, it makes the world's
 //!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every random
 //!    number drawn through `Cx` comes from `seed`;
 //!    [`Seed::random`](crate::Seed::random) picks a fresh one.
-//!    Pass [`RunOptions`](crate::RunOptions) to install one observer before execution.
-//!    It receives events, packets, TLS keys and topology according to interest.
-//!    Use [`Fanout`](crate::events::Fanout) to combine consumers from
-//!    Consumers own their storage and presentation.
-//!    `run` and `lab` emit `run.start` once at zero when interested.
-//!    [`events`](crate::events#interest-identity-and-order) says what
-//!    observation skips without an observer. Every task the world starts
+//!    Every task the world starts
 //!    with [`Cx::spawn`](crate::Cx::spawn), and every stdlib task, is polled
 //!    inside this same future.
 //! 4. **[`block_on`](crate::block_on)** polls the future on the current
@@ -232,7 +226,7 @@
 //! # fn main() -> Result {
 //! # let (_attacher, attachments) = fictionet::attachments();
 //! let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-//! runtime.block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), move |fcx| world(fcx, attachments)))
+//! runtime.block_on(fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments)))
 //! # }
 //! ```
 //!
@@ -273,7 +267,7 @@
 //! // The test plays the sandbox "agent": it holds the sandbox's end.
 //! let mut agent = attacher.attach("agent").unwrap();
 //!
-//! let test = fictionet::lab(fictionet::RunOptions::new(fictionet::Seed::from_u64(1)), move |fcx| async move {
+//! let test = fictionet::lab(fictionet::Seed::from_u64(1), move |fcx| async move {
 //!     fcx.spawn(move |fcx| world(fcx, attachments));
 //!     agent.send(Packet(vec![0x45, 0, 0, 20]));
 //!     assert_eq!(agent.recv(&fcx).await?, Packet(vec![0x45, 0, 0, 20]));
@@ -332,9 +326,7 @@
 //! - **Nothing waits forever.** A lab whose tasks all wait with no deadline
 //!   ends with an error that says so.
 //!
-//! With those conditions, a lab run with fixed interests and limits repeats
-//! all four observation streams with the same stamps and packet bytes.
-//! Interactive capture and worker queue overflow depend on external scheduling.
+//! With those conditions, a lab repeats its world-owned facts and packet bytes.
 //! The seed alone is not enough. Keep the world code,
 //! configuration and ordered inputs fixed. Use `Cx` for time, randomness
 //! and task scheduling. Do not let host clocks, OS entropy, external I/O,
@@ -352,5 +344,4 @@
 //! arrive and in which order, so the times in its observations, and anything that
 //! depends on them, differ from run to run. Repeating the world's side of
 //! a real run would take a log of every input: each inbound packet's
-//! bytes and the moment it arrived, and the order of attachments. Service
-//! events do not record all those inputs.
+//! bytes and the moment it arrived, and the order of attachments.

@@ -10,12 +10,10 @@ use http::header::HOST;
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame};
 
-use fictionet::events::Fields;
 use fictionet::stdlib::codec::{Decode, Step};
-use fictionet::stdlib::network::ConnError;
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::services::serve::{
-    self, Driver, Ended, Flow, Pending, PendingDriver,
+    self, Driver, Flow, Pending, PendingDriver,
 };
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
@@ -23,11 +21,11 @@ use fictionet::{Cx, Error};
 use super::body::Inner;
 use super::handlers::status_only;
 use super::response::{
-    ResponsePolicy, Tracker, answered, error_event, error_response, head_held, request_held,
+    ResponsePolicy, error_response, head_held, request_held,
 };
 use super::sites::no_host;
 use super::{
-    Body, BodyClassifier, Exchange, Handler, Later, Limits, PIECE, Received, Reply, UpgradeHandler,
+    Body, Exchange, Handler, Later, Limits, PIECE, Reply, UpgradeHandler,
     date_header,
 };
 
@@ -46,8 +44,6 @@ pub enum Timer {
 /// HTTP/1.0 and 1.1 for one connection, answering with a [`Handler`].
 pub struct Http1 {
     handler: Arc<dyn Handler>,
-    pub(super) observe: Option<Arc<dyn BodyClassifier>>,
-    tracker: Option<Tracker>,
     opts: Limits,
     /// The world's date at the start of the run, for `Date` headers.
     pub(super) date: Option<SystemTime>,
@@ -69,8 +65,6 @@ impl Http1 {
     pub fn with(handler: Arc<dyn Handler>, opts: Limits) -> Http1 {
         Http1 {
             handler,
-            observe: None,
-            tracker: None,
             opts,
             date: None,
             upgrade: None,
@@ -90,64 +84,12 @@ impl Http1 {
         self
     }
 
-    /// Observes each request before routing and while its body arrives.
-    pub fn observe(mut self, observer: Arc<dyn BodyClassifier>) -> Http1 {
-        self.observe = Some(observer);
-        self
-    }
-
-    fn track(&mut self, head: &RequestHead, driver: &Driver<'_, http1::RequestEvents, Timer>) {
-        let enabled = driver.event_enabled("http", "request");
-        if !enabled || self.observe.is_none() {
-            self.tracker = Some(Tracker::tracking(enabled));
-            return;
-        }
-        if let Some(request) = to_request(head, version_of(head), Body::empty()) {
-            self.tracker = Some(Tracker::observing(
-                enabled,
-                &request,
-                driver.conn(),
-                self.observe.clone(),
-            ));
-        }
-    }
-
-    fn finish_receipt(
-        &mut self,
-        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
-        received: Received,
-    ) {
-        if let Some(mut tracker) = self.tracker.take() {
-            tracker.received(received);
-            if driver.event_enabled("http", "request")
-                && let Some(head) = &self.head
-                && let Some(mut request) = to_request(head, version_of(head), Body::empty())
-            {
-                tracker.start(&mut request, driver.conn(), self.started);
-            }
-            if let Some(event) = tracker.finish(
-                || Some(Fields::new().with("answer", received.as_str())),
-                None,
-                0,
-                false,
-            ) {
-                driver.emit("http", "request", |_| event);
-            }
-        }
-        self.head = None;
-    }
 
     fn respond(&mut self, driver: &mut Driver<'_, http1::RequestEvents, Timer>) -> Flow {
         let held = self.body.capacity();
         let body = Body::from(std::mem::take(&mut self.body));
         let close = self.too_big;
-        if let Some(tracker) = &mut self.tracker {
-            tracker.received(if self.too_big {
-                Received::TooLarge
-            } else {
-                Received::Complete
-            });
-        }
+
         self.dispatch(driver, body, close, held)
     }
 
@@ -175,12 +117,8 @@ impl Http1 {
         };
         let mut request = request;
         request.extensions_mut().insert(driver.conn().clone());
-        if driver.event_enabled("http", "request") {
-            request.extensions_mut().insert(super::EventInterest(true));
-        }
+
         let head_only = request.method() == Method::HEAD;
-        let mut tracker = self.tracker.take().expect("a parsed request has a tracker");
-        tracker.start(&mut request, driver.conn(), self.started);
         let held = held + request_held(&request);
         let now = driver.now();
         let conn = driver.conn().clone();
@@ -189,21 +127,13 @@ impl Http1 {
         // refuses such a head, so only `on_fail` brings one here.
         let lacks_host = version == Version::HTTP_11 && !request.headers().contains_key(HOST);
         let reply = if self.too_big {
-            Reply::Now(answered(
-                status_only(StatusCode::PAYLOAD_TOO_LARGE),
-                "too_large",
-                driver.event_enabled("http", "request"),
-            ))
+            Reply::Now(status_only(StatusCode::PAYLOAD_TOO_LARGE))
         } else if lacks_host {
-            Reply::Now(no_host(driver.event_enabled("http", "request")))
+            Reply::Now(no_host())
         } else if request.headers().contains_key(http::header::UPGRADE)
             && matches!(&request.body().0, Inner::Stream(_))
         {
-            Reply::Now(answered(
-                status_only(StatusCode::BAD_REQUEST),
-                "cut_off",
-                driver.event_enabled("http", "request"),
-            ))
+            Reply::Now(status_only(StatusCode::BAD_REQUEST))
         } else {
             self.handler
                 .call(request, &mut Exchange::new(now, driver.entropy(), &conn))
@@ -215,15 +145,13 @@ impl Http1 {
             self.upgrade = Some(upgrade.clone());
         }
         let close = (!keep_alive || lacks_host) && self.upgrade.is_none();
-        // Every answer goes out as deferred work, so its event is made
-        // once its bytes are written.
         let (work, response) = match reply {
             Reply::Now(response) => (None, Some(response)),
             Reply::Later(work) => (Some(work), None),
 
         };
         driver.defer(
-            Streaming::new(work, response, version, head_only, close, tracker)
+            Streaming::new(work, response, version, head_only, close)
                 .dated(self.date, now)
                 .holding_request(held),
         );
@@ -261,7 +189,7 @@ fn without_host(unread: &[u8]) -> Option<(RequestHead, http1::RequestEvents, usi
     let Step::Item(H1::Head(mut head), _) = decoder.decode(&patched, false).ok()? else {
         return None;
     };
-    // The event records the request as it came, without the field added.
+    // Preserve the request as it came, without the field added.
     if head
         .headers
         .first()
@@ -438,15 +366,12 @@ impl serve::Service for Http1 {
                         .extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
                 }
                 self.started = driver.now();
-                self.track(&head, driver);
                 self.head = Some(head);
                 self.body.clear();
                 self.too_big = false;
             }
             H1::Body(bytes) => {
-                if let Some(tracker) = &mut self.tracker {
-                    tracker.body(&bytes);
-                }
+
                 if self.body.len() + bytes.len() > self.opts.body {
                     self.too_big = true;
                 } else {
@@ -462,35 +387,15 @@ impl serve::Service for Http1 {
         &mut self,
         _: Timer,
         _: &(),
-        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
+        _driver: &mut Driver<'_, http1::RequestEvents, Timer>,
     ) -> Result<Flow, Infallible> {
-        let detail = if self.head.is_some() {
-            Some("request body timed out")
-        } else if !driver.unread().is_empty() {
-            Some("request head timed out")
-        } else {
-            None
-        };
-        if let Some(detail) = detail {
-            driver.emit("http", "error", |_| {
-                error_event(driver.conn(), "timeout", detail)
-            });
-        }
-        // The observer still sees the body bytes the decoder buffers.
-        if let Some(tracker) = &mut self.tracker {
-            let len = driver
-                .peek_decoder()
-                .pending_body_len(driver.unread().len());
-            tracker.body(&driver.unread()[..len]);
-        }
-        self.finish_receipt(driver, Received::Timeout);
+        self.head = None;
         Ok(Flow::Close)
     }
 
     fn held(&self) -> usize {
         self.body.capacity()
             + self.head.as_ref().map_or(0, head_held)
-            + self.tracker.as_ref().map_or(0, Tracker::held)
     }
 
     fn on_fail(
@@ -500,16 +405,7 @@ impl serve::Service for Http1 {
         driver: &mut Driver<'_, http1::RequestEvents, Timer>,
     ) -> Result<(), Infallible> {
         if self.head.is_some() {
-            let buffered = driver.unread().len();
-            let len = driver.peek_decoder().pending_body_len(buffered);
-            if let Some(tracker) = &mut self.tracker {
-                tracker.body(&driver.unread()[..len]);
-                tracker.received(if self.too_big {
-                    Received::TooLarge
-                } else {
-                    Received::CutOff
-                });
-            }
+
             // The body was cut off: the handler still sees what came, as a
             // body that ends in an error.
             let mut got = std::mem::take(&mut self.body);
@@ -528,41 +424,34 @@ impl serve::Service for Http1 {
             // The service answers an HTTP/1.1 request with no Host field
             // with `400` and `no_host`, then closes the connection.
             self.started = driver.now();
-            self.track(&head, driver);
-            if let Some(tracker) = &mut self.tracker {
+
                 let mut unread = &driver.unread()[head_end..];
                 let mut received_bytes = 0;
-                let received = loop {
+                loop {
                     match decoder.decode(unread, false) {
                         Ok(Step::Item(H1::Body(bytes), n)) => {
-                            tracker.body(&bytes);
+
                             received_bytes += bytes.len();
                             unread = &unread[n..];
                         }
                         Ok(Step::Skip(n)) => unread = &unread[n..],
-                        Ok(Step::Item(H1::Done, _)) => break Received::Complete,
+                        Ok(Step::Item(H1::Done, _)) => break,
                         _ => {
                             let len = decoder.pending_body_len(unread.len());
-                            tracker.body(&unread[..len]);
+
                             received_bytes += len;
-                            break Received::CutOff;
+                            break;
                         }
                     }
                 };
                 self.too_big = received_bytes > self.opts.body;
-                tracker.received(if self.too_big {
-                    Received::TooLarge
-                } else {
-                    received
-                });
-            }
+
+
             self.head = Some(head);
             self.dispatch(driver, Body::empty(), true, 0);
             return Ok(());
         }
-        driver.emit("http", "error", |_| {
-            error_event(driver.conn(), "protocol", fictionet::ErrorChain(error))
-        });
+
         let date = date_header(self.date, driver.now());
         let status = if matches!(
             error,
@@ -576,42 +465,6 @@ impl serve::Service for Http1 {
         Ok(())
     }
 
-    fn on_end(
-        &mut self,
-        end: Ended,
-        _: &(),
-        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
-    ) -> Result<(), Infallible> {
-        // The client broke off inside a request head, as by a reset. A head
-        // cut off by the end of input fails the decoder and is logged there.
-        if let Ended::Conn(e) = end
-            && e != ConnError::Broken
-            && self.head.is_none()
-            && !driver.unread().is_empty()
-        {
-            driver.emit("http", "error", |_| {
-                error_event(
-                    driver.conn(),
-                    "protocol",
-                    format_args!("the connection ended inside a request head: {e}"),
-                )
-            });
-        }
-        self.finish_receipt(
-            driver,
-            if end == Ended::Budget {
-                Received::Budget
-            } else {
-                Received::CutOff
-            },
-        );
-        if end == Ended::Conn(ConnError::Broken) {
-            driver.emit("http", "error", |_| {
-                error_event(driver.conn(), "transport", "a TLS record did not decrypt")
-            });
-        }
-        Ok(())
-    }
 }
 
 mod serve_fail {
@@ -622,10 +475,6 @@ mod serve_fail {
 type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
 
 /// A response being made or streamed, as deferred work of a connection.
-///
-/// Its event says what the connection took: each piece counts in `sent`
-/// once the driver wrote all of it, and the event is made when the last
-/// piece is written, or when the connection ends first.
 struct Streaming {
     work: Option<Later>,
     making: Option<Making>,
@@ -638,16 +487,9 @@ struct Streaming {
     head_only: bool,
     close: bool,
     chunked: bool,
-    tracker: Tracker,
-    extra: Option<Fields>,
-    status: Option<StatusCode>,
     /// Body bytes the connection took.
-    body_sent: u64,
     /// Bytes returned to the driver, and the body bytes in the last piece,
     /// which count once the driver has written that far.
-    returned: u64,
-    in_flight: u64,
-    finished: bool,
     /// The world's date at the start of the run, and when the request was
     /// answered, for the `Date` header.
     date: Option<SystemTime>,
@@ -661,7 +503,6 @@ impl Streaming {
         version: Version,
         head_only: bool,
         close: bool,
-        tracker: Tracker,
     ) -> Streaming {
         Streaming {
             work,
@@ -675,13 +516,6 @@ impl Streaming {
             head_only,
             close,
             chunked: false,
-            tracker,
-            extra: None,
-            status: None,
-            body_sent: 0,
-            returned: 0,
-            in_flight: 0,
-            finished: false,
             date: None,
             asked: Instant::ZERO,
         }
@@ -713,32 +547,12 @@ impl Streaming {
         }
     }
 
-    /// Counts the last piece's body bytes once the driver wrote it all.
-    fn confirm(&mut self, driver: &PendingDriver<'_>) {
-        if driver.written() >= self.returned {
-            self.body_sent += std::mem::take(&mut self.in_flight);
-        }
-    }
 
     /// Hands the driver `bytes`, of which `body` are body bytes.
-    fn piece(&mut self, bytes: Vec<u8>, body: usize) -> Poll<Option<Result<Vec<u8>, Error>>> {
-        self.returned += bytes.len() as u64;
-        self.in_flight = body as u64;
+    fn piece(&mut self, bytes: Vec<u8>, _body: usize) -> Poll<Option<Result<Vec<u8>, Error>>> {
         Poll::Ready(Some(Ok(bytes)))
     }
 
-    fn end(&mut self, driver: &mut PendingDriver<'_>, complete: bool) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-        if let Some(e) =
-            self.tracker
-                .finish(|| self.extra.take(), self.status, self.body_sent, complete)
-        {
-            driver.emit("http", "request", |_| e);
-        }
-    }
 
     /// `piece` as it goes on the wire: a chunk, when chunked.
     fn frame(&self, piece: &[u8], out: &mut Vec<u8>) {
@@ -759,7 +573,7 @@ impl Pending for Streaming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Vec<u8>, Error>>> {
         // The driver polls again only once the last piece is written.
-        self.confirm(driver);
+
         loop {
             if let Some(work) = self.work.take() {
                 self.making = Some(match driver.fcx() {
@@ -774,7 +588,7 @@ impl Pending for Streaming {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(r)) => r,
                     Poll::Ready(Err(e)) => {
-                        error_response(&e, driver.event_enabled("http", "request"))
+                        error_response(&e)
                     }
                 };
                 self.making = None;
@@ -782,8 +596,8 @@ impl Pending for Streaming {
                 self.response = Some(response);
             }
             if let Some(response) = self.response.take() {
-                let (mut parts, body) =
-                    super::response::inspect(driver.fcx(), response).into_parts();
+                let (parts, body) =
+                    response.into_parts();
                 let now = driver.fcx().map_or(self.asked, Cx::now);
                 let policy = ResponsePolicy::new(
                     &parts,
@@ -798,8 +612,6 @@ impl Pending for Streaming {
                     // body that ends with the connection closes it.
                     driver.close();
                 }
-                self.status = Some(parts.status);
-                self.extra = parts.extensions.remove::<Fields>();
                 self.chunked =
                     !policy.bodiless && policy.len.is_none() && self.version != Version::HTTP_10;
                 if policy.bodiless {
@@ -829,7 +641,7 @@ impl Pending for Streaming {
                 return self.piece(out, piece.len());
             }
             let Some(body) = &mut self.body else {
-                self.end(driver, true);
+
                 return Poll::Ready(None);
             };
             match Pin::new(body).poll_frame(cx) {
@@ -843,7 +655,7 @@ impl Pending for Streaming {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.body = None;
-                    self.end(driver, false);
+
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(Some(Ok(frame))) => {
@@ -858,25 +670,18 @@ impl Pending for Streaming {
         }
     }
 
-    fn cancel(&mut self, driver: &mut PendingDriver<'_>) {
-        self.confirm(driver);
-        if self.status.is_none() {
-            self.extra = None;
-        }
-        self.end(driver, false);
-    }
 
     fn held(&self) -> usize {
         let response = self.response.as_ref().map_or(0, |r| r.body().full_len());
         let body = self.body.as_ref().map_or(0, Body::full_len);
-        self.request_held + self.tracker.held() + self.rest_held + response + body
+        self.request_held + self.rest_held + response + body
     }
 }
 
 #[cfg(test)]
 mod router_tests {
     use super::*;
-    use fictionet::events::ConnInfo;
+    
     use fictionet::sync::Mutex;
 
     #[test]
@@ -925,19 +730,12 @@ mod router_tests {
             }
         }
         let held = Arc::new(Mutex::new(Vec::new()));
-        let tracker = Tracker::new(
-            &Request::new(Body::empty()),
-            &ConnInfo::default(),
-            Instant::ZERO,
-        );
-        let metadata = tracker.held();
         let inner = Streaming::new(
             None,
             Some(Response::new(Body::from(vec![b'x'; 3 * PIECE]))),
             Version::HTTP_11,
             false,
             true,
-            tracker,
         );
         let mut harness = Harness::new(
             fictionet::Seed::from_u64(0),
@@ -950,7 +748,7 @@ mod router_tests {
         harness.open().unwrap();
         assert_eq!(
             &held.lock()[..3],
-            &[3 * PIECE + metadata, 3 * PIECE + metadata, metadata]
+            &[3 * PIECE, 3 * PIECE, 0]
         );
         assert_eq!(held.lock().last(), Some(&0));
     }

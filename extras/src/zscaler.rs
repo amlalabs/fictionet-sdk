@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn a_client_that_trusts_only_the_root_validates_a_reissued_leaf() {
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+            fictionet::Seed::from_u64(7),
             |fcx| async move {
                 let now = 1_800_000_000;
                 let z = zscaler(&fcx, DEFAULT_CLOUD, now)?;
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn extreme_dates_return_errors() {
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(11)),
+            fictionet::Seed::from_u64(11),
             |fcx| async move {
                 let z = zscaler(&fcx, DEFAULT_CLOUD, 1_800_000_000)?;
                 for now in [i64::MIN, i64::MAX] {
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn long_leaf_names_keep_the_full_san() {
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(11)),
+            fictionet::Seed::from_u64(11),
             |fcx| async move {
                 let now = 1_800_000_000;
                 let z = zscaler(&fcx, DEFAULT_CLOUD, now)?;
@@ -423,7 +423,7 @@ mod tests {
             let bytes = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
             let output = bytes.clone();
             fictionet::block_on(fictionet::lab(
-                fictionet::RunOptions::new(fictionet::Seed::from_u64(seed)),
+                fictionet::Seed::from_u64(seed),
                 move |fcx| async move {
                     let z = zscaler(&fcx, DEFAULT_CLOUD, 1_800_000_000)?;
                     let Leaf { chain, key, .. } =
@@ -459,7 +459,7 @@ mod tests {
         let certificates = Arc::new(fictionet::sync::Mutex::new(None));
         let output = certificates.clone();
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(seed)),
+            fictionet::Seed::from_u64(seed),
             move |fcx| async move {
                 let now = 1_800_000_000;
                 let z = zscaler(&fcx, DEFAULT_CLOUD, now)?;

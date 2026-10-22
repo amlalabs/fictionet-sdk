@@ -7,7 +7,6 @@ mod service_fixture;
 
 pub mod alloc;
 pub mod echo_service;
-pub mod http_observer;
 pub mod io;
 pub mod rustls_client;
 pub mod threads;
@@ -36,27 +35,4 @@ pub fn ran_in_own_process(name: &str) -> bool {
         String::from_utf8_lossy(&out.stderr)
     );
     true
-}
-
-/// Runs a lab with the test event log installed.
-pub async fn observed_lab<F, Fut>(seed: fictionet::Seed, world: F) -> fictionet::Result
-where
-    F: FnOnce(fictionet::Cx, std::sync::Arc<fictionet_test_support::EventLog>) -> Fut + Send,
-    Fut: std::future::Future<Output = fictionet::Result> + Send + 'static,
-{
-    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
-    fictionet::lab(
-        fictionet::RunOptions::new(seed).observer(log.clone()),
-        move |cx| world(cx, log),
-    )
-    .await
-}
-
-/// Serializes a complete log after a deterministic run.
-pub fn log_bytes(log: &fictionet_test_support::EventLog) -> Vec<u8> {
-    log.all()
-        .iter()
-        .map(|event| event.to_line().unwrap() + "\n")
-        .collect::<String>()
-        .into_bytes()
 }

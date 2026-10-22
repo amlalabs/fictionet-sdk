@@ -64,7 +64,7 @@ pub async fn run() -> Result {
     let observe = tokio::spawn(async move { view.observe(observations).await });
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let mut task = tokio::spawn(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+        fictionet::Seed::from_u64(7),
         move |cx| async move {
             let start = web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed, start)?;
@@ -76,7 +76,7 @@ pub async fn run() -> Result {
                 |s| s,
             ));
             let net = network::build(&world, &cx, log, kit::mirror::new(&cx)?)?;
-            network::start(&cx, net, attachments, world.pages.clone())?;
+            net.start(&cx, attachments)?;
             page.run_commands(&cx, world.pages.clone(), commands);
             let workstation = machine(
                 &cx,

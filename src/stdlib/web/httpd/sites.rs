@@ -14,9 +14,8 @@ use fictionet::Cx;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::world::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
 
-use super::response::answered;
 use super::{
-    Body, BodyClassifier, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text,
+    Body, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text,
 };
 
 pub use fictionet::stdlib::world::net::normalize;
@@ -165,33 +164,19 @@ impl VirtualHosts {
 
 impl Handler for VirtualHosts {
     fn call(&self, mut request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
-        let observing = super::EventInterest::of(&request);
         let Some(host) = request_host(&request) else {
-            return Reply::Now(no_host(observing));
+            return Reply::Now(no_host());
         };
         let misdirected = || {
-            Reply::Now(answered(
-                text(
+            Reply::Now(text(
                     StatusCode::MISDIRECTED_REQUEST,
                     "This server does not serve that host.\n",
-                ),
-                "misdirected",
-                observing,
-            ))
+                ))
         };
         let Some((site, routing)) = self.site_or_default(&host) else {
             return misdirected();
         };
-        if let Some(fields) = request.extensions().get::<super::RequestFields>() {
-            let site = match routing {
-                Routing::Exact => host.as_str(),
-                Routing::Fallback => "the default site",
-            };
-            fields.extend(
-                fictionet::events::Fields::new().with("world_site", site),
-                true,
-            );
-        }
+
         let tls = ex.conn().tls;
         match (tls, site.https) {
             (true, false) => misdirected(),
@@ -209,7 +194,7 @@ impl Handler for VirtualHosts {
                 if let Ok(value) = location.parse() {
                     response.headers_mut().insert(LOCATION, value);
                 }
-                Reply::Now(answered(response, "redirect", observing))
+                Reply::Now(response)
             }
             _ => {
                 let conn = ex.conn();
@@ -230,12 +215,8 @@ impl Handler for VirtualHosts {
 /// The answer to a request that names no host: `400`, with `answer`
 /// `no_host` in its event. [`VirtualHosts`] gives it, and [`Http1`](super::Http1)
 /// gives it to an HTTP/1.1 request without `Host` before any handler.
-pub(super) fn no_host(observing: bool) -> http::Response<Body> {
-    answered(
-        text(StatusCode::BAD_REQUEST, "The request names no host.\n"),
-        "no_host",
-        observing,
-    )
+pub(super) fn no_host() -> http::Response<Body> {
+    text(StatusCode::BAD_REQUEST, "The request names no host.\n")
 }
 
 /// The host a request is for: the authority of its URI (HTTP/2's
@@ -278,7 +259,6 @@ pub struct Server {
     default_host: bool,
     limits: Limits,
     date: Option<SystemTime>,
-    observe: Option<Arc<dyn BodyClassifier>>,
     vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
     tls: Option<ConfigFor>,
 }
@@ -300,7 +280,6 @@ impl Server {
             default_host: false,
             limits: Limits::default(),
             date: None,
-            observe: None,
             vhosts: Arc::default(),
             tls: None,
         }
@@ -348,12 +327,6 @@ impl Server {
         self
     }
 
-    /// Observes requests before virtual hosting and admission. Sites sharing
-    /// an endpoint use the first server's observer, as they do its date.
-    pub fn observe(mut self, observer: Arc<dyn BodyClassifier>) -> Server {
-        self.observe = Some(observer);
-        self
-    }
 
     /// Serves HTTPS on 443 with a config selected for each handshake.
     /// Port 80 redirects to HTTPS unless [`plain_http`](Self::plain_http) was selected.
@@ -403,7 +376,6 @@ impl PortServer for Server {
             first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
             budget: arrival.budget,
             date: self.date,
-            observe: self.observe.clone(),
         };
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {

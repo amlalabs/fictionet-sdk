@@ -3,13 +3,13 @@
 
 use super::hosts::{Admission, Lookup, pings};
 use super::normalize;
-use fictionet::events::{ConnInfo, Event, opt as jopt};
 use fictionet::stdlib::codec::{Collect, CollectError, Decode, Step};
 use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA,
 };
+use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{self, ServeOptions, Service};
 use fictionet::{Cx, End, Error};
 use std::net::IpAddr;
@@ -55,90 +55,26 @@ pub(super) fn start_dns(
 // ---------------------------------------------------------------------------
 // DNS at the gateway
 
-/// What the DNS server answered, for the event.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum DnsAnswer {
-    Addr(IpAddr),
-    NoData,
-    NxDomain,
-    Error(u16),
-    None,
-}
-
-/// The answer to one DNS message, and what it was.
-struct Answered {
-    reply: Option<Vec<u8>>,
-    name: Option<String>,
-    qtype: Option<u16>,
-    answer: DnsAnswer,
-}
-
-impl Answered {
-    fn none() -> Answered {
-        Answered {
-            reply: None,
-            name: None,
-            qtype: None,
-            answer: DnsAnswer::None,
-        }
-    }
-
-    fn event(&self, tcp: bool) -> Event {
-        let answer = if self.reply.is_some() {
-            self.answer.clone()
-        } else {
-            DnsAnswer::None
-        };
-        let (kind, addr, rcode) = match &answer {
-            DnsAnswer::Addr(a) => ("addr", Some(a.to_string()), None),
-            DnsAnswer::NoData => ("nodata", None, None),
-            DnsAnswer::NxDomain => ("nxdomain", None, None),
-            DnsAnswer::Error(code) => ("error", None, Some(u32::from(*code))),
-            DnsAnswer::None => ("none", None, None),
-        };
-        Event::new("dns", "query")
-            .summary(format_args!(
-                "{} {}: {}",
-                self.name.as_deref().unwrap_or("-"),
-                self.qtype.unwrap_or(0),
-                addr.as_deref().unwrap_or(kind)
-            ))
-            .field("tcp", tcp)
-            .field("name", jopt(self.name.clone()))
-            .field("qtype", jopt(self.qtype.map(u32::from)))
-            .field("answer", kind)
-            .field("addr", jopt(addr))
-            .field("rcode", jopt(rcode))
-    }
-}
-
 /// The answer to one DNS message.
-fn answer(lookup: &LookupName, bytes: &[u8]) -> Answered {
+fn answer(lookup: &LookupName, bytes: &[u8]) -> Option<Vec<u8>> {
     let query = match Message::from_vec(bytes) {
-        Ok(q) => q,
+        Ok(query) => query,
         Err(_) => {
             if bytes.len() < 12 || bytes[2] & 0x80 != 0 {
-                return Answered::none();
+                return None;
             }
-            let id = u16::from_be_bytes([bytes[0], bytes[1]]);
-            let reply = Message::error_msg(id, OpCode::Query, ResponseCode::FormErr)
-                .to_vec()
-                .ok();
-            return Answered {
-                reply,
-                name: None,
-                qtype: None,
-                answer: DnsAnswer::Error(1),
-            };
+            return Message::error_msg(
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                OpCode::Query,
+                ResponseCode::FormErr,
+            )
+            .to_vec()
+            .ok();
         }
     };
     if query.metadata.message_type != MessageType::Query {
-        return Answered::none();
+        return None;
     }
-    let first = query.queries.first().filter(|_| query.queries.len() == 1);
-    let mut name = first.map(|q| normalize(&q.name().to_ascii()));
-    let qtype = first.map(|q| u16::from(q.query_type()));
-    let event_answer;
     let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
     reply.metadata.authoritative = true;
     reply.metadata.recursion_desired = query.metadata.recursion_desired;
@@ -151,28 +87,19 @@ fn answer(lookup: &LookupName, bytes: &[u8]) -> Answered {
     }
     if query.metadata.op_code != OpCode::Query {
         reply.metadata.response_code = ResponseCode::NotImp;
-        event_answer = DnsAnswer::Error(4);
     } else if query.queries.len() != 1 {
         reply.metadata.response_code = ResponseCode::FormErr;
-        event_answer = DnsAnswer::Error(1);
-        name = None;
     } else {
         let q = &query.queries[0];
-        let name = name.as_deref().unwrap_or_default();
+        let name = normalize(&q.name().to_ascii());
         let found = if name.is_empty() {
             Lookup::NoHost
         } else {
-            lookup(name)
+            lookup(&name)
         };
         match found {
-            Lookup::NoHost => {
-                reply.metadata.response_code = ResponseCode::NXDomain;
-                event_answer = DnsAnswer::NxDomain;
-            }
-            Lookup::Full => {
-                reply.metadata.response_code = ResponseCode::ServFail;
-                event_answer = DnsAnswer::Error(2);
-            }
+            Lookup::NoHost => reply.metadata.response_code = ResponseCode::NXDomain,
+            Lookup::Full => reply.metadata.response_code = ResponseCode::ServFail,
             Lookup::Host(placed) => {
                 let class_ok = matches!(q.query_class(), DNSClass::IN | DNSClass::ANY);
                 let rdata = match (class_ok, q.query_type()) {
@@ -180,29 +107,15 @@ fn answer(lookup: &LookupName, bytes: &[u8]) -> Answered {
                     (true, RecordType::AAAA) => placed.v6.map(|a| RData::AAAA(AAAA(a))),
                     _ => None,
                 };
-                match rdata {
-                    Some(rdata) => {
-                        event_answer = DnsAnswer::Addr(match &rdata {
-                            RData::A(a) => a.0.into(),
-                            RData::AAAA(a) => a.0.into(),
-                            _ => unreachable!("only A and AAAA are made"),
-                        });
-                        reply
-                            .answers
-                            .push(Record::from_rdata(q.name().clone(), TTL, rdata));
-                    }
-                    None => event_answer = DnsAnswer::NoData,
+                if let Some(rdata) = rdata {
+                    reply
+                        .answers
+                        .push(Record::from_rdata(q.name().clone(), TTL, rdata));
                 }
             }
         }
     }
-    let qtype = if name.is_some() { qtype } else { None };
-    Answered {
-        reply: reply.to_vec().ok(),
-        name,
-        qtype,
-        answer: event_answer,
-    }
+    reply.to_vec().ok()
 }
 
 /// Framing for a DNS query over UDP or TCP.
@@ -274,9 +187,7 @@ impl Service for Dns {
         state: &State,
         driver: &mut serve::Driver<'_, DnsQueries, QueryTimer>,
     ) -> Result<serve::Flow, Self::Error> {
-        let answered = answer(&*state.lookup, &query);
-        driver.emit("dns", "query", |_| answered.event(self.tcp));
-        if let Some(reply) = answered.reply {
+        if let Some(reply) = answer(&*state.lookup, &query) {
             if self.tcp {
                 if let Ok(n) = u16::try_from(reply.len()) {
                     driver.reply().extend_from_slice(&n.to_be_bytes());
@@ -303,7 +214,6 @@ impl Service for Dns {
 async fn dns_udp(fcx: Cx, socket: udp::Socket, context: Context) -> fictionet::Result {
     let local = socket.local_addr();
     let opts = ServeOptions {
-        protocol: "dns",
         sandbox: Some(context.admission.sandbox()),
         ..ServeOptions::default()
     };
@@ -347,9 +257,7 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
         ..ConnInfo::default()
     };
     let opts = ServeOptions {
-        protocol: "dns",
         idle: None,
-        connection_events: false,
         budget: info
             .sandbox
             .as_ref()
@@ -369,40 +277,21 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
 }
 
 #[cfg(test)]
-mod observation_tests {
+mod tests {
     use super::*;
-    use fictionet::events::recorder::Recorder;
     use fictionet::stdlib::protocols::dns::{op::Query, rr::Name};
 
     #[test]
-    fn dns_replies_are_identical_without_observation() {
+    fn unknown_names_answer_nxdomain() {
         let mut query = Message::new(7, MessageType::Query, OpCode::Query);
         query.queries.push(Query::query(
-            Name::from_ascii("missing.test").unwrap(),
+            Name::from_ascii("missing.test.").unwrap(),
             RecordType::A,
         ));
-        let query = query.to_vec().unwrap();
-        let mut wire = (query.len() as u16).to_be_bytes().to_vec();
-        wire.extend_from_slice(&query);
-        let run = |observed| {
-            let memory = Arc::new(Recorder::default());
-            let mut harness = serve::Harness::new(
-                fictionet::Seed::from_u64(1),
-                Dns { tcp: true },
-                State {
-                    lookup: Arc::new(|_| Lookup::NoHost),
-                    tcp_idle: Duration::from_secs(1),
-                },
-            );
-            if observed {
-                harness = harness.observer(memory.clone());
-            }
-            let reply = harness.push(&wire).unwrap();
-            assert_eq!(memory.of("dns", "query").len(), usize::from(observed));
-            let parsed = Message::from_vec(&reply[2..]).unwrap();
-            assert_eq!(parsed.metadata.response_code, ResponseCode::NXDomain);
-            reply
-        };
-        assert_eq!(run(false), run(true));
+        let reply = answer(&|_| Lookup::NoHost, &query.to_vec().unwrap()).unwrap();
+        let parsed = Message::from_vec(&reply).unwrap();
+        assert_eq!(parsed.metadata.id, 7);
+        assert_eq!(parsed.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(parsed.queries, query.queries);
     }
 }

@@ -84,8 +84,8 @@ from a checkout with `cargo install --locked --path cli`.
 ## Quick start
 
 Follow [Getting started](src/guide/getting_started.rs) for the full Linux namespace
-walkthrough: build the `web_fixture` example, attach a namespace, make HTTPS requests, watch
-the world's events, and clean up. It includes expected output and troubleshooting.
+walkthrough: build the `web_fixture` example, attach a namespace, make HTTPS requests,
+and clean up. It includes expected output and troubleshooting.
 You need Linux, Rust 1.99 or later, `sudo`, iproute2 and `curl`.
 
 This is a **trusted connectivity demonstration**. A network namespace isolates
@@ -145,11 +145,7 @@ bottleneck, a router, a TCP endpoint. The crate docs show each layer.
 services on its ports. A service is the server side of one protocol for one
 connection, written with no I/O: it gets decoded items and appends reply bytes,
 and one driver runs it over any connection. HTTP is a service
-(`stdlib::web::httpd`), and `web::Sites` is a preset on `Net` for websites. Every
-service emits structured events. Core produces four streams through
-[`fictionet::events`](src/events.rs): events, packets, TLS keys and topology.
-The integrator installs one observer through `RunOptions` before the run.
-`Fanout` combines observers. With no observer, core skips observation work.
+(`stdlib::web::httpd`), and `web::Sites` is a preset on `Net` for websites.
 
 Each world owns its observation types, views, and page. The stdlib offers
 opt-in pieces: `dissect` turns caller-supplied packets into protocol layers,

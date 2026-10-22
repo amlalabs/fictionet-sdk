@@ -41,6 +41,7 @@ pub enum HostState {
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct HostStatus {
+    pub features: super::Features,
     pub state: HostState,
     pub addresses: Vec<String>,
     pub screen: bool,
@@ -48,6 +49,7 @@ pub struct HostStatus {
 }
 #[derive(Clone)]
 pub struct GuestConsole {
+    features: super::Features,
     name: String,
     desktop: Option<(u16, String)>,
     terminal: Option<String>,
@@ -74,11 +76,16 @@ enum Readiness {
 impl GuestConsole {
     pub(super) fn new(guest: &Guest) -> Self {
         Self {
+            features: guest.features,
             name: guest.hostname.clone(),
             desktop: guest.desktop.clone(),
             terminal: guest.terminal.clone(),
             session: Arc::new(Mutex::new(SessionState::default())),
-            status: watch::channel(HostStatus::default()).0,
+            status: watch::channel(HostStatus {
+                features: guest.features,
+                ..HostStatus::default()
+            })
+            .0,
             ready: watch::channel(Readiness::Waiting(
                 "no completed attempt; exit code unavailable; stderr: empty".into(),
             ))
@@ -141,6 +148,7 @@ impl GuestConsole {
         terminal: bool,
     ) {
         self.status.send_replace(HostStatus {
+            features: self.features,
             state,
             addresses,
             screen,

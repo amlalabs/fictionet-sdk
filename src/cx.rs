@@ -1,11 +1,8 @@
 use std::future::{Future, poll_fn};
-use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Poll, Waker};
 
-use crate::events::Event;
-use crate::group::Group;
 use crate::run::RunShared;
 use crate::time::{Duration, Instant};
 
@@ -68,24 +65,6 @@ pub use timer::Timer;
 ///
 #[doc = include_str!("../docs/diagrams/regions.svg")]
 ///
-/// # Groups
-///
-/// A group names a set of tasks for the people watching a world, such as
-/// "office LAN" or "simulated hosts". [`Cx::group`] returns a `Cx` whose
-/// tasks belong to that group. Every task started with that `Cx`, and
-/// every task those tasks start, belongs to the group too, and so do the
-/// stdlib's own tasks, such as a [`router`](crate::stdlib::network::route::router)
-/// or a [`tcp::endpoint`](crate::stdlib::network::tcp::endpoint). Groups nest: a
-/// group made from a grouped `Cx` sits inside that group.
-///
-/// Groups change nothing about how the world runs. A grouped `Cx` stays in
-/// the same [region](Cx#regions), with the same cancellation and error rules.
-/// [`Cx::host`] also creates an explicit host entity with its own identity.
-/// Observers can bind connections to the nearest enclosing host.
-/// Both calls allocate group state even without topology interest; see their
-/// method docs for costs. Core publishes topology changes. The
-/// consumer chooses how to store and display them.
-///
 /// # Waiting
 ///
 /// [`Cx::sleep`] and [`Cx::sleep_until`] wait on the run's clock.
@@ -121,22 +100,9 @@ pub use timer::Timer;
 pub struct Cx {
     pub(crate) run: Arc<RunShared>,
     pub(crate) region: Arc<Region>,
-    /// The [group](Cx#groups) its tasks belong to, if any.
-    pub(crate) group: Option<Arc<Group>>,
 }
 
 impl Cx {
-    /// Names the interface's link for observation and returns the interface.
-    /// Tapped links offer crossings to the run's observer under this name.
-    /// Tapping again renames the stream. Untapped links offer no packets.
-    /// An interface without a link handle is returned without a tap.
-    pub fn tap<I: crate::Interface>(&self, name: &str, interface: I) -> I {
-        if let Some(link) = interface.link() {
-            link.0.tap(self, name);
-        }
-        interface
-    }
-
     /// The current time on the run's clock: how long ago the run started.
     ///
     /// Under [`run`](crate::run) this is real time, read from the system's
@@ -263,29 +229,10 @@ impl Cx {
         F: FnOnce(Cx) -> Fut,
         Fut: Future<Output = crate::Result> + Send + 'static,
     {
-        self.spawn_as(std::any::type_name::<Fut>, work)
-    }
-
-    /// [`Cx::spawn`], with the name observers see for the task. The
-    /// stdlib names its tasks after the function that starts them, and a
-    /// copy of a stdlib file can do the same.
-    ///
-    /// The `name` closure returns a borrowed static task name. It runs once
-    /// if the region admits the task, even without an observer, before taking
-    /// the scheduler's queue lock. It may call methods on this `Cx`, including
-    /// [`Cx::cancel`].
-    #[track_caller]
-    pub fn spawn_as<F, Fut>(&self, name: impl FnOnce() -> &'static str, work: F) -> Task
-    where
-        F: FnOnce(Cx) -> Fut,
-        Fut: Future<Output = crate::Result> + Send + 'static,
-    {
-        let location = Location::caller();
         let region = self.region.clone();
         let future = work(Cx {
             run: self.run.clone(),
             region: region.clone(),
-            group: self.group.clone(),
         });
         let join = Arc::new(JoinState::default());
         if !region.try_start_task() {
@@ -293,189 +240,16 @@ impl Cx {
             join.finish(Err(JoinError::Cancelled));
             return Task { join };
         }
-        let group = self.group.as_ref();
-        if let Err(future) = self.run.spawn(
-            Box::pin(future),
-            region.clone(),
-            join.clone(),
-            name,
-            location,
-            group,
-        ) {
+        if let Err(future) = self
+            .run
+            .spawn(Box::pin(future), region.clone(), join.clone())
+        {
             // The run is gone, so the work can never run.
             drop(future);
             region.task_done(false);
             join.finish(Err(JoinError::Cancelled));
         }
         Task { join }
-    }
-
-    /// Returns a `Cx` whose tasks belong to a [group](Cx#groups) called
-    /// `name`, inside this `Cx`'s group if it has one.
-    ///
-    /// The returned `Cx` is in the same [region](Cx#regions) as this one, so
-    /// only observers see the difference. Hand it to the code that builds
-    /// one part of the world, and every task that code starts, directly or
-    /// through the stdlib, belongs to the group:
-    ///
-    /// ```
-    /// # use fictionet::{Cx, Interface, Result};
-    /// # use fictionet::stdlib::network::{ip, tcp};
-    /// fn office(fcx: &Cx, uplink: impl Interface) -> Result {
-    ///     let lan = fcx.group("office LAN");
-    ///     let (tcp, _udp, _icmp, _other) = ip::split_protocols(&lan, uplink);
-    ///     let printer = tcp::endpoint(&lan, tcp, "10.1.0.20".parse()?);
-    ///     let _ipp = printer.listen(631)?;
-    ///     Ok(())
-    /// }
-    /// ```
-    ///
-    /// A sandbox belongs to the group of the task that reads its
-    /// [`Attachment`](crate::Attachment), such as a
-    /// [`delay`](crate::stdlib::network::delay) started with a grouped `Cx`. Each
-    /// call makes a distinct group, even when names match. It owns the name
-    /// string, allocates one shared struct and assigns a run-scoped group id.
-    /// This cost applies without an observer too. Group, host or connection
-    /// topology interest adds a dispatch reference. Interested group creation
-    /// and removal are published as topology, with bounded staging during polls.
-    /// A grouped task holds two group references: one in its `Cx` and one in
-    /// its runtime identity. A nested group also holds its parent.
-    pub fn group(&self, name: impl Into<String>) -> Cx {
-        self.make_group(name, false)
-    }
-
-    /// Makes a simulated host and its group inside this context's group.
-    /// A host is its own topology entity, distinct from the group. It changes
-    /// no scheduling, cancellation or packet behavior.
-    ///
-    /// Allocation and reference costs match [`Self::group`], even without
-    /// topology interest. Group, host or connection interest also assigns a
-    /// run-scoped host id, without another host allocation. Interested host
-    /// creation and removal are published separately from group changes.
-    /// The host and group live until the last group reference drops.
-    pub fn host(&self, name: impl Into<String>) -> Cx {
-        self.make_group(name, true)
-    }
-
-    /// Tells interested observers that a service in this context accepted
-    /// `conn` speaking `protocol`, binding it to the serving task and the nearest
-    /// [host](Cx::host). A custom service calls this when it accepts a
-    /// connection, and [`Cx::connection_closed`] when it closes. This publishes
-    /// topology; it changes nothing about the connection or world execution.
-    /// Without connection topology interest it does nothing. With interest,
-    /// it looks up the current task and nearest host and publishes the binding.
-    /// During a task poll, bounded staging owns a copy of the connection data.
-    pub fn connection_opened(&self, protocol: &'static str, conn: &crate::events::ConnInfo) {
-        use crate::events::{TaskId, TopologyKind, TopologyRef};
-        if self.run.observer.topology_enabled(TopologyKind::Connection) {
-            let host = std::iter::successors(self.group.as_ref(), |group| group.parent.as_ref())
-                .find_map(|group| group.host);
-            self.run.observer.topology(TopologyRef::ConnectionOpened {
-                protocol,
-                conn,
-                task: crate::run::RunTask::current_in(self.run.id).map(|task| TaskId(task.id)),
-                host,
-            });
-        }
-    }
-
-    /// Tells interested observers that `conn`, opened with
-    /// [`Cx::connection_opened`], has closed. This publishes a topology removal;
-    /// it does not close the connection itself. Without connection topology
-    /// interest it does nothing. During a task poll, bounded staging owns a
-    /// copy of the connection data.
-    pub fn connection_closed(&self, conn: &crate::events::ConnInfo) {
-        use crate::events::{TopologyKind, TopologyRef};
-        if self.run.observer.topology_enabled(TopologyKind::Connection) {
-            self.run
-                .observer
-                .topology(TopologyRef::ConnectionClosed { conn });
-        }
-    }
-
-    fn make_group(&self, name: impl Into<String>, host: bool) -> Cx {
-        let observer = &self.run.observer;
-        let group = Group::new(
-            self.run
-                .next_group
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            name.into(),
-            self.group.clone(),
-            (observer.topology_enabled(crate::events::TopologyKind::Group)
-                || observer.topology_enabled(crate::events::TopologyKind::Host)
-                || observer.topology_enabled(crate::events::TopologyKind::Connection))
-            .then(|| observer.shared().unwrap().clone()),
-            host,
-        );
-        Cx {
-            run: self.run.clone(),
-            region: self.region.clone(),
-            group: Some(group),
-        }
-    }
-
-    /// Opens a consumer for service output before transport encryption.
-    pub fn content(
-        &self,
-        source: crate::events::Content<'_>,
-    ) -> Option<Box<dyn crate::events::ContentSink>> {
-        self.run.observer.shared()?.content(source)
-    }
-
-    /// A connection's TLS key adapter for interested observers.
-    /// The typed stream stops when the run ends. The adapter does not retain the run.
-    #[doc(hidden)]
-    pub fn tls_key_log(
-        &self,
-        connection: Option<&crate::events::ConnInfo>,
-    ) -> Option<Arc<dyn rustls::KeyLog>> {
-        crate::tls_keys::KeyLog::for_cx(self, connection)
-    }
-
-    /// Checks interest before constructing event-specific tracking state.
-    pub fn event_enabled(&self, source: &'static str, kind: &'static str) -> bool {
-        self.run.observer.enabled(crate::events::Interest::Event(
-            crate::events::Metadata { source, kind },
-            &crate::events::ConnInfo::default(),
-        ))
-    }
-
-    /// Builds and emits an event only when a destination is interested.
-    /// With no observer this does not invoke `build`, read time, or number a record.
-    pub fn emit(
-        &self,
-        source: &'static str,
-        kind: &'static str,
-        build: impl FnOnce(Event) -> Event,
-    ) {
-        if self.event_enabled(source, kind) {
-            self.emit_observation(build(Event::new(source, kind)));
-        }
-    }
-
-    /// Borrows an emitter carrying explicit connection context.
-    pub fn emitter<'a>(
-        &'a self,
-        connection: &'a crate::events::ConnInfo,
-    ) -> crate::events::Emitter<'a> {
-        crate::events::Emitter {
-            cx: self,
-            connection,
-        }
-    }
-
-    /// Reports facts omitted by a bounded producer before event delivery.
-    /// Installed observers retain this loss status for completeness checks.
-    pub fn events_lost(&self, count: u64) {
-        self.run.observer.lost(crate::events::Loss::staged(
-            crate::events::Stream::Events,
-            count,
-        ));
-    }
-
-    pub(crate) fn emit_observation(&self, mut event: Event) {
-        event.origin = crate::run::current_origin(self.run.id);
-        self.run.observer.emit(event, || self.now());
     }
 
     /// Waits until every task in this run is waiting, before a lab's clock
@@ -487,7 +261,7 @@ impl Cx {
     /// [`Cancelled`] if this context's region is cancelled.
     ///
     /// ```
-    /// # fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(fictionet::Seed::from_u64(1)), |cx| async move {
+    /// # fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |cx| async move {
     /// let start = cx.now();
     /// cx.idle().await?;
     /// assert_eq!(cx.now(), start);
@@ -536,7 +310,7 @@ impl Cx {
     ///
     /// ```
     /// # {
-    /// # fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
+    /// # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
     /// use fictionet::RaceError;
     /// let late = fcx.race(Some(fcx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
     /// assert_eq!(late, Err(RaceError::Deadline));
@@ -591,8 +365,8 @@ impl Cx {
     /// and [`run`](crate::run) returns `Ok(())` once every task has ended.
     /// Some stdlib code runs work in a region of its own inside the world's,
     /// and hands that region's `Cx` to callbacks: for example,
-    /// [`web::Sites`](crate::stdlib::web::Sites) runs each HTTP connection,
-    /// and the event callback for it, in the connection's own region.
+    /// [`web::Sites`](crate::stdlib::web::Sites) runs each HTTP connection
+    /// in the connection's own region.
     /// Calling `cancel` on such a `Cx` stops only that connection. To stop
     /// the world from there, keep a clone of the world's `Cx` and cancel
     /// that. A `Cx` is `Send` and
@@ -651,7 +425,6 @@ impl Cx {
         let mut work = Box::pin(f(Cx {
             run: self.run.clone(),
             region: child.clone(),
-            group: self.group.clone(),
         }));
         let result = work.as_mut().await;
         if let Err(e) = result {

@@ -78,7 +78,7 @@ fn a_model_answers_over_http() {
     let server = serve_once(listener, 200, reply);
     let (tx, rx) = std::sync::mpsc::channel();
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+        fictionet::Seed::from_u64(1),
         move |cx| async move {
             let https = Https::at(&cx, origin, "/api/v1/chat/completions")?;
             let key = Key::new("OPENROUTER_API_KEY", Some(KEY.into())).unwrap();
@@ -140,7 +140,7 @@ fn an_http_failure_is_redacted_and_not_retried_when_permanent() {
     );
     let (tx, rx) = std::sync::mpsc::channel();
     fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+        fictionet::Seed::from_u64(1),
         move |cx| async move {
             let https = Https::at(&cx, origin, "/v1/messages")?;
             let key = Key::new("ANTHROPIC_API_KEY", Some(KEY.into())).unwrap();

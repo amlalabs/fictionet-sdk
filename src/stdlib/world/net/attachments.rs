@@ -1,13 +1,13 @@
 use super::addresses::{Bind, Bindings};
 use super::hosts::Machines;
 use super::{PROTO_TCP, PROTO_UDP, host_prefix, link};
-use fictionet::events::{ConnInfo, Event, Fields, Level, Sandbox, opt as jopt};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::ip::{Header, Intake, Reassembly};
 use fictionet::stdlib::network::ports::{self, Ports};
 use fictionet::stdlib::network::route::{Lan, Prefix, Router};
 use fictionet::stdlib::network::{ip, udp};
 use fictionet::stdlib::protocols::dhcp;
+use fictionet::stdlib::services::serve::Sandbox;
 use fictionet::stdlib::services::serve::{Budget, Counted};
 use fictionet::sync::Mutex;
 use fictionet::{Attachment, Cx, Interface, Packet};
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
 
-/// What events need to name sandboxes.
+/// Sandbox addresses, connection numbering and admission budgets.
 pub(super) struct Hooks {
     /// The sandbox that last bound each address. An entry stays after its
     /// sandbox detaches, until another binds the address, so packets and
@@ -60,13 +60,6 @@ impl Hooks {
     }
 }
 
-pub(super) fn sandbox_only(sandbox: Sandbox) -> ConnInfo {
-    ConnInfo {
-        sandbox: Some(sandbox),
-        ..ConnInfo::default()
-    }
-}
-
 /// Attachment ownership, identity and routing, with transport cleanup supplied
 /// by the network. It cannot resolve names or install host services.
 pub(super) struct Context {
@@ -102,14 +95,14 @@ impl Context {
     }
 
     /// A member sandbox attached: it joins its LAN at its address, with no
-    /// filter, and events know it by that address. It detaches as any
+    /// filter. It detaches as any
     /// sandbox does when the LAN lets its interface go: when it closes,
     /// when another takes its address, or when it could not join.
     pub(super) fn join_lan(
         self: &Arc<Self>,
         fcx: &Cx,
         name: &str,
-        lan: &str,
+        _lan: &str,
         segment: &Lan<Box<dyn Interface>>,
         addr: IpAddr,
         sandbox: Attachment,
@@ -135,23 +128,7 @@ impl Context {
             sandbox,
             _attached: attached.clone(),
         };
-        let joined = segment.add(addr, Box::new(member), Some(me.clone()));
-        fcx.emitter(&sandbox_only(me)).emit(
-            "net",
-            if joined.is_ok() { "attached" } else { "error" },
-            |event| {
-                let event = match joined {
-                    Ok(()) => {
-                        event.summary(format_args!("sandbox {name} joined LAN {lan} at {addr}"))
-                    }
-                    Err(e) => event
-                        .level(Level::Notice)
-                        .summary(format_args!("sandbox {name} could not join LAN {lan}: {e}"))
-                        .field("error", e.to_string()),
-                };
-                event.field("lan", lan).field("addr", addr.to_string())
-            },
-        );
+        let _joined = segment.add(addr, Box::new(member));
     }
 }
 
@@ -198,20 +175,13 @@ impl Interface for Routed {
                 .lock()
                 .get(&header.dst)
                 .is_some_and(|sandbox| self.context.hooks.is_attached(sandbox.id));
-            if !attached && let Some(why) = self.context.destinations.refused(&packet.0) {
-                fcx.emitter(&sandbox_only(me))
-                    .emit("net", "blocked", |_| blocked(why, &packet.0));
-            }
+            if !attached && let Some(_why) = self.context.destinations.refused(&packet.0) {}
         }
         result
     }
 
     fn send(&mut self, packet: Packet) {
         self.sandbox.send(packet);
-    }
-
-    fn link(&self) -> Option<fictionet::LinkHandle> {
-        self.sandbox.link()
     }
 }
 
@@ -281,14 +251,13 @@ fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option
 struct Attached {
     context: Arc<Context>,
     owner: u64,
-    fcx: Cx,
     name: Arc<str>,
     /// A LAN member's address. A filtered sandbox's are its leases.
     fixed: Option<IpAddr>,
 }
 
 impl Attached {
-    fn new(context: &Arc<Context>, fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
+    fn new(context: &Arc<Context>, _fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
         let owner = context.bindings.new_owner();
         context
             .hooks
@@ -298,7 +267,6 @@ impl Attached {
         Attached {
             context: context.clone(),
             owner,
-            fcx: fcx.clone(),
             name,
             fixed,
         }
@@ -326,17 +294,12 @@ impl Drop for Attached {
             (context.abort_peers)(&addrs);
         }
         context.bindings.release(self.owner);
-        let sandbox = Sandbox {
+        let _sandbox = Sandbox {
             id: self.owner,
             name: self.name.clone(),
             addr: bound,
             addr_v6: bound6,
         };
-        self.fcx
-            .emitter(&sandbox_only(sandbox))
-            .emit("net", "detached", |event| {
-                event.summary(format_args!("sandbox {} detached", self.name))
-            });
     }
 }
 
@@ -359,10 +322,6 @@ impl Interface for Member {
     fn send(&mut self, packet: Packet) {
         self.sandbox.send(packet);
     }
-
-    fn link(&self) -> Option<fictionet::LinkHandle> {
-        self.sandbox.link()
-    }
 }
 
 /// One sandbox's filter, between its attachment and the router.
@@ -384,10 +343,7 @@ pub(super) async fn filter(
         route6: None,
         reassembly: Reassembly::default(),
     };
-    fcx.emitter(&sandbox_only(f.me()))
-        .emit("net", "attached", |event| {
-            event.summary(format_args!("sandbox {} attached", f.name))
-        });
+
     // Detaches before the filter's links close.
     let _attached = attached;
     loop {
@@ -408,115 +364,14 @@ pub(super) async fn filter(
 /// Why the network dropped or refused a packet from a sandbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum BlockedWhy {
-    /// Its source was not the sandbox's address, or the static address it
-    /// tried to bind was not free. Dropped.
-    NotItsAddress,
-    /// It was for another sandbox's address. Dropped.
-    OtherSandbox,
-    /// It was for a broadcast, multicast or unspecified address, and was
-    /// not DHCP. Dropped.
-    Broadcast,
-    /// It was IPv6, on a network with IPv6 off. Dropped.
-    Ipv6,
-    /// It was not an IP packet, or its header was broken. Dropped.
-    Malformed,
-    /// No machine has its destination: answered "host unreachable".
+enum BlockedWhy {
     NoRoute,
-    /// Its destination port is closed: TCP gets a RST, UDP "port
-    /// unreachable".
     ClosedPort,
-    /// A new TCP connection past the network's limit per peer address, or past
-    /// a service's cap. Reset.
-    TooManyConnections,
-}
-
-impl BlockedWhy {
-    /// The name in the `why` field of a `net.blocked` event: the variant's
-    /// name, as `NotItsAddress`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BlockedWhy::NotItsAddress => "NotItsAddress",
-            BlockedWhy::OtherSandbox => "OtherSandbox",
-            BlockedWhy::Broadcast => "Broadcast",
-            BlockedWhy::Ipv6 => "Ipv6",
-            BlockedWhy::Malformed => "Malformed",
-            BlockedWhy::NoRoute => "NoRoute",
-            BlockedWhy::ClosedPort => "ClosedPort",
-            BlockedWhy::TooManyConnections => "TooManyConnections",
-        }
-    }
 }
 
 /// Counts an accepted connection or records why the connection limit refused it.
-pub fn connection_limit(
-    fcx: &Cx,
-    info: &ConnInfo,
-    open: &Arc<AtomicUsize>,
-    max: usize,
-) -> Option<Counted> {
-    let guard = Counted::enter(open, max);
-    if guard.is_none() {
-        let (src, dst) = (info.peer, info.local);
-        let conn = ConnInfo {
-            sandbox: info.sandbox.clone(),
-            ..ConnInfo::default()
-        };
-        fcx.emitter(&conn).emit("net", "blocked", |_| {
-            let event = blocked_event(
-                BlockedWhy::TooManyConnections,
-                Some(PROTO_TCP),
-                src.map(|a| a.ip()),
-                dst.map(|a| a.ip()),
-            );
-            port_detail(event, dst.map(|a| a.port()))
-        });
-    }
-    guard
-}
-
-/// A `net.blocked` event. The destination port goes in its detail
-/// ([`port_detail`]), since a scan changes it with every packet.
-pub(super) fn blocked_event(
-    why: BlockedWhy,
-    protocol: Option<u8>,
-    src: Option<IpAddr>,
-    dst: Option<IpAddr>,
-) -> Event {
-    Event::new("net", "blocked")
-        .level(Level::Notice)
-        .summary(format_args!(
-            "blocked {}: {} -> {}",
-            why.as_str(),
-            src.map_or("-".into(), |a| a.to_string()),
-            dst.map_or("-".into(), |a| a.to_string())
-        ))
-        .field("why", why.as_str())
-        .field("protocol", jopt(protocol.map(u32::from)))
-        .field("src", jopt(src.map(|a| a.to_string())))
-        .field("dst", jopt(dst.map(|a| a.to_string())))
-}
-
-/// The detail of a `net.blocked` event: its destination port.
-pub(super) fn port_detail(event: Event, port: Option<u16>) -> Event {
-    let value = jopt(port.map(u32::from));
-    // Gateway DNS is graded separately from attempts to leave the network.
-    if port == Some(53) {
-        event.field("dst_port", value).repeat(Fields::new())
-    } else {
-        event.repeat(Fields::new().with("dst_port", value))
-    }
-}
-
-/// The event for a blocked packet.
-fn blocked(why: BlockedWhy, p: &[u8]) -> Event {
-    match Header::parse_truncated(p) {
-        Some(h) => port_detail(
-            blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst)),
-            h.dst_port(p),
-        ),
-        None => port_detail(blocked_event(why, None, None, None), None),
-    }
+pub fn connection_limit(open: &Arc<AtomicUsize>, max: usize) -> Option<Counted> {
+    Counted::enter(open, max)
 }
 
 struct Filter {
@@ -541,12 +396,7 @@ impl Filter {
         }
     }
 
-    fn block(&self, fcx: &Cx, why: BlockedWhy, packet: &[u8]) {
-        fcx.emitter(&sandbox_only(self.me()))
-            .emit("net", "blocked", |_| blocked(why, packet));
-    }
-
-    fn bound_now(&mut self, fcx: &Cx, addr: IpAddr, by_dhcp: bool) {
+    fn bound_now(&mut self, _fcx: &Cx, addr: IpAddr, _by_dhcp: bool) {
         let (router_side, mine) = link();
         self.context
             .router
@@ -567,20 +417,12 @@ impl Filter {
             by_addr.insert(a, sandbox.clone());
         }
         drop(by_addr);
-        fcx.emitter(&sandbox_only(sandbox))
-            .emit("net", "bound", |event| {
-                event
-                    .summary(format_args!("sandbox {} bound {addr}", self.name))
-                    .field("by_dhcp", by_dhcp)
-                    .field("addr", addr.to_string())
-            });
     }
 
     fn sent_v4(&mut self, fcx: &Cx, packet: Packet) {
         let context = self.context.clone();
         let gateway = context.bindings.subnet.gateway;
         let Some(h) = Header::parse(&packet.0).filter(|h| h.src.is_ipv4()) else {
-            self.block(fcx, BlockedWhy::Malformed, &packet.0);
             return;
         };
         let (IpAddr::V4(src), IpAddr::V4(dst)) = (h.src, h.dst) else {
@@ -592,7 +434,6 @@ impl Filter {
                 && message.message_type() == Some(dhcp::INFORM)
                 && context.bindings.may_bind(self.owner, src);
             if !(src.is_unspecified() || Some(src) == self.bound || inform_first) {
-                self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                 return;
             }
             let (reply, new) = context.bindings.dhcp(self.owner, src, &message);
@@ -607,23 +448,19 @@ impl Filter {
         match self.bound {
             Some(a) if a == src => {}
             Some(_) => {
-                self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                 return;
             }
             None => {
                 if context.bindings.bind(self.owner, src) != Bind::New {
-                    self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                     return;
                 }
                 self.bound_now(fcx, src.into(), false);
             }
         }
         if dst.is_broadcast() || dst.is_multicast() || dst.is_unspecified() {
-            self.block(fcx, BlockedWhy::Broadcast, &packet.0);
             return;
         }
         if context.bindings.subnet.contains(dst) && dst != gateway {
-            self.block(fcx, BlockedWhy::OtherSandbox, &packet.0);
             return;
         }
         self.forward(fcx, self.route4, packet);
@@ -632,36 +469,30 @@ impl Filter {
     fn sent_v6(&mut self, fcx: &Cx, packet: Packet) {
         let context = self.context.clone();
         let Some(subnet) = context.bindings.subnet6 else {
-            self.block(fcx, BlockedWhy::Ipv6, &packet.0);
             return;
         };
         let Some(h) = Header::parse(&packet.0).filter(|h| h.src.is_ipv6()) else {
-            self.block(fcx, BlockedWhy::Malformed, &packet.0);
             return;
         };
         let (IpAddr::V6(src), IpAddr::V6(dst)) = (h.src, h.dst) else {
             return;
         };
         if dst.is_multicast() || dst.is_unspecified() {
-            self.block(fcx, BlockedWhy::Broadcast, &packet.0);
             return;
         }
         match self.bound6 {
             Some(a) if a == src => {}
             Some(_) => {
-                self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                 return;
             }
             None => {
                 if context.bindings.bind6(self.owner, src) != Bind::New {
-                    self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                     return;
                 }
                 self.bound_now(fcx, src.into(), false);
             }
         }
         if subnet.contains(dst) && dst != subnet.gateway {
-            self.block(fcx, BlockedWhy::OtherSandbox, &packet.0);
             return;
         }
         self.forward(fcx, self.route6, packet);
@@ -682,9 +513,7 @@ impl Filter {
                 }
             }
         };
-        if let Some(why) = self.context.destinations.refused(&packet.0) {
-            self.block(fcx, why, &packet.0);
-        }
+        if let Some(_why) = self.context.destinations.refused(&packet.0) {}
         if let Some(port) = route {
             self.ports.send(port, packet);
         }
