@@ -167,3 +167,5 @@ active modes are covered by copied corpus and model transport integration tests.
 
 - `demos/search/world/src/pages/tests/bylines.rs::site_names_use_profiles`: repeats the display-name data table. Removed CSS marker assertions from the neighboring question rendering test and retained code and answer preservation.
 - Trimmed `demos/search/app/src/main.rs::the_app_takes_its_folder_or_preview` to its current modes and generic invalid arguments, removing the list of retired options and commands.
+
+- `demos/kit/tests/guests.rs::every_guest_seed_carries_quieting_and_no_forbidden_words`: removed copied CSS, policy, service command and configuration assertions, and imports of every demo's private guest module. Kept a smaller real FAT image roundtrip that requires the NoCloud files and preserves installed file bytes. Removed the four world dev-dependencies used only by those imports.

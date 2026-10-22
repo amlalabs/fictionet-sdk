@@ -53,9 +53,3 @@ vmm-sys-util = "0.14"
 [[bin]]
 name = "open"
 path = "src/bin/open.rs"
-
-[dev-dependencies]
-border-world = { path = "../border/world" }
-scan-world = { path = "../scan/world" }
-artifactory-world = { path = "../artifactory/world" }
-fakewiki-world = { path = "../fakewiki/world" }

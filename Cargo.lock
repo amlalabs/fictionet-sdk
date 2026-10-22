@@ -1100,11 +1100,8 @@ name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "artifactory-world",
- "border-world",
  "bytes",
  "crc32fast",
- "fakewiki-world",
  "fatfs",
  "fictionet",
  "fictionet-extras",
@@ -1119,7 +1116,6 @@ dependencies = [
  "quick-xml",
  "russh",
  "rustls",
- "scan-world",
  "serde",
  "serde_json",
  "tokio",
