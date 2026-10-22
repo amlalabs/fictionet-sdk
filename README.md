@@ -22,11 +22,11 @@ server on purpose. See [the security model](SECURITY.md).
 Fictionet is for people who build evals and RL environments for agents that use
 the network. The examples in this repository ask questions like these:
 
-* Does an agent believe a tampered Wikipedia page ([FakeWiki](examples/fakewiki))?
+* Does an agent believe a tampered Wikipedia page ([FakeWiki](demos/fakewiki))?
 * Does it notice a BGP hijack before it sends a password to an impostor bank
-  ([Border](examples/border))?
+  ([Border](demos/border))?
 * What does it make of a subnet full of hosts when it runs `nmap`
-  ([scan](examples/scan))?
+  ([scan](demos/scan))?
 
 A world can give each run the same sites, with no live pages that change and no
 real accounts. Keeping the agent inside it depends on the harness's sandbox boundary.
@@ -141,7 +141,7 @@ fn world(
 ```
 
 A longer version, which the docs compile as a test, is at the top of
-[`stdlib::web`](src/stdlib/web/mod.rs), and [`examples/web_world.rs`](examples/web_world.rs)
+[`stdlib::web`](src/stdlib/web/mod.rs), and [`demos/web/main.rs`](demos/web/main.rs)
 is a complete world.
 
 Underneath, a world is a set of tasks joined by packet interfaces: a delay, a
@@ -174,9 +174,9 @@ Protocol codecs also work in unit tests and fuzz targets. The companion's
 The [stdlib docs](src/stdlib/mod.rs) list the modules and describe their uses.
 To change a protocol, see
 [the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
-[`custom_protocol`](examples/custom_protocol) serves a Modbus gateway that
+[`custom_protocol`](demos/custom_protocol) serves a Modbus gateway that
 accepts nonzero protocol identifiers.
-`cargo run --example custom_protocol` needs no network or root. To show a
+`cargo run -p fictionet-custom-protocol-demo --bin custom_protocol` needs no network or root. To show a
 protocol of your own in the dashboard, see
 [adding an observe protocol](docs/observe-protocols.md).
 
@@ -187,7 +187,7 @@ protocol of your own in the dashboard, see
 | A network namespace on the host (`ip netns`) | `tun` | [Getting started](src/guide/getting_started.rs) |
 | Docker Compose: the agent shares the network namespace of an `attach` container | `tun` | `tests/docker/web`, and the examples below |
 | Kubernetes: `world` and `attach` as native sidecars, from the Helm chart in [`charts/fictionet-sandbox`](charts/fictionet-sandbox), which the k8s sandbox of [Inspect](https://inspect.aisi.org.uk/), a framework for running AI evals, accepts | `tun`, under runc and gVisor | `cargo xtask k8s tun` on kind |
-| Daytona and E2B: the Compose setup inside one hosted sandbox | `tun` | [`examples/hosted`](examples/hosted) |
+| Daytona and E2B: the Compose setup inside one hosted sandbox | `tun` | [`demos/hosted`](demos/hosted) |
 | A sandbox with no privileges and no `tun`, where the platform blocks all other egress, including a pod under Pod Security "restricted" | `http_proxy` or `socks5` | `tests/docker/proxy`, `cargo xtask k8s proxy` |
 | A virtual machine: QEMU over its stream socket, with no root; Firecracker, Cloud Hypervisor or QEMU on a TAP device | `tap` | `cargo xtask vm`, and `cargo xtask vm nested` under nested KVM |
 
@@ -208,24 +208,24 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 
 | Example | What it is |
 |---|---|
-| [`examples/ping_world.rs`](examples/ping_world.rs) | The smallest world: it answers every ping and drops everything else. |
-| [`examples/custom_protocol`](examples/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom presenter installed in its in-process collector. Runs without network or root; it serves no observation socket. |
-| [`examples/web_world.rs`](examples/web_world.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The getting-started tutorial runs it. |
-| [`examples/delayed_sites.rs`](examples/delayed_sites.rs) | Each site is 200 ms away, using `stdlib::network::delay` and `Attachments::map`. |
-| [`examples/lossy_sites.rs`](examples/lossy_sites.rs) | `stdlib::network::filter` drops 5% of packets each way. |
-| [`examples/bottleneck_sites.rs`](examples/bottleneck_sites.rs) | An 8 Mbit/s link using `stdlib::network::bottleneck`, with a count of queue drops. |
-| [`examples/capture_sites.rs`](examples/capture_sites.rs) | Writes sandbox packets to a pcap file that tshark and Wireshark open. |
-| [`examples/route_change/main.rs`](examples/route_change/main.rs) | Sends the bank's address to an impostor machine mid-run, the core of the BGP hijack in `examples/border`. |
-| [`examples/wasm_world`](examples/wasm_world) | Runs a world and one in-process sandbox in a JavaScript engine (wasm32), with DNS and HTTP over TCP or TLS. |
-| [`python/inspect_fictionet/examples/web_eval.py`](python/inspect_fictionet/examples/web_eval.py) | A starter Inspect eval that runs shell commands to check the world's HTTPS, DNS and CA, and that real internet access fails. |
-| [`examples/fakewiki`](examples/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |
-| [`examples/artifactory`](examples/artifactory) | An Inspect eval on a sealed company package mirror: when a package is missing, does the agent fall back to public PyPI, ask the mirror to fetch from upstream, install a typosquat, or answer a message left in the cache? |
-| [`examples/adaptive-web`](examples/adaptive-web) | Any public host name, any URL, any search: pages and results made from a short seed the first time the agent asks, then kept, so the same URL always returns the same page. |
-| [`examples/border`](examples/border) | An Inspect eval: does an agent notice a BGP hijack and an impostor bank before it sends the password? With results for two open-weight models. |
-| [`examples/scan`](examples/scan) | A small office subnet for `nmap`: four simulated hosts from the stdlib, and a real container with nginx and OpenSSH routed into the same subnet. |
-| [`examples/goad`](examples/goad) | A private IPv4 LAN for real GOAD or GOAD-like Windows VMs and an attacker, carrying their real AD traffic with unicast, broadcast and multicast forwarding. |
-| [`examples/attach`](examples/attach) | Compose, Kubernetes and network-namespace setups for `fictionet attach`. |
-| [`examples/hosted`](examples/hosted) | The Compose setup on Daytona and E2B, through Inspect and the Harbor eval harness. |
+| [`demos/ping_world/main.rs`](demos/ping_world/main.rs) | The smallest world: it answers every ping and drops everything else. |
+| [`demos/custom_protocol`](demos/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom presenter installed in its in-process collector. Runs without network or root; it serves no observation socket. |
+| [`demos/web/main.rs`](demos/web/main.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The getting-started tutorial runs it. |
+| [`demos/delayed_sites/main.rs`](demos/delayed_sites/main.rs) | Each site is 200 ms away, using `stdlib::network::delay` and `Attachments::map`. |
+| [`demos/lossy_sites/main.rs`](demos/lossy_sites/main.rs) | `stdlib::network::filter` drops 5% of packets each way. |
+| [`demos/bottleneck_sites/main.rs`](demos/bottleneck_sites/main.rs) | An 8 Mbit/s link using `stdlib::network::bottleneck`, with a count of queue drops. |
+| [`demos/capture_sites/main.rs`](demos/capture_sites/main.rs) | Writes sandbox packets to a pcap file that tshark and Wireshark open. |
+| [`demos/route_change/main.rs`](demos/route_change/main.rs) | Sends the bank's address to an impostor machine mid-run, the core of the BGP hijack in `demos/border`. |
+| [`demos/wasm_world`](demos/wasm_world) | Runs a world and one in-process sandbox in a JavaScript engine (wasm32), with DNS and HTTP over TCP or TLS. |
+| [`python/inspect_fictionet/demos/web_eval.py`](python/inspect_fictionet/demos/web_eval.py) | A starter Inspect eval that runs shell commands to check the world's HTTPS, DNS and CA, and that real internet access fails. |
+| [`demos/fakewiki`](demos/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |
+| [`demos/artifactory`](demos/artifactory) | An Inspect eval on a company package mirror with no upstream: when a package is missing, does the agent fall back to public PyPI, ask the mirror to fetch from upstream, install a typosquat, or answer a message left in the cache? |
+| [`demos/search`](demos/search) | Any public host name, any URL, any search: pages and results made from a short seed the first time the agent asks, then kept, so the same URL always returns the same page. |
+| [`demos/border`](demos/border) | An Inspect eval: does an agent notice a BGP hijack and an impostor bank before it sends the password? With results for two open-weight models. |
+| [`demos/scan`](demos/scan) | A small office subnet for `nmap`: four simulated hosts from the stdlib, and a real container with nginx and OpenSSH routed into the same subnet. |
+| [`demos/goad`](demos/goad) | A private IPv4 LAN for real GOAD or GOAD-like Windows VMs and an attacker, carrying their real AD traffic with unicast, broadcast and multicast forwarding. |
+| [`demos/attach`](demos/attach) | Compose, Kubernetes and network-namespace setups for `fictionet attach`. |
+| [`demos/hosted`](demos/hosted) | The Compose setup on Daytona and E2B, through Inspect and the Harbor eval harness. |
 
 ## Documentation
 

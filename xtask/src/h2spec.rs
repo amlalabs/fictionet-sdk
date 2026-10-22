@@ -26,10 +26,8 @@ pub fn run(args: &[String]) -> Result {
                 "run",
                 "--locked",
                 "-p",
-                "fictionet",
-                "--features",
-                "tokio",
-                "--example",
+                "fictionet-h2spec-world-demo",
+                "--bin",
                 "h2spec_world",
             ],
         )

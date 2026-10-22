@@ -25,7 +25,7 @@ pub fn run(args: &[String]) -> Result {
 fn artifactory() -> Result {
     for target in ["world", "attach", "agent"] {
         build(
-            "examples/artifactory/docker/Dockerfile",
+            "demos/artifactory/docker/Dockerfile",
             target,
             &format!("fictionet-artifactory-{target}:dev"),
         )?;
@@ -34,7 +34,7 @@ fn artifactory() -> Result {
 }
 
 fn hosted() -> Result {
-    execute(&mut cmd("python3", &["examples/hosted/package_harbor.py"]))?;
+    execute(&mut cmd("python3", &["demos/hosted/package_harbor.py"]))?;
     build(
         "tests/docker/web/Dockerfile",
         "runtime",
@@ -48,8 +48,8 @@ fn hosted() -> Result {
     cleanup.push(cmd("docker", &["rm", id.trim()]));
     let result = (|| {
         for dir in [
-            "examples/hosted/bin",
-            "examples/hosted/harbor/fictionet-web/environment/bin",
+            "demos/hosted/bin",
+            "demos/hosted/harbor/fictionet-web/environment/bin",
         ] {
             std::fs::create_dir_all(crate::root().join(dir))?;
             for binary in ["fictionet", "web_world"] {

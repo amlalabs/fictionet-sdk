@@ -1199,7 +1199,7 @@ fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
         a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[9])));
         assert_eq!(recv_soon(&fcx, &mut gw2).await.0[28], 9);
 
-        // When the gateway closes, the LAN is sealed again.
+        // When the gateway closes, the LAN has no route to the internet again.
         drop(gw2);
         fcx.idle().await?;
         assert!(gw2_removed.load(Ordering::SeqCst));

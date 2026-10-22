@@ -1,8 +1,8 @@
 """The world's variants, page identities, stance policy and stance markers.
 
-The world writes these into fixtures/scenario.json (examples/fakewiki/fixtures,
+The world writes these into fixtures/scenario.json (demos/fakewiki/fixtures,
 beside the corpus), and its test the_evals_scenario_is_the_worlds
-(examples/fakewiki/world/src/pages/tests.rs) keeps the file current. This
+(demos/fakewiki/world/src/pages/tests.rs) keeps the file current. This
 module uses only the standard library.
 """
 from __future__ import annotations

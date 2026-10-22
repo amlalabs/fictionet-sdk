@@ -1,0 +1,15 @@
+[package]
+name = "fictionet-lossy-sites-demo"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "lossy_sites"
+path = "main.rs"
+
+[dependencies]
+fictionet = { path = "../..", features = ["web-proxy", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["ws"] }
+fictionet-observe = { path = "../../observe", features = ["native"] }

@@ -232,7 +232,7 @@ USER 65532:65532
 ENTRYPOINT ["/world"]
 """
 
-_CARGO_DOCKERIGNORE = "target\n**/target\n.git\n.venv\n**/.venv\nnode_modules\n"
+_CARGO_DOCKERIGNORE = "target\n**/target\n**/downloads\n.git\n.venv\n**/.venv\nnode_modules\n"
 
 
 def _cargo_build(example: CargoExample, cache: Path) -> Build:

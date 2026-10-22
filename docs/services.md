@@ -796,7 +796,7 @@ failures before a tracked head and bytes after protocol upgrade are outside
 this hook. Consumers must use complete receipt or an observer verdict before
 judging safety; no handler label does not mean no exposure.
 
-See the [Border example](../examples/border/README.md) for credential scanning
+See the [Border example](../demos/border/README.md) for credential scanning
 with this hook.
 
 In `http2::Session`, HPACK reductions wait for the corresponding SETTINGS

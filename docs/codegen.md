@@ -374,11 +374,11 @@ in `src/stdlib/protocols/cme_mdp3/mod.rs`. It is followed by a short hand-writte
 tail that declares the hand-written packet framing in
 `src/stdlib/protocols/cme_mdp3/framing.rs`: the binary packet header and the
 two-byte message size. The module docs are in `src/stdlib/protocols/cme_mdp3/docs.md`.
-A test checks that `mod.rs` still starts with the generator's output. To
-regenerate the generated part and keep the hand-written tail:
+Differential codec tests compare decoded values and encoded bytes with the
+runtime SBE decoder. To regenerate the generated part and keep the hand-written tail:
 
 ```sh
-BLESS_CODEGEN=1 cargo test --test it sbe_codegen::module_is
+cargo xtask bless
 ```
 
 ## Rust identifiers
@@ -498,7 +498,7 @@ and the SDK test target runs the integration checks in `tests/it/codegen.rs`. Ad
 work budgets, long identifiers, and maximum-sized stream headers. To update:
 
 ```sh
-BLESS_CODEGEN=1 cargo test -p fictionet-codegen --test golden goldens_and_determinism
+cargo xtask bless
 cargo test --workspace --tests
 ```
 

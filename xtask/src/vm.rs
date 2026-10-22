@@ -240,47 +240,29 @@ impl Vm {
         }
         let ssh_port = port(2222)?;
         fs::write(self.path("run/ssh-port"), ssh_port.to_string())?;
-        let mem = std::env::var("VM_MEM").unwrap_or_else(|_| "5G".into());
+        let mem = "5G";
         let mut command = cmd("qemu-system-x86_64", &[]);
-        if std::env::var("VM_SCOPE").as_deref() != Ok("0") {
-            if cmd("systemd-run", &["--user", "--scope", "-q", "true"])
-                .output()
-                .is_ok_and(|o| o.status.success())
-            {
-                let memory = mem.to_uppercase();
-                let mib = if let Some(gib) = memory.strip_suffix('G') {
-                    gib.parse::<u64>()?
-                        .checked_mul(1024)
-                        .ok_or("VM_MEM too large")?
-                } else {
-                    memory.trim_end_matches('M').parse::<u64>()?
-                };
-                // A fresh scope name for each boot: on the first run, the
-                // scope that prepared the image is still loaded when the
-                // prepared image boots, and systemd refuses a loaded name.
-                command = cmd(
-                    "systemd-run",
-                    &[
-                        "--user",
-                        "--scope",
-                        "-q",
-                        "--unit",
-                        &format!("fictionet-vm-{}", token(4)?),
-                        "-p",
-                        &format!(
-                            "MemoryMax={}M",
-                            mib.checked_add(1024).ok_or("VM_MEM too large")?
-                        ),
-                        "-p",
-                        "MemorySwapMax=0",
-                        "qemu-system-x86_64",
-                    ],
-                );
-            } else {
-                eprintln!(
-                    "No systemd user session; QEMU runs without the memory cap (VM_SCOPE=0 silences this)."
-                );
-            }
+        if cmd("systemd-run", &["--user", "--scope", "-q", "true"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            command = cmd(
+                "systemd-run",
+                &[
+                    "--user",
+                    "--scope",
+                    "-q",
+                    "--unit",
+                    &format!("fictionet-vm-{}", token(4)?),
+                    "-p",
+                    "MemoryMax=6144M",
+                    "-p",
+                    "MemorySwapMax=0",
+                    "qemu-system-x86_64",
+                ],
+            );
+        } else {
+            eprintln!("No systemd user session; QEMU runs without the memory cap.");
         }
         command
             .args([
@@ -291,9 +273,9 @@ impl Vm {
                 "-cpu",
                 "host",
                 "-smp",
-                &std::env::var("VM_CPUS").unwrap_or_else(|_| "4".into()),
+                "4",
                 "-m",
-                &mem,
+                mem,
                 "-nodefaults",
                 "-display",
                 "none",
@@ -635,13 +617,10 @@ pub fn with_vm(action: impl FnOnce(&Vm) -> Result) -> Result {
     let vm = Vm::new();
     let booted = vm.pid().is_none();
     let result = vm.up().and_then(|()| action(&vm));
-    if booted && std::env::var("VM_KEEP").as_deref() != Ok("1") {
+    if booted {
         let stopped = vm.down();
         result.and(stopped)
     } else {
-        if booted {
-            eprintln!("The VM is still running (VM_KEEP=1). Stop it with cargo xtask vm down.");
-        }
         result
     }
 }

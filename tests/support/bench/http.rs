@@ -2,7 +2,7 @@ mod observer;
 
 use super::World;
 use bytes::Bytes;
-use example_common::hyper_io::{Exec, Io};
+use fictionet_extras::hyper_io::{Exec, Io};
 use fictionet::stdlib::protocols::dns::op::{MessageType, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
 use fictionet::stdlib::world::sandbox::{self, Machine, TlsClient};

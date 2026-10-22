@@ -137,9 +137,9 @@ fn install(release: &str, namespace: &str, proxy: bool, wait: bool) -> Command {
         namespace,
         "-f",
         if proxy {
-            "examples/attach/k8s-proxy.yaml"
+            "demos/attach/k8s-proxy.yaml"
         } else {
-            "examples/attach/k8s-tun.yaml"
+            "demos/attach/k8s-tun.yaml"
         },
     ]);
     if proxy {

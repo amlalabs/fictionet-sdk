@@ -5,6 +5,7 @@ use http_body::{Body as HttpBody, Frame};
 
 pub(super) struct Call {
     cx: Cx,
+    connection: fictionet::events::ConnInfo,
     id: u64,
     provider: Provider,
     path: String,
@@ -29,6 +30,7 @@ pub(super) struct Call {
     ledger: Arc<Mutex<Ledger>>,
     prices: Option<Prices>,
     secret: Secret,
+    credential: &'static str,
 }
 impl Call {
     pub fn new(
@@ -38,16 +40,15 @@ impl Call {
         request: &[u8],
         free: bool,
         transport: &'static str,
+        secret: &Secret,
     ) -> Self {
         let call = Self {
             cx: site.cx.clone(),
+            connection: site.connection.clone(),
             id: site.cx.random_u64(),
             provider: site.provider,
             path,
-            model: site
-                .credential
-                .real
-                .redact(body["model"].as_str().unwrap_or("")),
+            model: secret.redact(body["model"].as_str().unwrap_or("")),
             stream: body["stream"].as_bool().unwrap_or(false),
             transport,
             request_bytes: request.len(),
@@ -69,27 +70,31 @@ impl Call {
             prices: site.prices.as_ref().and_then(|(model, prices)| {
                 (body["model"].as_str() == Some(model.as_str())).then_some(*prices)
             }),
-            secret: site.credential.real.clone(),
+            secret: secret.clone(),
+            credential: if site.credential.is_none() {
+                "guest"
+            } else {
+                "placeholder"
+            },
         };
         if call.cx.event_enabled("model", "body") {
             call.transcript(
                 "request",
-                site.credential
-                    .real
-                    .redact(&String::from_utf8_lossy(request))
-                    .as_bytes(),
+                secret.redact(&String::from_utf8_lossy(request)).as_bytes(),
             );
         }
         call
     }
     fn transcript(&self, direction: &str, data: &[u8]) {
         for chunk in data.chunks(64 * 1024) {
-            self.cx.emit("model", "body", |e| {
-                e.field("call", self.id)
-                    .field("direction", direction)
-                    .field("encoding", "base64")
-                    .field("data", fictionet::stdlib::codec::base64::encode(chunk))
-            });
+            self.cx
+                .emitter(&self.connection)
+                .emit("model", "body", |e| {
+                    e.field("call", self.id)
+                        .field("direction", direction)
+                        .field("encoding", "base64")
+                        .field("data", fictionet::stdlib::codec::base64::encode(chunk))
+                });
         }
     }
     fn read(&mut self, value: &Value) {
@@ -196,26 +201,28 @@ impl Drop for Call {
             ledger.unknown |= self.status < 400 && (!self.complete || !self.usage);
             ledger.unknown_cost |= self.status < 400 && cost.is_none();
         }
-        self.cx.emit("model", "call", |e| {
-            e.field("call", self.id)
-                .field("provider", self.provider.host())
-                .field("host", self.provider.host())
-                .field("path", self.path.as_str())
-                .field("model", self.model.as_str())
-                .field("stream", self.stream)
-                .field("transport", self.transport)
-                .field("status", self.status as u64)
-                .field("input_tokens", self.input)
-                .field("output_tokens", self.output)
-                .field("cache_read_input_tokens", self.cache_read)
-                .field("cache_creation_input_tokens", self.cache_write)
-                .field("request_bytes", self.request_bytes as u64)
-                .field("response_bytes", self.response_bytes as u64)
-                .field("first_byte_ms", self.first.unwrap_or(0))
-                .field("total_ms", self.start.elapsed().as_millis() as u64)
-                .field("stop_reason", self.stop.as_str())
-                .field("credential", "placeholder")
-        });
+        self.cx
+            .emitter(&self.connection)
+            .emit("model", "call", |e| {
+                e.field("call", self.id)
+                    .field("provider", self.provider.host())
+                    .field("host", self.provider.host())
+                    .field("path", self.path.as_str())
+                    .field("model", self.model.as_str())
+                    .field("stream", self.stream)
+                    .field("transport", self.transport)
+                    .field("status", self.status as u64)
+                    .field("input_tokens", self.input)
+                    .field("output_tokens", self.output)
+                    .field("cache_read_input_tokens", self.cache_read)
+                    .field("cache_creation_input_tokens", self.cache_write)
+                    .field("request_bytes", self.request_bytes as u64)
+                    .field("response_bytes", self.response_bytes as u64)
+                    .field("first_byte_ms", self.first.unwrap_or(0))
+                    .field("total_ms", self.start.elapsed().as_millis() as u64)
+                    .field("stop_reason", self.stop.as_str())
+                    .field("credential", self.credential)
+            });
     }
 }
 

@@ -1,0 +1,51 @@
+[package]
+name = "fictionet-artifactory-demo"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description = "Shared microVM kit and demos: Ubuntu's official cloud image in an embedded Cloud Hypervisor, networked by a world in the same process."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+arc-swap = "1.9.3"
+fictionet-extras = { path = "../../../extras" }
+fictionet-host = { path = "../../../host" }
+artifactory-world = { path = "../world" }
+quick-xml = { version = "0.38", features = ["serialize"] }
+fictionet-observe = { path = "../../../observe", features = ["page"] }
+# `tokio` hands the jump host's TCP connection to the SSH client.
+fictionet = { path = "../../..", features = ["web-proxy", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+bytes = "1"
+http = "1.5.0"
+http-body = "1.1.0"
+http-body-util = "0.1"
+httpdate = "1"
+tower-service = "0.3.3"
+# Parses the Chrome DevTools Protocol replies the desktop demo drives Chromium
+# with to screenshot the noVNC viewer.
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+# Encode the guest screen the viewer capture reads over RFB as a PNG: deflate
+# and CRC from vetted crates, chunk framing in the demo.
+flate2 = "1"
+crc32fast = "1"
+
+# The shared kit's image and SSH support: a cloud-init NoCloud seed and a
+# per-run disk overlay written in Rust, and an embedded SSH client. These
+# prepare and reach an unmodified distro image whatever hypervisor boots it.
+
+# The vhost-user-net backend that joins Cloud Hypervisor's guest to the
+# world. Versions track vhost-user-backend 0.18's own, so the virtio-queue,
+# vm-memory and vhost types are one instance across the crates.
+vhost-user-backend = "0.18"
+
+
+fictionet-demo = { path = "../../kit" }
+
+[[bin]]
+name = "artifactory"
+path = "src/main.rs"

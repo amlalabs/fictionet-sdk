@@ -5,8 +5,8 @@ use http_body::{Body as HttpBody, Frame};
 use ring::aead;
 use tokio::sync::mpsc;
 
-pub(super) struct Seal(aead::LessSafeKey);
-impl Seal {
+pub(super) struct TokenCipher(aead::LessSafeKey);
+impl TokenCipher {
     pub fn new(cx: &Cx) -> Self {
         let mut bytes = [0; 32];
         cx.fill_random(&mut bytes);
@@ -14,7 +14,7 @@ impl Seal {
             aead::UnboundKey::new(&aead::AES_256_GCM, &bytes).unwrap(),
         ))
     }
-    pub(super) fn seal(&self, cx: &Cx, value: &Value) -> String {
+    pub(super) fn encrypt(&self, cx: &Cx, value: &Value) -> String {
         let mut nonce = [0; 12];
         cx.fill_random(&mut nonce);
         let mut bytes = value.to_string().into_bytes();
@@ -89,17 +89,17 @@ fn definition(name: &str, kind: &str) -> Value {
         json!({"name":name,"description":"Fetch a web page.","input_schema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}})
     }
 }
-fn original_id(seal: &Seal, id: &Value) -> fictionet::Result<String> {
+fn original_id(cipher: &TokenCipher, id: &Value) -> fictionet::Result<String> {
     let token = id
         .as_str()
         .and_then(|id| id.strip_prefix("srvtoolu_"))
         .ok_or_else(invalid)?;
-    seal.open(token)?["id"]
+    cipher.open(token)?["id"]
         .as_str()
         .map(str::to_owned)
         .ok_or_else(invalid)
 }
-fn history(body: &mut Value, seal: &Seal) -> fictionet::Result<()> {
+fn history(body: &mut Value, cipher: &TokenCipher) -> fictionet::Result<()> {
     let Some(messages) = body["messages"].as_array_mut() else {
         return Err(invalid());
     };
@@ -137,12 +137,12 @@ fn history(body: &mut Value, seal: &Seal) -> fictionet::Result<()> {
             match typ {
                 "server_tool_use" => {
                     let mut block = block.clone();
-                    block["id"] = json!(original_id(seal, &block["id"])?);
+                    block["id"] = json!(original_id(cipher, &block["id"])?);
                     block["type"] = json!("tool_use");
                     assistant.push(block);
                 }
                 "web_search_tool_result" | "web_fetch_tool_result" => {
-                    let id = original_id(seal, &block["tool_use_id"])?;
+                    let id = original_id(cipher, &block["tool_use_id"])?;
                     if !assistant
                         .iter()
                         .any(|b| b["type"] == "tool_use" && b["id"] == id)
@@ -160,7 +160,7 @@ fn history(body: &mut Value, seal: &Seal) -> fictionet::Result<()> {
                             let token = entries[0]["encrypted_content"]
                                 .as_str()
                                 .ok_or_else(invalid)?;
-                            let payload = seal.open(token)?;
+                            let payload = cipher.open(token)?;
                             if payload["id"] != id {
                                 return Err(invalid());
                             }
@@ -271,7 +271,7 @@ pub(super) async fn count(
     mut body: Value,
 ) -> fictionet::Result<Response<Body>> {
     model.engine = None;
-    if history(&mut body, &model.seal).is_err() {
+    if history(&mut body, &model.cipher).is_err() {
         return Ok(invalid_history(&model));
     }
     definitions(&mut body);
@@ -284,7 +284,7 @@ pub(super) async fn serve(
     mut body: Value,
 ) -> fictionet::Result<Response<Body>> {
     let engine = model.engine.take().expect("engine checked");
-    if history(&mut body, &model.seal).is_err() {
+    if history(&mut body, &model.cipher).is_err() {
         return Ok(invalid_history(&model));
     }
     let tools = definitions(&mut body);
@@ -540,7 +540,7 @@ fn visible(
         let original = block["id"].as_str().unwrap_or("").to_owned();
         let id = format!(
             "srvtoolu_{}",
-            model.seal.seal(&model.cx, &json!({"id":original}))
+            model.cipher.encrypt(&model.cx, &json!({"id":original}))
         );
         ids.insert(original, id.clone());
         block["type"] = json!("server_tool_use");
@@ -578,14 +578,17 @@ async fn run(
             if *kind == "web_search" {
                 searches += 1;
             }
-            model.cx.emit("model", "tool", |e| {
-                e.field("tool", *kind)
-                    .field("query", block["input"]["query"].as_str().unwrap_or(""))
-                    .field("url", block["input"]["url"].as_str().unwrap_or(""))
-                    .field("source", "world")
-                    .field("results", content.as_array().map_or(0, Vec::len) as u64)
-                    .field("ms", start.elapsed().as_millis() as u64)
-            });
+            model
+                .cx
+                .emitter(&model.connection)
+                .emit("model", "tool", |e| {
+                    e.field("tool", *kind)
+                        .field("query", block["input"]["query"].as_str().unwrap_or(""))
+                        .field("url", block["input"]["url"].as_str().unwrap_or(""))
+                        .field("source", "world")
+                        .field("results", content.as_array().map_or(0, Vec::len) as u64)
+                        .field("ms", start.elapsed().as_millis() as u64)
+                });
             output.block(json!({"type":format!("{kind}_tool_result"),"tool_use_id":id,"content":content})).await?;
             results.push(json!({"type":"tool_result","tool_use_id":block["id"],"content":text}));
         }
@@ -635,7 +638,15 @@ async fn answer(
         let Some(query) = block["input"]["query"].as_str() else {
             return error("invalid_input");
         };
-        let Ok(results) = engine.search(model.cx.clone(), query.into()).await else {
+        let Ok(results) = engine
+            .search(
+                model.cx.clone(),
+                query.into(),
+                "claude_web_search",
+                settings.clone(),
+            )
+            .await
+        else {
             return error("unavailable");
         };
         let results: Vec<_> = results
@@ -644,7 +655,7 @@ async fn answer(
             .collect();
         let text = serde_json::to_string(&results).unwrap();
         let mut content: Vec<Value> = results.iter().map(|r| json!({"type":"web_search_result","url":r.url,"title":r.title,"page_age":r.date})).collect();
-        let token = model.seal.seal(
+        let token = model.cipher.encrypt(
             &model.cx,
             &json!({"id":block["id"],"text":text,"visible":content}),
         );
@@ -696,7 +707,13 @@ mod tests {
     use super::*;
     struct Pages;
     impl Engine for Pages {
-        fn search(self: Arc<Self>, _: Cx, _: String) -> tools::Answer<Vec<crate::search::Result>> {
+        fn search(
+            self: Arc<Self>,
+            _: Cx,
+            _: String,
+            _: &'static str,
+            _: Value,
+        ) -> tools::Answer<Vec<crate::search::Result>> {
             Box::pin(async { Ok(Vec::new()) })
         }
         fn fetch(self: Arc<Self>, _: Cx, _: String) -> tools::Answer<tools::Page> {
@@ -733,7 +750,7 @@ mod tests {
             let shown = visible(block.clone(), &model, &std::collections::HashMap::from([("web_fetch".into(), ("web_fetch", settings))]), &mut Default::default());
             let mut replay = body.clone();
             replay["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","content":[shown.clone(),{"type":"web_fetch_tool_result","tool_use_id":shown["id"],"content":content},{"type":"text","text":"Done"}]}));
-            history(&mut replay, &model.seal)?;
+            history(&mut replay, &model.cipher)?;
             assert_eq!(replay["messages"][1]["content"][0], block);
             assert_eq!(replay["messages"][2]["content"][0]["content"], text);
             assert_eq!(replay["messages"][3]["content"][0]["text"], "Done");

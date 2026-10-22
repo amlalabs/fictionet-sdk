@@ -91,7 +91,7 @@ ATTACH_LIMITS = Limits(memory="512m", pids=256)
 
 @dataclass(frozen=True)
 class CargoExample:
-    """A world built from a cargo example in a crate, such as `web_world`.
+    """A world built from a cargo example in a user crate.
 
     The image is generated: the example is built with musl on
     `rust_image`, statically, and copied alone onto `scratch`, where it

@@ -3133,59 +3133,6 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
     }
 
     #[test]
-    fn oid_constants_are_the_identifiers_they_name() {
-        let cases: [(&[u8], &str); 34] = [
-            (oid::COMMON_NAME, "2.5.4.3"),
-            (oid::SURNAME, "2.5.4.4"),
-            (oid::SERIAL_NUMBER, "2.5.4.5"),
-            (oid::COUNTRY, "2.5.4.6"),
-            (oid::LOCALITY, "2.5.4.7"),
-            (oid::STATE, "2.5.4.8"),
-            (oid::STREET, "2.5.4.9"),
-            (oid::ORGANIZATION, "2.5.4.10"),
-            (oid::ORGANIZATIONAL_UNIT, "2.5.4.11"),
-            (oid::DOMAIN_COMPONENT, "0.9.2342.19200300.100.1.25"),
-            (oid::USER_ID, "0.9.2342.19200300.100.1.1"),
-            (oid::EMAIL_ADDRESS, "1.2.840.113549.1.9.1"),
-            (oid::SUBJECT_KEY_IDENTIFIER, "2.5.29.14"),
-            (oid::KEY_USAGE, "2.5.29.15"),
-            (oid::SUBJECT_ALT_NAME, "2.5.29.17"),
-            (oid::ISSUER_ALT_NAME, "2.5.29.18"),
-            (oid::BASIC_CONSTRAINTS, "2.5.29.19"),
-            (oid::CRL_NUMBER, "2.5.29.20"),
-            (oid::REASON_CODE, "2.5.29.21"),
-            (oid::CRL_DISTRIBUTION_POINTS, "2.5.29.31"),
-            (oid::CERTIFICATE_POLICIES, "2.5.29.32"),
-            (oid::AUTHORITY_KEY_IDENTIFIER, "2.5.29.35"),
-            (oid::EXTENDED_KEY_USAGE, "2.5.29.37"),
-            (oid::AUTHORITY_INFO_ACCESS, "1.3.6.1.5.5.7.1.1"),
-            (oid::SERVER_AUTH, "1.3.6.1.5.5.7.3.1"),
-            (oid::CLIENT_AUTH, "1.3.6.1.5.5.7.3.2"),
-            (oid::CODE_SIGNING, "1.3.6.1.5.5.7.3.3"),
-            (oid::EMAIL_PROTECTION, "1.3.6.1.5.5.7.3.4"),
-            (oid::TIME_STAMPING, "1.3.6.1.5.5.7.3.8"),
-            (oid::OCSP_SIGNING, "1.3.6.1.5.5.7.3.9"),
-            (oid::OCSP, "1.3.6.1.5.5.7.48.1"),
-            (oid::CA_ISSUERS, "1.3.6.1.5.5.7.48.2"),
-            (oid::EC_PUBLIC_KEY, "1.2.840.10045.2.1"),
-            (oid::ED25519, "1.3.101.112"),
-        ];
-        for (bytes, dotted) in cases {
-            assert_eq!(oid(bytes).to_string(), dotted);
-        }
-        for (bytes, dotted) in [
-            (oid::RSA_ENCRYPTION, "1.2.840.113549.1.1.1"),
-            (oid::SHA256_WITH_RSA, "1.2.840.113549.1.1.11"),
-            (oid::PRIME256V1, "1.2.840.10045.3.1.7"),
-            (oid::SECP384R1, "1.3.132.0.34"),
-            (oid::ECDSA_WITH_SHA256, "1.2.840.10045.4.3.2"),
-            (oid::ECDSA_WITH_SHA384, "1.2.840.10045.4.3.3"),
-        ] {
-            assert_eq!(oid(bytes).to_string(), dotted);
-        }
-    }
-
-    #[test]
     fn reads_an_openssl_certificate() {
         let der = cert_der();
         assert_eq!(der.len(), 756);

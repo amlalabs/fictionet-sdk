@@ -210,7 +210,7 @@
 //! the same service driver. A companion `Present` adapter can use the copied
 //! parser. Register it in `fictionet_observe::Registry` and set
 //! `fictionet_observe::DashboardOptions::protocols` before installing the observer.
-//! `examples/custom_protocol` runs this gateway on a
+//! `demos/custom_protocol` runs this gateway on a
 //! [`net::Net`](world::net::Net) and reads a register using a request with a
 //! nonzero protocol identifier.
 //!

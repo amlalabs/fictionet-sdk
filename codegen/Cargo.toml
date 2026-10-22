@@ -11,7 +11,6 @@ license = "MIT OR Apache-2.0"
 # fictionet without host integration or runtime adapters.
 fictionet = { path = "..", default-features = false }
 fictionet-codegen-golden = { path = "tests/golden" }
-fictionet-codegen-layouts = { path = "tests/layouts" }
 
 [lints.rust]
 missing_docs = "deny"

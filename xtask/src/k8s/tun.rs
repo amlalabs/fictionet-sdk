@@ -25,7 +25,7 @@ pub fn run() -> Result {
             "fntest",
             "charts/fictionet-sandbox",
             "-f",
-            "examples/attach/k8s-tun.yaml",
+            "demos/attach/k8s-tun.yaml",
             "--wait",
             "--timeout",
             "180s",

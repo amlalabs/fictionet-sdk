@@ -15,12 +15,12 @@ COPY xtask xtask
 COPY smoltcp smoltcp
 COPY demos demos
 COPY tests tests
-COPY examples examples
+COPY extras extras
 # The hosted example also copies web_world out of this image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-web-target \
-    cargo build --release --locked --features web-proxy,tokio --bin fictionet --example web_world --example web_fixture \
-    && cp target/release/fictionet target/release/examples/web_world target/release/examples/web_fixture /usr/local/bin/
+    cargo build --release --locked --features web-proxy,tokio -p fictionet-cli --bin fictionet -p fictionet-web-world-demo --bin web_world -p fictionet --example web_fixture \
+    && cp target/release/fictionet target/release/web_world target/release/examples/web_fixture /usr/local/bin/
 
 # The world, the real upstream, and attach.
 FROM debian:bookworm-slim AS runtime

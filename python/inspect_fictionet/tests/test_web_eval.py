@@ -22,8 +22,8 @@ def load(name, path):
     return module
 
 
-HOSTED = load("hosted_eval", REPO / "examples/hosted/eval.py")
-WEB = load("web_eval", REPO / "python/inspect_fictionet/examples/web_eval.py")
+HOSTED = load("hosted_eval", REPO / "demos/hosted/eval.py")
+WEB = load("web_eval", REPO / "python/inspect_fictionet/demos/web_eval.py")
 
 
 class WebEvalTests(unittest.IsolatedAsyncioTestCase):

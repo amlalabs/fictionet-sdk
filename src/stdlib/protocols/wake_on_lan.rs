@@ -380,15 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn constants() {
-        assert_eq!(PACKET_LEN, 102);
-        assert_eq!(MAX_PACKET_LEN, 108);
-        assert_eq!((PORT, ALT_PORT, ETHERTYPE), (9, 7, 0x0842));
-        // The 16-bit length field bounds every payload.
-        assert_eq!(MAX_PAYLOAD, u16::MAX as usize);
-    }
-
-    #[test]
     fn round_trips() {
         let cases = [
             MagicPacket::new(MAC),

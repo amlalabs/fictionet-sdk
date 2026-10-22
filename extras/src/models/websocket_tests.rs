@@ -89,7 +89,11 @@ impl Client {
         (String::from_utf8(head).unwrap().to_lowercase(), client)
     }
     async fn open(cx: &Cx, model: &Model) -> Client {
-        let key = model.credential.wire(model.provider, false);
+        let key = model
+            .credential
+            .as_ref()
+            .unwrap()
+            .wire(model.provider, false);
         let conn = Client::connect(cx, model.clone()).await;
         let (head, client) = Client::handshake(cx, conn, &key, "13").await;
         assert!(head.starts_with("http/1.1 101"), "{head}");
@@ -166,7 +170,7 @@ fn the_handshake_and_socket_answer_like_openai() {
     fictionet::block_on(fictionet::run(options, |cx| async move {
         // Nothing listens there: no request may reach an upstream.
         let model = openai(&cx, "127.0.0.1:1".parse()?)?;
-        let key = model.credential.wire(model.provider, false);
+        let key = model.credential.as_ref().unwrap().wire(model.provider, false);
         let conn = Client::connect(&cx, model.clone()).await;
         let (head, _) = Client::handshake(&cx, conn, "Bearer sk-proj-wrong", "13").await;
         assert!(head.starts_with("http/1.1 401"), "{head}");

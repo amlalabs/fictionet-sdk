@@ -303,32 +303,29 @@ impl Proxy {
                 )));
             })
         };
-        let mut child = std::process::Command::new(
-            std::env::var("FICTIONET_BIN")
-                .unwrap_or_else(|_| env!("CARGO_BIN_EXE_fictionet").to_string()),
-        )
-        .args([
-            "attach",
-            "--world",
-            &format!("unix:{}", path.display()),
-            "--name",
-            "agent",
-            "--type",
-            "http_proxy",
-        ])
-        .args([
-            "--listen",
-            "127.0.0.1:0",
-            "--token-file",
-            token.to_str().unwrap(),
-            "--ip-addr",
-            "10.0.0.2",
-            "--dns",
-            "10.0.0.1",
-        ])
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("fictionet attach");
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fictionet"))
+            .args([
+                "attach",
+                "--world",
+                &format!("unix:{}", path.display()),
+                "--name",
+                "agent",
+                "--type",
+                "http_proxy",
+            ])
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--token-file",
+                token.to_str().unwrap(),
+                "--ip-addr",
+                "10.0.0.2",
+                "--dns",
+                "10.0.0.1",
+            ])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("fictionet attach");
         let mut lines = std::io::BufReader::new(child.stderr.take().unwrap()).lines();
         let first = lines.next().unwrap().unwrap();
         let addr: SocketAddr = first

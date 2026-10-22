@@ -15,11 +15,11 @@ COPY xtask xtask
 COPY smoltcp smoltcp
 COPY demos demos
 COPY tests tests
-COPY examples examples
+COPY extras extras
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-ping-target \
-    cargo build --release --locked --bin fictionet --example ping_world \
-    && cp target/release/fictionet target/release/examples/ping_world /usr/local/bin/
+    cargo build --release --locked -p fictionet-cli --bin fictionet -p fictionet-ping-world-demo --bin ping_world \
+    && cp target/release/fictionet target/release/ping_world /usr/local/bin/
 
 # The world and attach. Attach needs nothing but the binary: it sets up the
 # device with netlink, not with `ip`.

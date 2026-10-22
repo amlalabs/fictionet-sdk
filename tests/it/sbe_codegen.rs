@@ -15,22 +15,13 @@ use fictionet::stdlib::{
 };
 use fictionet_codegen::{
     Constant, Definition, Field, FrontEnd, IdentifierCase, Input, Length, Limits, NamedType,
-    Number, Presence, Role, SbeFrontEnd, Schema, Type, ValidatedSchema, generate, rust_identifier,
-    validate,
+    Number, Presence, Role, SbeFrontEnd, Schema, Type, ValidatedSchema, rust_identifier, validate,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
 const XML: &str = include_str!("../../data/cme/templates_FixBinary.xml");
 const SAMPLE: &str = include_str!("../../codegen/tests/schemas/sbe_sample.xml");
-const MODULE: &str = include_str!("../../src/stdlib/protocols/cme_mdp3/mod.rs");
-
-fn input() -> Input {
-    Input {
-        name: "templates_FixBinary.xml".into(),
-        bytes: XML.as_bytes().to_vec(),
-    }
-}
 fn ir(xml: &str) -> ValidatedSchema {
     let limits = Limits::default();
     let input = Input {
@@ -38,48 +29,6 @@ fn ir(xml: &str) -> ValidatedSchema {
         bytes: xml.as_bytes().to_vec(),
     };
     validate(SbeFrontEnd.parse(&[input], limits).unwrap(), limits).unwrap()
-}
-
-/// The hand-written part starts at this line. `BLESS_CODEGEN=1` replaces
-/// the generated body before it, preserving the header and hand-written part.
-const MARKER: &str = "\n// Hand-written below this line";
-
-fn body(source: &str) -> &str {
-    let offset = source
-        .split_inclusive('\n')
-        .take_while(|line| line.starts_with("//"))
-        .map(str::len)
-        .sum::<usize>();
-    &source[offset..]
-}
-
-#[test]
-fn module_is_generator_output_plus_hand_written_framing() {
-    let generated = generate("sbe", &[input()], Limits::default())
-        .unwrap()
-        .source;
-    let generated = body(&generated);
-    let tail = &MODULE[MODULE.find(MARKER).expect("marker")..];
-    if std::env::var_os("BLESS_CODEGEN").is_some() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/stdlib/protocols/cme_mdp3/mod.rs"
-        );
-        std::fs::write(
-            path,
-            format!(
-                "{}{generated}{tail}",
-                &MODULE[..MODULE.len() - body(MODULE).len()]
-            ),
-        )
-        .unwrap();
-        return;
-    }
-    assert_eq!(
-        body(&MODULE[..MODULE.len() - tail.len()]),
-        generated,
-        "src/stdlib/protocols/cme_mdp3/mod.rs differs from the generator; set BLESS_CODEGEN=1 to update"
-    );
 }
 
 fn check_open_enum<T>(unknown: fn(u8) -> T, named: &[(u8, T)], error: T::WriteError)

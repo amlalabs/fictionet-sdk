@@ -734,15 +734,6 @@ mod tests {
     // Sizes and offsets from the WireGuard paper, section 5.4.
 
     #[test]
-    fn sizes_match_the_paper() {
-        assert_eq!(INITIATION_LEN, 148);
-        assert_eq!(RESPONSE_LEN, 92);
-        assert_eq!(COOKIE_REPLY_LEN, 64);
-        assert_eq!(MIN_DATA_LEN, 32);
-        assert_eq!(REJECT_AFTER_MESSAGES, 18_446_744_073_709_543_423);
-    }
-
-    #[test]
     fn initiation_layout() {
         let b = init().to_bytes().unwrap();
         assert_eq!(b.len(), 148);

@@ -8,6 +8,13 @@ import { scoped, listen } from '../dom.mjs';
 
 const SIZE_KEY = 'fictionet-terminal-size';
 
+export function applyTheme(terminal, colors) {
+  const color = (value) => value.startsWith('#') ? value : '#' + value.match(/\d+/g).slice(0, 3).map((n) => Number(n).toString(16).padStart(2, '0')).join('');
+  terminal.renderer.setTheme(colors);
+  terminal.write(`\x1b]10;${color(colors.foreground)}\x1b\\\x1b]11;${color(colors.background)}\x1b\\`);
+  terminal.renderer.render(terminal.wasmTerm, true, terminal.getViewportY(), terminal);
+}
+
 export function mount(root, services, options) {
   let active, focus = options.focus, fontSize = 13;
   const sizing = [];
@@ -46,14 +53,18 @@ export function mount(root, services, options) {
       entry.socket = socket;
       const { Terminal, FitAddon } = panel.library;
       const font = getComputedStyle(panel.display).fontFamily;
-      const terminal = entry.terminal = new Terminal({ scrollback: 5000, theme: theme(panel.display), allowProposedApi: false, fontSize, ...(font ? { fontFamily: font } : {}) });
+      const terminal = entry.terminal = new Terminal({ scrollback: 5000, theme: theme(panel.display), fontSize, ...(font ? { fontFamily: font } : {}) });
       const fit = new FitAddon();
       terminal.loadAddon(fit);
+      const focused = panel.display.ownerDocument.activeElement;
       terminal.open(panel.display);
+      if (!focus) { terminal.blur(); focused?.focus(); }
+      panel.display.terminal = terminal;
       const send = (data) => { if (active === entry && socket.readyState === 1) socket.send(data); };
       const resize = () => {
         if (!panel.display.clientWidth || !panel.display.clientHeight) return;
-        fit.fit();
+        const size = fit.proposeDimensions();
+        if (size && (size.cols !== terminal.cols || size.rows !== terminal.rows)) terminal.resize(size.cols, size.rows);
         send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }));
       };
       entry.resize = resize;
@@ -62,8 +73,6 @@ export function mount(root, services, options) {
         resize();
         if (focus) { focus = false; terminal.focus(); }
       };
-      let prompt = '';
-      const decoder = new TextDecoder();
       const received = (event) => {
         if (active !== entry || !(event.data instanceof ArrayBuffer)) return;
         const bytes = new Uint8Array(event.data);
@@ -71,13 +80,11 @@ export function mount(root, services, options) {
       };
       const closed = (event) => { if (active === entry) disconnected(panel, event.reason); };
       const input = terminal.onData((text) => send(new TextEncoder().encode(text)));
-      const binary = terminal.onBinary((text) => send(Uint8Array.from(text, (c) => c.charCodeAt(0))));
       socket.addEventListener('open', opened);
       socket.addEventListener('message', received);
       socket.addEventListener('close', closed);
       entry.cleanup = () => {
         input.dispose();
-        binary.dispose();
         socket.removeEventListener('open', opened);
         socket.removeEventListener('message', received);
         socket.removeEventListener('close', closed);
@@ -96,6 +103,7 @@ export function mount(root, services, options) {
     old?.controller.abort();
     old?.socket?.close();
     old?.observer?.disconnect();
+    if (old?.terminal) delete panel.display.terminal;
     old?.terminal?.dispose();
   }
   const { panel, dispose } = mountConsole(root, services, options, {
@@ -111,7 +119,11 @@ export function mount(root, services, options) {
     },
   });
   const offTheme = services.theme.subscribe(() => {
-    if (active?.terminal) active.terminal.options.theme = theme(panel.display);
+    if (active?.terminal) {
+      // This release exposes the renderer; changing options.theme alone does
+      // not repaint an open terminal.
+      applyTheme(active.terminal, theme(panel.display));
+    }
   });
   return () => {
     if (!dispose()) return;

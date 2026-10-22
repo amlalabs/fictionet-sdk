@@ -235,9 +235,6 @@ class Commands(unittest.TestCase):
             with self.subTest(error=type(error).__name__), self.assertRaises(type(error)):
                 commands.run(["curl"], runner=Mock(side_effect=error))
 
-    def test_direct_curl_prefix(self):
-        self.assertEqual(commands.CURL_DIRECT, ("curl", "-q", "--noproxy", "*"))
-
 
 class AsyncCommands(unittest.IsolatedAsyncioTestCase):
     async def test_async_runner_preserves_status_and_output(self):

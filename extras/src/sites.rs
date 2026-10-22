@@ -881,7 +881,7 @@ mod tests {
                 );
             }
             assert!(!low.contains("saved from"));
-            assert!(!low.contains("adaptive-web"));
+            assert!(!low.contains("web_world"));
         };
         for dir in FILES.dirs() {
             for file in dir.files() {

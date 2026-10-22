@@ -40,7 +40,7 @@ export function createTables({ $, el, state, view, runTime, fmtDuration, fmtByte
       out.push(el('div', { class: 'sub', text: `${n.file}:${n.line}` }));
     }
     const rows = [];
-    rows.push(['Links', String(n.edges.size)]);
+    rows.push(['Links', String([...n.edges].filter((id) => state.edges.has(id)).length)]);
     rows.push(['Packets/s on its links', fmtRate(itemRate(n))]);
     if (n.started !== undefined) rows.push(['Running for', fmtDuration(runTime() - n.started)]);
     if (n.drops) rows.push(['Packets dropped', fmtCount(n.drops)]);

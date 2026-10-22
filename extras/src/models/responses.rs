@@ -66,8 +66,8 @@ fn is_world(item: &Value) -> bool {
         )
 }
 /// Turns the client's `web_search_call` items back into the function call
-/// and output the model saw. The world's sealed token carries both.
-fn history(body: &mut Value, seal: &splice::Seal) -> fictionet::Result<()> {
+/// and output the model saw. The world's encrypted token carries both.
+fn history(body: &mut Value, cipher: &splice::TokenCipher) -> fictionet::Result<()> {
     let Some(items) = body["input"].as_array_mut() else {
         return Ok(());
     };
@@ -80,7 +80,7 @@ fn history(body: &mut Value, seal: &splice::Seal) -> fictionet::Result<()> {
         let token = item["encrypted_content"]
             .as_str()
             .ok_or_else(|| Error::msg("Invalid search history"))?;
-        let value = seal.open(token)?;
+        let value = cipher.open(token)?;
         if value["id"] != item["id"] {
             return Err(Error::msg("Invalid search history"));
         }
@@ -136,7 +136,7 @@ pub(super) async fn serve(
     mut body: Value,
 ) -> fictionet::Result<Response<Body>> {
     let engine = model.engine.take().expect("engine checked");
-    if history(&mut body, &model.seal).is_err() {
+    if history(&mut body, &model.cipher).is_err() {
         return Ok(model
             .provider
             .error(400, "invalid_request_error", "Invalid search history"));
@@ -373,7 +373,16 @@ async fn answer(
         "web_search" => {
             let query = text("query");
             let mut action = json!({"type":"search","query":query,"queries":[query]});
-            let Ok(found) = engine.clone().search(model.cx.clone(), query.clone()).await else {
+            let Ok(found) = engine
+                .clone()
+                .search(
+                    model.cx.clone(),
+                    query.clone(),
+                    "codex_web_search",
+                    domains.clone(),
+                )
+                .await
+            else {
                 return error(action, "unavailable");
             };
             let found: Vec<_> = found
@@ -474,19 +483,22 @@ async fn run(
             let result =
                 json!({"type":"function_call_output","call_id":call["call_id"],"output":text});
             let token = model
-                .seal
-                .seal(&model.cx, &json!({"id":id,"call":call,"result":result}));
+                .cipher
+                .encrypt(&model.cx, &json!({"id":id,"call":call,"result":result}));
             let item = json!({"type":"web_search_call","id":id,"status":"completed","action":action,"encrypted_content":token});
             output.items[offset + index] = item.clone();
-            model.cx.emit("model", "tool", |e| {
-                e.field("provider", model.provider.host())
-                    .field("tool", call["name"].as_str().unwrap_or(""))
-                    .field("query", action["query"].as_str().unwrap_or(""))
-                    .field("url", action["url"].as_str().unwrap_or(""))
-                    .field("results", count)
-                    .field("source", "world")
-                    .field("ms", start.elapsed().as_millis() as u64)
-            });
+            model
+                .cx
+                .emitter(&model.connection)
+                .emit("model", "tool", |e| {
+                    e.field("provider", model.provider.host())
+                        .field("tool", call["name"].as_str().unwrap_or(""))
+                        .field("query", action["query"].as_str().unwrap_or(""))
+                        .field("url", action["url"].as_str().unwrap_or(""))
+                        .field("results", count)
+                        .field("source", "world")
+                        .field("ms", start.elapsed().as_millis() as u64)
+                });
             output
                 .emit(json!({"type":"response.web_search_call.completed","item_id":id,"output_index":offset+index}))
                 .await?;

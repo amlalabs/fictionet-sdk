@@ -28,8 +28,42 @@
 //! ```
 #![warn(missing_docs)]
 
+pub mod args;
+pub mod events;
+pub mod headers;
+pub mod hyper_io;
+pub mod log;
+pub mod names;
+
+#[cfg(not(target_arch = "wasm32"))]
 mod dom;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod models;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod search;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod sites;
+
+#[cfg(not(target_arch = "wasm32"))]
 mod text;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod capture;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod crawl;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod warc;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod guest_content;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod web_world;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod zscaler;

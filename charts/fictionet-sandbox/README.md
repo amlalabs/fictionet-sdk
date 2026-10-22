@@ -10,8 +10,8 @@ startup and restart behavior, and isolation requirements:
 
 [values.yaml](values.yaml) is the reference for settings and defaults;
 [values.schema.json](values.schema.json) validates their shape. Runnable values
-files are [k8s-tun.yaml](../../examples/attach/k8s-tun.yaml) and
-[k8s-proxy.yaml](../../examples/attach/k8s-proxy.yaml). The guide includes both
+files are [k8s-tun.yaml](../../demos/attach/k8s-tun.yaml) and
+[k8s-proxy.yaml](../../demos/attach/k8s-proxy.yaml). The guide includes both
 files and gives the build, install, check and cleanup commands.
 
 `cargo xtask k8s tun` and

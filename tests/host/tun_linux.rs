@@ -102,7 +102,6 @@ fn demux(fcx: &Cx, tun: Tun) -> [End; 4] {
         let mut tun = tun;
         let mut sides = [wa, wb, wc, wd];
         let mut seed = 0x9e3779b97f4a7c15u64;
-        let trace = std::env::var("FICTIONET_TRACE").is_ok();
         let mut lose = move |p: &Packet| {
             let loss = LOSS.load(Ordering::Relaxed) as u64;
             if loss == 0 {
@@ -139,7 +138,7 @@ fn demux(fcx: &Cx, tun: Tun) -> [End; 4] {
             .await;
             let lost = matches!(&ev, Ok((_, p)) if lose(p));
             if let Ok((from, p)) = &ev {
-                trace_packet(&fcx, from.is_none(), p, trace, lost);
+                trace_packet(&fcx, from.is_none(), p, lost);
             }
             match ev {
                 Ok(_) if lost => {}
@@ -170,7 +169,7 @@ fn demux(fcx: &Cx, tun: Tun) -> [End; 4] {
 static RING: Mutex<std::collections::VecDeque<String>> =
     Mutex::new(std::collections::VecDeque::new());
 
-fn trace_packet(fcx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool) {
+fn trace_packet(fcx: &Cx, from_kernel: bool, p: &Packet, lost: bool) {
     let (proto, hdr) = if p.0[0] >> 4 == 4 {
         (p.0[9], (p.0[0] & 15) as usize * 4)
     } else {
@@ -194,9 +193,6 @@ fn trace_packet(fcx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool
         p.0.len() - hdr - off,
         if lost { " LOST" } else { "" }
     );
-    if print {
-        eprintln!("{line}");
-    }
     let mut ring = RING.lock().unwrap();
     if ring.len() == 300 {
         ring.pop_front();

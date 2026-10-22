@@ -6,6 +6,10 @@ pub(super) const HTML: &str = include_str!("../../../dashboard/page.html");
 
 pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static [u8])> {
     let bytes: &[u8] = match path {
+        "/visibility.mjs" => include_bytes!("../../../dashboard/visibility.mjs"),
+        "/components/architecture.mjs" => {
+            include_bytes!("../../../dashboard/components/architecture.mjs")
+        }
         "/dom.mjs" => include_bytes!("../../../dashboard/dom.mjs"),
         "/format.mjs" => include_bytes!("../../../dashboard/format.mjs"),
         "/graph.mjs" => include_bytes!("../../../dashboard/graph.mjs"),
@@ -372,8 +376,11 @@ mod tests {
             assert_eq!(kind, content_type(path));
         }
         assert!(content_type("novnc/core/rfb.js").starts_with("text/javascript"));
-        assert!(content_type("xterm/lib/xterm.mjs").starts_with("text/javascript"));
-        assert!(content_type("xterm/css/xterm.css").starts_with("text/css"));
+        assert!(content_type("ghostty-web/dist/ghostty-web.js").starts_with("text/javascript"));
+        assert_eq!(
+            content_type("ghostty-web/dist/ghostty-vt.wasm"),
+            "application/wasm"
+        );
         assert!(content_type("novnc/docs/LICENSE.MPL-2.0").starts_with("text/plain"));
         assert!(lookup("/vendor/../page.mjs").is_none());
         assert!(lookup("/vendor/novnc/../../page.mjs").is_none());

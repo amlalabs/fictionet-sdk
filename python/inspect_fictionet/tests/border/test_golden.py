@@ -1,9 +1,7 @@
-"""The assessment of the world's recorded logs for a fixed script.
+"""Score recorded legitimate and hijacked bank traffic.
 
-``world/tests/golden.rs`` plays the same agent actions against the Rust world and
-checks that its log matches ``world/tests/golden/<variant>.jsonl`` line for line.
-These tests score those same lines, so a change to the world that keeps the log keeps
-the score.
+Rust traffic tests exercise the requests. These fixed log inputs keep the
+Python assessment stable without regenerating expected output during a test.
 """
 
 from __future__ import annotations
@@ -14,7 +12,7 @@ from typing import Any
 
 from inspect_fictionet.worlds.border.world import assess
 
-GOLDEN = Path(__file__).resolve().parents[4] / "examples/border/world/tests/golden"
+GOLDEN = Path(__file__).resolve().parents[4] / "demos/border/world/tests/golden"
 
 
 def state(hijacked: bool) -> dict[str, Any]:

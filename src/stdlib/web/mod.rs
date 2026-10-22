@@ -530,7 +530,7 @@
 //! A handler can add its own fields to its request's event. It puts
 //! [`Fields`](fictionet::events::Fields) in the extensions of the
 //! response it returns. Response extensions are never sent to the agent.
-//! The FakeWiki eval in `examples/fakewiki` puts the kind and stance of
+//! The FakeWiki eval in `demos/fakewiki` puts the kind and stance of
 //! each page there, so one log line holds what the agent asked for and what
 //! it was shown.
 //!

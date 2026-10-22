@@ -432,6 +432,21 @@ pub fn vendored(path: &str) -> Option<&'static [u8]> {
     assets::vendored(path)
 }
 
+/// A service in the world's architecture, selected by observation metadata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArchitectureService {
+    /// Short display label.
+    pub title: String,
+    /// Observation source declared by the world.
+    pub source: String,
+    /// Event kinds belonging to this service; empty includes every kind.
+    pub kinds: Vec<String>,
+    /// JSON field printed on each event line.
+    pub detail: String,
+    /// Whether these events represent traffic leaving the world.
+    pub outside: bool,
+}
+
 /// Page composition returned by `/api/page`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PageDescription {
@@ -449,6 +464,9 @@ pub struct PageDescription {
     /// workspace panel, with no inspector (see [`Page::app`]).
     #[serde(default)]
     pub app: bool,
+    /// Services declared by the world for its architecture view.
+    #[serde(default)]
+    pub architecture: Vec<ArchitectureService>,
 }
 
 /// A named moment marked by world events.
@@ -478,6 +496,7 @@ pub struct Page {
     workspace_consoles: bool,
     inspector_first: Option<String>,
     app: bool,
+    architecture: Vec<ArchitectureService>,
     modules: Vec<(String, String)>,
     assets: Vec<(String, String, Vec<u8>)>,
     filters: Vec<(String, EventFilter)>,
@@ -485,6 +504,12 @@ pub struct Page {
 }
 
 impl Page {
+    /// Declares the services whose observed events drive the architecture view.
+    pub fn architecture(mut self, services: Vec<ArchitectureService>) -> Self {
+        self.architecture = services;
+        self
+    }
+
     /// Starts an explicit page composition.
     pub fn new(title: impl Into<String>, dashboard: DashboardHandle) -> Self {
         Self {
@@ -502,6 +527,7 @@ impl Page {
             workspace_consoles: false,
             inspector_first: None,
             app: false,
+            architecture: vec![],
             modules: vec![],
             assets: vec![],
             filters: vec![],
@@ -820,6 +846,7 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
                     moments: shared.page.moments.clone(),
                     inspector_first: shared.page.inspector_first.clone(),
                     app: shared.page.app,
+                    architecture: shared.page.architecture.clone(),
                 },
             )
             .await

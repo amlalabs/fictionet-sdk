@@ -12,7 +12,7 @@ async def finalize_world(world, agent, log: str, timeout: float = 20) -> None:
     so the harness can read its files. Repeated calls read the same acknowledgement.
 
     Requires a separate world sandbox with exec, touch and cat, and the control
-    protocol in examples/common/log.rs. The log's parent must be private to the
+    protocol in extras/src/log.rs. The log's parent must be private to the
     world and writable. The world clears stale control files at startup, watches
     for "finalize", then writes "ok" and a newline to "finalized" after draining
     the writer and checking output failures and lost lines. Await this helper

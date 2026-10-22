@@ -3,6 +3,7 @@
 // The packet list for the selected host's links, or for every declared
 // host's links when no host is selected, merged by the page server. A page
 // with no declared hosts lists every sandbox's links.
+import { declaredSandbox } from '../visibility.mjs';
 import { labelAction } from './labels.mjs';
 import { scoped, listen } from '../dom.mjs';
 import { createPackets } from '../packets.mjs';
@@ -150,8 +151,7 @@ export function mount(root, services, options = {}) {
     if (selected.links.length) show(selected.links, selected.host || 'Selected links');
     // A sandbox the page does not declare, such as the kit's admin host, is
     // not one of its hosts.
-    const declared = new Set(services.hosts.map((host) => host.sandbox));
-    const guest = (node) => node?.kind === 'sandbox' && (!declared.size || declared.has(node.name));
+    const guest = (node) => node?.kind === 'sandbox' && declaredSandbox(services.hosts, node.name);
     const live = [...state.edges.values()].filter((e) => guest(state.nodes.get(e.a)) || guest(state.nodes.get(e.b))).map((e) => e.id);
     if (!selected.host && !selected.links.length) {
       show(live, 'All hosts');
@@ -187,9 +187,9 @@ export function mount(root, services, options = {}) {
   const badge = $('pair'), text = $('pair-text');
   cleanup.push(listen($('pair-clear'), 'click', () => services.packetPair.set(null)));
   cleanup.push(services.packetPair.subscribe((pair) => {
-    view.setPair(pair && [pair.local, pair.peer]);
+    view.setPair(pair && (pair.pairs || [pair.local, pair.peer]));
     badge.hidden = !pair;
-    text.textContent = pair ? `${pair.local} ↔ ${pair.peer}. ${APPROXIMATE}` : '';
+    text.textContent = pair?.label || (pair ? `${pair.local} ↔ ${pair.peer}. ${APPROXIMATE}` : '');
   }));
   if (options.visibility) cleanup.push(options.visibility.subscribe((value) => {
     visible = value;

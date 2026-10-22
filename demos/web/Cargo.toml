@@ -1,0 +1,17 @@
+[package]
+name = "fictionet-web-world-demo"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "web_world"
+doc = false
+path = "main.rs"
+
+[dependencies]
+fictionet = { path = "../..", features = ["web-proxy", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["ws"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+fictionet-extras = { path = "../../extras" }

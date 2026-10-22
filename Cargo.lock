@@ -3,30 +3,6 @@
 version = 4
 
 [[package]]
-name = "adaptive-web-world"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "example-common",
- "fictionet",
- "fictionet-extras",
- "fictionet-host",
- "fictionet-observe",
- "form_urlencoded",
- "http",
- "http-body-util",
- "kuchiki",
- "regex",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "toml",
- "tower-service",
- "url",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -147,8 +123,8 @@ name = "artifactory-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "fictionet-test-support",
  "http",
@@ -216,7 +192,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "http",
@@ -269,6 +245,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -340,10 +322,10 @@ dependencies = [
 name = "border-world"
 version = "0.0.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "fictionet-test-support",
  "flate2",
@@ -898,35 +880,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "example-common"
-version = "0.0.0"
-dependencies = [
- "axum",
- "brotli",
- "fictionet",
- "fictionet-observe",
- "flate2",
- "http",
- "hyper",
- "percent-encoding",
- "quick-xml",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "tar",
- "tokio",
- "xz2",
- "zip",
- "zstd",
-]
-
-[[package]]
 name = "fakewiki-world"
 version = "0.0.0"
 dependencies = [
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "form_urlencoded",
  "http",
@@ -971,9 +929,9 @@ dependencies = [
  "bytes",
  "divan",
  "etherparse",
- "example-common",
  "fictionet-codegen",
  "fictionet-codegen-golden",
+ "fictionet-extras",
  "fictionet-host",
  "fictionet-observe",
  "fictionet-test-support",
@@ -1003,6 +961,80 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-artifactory-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "artifactory-world",
+ "bytes",
+ "crc32fast",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+]
+
+[[package]]
+name = "fictionet-border-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "border-world",
+ "bytes",
+ "crc32fast",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+]
+
+[[package]]
+name = "fictionet-bottleneck-sites-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
+name = "fictionet-capture-sites-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
 name = "fictionet-cli"
 version = "0.1.0"
 dependencies = [
@@ -1029,7 +1061,6 @@ version = "0.1.0"
 dependencies = [
  "fictionet",
  "fictionet-codegen-golden",
- "fictionet-codegen-layouts",
 ]
 
 [[package]]
@@ -1048,17 +1079,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-custom-protocol-demo"
+version = "0.1.0"
+dependencies = [
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
+name = "fictionet-delayed-sites-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
 name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
- "adaptive-web-world",
  "arc-swap",
- "artifactory-world",
- "border-world",
  "bytes",
  "crc32fast",
- "example-common",
- "fakewiki-world",
  "fatfs",
  "fictionet",
  "fictionet-extras",
@@ -1073,7 +1116,6 @@ dependencies = [
  "quick-xml",
  "russh",
  "rustls",
- "scan-world",
  "serde",
  "serde_json",
  "tokio",
@@ -1087,28 +1129,114 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-desktop-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+ "web-world",
+]
+
+[[package]]
 name = "fictionet-extras"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "brotli",
  "bytes",
  "fictionet",
  "fictionet-host",
  "fictionet-observe",
+ "flate2",
  "http",
  "http-body",
  "http-body-util",
+ "httparse",
+ "hyper",
  "include_dir",
  "kuchiki",
  "percent-encoding",
+ "quick-xml",
  "redb",
+ "regex",
+ "reqwest",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
+ "tar",
  "time",
  "tokio",
  "tower-service",
  "url",
+ "xz2",
+ "zip",
  "zstd",
+]
+
+[[package]]
+name = "fictionet-fakewiki-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "fakewiki-world",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+]
+
+[[package]]
+name = "fictionet-goad-demo"
+version = "0.1.0"
+dependencies = [
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
+name = "fictionet-h2spec-world-demo"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fictionet",
+ "http",
+ "tokio",
 ]
 
 [[package]]
@@ -1126,6 +1254,15 @@ dependencies = [
  "tokio",
  "tower-service",
  "webpki-roots",
+]
+
+[[package]]
+name = "fictionet-lossy-sites-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-observe",
 ]
 
 [[package]]
@@ -1147,22 +1284,111 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-ping-world-demo"
+version = "0.1.0"
+dependencies = [
+ "fictionet",
+ "fictionet-observe",
+]
+
+[[package]]
+name = "fictionet-route-change-demo"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fictionet",
+ "fictionet-observe",
+ "fictionet-test-support",
+ "http",
+]
+
+[[package]]
+name = "fictionet-scan-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "scan-world",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+]
+
+[[package]]
+name = "fictionet-search-demo"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32fast",
+ "fictionet",
+ "fictionet-demo",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
+ "quick-xml",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "vhost-user-backend",
+ "web-world",
+]
+
+[[package]]
 name = "fictionet-test-support"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bytes",
  "divan",
- "example-common",
  "fictionet",
+ "fictionet-extras",
+ "fictionet-host",
  "fictionet-observe",
  "http",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "libc",
  "rustls",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tower-service",
+]
+
+[[package]]
+name = "fictionet-web-world-demo"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fictionet",
+ "fictionet-extras",
+ "rustls",
 ]
 
 [[package]]
@@ -1573,18 +1799,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-rustls"
+version = "0.27.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53"
+dependencies = [
+ "http",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+ "webpki-roots",
+]
+
+[[package]]
 name = "hyper-util"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
 dependencies = [
+ "base64 0.23.1",
  "bytes",
+ "futures-channel",
+ "futures-util",
  "http",
  "http-body",
+ "httparse",
  "hyper",
+ "ipnet",
+ "libc",
+ "percent-encoding",
  "pin-project-lite",
+ "socket2",
  "tokio",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -1929,6 +2180,12 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "lru-slab"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lzma-sys"
@@ -2489,6 +2746,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "quinn"
+version = "0.11.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "pin-project-lite",
+ "quinn-proto",
+ "quinn-udp",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-proto"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
+dependencies = [
+ "bytes",
+ "getrandom 0.4.3",
+ "lru-slab",
+ "rand 0.10.3",
+ "rand_pcg 0.10.2",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "thiserror 2.0.21",
+ "tinyvec",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-udp"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "once_cell",
+ "socket2",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2520,7 +2833,7 @@ dependencies = [
  "rand_chacha 0.2.2",
  "rand_core 0.5.1",
  "rand_hc",
- "rand_pcg",
+ "rand_pcg 0.2.1",
 ]
 
 [[package]]
@@ -2637,6 +2950,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "redb"
 version = "4.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2688,6 +3010,46 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webpki-roots",
+]
 
 [[package]]
 name = "rfc6979"
@@ -2823,6 +3185,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2886,6 +3254,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "salsa20"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2907,8 +3281,8 @@ dependencies = [
 name = "scan-world"
 version = "0.0.0"
 dependencies = [
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "http",
  "serde",
@@ -3035,6 +3409,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa 1.0.18",
+ "ryu",
+ "serde",
 ]
 
 [[package]]
@@ -3280,6 +3666,9 @@ name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
+dependencies = [
+ "futures-core",
+]
 
 [[package]]
 name = "synstructure"
@@ -3513,6 +3902,24 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "pin-project-lite",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "url",
 ]
 
 [[package]]
@@ -3862,8 +4269,8 @@ name = "wasm-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "example-common",
  "fictionet",
+ "fictionet-extras",
  "fictionet-observe",
  "http",
  "http-body-util",
@@ -3876,6 +4283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-sys"
+version = "0.3.106"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88261b9deccee56594c11a3460c462c41f58d148598fe70ad77070126a68aba4"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "web-time"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3883,6 +4300,29 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "web-world"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fictionet",
+ "fictionet-extras",
+ "fictionet-host",
+ "fictionet-observe",
+ "form_urlencoded",
+ "http",
+ "http-body-util",
+ "kuchiki",
+ "regex",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "toml",
+ "tower-service",
+ "url",
 ]
 
 [[package]]
@@ -4233,10 +4673,16 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
+ "fictionet",
+ "fictionet-codegen",
+ "fictionet-extras",
+ "kuchiki",
  "libc",
  "regex",
  "serde_json",
+ "url",
+ "web-world",
 ]
 
 [[package]]

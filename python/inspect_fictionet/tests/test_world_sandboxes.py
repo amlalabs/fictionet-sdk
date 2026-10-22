@@ -9,14 +9,14 @@ import yaml
 from inspect_fictionet import fictionet_sandbox
 
 
-@pytest.mark.parametrize("name", ["border", "fakewiki", "adaptive_web", "artifactory"])
+@pytest.mark.parametrize("name", ["border", "fakewiki", "web", "artifactory"])
 def test_tasks_use_isolated_shared_sandbox(name, monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     tasks = importlib.import_module(f"inspect_fictionet.worlds.{name}.tasks")
     task = getattr(tasks, name)()
     config = yaml.safe_load(Path(task.sandbox.config).read_text())
     world, attach, agent = (config["services"][key] for key in ("world", "attach", "default"))
-    assert world["network_mode"] == ("bridge" if name == "adaptive_web" else "none")
+    assert world["network_mode"] == ("bridge" if name == "web" else "none")
     assert attach["network_mode"] == "none"
     assert agent["network_mode"] == "service:attach"
     assert "NET_RAW" in agent["cap_drop"]
@@ -41,8 +41,8 @@ def test_border_home_configuration(monkeypatch, tmp_path):
     }
 
 
-def test_adaptive_model_access_and_store_are_world_only(monkeypatch, tmp_path):
-    from inspect_fictionet.worlds.adaptive_web.world import world_sandbox
+def test_web_model_access_and_store_are_world_only(monkeypatch, tmp_path):
+    from inspect_fictionet.worlds.web.world import world_sandbox
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "private-key")
@@ -52,7 +52,7 @@ def test_adaptive_model_access_and_store_are_world_only(monkeypatch, tmp_path):
     assert "private-key" not in text
     assert config["world"]["network_mode"] == "bridge"
     assert config["world"]["environment"]["OPENROUTER_API_KEY"] == "${OPENROUTER_API_KEY:-}"
-    assert {"type": "bind", "source": str(tmp_path / "pages"), "target": "/var/lib/adaptive-web"} in config["world"]["volumes"]
+    assert {"type": "bind", "source": str(tmp_path / "pages"), "target": "/var/lib/web"} in config["world"]["volumes"]
     assert config["attach"]["network_mode"] == "none"
     assert config["default"]["network_mode"] == "service:attach"
     assert "OPENROUTER_API_KEY" not in config["default"]["environment"]
@@ -71,12 +71,3 @@ def test_invalid_world_options(options, tmp_path):
         fictionet_sandbox("world", cache_dir=tmp_path, **options)
 
 
-@pytest.mark.parametrize("generator", ["stub", "replay", "openrouter", "anthropic"])
-def test_adaptive_world_has_outbound_networking_with_every_generator(generator, monkeypatch, tmp_path):
-    from inspect_fictionet.worlds.adaptive_web.world import world_sandbox
-
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    config = yaml.safe_load(Path(world_sandbox(generator=generator).config).read_text())["services"]
-    assert config["world"]["network_mode"] == "bridge"
-    assert config["attach"]["network_mode"] == "none"
-    assert config["default"]["network_mode"] == "service:attach"

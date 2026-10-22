@@ -34,6 +34,10 @@ impl Key {
         let variable = provider.key_variable();
         Self::new(variable, std::env::var(variable).ok())
     }
+    /// The credential value for a host-side API request header.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
     /// The provider's credential header, for host-side requests only.
     pub fn header(&self, provider: Provider) -> (&'static str, String) {
         (
@@ -172,7 +176,7 @@ impl Transport for Https {
             let site = Model::with_forward(
                 cx,
                 self.provider,
-                credential,
+                Some(credential),
                 self.forward.clone(),
                 self.authority.clone(),
             );
