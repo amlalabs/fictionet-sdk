@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Instant;
 
 pub fn run(args: &[String]) -> Result {
-    let dir = crate::root().join("demos/guest");
+    let dir = crate::root().join("demos");
     let demos = demos(&dir)?;
     let binaries = binaries(&crate::root().join("demos"))?;
     if args.is_empty() {
@@ -46,11 +46,8 @@ pub fn run(args: &[String]) -> Result {
         && binaries.contains(name)
     {
         let rest = rest.strip_prefix(&[String::from("--")]).unwrap_or(rest);
-        // A preview serves the page without a VM, and a bake makes pages
-        // ahead of time: neither needs the VM's files or a downloads folder.
-        let preview = rest
-            .first()
-            .is_some_and(|arg| arg == "preview" || arg == "bake");
+        // A preview serves the page without a VM or its downloads.
+        let preview = rest.first().is_some_and(|arg| arg == "preview");
         if preview {
             libraries::assets()?;
         } else {
@@ -74,7 +71,7 @@ pub fn run(args: &[String]) -> Result {
     if !demos.contains(name) {
         return Err(format!("unknown demo: {name}\n{usage}").into());
     }
-    let script = fs::read_to_string(dir.join(format!("{name}.sh")))?;
+    let script = fs::read_to_string(dir.join(name).join("guest.sh"))?;
     let targets: Vec<String> = script
         .lines()
         .filter_map(|line| line.strip_prefix("# needs: "))
@@ -93,7 +90,7 @@ pub fn run(args: &[String]) -> Result {
             command.arg("-t");
         }
         command.arg("root@127.0.0.1").arg(format!(
-            "KIND_NODE_IMAGE={} bash /src/demos/guest/{name}.sh",
+            "KIND_NODE_IMAGE={} bash /src/demos/{name}/guest.sh",
             quote(vm::KIND_NODE),
         ));
         let result = execute(&mut command);
@@ -107,19 +104,21 @@ pub fn run(args: &[String]) -> Result {
     })
 }
 
-/// The demos are the scripts in demos/guest with a `# needs:` line.
+/// VM demos own a guest script with a `# needs:` line.
 fn demos(dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "sh")
+        let folder = entry?.path();
+        let path = folder.join("guest.sh");
+        if path.is_file()
             && fs::read_to_string(&path)?
                 .lines()
                 .any(|line| line.starts_with("# needs: "))
         {
             names.push(
-                path.file_stem()
-                    .ok_or("a script without a name")?
+                folder
+                    .file_name()
+                    .ok_or("a script without a demo folder")?
                     .to_string_lossy()
                     .into_owned(),
             );

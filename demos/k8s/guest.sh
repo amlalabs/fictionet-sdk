@@ -3,7 +3,7 @@
 # Helm chart in charts/fictionet-sandbox, and an agent pod whose only
 # network is the world.
 # needs: sdk
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../kit/guest/lib.sh"
 cluster=fictionet-demo
 release=demo
 pod="fictionet-sandbox-$release-default-0"

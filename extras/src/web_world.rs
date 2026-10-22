@@ -1,4 +1,4 @@
-//! The sites and startup of the quick-start world, `demos/web_world/main.rs`.
+//! The sites and startup of the quick-start world, `demos/web/main.rs`.
 //! The web test's fixture, `tests/web_fixture`, serves the same world with
 //! routes of its own added.
 //!

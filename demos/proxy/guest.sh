@@ -3,8 +3,8 @@
 # privileges and no tun device reaches the world through attach's HTTP
 # proxy and SOCKS5 proxy.
 # needs: sdk
-. "$(dirname "$0")/lib.sh"
-. "$(dirname "$0")/web_setup.sh"
+. "$(dirname "$0")/../kit/guest/lib.sh"
+. "$(dirname "$0")/../kit/guest/web_setup.sh"
 
 token="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
 proxy="http://relay:$token@127.0.0.1:8080"

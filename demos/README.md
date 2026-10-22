@@ -80,8 +80,8 @@ interactive applications.
 The shared kit handles guests, provisioning, networking and run lifetime.
 `Kit::page` declares hosts and panels. `Kit::world` starts the world's
 services. `Guest::forbid` adds words that must not appear in guest files,
-names, packages or commands. The kit's containment panel reports observed
-network probes.
+names, packages or commands. The Architecture and Packets views show observed
+network activity.
 
 For a series of VM integration runs, use `cargo xtask vm up` first and
 `cargo xtask vm down` when finished. A demo shuts down a VM it started.

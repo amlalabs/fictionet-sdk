@@ -12,7 +12,7 @@ fn main() {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets it"));
 
     // Cloud Hypervisor's static binary, embedded when it has been downloaded.
-    println!("cargo::rerun-if-changed=downloads/cloudimage/cloud-hypervisor");
+    println!("cargo::rerun-if-changed=../downloads/cloudimage/cloud-hypervisor");
     let ch = manifest.join("../downloads/cloudimage/cloud-hypervisor");
     let ch_rs = if ch.is_file() {
         format!(

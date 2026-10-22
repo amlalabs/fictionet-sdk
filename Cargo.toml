@@ -18,7 +18,7 @@ members = [
     "demos/lossy_sites",
     "demos/ping_world",
     "demos/route_change",
-    "demos/web_world",
+    "demos/web",
 
     "demos/*/app",
     "demos/*/world",
@@ -121,7 +121,7 @@ divan = "0.1.21"
 # Example targets. `cargo test` also runs those marked with `test = true`.
 [[example]]
 name = "web_world"
-path = "demos/web_world/main.rs"
+path = "demos/web/main.rs"
 required-features = ["std"]
 test = false
 

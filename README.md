@@ -141,7 +141,7 @@ fn world(
 ```
 
 A longer version, which the docs compile as a test, is at the top of
-[`stdlib::web`](src/stdlib/web/mod.rs), and [`demos/web_world/main.rs`](demos/web_world/main.rs)
+[`stdlib::web`](src/stdlib/web/mod.rs), and [`demos/web/main.rs`](demos/web/main.rs)
 is a complete world.
 
 Underneath, a world is a set of tasks joined by packet interfaces: a delay, a
@@ -210,7 +210,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 |---|---|
 | [`demos/ping_world/main.rs`](demos/ping_world/main.rs) | The smallest world: it answers every ping and drops everything else. |
 | [`demos/custom_protocol`](demos/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom presenter installed in its in-process collector. Runs without network or root; it serves no observation socket. |
-| [`demos/web_world/main.rs`](demos/web_world/main.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The getting-started tutorial runs it. |
+| [`demos/web/main.rs`](demos/web/main.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The getting-started tutorial runs it. |
 | [`demos/delayed_sites/main.rs`](demos/delayed_sites/main.rs) | Each site is 200 ms away, using `stdlib::network::delay` and `Attachments::map`. |
 | [`demos/lossy_sites/main.rs`](demos/lossy_sites/main.rs) | `stdlib::network::filter` drops 5% of packets each way. |
 | [`demos/bottleneck_sites/main.rs`](demos/bottleneck_sites/main.rs) | An 8 Mbit/s link using `stdlib::network::bottleneck`, with a count of queue drops. |

@@ -3,8 +3,8 @@
 # sandbox that reaches it through a tun device, with ordinary tools. Then
 # `fictionet observe` reads what the world saw from its observation socket.
 # needs: sdk
-. "$(dirname "$0")/lib.sh"
-. "$(dirname "$0")/web_setup.sh"
+. "$(dirname "$0")/../kit/guest/lib.sh"
+. "$(dirname "$0")/../kit/guest/web_setup.sh"
 
 cleanup() {
     cleanup_web
