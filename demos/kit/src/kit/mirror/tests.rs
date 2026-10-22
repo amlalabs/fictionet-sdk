@@ -140,7 +140,6 @@ where
     match hosts.call(request, &mut Exchange::new(fcx.now(), fcx, &conn)) {
         Reply::Now(r) => Ok(r),
         Reply::Later(f) => f(fcx.clone()).await,
-        Reply::Handoff(_) => panic!("unexpected upgrade"),
     }
 }
 

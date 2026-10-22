@@ -9,6 +9,7 @@ use fictionet::{
             dns::rr::{RData, RecordType},
             http1,
         },
+        web::httpd,
         world::sandbox::{self, Machine, machine},
     },
 };
@@ -19,6 +20,15 @@ use std::{
     time::SystemTime,
 };
 use web_world::{World, pages::Seed, search::Searches};
+
+/// The caller's own site: "caller content" on every path.
+struct CallerContent;
+
+impl httpd::Handler for CallerContent {
+    fn call(&self, _: http::Request<httpd::Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        httpd::Reply::Now(httpd::text(http::StatusCode::OK, "caller content"))
+    }
+}
 
 async fn fetch(
     cx: &Cx,
@@ -75,13 +85,9 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
             world
                 .net(&cx, log, move |name| {
                     (name == "forwarded.com").then(|| {
-                        fictionet::stdlib::web::Site::handler(
-                            fictionet::stdlib::web::httpd::Router::new().get("/", |_, _| {
-                                http::Response::new(bytes::Bytes::from_static(b"caller content"))
-                            }),
-                        )
-                        .tls(tls.clone())
-                        .into_host(name)
+                        fictionet::stdlib::web::Site::handler(CallerContent)
+                            .tls(tls.clone())
+                            .into_host(name)
                     })
                 })
                 .start(&cx, attachments)?;
