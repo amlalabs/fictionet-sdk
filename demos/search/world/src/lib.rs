@@ -1,38 +1,18 @@
-//! The web on Fictionet: every name resolves, every HTTPS host has
-//! a certificate, and every page is made the first time it is asked for.
+//! The Search world's DNS, TLS, web pages and search engines.
 //!
-//! ```text
-//! web-world --seed web --socket /run/fictionet/sock/world.sock \
-//!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready
-//! ```
+//! [`World`] joins public hostnames to certificates and an HTTP handler.
+//! [`pages`] supplies copied WARC responses, model-written pages, or live
+//! captures. Google, Bing and DuckDuckGo render results over the same index.
+//! The world's clock comes from the brief's date; headers, pages and
+//! certificates use it together. [`events`] writes the request log and
+//! [`search`] projects those observations for the page.
 //!
-//! - **Names** ([`admit`]): any name that could exist on the internet gets
-//!   a site the first time it is looked up. Single-label names and the
-//!   reserved and private top-level domains get NXDOMAIN.
-//! - **Addresses** ([`Addresses`]): the search engines and the seed's
-//!   hosts have fixed addresses. Every other host gets the next free
-//!   address from two public-looking pools, in the order hosts are first
-//!   looked up, and keeps it for the run. Each assignment is appended to
-//!   the store's `addresses.jsonl`, so a later run, or another world, on
-//!   the same store gives every host the same address. Unreadable or
-//!   corrupt history fails startup. An append failure refuses the host and
-//!   fails finalization.
-//! - **TLS** ([`Ca`]): a host's certificate is made at its first handshake
-//!   and signed by a seeded CA whose public root is written at startup.
-//! - **Dates** ([`world_start`]): the world's clock starts on the seed's
-//!   date, so every response's `Date` header follows the world clock, and each
-//!   certificate was issued shortly before it.
-//! - **Pages** ([`pages`]): searches and pages, made by the offline
-//!   generator or a model, kept in a store, and checked for consistency
-//!   with what the world already said. [`handler`] answers every site from
-//!   them.
-//! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, the
-//!   ready file, and the store. The log is written from the run's events
-//!   ([`events`]).
+//! The demo app in `demos/search/app` adds the VM, guest credential model
+//! gateway, provider sign-in relay and package mirror. The standalone
+//! `web-world` binary accepts its configuration as JSON, followed by socket,
+//! certificate, state and ready-file arguments.
 //!
-//! An in-process [`World`] keeps its addresses, pages and CA in memory.
-//! This example sends its log to standard output, and turns generation off
-//! once the network is up.
+//! An in-process world can also serve an attached guest:
 //!
 //! ```no_run
 //! use std::sync::Arc;
