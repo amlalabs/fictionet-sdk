@@ -40,7 +40,7 @@ const ATTEMPTS: u32 = 3;
 /// How long one HTTP attempt may take.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
-/// A model API used by the page maker.
+/// A model API selected by the world configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -251,7 +251,36 @@ pub struct Answer<T> {
     pub raw: String,
 }
 
+struct OpenRouter;
+
+impl Transport for OpenRouter {
+    fn post<'a>(
+        &'a self,
+        cx: &'a Cx,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    ) -> fictionet_extras::models::Post<'a> {
+        Box::pin(async move {
+            fictionet_extras::models::Https::new(cx, fictionet_extras::models::Provider::OpenRouter)
+                .map_err(|e| e.to_string())?
+                .post(cx, headers, body)
+                .await
+        })
+    }
+}
+
 impl Model {
+    /// The default page writer, using the existing OpenRouter credential.
+    pub fn openrouter() -> Result<Self, String> {
+        Ok(Self::new(
+            Provider::OpenRouter,
+            "",
+            "",
+            Key::from_env(fictionet_extras::models::Provider::OpenRouter)?,
+            Arc::new(OpenRouter),
+        ))
+    }
+
     /// A model of `provider`; an empty `model` is the provider's default.
     pub fn new(
         provider: Provider,
@@ -342,7 +371,7 @@ impl Model {
                     vec![
                         self.key.header(self.provider.into()),
                         ("content-type", "application/json".into()),
-                        ("x-title", "Fictionet adaptive web".into()),
+                        ("x-title", "Fictionet web".into()),
                     ],
                     body,
                 )

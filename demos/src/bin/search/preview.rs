@@ -106,7 +106,7 @@ pub async fn run() -> Result {
                 start,
             };
             let (attacher, attachments) = fictionet::attachments();
-            page::network(&world, &cx, log, kit::mirror::new(&cx)?, None)?
+            page::network(&world, &cx, log, kit::mirror::new(&cx)?)?
                 .start(&cx, attachments)?;
             topics.start(&cx, searches.clone(), world.pages.clone())?;
             let workstation = machine(

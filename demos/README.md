@@ -18,14 +18,12 @@ supported search tools from its own web.
 
 ## Search
 
-`cargo xtask demo search` opens an Ubuntu desktop on the adaptive web.
-Firefox, Claude Code and Codex share the world's pages. Agents sign in
-inside the VM. With `OPENROUTER_API_KEY` the world's page maker can generate
-pages; without it, the offline maker answers. This key belongs to the world,
-not to an agent.
-
-`cargo xtask demo search bake` uses the world's model key to make a canned
-page store. `cargo xtask demo search preview` serves the page without a VM.
+`cargo xtask demo search` opens an Ubuntu desktop on the astronomy web.
+Firefox, Claude Code and Codex share its pages and search index. Agents sign
+in inside the VM and model calls use their own credentials. The World menu
+selects Copied, Model-written or Live pages. `OPENROUTER_API_KEY` enables
+model-written pages; the world's key is separate from the agents' keys.
+`cargo xtask demo search preview` serves the page without a VM.
 
 ## Border
 
