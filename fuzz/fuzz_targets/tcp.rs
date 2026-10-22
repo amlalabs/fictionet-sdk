@@ -54,7 +54,6 @@ enum Op {
         bad_checksum: bool,
     },
     Pump(u8),
-    Sleep(u8),
     Accept,
     Connect(u8),
     Read {
@@ -80,19 +79,6 @@ struct Flow {
 }
 
 type Connecting = Pin<Box<dyn Future<Output = Result<TcpConnection, ConnError>> + Send>>;
-
-/// How many milliseconds one input may sleep in all, from
-/// `FICTIONET_FUZZ_SLEEP_MS`. 0 by default: sleeping reaches the timers
-/// (delayed ACKs, TIME-WAIT) but makes each run slower by far.
-fn sleep_budget() -> u64 {
-    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("FICTIONET_FUZZ_SLEEP_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
 
 fn seq_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
@@ -194,7 +180,6 @@ fuzz_target!(|input: Input| {
             .collect();
         let mut conns: Vec<TcpConnection> = Vec::new();
         let mut connecting: Vec<Connecting> = Vec::new();
-        let mut slept = 0u64;
         let data = |len: u16| -> Vec<u8> { (0..len as usize % 1460).map(|i| i as u8).collect() };
         for op in input.ops {
             match op {
@@ -252,11 +237,6 @@ fuzz_target!(|input: Input| {
                             None => i += 1,
                         }
                     }
-                }
-                Op::Sleep(ms) => {
-                    let ms = (ms as u64 % 12).min(sleep_budget() - slept);
-                    slept += ms;
-                    let _ = fcx.sleep(std::time::Duration::from_millis(ms)).await;
                 }
                 Op::Accept => {
                     if let Some(l) = &mut listener

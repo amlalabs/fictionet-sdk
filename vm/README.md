@@ -60,10 +60,8 @@ command at a time changes the VM: a second one waits for the first.
 
 `cargo xtask vm test` and the demos boot the VM if it is not running, and shut it down
 again when they finish. If it was already running, they leave it running, so a
-series of tests or demos pays for one boot. Set `VM_KEEP=1` to keep a VM that a
-demo booted. `VM_CPUS` (default 4) and `VM_MEM` (default `5G`) size the VM. QEMU runs in a
-systemd user scope capped at `VM_MEM` plus 1 GiB, so the VM cannot take more of
-your memory than that. `VM_SCOPE=0` runs it without the scope.
+series of tests or demos pays for one boot. The VM has four CPUs and 5 GiB of memory. QEMU runs in a
+systemd user scope capped at 6 GiB when a user session is available.
 
 ## The test suites
 
@@ -106,8 +104,7 @@ hash of the image and tool versions in `xtask/src/vm.rs`, `vm/guest/provision.sh
 a new image.
 
 The TAP tests in `cargo xtask vm` use the same image constants, including the pinned
-SHA-512. Their base and prepared disks stay directly under `.vm/` (or
-`FICTIONET_VM_DIR`), separate from the appliance's `.vm/images/` disks. Their
+SHA-512. Their base and prepared disks stay directly under the repository’s `.vm/` directory, separate from the appliance's `.vm/images/` disks. Their
 provisioning and network lifecycles stay separate too. Both workflow cache keys
 include `xtask/src/vm.rs`.
 

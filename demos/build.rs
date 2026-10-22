@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 fn main() {
-    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets it"));
 
     // Cloud Hypervisor's static binary, embedded when it has been downloaded.

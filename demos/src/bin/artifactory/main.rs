@@ -2,7 +2,6 @@
 //! serves its page: Doors tried, Packages and Requests beside the standard
 //! panels. Run `cargo xtask demo artifactory`. The default variant is
 //! lookalike. Select normal, missing, lookalike or peer with `--variant`.
-//! Add `--stay` to keep the page open after the checks until Ctrl-C.
 //! `artifactory preview` serves the page without a VM. Its `--extra-reads N`
 //! adds N index reads after the replayed story, enough to fill the page's
 //! row bound. With `--variant peer`, `--sessions shared|separate` adds a
@@ -27,13 +26,9 @@ use fictionet::events::Fanout;
 use fictionet_demo::kit::{self, Kit};
 use fictionet_observe::Aggregate;
 use guest::HOSTNAME;
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
+use std::io;
+use std::path::PathBuf;
+use std::sync::{Arc, atomic::AtomicBool};
 use story::Mode;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -42,14 +37,13 @@ struct Args {
     /// None for the preview without a VM.
     downloads: Option<PathBuf>,
     variant: Variant,
-    stay: bool,
     extra_reads: usize,
     sessions: Option<Mode>,
 }
 
 fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
     let first = args.next().ok_or(
-        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--sessions shared|separate] [--stay], or artifactory preview [--variant V] [--sessions S] [--extra-reads N]",
+        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--sessions shared|separate], or artifactory preview [--variant V] [--sessions S] [--extra-reads N]",
     )?;
     if first.starts_with("--") {
         return Err("expected the downloads directory or preview before options".into());
@@ -58,14 +52,12 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
     let mut parsed = Args {
         downloads: (!preview).then(|| first.into()),
         variant: Variant::Lookalike,
-        stay: false,
         extra_reads: 0,
         sessions: None,
     };
     let (mut selected, mut reads) = (false, false);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--stay" if !preview && !parsed.stay => parsed.stay = true,
             "--variant" if !selected => {
                 selected = true;
                 parsed.variant = names::parse(&args.next().ok_or("--variant needs a value")?)
@@ -105,14 +97,14 @@ async fn execute() -> Result {
     let Args {
         downloads,
         variant,
-        stay,
         extra_reads,
         sessions,
     } = args(std::env::args().skip(1))?;
     let Some(downloads) = downloads else {
         return preview::serve(variant, sessions, extra_reads).await;
     };
-    let shots = kit::checks::output(&downloads, "artifactory")?;
+    let shots = downloads.join("artifactory");
+    std::fs::create_dir_all(&shots)?;
     let log_path = shots.join("artifactory.jsonl");
     let log = Log::start(Box::new(std::io::BufWriter::new(std::fs::File::create(
         &log_path,
@@ -174,80 +166,10 @@ async fn execute() -> Result {
         .world(move |fcx, world| async move {
             world::start(&fcx, world, states, world_log, mirror_closed)
         });
-    let final_facts = facts.clone();
-    let final_publisher = publisher.clone();
-    let result = kit::checks::run(
-        kit,
-        &downloads,
-        &shots,
-        kit::checks::story(
-            move |run, _| -> kit::checks::Story<'_, Box<dyn std::error::Error>> {
-                Box::pin(async move {
-                    checks(run, &facts, &publisher, &closed, variant, sessions).await?;
-                    if stay {
-                        kit::checks::stay_open().await?;
-                    }
-                    Ok::<_, Box<dyn std::error::Error>>(())
-                })
-            },
-        )
-        .finish_with(move || {
-            Box::pin(async move {
-                let published = final_publisher
-                    .flush()
-                    .await
-                    .and_then(|()| final_facts.state.lock().unwrap().check_complete());
-                let finished = log.finish();
-                published?;
-                finished.map_err(Into::into)
-            })
-        }),
-    )
-    .await;
-    if result.is_err() {
-        tail(&log_path)?;
-    }
+    let result = kit.run_app(&downloads, HOSTNAME).await;
+    publisher.flush().await?;
+    log.finish()?;
     result?;
-    Ok(())
-}
-
-async fn checks(
-    run: &kit::Run,
-    facts: &facts::Facts,
-    publisher: &facts::Publisher,
-    closed: &AtomicBool,
-    variant: Variant,
-    sessions: Option<Mode>,
-) -> Result<Duration> {
-    let guest = run.guest(HOSTNAME);
-    let colleague = sessions.map(|_| run.guest(guest::COLLEAGUE));
-    closed.store(true, Ordering::SeqCst);
-    println!("mirror closed");
-    let index = facts.wait_until(Duration::from_secs(30), |state| {
-        state.requests.iter().any(|r| {
-            r.step == "setup"
-                && r.row.host.as_deref() == Some(artifactory_world::REPOSITORY_NAME)
-                && r.row.path == "/simple/"
-                && r.row.outcome.status == Some(200)
-                && r.row.outcome.complete
-        })
-    });
-    if !index.await? {
-        return Err("Firefox did not load the internal package index".into());
-    }
-    guest::open_terminal(guest).await?;
-    let story_time = story::run(guest, colleague, facts, publisher, variant, sessions).await?;
-    println!("{}", page::check(run.page_url(), variant, sessions).await?);
-    Ok(story_time)
-}
-
-fn tail(path: &Path) -> io::Result<()> {
-    let mut file = std::fs::File::open(path)?;
-    let length = file.metadata()?.len();
-    file.seek(SeekFrom::Start(length.saturating_sub(16 * 1024)))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    eprintln!("world log tail:\n{}", String::from_utf8_lossy(&bytes));
     Ok(())
 }
 
@@ -263,13 +185,6 @@ mod tests {
                 names::name(&parse(&["downloads", "--variant", variant]).unwrap().variant),
                 variant
             );
-        }
-        for input in [
-            &["d", "--stay"][..],
-            &["d", "--stay", "--variant", "peer"],
-            &["d", "--variant", "normal", "--stay"],
-        ] {
-            assert!(parse(input).unwrap().stay);
         }
         for input in [&["preview"][..], &["preview", "--variant", "peer"]] {
             assert!(parse(input).unwrap().downloads.is_none());

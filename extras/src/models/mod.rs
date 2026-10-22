@@ -358,8 +358,9 @@ impl Ledger {
 #[derive(Clone)]
 pub struct Model {
     cx: Cx,
+    connection: fictionet::events::ConnInfo,
     provider: Provider,
-    credential: Credential,
+    credential: Option<Credential>,
     forward: web::Forward,
     authority: String,
     upstream_provider: Provider,
@@ -367,7 +368,7 @@ pub struct Model {
     ledger: Arc<Mutex<Ledger>>,
     prices: Option<(String, Prices)>,
     engine: Option<Arc<dyn Engine>>,
-    seal: Arc<splice::Seal>,
+    cipher: Arc<splice::TokenCipher>,
     continued: Arc<Mutex<Continued>>,
     catalog: Option<Catalog>,
 }
@@ -417,6 +418,30 @@ impl Model {
             format!("https://{}", provider.host()).parse()?,
         )
     }
+    /// Uses credentials supplied by the guest without replacing them.
+    /// The world must terminate TLS and restrict the mounted provider hosts.
+    pub fn guest(cx: &Cx, provider: Provider) -> fictionet::Result<Self> {
+        Self::guest_at(
+            cx,
+            provider,
+            format!("https://{}", provider.host()).parse()?,
+        )
+    }
+
+    fn guest_at(cx: &Cx, provider: Provider, origin: http::Uri) -> fictionet::Result<Self> {
+        let authority = origin
+            .authority()
+            .ok_or_else(|| Error::msg("model origin needs an authority"))?
+            .to_string();
+        Ok(Self::with_forward(
+            cx,
+            provider,
+            None,
+            web::forward(cx, origin, Arc::new(fictionet_host::Client::new()))?,
+            authority,
+        ))
+    }
+
     /// Builds a provider using a supplied credential and origin.
     /// Custom origins let a world use its own gateway or a local upstream.
     pub fn at(
@@ -432,7 +457,7 @@ impl Model {
         Ok(Self::with_forward(
             cx,
             provider,
-            credential,
+            Some(credential),
             web::forward(
                 cx,
                 origin,
@@ -444,12 +469,13 @@ impl Model {
     fn with_forward(
         cx: &Cx,
         provider: Provider,
-        credential: Credential,
+        credential: Option<Credential>,
         forward: web::Forward,
         authority: String,
     ) -> Self {
         Self {
             cx: cx.clone(),
+            connection: Default::default(),
             provider,
             credential,
             forward,
@@ -459,7 +485,7 @@ impl Model {
             ledger: Arc::new(Mutex::new(Ledger::default())),
             prices: None,
             engine: None,
-            seal: Arc::new(splice::Seal::new(cx)),
+            cipher: Arc::new(splice::TokenCipher::new(cx)),
             continued: Arc::default(),
             catalog: None,
         }
@@ -470,7 +496,9 @@ impl Model {
         origin: http::Uri,
         answer: Option<(String, Bytes)>,
     ) -> fictionet::Result<Self> {
-        if self.provider != Provider::OpenAi || self.credential.oauth.is_some() {
+        if self.provider != Provider::OpenAi
+            || self.credential.as_ref().is_none_or(|c| c.oauth.is_some())
+        {
             return Err(Error::msg(
                 "Codex API-key catalogs require an OpenAI model site",
             ));
@@ -483,7 +511,7 @@ impl Model {
         let mut site = Self::at(
             &self.cx,
             Provider::ChatGpt,
-            self.credential.clone(),
+            self.credential.clone().expect("API key catalog"),
             origin.clone(),
         )?;
         site.ledger = self.ledger.clone();
@@ -528,28 +556,33 @@ impl Model {
     }
     /// Placeholder environment for a guest.
     pub fn guest_env(&self) -> Vec<(&'static str, String)> {
-        if self.credential.oauth.is_some() {
+        let Some(credential) = &self.credential else {
+            return Vec::new();
+        };
+        if credential.oauth.is_some() {
             return Vec::new();
         }
-        vec![(
-            self.provider.key_variable(),
-            self.credential.placeholder.clone(),
-        )]
+        vec![(self.provider.key_variable(), credential.placeholder.clone())]
     }
     fn refused(&self, path: &str, reason: &'static str) {
-        self.cx.emit("model", "refused", |e| {
-            e.field("provider", self.provider.host())
-                .field("path", path)
-                .field("reason", reason)
-        });
+        self.cx
+            .emitter(&self.connection)
+            .emit("model", "refused", |e| {
+                e.field("provider", self.provider.host())
+                    .field("path", path)
+                    .field("reason", reason)
+            });
     }
     /// Whether the request carries exactly the guest's credential.
     fn authorized(&self, headers: &http::HeaderMap) -> bool {
-        let expected = self.credential.wire(self.provider, false);
-        let values = headers.get_all(self.credential.header(self.provider));
+        let Some(credential) = &self.credential else {
+            return self.guest_secret(headers).is_ok();
+        };
+        let expected = credential.wire(self.provider, false);
+        let values = headers.get_all(credential.header(self.provider));
         values.iter().count() == 1
             && values.iter().next().is_some_and(|v| {
-                if let Some(oauth) = &self.credential.oauth {
+                if let Some(oauth) = &credential.oauth {
                     v.to_str()
                         .ok()
                         .and_then(|v| v.strip_prefix("Bearer "))
@@ -558,6 +591,30 @@ impl Model {
                     v.as_bytes() == expected.as_bytes()
                 }
             })
+    }
+    fn guest_secret(&self, headers: &http::HeaderMap) -> fictionet::Result<Secret> {
+        let name = if headers.contains_key("authorization") {
+            "authorization"
+        } else {
+            self.provider.header()
+        };
+        let values = headers.get_all(name);
+        if values.iter().count() != 1 {
+            return Err(Error::msg("Missing or ambiguous model credential"));
+        }
+        let value = values
+            .iter()
+            .next()
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Error::msg("Invalid model credential"))?;
+        let value = if name == "authorization" {
+            value
+                .strip_prefix("Bearer ")
+                .ok_or_else(|| Error::msg("Invalid bearer credential"))?
+        } else {
+            value
+        };
+        Secret::new("guest credential", value.to_owned())
     }
     fn unauthorized(&self) -> Response<Body> {
         self.provider.error(
@@ -571,15 +628,17 @@ impl Model {
     fn admit(&self, path: &str, count: bool) -> Option<Response<Body>> {
         let mut ledger = self.ledger.lock().unwrap();
         if let Some(kind) = ledger.exhausted() {
-            self.cx.emit("model", "budget", |e| {
-                e.field("provider", self.provider.host())
-                    .field("kind", kind)
-            });
+            self.cx
+                .emitter(&self.connection)
+                .emit("model", "budget", |e| {
+                    e.field("provider", self.provider.host())
+                        .field("kind", kind)
+                });
             self.refused(path, "budget");
             return Some(
                 self.credential
-                    .oauth
                     .as_ref()
+                    .and_then(|c| c.oauth.as_ref())
                     .map_or_else(|| self.provider.stop(), oauth::OAuth::stop),
             );
         }
@@ -627,6 +686,26 @@ impl Model {
         {
             return Ok(Response::new(Body::empty()));
         }
+        // The guest's subscription login reads its profile and account at
+        // the API host as well as exchanging tokens at the sign-in host.
+        if self.credential.is_none()
+            && self.provider == Provider::Anthropic
+            && path.strip_prefix("/api/oauth/").is_some_and(|tail| {
+                !tail.is_empty()
+                    && tail
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"/_-".contains(&b))
+            })
+        {
+            if !self.authorized(request.headers()) {
+                return Ok(self.unauthorized());
+            }
+            let mut request = request;
+            request
+                .headers_mut()
+                .insert("host", self.authority.parse()?);
+            return self.forward.clone().call(request).await;
+        }
         // With a ChatGPT login, Codex reads its account, usage and models first.
         let listing = self.provider == Provider::ChatGpt
             && request.method() == http::Method::GET
@@ -649,7 +728,7 @@ impl Model {
             self.refused(&path, "credential");
             return Ok(self.unauthorized());
         }
-        if policy_limits {
+        if policy_limits && self.credential.is_some() {
             return Ok(Response::builder()
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"restrictions":{}}"#))?);
@@ -711,7 +790,7 @@ impl Model {
         parts.headers.remove("content-length");
         let mut body: Value = match serde_json::from_slice(&bytes) {
             Ok(Value::Object(body)) => Value::Object(body),
-            _ if listing && bytes.is_empty() => json!({}),
+            _ if (listing || policy_limits) && bytes.is_empty() => json!({}),
             _ => {
                 return Ok(self.provider.error(
                     400,
@@ -775,8 +854,10 @@ impl Model {
         if !free && let Some(stop) = self.admit(&path, true) {
             return Ok(stop);
         }
-        if let Some(oauth) = &self.credential.oauth {
-            self.credential.real = oauth.secret().await?;
+        if let Some(credential) = &mut self.credential
+            && let Some(oauth) = &credential.oauth
+        {
+            credential.real = oauth.secret().await?;
             if self.provider == Provider::ChatGpt {
                 parts
                     .headers
@@ -788,20 +869,26 @@ impl Model {
         } else {
             "http"
         };
-        let mut call = response::Call::new(&self, path, &body, &bytes, free, transport);
-        for name in [
-            "authorization",
-            "x-api-key",
-            "x-goog-api-key",
-            "cookie",
-            "proxy-authorization",
-        ] {
-            parts.headers.remove(name);
+        let secret = match &self.credential {
+            Some(credential) => credential.real.clone(),
+            None => self.guest_secret(&parts.headers)?,
+        };
+        let mut call = response::Call::new(&self, path, &body, &bytes, free, transport, &secret);
+        if let Some(credential) = &self.credential {
+            for name in [
+                "authorization",
+                "x-api-key",
+                "x-goog-api-key",
+                "cookie",
+                "proxy-authorization",
+            ] {
+                parts.headers.remove(name);
+            }
+            parts.headers.insert(
+                credential.header(self.upstream_provider),
+                credential.wire(self.upstream_provider, true).parse()?,
+            );
         }
-        parts.headers.insert(
-            self.credential.header(self.upstream_provider),
-            self.credential.wire(self.upstream_provider, true).parse()?,
-        );
         if !self.path_prefix.is_empty() {
             parts.uri = format!(
                 "{}{}",
@@ -831,21 +918,14 @@ impl Model {
                 response.headers_mut().remove("content-length");
                 for value in response.headers_mut().values_mut() {
                     if let Ok(text) = value.to_str() {
-                        *value = self.credential.real.redact(text).parse()?;
+                        *value = secret.redact(text).parse()?;
                     }
                 }
-                Ok(response.map(|body| {
-                    Body::new(response::Metered::new(
-                        body,
-                        call,
-                        sse,
-                        self.credential.real,
-                    ))
-                }))
+                Ok(response.map(|body| Body::new(response::Metered::new(body, call, sse, secret))))
             }
             Err(error) => {
                 call.stop = "transport_error".into();
-                Err(Error::msg(self.credential.real.redact(&error.to_string())))
+                Err(Error::msg(secret.redact(&error.to_string())))
             }
         }
     }
@@ -860,11 +940,12 @@ fn set_catalog_origin(response: &mut Response<Body>, origin: &str) {
 /// The site's requests: a Responses WebSocket handshake gets its `101`
 /// here, and every other request runs as deferred work.
 impl httpd::Handler for Model {
-    fn call(&self, request: Request<Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+    fn call(&self, request: Request<Body>, exchange: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        let mut model = self.clone();
+        model.connection = exchange.conn().clone();
         if self.catalog.is_none() && websocket::wanted(self.provider, &request) {
-            return httpd::Reply::Now(websocket::accept(self.clone(), request));
+            return httpd::Reply::Now(websocket::accept(model, request));
         }
-        let model = self.clone();
         httpd::Reply::Later(Box::new(move |_| Box::pin(model.send(request))))
     }
 }

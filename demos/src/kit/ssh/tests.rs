@@ -117,7 +117,6 @@ pub(crate) struct Peer {
     pub session: Arc<Session>,
     pub events: mpsc::UnboundedReceiver<String>,
     pub ready: Arc<AtomicBool>,
-    pub rfb: Arc<Mutex<Vec<u8>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Peer {
@@ -162,7 +161,6 @@ impl Peer {
             session: Arc::new(session),
             events: rx,
             ready,
-            rfb,
             task,
         }
     }
@@ -217,8 +215,8 @@ impl server::Handler for Server {
             if data == b"large-output\r" {
                 let output: Vec<u8> = (0..512 * 1024).map(|n| (n % 251) as u8).collect();
                 session.data(id, CryptoVec::from_slice(&output))?;
-            } else if data == crate::kit::checks::HOSTNAME_LINE {
-                // The shell runs the checks' hostname line on the workstation.
+            } else if data == b"printf 'name:%s:end\\n' \"$(hostname)\"\r" {
+                // The shell prints the workstation hostname.
                 session.data(id, CryptoVec::from_slice(data))?;
                 session.data(id, CryptoVec::from_slice(b"name:workstation:end\r\n"))?;
             } else {

@@ -524,3 +524,58 @@ test('event cuts stay distinct from loss and successful downloads restore their 
   assert.equal(button.textContent, 'JSONL');
   dispose(); h.clean();
 });
+
+test('map excludes undeclared administrative nodes, links and counters', async (t) => {
+  const length = Element.prototype.getTotalLength;
+  Element.prototype.getTotalLength = () => 100;
+  t.after(() => { Element.prototype.getTotalLength = length; });
+  const h = await fixture(t);
+  const dispose = map(h.root, h.services);
+  h.watches[0].emit('snapshot', {
+    ...h.snapshot,
+    nodes: [...h.snapshot.nodes, { id: 't1', kind: 'task', name: 'network' }, { id: 's9', kind: 'sandbox', name: 'admin' }],
+    edges: [{ id: 'e1', a: 's1', b: 't1' }, { id: 'e9', a: 's9', b: 't1' }],
+    counters: { e1: [2, 80, 1, 40], e9: [9876, 999999, 1234, 99999] },
+  });
+  h.frame();
+  assert.doesNotMatch(h.root.textContent, /admin|9876|1234|999999/);
+  assert.equal(h.root.querySelector('#nodes').children.length, 2);
+  assert.equal(h.root.querySelector('#edges').children.length, 1);
+  dispose();
+  h.clean();
+});
+
+test('map links and nodes filter the full packet list and clearing restores all links', async (t) => {
+  for (const [name, value] of [['getTotalLength', () => 100], ['getPointAtLength', () => ({ x: 0, y: 0 })]]) {
+    const previous = Element.prototype[name];
+    Element.prototype[name] = value;
+    t.after(() => { Element.prototype[name] = previous; });
+  }
+  const h = await fixture(t);
+  h.services.transport.get = async () => ({ links: ['e1', 'e2'] });
+  const flow = h.root.ownerDocument.createElement('section');
+  const list = h.root.ownerDocument.createElement('section');
+  h.root.append(flow, list);
+  const stopMap = map(flow, h.services), stopList = packets(list, h.services);
+  h.watches[0].emit('snapshot', {
+    ...h.snapshot,
+    nodes: [...h.snapshot.nodes, { id: 't1', kind: 'task', name: 'DNS' }, { id: 't2', kind: 'task', name: 'Web' }],
+    edges: [{ id: 'e1', a: 's1', b: 't1' }, { id: 'e2', a: 's1', b: 't2' }],
+    counters: { e1: [1, 40, 1, 40], e2: [1, 40, 1, 40] },
+  });
+  await settle(); h.frame();
+  assert.equal(h.streams.at(-1).links, 'e1,e2');
+  const headings = list.querySelectorAll('th').map((cell) => cell.textContent);
+  for (const text of ['No.', 'Time', 'Source', 'Destination', 'Protocol', 'Length', 'Info']) assert.ok(headings.includes(text), text);
+  const link = flow.querySelectorAll('path.hit')[0];
+  link.click(); await settle();
+  assert.equal(h.streams.at(-1).links.split(',').length, 1);
+  const node = flow.querySelectorAll('.node').find((item) => item.dataset.id === 't2');
+  node.click(); await settle();
+  assert.equal(h.streams.at(-1).links, 'e2');
+  const key = new Event('keydown'); key.key = 'Escape'; flow.dispatchEvent(key);
+  await settle();
+  assert.equal(h.streams.at(-1).links, 'e1,e2');
+  assert.ok(list.querySelector('#tree')); assert.ok(list.querySelector('#hex')); assert.ok(list.querySelector('#pcap'));
+  stopMap(); stopList(); h.clean();
+});

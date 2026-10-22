@@ -40,7 +40,7 @@ fn ir(xml: &str) -> ValidatedSchema {
     validate(SbeFrontEnd.parse(&[input], limits).unwrap(), limits).unwrap()
 }
 
-/// The hand-written part starts at this line. `BLESS_CODEGEN=1` replaces
+/// The hand-written part starts at this line. `cargo xtask bless` replaces
 /// the generated body before it, preserving the header and hand-written part.
 const MARKER: &str = "\n// Hand-written below this line";
 
@@ -60,25 +60,10 @@ fn module_is_generator_output_plus_hand_written_framing() {
         .source;
     let generated = body(&generated);
     let tail = &MODULE[MODULE.find(MARKER).expect("marker")..];
-    if std::env::var_os("BLESS_CODEGEN").is_some() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/stdlib/protocols/cme_mdp3/mod.rs"
-        );
-        std::fs::write(
-            path,
-            format!(
-                "{}{generated}{tail}",
-                &MODULE[..MODULE.len() - body(MODULE).len()]
-            ),
-        )
-        .unwrap();
-        return;
-    }
     assert_eq!(
         body(&MODULE[..MODULE.len() - tail.len()]),
         generated,
-        "src/stdlib/protocols/cme_mdp3/mod.rs differs from the generator; set BLESS_CODEGEN=1 to update"
+        "src/stdlib/protocols/cme_mdp3/mod.rs differs from the generator; run cargo xtask bless to update"
     );
 }
 

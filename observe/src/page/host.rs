@@ -91,6 +91,12 @@ pub struct HostDescription {
     pub terminal: Option<String>,
     /// Whether Claude Code is installed.
     pub claude_code: bool,
+    /// Whether Codex is installed.
+    #[serde(default)]
+    pub codex: bool,
+    /// Whether Firefox is installed.
+    #[serde(default)]
+    pub firefox: bool,
 }
 
 /// One machine in a page composition.
@@ -103,6 +109,8 @@ pub struct Host {
     pub(super) screen: bool,
     pub(super) terminal: bool,
     claude_code: bool,
+    codex: bool,
+    firefox: bool,
 }
 
 impl Host {
@@ -118,6 +126,8 @@ impl Host {
             screen: false,
             terminal: false,
             claude_code: false,
+            codex: false,
+            firefox: false,
         }
     }
     /// Pins this host in the initial tiled workspace.
@@ -140,6 +150,16 @@ impl Host {
         self.claude_code = installed;
         self
     }
+    /// Declares that Codex is installed.
+    pub fn codex(mut self, installed: bool) -> Self {
+        self.codex = installed;
+        self
+    }
+    /// Declares that Firefox is installed.
+    pub fn firefox(mut self, installed: bool) -> Self {
+        self.firefox = installed;
+        self
+    }
     /// Supplies live status from the machine owner.
     pub fn status(mut self, topic: StateTopic<HostStatus>) -> Self {
         self.status = topic;
@@ -149,6 +169,8 @@ impl Host {
         HostDescription {
             pinned: self.pinned,
             claude_code: self.claude_code,
+            codex: self.codex,
+            firefox: self.firefox,
             name: self.name.clone(),
             sandbox: self.sandbox.clone(),
             status: format!("/api/state/host-{}", self.name),

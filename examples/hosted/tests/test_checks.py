@@ -71,7 +71,7 @@ class CheckTests(unittest.TestCase):
                 stub.chmod(0o755)
             return subprocess.run(
                 [shutil.which("sh"), str(CHECK)],
-                env={**os.environ, "PATH": directory},
+                env={"PATH": directory},
                 capture_output=True, text=True, check=False,
             )
 

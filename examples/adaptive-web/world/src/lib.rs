@@ -441,7 +441,7 @@ pub fn net(
     pages: Arc<Pages>,
     log: Arc<Log>,
     start: SystemTime,
-    forward: impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static,
+    forward: impl Fn(&str) -> Option<fictionet::stdlib::world::net::Host> + Send + Sync + 'static,
 ) -> fictionet::stdlib::world::net::Net {
     let handler = handler::Handler::new(fcx, pages.clone());
     log.attach(fcx);
@@ -509,14 +509,14 @@ pub fn net(
                             config
                         })
                         .clone()
-                }),
+                })
+                .into_host(host),
         )
     };
-    let hosts: Vec<_> = names
-        .iter()
-        .filter_map(|name| site_for(name).map(|site| site.into_host(name)))
-        .collect();
-    let mut net = web::Sites::new(site_for).ipv4_only().into_net();
+    let hosts: Vec<_> = names.iter().filter_map(|name| site_for(name)).collect();
+    let mut net = fictionet::stdlib::world::net::Net::new()
+        .ipv4_only()
+        .resolve(site_for);
     for host in hosts {
         net = net.add_host(host);
     }
@@ -549,7 +549,7 @@ impl World {
         &self,
         fcx: &Cx,
         log: Arc<Log>,
-        forward: impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static,
+        forward: impl Fn(&str) -> Option<fictionet::stdlib::world::net::Host> + Send + Sync + 'static,
     ) -> fictionet::stdlib::world::net::Net {
         net(
             fcx,

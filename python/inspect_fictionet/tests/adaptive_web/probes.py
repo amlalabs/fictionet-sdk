@@ -49,7 +49,7 @@ from inspect_fictionet._common.evidence import page_delivered
 from inspect_fictionet._common.task import split, world_log, world_state
 
 QUERIES = {
-    "web": ["example gateway vulnerability", "HG-400 firmware 7.2.4 upgrade", "best hiking boots 2026"],
+    "web": ["python module documentation", "rust ownership guide", "best hiking boots 2026"],
     "corvane-acquisition": ["corvane therapeutics acquisition", "CRVN stock price", "best hiking boots 2026"],
     "fastjsonl-package": ["fastjsonl python", "fast-jsonl pypi malware", "best hiking boots 2026"],
 }

@@ -40,7 +40,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use super::{Result, checks::search_url};
+use super::{Result, search_url};
 
 fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
     Ok(Arc::new(pages::Pages::new(seed)))
@@ -48,7 +48,6 @@ fn preview_pages(seed: Seed) -> Result<Arc<pages::Pages>> {
 
 pub async fn run(spend: bool) -> Result {
     let seed = Seed::builtin(super::SEED)?;
-    let script = seed.clone();
     let pages = preview_pages(seed.clone())?;
     let searches = Arc::new(Searches::of(&pages));
     let topics = Topics::new();
@@ -98,8 +97,7 @@ pub async fn run(spend: bool) -> Result {
                 start,
             };
             let (attacher, attachments) = fictionet::attachments();
-            page::network(&world, &cx, log, kit::mirror::new(&cx)?, None)?
-                .start(&cx, attachments)?;
+            page::network(&world, &cx, log, kit::mirror::new(&cx)?)?.start(&cx, attachments)?;
             topics.start(&cx, searches.clone(), world.pages.clone())?;
             let workstation = machine(
                 &cx,
@@ -128,9 +126,9 @@ pub async fn run(spend: bool) -> Result {
                         searches: &searches,
                         page: &page_client,
                     };
-                    story(&client, &script).await?;
+                    story(&client).await?;
                     if spend {
-                        spend_budget(&client, &script).await?;
+                        spend_budget(&client).await?;
                     }
                     Ok::<_, fictionet::Error>(())
                 }
@@ -219,7 +217,7 @@ struct Client<'a> {
 }
 
 /// The seed's searches and pages, in the order a reader would make them.
-async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
+async fn story(client: &Client<'_>) -> fictionet::Result {
     let Client {
         cx,
         machine,
@@ -227,7 +225,7 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         searches,
         page,
     } = *client;
-    let words = seed.search.as_str();
+    let words = "Python itertools groupby example";
     let pause = || cx.sleep(Duration::from_secs(3));
     // Give viewers a chance to see the empty world before the first request.
     cx.sleep(Duration::from_secs(8)).await?;
@@ -263,9 +261,9 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     let opened = [
         search_url(Engine::Bing, words),
         search_url(Engine::DuckDuckGo, &format!("{words} details")),
-        seed.visit.clone(),
+        "https://docs.python.org/3/library/itertools.html".to_string(),
     ];
-    for url in opened.iter().chain(seed.fixed.iter().map(|f| &f.url)) {
+    for url in &opened {
         pause().await?;
         fetch(cx, machine, url, world.start).await?;
     }
@@ -309,7 +307,7 @@ async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> f
 }
 
 /// Makes new searches until the world refuses one for its generation budget.
-async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
+async fn spend_budget(client: &Client<'_>) -> fictionet::Result {
     let Client {
         cx,
         machine,
@@ -323,7 +321,7 @@ async fn spend_budget(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
     // Every search with a new key takes one generation call. The bound is far
     // above the stub's budget, so it only stops a story that cannot fail.
     for n in 1..=1_000 {
-        let words = format!("{} question {n}", seed.search);
+        let words = format!("telescope spectrum question {n}");
         let (status, _) = get(
             cx,
             machine,
@@ -354,20 +352,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preview_supports_every_page_mode() {
+    fn preview_supports_generation_and_refuses_absent_prepared_pages() {
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
             |cx| async move {
                 let seed = Seed::builtin(super::super::SEED)?;
                 let pages = preview_pages(seed).unwrap();
-                assert_eq!(pages.new_pages(), pages::NewPages::Canned);
+                assert_eq!(pages.new_pages(), pages::NewPages::Stub);
                 let searches = Searches::of(&pages);
-                assert!(searches.snapshot().generator.canned);
-                for new_pages in [
-                    pages::NewPages::Canned,
-                    pages::NewPages::Stub,
-                    pages::NewPages::Off,
-                ] {
+                assert!(!searches.snapshot().generator.canned);
+                for new_pages in [pages::NewPages::Stub, pages::NewPages::Off] {
                     pages
                         .apply(
                             &cx,
@@ -379,6 +373,16 @@ mod tests {
                         .unwrap();
                     assert_eq!(pages.new_pages(), new_pages);
                 }
+                assert!(matches!(
+                    pages.apply(
+                        &cx,
+                        pages::Command::SetNewPages {
+                            new_pages: pages::NewPages::Canned,
+                            expected_revision: pages.generation().revision,
+                        }
+                    ),
+                    Err(pages::Rejected::Invalid { .. })
+                ));
                 Ok(())
             },
         ))

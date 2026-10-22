@@ -1,14 +1,7 @@
 //! Ubuntu desktops on Xvnc, reached through the admin SSH session: a
-//! browser with Xfce and Firefox, or one full-screen terminal that types
-//! the commands [`GuestHandle::type_command`] sends.
+//! browser with Xfce and Firefox, or one full-screen interactive terminal.
 
-use std::io;
-use std::time::Duration;
-
-use fictionet::stdlib::codec::base64;
-use fictionet_extras::models;
-
-use super::{Guest, GuestHandle, ssh};
+use super::{Guest, ssh};
 
 /// Xvnc's display port on the guest's loopback.
 pub const VNC_PORT: u16 = 5901;
@@ -18,132 +11,10 @@ pub const HOSTS: &[&str] = &["packages.mozilla.org"];
 
 const MOZILLA_KEY: &str = include_str!("desktop/packages.mozilla.org.asc");
 
-/// Where the typed-command program reads commands and writes results, in
-/// the user's home.
-const WORK: &str = ".local/work";
-/// The typed-command program. It waits on its pipe for a line holding a time
-/// limit in seconds and a command. It shows a prompt and types the command
-/// out, runs it for at most that limit, and writes back its exit status. Its
-/// arguments are a heading it shows first.
-const ASSISTANT: &str = r#"#!/bin/bash
-work=$HOME/.local/work
-[ $# -eq 0 ] || printf '%s\n\n' "$*"
-while read -r limit command < "$work/commands"; do
-    : > "$work/output"
-    printf '\033[01;32m%s@%s\033[00m:\033[01;34m%s\033[00m$ ' "$USER" "$(hostname)" "${PWD/#$HOME/\~}"
-    for ((i = 0; i < ${#command}; i++)); do
-        printf '%s' "${command:i:1}"
-        sleep 0.03
-    done
-    printf '\n'
-    timeout "$limit" bash -c "$command" 2>&1 | tee "$work/output"
-    status=${PIPESTATUS[0]}
-    printf '\n[exit %s]\n\n' "$status"
-    printf '%s\n' "$status" > "$work/results"
-done
-"#;
 /// Prints the title of the first visible Firefox window on the guest's
 /// display, or nothing when none shows.
 pub(crate) const FIREFOX_TITLE: &str = "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible \
     --class firefox | head -n1 | xargs -r xdotool getwindowname'";
-
-/// Returns the title of the first visible Firefox window on the guest's
-/// screen, or an empty string when none shows. It takes at most 10 s.
-pub async fn firefox_title(ssh: &ssh::Session) -> io::Result<String> {
-    let out = tokio::time::timeout(Duration::from_secs(10), ssh.run(FIREFOX_TITLE))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the Firefox title query hung"))??;
-    if out.code != 0 {
-        return Err(io::Error::other(format!(
-            "the Firefox title query exited {}: {}",
-            out.code, out.stderr
-        )));
-    }
-    Ok(out.stdout.trim().to_owned())
-}
-
-/// How much longer than a command's limit [`GuestHandle::type_command`]
-/// waits, for the typing.
-const TYPING: Duration = Duration::from_secs(30);
-/// The most of a typed command's output [`GuestHandle::type_command`] reads
-/// back: its last 1 MiB.
-const OUTPUT_LIMIT: usize = 1 << 20;
-
-impl Guest {
-    /// Installs `/opt/assistant`, the program a terminal window runs to
-    /// type and run the commands [`GuestHandle::type_command`] sends, and
-    /// the pipes it reads them from. [`terminal`] includes it.
-    pub fn typed_commands(self) -> Self {
-        let (user, work) = (self.user.clone(), WORK);
-        self.file("/opt/assistant", 0o755, ASSISTANT).run(format!(
-            "sudo -u {user} mkdir -p -m700 /home/{user}/{work} \
-             && sudo -u {user} mkfifo -m600 /home/{user}/{work}/commands /home/{user}/{work}/results"
-        ))
-    }
-}
-
-/// What a command typed with [`GuestHandle::type_command`] did.
-pub struct Typed {
-    /// The command's exit status; 124 when it ran out of time.
-    pub code: i32,
-    /// Its output and error output together: the last 1 MiB when it printed
-    /// more.
-    pub output: String,
-}
-
-impl GuestHandle {
-    /// Types `command` in the terminal window that runs `/opt/assistant`
-    /// (see [`Guest::typed_commands`]) and runs it for at most `limit`,
-    /// whole seconds and at least one. The command is one line. When the
-    /// terminal does not report back, the error carries the output so far.
-    pub async fn type_command(&self, command: &str, limit: Duration) -> io::Result<Typed> {
-        if command.contains(['\n', '\r', '\0']) {
-            return Err(io::Error::other("a typed command must be one line"));
-        }
-        let wait = limit + TYPING;
-        let send = send_typed(command, limit);
-        let sent = self.ssh().run_bounded(&send, OUTPUT_LIMIT + 64);
-        let error = match tokio::time::timeout(wait, sent).await {
-            Err(_) => format!("it did not finish in {wait:?}"),
-            Ok(Err(error)) => error.to_string(),
-            Ok(Ok(out)) => match out.stdout.split_once('\n') {
-                Some((status, output)) if out.code == 0 => match status.trim().parse() {
-                    Ok(code) => {
-                        return Ok(Typed {
-                            code,
-                            output: output.to_owned(),
-                        });
-                    }
-                    Err(_) => format!("its status line was {status:?}"),
-                },
-                _ => format!("exit {}; {}", out.code, out.stderr),
-            },
-        };
-        let read = format!("tail -c {OUTPUT_LIMIT} ~/{WORK}/output");
-        let reading = self.ssh().run_bounded(&read, OUTPUT_LIMIT);
-        let output = match tokio::time::timeout(Duration::from_secs(10), reading).await {
-            Ok(Ok(out)) => out.stdout,
-            Ok(Err(error)) => format!("(unreadable: {error})"),
-            Err(_) => "(reading it timed out)".into(),
-        };
-        Err(io::Error::other(format!(
-            "{}: the terminal did not run {command:?}: {error}\nits output so far:\n{output}",
-            self.name()
-        )))
-    }
-}
-
-/// The shell command that hands `command` and its time limit to
-/// `/opt/assistant` and prints its exit status on one line, then the last
-/// [`OUTPUT_LIMIT`] bytes of its output.
-fn send_typed(command: &str, limit: Duration) -> String {
-    let line = format!("{} {command}\n", limit.as_secs().max(1));
-    format!(
-        "printf %s {} | base64 -d > ~/{WORK}/commands && head -n1 ~/{WORK}/results \
-         && tail -c {OUTPUT_LIMIT} ~/{WORK}/output",
-        ssh::quote(&base64::encode(line.as_bytes()))
-    )
-}
 
 /// An Ubuntu guest whose screen is Xvnc on display :1, `width` by `height`
 /// pixels, on the guest's loopback with no password: only the admin SSH
@@ -193,16 +64,14 @@ fn xvnc(
 }
 
 /// An Ubuntu guest whose screen is one full-screen terminal at `size`
-/// pixels with `font_size` text. It runs `/opt/assistant` in the user's
-/// home, headed by `title`, so it types each command
-/// [`GuestHandle::type_command`] sends.
+/// pixels with `font_size` text. It opens a login shell in the user’s home.
 pub fn terminal(hostname: &str, user: &str, title: &str, size: (u16, u16), font_size: u8) -> Guest {
     let title = ssh::quote(title);
     let session = format!(
         "openbox &\n\
          cd \"$HOME\"\n\
          exec xterm -fa 'DejaVu Sans Mono' -fs {font_size} -fullscreen -bg '#101820' -fg '#e7edf4' \
-           -title {title} -e /opt/assistant {title}\n"
+           -title {title} -e bash -l\n"
     );
     xvnc(
         hostname,
@@ -212,7 +81,6 @@ pub fn terminal(hostname: &str, user: &str, title: &str, size: (u16, u16), font_
         "env DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && pgrep -x xterm >/dev/null",
     )
     .packages(&["openbox", "xterm"])
-    .typed_commands()
     .run("systemctl daemon-reload && systemctl enable --now vnc.service")
 }
 
@@ -288,76 +156,6 @@ pub fn codex(guest: Guest) -> Guest {
         .packages(&["zstd"])
         .file("/opt/install-codex.sh", 0o755, script)
         .run("bash /opt/install-codex.sh")
-}
-
-/// The model Claude Code runs. OpenRouter serves it under the same name as
-/// Anthropic does (as `anthropic/claude-sonnet-5.5`), and with the name it
-/// knows, Claude Code shapes its requests for this model.
-pub const CLAUDE_MODEL: &str = "claude-sonnet-5-5";
-/// Claude Code's calls one run may make, as a ceiling on what a run costs.
-pub const CLAUDE_CALLS: u64 = 60;
-
-/// Claude Code's model site, from the host's key: `ANTHROPIC_API_KEY`, else
-/// `OPENROUTER_API_KEY`, with at most [`CLAUDE_CALLS`] calls. None without
-/// either. Serve it at `models::Provider::Anthropic.host()` with a
-/// certificate from the CA passed to World::trust, and sign Claude Code in
-/// with [`sign_in_claude`].
-pub fn claude_model(cx: &fictionet::Cx) -> fictionet::Result<Option<models::Model>> {
-    let model = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
-        models::anthropic(cx)?
-    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
-        models::anthropic_via_openrouter(cx)?
-    } else {
-        return Ok(None);
-    };
-    Ok(Some(
-        model.budget(models::Budget::new().calls(CLAUDE_CALLS)),
-    ))
-}
-
-/// Signs Claude Code in for `user` with the model site's placeholder key:
-/// the key in the guest's environment, and in the user's home the model and
-/// the first-run questions already answered for that key.
-pub fn sign_in_claude(
-    world: &mut super::World,
-    model: &models::Model,
-    user: &str,
-) -> fictionet::Result {
-    let env = model.guest_env();
-    let key = env
-        .first()
-        .map(|(_, value)| value.clone())
-        .unwrap_or_default();
-    world.seed_env(env)?;
-    world.seed_home_files(claude_files(user, &key, CLAUDE_MODEL))
-}
-
-/// Claude Code's settings and state for `user`: `model`, and the first-run
-/// questions answered for `key`.
-pub fn claude_files(user: &str, key: &str, model: &str) -> Vec<(&'static str, String)> {
-    let settings = serde_json::json!({ "model": model, "spinnerTipsEnabled": false });
-    let tail: String = key
-        .chars()
-        .rev()
-        .take(20)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let state = serde_json::json!({
-        "hasCompletedOnboarding": true,
-        "lastReleaseNotesSeen": CLAUDE_VERSION,
-        "hasSeenAutoDefaultNotice": true,
-        "hasSeenAutoModeEntryWarning": true,
-        "fullscreenDownsellSeenCount": 5,
-        "theme": "dark",
-        "customApiKeyResponses": { "approved": [tail], "rejected": [] },
-        "projects": { format!("/home/{user}"): { "hasTrustDialogAccepted": true } },
-    });
-    vec![
-        (".claude/settings.json", settings.to_string()),
-        (".claude.json", state.to_string()),
-    ]
 }
 
 /// An Ubuntu guest with Xfce on Xvnc at 1280x800 and Mozilla's Firefox at
@@ -879,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_runs_the_assistant_full_screen_on_the_shared_session() {
+    fn terminal_runs_a_shell_full_screen_on_the_shared_session() {
         let guest = terminal("workstation", "analyst", "Office inventory", (960, 400), 15);
         guest.validate().unwrap();
         let content = |guest: &Guest, path: &str| seed(guest).1[path].clone();
@@ -889,9 +687,8 @@ mod tests {
         assert!(start.contains("-geometry 960x400 "));
         assert!(start.contains(
             "exec xterm -fa 'DejaVu Sans Mono' -fs 15 -fullscreen -bg '#101820' -fg '#e7edf4' \
-             -title 'Office inventory' -e /opt/assistant 'Office inventory'"
+             -title 'Office inventory' -e bash -l"
         ));
-        assert_eq!(content(&guest, "/opt/assistant"), ASSISTANT);
         let browser = browser("workstation", "analyst", "https://example.test/");
         assert_eq!(
             content(&guest, "/etc/systemd/system/vnc.service"),
@@ -899,84 +696,6 @@ mod tests {
         );
         let (_, ready) = guest.desktop.as_ref().unwrap();
         assert!(ready.contains("pgrep -x xterm"));
-        let fifos = guest
-            .steps
-            .iter()
-            .position(|s| s.contains("mkfifo"))
-            .unwrap();
-        let enable = guest
-            .steps
-            .iter()
-            .position(|s| s.contains("enable --now vnc"))
-            .unwrap();
-        assert!(fifos < enable, "the pipes exist before the terminal starts");
-    }
-
-    #[test]
-    fn the_assistant_types_runs_and_reports_each_command() {
-        let home = crate::kit::util::RunDir::new(&std::env::temp_dir(), "assistant").unwrap();
-        let home = home.path();
-        let work = home.join(WORK);
-        std::fs::create_dir_all(&work).unwrap();
-        let mkfifo = std::process::Command::new("mkfifo")
-            .arg(work.join("commands"))
-            .arg(work.join("results"))
-            .status()
-            .unwrap();
-        assert!(mkfifo.success());
-        std::fs::write(home.join("assistant"), ASSISTANT).unwrap();
-        /// Stops the program when the test ends, passing or not.
-        struct Running(std::process::Child);
-        impl Drop for Running {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let mut child = std::process::Command::new("bash")
-            .arg(home.join("assistant"))
-            .arg("Office inventory")
-            .env("HOME", home)
-            .env("USER", "analyst")
-            .current_dir(home)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut stdout = child.stdout.take().unwrap();
-        let assistant = Running(child);
-        // The screen is read as the program writes it, so a long output
-        // never fills the pipe.
-        let screen = std::thread::spawn(move || {
-            let mut screen = String::new();
-            std::io::Read::read_to_string(&mut stdout, &mut screen).unwrap();
-            screen
-        });
-        let typed = |command: &str, limit: u64| {
-            let out = std::process::Command::new("bash")
-                .args(["-c", &send_typed(command, Duration::from_secs(limit))])
-                .env("HOME", home)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{out:?}");
-            String::from_utf8(out.stdout).unwrap()
-        };
-        assert_eq!(typed("echo \"it's here\"; exit 3", 10), "3\nit's here\n");
-        assert_eq!(typed("printf 'one\\ntwo\\n'", 10), "0\none\ntwo\n");
-        assert_eq!(typed("echo started; sleep 5", 1), "124\nstarted\n");
-        let long = typed("head -c 1100000 /dev/zero | tr '\\0' x", 10);
-        assert_eq!(long, format!("0\n{}", "x".repeat(OUTPUT_LIMIT)));
-        drop(assistant);
-        let screen = screen.join().unwrap();
-        assert!(screen.starts_with("Office inventory\n\n"), "{screen}");
-        assert!(
-            screen.contains("echo \"it's here\"; exit 3\nit's here\n\n[exit 3]\n"),
-            "{screen}"
-        );
-        assert!(
-            screen.contains("printf 'one\\ntwo\\n'\none\ntwo\n\n[exit 0]\n"),
-            "{screen}"
-        );
     }
 
     #[test]
@@ -1017,39 +736,6 @@ mod tests {
         assert_eq!(
             settings["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
             "1"
-        );
-    }
-
-    #[test]
-    fn claude_code_keeps_the_selected_model_and_disables_tips() {
-        let files = claude_files("analyst", "", "claude-haiku-4-5-20251001");
-        let settings: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
-        assert_eq!(settings["model"], "claude-haiku-4-5-20251001");
-        assert_eq!(settings["spinnerTipsEnabled"], false);
-        let state: serde_json::Value = serde_json::from_str(&files[1].1).unwrap();
-        assert_eq!(state["hasCompletedOnboarding"], true);
-    }
-
-    #[test]
-    fn claude_code_starts_signed_in_with_the_placeholder_key() {
-        let key = format!("sk-ant-api03-{}", "b".repeat(96));
-        let files = claude_files("analyst", &key, CLAUDE_MODEL);
-        let settings: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
-        assert_eq!(settings["model"], "claude-sonnet-5-5");
-        assert_eq!(settings["spinnerTipsEnabled"], false);
-        let state: serde_json::Value = serde_json::from_str(&files[1].1).unwrap();
-        assert_eq!(
-            state["customApiKeyResponses"]["approved"][0],
-            "b".repeat(20)
-        );
-        assert_eq!(state["hasCompletedOnboarding"], true);
-        assert_eq!(state["lastReleaseNotesSeen"], CLAUDE_VERSION);
-        assert_eq!(state["hasSeenAutoDefaultNotice"], true);
-        assert_eq!(state["hasSeenAutoModeEntryWarning"], true);
-        assert_eq!(state["fullscreenDownsellSeenCount"], 5);
-        assert_eq!(
-            state["projects"]["/home/analyst"]["hasTrustDialogAccepted"],
-            true
         );
     }
 }

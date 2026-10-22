@@ -41,6 +41,7 @@ mod tests {
             "firefox",
             "xdotool",
             "xclip",
+            "nmap",
             "tigervnc-standalone-server",
             "xfce4",
         ] {

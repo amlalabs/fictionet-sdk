@@ -86,6 +86,17 @@ impl Handler {
             .get::<ConnInfo>()
             .cloned()
             .unwrap_or_default();
+        self.fcx
+            .emitter(&conn)
+            .emit("adaptive", "request", |event| {
+                event.field("host", target.host.as_str()).field(
+                    "path",
+                    request
+                        .uri()
+                        .path_and_query()
+                        .map_or("/", |path| path.as_str()),
+                )
+            });
         let (parts, body) = request.into_parts();
         let body = body.collect().await?.to_bytes();
         let form = (parts.method == http::Method::POST

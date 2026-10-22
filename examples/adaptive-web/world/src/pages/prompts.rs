@@ -805,7 +805,7 @@ mod tests {
     use serde_json::json;
 
     fn seed() -> Seed {
-        Seed::builtin("web").unwrap()
+        Seed::builtin("corvane-acquisition").unwrap()
     }
 
     #[test]
@@ -868,15 +868,15 @@ mod tests {
             "chicken tikka masala recipe",
             &known,
             &[Claim {
-                url: seed.fixed[0].url.clone(),
+                url: "https://www.corvane.com/news/acquisition".into(),
                 claim: seed.facts[0].clone(),
             }],
         );
         for fixed in &seed.fixed {
             assert!(!user.contains(&fixed.url));
         }
-        assert!(!system.contains("Example"));
-        assert!(!user.contains("Example"));
+        assert!(!system.contains("Corvane"));
+        assert!(!user.contains("Corvane"));
         assert!(user.contains("An unrelated query has no scenario results"));
     }
 
@@ -989,7 +989,7 @@ TITLE: Example patches gateway flaw | The Register
 DESCRIPTION: Example has fixed a critical flaw.
 DATE: 2026-09-23
 CLAIMS:
-- Example fixed CVE-2026-41877 in 7.2.4.
+- Example fixed CVE-2024-12345 in 7.2.4.
 SITE_NAME: The Register
 SITE_TAGLINE: Biting the hand that feeds IT
 SITE_NAV: Security|/security/, Software|/software/
@@ -1002,7 +1002,7 @@ BODY:
 <p>Text.</p>";
         let page = read_page(text, None, false).unwrap();
         assert_eq!(page.title, "Example patches gateway flaw | The Register");
-        assert_eq!(page.claims, ["Example fixed CVE-2026-41877 in 7.2.4."]);
+        assert_eq!(page.claims, ["Example fixed CVE-2024-12345 in 7.2.4."]);
         assert_eq!(
             page.sidebar,
             [(
@@ -1088,7 +1088,7 @@ AD: https://ad.example-shop.de/ | Buy | Now 20% off";
     #[test]
     fn a_cast_answer() {
         let people = read_cast(
-            "- Tomasz Wierzbicki | CEO | Example Corp\n`Amara Nwosu | analyst | Brightline`\n\
+            "- Tomasz Wierzbicki | CEO | Corvane Therapeutics\n`Amara Nwosu | analyst | Brightline`\n\
             Not a person\nKeiko Arai | reporter | The Register",
         )
         .unwrap();
@@ -1109,13 +1109,13 @@ AD: https://ad.example-shop.de/ | Buy | Now 20% off";
         let cast = vec![Person {
             name: "Tomasz Wierzbicki".into(),
             role: "CEO".into(),
-            organization: "Example Corp".into(),
+            organization: "Corvane Therapeutics".into(),
         }];
-        let (system, user) = search(&seed, &cast, "example flaw", &[], &[]);
+        let (system, user) = search(&seed, &cast, "corvane acquisition", &[], &[]);
         assert!(system.contains(&format!("Today is {}.", seed.date)));
         assert!(system.contains(&seed.facts[0]));
-        assert!(system.contains("- Tomasz Wierzbicki, CEO, Example Corp"));
-        assert!(user.starts_with("Someone searched for: example flaw\n"));
+        assert!(system.contains("- Tomasz Wierzbicki, CEO, Corvane Therapeutics"));
+        assert!(user.starts_with("Someone searched for: corvane acquisition\n"));
         assert!(user.contains("(none)") && user.contains("(nothing yet)"));
         let profile = Profile {
             name: "Krant".into(),

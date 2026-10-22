@@ -1,15 +1,13 @@
-//! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
+//! The Search demo: an Ubuntu desktop with Firefox, Claude Code and Codex on the
 //! plain adaptive web: no scenario, nothing planted.
 //!
 //! - `search <downloads>` is the app: it boots, opens the page and stays up
-//!   until Ctrl-C. Prepared pages answer first. A model fills the gaps
-//!   with an OpenRouter key; otherwise the offline maker does.
-//! - `search <downloads> check` runs the scripted story and its checks.
+//!   until Ctrl-C. An optional OpenRouter key enables live page generation;
+//!   otherwise the offline maker answers.
 //! - `search preview` shows the page with an in-world client and no VM.
 //! - `search bake` makes the canned store with a model (see `bake.rs`).
 
 mod bake;
-mod checks;
 mod guest;
 mod preview;
 use fictionet_demo::search as page;
@@ -22,27 +20,26 @@ use adaptive_web_world::{
 };
 use example_common::log::Log;
 use fictionet_demo::kit::{self, Kit};
-use std::{collections::BTreeSet, fs::File, path::PathBuf, sync::Arc, time::Instant};
+use std::{fs::File, path::PathBuf, sync::Arc, time::Instant};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The seed the app shows, and whose canned pages it serves.
+/// The plain web seed used by the app.
 const SEED: &str = "web";
 
-/// What to run: the app or its checks with the downloads folder, the
+/// What to run: the app with the downloads folder, the
 /// preview without a VM and whether it spends the generation budget, or
 /// the bake.
 #[derive(Debug, PartialEq)]
 enum Mode {
     App { downloads: PathBuf },
-    Check { downloads: PathBuf },
     Preview { spend: bool },
     Bake,
 }
 
 fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
     const USAGE: &str =
-        "usage: search <downloads> [check], search preview [--spend-budget], or search bake";
+        "usage: search <downloads>, search preview [--spend-budget], or search bake";
     let first = args.next().ok_or(USAGE)?;
     let second = args.next();
     if args.next().is_some() {
@@ -55,9 +52,6 @@ fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
         ("preview" | "bake", _) => Err(USAGE.into()),
         (folder, _) if folder.starts_with('-') => Err(USAGE.into()),
         (folder, None) => Ok(Mode::App {
-            downloads: folder.into(),
-        }),
-        (folder, Some("check")) => Ok(Mode::Check {
             downloads: folder.into(),
         }),
         _ => Err(USAGE.into()),
@@ -82,10 +76,10 @@ impl fictionet_extras::models::Transport for OpenRouter {
     }
 }
 
-fn app_pages(seed: Seed, check: bool) -> Result<Pages> {
+fn app_pages(seed: Seed) -> Result<Pages> {
     use adaptive_web_world::pages::model::Provider;
     use fictionet_extras::models::Key;
-    let key = if !check && std::env::var_os("OPENROUTER_API_KEY").is_some() {
+    let key = if std::env::var_os("OPENROUTER_API_KEY").is_some() {
         Some(Key::from_env(Provider::OpenRouter.into())?)
     } else {
         None
@@ -109,15 +103,15 @@ fn pages_for_key(seed: Seed, key: Option<fictionet_extras::models::Key>) -> Resu
 #[tokio::main]
 async fn main() -> Result {
     let total = Instant::now();
-    let (downloads, check) = match arguments(std::env::args().skip(1))? {
+    let downloads = match arguments(std::env::args().skip(1))? {
         Mode::Preview { spend } => return preview::run(spend).await,
         Mode::Bake => return bake::run().await,
-        Mode::App { downloads } => (downloads, false),
-        Mode::Check { downloads } => (downloads, true),
+        Mode::App { downloads } => downloads,
     };
     let seed = Seed::builtin(SEED)?;
-    let pages = Arc::new(app_pages(seed.clone(), check)?);
-    let output = kit::checks::output(&downloads, "search")?;
+    let pages = Arc::new(app_pages(seed.clone())?);
+    let output = downloads.join("search");
+    std::fs::create_dir_all(&output)?;
     let searches = Arc::new(Searches::of(&pages));
     let topics = page::Topics::new();
     let view = topics.clone();
@@ -127,9 +121,7 @@ async fn main() -> Result {
         |s| s,
     ));
     let world_log = log.clone();
-    let scenario = seed.clone();
     let kit = Kit::new("search")
-        .page_words(checks::PAGE_WORDS)
         .guest(guest::guest(&seed.date))
         .observer(searches.clone())
         .observer(Arc::new(LogObserver { log: log.clone() }))
@@ -143,30 +135,31 @@ async fn main() -> Result {
                 start,
             };
             world.trust("office", &web.ca.cert_pem())?;
-            // Claude Code and Codex sign in inside the guest themselves; the
-            // world passes their model and sign-in traffic straight through.
-            let model = None;
             topics.start(&cx, searches, pages)?;
-            page::network(&web, &cx, world_log, world.mirror(&cx)?, model)?
+            page::network(&web, &cx, world_log, world.mirror(&cx)?)?
                 .route(kit::JUMP, kit::jump_prefix())
                 .start(&cx, world.into_attachments())
         });
-    if !check {
-        let result = kit.run_app(downloads, guest::HOST).await;
-        let finish = log.finish();
-        println!("whole run: {} ms", total.elapsed().as_millis());
-        result?;
-        finish?;
-        return Ok(());
-    }
-    let story = checks::Story {
-        seed: scenario,
-        log,
-        visited: BTreeSet::new(),
-        output: output.clone(),
-    };
-    kit::checks::run(kit, &downloads, &output, story).await?;
+    let result = kit.run_app(downloads, guest::HOST).await;
+    let finish = log.finish();
+    println!("whole run: {} ms", total.elapsed().as_millis());
+    result?;
+    finish?;
     Ok(())
+}
+
+fn search_url(engine: fictionet_extras::search::Engine, words: &str) -> String {
+    use fictionet_extras::search::Engine;
+    let base = match engine {
+        Engine::Google => "https://www.google.com/search?q=",
+        Engine::Bing => "https://www.bing.com/search?q=",
+        Engine::DuckDuckGo => "https://html.duckduckgo.com/html/?q=",
+        Engine::YouTube => "https://www.youtube.com/results?search_query=",
+    };
+    format!(
+        "{base}{}",
+        adaptive_web_world::pages::text::quote(words, "")
+    )
 }
 
 #[cfg(test)]
@@ -178,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn the_key_selects_the_maker_and_checks_always_use_offline_pages() {
+    fn the_key_selects_the_page_maker() {
         use adaptive_web_world::pages::model::Provider;
         use adaptive_web_world::pages::{GeneratorKind, NewPages, Seed};
         use fictionet_extras::models::Key;
@@ -186,10 +179,7 @@ mod tests {
         let offline = super::pages_for_key(seed(), None).unwrap();
         assert_eq!(offline.generator_kind(), GeneratorKind::Stub);
         assert_eq!(offline.prefetch(), 0);
-        assert_eq!(offline.new_pages(), NewPages::Canned);
-        let check = super::app_pages(seed(), true).unwrap();
-        assert_eq!(check.generator_kind(), GeneratorKind::Stub);
-        assert_eq!(check.prefetch(), 0);
+        assert_eq!(offline.new_pages(), NewPages::Stub);
         let key = Key::new("OPENROUTER_API_KEY", Some("test-key".into())).unwrap();
         let live = super::pages_for_key(seed(), Some(key)).unwrap();
         assert_eq!(
@@ -198,23 +188,18 @@ mod tests {
         );
         assert_eq!(live.model(), Provider::OpenRouter.default_model());
         assert_eq!(live.prefetch(), 5);
-        assert_eq!(live.new_pages(), NewPages::Canned);
+        assert_eq!(live.new_pages(), NewPages::Stub);
     }
 
     #[test]
-    fn the_app_takes_only_its_folder_and_check_its_word() {
+    fn the_app_takes_only_its_folder() {
         assert_eq!(
             parse(&["d"]),
             Some(Mode::App {
                 downloads: "d".into()
             })
         );
-        assert_eq!(
-            parse(&["d", "check"]),
-            Some(Mode::Check {
-                downloads: "d".into()
-            })
-        );
+        assert_eq!(parse(&["d", "check"]), None);
         assert_eq!(parse(&["preview"]), Some(Mode::Preview { spend: false }));
         assert_eq!(
             parse(&["preview", "--spend-budget"]),

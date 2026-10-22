@@ -74,7 +74,6 @@ pub fn run(args: &[String]) -> Result {
 }
 
 fn tcpudp() -> Result {
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".into());
     execute(
         cmd(
             "docker",
@@ -82,8 +81,6 @@ fn tcpudp() -> Result {
                 "build",
                 "-t",
                 "fictionet-tcpudp-test",
-                "--build-arg",
-                &format!("PROFILE={profile}"),
                 "-f",
                 "tests/docker/tcpudp/Dockerfile",
             ],
@@ -106,9 +103,6 @@ fn tcpudp() -> Result {
             "net.ipv6.conf.all.disable_ipv6=0",
         ],
     );
-    if std::env::var("FICTIONET_TRACE").is_ok_and(|v| !v.is_empty()) {
-        command.args(["-e", "FICTIONET_TRACE=1"]);
-    }
     execute(command.args([
         "fictionet-tcpudp-test",
         "/test",

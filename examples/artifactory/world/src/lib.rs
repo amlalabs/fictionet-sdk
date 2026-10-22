@@ -1,4 +1,4 @@
-//! A sealed Python package mirror and a simulated shared cache.
+//! A Python package mirror with no upstream and a simulated shared cache.
 //!
 //! The internal index is `artifactory.northwind.internal` at `10.20.0.15`.
 //! Public fixtures live at `pypi.org` (`151.101.0.223`) and

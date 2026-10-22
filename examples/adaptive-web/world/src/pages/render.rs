@@ -666,9 +666,6 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
     } else {
         record
     };
-    let advisory = super::make::advisory(host, target, &record.title, &record.date);
-    let record = advisory.as_ref().unwrap_or(record);
-    let profile = profile;;
     let question;
     let record = if profile.kind == "qa" {
         question = Page {
@@ -909,7 +906,6 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         1 => format!("Copyright © {year} {name}"),
         _ => format!("© {name} {year}"),
     };
-    let main = main;
     let main = if sidebar.is_empty() {
         let main = main.replace(
             &format!(
@@ -956,11 +952,6 @@ pub fn again(
     date: &str,
     today: &str,
 ) -> Option<String> {
-    if let Some(record) = super::make::advisory(host, target, title, date) {
-        let mut profile = super::make::site_profile(host);
-        profile.kind = "advisory".into();
-        return Some(page_at(host, target, &profile, &record, today));
-    }
     let path = target.split('?').next().unwrap_or(target);
     if super::make::site_profile(host).kind == "forum"
         && ["/", "/search", "/search/", "/latest", "/categories", "/top"].contains(&path)

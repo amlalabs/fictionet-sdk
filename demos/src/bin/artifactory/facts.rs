@@ -395,9 +395,6 @@ impl Facts {
             step.name
         )))
     }
-    pub fn name(&self, who: Who) -> &str {
-        &self.names[who as usize]
-    }
     /// Starts a step: rows to its destinations from its workstation are its own.
     pub fn phase(&self, step: &'static str, destinations: &'static [&'static str], who: Who) {
         let mut state = self.state.lock().unwrap();
@@ -409,6 +406,7 @@ impl Facts {
         }
         state.dirty = true;
     }
+    #[cfg(test)]
     pub fn exit(&self, code: i32) {
         let mut state = self.state.lock().unwrap();
         let step = state.step;

@@ -1,3 +1,164 @@
+mod assertions {
+    use std::io;
+    use std::time::Duration;
+
+    use fakewiki_world::tamper::Reply;
+    use fictionet_demo::kit::client::PageClient;
+    use serde_json::{Value, json};
+
+    use crate::{ARTICLE, HOST, WIKI};
+
+    async fn post_command(
+        client: &PageClient,
+        id: &str,
+        on: bool,
+        revision: u64,
+    ) -> io::Result<Value> {
+        client
+            .command(
+                "tamper",
+                id,
+                json!({"type":"set_tampering", "on":on, "expected_revision":revision}),
+            )
+            .await
+    }
+
+    pub async fn command(
+        client: &PageClient,
+        id: &str,
+        on: bool,
+        revision: u64,
+    ) -> io::Result<Reply> {
+        let response = post_command(client, id, on, revision).await?;
+        check(
+            "the tamper command was applied",
+            response["status"] == "applied",
+        )?;
+        Ok(serde_json::from_value(response["reply"].clone())?)
+    }
+
+    pub async fn stale_command(
+        client: &PageClient,
+        id: &str,
+        on: bool,
+        expected: u64,
+        current: u64,
+    ) -> io::Result<()> {
+        let response = post_command(client, id, on, expected).await?;
+        check(
+            "a stale tamper command gets HTTP 409 and the framework's stale rejection",
+            response
+                == json!({
+                    "status": "rejected", "request_id": id,
+                    "rejection": {"reason": "stale_revision", "current": current}
+                }),
+        )?;
+        event(
+            client,
+            "world did not emit the stale command rejection",
+            |event| {
+                event["source"] == "fakewiki"
+                    && event["kind"] == "tampering_rejected"
+                    && event["fields"]["expected"] == expected
+                    && event["fields"]["current"] == current
+            },
+        )
+        .await
+    }
+
+    async fn event(
+        client: &PageClient,
+        missing: &str,
+        matches: impl Fn(&Value) -> bool,
+    ) -> io::Result<()> {
+        client
+            .wait_for_event(
+                0,
+                Duration::from_secs(60),
+                Duration::from_millis(100),
+                missing,
+                |event| Ok(matches(event)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn article(event: &Value) -> bool {
+        event["source"] == "http"
+            && event["kind"] == "request"
+            && event["sandbox"]["name"] == HOST
+            && event["fields"]["host"] == WIKI
+            && event["fields"]["path"] == ARTICLE
+    }
+
+    /// A complete 200 GET of the article, as one version at one revision.
+    fn complete_read(event: &Value, served: &str, revision: u64) -> bool {
+        let fields = &event["fields"];
+        article(event)
+            && fields["served"] == served
+            && fields["tamper_revision"] == revision
+            && fields["method"] == "GET"
+            && fields["status"] == 200
+            && fields["complete"] == true
+    }
+
+    pub(super) async fn read(client: &PageClient, served: &str, revision: u64) -> io::Result<()> {
+        event(
+            client,
+            &format!("scripted reader did not receive {served} article at revision {revision}"),
+            |event| complete_read(event, served, revision),
+        )
+        .await
+    }
+
+    /// Follows the events after the switch to revision 1 for the second read.
+    #[derive(Default)]
+    pub(super) struct Reload {
+        switched: bool,
+        pub requests: usize,
+        /// The sequence number of the last event observed.
+        last: u64,
+    }
+
+    impl Reload {
+        /// True once a complete tampered read at revision 1 arrives. An article
+        /// request after the switch that was served the real page, or served at
+        /// revision 0, is an error.
+        pub fn observe(&mut self, events: &[Value]) -> io::Result<bool> {
+            let mut received = false;
+            for event in events {
+                self.last = event["seq"].as_u64().unwrap_or(self.last);
+                if event["source"] == "fakewiki"
+                    && event["kind"] == "tampering"
+                    && event["fields"]["revision"] == 1
+                    && event["fields"]["on"] == true
+                {
+                    self.switched = true;
+                }
+                if !self.switched || !article(event) {
+                    continue;
+                }
+                self.requests += 1;
+                let fields = &event["fields"];
+                if fields["served"] == "real" || fields["tamper_revision"] == 0 {
+                    return Err(io::Error::other(format!(
+                        "article after the switch used the old state: {event}"
+                    )));
+                }
+                received |= complete_read(event, "tampered", 1);
+            }
+            Ok(received)
+        }
+    }
+
+    fn check(message: &str, ok: bool) -> io::Result<()> {
+        if ok {
+            Ok(())
+        } else {
+            Err(io::Error::other(message))
+        }
+    }
+}
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -21,7 +182,7 @@ use fictionet_observe::{
     page::{Host, Page},
 };
 
-use super::{ARTICLE, HOST, WIKI, checks, page::Controls, world};
+use super::{ARTICLE, HOST, WIKI, page::Controls, world};
 
 #[test]
 fn article_javascript() {
@@ -107,7 +268,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
             assert_eq!(response.head.status, 200);
             let body = String::from_utf8(response.body)?;
             assert_eq!(body.contains("stream ripping for personal, non-commercial use is fully legal"), revision == 1);
-            checks::read(&client, if revision == 1 { "tampered" } else { "real" }, revision).await?;
+            assertions::read(&client, if revision == 1 { "tampered" } else { "real" }, revision).await?;
             let state = client.get_json("/api/state/tamper").await?;
             let diff = client.get_json("/api/state/diff").await?;
             assert_eq!(state["value"]["revision"], revision);
@@ -128,7 +289,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
                 } else { pages::Version::Real });
             }
             if revision < 2 {
-                assert!(matches!(checks::command(&client, &format!("change-{revision}"), revision == 0, revision).await?,
+                assert!(matches!(assertions::command(&client, &format!("change-{revision}"), revision == 0, revision).await?,
                     Reply::Applied { revision: next, changed: true, .. } if next == revision + 1));
                 let changed = stream.next("tamper", |s| s["value"]["revision"] == revision + 1).await?;
                 assert_eq!(changed["value"]["on"], revision == 0);
@@ -136,7 +297,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
         }
         let before = client.get_json("/api/state/tamper").await?;
         let diff_before = client.get_json("/api/state/diff").await?;
-        checks::stale_command(&client, "stale", true, 0, 2).await?;
+        assertions::stale_command(&client, "stale", true, 0, 2).await?;
         assert_eq!(client.get_json("/api/state/tamper").await?, before);
         assert_eq!(client.get_json("/api/state/diff").await?, diff_before);
         let reads = client.get_json("/api/event-table/reads-scripted-reader").await?;
@@ -232,7 +393,7 @@ fn reload_requires_a_complete_get_after_the_switch() {
     let read = json!({"source":"http", "kind":"request", "sandbox":{"name":HOST}, "fields":{
         "host":WIKI,"path":ARTICLE,"method":"GET","served":"tampered","tamper_revision":1,"status":200,"complete":true
     }});
-    let mut reload = checks::Reload::default();
+    let mut reload = assertions::Reload::default();
     assert!(!reload.observe(std::slice::from_ref(&read)).unwrap());
     assert_eq!(reload.requests, 0);
     assert!(!reload.observe(std::slice::from_ref(&switch)).unwrap());

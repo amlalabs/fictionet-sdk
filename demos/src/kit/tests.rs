@@ -353,8 +353,6 @@ fn root_certificate_names_are_neutral() {
         setup: Arc::new(mirror::Setup::new([])),
         attachments,
         ca: Arc::new(Mutex::new(None)),
-        environment: Default::default(),
-        home_files: Default::default(),
         now_unix: 0,
         mirror: Arc::default(),
         mirror_addresses: Default::default(),
@@ -428,130 +426,6 @@ impl PageFixture {
             .await
             .unwrap()
     }
-}
-
-#[tokio::test]
-async fn page_consoles_cross_ssh_without_claiming_input() {
-    use client::Capability;
-    use fictionet_observe::page::Console;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tokio::time::timeout(Duration::from_secs(20), async {
-        let mut fixture = PageFixture::new().await;
-        let error = fixture.run.guests[0]
-            .console
-            .screen()
-            .unwrap()
-            .await
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("workstation is still booting"));
-        let ticket = fixture
-            .client
-            .ticket("workstation", Capability::Screen)
-            .await
-            .unwrap();
-        let mut socket = fixture
-            .client
-            .open("workstation", Capability::Screen, Some(&ticket.ticket))
-            .await
-            .unwrap();
-        let error = socket.read_u8().await.unwrap_err().to_string();
-        assert!(error.contains("1008"), "{error}");
-        assert!(error.contains("workstation is still booting"), "{error}");
-        let wrong_url = format!(
-            "{}#token={}",
-            fixture.run.page_url().split('#').next().unwrap(),
-            "0".repeat(64)
-        );
-        let error = client::PageClient::from_url(wrong_url)
-            .unwrap()
-            .bootstrap()
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("HTTP/1.1 401"), "{error}");
-        assert!(error.contains("error"), "{error}");
-        let error = fixture
-            .client
-            .open("workstation", Capability::Screen, None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("HTTP/1.1 401"), "{error}");
-        assert!(error.contains("error"), "{error}");
-        fixture.network();
-        fixture.connect();
-        let before = fixture.state("leases").await;
-        assert!(before["value"]["workstation"]["holder"].is_null());
-        let out = fixture.run.path().join("screen.png");
-        let capture = rfb::capture_page(fixture.run.page_url(), "workstation", &out)
-            .await
-            .unwrap();
-        assert_eq!(
-            (capture.width, capture.height, capture.colors),
-            (64, 64, 256)
-        );
-        let png = std::fs::read(out).unwrap();
-        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(&png[16..24], &[0, 0, 0, 64, 0, 0, 0, 64]);
-        let mut chunks = &png[8..];
-        let mut compressed = Vec::new();
-        while !chunks.is_empty() {
-            let len = u32::from_be_bytes(chunks[..4].try_into().unwrap()) as usize;
-            if &chunks[4..8] == b"IDAT" {
-                compressed.extend_from_slice(&chunks[8..8 + len]);
-            }
-            chunks = &chunks[12 + len..];
-        }
-        let mut pixels = Vec::new();
-        flate2::read::ZlibDecoder::new(compressed.as_slice())
-            .read_to_end(&mut pixels)
-            .unwrap();
-        assert_eq!(pixels.len(), 64 * (64 * 3 + 1));
-        for y in 0..64u8 {
-            let row = &pixels[y as usize * 193..][..193];
-            assert_eq!(row[0], 0);
-            for x in 0..64u8 {
-                assert_eq!(&row[1 + x as usize * 3..][..3], &[x ^ y, y * 4, x * 4]);
-            }
-        }
-        assert_eq!(*fixture.peer.rfb.lock().unwrap(), vec![0, 2, 3]);
-        assert_eq!(
-            fixture.state("leases").await,
-            before,
-            "no lease publication during capture"
-        );
-        let ticket = fixture
-            .client
-            .ticket("workstation", Capability::Terminal)
-            .await
-            .unwrap();
-        let mut socket = fixture
-            .client
-            .open("workstation", Capability::Terminal, Some(&ticket.ticket))
-            .await
-            .unwrap();
-        let mut ready = [0; 5];
-        socket.read_exact(&mut ready).await.unwrap();
-        assert_eq!(&ready, b"ready");
-        socket.write_all(b"hello\r").await.unwrap();
-        let mut echo = [0; 6];
-        socket.read_exact(&mut echo).await.unwrap();
-        assert_eq!(&echo, b"hello\r");
-        fixture.run.stop_status();
-        let error = fixture.run.guests[0]
-            .console
-            .terminal(80, 24)
-            .unwrap()
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error.to_string(), "workstation has stopped");
-        fixture.run.shutdown().await.unwrap();
-    })
-    .await
-    .unwrap();
 }
 
 #[tokio::test]
@@ -679,84 +553,6 @@ async fn desktop_readiness_does_not_require_a_page() {
 }
 
 #[tokio::test]
-async fn page_wires_containment_and_labels() {
-    let mut fixture = PageFixture::new().await;
-    let description = fixture.client.get_json("/api/page").await.unwrap();
-    let panels = description["panels"].as_array().unwrap();
-    let containment = panels.iter().find(|p| p["id"] == "containment").unwrap();
-    assert_eq!(containment["state"], "/api/state/containment");
-    let labels = panels.iter().find(|p| p["id"] == "labels").unwrap();
-    assert_eq!(labels["command"], "/api/command/labels");
-    let response = fixture.client.request("POST", "/api/command/labels", Some(&serde_json::json!({
-        "request_id":"label", "command":{"action":"add","target":{"kind":"event","seq":1},"text":"Boot"}
-    })), true).await.unwrap();
-    assert_eq!(response.status, 200);
-    assert_eq!(fixture.state("labels").await["value"][0]["text"], "Boot");
-    assert!(fixture.run.guests[1].console.status.revision() > 0);
-    fixture.connect();
-    fixture.run.guests[1].addr = watch::channel(Some(Ipv4Addr::new(10, 0, 0, 3))).1;
-    fixture.run.connected(1, fixture.peer.session.clone());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while fixture.run.containment.revision() < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let state = fixture.state("containment").await;
-    let probes = state["value"]["probes"].as_array().unwrap();
-    assert_eq!(probes.len(), 2 * containment::PROBES.len());
-    for guest in ["workstation", "server"] {
-        assert_eq!(
-            probes.iter().filter(|p| p["guest"] == guest).count(),
-            containment::PROBES.len()
-        );
-    }
-    assert!(fixture.run.containment().await.is_err());
-    let mut all = fixture.run.probes.lock().unwrap().clone();
-    for probe in &mut all.probes {
-        probe.outcome = if matches!(
-            probe.destination.as_str(),
-            "IPv6 routing table" | "environment" | "/etc/environment" | "apt configuration"
-        ) {
-            fictionet_observe::page::ProbeOutcome::Fact
-        } else {
-            fictionet_observe::page::ProbeOutcome::Contained
-        };
-    }
-    *fixture.run.probes.lock().unwrap() = all.clone();
-    fixture
-        .run
-        .containment
-        .publish(fictionet::time::Instant::ZERO, &all)
-        .unwrap();
-    fixture.run.containment().await.unwrap();
-    for outcome in [
-        fictionet_observe::page::ProbeOutcome::Unknown,
-        fictionet_observe::page::ProbeOutcome::MissingTool,
-        fictionet_observe::page::ProbeOutcome::TimedOut,
-        fictionet_observe::page::ProbeOutcome::Fact,
-        fictionet_observe::page::ProbeOutcome::Forwarded,
-        fictionet_observe::page::ProbeOutcome::NotContained,
-    ] {
-        let mut all = fixture.run.probes.lock().unwrap().clone();
-        all.probes[3].outcome = outcome;
-        fixture
-            .run
-            .containment
-            .publish(fictionet::time::Instant::ZERO, &all)
-            .unwrap();
-        let error = fixture.run.containment().await.unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "required check failed: no containment probe was forwarded or answered from \
-             outside the world"
-        );
-    }
-    fixture.run.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn duplicate_kit_panels_are_actionable_errors() {
     for labels in [false, true] {
         let mut kit = Kit::new("duplicate")
@@ -812,43 +608,6 @@ async fn hold_world(cx: Cx, world: World) -> fictionet::Result {
         Ok(())
     });
     Ok(())
-}
-
-#[tokio::test]
-async fn chromium_paints_the_page_through_the_ssh_console() {
-    let mut fixture = PageFixture::new().await;
-    fixture
-        .peer
-        .ready
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    fixture.network();
-    fixture.connect();
-    fixture
-        .run
-        .guest("workstation")
-        .wait_desktop(Duration::from_secs(5))
-        .await
-        .unwrap();
-    let before = fixture.state("leases").await;
-    let (screen, page) = (
-        fixture.run.path().join("screen.png"),
-        fixture.run.path().join("console.png"),
-    );
-    let shots = fixture
-        .run
-        .screenshots("workstation", &screen, &page)
-        .await
-        .unwrap();
-    assert_eq!((shots.screen.width, shots.screen.colors), (64, 256));
-    assert_eq!(shots.page, page);
-    let captured = shots.page;
-    let png = std::fs::read(&captured).unwrap();
-    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 1440);
-    assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 900);
-    assert_eq!(fixture.state("leases").await, before);
-    fixture.run.shutdown().await.unwrap();
-    assert!(!std::path::Path::new(&captured).exists());
 }
 
 #[test]
@@ -920,148 +679,6 @@ async fn page_terminal_executes_the_declared_command_on_a_pty() {
         b"window manager is not running"
     );
     assert!(terminal.read().await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn rfb_pointer_update_waits_for_every_rectangle() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let (client, mut server) = tokio::io::duplex(64);
-        let (sent, received) = tokio::sync::oneshot::channel();
-        let (finish, finishing) = tokio::sync::oneshot::channel();
-        let peer = tokio::spawn(async move {
-            server.write_all(b"RFB 003.008\n").await.unwrap();
-            let mut banner = [0; 12];
-            server.read_exact(&mut banner).await.unwrap();
-            assert_eq!(&banner, b"RFB 003.008\n");
-            server.write_all(&[1, 1]).await.unwrap();
-            assert_eq!(server.read_u8().await.unwrap(), 1);
-            server.write_all(&[0; 4]).await.unwrap();
-            assert_eq!(server.read_u8().await.unwrap(), 1);
-            let mut init = [0; 24];
-            init[..4].copy_from_slice(&[0, 2, 0, 1]);
-            server.write_all(&init).await.unwrap();
-            let mut format = [0; 28];
-            server.read_exact(&mut format).await.unwrap();
-            assert_eq!(
-                format,
-                [
-                    0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0, 2, 0, 0,
-                    1, 0, 0, 0, 0
-                ]
-            );
-            let mut pointer = [0; 6];
-            server.read_exact(&mut pointer).await.unwrap();
-            assert_eq!(pointer, [5, 0, 0, 1, 0, 0]);
-            let mut request = [0; 10];
-            server.read_exact(&mut request).await.unwrap();
-            assert_eq!(request, [3, 0, 0, 0, 0, 0, 0, 2, 0, 1]);
-            // Send the first of two rectangles before allowing the reply to finish.
-            server
-                .write_all(&[0, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 255, 0])
-                .await
-                .unwrap();
-            sent.send(()).unwrap();
-            finishing.await.unwrap();
-            server
-                .write_all(&[0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 255, 0, 0])
-                .await
-                .unwrap();
-        });
-        let mut viewer = rfb::Viewer::handshake(client).await.unwrap();
-        assert_eq!(viewer.size(), (2, 1));
-        viewer.pointer(1, 0, 0).await.unwrap();
-        let update = viewer.update();
-        tokio::pin!(update);
-        tokio::select! {
-            biased;
-            result = &mut update => panic!("update completed before the reply: {result:?}"),
-            result = received => result.unwrap(),
-        }
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(
-                update.as_mut().poll(cx).is_pending()
-            ))
-            .await
-        );
-        finish.send(()).unwrap();
-        assert_eq!(update.await.unwrap(), vec![255, 0, 0, 0, 255, 0]);
-        peer.await.unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn page_capture_reports_websocket_failure() {
-    use fictionet::stdlib::protocols::websocket;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let out = std::env::temp_dir().join(format!("{}.png", random_uuid()));
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let url = format!(
-        "http://{}/#token={}",
-        listener.local_addr().unwrap(),
-        "a".repeat(64)
-    );
-    let peer = tokio::spawn(async move {
-        for path in [
-            "/api/bootstrap",
-            "/api/ticket",
-            "/ws/screen/workstation?ticket=abcd",
-        ] {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut head = Vec::new();
-            while !head.ends_with(b"\r\n\r\n") {
-                head.push(stream.read_u8().await.unwrap());
-            }
-            let head = String::from_utf8(head).unwrap();
-            assert_eq!(head.split_whitespace().nth(1), Some(path));
-            let header = |name: &str| {
-                head.lines()
-                    .filter_map(|line| line.split_once(':'))
-                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                    .map(|(_, value)| value.trim())
-            };
-            let length = header("Content-Length").unwrap_or("0").parse().unwrap();
-            stream.read_exact(&mut vec![0; length]).await.unwrap();
-            match path {
-                "/api/bootstrap" => stream
-                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
-                    .await
-                    .unwrap(),
-                "/api/ticket" => {
-                    let body = r#"{"ticket":"abcd","session":"ef01"}"#;
-                    stream
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                                body.len()
-                            )
-                            .as_bytes(),
-                        )
-                        .await
-                        .unwrap();
-                }
-                _ => {
-                    let accept = websocket::accept_key(header("Sec-WebSocket-Key").unwrap());
-                    stream.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
-                    stream.write_all(b"\x82\x0cRFB 003.008\n").await.unwrap();
-                    let mut banner = [0; 18];
-                    stream.read_exact(&mut banner).await.unwrap();
-                    stream.write_all(b"\x88\x00").await.unwrap();
-                }
-            }
-        }
-    });
-    let error = rfb::capture_page(&url, "workstation", &out)
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(error.to_string(), "page WebSocket closed: None");
-    peer.await.unwrap();
-    assert!(!out.exists());
 }
 
 #[test]
@@ -1293,44 +910,6 @@ async fn page_client_reads_state_posts_commands_and_waits() {
     assert!(client.state_stream(&["labels,leases"]).await.is_err());
     assert!(client.state_stream(&[]).await.is_err());
     fixture.run.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn checks_cover_access_the_terminal_and_a_settled_screen() {
-    use client::Capability;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let mut fixture = PageFixture::new().await;
-        fixture
-            .peer
-            .ready
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        fixture.network();
-        fixture.connect();
-        let client = &fixture.client;
-        checks::bearer_required(client).await.unwrap();
-        checks::single_use_ticket(client, "workstation", Capability::Screen)
-            .await
-            .unwrap();
-        assert!(
-            !String::from_utf8_lossy(checks::HOSTNAME_LINE).contains("name:workstation:end"),
-            "an echo of the typed line must not pass the terminal check"
-        );
-        checks::terminal_runs_on(client, "workstation")
-            .await
-            .unwrap();
-        let out = fixture.run.path().join("settled.png");
-        let (capture, settled) = fixture
-            .run
-            .settled_screen("workstation", &out)
-            .await
-            .unwrap();
-        assert_eq!((capture.width, capture.colors), (64, 256));
-        assert_eq!(settled, Some(2), "an unchanging screen settles at once");
-        assert_eq!(capture.png, out);
-        fixture.run.shutdown().await.unwrap();
-    })
-    .await
-    .unwrap();
 }
 
 #[tokio::test]
@@ -1832,67 +1411,190 @@ async fn configured_address_does_not_claim_network_readiness() {
 }
 
 #[tokio::test]
-async fn model_environment_is_seeded_before_login() {
-    let mut kit = Kit::new("office").guest(Guest::ubuntu("workstation", "analyst"));
-    let (mut run, prepared) = kit.prepare().unwrap();
-    run.start_world(
-        |cx, mut world| async move {
-            assert!(world.seed_env([("BAD", "a\nINJECT=value".into())]).is_err());
-            world.seed_env([("ANTHROPIC_API_KEY", "sk-ant-api03-placeholder".into())])?;
-            hold_world(cx, world).await
-        },
-        prepared,
-    )
+async fn page_consoles_cross_ssh_without_claiming_input() {
+    use client::Capability;
+    use fictionet_observe::page::Console;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut fixture = PageFixture::new().await;
+        let error = fixture.run.guests[0]
+            .console
+            .screen()
+            .unwrap()
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("workstation is still booting"));
+        let ticket = fixture
+            .client
+            .ticket("workstation", Capability::Screen)
+            .await
+            .unwrap();
+        let mut socket = fixture
+            .client
+            .open("workstation", Capability::Screen, Some(&ticket.ticket))
+            .await
+            .unwrap();
+        let error = socket.read_u8().await.unwrap_err().to_string();
+        assert!(error.contains("1008"), "{error}");
+        assert!(error.contains("workstation is still booting"), "{error}");
+        let wrong_url = format!(
+            "{}#token={}",
+            fixture.run.page_url().split('#').next().unwrap(),
+            "0".repeat(64)
+        );
+        let error = client::PageClient::from_url(wrong_url)
+            .unwrap()
+            .bootstrap()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP/1.1 401"), "{error}");
+        assert!(error.contains("error"), "{error}");
+        let error = fixture
+            .client
+            .open("workstation", Capability::Screen, None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("HTTP/1.1 401"), "{error}");
+        assert!(error.contains("error"), "{error}");
+        fixture.network();
+        fixture.connect();
+        let before = fixture.state("leases").await;
+        assert!(before["value"]["workstation"]["holder"].is_null());
+        let ticket = fixture
+            .client
+            .ticket("workstation", Capability::Screen)
+            .await
+            .unwrap();
+        let mut screen = fixture
+            .client
+            .open("workstation", Capability::Screen, Some(&ticket.ticket))
+            .await
+            .unwrap();
+        let mut banner = [0; 12];
+        screen.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"RFB 003.008\n");
+        drop(screen);
+        assert_eq!(
+            fixture.state("leases").await,
+            before,
+            "no lease publication during screen access"
+        );
+        let ticket = fixture
+            .client
+            .ticket("workstation", Capability::Terminal)
+            .await
+            .unwrap();
+        let mut socket = fixture
+            .client
+            .open("workstation", Capability::Terminal, Some(&ticket.ticket))
+            .await
+            .unwrap();
+        let mut ready = [0; 5];
+        socket.read_exact(&mut ready).await.unwrap();
+        assert_eq!(&ready, b"ready");
+        socket.write_all(b"hello\r").await.unwrap();
+        let mut echo = [0; 6];
+        socket.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"hello\r");
+        fixture.run.stop_status();
+        let error = fixture.run.guests[0]
+            .console
+            .terminal(80, 24)
+            .unwrap()
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "workstation has stopped");
+        fixture.run.shutdown().await.unwrap();
+    })
     .await
     .unwrap();
-    let data = seed::user_data(&seed::Provision {
-        guest: &run.guests[0].guest,
-        authorized_key: "key",
-        ca: None,
-    });
-    assert!(data.contains(&base64::encode(
-        b"ANTHROPIC_API_KEY=sk-ant-api03-placeholder\n"
-    )));
-    assert!(data.contains(&base64::encode(
-        b"export ANTHROPIC_API_KEY=sk-ant-api03-placeholder\n"
-    )));
-    run.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn private_home_files_are_seeded_with_the_guest_owner() {
-    let mut kit = Kit::new("office").guest(Guest::ubuntu("workstation", "analyst"));
-    let (mut run, prepared) = kit.prepare().unwrap();
-    run.start_world(
-        |cx, mut world| async move {
-            for path in ["../outside", "/etc/other", ""] {
-                assert!(world.seed_home_files([(path, "value".into())]).is_err());
-            }
-            world.seed_home_files([(".claude/settings.json", "{}".into())])?;
-            hold_world(cx, world).await
-        },
-        prepared,
-    )
+async fn page_wires_containment_and_labels() {
+    let mut fixture = PageFixture::new().await;
+    let description = fixture.client.get_json("/api/page").await.unwrap();
+    let panels = description["panels"].as_array().unwrap();
+    let containment = panels.iter().find(|p| p["id"] == "containment").unwrap();
+    assert_eq!(containment["state"], "/api/state/containment");
+    let labels = panels.iter().find(|p| p["id"] == "labels").unwrap();
+    assert_eq!(labels["command"], "/api/command/labels");
+    let response = fixture.client.request("POST", "/api/command/labels", Some(&serde_json::json!({
+        "request_id":"label", "command":{"action":"add","target":{"kind":"event","seq":1},"text":"Boot"}
+    })), true).await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(fixture.state("labels").await["value"][0]["text"], "Boot");
+    assert!(fixture.run.guests[1].console.status.revision() > 0);
+    fixture.connect();
+    fixture.run.guests[1].addr = watch::channel(Some(Ipv4Addr::new(10, 0, 0, 3))).1;
+    fixture.run.connected(1, fixture.peer.session.clone());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.run.containment.revision() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
     .unwrap();
-    let guest = &run.guests[0].guest;
-    let file = guest
-        .files
-        .iter()
-        .find(|f| f.path == "/home/analyst/.claude/settings.json")
+    let state = fixture.state("containment").await;
+    let probes = state["value"]["probes"].as_array().unwrap();
+    assert_eq!(probes.len(), 2 * containment::PROBES.len());
+    for guest in ["workstation", "server"] {
+        assert_eq!(
+            probes.iter().filter(|p| p["guest"] == guest).count(),
+            containment::PROBES.len()
+        );
+    }
+    assert!(!containment::passed(
+        &fixture.client.state("containment").await.unwrap(),
+        &["workstation", "server"]
+    ));
+    let mut all = fixture.run.probes.lock().unwrap().clone();
+    for probe in &mut all.probes {
+        probe.outcome = if matches!(
+            probe.destination.as_str(),
+            "IPv6 routing table" | "environment" | "/etc/environment" | "apt configuration"
+        ) {
+            fictionet_observe::page::ProbeOutcome::Fact
+        } else {
+            fictionet_observe::page::ProbeOutcome::Contained
+        };
+    }
+    *fixture.run.probes.lock().unwrap() = all.clone();
+    fixture
+        .run
+        .containment
+        .publish(fictionet::time::Instant::ZERO, &all)
         .unwrap();
-    assert_eq!(file.mode, 0o600);
-    let data = seed::user_data(&seed::Provision {
-        guest,
-        authorized_key: "key",
-        ca: None,
-    });
-    assert_eq!(
-        seed::files(&data).unwrap()["/home/analyst/.claude/settings.json"],
-        "{}"
-    );
-    assert!(data.contains("owner: analyst:analyst\n    defer: true"));
-    run.shutdown().await.unwrap();
+    assert!(containment::passed(
+        &fixture.client.state("containment").await.unwrap(),
+        &["workstation", "server"]
+    ));
+    for outcome in [
+        fictionet_observe::page::ProbeOutcome::Unknown,
+        fictionet_observe::page::ProbeOutcome::MissingTool,
+        fictionet_observe::page::ProbeOutcome::TimedOut,
+        fictionet_observe::page::ProbeOutcome::Fact,
+        fictionet_observe::page::ProbeOutcome::Forwarded,
+        fictionet_observe::page::ProbeOutcome::NotContained,
+    ] {
+        let mut all = fixture.run.probes.lock().unwrap().clone();
+        all.probes[3].outcome = outcome;
+        fixture
+            .run
+            .containment
+            .publish(fictionet::time::Instant::ZERO, &all)
+            .unwrap();
+        assert!(!containment::passed(
+            &fixture.client.state("containment").await.unwrap(),
+            &["workstation", "server"]
+        ));
+    }
+    fixture.run.shutdown().await.unwrap();
 }
 
 #[test]
@@ -1905,244 +1607,10 @@ fn guest_macs_have_a_stable_vendor_address_per_hostname() {
     {
         let guest = Guest::ubuntu(&hostname, "analyst");
         let first = Resources::new(root.path(), &guest).unwrap();
-        assert!(checks::vendor_mac(first.mac));
+        assert_eq!(first.mac[0] & 3, 0);
         assert_eq!(&first.mac[..3], &[0xe4, 0xc7, 0x67]);
         assert!(addresses.insert(first.mac));
         let other = util::RunDir::new(&std::env::temp_dir(), "links").unwrap();
         assert_eq!(first.mac, Resources::new(other.path(), &guest).unwrap().mac);
     }
-}
-
-#[test]
-fn network_checks_distinguish_lan_and_public_addresses_and_local_macs() {
-    for address in [
-        "10.0.0.1",
-        "10.10.5.20",
-        "172.16.0.1",
-        "172.31.255.255",
-        "192.168.1.1",
-        "127.0.0.1",
-        "fc00::1",
-        "fdff:ffff::1",
-        "169.254.0.1",
-        "169.254.255.255",
-        "::1",
-        "fe80::1",
-        "febf:ffff::1",
-        "::ffff:10.0.0.1",
-        "::ffff:169.254.1.1",
-    ] {
-        let address = address.parse().unwrap();
-        assert!(!checks::reserved_address(address), "{address}");
-        assert!(checks::non_public_address(address), "{address}");
-    }
-    for address in [
-        "198.18.0.0",
-        "198.19.255.255",
-        "192.0.2.1",
-        "198.51.100.1",
-        "203.0.113.1",
-        "100.64.0.0",
-        "100.127.255.255",
-        "240.0.0.0",
-        "255.255.255.255",
-        "2001:2::1",
-        "2001:db8::1",
-        "::ffff:198.18.0.1",
-    ] {
-        assert!(
-            checks::reserved_address(address.parse().unwrap()),
-            "{address}"
-        );
-        assert!(
-            checks::non_public_address(address.parse().unwrap()),
-            "{address}"
-        );
-    }
-    for address in [
-        "104.18.0.1",
-        "104.19.255.254",
-        "2606:4700:100::1",
-        "172.15.255.255",
-        "172.32.0.0",
-        "104.21.48.57",
-        "172.67.13.55",
-        "100.63.255.255",
-        "100.128.0.0",
-        "2001:4860:4860::8888",
-    ] {
-        assert!(
-            !checks::reserved_address(address.parse().unwrap()),
-            "{address}"
-        );
-        assert!(
-            !checks::non_public_address(address.parse().unwrap()),
-            "{address}"
-        );
-    }
-    assert!(!checks::vendor_mac([2, 0, 0, 0, 0, 2]));
-    assert!(!checks::vendor_mac([1, 0, 0, 0, 0, 2]));
-    assert!(!checks::vendor_mac([0x74, 0x83, 0xc2, 0x66, 0x6e, 1]));
-    assert!(checks::vendor_mac([0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]));
-}
-
-#[test]
-fn demos_use_the_shared_check_sequence() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
-    for entry in std::fs::read_dir(root).unwrap() {
-        let directory = entry.unwrap().path();
-        let path = directory.join("main.rs");
-        if !path.is_file() {
-            continue;
-        }
-        let main = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            main.contains("kit::checks::run("),
-            "{} has no shared runner",
-            path.display()
-        );
-        for file in ["main.rs", "checks.rs", "story.rs"] {
-            let path = directory.join(file);
-            if !path.exists() {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).unwrap();
-            for call in [
-                ".wait_cloud_init(",
-                ".wait_desktop(",
-                ".boot(",
-                ".shutdown(",
-                ".containment(",
-                ".screenshots(",
-                "every required check passed",
-            ] {
-                assert!(!source.contains(call), "{} owns {call}", path.display());
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn shared_checks_wait_before_access_and_story_and_stop_on_failure() {
-    let mut fixture = PageFixture::new().await;
-    fixture
-        .peer
-        .ready
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    fixture.network();
-    fixture.connect();
-    fixture.run.guests[1].ssh = Some(fixture.peer.session.clone());
-    let out = fixture.run.path().join("shots");
-    std::fs::create_dir(&out).unwrap();
-    let played = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reached = played.clone();
-    let mut story = checks::story(move |run, _| -> checks::Story<'_, std::io::Error> {
-        Box::pin(async move {
-            let client = client::PageClient::from_url(run.page_url())?;
-            assert_eq!(
-                client.get_json("/api/page").await?["hosts"][0]["name"],
-                "workstation"
-            );
-            reached.store(true, std::sync::atomic::Ordering::SeqCst);
-            Err(std::io::Error::other("story stopped"))
-        })
-    });
-    let error = checks::sequence(&fixture.run, &out, &mut story)
-        .await
-        .unwrap_err();
-    assert_eq!(error.to_string(), "story stopped");
-    assert!(played.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(!out.join("world-dark.png").exists());
-    let mut events = Vec::new();
-    while let Ok(event) = fixture.peer.events.try_recv() {
-        events.push(event);
-    }
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.as_str() == "exec sudo cloud-init status --wait --long")
-            .count(),
-        2
-    );
-    let first_shell = events.iter().position(|event| event == "shell").unwrap();
-    let last_wait = events
-        .iter()
-        .rposition(|event| event == "exec sudo cloud-init status --wait --long")
-        .unwrap();
-    assert!(last_wait < first_shell, "{events:?}");
-    fixture.run.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn shared_checks_capture_light_and_dark_after_the_story() {
-    use fictionet_observe::page::{ProbeOutcome, ProbeResult};
-    let mut fixture = PageFixture::with_app(true).await;
-    fixture
-        .peer
-        .ready
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    fixture.network();
-    fixture.connect();
-    fixture.run.guests[1].ssh = Some(fixture.peer.session.clone());
-    let out = fixture.run.path().join("shots");
-    std::fs::create_dir(&out).unwrap();
-    let mut story = checks::story(|run, out| -> checks::Story<'_, std::io::Error> {
-        Box::pin(async move {
-            assert!(!out.join("world-light.png").exists());
-            assert!(!out.join("world-dark.png").exists());
-            let probes = Containment {
-                probes: run
-                    .guests()
-                    .iter()
-                    .flat_map(|guest| {
-                        containment::PROBES
-                            .iter()
-                            .enumerate()
-                            .map(move |(index, probe)| ProbeResult {
-                                guest: guest.guest.attachment.clone(),
-                                name: probe.name.into(),
-                                command: probe.command.into(),
-                                destination: probe.destination.into(),
-                                outcome: if index < 5 {
-                                    ProbeOutcome::Contained
-                                } else {
-                                    ProbeOutcome::Fact
-                                },
-                                guest_result: "fixture response".into(),
-                                summary: "fixture response".into(),
-                                world_answer: "fixture response".into(),
-                                proxies: vec![],
-                            })
-                    })
-                    .collect(),
-            };
-            run.containment
-                .publish(fictionet::time::Instant::ZERO, &probes)
-                .map_err(std::io::Error::other)?;
-            Ok(())
-        })
-    });
-    checks::sequence(&fixture.run, &out, &mut story)
-        .await
-        .unwrap();
-    assert!(out.join("workstation-screen.png").is_file());
-    assert!(out.join("workstation-page.png").is_file());
-    let light = std::fs::read(out.join("world-light.png")).unwrap();
-    let dark = std::fs::read(out.join("world-dark.png")).unwrap();
-    assert_ne!(light, dark, "both themes must render differently");
-    fixture.run.page_words.push("Desktop".into());
-    let refused = fixture.run.path().join("refused");
-    std::fs::create_dir(&refused).unwrap();
-    let mut story =
-        checks::story(|_, _| -> checks::Story<'_, std::io::Error> { Box::pin(async { Ok(()) }) });
-    let error = checks::sequence(&fixture.run, &refused, &mut story)
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("Visible words 'Desktop'"),
-        "{error}"
-    );
-    assert!(!refused.join("world-light.png").exists());
-    assert!(!refused.join("world-dark.png").exists());
-    fixture.run.shutdown().await.unwrap();
 }

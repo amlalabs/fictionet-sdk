@@ -2,7 +2,7 @@
 name = "artifactory-world"
 version = "0.0.0"
 edition = "2024"
-description = "The Artifactory world on Fictionet: a sealed company package mirror with no upstream."
+description = "The Artifactory world on Fictionet: a company package mirror with no upstream."
 license = "MIT OR Apache-2.0"
 publish = false
 

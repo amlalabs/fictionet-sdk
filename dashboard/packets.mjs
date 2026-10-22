@@ -265,11 +265,11 @@ export function createPackets({
     const gap = tr.classList.contains('gap');
     const text = !q || (!gap && (tr.dataset.text || '').includes(q));
     const { src, dst } = tr.dataset;
-    const ends = !pair || (!gap && ((src === pair[0] && dst === pair[1]) || (src === pair[1] && dst === pair[0])));
+    const ends = !pair || (!gap && pair.some(([a, b]) => (src === a && dst === b) || (src === b && dst === a)));
     tr.hidden = !(text && ends);
   }
   function setPair(next) {
-    pair = next ? [String(next[0]), String(next[1])] : null;
+    pair = next ? (Array.isArray(next[0]) || !next.length ? next : [next]).map(([a, b]) => [String(a), String(b)]) : null;
     for (const tr of prows.children) filterRow(tr);
   }
 

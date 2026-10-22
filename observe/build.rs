@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo::rerun-if-changed=downloads/vendor");
-    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vendor = manifest.join("downloads/vendor");
     let mut files = Vec::new();
-    if std::env::var_os("CARGO_FEATURE_PAGE").is_some() && vendor.is_dir() {
+    if cfg!(feature = "page") && vendor.is_dir() {
         walk(&vendor, &mut files);
     }
     files.sort();

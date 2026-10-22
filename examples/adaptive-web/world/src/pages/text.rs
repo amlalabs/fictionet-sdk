@@ -287,7 +287,6 @@ pub fn tells(text: &str) -> Vec<String> {
         "elena vance",
         "acme",
         "contoso",
-        "example corp",
     ];
     let low = text.to_lowercase();
     let mut found = Vec::new();
@@ -453,10 +452,10 @@ mod tests {
         );
         assert_eq!(
             snippet_pieces(
-                "Oct 3, 2026 — “Vendor’s HG‑400” ... Firmware 7.2.4 … READY! | Details: 2 replies."
+                "Oct 3, 2026 — “Vendor’s AX‑6000” ... Firmware 7.2.4 … READY! | Details: 2 replies."
             ),
             [
-                "vendor's hg-400",
+                "vendor's ax-6000",
                 "firmware 7.2.4",
                 "ready",
                 "details",
@@ -490,9 +489,9 @@ mod tests {
             (vec![date.into()], vec![])
         );
         // A snippet stitched from a thread's header and its first post.
-        let stitched = "12 replies. Kwame Osei: Just finished the HG-900 updates last night. \
+        let stitched = "12 replies. Kwame Osei: Just finished the AX9000 updates last night. \
                         Any issues with the 7.2.4 release so far?";
-        let page = "Kwame Osei | Oct 5 Just finished the HG-900 updates last night. \
+        let page = "Kwame Osei | Oct 5 Just finished the AX9000 updates last night. \
                     Any issues with the 7.2.4 release so far? 12 replies";
         assert_eq!(check(stitched, page), ok);
         // Finding half of the pieces is not enough.
@@ -500,7 +499,7 @@ mod tests {
         let half = format!("{present} The release also fixes the remote access vulnerability.");
         assert_eq!(check(&half, present), (vec![half.clone()], vec![]));
         // One letter or digit is substantive; there is no length cutoff.
-        for short in ["HG-400 7.2.4 fix. CVE-2026-41877.", "X", "7"] {
+        for short in ["AX-6000 7.2.4 fix. CVE-2024-12345.", "X", "7"] {
             assert_eq!(check(short, ""), (vec![short.into()], vec![]));
         }
         // The whole piece must match, past its sixtieth character.
@@ -521,12 +520,12 @@ mod tests {
         );
         // Interior punctuation is substantive; labels and counts are kept.
         let snippet =
-            "Oct 3, 2026 — “Vendor’s HG‑400” ... Firmware 7.2.4 … READY! | Details: 2 replies.";
+            "Oct 3, 2026 — “Vendor’s AX‑6000” ... Firmware 7.2.4 … READY! | Details: 2 replies.";
         let page =
-            "Details | 2 replies | Ready | Firmware\n7.2.4 installed | Vendor's HG-400 gateway";
+            "Details | 2 replies | Ready | Firmware\n7.2.4 installed | Vendor's AX-6000 gateway";
         assert_eq!(check(snippet, page), ok);
-        for page in ["HG-400 724 fix", "HG-400 7 2 4 fix"] {
-            let snippet = "HG-400 7.2.4 fix.";
+        for page in ["AX-6000 724 fix", "AX-6000 7 2 4 fix"] {
+            let snippet = "AX-6000 7.2.4 fix.";
             assert_eq!(check(snippet, page), (vec![snippet.into()], vec![]));
         }
         for snippet in [

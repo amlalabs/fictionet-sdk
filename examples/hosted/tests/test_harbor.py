@@ -45,7 +45,7 @@ class VerifierTests(unittest.TestCase):
         self.status = self.root / "status"
         self.status.write_text("Name:\tbash\nCapEff:\t00000000a80425fb\n")
         self.calls = self.root / "calls.jsonl"
-        self.env = {**os.environ, "PATH": str(self.bin)}
+        self.env = {"PATH": str(self.bin)}
         self.responses = {
             "curl": {FETCH: (NONCE, "", 0), PROBE: ("0.000000", "Failed to connect\n", 7)},
             "dig": {("+time=2", "+tries=1", "@8.8.8.8", "example.com"):

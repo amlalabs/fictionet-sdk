@@ -111,50 +111,55 @@ async fn collect(response: Response<Body>, stream: bool) -> Value {
 }
 #[test]
 fn responses_search_preserves_reasoning_and_restores_function_pairs() {
-    for stream in [false, true] {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let first = receive(&mut socket);
-            assert_eq!(first["tools"][0]["type"], "function");
-            assert_eq!(
-                first["tool_choice"],
-                json!({"type":"function","name":"web_search"})
-            );
-            let reasoning = json!({"type":"reasoning","id":"rs_first","encrypted_content":"preserved","summary":[]});
-            let call = json!({"type":"function_call","id":"fc_first","call_id":"call_first","name":"web_search","arguments":"{\"query\":\"page\"}","status":"completed"});
-            answer(&mut socket, vec![reasoning.clone(), call.clone()], stream);
-            let (mut socket, _) = listener.accept().unwrap();
-            let second = receive(&mut socket);
-            assert_eq!(second["tools"], first["tools"]);
-            assert_eq!(second["input"][1], reasoning);
-            assert_eq!(second["input"][2], call);
-            assert_eq!(second["input"][3]["type"], "function_call_output");
-            assert!(
-                second["input"][3]["output"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Page title")
-            );
-            let text = json!({"type":"message","id":"msg_final","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Page title","annotations":[]}]});
-            answer(&mut socket, vec![text.clone()], stream);
-            let (mut socket, _) = listener.accept().unwrap();
-            let third = receive(&mut socket);
-            assert_eq!(
-                &third["input"].as_array().unwrap()[..4],
-                second["input"].as_array().unwrap()
-            );
-            assert_eq!(third["input"][4], text);
-            answer(&mut socket, vec![text], stream);
-        });
-        let pages = Arc::new(Pages(AtomicUsize::new(0)));
-        let engine = pages.clone();
-        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(10)), |cx| async move {
+    for (provider, guest) in [
+        (Provider::OpenAi, false),
+        (Provider::OpenAi, true),
+        (Provider::ChatGpt, true),
+    ] {
+        for stream in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let first = receive(&mut socket);
+                assert_eq!(first["tools"][0]["type"], "function");
+                assert_eq!(
+                    first["tool_choice"],
+                    json!({"type":"function","name":"web_search"})
+                );
+                let reasoning = json!({"type":"reasoning","id":"rs_first","encrypted_content":"preserved","summary":[]});
+                let call = json!({"type":"function_call","id":"fc_first","call_id":"call_first","name":"web_search","arguments":"{\"query\":\"page\"}","status":"completed"});
+                answer(&mut socket, vec![reasoning.clone(), call.clone()], stream);
+                let (mut socket, _) = listener.accept().unwrap();
+                let second = receive(&mut socket);
+                assert_eq!(second["tools"], first["tools"]);
+                assert_eq!(second["input"][1], reasoning);
+                assert_eq!(second["input"][2], call);
+                assert_eq!(second["input"][3]["type"], "function_call_output");
+                assert!(
+                    second["input"][3]["output"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Page title")
+                );
+                let text = json!({"type":"message","id":"msg_final","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Page title","annotations":[]}]});
+                answer(&mut socket, vec![text.clone()], stream);
+                let (mut socket, _) = listener.accept().unwrap();
+                let third = receive(&mut socket);
+                assert_eq!(
+                    &third["input"].as_array().unwrap()[..4],
+                    second["input"].as_array().unwrap()
+                );
+                assert_eq!(third["input"][4], text);
+                answer(&mut socket, vec![text], stream);
+            });
+            let pages = Arc::new(Pages(AtomicUsize::new(0)));
+            let engine = pages.clone();
+            fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(10)), |cx| async move {
             let credential = Credential::api_key(&cx, Secret::new("key", "private".into())?);
             let key = credential.wire(Provider::OpenAi, false);
-            let model = Model::at(&cx, Provider::OpenAi, credential, format!("http://{address}").parse()?)?.search(engine);
-            let request = |body: &Value| Request::post("/v1/responses").header("authorization", &key).body(Body::from(body.to_string())).unwrap();
+            let model = if guest { Model::guest_at(&cx, provider, format!("http://{address}").parse()?)? } else { Model::at(&cx, provider, credential, format!("http://{address}").parse()?)? }.search(engine);
+            let request = |body: &Value| Request::post(if provider == Provider::ChatGpt { "/backend-api/codex/responses" } else { "/v1/responses" }).header("authorization", &key).body(Body::from(body.to_string())).unwrap();
             let mut body = json!({"model":"small","stream":stream,"store":false,"input":[{"role":"user","content":"Search"}],"tools":[{"type":"web_search","filters":{"allowed_domains":["example.com"]}}],"tool_choice":{"type":"web_search"},"include":["reasoning.encrypted_content","web_search_call.action.sources"]});
             let response = collect(model.clone().send(request(&body)).await?, stream).await;
             assert_eq!(response["usage"]["output_tokens"], 4);
@@ -169,10 +174,12 @@ fn responses_search_preserves_reasoning_and_restores_function_pairs() {
             collect(model.clone().send(request(&body)).await?, stream).await;
             Ok(())
         })).unwrap();
-        server.join().unwrap();
-        assert_eq!(pages.0.load(Ordering::SeqCst), 1);
+            server.join().unwrap();
+            assert_eq!(pages.0.load(Ordering::SeqCst), 1);
+        }
     }
 }
+
 #[test]
 fn zstd_requests_are_decoded_and_metered() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

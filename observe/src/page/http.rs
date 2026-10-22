@@ -253,11 +253,11 @@ async fn headers_with_policy(
 pub(super) async fn page(conn: &mut TcpStream) -> io::Result<()> {
     let nonce = super::random_hex()?;
     let body = super::assets::HTML.replace("PAGE_NONCE", &nonce);
-    // xterm injects style elements; style attributes in markup remain blocked.
+    // ghostty-web injects style elements; style attributes in markup remain blocked.
     let security = SECURITY
         .replace(
-            "script-src 'self';",
-            &format!("script-src 'self' 'nonce-{nonce}';"),
+            "script-src 'self' 'wasm-unsafe-eval';",
+            &format!("script-src 'self' 'wasm-unsafe-eval' 'nonce-{nonce}';"),
         )
         .replace(
             "style-src 'self';",

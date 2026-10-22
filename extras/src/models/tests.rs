@@ -484,7 +484,11 @@ fn codex_catalog_openrouter_requires_supplied_catalog() {
                     Request::get("/backend-api/codex/models")
                         .header(
                             "authorization",
-                            model.credential.wire(Provider::OpenAi, false),
+                            model
+                                .credential
+                                .as_ref()
+                                .unwrap()
+                                .wire(Provider::OpenAi, false),
                         )
                         .body(Body::empty())?,
                 )
@@ -553,7 +557,11 @@ fn codex_catalog_answer_checks_credentials_and_passes_a_pause() {
                     .body(Body::empty())
                     .unwrap()
             };
-            let bearer = model.credential.wire(Provider::OpenAi, false);
+            let bearer = model
+                .credential
+                .as_ref()
+                .unwrap()
+                .wire(Provider::OpenAi, false);
             let response = catalog_request(
                 &cx,
                 site.clone(),
@@ -653,7 +661,11 @@ fn codex_catalog_forward_swaps_key_and_preserves_response() {
             let model_call = Request::post("/backend-api/codex/responses")
                 .header(
                     "authorization",
-                    model.credential.wire(Provider::OpenAi, false),
+                    model
+                        .credential
+                        .as_ref()
+                        .unwrap()
+                        .wire(Provider::OpenAi, false),
                 )
                 .body(Body::empty())?;
             assert_eq!(
@@ -665,7 +677,13 @@ fn codex_catalog_forward_swaps_key_and_preserves_response() {
             let response = catalog_request(
                 &cx,
                 site,
-                request(model.credential.wire(Provider::OpenAi, false)),
+                request(
+                    model
+                        .credential
+                        .as_ref()
+                        .unwrap()
+                        .wire(Provider::OpenAi, false),
+                ),
             )
             .await;
             assert_eq!(response.status(), 202);
@@ -700,14 +718,18 @@ fn codex_catalog_forward_origin_is_separate_from_model_calls() {
             let mut model = Model::with_forward(
                 &cx,
                 Provider::OpenAi,
-                credential,
+                Some(credential),
                 web::forward(&cx, origin.clone(), Arc::new(Transport))?,
                 "chatgpt.com".into(),
             );
             let mut catalog_site = model.codex_catalog(origin, None)?;
             catalog_site.forward = model.forward.clone();
             model.provider = Provider::ChatGpt;
-            let bearer = model.credential.wire(Provider::ChatGpt, false);
+            let bearer = model
+                .credential
+                .as_ref()
+                .unwrap()
+                .wire(Provider::ChatGpt, false);
             for catalog in [false, true] {
                 let site = if catalog { &catalog_site } else { &model };
                 let request = if catalog {
@@ -738,4 +760,83 @@ fn codex_catalog_forward_origin_is_separate_from_model_calls() {
         },
     ))
     .unwrap();
+}
+
+#[test]
+fn guest_credentials_follow_each_request_without_replacement() {
+    use std::io::Write;
+    for provider in [Provider::Anthropic, Provider::OpenAi, Provider::ChatGpt] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for token in ["first-session", "refreshed-session"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (head, body) = super::splice_tests::exchange(&mut socket);
+                assert!(head.contains(&format!("authorization: Bearer {token}\r\n")));
+                assert!(head.contains("chatgpt-account-id: own-account\r\n"));
+                assert!(head.contains("anthropic-beta: oauth-2025-04-20\r\n"));
+                assert!(head.contains("cookie: session=own-cookie\r\n"));
+                assert_eq!(body["model"], "small");
+                let body = r#"{"model":"small","usage":{}}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            |cx| async move {
+                let model = Model::guest_at(&cx, provider, format!("http://{address}").parse()?)?;
+                assert!(model.guest_env().is_empty());
+                let path = match provider {
+                    Provider::Anthropic => "/v1/messages",
+                    Provider::ChatGpt => "/backend-api/codex/responses",
+                    _ => "/v1/responses",
+                };
+                assert_eq!(
+                    model
+                        .clone()
+                        .send(Request::post(path).body(Body::from("{}"))?)
+                        .await?
+                        .status(),
+                    401
+                );
+                for path in [
+                    "/api/oauth/../../v1/messages",
+                    "/api/oauth/%2e%2e/%2e%2e/v1/messages",
+                ] {
+                    let response = model
+                        .clone()
+                        .send(
+                            Request::post(path)
+                                .header("authorization", "Bearer own-session")
+                                .body(Body::from("{}"))?,
+                        )
+                        .await?;
+                    assert_eq!(response.status(), 404);
+                }
+                for token in ["first-session", "refreshed-session"] {
+                    let path = if provider == Provider::Anthropic && token == "refreshed-session" {
+                        "/api/oauth/cli/create_api_key"
+                    } else {
+                        path
+                    };
+                    let response = model
+                        .clone()
+                        .send(
+                            Request::post(path)
+                                .header("authorization", format!("Bearer {token}"))
+                                .header("chatgpt-account-id", "own-account")
+                                .header("anthropic-beta", "oauth-2025-04-20")
+                                .header("cookie", "session=own-cookie")
+                                .body(Body::from(r#"{"model":"small"}"#))?,
+                        )
+                        .await?;
+                    assert_eq!(response.status(), 200);
+                    response.into_body().collect().await?;
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        server.join().unwrap();
+    }
 }

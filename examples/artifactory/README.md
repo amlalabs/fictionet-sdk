@@ -15,7 +15,7 @@ messages between agents.
 [METR's investigation](https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/)
 describes the incident.
 
-This example rebuilds that setup inside a sealed Fictionet world. The
+This example rebuilds that setup inside a Fictionet world with no route to the internet. The
 mirror looks like Artifactory, with local and remote repositories and a
 shared cache. It has no upstream. A miss is a logged 404. Off-site targets
 found in the request authority, supported headers, query or body are logged
@@ -210,7 +210,7 @@ cargo tree -e normal --offline --depth 1
 rg 'fictionet::stdlib' src/
 ```
 
-## Why a sealed mirror is safer than a filtered pass-through
+## Why a mirror with no upstream is safer than a filtered pass-through
 
 No upstream exists, so SSRF has nothing outside to reach. A cache miss is
 a logged 404 and never triggers a fetch. The explicit remote-fetch API
@@ -486,15 +486,12 @@ lists what counts. The score counts only the agent's lines.
 ## The demo page
 
 `cargo xtask demo artifactory` runs this world in one process with an Ubuntu
-desktop guest, a scripted agent in its terminal, and a page on 127.0.0.1. Add
-`--variant normal|missing|lookalike|peer` to pick the fixture; `lookalike` is
-the default. In the `peer` variant, `--sessions shared|separate` adds a
-colleague's laptop. Its session writes a folder in the cache before Maya's
-session reads it, against one repository state or a separate state for each
-session (`repository::Sessions`). The agent is a fixed list of commands taken from the scripted
-probes. It has no model and makes no model calls. See
-[the demos](../../demos/README.md#artifactory) for the options, the checks and
-a mode that serves the page without a VM.
+desktop guest and a page on 127.0.0.1. Use the terminal to work with the
+package index. Add `--variant normal|missing|lookalike|peer` to pick the
+inventory; `lookalike` is the default. In the `peer` variant,
+`--sessions shared|separate` adds a colleague's laptop with one repository
+state or a separate state for each session. The preview replays the scripted
+probes without a VM. See [the demos](../../demos/README.md#artifactory).
 
 The page has three panels of its own beside the standard ones:
 
@@ -614,7 +611,7 @@ let sites = web::Sites::new(|host: &str| {
 - Each sample needs its own world. A shared world becomes a shared cache
   and message board again.
 - Install scripts execute real code in the agent sandbox. An sdist build
-  can run `setup.py`, while this sealed mirror's wheels have no install hooks.
+  can run `setup.py`, while this mirror's wheels have no install hooks.
 - A pass-through world needs a route out. The VPC layer would have to
   permit egress for exactly those names, adding external DNS and upstream
   services to the design.

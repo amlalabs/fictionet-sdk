@@ -1,5 +1,6 @@
 // mount(root, services) returns dispose. The map draws the page's graph model
 // (services.graph) and follows services.selection.
+import { pageGraph } from '../visibility.mjs';
 import { scoped, listen } from '../dom.mjs';
 import { createGraph } from '../graph.mjs';
 import { createInteraction } from '../interaction.mjs';
@@ -21,7 +22,26 @@ export function mount(root, services) {
     info: new Map(), // group id -> { key, depth, leaves, sandboxes, tasks }
   };
 
-  const { state, runTime } = services.graph;
+  const { runTime } = services.graph;
+  const state = pageGraph(services.graph.state, services.hosts);
+  Object.defineProperty(state, 'selected', {
+    get: () => services.graph.state.selected,
+    set: (value) => { services.graph.state.selected = value; },
+  });
+  function update() {
+    const next = pageGraph(services.graph.state, services.hosts);
+    state.nodes = next.nodes;
+    state.edges = next.edges;
+    state.events = next.events;
+    state.groups = next.groups;
+    state.hosts = next.hosts;
+    state.known = next.known;
+    state.ended = next.ended;
+    state.status = next.status;
+    state.layoutDirty ||= next.layoutDirty;
+    state.sideDirty ||= next.sideDirty;
+    services.graph.state.layoutDirty = services.graph.state.sideDirty = false;
+  }
   // The model outlives the map: draw everything it holds afresh.
   const undraw = () => { for (const n of state.nodes.values()) n.g = null; };
   undraw();
@@ -110,6 +130,7 @@ export function mount(root, services) {
   }
   function onSelect(selected) {
     if (syncingSelection) return;
+    services.packetPair.set(null);
     const node = state.nodes.get(selected?.id);
     const owner = state.hosts.get(node?.host) || [...state.hosts.values()].find((host) => host.group === selected?.id);
     let sandbox = owner?.sandbox || owner?.name || (node?.kind === 'sandbox' ? node.name : null);
@@ -121,7 +142,7 @@ export function mount(root, services) {
       sandbox = parent?.kind === 'sandbox' ? parent.name : parent?.sandbox?.name;
     }
     const host = services.hostOf(sandbox);
-    services.selection.set({ connection: null, request: null, node: node?.id || null, host, event: selected?.event || null, links: selected?.kind === 'edge' ? (view.dedges.get(selected.id)?.members || []).map(({ e }) => e.id) : [] });
+    services.selection.set({ connection: null, request: null, node: node?.id || null, host, event: selected?.event || null, links: selected?.kind === 'edge' ? (view.dedges.get(selected.id)?.members || []).map(({ e }) => e.id) : [...(node?.edges || [])].filter((id) => state.edges.has(id)) });
     // The map made this selection: it is not applied back to the map.
     pendingSelection = null;
   }
@@ -131,10 +152,15 @@ export function mount(root, services) {
       ev.preventDefault();
       $('search').focus();
     }
-    if (ev.key === 'Escape' && active === root.ownerDocument.body) select(null);
+    if (ev.key === 'Escape') {
+      $('search').value = '';
+      applySearch();
+      select(null);
+    }
   });
   const stop = services.graph.subscribe((name, data) => {
-    if (name === 'event') pulse(data);
+    update();
+    if (name === 'event' && state.events.includes(data)) pulse(data);
     if (name === 'group_end') {
       view.gviews.get(data.id)?.g?.remove();
       view.gviews.delete(data.id);

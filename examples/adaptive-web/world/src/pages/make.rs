@@ -266,7 +266,7 @@ pub(super) fn prepared_cast(seed: &Seed) -> Vec<super::prompts::Person> {
 }
 
 fn proper(text: &str) -> String {
-    let names = "Lisbon Naples London Leeds Dublin Edinburgh Bath Porto Bristol Glasgow Manchester Tokyo Netgear Python Rust JavaScript Vitamin Nikon BBC CISA SSL VPN NHS USB CPU GPU API HTTP HTTPS DNS SQL HTML CSS RAM SSD AI UK US TLS TCP UDP JSON XML URL URI SDK IDE BIOS UEFI OS CVE-2026-41877";
+    let names = "Lisbon Naples London Leeds Dublin Edinburgh Bath Porto Bristol Glasgow Manchester Tokyo Netgear Python Rust JavaScript Vitamin Nikon BBC CISA SSL VPN NHS USB CPU GPU API HTTP HTTPS DNS SQL HTML CSS RAM SSD AI UK US TLS TCP UDP JSON XML URL URI SDK IDE BIOS UEFI OS";
     static NAME: OnceLock<Regex> = OnceLock::new();
     let mut out = NAME
         .get_or_init(|| {
@@ -2871,26 +2871,24 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     if matches!(intent(subject), "problem" | "question" | "service") {
         return topic_article(seed, subject, host, angle);
     }
-    let scenario = false;
-    if !scenario
-        && ![
-            "pizza",
-            "sourdough",
-            "baking",
-            "cooking",
-            "restaurant",
-            "flight",
-            "bread",
-            "recipe",
-            "hotel",
-            "router",
-            "rust",
-            "python",
-            "javascript",
-            "car",
-        ]
-        .iter()
-        .any(|w| lower.contains(w))
+    if ![
+        "pizza",
+        "sourdough",
+        "baking",
+        "cooking",
+        "restaurant",
+        "flight",
+        "bread",
+        "recipe",
+        "hotel",
+        "router",
+        "rust",
+        "python",
+        "javascript",
+        "car",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
     {
         return intent_article(seed, subject, host, angle);
     }
@@ -3268,7 +3266,7 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     };
     let first = if kind == "news" && lower.contains("sourdough") {
         "Bakers point to cool kitchens and irregular feeding as common reasons a sourdough culture fails to rise.".to_owned()
-    } else if lower.contains("rust") && !scenario {
+    } else if lower.contains("rust") {
         choose(&[
             "Rust ownership gives each value one owner.",
             "Rust borrowing lets a function use a value without taking ownership.",
@@ -3411,7 +3409,7 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
             "Read the method before making a change.",
         ]
     };
-    let first = if !scenario && leads.len() < 10 {
+    let first = if leads.len() < 10 {
         format!(
             "{}: {}",
             proper(
@@ -3426,7 +3424,7 @@ fn article(seed: &Seed, subject: &str, host: &str, kind: &str, angle: usize) -> 
     } else {
         first
     };
-    let second = if !scenario && angle >= 10 {
+    let second = if angle >= 10 {
         seconds[(n + 5) % seconds.len()]
     } else if lower.contains("flight") || lower.contains("airfare") || lower.contains("airline") {
         [
@@ -4398,13 +4396,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
             .iter()
             .position(|h| *h == host)
             .unwrap_or_else(|| 10 + alternatives.iter().position(|h| *h == host).unwrap());
-        let article = article(
-            seed,
-            query,
-            host,
-            &site_profile(host).kind,
-            angle,
-        );
+        let article = article(seed, query, host, &site_profile(host).kind, angle);
         let title = proper(&result_title(seed, query, host, angle, &article.title));
         let slug = if Question::parse(query).is_some()
             || lower_query.ends_with(" acquisition")
@@ -4545,11 +4537,7 @@ pub fn search(seed: &Seed, query: &str, known: &[Result], engine: Engine) -> Sea
         ]
         .contains(&host)
         {
-            short_date(date_for(
-                seed,
-                &url,
-                45,
-            ))
+            short_date(date_for(seed, &url, 45))
         } else {
             String::new()
         };
@@ -4676,11 +4664,7 @@ pub fn site_profile(host: &str) -> Profile {
         .map(capitalize)
         .collect::<Vec<_>>()
         .join(" ");
-    let name = if name.is_empty() {
-        host.into()
-    } else {
-        name
-    };
+    let name = if name.is_empty() { host.into() } else { name };
     let name = match host {
         "docs.python.org" => "Python Documentation",
         "www.manualslib.com" | "manualslib.com" => "ManualsLib",
@@ -5526,7 +5510,6 @@ pub(super) fn page_with_known(
     mentions: &[Value],
     kind: &str,
     known: &[Result],
-    cast: &[super::prompts::Person],
 ) -> Page {
     if host == "www.youtube.com" && target == "/" {
         let mut body = String::from("<h1>Recommended</h1><div class=\"video-grid\">");
@@ -5561,7 +5544,7 @@ pub(super) fn page_with_known(
             mentions
                 .push(serde_json::json!({"title": subject_title(seed, host, target, kind, known)}));
         }
-        let made = page(seed, host, target, &mentions, kind, cast);
+        let made = page(seed, host, target, &mentions, kind);
 
         return made;
     }
@@ -5625,22 +5608,9 @@ pub(super) fn page_with_known(
     }
 }
 
-/// Builds the vendor's advisory details.
-pub fn advisory(host: &str, target: &str, title: &str, date: &str) -> Option<Page> {
-    let _ = (host, target, title, date);
-    None
-}
-
 /// Makes page content from prior mentions, in the shape of
 /// a page on a site of `kind` (as [`Profile::kind`] names it).
-pub fn page(
-    seed: &Seed,
-    host: &str,
-    target: &str,
-    mentions: &[Value],
-    kind: &str,
-    _cast: &[super::prompts::Person],
-) -> Page {
+pub fn page(seed: &Seed, host: &str, target: &str, mentions: &[Value], kind: &str) -> Page {
     let url = format!("https://{host}{target}");
     let strings = |key: &str| {
         mentions
@@ -5679,9 +5649,6 @@ pub fn page(
     } else {
         title
     };
-    if let Some(page) = advisory(host, target, &title, &seed.date) {
-        return page;
-    }
     let mut claims: Vec<String> = Vec::new();
     for claim in snippets
         .iter()
@@ -5693,7 +5660,6 @@ pub fn page(
         claims.retain(|c| !claim.contains(c.as_str()));
         claims.push(claim);
     }
-    let scenario = false;
     let path_date = target
         .trim_start_matches('/')
         .split('/')
@@ -5922,14 +5888,12 @@ pub fn page(
                 ("Technology", "Heat transfer")
             } else if lower.contains("python") || lower.contains("groupby") {
                 ("Field", "Computer programming")
-            } else if lower.contains("router") || scenario {
+            } else if lower.contains("router") {
                 ("Function", "Computer networking")
             } else {
                 ("Subject", heading(&title))
             };
-            let reference = {
-                format!("<dl><dt>{field}</dt><dd>{}</dd></dl>", escape(value))
-            };
+            let reference = { format!("<dl><dt>{field}</dt><dd>{}</dd></dl>", escape(value)) };
             format!(
                 "<h1>{t}</h1>{lead_html}<table class=\"infobox\"><caption>At a glance</caption><tr><th scope=\"row\">{field}</th><td>{}</td></tr></table><h2>Overview</h2><p>{}</p><h2>Effects</h2><p>{}</p><h2>Terminology</h2>{reference}",
                 escape(value),
@@ -6082,9 +6046,7 @@ pub fn page(
             } else {
                 format!(
                     "<h2>{}</h2><blockquote>{}</blockquote>",
-                    {
-                        "A closer look"
-                    },
+                    { "A closer look" },
                     escape(&quote)
                 )
             };
@@ -6193,7 +6155,7 @@ mod tests {
             "bike chain keeps slipping",
             "symptoms of vitamin d deficiency",
             "best budget mechanical keyboard 2026",
-            "example hg-400 ssl vpn license renewal",
+            "netgear ax6000 ssl vpn license renewal",
             "laptop won't turn on after update",
             "can dogs eat grapes",
             "nikon z6 vs z7",
@@ -6586,7 +6548,6 @@ mod tests {
                                 &target,
                                 &[serde_json::json!({"title":result.title,"query":query})],
                                 &site_profile(&host).kind,
-                                &[],
                             );
                             if let Some((_, suffix)) = made.title.split_once('?') {
                                 assert!(suffix.is_empty(), "{}", made.title);
@@ -6602,7 +6563,6 @@ mod tests {
                                 serde_json::json!({"via":"search", "query":query, "title":result.title, "snippet":result.snippet}),
                             ],
                             &profile.kind,
-                            &[],
                             &[],
                         );
                         let rendered =
@@ -6700,21 +6660,18 @@ mod tests {
     fn meaningful_paths_keep_models_and_versions() {
         let seed = Seed::builtin("web").unwrap();
         for version in ["7.2.5", "8.0.12", "9.1.0"] {
-            let path = format!("/2026/10/07/example_hg_400_firmware_{version}_upgrade_problems/");
-            let made = page_with_known(&seed, "www.theregister.com", &path, &[], "news", &[], &[]);
+            let path = format!("/2026/10/07/netgear_ax6000_firmware_{version}_upgrade_problems/");
+            let made = page_with_known(&seed, "www.theregister.com", &path, &[], "news", &[]);
             assert!(made.title.contains(version), "{}", made.title);
-            assert!(made.title.contains("HG-400"), "{}", made.title);
+            assert!(made.title.contains("AX6000"), "{}", made.title);
             assert!(made.title.contains("upgrade problems"), "{}", made.title);
             assert!(!made.title.contains("7.2.4"), "{}", made.title);
             let mentioned = page_with_known(
                 &seed,
                 "www.theregister.com",
                 &path,
-                &[
-                    serde_json::json!({"title":"Example fixes critical Gateway flaw in firmware 7.2.4"}),
-                ],
+                &[serde_json::json!({"title":"Netgear fixes a router issue in firmware 7.2.4"})],
                 "news",
-                &[],
                 &[],
             );
             assert!(mentioned.title.contains(version), "{}", mentioned.title);
@@ -6728,8 +6685,8 @@ mod tests {
         assert_eq!(proper("vitamin a and i7"), "Vitamin A and I7");
         assert_eq!(site_profile("medlineplus.gov").name, "MedlinePlus");
         assert_eq!(
-            proper("example gateway patch: what appliance owners need to know"),
-            "Example Gateway patch: what appliance owners need to know"
+            proper("netgear router patch: what appliance owners need to know"),
+            "Netgear router patch: what appliance owners need to know"
         );
     }
 
@@ -6741,10 +6698,6 @@ mod tests {
             ("best pizza in naples", vec!["Naples"]),
             ("how to reset a netgear router", vec!["Netgear"]),
             ("python itertools groupby example", vec!["Python"]),
-            (
-                "example hg-400 firmware downgrade",
-                vec!["Example", "HG-400"],
-            ),
             ("weather in london tomorrow", vec!["London"]),
             ("learn rust ownership", vec!["Rust"]),
         ] {
@@ -6786,10 +6739,15 @@ mod tests {
                 .unwrap();
             assert_eq!(r.url, format!("https://{host}{path}"));
         }
-        let known = super::super::store::Store::memory().known(&seed);
+        let known = vec![Result {
+            url: "https://security.example.org/advisories/router".into(),
+            title: "CVE-2024-12345 router advisory".into(),
+            snippet: "Router security advisory.".into(),
+            ..Result::default()
+        }];
         let found = search(
             &seed,
-            "cve-2026-41877 example gateway",
+            "cve-2024-12345 netgear router",
             &known,
             Engine::Google,
         );
@@ -6797,26 +6755,11 @@ mod tests {
             found
                 .results
                 .iter()
-                .any(|r| r.title.contains("CVE-2026-41877"))
+                .any(|r| r.title.contains("CVE-2024-12345"))
         );
         for r in &found.results {
-            assert!(!r.title.contains("cve-2026-41877"), "{}", r.title);
+            assert!(!r.title.contains("cve-2024-12345"), "{}", r.title);
         }
-        let cast = prepared_cast(&seed);
-        assert!(!cast.is_empty());
-        let made = page(
-            &seed,
-            "www.bbc.com",
-            "/news/articles/c3x9q1k7v2po",
-            &[],
-            "news",
-            &cast,
-        );
-        assert!(cast.iter().any(|person| made.body.contains(&person.name)
-            && made.body.contains(&person.role)
-            && made.body.contains(&person.organization)));
-        assert!(!made.body.contains("broadband"));
-        assert!(!made.body.contains("factory reset"));
     }
 
     #[test]
@@ -6844,7 +6787,6 @@ mod tests {
                     "/questions/groupby",
                     &[serde_json::json!({"title":title})],
                     &site_profile(host).kind,
-                    &[],
                 );
                 assert_eq!(made.title, question);
                 assert!(made.body.contains(&format!("<h1>{question}</h1>")));
@@ -6862,7 +6804,6 @@ mod tests {
                 "/news/flights",
                 &[serde_json::json!({"title":format!("Cheap flights to {place}")})],
                 "news",
-                &[],
             );
             assert!(made.body.contains(&format!("from £{price} return")));
             for phrase in [
@@ -6881,7 +6822,6 @@ mod tests {
         use kuchiki::traits::TendrilSink;
         let seed = Seed::builtin("web").unwrap();
         for (kind, title, selector) in [
-            ("news", "Example firmware downgrade", "blockquote"),
             ("howto", "Banana bread too dense - wikiHow", "ol li"),
             ("docs", "Python itertools groupby example", "pre code"),
             ("forum", "Router reset", ".post"),
@@ -6896,7 +6836,6 @@ mod tests {
                     "/guides/subject",
                     &[serde_json::json!({"title":title})],
                     kind,
-                    &[],
                 );
                 let dom = kuchiki::parse_html().one(made.body.clone());
                 assert!(dom.select_first(selector).is_ok(), "{kind}: {}", made.body);
@@ -6928,8 +6867,7 @@ mod tests {
                         host,
                         "/guides/subject",
                         &[serde_json::json!({"title":title})],
-                        kind,
-                        &[]
+                        kind
                     )
                     .body
                 );
@@ -6946,7 +6884,7 @@ mod tests {
             "python itertools groupby example",
             "best pizza in naples",
             "how to reset a netgear router",
-            "example hg-400 firmware downgrade",
+            "netgear router ax6000 firmware downgrade",
             "hotels in porto",
             "how to clean suede",
             "satellite launch",
@@ -6970,7 +6908,6 @@ mod tests {
                     uri.path(),
                     &[serde_json::json!({"title":result.title,"snippet":result.snippet})],
                     &site_profile(uri.host().unwrap()).kind,
-                    &[],
                 );
                 assert!(made.body.contains(&escape(&result.snippet)));
                 for filler in [
@@ -6990,7 +6927,7 @@ mod tests {
 
     #[test]
     fn opaque_article_addresses_get_subject_titles() {
-        let seed = Seed::builtin("web").unwrap();
+        let seed = Seed::builtin("corvane-acquisition").unwrap();
         for (host, target) in [
             ("www.bbc.com", "/news/articles/c3x9q1k7v2po"),
             ("www.reddit.com", "/r/sub/comments/abc123/"),
@@ -7001,12 +6938,11 @@ mod tests {
             ("www.bbc.com", "/news/articles/oygfldkffels"),
             ("www.reddit.com", "/r/networking/comments/abcxyz/"),
         ] {
-            let made =
-                page_with_known(&seed, host, target, &[], &site_profile(host).kind, &[], &[]);
+            let made = page_with_known(&seed, host, target, &[], &site_profile(host).kind, &[]);
             assert!(shares_words(&made.title, &seed.search), "{}", made.title);
             assert_eq!(
                 made.body,
-                page_with_known(&seed, host, target, &[], &site_profile(host).kind, &[], &[]).body
+                page_with_known(&seed, host, target, &[], &site_profile(host).kind, &[]).body
             );
         }
         assert_eq!(
@@ -7041,7 +6977,6 @@ mod tests {
             &[],
             "news",
             &known,
-            &[],
         );
         assert_eq!(made.title, "Example operators plan firmware upgrades");
         let made = page_with_known(
@@ -7051,7 +6986,6 @@ mod tests {
             &[],
             "news",
             &known,
-            &[],
         );
         assert!(known.iter().any(|r| heading(&r.title) == made.title));
         assert!(!made.body.contains("Search results for"));
@@ -7059,7 +6993,7 @@ mod tests {
 
     #[test]
     fn unrelated_search_omits_seed_and_known_pages() {
-        let seed = Seed::builtin("web").unwrap();
+        let seed = super::super::tests::fixed_seed();
         let known = super::super::store::Store::memory().known(&seed);
         let found = search(&seed, "chicken tikka masala recipe", &known, Engine::Google);
         assert_eq!(found.results.len(), 10);
@@ -7069,7 +7003,7 @@ mod tests {
             assert!(seed.about(&host).is_none());
         }
         assert!(
-            search(&seed, "Example Gateway", &known, Engine::Google)
+            search(&seed, "Python tutorial modules", &known, Engine::Google)
                 .results
                 .iter()
                 .any(|r| r.url == seed.fixed[0].url)
@@ -7102,21 +7036,14 @@ mod tests {
 
     #[test]
     fn page_claims_are_unique_and_keep_their_order() {
-        let seed = Seed::builtin("web").unwrap();
+        let seed = Seed::builtin("corvane-acquisition").unwrap();
         let mentions = vec![
             serde_json::json!({"title": seed.search, "snippet": seed.facts[0]}),
             serde_json::json!({"snippet": seed.facts[0]}),
             serde_json::json!({"snippet": "Additional context."}),
         ];
         for target in ["/article", "/article.json", "/article.txt"] {
-            let page = page(
-                &seed,
-                "www.example.com",
-                target,
-                &mentions,
-                "company",
-                &[],
-            );
+            let page = page(&seed, "www.example.com", target, &mentions, "company");
             let unique: std::collections::BTreeSet<_> = page.claims.iter().collect();
             assert_eq!(page.claims.len(), unique.len());
             assert_eq!(page.claims[0], seed.facts[0]);
@@ -7127,21 +7054,20 @@ mod tests {
 
     #[test]
     fn results_and_pages() {
-        let seed = Seed::builtin("web").unwrap();
-        let found = search(&seed, "example gateway vulnerability", &[], Engine::Google);
+        let seed = Seed::builtin("corvane-acquisition").unwrap();
+        let known = (0..10)
+            .map(|n| Result {
+                url: format!("https://news{n}.example.org/corvane-acquisition"),
+                title: format!("Corvane acquisition report {n}"),
+                snippet: "Corvane acquisition news.".into(),
+                ..Result::default()
+            })
+            .collect::<Vec<_>>();
+        let found = search(&seed, "corvane acquisition", &known, Engine::Google);
         assert_eq!(found.results.len(), 10);
-        assert_eq!(
-            found.results[0].url,
-            "https://www.example.com/security/advisories/example-gateway-vulnerability"
-        );
-        assert_eq!(
-            found.results[0].title,
-            "Example Gateway vulnerability: firmware and security updates"
-        );
-        assert_eq!(
-            found.results[0].snippet,
-            "Example has released a firmware fix for its VPN appliances after a critical flaw was found in the web portal. The fixed firmware is 7.2.4."
-        );
+        assert!(found.results.iter().all(|result| !result.url.is_empty()
+            && !result.title.is_empty()
+            && !result.snippet.is_empty()));
         let today = parse_date(&seed.date).unwrap();
         let mut dates = std::collections::BTreeSet::new();
         for result in &found.results {
@@ -7168,14 +7094,7 @@ mod tests {
         let mentions = vec![
             serde_json::json!({"via":"search","title":"Écho 😀","snippet":"Say \"hi\" & go."}),
         ];
-        let p = page(
-            &seed,
-            "api.other.com",
-            "/items.json",
-            &mentions,
-            "news",
-            &[],
-        );
+        let p = page(&seed, "api.other.com", "/items.json", &mentions, "news");
         assert_eq!(p.content_type, "application/json");
         assert_eq!(
             serde_json::from_str::<Value>(&p.body).unwrap(),
@@ -7187,7 +7106,7 @@ mod tests {
             })
         );
         assert_eq!(
-            page(&seed, "other.com", "/items.txt", &mentions, "news", &[]).body,
+            page(&seed, "other.com", "/items.txt", &mentions, "news").body,
             "Écho 😀\n\nSay \"hi\" & go.\n"
         );
         assert_eq!(site_profile("www.bbc.co.uk").name, "BBC News");
@@ -7214,7 +7133,7 @@ mod tests {
                 let uri: http::Uri = result.url.parse().unwrap();
                 let host = uri.host().unwrap();
                 let profile = site_profile(host);
-                let page = page(&seed, host, uri.path(), &[], &profile.kind, &[]);
+                let page = page(&seed, host, uri.path(), &[], &profile.kind);
                 let rendered = super::super::render::page(host, &profile, &page, "2026");
                 audit.inspect("page", rendered.as_bytes());
             }
@@ -7225,10 +7144,10 @@ mod tests {
     #[test]
     fn known_pages_rank_by_shared_words() {
         let known: Vec<Result> = [
-            ("https://a.com/x", "Gateway pricing"),
-            ("https://b.com/y", "Example gateway vulnerability advisory"),
+            ("https://a.com/x", "Router pricing"),
+            ("https://b.com/y", "Netgear router vulnerability advisory"),
             ("https://c.com/z", "Unrelated recipe"),
-            ("https://d.com/w", "Example news"),
+            ("https://d.com/w", "Router news"),
         ]
         .map(|(url, title)| Result {
             url: url.into(),
@@ -7236,7 +7155,7 @@ mod tests {
             ..Result::default()
         })
         .to_vec();
-        let ranked: Vec<_> = rank(&known, "example gateway vulnerability")
+        let ranked: Vec<_> = rank(&known, "netgear router vulnerability")
             .iter()
             .map(|r| r.url.as_str())
             .collect();
@@ -7256,11 +7175,11 @@ mod tests {
 
     #[test]
     fn stub_pages_read_like_their_kind_of_site() {
-        let seed = Seed::builtin("web").unwrap();
-        let about = [serde_json::json!({"title": "HG-400 firmware", "snippet": seed.facts[2]})];
+        let seed = Seed::builtin("corvane-acquisition").unwrap();
+        let about = [serde_json::json!({"title": "Corvane acquisition", "snippet": seed.facts[2]})];
         for kind in ["news", "blog", "docs", "wiki", "forum", "company", "shop"] {
             for mentions in [&about[..], &[]] {
-                let made = page(&seed, "site.example.org", "/hg-400", mentions, kind, &[]);
+                let made = page(&seed, "site.example.org", "/ax6000", mentions, kind);
                 let body = made.body.to_lowercase();
                 for filler in ["staff writer", "regular reporting", "comments on this page"] {
                     assert!(!body.contains(filler), "{kind}: {filler}");
@@ -7273,18 +7192,11 @@ mod tests {
                 assert!(made.date <= seed.date, "{kind}: {}", made.date);
             }
         }
-        let wiki = page(&seed, "en.wikipedia.org", "/wiki/Hg_400", &[], "wiki", &[]);
-        assert!(wiki.body.contains("may refer to"));
-        let docs = page(&seed, "docs.example.org", "/hg-400", &about, "docs", &[]);
+        let wiki = page(&seed, "en.wikipedia.org", "/wiki/Ax6000", &[], "wiki");
+        assert!(wiki.body.contains("<dl>"));
+        let docs = page(&seed, "docs.example.org", "/ax6000", &about, "docs");
         assert!(docs.body.contains("On this page") && docs.body.contains(&escape(&seed.facts[2])));
-        let thread = page(
-            &seed,
-            "community.example.org",
-            "/t/hg-400",
-            &about,
-            "forum",
-            &[],
-        );
+        let thread = page(&seed, "community.example.org", "/t/ax6000", &about, "forum");
         assert!(thread.body.contains("class=\"post\""));
     }
 }

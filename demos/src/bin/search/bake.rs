@@ -2,7 +2,7 @@
 //! VM. It runs every search and address in the seed's query list
 //! (`examples/adaptive-web/seeds/<seed>.queries`), makes the page behind
 //! every result, and keeps them in `examples/adaptive-web/stores/<seed>/`.
-//! The app serves those pages first and writes the rest during the run.
+//! Worlds can load the store to serve those pages ahead of new generation.
 //!
 //! The key comes from `OPENROUTER_API_KEY`. Model calls stop before they
 //! could pass [`CALLS`]: each search or page is started only while the calls
@@ -21,7 +21,7 @@ use adaptive_web_world::pages::{
 use fictionet_extras::models::{Https, Key};
 use fictionet_extras::search::Engine;
 
-use super::{Result, checks::search_url};
+use super::{Result, search_url};
 
 /// The most model calls one bake makes, retries included.
 const CALLS: usize = 400;
@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seeds_query_list_has_forty_searches_on_every_engine() {
+    fn the_query_list_has_forty_searches_and_every_engine() {
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../examples/adaptive-web/seeds/web.queries"),

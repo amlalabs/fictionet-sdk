@@ -8,7 +8,6 @@ use adaptive_web_world::{
     search::{self, Searches},
 };
 use fictionet::Cx;
-use fictionet_extras::models;
 use fictionet_observe::page::Host;
 use fictionet_observe::{
     DashboardHandle,
@@ -16,8 +15,7 @@ use fictionet_observe::{
 };
 
 /// The names the world forwards to the real internet, and why: the guest's
-/// packages and Claude Code, installed at boot. Claude Code's model calls
-/// go out through the model site, when there is one.
+/// packages and coding agents, installed at boot.
 pub const FORWARDED: &[(&str, &str)] = &[
     ("archive.ubuntu.com", "Ubuntu packages installed at boot"),
     (
@@ -32,16 +30,13 @@ pub const FORWARDED: &[(&str, &str)] = &[
     ("releases.openai.com", "Codex installed at boot"),
 ];
 
-/// Model and sign-in services, passed straight through to the real ones:
-/// Claude Code and Codex sign in and call their models as they normally do.
+/// Sign-in connections retain the providers' end-to-end TLS.
 pub const PASSED: &[&str] = &[
-    "api.anthropic.com",
     "claude.ai",
     "console.anthropic.com",
     "platform.claude.com",
-    "api.openai.com",
     "auth.openai.com",
-    "chatgpt.com",
+    "challenges.cloudflare.com",
 ];
 
 #[derive(Clone)]
@@ -64,6 +59,7 @@ impl Topics {
         Page::new("Search", dashboard)
             .host(host)
             .standard_panels()
+            .architecture(crate::kit::architecture("adaptive"))
             .command("generation", self.commands.clone())
             .custom(
                 "Web",
@@ -159,33 +155,45 @@ impl Default for Topics {
 }
 
 /// The world's network for the guest run and the preview: the adaptive web,
-/// with the names in [`FORWARDED`] served from the kit's package mirror and,
-/// given one, Claude Code's model site at `api.anthropic.com`. Every HTTPS
-/// name has a certificate from the world's CA.
+/// with package downloads mirrored, sign-in relayed over raw TLS, and model
+/// search and fetch answered by the world using the guest’s own credentials.
 pub fn network(
     world: &adaptive_web_world::World,
     cx: &Cx,
     log: Arc<example_common::log::Log>,
     mirror: crate::kit::mirror::Cache<fictionet::stdlib::web::Proxy>,
-    model: Option<models::Model>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     use fictionet::stdlib::web::Site;
     let mozilla = world.ca.config(cx, crate::kit::desktop::HOSTS[0])?.0;
     let claude = world.ca.config(cx, crate::kit::desktop::CLAUDE_HOST)?.0;
-    let api = world.ca.config(cx, models::Provider::Anthropic.host())?.0;
-    let passed: std::collections::HashMap<&'static str, _> = PASSED
-        .iter()
-        .map(|host| Ok((*host, world.ca.config(cx, host)?.0)))
-        .collect::<fictionet::Result<_>>()?;
     let openai = world.ca.config(cx, "releases.openai.com")?.0;
+    use fictionet_extras::models::{Model, Provider};
+    let models = [Provider::Anthropic, Provider::OpenAi, Provider::ChatGpt]
+        .into_iter()
+        .map(|provider| {
+            Ok((
+                provider.host(),
+                (
+                    Model::guest(cx, provider)?.search(world.pages.clone()),
+                    world.ca.config(cx, provider.host())?.0,
+                ),
+            ))
+        })
+        .collect::<fictionet::Result<Vec<_>>>()?;
     Ok(world.net(cx, log, move |host| {
-        if host == models::Provider::Anthropic.host()
-            && let Some(model) = model.clone()
-        {
-            return Some(Site::handler(model).tls(api.clone()));
+        if let Some((_, (model, tls))) = models.iter().find(|(name, _)| *name == host) {
+            return Some(
+                Site::handler(model.clone())
+                    .tls(tls.clone())
+                    .into_host(host),
+            );
         }
-        if let Some(config) = passed.get(host) {
-            return Some(Site::new(mirror.clone()).tls(config.clone()));
+        if PASSED.contains(&host) {
+            return Some(
+                fictionet::stdlib::world::net::Host::new(host)
+                    .dns_name(host)
+                    .port_server(443, Relay(format!("{host}:443"))),
+            );
         }
         FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
             let site = Site::new(mirror.clone());
@@ -198,9 +206,44 @@ pub fn network(
             } else {
                 site
             }
+            .into_host(host)
         })
     }))
 }
 
 #[cfg(test)]
 mod tests;
+
+/// One vendor connection, carrying only the guest's encrypted bytes.
+pub struct Relay(pub String);
+
+impl fictionet::stdlib::world::net::PortServer for Relay {
+    fn serve(
+        &self,
+        cx: Cx,
+        arrival: fictionet::stdlib::world::net::Arrival,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        use fictionet::tokio::ConnectionTokioExt;
+        let host = self.0.clone();
+        Box::pin(async move {
+            let work = async {
+                let mut upstream = tokio::net::TcpStream::connect(host.as_str()).await?;
+                cx.emitter(&arrival.info)
+                    .emit("signin", "connection", |event| {
+                        event.field("host", host.trim_end_matches(":443"))
+                    });
+                let mut guest = arrival.conn.into_tokio(&cx);
+                tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
+                Ok::<_, std::io::Error>(())
+            };
+            tokio::select! {
+                _ = cx.cancelled() => {},
+                result = work => {
+                    if let Err(error) = result {
+                        cx.emit("search", "relay_error", |event| event.field("host", host.as_str()).field("error", error.to_string()));
+                    }
+                }
+            }
+        })
+    }
+}
