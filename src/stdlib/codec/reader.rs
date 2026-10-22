@@ -543,6 +543,6 @@ mod tests {
         assert_eq!(r.position(), 3);
         assert!(r.is_empty());
         assert_eq!(r.finish(), Ok(()));
-        assert_eq!(r.rest(), &[]);
+        assert_eq!(r.rest(), &[] as &[u8]);
     }
 }

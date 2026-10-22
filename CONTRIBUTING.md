@@ -9,23 +9,9 @@ The `fictionet` command is the `fictionet-cli` package in `cli/`, and Cargo
 builds it with the SDK from the top directory. Install it from a checkout with
 `cargo install --locked --path cli`.
 
-The [`fictionet-observe`](observe/README.md) crate owns consumption. Its base
-has `Memory`, `Aggregate` and `Collector`, with bounded topology, packet copies,
-TLS keys and loss totals. It is sans-I/O and builds for wasm. `decode` adds
-packet decoders, protocol presenters, pcapng, `DashboardObserver` and request
-sessions. `native` enables `decode` and adds JSONL workers on native targets,
-plus the observation endpoint and client on Unix. `tracing` uses an explicit
-dispatch supplied by the integrator.
-
-Check the companion's base and all features, and its base wasm build:
-
-```console
-$ cargo clippy --locked --all-targets -p fictionet-observe --no-default-features -- -D warnings
-$ cargo clippy --locked --all-targets -p fictionet-observe --all-features -- -D warnings
-$ cargo check --locked --lib -p fictionet-observe --no-default-features --target wasm32-unknown-unknown
-```
-
-The workspace `--all-features` checks below include its tests and docs.
+The stdlib's packet dissectors use the same decoders as its services. Pcap
+output takes caller-supplied packets, and the optional `page` feature streams
+one typed state. Worlds own their observation and browser pages.
 
 Run these commands with four sets of flags:
 
@@ -107,11 +93,8 @@ $ cargo bench --locked --bench network -- --list
 
 `network` covers TCP throughput, routed paths, idle connections, delayed links,
 scheduling and unread-link memory. `services` covers relay traffic, HTTPS sites
-and proxy DNS caching. `runtime::logging` compares event handling with and
-without a JSONL writer. `runtime::observe::links` compares no collector,
-topology collection, packet capture and packet classification.
-`runtime::logging::policy` compares keeping all events with declining half;
-`runtime::observe::graph` uses 1,000 sites.
+and proxy DNS caching. `runtime::http` measures HTTPS throughput over HTTP/1
+and HTTP/2.
 `network::sched::packet_round_trips` compares no observer, event-only
 interest and packet interest. `runtime::timers` covers timers.
 `decoders` feeds TPKT/COTP, HTTP/1 requests and ITCH add orders in 16 KiB

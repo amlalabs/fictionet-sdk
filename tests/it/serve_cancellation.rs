@@ -70,8 +70,7 @@ fn cancelling_deferred_end_work_keeps_the_world_running() {
                 })
                 .await?;
                 assert!(
-                    log.checked_all()
-                        .unwrap()
+                    log.all()
                         .iter()
                         .any(|e| e.is("conn", "close") && e.str("end") == Some("cancelled"))
                 );
@@ -260,7 +259,7 @@ fn service_error_stays_primary_when_background_work_fails() {
 }
 
 fn background_failure(fail: bool) {
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::lab(
         RunOptions::new(fictionet::Seed::from_u64(3)).observer(log.clone()),
         |fcx| async move {
@@ -303,7 +302,7 @@ fn background_failure(fail: bool) {
                 assert!(fictionet::ErrorChain(&error).to_string().contains("boom"));
                 assert_eq!(service.ended, [serve::Ended::Cancelled]);
             }
-            let errors = log.checked_of("conn", "error").unwrap();
+            let errors = log.of("conn", "error");
             assert_eq!(errors.len(), if fail { 2 } else { 1 });
             if fail {
                 assert_eq!(errors[0].str("kind"), Some("service"));
@@ -312,7 +311,7 @@ fn background_failure(fail: bool) {
             assert_eq!(task.str("kind"), Some("task"));
             assert_eq!(task.str("error"), Some("boom"));
             assert_eq!(task.conn.id, Some(42));
-            let closes = log.checked_of("conn", "close").unwrap();
+            let closes = log.of("conn", "close");
             assert_eq!(closes.len(), 1);
             assert!(closes[0].seq < task.seq, "the region ends after the run");
             assert!(!fcx.is_cancelled());
@@ -324,7 +323,7 @@ fn background_failure(fail: bool) {
 
 fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Option<&'static str>) {
     use std::future::{Future, poll_fn};
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::lab(
         RunOptions::new(fictionet::Seed::from_u64(4)).observer(log.clone()),
         |fcx| async move {
@@ -377,14 +376,11 @@ fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Opt
                 [end],
                 "on_end runs once with the primary cause"
             );
-            let closes = log.checked_of("conn", "close").unwrap();
+            let closes = log.of("conn", "close");
             assert_eq!(closes.len(), 1);
             assert_eq!(closes[0].str("end"), Some(end.as_str()));
             assert_eq!(closes[0].str("shutdown"), secondary);
-            assert_eq!(
-                log.checked_of("conn", "error").unwrap().len(),
-                usize::from(fail)
-            );
+            assert_eq!(log.of("conn", "error").len(), usize::from(fail));
             assert!(!fcx.is_cancelled());
             Ok(())
         },

@@ -157,10 +157,10 @@ fn openai(cx: &Cx, address: SocketAddr) -> fictionet::Result<Model> {
     )
 }
 
-fn observed() -> (Arc<fictionet_observe::Memory>, fictionet::RunOptions) {
-    let memory = Arc::new(fictionet_observe::Memory::default());
-    let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(21))
-        .observer(Arc::new(fictionet_observe::Aggregate::new(memory.clone())));
+fn observed() -> (Arc<fictionet_test_support::EventLog>, fictionet::RunOptions) {
+    let memory = Arc::new(fictionet_test_support::EventLog::default());
+    let options =
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(21)).observer(memory.clone());
     (memory, options)
 }
 
@@ -244,14 +244,14 @@ fn the_handshake_and_socket_answer_like_openai() {
         Ok(())
     }))
     .unwrap();
-    let opened = memory.checked_of("model", "transport").unwrap();
+    let opened = memory.of("model", "transport");
     assert!(
         opened
             .iter()
             .any(|e| e.u64("status") == Some(101) && e.str("transport") == Some("websocket"))
     );
     assert!(opened.iter().any(|e| e.u64("closed") == Some(1003)));
-    assert!(memory.checked_of("model", "call").unwrap().is_empty());
+    assert!(memory.of("model", "call").is_empty());
 }
 
 #[test]
@@ -362,14 +362,14 @@ fn a_codex_turn_runs_over_the_socket_with_a_world_search() {
     .unwrap();
     upstream.join().unwrap();
     assert_eq!(pages.0.load(Ordering::SeqCst), 1);
-    let calls = memory.checked_of("model", "call").unwrap();
+    let calls = memory.of("model", "call");
     assert_eq!(calls.len(), 3);
     for call in &calls {
         assert_eq!(call.str("transport"), Some("websocket"));
         assert_eq!(call.str("path"), Some("/v1/responses"));
         assert_eq!(call.u64("status"), Some(200));
     }
-    let tools = memory.checked_of("model", "tool").unwrap();
+    let tools = memory.of("model", "tool");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].str("source"), Some("world"));
     assert_eq!(tools[0].u64("results"), Some(1));

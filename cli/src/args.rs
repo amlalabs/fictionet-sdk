@@ -1,6 +1,4 @@
-//! The flags of `fictionet attach`, parsed by hand, and the `--observation` flag
-//! that `observe` takes. It names the Unix socket a world serves with
-//! `fictionet_observe::serve`.
+//! The flags of `fictionet attach`, parsed by hand.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -173,26 +171,6 @@ pub(crate) enum Parsed {
     Proxy(ProxyArgs),
     /// Run `--type tap` with these flags.
     Tap(TapArgs),
-}
-
-/// Splits `--observation <w>` (or `--observation=<w>`) from the other words.
-pub(crate) fn take_observation(args: &[String]) -> Result<(String, Vec<String>), String> {
-    let mut observation = None;
-    let mut rest = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--observation" {
-            observation = Some(it.next().ok_or("--observation needs a value")?.clone());
-        } else if let Some(w) = a.strip_prefix("--observation=") {
-            observation = Some(w.to_owned());
-        } else {
-            rest.push(a.clone());
-        }
-    }
-    Ok((
-        observation.ok_or("--observation unix:<path> is required")?,
-        rest,
-    ))
 }
 
 /// Parses the arguments after `attach`.
@@ -723,27 +701,7 @@ fn parse_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::observation_path;
     use std::net::IpAddr;
-
-    fn words(s: &str) -> Vec<String> {
-        s.split_whitespace().map(str::to_owned).collect()
-    }
-
-    #[test]
-    fn observation_flag() {
-        let (w, rest) = take_observation(&words("--observation unix:/run/w.sock watch")).unwrap();
-        assert_eq!(
-            (observation_path(&w).unwrap(), rest),
-            ("/run/w.sock".to_owned(), words("watch"))
-        );
-        assert_eq!(
-            observation_path("tls:x:1").unwrap_err(),
-            r#"--observation: expected unix:<path>, not "tls:x:1""#
-        );
-        assert!(observation_path("unix:").is_err());
-        assert!(take_observation(&words("graph")).is_err());
-    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()

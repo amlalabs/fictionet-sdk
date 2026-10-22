@@ -60,10 +60,10 @@ where
 /// Runs a lab fixture with an event log installed.
 pub fn observed_world<F, Fut>(limit: Duration, f: F)
 where
-    F: FnOnce(Cx, std::sync::Arc<fictionet_observe::Memory>) -> Fut + Send + 'static,
+    F: FnOnce(Cx, std::sync::Arc<fictionet_test_support::EventLog>) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     seeded_world(
         RunOptions::new(fictionet::Seed::from_u64(1)).observer(log.clone()),
         limit,

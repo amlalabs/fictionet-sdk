@@ -17,7 +17,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fictionet = { path = "..", features = ["web-proxy", "tokio"] }
-fictionet-observe = { path = "../observe", features = ["native"] }
 axum = { version = "0.8", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 xz2 = "0.1"
@@ -44,4 +43,4 @@ url = "2"
 zstd = "0.13"
 
 [dev-dependencies]
-fictionet-observe = { path = "../observe", features = ["native"] }
+fictionet-test-support = { path = "../tests/support" }

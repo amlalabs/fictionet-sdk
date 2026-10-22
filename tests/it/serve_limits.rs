@@ -46,7 +46,7 @@ fn idle_http2_budget(budget: &Budget) {
 
 async fn hyper_exposure(
     fcx: Cx,
-    log: Arc<fictionet_observe::Memory>,
+    log: Arc<fictionet_test_support::EventLog>,
     received: httpd::Received,
     expected_status: u16,
 ) -> fictionet::Result {
@@ -293,7 +293,7 @@ fn observer_sees_metadata_budget_rejection() {
         let request = metadata_request().map(|_| ());
         let (response, _) = send.send_request(request, true)?;
         assert!(response.await.is_err());
-        let events = log.checked_of("http", "request").unwrap();
+        let events = log.of("http", "request");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("answer"), Some("budget"));
         assert_eq!(events[0].str("received"), Some("budget"));
@@ -402,7 +402,7 @@ fn observer_sees_upgrade_path_body_limit() {
                 .await
                 .starts_with(b"HTTP/1.1 413")
         );
-        let events = log.checked_of("http", "request").unwrap();
+        let events = log.of("http", "request");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("answer"), Some("too_large"));
         assert_eq!(events[0].str("received"), Some("too_large"));
@@ -466,7 +466,7 @@ fn observer_sees_a_handed_off_request_once() {
             *observer.ends.lock().unwrap(),
             [("/login".into(), SECRET.len(), httpd::Received::Complete)]
         );
-        let events = log.checked_of("http", "request").unwrap();
+        let events = log.of("http", "request");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("received"), Some("complete"));
         assert_eq!(
@@ -593,7 +593,7 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
     let opts = ServeOptions::default()
         .idle(None)
         .budget(Budget::new(512 << 10));
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     let mut h = Harness::with_options(
         fictionet::Seed::from_u64(0),
         Http1::new(page(1 << 20)),
@@ -607,8 +607,7 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
     );
     assert_eq!(h.end_reason(), Some(Ended::Budget));
     let request = log
-        .checked_all()
-        .unwrap()
+        .all()
         .iter()
         .find(|e| e.is("http", "request"))
         .expect("an http.request event")
@@ -663,13 +662,12 @@ fn item_faults_that_stop_record_why() {
         ..Plan::default()
     });
     let opts = ServeOptions::default().idle(None).faults(plan);
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     let mut h = Harness::with_options(fictionet::Seed::from_u64(0), Http1::new(page(2)), (), opts)
         .observer(log.clone());
     let _ = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n\x00\x01 not http\r\n\r\n");
     let stopped = log
-        .checked_all()
-        .unwrap()
+        .all()
         .iter()
         .find(|e| e.is("conn", "faults"))
         .expect("a conn.faults event")
@@ -1009,7 +1007,7 @@ fn http2_caps_the_streams_a_connection_opens() {
 /// a handler's randomness from the run's stream, as HTTP/1 does.
 #[test]
 fn http2_has_the_limits_budget_and_seed_of_http1() {
-    let log = Arc::new(fictionet_observe::Memory::default());
+    let log = Arc::new(fictionet_test_support::EventLog::default());
     world::seeded_world(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(log.clone()),
         Duration::from_secs(60),
@@ -1265,7 +1263,7 @@ fn http2_rejects_metadata_before_calling_the_handler() {
             Ok(())
         });
         assert!(send.send_request(metadata_request()).await.is_err());
-        let events = log.checked_of("http", "request").unwrap();
+        let events = log.of("http", "request");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("answer"), Some("budget"));
         idle_http2_budget(&budget);
@@ -1328,7 +1326,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             let two = budget.used();
             assert!(two >= other.bytes() + 2 * 8192);
             assert!(send.send_request(metadata_request()).await.is_err());
-            assert_eq!(log.checked_of("test", "waiting").unwrap().len(), 2);
+            assert_eq!(log.of("test", "waiting").len(), 2);
             let rejected = budget.used();
             assert_eq!(rejected, two);
             let request_charge = two - one - other.bytes();
@@ -1390,7 +1388,7 @@ fn http1_pending_metadata_releases_on_reset() {
         fcx.idle().await?;
         assert_eq!(budget.used(), 0);
         assert_eq!(
-            log.checked_of("http", "request").unwrap()[0].str("answer"),
+            log.of("http", "request")[0].str("answer"),
             Some("cancelled")
         );
         Ok(())
@@ -1423,7 +1421,7 @@ impl Handler for StreamingMetadata {
 fn request_events_stay_charged_while_responses_stream() {
     crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
         let budget = Budget::new(1 << 20);
-        let harness_log = std::sync::Arc::new(fictionet_observe::Memory::default());
+        let harness_log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
         let mut h = Harness::with_options(
             fictionet::Seed::from_u64(0),
             Http1::new(StreamingMetadata),
@@ -1444,13 +1442,7 @@ fn request_events_stay_charged_while_responses_stream() {
         );
         assert_eq!(h.pending(), (1, 0));
         assert!(budget.used() >= base + 4096);
-        assert!(
-            !harness_log
-                .checked_all()
-                .unwrap()
-                .iter()
-                .any(|e| e.is("http", "request"))
-        );
+        assert!(!harness_log.all().iter().any(|e| e.is("http", "request")));
         drop(h);
         assert_eq!(budget.used(), 0);
 
@@ -1483,7 +1475,7 @@ fn request_events_stay_charged_while_responses_stream() {
         let response = send.send_request(metadata_request()).await?;
         assert_eq!(response.status(), 200);
         assert!(budget.used() >= 4096);
-        assert!(log.checked_of("http", "request").unwrap().is_empty());
+        assert!(log.of("http", "request").is_empty());
         drop(response);
         fcx.idle().await?;
         idle_http2_budget(&budget);
@@ -1554,7 +1546,7 @@ async fn keep_alive_response(fcx: &Cx, conn: &mut impl Connection) -> http1::Res
 #[cfg(feature = "tokio")]
 async fn upgrade_keep_alive_line_limit(
     fcx: &Cx,
-    log: &fictionet_observe::Memory,
+    log: &fictionet_test_support::EventLog,
 ) -> fictionet::Result {
     let (server, client) = two_machines(fcx);
     let opts = HttpOptions {
@@ -1614,7 +1606,7 @@ async fn upgrade_keep_alive_line_limit(
         .await;
     // The upgrade path rejects the head by closing without a status response.
     assert_eq!(result, Ok(Ok(0)));
-    assert_eq!(log.checked_of("http", "request").unwrap().len(), 2);
+    assert_eq!(log.of("http", "request").len(), 2);
     Ok(())
 }
 
@@ -1631,7 +1623,7 @@ fn upgrade_keep_alive_preserves_line_limits() {
 fn upgrade_keep_alive_line_limit_rejection_records_protocol_error() {
     crate::common::world::observed_world(Duration::from_secs(10), |fcx, log| async move {
         upgrade_keep_alive_line_limit(&fcx, &log).await?;
-        let errors = log.checked_of("http", "error").unwrap();
+        let errors = log.of("http", "error");
         assert_eq!(errors.len(), 1, "missing limit rejection event");
         assert_eq!(errors[0].str("cause"), Some("protocol"));
         Ok(())

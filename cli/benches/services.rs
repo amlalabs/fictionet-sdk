@@ -6,7 +6,7 @@ use fictionet::stdlib::web;
 use fictionet::{Interface, WorldSocket, block_on, listen, run};
 use fictionet_test_support::bench::finish;
 use fictionet_test_support::bench::http as http_world;
-use http_world::{HttpCase, Page, Watch, socket_path};
+use http_world::{HttpCase, Page, socket_path};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -147,20 +147,15 @@ mod sites {
 
     #[divan::bench(args = [1, 10], sample_count = 3, sample_size = 1)]
     fn http1(bencher: Bencher, sandboxes: usize) {
-        requests(bencher, sandboxes, false, false);
+        requests(bencher, sandboxes, false);
     }
 
     #[divan::bench(args = [1, 10], sample_count = 3, sample_size = 1)]
     fn http2(bencher: Bencher, sandboxes: usize) {
-        requests(bencher, sandboxes, true, false);
+        requests(bencher, sandboxes, true);
     }
 
-    #[divan::bench(sample_count = 3, sample_size = 1)]
-    fn event_hooks(bencher: Bencher) {
-        requests(bencher, 10, false, true);
-    }
-
-    fn requests(bencher: Bencher, sandboxes: usize, h2: bool, hooks: bool) {
+    fn requests(bencher: Bencher, sandboxes: usize, h2: bool) {
         http_world::bench(
             bencher,
             HttpCase {
@@ -169,9 +164,6 @@ mod sites {
                 requests: 30_000,
                 body: 1024,
                 sites: 1,
-                watch: Watch::None,
-                hooks,
-                writer: false,
             },
         );
     }

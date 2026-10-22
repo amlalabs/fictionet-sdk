@@ -12,12 +12,12 @@ use fictionet::RunOptions;
 /// events it has checked.
 #[derive(Clone)]
 pub(super) struct Log {
-    pub(super) events: Arc<Memory>,
+    pub(super) events: Arc<EventLog>,
     from: Arc<AtomicU64>,
 }
 
 impl Log {
-    pub(super) fn new(events: Arc<Memory>) -> Log {
+    pub(super) fn new(events: Arc<EventLog>) -> Log {
         Log {
             events,
             from: Arc::default(),
@@ -38,14 +38,14 @@ where
 {
     world_events_with_memory(
         |memory| RunOptions::new(Seed::from_u64(1)).observer(memory),
-        Arc::new(Memory::default()),
+        Arc::new(EventLog::default()),
         f,
     )
 }
 
 fn world_events_with_memory<F, Fut>(
-    options: impl FnOnce(Arc<Memory>) -> RunOptions,
-    events: Arc<Memory>,
+    options: impl FnOnce(Arc<EventLog>) -> RunOptions,
+    events: Arc<EventLog>,
     f: F,
 ) where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
@@ -68,8 +68,7 @@ fn world_events_with_memory<F, Fut>(
 /// The events after the log's mark that `pick` keeps.
 pub(super) fn picked<T>(log: &Log, pick: impl FnMut(&Event) -> Option<T>) -> Vec<T> {
     log.events
-        .checked_all()
-        .unwrap()
+        .all()
         .iter()
         .filter(|event| event.seq > log.from.load(Ordering::SeqCst))
         .filter_map(pick)
@@ -91,10 +90,7 @@ pub(super) async fn wait_for<T>(
         .await
         .expect("the world stopped");
     if got.len() < n {
-        panic!(
-            "fewer than {n} such events: {:#?}",
-            log.events.checked_all().unwrap()
-        );
+        panic!("fewer than {n} such events: {:#?}", log.events.all());
     }
     got.iter().filter_map(pick).collect()
 }
@@ -1497,112 +1493,6 @@ fn events_for_blocked_packets() {
     });
 }
 
-/// A scan cannot evict the events a grader reads under the production observer limits.
-#[test]
-fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
-    const SCAN: u16 = 55_000;
-    let path = std::env::temp_dir().join(format!("fictionet-scan-{}.jsonl", std::process::id()));
-    let jsonl = Arc::new(fictionet_observe::Jsonl::open(&path, Default::default()).unwrap());
-    let kept: Arc<std::sync::Mutex<Option<Arc<Memory>>>> = Arc::default();
-    let keep = kept.clone();
-    world_events_with_memory(
-        |memory| {
-            RunOptions::new(Seed::from_u64(1)).observer(Arc::new(
-                fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
-                    memory,
-                    jsonl.clone(),
-                ]))),
-            ))
-        },
-        Arc::new(Memory::default()),
-        move |fcx, attacher, env, log| async move {
-            // What a grader reads: a lookup, a TLS handshake and a request.
-            let m = default_machine(&fcx, &attacher);
-            assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
-            let conn = tls_connect(&fcx, &m, &env, SECURE_ADDR, "secure.test", &[b"http/1.1"])
-                .await
-                .unwrap();
-            let mut client = Client::new(&fcx, conn, false).await;
-            assert_eq!(
-                client.get("https", "secure.test", "/").await.status,
-                StatusCode::OK
-            );
-
-            // The scan, from another sandbox: every port but the open ones.
-            let me = Ipv4Addr::new(10, 0, 0, 3);
-            let mut raw = attacher.attach("b").unwrap();
-            raw.send(ping(me, GATEWAY, 1));
-            assert!(
-                recv_within(&fcx, &mut raw, Duration::from_secs(2))
-                    .await
-                    .is_some()
-            );
-            let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "plain.test", 2)
-                .await
-                .unwrap();
-            let plain = addrs[0];
-            let ports: Vec<u16> = (1..)
-                .filter(|p| ![80, 443].contains(p))
-                .take(usize::from(SCAN))
-                .collect();
-            for batch in ports.chunks(500) {
-                for &port in batch {
-                    raw.send(tcp_seg(me, 40_000, plain, port, 1, 0, SYN, &[]));
-                }
-                for _ in batch {
-                    let (_, _, _, t) = parse(
-                        &recv_within(&fcx, &mut raw, Duration::from_secs(2))
-                            .await
-                            .expect("a RST"),
-                    );
-                    assert_eq!(t[13] & RST, RST);
-                }
-            }
-            *keep.lock().unwrap() = Some(log.events.clone());
-            Ok(())
-        },
-    );
-    jsonl.finish().unwrap();
-    let events = kept.lock().unwrap().take().unwrap();
-    fn from(e: &Event, name: &str) -> bool {
-        sandbox_of(e).is_some_and(|s| &*s.name == name)
-    }
-    let all = events.checked_all().unwrap();
-    let graders: Vec<_> = all
-        .iter()
-        .filter(|e| from(e, "a") && e.source != "net")
-        .map(|e| format!("{}.{}", e.source, e.kind))
-        .collect();
-    for want in ["dns.query", "tls.handshake", "http.request"] {
-        assert!(
-            graders.iter().any(|g| g == want),
-            "{want} is gone: {graders:?}"
-        );
-    }
-    assert_eq!(events.losses().events(), 0);
-    let blocked: Vec<_> = all
-        .iter()
-        .filter(|e| e.is("net", "blocked") && from(e, "b"))
-        .collect();
-    assert!(blocked.len() < 100, "{} events for the scan", blocked.len());
-    assert_eq!(
-        blocked
-            .iter()
-            .map(|event| event.u64("count").unwrap_or(1))
-            .sum::<u64>(),
-        u64::from(SCAN)
-    );
-    assert_eq!(jsonl.lost(), 0);
-    let text = std::fs::read_to_string(&path).unwrap();
-    let _ = std::fs::remove_file(&path);
-    assert_eq!(text.lines().count(), all.len());
-    assert_eq!(text.as_bytes(), crate::common::log_bytes(&events));
-    assert!(
-        text.lines()
-            .any(|l| l.contains(r#""source":"http","kind":"request""#))
-    );
-}
-
 #[test]
 fn default_site_events_do_not_claim_the_requested_name_was_registered() {
     let saved = Arc::new(std::sync::Mutex::new(None));
@@ -1621,7 +1511,7 @@ fn default_site_events_do_not_claim_the_requested_name_was_registered() {
         Ok(())
     });
     let log = saved.lock().unwrap().take().unwrap();
-    let events = log.checked_of("http", "request").unwrap();
+    let events = log.of("http", "request");
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].str("world_site"), Some("default.test"));
     assert_eq!(events[1].str("world_site"), Some("the default site"));

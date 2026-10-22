@@ -146,7 +146,7 @@ async fn read_until(cx: &Cx, conn: &mut impl Connection, needle: &[u8]) -> Vec<u
 }
 
 fn world(seed: Seed, trace: Arc<Mutex<Trace>>) -> impl Future<Output = fictionet::Result> {
-    let log = Arc::new(fictionet_observe::Memory::default());
+    let log = Arc::new(fictionet_test_support::EventLog::default());
     let output = log.clone();
     async move {
         let packets = trace.clone();
@@ -377,7 +377,7 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
     };
 
     let episode = |seed| {
-        let log = Arc::new(fictionet_observe::Memory::default());
+        let log = Arc::new(fictionet_test_support::EventLog::default());
         let output = log.clone();
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let replies = bodies.clone();
@@ -532,14 +532,12 @@ fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
         .unwrap();
         let logs = logs.lock().unwrap();
         let outer = logs[0]
-            .checked_all()
-            .unwrap()
+            .all()
             .into_iter()
             .filter(|e| e.source == "test")
             .collect::<Vec<_>>();
         let inner = logs[1]
-            .checked_all()
-            .unwrap()
+            .all()
             .into_iter()
             .filter(|e| e.source == "test")
             .collect::<Vec<_>>();
@@ -552,8 +550,7 @@ fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
         }
         logs.iter()
             .map(|log| {
-                log.checked_all()
-                    .unwrap()
+                log.all()
                     .iter()
                     .map(|e| e.to_line().unwrap())
                     .collect::<Vec<_>>()
@@ -584,8 +581,7 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
             })
             .await?;
             let events = log
-                .checked_all()
-                .unwrap()
+                .all()
                 .into_iter()
                 .filter(|e| e.source == "test")
                 .collect::<Vec<_>>();
@@ -604,8 +600,7 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
         .unwrap()
         .take()
         .unwrap()
-        .checked_all()
-        .unwrap()
+        .all()
         .into_iter()
         .filter(|e| e.source == "test")
         .collect::<Vec<_>>();
@@ -632,8 +627,7 @@ fn a_nested_panic_restores_the_outer_task() {
             .join(&fcx)
             .await?;
             let events = log
-                .checked_all()
-                .unwrap()
+                .all()
                 .into_iter()
                 .filter(|e| e.source == "test")
                 .collect::<Vec<_>>();

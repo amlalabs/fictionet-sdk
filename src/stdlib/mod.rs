@@ -161,8 +161,8 @@
 //! [`serve::connection`](services::serve::connection) runs it over a
 //! connection. A [`net::Host`](world::net::Host) puts the service on a port of
 //! a machine with a name and an address. Capture presentation belongs to
-//! [Fictionet Observe](../../fictionet_observe/index.html). Its `Present`
-//! adapters use these codecs, and its `Registry` selects adapters for traffic.
+//! [`dissect`]. Its `Present` adapters use these codecs, and its `Registry`
+//! selects adapters for traffic.
 //! Wire parsing, serving and capture presentation are
 //! separate responsibilities. A codec does not imply a live server or a
 //! built-in capture presenter. See the codec's [serving and capture
@@ -187,10 +187,8 @@
 //!
 //! A service and a presenter are optional additions. A service owns replies,
 //! connection state and events; install it on a [`net::Host`](world::net::Host)
-//! port. Capture adapters and their registration belong to the companion.
-//! Set `fictionet_observe::DashboardOptions::protocols` before installing the
-//! observer to use a custom `Registry`. See the
-//! [companion's protocol guide](../../fictionet_observe/index.html#user-protocols).
+//! port. Capture adapters and protocol selection live in [`dissect`]. Create a
+//! [`dissect::Dissector::with_registry`] to inspect packets with custom adapters.
 //!
 //! ## Changing a protocol by copying it
 //!
@@ -205,9 +203,8 @@
 //! [`serve::Service`](services::serve::Service) whose decoder is
 //! `codec::Frames<modbus::Frame>` from that copy, and install it with
 //! [`net::Host::tcp`](world::net::Host::tcp). Fault plans and transcripts use
-//! the same service driver. A companion `Present` adapter can use the copied
-//! parser. Register it in `fictionet_observe::Registry` and set
-//! `fictionet_observe::DashboardOptions::protocols` before installing the observer.
+//! the same service driver. A [`dissect::Present`] adapter can use the copied
+//! parser. Register it in [`dissect::Registry`] and pass it to your dissector.
 //!
 //! A module can also be generated from a schema; see
 //! [code generation](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md).
@@ -391,3 +388,10 @@ pub mod services;
 pub mod test_support;
 fictionet::cfg_std! { pub mod web; }
 pub mod world;
+
+/// Opt-in packet dissection built on the stdlib decoders.
+pub mod dissect;
+#[cfg(feature = "page")]
+pub mod page;
+/// Pcapng output for packets supplied by the caller.
+pub mod pcap;

@@ -43,13 +43,13 @@ pub fn ran_in_own_process(name: &str) -> bool {
     true
 }
 
-/// Runs a lab with a bounded event log installed.
+/// Runs a lab with the test event log installed.
 pub async fn observed_lab<F, Fut>(seed: fictionet::Seed, world: F) -> fictionet::Result
 where
-    F: FnOnce(fictionet::Cx, std::sync::Arc<fictionet_observe::Memory>) -> Fut + Send,
+    F: FnOnce(fictionet::Cx, std::sync::Arc<fictionet_test_support::EventLog>) -> Fut + Send,
     Fut: std::future::Future<Output = fictionet::Result> + Send + 'static,
 {
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     fictionet::lab(
         fictionet::RunOptions::new(seed).observer(log.clone()),
         move |cx| world(cx, log),
@@ -58,9 +58,8 @@ where
 }
 
 /// Serializes a complete log after a deterministic run.
-pub fn log_bytes(log: &fictionet_observe::Memory) -> Vec<u8> {
-    log.checked_all()
-        .unwrap()
+pub fn log_bytes(log: &fictionet_test_support::EventLog) -> Vec<u8> {
+    log.all()
         .iter()
         .map(|event| event.to_line().unwrap() + "\n")
         .collect::<String>()

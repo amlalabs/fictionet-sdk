@@ -24,9 +24,6 @@
 //! The integrator installs one observer in [`RunOptions`]. [`events`] defines
 //! the contract, including
 //! [what observation skips without an observer](events#interest-identity-and-order).
-//! [Fictionet Observe](../fictionet_observe/index.html) consumes
-//! these streams: `Memory` and `Aggregate` for grading, `Jsonl` for files,
-//! `Collector` for bounded collection, and `DashboardObserver` for clients.
 //! `run.start` emits the seed to interested observers. Core retains no
 //! observation history.
 //!
@@ -176,8 +173,6 @@
 //!   sandboxes' subnet with DHCP, DNS for every host's names, a router, one
 //!   machine per address, and each host's services on their ports.
 //! - [`events`]: structured facts emitted lazily to the run's observer.
-//!   The companion's `Memory`, `Aggregate` and `Jsonl` retain, summarize
-//!   and export them. See [Fictionet Observe](../fictionet_observe/index.html).
 //!
 //! HTTP is a service too ([`stdlib::web::httpd`]): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
@@ -237,24 +232,16 @@
 //! HTTP has a ready server, [`stdlib::world::net::Net`] serves DNS and DHCP, and
 //! TLS is built in. For other protocols, a world writes a
 //! [`Service`](stdlib::services::serve::Service) around the module's decoder.
-//! The codecs also work in unit tests and fuzz targets. The companion's
-//! `Present` adapters use them to decode captured traffic for the dashboard.
+//! The codecs also work in unit tests and fuzz targets. The
+//! [`stdlib::dissect`] adapters use them to inspect caller-supplied packets.
 //! See [Changing a protocol by copying it](stdlib#changing-a-protocol-by-copying-it).
 //!
 //! # Watching a world
 //!
-//! Install `fictionet_observe::DashboardObserver` in [`RunOptions`] before
-//! execution. It consumes all four streams and owns their bounded retention.
-//! A world shows its own page with `fictionet_observe::page::Page`, and serves
-//! the handle on a private observation socket for `fictionet observe`, using
-//! `--observation unix:PATH`. The attachment socket carries sandbox traffic.
-//! Late clients see retained history.
-//!
-//! The page draws tasks and groups with host context from topology and
-//! decodes captured packets. It can decrypt TLS 1.3 when instrumented endpoints
-//! emit the needed keys. `fictionet observe` prints JSON replies and streams,
-//! or exports packets and keys. The [companion crate](../fictionet_observe/index.html)
-//! covers installation, sign-in, capture limits and the observation protocol.
+//! Each world owns its observation types, views, and page. The optional
+//! [`stdlib::dissect`] and [`stdlib::pcap`] pieces inspect and export packets
+//! supplied by the caller. With the `page` feature, `stdlib::page` streams
+//! one concrete state type to a browser and supplies copyable socket UI pieces.
 //!
 //! # Where to go next
 //!
@@ -266,9 +253,7 @@
 //! 4. [`stdlib`], then [`stdlib::world::net`] and [`stdlib::services::serve`]: the
 //!    networking pieces a world is built from, and a network of hosts and
 //!    services in a few lines. [`stdlib::web`] does the same for websites.
-//! 5. [Fictionet Observe](../fictionet_observe/index.html): collection, grading,
-//!    files, the dashboard and the observation protocol. [`events`] covers
-//!    producing observations from world code.
+//! 5. [`stdlib::dissect`]: packet inspection built on the protocol decoders.
 //! 6. [`proto`](guide::proto): the protocol between attach and a world, if you
 //!    want to write your own attach.
 //! 7. [`roadmap`](guide::roadmap): what is planned, such as attaching remote
@@ -280,10 +265,11 @@
 //! |---|---|---|---|
 //! | `std` | Real clocks, OS entropy, real-time timers, HTTP/1 and HTTP/2 servers; world sockets and relay on native targets | — | Yes |
 //! | `tokio` | Tokio adapters and axum upgrades | `std` | No |
+//! | `page` | One typed state stream and copyable terminal and screen components | `tokio` | No |
 //! | `web-proxy` | `web::proxy` and `web::forward`, with an injected `Upstream` transport | `std` | No |
 //!
-//! The default features build without tokio, hyper or h2. File export belongs
-//! to the companion's `native` feature, not core's `std` feature.
+//! The default features build without tokio, hyper or h2. Pcapng encoding
+//! in [`stdlib::pcap`] needs no file I/O.
 //! Disabling default features leaves the simulated-time executor, seeded
 //! randomness, packet links, and protocol codecs. The crate still links
 //! the Rust standard library; this is not a `no_std` build. Mutexes use a
@@ -298,8 +284,8 @@
 //! [`Cx`] and its timers, [`block_on`], [`pair`], [`attachments`], the
 //! [`stdlib`] with smoltcp, DNS, `web::Sites` and TLS (rustls with the
 //! run-aware provider and ring, whose C code needs a clang with the wasm32
-//! target). All four observation streams are available, and the companion's
-//! base collectors build for wasm too. The page plays the sandboxes through [`Attacher::attach`],
+//! target). Packet dissection and pcapng encoding work in a browser too.
+//! The page plays the sandboxes through [`Attacher::attach`],
 //! whose [`End`] carries raw IP packets.
 //!
 //! What needs an operating system is left out of that build: [`listen`],

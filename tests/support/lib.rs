@@ -3,7 +3,9 @@
 
 pub mod certs;
 mod done;
+mod events;
 mod logged;
+pub use events::EventLog;
 mod pattern;
 pub mod poll;
 mod response;

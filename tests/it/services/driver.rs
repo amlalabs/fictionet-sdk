@@ -111,7 +111,7 @@ fn listen_serves_each_connection_and_records_it() {
             })
             .await?;
         assert_eq!(entries.len(), 1);
-        let events = kept.checked_all().unwrap();
+        let events = kept.all();
         let (start, all) = events.split_first().unwrap();
         assert!(start.is("run", "start"));
         assert_eq!(start.seq, 1);
@@ -445,9 +445,9 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
         conn.write_all(&fcx, &input).await?;
         assert_eq!(read_some(&fcx, &mut conn, 8).await, b"long\nok\n");
         assert!(
-            kept.checked_of("conn", "close").unwrap().is_empty(),
+            kept.of("conn", "close").is_empty(),
             "{:?}",
-            kept.checked_of("conn", "close").unwrap()
+            kept.of("conn", "close")
         );
         Ok(())
     });
@@ -457,19 +457,14 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
 /// does. Before, it dropped the work and took an upgrade for a close.
 #[test]
 fn the_harness_runs_deferred_work_and_reports_upgrades() {
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(log.clone());
     let got = h.push(b"one\nlater\ntwo\n");
     assert_eq!(
         got.as_deref().map(String::from_utf8_lossy).unwrap(),
         "hello\none\nlater\ntwo\n"
     );
-    assert!(
-        log.checked_all()
-            .unwrap()
-            .iter()
-            .any(|e| e.is("echo", "later"))
-    );
+    assert!(log.all().iter().any(|e| e.is("echo", "later")));
     assert!(matches!(
         h.push(b"handoff\nrest"),
         Err(HarnessError::Upgraded(Upgrade::Handoff))

@@ -377,11 +377,9 @@
 //! program to [`Sites`](crate::stdlib::web::Sites) and back, once for
 //! each type. The world is the `web_fixture` example from
 //! [`getting_started`](crate::guide::getting_started). The packet lists are what
-//! the world saw on the sandbox's `Attachment`, from
-//! `fictionet observe --observation unix:PATH packets <link>` (see
-//! [Fictionet Observe](../../../fictionet_observe/index.html)),
-//! cut to their source, destination and summary. TLS 1.3 is shown
-//! decrypted with keys emitted by the world and retained by the companion.
+//! the world saw on the sandbox's `Attachment`, decoded with
+//! [`dissect`](crate::stdlib::dissect), cut to source, destination and summary.
+//! TLS 1.3 is decrypted with keys supplied by the world.
 //!
 //! ## `tun`
 //!

@@ -23,26 +23,7 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// Options select the seed and one optional observer, shared by every region.
 /// It receives events, packets, TLS keys and topology according to its interest.
 /// Use [`Fanout`](crate::events::Fanout) to combine consumers.
-/// [Fictionet Observe](../fictionet_observe/index.html) supplies `Memory`,
-/// `Aggregate`, `Jsonl`, `Collector` and `DashboardObserver`.
-/// Core keeps no history. [`events`](crate::events#interest-identity-and-order)
-/// says what observation skips without an observer.
-///
-/// ```
-/// use std::sync::Arc;
-/// use fictionet::{RunOptions, Seed, block_on, lab};
-/// use fictionet_observe::{Limits, Memory};
-///
-/// let grader = Arc::new(Memory::new(Limits::new(1000, 1 << 20)));
-/// let options = RunOptions::new(Seed::from_u64(7)).observer(grader.clone());
-/// block_on(lab(options, |fcx| async move {
-///     fcx.emit("shop", "order", |e| e.field("item", "pump"));
-///     Ok(())
-/// }))?;
-/// let orders = grader.checked_of("shop", "order")?;
-/// assert_eq!(orders[0].str("item"), Some("pump"));
-/// # Ok::<(), fictionet::Error>(())
-/// ```
+/// Core keeps no history; consumers own storage.
 pub struct RunOptions {
     seed: crate::Seed,
     observer: Option<Arc<dyn crate::events::Observer>>,
@@ -196,11 +177,6 @@ where
 ///
 /// Like [`run`], `lab` emits `run.start` automatically when an observer wants it.
 /// Keep inputs, interests and limits fixed to repeat observations and stamps.
-/// The companion's synchronous `Memory` retains events for grading;
-/// `Aggregate` can summarize repeats. Worker queue overflow and interactive
-/// capture depend on external scheduling. See
-/// [Fictionet Observe](../fictionet_observe/index.html).
-///
 /// Each run has its own task identities. A lab started inside another
 /// run's task has a world root with no parent in the outer run.
 ///

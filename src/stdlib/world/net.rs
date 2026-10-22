@@ -11,8 +11,6 @@
 //! kept from reaching the other sandboxes. A world then writes only its
 //! services. Services emit events lazily to the observer installed in
 //! [`RunOptions`](fictionet::RunOptions). Without one they skip construction.
-//! [Fictionet Observe](../../../../fictionet_observe/index.html) owns event
-//! retention, aggregation and export.
 //!
 //! An office: a domain controller that answers LDAP and Kerberos, a web
 //! server, and a PLC, with DNS names for each:
@@ -81,8 +79,7 @@
 //!   [`Host::on`] and attached virtual machines with [`Net::member`], as
 //!   machines on one Ethernet: broadcast and multicast reach every member.
 //!   The router sends the LAN's prefix to its gateway, the LAN's first
-//!   address answers DNS. Drops emit events to interested observers;
-//!   the companion's `Aggregate` can summarize repeats.
+//!   address answers DNS. Drops emit events to interested observers.
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". UDP delivery and closed-port
 //!   events use the declared UDP length. Invalid lengths are dropped;

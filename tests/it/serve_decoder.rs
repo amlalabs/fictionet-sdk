@@ -108,7 +108,7 @@ fn assert_fault_error(
 
     let input = input.to_vec();
     let seen = seen.to_vec();
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     fictionet::block_on(fictionet::lab(
         RunOptions::new(Seed::from_u64(1)).observer(log.clone()),
         |fcx| async move {
@@ -138,7 +138,7 @@ fn assert_fault_error(
             assert_eq!(service.seen, seen);
             assert_eq!(service.ended, [Ended::Closed]);
             assert!(output.lock().unwrap().is_empty());
-            let events = log.checked_of("conn", "error").unwrap();
+            let events = log.of("conn", "error");
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].level, fictionet::events::Level::Notice);
             assert_eq!(events[0].str("kind"), Some("faults"));
@@ -276,7 +276,7 @@ fn outbound_fault_error_cancels_work_with_written_bytes() {
             Ok(Flow::Continue)
         }
     }
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
         Replies,
@@ -294,8 +294,7 @@ fn outbound_fault_error_cancels_work_with_written_bytes() {
     assert_eq!(harness.output(), b"one\n");
     assert_eq!(harness.end_reason(), Some(Ended::Closed));
     let cancelled: Vec<_> = log
-        .checked_all()
-        .unwrap()
+        .all()
         .into_iter()
         .filter(|e| e.is("chunks", "cancel"))
         .collect();
@@ -418,7 +417,7 @@ service_fixture! {
 #[test]
 fn smtp_data_changes_the_active_decoder_and_stops_item_faults() {
     let opts = ServeOptions::default().faults(FaultPlan::new(Plan::default()));
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     let mut harness =
         Harness::with_options(Seed::from_u64(1), Mail::default(), (), opts).observer(log.clone());
     harness.push(b"DATA\r\n").unwrap();
@@ -426,8 +425,7 @@ fn smtp_data_changes_the_active_decoder_and_stops_item_faults() {
     assert_eq!(harness.service().messages, [b".hello\r\n".to_vec()]);
     assert_eq!(harness.output(), b"354 Send data\r\n250 Queued\r\n");
     assert_eq!(
-        log.checked_all()
-            .unwrap()
+        log.all()
             .iter()
             .filter(|event| event.get("stopped").and_then(|v| v.as_str()) == Some("decoder"))
             .count(),
@@ -604,14 +602,13 @@ fn decoder_upgrade_stops_faults_before_buffered_items() {
         }],
         ..Plan::default()
     }));
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     let mut harness = Harness::with_options(Seed::from_u64(1), Switch { seen: vec![] }, (), opts)
         .observer(log.clone());
     harness.push(b"one\ntwo\n").unwrap();
     assert_eq!(harness.service().seen, [b"one".to_vec(), b"two".to_vec()]);
     assert_eq!(
-        log.checked_all()
-            .unwrap()
+        log.all()
             .iter()
             .filter(|event| event.get("stopped").and_then(|v| v.as_str()) == Some("upgrade"))
             .count(),
@@ -646,7 +643,7 @@ fn stuck_item_fault_decoder_passes_the_partial_item_through() {
         }],
         ..Plan::default()
     }));
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     let mut harness =
         Harness::with_options(Seed::from_u64(1), LargeLine { seen: vec![] }, (), opts)
             .observer(log.clone());
@@ -657,8 +654,7 @@ fn stuck_item_fault_decoder_passes_the_partial_item_through() {
     assert_eq!(harness.service().seen.len(), 1);
     assert_eq!(harness.service().seen[0], bytes);
     assert_eq!(
-        log.checked_all()
-            .unwrap()
+        log.all()
             .iter()
             .filter(|event| event.is("conn", "faults")
                 && event.get("stopped").and_then(|v| v.as_str()) == Some("stuck"))

@@ -478,8 +478,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         })
         .await?;
         let kinds: BTreeSet<String> = kept
-            .checked_all()
-            .unwrap()
+            .all()
             .iter()
             .map(|e| format!("{}.{}", e.source, e.kind))
             .collect();
@@ -494,7 +493,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         ] {
             assert!(kinds.contains(want), "no {want} in {kinds:?}");
         }
-        let blocked = kept.checked_of("net", "blocked").unwrap();
+        let blocked = kept.of("net", "blocked");
         assert_eq!(blocked[0].u64("dst_port"), Some(102));
 
         // The dashboard's decoder reads both protocols from the packets.
@@ -615,10 +614,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
 
         // The service's own events carry the connection, numbered by Net.
         assert!(
-            kept.checked_all()
-                .unwrap()
-                .iter()
-                .all(|e| e.source != "echo"),
+            kept.all().iter().all(|e| e.source != "echo"),
             "no line was sent yet"
         );
         conn.write_all(&fcx, b"hi\n").await?;
@@ -897,8 +893,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             Some("agent")
         );
         assert!(
-            kept.checked_of("net", "blocked")
-                .unwrap()
+            kept.of("net", "blocked")
                 .iter()
                 .all(|e| e.str("why") != Some("Lan"))
         );
@@ -918,15 +913,14 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         assert!(drops[1].get("count").is_none());
         assert_eq!(drops[1].str("why"), Some("no member at that address"));
         // The VM is named in events like any sandbox.
-        let joined = kept.checked_of("net", "attached").unwrap();
+        let joined = kept.of("net", "attached");
         assert!(
             joined
                 .iter()
                 .any(|e| e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01"))
         );
         let vm_lines: Vec<Event> = kept
-            .checked_all()
-            .unwrap()
+            .all()
             .into_iter()
             .filter(|e| {
                 e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == "ws01") && e.is("dns", "query")
@@ -954,7 +948,7 @@ fn trusted_routes_attribute_requests_and_refusals() {
             lookup(&fcx, &server, "office.internal").await,
             Some(PLC_ADDR)
         );
-        let queries = kept.checked_of("dns", "query").unwrap();
+        let queries = kept.of("dns", "query");
         assert!(queries.iter().any(|event| {
             event.str("name") == Some("office.internal")
                 && event.conn.sandbox.as_ref().is_some_and(|sandbox| {
@@ -975,8 +969,7 @@ fn trusted_routes_attribute_requests_and_refusals() {
         let mut connection = server.tcp.connect(&fcx, (ME, 390).into()).await?;
         assert_eq!(read_some(&fcx, &mut connection, 6).await, b"hello\n");
         assert!(
-            kept.checked_of("net", "blocked")
-                .unwrap()
+            kept.of("net", "blocked")
                 .iter()
                 .all(|event| { event.str("dst") != Some(ME.to_string().as_str()) })
         );
@@ -1220,7 +1213,7 @@ fn a_lan_member_detaches_like_any_sandbox() {
         let vm = machine(&fcx, attacher.attach("ws01")?, ws);
         let mut conn = vm.tcp.connect(&fcx, to).await?;
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
-        let attached = kept.checked_of("net", "attached").unwrap();
+        let attached = kept.of("net", "attached");
         assert_eq!(attached.len(), 2, "{attached:?}");
         assert_ne!(
             attached[1].conn.sandbox.as_ref().map(|s| s.id),
@@ -1275,37 +1268,4 @@ fn udp_ephemeral_ports_skip_bound_ports_and_reuse_released_ports() {
         assert_eq!(endpoint.bind(0)?.local_addr().port(), 49152);
         Ok(())
     });
-}
-
-#[test]
-fn refused_connections_share_a_bounded_aggregate() {
-    use fictionet::events::ConnInfo;
-    use fictionet::stdlib::world::net;
-    use fictionet_observe::{Aggregate, Limits, Memory};
-    use std::sync::atomic::AtomicUsize;
-
-    let log = Arc::new(Memory::new(Limits::new(4, 8192)));
-    let observer = Arc::new(Aggregate::new(log.clone()));
-    block_on(lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(observer),
-        |fcx| async move {
-            let open = Arc::new(AtomicUsize::new(0));
-            for port in 1000..2000 {
-                let conn = ConnInfo::new(
-                    u64::from(port),
-                    "10.0.0.1:443".parse()?,
-                    SocketAddr::from(([10, 0, 0, 2], port)),
-                );
-                assert!(net::connection_limit(&fcx, &conn, &open, 0).is_none());
-            }
-            Ok(())
-        },
-    ))
-    .unwrap();
-    let blocked = log.checked_of("net", "blocked").unwrap();
-    assert_eq!(blocked.len(), 2);
-    assert!(blocked[0].get("count").is_none());
-    assert_eq!(blocked[1].u64("count"), Some(999));
-    assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
-    assert!(blocked[0].conn.id.is_none());
 }

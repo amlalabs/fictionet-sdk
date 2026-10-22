@@ -9,7 +9,7 @@ use fictionet::stdlib::services::serve::{Ended, Flow, Harness, HarnessError};
 
 #[test]
 fn the_harness_runs_a_service_with_no_runtime() {
-    let log = std::sync::Arc::new(fictionet_observe::Memory::default());
+    let log = std::sync::Arc::new(fictionet_test_support::EventLog::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(log.clone());
     assert_eq!(h.open().unwrap(), b"hello\n");
     assert_eq!(h.push(b"one\ntw").unwrap(), b"one\n");
@@ -21,12 +21,7 @@ fn the_harness_runs_a_service_with_no_runtime() {
     assert!(h.closed());
     assert_eq!(h.end_reason(), Some(Ended::Closed));
     assert!(matches!(h.push(b"more\n"), Err(HarnessError::Closed)));
-    let lines: Vec<String> = log
-        .checked_all()
-        .unwrap()
-        .into_iter()
-        .map(|e| e.summary)
-        .collect();
+    let lines: Vec<String> = log.all().into_iter().map(|e| e.summary).collect();
     assert_eq!(lines, ["one", "two", "three", "quit"]);
     assert_eq!(h.output(), b"hello\none\ntwo\ntoo long\nthree\nbye\n");
 }
@@ -89,7 +84,7 @@ fn resuming_an_upgrade_keeps_the_observer_and_sequence() {
     use fictionet::events::ConnInfo;
     use fictionet::stdlib::codec::{Ending, LineError, Lines};
     use fictionet::stdlib::services::serve::Upgrade;
-    use fictionet_observe::Memory;
+    use fictionet_test_support::EventLog;
     use std::sync::Arc;
 
     struct Switch;
@@ -102,7 +97,7 @@ fn resuming_an_upgrade_keeps_the_observer_and_sequence() {
             Ok(if line == b"tls" { Flow::Upgrade(Upgrade::Tls) } else { Flow::Continue })
         }
     }
-    let log = Arc::new(Memory::default());
+    let log = Arc::new(EventLog::default());
     let mut harness = Harness::new(fictionet::Seed::from_u64(1), Switch, ()).observer(log.clone());
     assert!(matches!(
         harness.push(b"tls\n"),
@@ -115,7 +110,7 @@ fn resuming_an_upgrade_keeps_the_observer_and_sequence() {
         })
         .unwrap();
     harness.push(b"hello\n").unwrap();
-    let events = log.checked_of("test", "line").unwrap();
+    let events = log.of("test", "line");
     assert_eq!(
         events
             .iter()

@@ -805,7 +805,7 @@ mod tests {
         }
         let (sent, received) = mpsc::channel();
         let log = Log::new(Box::new(Lines(sent)), &["blocked"], |s| s);
-        let evidence = Arc::new(fictionet_observe::Memory::default());
+        let evidence = Arc::new(fictionet_test_support::EventLog::default());
         let drain = log.clone();
         fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
@@ -821,13 +821,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(first["dst_port"], 1);
                 assert_eq!(summary["count"], 1);
-                assert!(
-                    evidence
-                        .checked_all()
-                        .unwrap()
-                        .iter()
-                        .all(|event| event.source != "example")
-                );
+                assert!(evidence.all().iter().all(|event| event.source != "example"));
                 Ok(())
             },
         ))
@@ -840,7 +834,7 @@ mod tests {
         let output = Output(Arc::new(Mutex::new(Vec::new())));
         let out = output.clone();
         let log = Log::new(Box::new(out), &["blocked"], |s| s);
-        let evidence = Arc::new(fictionet_observe::Memory::default());
+        let evidence = Arc::new(fictionet_test_support::EventLog::default());
         let drain = log.clone();
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
@@ -848,13 +842,7 @@ mod tests {
                 log.attach(&fcx);
                 log.write(json!({"type": "blocked", "dst_port": 1}));
                 log.write(json!({"type": "blocked", "dst_port": 2}));
-                assert!(
-                    evidence
-                        .checked_all()
-                        .unwrap()
-                        .iter()
-                        .all(|event| event.source != "example")
-                );
+                assert!(evidence.all().iter().all(|event| event.source != "example"));
                 Ok(())
             },
         ))

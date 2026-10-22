@@ -12,7 +12,6 @@ cargo-fuzz = true
 arbitrary = { version = "1", features = ["derive"] }
 bytes = "1"
 fictionet = { path = ".." }
-fictionet-observe = { path = "../observe", features = ["decode"] }
 fictionet-cli = { path = "../cli" }
 fictionet-codegen-golden = { path = "../codegen/tests/golden" }
 http = "1"

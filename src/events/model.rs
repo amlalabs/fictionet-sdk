@@ -155,9 +155,7 @@ impl Sandbox {
     }
 }
 
-/// How a connection's bytes travel. An event's connection and an observed
-/// conversation (`fictionet_observe::Selection`) both
-/// use it.
+/// How an event's connection carries bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Transport {
     /// A byte stream: TCP, or TLS over it.
@@ -378,7 +376,7 @@ impl Event {
     }
 
     /// Marks a repeatable fact and adds per-occurrence detail.
-    /// An optional `fictionet_observe::Aggregate` combines matching facts and summarizes
+    /// A consumer can combine matching facts and summarize
     /// numeric detail as ranges. Detail names must not replace identifying fields.
     /// Without that observer, every occurrence is delivered unchanged.
     pub fn repeat(mut self, detail: Fields) -> Self {

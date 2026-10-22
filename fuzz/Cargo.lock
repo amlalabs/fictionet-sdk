@@ -12,15 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arc-swap"
-version = "1.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -321,7 +312,6 @@ name = "fictionet-cli"
 version = "0.1.0"
 dependencies = [
  "fictionet",
- "fictionet-observe",
  "libc",
  "tokio",
 ]
@@ -342,23 +332,12 @@ dependencies = [
  "fictionet",
  "fictionet-cli",
  "fictionet-codegen-golden",
- "fictionet-observe",
  "http",
  "http-body-util",
  "libfuzzer-sys",
  "rustls",
  "tokio",
  "tower-service",
-]
-
-[[package]]
-name = "fictionet-observe"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "fictionet",
- "hickory-proto",
- "ring",
 ]
 
 [[package]]

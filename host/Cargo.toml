@@ -21,7 +21,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 webpki-roots = "1"
 
 [dev-dependencies]
-fictionet-observe = { path = "../observe", features = ["native"] }
+fictionet-test-support = { path = "../tests/support" }
 http-body-util = "0.1"
 tower-service = "0.3"
 tokio = { version = "1", features = ["sync"] }

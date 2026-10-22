@@ -233,7 +233,7 @@ fn stream_reports_cumulative_input_buffer_copies() {
 fn buffer_random_operations_match_a_queue() {
     let mut rng = fictionet::stdlib::codec::Lcg::new(72);
     let mut b = Buffer::new(31);
-    let mut expected = alloc::collections::VecDeque::new();
+    let mut expected = alloc::collections::VecDeque::<u8>::new();
     let mut consumed = 0;
     for _ in 0..4000 {
         if rng.below(2) == 0 {
@@ -1325,11 +1325,11 @@ fn test_support_decode_all() {
     assert_eq!(items, vec![b"a".to_vec()]);
     assert_eq!(failure, Some(Fail::Truncated { unread: 2 }));
     let (items, failure) = test_support::decode_all(|| Frames, &[0, 0x40, 0]);
-    assert_eq!(items, vec![Vec::new()]);
+    assert_eq!(items, vec![Vec::<u8>::new()]);
     assert_eq!(failure, Some(Fail::Protocol(TestError)));
     // Bytes after End are left undecoded.
     let (items, failure) = test_support::decode_all(|| Frames, &[0, 0xff, 0x40]);
-    assert_eq!(items, vec![Vec::new()]);
+    assert_eq!(items, vec![Vec::<u8>::new()]);
     assert_eq!(failure, None);
     let (items, failure) = test_support::decode_all(|| Frames, b"");
     assert!(items.is_empty());

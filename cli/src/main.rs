@@ -1,8 +1,7 @@
 //! The `fictionet` command. Its subcommands: `attach`, with the types
 //! `tun`, `tap`, `http_proxy` and `socks5`; `ready`, a probe for attach's ready
 //! file; `wait-blocked`, which waits until a pod's NetworkPolicy blocks its
-//! direct traffic; and `observe`, the observe API from a shell. See the crate
-//! docs, `fictionet::guide` and `fictionet_observe`.
+//! direct traffic. See `fictionet::guide`.
 //!
 //! Exit status of `attach`: 0 when the world closed the connection (or,
 //! for `tap`, when QEMU closed its connection) or after `--help`, 1 on an error, 2 on bad arguments, 3 when the world
@@ -22,7 +21,6 @@ mod config;
 mod lifecycle;
 mod linux;
 mod netlink;
-mod observe;
 mod proxy;
 mod tap;
 mod tun;
@@ -35,11 +33,8 @@ usage: fictionet attach --world unix:<path> --name <name> --type tun|tap|http_pr
        fictionet --version
        fictionet ready <path>
        fictionet wait-blocked [--api-server] [--timeout <seconds>] [<ip:port>...]
-       fictionet observe --observation unix:<path> [<request>]
 
-Run `fictionet attach --help` for the flags, and `fictionet observe --help`
-for observation requests. --observation names the Unix socket a world serves
-with fictionet_observe::serve.
+Run `fictionet attach --help` for the flags.
 `fictionet ready <path>` exits 0 if <path> exists, and 1 if not. Use it as
 a probe on attach's --ready-file, in an image with no shell.
 `fictionet wait-blocked` exits 0 once the addresses stop answering, such as
@@ -105,7 +100,6 @@ fn main() {
             }
         },
         Some("wait-blocked") => std::process::exit(blocked::main(&argv[1..])),
-        Some("observe") => std::process::exit(observe::main(&argv[1..])),
         Some("--version") if argv.len() == 1 => println!("fictionet {}", env!("CARGO_PKG_VERSION")),
         Some("-h" | "--help") => println!("{USAGE}"),
         _ => {

@@ -1585,7 +1585,7 @@ mod tests {
         let Ok(Packet::V3Data(plain)) = Packet::parse(&d) else {
             panic!()
         };
-        assert_eq!(plain.cookie, []);
+        assert_eq!(plain.cookie, [] as [u8; 0]);
         assert_eq!(plain.payload.len(), 6);
         let v = V3Data::<4>::parse(&d).unwrap();
         assert_eq!(
@@ -1599,7 +1599,7 @@ mod tests {
         assert_eq!(v.to_bytes(), Ok(d.to_vec()));
         assert_eq!(v.to_bytes(), Ok(d.to_vec()));
         assert_eq!(V3Data::<8>::parse(&d), Err(Error::Truncated));
-        assert_eq!(V3Data::<4>::parse(&d[..12]).unwrap().payload, []);
+        assert_eq!(V3Data::<4>::parse(&d[..12]).unwrap().payload, [] as [u8; 0]);
         // Reserved bits in the data header are ignored and written as zero.
         let mut r = d;
         r[0] = 0x7f;

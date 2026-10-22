@@ -13,7 +13,6 @@ mod codegen;
 mod compose;
 #[cfg(feature = "std")]
 mod core;
-mod dashboard_js;
 mod datagrams_codec;
 mod db_codec;
 #[cfg(feature = "std")]
@@ -51,8 +50,6 @@ mod listen;
 mod mail_codec;
 mod media_codec;
 mod messaging_codec;
-#[cfg(feature = "std")]
-mod observe;
 #[cfg(feature = "std")]
 mod packets;
 mod protocol_primitives;
