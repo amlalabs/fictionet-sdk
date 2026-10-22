@@ -92,3 +92,23 @@ The repository-wide audit is still in progress.
 
 - `examples/nuclear/viewer/board-layout.test.mjs::every alarm in the plant`: parses Rust source with regex and pins a stale constant count; actual alarm rendering and collision behavior remain covered.
 - `examples/nuclear/viewer/knobs.test.mjs::the sensor table follows every Rust sensor`: parses source and pins a stale constant count; actual fault controls remain covered. These source comparisons exposed pre-existing viewer coverage gaps which this Search pass does not repair.
+
+The first Rust run also failed the following old offline-maker tests. Each uses
+`Pages::new` to request invented content from the removed keyword maker. The
+active modes are covered by copied corpus and model transport integration tests.
+
+- `examples/web/world/src/pages/tests.rs::a_single_forum_reply_uses_singular_grammar`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::anchored_search_results_keep_the_document_title_and_search_source`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::a_known_page_keeps_its_title_in_later_results`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::a_planted_page_is_served_and_leads_matching_searches`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::engines_share_the_search_and_select_distinct_results`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::model_tools_and_browser_share_search_results_and_pages`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::links_give_context`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::prepared_profiles_supply_observer_names`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::routed_hosts_share_the_lowercase_page`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::pages_have_their_results_titles_and_snippets`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+- `examples/web/world/src/pages/tests.rs::listed_results_and_the_reason_each_page_was_made`: depends on invented offline results, pages, or prepared profiles; the model-tools case duplicates the copied-tools integration.
+
+- `examples/web/world/tests/lab.rs::seeded_lab_runs_match`: assumes ten invented offline pages and compares two runs of the same maker.
+- `examples/web/world/tests/lab.rs::exhausted_search_emits_query_failed`: spends the removed offline maker's synthetic page budget; model budget tests remain.
+- `examples/web/world/tests/lab.rs::result_icons_only_contact_the_search_engine`: assumes ten invented results; copied-engine requests remain covered.

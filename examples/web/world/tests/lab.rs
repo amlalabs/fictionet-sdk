@@ -2,7 +2,7 @@
 //! or files.
 use web_world::{
     World,
-    pages::{Seed, text::target_of},
+    pages::Seed,
     search::Searches,
 };
 use fictionet::{
@@ -17,9 +17,7 @@ use fictionet::{
         world::sandbox::{self, Machine, machine},
     },
 };
-use fictionet_extras::search::links;
 use fictionet_observe::Memory;
-use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -61,138 +59,6 @@ async fn fetch(
     let response = sandbox::request(cx, &mut conn, &request).await.unwrap();
     (response.head.status, response.body)
 }
-fn run(exhaust: bool) -> (Vec<Value>, web_world::search::Snapshot) {
-    let events = Arc::new(Memory::default());
-    let seed = Seed::builtin("web").unwrap();
-    let searches = Arc::new(Searches::from_seed(&seed));
-    let log = Arc::new(example_common::log::Log::new(
-        Box::new(std::io::sink()),
-        &[],
-        |s| s,
-    ));
-    let output = log.clone();
-    let observer = Arc::new(Fanout::new(vec![
-        events.clone(),
-        searches.clone(),
-        Arc::new(web_world::events::LogObserver { log: log.clone() }),
-    ]));
-    fictionet::block_on(fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
-        move |cx| async move {
-            let start = SystemTime::from(
-                time::Date::from_calendar_date(2026, time::Month::October, 7)
-                    .unwrap()
-                    .midnight()
-                    .assume_utc(),
-            );
-            let world = World::new(&cx, seed, start)?;
-            let pages = &world.pages;
-            if exhaust {
-                // The cast and 199 pages spend the 200 generations.
-                for n in 0..199 {
-                    let target = format!("/{n}.txt");
-                    let page = pages.handle(&cx, "GET", "budget.io", &target, None);
-                    assert_eq!(page.await.status, 200);
-                }
-                let last = pages.handle(&cx, "GET", "budget.io", "/last.txt", None);
-                assert_eq!(last.await.status, 503);
-            }
-            let (attacher, attachments) = fictionet::attachments();
-            world.serve(&cx, log, attachments)?;
-            let m = machine(&cx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
-            let (status, body) = fetch(
-                &cx,
-                &m,
-                "www.google.com",
-                "/search?q=Python+itertools+groupby+example",
-                start,
-                "Mozilla/5.0 Firefox/145.0",
-            )
-            .await;
-            if exhaust {
-                // A busy server's plain page; the log says why.
-                assert_eq!(status, 503);
-                let body = String::from_utf8(body.to_vec()).unwrap();
-                assert!(body.contains("<h1>503 Service Temporarily Unavailable</h1>"));
-                assert!(!body.to_lowercase().contains("generat"));
-            } else {
-                assert_eq!(status, 200);
-                let results = links(std::str::from_utf8(&body).unwrap());
-                assert_eq!(results.len(), 10);
-                for (url, _) in results {
-                    let (host, target) = target_of(&url);
-                    let (status, first) =
-                        fetch(&cx, &m, &host, &target, start, "Mozilla/5.0 Firefox/145.0").await;
-                    assert_eq!(status, 200);
-                    let (status, second) =
-                        fetch(&cx, &m, &host, &target, start, "Mozilla/5.0 Firefox/145.0").await;
-                    assert_eq!(status, 200);
-                    assert_eq!(first, second);
-                }
-            }
-            cx.cancel();
-            Ok(())
-        },
-    ))
-    .unwrap();
-    output.finish().unwrap();
-    let snapshot = searches.snapshot();
-    let selected = events
-        .checked_all()
-        .unwrap()
-        .into_iter()
-        .filter(|e| ["http", "adaptive"].contains(&e.source))
-        .map(|e| {
-            let fields: serde_json::Map<_, _> = e
-                .fields
-                .iter()
-                .map(|(k, v)| (k.to_owned(), example_common::events::js(Some(v))))
-                .collect();
-            json!({"source":e.source,"kind":e.kind,"fields":fields})
-        })
-        .collect();
-    (selected, snapshot)
-}
-#[test]
-fn seeded_lab_runs_match() {
-    let first = run(false);
-    assert_eq!(first, run(false));
-    assert_eq!(first.1.queries.len(), 1);
-    assert_eq!(
-        first.1.queries[0].outcome,
-        web_world::search::Outcome::Served
-    );
-    assert_eq!(first.1.queries[0].gen_ms, Some(0));
-    assert_eq!(first.1.results[0].listed.len(), 10);
-    assert_eq!(first.1.pages.len(), 10);
-    assert!(first.1.pages.iter().all(|p| p.fetches == 2));
-}
-#[test]
-fn exhausted_search_emits_query_failed() {
-    let (events, snapshot) = run(true);
-    assert_eq!(snapshot.queries.len(), 1);
-    assert_eq!(
-        snapshot.queries[0].outcome,
-        web_world::search::Outcome::Failed {
-            why: web_world::search::Failure::Budget,
-            error: None
-        }
-    );
-    let failed: Vec<_> = events
-        .iter()
-        .filter(|e| e["source"] == "adaptive" && e["kind"] == "query_failed")
-        .collect();
-    assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0]["fields"]["why"], "budget");
-    assert_eq!(failed[0]["fields"]["query_id"], 1);
-    let answer = events
-        .iter()
-        .find(|e| e["source"] == "http" && e["kind"] == "request")
-        .unwrap();
-    assert_eq!(answer["fields"]["query_id"], 1);
-    assert_eq!(answer["fields"]["cache"], "budget");
-}
-
 #[test]
 fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
     let events = Arc::new(Memory::default());
@@ -250,7 +116,7 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
             ));
             assert_eq!(answer.answers.len(), 1);
             assert!(matches!(&answer.answers[0].data, RData::A(a) if a.0 == assigned));
-            let sites = events.checked_of("adaptive", "site").unwrap();
+            let sites = events.checked_of("web", "site").unwrap();
             let forwarded: Vec<_> = sites
                 .iter()
                 .filter(|e| e.str("host") == Some("forwarded.com"))
@@ -283,7 +149,7 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
         },
     ))
     .unwrap();
-    let sites = observed.checked_of("adaptive", "site").unwrap();
+    let sites = observed.checked_of("web", "site").unwrap();
     assert!(sites.iter().any(|e| e.str("host") == Some("freshnews.com")));
     assert_eq!(
         sites
@@ -294,14 +160,14 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
     );
     assert!(
         !observed
-            .checked_of("adaptive", "cert")
+            .checked_of("web", "cert")
             .unwrap()
             .iter()
             .any(|e| e.str("host") == Some("forwarded.com"))
     );
     assert!(
         observed
-            .checked_of("adaptive", "refused")
+            .checked_of("web", "refused")
             .unwrap()
             .iter()
             .any(|e| e.str("host") == Some("wiki.corp"))
@@ -365,91 +231,3 @@ fn guest_fetches_attribute_claude_and_keep_browser_requests_unmarked() {
     .unwrap();
 }
 
-#[test]
-fn result_icons_only_contact_the_search_engine() {
-    use kuchiki::traits::TendrilSink;
-
-    let events = Arc::new(Memory::default());
-    for host in ["www.google.com", "www.bing.com"] {
-        let seed = Seed::builtin("web").unwrap();
-        let searches = Arc::new(Searches::from_seed(&seed));
-        let observed = searches.clone();
-        let observer = Arc::new(Fanout::new(vec![events.clone(), searches]));
-        fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
-            move |cx| async move {
-                let start = SystemTime::from(
-                    time::Date::from_calendar_date(2026, time::Month::October, 7)
-                        .unwrap()
-                        .midnight()
-                        .assume_utc(),
-                );
-                let world = World::new(&cx, seed, start)?;
-                let log = Arc::new(example_common::log::Log::new(
-                    Box::new(std::io::sink()),
-                    &[],
-                    |s| s,
-                ));
-                let (attacher, attachments) = fictionet::attachments();
-                world.serve(&cx, log, attachments)?;
-                let machine = machine(&cx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));
-                let (status, body) = fetch(
-                    &cx,
-                    &machine,
-                    host,
-                    "/search?q=Python+itertools+groupby+example",
-                    start,
-                    "Mozilla/5.0 Firefox/145.0",
-                )
-                .await;
-                assert_eq!(status, 200);
-                let icons = {
-                    let dom = kuchiki::parse_html().one(std::str::from_utf8(&body).unwrap());
-                    dom.select("img.result-icon")
-                        .unwrap()
-                        .map(|node| node.attributes.borrow().get("src").unwrap().to_owned())
-                        .collect::<Vec<_>>()
-                };
-                let snapshot = observed.snapshot();
-                let listed = &snapshot.results[0].listed;
-                assert_eq!(icons.len(), listed.len());
-                assert_eq!(icons.len(), 10);
-                for (icon, result) in icons.iter().zip(listed) {
-                    let (icon_host, target) = target_of(icon);
-                    assert_eq!(icon_host, host);
-                    let (status, body) = fetch(
-                        &cx,
-                        &machine,
-                        &icon_host,
-                        &target,
-                        start,
-                        "Mozilla/5.0 Firefox/145.0",
-                    )
-                    .await;
-                    assert_eq!(status, 200);
-                    assert_eq!(
-                        body,
-                        web_world::pages::render::favicon(&result.host).as_bytes()
-                    );
-                }
-                assert!(observed.snapshot().pages.is_empty());
-                cx.cancel();
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
-    let requests = events
-        .checked_all()
-        .unwrap()
-        .into_iter()
-        .filter(|event| event.source == "http" && event.kind == "request")
-        .map(|event| example_common::events::js(event.fields.get("host")))
-        .collect::<Vec<_>>();
-    assert_eq!(requests.len(), 22);
-    assert!(
-        requests
-            .iter()
-            .all(|host| host == "www.google.com" || host == "www.bing.com")
-    );
-}

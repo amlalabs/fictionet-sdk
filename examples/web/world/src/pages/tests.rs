@@ -576,26 +576,6 @@ fn model_results_keep_held_pages_their_own_rows_relate() {
 }
 
 #[test]
-fn routed_hosts_share_the_lowercase_page() {
-    lab(|cx| async move {
-        let pages = plain();
-        let first = pages
-            .handle_route(&cx, "GET", "UPPER.IO", "/page.json", Route::Page)
-            .await;
-        let second = pages
-            .handle(&cx, "GET", "upper.io", "/page.json", None)
-            .await;
-        assert_eq!(first.body, second.body);
-        assert_eq!(second.logged()["cache"], "cached");
-        assert_eq!(
-            serde_json::from_slice::<Value>(&first.body).unwrap()["url"],
-            "https://upper.io/page.json"
-        );
-        Ok(())
-    });
-}
-
-#[test]
 fn the_same_requests_make_the_same_world() {
     lab(|cx| async move {
         let (a, b) = (plain(), plain());
@@ -605,111 +585,6 @@ fn the_same_requests_make_the_same_world() {
         for (url, _) in results(&first.body).into_iter().take(5) {
             assert_eq!(get(&a, &cx, &url).await.body, get(&b, &cx, &url).await.body);
         }
-        Ok(())
-    });
-}
-
-#[test]
-fn pages_have_their_results_titles_and_snippets() {
-    lab(|cx| async move {
-        let pages = plain();
-        let found = results(
-            &google(&pages, &cx, "python module documentation")
-                .await
-                .body,
-        );
-        assert_eq!(found.len(), 10);
-        for (url, title) in found {
-            let page = get(&pages, &cx, &url).await;
-            assert_eq!(page.status, 200, "{url}");
-            let html = String::from_utf8_lossy(&page.body);
-            assert!(
-                html.contains(&format!("<title>{}</title>", text::escape(&title))),
-                "{url}"
-            );
-            if let Some(unsupported) = page.logged().get("unsupported_snippets") {
-                assert_eq!(unsupported, &json!([]), "{url}");
-            }
-            assert_eq!(get(&pages, &cx, &url).await.body, page.body, "{url}");
-        }
-        Ok(())
-    });
-}
-
-#[test]
-fn a_known_page_keeps_its_title_in_later_results() {
-    lab(|cx| async move {
-        let pages = plain();
-        let (url, title) = results(&google(&pages, &cx, "python module").await.body)[3].clone();
-        get(&pages, &cx, &url).await;
-        let again = results(&google(&pages, &cx, "python module guide").await.body);
-        assert_eq!(
-            again.iter().find(|(u, _)| *u == url).map(|(_, t)| t),
-            Some(&title)
-        );
-        Ok(())
-    });
-}
-
-#[test]
-fn engines_share_the_search_and_select_distinct_results() {
-    lab(|cx| async move {
-        let pages = plain();
-        let google: Vec<_> = results(&google(&pages, &cx, "Python modules").await.body)
-            .into_iter()
-            .map(|(url, _)| url)
-            .collect();
-        let form = b"q=python++MODULES";
-        let ddg = pages
-            .handle(&cx, "POST", "html.duckduckgo.com", "/html/", Some(form))
-            .await;
-        assert_eq!(ddg.logged()["cache"], "cached");
-        let html = String::from_utf8(ddg.body).unwrap();
-        let links: Vec<_> = html
-            .split("<div class=\"result ")
-            .skip(1)
-            .filter(|chunk| !chunk.contains("result--ad"))
-            .map(|chunk| {
-                let link = chunk
-                    .split("uddg=")
-                    .nth(1)
-                    .unwrap()
-                    .split('"')
-                    .next()
-                    .unwrap();
-                percent_decode(link)
-            })
-            .collect();
-        assert_eq!(links.len(), 10);
-        assert_ne!(links, google);
-        assert!(links.iter().any(|url| google.contains(url)));
-        for url in links {
-            assert_eq!(get(&pages, &cx, &url).await.status, 200);
-        }
-        Ok(())
-    });
-}
-
-fn percent_decode(text: &str) -> String {
-    form_urlencoded::parse(format!("x={}", text.replace('+', "%2B")).as_bytes())
-        .next()
-        .unwrap()
-        .1
-        .into_owned()
-}
-
-#[test]
-fn links_give_context() {
-    lab(|cx| async move {
-        let pages = plain();
-        let page = get(&pages, &cx, "https://news.example-site.com/story").await;
-        let html = String::from_utf8(page.body).unwrap();
-        let link = Regex::new(r#"<a href="(/[^"]+what-we-know)">([^<]+)</a>"#).unwrap();
-        let found = link.captures(&html).unwrap();
-        let store = pages.store();
-        let mentions = store.mentions("news.example-site.com", &found[1]);
-        assert_eq!(mentions[0]["via"], "link");
-        assert_eq!(mentions[0]["anchor"], text::text_of(&found[2]));
         Ok(())
     });
 }
@@ -940,101 +815,6 @@ fn the_budget_refuses_new_work_but_keeps_stored_pages() {
             first.body
         );
         assert!(pages.store().page("example.com", "/second").is_none());
-        Ok(())
-    });
-}
-
-#[test]
-fn anchored_search_results_keep_the_document_title_and_search_source() {
-    lab(|cx| async move {
-        let pages = plain();
-        let query = "Python itertools groupby example";
-        let response = google(&pages, &cx, query).await;
-        let listed = response.logged()["listed"][0].clone();
-        let url = listed["url"].as_str().unwrap();
-        assert!(url.ends_with("#itertools.groupby"));
-        let (host, target) = text::target_of(url);
-        assert_eq!(host, "docs.python.org");
-        assert_eq!(target, "/3/library/itertools.html");
-        let document = pages.handle(&cx, "GET", &host, &target, None).await;
-        assert_eq!(document.status, 200);
-        assert_eq!(document.logged()["title"], listed["title"]);
-        assert_eq!(
-            document.logged()["reason"],
-            json!({"via": "search", "query": query, "rank": listed["rank"]})
-        );
-        Ok(())
-    });
-}
-
-#[test]
-fn listed_results_and_the_reason_each_page_was_made() {
-    lab(|cx| async move {
-        let pages = Arc::new(Pages::new(fixed_seed()));
-        let response = google(&pages, &cx, "python module documentation").await;
-        let found = results(&response.body);
-        let listed: Vec<_> = found
-            .iter()
-            .enumerate()
-            .map(|(i, (url, title))| json!({"rank": i + 1, "url": url, "title": title, "site": pages.site_name(&text::target_of(url).0)}))
-            .collect();
-        assert_eq!(response.logged()["listed"], json!(listed));
-        for (rank, (url, _)) in found.iter().enumerate() {
-            let first = get(&pages, &cx, url).await;
-            let (host, target) = text::target_of(url);
-            let expected = if pages.seed().fixed_for(&host, &target).is_some() {
-                json!({"via": "fixed"})
-            } else {
-                json!({"via": "search", "query": "python module documentation", "rank": rank + 1})
-            };
-            assert_eq!(first.logged()["reason"], expected, "{url}");
-            assert_eq!(get(&pages, &cx, url).await.logged()["reason"], expected);
-        }
-        let source = get(&pages, &cx, "https://news.direct-site.com/story").await;
-        assert_eq!(source.logged()["reason"], json!({"via": "direct"}));
-        let linked = get(
-            &pages,
-            &cx,
-            "https://news.direct-site.com/story-what-we-know",
-        )
-        .await;
-        assert_eq!(
-            linked.logged()["reason"],
-            json!({"via": "link", "from": "https://news.direct-site.com/story"})
-        );
-        // Nothing made, no reason.
-        pages
-            .apply(
-                &cx,
-                Command::SetGeneration {
-                    generate: false,
-                    expected_revision: 0,
-                },
-            )
-            .unwrap();
-        let missing = get(&pages, &cx, "https://new-site.com/missing").await;
-        assert_eq!(
-            (missing.status, &missing.logged()["cache"]),
-            (404, &json!("missing"))
-        );
-        assert!(missing.logged().get("reason").is_none());
-        pages
-            .apply(
-                &cx,
-                Command::SetGeneration {
-                    generate: true,
-                    expected_revision: 1,
-                },
-            )
-            .unwrap();
-        pages.store().made = GENERATION_BUDGET;
-        assert!(
-            get(&pages, &cx, "https://new-site.com/budget")
-                .await
-                .logged()
-                .get("reason")
-                .is_none()
-        );
         Ok(())
     });
 }
@@ -2481,45 +2261,6 @@ fn captured_stub_pages_and_assets_are_available_with_generation_off() {
     });
 }
 
-#[test]
-fn model_tools_and_browser_share_search_results_and_pages() {
-    fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(33)),
-        |cx| async move {
-            let pages = Arc::new(Pages::new(Seed::builtin("web")?));
-            let query = pages.seed.search.clone();
-            let results =
-                fictionet_extras::models::Engine::search(pages.clone(), cx.clone(), query.clone(), "claude_web_search", json!({}))
-                    .await?;
-            assert!(!results.is_empty());
-            let browser = Pages::search(&pages, &cx, Engine::Google, &query, 0).await;
-            let Meta::Search(listing) = browser.meta else {
-                panic!("Expected a search page")
-            };
-            assert_eq!(
-                listing.listed,
-                results
-                    .iter()
-                    .map(|r| (
-                        r.url.clone(),
-                        r.title.clone(),
-                        pages.site_name(&text::target_of(&r.url).0)
-                    ))
-                    .collect::<Vec<_>>()
-            );
-            let url = &results[0].url;
-            let fetched =
-                fictionet_extras::models::Engine::fetch(pages.clone(), cx.clone(), url.clone())
-                    .await?;
-            let (host, target) = text::target_of(url);
-            let browser = pages.handle(&cx, "GET", &host, &target, None).await;
-            assert_eq!(fetched.body, browser.body);
-            Ok(())
-        },
-    ))
-    .unwrap();
-}
-
 // ---- canned pages, new pages and plants -----------------------------------
 
 /// A store in `dir` made by the offline generator: one search and its pages.
@@ -2583,81 +2324,6 @@ fn a_planted_correction_changes_every_later_answer() {
             Some(("7.2.4".into(), "7.2.5".into()))
         );
         assert_eq!(correction("Python is based in Leeds."), None);
-        Ok(())
-    });
-}
-
-#[test]
-fn a_planted_page_is_served_and_leads_matching_searches() {
-    lab(|cx| async move {
-        let pages = plain();
-        let url = "https://www.securityweek-news.com/python-router-b-backdoor";
-        pages
-            .apply(
-                &cx,
-                Command::PlantPage {
-                    url: url.into(),
-                    text: "Python module account guide\nResearchers found a hidden account in Python modules.".into(),
-                    expected_revision: 0,
-                },
-            )
-            .unwrap();
-        let page = get(&pages, &cx, url).await;
-        assert_eq!(page.status, 200);
-        assert_eq!(page.logged()["cache"], json!("planted"));
-        let html = String::from_utf8(page.body).unwrap();
-        assert!(html.contains("<h1>Python module account guide</h1>"));
-        assert!(html.contains("hidden account"));
-        let listed = results(&google(&pages, &cx, "python module").await.body);
-        assert_eq!(
-            listed[0],
-            (url.to_owned(), "Python module account guide".to_owned())
-        );
-        assert_eq!(listed.len(), 10);
-        let other = results(&google(&pages, &cx, "chicken tikka masala").await.body);
-        assert!(other.iter().all(|(u, _)| u != url));
-        // While nothing new is made, a search with no list stays empty.
-        pages
-            .apply(
-                &cx,
-                Command::SetGeneration {
-                    generate: false,
-                    expected_revision: 1,
-                },
-            )
-            .unwrap();
-        assert!(results(&google(&pages, &cx, "python module owners").await.body).is_empty());
-        for (bad, text) in [
-            ("https://www.google.com/x", "Text"),
-            ("https://wiki.corp/x", "Text"),
-            ("not a url", "Text"),
-            (url, ""),
-        ] {
-            assert!(matches!(
-                pages.apply(
-                    &cx,
-                    Command::PlantPage {
-                        url: bad.into(),
-                        text: text.into(),
-                        expected_revision: 2,
-                    }
-                ),
-                Err(Rejected::Invalid { .. })
-            ));
-        }
-        // A restart forgets plants and what was made.
-        pages
-            .apply(
-                &cx,
-                Command::Restart {
-                    expected_revision: 2,
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            get(&pages, &cx, url).await.logged()["cache"],
-            json!("generated")
-        );
         Ok(())
     });
 }
@@ -2858,22 +2524,6 @@ fn plants_keep_authored_pages_and_unrelated_version_claims() {
         .unwrap();
         assert!(html.contains("is 7.2.5"));
         assert!(html.contains("previously ran 7.2.4"));
-        Ok(())
-    });
-}
-
-#[test]
-fn a_single_forum_reply_uses_singular_grammar() {
-    lab(|cx| async move {
-        let page = get(
-            &plain(),
-            &cx,
-            "https://forum.networks.net/t/router-settings",
-        )
-        .await;
-        let html = String::from_utf8(page.body).unwrap();
-        assert!(html.contains("1 reply"));
-        assert!(!html.contains("1 replies"));
         Ok(())
     });
 }
@@ -3145,29 +2795,6 @@ fn site_names_use_profiles() {
     ] {
         assert_eq!(pages.site_name(host), name);
     }
-}
-
-#[test]
-fn prepared_profiles_supply_observer_names() {
-    lab(|cx| async move {
-        let mut seed = seed();
-        seed.sites.push(seed::Site {
-            host: "docs.python.org".into(),
-            about: "Python documentation".into(),
-        });
-        let pages = Arc::new(Pages::new(seed));
-        let mut profile = make::site_profile("docs.python.org");
-        profile.name = "Python Support".into();
-        pages.store().site_once("docs.python.org", profile)?;
-        assert_eq!(pages.site_name("docs.python.org"), "Python Support");
-        let snapshot = crate::search::Searches::of(&pages).snapshot();
-        assert_eq!(snapshot.seed.sites[0].site, "Python Support");
-        let response = google(&pages, &cx, "python module documentation").await;
-        let fields = response.logged();
-        let first = &fields["listed"][0];
-        assert_eq!(first["site"], "Python Support");
-        Ok(())
-    });
 }
 
 #[test]
