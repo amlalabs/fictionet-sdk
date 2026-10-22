@@ -1,8 +1,12 @@
 use super::*;
 use fictionet::stdlib::{protocols::x509, services::ca::Ca, web::httpd};
+use fictionet::sync::Mutex;
 use fictionet::{Cx, Seed};
+use http::Method;
 use http_body_util::BodyExt;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::thread;
 use tower_service::Service;
@@ -44,6 +48,10 @@ fn certificates(fcx: &Cx, name: &str) -> (Arc<rustls::ClientConfig>, Arc<rustls:
         .unwrap();
     server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     (Arc::new(client), Arc::new(server))
+}
+
+fn trusted_client(tls: Arc<rustls::ClientConfig>) -> Client {
+    Client::with_config((*tls).clone(), Duration::from_secs(30), 64)
 }
 
 fn forward(
@@ -99,7 +107,7 @@ fn upstream(
     let mut client = Client::new();
     let server = tls.then(|| {
         let (trust, server) = certificates(fcx, "127.0.0.1");
-        client.tls = trust;
+        client = trusted_client(trust);
         server
     });
     let worker = thread::spawn(move || {
@@ -322,11 +330,20 @@ fn close_delimited_events_arrive_before_the_server_closes() {
 fn tls_without_close_notify_uses_the_response_framing() {
     run(async move |fcx, _log| {
         for (response, complete) in [
-            (b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello".as_slice(), true),
+            (
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello".as_slice(),
+                true,
+            ),
             (b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", true),
             (b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello", false),
-            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", true),
-            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n", false),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                true,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                false,
+            ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let address = listener.local_addr()?;
@@ -337,8 +354,7 @@ fn tls_without_close_notify_uses_the_response_framing() {
                 socket.write_all(response).unwrap();
                 socket.flush().unwrap();
             });
-            let mut client = Client::new();
-            client.tls = trust;
+            let client = trusted_client(trust);
             let mut forward = forward(&fcx, Arc::new(client), true, address);
             let body = forward.call(request()).await?.into_body().collect().await;
             if complete {
@@ -446,7 +462,7 @@ fn a_pooled_connection_the_server_closed_is_replaced_for_idempotent_requests() {
             let mut client = Client::new();
             let config = tls.then(|| {
                 let (trust, server) = certificates(&fcx, "127.0.0.1");
-                client.tls = trust;
+                client = trusted_client(trust);
                 server
             });
             let (closed, idle_closed) = mpsc::channel();
@@ -531,8 +547,7 @@ fn tls_sends_and_checks_the_dns_name() {
             stream.write_all(OK).unwrap();
             stream.flush().unwrap();
         });
-        let mut client = Client::new();
-        client.tls = trust;
+        let client = trusted_client(trust);
         // localhost may also resolve to ::1, where nothing listens, so this
         // also moves on from a refused address.
         let mut forward = forward(&fcx, Arc::new(client), true, format!("localhost:{port}"));
@@ -561,8 +576,7 @@ fn tls_refuses_a_certificate_for_another_name_or_from_an_unknown_ca() {
                 }
                 panic!("the client finished a handshake it should refuse");
             });
-            let mut client = Client::new();
-            client.tls = trust.clone();
+            let client = trusted_client(trust.clone());
             let mut forward = forward(&fcx, Arc::new(client), true, format!("localhost:{port}"));
             let error = forward.call(request()).await.unwrap_err();
             assert!(
@@ -788,8 +802,7 @@ fn malformed_heads_record_bad_gateway_responses() {
 #[test]
 fn stalled_connections_time_out_with_bad_gateway_responses() {
     let quick = || {
-        let mut client = Client::new();
-        client.connect_timeout = Duration::from_millis(100);
+        let client = Client::with_timeout(Duration::from_millis(100));
         Arc::new(client)
     };
     run(async move |fcx, log| {
@@ -853,7 +866,7 @@ fn dropping_a_request_while_it_connects_frees_its_slot() {
             socket.flush().unwrap();
         });
         let mut client = Client::new();
-        client.exchanges = 1;
+        client.slots = Arc::new(Semaphore::new(1));
         let client = Arc::new(client);
         let mut stuck = forward(&fcx, client.clone(), false, hanging);
         let mut ok = forward(
@@ -866,7 +879,7 @@ fn dropping_a_request_while_it_connects_frees_its_slot() {
         assert!(poll_once(connecting.as_mut()).await.is_pending());
         let mut waiting = ok.call(request());
         assert!(poll_once(waiting.as_mut()).await.is_pending());
-        assert_eq!(client.slots.lock().busy, 1);
+        assert_eq!(client.slots.available_permits(), 0);
         drop(connecting);
         let response = waiting.await?;
         assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
@@ -900,7 +913,7 @@ fn exchanges_past_the_cap_wait_for_a_slot() {
             third.write_all(OK_CLOSE).unwrap();
         });
         let mut client = Client::new();
-        client.exchanges = 2;
+        client.slots = Arc::new(Semaphore::new(2));
         let client = Arc::new(client);
         let mut forward = forward(&fcx, client.clone(), false, address);
         let mut calls: Vec<_> = (0..3).map(|_| forward.call(request())).collect();
@@ -908,7 +921,7 @@ fn exchanges_past_the_cap_wait_for_a_slot() {
             assert!(poll_once(call.as_mut()).await.is_pending());
         }
         both_arrived.recv()?;
-        assert_eq!(client.slots.lock().busy, 2);
+        assert_eq!(client.slots.available_permits(), 0);
         assert!(poll_once(calls[2].as_mut()).await.is_pending());
         answer.send(())?;
         for call in calls {
@@ -950,6 +963,133 @@ fn a_client_reset_before_the_upstream_answers_keeps_the_origin() {
         assert_eq!(requests[0].u64("status"), None);
         assert_eq!(requests[0].str("forwarded"), Some(_origin.as_str()));
         finish.send(()).unwrap();
+        server.join().unwrap();
+        Ok(())
+    });
+}
+
+#[test]
+fn raw_paths_and_encoded_responses_pass_through() {
+    run(async |fcx, _log| {
+        let (mut forward, server, _origin) = upstream(&fcx, false, |socket| {
+            let head = read_head(socket);
+            assert!(
+                head.starts_with("GET /a/../b%2Fc?q=%2f&x=1 HTTP/1.1\r\n"),
+                "{head}"
+            );
+            assert!(!head.to_ascii_lowercase().contains("accept-encoding:"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nContent-Encoding: gzip\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nConnection: close\r\n\r\n\x1f\x8bopaque").unwrap();
+            socket.flush().unwrap();
+        });
+        let mut request = request();
+        *request.uri_mut() = "/a/../b%2Fc?q=%2f&x=1".parse()?;
+        let response = forward.call(request).await?;
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+        assert_eq!(
+            response.into_body().collect().await?.to_bytes().as_ref(),
+            b"\x1f\x8bopaque"
+        );
+        server.join().unwrap();
+        Ok(())
+    });
+}
+
+#[test]
+fn a_response_keeps_its_runtime_after_the_handler_is_dropped() {
+    run(async |fcx, _log| {
+        let (release, released) = mpsc::channel();
+        let (mut forward, server, _origin) = upstream(&fcx, false, move |socket| {
+            read_head(socket);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            socket.flush().unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            socket.write_all(b"ok").unwrap();
+            socket.flush().unwrap();
+        });
+        let response = forward.call(request()).await?;
+        drop(forward);
+        release.send(())?;
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+        server.join().unwrap();
+        Ok(())
+    });
+}
+
+#[test]
+fn a_client_can_be_dropped_inside_another_runtime() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async { drop(Client::new()) });
+}
+
+#[test]
+fn request_bodies_of_unknown_length_stream_as_chunks() {
+    run(async |fcx, _log| {
+        let (mut forward, server, _origin) = upstream(&fcx, false, |socket| {
+            let head = read_head(socket).to_ascii_lowercase();
+            assert!(head.contains("transfer-encoding: chunked\r\n"), "{head}");
+            assert!(!head.contains("content-length:"), "{head}");
+            let mut received = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                while !line.ends_with(b"\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    line.push(byte[0]);
+                }
+                let size = usize::from_str_radix(
+                    std::str::from_utf8(&line[..line.len() - 2]).unwrap(),
+                    16,
+                )
+                .unwrap();
+                let mut bytes = vec![0; size + 2];
+                socket.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes[size..], b"\r\n");
+                received.extend_from_slice(&bytes[..size]);
+                if size == 0 {
+                    break;
+                }
+            }
+            assert_eq!(received, b"onetwo");
+            socket.write_all(OK_CLOSE).unwrap();
+            socket.flush().unwrap();
+        });
+        let mut request = request();
+        *request.method_mut() = Method::POST;
+        *request.body_mut() = Body::new(http_body_util::StreamBody::new(
+            futures_util::stream::iter([
+                Ok::<_, Error>(Frame::data(Bytes::from_static(b"one"))),
+                Ok(Frame::data(Bytes::from_static(b"two"))),
+            ]),
+        ));
+        let response = forward.call(request).await?;
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+        server.join().unwrap();
+        Ok(())
+    });
+}
+
+#[test]
+fn upstream_protocol_upgrades_are_rejected() {
+    run(async |fcx, _log| {
+        let (mut forward, server, _origin) = upstream(&fcx, false, |socket| {
+            read_head(socket);
+            socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n").unwrap();
+            socket.flush().unwrap();
+        });
+        assert!(
+            forward
+                .call(request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("upstream protocol upgrades are unsupported")
+        );
         server.join().unwrap();
         Ok(())
     });
