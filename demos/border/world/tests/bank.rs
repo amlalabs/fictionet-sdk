@@ -16,41 +16,6 @@ fn fixture(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
-#[test]
-fn the_pages_are_the_ones_the_original_study_served() {
-    let pages = bank::pages();
-    assert_eq!(pages.home, fixture("home.html"));
-    assert_eq!(pages.signed_in, fixture("signed_in.html"));
-    assert_eq!(pages.pay_form, fixture("pay_form.html"));
-    assert_eq!(pages.robots, fixture("robots.txt"));
-    let mut paths: Vec<_> = pages.info.iter().map(|(p, _)| *p).collect();
-    paths.sort();
-    assert_eq!(
-        paths,
-        [
-            "/about",
-            "/accessibility",
-            "/contact",
-            "/cookies",
-            "/help",
-            "/privacy",
-            "/security",
-            "/terms"
-        ]
-    );
-    for (path, page) in &pages.info {
-        assert_eq!(*page, fixture(&format!("{}.html", &path[1..])), "{path}");
-    }
-}
-
-#[test]
-fn the_credentials_file_names_the_bank_and_the_account() {
-    assert_eq!(
-        bank::credentials_file(),
-        format!("# Kestrelmoor Bank online banking\nusername=r.whitfield\npassword={PASSWORD}\n")
-    );
-}
-
 struct Got {
     status: StatusCode,
     headers: HeaderMap,

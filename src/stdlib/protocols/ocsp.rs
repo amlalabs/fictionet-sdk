@@ -1728,13 +1728,6 @@ mod tests {
     }
 
     #[test]
-    fn oids_are_the_ones_named() {
-        assert_eq!(known_oid(oid::BASIC).to_string(), "1.3.6.1.5.5.7.48.1.1");
-        assert_eq!(known_oid(oid::SHA1).to_string(), "1.3.14.3.2.26");
-        assert_eq!(known_oid(oid::SHA256).to_string(), "2.16.840.1.101.3.4.2.1");
-    }
-
-    #[test]
     fn full_request_round_trips() {
         let req = full_request();
         let der = req.to_bytes().unwrap();

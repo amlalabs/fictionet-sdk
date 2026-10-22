@@ -144,3 +144,9 @@ active modes are covered by copied corpus and model transport integration tests.
 - `demos/border/world/tests/golden.rs`: removed log snapshots and their flush sleeps; kept real DNS, HTTP, TLS, ping and refused-connection assertions in `traffic.rs`.
 - `demos/fakewiki/world/tests/golden.rs`: removed the regenerated log comparison; kept real requests, HEAD delivery and redirect evidence in `requests.rs`.
 - `demos/fakewiki/world/tests/golden/altered_one.jsonl`: unused after removing the output comparison.
+
+- `src/stdlib/protocols/x509.rs::oid_constants_are_the_identifiers_they_name`: compares identifier constants to their literal names; certificate parsing and validation tests remain.
+- `src/stdlib/protocols/ocsp.rs::oids_are_the_ones_named`: compares identifier constants to their literal names; real request and response parsing remains.
+- `demos/border/world/tests/bank.rs::the_pages_are_the_ones_the_original_study_served`: compares copied page files; authenticated responses, payment handling and network behavior remain.
+- `demos/border/world/tests/bank.rs::the_credentials_file_names_the_bank_and_the_account`: pins static credential file copy; actual authentication remains covered.
+- `demos/fakewiki/world/src/pages/tests.rs::the_evals_scenario_is_the_worlds` and `the_evals_probe_pages_are_the_worlds`: regenerate scorer fixtures and compare their text. The fixtures stay because Python scorer regressions read them; real HTTP and evidence labeling tests remain. Removed their unused file comparison helpers.
