@@ -164,3 +164,6 @@ active modes are covered by copied corpus and model transport integration tests.
 - `tests/it/sbe_codegen.rs::module_is_generator_output_plus_hand_written_framing`: compares regenerated Rust source with generated Rust source. Removed its unused source parsing helpers; independent SBE encoding, runtime decoding and mutation checks remain.
 
 - Removed the generated command string assertion from `python/inspect_fictionet/tests/test_sandbox.py::test_build_and_cargo_example`; retained real build-context snapshot checks and the external-crate Docker rebuild test. SDK demo targets are now built through their owning packages, while the generic Cargo example helper is tested with the SDK's actual web test fixture.
+
+- `demos/search/world/src/pages/tests/bylines.rs::site_names_use_profiles`: repeats the display-name data table. Removed CSS marker assertions from the neighboring question rendering test and retained code and answer preservation.
+- Trimmed `demos/search/app/src/main.rs::the_app_takes_its_folder_or_preview` to its current modes and generic invalid arguments, removing the list of retired options and commands.

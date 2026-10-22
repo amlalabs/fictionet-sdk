@@ -143,20 +143,12 @@ mod tests {
             })
         );
         assert_eq!(parse(&["preview"]), Some(Mode::Preview));
-        assert_eq!(parse(&["preview", "--spend-budget"]), None);
         for bad in [
             &[][..],
-            &["--stay"],
-            &["d", "--stay"],
-            &["d", "--seed", "corvane-acquisition"],
-            &["d", "--model", "openrouter"],
-            &["d", "--model-name", "x"],
-            &["d", "--store", "s"],
-            &["d", "check", "check"],
+            &["--unknown"],
             &["d", "extra"],
-            &["preview", "--stay"],
-            &["preview", "--spend-budget", "--spend-budget"],
-            &["bake", "now"],
+            &["preview", "extra"],
+            &["preview", "extra", "extra"],
         ] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
