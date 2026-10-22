@@ -1,7 +1,7 @@
 //! The control room viewer: the plant on the wall clock, the operator network,
 //! the scripted story, and a control room page on the loopback interface.
 //!
-//! Run `cargo run --example viewer` and open the printed address. Plant time is
+//! Run `cargo run -p nuclear-world --bin viewer` and open the printed address. Plant time is
 //! initially run time, so one plant second is one second. The scripted story starts at
 //! once. It reads hmi01 and publishes its steps in the first inspector panel.
 //! Page moments mark the plant actions and faults. Ctrl-C stops the viewer.
@@ -38,18 +38,18 @@ type Reply = Result<Applied, Rejected>;
 const JS: &str = "text/javascript; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
 
-const CONTROL_ROOM: &str = include_str!("../../viewer/control-room.mjs");
-const CONTROL_BOARD: &str = include_str!("../../viewer/control-board.mjs");
-const DESK_SCREENS: &str = include_str!("../../viewer/desk-screens.mjs");
-const BOARD_LAYOUT: &str = include_str!("../../viewer/board-layout.mjs");
-const ROOM_MOTION: &str = include_str!("../../viewer/room-motion.mjs");
-const LOOK: &str = include_str!("../../viewer/look.mjs");
-const METERS: &str = include_str!("../../viewer/meters.mjs");
-const INSTRUMENTS: &str = include_str!("../../viewer/instruments.mjs");
-const KNOBS: &str = include_str!("../../viewer/knobs.mjs");
-const PLANT_SCENE: &str = include_str!("../../viewer/plant-scene.mjs");
-const VIEWER_CSS: &str = include_str!("../../viewer/viewer.css");
-const CONTROL_ROOM_CSS: &str = include_str!("../../viewer/control-room.css");
+const CONTROL_ROOM: &str = include_str!("../../../viewer/control-room.mjs");
+const CONTROL_BOARD: &str = include_str!("../../../viewer/control-board.mjs");
+const DESK_SCREENS: &str = include_str!("../../../viewer/desk-screens.mjs");
+const BOARD_LAYOUT: &str = include_str!("../../../viewer/board-layout.mjs");
+const ROOM_MOTION: &str = include_str!("../../../viewer/room-motion.mjs");
+const LOOK: &str = include_str!("../../../viewer/look.mjs");
+const METERS: &str = include_str!("../../../viewer/meters.mjs");
+const INSTRUMENTS: &str = include_str!("../../../viewer/instruments.mjs");
+const KNOBS: &str = include_str!("../../../viewer/knobs.mjs");
+const PLANT_SCENE: &str = include_str!("../../../viewer/plant-scene.mjs");
+const VIEWER_CSS: &str = include_str!("../../../viewer/viewer.css");
+const CONTROL_ROOM_CSS: &str = include_str!("../../../viewer/control-room.css");
 
 /// The module the page loads for the control room. A custom panel gets only its
 /// module, state and title, so this entry adds the two command paths the knobs
@@ -313,7 +313,7 @@ fn gate_flag() -> Result<bool, Box<dyn StdError>> {
     match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
         [] => Ok(false),
         [flag] if flag == "--gate" => Ok(true),
-        _ => Err("usage: cargo run --example viewer -- [--gate]".into()),
+        _ => Err("usage: cargo run -p nuclear-world --bin viewer -- [--gate]".into()),
     }
 }
 

@@ -84,7 +84,7 @@
 //! a stopped pump. Telemetry quiet freezes readings and reported equipment
 //! status together; controller modes remain live.
 //! Fault slots and the schedule are fixed arrays, so overflow cannot be built.
-//! The viewer example, `examples/viewer.rs`, runs the plant in real time and
+//! The viewer binary, `src/bin/viewer.rs`, runs the plant in real time and
 //! serves the control room page with scripted steps, plant moments, and a scenario command port. The operator
 //! reads and commands through hmi01. The checks read plant truth. Each HMI link
 //! shows a telemetry heartbeat that stops when the feed freezes; the update time keeps advancing.
