@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [[bin]]
-name = "web_world"
+name = "web"
 path = "main.rs"
 
 [dependencies]
