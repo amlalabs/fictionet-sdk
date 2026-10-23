@@ -186,18 +186,12 @@ where
         let mut mirror = self.clone();
         Box::pin(async move {
             if mirror.closed.load(Ordering::Acquire) {
-                return Ok(web::httpd::text(
-                    StatusCode::FORBIDDEN,
-                    "Package mirror closed\n",
-                ));
+                return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
             }
             let path = key(&request).map(|key| mirror.root.join(key));
             let _download = mirror.download.lock().await;
             if mirror.closed.load(Ordering::Acquire) {
-                return Ok(web::httpd::text(
-                    StatusCode::FORBIDDEN,
-                    "Package mirror closed\n",
-                ));
+                return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
             }
             if let Some(path) = &path {
                 match tokio::fs::File::open(path).await {
@@ -212,10 +206,7 @@ where
             }
             std::future::poll_fn(|cx| mirror.upstream.poll_ready(cx)).await?;
             if mirror.closed.load(Ordering::Acquire) {
-                return Ok(web::httpd::text(
-                    StatusCode::FORBIDDEN,
-                    "Package mirror closed\n",
-                ));
+                return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
             }
             let response = mirror.upstream.call(request).await?;
             let Some(path) = path.filter(|_| {

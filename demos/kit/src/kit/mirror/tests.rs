@@ -156,10 +156,9 @@ async fn closing_the_mirror_refuses_cached_and_upstream_files() {
     bytes(send(&mirror, request(PACKAGE)).await.unwrap()).await;
     mirror.closed.store(true, Ordering::Release);
     for path in [PACKAGE, "/ubuntu/dists/noble/InRelease"] {
-        assert_eq!(
-            send(&mirror, request(path)).await.unwrap().status(),
-            StatusCode::FORBIDDEN
-        );
+        let response = send(&mirror, request(path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(bytes(response).await, "Forbidden\n");
     }
     assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
 }

@@ -71,7 +71,8 @@
 //!   it gets a free one from `104.18.0.0/15` (IPv4) and `2606:4700:100::/48`
 //!   (IPv6). Hosts with the same address share one machine.
 //! - **A router** with one route per machine. A packet for any other address
-//!   gets ICMP "host unreachable" (ICMPv6 "address unreachable"). The router is
+//!   gets ICMP "host unreachable" (ICMPv6 "address unreachable"), or is silently
+//!   dropped with [`Net::drop_unrouted`]. The router is
 //!   private
 //!   ([`Router::keep_ttl`](fictionet::stdlib::network::route::Router::keep_ttl)):
 //!   it leaves TTLs as they are, so every machine is one hop from the sandbox.
@@ -234,6 +235,7 @@ pub struct Net {
     hosts: Vec<Host>,
     resolver: Option<Arc<Resolver>>,
     unreachable: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
+    drop_unrouted: bool,
     max_hosts: usize,
     routes: Vec<(String, Prefix)>,
     limits: Limits,
@@ -263,6 +265,7 @@ impl Net {
             hosts: Vec::new(),
             resolver: None,
             unreachable: None,
+            drop_unrouted: false,
             max_hosts: MAX_HOSTS,
             routes: Vec::new(),
             limits: Limits::default(),
@@ -323,6 +326,14 @@ impl Net {
     /// Calls `report` when a packet has no route in this network.
     pub fn on_unreachable(mut self, report: impl Fn(Unreachable) + Send + Sync + 'static) -> Self {
         self.unreachable = Some(Arc::new(report));
+        self
+    }
+
+    /// Silently drops packets with no route, as a filtering firewall does.
+    /// Clients use their normal retransmission and timeout behavior.
+    /// [`Net::on_unreachable`] still reports each dropped packet.
+    pub fn drop_unrouted(mut self) -> Self {
+        self.drop_unrouted = true;
         self
     }
 
@@ -405,7 +416,10 @@ impl Net {
         );
         let gateway = subnet.gateway;
         let report = self.unreachable.clone();
-        fcx.spawn(move |fcx| unreachable(fcx, unreachable_side, gateway.into(), report));
+        let drop_unrouted = self.drop_unrouted;
+        fcx.spawn(move |fcx| {
+            unreachable(fcx, unreachable_side, gateway.into(), report, drop_unrouted)
+        });
         if let Some(subnet6) = subnet6 {
             let (router_side, unreachable_side) = link();
             router.add(
@@ -417,7 +431,9 @@ impl Net {
             );
             let gateway = subnet6.gateway;
             let report = self.unreachable.clone();
-            fcx.spawn(move |fcx| unreachable(fcx, unreachable_side, gateway.into(), report));
+            fcx.spawn(move |fcx| {
+                unreachable(fcx, unreachable_side, gateway.into(), report, drop_unrouted)
+            });
         }
         let hooks = Arc::new(Hooks {
             by_addr: Mutex::default(),
@@ -728,6 +744,7 @@ async fn unreachable(
     mut end: End,
     gateway: IpAddr,
     report: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
+    drop_unrouted: bool,
 ) -> fictionet::Result {
     let mut run = 0;
     while let Ok(packet) = end.recv(&fcx).await {
@@ -739,12 +756,14 @@ async fn unreachable(
                 to: header.dst,
             });
         }
-        let reply = match gateway {
-            IpAddr::V4(g) => icmp::host_unreachable(&packet.0, g),
-            IpAddr::V6(g) => icmp::address_unreachable(&packet.0, g),
-        };
-        if let Some(reply) = reply {
-            end.send(reply);
+        if !drop_unrouted {
+            let reply = match gateway {
+                IpAddr::V4(g) => icmp::host_unreachable(&packet.0, g),
+                IpAddr::V6(g) => icmp::address_unreachable(&packet.0, g),
+            };
+            if let Some(reply) = reply {
+                end.send(reply);
+            }
         }
         run = (run + 1) % 64;
         if run == 0 && fcx.yield_now().await.is_err() {
@@ -912,6 +931,48 @@ mod tests {
 mod unreachable_tests {
     use super::*;
     use crate::stdlib::network::ip;
+
+    #[test]
+    fn dropped_unrouted_packets_are_reported_without_icmp_replies() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                let facts = Arc::new(Mutex::new(Vec::new()));
+                let recorded = facts.clone();
+                let (attacher, attachments) = fictionet::attachments();
+                Net::new()
+                    .drop_unrouted()
+                    .on_unreachable(move |fact| recorded.lock().push(fact))
+                    .start(&cx, attachments)?;
+                let mut guest = attacher.attach("guest")?;
+                let routes = [
+                    ("10.0.0.2", "203.0.113.9"),
+                    ("2001:db8::2", "2001:db8:99::9"),
+                ];
+                for (from, to) in routes {
+                    guest.send(ip::packet(from.parse()?, to.parse()?, 253, &[1, 2, 3]));
+                }
+                let received = cx
+                    .race(
+                        Some(cx.now() + std::time::Duration::from_secs(1)),
+                        guest.recv(&cx),
+                    )
+                    .await;
+                assert!(matches!(received, Err(fictionet::RaceError::Deadline)));
+                let facts = facts.lock();
+                assert_eq!(facts.len(), 2);
+                for (from, to) in routes {
+                    assert!(facts.contains(&Unreachable {
+                        from: from.parse()?,
+                        to: to.parse()?,
+                    }));
+                }
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn a_world_can_report_missing_routes_without_changing_icmp_replies() {
