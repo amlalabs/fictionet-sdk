@@ -53,7 +53,9 @@ capture provenance and are outside that scope; their words are not allowlisted.
 Every world-served HTTPS host uses the Zscaler look-alike chain from
 `fictionet-extras`, with its root installed in the guest. Sign-in hosts include
 `claude.com`. Their HTTPS requests are inspected and forwarded only during
-setup. The first successful inference response closes interactive sign-in for
+setup, including provider-hosted assets and hCaptcha. Its regional asset hosts
+follow the [published hCaptcha domains](https://docs.hcaptcha.com/#content-security-policy-settings).
+The first successful inference response closes interactive sign-in for
 the rest of the run, including requests on existing connections. Only validated
 refresh-token grants to the Claude and OpenAI token endpoints remain on these
 hosts. Refresh requests are serialized from the validated fields before sending.

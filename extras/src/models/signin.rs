@@ -5,11 +5,18 @@ pub const HOSTS: &[&str] = &[
     "claude.ai",
     "claude.com",
     "assets-proxy.anthropic.com",
+    "s-cdn.anthropic.com",
+    "hcaptcha.com",
     "console.anthropic.com",
     "platform.claude.com",
     "auth.openai.com",
     "challenges.cloudflare.com",
 ];
+
+/// The login's CAPTCHA assets use regional subdomains of one service.
+pub fn is_host(host: &str) -> bool {
+    HOSTS.contains(&host) || host.ends_with(".hcaptcha.com")
+}
 
 /// The authority under which an authentication request may leave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +51,7 @@ impl Session {
         path: &str,
         body: &serde_json::Value,
     ) -> Option<Access> {
-        if !HOSTS.contains(&host) {
+        if !is_host(host) {
             return None;
         }
         if !self.closed() {
@@ -107,6 +114,27 @@ mod tests {
             "/",
             &json!(null)
         ));
+        assert!(allows(
+            &session,
+            "newassets.hcaptcha.com",
+            &Method::GET,
+            "/",
+            &json!(null)
+        ));
+        assert!(!allows(
+            &session,
+            "hcaptcha.com.example.com",
+            &Method::GET,
+            "/",
+            &json!(null)
+        ));
+        assert!(!allows(
+            &session,
+            "evilhcaptcha.com",
+            &Method::GET,
+            "/",
+            &json!(null)
+        ));
         assert!(session.close());
         assert!(!other.close());
         assert!(!allows(
@@ -114,6 +142,13 @@ mod tests {
             "claude.com",
             &Method::GET,
             "/oauth/authorize",
+            &json!(null)
+        ));
+        assert!(!allows(
+            &session,
+            "newassets.hcaptcha.com",
+            &Method::GET,
+            "/",
             &json!(null)
         ));
         for host in HOSTS {

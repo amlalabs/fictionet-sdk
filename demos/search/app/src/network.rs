@@ -42,27 +42,9 @@ pub fn build(
     use fictionet_extras::models::{Model, Provider, signin};
     let signin = signin::Session::default();
     report_signin(&world.pages, cx, true);
-    let signins = signin::HOSTS
-        .iter()
-        .map(|host| {
-            Ok((
-                *host,
-                (
-                    SignIn {
-                        session: signin.clone(),
-                        pages: world.pages.clone(),
-                        host: host.parse()?,
-                        forward: fictionet::stdlib::web::forward(
-                            cx,
-                            format!("https://{host}").parse()?,
-                            Arc::new(fictionet_host::Client::new()),
-                        )?,
-                    },
-                    world.ca.config(cx, host)?.0,
-                ),
-            ))
-        })
-        .collect::<fictionet::Result<Vec<_>>>()?;
+    let signin_ca = world.ca.clone();
+    let signin_pages = world.pages.clone();
+    let signin_cx = cx.clone();
     let models = [Provider::Anthropic, Provider::OpenAi, Provider::ChatGpt]
         .into_iter()
         .map(|provider| {
@@ -88,12 +70,20 @@ pub fn build(
                     .into_host(host),
             );
         }
-        if let Some((_, (signin, tls))) = signins.iter().find(|(name, _)| *name == host) {
-            return Some(
-                Site::handler(signin.clone())
-                    .tls(tls.clone())
-                    .into_host(host),
-            );
+        if signin::is_host(host) {
+            let handler = SignIn {
+                session: signin.clone(),
+                pages: signin_pages.clone(),
+                host: host.parse().ok()?,
+                forward: fictionet::stdlib::web::forward(
+                    &signin_cx,
+                    format!("https://{host}").parse().ok()?,
+                    Arc::new(fictionet_host::Client::new()),
+                )
+                .ok()?,
+            };
+            let tls = signin_ca.config(&signin_cx, host).ok()?.0;
+            return Some(Site::handler(handler).tls(tls).into_host(host));
         }
         FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
             let site = Site::new(mirror.clone());
@@ -585,7 +575,7 @@ mod tests {
 
 fn report_signin(pages: &web_world::pages::Pages, cx: &Cx, open: bool) {
     pages.report(cx, SearchObs::Signin { open, exceptions: if open {
-        fictionet_extras::models::signin::HOSTS.iter().map(|host| format!("https://{host}:443 during sign-in")).collect()
+        fictionet_extras::models::signin::HOSTS.iter().map(|host| format!("https://{host}:443 during sign-in")).chain(std::iter::once("https://*.hcaptcha.com:443 during sign-in".into())).collect()
     } else {
         vec!["POST platform.claude.com/v1/oauth/token with a refresh grant".into(), "POST auth.openai.com/oauth/token with a refresh grant".into(),
              "GET api.anthropic.com/api/oauth/profile and /api/oauth/roles".into(), "GET api.anthropic.com/api/claude_code/policy_limits".into(),
