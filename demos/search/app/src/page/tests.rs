@@ -63,7 +63,7 @@ async fn real_search_page_and_dns_facts_reach_the_owned_views_without_an_observe
         let world=web_world::World {pages:pages.clone(),..web_world::World::new(&cx,seed,start)?};
         let (attacher,attachments)=fictionet::attachments();
         let log=Arc::new(fictionet_extras::log::Log::new(Box::new(std::io::sink()),&[],|s|s));
-        let net=crate::network::build(&world,&cx,log,fictionet_demo::kit::mirror::new(&cx)?, None)?;
+        let net=crate::network::build(&world,&cx,log, None)?;
         net.start(&cx,attachments)?;
         let client=machine(&cx,attacher.attach("workstation")?,"10.0.0.2".parse::<std::net::Ipv4Addr>()?);
         fetch(&cx,&client,"www.google.com","/search?q=black+hole",start).await;

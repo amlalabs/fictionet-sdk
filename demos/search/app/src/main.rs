@@ -138,7 +138,7 @@ async fn main() -> Result {
             };
             run.trust("office", &web.ca.cert_pem())?;
             page.run_commands(&cx, pages.clone(), commands);
-            let net = network::build(&web, &cx, world_log, run.mirror(&cx)?, claude_token)?
+            let net = network::build(&web, &cx, world_log, claude_token)?
                 .route(kit::JUMP, kit::jump_prefix());
             net.start(&cx, run.into_attachments())
         },

@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+fictionet-demo = { path = "../demos/kit" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "signal"] }

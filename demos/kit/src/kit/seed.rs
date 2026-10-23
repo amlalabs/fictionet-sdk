@@ -32,6 +32,9 @@ pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
     {
         return Err(std::io::Error::other("invalid root certificate name"));
     }
+    if provision.guest.image.is_some() {
+        return super::image::seed(provision);
+    }
     let user_data = user_data(provision);
     let audit = fictionet_extras::guest_content::Audit::default();
     for (path, content) in files(&user_data)? {
