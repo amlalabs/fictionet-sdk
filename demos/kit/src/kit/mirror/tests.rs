@@ -184,3 +184,37 @@ fn file_keys_reject_traversal_and_mutable_releases() {
         "/claude-code-releases/latest/linux-x64/claude.zst"
     ));
 }
+
+#[tokio::test]
+async fn observations_report_upstream_requests_without_cache_hits_or_closed_setup() {
+    let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "mirror").unwrap();
+    let upstream = Upstream::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let destination = events.clone();
+    let mirror = Mirror::new(upstream.clone(), dir.path().into()).observe_upstream(Arc::new(
+        move |request, status| {
+            destination
+                .lock()
+                .unwrap()
+                .push((request.uri().path().to_owned(), status));
+        },
+    ));
+    bytes(send(&mirror, request(PACKAGE)).await.unwrap()).await;
+    bytes(send(&mirror, request(PACKAGE)).await.unwrap()).await;
+    mirror.closed.store(true, Ordering::Release);
+    assert_eq!(
+        send(&mirror, request("/ubuntu/dists/noble/InRelease"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            (PACKAGE.into(), None),
+            (PACKAGE.into(), Some(StatusCode::OK))
+        ]
+    );
+    assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+}

@@ -245,7 +245,8 @@ fn serve_latches_a_failed_record() {
         |s| s,
     ));
     let output = log.clone();
-    let (observations, mut facts) = tokio::sync::mpsc::unbounded_channel();
+    let (observations, mut facts) =
+        tokio::sync::mpsc::channel(crate::observation::OBSERVATION_CAPACITY);
     fictionet::block_on(fictionet::run(
         fictionet::Seed::from_u64(1),
         move |fcx| async move {

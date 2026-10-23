@@ -17,11 +17,21 @@ and package mirror. Search explicitly reports typed facts from its request and
 tool handlers, its name resolver and the typed no-route callback on its network.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
-model calls and recent activity. Selecting a site or gateway expands the map
-beside its details. The scrubber replays the retained observation history; the
+model calls and recent activity. Selecting a site or gateway keeps the map
+above its details while the agent remains visible. The scrubber replays the retained observation history; the
 agent stays live. The World menu chooses the page source or restarts world pages.
-The last 1024 observations are kept for rewind. The app writes its typed facts to
-`<downloads>/search/log.jsonl`.
+The last 1024 observations are kept for rewind. Each launch writes its typed facts to a separate
+`<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
+owner-only permissions. Preview records are under `demos/downloads/search-preview/`.
+Request credentials are redacted before entering the observation channel; request
+bodies are not retained. The map draws internet routes from upstream facts,
+including setup downloads and sign-in, rather than from model call activity.
+Local and rejected model requests therefore leave the internet wire dark.
+
+Guest web bodies are limited to one MiB, including chunked requests; larger
+bodies receive 413 before routing. The observation queue holds at most 256 facts,
+including one reserved failure notification. A burst or a fact larger than 256
+KiB fails recording explicitly; the app stops instead of silently losing facts.
 
 The page prints a loopback URL with its run token. Browser libraries are served
 locally. Recorded page previews are inert and cannot run scripts or contact

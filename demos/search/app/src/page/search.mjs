@@ -11,14 +11,14 @@ const button = (text, action, className) => {
   node.addEventListener('click', action);
   return node;
 };
-const time = (ms) => `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`;
-const stamp = (ms) => (ms / 1000).toFixed(3);
+const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false });
+const time = stamp;
 const size = (bytes) => bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
-const sourceName = (source) => source.kind === 'copy' ? source.captured ? `copy captured ${source.captured.slice(0, 10)}` : 'copy · capture date unavailable' : source.kind === 'live' ? 'live' : 'model-written';
+const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied · ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'live' : 'model-written';
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
-let latest = { at_ms: 0, oldest_ms: 0, sites: [], calls: [], activity: [] };
+let latest = { at_ms: 0, oldest_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
 let shown = latest, selection = null, live = true, world = null;
-let rewindRequest, noticeTimer, activeConsole = 'terminal', hostStatus = null;
+let rewindRequest, noticeTimer, activeConsole = 'terminal', hostStatus = null, fontSize = 19;
 const consoles = new Map();
 const mounting = new Set();
 const socketUrl = (path) => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/${path}`;
@@ -33,12 +33,16 @@ function select(key) {
   selection = key;
   $('details').hidden = !key;
   document.body.classList.toggle('details-open', !!key);
-  $('agent').hidden = !!key; $('agent-toggle').setAttribute('aria-pressed', String(!key));
+  if (key) { $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); }
   draw();
 }
 $('close-details').onclick = () => select(null);
+$('agent-size').onclick = () => {
+  const expanded = document.body.classList.toggle('agent-expanded');
+  $('agent-size').setAttribute('aria-pressed', String(expanded));
+  $('agent-size').setAttribute('aria-label', expanded ? 'Shrink agent' : 'Expand agent');
+};
 $('agent-toggle').onclick = () => {
-  if (selection) { select(null); return; }
   $('agent').hidden = !$('agent').hidden;
   $('agent-toggle').setAttribute('aria-pressed', String(!$('agent').hidden));
 };
@@ -51,53 +55,71 @@ function svg(tag, attrs = {}, text) {
 function graph() {
   const map = $('map');
   map.replaceChildren();
-  map.append(svg('rect', { x: 20, y: 262, width: 155, height: 136, rx: 16, fill: 'none', stroke: '#252e42', 'stroke-dasharray': '3 5' }), svg('rect', { x: 200, y: 20, width: 560, height: 620, rx: 22, fill: '#0d1426', 'fill-opacity': '.6', stroke: '#1e3361' }), svg('rect', { x: 790, y: 262, width: 188, height: 136, rx: 16, fill: '#140e0b', stroke: '#4d2c16' }));
-  map.append(svg('text', { x: 36, y: 287, class: 'map-label' }, 'VM'), svg('text', { x: 220, y: 45, class: 'map-label', style: 'fill:#5b86d9' }, 'THE WORLD'), svg('text', { x: 806, y: 287, class: 'map-label', style: 'fill:#c9814f' }, 'INTERNET'));
-  const wire = (path, kind = '') => map.append(svg('path', { d: path, class: `wire ${kind}` }));
-  const node = (id, x, y, width, title, address, outside = false, active = false) => {
-    const group = svg('g', { class: `node ${selection === id ? 'selected' : ''} ${outside ? 'outside' : ''} ${active ? 'active' : ''}`, role: 'button', tabindex: '0', 'aria-label': title, 'aria-pressed': String(selection === id) });
-    group.append(svg('title', {}, `${title}${address ? ` · ${address}` : ''}`), svg('rect', { x, y, width, height: 48, rx: 11 }));
-    group.append(svg('text', { x: x + 12, y: y + (address ? 20 : 29) }, title.length > 27 ? `${title.slice(0, 25)}…` : title));
-    if (address) group.append(svg('text', { x: x + 12, y: y + 36, class: 'address' }, address));
-    group.addEventListener('click', () => select(id));
-    group.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(id); } });
+  const compact = !!selection;
+  const y = (value) => compact ? value * .65 + 10 : value;
+  map.setAttribute('viewBox', compact ? '0 0 1000 410' : '0 0 1000 600');
+  map.append(svg('rect', { x: 18, y: y(244), width: 156, height: compact ? 78 : 112, rx: 16, class: 'vm-zone' }), svg('rect', { x: 195, y: y(20), width: 548, height: compact ? 376 : 560, rx: 22, class: 'world-zone' }), svg('rect', { x: 775, y: y(20), width: 207, height: compact ? 376 : 560, rx: 18, class: 'internet-zone' }));
+  for (const [x, top, title, kind] of [[34, 270, 'VM', ''], [215, 49, 'THE WORLD', 'world-label'], [793, 49, 'INTERNET', 'internet-label']]) map.append(svg('text', { x, y: y(top), class: `map-label ${kind}` }, title));
+  const wire = (path, kind = '', pulse = false) => {
+    map.append(svg('path', { d: path, class: `wire ${kind}` }));
+    if (pulse && live) {
+      const dot = svg('circle', { r: 3, class: `packet ${kind}` });
+      dot.append(svg('animateMotion', { path, dur: '1.2s', repeatCount: '1', fill: 'freeze' }));
+      map.append(dot);
+    }
+  };
+  const node = (id, x, top, width, title, address = '', outside = false) => {
+    const at = y(top), height = compact ? 34 : 46;
+    const group = svg('g', { class: `node ${selection === id ? 'selected' : ''} ${outside ? 'outside' : ''}`, role: 'button', tabindex: '0', 'aria-label': title, 'aria-pressed': String(selection === id) });
+    group.append(svg('title', {}, `${title}${address ? ` · ${address}` : ''}`), svg('rect', { x, y: at, width, height, rx: 10 }));
+    group.append(svg('text', { x: x + 11, y: at + (address ? compact ? 14 : 19 : compact ? 22 : 28) }, title.length > 24 ? `${title.slice(0, 22)}…` : title));
+    if (address) group.append(svg('text', { x: x + 11, y: at + (compact ? 27 : 35), class: 'address' }, address));
+    group.onclick = () => select(id);
+    group.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(id); } };
     map.append(group);
   };
-  wire('M160 330 L248 330', shown.activity.length ? 'hot' : '');
-  wire('M360 330 L580 330 M718 330 L800 330', shown.calls.length ? 'outside hot' : 'outside');
-  node('workstation', 32, 306, 128, 'workstation', hostStatus?.addresses[0] || '10.0.0.2', false, true);
-  node('router', 248, 306, 112, 'router', '10.0.0.1', false, true);
-  node('calls', 580, 306, 138, 'model gateway', '', true);
-  const provider = shown.calls.at(-1)?.host;
-  node('calls', 800, 306, 167, provider || 'Model provider', provider ? '' : 'No calls yet', true);
-  const rows = [{ host: 'DNS', address: '10.0.0.1:53', at_ms: shown.activity.filter((r) => r.fact.kind === 'resolved').at(-1)?.at_ms ?? 0 }];
-  const all = [...shown.sites].sort((a, b) => b.at_ms - a.at_ms);
-  const visible = all.slice(0, 7);
-  if (selection?.startsWith('site:')) {
-    const selected = all.find((s) => `site:${s.host}` === selection);
-    if (selected && !visible.includes(selected)) visible.splice(-1, 1, selected);
+  wire(`M160 ${y(310)} L230 ${y(310)}`, shown.activity.length ? 'hot' : '');
+  node('workstation', 30, 287, 130, 'workstation', hostStatus?.addresses[0] || '10.0.0.2');
+  node('router', 230, 287, 112, 'router', '10.0.0.1');
+  const last = shown.activity.at(-1);
+  const outgoing = shown.egress.filter((row) => ['attempt', 'response', 'failed'].includes(row.fact.phase));
+  const externalHosts = new Set(shown.connections.map((row) => row.host));
+  const providerHosts = new Set(shown.calls.map((call) => call.host));
+  const sites = shown.sites.filter((site) => !externalHosts.has(site.host) && !providerHosts.has(site.host)).sort((a, b) => b.at_ms - a.at_ms);
+  const visible = sites.slice(0, 3);
+  const selectedHost = selection?.startsWith('site:') ? selection.slice(5) : selection?.startsWith('page:') ? hostOf(selection.slice(5)) : null;
+  const selected = sites.find((site) => site.host === selectedHost);
+  if (selected && !visible.includes(selected)) visible.splice(2, 1, selected);
+  const services = [{ id: 'dns', title: 'DNS', address: '10.0.0.1:53', y: 70 }, ...visible.map((site, i) => ({ id: `site:${site.host}`, title: site.host, address: site.address || '', y: 132 + i * 62 }))];
+  if (sites.length > 3) services.push({ id: 'sites', title: 'All sites ›', y: 318 });
+  services.push({ id: 'calls', title: 'model gateway', y: 380 }, { id: 'egress', title: 'sign-in', address: shown.signin ? shown.signin.fact.open ? 'Open' : 'Closed' : '', y: 442 }, { id: 'egress', title: 'package mirror', y: 504 });
+  for (const service of services) {
+    const hot = last && ((service.id === 'calls' && ['model_call', 'tool'].includes(last.fact.kind)) || service.id === `site:${last.fact.host}` || (service.id === 'dns' && last.fact.kind === 'resolved'));
+    wire(`M342 ${y(310)} C390 ${y(310)},390 ${y(service.y) + (compact ? 17 : 23)},445 ${y(service.y) + (compact ? 17 : 23)}`, hot ? 'hot' : '', hot);
+    node(service.id, 445, service.y, 274, service.title, service.address);
   }
-  rows.push(...visible);
-  const positions = [56, 116, 176, 236, 424, 484, 544, 604];
-  rows.forEach((site, i) => {
-    const y = positions[i];
-    const active = shown.activity.at(-1)?.at_ms === site.at_ms && (live || selection === `site:${site.host}`);
-    wire(`M360 330 C410 330,420 ${y},480 ${y}`, active ? 'hot' : '');
-    node(site.host === 'DNS' ? 'dns' : `site:${site.host}`, 480, y - 24, 238, site.host, String(site.address || ''), false, active);
-  });
-  const refusal = shown.activity.filter((r) => r.fact.kind === 'no_route').at(-1);
+  const destinations = [...externalHosts].sort();
+  for (const [i, host] of destinations.slice(0, 7).entries()) {
+    const rows = outgoing.filter((row) => row.fact.host === host);
+    const purposes = [...new Set(shown.connections.filter((row) => row.host === host).map((row) => row.purpose))];
+    const top = 76 + i * 65;
+    const sources = [...new Set(purposes.map((purpose) => purpose === 'setup' ? 504 : ['sign-in', 'token refresh'].includes(purpose) ? 442 : 380))];
+    const active = rows.at(-1)?.at_ms === shown.at_ms;
+    for (const source of sources) {
+      const from = y(source) + (compact ? 17 : 23), to = y(top) + (compact ? 17 : 23);
+      wire(`M719 ${from} C753 ${from},750 ${to},790 ${to}`, 'outside observed', active);
+    }
+    node('egress', 790, top, 177, host, purposes.join(' · '), true);
+  }
+  if (destinations.length > 7) node('egress', 790, 531, 177, 'All connections ›', '', true);
+  if (!destinations.length) map.append(svg('text', { x: 795, y: y(105), class: 'map-empty' }, 'No connections'));
+  const refusal = shown.activity.filter((row) => row.fact.kind === 'no_route').at(-1);
   if (refusal) {
-    wire('M304 354 C304 440,266 518,250 560', 'no-route');
-    map.append(svg('circle', { cx: 250, cy: 570, r: 10, fill: '#1a1016', stroke: '#7a3a4a' }), svg('path', { d: 'M246 566 L254 574 M254 566 L246 574', stroke: '#f2a7b4', 'stroke-width': 1.6 }), svg('text', { x: 268, y: 568, style: 'fill:#e6a3b0;font:12px monospace' }, refusal.fact.to), svg('text', { x: 268, y: 586, style: 'fill:#6b768a;font:11px sans-serif' }, 'no route'));
+    wire(`M286 ${y(333)} L286 ${y(510)}`, 'no-route');
+    map.append(svg('circle', { cx: 286, cy: y(520), r: 10, class: 'refusal' }), svg('path', { d: `M282 ${y(516)} L290 ${y(524)} M290 ${y(516)} L282 ${y(524)}`, class: 'refusal-cross' }), svg('text', { x: 230, y: y(553), class: 'map-refusal' }, refusal.fact.to));
   }
-  if (all.length > 7) {
-    const more = svg('g', { class: 'node', role: 'button', tabindex: '0', 'aria-label': 'All sites' });
-    more.append(svg('text', { x: 730, y: 620, style: 'fill:#7fb0ff;font:11px sans-serif' }, 'All sites ›'));
-    more.onclick = () => select('sites'); more.onkeydown = (e) => { if (e.key === 'Enter') select('sites'); };
-    map.append(more);
-  }
-  $('empty').hidden = !!shown.activity.length;
 }
+
 function activityText(row) {
   const fact = row.fact;
   switch (fact.kind) {
@@ -106,22 +128,26 @@ function activityText(row) {
     case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
     case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${fact.path} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
-    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Sign-in open until the first successful inference' : `Sign-in closed · ${fact.exceptions.join(', ')}`, 'calls'];
-    case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${fact.path} · ${fact.status || fact.phase}`, 'calls'];
+    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Opened sign-in' : 'Closed sign-in', 'egress'];
+    case 'egress': return [fact.host, 'Upstream', `${fact.method} ${fact.path} · ${fact.status || fact.phase}`, 'egress'];
+    case 'observation_failed': return ['Recording', 'Error', fact.reason, 'egress'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
     default: return ['', '', '', 'router'];
   }
 }
 function feed() {
+  const atBottom = $('activity').scrollHeight - $('activity').scrollTop - $('activity').clientHeight < 24;
   $('activity').replaceChildren();
-  for (const row of shown.activity.slice(-5)) {
+  for (const row of shown.activity.filter((r) => r.fact.kind !== 'run_started' && !(r.fact.kind === 'egress' && r.fact.purpose === 'model')).slice(-100)) {
     const [target, protocol, text, selected] = activityText(row);
     const item = button('', () => select(selected), `activity-row ${row.fact.kind}`);
     item.append(element('span', stamp(row.at_ms), 'stamp'), element('span', target), element('span', protocol), element('span', text));
+    item.title = `${target} · ${text}`;
     $('activity').append(item);
   }
+  if (atBottom) $('activity').scrollTop = $('activity').scrollHeight;
   if (world?.preview) {
-    $('preview-output').textContent = shown.activity.slice(-10).map((r) => { const [host, protocol, text] = activityText(r); return `${protocol}  ${host}\n  ${text}`; }).join('\n\n');
+    $('preview-output').textContent = latest.activity.filter((r) => r.fact.kind !== 'run_started').slice(-10).map((r) => { const [host, protocol, text] = activityText(r); return `${protocol}  ${host}\n  ${text}`; }).join('\n\n');
   }
 }
 function detailRow(at, label, meta, content) {
@@ -134,96 +160,130 @@ function detailRow(at, label, meta, content) {
   row.append(body);
   return row;
 }
+function requestFor(url) {
+  try {
+    const target = new URL(url); target.hash = '';
+    return [...(shown.sites.find((site) => site.host === target.host)?.requests || [])].reverse().find((request) => request.url === target.href && request.method === 'GET');
+  } catch { return null; }
+}
 function results(hits) {
   const list = element('div');
-  const add = (hit) => {
-    const row = element('div', undefined, 'result'), link = element('a', hit.title || hit.url);
-    link.href = '#';
-    link.onclick = (event) => { event.preventDefault(); select(`site:${hostOf(hit.url)}`); };
-    row.append(link, element('small', hostOf(hit.url))); list.append(row);
-  };
-  hits.slice(0, 4).forEach(add);
-  if (hits.length > 4) list.append(button(`${hits.length - 4} more`, (event) => { event.currentTarget.remove(); hits.slice(4).forEach(add); }, 'more'));
+  for (const hit of hits) {
+    const opened = requestFor(hit.url);
+    const row = button('', () => select(`page:${hit.url}`), `result ${opened ? 'opened' : 'unopened'}`);
+    row.append(element('span', hit.title || hit.url, 'result-title'), element('small', hit.url), element('span', opened ? 'Opened' : 'Unopened', 'result-state'));
+    list.append(row);
+  }
   return list;
 }
+async function readPage(url, request, container) {
+  const target = new URL(url);
+  const query = new URLSearchParams({ scheme: target.protocol.slice(0, -1), host: target.host, path: `${target.pathname}${target.search}`, at_ms: request.at_ms });
+  const response = await fetch(`/preview?${query}`);
+  if (!response.ok) throw new Error(await response.text());
+  const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+  const content = doc.querySelector('main, article, [role="main"]') || doc.body;
+  for (const node of content.querySelectorAll('script,style,link,meta,iframe,object,embed,form,nav,header,footer,svg,img,video,audio,source,template')) node.remove();
+  for (const node of [content, ...content.querySelectorAll('*')]) {
+    for (const attribute of [...node.attributes]) node.removeAttribute(attribute.name);
+  }
+  const frame = element('iframe', undefined, 'recorded-page');
+  frame.setAttribute('sandbox', ''); frame.referrerPolicy = 'no-referrer'; frame.title = url;
+  frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>body{margin:24px;color:#243047;background:#fff;font:16px/1.7 system-ui}h1,h2,h3{line-height:1.25}a{color:#2c61bd}pre,table{white-space:pre-wrap;overflow-wrap:anywhere}*{max-width:100%;box-sizing:border-box}</style>${content.outerHTML}`;
+  container.replaceChildren(frame);
+}
+let detailSignature = '';
+
 function details() {
-  if (!selection) return;
+  if (!selection) { detailSignature = ''; return; }
+  const signature = JSON.stringify([selection, shown]);
+  if (signature === detailSignature) return;
+  detailSignature = signature;
   const body = $('detail-body'), actions = $('detail-actions');
+  const scroll = body.scrollTop;
+  const expanded = new Set([...body.querySelectorAll('details[open]')].map((node) => node.dataset.key));
   body.replaceChildren(); actions.replaceChildren();
   const heading = (title, subtitle = '') => { $('detail-title').textContent = title; $('detail-subtitle').textContent = subtitle; };
   if (selection === 'calls') {
-    heading('Model calls', [...new Set(shown.calls.map((c) => c.host))].join(' · ') || 'Through the world’s model gateway');
-    if (!shown.calls.length) body.append(element('p', 'No model calls yet. Calls appear here when an agent uses its provider.', 'detail-empty'));
+    heading('Model calls');
+    if (!shown.calls.length) body.append(element('p', 'No calls', 'detail-empty'));
     for (const call of shown.calls) {
-      const content = element('details');
-      content.open = call.tools.length > 0 || !['complete','interrupted'].includes(call.phase);
+      const content = element('details'); content.dataset.key = String(call.call);
+      content.open = expanded.has(content.dataset.key) || call.tools.length > 0 || !['complete', 'interrupted'].includes(call.phase);
       const summary = element('summary');
-      summary.append(element('div', `${call.method} ${call.path}`, 'label'), element('div', call.phase === 'streaming' ? 'streaming' : call.phase === 'interrupted' ? `${call.status || ''} · interrupted` : call.status ? `${call.status}${call.phase === 'complete' ? '' : ' · receiving'}` : 'connecting', call.phase === 'streaming' ? 'meta streaming' : 'meta'));
+      summary.append(element('div', `${call.host} · ${call.method} ${call.path}`, 'label'), element('div', `${call.status || ''} ${call.phase}`, 'meta'));
       content.append(summary);
       for (const tool of call.tools) {
-        content.append(element('p', `tool use: ${tool.tool === 'fetch' ? 'Fetch' : 'web_search'}`, 'meta'), element('p', tool.target, 'tool-query'));
-        content.append(element('p', tool.error || (tool.tool === 'fetch' ? 'Answered by the world' : `Answered by the world · ${tool.results.length} result${tool.results.length === 1 ? '' : 's'}`), 'world-answer'));
-        content.append(results(tool.results));
+        content.append(element('p', tool.tool === 'fetch' ? 'Fetch' : 'Web search', 'meta'), element('p', tool.target, 'tool-query'), element('p', tool.error || 'World answer', 'world-answer'), results(tool.results));
       }
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(call.at_ms), 'stamp'), content); body.append(row);
     }
+  } else if (selection.startsWith('page:')) {
+    const url = selection.slice(5), request = requestFor(url);
+    const hit = shown.sites.flatMap((site) => site.searches.flatMap((search) => search.results)).concat(shown.calls.flatMap((call) => call.tools.flatMap((tool) => tool.results))).find((hit) => hit.url === url);
+    heading(hit?.title || 'Page', url);
+    body.append(element('p', request ? `Opened · ${request.status} · ${sourceName(request.source)}` : 'Unopened', 'page-state'));
+    if (request?.has_preview) {
+      const container = element('div', undefined, 'reading-view');
+      body.append(container);
+      actions.append(button('Read page', () => readPage(url, request, container).catch((error) => notice(error.message))));
+    }
+    actions.append(button('Site', () => select(`site:${hostOf(url)}`)));
   } else if (selection.startsWith('site:')) {
-    const name = selection.slice(5), site = shown.sites.find((s) => s.host === name);
-    const last = site?.requests.at(-1);
-    heading(name, [site?.address, last && sourceName(last.source)].filter(Boolean).join(' · '));
-    for (const event of shown.activity.filter((row) => row.fact.kind === 'resolved' && row.fact.name === name)) body.append(detailRow(event.at_ms, 'DNS', `${name} → ${event.fact.address || 'no answer'}`));
+    const name = selection.slice(5), site = shown.sites.find((site) => site.host === name);
+    heading(name, site?.address || '');
     for (const search of site?.searches || []) {
-      const content = element('div'); content.append(element('p', `“${search.query}”`, 'tool-query'), results(search.results));
+      const content = element('div'); content.append(element('p', search.query, 'tool-query'), results(search.results));
       body.append(detailRow(search.at_ms, 'Search', `${search.results.length} results`, content));
     }
     for (const request of site?.requests || []) {
       const content = element('details'), summary = element('summary'), data = element('dl');
-      summary.append(element('div', `${request.method} ${request.path}`, 'label'), element('div', `${request.status} · ${request.content_type.split(';')[0]} · ${size(request.bytes)} · ${request.elapsed_ms} ms`, 'meta'));
-      for (const [key, value] of [...request.headers, ['served by', sourceName(request.source)]]) data.append(element('dt', key), element('dd', value));
+      content.dataset.key = `${request.method}:${request.path}:${request.at_ms}`;
+      content.open = expanded.has(content.dataset.key);
+      summary.append(element('div', `${request.method} ${request.path}`, 'label'), element('div', `${request.status} · ${size(request.bytes)} · ${sourceName(request.source)}`, 'meta'));
+      for (const [key, value] of [...request.headers, ['content-type', request.content_type], ['elapsed', `${request.elapsed_ms} ms`]]) data.append(element('dt', key), element('dd', value));
       content.append(summary, data);
+      if (request.has_preview) content.append(button('Page', () => select(`page:${request.url}`), 'more'));
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(request.at_ms), 'stamp'), content); body.append(row);
     }
-    if (!site?.requests.length && !site?.searches.length) body.append(element('p', site ? 'No page requests at this point in the run.' : 'This site has not been opened at this point in the run.', 'detail-empty'));
-    const recorded = [...(site?.requests || [])].reverse().find((r) => r.has_preview);
-    if (recorded) actions.append(button('Page', async (event) => {
-      event.currentTarget.disabled = true;
-      try {
-        const query = new URLSearchParams({ host: name, path: recorded.path, at_ms: recorded.at_ms });
-        const response = await fetch(`/preview?${query}`);
-        if (!response.ok) throw new Error(await response.text());
-        const markup = await response.text();
-        $('page-title').textContent = `${name}${recorded.path}`;
-        // Recorded markup stays inert inside the sandbox.
-        $('page-preview').srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">${markup}`;
-        $('page-dialog').showModal();
-      } catch (error) { notice(error.message); }
-      finally { const pageButton = $('detail-actions').querySelector('button'); if (pageButton) pageButton.disabled = false; }
-    }));
-  } else if (selection === 'sites') {
-    heading('Sites', 'Visited by the workstation');
-    for (const site of shown.sites) {
-      const row = button(site.host, () => select(`site:${site.host}`), 'site-list'); row.append(element('small', site.address || 'World search')); body.append(row);
+    if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Unopened', 'detail-empty'));
+  } else if (selection === 'egress') {
+    heading('Internet');
+    if (shown.signin) {
+      body.append(detailRow(shown.signin.at_ms, shown.signin.fact.open ? 'Sign-in open' : 'Sign-in closed', ''));
+      const exceptions = element('details', undefined, 'exceptions');
+      exceptions.append(element('summary', 'Exceptions'));
+      for (const exception of shown.signin.fact.exceptions) exceptions.append(element('p', exception, 'meta'));
+      body.append(exceptions);
     }
-    if (!shown.sites.length) body.append(element('p', 'No sites yet.', 'detail-empty'));
+    for (const connection of shown.connections.filter((connection) => !shown.egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, connection.purpose));
+    for (const row of shown.egress) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.purpose} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || row.fact.phase}`));
+    if (!shown.connections.length && !shown.egress.length) body.append(element('p', 'No connections', 'detail-empty'));
+  } else if (selection === 'sites') {
+    heading('Sites');
+    for (const site of shown.sites) {
+      const row = button(site.host, () => select(`site:${site.host}`), 'site-list'); row.append(element('small', site.address || '')); body.append(row);
+    }
+    if (!shown.sites.length) body.append(element('p', 'No sites', 'detail-empty'));
   } else if (selection === 'dns') {
     heading('DNS', '10.0.0.1:53');
-    for (const row of shown.activity.filter((row) => row.fact.kind === 'resolved')) body.append(detailRow(row.at_ms, row.fact.name, row.fact.address || 'no answer'));
+    for (const row of shown.activity.filter((row) => row.fact.kind === 'resolved')) body.append(detailRow(row.at_ms, row.fact.name, row.fact.address || 'No answer'));
   } else if (selection === 'router') {
     heading('Router', '10.0.0.1');
-    for (const row of shown.activity.filter((row) => row.fact.kind === 'no_route')) body.append(detailRow(row.at_ms, row.fact.to, 'no route'));
-    if (!body.children.length) body.append(element('p', 'Routes connect the workstation to services in the world.', 'detail-empty'));
+    for (const row of shown.activity.filter((row) => row.fact.kind === 'no_route')) body.append(detailRow(row.at_ms, row.fact.to, 'No route'));
   } else {
     heading('Workstation', hostStatus?.addresses.join(' · ') || '10.0.0.2');
-    body.append(element('p', world?.preview ? 'No VM is running. The preview client makes real requests inside the world.' : 'Ubuntu desktop with Firefox, Claude Code and Codex.', 'detail-empty'));
     actions.append(button('Show agent', () => { select(null); $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); }));
   }
+  body.scrollTop = scroll;
 }
+
 function draw() {
   graph(); feed(); details();
   $('clock').textContent = time(latest.at_ms);
   $('cursor-time').textContent = time(shown.at_ms);
   $('end-time').textContent = time(latest.at_ms);
-  $('oldest').textContent = `${time(latest.oldest_ms)}${latest.oldest_ms ? ' retained' : ' boot'}`;
+  $('oldest').textContent = time(latest.oldest_ms);
   $('scrubber').min = latest.oldest_ms;
   $('scrubber').max = Math.max(latest.at_ms, latest.oldest_ms);
   $('scrubber').value = shown.at_ms;
@@ -265,15 +325,14 @@ async function loadWorld() {
   for (const option of $('source').options) {
     option.disabled = !world[option.value];
     const text = { copied: 'Copied pages', model_written: 'Model-written pages', live: 'Live search' }[option.value];
-    option.textContent = `${text}${option.disabled ? option.value === 'copied' ? ' · corpus unavailable' : option.value === 'live' ? ' · needs EXA_API_KEY' : ' · needs OPENROUTER_API_KEY' : ''}`;
+    option.textContent = text;
   }
-  $('source-help').textContent = world.source.kind === 'copy' ? 'The copied corpus, served at its original URLs.' : world.source.kind === 'live' ? 'Searches and captures come from the internet.' : 'Pages are written from the world brief.';
   if (world.preview) {
     $('console-status').hidden = true;
     $('terminal').hidden = true; $('screen').hidden = true;
     $('preview-console').hidden = false;
     $('terminal-tab').disabled = true; $('screen-tab').disabled = true;
-    $('host-status').textContent = 'In-world client · no VM';
+    $('host-status').textContent = 'Preview';
     draw();
   }
 }
@@ -288,13 +347,18 @@ async function command(command) {
 }
 $('source').onchange = async () => { $('source').disabled = true; try { await command({ command: 'set_source', source: $('source').value }); } catch (error) { $('world-error').textContent = error.message; await loadWorld(); } finally { $('source').disabled = false; } };
 $('restart').onclick = async () => { $('restart').disabled = true; try { await command({ command: 'restart' }); select(null); goLive(); } catch (error) { $('world-error').textContent = error.message; } finally { $('restart').disabled = false; } };
-$('close-page').onclick = () => { $('page-dialog').close(); $('page-preview').srcdoc = ''; };
 $('story').onclick = async () => {
   $('story').disabled = true;
   try { const response = await fetch('/story', { method: 'POST' }); if (!response.ok) throw new Error(await response.text()); }
   catch (error) { notice(error.message); }
   finally { $('story').disabled = false; }
 };
+const scheme = matchMedia('(prefers-color-scheme: light)');
+function terminalTheme() { return scheme.matches ? { background: '#ffffff', foreground: '#243047', cursor: '#275fbb' } : { background: '#0b0f18', foreground: '#d6dee8', cursor: '#9dbdf5' }; }
+scheme.addEventListener('change', () => {
+  const terminal = consoles.get('terminal');
+  if (terminal) { terminal.component.dispose(); terminal.socket.close(); consoles.delete('terminal'); mountConsole(); }
+});
 async function mountConsole() {
   if (world?.preview || !hostStatus) return;
   const kind = activeConsole;
@@ -315,7 +379,7 @@ async function mountConsole() {
     if (kind === 'terminal') {
       const [library, component] = await Promise.all([import('/vendor/ghostty-web/dist/ghostty-web.js'), import('/terminal.mjs')]);
       await library.init();
-      create = (socket) => component.mount($('terminal'), library, socket, { fontSize: 13, fontFamily: 'monospace', theme: { background: '#0b0f18', foreground: '#d6dee8', cursor: '#9dbdf5' } });
+      create = (socket) => component.mount($('terminal'), library, socket, { fontSize, fontFamily: 'monospace', theme: terminalTheme() });
     } else {
       const [{ default: RFB }, component] = await Promise.all([import('/vendor/novnc/core/rfb.js'), import('/screen.mjs')]);
       create = (socket) => component.mount($('screen'), RFB, socket);
@@ -328,6 +392,12 @@ async function mountConsole() {
     consoles.set(kind, { component, socket });
   } catch (error) { socket?.close(); notice(`Console unavailable: ${error.message}`); }
   finally { mounting.delete(kind); }
+}
+for (const [id, change] of [['smaller-text', -1], ['larger-text', 1]]) {
+  $(id).onclick = () => {
+    fontSize = Math.max(16, Math.min(26, fontSize + change));
+    consoles.get('terminal')?.component.setFontSize(fontSize);
+  };
 }
 $('terminal-tab').onclick = () => { activeConsole = 'terminal'; mountConsole(); };
 $('screen-tab').onclick = () => { activeConsole = 'screen'; mountConsole(); };

@@ -2,5 +2,6 @@
 export function mount(root, RFB, socket) {
   const screen = new RFB(root, socket);
   screen.scaleViewport = true;
+  screen.resizeSession = true;
   return { dispose() { screen.disconnect(); } };
 }

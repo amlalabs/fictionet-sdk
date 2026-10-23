@@ -20,6 +20,13 @@ use web_world::{
 
 const HISTORY: usize = 1024;
 
+fn wall_start() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("current date")
+        .as_millis() as u64
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Site {
     pub host: String,
@@ -30,6 +37,7 @@ pub struct Site {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Request {
+    pub url: String,
     pub at_ms: u64,
     pub method: String,
     pub path: String,
@@ -68,21 +76,78 @@ pub struct ToolUse {
     pub error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
+pub struct Connection {
+    pub host: String,
+    pub purpose: String,
+    pub at_ms: u64,
+}
+#[derive(Clone, Debug, Serialize)]
 pub struct View {
+    pub started_at_ms: u64,
     pub at_ms: u64,
     pub oldest_ms: u64,
     pub sites: Vec<Site>,
     pub calls: Vec<Call>,
     pub activity: Vec<Observation>,
+    pub connections: Vec<Connection>,
+    pub egress: Vec<Observation>,
+    pub signin: Option<Observation>,
 }
 
-#[derive(Default)]
 pub struct Views {
+    started_at_ms: u64,
     observations: VecDeque<Observation>,
     oldest_ms: u64,
+    connections: Vec<Connection>,
+    signin: VecDeque<Observation>,
+}
+impl Default for Views {
+    fn default() -> Self {
+        Self {
+            started_at_ms: wall_start(),
+            observations: VecDeque::new(),
+            oldest_ms: 0,
+            connections: Vec::new(),
+            signin: VecDeque::new(),
+        }
+    }
 }
 impl Views {
     pub fn push(&mut self, observation: Observation) {
+        if let SearchObs::RunStarted { started_at_ms } = observation.fact {
+            self.started_at_ms = started_at_ms;
+        }
+        match &observation.fact {
+            SearchObs::Egress {
+                host,
+                purpose,
+                phase,
+                ..
+            } if matches!(phase.as_str(), "attempt" | "response" | "failed") => {
+                let host = host.to_ascii();
+                if !self
+                    .connections
+                    .iter()
+                    .any(|connection| connection.host == host && connection.purpose == *purpose)
+                {
+                    if self.connections.len() == HISTORY {
+                        self.connections.remove(0);
+                    }
+                    self.connections.push(Connection {
+                        host,
+                        purpose: purpose.clone(),
+                        at_ms: observation.at_ms,
+                    });
+                }
+            }
+            SearchObs::Signin { .. } => {
+                if self.signin.len() == HISTORY {
+                    self.signin.pop_front();
+                }
+                self.signin.push_back(observation.clone());
+            }
+            _ => {}
+        }
         if self.observations.len() == HISTORY {
             self.observations.pop_front();
             self.oldest_ms = self.observations.front().map_or(0, |row| row.at_ms);
@@ -91,11 +156,25 @@ impl Views {
     }
     pub fn at(&self, at_ms: u64) -> View {
         let mut view = View {
+            started_at_ms: self.started_at_ms,
             at_ms,
             oldest_ms: self.oldest_ms,
             sites: Vec::new(),
             calls: Vec::new(),
             activity: Vec::new(),
+            connections: self
+                .connections
+                .iter()
+                .filter(|row| row.at_ms <= at_ms)
+                .cloned()
+                .collect(),
+            egress: Vec::new(),
+            signin: self
+                .signin
+                .iter()
+                .rev()
+                .find(|row| row.at_ms <= at_ms)
+                .cloned(),
         };
         for observation in self.observations.iter().filter(|row| row.at_ms <= at_ms) {
             match &observation.fact {
@@ -106,6 +185,7 @@ impl Views {
                     }
                 }
                 SearchObs::Request {
+                    scheme,
                     host,
                     method,
                     path,
@@ -120,6 +200,7 @@ impl Views {
                     site(&mut view.sites, &host.to_ascii(), observation.at_ms)
                         .requests
                         .push(Request {
+                            url: format!("{scheme}://{host}{path}"),
                             at_ms: observation.at_ms,
                             method: method.to_string(),
                             path: path.to_string(),
@@ -201,32 +282,51 @@ impl Views {
                         });
                     }
                 }
-                SearchObs::NoRoute { .. } | SearchObs::Signin { .. } | SearchObs::Egress { .. } => {
-                }
+                SearchObs::Egress { .. } => view.egress.push(observation.clone()),
+                SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
+                SearchObs::NoRoute { .. }
+                | SearchObs::ObservationFailed { .. }
+                | SearchObs::RunStarted { .. } => {}
             }
-            view.activity.push(observation.clone());
+            if let SearchObs::ModelCall { call, .. } = observation.fact
+                && let Some(previous) = view.activity.iter_mut().find(
+                    |row| matches!(row.fact, SearchObs::ModelCall { call: id, .. } if id == call),
+                )
+            {
+                previous.fact = observation.fact.clone();
+            } else {
+                view.activity.push(observation.clone());
+            }
         }
         view
     }
-    pub fn preview(&self, host: &str, path: &str, at_ms: u64) -> Option<Arc<str>> {
+    pub fn preview(&self, url: &url::Url, at_ms: u64) -> Option<Arc<str>> {
         self.observations
             .iter()
             .rev()
             .filter(|row| row.at_ms <= at_ms)
             .find_map(|row| match &row.fact {
                 SearchObs::Request {
-                    host: site,
-                    path: target,
+                    scheme,
+                    host,
+                    path,
                     preview,
                     ..
-                } if site.to_ascii().trim_end_matches('.') == host && target.as_str() == path => {
+                } if scheme.as_str() == url.scheme()
+                    && Some(host.to_ascii().trim_end_matches('.')) == url.host_str()
+                    && path.as_str()
+                        == &url[url::Position::BeforePath..url::Position::AfterQuery] =>
+                {
                     preview.clone()
                 }
                 _ => None,
             })
     }
     pub fn current(&self) -> View {
-        self.at(self.observations.back().map_or(0, |row| row.at_ms))
+        self.at(self
+            .observations
+            .back()
+            .map_or(self.oldest_ms, |row| row.at_ms))
     }
 }
 fn site<'a>(sites: &'a mut Vec<Site>, host: &str, at_ms: u64) -> &'a mut Site {
@@ -273,7 +373,7 @@ pub enum Source {
 
 type Control = (Command, tokio::sync::oneshot::Sender<Result<(), String>>);
 type Receivers = (
-    mpsc::UnboundedReceiver<Observation>,
+    mpsc::Receiver<Observation>,
     mpsc::UnboundedReceiver<Control>,
 );
 
@@ -290,7 +390,7 @@ impl Page {
     pub fn new(pages: &Pages, preview: bool) -> (Self, Receivers) {
         let views = Views::default();
         let (snapshots, _) = watch::channel(views.current());
-        let (observations, receive) = mpsc::unbounded_channel();
+        let (observations, receive) = mpsc::channel(web_world::observation::OBSERVATION_CAPACITY);
         pages.observe(observations);
         let (commands, control) = mpsc::unbounded_channel();
         let world = world_state(pages, preview);
@@ -311,10 +411,63 @@ impl Page {
         views.push(observation);
         self.snapshots.send_replace(views.current());
     }
-    pub async fn observe(&self, mut observations: mpsc::UnboundedReceiver<Observation>) {
+    /// Writes a separate, private record for this launch before publishing each fact.
+    pub async fn record(
+        &self,
+        mut observations: mpsc::Receiver<Observation>,
+        directory: &std::path::Path,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::create_dir_all(directory)?;
+        let path = directory.join(format!("run-{}.jsonl", fictionet_demo::kit::random_uuid()));
+        let mut file = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)?,
+        );
+        println!("Run record: {}", path.display());
+        let mut started_at_ms = self.views.lock().unwrap().started_at_ms;
         while let Some(observation) = observations.recv().await {
+            if let SearchObs::RunStarted {
+                started_at_ms: start,
+            } = observation.fact
+            {
+                started_at_ms = start;
+            }
+            #[derive(Serialize)]
+            struct Entry<'a> {
+                timestamp: String,
+                #[serde(flatten)]
+                observation: &'a Observation,
+            }
+            let timestamp = time::OffsetDateTime::from_unix_timestamp_nanos(
+                i128::from(started_at_ms + observation.at_ms) * 1_000_000,
+            )
+            .map_err(std::io::Error::other)?
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(std::io::Error::other)?;
+            serde_json::to_writer(
+                &mut file,
+                &Entry {
+                    timestamp,
+                    observation: &observation,
+                },
+            )?;
+            writeln!(file)?;
+            file.flush()?;
+            let error = match &observation.fact {
+                SearchObs::ObservationFailed { reason } => Some(reason.clone()),
+                _ => None,
+            };
             self.publish(observation);
+            if let Some(error) = error {
+                return Err(std::io::Error::other(error));
+            }
         }
+        Ok(())
     }
     pub fn run_commands(
         &self,
@@ -346,7 +499,8 @@ impl Page {
                     .map(|_| {
                         if restart {
                             let mut views = page.views.lock().unwrap();
-                            *views = Views::default();
+                            views.observations.clear();
+                            views.oldest_ms = cx.now().since_start().as_millis() as u64;
                             page.snapshots.send_replace(views.current());
                         }
                         let preview = page.world.borrow().preview;
@@ -422,11 +576,15 @@ impl Page {
                 get(move |Query(query): Query<Preview>| {
                     let page = preview.clone();
                     async move {
-                        match page.views.lock().unwrap().preview(
-                            &query.host,
-                            &query.path,
-                            query.at_ms,
-                        ) {
+                        let Ok(url) = url::Url::parse(&format!(
+                            "{}://{}{}",
+                            query.scheme.as_deref().unwrap_or("https"),
+                            query.host,
+                            query.path
+                        )) else {
+                            return http::StatusCode::BAD_REQUEST.into_response();
+                        };
+                        match page.views.lock().unwrap().preview(&url, query.at_ms) {
                             Some(markup) => (
                                 http::StatusCode::OK,
                                 [(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -478,6 +636,7 @@ impl Page {
 }
 #[derive(Deserialize)]
 struct Preview {
+    scheme: Option<String>,
     host: String,
     path: String,
     at_ms: u64,
@@ -582,6 +741,8 @@ pub async fn serve(router: Router, port: u16) -> std::io::Result<Server> {
                             .unwrap(),
                     );
                 }
+                response.headers_mut().insert(http::header::CONTENT_SECURITY_POLICY,
+                    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'".parse().unwrap());
                 response
                     .headers_mut()
                     .insert("referrer-policy", "no-referrer".parse().unwrap());

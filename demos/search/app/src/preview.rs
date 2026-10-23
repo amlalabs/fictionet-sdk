@@ -70,7 +70,9 @@ pub async fn run() -> Result {
     let server = page::serve(router, kit::PAGE_PORT).await?;
     let _access = kit::PageAccess::new(&server.url)?;
     let view = page.clone();
-    let observe = tokio::spawn(async move { view.observe(observations).await });
+    let records =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../downloads/search-preview");
+    let mut observe = tokio::spawn(async move { view.record(observations, &records).await });
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let mut task = tokio::spawn(fictionet::run(
         fictionet::Seed::from_u64(7),
@@ -113,9 +115,15 @@ pub async fn run() -> Result {
     let result = tokio::select! {
         result = tokio::signal::ctrl_c() => { result?; let _=stop.send(()); task.await },
         result = &mut task => result,
+        result = &mut observe => {
+            let _ = stop.send(());
+            let _ = task.await;
+            server.shutdown().await;
+            return Err(super::recording_error(result).into());
+        },
     };
     server.shutdown().await;
-    observe.abort();
+    observe.await.map_err(std::io::Error::other)??;
     result??;
     Ok(())
 }
@@ -156,6 +164,7 @@ async fn story(cx: &Cx, machine: &Machine, world: &World, query: &str) -> fictio
     use fictionet_extras::models::Engine;
     // These pauses pace the presentation; tests drive the same services without them.
     cx.sleep(Duration::from_secs(1)).await?;
+    fetch(cx, machine, "api.anthropic.com", "/api/hello", world.start).await?;
     fetch(
         cx,
         machine,

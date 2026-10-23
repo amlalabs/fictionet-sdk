@@ -30,6 +30,16 @@ pub fn build(
     mirror: fictionet_demo::kit::mirror::Mirror<fictionet::stdlib::web::Proxy>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     use fictionet::stdlib::web::Site;
+    world.pages.report(
+        cx,
+        SearchObs::RunStarted {
+            started_at_ms: world
+                .start
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as u64
+                - cx.now().since_start().as_millis() as u64,
+        },
+    );
     let mozilla = world
         .ca
         .config(cx, fictionet_demo::kit::desktop::HOSTS[0])?
@@ -62,6 +72,28 @@ pub fn build(
             ))
         })
         .collect::<fictionet::Result<Vec<_>>>()?;
+    let mirror_pages = world.pages.clone();
+    let mirror_cx = cx.clone();
+    let mirror = mirror.observe_upstream(Arc::new(move |request, status| {
+        if let Some(target) = request.extensions().get::<fictionet::stdlib::web::Target>() {
+            mirror_pages.report(
+                &mirror_cx,
+                SearchObs::Egress {
+                    host: target.host.parse().expect("admitted mirror hostname"),
+                    method: request.method().to_string(),
+                    path: request.uri().path().into(),
+                    purpose: "setup".into(),
+                    phase: if status.is_some() {
+                        "response"
+                    } else {
+                        "attempt"
+                    }
+                    .into(),
+                    status: status.map(|value| value.as_u16()),
+                },
+            );
+        }
+    }));
     Ok(world.net(cx, log, move |host| {
         if let Some((_, (model, tls))) = models.iter().find(|(name, _)| *name == host) {
             return Some(
@@ -131,6 +163,7 @@ impl httpd::Handler for Gateway {
             .path_and_query()
             .cloned()
             .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        let path = web_world::observation::redact_path(&path);
         let method = request.method().clone();
         let pages = self.pages.clone();
         let host = self.host.clone();
@@ -398,7 +431,8 @@ mod tests {
                 let pages = Arc::new(web_world::pages::Pages::new(
                     web_world::pages::Seed::builtin("web")?,
                 ));
-                let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
+                let (sender, mut observations) =
+                    tokio::sync::mpsc::channel(web_world::observation::OBSERVATION_CAPACITY);
                 pages.observe(sender);
                 drop(CallBody {
                     inner: Body::from("unread"),
@@ -543,7 +577,7 @@ mod tests {
         });
         fictionet::run(fictionet::Seed::from_u64(3), |cx| async move {
             let pages = Arc::new(web_world::pages::Pages::new(web_world::pages::Seed::builtin("web")?));
-            let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
+            let (sender, mut observations) = tokio::sync::mpsc::channel(web_world::observation::OBSERVATION_CAPACITY);
             pages.observe(sender);
             let session = fictionet_extras::models::signin::Session::default();
             let handler = SignIn { session: session.clone(), pages, host: "platform.claude.com".parse()?, forward: fictionet::stdlib::web::forward(&cx, origin, Arc::new(fictionet_host::Client::new()))? };

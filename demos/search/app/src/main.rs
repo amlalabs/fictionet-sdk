@@ -11,7 +11,7 @@ use fictionet_search_demo::{network, page};
 
 use fictionet_demo::kit;
 use fictionet_extras::log::Log;
-use std::{fs::File, io::Write, path::PathBuf, sync::Arc, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Addresses, Ca, World,
     pages::{Pages, Seed},
@@ -80,20 +80,12 @@ async fn main() -> Result {
     let pages = Arc::new(app_pages(seed.clone(), &downloads)?);
     let output = downloads.join("search");
     std::fs::create_dir_all(&output)?;
-    let (page, (mut observations, commands)) = page::Page::new(&pages, false);
+    let (page, (observations, commands)) = page::Page::new(&pages, false);
     let server = page::serve(page.router(), kit::PAGE_PORT).await?;
     let _access = kit::PageAccess::new(&server.url)?;
     let observe_page = page.clone();
-    let mut recording = std::io::BufWriter::new(File::create(output.join("log.jsonl"))?);
-    let mut observation_task = tokio::spawn(async move {
-        while let Some(observation) = observations.recv().await {
-            serde_json::to_writer(&mut recording, &observation)?;
-            writeln!(&mut recording)?;
-            recording.flush()?;
-            observe_page.publish(observation);
-        }
-        Ok::<_, std::io::Error>(())
-    });
+    let mut observation_task =
+        tokio::spawn(async move { observe_page.record(observations, &output).await });
     let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
     let world_log = log.clone();
     let console_page = page.clone();
@@ -137,20 +129,23 @@ async fn main() -> Result {
     };
     let mut readiness = Box::pin(run.app_ready(guest::HOST));
     let mut ready = false;
+    let mut recording_ended = false;
     let result = loop {
         tokio::select! {
             result = &mut readiness, if !ready => match result {
                 Ok(()) => { ready = true; println!("The Search page stays open until Ctrl-C."); },
                 Err(error) => break Err(error),
             },
-            result = &mut observation_task => break Err(recording_error(result)),
+            result = &mut observation_task => { recording_ended = true; break Err(recording_error(result)); },
             _ = interrupt.recv() => break Ok(()),
         }
     };
     drop(readiness);
     let shutdown = run.shutdown().await;
     server.shutdown().await;
-    observation_task.abort();
+    if !recording_ended {
+        observation_task.await.map_err(std::io::Error::other)??;
+    }
     let finish = log.finish();
     println!("whole run: {} ms", total.elapsed().as_millis());
     result?;

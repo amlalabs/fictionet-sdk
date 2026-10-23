@@ -43,6 +43,7 @@ impl fictionet_extras::models::Engine for Pages {
                 self.report_response(
                     &cx,
                     crate::observation::RequestContext {
+                        scheme: &parsed.scheme().parse()?,
                         host: &host.parse()?,
                         method: &http::Method::GET,
                         path: &target.parse()?,

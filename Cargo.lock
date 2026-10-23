@@ -4574,6 +4574,7 @@ dependencies = [
  "fictionet-test-support",
  "form_urlencoded",
  "http",
+ "http-body",
  "http-body-util",
  "kuchiki",
  "regex",
