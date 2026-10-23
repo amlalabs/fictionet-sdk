@@ -28,6 +28,7 @@ pub fn build(
     cx: &Cx,
     log: Arc<fictionet_extras::log::Log>,
     mirror: fictionet_demo::kit::mirror::Mirror<fictionet::stdlib::web::Proxy>,
+    claude_token: Option<fictionet_extras::models::Credential>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     use fictionet::stdlib::web::Site;
     let mozilla = world
@@ -41,7 +42,10 @@ pub fn build(
     let openai = world.ca.config(cx, "releases.openai.com")?.0;
     use fictionet_extras::models::{Model, Provider, signin};
     let signin = signin::Session::default();
-    report_signin(&world.pages, cx, true);
+    if claude_token.is_some() {
+        signin.close();
+    }
+    report_signin(&world.pages, cx, !signin.closed());
     let signin_ca = world.ca.clone();
     let signin_pages = world.pages.clone();
     let signin_cx = cx.clone();
@@ -52,7 +56,20 @@ pub fn build(
                 provider.host(),
                 (
                     Gateway {
-                        model: Model::guest(cx, provider)?,
+                        model: if provider == Provider::Anthropic {
+                            if let Some(credential) = &claude_token {
+                                Model::at(
+                                    cx,
+                                    provider,
+                                    credential.clone(),
+                                    "https://api.anthropic.com".parse()?,
+                                )?
+                            } else {
+                                Model::guest(cx, provider)?
+                            }
+                        } else {
+                            Model::guest(cx, provider)?
+                        },
                         pages: world.pages.clone(),
                         host: provider.host().parse()?,
                         signin: signin.clone(),

@@ -84,7 +84,7 @@ pub async fn run() -> Result {
                 &[],
                 |s| s,
             ));
-            let net = network::build(&world, &cx, log, kit::mirror::new(&cx)?)?;
+            let net = network::build(&world, &cx, log, kit::mirror::new(&cx)?, None)?;
             net.start(&cx, attachments)?;
             page.run_commands(&cx, world.pages.clone(), commands);
             let workstation = machine(

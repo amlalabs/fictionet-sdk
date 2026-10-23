@@ -48,11 +48,14 @@ fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
 }
 
 fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
-    let model = std::env::var("OPENROUTER_API_KEY")
-        .ok()
-        .filter(|key| !key.is_empty())
-        .map(|_| web_world::pages::model::Model::openrouter())
-        .transpose()?;
+    use web_world::pages::model::Model;
+    let model = if std::env::var("OPENROUTER_API_KEY").is_ok_and(|key| !key.is_empty()) {
+        Some(Model::openrouter()?)
+    } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.is_empty()) {
+        Some(Model::anthropic()?)
+    } else {
+        None
+    };
     let pages = Pages::from_corpus(
         seed,
         downloads.parent().ok_or("downloads folder has no parent")?,
@@ -73,6 +76,22 @@ async fn main() -> Result {
     let downloads = match arguments(std::env::args().skip(1))? {
         Mode::Preview => return preview::run().await,
         Mode::App { downloads } => downloads,
+    };
+    let claude_token = if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
+        let value = std::fs::read_to_string(path)
+            .map_err(|_| "Cannot read the host Claude OAuth token file")?;
+        let secret =
+            fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        fictionet::run(fictionet::Seed::random(), |cx| async move {
+            let token = fictionet_extras::models::Credential::claude_token(&cx, secret)?;
+            let _ = send.send(token);
+            Ok(())
+        })
+        .await?;
+        Some(receive.await?)
+    } else {
+        None
     };
     let mut seed = Seed::builtin(SEED)?;
     let today = time::OffsetDateTime::now_utc().date();
@@ -101,7 +120,9 @@ async fn main() -> Result {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let boot = kit::boot(
         "search",
-        vec![guest::guest()],
+        vec![guest::guest(
+            claude_token.as_ref().map(|token| token.placeholder()),
+        )],
         downloads_for_boot,
         move |consoles| {
             let console = consoles.into_iter().next().expect("one workstation");
@@ -125,7 +146,7 @@ async fn main() -> Result {
             };
             run.trust("office", &web.ca.cert_pem())?;
             page.run_commands(&cx, pages.clone(), commands);
-            let net = network::build(&web, &cx, world_log, run.mirror(&cx)?)?
+            let net = network::build(&web, &cx, world_log, run.mirror(&cx)?, claude_token)?
                 .route(kit::JUMP, kit::jump_prefix());
             net.start(&cx, run.into_attachments())
         },
