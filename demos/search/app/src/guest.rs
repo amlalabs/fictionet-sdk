@@ -10,7 +10,7 @@ pub fn guest() -> Guest {
         .resources(4, 4096)
         // The searcher reads the address back before submitting it.
         .packages(&["xclip", "nmap", "tmux"])
-        .terminal("env DISPLAY=:1 tmux new-session -A -s main");
+        .terminal("env DISPLAY=:1 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus tmux new-session -A -s main");
     kit::desktop::codex(kit::desktop::claude_code(guest))
 }
 
@@ -30,6 +30,7 @@ mod tests {
         });
         for package in [
             "firefox",
+            "dbus-user-session",
             "xdotool",
             "xclip",
             "nmap",

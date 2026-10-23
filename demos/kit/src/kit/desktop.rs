@@ -221,7 +221,8 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
     }}).to_string();
     // The Xfce session, then its window manager, then Firefox, in order.
     let session = format!(
-        "while IFS= read -r entry; do export \"$entry\"; done < <(dbus-launch)\n\
+        "systemctl --user start dbus.socket\n\
+         export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus\n\
          startxfce4 >/tmp/xfce.log 2>&1 &\n\
          for _ in $(seq 1 150); do pgrep -x xfwm4 >/dev/null 2>&1 && break; sleep 0.2; done\n\
          sleep 2\n\
@@ -240,7 +241,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
     .packages(&[
         "xfce4",
         "xfce4-terminal",
-        "dbus-x11",
+        "dbus-user-session",
         "xdotool",
         "firefox",
         "p11-kit",
@@ -635,6 +636,9 @@ mod tests {
         }
         let start = content("/opt/start-desktop.sh");
         assert!(start.contains("Xvnc :1 -localhost"));
+        assert!(start.contains("systemctl --user start dbus.socket"));
+        assert!(start.contains("export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus"));
+        assert!(!start.contains("dbus-launch"));
         assert!(start.contains(" -SendCutText=0 "));
         assert!(start.contains(&format!(
             "firefox --profile \"$HOME/.mozilla/firefox/default\" '{url}'"

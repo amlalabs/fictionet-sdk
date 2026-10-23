@@ -99,7 +99,7 @@ The NASA, ESA and Wikipedia captures are stored in `demos/downloads/astronomy/`.
 
 The world's page modules separate routing, generation, listings, stored pages,
 corrections and model tools. Prompt construction and answer parsing are separate.
-The WARC reader, crawler, BM25 index, model gateway and sign-in relay live in
+The WARC reader, crawler, BM25 index, model gateway and sign-in policy live in
 `fictionet-extras`. The shared demo kit supplies VM lifetime, SSH console sockets and the package
 mirror. Search owns its HTML, styles and JavaScript, including copies of the
 terminal and screen pieces. ghostty-web 0.4.0 and noVNC 1.7.0, with their
