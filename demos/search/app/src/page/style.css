@@ -39,7 +39,6 @@ main{flex:1;min-height:0;display:flex;gap:14px;padding:0 16px 16px}
 #preview-output{font:12px/1.8 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
 .preview-star{color:#e8a87c}
 .agent-footer{display:flex;gap:8px;align-items:center;border-top:1px solid var(--line);padding:9px 12px;font-size:10px;color:#6b768a;min-height:40px}
-#input-status{margin-left:auto}
 .agent-footer button{font-size:10px;padding:4px 7px}
 .world{flex:1;min-width:0;display:flex}
 .network-column{flex:1;min-width:0;display:flex;flex-direction:column}

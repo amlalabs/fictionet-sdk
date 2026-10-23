@@ -18,7 +18,7 @@ const sourceName = (source) => source.kind === 'copy' ? source.captured ? `copy 
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
 let latest = { at_ms: 0, oldest_ms: 0, sites: [], calls: [], activity: [] };
 let shown = latest, selection = null, live = true, world = null;
-let rewindRequest, noticeTimer, activeConsole = 'terminal', input = false, hostStatus = null;
+let rewindRequest, noticeTimer, activeConsole = 'terminal', hostStatus = null;
 const consoles = new Map();
 const mounting = new Set();
 const socketUrl = (path) => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/${path}`;
@@ -271,7 +271,6 @@ async function loadWorld() {
     $('terminal').hidden = true; $('screen').hidden = true;
     $('preview-console').hidden = false;
     $('terminal-tab').disabled = true; $('screen-tab').disabled = true;
-    $('input-toggle').hidden = true; $('input-status').hidden = true;
     $('host-status').textContent = 'In-world client · no VM';
     draw();
   }
@@ -305,7 +304,7 @@ async function mountConsole() {
   $('console-status').textContent = hostStatus.state === 'failed' ? 'The workstation failed to start. See the process output.' : hostStatus.state === 'stopped' ? 'The workstation has stopped.' : 'Waiting for the workstation…';
   if (!ready || mounting.has(kind)) return;
   const existing = consoles.get(kind);
-  if (existing && existing.socket.readyState <= 1) { existing.component.setInput(input); return; }
+  if (existing && existing.socket.readyState <= 1) return;
   existing?.component.dispose();
   mounting.add(kind);
   let socket;
@@ -314,27 +313,22 @@ async function mountConsole() {
     if (kind === 'terminal') {
       const [library, component] = await Promise.all([import('/vendor/ghostty-web/dist/ghostty-web.js'), import('/terminal.mjs')]);
       await library.init();
-      create = (socket) => component.mount($('terminal'), library, socket, { fontSize: 13, fontFamily: 'monospace', disableStdin: !input, theme: { background: '#0b0f18', foreground: '#d6dee8', cursor: '#9dbdf5' } });
+      create = (socket) => component.mount($('terminal'), library, socket, { fontSize: 13, fontFamily: 'monospace', theme: { background: '#0b0f18', foreground: '#d6dee8', cursor: '#9dbdf5' } });
     } else {
       const [{ default: RFB }, component] = await Promise.all([import('/vendor/novnc/core/rfb.js'), import('/screen.mjs')]);
-      create = (socket) => component.mount($('screen'), RFB, socket, input);
+      create = (socket) => component.mount($('screen'), RFB, socket);
     }
     socket = new WebSocket(socketUrl(kind));
     socket.addEventListener('close', () => { if (activeConsole === kind) { $('console-status').hidden = false; $('console-status').textContent = 'Console disconnected. Select Terminal or Screen to reconnect.'; } });
     socket.addEventListener('error', () => notice('Could not connect to the workstation console'));
     $(kind).replaceChildren();
     const component = create(socket);
-    component.setInput(input);
     consoles.set(kind, { component, socket });
   } catch (error) { socket?.close(); notice(`Console unavailable: ${error.message}`); }
   finally { mounting.delete(kind); }
 }
 $('terminal-tab').onclick = () => { activeConsole = 'terminal'; mountConsole(); };
 $('screen-tab').onclick = () => { activeConsole = 'screen'; mountConsole(); };
-$('input-toggle').onclick = () => {
-  input = !input; $('input-status').textContent = input ? 'Input on' : 'Input off'; $('input-toggle').textContent = input ? 'Disable input' : 'Enable input';
-  for (const console of consoles.values()) console.component.setInput(input);
-};
 const status = new EventSource('/host/state');
 status.onmessage = (event) => {
   const next = JSON.parse(event.data);

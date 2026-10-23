@@ -32,5 +32,5 @@ export function mount(root, { Terminal, FitAddon }, socket, options = {}) {
     socket.removeEventListener('message', received);
     terminal.dispose();
   };
-  return { dispose, setInput(enabled) { terminal.options.disableStdin = !enabled; } };
+  return { dispose };
 }

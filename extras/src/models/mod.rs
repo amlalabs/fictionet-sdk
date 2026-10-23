@@ -662,8 +662,10 @@ impl Model {
                 .header("content-type", "application/json")
                 .body(Body::from(json!({"can_fetch":allowed}).to_string()))?);
         }
+        // Claude Code's startup check GETs this and requires a 200; its
+        // background check sends HEAD.
         if self.provider == Provider::Anthropic
-            && request.method() == http::Method::HEAD
+            && (request.method() == http::Method::HEAD || request.method() == http::Method::GET)
             && path == "/api/hello"
         {
             return Ok(Response::new(Body::empty()));
