@@ -98,7 +98,9 @@ impl Index {
                 .ok()
                 .map(|n| n.text_contents())
                 .unwrap_or_default();
-            if let Ok(nodes) = dom.select("script, style, noscript, template") {
+            if let Ok(nodes) = dom.select(
+                "script, style, noscript, template, nav, aside, header, footer, [role=navigation]",
+            ) {
                 for node in nodes.collect::<Vec<_>>() {
                     node.as_node().detach();
                 }
@@ -125,7 +127,7 @@ impl Index {
     }
 
     fn add(&mut self, url: String, title: String, text: String) {
-        let words = terms(&format!("{title} {title} {text}"));
+        let words = terms(&format!("{url} {title} {title} {text}"));
         let length = words.len();
         let mut counts = HashMap::new();
         for word in words {
@@ -154,35 +156,47 @@ impl Index {
         self.documents.is_empty()
     }
 
-    /// Rank matching documents with BM25, using URL order to break ties.
+    /// Rank documents covering every query term with BM25, using URL order to break ties.
     pub fn search(&self, query: &str, start: usize, limit: usize) -> search::Search {
         if self.is_empty() {
-            return search::Search::default();
+            return search::Search {
+                total: Some(0),
+                ..Default::default()
+            };
         }
         let n = self.documents.len() as f64;
         let average = (self.words as f64 / n).max(1.0);
-        let mut scores = HashMap::<usize, f64>::new();
+        let mut scores = HashMap::<usize, (f64, usize)>::new();
         let mut words = terms(query);
         words.sort();
         words.dedup();
         for word in &words {
             let Some(postings) = self.postings.get(word) else {
-                continue;
+                return search::Search {
+                    total: Some(0),
+                    ..Default::default()
+                };
             };
             let frequency = postings.len() as f64;
             let idf = (1.0 + (n - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in postings {
                 let tf = count as f64;
                 let norm = 1.2 * (0.25 + 0.75 * self.documents[id].length as f64 / average);
-                *scores.entry(id).or_default() += idf * tf * 2.2 / (tf + norm);
+                let (score, covered) = scores.entry(id).or_default();
+                *score += idf * tf * 2.2 / (tf + norm);
+                *covered += 1;
             }
         }
-        let mut ranked: Vec<_> = scores.into_iter().collect();
+        let mut ranked: Vec<_> = scores
+            .into_iter()
+            .filter_map(|(id, (score, covered))| (covered == words.len()).then_some((id, score)))
+            .collect();
         ranked.sort_by(|(a, x), (b, y)| {
             y.total_cmp(x)
                 .then(self.documents[*a].url.cmp(&self.documents[*b].url))
         });
         search::Search {
+            total: Some(ranked.len()),
             results: ranked
                 .into_iter()
                 .skip(start)
@@ -229,6 +243,43 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_query_term_must_be_covered_and_totals_precede_pagination() {
+        let mut index = Index::default();
+        for page in 0..12 {
+            index.add(
+                format!("https://sky.org/{page}"),
+                "Solar science".into(),
+                "Supply of hydrogen in the solar system".into(),
+            );
+        }
+        index.add(
+            "https://security.org/solarwinds".into(),
+            "SolarWinds supply chain attack".into(),
+            "An attacker compromised the software supply chain.".into(),
+        );
+        for query in ["solarwinds supply chain attack", "SOLARWINDS supply supply"] {
+            let found = index.search(query, 0, 10);
+            assert_eq!(found.total, Some(1));
+            assert_eq!(found.results.len(), 1);
+            assert_eq!(found.results[0].url, "https://security.org/solarwinds");
+        }
+        for query in ["supply dishwasher", "solar chain", "", "?!"] {
+            let found = index.search(query, 0, 10);
+            assert_eq!(found.total, Some(0));
+            assert!(found.results.is_empty());
+        }
+        let first = index.search("solar", 0, 10);
+        let second = index.search("solar", 10, 10);
+        assert_eq!(first.total, Some(12));
+        assert_eq!(second.total, Some(12));
+        assert_eq!(first.results.len(), 10);
+        assert_eq!(second.results.len(), 2);
+        let past = index.search("solar", usize::MAX, 10);
+        assert_eq!(past.total, Some(12));
+        assert!(past.results.is_empty());
+    }
     #[test]
     fn follows_only_corpus_links_and_ranks_page_text() {
         let pages = HashMap::from([
@@ -242,7 +293,7 @@ mod tests {
             ),
             (
                 "https://sky.org/stars",
-                "<title>Stars</title><p>Stars burn hydrogen. A star can become a black hole.</p>",
+                "<title>Stars</title><nav>Accretion dishwasher</nav><p>Stars burn hydrogen. A star can become a black hole.</p>",
             ),
             (
                 "https://sky.org/unlinked",

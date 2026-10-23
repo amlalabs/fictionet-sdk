@@ -45,6 +45,9 @@ pub struct Ad {
 /// Content shared by the search engine layouts.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Search {
+    /// Total matching documents before pagination, when the source knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
     /// Results in ranking order.
     pub results: Vec<Result>,
     /// Related search phrases.
@@ -171,18 +174,21 @@ fn display_url(url: &str) -> String {
     }
     host
 }
-fn estimate(query: &str, count: usize) -> String {
-    if count == 0 {
-        return "0".into();
+fn count_label(record: &Search) -> String {
+    let count = record.total.unwrap_or(record.results.len());
+    let noun = if count == 1 { "result" } else { "results" };
+    match record.total {
+        Some(_) => format!("{} {noun}", result_count(count)),
+        None => format!("{} {noun} on this page", result_count(count)),
     }
-    let hash = query
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .bytes()
-        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize));
-    result_count(100_000 + (hash % 9_900) * 1_000)
+}
+
+fn empty_results(query: &str, engine: Engine) -> String {
+    let tag = if engine == Engine::Bing { "li" } else { "div" };
+    format!(
+        "<{tag}><p>No results found for <strong>{}</strong>.</p></{tag}>",
+        e(query)
+    )
 }
 
 /// Formats the number of available results with comma separators.
@@ -226,7 +232,9 @@ fn render_with(
     record: &Search,
     start: u64,
 ) -> String {
-    if let Some(page) = html.and_then(|html| results(html, engine, query, record, start).ok()) {
+    if !record.results.is_empty()
+        && let Some(page) = html.and_then(|html| results(html, engine, query, record, start).ok())
+    {
         return page;
     }
     match engine {
@@ -239,15 +247,18 @@ fn render_with(
 fn google(query: &str, record: &Search, start: u64) -> String {
     let q = e(query);
     let qp = quote_plus(query);
-    let count = estimate(query, record.results.len());
+    let count = count_label(record);
     let mut out = vec![format!(
         r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{q} - Google Search</title><link rel="stylesheet" href="/search.css"></head>
 <body class="google"><div id="gb"><a href="https://mail.google.com/mail/">Gmail</a> <a href="https://www.google.com/imghp">Images</a> <a href="https://accounts.google.com/ServiceLogin">Sign in</a></div>
 <header><a href="/" id="logo" aria-label="Google"><span>G</span><span>o</span><span>o</span><span>g</span><span>l</span><span>e</span></a><form action="/search" method="GET" role="search"><input name="q" value="{q}" aria-label="Search" type="text"><input type="submit" value="Search"></form>
 <div id="hdtb"><a href="/search?q={qp}">All</a> <a href="/search?q={qp}&amp;tbm=nws">News</a> <a href="/search?q={qp}&amp;tbm=isch">Images</a> <a href="/search?q={qp}&amp;tbm=vid">Videos</a> <a href="https://maps.google.com/maps?q={qp}">Maps</a> <span>More</span> <span>Tools</span></div></header>
-<div id="main"><div id="result-stats">{count} results</div><div id="res"><div id="search">"#
+<div id="main"><div id="result-stats">{count}</div><div id="res"><div id="search">"#
     )];
+    if record.results.is_empty() {
+        out.push(empty_results(query, Engine::Google));
+    }
     if start == 0 {
         for (index, ad) in record.ads.iter().take(2).enumerate() {
             out.push(format!(
@@ -457,6 +468,9 @@ fn duckduckgo(query: &str, record: &Search) -> String {
 <body class="body--html"><div class="header"><a class="ddg-brand" href="/"><b>D</b>DuckDuckGo</a><form id="search_form" name="x" action="/html/" method="post" role="search"><input type="text" name="q" class="search__input" value="{q}" aria-label="Search" /><input type="submit" class="search__button" value="Search" /><select class="frm__select" name="kl" aria-label="Region"><option value="">All Regions</option><option value="uk-en">United Kingdom</option><option value="us-en">US (English)</option></select></form></div>
 <div class="serp__results"><div id="links" class="results">"#
     )];
+    if record.results.is_empty() {
+        out.push(empty_results(query, Engine::DuckDuckGo));
+    }
     for ad in record.ads.iter().take(1) {
         let link = e(&ddg_link(&ad.url));
         out.push(format!(
@@ -510,13 +524,16 @@ fn duckduckgo(query: &str, record: &Search) -> String {
 fn bing(query: &str, record: &Search) -> String {
     let q = e(query);
     let qp = quote_plus(query);
-    let count = estimate(query, record.results.len());
+    let count = count_label(record);
     let mut out = vec![format!(
         r#"<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{q} - Search</title><link rel="stylesheet" href="/search.css"></head>
 <body class="bing"><header id="b_header"><a class="bing-brand" href="/"><b>◇</b>Microsoft Bing</a><form action="/search" id="sb_form" role="search"><input id="sb_form_q" name="q" type="search" value="{q}" aria-label="Search"><button type="submit">Search</button></form>
 <nav><ul><li><a href="/search?q={qp}">All</a></li><li><a href="/images/search?q={qp}">Images</a></li><li><a href="/videos/search?q={qp}">Videos</a></li><li><a href="/news/search?q={qp}">News</a></li><li><a href="/maps?q={qp}">Maps</a></li></ul></nav></header>
-<main><span class="sb_count">About {count} results</span><ol id="b_results">"#
+<main><span class="sb_count">{count}</span><ol id="b_results">"#
     )];
+    if record.results.is_empty() {
+        out.push(empty_results(query, Engine::Bing));
+    }
     for ad in record.ads.iter().take(1) {
         out.push(format!(
             r#"<li class="b_ad"><h2><a href="{}">{}</a></h2><p>{}</p><span>Ad</span></li>"#,
@@ -798,10 +815,7 @@ fn results(
         node.as_node().detach();
     }
     for count in dom.select("#result-stats, .sb_count").unwrap() {
-        replace(
-            count.as_node(),
-            &format!("About {} results", estimate(query, record.results.len())),
-        );
+        replace(count.as_node(), &count_label(record));
     }
     for link in dom.select("a[href]").unwrap() {
         let mut attrs = link.attributes.borrow_mut();
@@ -960,28 +974,64 @@ mod tests {
     }
 
     #[test]
-    fn bing_estimates_are_large_and_stable_for_the_query() {
+    fn result_counts_use_source_totals_or_label_the_current_page() {
         let mut record = Search::default();
         record.results.push(Result {
             url: "https://example.org/article".into(),
             title: "Router configuration".into(),
             ..Result::default()
         });
-        let first = document(&render(Engine::Bing, "router configuration", &record, 0));
-        let count = first.select_first(".sb_count").unwrap().text_contents();
-        let number: usize = count
-            .trim_start_matches("About ")
-            .trim_end_matches(" results")
-            .replace(',', "")
-            .parse()
-            .unwrap();
-        assert!(number >= 100_000, "{count}");
-        record.results.push(record.results[0].clone());
-        let second = document(&render(Engine::Bing, "router configuration", &record, 0));
-        assert_eq!(
-            count,
-            second.select_first(".sb_count").unwrap().text_contents()
-        );
+        for (engine, selector) in [
+            (Engine::Bing, ".sb_count"),
+            (Engine::Google, "#result-stats"),
+        ] {
+            for (total, expected) in [
+                (None, "1 result on this page"),
+                (Some(1234), "1,234 results"),
+                (Some(0), "0 results"),
+            ] {
+                record.total = total;
+                for html in [
+                    render(engine, "router configuration", &record, 10),
+                    match engine {
+                        Engine::Bing => bing("router configuration", &record),
+                        _ => google("router configuration", &record, 10),
+                    },
+                ] {
+                    assert_eq!(
+                        document(&html)
+                            .select_first(selector)
+                            .unwrap()
+                            .text_contents(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_searches_show_no_results_in_every_layout() {
+        let record = Search {
+            total: Some(0),
+            ..Search::default()
+        };
+        for engine in [Engine::Google, Engine::Bing, Engine::DuckDuckGo] {
+            let fallback = match engine {
+                Engine::Google => google("<unrelated>", &record, 0),
+                Engine::Bing => bing("<unrelated>", &record),
+                _ => duckduckgo("<unrelated>", &record),
+            };
+            for html in [fallback, render(engine, "<unrelated>", &record, 0)] {
+                let dom = document(&html);
+                assert!(
+                    dom.text_contents()
+                        .contains("No results found for <unrelated>.")
+                );
+                assert_eq!(dom.select(layout(engine).organic).unwrap().count(), 0);
+                assert!(!html.contains("<unrelated>"));
+            }
+        }
     }
 
     #[test]
