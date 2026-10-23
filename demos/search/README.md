@@ -6,7 +6,7 @@ downloads folder to run without a VM. Agents sign in inside the guest. The termi
 tmux session; Screen shows the Firefox desktop. Input starts off and can be
 enabled beside the console.
 
-`preview` needs no downloads or API keys. It uses the astronomy corpus when
+`preview` needs no downloads or API keys. It uses the world's corpus when
 available, otherwise a small embedded sky.org capture. Its labeled client makes
 real requests inside the world. Model calls appear when an agent uses the
 gateway; preview does not invent provider traffic.
@@ -31,7 +31,10 @@ sites. Capture dates are shown only when the archive records them.
 
 - **Copied** replays WARC responses at their real URLs. A crawler builds one
   BM25 index from their titles and text. Google, Bing and DuckDuckGo render that
-  index in their own layouts. Missing URLs return 404.
+  index in their own layouts. Each result covers every query term; unrelated
+  searches have no results. Counts come from the index before pagination.
+  Missing URLs on captured hosts return 404. Uncaptured hosts return NXDOMAIN,
+  apart from the caller's declared model, sign-in and package services.
 - **Model-written** uses `OPENROUTER_API_KEY` to write pages from a prose brief,
   prior mentions and stored claims. Failed calls do not invent fallback articles.
 - **Live** uses `EXA_API_KEY` for [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml).
@@ -67,7 +70,39 @@ Eval questions live in the Python task's `QUESTIONS` mapping.
 
 ## Corpus
 
-The NASA, ESA and Wikipedia captures are stored in `demos/downloads/astronomy/`.
+The default world is [security](seeds/security.md). Its `[corpus]` front matter
+chooses the capture directory under `demos/downloads/` and the starting URLs.
+The app opens that declaration; it does not choose a topic or URL list itself.
+The capture contains MITRE ATT&CK techniques, CISA advisories, NIST guidance,
+and SolarWinds and XZ analyses from researchers and vendors. It is a bounded
+collection; links beyond the captures have no public-web fallback.
+
+WARCs are stored in `demos/downloads/security/`, outside git, with their wget
+logs. Capture the URLs in the seed with:
+
+```sh
+wget --page-requisites --span-hosts --compression=auto --delete-after \
+  --inet4-only --no-http-keep-alive --wait=0.3 --timeout=30 --tries=2 \
+  --warc-file=<directory>/<name> <URLs>
+```
+
+Use a separate WARC name for each batch. Keep original URLs, redirects, HTTP
+headers and response bodies; do not rewrite links or unpack the archives.
+Microsoft's site required a browser User-Agent. Referenced NIST PDFs are also
+captured. Some upstream optional images and fonts return errors in the original
+sites and retain those errors in replay.
+
+The downloaded-corpus acceptance test runs separately from the offline unit
+tests, and fails if its captures are missing or sources cannot be replayed:
+
+```sh
+rustup run 1.99.0 cargo test -p web-world --test corpus -- --nocapture
+```
+
+Set `SEARCH_DOWNLOADS` to another downloads root when testing captures outside
+this checkout. The test searches the real index, fetches citations through the
+world, and checks empty results without booting a VM or opening the demo port.
+The previous astronomy captures remain in `demos/downloads/astronomy/`.
 
 ## Code
 

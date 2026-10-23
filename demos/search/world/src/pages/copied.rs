@@ -7,6 +7,7 @@ use std::{path::Path, time::Instant};
 pub(super) struct Corpus {
     archive: Archive,
     index: Index,
+    hosts: HashSet<String>,
 }
 
 impl Corpus {
@@ -70,6 +71,27 @@ impl Pages {
         self.copied.is_some()
     }
 
+    /// In copied mode only captured hosts and the local search engines exist.
+    /// Generated and live worlds may admit new public hostnames.
+    pub fn serves_host(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        crate::admit(&host).is_ok()
+            && (!self.copied_only()
+                || crate::route::SEARCH_HOSTS.contains(&host.as_str())
+                || self.copied.as_ref().unwrap().hosts.contains(&host))
+    }
+
+    /// Open the corpus chosen by the world's brief, relative to the downloads root.
+    pub fn from_corpus(seed: Seed, downloads: &Path, model: Option<Model>) -> Result<Self, String> {
+        let corpus = seed
+            .corpus
+            .as_ref()
+            .ok_or("the seed has no copied corpus")?;
+        let root = downloads.join(&corpus.directory);
+        let urls = corpus.urls.clone();
+        Self::copied(seed, &root, &urls, model)
+    }
+
     /// Open the copied sites and crawl them from their starting URLs.
     /// The crawler and HTTP replay use the same response handler.
     pub fn copied(
@@ -80,10 +102,15 @@ impl Pages {
     ) -> Result<Self, String> {
         let started = Instant::now();
         let archive = Archive::directory(root).map_err(|e| e.to_string())?;
+        let hosts = archive
+            .urls()
+            .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
+            .collect();
         let scanned = started.elapsed();
         let mut corpus = Corpus {
             archive,
             index: Index::default(),
+            hosts,
         };
         corpus.index = Index::crawl(
             seeds,
@@ -231,6 +258,24 @@ pub(super) fn replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_seed_selects_the_corpus_and_starting_urls() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../extras/tests/fixtures");
+        let seed = Seed::parse(
+            "capture",
+            "+++\n[corpus]\ndirectory='.'\nurls=['https://sky.org/']\n+++\nCaptured pages",
+            |_| unreachable!(),
+        )
+        .unwrap();
+        let pages = Pages::from_corpus(seed.clone(), &root, None).unwrap();
+        assert!(pages.serves_host("SKY.ORG."));
+        assert!(!pages.serves_host("uncaptured.org"));
+        assert_eq!(pages.copied.as_ref().unwrap().index.len(), 3);
+        let mut absent = seed;
+        absent.corpus.as_mut().unwrap().urls = vec!["https://uncaptured.org/".into()];
+        assert!(Pages::from_corpus(absent, &root, None).is_err());
+    }
 
     #[test]
     fn engines_and_page_requests_share_the_copied_corpus() {

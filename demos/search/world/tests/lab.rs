@@ -22,6 +22,80 @@ use web_world::{World, observation::SearchObs, pages::Seed};
 /// The caller's own site: "caller content" on every path.
 struct CallerContent;
 
+#[test]
+fn copied_world_resolves_captured_and_forwarded_hosts_but_refuses_unknown_hosts() {
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(7),
+        |cx| async move {
+            use fictionet::stdlib::protocols::dns::op::ResponseCode;
+            let seed = Seed::builtin("web")?;
+            let start = web_world::world_start(&seed.date)?;
+            let world = World::new(&cx, seed.clone(), start)?;
+            let world = World {
+                pages: Arc::new(
+                    web_world::pages::Pages::copied(
+                        seed,
+                        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../../extras/tests/fixtures"),
+                        &["https://sky.org/".into()],
+                        None,
+                    )
+                    .map_err(fictionet::Error::msg)?,
+                ),
+                ..world
+            };
+            let log = Arc::new(fictionet_extras::log::Log::new(
+                Box::new(std::io::sink()),
+                &[],
+                |s| s,
+            ));
+            let (attacher, attachments) = fictionet::attachments();
+            world
+                .net(&cx, log, |name| {
+                    (name == "forwarded.com").then(|| {
+                        fictionet::stdlib::web::Site::handler(CallerContent).into_host(name)
+                    })
+                })
+                .start(&cx, attachments)?;
+            let m = machine(
+                &cx,
+                attacher.attach("workstation")?,
+                Ipv4Addr::new(10, 0, 0, 2),
+            );
+            for host in ["sky.org", "www.google.com", "www.bing.com", "forwarded.com"] {
+                let answer = m
+                    .lookup(&cx, web_world::GATEWAY.into(), host, RecordType::A)
+                    .await?;
+                assert_eq!(
+                    answer.metadata.response_code,
+                    ResponseCode::NoError,
+                    "{host}"
+                );
+                assert!(!answer.answers.is_empty(), "{host}");
+            }
+            for host in ["thisdoesnotexist-qx.com", "uncaptured.org", "wiki.corp"] {
+                let answer = m
+                    .lookup(&cx, web_world::GATEWAY.into(), host, RecordType::A)
+                    .await?;
+                assert_eq!(
+                    answer.metadata.response_code,
+                    ResponseCode::NXDomain,
+                    "{host}"
+                );
+                assert!(answer.answers.is_empty(), "{host}");
+                assert!(!world.pages.serves_host(host));
+            }
+            let (status, _) = fetch(&cx, &m, "sky.org", "/black-hole", start, "reader").await;
+            assert_eq!(status, 200);
+            let (status, _) = fetch(&cx, &m, "sky.org", "/missing", start, "reader").await;
+            assert_eq!(status, 404);
+            cx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
 impl httpd::Handler for CallerContent {
     fn call(&self, _: http::Request<httpd::Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
         httpd::Reply::Now(httpd::text(http::StatusCode::OK, "caller content"))

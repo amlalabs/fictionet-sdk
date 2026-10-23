@@ -26,3 +26,8 @@ kuchiki = "0.8"
 
 [dev-dependencies]
 fictionet-test-support = { path = "../../../tests/support" }
+
+# This acceptance test requires the downloaded security corpus.
+[[test]]
+name = "corpus"
+test = false

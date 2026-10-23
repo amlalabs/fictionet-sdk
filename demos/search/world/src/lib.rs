@@ -112,6 +112,11 @@ pub fn net(
             resolved(None);
             return None;
         }
+        let forwarded = forward(host);
+        if forwarded.is_none() && !refused_pages.serves_host(host) {
+            resolved(None);
+            return None;
+        }
         let (addr, _) = match addresses.assign(host) {
             Ok(Some(assigned)) => assigned,
             Ok(None) => {
@@ -125,7 +130,7 @@ pub fn net(
             }
         };
         resolved(Some(addr.into()));
-        if let Some(site) = forward(host) {
+        if let Some(site) = forwarded {
             return Some(site.at(addr));
         }
         let (ca, name) = (ca.clone(), host.to_owned());
@@ -151,6 +156,7 @@ pub fn net(
     let report_pages = pages.clone();
     fictionet::stdlib::world::net::Net::new()
         .ipv4_only()
+        .drop_unrouted()
         .resolve(site_for)
         .on_unreachable(move |unreachable| {
             report_pages.report(

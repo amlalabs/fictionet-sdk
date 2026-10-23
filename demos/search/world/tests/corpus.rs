@@ -1,0 +1,115 @@
+//! Acceptance checks over real captures, invoked with `cargo test --test corpus`.
+
+use fictionet_extras::{models::Engine, warc::Archive};
+use kuchiki::traits::TendrilSink;
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use web_world::pages::{Meta, Pages, Seed};
+
+#[test]
+fn security_research_searches_and_citations_replay_without_internet() {
+    let downloads = std::env::var_os("SEARCH_DOWNLOADS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../downloads"));
+    let seed = Seed::builtin("security").unwrap();
+    let corpus = seed.corpus.as_ref().unwrap();
+    let source_urls = corpus.urls.clone();
+    let archive = Archive::directory(&downloads.join(&corpus.directory)).unwrap();
+    let mut sources = HashSet::new();
+    for url in &corpus.urls {
+        let response = archive
+            .get(url)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing {url}"));
+        assert!(
+            response.status.is_success() || response.status.is_redirection(),
+            "{url}: {}",
+            response.status
+        );
+        sources.insert(url::Url::parse(url).unwrap().host_str().unwrap().to_owned());
+    }
+    assert!(sources.len() >= 8);
+    let pages = Arc::new(Pages::from_corpus(seed, &downloads, None).unwrap());
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(11),
+        |cx| async move {
+            let mut followed = HashSet::new();
+            for url in &source_urls {
+                let page = pages.clone().fetch(cx.clone(), url.clone()).await?;
+                assert!(!page.title.is_empty(), "{url}");
+                eprintln!("source {url}: {}", page.title);
+                let base = url::Url::parse(url)?;
+                let links: Vec<_> = {
+                    let dom =
+                        kuchiki::parse_html().one(String::from_utf8_lossy(&page.body).into_owned());
+                    dom.select("a[href]")
+                        .unwrap()
+                        .filter_map(|node| {
+                            let mut next = base.join(node.attributes.borrow().get("href")?).ok()?;
+                            next.set_fragment(None);
+                            (next.as_str() != url).then(|| next.to_string())
+                        })
+                        .collect()
+                };
+                for next in links {
+                    let Some(response) = archive.get(&next)? else {
+                        continue;
+                    };
+                    if response.status == 200
+                        && response
+                            .headers
+                            .get("content-type")
+                            .is_some_and(|value| value.as_bytes().starts_with(b"text/html"))
+                    {
+                        let linked = pages.clone().fetch(cx.clone(), next.clone()).await?;
+                        assert!(!linked.body.is_empty(), "{url} -> {next}");
+                        followed.insert(url.clone());
+                        break;
+                    }
+                }
+            }
+            assert!(
+                followed.len() >= 8,
+                "only {} sources have a replayable onward article",
+                followed.len()
+            );
+            for query in [
+                "solarwinds supply chain attack",
+                "xz backdoor",
+                "nist zero trust architecture",
+                "mitre attack lateral movement",
+            ] {
+                let hits = pages
+                    .clone()
+                    .search(cx.clone(), query.into(), "search", serde_json::json!({}))
+                    .await?;
+                assert!(!hits.is_empty(), "{query}");
+                eprintln!("{query}: {} results on the first page", hits.len());
+                for hit in hits.iter().take(3) {
+                    let page = pages.clone().fetch(cx.clone(), hit.url.clone()).await?;
+                    assert!(!page.body.is_empty(), "{}", hit.url);
+                    assert!(!page.title.is_empty(), "{}", hit.url);
+                    eprintln!("  {}: {}", hit.url, page.title);
+                }
+            }
+            for host in ["www.google.com", "www.bing.com", "html.duckduckgo.com"] {
+                let path = if host == "html.duckduckgo.com" {
+                    "/html/"
+                } else {
+                    "/search"
+                };
+                for query in ["dishwasher+astronomy", "solarwinds+hydrogen"] {
+                    let response = pages
+                        .handle(&cx, "GET", host, &format!("{path}?q={query}"), None)
+                        .await;
+                    assert_eq!(response.status, 200);
+                    let Meta::Search(list) = response.meta else {
+                        panic!("search metadata missing")
+                    };
+                    assert!(list.listed.is_empty(), "{query}");
+                }
+            }
+            Ok(())
+        },
+    ))
+    .unwrap();
+}

@@ -28,10 +28,19 @@ pub async fn run() -> Result {
     let downloads =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../downloads/cloudimage");
     let sample = kit::RunDir::new(&std::env::temp_dir(), "search-preview")?;
-    let pages = if downloads.parent().unwrap().join("astronomy").is_dir() {
+    let captured = seed
+        .corpus
+        .as_ref()
+        .is_some_and(|corpus| downloads.parent().unwrap().join(&corpus.directory).is_dir());
+    let query = if captured {
+        "supply chain"
+    } else {
+        "black hole"
+    };
+    let pages = if captured {
         Arc::new(super::app_pages(seed.clone(), &downloads)?)
     } else {
-        println!("No astronomy downloads found. Preview uses the small bundled sky.org capture.");
+        println!("No corpus downloads found. Preview uses the small bundled sky.org capture.");
         std::fs::write(
             sample.path().join("sky.warc.gz"),
             include_bytes!("../../../../extras/tests/fixtures/sky.warc.gz"),
@@ -85,7 +94,7 @@ pub async fn run() -> Result {
             );
             cx.spawn(move |cx| async move {
                 loop {
-                    story(&cx, &workstation, &world).await?;
+                    story(&cx, &workstation, &world, query).await?;
                     println!("Preview story complete. Use Run story again on the page.");
                     if cx.race(None, story_requests.recv()).await?.is_none() {
                         break;
@@ -143,7 +152,7 @@ async fn fetch(
     println!("Preview opened https://{host}{path}");
     Ok(())
 }
-async fn story(cx: &Cx, machine: &Machine, world: &World) -> fictionet::Result {
+async fn story(cx: &Cx, machine: &Machine, world: &World, query: &str) -> fictionet::Result {
     use fictionet_extras::models::Engine;
     // These pauses pace the presentation; tests drive the same services without them.
     cx.sleep(Duration::from_secs(1)).await?;
@@ -151,7 +160,7 @@ async fn story(cx: &Cx, machine: &Machine, world: &World) -> fictionet::Result {
         cx,
         machine,
         "www.google.com",
-        "/search?q=black+hole",
+        &format!("/search?q={}", query.replace(' ', "+")),
         world.start,
     )
     .await?;
@@ -161,7 +170,7 @@ async fn story(cx: &Cx, machine: &Machine, world: &World) -> fictionet::Result {
         .clone()
         .search(
             cx.clone(),
-            "black hole".into(),
+            query.into(),
             "claude_web_search",
             serde_json::json!({}),
         )
@@ -175,7 +184,7 @@ async fn story(cx: &Cx, machine: &Machine, world: &World) -> fictionet::Result {
         cx,
         machine,
         "www.bing.com",
-        "/search?q=black+hole",
+        &format!("/search?q={}", query.replace(' ', "+")),
         world.start,
     )
     .await?;
@@ -183,7 +192,7 @@ async fn story(cx: &Cx, machine: &Machine, world: &World) -> fictionet::Result {
         cx,
         machine,
         "html.duckduckgo.com",
-        "/html/?q=black+hole",
+        &format!("/html/?q={}", query.replace(' ', "+")),
         world.start,
     )
     .await?;

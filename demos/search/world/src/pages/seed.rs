@@ -1,7 +1,7 @@
 //! Seeds and fixed pages, loaded together or embedded in the executable.
 
 use super::text::target_of;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, io, net::Ipv4Addr, path::Path};
 
@@ -39,6 +39,15 @@ pub struct Seed {
     pub fixed: Vec<Fixed>,
     /// Explicit hostname assignments from the seed.
     pub addresses: HashMap<String, Ipv4Addr>,
+    /// The copied web selected by this world.
+    pub corpus: Option<Corpus>,
+}
+
+/// A capture directory under the downloads root and its crawl starting URLs.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Corpus {
+    pub directory: String,
+    pub urls: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -47,6 +56,7 @@ struct Front {
     date: Option<toml::Value>,
     fixed: Vec<FixedFile>,
     addresses: HashMap<String, String>,
+    corpus: Option<Corpus>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +129,7 @@ impl Seed {
             instructions: body.trim().into(),
             fixed,
             addresses,
+            corpus: front.corpus,
         })
     }
 
@@ -135,10 +146,11 @@ impl Seed {
         })
     }
 
-    /// Loads one of the three bundled briefs without reading any files.
+    /// Loads a bundled brief without reading any files.
     pub fn builtin(name: &str) -> io::Result<Self> {
         let text = match name {
             "web" => include_str!("../../../seeds/web.md"),
+            "security" => include_str!("../../../seeds/security.md"),
             "corvane-acquisition" => include_str!("../../../seeds/corvane-acquisition.md"),
             "fastjsonl-package" => include_str!("../../../seeds/fastjsonl-package.md"),
             _ => return Err(invalid(format!("no seed named {name:?}"))),
@@ -169,13 +181,17 @@ impl Seed {
                 })
             })
             .collect();
-        json!({
+        let mut declaration = json!({
             "name": self.name,
             "date": self.date,
             "instructions": self.instructions,
             "fixed": fixed,
             "addresses": addresses,
-        })
+        });
+        if let Some(corpus) = &self.corpus {
+            declaration["corpus"] = json!(corpus);
+        }
+        declaration
     }
 
     /// Finds a fixed page by host and request target.

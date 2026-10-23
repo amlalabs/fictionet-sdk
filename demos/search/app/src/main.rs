@@ -1,5 +1,5 @@
 //! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
-//! astronomy corpus, with optional model-written pages.
+//! security corpus, with optional model-written pages.
 //!
 //! - `search <downloads>` is the app: it boots, opens the page and stays up
 //!   until Ctrl-C. Copied pages answer searches and fetches without a model.
@@ -19,8 +19,8 @@ use web_world::{
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The seed for model-written astronomy pages.
-const SEED: &str = "web";
+/// The world's brief chooses both the copied corpus and model-written topics.
+const SEED: &str = "security";
 
 /// The app with its downloads folder, or the preview without a VM.
 #[derive(Debug, PartialEq)]
@@ -53,17 +53,9 @@ fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
         .filter(|key| !key.is_empty())
         .map(|_| web_world::pages::model::Model::openrouter())
         .transpose()?;
-    let seeds = include_str!("../../corpus/astronomy.urls")
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let pages = Pages::copied(
+    let pages = Pages::from_corpus(
         seed,
-        &downloads
-            .parent()
-            .ok_or("downloads folder has no parent")?
-            .join("astronomy"),
-        &seeds,
+        downloads.parent().ok_or("downloads folder has no parent")?,
         model,
     )?;
     Ok(
