@@ -564,6 +564,7 @@ mod tests {
             };
             assert_eq!(send(http::Request::get("/oauth/authorize?code=private-code").body(Body::empty())?).await?.status(), 200);
             session.close();
+            assert_eq!(send(http::Request::get("/v1/oauth/hello").body(Body::empty())?).await?.status(), 200);
             assert_eq!(send(http::Request::get("/oauth/authorize").body(Body::empty())?).await?.status(), 403);
             assert_eq!(send(http::Request::post("/v1/oauth/token").body(Body::from(r#"{"grant_type":"authorization_code"}"#))?).await?.status(), 403);
             let refresh = "grant_type=authorization_code&grant_type=refresh_token&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&refresh_token=private-refresh";
@@ -605,6 +606,24 @@ impl httpd::Handler for SignIn {
         let this = self.clone();
         httpd::Reply::Later(Box::new(move |cx| {
             Box::pin(async move {
+                if this.session.closed()
+                    && this.host.to_ascii().trim_end_matches('.') == "platform.claude.com"
+                    && matches!(*request.method(), http::Method::GET | http::Method::HEAD)
+                    && request.uri().path() == "/v1/oauth/hello"
+                {
+                    this.pages.report(
+                        &cx,
+                        SearchObs::Egress {
+                            host: this.host,
+                            method: request.method().to_string(),
+                            path: request.uri().path().into(),
+                            purpose: "startup".into(),
+                            phase: "local".into(),
+                            status: Some(200),
+                        },
+                    );
+                    return Ok(http::Response::new(Body::empty()));
+                }
                 let (parts, body) = request.into_parts();
                 let body = match http_body_util::Limited::new(body, 64 * 1024)
                     .collect()

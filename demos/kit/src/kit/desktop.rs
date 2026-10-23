@@ -225,7 +225,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
          startxfce4 >/tmp/xfce.log 2>&1 &\n\
          for _ in $(seq 1 150); do pgrep -x xfwm4 >/dev/null 2>&1 && break; sleep 0.2; done\n\
          sleep 2\n\
-         firefox --no-remote --profile \"$HOME/.mozilla/firefox/default\" '{start_url}' >/tmp/firefox.log 2>&1 &\n\
+         firefox --profile \"$HOME/.mozilla/firefox/default\" '{start_url}' >/tmp/firefox.log 2>&1 &\n\
          # Maximized, Firefox follows the screen when the viewer resizes it.\n\
          for _ in $(seq 1 300); do wmctrl -x -r firefox -b add,maximized_vert,maximized_horz 2>/dev/null && break; sleep 0.2; done\n\
          wait\n"
@@ -637,7 +637,7 @@ mod tests {
         assert!(start.contains("Xvnc :1 -localhost"));
         assert!(start.contains(" -SendCutText=0 "));
         assert!(start.contains(&format!(
-            "firefox --no-remote --profile \"$HOME/.mozilla/firefox/default\" '{url}'"
+            "firefox --profile \"$HOME/.mozilla/firefox/default\" '{url}'"
         )));
         assert!(
             content("/etc/systemd/system/vnc.service").contains("ExecStart=/opt/start-desktop.sh")

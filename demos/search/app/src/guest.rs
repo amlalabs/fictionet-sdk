@@ -10,7 +10,7 @@ pub fn guest() -> Guest {
         .resources(4, 4096)
         // The searcher reads the address back before submitting it.
         .packages(&["xclip", "nmap", "tmux"])
-        .terminal("tmux new-session -A -s main");
+        .terminal("env DISPLAY=:1 tmux new-session -A -s main");
     kit::desktop::codex(kit::desktop::claude_code(guest))
 }
 
@@ -42,7 +42,7 @@ mod tests {
         assert_eq!(files["/etc/apt/apt.conf.d/20apt-esm-hook.conf"], "");
         assert!(data.contains("    content: \"\"\n"));
         assert!(files["/opt/start-desktop.sh"].contains(&format!(
-            "firefox --no-remote --profile \"$HOME/.mozilla/firefox/default\" '{START}'"
+            "firefox --profile \"$HOME/.mozilla/firefox/default\" '{START}'"
         )));
         assert!(
             files["/etc/firefox/policies/policies.json"]
