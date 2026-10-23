@@ -252,7 +252,7 @@ pub struct Answer<T> {
 }
 
 mod transport;
-use transport::OpenRouter;
+use transport::ProviderTransport;
 
 impl Model {
     /// The default page writer, using the existing OpenRouter credential.
@@ -262,7 +262,18 @@ impl Model {
             "",
             "",
             Key::from_env(fictionet_extras::models::Provider::OpenRouter)?,
-            Arc::new(OpenRouter),
+            Arc::new(ProviderTransport(Provider::OpenRouter)),
+        ))
+    }
+
+    /// The default page writer with the host's Anthropic API credential.
+    pub fn anthropic() -> Result<Self, String> {
+        Ok(Self::new(
+            Provider::Anthropic,
+            "",
+            "",
+            Key::from_env(fictionet_extras::models::Provider::Anthropic)?,
+            Arc::new(ProviderTransport(Provider::Anthropic)),
         ))
     }
 

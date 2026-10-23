@@ -106,7 +106,7 @@ function activityText(row) {
     case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
     case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${fact.path} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
-    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Sign-in open until the first successful inference' : `Sign-in closed · ${fact.exceptions.join(', ')}`, 'calls'];
+    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Sign-in open until the first successful inference' : ['Sign-in closed', fact.exceptions.join(', ')].filter(Boolean).join(' · '), 'calls'];
     case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${fact.path} · ${fact.status || fact.phase}`, 'calls'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
     default: return ['', '', '', 'router'];
@@ -265,7 +265,7 @@ async function loadWorld() {
   for (const option of $('source').options) {
     option.disabled = !world[option.value];
     const text = { copied: 'Copied pages', model_written: 'Model-written pages', live: 'Live search' }[option.value];
-    option.textContent = `${text}${option.disabled ? option.value === 'copied' ? ' · corpus unavailable' : option.value === 'live' ? ' · needs EXA_API_KEY' : ' · needs OPENROUTER_API_KEY' : ''}`;
+    option.textContent = `${text}${option.disabled ? option.value === 'copied' ? ' · corpus unavailable' : option.value === 'live' ? ' · needs EXA_API_KEY' : ' · needs host model' : ''}`;
   }
   $('source-help').textContent = world.source.kind === 'copy' ? 'The copied corpus, served at its original URLs.' : world.source.kind === 'live' ? 'Searches and captures come from the internet.' : 'Pages are written from the world brief.';
   if (world.preview) {

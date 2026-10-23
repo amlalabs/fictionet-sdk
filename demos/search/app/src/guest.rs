@@ -5,13 +5,37 @@ pub const USER: &str = "analyst";
 pub const START: &str = "https://www.google.com/";
 
 /// The workstation inherits the host clock from the hypervisor.
-pub fn guest() -> Guest {
+pub fn guest(token: Option<&str>) -> Guest {
     let guest = kit::desktop::browser(HOST, USER, START)
         .resources(4, 4096)
         // The searcher reads the address back before submitting it.
         .packages(&["xclip", "nmap", "tmux"])
         .terminal("env DISPLAY=:1 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus tmux new-session -A -s main");
-    kit::desktop::codex(kit::desktop::claude_code(guest))
+    let mut guest = kit::desktop::codex(kit::desktop::claude_code(guest));
+    if let Some(token) = token {
+        let mut settings: serde_json::Value =
+            serde_json::from_str(kit::desktop::CLAUDE_SETTINGS).expect("managed settings");
+        settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"] = token.into();
+        guest = guest
+            .file(
+                &format!("/home/{USER}/.claude/settings.json"),
+                0o600,
+                settings.to_string(),
+            )
+            .file(
+                &format!("/home/{USER}/.claude.json"),
+                0o600,
+                serde_json::json!({
+                    "hasCompletedOnboarding": true,
+                    "theme": "dark",
+                    "projects": {
+                        format!("/home/{USER}"): {"hasTrustDialogAccepted": true}
+                    }
+                })
+                .to_string(),
+            );
+    }
+    guest
 }
 
 #[cfg(test)]
@@ -21,7 +45,7 @@ mod tests {
 
     #[test]
     fn desktop_installs_the_searcher_and_stays_quiet() {
-        let guest = guest();
+        let guest = guest(Some("sk-ant-oat01-guest-placeholder"));
         guest.validate().unwrap();
         let data = seed::user_data(&seed::Provision {
             guest: &guest,
@@ -59,6 +83,19 @@ mod tests {
         }
         assert!(data.contains("then systemctl stop apt-daily.timer; fi"));
         assert!(files.contains_key("/etc/claude-code/managed-settings.json"));
+        let settings: serde_json::Value =
+            serde_json::from_str(files["/home/analyst/.claude/settings.json"].as_str()).unwrap();
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"],
+            "sk-ant-oat01-guest-placeholder"
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&files["/home/analyst/.claude.json"]).unwrap();
+        assert_eq!(state["hasCompletedOnboarding"], true);
+        assert_eq!(
+            state["projects"]["/home/analyst"]["hasTrustDialogAccepted"],
+            true
+        );
         assert!(!data.contains("date -u -s"));
     }
 }

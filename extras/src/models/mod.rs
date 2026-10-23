@@ -179,6 +179,7 @@ pub struct Credential {
     real: Secret,
     placeholder: String,
     oauth: Option<oauth::OAuth>,
+    bearer: bool,
 }
 impl Credential {
     /// Mints a placeholder preserving the provider prefix and key length.
@@ -217,10 +218,20 @@ impl Credential {
             real,
             placeholder,
             oauth: None,
+            bearer: false,
         }
     }
+    /// A long-lived Claude subscription token, kept on the host with no refresh.
+    pub fn claude_token(cx: &Cx, real: Secret) -> fictionet::Result<Self> {
+        if !real.value.starts_with("sk-ant-oat01-") {
+            return Err(Error::msg("Claude OAuth token has an invalid prefix"));
+        }
+        let mut credential = Self::api_key(cx, real);
+        credential.bearer = true;
+        Ok(credential)
+    }
     fn header(&self, provider: Provider) -> &'static str {
-        if self.oauth.is_some() {
+        if self.bearer {
             "authorization"
         } else {
             provider.header()
@@ -236,7 +247,7 @@ impl Credential {
         } else {
             &self.placeholder
         };
-        if self.oauth.is_some() || provider.header() == "authorization" {
+        if self.bearer || provider.header() == "authorization" {
             format!("Bearer {value}")
         } else {
             value.clone()
@@ -416,6 +427,7 @@ impl Model {
             real: oauth.secret().await?,
             placeholder: oauth.placeholder(),
             oauth: Some(oauth),
+            bearer: true,
         };
         Self::at(
             cx,
@@ -590,7 +602,14 @@ impl Model {
         if credential.oauth.is_some() {
             return Vec::new();
         }
-        vec![(self.provider.key_variable(), credential.placeholder.clone())]
+        vec![(
+            if credential.bearer && self.provider == Provider::Anthropic {
+                "CLAUDE_CODE_OAUTH_TOKEN"
+            } else {
+                self.provider.key_variable()
+            },
+            credential.placeholder.clone(),
+        )]
     }
     /// Whether the request carries exactly the guest's credential.
     fn authorized(&self, headers: &http::HeaderMap) -> bool {
@@ -1136,6 +1155,7 @@ fn safe_content(content: &Value) -> bool {
                     | "document"
                     | "tool_use"
                     | "tool_result"
+                    | "tool_reference"
                     | "server_tool_use"
                     | "web_search_result"
                     | "web_search_tool_result_error"

@@ -864,6 +864,49 @@ fn anthropic_client_tools_accept_both_wire_spellings() {
     }
 }
 
+#[test]
+fn deferred_client_tool_references_preserve_the_provider_boundary() {
+    let mut body = json!({
+        "tools": [{"name":"WebFetch", "defer_loading":true, "input_schema":{"type":"object", "properties":{"url":{"type":"string"}}}}],
+        "messages": [
+            {"role":"assistant", "content":[{"type":"tool_use", "id":"discovery", "name":"ToolSearch", "input":{"query":"WebFetch"}, "caller":{"type":"direct"}}]},
+            {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"discovery", "content":[{"type":"tool_reference", "tool_name":"WebFetch"}]}]}
+        ]
+    });
+    assert!(safe_request(
+        Provider::Anthropic,
+        "/v1/messages",
+        &body,
+        false
+    ));
+    body["messages"][1]["content"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(
+            json!({"type":"image", "source":{"type":"url", "url":"https://example.com/image.png"}}),
+        );
+    assert!(!safe_request(
+        Provider::Anthropic,
+        "/v1/messages",
+        &body,
+        false
+    ));
+    body["messages"][1]["content"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    body["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"web_fetch_20260209", "name":"web_fetch"}));
+    assert!(!safe_request(
+        Provider::Anthropic,
+        "/v1/messages",
+        &body,
+        false
+    ));
+}
+
 struct ValidationPages;
 impl Engine for ValidationPages {
     fn serves(&self, _: &str) -> bool {
@@ -909,4 +952,52 @@ fn the_provider_receives_only_the_validated_json_value() {
         response.into_body().collect().await?;
         Ok(())
     })).unwrap();
+}
+
+#[tokio::test]
+async fn long_lived_claude_token_stays_on_the_host() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let router = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|headers: http::HeaderMap| async move {
+                assert_eq!(headers["authorization"], "Bearer sk-ant-oat01-host-private");
+                assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
+                assert!(!headers.contains_key("x-api-key"));
+                assert!(!headers.contains_key("cookie"));
+                axum::Json(json!({"content":[{"type":"text","text":"sk-ant-oat01-host-private"}]}))
+            }),
+        );
+        axum::serve(listener, router).await.unwrap();
+    });
+    fictionet::run(fictionet::Seed::from_u64(91), |cx| async move {
+        let credential = Credential::claude_token(&cx, Secret::new("Claude OAuth token", "sk-ant-oat01-host-private".into())?)?;
+        assert!(credential.placeholder().starts_with("sk-ant-oat01-"));
+        assert_ne!(credential.placeholder(), "sk-ant-oat01-host-private");
+        let bearer = format!("Bearer {}", credential.placeholder());
+        let site = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?;
+        assert_eq!(site.guest_env()[0].0, "CLAUDE_CODE_OAUTH_TOKEN");
+        for authorization in [None, Some("Bearer wrong")] {
+            let mut request = Request::post("/v1/messages");
+            if let Some(authorization) = authorization { request = request.header("authorization", authorization); }
+            assert_eq!(site.clone().send(request.body(Body::from("{}"))?).await?.status(), 401);
+        }
+        let response = site.clone().send(Request::get("/api/claude_code/policy_limits").header("authorization", &bearer).body(Body::empty())?).await?;
+        assert_eq!(response.status(), 200);
+        for path in ["/v1/files", "/api/oauth/cli/create_api_key", "/v1/oauth/token"] {
+            assert_eq!(site.clone().send(Request::post(path).header("authorization", &bearer).body(Body::from("{}"))?).await?.status(), 404);
+        }
+        let response = site.send(Request::post("/v1/messages")
+            .header("authorization", bearer).header("anthropic-beta", "oauth-2025-04-20")
+            .header("x-api-key", "unused").header("cookie", "unused")
+            .body(Body::from(r#"{"model":"claude","max_tokens":10,"messages":[{"role":"user","content":"Hello"}]}"#))?).await?;
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await?.to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("sk-ant-oat01-host-private"));
+        assert!(body.contains("<Claude OAuth token>"));
+        Ok(())
+    }).await.unwrap();
+    server.abort();
 }

@@ -63,7 +63,7 @@ async fn real_search_page_and_dns_facts_reach_the_owned_views_without_an_observe
         let world=web_world::World {pages:pages.clone(),..web_world::World::new(&cx,seed,start)?};
         let (attacher,attachments)=fictionet::attachments();
         let log=Arc::new(fictionet_extras::log::Log::new(Box::new(std::io::sink()),&[],|s|s));
-        let net=crate::network::build(&world,&cx,log,fictionet_demo::kit::mirror::new(&cx)?)?;
+        let net=crate::network::build(&world,&cx,log,fictionet_demo::kit::mirror::new(&cx)?, None)?;
         net.start(&cx,attachments)?;
         let client=machine(&cx,attacher.attach("workstation")?,"10.0.0.2".parse::<std::net::Ipv4Addr>()?);
         fetch(&cx,&client,"www.google.com","/search?q=black+hole",start).await;
@@ -185,7 +185,7 @@ async fn world_controls_report_errors_and_restart_the_visible_history() {
             .unwrap();
         assert_eq!(
             receive.await.unwrap().unwrap_err(),
-            "Model-written pages need OPENROUTER_API_KEY"
+            "Model-written pages need a host model credential"
         );
         assert_eq!(pages.new_pages(), NewPages::Copied);
         views.lock().unwrap().push(Observation {
