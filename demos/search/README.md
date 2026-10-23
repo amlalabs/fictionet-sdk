@@ -1,10 +1,43 @@
 # Search
 
-Run `cargo run --release -p fictionet-search-demo --bin search --
-demos/downloads/cloudimage` on Linux with KVM, or pass `preview` instead of the
-downloads folder to run without a VM. Agents sign in inside the guest. The terminal uses ghostty-web and a persistent
-tmux session; Screen shows the Firefox desktop. Input starts off and can be
-enabled beside the console.
+Build the shared workstation image once on Linux with KVM, `qemu-system-x86_64`,
+`qemu-img`, `curl` and `sha256sum` installed:
+
+```sh
+rustup run 1.99.0 cargo xtask search-image demos/downloads/cloudimage
+```
+
+The command verifies the pinned Ubuntu cloud disk, kernel and initrd and Cloud
+Hypervisor, then installs Xfce, Firefox, Claude Code, Codex, Python and the guest
+settings in a temporary VM. It writes `search-workstation.qcow2` atomically after
+successful shutdown. Construction needs the internet; the resulting workstation
+boots without downloading or installing software. Rebuilding replaces the image
+for subsequent launches; running guests retain their existing image.
+
+Run the demo with a host-held Claude token:
+
+```sh
+CLAUDE_CODE_OAUTH_TOKEN_FILE=/path/to/claude-oauth-token \
+  rustup run 1.99.0 cargo run --release -p fictionet-search-demo --bin search -- \
+  demos/downloads/cloudimage
+```
+
+The image contains no provider credentials, run CA, SSH identity or run clock.
+A read-only settings disk applies the run's root certificate, fresh SSH public
+key and placeholder Claude credential before SSH and the desktop start. The real
+Claude token stays on the host. `claude` opens ready to work. Each launch writes
+to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
+this workstation. The terminal uses ghostty-web and a persistent tmux session;
+Screen shows Firefox. Pass `preview` instead of the downloads folder to run
+without a VM.
+
+On the workstation, a before-and-after run reached full readiness in 63.384 s
+with boot-time installation and 7.213 s with the prepared image. Desktop readiness
+was 63.088 s and 7.208 s. The prepared boot recorded zero upstream attempts;
+Firefox's start page was served inside the world. Corpus loading and indexing
+were 0.468 s before and 0.532 s after, with no indexing changes. The image build
+took 98 s using the existing verified Ubuntu downloads and produced a standalone
+4.0 GiB disk. These are single-run wall-clock measurements, excluding compilation.
 
 `preview` needs no downloads or API keys. It uses the world's corpus when
 available, otherwise a small embedded sky.org capture. Its labeled client makes
@@ -12,8 +45,8 @@ real requests inside the world. Model calls appear when an agent uses the
 gateway; preview does not invent provider traffic.
 
 [app/src/main.rs](app/src/main.rs) assembles the workstation and its owned page.
-[app/src/network.rs](app/src/network.rs) connects the model gateway, sign-in relay
-and package mirror. Search explicitly reports typed facts from its request and
+[app/src/network.rs](app/src/network.rs) connects the model gateway and inspected
+provider sign-in. Search explicitly reports typed facts from its request and
 tool handlers, its name resolver and the typed no-route callback on its network.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
@@ -34,7 +67,7 @@ sites. Capture dates are shown only when the archive records them.
   index in their own layouts. Each result covers every query term; unrelated
   searches have no results. Counts come from the index before pagination.
   Missing URLs on captured hosts return 404. Uncaptured hosts return NXDOMAIN,
-  apart from the caller's declared model, sign-in and package services.
+  apart from the caller's declared model and sign-in services.
 - **Model-written** uses `OPENROUTER_API_KEY` to write pages from a prose brief,
   prior mentions and stored claims. Failed calls do not invent fallback articles.
 - **Live** uses `EXA_API_KEY` for [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml).
@@ -137,7 +170,7 @@ The previous astronomy captures remain in `demos/downloads/astronomy/`.
 The world's page modules separate routing, generation, listings, stored pages,
 corrections and model tools. Prompt construction and answer parsing are separate.
 The WARC reader, crawler, BM25 index, model gateway and sign-in policy live in
-`fictionet-extras`. The shared demo kit supplies VM lifetime, SSH console sockets and the package
-mirror. Search owns its HTML, styles and JavaScript, including copies of the
+`fictionet-extras`. The shared demo kit supplies VM lifetime, prepared images
+and SSH console sockets. Search owns its HTML, styles and JavaScript, including copies of the
 terminal and screen pieces. ghostty-web 0.4.0 and noVNC 1.7.0, with their
 licenses, live in `demos/kit/assets`.

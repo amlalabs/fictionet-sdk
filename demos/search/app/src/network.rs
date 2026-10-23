@@ -4,42 +4,15 @@ use fictionet::Cx;
 use http_body::Body as _;
 use std::sync::Arc;
 
-/// The names the world forwards to the real internet, and why: the guest's
-/// packages and coding agents, installed at boot.
-pub const FORWARDED: &[(&str, &str)] = &[
-    ("archive.ubuntu.com", "Ubuntu packages installed at boot"),
-    (
-        "security.ubuntu.com",
-        "Ubuntu security packages installed at boot",
-    ),
-    ("packages.mozilla.org", "Firefox installed at boot"),
-    (
-        fictionet_demo::kit::desktop::CLAUDE_HOST,
-        "Claude Code installed at boot",
-    ),
-    ("releases.openai.com", "Codex installed at boot"),
-];
-
-/// The world's network for the guest run and the preview: the web,
-/// with package downloads mirrored, sign-in inspected during setup, and model
-/// search and fetch answered by the world using the guest’s own credentials.
+/// The guest network: inspected sign-in and model calls, with search and fetch
+/// answered by the world. Software is supplied by the prepared image.
 pub fn build(
     world: &web_world::World,
     cx: &Cx,
     log: Arc<fictionet_extras::log::Log>,
-    mirror: fictionet_demo::kit::mirror::Mirror<fictionet::stdlib::web::Proxy>,
     claude_token: Option<fictionet_extras::models::Credential>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     use fictionet::stdlib::web::Site;
-    let mozilla = world
-        .ca
-        .config(cx, fictionet_demo::kit::desktop::HOSTS[0])?
-        .0;
-    let claude = world
-        .ca
-        .config(cx, fictionet_demo::kit::desktop::CLAUDE_HOST)?
-        .0;
-    let openai = world.ca.config(cx, "releases.openai.com")?.0;
     use fictionet_extras::models::{Model, Provider, signin};
     let signin = if claude_token.is_some() {
         world.pages.report(
@@ -110,19 +83,7 @@ pub fn build(
             let tls = signin_ca.config(&signin_cx, host).ok()?.0;
             return Some(Site::handler(handler).tls(tls).into_host(host));
         }
-        FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
-            let site = Site::new(mirror.clone());
-            if fictionet_demo::kit::desktop::HOSTS.contains(&host) {
-                site.tls(mozilla.clone())
-            } else if host == fictionet_demo::kit::desktop::CLAUDE_HOST {
-                site.tls(claude.clone())
-            } else if host == "releases.openai.com" {
-                site.tls(openai.clone())
-            } else {
-                site
-            }
-            .into_host(host)
-        })
+        None
     }))
 }
 
