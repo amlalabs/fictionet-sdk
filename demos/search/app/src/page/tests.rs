@@ -185,7 +185,7 @@ async fn world_controls_report_errors_and_restart_the_visible_history() {
             .unwrap();
         assert_eq!(
             receive.await.unwrap().unwrap_err(),
-            "Model-written pages need OPENROUTER_API_KEY"
+            "Model-written pages need a host model credential"
         );
         assert_eq!(pages.new_pages(), NewPages::Copied);
         views.lock().unwrap().push(Observation {

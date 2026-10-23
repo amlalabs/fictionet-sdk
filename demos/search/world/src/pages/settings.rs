@@ -152,7 +152,7 @@ impl Pages {
                 if new_pages == NewPages::ModelWritten
                     && !matches!(self.maker, Some(Maker::Model(_)))
                 {
-                    return Err(invalid("Model-written pages need OPENROUTER_API_KEY"));
+                    return Err(invalid("Model-written pages need a host model credential"));
                 }
                 if new_pages == NewPages::LiveSearch && self.live.is_none() {
                     return Err(invalid("Live search needs EXA_API_KEY on the host"));
