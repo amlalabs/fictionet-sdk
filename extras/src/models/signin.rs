@@ -6,6 +6,7 @@ use fictionet::Cx;
 pub const HOSTS: &[&str] = &[
     "claude.ai",
     "claude.com",
+    "assets-proxy.anthropic.com",
     "console.anthropic.com",
     "platform.claude.com",
     "auth.openai.com",
@@ -39,6 +40,15 @@ impl fictionet::stdlib::world::net::PortServer for Relay {
     }
 }
 
+/// The authority under which an authentication request may leave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// An interactive sign-in request admitted before setup closed.
+    SignIn,
+    /// A validated refresh grant to the provider's token endpoint.
+    Refresh,
+}
+
 /// A setup window shared by sign-in hosts and the inference gateway.
 /// Closing it is irreversible for this run.
 #[derive(Clone, Default)]
@@ -56,25 +66,25 @@ impl Session {
     }
 
     /// The only post-login requests to a sign-in host exchange refresh tokens.
-    pub fn allows(
+    pub fn authorize(
         &self,
         host: &str,
         method: &http::Method,
         path: &str,
         body: &serde_json::Value,
-    ) -> bool {
+    ) -> Option<Access> {
         if !HOSTS.contains(&host) {
-            return false;
+            return None;
         }
         if !self.closed() {
-            return true;
+            return Some(Access::SignIn);
         }
         let client = match (host, path) {
             ("platform.claude.com", "/v1/oauth/token") => "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
             ("auth.openai.com", "/oauth/token") => "app_EMoamEEZ73f0CkXaXp7hrann",
-            _ => return false,
+            _ => return None,
         };
-        method == http::Method::POST
+        (method == http::Method::POST
             && body["grant_type"] == "refresh_token"
             && body["client_id"] == client
             && body["refresh_token"]
@@ -87,7 +97,8 @@ impl Session {
                         "grant_type" | "client_id" | "refresh_token" | "scope"
                     )
                 })
-            })
+            }))
+        .then_some(Access::Refresh)
     }
 }
 
@@ -97,15 +108,50 @@ mod tests {
     use http::Method;
     use serde_json::json;
 
+    fn allows(
+        session: &Session,
+        host: &str,
+        method: &Method,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> bool {
+        session.authorize(host, method, path, body).is_some()
+    }
+
     #[test]
     fn setup_closes_to_token_refresh_only() {
         let session = Session::default();
         let other = session.clone();
-        assert!(session.allows("claude.com", &Method::GET, "/oauth/authorize", &json!(null)));
-        assert!(!session.allows("example.com", &Method::GET, "/", &json!(null)));
+        assert!(allows(
+            &session,
+            "claude.com",
+            &Method::GET,
+            "/oauth/authorize",
+            &json!(null)
+        ));
+        assert!(!allows(
+            &session,
+            "example.com",
+            &Method::GET,
+            "/",
+            &json!(null)
+        ));
         assert!(session.close());
         assert!(!other.close());
-        assert!(!other.allows("claude.com", &Method::GET, "/oauth/authorize", &json!(null)));
+        assert!(!allows(
+            &other,
+            "claude.com",
+            &Method::GET,
+            "/oauth/authorize",
+            &json!(null)
+        ));
+        for host in HOSTS {
+            assert!(
+                session
+                    .authorize(host, &Method::GET, "/", &json!(null))
+                    .is_none()
+            );
+        }
         for (host, path, client) in [
             (
                 "platform.claude.com",
@@ -119,9 +165,10 @@ mod tests {
             ),
         ] {
             let body = json!({"grant_type":"refresh_token", "client_id":client, "refresh_token":"local-token"});
-            assert!(other.allows(host, &Method::POST, path, &body));
-            assert!(!other.allows(host, &Method::GET, path, &body));
-            assert!(!other.allows(
+            assert!(allows(&other, host, &Method::POST, path, &body));
+            assert!(!allows(&other, host, &Method::GET, path, &body));
+            assert!(!allows(
+                &other,
                 host,
                 &Method::POST,
                 &format!("{path}?redirect_uri=https://example.com"),
@@ -138,7 +185,7 @@ mod tests {
                     .as_object_mut()
                     .unwrap()
                     .extend(patch.as_object().unwrap().clone());
-                assert!(!other.allows(host, &Method::POST, path, &invalid));
+                assert!(!allows(&other, host, &Method::POST, path, &invalid));
             }
         }
     }

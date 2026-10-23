@@ -653,31 +653,40 @@ impl httpd::Handler for SignIn {
                     serde_json::from_slice(&body).unwrap_or_default()
                 };
                 let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
-                if !this
-                    .session
-                    .allows(host.trim_end_matches('.'), &parts.method, path, &parsed)
-                {
+                let access = this.session.authorize(
+                    host.trim_end_matches('.'),
+                    &parts.method,
+                    path,
+                    &parsed,
+                );
+                let Some(access) = access else {
                     this.pages.report(
                         &cx,
                         SearchObs::Egress {
                             host: this.host,
                             method: parts.method.to_string(),
-                            path: parts.uri.path().into(),
+                            path: "/[sign-in path omitted]".into(),
                             purpose: "sign-in".into(),
                             phase: "denied".into(),
                             status: Some(403),
                         },
                     );
                     return Ok(http::Response::builder().status(403).body(Body::empty())?);
-                }
+                };
+                let path = if access == fictionet_extras::models::signin::Access::Refresh {
+                    parts.uri.path()
+                } else {
+                    "/[sign-in path omitted]"
+                };
                 let report = |phase: &str, status| {
                     this.pages.report(
                         &cx,
                         SearchObs::Egress {
                             host: this.host.clone(),
                             method: parts.method.to_string(),
-                            path: parts.uri.path().into(),
-                            purpose: if this.session.closed() {
+                            path: path.into(),
+                            purpose: if access == fictionet_extras::models::signin::Access::Refresh
+                            {
                                 "token refresh"
                             } else {
                                 "sign-in"
@@ -691,7 +700,7 @@ impl httpd::Handler for SignIn {
                 report("attempt", None);
                 // Query strings, bodies and headers can contain credentials and are never recorded.
                 let mut forward = this.forward.clone();
-                let refresh = this.session.closed();
+                let refresh = access == fictionet_extras::models::signin::Access::Refresh;
                 let body = if refresh {
                     bytes::Bytes::from(parsed.to_string())
                 } else {

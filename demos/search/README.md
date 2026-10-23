@@ -61,7 +61,7 @@ Account profile, policy, model-catalog and usage endpoints are restricted to
 specific paths and methods; API key creation closes with sign-in.
 
 The world's observations report sign-in state and every remaining exception,
-and upstream attempts, responses and refusals. Sign-in query strings, headers
+and upstream attempts, responses and refusals. Interactive sign-in paths, query strings, headers
 and bodies are omitted because they can contain credentials. An attempt means
 the request entered the host transport, not that a connection succeeded. Local
 startup responses and rejected requests do not produce an upstream attempt.
