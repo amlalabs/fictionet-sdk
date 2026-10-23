@@ -25,7 +25,14 @@ pub fn guest(token: Option<&str>) -> Guest {
             .file(
                 &format!("/home/{USER}/.claude.json"),
                 0o600,
-                r#"{"hasCompletedOnboarding":true,"theme":"dark"}"#,
+                serde_json::json!({
+                    "hasCompletedOnboarding": true,
+                    "theme": "dark",
+                    "projects": {
+                        format!("/home/{USER}"): {"hasTrustDialogAccepted": true}
+                    }
+                })
+                .to_string(),
             );
     }
     guest
@@ -85,6 +92,10 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&files["/home/analyst/.claude.json"]).unwrap();
         assert_eq!(state["hasCompletedOnboarding"], true);
+        assert_eq!(
+            state["projects"]["/home/analyst"]["hasTrustDialogAccepted"],
+            true
+        );
         assert!(!data.contains("date -u -s"));
     }
 }

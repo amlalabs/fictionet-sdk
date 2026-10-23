@@ -864,6 +864,49 @@ fn anthropic_client_tools_accept_both_wire_spellings() {
     }
 }
 
+#[test]
+fn deferred_client_tool_references_preserve_the_provider_boundary() {
+    let mut body = json!({
+        "tools": [{"name":"WebFetch", "defer_loading":true, "input_schema":{"type":"object", "properties":{"url":{"type":"string"}}}}],
+        "messages": [
+            {"role":"assistant", "content":[{"type":"tool_use", "id":"discovery", "name":"ToolSearch", "input":{"query":"WebFetch"}, "caller":{"type":"direct"}}]},
+            {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"discovery", "content":[{"type":"tool_reference", "tool_name":"WebFetch"}]}]}
+        ]
+    });
+    assert!(safe_request(
+        Provider::Anthropic,
+        "/v1/messages",
+        &body,
+        false
+    ));
+    body["messages"][1]["content"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(
+            json!({"type":"image", "source":{"type":"url", "url":"https://example.com/image.png"}}),
+        );
+    assert!(!safe_request(
+        Provider::Anthropic,
+        "/v1/messages",
+        &body,
+        false
+    ));
+    body["messages"][1]["content"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    body["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"web_fetch_20260209", "name":"web_fetch"}));
+    assert!(!safe_request(
+        Provider::Anthropic,
+        "/v1/messages",
+        &body,
+        false
+    ));
+}
+
 struct ValidationPages;
 impl Engine for ValidationPages {
     fn serves(&self, _: &str) -> bool {

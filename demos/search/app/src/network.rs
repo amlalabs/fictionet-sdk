@@ -41,11 +41,19 @@ pub fn build(
         .0;
     let openai = world.ca.config(cx, "releases.openai.com")?.0;
     use fictionet_extras::models::{Model, Provider, signin};
-    let signin = signin::Session::default();
-    if claude_token.is_some() {
-        signin.close();
-    }
-    report_signin(&world.pages, cx, !signin.closed());
+    let signin = if claude_token.is_some() {
+        world.pages.report(
+            cx,
+            SearchObs::Signin {
+                open: false,
+                exceptions: Vec::new(),
+            },
+        );
+        signin::Session::inference_only()
+    } else {
+        report_signin(&world.pages, cx, true);
+        signin::Session::default()
+    };
     let signin_ca = world.ca.clone();
     let signin_pages = world.pages.clone();
     let signin_cx = cx.clone();

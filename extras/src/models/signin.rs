@@ -29,18 +29,37 @@ pub enum Access {
 
 /// A setup window shared by sign-in hosts and the inference gateway.
 /// Closing it is irreversible for this run.
-#[derive(Clone, Default)]
-pub struct Session(std::sync::Arc<std::sync::atomic::AtomicBool>);
+#[derive(Clone)]
+pub struct Session {
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    refresh: bool,
+}
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            closed: Default::default(),
+            refresh: true,
+        }
+    }
+}
 
 impl Session {
-    /// Whether the first successful inference has closed interactive sign-in.
+    /// A provisioned long-lived token needs neither sign-in nor refresh.
+    pub fn inference_only() -> Self {
+        Self {
+            closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            refresh: false,
+        }
+    }
+
+    /// Whether interactive sign-in is closed.
     pub fn closed(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Closes interactive sign-in and returns whether this changed the state.
     pub fn close(&self) -> bool {
-        !self.0.swap(true, std::sync::atomic::Ordering::AcqRel)
+        !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// The only post-login requests to a sign-in host exchange refresh tokens.
@@ -56,6 +75,9 @@ impl Session {
         }
         if !self.closed() {
             return Some(Access::SignIn);
+        }
+        if !self.refresh {
+            return None;
         }
         let client = match (host, path) {
             ("platform.claude.com", "/v1/oauth/token") => "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
@@ -94,6 +116,42 @@ mod tests {
         body: &serde_json::Value,
     ) -> bool {
         session.authorize(host, method, path, body).is_some()
+    }
+
+    #[test]
+    fn provisioned_tokens_have_no_sign_in_or_refresh_egress() {
+        let session = Session::inference_only();
+        assert!(session.closed());
+        assert!(!session.close());
+        for host in HOSTS {
+            assert!(!allows(
+                &session,
+                host,
+                &Method::GET,
+                "/oauth/authorize",
+                &json!(null)
+            ));
+        }
+        for (host, path, client) in [
+            (
+                "platform.claude.com",
+                "/v1/oauth/token",
+                "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            ),
+            (
+                "auth.openai.com",
+                "/oauth/token",
+                "app_EMoamEEZ73f0CkXaXp7hrann",
+            ),
+        ] {
+            assert!(!allows(
+                &session,
+                host,
+                &Method::POST,
+                path,
+                &json!({"grant_type":"refresh_token", "client_id":client, "refresh_token":"guest-token"})
+            ));
+        }
     }
 
     #[test]

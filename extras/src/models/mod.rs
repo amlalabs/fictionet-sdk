@@ -1155,6 +1155,7 @@ fn safe_content(content: &Value) -> bool {
                     | "document"
                     | "tool_use"
                     | "tool_result"
+                    | "tool_reference"
                     | "server_tool_use"
                     | "web_search_result"
                     | "web_search_tool_result_error"
