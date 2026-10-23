@@ -57,6 +57,19 @@ pub enum SearchObs {
         results: Vec<Hit>,
         error: Option<String>,
     },
+    Signin {
+        open: bool,
+        exceptions: Vec<String>,
+    },
+    Egress {
+        #[serde(serialize_with = "display")]
+        host: HostName,
+        method: String,
+        path: String,
+        purpose: String,
+        phase: String,
+        status: Option<u16>,
+    },
     NoRoute {
         from: IpAddr,
         to: IpAddr,

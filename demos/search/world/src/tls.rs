@@ -6,7 +6,7 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 /// The world's certificate authority, which signs a certificate for each
 /// host at its first handshake.
 pub struct Ca {
-    pub(super) issuer: fictionet::stdlib::services::ca::Ca,
+    pub(super) issuer: fictionet_extras::zscaler::Zscaler,
     pub(super) start: SystemTime,
 }
 
@@ -22,50 +22,38 @@ impl Ca {
     /// Makes a seeded CA without writing files, for an in-process world.
     pub fn in_memory(fcx: &Cx, start: SystemTime) -> fictionet::Result<Ca> {
         Ok(Ca {
-            issuer: fictionet::stdlib::services::ca::Ca::new(fcx, "Internet Security Root CA")?,
+            issuer: fictionet_extras::zscaler::zscaler(
+                fcx,
+                fictionet_extras::zscaler::DEFAULT_CLOUD,
+                time::OffsetDateTime::from(start).unix_timestamp(),
+            )?,
             start,
         })
     }
 
     /// Returns the public root certificate in PEM format for a guest to trust.
     pub fn cert_pem(&self) -> String {
-        self.issuer.cert_pem()
+        self.issuer.root_pem().to_owned()
     }
 
-    /// A certificate for `host`: the host as CN and SAN, for server auth,
-    /// issued 30 days before the world's date. The chain sent is the leaf,
-    /// then the CA. Returns the TLS config and the validity, for the log.
-    ///
-    /// A client checks the certificate against its own clock, which is the
-    /// host's, not the world's. So the validity covers both: it starts 30
-    /// days before the earlier of the two, and lasts 90 days, or longer if
-    /// that would end within 30 days of the later one.
+    /// Issues the site's Zscaler chain against the run clock.
     pub fn config(
         &self,
         fcx: &Cx,
         host: &str,
     ) -> fictionet::Result<(Arc<ServerConfig>, String, String)> {
         let world_now = time::OffsetDateTime::from(self.start + fcx.now().since_start());
-        let host_now = time::OffsetDateTime::now_utc();
-        let not_before = world_now.min(host_now) - time::Duration::days(30);
-        let not_after = (not_before + time::Duration::days(90))
-            .max(world_now.max(host_now) + time::Duration::days(30));
-        let leaf = self.issuer.issue(
-            fcx,
-            &[host],
-            fictionet::stdlib::protocols::x509::Validity {
-                not_before: fictionet::stdlib::protocols::x509::Time::from_unix(
-                    not_before.unix_timestamp(),
-                )?,
-                not_after: fictionet::stdlib::protocols::x509::Time::from_unix(
-                    not_after.unix_timestamp(),
-                )?,
-            },
-        )?;
+        let leaf = self
+            .issuer
+            .issue(fcx, &[host], world_now.unix_timestamp())?;
         let config = leaf.server_config(fcx, self.start)?;
         let day = |t: time::OffsetDateTime| {
             format!("{:04}-{:02}-{:02}", t.year(), t.month() as u8, t.day())
         };
-        Ok((config, day(not_before), day(not_after)))
+        Ok((
+            config,
+            day(world_now - time::Duration::days(1)),
+            day(world_now + time::Duration::days(395)),
+        ))
     }
 }

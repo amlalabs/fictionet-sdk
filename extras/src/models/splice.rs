@@ -74,12 +74,10 @@ pub(super) fn needed(body: &Value) -> bool {
 }
 fn kind(tool: &Value) -> Option<&'static str> {
     let kind = tool["type"].as_str()?;
-    if kind.starts_with("web_search_") {
-        Some("web_search")
-    } else if kind.starts_with("web_fetch_") {
-        Some("web_fetch")
-    } else {
-        None
+    match kind {
+        "web_search_20250305" | "web_search_20260209" => Some("web_search"),
+        "web_fetch_20250910" | "web_fetch_20260209" => Some("web_fetch"),
+        _ => None,
     }
 }
 fn definition(name: &str, kind: &str) -> Value {

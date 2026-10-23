@@ -763,3 +763,150 @@ fn guest_credentials_follow_each_request_without_replacement() {
         server.join().unwrap();
     }
 }
+
+#[test]
+fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
+    struct Transport;
+    impl web::Upstream for Transport {
+        fn request(self: Arc<Self>, _: Request<Body>) -> web::UpstreamFuture {
+            panic!("refused request entered the upstream transport")
+        }
+    }
+    fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(4), |cx| async move {
+        for (provider, path) in [
+            (Provider::Anthropic, "/v1/messages"),
+            (Provider::Anthropic, "/v1/messages/count_tokens"),
+            (Provider::OpenAi, "/v1/responses"),
+            (Provider::OpenAi, "/v1/chat/completions"),
+            (Provider::ChatGpt, "/backend-api/codex/responses"),
+            (Provider::OpenRouter, "/api/v1/chat/completions"),
+            (Provider::Gemini, "/v1beta/models/gemini-flash:generateContent"),
+        ] {
+            let model = Model::with_forward(&cx, provider, None,
+                web::forward(&cx, format!("https://{}", provider.host()).parse()?, Arc::new(Transport))?,
+                provider.host().into()).search(Arc::new(ValidationPages));
+            let content = [
+                json!({"type":"image","source":{"type":"url","url":"https://example.com/image"}}),
+                json!({"type":"document","source":{"type":"url","url":"https://example.com/file"}}),
+                json!({"type":"image_url","image_url":{"url":"https://example.com/image"}}),
+                json!({"type":"input_image","image_url":"https://example.com/image"}),
+                json!({"type":"input_file","file_url":"https://example.com/file"}),
+                json!({"type":"input_file","file_id":"external-file"}),
+                json!({"type":"file","file":{"file_data":"https://example.com/file"}}),
+                json!({"fileData":{"fileUri":"https://example.com/file"}}),
+                json!({"file_data":{"file_uri":"https://example.com/file"}}),
+            ];
+            let mut blocked = Vec::new();
+            for block in content {
+                blocked.push(json!({"model":"small", "messages":[{"role":"user","content":[block.clone()]}]}));
+                blocked.push(json!({"model":"small", "input":[{"role":"user","content":[block.clone()]}]}));
+                blocked.push(json!({"contents":[{"role":"user","parts":[block.clone()]}]}));
+                blocked.push(json!({"model":"small", "messages":[{"role":"user","content":[{"type":"tool_result", "tool_use_id":"local", "content":[block]}]}]}));
+            }
+            for tool in [json!({"type":"future_server_tool"}), json!({"type":"web_search_future"}), json!({"googleSearch":{}}), json!({"urlContext":{}}), json!({"type":"mcp", "server_url":"https://example.com"})] {
+                blocked.push(json!({"model":"small", "tools":[tool.clone()]}));
+                blocked.push(json!({"model":"small", "tools":[{"type":"web_search_20250305", "name":"web_search"},tool.clone()]}));
+                blocked.push(json!({"model":"small", "tools":[{"type":"web_search"},tool]}));
+            }
+            blocked.extend([
+                json!({"model":"small", "plugins":[{"id":"web"}], "tools":[{"type":"web_search_20250305","name":"web_search"}]}),
+                json!({"model":"small", "mcp_servers":[{"url":"https://example.com"}], "tools":[{"type":"web_search"}]}),
+                json!({"model":"small:online"}),
+                json!({"model":"small:online:free"}),
+                json!({"model":"small-search-preview"}),
+            ]);
+            for body in blocked {
+                let request = Request::post(path).header("authorization", "Bearer local-token").header("x-api-key", "local-token").header("x-goog-api-key", "local-token").body(Body::from(body.to_string()))?;
+                let response = model.clone().send(request).await?;
+                assert_eq!(response.status(), 400, "{provider:?} {body}");
+            }
+        }
+        Ok(())
+    })).unwrap();
+}
+
+#[test]
+fn inline_content_and_client_url_arguments_stay_usable() {
+    for body in [
+        json!({"messages":[{"role":"user","content":"Read https://example.com"}]}),
+        json!({"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"WebFetch","input":{"url":"https://example.com"}}]}]}),
+        json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YQ=="}}]}]}),
+        json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,YQ=="},{"type":"input_file","file_data":"data:application/pdf;base64,YQ=="}]}]}),
+        json!({"contents":[{"parts":[{"inlineData":{"mimeType":"image/png","data":"YQ=="}}]}]}),
+    ] {
+        assert!(
+            safe_request(Provider::Anthropic, "/v1/messages", &body, false),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn anthropic_client_tools_accept_both_wire_spellings() {
+    for provider in [Provider::Anthropic, Provider::OpenRouter] {
+        let path = if provider == Provider::Anthropic {
+            "/v1/messages"
+        } else {
+            "/api/v1/messages"
+        };
+        for typed in [false, true] {
+            let mut tool = json!({"name":"WebFetch", "description":"Read a page", "input_schema":{"type":"object", "properties":{"url":{"type":"string"}}}});
+            if typed {
+                tool["type"] = json!("custom");
+            }
+            assert!(safe_request(
+                provider,
+                path,
+                &json!({"tools":[tool]}),
+                false
+            ));
+        }
+    }
+}
+
+struct ValidationPages;
+impl Engine for ValidationPages {
+    fn serves(&self, _: &str) -> bool {
+        true
+    }
+    fn search(
+        self: Arc<Self>,
+        _: Cx,
+        _: String,
+        _: &'static str,
+        _: Value,
+    ) -> tools::Answer<Vec<crate::search::Result>> {
+        panic!("refused before search")
+    }
+    fn fetch(self: Arc<Self>, _: Cx, _: String) -> tools::Answer<tools::Page> {
+        panic!("refused before fetch")
+    }
+}
+
+#[test]
+fn the_provider_receives_only_the_validated_json_value() {
+    struct Transport;
+    impl web::Upstream for Transport {
+        fn request(self: Arc<Self>, request: Request<Body>) -> web::UpstreamFuture {
+            Box::pin(async move {
+                let bytes = request.into_body().collect().await?.to_bytes();
+                let wire = std::str::from_utf8(&bytes).unwrap();
+                assert!(!wire.contains("web_search_preview"));
+                assert!(!wire.contains("https://example.com"));
+                let body: Value = serde_json::from_slice(&bytes)?;
+                assert_eq!(body["tools"][0]["type"], "function");
+                assert_eq!(body["input"], "local text");
+                Ok(Response::new(Body::from(r#"{"usage":{}}"#)))
+            })
+        }
+    }
+    fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(5), |cx| async move {
+        let model = Model::with_forward(&cx, Provider::OpenAi, None,
+            web::forward(&cx, "https://api.openai.com".parse()?, Arc::new(Transport))?, "api.openai.com".into());
+        let body = r#"{"model":"small","tools":[{"type":"web_search_preview"}],"input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image"}]}],"tools":[{"type":"function","name":"local","parameters":{}}],"input":"local text"}"#;
+        let response = model.send(Request::post("/v1/responses").header("authorization", "Bearer local-token").body(Body::from(body))?).await?;
+        assert_eq!(response.status(), 200);
+        response.into_body().collect().await?;
+        Ok(())
+    })).unwrap();
+}
