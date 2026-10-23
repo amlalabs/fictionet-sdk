@@ -812,6 +812,7 @@ fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
                 json!({"model":"small", "plugins":[{"id":"web"}], "tools":[{"type":"web_search_20250305","name":"web_search"}]}),
                 json!({"model":"small", "mcp_servers":[{"url":"https://example.com"}], "tools":[{"type":"web_search"}]}),
                 json!({"model":"small:online"}),
+                json!({"model":"small:online:free"}),
                 json!({"model":"small-search-preview"}),
             ]);
             for body in blocked {
@@ -880,4 +881,32 @@ impl Engine for ValidationPages {
     fn fetch(self: Arc<Self>, _: Cx, _: String) -> tools::Answer<tools::Page> {
         panic!("refused before fetch")
     }
+}
+
+#[test]
+fn the_provider_receives_only_the_validated_json_value() {
+    struct Transport;
+    impl web::Upstream for Transport {
+        fn request(self: Arc<Self>, request: Request<Body>) -> web::UpstreamFuture {
+            Box::pin(async move {
+                let bytes = request.into_body().collect().await?.to_bytes();
+                let wire = std::str::from_utf8(&bytes).unwrap();
+                assert!(!wire.contains("web_search_preview"));
+                assert!(!wire.contains("https://example.com"));
+                let body: Value = serde_json::from_slice(&bytes)?;
+                assert_eq!(body["tools"][0]["type"], "function");
+                assert_eq!(body["input"], "local text");
+                Ok(Response::new(Body::from(r#"{"usage":{}}"#)))
+            })
+        }
+    }
+    fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(5), |cx| async move {
+        let model = Model::with_forward(&cx, Provider::OpenAi, None,
+            web::forward(&cx, "https://api.openai.com".parse()?, Arc::new(Transport))?, "api.openai.com".into());
+        let body = r#"{"model":"small","tools":[{"type":"web_search_preview"}],"input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image"}]}],"tools":[{"type":"function","name":"local","parameters":{}}],"input":"local text"}"#;
+        let response = model.send(Request::post("/v1/responses").header("authorization", "Bearer local-token").body(Body::from(body))?).await?;
+        assert_eq!(response.status(), 200);
+        response.into_body().collect().await?;
+        Ok(())
+    })).unwrap();
 }

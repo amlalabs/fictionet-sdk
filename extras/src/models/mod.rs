@@ -821,12 +821,16 @@ impl Model {
             let continued = self.continued.lock().unwrap();
             continued.finals.get(id).cloned()
         });
-        let bytes = match last {
-            Some(last) if path.ends_with("/responses") => {
-                body["previous_response_id"] = json!(last);
-                Bytes::from(body.to_string())
-            }
-            _ => bytes,
+        if let Some(last) = last
+            && path.ends_with("/responses")
+        {
+            body["previous_response_id"] = json!(last);
+        }
+        // Forward the value we validate, including when an input repeated a field.
+        let bytes = if parts.method == http::Method::POST {
+            Bytes::from(body.to_string())
+        } else {
+            bytes
         };
         if !safe_request(self.provider, &path, &body, self.engine.is_some()) {
             return Ok(self.provider.error(
@@ -960,9 +964,9 @@ fn safe_request(provider: Provider, path: &str, body: &Value, world: bool) -> bo
     ]
     .iter()
     .any(|key| body.get(key).is_some())
-        || body["model"]
-            .as_str()
-            .is_some_and(|name| name.ends_with(":online") || name.contains("-search-"))
+        || body["model"].as_str().is_some_and(|name| {
+            name.split(':').skip(1).any(|variant| variant == "online") || name.contains("-search-")
+        })
     {
         return false;
     }
