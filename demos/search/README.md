@@ -33,7 +33,8 @@ without a VM.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
-was 63.088 s and 7.208 s. The prepared boot recorded zero upstream attempts;
+was 63.088 s and 7.208 s. A subsequent warm boot reached full readiness in
+5.890 s. The prepared boot recorded zero upstream attempts;
 Firefox's start page was served inside the world. Corpus loading and indexing
 were 0.468 s before and 0.532 s after, with no indexing changes. The image build
 took 98 s using the existing verified Ubuntu downloads and produced a standalone
