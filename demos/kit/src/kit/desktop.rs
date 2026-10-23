@@ -165,6 +165,11 @@ pub fn codex(mut guest: Guest) -> Guest {
 /// shell quoting or expansion characters. Desktop setup precedes
 /// caller-added run steps.
 pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
+    browser_image(hostname, user, start_url).run("systemctl start vnc.service")
+}
+
+/// The installed browser and desktop, enabled for the next boot.
+pub(super) fn browser_image(hostname: &str, user: &str, start_url: &str) -> Guest {
     let rest = start_url
         .strip_prefix("https://")
         .or_else(|| start_url.strip_prefix("http://"));
@@ -224,8 +229,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
         "systemctl --user start dbus.socket\n\
          export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus\n\
          startxfce4 >/tmp/xfce.log 2>&1 &\n\
-         for _ in $(seq 1 150); do pgrep -x xfwm4 >/dev/null 2>&1 && break; sleep 0.2; done\n\
-         sleep 2\n\
+         for _ in $(seq 1 150); do wmctrl -m >/dev/null 2>&1 && break; sleep 0.2; done\n\
          firefox --profile \"$HOME/.mozilla/firefox/default\" '{start_url}' >/tmp/firefox.log 2>&1 &\n\
          # Maximized, Firefox follows the screen when the viewer resizes it.\n\
          for _ in $(seq 1 300); do wmctrl -x -r firefox -b add,maximized_vert,maximized_horz 2>/dev/null && break; sleep 0.2; done\n\
@@ -511,9 +515,9 @@ fn setup_script(user: &str) -> String {
          cp -R /opt/desktop/xfce4 /home/{user}/.config/\n\
          cp -R /opt/desktop/firefox /home/{user}/.mozilla/\n\
          chown -R {user}:{user} /home/{user}/.config /home/{user}/.mozilla\n\
-         # Bring the desktop up.\n\
+         # Enable the desktop for boot.\n\
          systemctl daemon-reload\n\
-         systemctl enable --now vnc.service\n\
+         systemctl enable vnc.service\n\
 ",
     )
 }

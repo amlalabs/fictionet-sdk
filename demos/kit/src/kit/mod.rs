@@ -1,6 +1,7 @@
 //! Guest provisioning, networking and process lifetime. Each app owns its page.
 pub mod bridge;
 pub mod desktop;
+pub mod image;
 pub mod jump;
 pub mod mirror;
 pub mod net;
@@ -53,11 +54,12 @@ pub struct Features {
     pub firefox: bool,
 }
 
-/// A guest's identity, resources, card, and cloud-init steps.
+/// A guest's identity, resources, card, and provisioning.
 #[derive(Clone)]
 pub struct Guest {
     /// Software installed by this guest's setup.
     pub features: Features,
+    image: Option<String>,
     hostname: String,
     attachment: String,
     user: String,
@@ -77,9 +79,9 @@ pub struct Guest {
 impl Guest {
     /// Creates an Ubuntu guest with 2 vCPUs, 2048 MiB, and `Family::FromWorld`.
     /// DMI defaults to manufacturer `LENOVO` and product `20UES000-WS`.
-    /// Disables background refreshes and network time.
-    pub fn ubuntu(hostname: &str, user: &str) -> Self {
-        let mut guest = Self {
+    fn base(hostname: &str, user: &str) -> Self {
+        Self {
+            image: None,
             features: Features::default(),
             hostname: hostname.into(),
             attachment: hostname.into(),
@@ -95,7 +97,20 @@ impl Guest {
             desktop: None,
             terminal: None,
             forbidden: Vec::new(),
-        };
+        }
+    }
+
+    /// A guest whose software and services are already installed in an image.
+    pub fn prepared(hostname: &str, user: &str, image: &str) -> Self {
+        let mut guest = Self::base(hostname, user);
+        guest.image = Some(image.into());
+        guest
+    }
+
+    /// An Ubuntu cloud guest provisioned on its first boot, with background
+    /// refreshes and network time disabled.
+    pub fn ubuntu(hostname: &str, user: &str) -> Self {
+        let mut guest = Self::base(hostname, user);
         guest = guest
             // The Pro apt hook contacts the contract service during package setup.
             .file("/etc/apt/apt.conf.d/20apt-esm-hook.conf", 0o644, "")
@@ -269,6 +284,21 @@ impl Guest {
             .is_some_and(|command| command.trim().is_empty() || command.contains('\0'))
         {
             return Err(io::Error::other("terminal needs a nonempty command"));
+        }
+        if let Some(image) = &self.image {
+            if !matches!(
+                Path::new(image).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            ) {
+                return Err(io::Error::other(
+                    "prepared image must be a file in the downloads directory",
+                ));
+            }
+            if !self.packages.is_empty() || !self.steps.is_empty() {
+                return Err(io::Error::other(
+                    "prepared guests cannot install software at boot",
+                ));
+            }
         }
         let texts = [
             ("DMI string", &self.manufacturer),
@@ -591,7 +621,7 @@ impl Run {
             .await?;
         println!("desktop up: {} ms", desktop.as_millis());
         for guest in &self.guests {
-            let setup = guest.wait_cloud_init(Duration::from_secs(300)).await?;
+            let setup = guest.wait_setup(Duration::from_secs(300)).await?;
             println!("{} ready: {} ms", guest.name(), setup.as_millis());
         }
         Ok(())
@@ -643,16 +673,27 @@ struct Prepared {
     backends: Vec<BackendInput>,
 }
 
-fn check_downloads(downloads: &Path) -> io::Result<()> {
+fn check_downloads(downloads: &Path, guests: &[Guest]) -> io::Result<()> {
     for file in [
         "cloud-hypervisor",
-        "ubuntu-24.04-server-cloudimg-amd64.img",
         "ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
         "ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
     ] {
         if !downloads.join(file).is_file() {
             return Err(io::Error::other(format!(
                 "missing {}",
+                downloads.join(file).display()
+            )));
+        }
+    }
+    for guest in guests {
+        let file = guest
+            .image
+            .as_deref()
+            .unwrap_or("ubuntu-24.04-server-cloudimg-amd64.img");
+        if !downloads.join(file).is_file() {
+            return Err(io::Error::other(format!(
+                "missing {}; build it with cargo xtask search-image <downloads>",
                 downloads.join(file).display()
             )));
         }
@@ -738,7 +779,7 @@ where
     F: Future<Output = fictionet::Result> + Send + 'static,
 {
     let downloads = downloads.as_ref();
-    check_downloads(downloads)?;
+    check_downloads(downloads, &guests)?;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -837,8 +878,11 @@ impl Run {
     }
 
     fn provision(&self, image: &Path, key: &str, ca: Option<(&str, &str)>) -> io::Result<()> {
-        let image = std::fs::canonicalize(image)?;
         for guest in &self.guests {
+            let image = std::fs::canonicalize(match &guest.guest.image {
+                Some(name) => image.parent().unwrap().join(name),
+                None => image.to_path_buf(),
+            })?;
             let r = &guest.resources;
             std::fs::write(
                 &r.seed,
@@ -971,10 +1015,28 @@ impl Run {
     }
 }
 impl GuestHandle {
-    /// Waits up to `timeout` for cloud-init to finish on the guest, and
-    /// returns the time from VM startup. Fails with cloud-init's exit code
-    /// and its `status --long` report, bounded to 64 KiB, unless cloud-init
-    /// finished cleanly.
+    async fn wait_setup(&self, timeout: Duration) -> io::Result<Duration> {
+        if self.guest.image.is_none() {
+            return self.wait_cloud_init(timeout).await;
+        }
+        let output = tokio::time::timeout(
+            timeout,
+            self.ssh()
+                .run_bounded("systemctl is-active workstation-settings.service", 64 << 10),
+        )
+        .await
+        .map_err(io::Error::other)??;
+        if output.code != 0 {
+            return Err(io::Error::other(format!(
+                "guest settings failed: {}{}",
+                output.stdout, output.stderr
+            )));
+        }
+        Ok(self.boot.elapsed())
+    }
+
+    /// Waits for cloud-init and returns time since boot. Nonzero status fails
+    /// with its report, bounded to 64 KiB.
     pub async fn wait_cloud_init(&self, timeout: Duration) -> io::Result<Duration> {
         let output = tokio::time::timeout(
             timeout,

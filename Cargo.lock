@@ -4873,6 +4873,10 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "fictionet-demo",
+ "tokio",
+]
 
 [[package]]
 name = "xz2"
