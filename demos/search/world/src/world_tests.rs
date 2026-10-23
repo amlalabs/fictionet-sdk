@@ -252,10 +252,7 @@ fn serve_latches_a_failed_record() {
             let failing = FailingWriter(Arc::new(AtomicUsize::new(0)));
             let addresses = Arc::new(writing_to(HashMap::new(), &store, failing));
             let start = SystemTime::UNIX_EPOCH;
-            let ca = Arc::new(Ca {
-                issuer: fictionet::stdlib::services::ca::Ca::new(&fcx, "Test CA")?,
-                start,
-            });
+            let ca = Arc::new(Ca::in_memory(&fcx, start)?);
             let (attacher, attachments) = fictionet::attachments();
             let seed = pages::Seed::builtin("web")?;
             let pages = Arc::new(Pages::new(seed));

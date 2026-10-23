@@ -82,7 +82,9 @@ async fn main() -> Result {
         Mode::Preview => return preview::run().await,
         Mode::App { downloads } => downloads,
     };
-    let seed = Seed::builtin(SEED)?;
+    let mut seed = Seed::builtin(SEED)?;
+    let today = time::OffsetDateTime::now_utc().date();
+    seed.date = today.to_string();
     let pages = Arc::new(app_pages(seed.clone(), &downloads)?);
     let output = downloads.join("search");
     std::fs::create_dir_all(&output)?;
@@ -107,7 +109,7 @@ async fn main() -> Result {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let boot = kit::boot(
         "search",
-        vec![guest::guest(&seed.date)],
+        vec![guest::guest()],
         downloads_for_boot,
         move |consoles| {
             let console = consoles.into_iter().next().expect("one workstation");
@@ -122,7 +124,7 @@ async fn main() -> Result {
             });
         },
         move |cx, mut run| async move {
-            let start = web_world::world_start(&seed.date)?;
+            let start = std::time::SystemTime::now();
             let web = World {
                 ca: Arc::new(Ca::in_memory(&cx, start)?),
                 addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),

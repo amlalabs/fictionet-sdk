@@ -25,6 +25,8 @@ http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1"
 httpdate = "1"
+url = "2"
+time = "0.3"
 tower-service = "0.3.3"
 # Parses the Chrome DevTools Protocol replies the desktop demo drives Chromium
 # with to screenshot the noVNC viewer.
