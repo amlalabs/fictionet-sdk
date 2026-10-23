@@ -139,7 +139,8 @@ async fn fetch(
 }
 #[test]
 fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
-    let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut observations) =
+        tokio::sync::mpsc::channel(web_world::observation::OBSERVATION_CAPACITY);
     fictionet::block_on(fictionet::lab(
         fictionet::Seed::from_u64(7),
         move |cx| async move {
@@ -224,7 +225,8 @@ fn caller_sites_precede_generated_sites_and_reserved_names_are_refused() {
 #[test]
 fn guest_fetches_keep_their_typed_request_headers() {
     let seed = Seed::builtin("web").unwrap();
-    let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut observations) =
+        tokio::sync::mpsc::channel(web_world::observation::OBSERVATION_CAPACITY);
     fictionet::block_on(fictionet::lab(
         fictionet::Seed::from_u64(7),
         move |cx| async move {

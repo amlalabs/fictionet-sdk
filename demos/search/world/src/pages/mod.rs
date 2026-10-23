@@ -168,7 +168,7 @@ pub struct Response {
     pub carries: u64,
 }
 impl Response {
-    fn new(
+    pub(crate) fn new(
         status: u16,
         content_type: impl Into<String>,
         body: impl Into<Vec<u8>>,
@@ -423,7 +423,7 @@ struct Planted {
 /// The world's pages: its seed, its store and what makes new pages.
 pub struct Pages {
     pub(crate) observation:
-        Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::observation::Observation>>>,
+        Mutex<Option<tokio::sync::mpsc::Sender<crate::observation::Observation>>>,
     seed: Seed,
     maker: Option<Maker>,
     prefetch: usize,

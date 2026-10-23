@@ -42,14 +42,51 @@ impl Handler {
             .cloned()
             .ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
         let (parts, body) = request.into_parts();
-        let body = body.collect().await?.to_bytes();
+        let body = match http_body_util::Limited::new(body, MAX_FORM_BYTES)
+            .collect()
+            .await
+        {
+            Ok(body) => body.to_bytes(),
+            Err(error)
+                if error
+                    .downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some() =>
+            {
+                let answer = crate::pages::Response::new(
+                    413,
+                    "text/plain",
+                    "Request body too large",
+                    Vec::new(),
+                    crate::pages::Meta::Missing,
+                );
+                self.pages.report_response(
+                    &self.fcx,
+                    crate::observation::RequestContext {
+                        scheme: &target.scheme,
+                        host: &target.host.parse()?,
+                        method: &parts.method,
+                        path: parts
+                            .uri
+                            .path_and_query()
+                            .unwrap_or(&http::uri::PathAndQuery::from_static("/")),
+                        source: self.pages.source(),
+                        headers: parts.headers,
+                    },
+                    &answer,
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Full::new(Bytes::from_static(b"Request body too large")))?);
+            }
+            Err(error) => return Err(fictionet::Error::msg(error)),
+        };
         let form = (parts.method == http::Method::POST
             && parts
                 .headers
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("form-urlencoded")))
-        .then_some(&body[..body.len().min(MAX_FORM_BYTES)]);
+        .then_some(&body[..]);
         let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         let action = route(&target.host, path, form);
         let page_source = self.pages.source();
@@ -73,6 +110,7 @@ impl Handler {
         self.pages.report_response(
             &self.fcx,
             crate::observation::RequestContext {
+                scheme: &target.scheme,
                 host: &target.host.parse()?,
                 method: &parts.method,
                 path: &parts
@@ -117,5 +155,83 @@ impl tower_service::Service<Request<Body>> for Handler {
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         Box::pin(self.clone().serve(request))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::stdlib::web::httpd::{self, Handler as _};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Chunks {
+        read: Arc<AtomicUsize>,
+    }
+    impl http_body::Body for Chunks {
+        type Data = Bytes;
+        type Error = fictionet::Error;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            self.read.fetch_add(16 * 1024, Ordering::Relaxed);
+            Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from(vec![
+                b'x';
+                16 * 1024
+            ])))))
+        }
+    }
+
+    #[test]
+    fn oversized_bodies_are_rejected_before_routing_and_chunked_bodies_stop_reading() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                let pages = Arc::new(Pages::new(crate::pages::Seed::builtin("web")?));
+                let (sender, mut facts) =
+                    tokio::sync::mpsc::channel(crate::observation::OBSERVATION_CAPACITY);
+                pages.observe(sender);
+                let hosts = httpd::VirtualHosts::new();
+                hosts.insert(
+                    "www.google.com",
+                    httpd::VHost::new(httpd::tower(Handler::new(&cx, pages))),
+                );
+                let read = Arc::new(AtomicUsize::new(0));
+                for (body, length) in [
+                    (
+                        Body::from(vec![b'x'; MAX_FORM_BYTES + 1]),
+                        Some(MAX_FORM_BYTES + 1),
+                    ),
+                    (Body::new(Chunks { read: read.clone() }), None),
+                ] {
+                    let mut request = Request::post("/search")
+                        .header("host", "www.google.com")
+                        .header(CONTENT_TYPE, "application/x-www-form-urlencoded");
+                    if let Some(length) = length {
+                        request = request.header(CONTENT_LENGTH, length);
+                    }
+                    let reply = hosts.call(
+                        request.body(body)?,
+                        &mut httpd::Exchange::new(cx.now(), &cx, &Default::default()),
+                    );
+                    let response = match reply {
+                        httpd::Reply::Now(response) => response,
+                        httpd::Reply::Later(work) => work(cx.clone()).await?,
+                    };
+                    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+                    assert!(matches!(
+                        facts.try_recv().unwrap().fact,
+                        crate::observation::SearchObs::Request {
+                            status: StatusCode::PAYLOAD_TOO_LARGE,
+                            ..
+                        }
+                    ));
+                    assert!(facts.try_recv().is_err());
+                }
+                assert_eq!(read.load(Ordering::Relaxed), MAX_FORM_BYTES + 16 * 1024);
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 }

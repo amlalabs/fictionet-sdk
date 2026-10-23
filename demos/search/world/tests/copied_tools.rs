@@ -100,7 +100,8 @@ fn intercepted_search(bearer: bool) {
         )
         .unwrap(),
     );
-    let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut observations) =
+        tokio::sync::mpsc::channel(web_world::observation::OBSERVATION_CAPACITY);
     pages.observe(sender);
     fictionet::block_on(fictionet::run(
         fictionet::Seed::from_u64(17),

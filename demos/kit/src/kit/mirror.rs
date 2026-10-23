@@ -24,6 +24,8 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tower_service::Service;
 
+type UpstreamObserver = dyn Fn(&Request<Body>, Option<StatusCode>) + Send + Sync;
+
 type Answer = Result<Response<Body>, Error>;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -42,14 +44,21 @@ pub struct Mirror<S> {
     root: PathBuf,
     pub(crate) closed: Arc<AtomicBool>,
     download: Arc<tokio::sync::Mutex<()>>,
+    observer: Option<Arc<UpstreamObserver>>,
 }
 impl<S> Mirror<S> {
+    /// Reports only requests that use the upstream, excluding cache hits and closed setup.
+    pub fn observe_upstream(mut self, observer: Arc<UpstreamObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
     fn new(upstream: S, root: PathBuf) -> Self {
         Self {
             upstream,
             root,
             closed: Arc::default(),
             download: Arc::default(),
+            observer: None,
         }
     }
 }
@@ -208,7 +217,22 @@ where
             if mirror.closed.load(Ordering::Acquire) {
                 return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
             }
+            let observed = if mirror.observer.is_some() {
+                let mut head = Request::new(Body::empty());
+                *head.method_mut() = request.method().clone();
+                *head.uri_mut() = request.uri().clone();
+                *head.extensions_mut() = request.extensions().clone();
+                Some(head)
+            } else {
+                None
+            };
+            if let (Some(observer), Some(head)) = (&mirror.observer, &observed) {
+                observer(head, None);
+            }
             let response = mirror.upstream.call(request).await?;
+            if let (Some(observer), Some(head)) = (&mirror.observer, &observed) {
+                observer(head, Some(response.status()));
+            }
             let Some(path) = path.filter(|_| {
                 response.status() == StatusCode::OK
                     && !response.headers().contains_key(header::CONTENT_ENCODING)

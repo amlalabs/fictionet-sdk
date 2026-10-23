@@ -85,7 +85,7 @@ async fn real_search_page_and_dns_facts_reach_the_owned_views_without_an_observe
         assert_eq!(request.path,"/black-hole");
         assert_eq!(request.status,200);
         assert!(request.has_preview);
-        assert!(views.preview("sky.org","/black-hole",current.at_ms).unwrap().contains("bends spacetime"));
+        assert!(views.preview(&"https://sky.org/black-hole".parse().unwrap(),current.at_ms).unwrap().contains("bends spacetime"));
         assert!(matches!(request.source,PageSource::Copy { .. }));
         assert_eq!(request.headers,vec![("host".into(),"sky.org".into()),("user-agent".into(),"Firefox/1".into())]);
         assert!(current.activity.iter().any(|row|matches!(&row.fact,SearchObs::Resolved {name,address:None} if name.to_ascii()=="wiki.corp")));
@@ -252,6 +252,7 @@ async fn page_routes_serve_local_components_and_stream_current_state() {
     page.views.lock().unwrap().push(Observation {
         at_ms: 1,
         fact: SearchObs::Request {
+            scheme: http::uri::Scheme::HTTPS,
             host: "sky.org".parse().unwrap(),
             method: http::Method::GET,
             path: http::uri::PathAndQuery::from_static("/article"),
@@ -357,4 +358,232 @@ async fn authenticated_server_rejects_cross_origin_reads_and_writes() {
     assert!(allowed.starts_with("HTTP/1.1 200"));
     assert!(allowed.contains("\"copied\":true"));
     server.shutdown().await;
+}
+
+#[test]
+fn activity_updates_a_model_call_in_place_and_local_calls_have_no_egress() {
+    let mut views = Views::default();
+    for (at_ms, phase) in [
+        (100, CallPhase::Connecting),
+        (200, CallPhase::Receiving),
+        (300, CallPhase::Complete),
+    ] {
+        views.push(Observation {
+            at_ms,
+            fact: SearchObs::ModelCall {
+                call: 1,
+                host: "api.anthropic.com".parse().unwrap(),
+                method: http::Method::GET,
+                path: http::uri::PathAndQuery::from_static("/api/hello"),
+                status: Some(http::StatusCode::OK),
+                phase,
+            },
+        });
+    }
+    let view = views.current();
+    assert_eq!(view.activity.len(), 1);
+    assert_eq!(view.activity[0].at_ms, 100);
+    assert_eq!(view.calls.len(), 1);
+    assert!(view.egress.is_empty());
+    assert!(matches!(
+        view.activity[0].fact,
+        SearchObs::ModelCall {
+            phase: CallPhase::Complete,
+            ..
+        }
+    ));
+    views.push(Observation {
+        at_ms: 400,
+        fact: SearchObs::Egress {
+            host: "archive.ubuntu.com".parse().unwrap(),
+            method: "GET".into(),
+            path: "/ubuntu/dists/noble/InRelease".into(),
+            purpose: "setup".into(),
+            phase: "attempt".into(),
+            status: None,
+        },
+    });
+    assert!(views.at(399).egress.is_empty());
+    assert_eq!(views.current().egress.len(), 1);
+}
+
+#[tokio::test]
+async fn each_launch_preserves_its_own_readable_private_record_and_drains_the_queue() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory =
+        fictionet_demo::kit::RunDir::new(&std::env::temp_dir(), "search-record").unwrap();
+    for _ in 0..2 {
+        let pages = pages();
+        let (page, _) = Page::new(&pages, true);
+        let (sender, receiver) = mpsc::channel(4);
+        for at_ms in [100, 200] {
+            sender
+                .try_send(Observation {
+                    at_ms,
+                    fact: SearchObs::NoRoute {
+                        from: "10.0.0.2".parse().unwrap(),
+                        to: "1.1.1.1".parse().unwrap(),
+                    },
+                })
+                .unwrap();
+        }
+        drop(sender);
+        page.record(receiver, directory.path()).await.unwrap();
+        assert_eq!(page.snapshots.borrow().activity.len(), 2);
+    }
+    let files: Vec<_> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|file| file.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 2);
+    for file in files {
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let text = std::fs::read_to_string(file).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0]["timestamp"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(lines[1]["at_ms"], 200);
+    }
+}
+
+#[tokio::test]
+async fn observation_failure_is_recorded_and_fails_the_recording_task() {
+    let directory =
+        fictionet_demo::kit::RunDir::new(&std::env::temp_dir(), "search-record").unwrap();
+    let (page, _) = Page::new(&pages(), true);
+    let (sender, receiver) = mpsc::channel(2);
+    sender
+        .try_send(Observation {
+            at_ms: 1,
+            fact: SearchObs::ObservationFailed {
+                reason: "Observation queue exceeded its capacity".into(),
+            },
+        })
+        .unwrap();
+    drop(sender);
+    assert!(
+        page.record(receiver, directory.path())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("capacity")
+    );
+    let file = std::fs::read_dir(directory.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(
+        std::fs::read_to_string(file)
+            .unwrap()
+            .contains("observation_failed")
+    );
+}
+
+#[test]
+fn previews_match_the_exact_page_scheme_query_and_observation_time() {
+    let mut views = Views::default();
+    for (at_ms, scheme, path, text) in [
+        (100, http::uri::Scheme::HTTPS, "/black-hole", "Black hole"),
+        (
+            200,
+            http::uri::Scheme::HTTPS,
+            "/solar-system",
+            "Solar system",
+        ),
+        (300, http::uri::Scheme::HTTP, "/black-hole", "Plain HTTP"),
+        (
+            400,
+            http::uri::Scheme::HTTPS,
+            "/black-hole?edition=2",
+            "Second edition",
+        ),
+    ] {
+        views.push(Observation {
+            at_ms,
+            fact: SearchObs::Request {
+                scheme,
+                host: "sky.org".parse().unwrap(),
+                method: http::Method::GET,
+                path: path.parse().unwrap(),
+                status: http::StatusCode::OK,
+                bytes: text.len(),
+                content_type: "text/html".into(),
+                source: PageSource::Copy { captured: None },
+                elapsed_ms: 0,
+                headers: http::HeaderMap::new(),
+                preview: Some(Arc::from(text)),
+            },
+        });
+    }
+    for (url, expected) in [
+        ("https://sky.org/black-hole", "Black hole"),
+        ("https://sky.org/solar-system", "Solar system"),
+        ("http://sky.org/black-hole", "Plain HTTP"),
+        ("https://sky.org/black-hole?edition=2", "Second edition"),
+    ] {
+        assert_eq!(
+            views.preview(&url.parse().unwrap(), 400).as_deref(),
+            Some(expected)
+        );
+    }
+    assert!(
+        views
+            .preview(&"https://sky.org/solar-system".parse().unwrap(), 100)
+            .is_none()
+    );
+    assert!(
+        views
+            .preview(&"https://sky.org/unopened".parse().unwrap(), 400)
+            .is_none()
+    );
+}
+
+#[test]
+fn setup_connections_and_sign_in_policy_remain_visible_after_activity_expires() {
+    let mut views = Views::default();
+    views.push(Observation {
+        at_ms: 100,
+        fact: SearchObs::Egress {
+            host: "archive.ubuntu.com".parse().unwrap(),
+            method: "GET".into(),
+            path: "/ubuntu/dists/noble/InRelease".into(),
+            purpose: "setup".into(),
+            phase: "attempt".into(),
+            status: None,
+        },
+    });
+    views.push(Observation {
+        at_ms: 200,
+        fact: SearchObs::Signin {
+            open: false,
+            exceptions: vec!["Token refresh".into()],
+        },
+    });
+    for at_ms in 300..HISTORY as u64 + 400 {
+        views.push(Observation {
+            at_ms,
+            fact: SearchObs::NoRoute {
+                from: "10.0.0.2".parse().unwrap(),
+                to: "1.1.1.1".parse().unwrap(),
+            },
+        });
+    }
+    let view = views.current();
+    assert!(view.egress.is_empty());
+    assert_eq!(view.connections.len(), 1);
+    assert_eq!(view.connections[0].host, "archive.ubuntu.com");
+    assert!(matches!(
+        view.signin.unwrap().fact,
+        SearchObs::Signin { open: false, .. }
+    ));
+    assert!(views.at(99).connections.is_empty());
+    assert!(views.at(199).signin.is_none());
 }
