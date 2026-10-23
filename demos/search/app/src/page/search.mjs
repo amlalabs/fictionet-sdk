@@ -106,6 +106,8 @@ function activityText(row) {
     case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
     case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${fact.path} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
+    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Sign-in open until the first successful inference' : `Sign-in closed · ${fact.exceptions.join(', ')}`, 'calls'];
+    case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${fact.path} · ${fact.status || fact.phase}`, 'calls'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
     default: return ['', '', '', 'router'];
   }

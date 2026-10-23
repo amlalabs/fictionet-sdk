@@ -21,7 +21,7 @@ pub const FORWARDED: &[(&str, &str)] = &[
 ];
 
 /// The world's network for the guest run and the preview: the web,
-/// with package downloads mirrored, sign-in relayed over raw TLS, and model
+/// with package downloads mirrored, sign-in inspected during setup, and model
 /// search and fetch answered by the world using the guest’s own credentials.
 pub fn build(
     world: &web_world::World,
@@ -39,7 +39,30 @@ pub fn build(
         .config(cx, fictionet_demo::kit::desktop::CLAUDE_HOST)?
         .0;
     let openai = world.ca.config(cx, "releases.openai.com")?.0;
-    use fictionet_extras::models::{Model, Provider};
+    use fictionet_extras::models::{Model, Provider, signin};
+    let signin = signin::Session::default();
+    report_signin(&world.pages, cx, true);
+    let signins = signin::HOSTS
+        .iter()
+        .map(|host| {
+            Ok((
+                *host,
+                (
+                    SignIn {
+                        session: signin.clone(),
+                        pages: world.pages.clone(),
+                        host: host.parse()?,
+                        forward: fictionet::stdlib::web::forward(
+                            cx,
+                            format!("https://{host}").parse()?,
+                            Arc::new(fictionet_host::Client::new()),
+                        )?,
+                    },
+                    world.ca.config(cx, host)?.0,
+                ),
+            ))
+        })
+        .collect::<fictionet::Result<Vec<_>>>()?;
     let models = [Provider::Anthropic, Provider::OpenAi, Provider::ChatGpt]
         .into_iter()
         .map(|provider| {
@@ -50,6 +73,7 @@ pub fn build(
                         model: Model::guest(cx, provider)?,
                         pages: world.pages.clone(),
                         host: provider.host().parse()?,
+                        signin: signin.clone(),
                     },
                     world.ca.config(cx, provider.host())?.0,
                 ),
@@ -64,14 +88,11 @@ pub fn build(
                     .into_host(host),
             );
         }
-        if fictionet_extras::models::signin::HOSTS.contains(&host) {
+        if let Some((_, (signin, tls))) = signins.iter().find(|(name, _)| *name == host) {
             return Some(
-                fictionet::stdlib::world::net::Host::new(host)
-                    .dns_name(host)
-                    .port_server(
-                        443,
-                        fictionet_extras::models::signin::Relay(format!("{host}:443")),
-                    ),
+                Site::handler(signin.clone())
+                    .tls(tls.clone())
+                    .into_host(host),
             );
         }
         FORWARDED.iter().any(|(name, _)| *name == host).then(|| {
@@ -98,6 +119,7 @@ struct Gateway {
     model: fictionet_extras::models::Model,
     pages: Arc<web_world::pages::Pages>,
     host: web_world::observation::HostName,
+    signin: fictionet_extras::models::signin::Session,
 }
 impl httpd::Handler for Gateway {
     fn call(
@@ -105,6 +127,14 @@ impl httpd::Handler for Gateway {
         request: http::Request<Body>,
         exchange: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
+        if self.signin.closed() && request.uri().path() == "/api/oauth/cli/create_api_key" {
+            return httpd::Reply::Now(
+                http::Response::builder()
+                    .status(403)
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+        }
         let call = exchange.random_u64();
         let path = request
             .uri()
@@ -117,6 +147,45 @@ impl httpd::Handler for Gateway {
         let model = self.model.clone().search(Arc::new(Tools {
             pages: pages.clone(),
             call,
+        }));
+        let egress_pages = pages.clone();
+        let egress_host = host.clone();
+        let signin = self.signin.clone();
+        let model = model.observe_upstream(Arc::new(move |cx, method, path, status| {
+            egress_pages.report(
+                cx,
+                SearchObs::Egress {
+                    host: egress_host.clone(),
+                    method: method.to_string(),
+                    path: path.path().into(),
+                    purpose: if path.path().contains("oauth") {
+                        "account"
+                    } else {
+                        "model"
+                    }
+                    .into(),
+                    phase: if status.is_some() {
+                        "response"
+                    } else {
+                        "attempt"
+                    }
+                    .into(),
+                    status: status.map(|s| s.as_u16()),
+                },
+            );
+            if method == http::Method::POST
+                && matches!(
+                    path.path(),
+                    "/v1/messages"
+                        | "/v1/responses"
+                        | "/v1/chat/completions"
+                        | "/backend-api/codex/responses"
+                )
+                && status.is_some_and(|s| s.is_success())
+                && signin.close()
+            {
+                report_signin(&egress_pages, cx, false);
+            }
         }));
         let reply = model.call(request, exchange);
         httpd::Reply::Later(Box::new(move |cx| {
@@ -402,6 +471,7 @@ mod tests {
         );
         let (page, (mut observations, _)) = crate::page::Page::new(&pages, false);
         fictionet::run(fictionet::Seed::from_u64(7), move |cx| async move {
+            let signin = fictionet_extras::models::signin::Session::default();
             let gateway = Gateway {
                 model: fictionet_extras::models::Model::guest_at(
                     &cx,
@@ -410,6 +480,7 @@ mod tests {
                 )?,
                 pages,
                 host: "api.anthropic.com".parse().unwrap(),
+                signin: signin.clone(),
             };
             let request = http::Request::post("/v1/messages")
                 .header("x-api-key", "local-only")
@@ -430,11 +501,14 @@ mod tests {
             let bytes = response.into_body().collect().await?.to_bytes();
             let body: Value = serde_json::from_slice(&bytes)?;
             assert_eq!(body["stop_reason"], "end_turn");
+            assert!(signin.closed());
             while let Ok(row) = observations.try_recv() {
                 page.publish(row);
             }
             let view = page.snapshots.borrow();
             assert_eq!(view.calls.len(), 1);
+            assert_eq!(view.activity.iter().filter(|row| matches!(row.fact, SearchObs::Egress { ref phase, .. } if phase == "attempt")).count(), 3);
+            assert_eq!(view.activity.iter().filter(|row| matches!(row.fact, SearchObs::Signin { open: false, .. })).count(), 1);
             let call = &view.calls[0];
             assert_eq!(call.status, Some(200));
             assert_eq!(call.phase, CallPhase::Complete);
@@ -449,5 +523,179 @@ mod tests {
         .unwrap();
         assert_eq!(turns.load(Ordering::SeqCst), 3);
         upstream.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sign_in_requests_close_on_existing_handlers_and_refresh_remains_observed() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let received = count.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let upstream = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let received = received.clone();
+            async move {
+                let n = received.fetch_add(1, Ordering::SeqCst);
+                if n == 1 {
+                    assert_eq!(request.uri().path(), "/v1/oauth/token");
+                    let body = axum::body::to_bytes(request.into_body(), 65536)
+                        .await
+                        .unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["grant_type"], "refresh_token");
+                    assert_eq!(body["refresh_token"], "private-refresh");
+                }
+                http::StatusCode::OK
+            }
+        });
+        let upstream = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        fictionet::run(fictionet::Seed::from_u64(3), |cx| async move {
+            let pages = Arc::new(web_world::pages::Pages::new(web_world::pages::Seed::builtin("web")?));
+            let (sender, mut observations) = tokio::sync::mpsc::unbounded_channel();
+            pages.observe(sender);
+            let session = fictionet_extras::models::signin::Session::default();
+            let handler = SignIn { session: session.clone(), pages, host: "platform.claude.com".parse()?, forward: fictionet::stdlib::web::forward(&cx, origin, Arc::new(fictionet_host::Client::new()))? };
+            let send = |request| {
+                let reply = handler.call(request, &mut httpd::Exchange::new(cx.now(), &cx, &Default::default()));
+                let httpd::Reply::Later(work) = reply else { panic!("deferred sign-in") };
+                work(cx.clone())
+            };
+            assert_eq!(send(http::Request::get("/oauth/authorize?code=private-code").body(Body::empty())?).await?.status(), 200);
+            session.close();
+            assert_eq!(send(http::Request::get("/oauth/authorize").body(Body::empty())?).await?.status(), 403);
+            assert_eq!(send(http::Request::post("/v1/oauth/token").body(Body::from(r#"{"grant_type":"authorization_code"}"#))?).await?.status(), 403);
+            let refresh = "grant_type=authorization_code&grant_type=refresh_token&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&refresh_token=private-refresh";
+            assert_eq!(send(http::Request::post("/v1/oauth/token").header("content-type", "application/x-www-form-urlencoded").body(Body::from(refresh))?).await?.status(), 200);
+            let mut facts = Vec::new();
+            while let Ok(row) = observations.try_recv() { facts.push(row); }
+            assert_eq!(facts.iter().filter(|r| matches!(r.fact, SearchObs::Egress { ref phase, .. } if phase == "attempt")).count(), 2);
+            assert_eq!(facts.iter().filter(|r| matches!(r.fact, SearchObs::Egress { ref phase, .. } if phase == "denied")).count(), 2);
+            let recorded = serde_json::to_string(&facts)?;
+            assert!(!recorded.contains("private-code"));
+            assert!(!recorded.contains("private-refresh"));
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        upstream.abort();
+    }
+}
+
+fn report_signin(pages: &web_world::pages::Pages, cx: &Cx, open: bool) {
+    pages.report(cx, SearchObs::Signin { open, exceptions: if open {
+        fictionet_extras::models::signin::HOSTS.iter().map(|host| format!("https://{host}:443 during sign-in")).collect()
+    } else {
+        vec!["POST platform.claude.com/v1/oauth/token with a refresh grant".into(), "POST auth.openai.com/oauth/token with a refresh grant".into(),
+             "GET api.anthropic.com/api/oauth/profile and /api/oauth/roles".into(), "GET api.anthropic.com/api/claude_code/policy_limits".into(),
+             "GET chatgpt.com/backend-api/codex/models, /backend-api/wham/accounts/check and /backend-api/wham/usage".into()]
+    }});
+}
+
+#[derive(Clone)]
+struct SignIn {
+    session: fictionet_extras::models::signin::Session,
+    pages: Arc<web_world::pages::Pages>,
+    host: web_world::observation::HostName,
+    forward: fictionet::stdlib::web::Forward,
+}
+impl httpd::Handler for SignIn {
+    fn call(&self, request: http::Request<Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        use http_body_util::BodyExt;
+        let this = self.clone();
+        httpd::Reply::Later(Box::new(move |cx| {
+            Box::pin(async move {
+                let (parts, body) = request.into_parts();
+                let body = match http_body_util::Limited::new(body, 64 * 1024)
+                    .collect()
+                    .await
+                {
+                    Ok(body) => body.to_bytes(),
+                    Err(_) => {
+                        return Ok(http::Response::builder().status(413).body(Body::empty())?);
+                    }
+                };
+                let host = this.host.to_ascii();
+                let parsed = if parts
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .is_some_and(|v| {
+                        v.as_bytes()
+                            .starts_with(b"application/x-www-form-urlencoded")
+                    }) {
+                    serde_json::Value::Object(
+                        url::form_urlencoded::parse(&body)
+                            .map(|(k, v)| {
+                                (k.into_owned(), serde_json::Value::String(v.into_owned()))
+                            })
+                            .collect(),
+                    )
+                } else {
+                    serde_json::from_slice(&body).unwrap_or_default()
+                };
+                let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
+                if !this
+                    .session
+                    .allows(host.trim_end_matches('.'), &parts.method, path, &parsed)
+                {
+                    this.pages.report(
+                        &cx,
+                        SearchObs::Egress {
+                            host: this.host,
+                            method: parts.method.to_string(),
+                            path: parts.uri.path().into(),
+                            purpose: "sign-in".into(),
+                            phase: "denied".into(),
+                            status: Some(403),
+                        },
+                    );
+                    return Ok(http::Response::builder().status(403).body(Body::empty())?);
+                }
+                let report = |phase: &str, status| {
+                    this.pages.report(
+                        &cx,
+                        SearchObs::Egress {
+                            host: this.host.clone(),
+                            method: parts.method.to_string(),
+                            path: parts.uri.path().into(),
+                            purpose: if this.session.closed() {
+                                "token refresh"
+                            } else {
+                                "sign-in"
+                            }
+                            .into(),
+                            phase: phase.into(),
+                            status,
+                        },
+                    )
+                };
+                report("attempt", None);
+                // Query strings, bodies and headers can contain credentials and are never recorded.
+                let mut forward = this.forward.clone();
+                let refresh = this.session.closed();
+                let body = if refresh {
+                    bytes::Bytes::from(parsed.to_string())
+                } else {
+                    body
+                };
+                let mut request = http::Request::from_parts(parts.clone(), Body::from(body));
+                if refresh {
+                    request.headers_mut().insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_static("application/json"),
+                    );
+                    request.headers_mut().remove(http::header::CONTENT_LENGTH);
+                }
+                request
+                    .headers_mut()
+                    .insert(http::header::HOST, host.trim_end_matches('.').parse()?);
+                let result = tower_service::Service::call(&mut forward, request).await;
+                report(
+                    if result.is_ok() { "response" } else { "failed" },
+                    result.as_ref().ok().map(|r| r.status().as_u16()),
+                );
+                result
+            })
+        }))
     }
 }

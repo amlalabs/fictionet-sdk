@@ -372,7 +372,12 @@ pub struct Model {
     cipher: Arc<splice::TokenCipher>,
     continued: Arc<Mutex<Continued>>,
     catalog: Option<Catalog>,
+    upstream: Option<Arc<UpstreamObserver>>,
 }
+/// Reports an upstream attempt and then its response status, without credentials or bodies.
+pub type UpstreamObserver =
+    dyn Fn(&Cx, &http::Method, &http::uri::PathAndQuery, Option<http::StatusCode>) + Send + Sync;
+
 #[derive(Clone)]
 enum Catalog {
     Forward,
@@ -490,8 +495,32 @@ impl Model {
             cipher: Arc::new(splice::TokenCipher::new(cx)),
             continued: Arc::default(),
             catalog: None,
+            upstream: None,
         }
     }
+    /// Observes requests that actually enter the upstream transport, including splice turns.
+    pub fn observe_upstream(mut self, observer: Arc<UpstreamObserver>) -> Self {
+        self.upstream = Some(observer);
+        self
+    }
+
+    async fn forward_request(&self, request: Request<Body>) -> fictionet::Result<Response<Body>> {
+        let method = request.method().clone();
+        let path = request
+            .uri()
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        if let Some(observer) = &self.upstream {
+            observer(&self.cx, &method, &path, None);
+        }
+        let result = self.forward.clone().call(request).await;
+        if let (Some(observer), Ok(response)) = (&self.upstream, &result) {
+            observer(&self.cx, &method, &path, Some(response.status()));
+        }
+        result
+    }
+
     /// Serves Codex's API-key catalog from an origin or a supplied catalog.
     pub fn codex_catalog(
         &self,
@@ -674,12 +703,13 @@ impl Model {
         // the API host as well as exchanging tokens at the sign-in host.
         if self.credential.is_none()
             && self.provider == Provider::Anthropic
-            && path.strip_prefix("/api/oauth/").is_some_and(|tail| {
-                !tail.is_empty()
-                    && tail
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"/_-".contains(&b))
-            })
+            && matches!(
+                (request.method(), path.as_str()),
+                (
+                    &http::Method::GET,
+                    "/api/oauth/profile" | "/api/oauth/roles"
+                ) | (&http::Method::POST, "/api/oauth/cli/create_api_key")
+            )
         {
             if !self.authorized(request.headers()) {
                 return Ok(self.unauthorized());
@@ -688,7 +718,7 @@ impl Model {
             request
                 .headers_mut()
                 .insert("host", self.authority.parse()?);
-            return self.forward.clone().call(request).await;
+            return self.forward_request(request).await;
         }
         // With a ChatGPT login, Codex reads its account, usage and models first.
         let listing = self.provider == Provider::ChatGpt
@@ -798,6 +828,13 @@ impl Model {
             }
             _ => bytes,
         };
+        if !safe_request(self.provider, &path, &body, self.engine.is_some()) {
+            return Ok(self.provider.error(
+                400,
+                "invalid_request_error",
+                "Remote sources and unsupported server tools are not enabled for this workspace.",
+            ));
+        }
         if self.provider == Provider::Anthropic && self.engine.is_some() && splice::needed(&body) {
             if path.ends_with("/count_tokens") {
                 return Box::pin(splice::count(self, parts, body)).await;
@@ -810,31 +847,6 @@ impl Model {
             && responses::needed(&body)
         {
             return Box::pin(responses::serve(self, parts, body)).await;
-        }
-        if body
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| {
-                tools.iter().any(|t| {
-                    !client_tool(t)
-                        || t.get("google_search").is_some()
-                        || t.get("googleSearch").is_some()
-                        || t.get("codeExecution").is_some()
-                        || t.get("urlContext").is_some()
-                })
-            })
-            || body.get("mcp_servers").is_some()
-            || body.get("plugins").is_some()
-            || body.get("web_search_options").is_some()
-            || body["model"]
-                .as_str()
-                .is_some_and(|model| model.ends_with(":online") || model.contains("-search-"))
-        {
-            return Ok(self.provider.error(
-                400,
-                "invalid_request_error",
-                "Server tools are not enabled for this workspace.",
-            ));
         }
         let free = path.ends_with("/count_tokens") || listing;
         if !free && let Some(stop) = self.admit(&path, true) {
@@ -885,7 +897,7 @@ impl Model {
         parts.headers.insert("host", self.authority.parse()?);
         parts.headers.insert("accept-encoding", "identity".parse()?);
         let request = Request::from_parts(parts, Body::from(bytes));
-        let result = self.forward.clone().call(request).await;
+        let result = self.forward_request(request).await;
         match result {
             Ok(mut response) => {
                 call.status = response.status().as_u16();
@@ -934,17 +946,213 @@ fn rfc3339(at: time::OffsetDateTime) -> String {
         at.second()
     )
 }
-/// A tool the client runs itself: a function, a custom tool, or a namespace
-/// of them. Anything else is a provider-side tool the world does not offer.
-fn client_tool(tool: &Value) -> bool {
-    match tool.get("type").and_then(Value::as_str) {
-        None | Some("custom" | "function") => true,
-        Some("namespace") => tool["tools"].as_array().is_some_and(|tools| {
-            tools
-                .iter()
-                .all(|t| t.get("type").is_some() && client_tool(t))
+/// Checks transport-bearing fields before any web tool can enter a splice.
+fn safe_request(provider: Provider, path: &str, body: &Value, world: bool) -> bool {
+    if [
+        "mcp_servers",
+        "plugins",
+        "web_search_options",
+        "connector_ids",
+        "connectors",
+        "vector_store_ids",
+        "container",
+        "environment",
+    ]
+    .iter()
+    .any(|key| body.get(key).is_some())
+        || body["model"]
+            .as_str()
+            .is_some_and(|name| name.ends_with(":online") || name.contains("-search-"))
+    {
+        return false;
+    }
+    if let Some(tools) = body.get("tools") {
+        let Some(tools) = tools.as_array() else {
+            return false;
+        };
+        if !tools
+            .iter()
+            .all(|tool| safe_tool(provider, path, tool, world))
+        {
+            return false;
+        }
+    }
+    if let Some(functions) = body.get("functions")
+        && !functions.as_array().is_some_and(|fs| {
+            fs.iter()
+                .all(|f| f["name"].is_string() && f["parameters"].is_object())
+        })
+    {
+        return false;
+    }
+    for key in [
+        "messages",
+        "input",
+        "system",
+        "contents",
+        "systemInstruction",
+        "system_instruction",
+    ] {
+        if let Some(content) = body.get(key)
+            && !safe_content(content)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn safe_tool(provider: Provider, path: &str, tool: &Value, world: bool) -> bool {
+    let Some(object) = tool.as_object() else {
+        return false;
+    };
+    match tool["type"].as_str() {
+        None => match provider {
+            Provider::Anthropic => {
+                tool["name"].is_string()
+                    && tool["input_schema"].is_object()
+                    && object.keys().all(|k| {
+                        matches!(
+                            k.as_str(),
+                            "name"
+                                | "description"
+                                | "input_schema"
+                                | "cache_control"
+                                | "strict"
+                                | "defer_loading"
+                                | "input_examples"
+                                | "allowed_callers"
+                        )
+                    })
+            }
+            Provider::Gemini => {
+                object.len() == 1
+                    && (tool["functionDeclarations"].is_array()
+                        || tool["function_declarations"].is_array())
+            }
+            _ => false,
+        },
+        Some("function" | "custom") => object.keys().all(|k| {
+            matches!(
+                k.as_str(),
+                "type"
+                    | "function"
+                    | "name"
+                    | "description"
+                    | "parameters"
+                    | "strict"
+                    | "format"
+                    | "defer_loading"
+            )
         }),
+        Some("namespace") => {
+            object
+                .keys()
+                .all(|k| matches!(k.as_str(), "type" | "name" | "description" | "tools"))
+                && tool["tools"]
+                    .as_array()
+                    .is_some_and(|ts| ts.iter().all(|t| safe_tool(provider, path, t, false)))
+        }
+        Some(
+            "web_search_20250305"
+            | "web_search_20260209"
+            | "web_fetch_20250910"
+            | "web_fetch_20260209",
+        ) => {
+            world
+                && provider == Provider::Anthropic
+                && (path == "/v1/messages" || path == "/v1/messages/count_tokens")
+        }
+        Some("web_search" | "web_search_preview") => {
+            world
+                && matches!(provider, Provider::OpenAi | Provider::ChatGpt)
+                && path.ends_with("/responses")
+        }
         Some(_) => false,
+    }
+}
+
+fn inline_data(value: &Value) -> bool {
+    value.as_str().is_some_and(|data| {
+        data.starts_with("data:")
+            && data
+                .split_once(',')
+                .is_some_and(|(head, _)| head.ends_with(";base64"))
+    })
+}
+
+/// Text and client tool arguments are opaque; only provider content containers are traversed.
+fn safe_content(content: &Value) -> bool {
+    match content {
+        Value::Null | Value::String(_) => true,
+        Value::Array(items) => items.iter().all(safe_content),
+        Value::Object(object) => {
+            if ["fileData", "file_uri", "fileUri", "file_url", "file_id"]
+                .iter()
+                .any(|key| object.contains_key(*key))
+            {
+                return false;
+            }
+            if object
+                .get("file_data")
+                .is_some_and(|value| !inline_data(value))
+            {
+                return false;
+            }
+            if let Some(source) = object.get("source")
+                && (!matches!(source["type"].as_str(), Some("text" | "base64"))
+                    || source.get("url").is_some())
+            {
+                return false;
+            }
+            match content["type"].as_str() {
+                Some("image_url" | "input_image") => {
+                    let image = &content["image_url"];
+                    if !inline_data(image) && !inline_data(&image["url"]) {
+                        return false;
+                    }
+                }
+                Some("input_file") => {
+                    if !inline_data(&content["file_data"]) {
+                        return false;
+                    }
+                }
+                Some(
+                    "text"
+                    | "input_text"
+                    | "output_text"
+                    | "refusal"
+                    | "image"
+                    | "document"
+                    | "tool_use"
+                    | "tool_result"
+                    | "server_tool_use"
+                    | "web_search_result"
+                    | "web_search_tool_result_error"
+                    | "web_fetch_result"
+                    | "web_fetch_tool_result_error"
+                    | "web_search_tool_result"
+                    | "web_fetch_tool_result"
+                    | "thinking"
+                    | "redacted_thinking"
+                    | "message"
+                    | "function_call"
+                    | "function_call_output"
+                    | "custom_tool_call"
+                    | "custom_tool_call_output"
+                    | "reasoning"
+                    | "web_search_call"
+                    | "input_audio"
+                    | "audio",
+                )
+                | None => {}
+                Some(_) => return false,
+            }
+            ["content", "parts", "output"]
+                .iter()
+                .all(|key| object.get(*key).is_none_or(safe_content))
+        }
+        _ => false,
     }
 }
 fn from_env(cx: &Cx, provider: Provider) -> fictionet::Result<Model> {

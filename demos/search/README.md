@@ -48,6 +48,30 @@ The page reports the source that answered each request.
 The content audit applies to text the world writes. Replayed WARC responses carry
 capture provenance and are outside that scope; their words are not allowlisted.
 
+## Provider boundary
+
+Every world-served HTTPS host uses the Zscaler look-alike chain from
+`fictionet-extras`, with its root installed in the guest. Sign-in hosts include
+`claude.com`. Their HTTPS requests are inspected and forwarded only during
+setup. The first successful inference response closes interactive sign-in for
+the rest of the run, including requests on existing connections. Only validated
+refresh-token grants to the Claude and OpenAI token endpoints remain on these
+hosts. Refresh requests are serialized from the validated fields before sending.
+Account profile, policy, model-catalog and usage endpoints are restricted to
+specific paths and methods; API key creation closes with sign-in.
+
+The world's observations report sign-in state and every remaining exception,
+and upstream attempts, responses and refusals. Sign-in query strings, headers
+and bodies are omitted because they can contain credentials. An attempt means
+the request entered the host transport, not that a connection succeeded. Local
+startup responses and rejected requests do not produce an upstream attempt.
+
+Provider URL image, document and file sources and unsupported server tools are
+refused before web-tool splicing, including requests mixing allowed web tools
+with unsupported features. Inline data and client tool arguments containing URLs
+remain usable. Provider-native search and fetch become client functions answered
+from the world's pages; they do not reach the provider as native web tools.
+
 ## Briefs
 
 A file in [seeds/](seeds) has a world date and free-text instructions:
@@ -61,7 +85,9 @@ date = "2026-10-21"
 Write the world's full brief after the closing marker: what is true, what the
 sites contain and which sources matter. Optional `[[fixed]]` entries retain
 `url`, `file`, `title`, `description` and `content_type`; their files are served
-verbatim. The date controls pages, HTTP dates and certificate validity.
+verbatim. For the VM demo, the brief's date is replaced by the run day. The guest
+inherits the host clock; HTTP dates and certificates use the run clock. The
+standalone world can still run against a brief's historical date.
 Search ranking receives the prose without special treatment for named sites.
 Eval questions live in the Python task's `QUESTIONS` mapping.
 

@@ -201,7 +201,8 @@ impl Views {
                         });
                     }
                 }
-                SearchObs::NoRoute { .. } => {}
+                SearchObs::NoRoute { .. } | SearchObs::Signin { .. } | SearchObs::Egress { .. } => {
+                }
             }
             view.activity.push(observation.clone());
         }
