@@ -1008,7 +1008,9 @@ fn safe_tool(provider: Provider, path: &str, tool: &Value, world: bool) -> bool 
     };
     match tool["type"].as_str() {
         None => match provider {
-            Provider::Anthropic => {
+            Provider::Anthropic | Provider::OpenRouter
+                if path.ends_with("/messages") || path.ends_with("/messages/count_tokens") =>
+            {
                 tool["name"].is_string()
                     && tool["input_schema"].is_object()
                     && object.keys().all(|k| {
@@ -1040,6 +1042,10 @@ fn safe_tool(provider: Provider, path: &str, tool: &Value, world: bool) -> bool 
                     | "name"
                     | "description"
                     | "parameters"
+                    | "input_schema"
+                    | "cache_control"
+                    | "input_examples"
+                    | "allowed_callers"
                     | "strict"
                     | "format"
                     | "defer_loading"

@@ -766,11 +766,12 @@ fn guest_credentials_follow_each_request_without_replacement() {
 
 #[test]
 fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let origin: http::Uri = format!("http://{}", listener.local_addr().unwrap())
-        .parse()
-        .unwrap();
+    struct Transport;
+    impl web::Upstream for Transport {
+        fn request(self: Arc<Self>, _: Request<Body>) -> web::UpstreamFuture {
+            panic!("refused request entered the upstream transport")
+        }
+    }
     fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(4), |cx| async move {
         for (provider, path) in [
             (Provider::Anthropic, "/v1/messages"),
@@ -781,7 +782,9 @@ fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
             (Provider::OpenRouter, "/api/v1/chat/completions"),
             (Provider::Gemini, "/v1beta/models/gemini-flash:generateContent"),
         ] {
-            let model = Model::guest_at(&cx, provider, origin.clone())?.search(Arc::new(ValidationPages));
+            let model = Model::with_forward(&cx, provider, None,
+                web::forward(&cx, format!("https://{}", provider.host()).parse()?, Arc::new(Transport))?,
+                provider.host().into()).search(Arc::new(ValidationPages));
             let content = [
                 json!({"type":"image","source":{"type":"url","url":"https://example.com/image"}}),
                 json!({"type":"document","source":{"type":"url","url":"https://example.com/file"}}),
@@ -815,7 +818,6 @@ fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
                 let request = Request::post(path).header("authorization", "Bearer local-token").header("x-api-key", "local-token").header("x-goog-api-key", "local-token").body(Body::from(body.to_string()))?;
                 let response = model.clone().send(request).await?;
                 assert_eq!(response.status(), 400, "{provider:?} {body}");
-                assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
             }
         }
         Ok(())
@@ -835,6 +837,29 @@ fn inline_content_and_client_url_arguments_stay_usable() {
             safe_request(Provider::Anthropic, "/v1/messages", &body, false),
             "{body}"
         );
+    }
+}
+
+#[test]
+fn anthropic_client_tools_accept_both_wire_spellings() {
+    for provider in [Provider::Anthropic, Provider::OpenRouter] {
+        let path = if provider == Provider::Anthropic {
+            "/v1/messages"
+        } else {
+            "/api/v1/messages"
+        };
+        for typed in [false, true] {
+            let mut tool = json!({"name":"WebFetch", "description":"Read a page", "input_schema":{"type":"object", "properties":{"url":{"type":"string"}}}});
+            if typed {
+                tool["type"] = json!("custom");
+            }
+            assert!(safe_request(
+                provider,
+                path,
+                &json!({"tools":[tool]}),
+                false
+            ));
+        }
     }
 }
 
