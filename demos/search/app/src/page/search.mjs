@@ -30,6 +30,8 @@ function notice(text) {
   noticeTimer = setTimeout(() => { $('notice').hidden = true; }, 6500);
 }
 function select(key) {
+  if (key !== selection) document.body.classList.remove('page-expanded');
+  document.body.classList.toggle('page-selected', !!key?.startsWith('page:'));
   selection = key;
   $('details').hidden = !key;
   document.body.classList.toggle('details-open', !!key);
@@ -52,7 +54,7 @@ function svg(tag, attrs = {}, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
-function graph() {
+function graph(upstream, newData) {
   const map = $('map');
   map.replaceChildren();
   const compact = !!selection;
@@ -82,7 +84,6 @@ function graph() {
   node('workstation', 30, 287, 130, 'workstation', hostStatus?.addresses[0] || '10.0.0.2');
   node('router', 230, 287, 112, 'router', '10.0.0.1');
   const last = shown.activity.at(-1);
-  const outgoing = shown.egress.filter((row) => ['attempt', 'response', 'failed'].includes(row.fact.phase));
   const externalHosts = new Set(shown.connections.map((row) => row.host));
   const providerHosts = new Set(shown.calls.map((call) => call.host));
   const sites = shown.sites.filter((site) => !externalHosts.has(site.host) && !providerHosts.has(site.host)).sort((a, b) => b.at_ms - a.at_ms);
@@ -92,24 +93,23 @@ function graph() {
   if (selected && !visible.includes(selected)) visible.splice(2, 1, selected);
   const services = [{ id: 'dns', title: 'DNS', address: '10.0.0.1:53', y: 70 }, ...visible.map((site, i) => ({ id: `site:${site.host}`, title: site.host, address: site.address || '', y: 132 + i * 62 }))];
   if (sites.length > 3) services.push({ id: 'sites', title: 'All sites ›', y: 318 });
-  services.push({ id: 'calls', title: 'model gateway', y: 380 }, { id: 'egress', title: 'sign-in', address: shown.signin ? shown.signin.fact.open ? 'Open' : 'Closed' : '', y: 442 }, { id: 'egress', title: 'package mirror', y: 504 });
+  services.push({ id: 'calls', title: 'model gateway', y: 380 }, { id: 'signin', title: 'sign-in', address: shown.signin ? shown.signin.fact.open ? 'Open' : 'Closed' : '', y: 442 }, { id: 'mirror', title: 'package mirror', y: 504 });
   for (const service of services) {
     const hot = last && ((service.id === 'calls' && ['model_call', 'tool'].includes(last.fact.kind)) || service.id === `site:${last.fact.host}` || (service.id === 'dns' && last.fact.kind === 'resolved'));
-    wire(`M342 ${y(310)} C390 ${y(310)},390 ${y(service.y) + (compact ? 17 : 23)},445 ${y(service.y) + (compact ? 17 : 23)}`, hot ? 'hot' : '', hot);
+    wire(`M342 ${y(310)} C390 ${y(310)},390 ${y(service.y) + (compact ? 17 : 23)},445 ${y(service.y) + (compact ? 17 : 23)}`, hot ? 'hot' : '', hot && newData);
     node(service.id, 445, service.y, 274, service.title, service.address);
   }
   const destinations = [...externalHosts].sort();
   for (const [i, host] of destinations.slice(0, 7).entries()) {
-    const rows = outgoing.filter((row) => row.fact.host === host);
     const purposes = [...new Set(shown.connections.filter((row) => row.host === host).map((row) => row.purpose))];
     const top = 76 + i * 65;
     const sources = [...new Set(purposes.map((purpose) => purpose === 'setup' ? 504 : ['sign-in', 'token refresh'].includes(purpose) ? 442 : 380))];
-    const active = rows.at(-1)?.at_ms === shown.at_ms;
+    const active = live && upstream?.host === host;
     for (const source of sources) {
       const from = y(source) + (compact ? 17 : 23), to = y(top) + (compact ? 17 : 23);
-      wire(`M719 ${from} C753 ${from},750 ${to},790 ${to}`, 'outside observed', active);
+      wire(`M719 ${from} C753 ${from},750 ${to},790 ${to}`, active ? 'outside observed hot' : 'outside observed', active);
     }
-    node('egress', 790, top, 177, host, purposes.join(' · '), true);
+    node(`egress:${host}`, 790, top, 177, host, purposes.join(' · '), true);
   }
   if (destinations.length > 7) node('egress', 790, 531, 177, 'All connections ›', '', true);
   if (!destinations.length) map.append(svg('text', { x: 795, y: y(105), class: 'map-empty' }, 'No connections'));
@@ -128,8 +128,8 @@ function activityText(row) {
     case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
     case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${fact.path} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
-    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Opened sign-in' : 'Closed sign-in', 'egress'];
-    case 'egress': return [fact.host, 'Upstream', `${fact.method} ${fact.path} · ${fact.status || fact.phase}`, 'egress'];
+    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Opened sign-in' : 'Closed sign-in', 'signin'];
+    case 'egress': return [fact.host, 'Upstream', `${fact.method} ${fact.path} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
     case 'observation_failed': return ['Recording', 'Error', fact.reason, 'egress'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
     default: return ['', '', '', 'router'];
@@ -182,8 +182,16 @@ async function readPage(url, request, container) {
   const response = await fetch(`/preview?${query}`);
   if (!response.ok) throw new Error(await response.text());
   const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
-  const content = doc.querySelector('main, article, [role="main"]') || doc.body;
-  for (const node of content.querySelectorAll('script,style,link,meta,iframe,object,embed,form,nav,header,footer,svg,img,video,audio,source,template')) node.remove();
+  for (const node of doc.querySelectorAll('[hidden], [aria-hidden="true"]')) node.remove();
+  for (const node of doc.querySelectorAll('[style]')) {
+    if (node.style.display === 'none' || node.style.visibility === 'hidden') node.remove();
+  }
+  for (const node of doc.querySelectorAll('script,style,link,meta,iframe,object,embed,form,nav,header,footer,aside,svg,img,video,audio,source,template,noscript')) node.remove();
+  let content = doc.querySelector('main, article, [role="main"]');
+  if (!content) {
+    content = doc.querySelector('h1')?.parentElement || doc.body;
+    while (content !== doc.body && content.parentElement && content.querySelectorAll('p').length < 2) content = content.parentElement;
+  }
   for (const node of [content, ...content.querySelectorAll('*')]) {
     for (const attribute of [...node.attributes]) node.removeAttribute(attribute.name);
   }
@@ -196,7 +204,7 @@ let detailSignature = '';
 
 function details() {
   if (!selection) { detailSignature = ''; return; }
-  const signature = JSON.stringify([selection, shown]);
+  const signature = JSON.stringify([selection, selection.startsWith('page:') ? requestFor(selection.slice(5)) : shown]);
   if (signature === detailSignature) return;
   detailSignature = signature;
   const body = $('detail-body'), actions = $('detail-actions');
@@ -226,7 +234,22 @@ function details() {
     if (request?.has_preview) {
       const container = element('div', undefined, 'reading-view');
       body.append(container);
-      actions.append(button('Read page', () => readPage(url, request, container).catch((error) => notice(error.message))));
+      let loaded = false;
+      const read = button('Read page', async () => {
+        if (loaded) {
+          const expanded = document.body.classList.toggle('page-expanded');
+          read.textContent = expanded ? 'Shrink page' : 'Expand page';
+          return;
+        }
+        read.disabled = true;
+        try {
+          await readPage(url, request, container);
+          loaded = true;
+          read.textContent = 'Expand page';
+        } catch (error) { notice(error.message); }
+        finally { read.disabled = false; }
+      });
+      actions.append(read);
     }
     actions.append(button('Site', () => select(`site:${hostOf(url)}`)));
   } else if (selection.startsWith('site:')) {
@@ -247,18 +270,20 @@ function details() {
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(request.at_ms), 'stamp'), content); body.append(row);
     }
     if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Unopened', 'detail-empty'));
-  } else if (selection === 'egress') {
-    heading('Internet');
-    if (shown.signin) {
+  } else if (['egress', 'signin', 'mirror'].includes(selection) || selection.startsWith('egress:')) {
+    const accepts = (row) => selection === 'mirror' ? row.purpose === 'setup' : selection === 'signin' ? ['sign-in', 'token refresh', 'account', 'startup'].includes(row.purpose) : selection.startsWith('egress:') ? row.host === selection.slice(7) : true;
+    const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact));
+    heading(selection === 'mirror' ? 'Packages' : selection === 'signin' ? 'Sign-in' : selection.startsWith('egress:') ? selection.slice(7) : 'Internet');
+    if (shown.signin && ['signin', 'egress'].includes(selection)) {
       body.append(detailRow(shown.signin.at_ms, shown.signin.fact.open ? 'Sign-in open' : 'Sign-in closed', ''));
       const exceptions = element('details', undefined, 'exceptions');
       exceptions.append(element('summary', 'Exceptions'));
       for (const exception of shown.signin.fact.exceptions) exceptions.append(element('p', exception, 'meta'));
       body.append(exceptions);
     }
-    for (const connection of shown.connections.filter((connection) => !shown.egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, connection.purpose));
-    for (const row of shown.egress) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.purpose} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || row.fact.phase}`));
-    if (!shown.connections.length && !shown.egress.length) body.append(element('p', 'No connections', 'detail-empty'));
+    for (const connection of connections.filter((connection) => !egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, connection.purpose));
+    for (const row of egress) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.purpose} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || row.fact.phase}`));
+    if (!connections.length && !egress.length) body.append(element('p', 'No connections', 'detail-empty'));
   } else if (selection === 'sites') {
     heading('Sites');
     for (const site of shown.sites) {
@@ -278,8 +303,8 @@ function details() {
   body.scrollTop = scroll;
 }
 
-function draw() {
-  graph(); feed(); details();
+function draw(upstream = null, newData = false) {
+  graph(upstream, newData); feed(); details();
   $('clock').textContent = time(latest.at_ms);
   $('cursor-time').textContent = time(shown.at_ms);
   $('end-time').textContent = time(latest.at_ms);
@@ -310,9 +335,14 @@ const stream = new EventSource('/state');
 stream.onopen = () => { $('connection').classList.add('connected'); $('connection').title = 'Connected'; };
 stream.onerror = () => { $('connection').classList.remove('connected'); $('connection').title = 'Reconnecting'; };
 stream.onmessage = (event) => {
+  const forwarded = (row) => ['attempt', 'response', 'failed'].includes(row.fact.phase);
+  const before = latest.egress.filter(forwarded).at(-1);
+  const connected = !!latest.started_at_ms;
   latest = JSON.parse(event.data);
+  const after = latest.egress.filter(forwarded).at(-1);
+  const upstream = connected && JSON.stringify(before) !== JSON.stringify(after) ? after?.fact : null;
   if (live || shown.at_ms < latest.oldest_ms) { shown = latest; live = true; }
-  draw();
+  draw(upstream, true);
 };
 async function loadWorld() {
   const response = await fetch('/world');
@@ -378,14 +408,14 @@ async function mountConsole() {
     let create;
     if (kind === 'terminal') {
       const [library, component] = await Promise.all([import('/vendor/ghostty-web/dist/ghostty-web.js'), import('/terminal.mjs')]);
-      await library.init();
-      create = (socket) => component.mount($('terminal'), library, socket, { fontSize, fontFamily: 'monospace', theme: terminalTheme() });
+      const ghostty = await library.Ghostty.load('/vendor/ghostty-web/dist/ghostty-vt.wasm');
+      create = (socket) => component.mount($('terminal'), library, socket, { ghostty, fontSize, fontFamily: 'monospace', theme: terminalTheme() });
     } else {
       const [{ default: RFB }, component] = await Promise.all([import('/vendor/novnc/core/rfb.js'), import('/screen.mjs')]);
       create = (socket) => component.mount($('screen'), RFB, socket);
     }
     socket = new WebSocket(socketUrl(kind));
-    socket.addEventListener('close', () => { if (activeConsole === kind) { $('console-status').hidden = false; $('console-status').textContent = 'Console disconnected. Select Terminal or Screen to reconnect.'; } });
+    socket.addEventListener('close', () => { if (activeConsole === kind && consoles.get(kind)?.socket === socket) { $('console-status').hidden = false; $('console-status').textContent = 'Console disconnected. Select Terminal or Screen to reconnect.'; } });
     socket.addEventListener('error', () => notice('Could not connect to the workstation console'));
     $(kind).replaceChildren();
     const component = create(socket);

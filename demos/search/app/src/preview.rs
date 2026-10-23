@@ -208,6 +208,11 @@ async fn story(cx: &Cx, machine: &Machine, world: &World, query: &str) -> fictio
     machine
         .lookup(cx, "10.0.0.1".parse()?, "wiki.corp", RecordType::A)
         .await?;
-    let _ = machine.tcp.connect(cx, "1.1.1.1:443".parse()?).await;
+    let _ = cx
+        .race(
+            Some(cx.now() + Duration::from_secs(3)),
+            machine.tcp.connect(cx, "1.1.1.1:443".parse()?),
+        )
+        .await;
     Ok(())
 }

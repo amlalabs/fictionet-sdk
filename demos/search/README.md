@@ -3,8 +3,8 @@
 Run `cargo run --release -p fictionet-search-demo --bin search --
 demos/downloads/cloudimage` on Linux with KVM, or pass `preview` instead of the
 downloads folder to run without a VM. Agents sign in inside the guest. The terminal uses ghostty-web and a persistent
-tmux session; Screen shows the Firefox desktop. Input starts off and can be
-enabled beside the console.
+tmux session; Screen shows the Firefox desktop. Terminal text starts at 19 px;
+the text controls adjust its size and the expand control widens the agent pane.
 
 `preview` needs no downloads or API keys. It uses the world's corpus when
 available, otherwise a small embedded sky.org capture. Its labeled client makes
@@ -18,9 +18,10 @@ tool handlers, its name resolver and the typed no-route callback on its network.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
-above its details while the agent remains visible. The scrubber replays the retained observation history; the
-agent stays live. The World menu chooses the page source or restarts world pages.
-The last 1024 observations are kept for rewind. Each launch writes its typed facts to a separate
+above its details while the agent remains visible. The scrubber replays the
+retained observation history; the agent stays live. The World menu chooses the page source or restarts world pages.
+The last 1024 observations are kept for rewind. Setup connections and sign-in
+policy survive activity expiry and page restarts. Each launch writes its facts to a separate
 `<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
 owner-only permissions. Preview records are under `demos/downloads/search-preview/`.
 Request credentials are redacted before entering the observation channel; request
@@ -28,7 +29,7 @@ bodies are not retained. The map draws internet routes from upstream facts,
 including setup downloads and sign-in, rather than from model call activity.
 Local and rejected model requests therefore leave the internet wire dark.
 
-Guest web bodies are limited to one MiB, including chunked requests; larger
+Page and search request bodies are limited to one MiB, including chunked requests; larger
 bodies receive 413 before routing. The observation queue holds at most 256 facts,
 including one reserved failure notification. A burst or a fact larger than 256
 KiB fails recording explicitly; the app stops instead of silently losing facts.
