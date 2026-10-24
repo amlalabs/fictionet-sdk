@@ -354,6 +354,29 @@ impl Pages {
                 cast,
             }
         };
+        {
+            let store = self.writing_store()?;
+            let mut referenced = HashSet::new();
+            for mention in &ask.mentions {
+                if let Some(url) = mention["from"].as_str()
+                    && referenced.insert(url)
+                {
+                    let (host, target) = text::target_of(url);
+                    if let Some(page) = store.page(&host, &target) {
+                        let body = String::from_utf8_lossy(&page.body);
+                        let text = if page.content_type.starts_with("text/html") {
+                            text::text_of(&body)
+                        } else {
+                            body.into_owned()
+                        };
+                        ask.claims.push(prompts::Claim {
+                            url: url.into(),
+                            claim: format!("This document links to the requested page (publication/update {}): {}", page.date, text),
+                        });
+                    }
+                }
+            }
+        }
         let _publication = publication.filter(|_| {
             !self
                 .store()

@@ -91,6 +91,10 @@ last week, yesterday, today, days ago or the second week of a month. When a
 source used relative wording, state the exact date or inclusive date range
 that it means in that source, preserving the established timeline. Search snippets establish these facts before any page is opened.
 Use earlier published text as binding context even when it has no explicit claims.
+A document linking here is authoritative about what it quotes from this page,
+including the date of the quoted statement or guidance. Preserve that date.
+If this page was subsequently updated, distinguish its original statement date
+from its later update date explicitly; neither replaces the other.
 Do not introduce a second incompatible timeline or leave an established identity vague.
 Use public site domains, never reserved example domains or special-use hostnames. A page must
 fulfil what its search result and incoming anchor promised. Do not discuss the

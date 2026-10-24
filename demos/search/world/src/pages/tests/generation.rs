@@ -839,3 +839,44 @@ fn the_headline_obeys_the_document_dateline() {
         crate::pages::answers::chronology(&page, seed::parse_date("2026-10-21").unwrap()).is_err()
     );
 }
+
+#[test]
+fn linked_pages_receive_the_complete_referring_document() {
+    let calls = AtomicUsize::new(0);
+    let fake = Fake::new(move |_, body| {
+        let prompt = body["messages"][1]["content"].as_str().unwrap();
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            completion(
+                0,
+                &format!(
+                    "STATUS: 200\nTITLE: Recall\nDATE: 2026-10-14\nSITE_CSS: body {{color:#234}}\nBODY:\n<h1>Recall</h1><p>{}</p><p>The charging guidance was issued on 12 October 2026: <a href='https://guidance.fields.com/charging'>Charging guidance</a>.</p>",
+                    "Background information. ".repeat(300)
+                ),
+                None,
+            )
+        } else {
+            assert!(prompt.contains("The charging guidance was issued on 12 October 2026"));
+            completion(
+                0,
+                "STATUS: 200\nTITLE: Charging guidance\nDATE: 2026-10-14\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Charging guidance</h1><p>Issued on 12 October 2026. Updated on 14 October 2026.</p>",
+                None,
+            )
+        }
+    });
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake)));
+    lab(move |cx| async move {
+        assert_eq!(
+            get(&pages, &cx, "https://news.fields.com/recall")
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            get(&pages, &cx, "https://guidance.fields.com/charging")
+                .await
+                .status,
+            200
+        );
+        Ok(())
+    });
+}
