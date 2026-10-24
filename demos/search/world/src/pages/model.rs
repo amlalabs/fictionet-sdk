@@ -350,7 +350,7 @@ impl Model {
         Self::new(
             Provider::Anthropic,
             "claude-haiku-5-5",
-            "low",
+            "",
             key,
             Arc::new(ProviderTransport::new(Provider::Anthropic)),
         )
