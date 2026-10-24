@@ -35,7 +35,8 @@ pub(super) struct Live {
     endpoint: url::Url,
     path: PathBuf,
     state: Mutex<State>,
-    fetcher: Mutex<Option<Fetcher>>,
+    fetcher: Fetcher,
+    observer: Mutex<Option<Arc<capture::Observer>>>,
 }
 
 impl Live {
@@ -54,7 +55,8 @@ impl Live {
                 std::process::id()
             )),
             state: Mutex::default(),
-            fetcher: Mutex::default(),
+            fetcher: Fetcher::new(capture::BROWSER).map_err(|e| e.to_string())?,
+            observer: Mutex::default(),
         }))
     }
 
@@ -100,26 +102,7 @@ impl Live {
     }
 
     fn download(self: Arc<Self>) {
-        let mut transport = self.fetcher.lock().unwrap_or_else(|e| e.into_inner());
-        let fetcher = match transport
-            .take()
-            .map(Ok)
-            .unwrap_or_else(|| Fetcher::new(capture::BROWSER))
-        {
-            Ok(fetcher) => fetcher,
-            Err(_) => {
-                let mut state = self.state();
-                for job in state.queue.drain(..).collect::<Vec<_>>() {
-                    if let Some(done) = state.reached.get(&job.url) {
-                        done.send_replace(true);
-                    }
-                }
-                state.running = false;
-                return;
-            }
-        };
-        *transport = Some(fetcher);
-        let fetcher = transport.as_mut().unwrap();
+        let mut fetcher = self.fetcher.fresh();
         loop {
             let job = {
                 let mut state = self.state();
@@ -137,6 +120,9 @@ impl Live {
                 }
                 state.running = false;
                 return;
+            }
+            if let Some(observer) = self.observer.lock().unwrap().clone() {
+                fetcher.observe(job.cx.clone(), observer);
             }
             let existing = self.state().archive.get(&job.url);
             let result = match existing {
@@ -222,7 +208,10 @@ impl Live {
         let query = query.to_owned();
         std::thread::spawn(move || {
             let result = (|| {
-                let fetcher = Fetcher::new(capture::BROWSER).map_err(|e| e.to_string())?;
+                let mut fetcher = live.fetcher.fresh();
+                if let Some(observer) = live.observer.lock().unwrap().clone() {
+                    fetcher.observe(cx_thread.clone(), observer);
+                }
                 let request = json!({"query": query, "numResults": (start + 10).min(100), "contents": {"highlights": true}});
 
                 let response = fetcher
@@ -338,6 +327,12 @@ fn parse_results(value: &Value) -> Result<search::Search, String> {
 }
 
 impl Pages {
+    pub(crate) fn observe_live(&self, observer: Arc<capture::Observer>) {
+        if let Some(live) = &self.live {
+            *live.observer.lock().unwrap() = Some(observer);
+        }
+    }
+
     /// Whether Live mode has a configured host search credential.
     pub fn live_available(&self) -> bool {
         self.live.is_some()
@@ -390,5 +385,4 @@ impl Pages {
 }
 
 #[cfg(test)]
-#[path = "live_tests.rs"]
 mod tests;

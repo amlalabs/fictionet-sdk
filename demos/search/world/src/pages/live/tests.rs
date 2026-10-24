@@ -1,6 +1,75 @@
 use super::*;
 
 #[test]
+fn public_captures_record_private_destination_failures_without_archiving_them() {
+    let path = std::env::temp_dir().join(format!(
+        "fictionet-live-private-{}.warc.gz",
+        std::process::id()
+    ));
+    let live = Arc::new(Live {
+        key: Key::new("EXA_API_KEY", Some("host-only-key".into())).unwrap(),
+        endpoint: "https://api.exa.ai/search".parse().unwrap(),
+        path: path.clone(),
+        state: Mutex::default(),
+        fetcher: Fetcher::new(capture::BROWSER).unwrap(),
+        observer: Mutex::default(),
+    });
+    let mut pages = Pages::new(Seed::builtin("web").unwrap());
+    pages.live = Some(live.clone());
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::from_u64(12),
+        |cx| async move {
+            let (sender, mut records) = tokio::sync::mpsc::channel(32);
+            pages.observe(sender);
+            for url in [
+                "http://127.0.0.1/private",
+                "http://localhost/private",
+                "http://[::1]/private",
+                "http://169.254.169.254/latest/meta-data/",
+            ] {
+                live.enqueue(
+                    Job {
+                        url: url.into(),
+                        navigation: None,
+                        redirects: 0,
+                        cx: cx.clone(),
+                    },
+                    true,
+                );
+                assert!(live.response(&cx, url).await.is_none());
+            }
+            use crate::observation::{EgressPhase, EgressPurpose, SearchObs};
+            let mut attempts = Vec::new();
+            let mut failures = Vec::new();
+            while let Ok(record) = records.try_recv() {
+                if let SearchObs::Egress {
+                    attempt,
+                    purpose,
+                    phase,
+                    status,
+                    ..
+                } = record.fact
+                {
+                    assert_eq!(purpose, EgressPurpose::LiveCapture);
+                    assert_eq!(status, None);
+                    match phase {
+                        EgressPhase::Attempt => attempts.push(attempt),
+                        EgressPhase::Failed => failures.push(attempt),
+                        phase => panic!("unexpected phase: {phase:?}"),
+                    }
+                }
+            }
+            assert_eq!(attempts.len(), 4);
+            assert_eq!(attempts, failures);
+            assert_eq!(live.state().archive.urls().count(), 0);
+            assert!(!path.exists());
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
 fn external_redirects_do_not_grant_a_crawl_of_another_site() {
     use std::{
         io::{BufRead, BufReader, Write},
@@ -53,7 +122,8 @@ fn external_redirects_do_not_grant_a_crawl_of_another_site() {
         endpoint: "https://api.exa.ai/search".parse().unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Mutex::default(),
+        fetcher: Fetcher::loopback(capture::BROWSER).unwrap(),
+        observer: Mutex::default(),
     });
     fictionet::block_on(fictionet::run(
         fictionet::Seed::from_u64(6),
@@ -161,7 +231,8 @@ fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
         endpoint: format!("{origin}/search").parse().unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Mutex::default(),
+        fetcher: Fetcher::loopback(capture::BROWSER).unwrap(),
+        observer: Mutex::default(),
     });
     let mut pages = Pages::new(Seed::builtin("web").unwrap());
     pages.live = Some(live);
@@ -170,6 +241,8 @@ fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let pages = Arc::new(pages);
     fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(8), |cx| async move {
+            let (sender, mut records) = tokio::sync::mpsc::channel(128);
+            pages.observe(sender);
             for (host, target) in [
                 ("www.google.com", "/search?q=stellar+%26+gas"),
                 ("www.bing.com", "/search?q=stellar+%26+gas"),
@@ -187,6 +260,21 @@ fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
             pages.apply(&cx, Command::SetNewPages { new_pages: NewPages::Off, expected_revision: 0 }).unwrap();
             let response = pages.handle(&cx, "GET", "www.google.com", "/search?q=stellar+%26+gas", None).await;
             assert!(matches!(response.meta, Meta::Search(list) if list.cache == Cache::Cached && list.listed.len() == 1));
+            let mut egress = Vec::new();
+            while let Ok(record) = records.try_recv() {
+                if let crate::observation::SearchObs::Egress { attempt, purpose, phase, status, .. } = record.fact {
+                    egress.push((attempt, purpose, phase, status));
+                }
+            }
+            use crate::observation::{EgressPhase, EgressPurpose};
+            assert_eq!(egress.len(), 10);
+            for (purpose, expected) in [(EgressPurpose::LiveSearch, 4), (EgressPurpose::LiveCapture, 1)] {
+                let attempts: Vec<_> = egress.iter().filter(|(_, p, phase, _)| *p == purpose && *phase == EgressPhase::Attempt).collect();
+                assert_eq!(attempts.len(), expected);
+                for (attempt, _, _, _) in attempts {
+                    assert!(egress.iter().any(|(id, p, phase, status)| id == attempt && *p == purpose && *phase == EgressPhase::Response && *status == Some(200)));
+                }
+            }
             Ok(())
         })).unwrap();
     server.join().unwrap();
@@ -263,7 +351,8 @@ fn copies_dependencies_and_same_host_links_through_five_levels() {
         endpoint: url::Url::parse("https://api.exa.ai/search").unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Mutex::default(),
+        fetcher: Fetcher::loopback(capture::BROWSER).unwrap(),
+        observer: Mutex::default(),
     });
     let copy = live.clone();
     fictionet::block_on(fictionet::run(
@@ -370,7 +459,8 @@ fn unknown_urls_do_not_fetch_and_completed_copies_survive_mode_changes() {
         endpoint: url::Url::parse("https://api.exa.ai/search").unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Mutex::default(),
+        fetcher: Fetcher::loopback(capture::BROWSER).unwrap(),
+        observer: Mutex::default(),
     });
     let response = warc::Response {
         status: http::StatusCode::OK,

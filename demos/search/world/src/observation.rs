@@ -76,7 +76,7 @@ pub enum SearchObs {
     Egress {
         attempt: u64,
         #[serde(serialize_with = "display")]
-        host: HostName,
+        host: EgressHost,
         method: String,
         path: String,
         purpose: EgressPurpose,
@@ -124,6 +124,38 @@ pub enum EgressPurpose {
     PageWriter,
     Account,
     Setup,
+    LiveSearch,
+    LiveCapture,
+}
+
+/// A host transport destination can be a DNS name or an IP literal.
+#[derive(Clone, Debug)]
+pub struct EgressHost(url::Host);
+
+impl EgressHost {
+    pub fn to_ascii(&self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl std::fmt::Display for EgressHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl From<HostName> for EgressHost {
+    fn from(name: HostName) -> Self {
+        Self(url::Host::Domain(name.to_ascii()))
+    }
+}
+
+impl std::str::FromStr for EgressHost {
+    type Err = url::ParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        url::Host::parse(value).map(Self)
+    }
 }
 
 /// Operational account endpoints; interactive setup and refresh stay host-owned.
@@ -197,6 +229,30 @@ impl Pages {
     /// Installs this world's concrete observation destination. No SDK observer is used.
     pub fn observe(&self, destination: Sender<Observation>) {
         *self.observation.lock().unwrap() = Some(destination);
+        let destination = self.observation.clone();
+        self.observe_live(std::sync::Arc::new(move |cx, event| {
+            report(
+                &destination,
+                cx,
+                SearchObs::Egress {
+                    attempt: event.attempt,
+                    host: event
+                        .url
+                        .host_str()
+                        .expect("capture host")
+                        .parse()
+                        .expect("capture hostname"),
+                    method: event.method.to_string(),
+                    path: event.url.as_str().into(),
+                    purpose: match event.purpose {
+                        fictionet_extras::capture::Purpose::Search => EgressPurpose::LiveSearch,
+                        fictionet_extras::capture::Purpose::Capture => EgressPurpose::LiveCapture,
+                    },
+                    phase: event.phase,
+                    status: event.status.map(|status| status.as_u16()),
+                },
+            );
+        }));
         let destination = self.observation.clone();
         self.observe_writer(std::sync::Arc::new(move |cx, provider, event| {
             report(
