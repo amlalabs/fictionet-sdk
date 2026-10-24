@@ -273,9 +273,13 @@ impl Pages {
     }
 
     /// In copied mode only captured hosts and the local search engines exist.
-    /// Live worlds may admit any public hostname.
+    /// Live worlds may admit any public hostname; a written world, any
+    /// spelled the way a registered site is.
     pub fn serves_host(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
+        if self.written.is_some() {
+            return crate::admit(&host).is_ok() && !written::misspelled_host(&host);
+        }
         crate::admit(&host).is_ok()
             && (self.source() != Source::Copied
                 || crate::route::SEARCH_HOSTS.contains(&host.as_str())

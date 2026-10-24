@@ -34,13 +34,13 @@ pub enum Provider {
 
 impl Provider {
     /// The model used when none is named.
-    fn default_model(self) -> &'static str {
+    pub(in crate::pages) fn default_model(self) -> &'static str {
         match self {
             Self::Anthropic => "claude-haiku-5-5",
             Self::OpenRouter => "anthropic/claude-haiku-5.5",
         }
     }
-    fn label(self) -> &'static str {
+    pub(in crate::pages) fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenRouter => "OpenRouter",

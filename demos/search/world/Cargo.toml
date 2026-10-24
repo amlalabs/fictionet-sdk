@@ -2,7 +2,7 @@
 name = "web-world"
 version = "0.0.0"
 edition = "2024"
-description = "A web world with copied captures, live pages and pages edited for a scenario."
+description = "A web world with copied captures, live pages, pages edited for a scenario, and written pages for the standalone world."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -26,5 +26,10 @@ tower-service = "0.3"
 kuchiki = "0.8"
 zim = "0.5"
 rayon = "1"
+pdf-writer = "0.15"
+subsetter = "0.2.6"
+ttf-parser = "0.25"
+flate2 = "1"
+pdf-extract = "0.12.1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1"

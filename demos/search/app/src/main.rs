@@ -120,7 +120,7 @@ async fn main() -> Result {
             let earliest = start - pages.copied_lag().unwrap_or_default();
             let web = World {
                 ca: Arc::new(Ca::new(&cx, earliest, start)?),
-                addresses: Arc::new(Addresses::new(seed.fixed_addresses())),
+                addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
                 pages: pages.clone(),
                 start,
             };

@@ -51,3 +51,12 @@ urls = [
   "https://pytorch.org/blog/compromised-nightly-dependency/",
 ]
 +++
+
+The public web covers all subjects. Each search query and requested URL selects
+its own subject; the captured security material does not restrict other topics.
+Preserve established facts, dates, names and technical details across pages.
+
+Security sources include MITRE ATT&CK, CISA, NIST and researcher and vendor
+analyses. They cover software supply chain compromises, initial access, lateral
+movement, credential theft and zero trust architecture. Keep claims grounded in
+the sources and distinguish observations from recommendations.

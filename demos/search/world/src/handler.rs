@@ -93,6 +93,10 @@ impl Handler {
             package
         } else if let Some(asset) = Pages::search_asset(&target.host, path) {
             asset
+        } else if let Some(written) = self.pages.written() {
+            written
+                .handle_route(&self.fcx, &parts.method, &target.host, path, action)
+                .await
         } else if action == Route::Page {
             // A page's own request belongs to the page that asked for it.
             let page = (crate::observation::Fetch::of(&parts.headers)

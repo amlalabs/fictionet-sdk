@@ -38,6 +38,13 @@ impl Pages {
         user_agent: Option<&http::HeaderValue>,
         page: Option<url::Url>,
     ) -> Response {
+        if let Some(written) = &self.written {
+            let (host, target) = text::target_of(url);
+            let route = crate::route::route(&host, &target, None);
+            return written
+                .handle_route(cx, &http::Method::GET, &host, &target, route)
+                .await;
+        }
         match self.source() {
             Source::Copied => self.copied_url(url),
             Source::Live | Source::Edited => self.live_url(cx, url, user_agent, page).await,

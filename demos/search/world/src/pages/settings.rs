@@ -66,7 +66,20 @@ impl Pages {
             live: None,
             editor: None,
             fetcher: Default::default(),
+            written: None,
         }
+    }
+
+    /// Pages that the written web answers: the standalone world's.
+    pub fn from_written(written: written::Written) -> Self {
+        let mut pages = Self::with_source(written.seed().clone(), Source::Copied);
+        pages.written = Some(Arc::new(written));
+        pages
+    }
+
+    /// The written web, for the standalone world.
+    pub fn written(&self) -> Option<&Arc<written::Written>> {
+        self.written.as_ref()
     }
 
     /// Edits pages with `model` in Edited mode.

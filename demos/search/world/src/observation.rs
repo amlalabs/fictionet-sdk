@@ -130,6 +130,8 @@ pub enum EgressPurpose {
     LiveCapture,
     /// A package index or file the copied web lacks.
     Package,
+    /// The public original of a page a model writes, read to ground it.
+    Original,
 }
 
 /// A host transport destination can be a DNS name or an IP literal.
@@ -193,6 +195,8 @@ pub enum PageSource {
     Live,
     /// A live page with the scenario's edits.
     Edited,
+    /// A page the standalone world wrote for its seed.
+    Written,
     /// A package index, file or source archive, whatever the page source:
     /// captured, or copied from its real host when the capture lacks it.
     Package,
@@ -284,6 +288,7 @@ impl Pages {
                         fictionet_extras::capture::Purpose::Search => EgressPurpose::LiveSearch,
                         fictionet_extras::capture::Purpose::Capture => EgressPurpose::LiveCapture,
                         fictionet_extras::capture::Purpose::Package => EgressPurpose::Package,
+                        fictionet_extras::capture::Purpose::Original => EgressPurpose::Original,
                     },
                     phase: event.phase,
                     status: event.status.map(|status| status.as_u16()),
@@ -315,6 +320,9 @@ impl Pages {
 
     /// The source that answers a page asked for now.
     pub fn page_source(&self) -> PageSource {
+        if self.written().is_some() {
+            return PageSource::Written;
+        }
         match self.source() {
             Source::Copied => PageSource::Copy { captured: None },
             Source::Live => PageSource::Live,

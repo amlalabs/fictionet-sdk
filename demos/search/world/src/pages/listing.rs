@@ -9,7 +9,8 @@ pub(super) struct Found {
 }
 
 /// The page a busy server shows when the search provider cannot answer.
-const UNAVAILABLE: &[u8] = b"<html><head><title>503 Service Temporarily Unavailable</title></head>\
+pub(super) const UNAVAILABLE: &[u8] =
+    b"<html><head><title>503 Service Temporarily Unavailable</title></head>\
 <body><center><h1>503 Service Temporarily Unavailable</h1></center><hr><center>nginx</center>\
 </body></html>";
 
@@ -65,6 +66,12 @@ impl Pages {
                     total: Some(0),
                     ..Default::default()
                 },
+                edits: Vec::new(),
+            });
+        }
+        if let Some(written) = &self.written {
+            return Ok(Found {
+                search: written.results(cx, query, start).await?,
                 edits: Vec::new(),
             });
         }
