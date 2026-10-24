@@ -71,6 +71,30 @@ impl Clock {
 
     pub(crate) fn add(&self, at: Instant, waker: Waker) -> u64 {
         let mut s = self.state.lock();
+        let id = Self::register(&mut s, at, waker);
+        self.arm(&mut s);
+        id
+    }
+
+    /// Moves registration `id` to `at`. The move is a new registration, so
+    /// it wakes after every timer already set for the same instant, and the
+    /// returned ID replaces `id`.
+    pub(crate) fn reset(&self, id: u64, at: Instant, waker: &Waker) -> u64 {
+        let mut s = self.state.lock();
+        let old = s
+            .deadlines
+            .remove(&id)
+            .and_then(|old| s.entries.remove(&(old, id)));
+        let id = Self::register(&mut s, at, waker.clone());
+        self.arm(&mut s);
+        drop(s);
+        drop(old);
+        id
+    }
+
+    /// Adds an entry for `at` under the next registration ID, which orders
+    /// it after every entry already due at the same instant.
+    fn register(s: &mut State, at: Instant, waker: Waker) -> u64 {
         let id = s.next_id;
         s.next_id = s
             .next_id
@@ -78,20 +102,7 @@ impl Clock {
             .expect("timer registration IDs exhausted");
         s.entries.insert((at, id), waker);
         s.deadlines.insert(id, at);
-        self.arm(&mut s);
         id
-    }
-
-    pub(crate) fn reset(&self, id: u64, at: Instant, waker: &Waker) {
-        let mut s = self.state.lock();
-        let old = s
-            .deadlines
-            .insert(id, at)
-            .and_then(|old| s.entries.remove(&(old, id)));
-        s.entries.insert((at, id), waker.clone());
-        self.arm(&mut s);
-        drop(s);
-        drop(old);
     }
 
     pub(crate) fn update(&self, id: u64, waker: &Waker) {

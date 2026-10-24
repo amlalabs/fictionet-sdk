@@ -388,7 +388,9 @@ pub(super) async fn upstream(
 
 struct Turn {
     content: Vec<OutputBlock>,
-    ids: std::collections::HashMap<String, String>,
+    /// The id the client sees for each server tool block, by its index in `content`.
+    /// Upstream ids may repeat, so a client tool can share one with a server tool.
+    ids: std::collections::HashMap<usize, String>,
     usage: Value,
     stop: Value,
 }
@@ -416,9 +418,9 @@ async fn read(
             .map_err(|_| Error::msg("Invalid model message"))?;
         turn.usage = message["usage"].clone();
         turn.stop = message["stop_reason"].clone();
-        for block in &turn.content {
+        for (index, block) in turn.content.iter().enumerate() {
             output
-                .block(visible(block.clone(), model, tools, &mut turn.ids))
+                .block(visible(block.clone(), index, model, tools, &mut turn.ids))
                 .await?;
         }
         return Ok(turn);
@@ -467,7 +469,7 @@ async fn read(
                     let block: OutputBlock =
                         serde_json::from_value(event["content_block"].clone())?;
                     turn.content.push(block.clone());
-                    let shown = visible(block, model, tools, &mut turn.ids);
+                    let shown = visible(block, index, model, tools, &mut turn.ids);
                     event["content_block"] = serde_json::to_value(&shown)?;
                     output.content.push(shown);
                     event["index"] = json!(offset + index);
@@ -498,9 +500,9 @@ async fn read(
                                 .map_err(|_| Error::msg("Invalid model tool input"))?,
                         )?;
                     }
-                    let shown = block
-                        .tool()
-                        .and_then(|(id, _, _)| turn.ids.get(id))
+                    let shown = turn
+                        .ids
+                        .get(&index)
                         .map(|id| block.show_tool(id.clone()))
                         .unwrap_or_else(|| block.clone());
                     output.content[offset + index] = shown;
@@ -516,9 +518,10 @@ async fn read(
 }
 fn visible(
     block: OutputBlock,
+    index: usize,
     model: &Model,
     tools: &Tools,
-    ids: &mut std::collections::HashMap<String, String>,
+    ids: &mut std::collections::HashMap<usize, String>,
 ) -> OutputBlock {
     if let Some((original, _, _)) = block
         .tool()
@@ -528,7 +531,7 @@ fn visible(
             "srvtoolu_{}",
             model.cipher.encrypt(&model.cx, &json!({"id":original}))
         );
-        ids.insert(original.into(), id.clone());
+        ids.insert(index, id.clone());
         return block.show_tool(id);
     }
     block
@@ -549,11 +552,8 @@ async fn run(
         let turn = read(response, &model, &tools, output).await?;
         output_tokens += turn.usage["output_tokens"].as_u64().unwrap_or(0);
         let mut results = Vec::new();
-        for block in &turn.content {
-            let Some((original, name, _)) = block.tool() else {
-                continue;
-            };
-            let Some(id) = turn.ids.get(original) else {
+        for (index, block) in turn.content.iter().enumerate() {
+            let (Some((original, name, _)), Some(id)) = (block.tool(), turn.ids.get(&index)) else {
                 continue;
             };
             let (kind, settings) = &tools[name];
@@ -579,8 +579,8 @@ async fn run(
         let external = turn
             .content
             .iter()
-            .filter_map(OutputBlock::tool)
-            .any(|(id, _, _)| !turn.ids.contains_key(id));
+            .enumerate()
+            .any(|(index, block)| block.tool().is_some() && !turn.ids.contains_key(&index));
         if results.is_empty() || external {
             let mut usage = turn.usage;
             usage["output_tokens"] = json!(output_tokens);
@@ -737,7 +737,7 @@ mod tests {
             assert_eq!(error["error_code"], "max_uses_exceeded");
             let (error, _) = answer(&model, engine, &body, &native, WebTool::Fetch, &serde_json::from_value(json!({"blocked_domains":["example.com"]}))?, 1).await;
             assert_eq!(error["error_code"], "url_not_accessible");
-            let shown = visible(native.clone(), &model, &std::collections::HashMap::from([("web_fetch".into(), (WebTool::Fetch, settings))]), &mut Default::default());
+            let shown = visible(native.clone(), 0, &model, &std::collections::HashMap::from([("web_fetch".into(), (WebTool::Fetch, settings))]), &mut Default::default());
             let shown = serde_json::to_value(shown)?;
             let mut replay = body.clone();
             replay.messages.as_mut().unwrap().push(serde_json::from_value(json!({"role":"assistant","content":[shown.clone(),{"type":"web_fetch_tool_result","tool_use_id":shown["id"],"content":content},{"type":"text","text":"Done"}]}))?);

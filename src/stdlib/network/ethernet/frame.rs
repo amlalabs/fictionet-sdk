@@ -577,8 +577,10 @@ pub(super) mod tests {
         );
         let mut first = ipv4(src, dst, packet[9], &packet[20..20 + cut]);
         first[6] = 0x20;
+        ip::set_header_checksum(&mut first[..20]);
         let mut second = ipv4(src, dst, packet[9], &packet[20 + cut..]);
         second[6..8].copy_from_slice(&((cut / 8) as u16).to_be_bytes());
+        ip::set_header_checksum(&mut second[..20]);
         (first, second)
     }
 
@@ -735,10 +737,12 @@ pub(super) mod tests {
         // The first fragment gives the port, and only the port.
         let mut first = p.clone();
         first[6] = 0x20;
+        ip::set_header_checksum(&mut first[..20]);
         first[24..26].copy_from_slice(&100u16.to_be_bytes());
         assert_eq!(upper(&first), Ok(Upper::UdpFragment { port: 67 }));
         let mut later = p.clone();
         later[7] = 1;
+        ip::set_header_checksum(&mut later[..20]);
         assert_eq!(upper(&later), Ok(Upper::Other));
         // A first fragment that stops inside the UDP header.
         let cut = ipv4(
@@ -749,6 +753,7 @@ pub(super) mod tests {
         );
         let mut cut_first = cut.clone();
         cut_first[6] = 0x20;
+        ip::set_header_checksum(&mut cut_first[..20]);
         assert_eq!(upper(&cut_first), Err(Unreadable));
         // IPv6: a first fragment of a DHCPv6 request.
         let u = udp6(

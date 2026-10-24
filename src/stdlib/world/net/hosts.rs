@@ -415,13 +415,58 @@ pub(super) enum Known {
 pub(super) enum Lookup {
     Host(Placed),
     NoHost,
+    /// No host has the name, but hosts have names below it.
+    Parent,
     /// The resolver gave a host, but the network has as many as it may.
     Full,
 }
 
+/// Every name looked up or declared, and the parents of host names.
+#[derive(Default)]
+pub(super) struct Names {
+    known: HashMap<String, Known>,
+    /// Names with a host name below them. Names are never removed, so
+    /// neither are parents.
+    parents: HashSet<String>,
+}
+
+impl Names {
+    pub(super) fn get(&self, name: &str) -> Option<&Known> {
+        self.known.get(name)
+    }
+
+    pub(super) fn insert(&mut self, name: String, known: Known) {
+        if let Known::Host(_) = known {
+            let mut rest = name.as_str();
+            while let Some((_, parent)) = rest.split_once('.') {
+                if !self.parents.insert(parent.to_owned()) {
+                    break;
+                }
+                rest = parent;
+            }
+        }
+        self.known.insert(name, known);
+    }
+
+    /// Whether a host name lies below `name`.
+    pub(super) fn is_parent(&self, name: &str) -> bool {
+        self.parents.contains(name)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.known.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.known.is_empty()
+    }
+}
+
 /// Names and machines.
 pub(super) struct World {
-    pub(super) names: HashMap<String, Known>,
+    pub(super) names: Names,
     unknown: usize,
     pub(super) max_unknown: usize,
     pub(super) resolved: usize,
@@ -434,7 +479,7 @@ pub(super) struct World {
 impl World {
     pub(super) fn new(max_hosts: usize) -> World {
         World {
-            names: HashMap::new(),
+            names: Names::default(),
             unknown: 0,
             max_unknown: MAX_UNKNOWN_NAMES,
             resolved: 0,
@@ -474,8 +519,16 @@ pub(super) struct LookupContext<'a> {
 
 impl LookupContext<'_> {
     /// What `name` is. The first lookup of a name no host has runs the
-    /// resolver and, for a host, starts its machines.
+    /// resolver and, for a host, starts its machines. A name without a host
+    /// is a parent while a host has a name below it.
     pub(super) fn lookup(&self, name: &str) -> Lookup {
+        match self.find(name) {
+            Lookup::NoHost if self.world.lock().names.is_parent(name) => Lookup::Parent,
+            found => found,
+        }
+    }
+
+    fn find(&self, name: &str) -> Lookup {
         let mut world = self.world.lock();
         if let Some(known) = world.names.get(name) {
             return match known {
