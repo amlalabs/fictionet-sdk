@@ -16,11 +16,14 @@ async fn main() -> Result {
         .ok_or("expected search-image or search-capture")?;
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
     if task == "search-capture" {
-        let python = PathBuf::from(args.next().ok_or("missing Python with pip (Python 3.12)")?);
+        let selection = args
+            .next()
+            .ok_or("expected --research or Python with pip (Python 3.12)")?;
+        let python = (selection != "--research").then(|| PathBuf::from(selection));
         if args.next().is_some() {
             return Err("unexpected argument".into());
         }
-        return capture::run(&downloads, &python).await;
+        return capture::run(&downloads, python.as_deref()).await;
     }
     if task != "search-image" {
         return Err("expected search-image or search-capture".into());

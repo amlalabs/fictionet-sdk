@@ -139,16 +139,23 @@ async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) ->
     std::fs::rename(&log, &published_log)?;
     // Optional page assets and missing-page captures may return HTTP errors.
     // Required documents and distributions are verified from the archive below.
-    if !status.success() && !matches!(status.code(), Some(4 | 8)) {
+    if !status.success() && !matches!(status.code(), Some(4..=8)) {
         return Err(format!("wget failed: {status}; see {}", published_log.display()).into());
     }
-    if status.code() == Some(4) {
+    if matches!(status.code(), Some(4..=7)) {
         eprintln!(
             "Some downloads were unreachable; required responses will be verified. See {}",
             published_log.display()
         );
     }
     let archive = prefix.with_extension("warc.gz");
+    let captured = Archive::open([archive.clone()])?;
+    for url in captured.urls() {
+        captured
+            .get(url)?
+            .ok_or("missing response body")?
+            .decoded()?;
+    }
     std::fs::rename(&archive, root.join(archive.file_name().unwrap()))?;
     Ok(())
 }
@@ -312,73 +319,107 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
 }
 
 async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
-    for group in urls.chunks(4) {
-        let mut jobs = tokio::task::JoinSet::new();
-        for url in group {
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut urls = urls.iter();
+    loop {
+        while jobs.len() < 8 {
+            let Some(url) = urls.next() else {
+                break;
+            };
             let root = root.to_owned();
             let name = name.to_owned();
             let url = url.clone();
             jobs.spawn(async move {
                 match download(&root, &name, std::slice::from_ref(&url), false).await {
                     Err(error)
-                        if error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut) =>
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::InvalidData
+                            )
+                        }) =>
                     {
-                        eprintln!("Capture timed out: {url}");
+                        eprintln!("Capture unavailable: {url}: {error}");
                         Ok(())
                     }
                     result => result,
                 }
             });
         }
-        while let Some(result) = jobs.join_next().await {
-            result??;
-        }
+        let Some(result) = jobs.join_next().await else {
+            return Ok(());
+        };
+        result??;
     }
-    Ok(())
 }
 
 async fn research(root: &Path, sources: &[String]) -> Result {
-    wget(root, "research", sources, true).await?;
-    let archive = Archive::directory(root)?;
-    let mut references = BTreeSet::new();
+    // New batches sort after the original archives to supersede stale errors.
+    wget(root, "zz-research", sources, true).await?;
+    let mut archive = Archive::directory(root)?;
+    let mut frontier = sources.to_vec();
+    let mut seen = HashSet::new();
+    let mut origins = BTreeSet::new();
     for url in sources {
         verify(&archive, url)?;
-        let (url, response) = captured_at(&archive, url)?;
-        references.extend(
-            fictionet_extras::capture::references(&url, &response)?
-                .into_iter()
-                .take(32),
+    }
+    for depth in 1..=2 {
+        let mut references = BTreeSet::new();
+        for url in &frontier {
+            let (url, response) = captured_at(&archive, url)?;
+            origins.insert(url.clone());
+            if seen.insert(url.clone()) {
+                match fictionet_extras::capture::references(&url, &response) {
+                    Ok(found) => references.extend(found.into_iter().take(32)),
+                    Err(error) => eprintln!("Reference discovery unavailable: {url}: {error}"),
+                }
+            }
+        }
+        references.retain(|url| !seen.contains(url));
+        let pending = references
+            .iter()
+            .filter(|url| verify(&archive, url).is_err())
+            .cloned()
+            .collect::<Vec<_>>();
+        println!(
+            "Capturing hop {depth}: {} article references ({} already present)",
+            references.len(),
+            references.len() - pending.len()
         );
-    }
-    let references: Vec<_> = references.into_iter().collect();
-    let mut pending = Vec::new();
-    for url in &references {
-        if !captured(&archive, url).is_ok_and(|response| {
-            response.status.is_success() || response.status == http::StatusCode::NOT_FOUND
-        }) {
-            pending.push(url.clone());
+        documents(root, "zz-references", &pending).await?;
+        archive = Archive::directory(root)?;
+        frontier.clear();
+        for url in references {
+            if verify(&archive, &url).is_ok() {
+                frontier.push(url);
+            } else {
+                eprintln!("Reference unavailable: {url}");
+            }
         }
     }
-    println!(
-        "Capturing {} article references ({} already present)",
-        references.len(),
-        references.len() - pending.len()
-    );
-    // Only the source articles discover navigation. References are documents,
-    // so third-party application assets cannot expand the capture recursively.
-    documents(root, "references", &pending).await?;
+    origins.extend(frontier);
+    let roots = origins
+        .iter()
+        .map(|url| {
+            Ok(format!(
+                "{}/",
+                url::Url::parse(url)?.origin().ascii_serialization()
+            ))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let pending = roots
+        .iter()
+        .filter(|url| verify(&archive, url).is_err())
+        .cloned()
+        .collect::<Vec<_>>();
+    documents(root, "zz-roots", &pending).await?;
     let archive = Archive::directory(root)?;
-    let mut origins = sources.to_vec();
-    for url in references {
-        if captured(&archive, &url).is_ok_and(|response| response.status.is_success()) {
-            origins.push(url);
-        } else {
-            eprintln!("Reference unavailable: {url}");
+    for url in roots {
+        if verify(&archive, &url).is_ok() {
+            origins.insert(url);
         }
     }
-    missing_pages(root, &origins, sources).await
+    missing_pages(root, &origins.into_iter().collect::<Vec<_>>(), sources).await
 }
 
 fn package_root(root: &Path) -> std::io::Result<std::path::PathBuf> {
@@ -406,7 +447,7 @@ fn publish(packages: &Path, destination: &Path) -> Result {
     Ok(())
 }
 
-pub async fn run(downloads: &Path, python: &Path) -> Result {
+pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     let seed = web_world::pages::Seed::builtin("security")?;
     let corpus = seed.corpus.ok_or("missing corpus declaration")?;
     let root = downloads.join(&corpus.directory);
@@ -416,10 +457,6 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
     capture
         .try_lock()
         .map_err(|error| format!("cannot own corpus capture: {error}"))?;
-    research(&root, &corpus.urls).await?;
-
-    // Resolve and capture into an empty batch. Mutable indexes and their complete
-    // dependency closure are published together only after an offline install.
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -429,9 +466,58 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
     for entry in std::fs::read_dir(&root)? {
         let entry = entry?;
         if entry.path().to_string_lossy().ends_with(".warc.gz") {
-            std::os::unix::fs::symlink(entry.path(), staged_corpus.join(entry.file_name()))?;
+            let destination = staged_corpus.join(entry.file_name());
+            if entry.file_name() == "missing-pages.warc.gz" {
+                std::fs::copy(entry.path(), destination)?;
+            } else {
+                std::os::unix::fs::symlink(entry.path(), destination)?;
+            }
         }
     }
+    research(&staged_corpus, &corpus.urls).await?;
+    if root.join("packages").is_dir() {
+        std::os::unix::fs::symlink(root.join("packages"), staged_corpus.join("packages"))?;
+    }
+    let status = Command::new("rustup")
+        .args([
+            "run",
+            "1.99.0",
+            "cargo",
+            "test",
+            "--offline",
+            "-p",
+            "web-world",
+            "--test",
+            "corpus",
+        ])
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
+        .env("SEARCH_DOWNLOADS", std::fs::canonicalize(&batch.0)?)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err("offline research replay failed".into());
+    }
+    for entry in std::fs::read_dir(&staged_corpus)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && (path.to_string_lossy().ends_with(".warc.gz")
+                || path.extension().is_some_and(|extension| extension == "log"))
+        {
+            let destination = root.join(entry.file_name());
+            std::fs::rename(&path, &destination)?;
+            std::os::unix::fs::symlink(destination, path)?;
+        }
+    }
+    let Some(python) = python else {
+        println!("Captured research sources in {}", root.display());
+        return Ok(());
+    };
+    if staged_corpus.join("packages").is_symlink() {
+        std::fs::remove_file(staged_corpus.join("packages"))?;
+    }
+    // Resolve packages into an empty batch. Indexes and distributions are
+    // published together only after an offline install.
     let output = Command::new(python)
         .args([
             "-m",
@@ -557,6 +643,103 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn research_captures_two_article_hops_and_site_roots() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        assert!(request.len() < 8192);
+                        request.push(stream.read_u8().await.unwrap());
+                    }
+                    let request = std::str::from_utf8(&request).unwrap();
+                    let (status, body) = match request.split_whitespace().nth(1).unwrap() {
+                        "/incident" => (
+                            200,
+                            "<title>Incident</title><article><a href='/reviewdog#details'>Analysis</a></article>",
+                        ),
+                        "/reviewdog" => (
+                            200,
+                            "<title>Analysis</title><article><a href='/guidance'>Guidance</a></article>",
+                        ),
+                        "/guidance" => (
+                            200,
+                            "<title>Guidance</title><article><a href='/third'>More</a></article>",
+                        ),
+                        "/" => (200, "<title>Publisher</title>"),
+                        _ => (404, "<title>Page not found</title>"),
+                    };
+                    stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let root = Batch(std::env::temp_dir().join(format!(
+            "article-capture-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        std::fs::create_dir_all(&root.0).unwrap();
+        let mut previous = Archive::default();
+        previous
+            .append(
+                &root.0.join("references.warc.gz"),
+                &format!("{origin}/reviewdog"),
+                &fictionet_extras::warc::Response {
+                    status: http::StatusCode::NOT_FOUND,
+                    headers: Default::default(),
+                    body: "Missing".into(),
+                },
+            )
+            .unwrap();
+        let source = format!("{origin}/incident");
+        research(&root.0, std::slice::from_ref(&source))
+            .await
+            .unwrap();
+        server.abort();
+        let archive = Archive::directory(&root.0).unwrap();
+        for path in ["/incident", "/reviewdog", "/guidance", "/"] {
+            verify(&archive, &format!("{origin}{path}")).unwrap();
+        }
+        assert!(!archive.contains(&format!("{origin}/third")));
+        assert_eq!(
+            not_found(&archive, &format!("{origin}/404"))
+                .unwrap()
+                .status,
+            404
+        );
+        let pages = std::sync::Arc::new(
+            web_world::pages::Pages::copied(
+                web_world::pages::Seed::builtin("security").unwrap(),
+                &root.0,
+                &[source],
+                None,
+            )
+            .unwrap(),
+        );
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                use fictionet_extras::models::Engine;
+                for path in ["/reviewdog", "/guidance", "/"] {
+                    let page = pages
+                        .clone()
+                        .fetch(cx.clone(), format!("{origin}{path}"))
+                        .await?;
+                    assert!(!page.title.is_empty());
+                    assert!(!page.body.is_empty());
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn publishing_keeps_existing_worlds_and_git_paths_on_their_batch() {
