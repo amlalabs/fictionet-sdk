@@ -4784,7 +4784,6 @@ dependencies = [
  "libc",
  "percent-encoding",
  "regex",
- "reqwest",
  "rustybuzz",
  "serde",
  "serde_json",

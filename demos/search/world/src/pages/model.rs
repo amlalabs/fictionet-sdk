@@ -68,7 +68,6 @@ impl Provider {
 #[serde(rename_all = "lowercase")]
 pub enum GenerationOutcome {
     Ok,
-    Recovered,
     Error,
 }
 
@@ -240,7 +239,6 @@ impl Ledger {
 pub struct Failure {
     pub error: String,
     pub rejection: Option<Unreadable>,
-    pub(super) draft: Option<String>,
 }
 
 impl std::fmt::Debug for Failure {
@@ -249,15 +247,6 @@ impl std::fmt::Debug for Failure {
             .field("error", &self.error)
             .field("rejection", &self.rejection)
             .finish_non_exhaustive()
-    }
-}
-
-impl Failure {
-    pub(super) fn can_render_locally(&self) -> bool {
-        matches!(
-            self.rejection,
-            Some(Unreadable::Disclosure(_) | Unreadable::Incomplete | Unreadable::Content(_))
-        )
     }
 }
 
@@ -445,14 +434,13 @@ impl Model {
                 } else {
                     json!(system)
                 };
-                let body = json!({
+                json!({
                     "model": self.model,
                     "max_tokens": MAX_OUTPUT_TOKENS,
                     "thinking": {"type": "disabled"},
                     "system": system,
                     "messages": [{"role":"user", "content":user}],
-                });
-                body
+                })
             }
             Provider::OpenRouter => {
                 let mut body = json!({
@@ -566,7 +554,6 @@ impl Model {
         Err(Failure {
             error: self.redact(&format!("{what} failed: {failure}")),
             rejection: None,
-            draft: None,
         })
     }
 
@@ -598,7 +585,6 @@ impl Model {
             Failure {
                 error,
                 rejection: None,
-                draft: None,
             }
         };
         let completion = fictionet_extras::models::Completion::read(self.provider.into(), &answer)
@@ -663,7 +649,6 @@ impl Model {
             .map_err(|reason| Failure {
                 error: reason.to_string(),
                 rejection: Some(reason),
-                draft: None,
             })?;
         Ok(Answer { fields, raw })
     }
@@ -724,16 +709,7 @@ impl Model {
                 }
             };
             let answer_attempt = ledger.attempts.len() - 1;
-            let read = if ledger
-                .attempts
-                .last()
-                .is_some_and(|attempt| attempt.cut_off)
-            {
-                Err(Unreadable::Incomplete)
-            } else {
-                read(&text)
-            };
-            let read = match read {
+            let read = match read(&text) {
                 Ok(parsed) => self
                     .chronology(cx, &parsed.publications, &mut ledger)
                     .await
@@ -757,7 +733,6 @@ impl Model {
                         return (
                             Err(Failure {
                                 error: reason,
-                                draft: None,
                                 rejection: Some(rejection),
                             }),
                             ledger,

@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 pub enum Unreadable {
     Format(String),
     Disclosure(&'static str),
-    Incomplete,
     Credential,
     Content(String),
     Chronology(String),
@@ -36,9 +35,6 @@ impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Credential => f.write_str("provider response contained a credential"),
-            Self::Incomplete => {
-                f.write_str("answer stopped at its output limit; write a shorter complete answer")
-            }
             Self::Format(reason) | Self::Content(reason) | Self::Chronology(reason) => {
                 f.write_str(reason)
             }
@@ -149,7 +145,10 @@ Those new details become binding facts for every subsequent document and search.
 Authorship belongs to the cited URL: preserve its original authors, author order,
 publication title and date wherever it is cited. Use real authors for established
 papers. A journalist covering a paper has their own byline; they do not become
-that paper's author. Include these bibliographic identities in CLAIMS.
+that paper's author. An established DOI or paper identifier names one particular
+work: use its original title, authors and publication date, never a new paper
+about the same subject. An article landing page includes that full citation,
+abstract and the full-text link. Include these bibliographic identities in CLAIMS.
 Do not replace missing context with a generic unnamed company or facility.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.
@@ -218,7 +217,10 @@ or photo credits unless an actual image accompanies them.
 Nothing is dated after today. A dated article knows only what was known then.
 Future plans and deadlines may be mentioned before their scheduled dates. They
 are known when announced; a forecast is not knowledge of its eventual outcome.
-For each CLAIMS entry record when the statement became known, separately from
+For each CLAIMS entry record the earliest date when the statement became known,
+usually its original publication date, never the date of this writing session.
+An old paper's title and authors were known when it was published.
+Keep that date separate from
 any event date in its text. No statement may depend on knowledge acquired after
 DATE. Keep the visible dateline and the statement's known-on date consistent.
 When covering a development after an article's original publication date,
@@ -336,7 +338,7 @@ TITLE: the page's <title>, with the site name where that site puts it
 DESCRIPTION: its meta description, one sentence
 DATE: YYYY-MM-DD it was published or last updated, or none
 CLAIMS:
-- YYYY-MM-DD | durable fact (0 to 8 entries). The date is when this statement
+- YYYY-MM-DD | durable fact. The date is when this statement
   became known, not the date of a planned event or deadline. Include names of
   people with roles, organizations, sites, versions, numbers and event dates.
 ";
@@ -386,7 +388,7 @@ SITE_CSS: the site's complete stylesheet on one line, no fences or style tags
 Write the stylesheet once for this host, with a distinctive design suited to its
 kind. Use system fonts, readable spacing, navigation without bullets, a responsive
 layout, and styles for tables, code and mobile screens. No scripts, external
-imports, remote fonts or images. Keep it under 400 tokens. The page links
+imports, remote fonts or images. The page links
 /static/css/main.css. Style the shared HTML structure described below:
 ";
 
@@ -413,7 +415,7 @@ pub fn stylesheet(seed: &Seed, host: &str, profile: &Profile) -> (String, String
             "Write only CSS for {host}, the site {} of kind {}. No fences or style tags. \
          Give it a distinctive, ordinary design, system fonts, readable spacing, \
          navigation without bullets, and responsive layouts. No scripts, external \
-         imports, remote fonts or images. Keep it under 400 tokens.\n{SITE_LAYOUT}\n\n\
+         imports, remote fonts or images.\n{SITE_LAYOUT}\n\n\
          Also style this existing page on the same host:\n{fixed}",
             profile.name, profile.kind
         ),

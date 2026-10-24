@@ -74,12 +74,11 @@ tool handlers, its name resolver and the typed no-route callback on its network.
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
 above its details while the agent remains visible. The scrubber replays the
-retained observation history; the agent stays live. The World menu chooses the page source or restarts world pages.
-The last 1024 observations are kept for rewind. Observed internet destinations
-and sign-in policy survive activity expiry and page restarts. Each launch writes its facts to a separate
+retained observation history; the agent stays live. The visible source switch changes modes during a session; the World menu restarts pages.
+Observations are kept for rewind throughout the session. Observed internet destinations
+and sign-in policy survive page restarts. Each launch writes its facts to a separate
 `<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
-owner-only permissions. Preview records are under `demos/downloads/search-preview/`.
-Request credentials are redacted before entering the observation channel; request
+owner-only permissions. Request credentials are redacted before entering the observation channel; request
 bodies are not retained. Header details show only values retained by recording.
 The map draws internet
 routes from upstream facts, including host page-writer calls, rather than from
@@ -87,12 +86,7 @@ model call activity. Local and rejected model requests therefore leave the
 internet wire dark. The activity feed updates one row per upstream attempt;
 the run record retains each transport phase.
 
-Page and search request bodies are limited to one MiB, including chunked requests; larger
-bodies receive 413 before routing. The observation queue holds at most 256 facts,
-including one reserved failure notification. A burst or a fact larger than 256
-KiB fails recording explicitly; the app stops instead of silently losing facts.
-
-The page prints a loopback URL with its run token. Browser libraries are served
+The page binds to localhost with no authentication. Browser libraries are served
 locally. Recorded page previews are inert and cannot run scripts or contact
 sites. Capture dates are shown only when the archive records them.
 
@@ -109,14 +103,17 @@ sites. Capture dates are shown only when the archive records them.
   claims. The app chooses the host-held Claude token first, then
   `OPENROUTER_API_KEY`, then `ANTHROPIC_API_KEY`. The page writer uses its own
   host-side model client; it does not send its credential through the guest.
+  The writer is Claude Haiku 5.5 with thinking disabled. Search results start
+  writing their destination pages in parallel. Each site shares its navigation,
+  stylesheet and footer across pages. PDF URLs return typeset PDF documents
+  with embedded fonts. Authored claims preserve citation identities across pages.
   Failed calls do not invent fallback articles.
 - **Live** uses `EXA_API_KEY` for [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml).
   Results retain their order, titles, URLs and snippets in each engine's skin.
-  The World menu shows why a source is unavailable: missing captures, a page
+  The source switch shows why a source is unavailable: missing captures, a page
   writer or a search key. Other sources remain usable.
 
-Live downloads result pages and requisites, following navigation to depth five
-within each result's site. Redirects and cross-host assets are retained at their
+Live downloads result pages and requisites, following navigation within each result's site. Redirects and cross-host assets are retained at their
 real URLs. Live search and capture use a separate host HTTP transport, outside
 the guest model gateway; selecting Live permits public-web downloads. Search
 queries and served pages are logged and displayed. The crawler ignores
@@ -175,7 +172,7 @@ verbatim. For the VM demo, the brief's date is replaced by the run day. The gues
 inherits the host clock; HTTP dates and certificates use the run clock. The
 standalone world can still run against a brief's historical date.
 Search ranking receives the prose without special treatment for named sites.
-Eval questions live in the Python task's `QUESTIONS` mapping.
+Use unplanned research questions when driving the workstation.
 
 ## Corpus
 
@@ -235,5 +232,6 @@ corrections and model tools. Prompt construction and answer parsing are separate
 The WARC reader, crawler, BM25 index, model gateway and credential transport live in
 `fictionet-extras`. The shared demo kit supplies VM lifetime, prepared images
 and SSH console sockets. Search owns its HTML, styles and JavaScript, including copies of the
-terminal and screen pieces. ghostty-web 0.4.0 and noVNC 1.7.0, with their
+terminal and screen pieces. Vendored upstream ghostty-web with wheel reporting
+and noVNC 1.7.0, with their
 licenses, live in `demos/kit/assets`.

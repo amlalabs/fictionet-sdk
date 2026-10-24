@@ -63,28 +63,34 @@ function graph() {
   const services = [
     { id: 'dns', title: 'DNS', subtitle: '10.0.0.1:53', reached: facts.some((fact) => fact.kind === 'resolved') },
     { id: 'search', title: 'Search', subtitle: searches ? `${searches} searches` : '', reached: searches > 0, purpose: 'live_search' },
-    { id: 'sites', title: 'Sites', subtitle: sites.map((site) => site.host).join(' · '), reached: sites.some((site) => site.requests.length), purpose: 'live_capture' },
+    { id: 'sites', title: 'Sites', subtitle: sites.length ? `${sites.length} ${sites.length === 1 ? 'site' : 'sites'}` : '', reached: sites.some((site) => site.requests.length), purpose: 'live_capture' },
     { id: 'calls', title: 'Model gateway', subtitle: shown.calls.length ? `${shown.calls.length} calls` : '', reached: shown.calls.length > 0, purpose: 'model' },
     { id: 'writer', title: 'Page writer', subtitle: '', reached: false, purpose: 'page writer' },
     { id: 'signin', title: 'Sign-in', subtitle: shown.signin?.fact.open ? 'Open' : 'Closed', reached: modelHosts('account').length > 0, purpose: 'account' },
     { id: 'router', title: 'Router', subtitle: facts.filter((fact) => fact.kind === 'no_route').at(-1)?.to || '10.0.0.1', reached: facts.some((fact) => fact.kind === 'no_route') },
   ];
   const lanes = element('div', undefined, 'traffic-lanes');
+  const firstReached = services.findIndex((service) => service.reached);
+  const lastReached = services.findLastIndex((service) => service.reached);
   for (const [index, service] of services.entries()) {
     const lane = element('div', undefined, 'traffic-lane');
-    if (services.some((service) => service.reached)) lane.append(element('span', undefined, 'vm-stem'));
-    if (!index) {
+    if (index >= firstReached && index <= lastReached) lane.append(element('span', undefined, 'vm-stem'));
+    if (index === Math.max(0, firstReached)) {
       const vm = button('workstation', () => select('workstation'), 'vm-label');
       vm.append(element('small', hostStatus?.addresses[0] || '10.0.0.2'));
+      if (firstReached >= 0) vm.classList.add('connected');
       lane.append(vm);
     }
     const control = button('', () => select(service.id), `service ${service.reached ? 'active' : 'unused'}`);
     control.setAttribute('aria-pressed', String(selection === service.id));
-    control.append(element('strong', service.title));
-    if (service.subtitle) control.append(element('small', service.subtitle, service.id === 'router' && service.reached ? 'map-refusal' : ''));
+    const label = element('span', undefined, 'service-label');
+    label.append(element('strong', service.title));
+    if (service.subtitle) label.append(element('small', service.subtitle, service.id === 'router' && service.reached ? 'map-refusal' : ''));
+    control.append(label);
     lane.append(control);
     const hosts = modelHosts(service.purpose);
     if (hosts.length) {
+      control.classList.add('has-egress');
       const destinations = element('div', undefined, 'destinations');
       if (service.purpose === 'live_capture') {
         const pages = shown.sites.flatMap((site) => site.requests.filter((request) => request.source.kind === 'live' && request.has_preview));
@@ -100,6 +106,8 @@ function graph() {
       }
       lane.append(destinations);
     } else if (!index && !shown.connections.length) lane.append(element('p', 'No connections', 'map-empty'));
+    if (index === firstReached) lane.classList.add('first-reached');
+    if (index === lastReached) lane.classList.add('last-reached');
     lanes.append(lane);
   }
   map.append(lanes);
@@ -118,9 +126,8 @@ function activityText(row) {
     case 'egress': return [fact.host, 'Upstream', `${purposeName(fact.purpose)} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || phaseName(fact.phase)}`, `egress:${fact.host}`];
     case 'page_revision': {
       const target = fact.target.url ? new URL(fact.target.url).hostname : fact.target.host || 'Search';
-      return [target, 'Writer', fact.action === 'rejected' ? 'Answer rejected' : 'Recovered', 'writer'];
+      return [target, 'Writer', 'Revising page', 'writer'];
     }
-    case 'observation_failed': return ['Recording', 'Error', fact.reason, 'egress'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
     default: return ['', '', '', 'router'];
   }
@@ -301,12 +308,14 @@ function details() {
     }
     if (!searches.length) body.append(element('p', 'No searches', 'detail-empty'));
   } else if (selection === 'writer') {
-    heading('Writer');
+    heading('Page writer');
+    for (const row of activityRows().filter((row) => row.fact.kind === 'egress' && row.fact.purpose === 'page writer')) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.method} ${row.fact.path} · ${row.fact.status || phaseName(row.fact.phase)}`));
     for (const row of shown.activity.filter((row) => row.fact.kind === 'page_revision')) {
       const fact = row.fact;
       const target = fact.target.url || fact.target.host || fact.target.query || 'Cast';
-      body.append(detailRow(row.at_ms, target, fact.action === 'rejected' ? 'Answer rejected' : 'Recovered', element('p', fact.reason, fact.action === 'rejected' ? 'writer-error' : 'meta')));
+      body.append(detailRow(row.at_ms, target, 'Revising page', element('p', fact.reason, 'writer-error')));
     }
+    if (!body.childElementCount) body.append(element('p', 'No pages written', 'detail-empty'));
   } else if (selection === 'sites') {
     heading('Sites');
     for (const site of localSites()) {

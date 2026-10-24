@@ -79,7 +79,7 @@ impl Pages {
         target: crate::observation::WriterTarget,
         stored: impl FnOnce() -> T,
         prompt: impl FnOnce() -> (String, String),
-        read: impl Fn(&str, bool) -> Result<T, prompts::Unreadable>,
+        read: impl Fn(&str) -> Result<T, prompts::Unreadable>,
     ) -> Result<Made<T>, Stop> {
         let context = serde_json::to_value(&target).expect("generation target");
         match self.maker() {
@@ -91,7 +91,7 @@ impl Pages {
                     if let Some(reason) = gives_away(text) {
                         return Err(prompts::Unreadable::Disclosure(reason));
                     }
-                    let fields = read(text, false)?;
+                    let fields = read(text)?;
                     let publications =
                         fields.later_text(seed::parse_date(&self.seed.date).expect("world date"));
                     Ok(model::Parsed {
@@ -113,54 +113,20 @@ impl Pages {
                     .ask_reviewed(cx, &system, &user, parse, rejected)
                     .await;
                 let usage = ledger.usage();
-                let repaired = match &answer {
-                    Err(failure)
-                        if failure.can_render_locally()
-                            && matches!(target, crate::observation::WriterTarget::Page { .. }) =>
-                    {
-                        failure
-                            .draft
-                            .as_deref()
-                            .and_then(|raw| read(raw, true).ok())
-                            .filter(|fields| {
-                                let audit = fictionet_extras::guest_content::Audit::default();
-                                audit.inspect(
-                                    "repaired document",
-                                    &serde_json::to_vec(fields).expect("page fields"),
-                                );
-                                audit.check().is_ok()
-                            })
-                    }
-                    _ => None,
-                };
                 let status = if answer.is_ok() {
                     model::GenerationOutcome::Ok
-                } else if repaired.is_some() {
-                    model::GenerationOutcome::Recovered
                 } else {
                     model::GenerationOutcome::Error
                 };
                 let mut rows = ledger.rows(&context, status);
                 rows.iter_mut().for_each(|row| model.redact_json(row));
-                if repaired.is_none() {
-                    self.log(cx, &rows)?;
-                }
-                match (answer, repaired) {
-                    (Ok(answer), _) => Ok(Made {
+                self.log(cx, &rows)?;
+                match answer {
+                    Ok(answer) => Ok(Made {
                         fields: answer.fields,
                         usage,
-                        recovery: None,
                     }),
-                    (Err(failure), Some(fields)) => Ok(Made {
-                        fields,
-                        usage,
-                        recovery: Some(Recovery {
-                            target,
-                            reason: model.redact(&failure.error),
-                            rows,
-                        }),
-                    }),
-                    (Err(Failure { error, .. }), None) => Err(Stop::Failed {
+                    Err(Failure { error, .. }) => Err(Stop::Failed {
                         error: model.redact(&error),
                         usage: Some(Box::new(usage)),
                     }),
@@ -185,11 +151,7 @@ impl Pages {
         }
         context["raw"] = Value::Null;
         self.log(cx, &[context])?;
-        Ok(Made {
-            fields,
-            usage,
-            recovery: None,
-        })
+        Ok(Made { fields, usage })
     }
 
     /// The people the world names, made the first time a list or page
@@ -219,7 +181,7 @@ impl Pages {
                 crate::observation::WriterTarget::Cast,
                 Vec::new,
                 || prompts::cast(&self.seed),
-                |text, _| prompts::read_cast(text),
+                prompts::read_cast,
             )
             .await?;
         let record = CastRecord {
@@ -260,7 +222,7 @@ impl Pages {
                     crate::observation::WriterTarget::Stylesheet { host: host.into() },
                     String::new,
                     || prompts::stylesheet(&self.seed, host, &profile),
-                    |text, _| {
+                    |text| {
                         let css = text.trim();
                         if css.is_empty() {
                             Err(prompts::Unreadable::Format("empty stylesheet".into()))
@@ -456,7 +418,7 @@ impl Pages {
                     user.push_str(&format!("\nThe latest permitted publication/update date is {latest}. Incoming links already published by this date must remain possible. Later context describes the wider world; do not import its later knowledge into this page."));
                     (system, user)
                 },
-                |text, repair| {
+                |text| {
                     let mut page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
                     if page.date.is_empty() && page.content_type.starts_with("text/html") {
                         page.date = latest.to_string();
@@ -465,9 +427,6 @@ impl Pages {
                         let store = self.store();
                         model.check_document(&page.content_type, &page.body)?;
                         self.check_page_dates(&store, host, target, &page, latest)?;
-                    }
-                    if repair {
-                        super::answers::repair_page(&mut page)?;
                     }
                     if self.interactive {
                         let body = if page.content_type.starts_with("text/html") {
@@ -609,17 +568,6 @@ impl Pages {
             store.unserved.insert((host.into(), target.into()));
         }
         drop(store);
-        if let Some(recovery) = made.recovery {
-            self.log(cx, &recovery.rows)?;
-            self.report(
-                cx,
-                crate::observation::SearchObs::PageRevision {
-                    target: recovery.target,
-                    action: crate::observation::RevisionAction::LocalRendering,
-                    reason: recovery.reason,
-                },
-            );
-        }
         Ok(record)
     }
 }

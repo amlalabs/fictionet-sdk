@@ -270,7 +270,7 @@ impl Pages {
                     }
                 },
                 || prompts::search(&seed, &cast, query, &known, &claims),
-                |text, _| {
+                |text| {
                     let search = prompts::read_search(text)?;
                     for result in &search.results {
                         let date = if result.date.is_empty() {
