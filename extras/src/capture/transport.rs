@@ -16,7 +16,10 @@ impl Pool {
     /// Obtain the connection pool for this URL's origin.
     pub async fn client(&self, url: &Url) -> io::Result<reqwest::Client> {
         if !url.username().is_empty() || url.password().is_some() {
-            return Err(io::Error::other("URL contains credentials"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "URL contains credentials",
+            ));
         }
         let origin = url.origin();
         if let Some(client) = self.clients.lock().await.get(&origin) {
@@ -69,7 +72,10 @@ pub async fn client(url: &Url) -> io::Result<reqwest::Client> {
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Err(io::Error::other("URL is not a public HTTP destination"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "URL is not a public HTTP destination",
+        ));
     }
     let host = url
         .host_str()
@@ -85,7 +91,8 @@ pub async fn client(url: &Url) -> io::Result<reqwest::Client> {
             .iter()
             .any(|address| !public_address(address.ip()))
     {
-        return Err(io::Error::other(
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
             "destination is outside the public network",
         ));
     }

@@ -2,6 +2,7 @@
 
 use super::*;
 use fictionet_extras::models::UpstreamPhase;
+use std::io;
 
 struct Runtime(Option<tokio::runtime::Runtime>);
 impl Drop for Runtime {
@@ -62,7 +63,7 @@ impl Transport {
         observer: Option<Arc<capture::Observer>>,
         url: &str,
         search: Option<(&Key, &Value)>,
-    ) -> Result<warc::Response, String> {
+    ) -> io::Result<warc::Response> {
         struct Attempt {
             cx: Cx,
             observer: Arc<capture::Observer>,
@@ -73,7 +74,8 @@ impl Transport {
                 (self.observer)(&self.cx, &self.event);
             }
         }
-        let url = url::Url::parse(url).map_err(|_| "Invalid Live URL")?;
+        let url = url::Url::parse(url)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid Live URL"))?;
         let mut destination = url.clone();
         let _ = destination.set_username("");
         let _ = destination.set_password(None);
@@ -97,7 +99,10 @@ impl Transport {
         };
         // No attempt is published after a lifetime has been revoked.
         if lifetime.cancelled() || cx.is_cancelled() {
-            return Err("Live session stopped".into());
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Live session stopped",
+            ));
         }
         let mut attempt = observer.map(|observer| {
             observer(cx, &event);
@@ -111,7 +116,7 @@ impl Transport {
             }
         });
         let work = async {
-            let client = self.clients.client(&url).await.map_err(|e| e.to_string())?;
+            let client = self.clients.client(&url).await?;
             let request = if let Some((key, body)) = search {
                 client
                     .post(url)
@@ -122,14 +127,14 @@ impl Transport {
                 client.get(url).header("accept-encoding", "identity")
             };
             let response = request.send().await;
-            let response = response.map_err(|_| "Live request failed")?;
+            let response = response.map_err(|error| {
+                io::Error::other(format!("Live request failed: {:?}", error.without_url()))
+            })?;
             if let Some(attempt) = &mut attempt {
                 attempt.event.phase = UpstreamPhase::Response;
                 attempt.event.status = Some(response.status());
             }
-            let mut response = capture::receive(response)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut response = capture::receive(response).await?;
             self.process(cx, lifetime, move || {
                 response.body = response
                     .decoded()
@@ -142,15 +147,19 @@ impl Transport {
                 Ok(response)
             })
             .await
+            .map_err(io::Error::other)
         };
         let mut stopped = lifetime.stop.subscribe();
         if *stopped.borrow() {
-            return Err("Live session stopped".into());
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Live session stopped",
+            ));
         }
         tokio::select! {
             biased;
-            _ = stopped.changed() => Err("Live session stopped".into()),
-            _ = cx.cancelled() => Err("Live run stopped".into()),
+            _ = stopped.changed() => Err(io::Error::new(io::ErrorKind::Interrupted, "Live session stopped")),
+            _ = cx.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "Live run stopped")),
             result = work => {
                 if result.is_err() && let Some(attempt) = &mut attempt && attempt.event.phase == UpstreamPhase::Cancelled {
                     attempt.event.phase = UpstreamPhase::Failed;

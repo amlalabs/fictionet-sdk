@@ -114,7 +114,7 @@ impl Live {
         let lifetime = lifetime.clone();
         let cx = cx.clone();
         self.fetcher.spawn(async move {
-            let result = live.download(&lifetime, &cx, &url).await;
+            let result = live.download(&lifetime, &cx, &url, &send).await;
             send.send_replace(match result {
                 Ok(()) => CaptureState::Ready,
                 Err(_) if lifetime.cancelled() || cx.is_cancelled() => CaptureState::Cancelled,
@@ -129,15 +129,40 @@ impl Live {
         lifetime: &Arc<Lifetime>,
         cx: &Cx,
         url: &str,
+        ready: &watch::Sender<CaptureState>,
     ) -> Result<(), String> {
         if self.state().archive.contains(url) {
             return Ok(());
         }
         let observer = self.observer.lock().unwrap().clone();
-        let response = self
-            .fetcher
-            .request(cx, lifetime, observer, url, None)
-            .await?;
+        let mut stopped = lifetime.stop.subscribe();
+        let mut pause = std::time::Duration::from_secs(1);
+        let response = loop {
+            match self
+                .fetcher
+                .request(cx, lifetime, observer.clone(), url, None)
+                .await
+            {
+                Ok(response) => break response,
+                Err(error) => {
+                    if lifetime.cancelled()
+                        || cx.is_cancelled()
+                        || matches!(
+                            error.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
+                        )
+                    {
+                        return Err(error.to_string());
+                    }
+                    tokio::select! {
+                        _ = stopped.changed() => return Err("Live session stopped".into()),
+                        _ = cx.cancelled() => return Err("Live run stopped".into()),
+                        _ = tokio::time::sleep(pause) => {},
+                    }
+                    pause += std::time::Duration::from_secs(1);
+                }
+            }
+        };
         {
             let mut state = self.state();
             if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
@@ -149,15 +174,18 @@ impl Live {
                 .append(&path, url, &response)
                 .map_err(|error| error.to_string())?;
         }
+        ready.send_replace(CaptureState::Ready);
         let url = url.to_owned();
         let links = self
             .fetcher
             .process(cx, lifetime, move || {
                 capture::links(&url, &response).map_err(|error| error.to_string())
             })
-            .await?;
-        for url in links.assets {
-            let _ = self.capture(lifetime, cx, url);
+            .await;
+        if let Ok(links) = links {
+            for url in links.assets {
+                let _ = self.capture(lifetime, cx, url);
+            }
         }
         Ok(())
     }
@@ -211,7 +239,8 @@ impl Live {
                 self.endpoint.as_str(),
                 Some((&self.key, &request)),
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         if !response.status.is_success() {
             return Err(format!("Exa search API returned {}", response.status));
         }
