@@ -56,24 +56,25 @@ impl Pages {
                 let target: crate::observation::WriterTarget =
                     serde_json::from_value(context.clone()).expect("generation context");
                 let read = |text: &str| match gives_away(text) {
-                    Some(reason) => {
-                        self.report(
-                            cx,
-                            crate::observation::SearchObs::PageRevision {
-                                target: target.clone(),
-                                action: crate::observation::RevisionAction::Rewrite,
-                                reason: reason.into(),
-                            },
-                        );
-                        Err(prompts::Unreadable::Disclosure(reason))
-                    }
+                    Some(reason) => Err(prompts::Unreadable::Disclosure(reason)),
                     None => read(text),
                 };
-                let (answer, ledger): (_, Ledger) =
-                    model.ask(cx, &system, &user, max_tokens, read).await;
+                let rejected = |reason: &prompts::Unreadable| {
+                    self.report(
+                        cx,
+                        crate::observation::SearchObs::PageRevision {
+                            target: target.clone(),
+                            action: crate::observation::RevisionAction::Rewrite,
+                            reason: model.redact(&reason.to_string()),
+                        },
+                    );
+                };
+                let (answer, ledger): (_, Ledger) = model
+                    .ask(cx, &system, &user, max_tokens, read, rejected)
+                    .await;
                 let status = match &answer {
                     Ok(_) => "ok",
-                    Err(failure) if failure.disclosure => "recovered",
+                    Err(failure) if failure.can_render_locally() => "recovered",
                     Err(_) => "error",
                 };
                 let mut rows = ledger.rows(&context, status);
@@ -85,10 +86,7 @@ impl Pages {
                         fields: answer.fields,
                         usage,
                     }),
-                    Err(Failure {
-                        error,
-                        disclosure: true,
-                    }) => {
+                    Err(failure) if failure.can_render_locally() => {
                         let fields = stored();
                         let audit = fictionet_extras::guest_content::Audit::default();
                         audit.inspect(
@@ -103,7 +101,7 @@ impl Pages {
                             crate::observation::SearchObs::PageRevision {
                                 target,
                                 action: crate::observation::RevisionAction::LocalRendering,
-                                reason: model.redact(&error),
+                                reason: model.redact(&failure.error),
                             },
                         );
                         Ok(Made { fields, usage })

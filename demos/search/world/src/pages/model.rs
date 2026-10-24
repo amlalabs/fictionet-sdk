@@ -220,7 +220,16 @@ impl Ledger {
 #[derive(Debug)]
 pub struct Failure {
     pub error: String,
-    pub disclosure: bool,
+    pub rejection: Option<Unreadable>,
+}
+
+impl Failure {
+    pub(super) fn can_render_locally(&self) -> bool {
+        matches!(
+            self.rejection,
+            Some(Unreadable::Disclosure(_) | Unreadable::Incomplete)
+        )
+    }
 }
 
 /// What a store made with a model records: provider, model (an empty one
@@ -508,7 +517,7 @@ impl Model {
         }
         Err(Failure {
             error: self.redact(&format!("{what} failed: {failure}")),
-            disclosure: false,
+            rejection: None,
         })
     }
 
@@ -531,7 +540,7 @@ impl Model {
             attempt.error = Some(error.clone());
             Failure {
                 error,
-                disclosure: false,
+                rejection: None,
             }
         };
         let (text, cut_off) = match self.provider {
@@ -582,6 +591,7 @@ impl Model {
         user: &str,
         max_tokens: u32,
         read: impl Fn(&str) -> Result<T, Unreadable>,
+        rejected: impl Fn(&Unreadable),
     ) -> (Result<Answer<T>, Failure>, Ledger) {
         let mut ledger = Ledger::new();
         let mut user = user.to_owned();
@@ -597,12 +607,20 @@ impl Model {
                     return (Err(failure), ledger);
                 }
             };
-            let read = read(&text);
+            let read = if ledger
+                .attempts
+                .last()
+                .is_some_and(|attempt| attempt.cut_off)
+            {
+                Err(Unreadable::Incomplete)
+            } else {
+                read(&text)
+            };
             ledger.ended = Some(now(cx));
             match read {
                 Ok(fields) => return (Ok(Answer { fields, raw: text }), ledger),
                 Err(rejection) => {
-                    let disclosure = matches!(rejection, Unreadable::Disclosure(_));
+                    rejected(&rejection);
                     let reason = rejection.to_string();
                     let last = ledger.attempts.last_mut().expect("an attempt");
                     last.outcome = "unreadable".into();
@@ -628,13 +646,13 @@ impl Model {
                         return (
                             Err(Failure {
                                 error: reason,
-                                disclosure,
+                                rejection: Some(rejection),
                             }),
                             ledger,
                         );
                     }
                     user = format!(
-                        "{user}\n\nPrevious answer:\n{text}\n\nThe previous answer could not be read: {reason}\nRewrite the full answer in the requested format. Preserve its legitimate facts and links, and remove the named disclosure."
+                        "{user}\n\nPrevious answer:\n{text}\n\nThe previous answer could not be read: {reason}\nRewrite the full answer in the requested format. Preserve its legitimate facts and links, and fix the named issue. Finish the entire answer within {max_tokens} output tokens."
                     );
                 }
             }
@@ -714,9 +732,14 @@ mod transport_tests {
                 )
                 .live(Arc::new(AtomicUsize::new(0)));
                 let (answer, ledger) = model
-                    .ask(&cx, "Write a page.", "About stars.", 200, |_| {
-                        Err::<(), _>(Unreadable::Format("try again".into()))
-                    })
+                    .ask(
+                        &cx,
+                        "Write a page.",
+                        "About stars.",
+                        200,
+                        |_| Err::<(), _>(Unreadable::Format("try again".into())),
+                        |_| {},
+                    )
                     .await;
                 assert!(answer.is_err());
                 assert_eq!(ledger.attempts.len(), 2);

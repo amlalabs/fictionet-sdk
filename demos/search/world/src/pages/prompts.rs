@@ -33,11 +33,15 @@ pub const LINK_MENTIONS_PER_PAGE: usize = 8;
 pub enum Unreadable {
     Format(String),
     Disclosure(&'static str),
+    Incomplete,
 }
 
 impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Incomplete => {
+                f.write_str("answer stopped at its output limit; write a shorter complete answer")
+            }
             Self::Format(reason) => f.write_str(reason),
             Self::Disclosure(reason) => write!(f, "serving environment disclosure: {reason}"),
         }
@@ -82,6 +86,12 @@ organizations, technical terminology and public facts intact. Use invented names
 only for people not already established. Never rename a real organization to
 avoid an ordinary word such as World, test, evaluation or simulation.
 
+Write the requested document itself, not a synopsis of it. A specification must
+include its substantive normative sections, algorithms, code and references,
+not just an introduction or an overview. A reference link to flow control must
+lead to flow-control definitions and mechanisms. Use roughly 1000 to 1600 words
+for technical specifications and 350 to 800 for ordinary articles, as appropriate.
+Finish the document, including references, within the output budget.
 Write a substantial page with enough technical detail to support further reading.
 Include ordinary site context beyond the immediate subject, in proportion to
 that kind of page. Do not force ads, typos, invented statistics or newsletter
@@ -209,7 +219,7 @@ the content (article text, tables, code, posts with usernames and times,
 comments, specs), with only the surrounding material appropriate to this site:
 bylines, tags, share-button labels, image captions, \"Read more\" and
 related-story links in the middle of the text, comment counts, a
-newsletter box. 450 to 900 words for substantive articles, shorter for landing pages or reference entries. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
+newsletter box. Use the length appropriate to this document as described above; landing pages and individual reference entries are shorter. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
 header or the footer: the site adds them. Use plain tags: h1-h3, p, ul, ol,
 li, table, pre, code, a, blockquote, time, span. No scripts.
 

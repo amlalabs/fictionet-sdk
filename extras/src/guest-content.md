@@ -21,6 +21,7 @@ contain their own testing machinery, but internal project names are still checke
 First-party pages and installed tools receive the full disclosure check.
 
 The page writer retries a rejected answer with that answer and the named issue.
-Rejections and recovery are world observations. Repeated disclosure rejection
+Rejections and recovery are world observations. Answers stopped by the provider's
+output limit are also rewritten as shorter complete documents. Repeated rejection
 uses the world's local renderer and established context, never the rejected
 bytes. Transport failures and invalid answer formats remain explicit failures.

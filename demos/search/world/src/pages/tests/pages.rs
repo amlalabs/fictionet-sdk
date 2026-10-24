@@ -457,3 +457,33 @@ fn concurrent_requests_make_one_page() {
         Ok(())
     });
 }
+
+#[test]
+fn concurrent_interactive_pages_read_the_preceding_pages_claims() {
+    let script = Arc::new(Script::default());
+    let fake = fake_openrouter(script);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    lab(move |cx| async move {
+        let other = pages.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        cx.spawn(move |cx| async move {
+            send.send(get(&other, &cx, "https://docs.fields.com/reference").await)
+                .unwrap();
+            Ok(())
+        });
+        let first = get(&pages, &cx, "https://docs.fields.com/guide").await;
+        let second = receive.await.unwrap();
+        assert_eq!((first.status, second.status), (200, 200));
+        let prompts = fake.users();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("a claim about https://docs.fields.com/guide"));
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.contains("SITE_CSS:"))
+                .count(),
+            1
+        );
+        Ok(())
+    });
+}

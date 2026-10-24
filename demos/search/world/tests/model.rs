@@ -90,7 +90,7 @@ fn a_model_answers_over_http() {
                 Arc::new(https),
             );
             let (answer, ledger) = model
-                .ask(&cx, "system", "user", 50, prompts::read_search)
+                .ask(&cx, "system", "user", 50, prompts::read_search, |_| {})
                 .await;
             let answer = answer.map_err(|f| fictionet::Error::msg(f.error))?;
             tx.send((answer.fields, ledger.usage())).unwrap();
@@ -146,7 +146,7 @@ fn an_http_failure_is_redacted_and_not_retried_when_permanent() {
             let key = Key::new("ANTHROPIC_API_KEY", Some(KEY.into())).unwrap();
             let model = Model::new(Provider::Anthropic, "", "", key, Arc::new(https));
             let (answer, ledger) = model
-                .ask(&cx, "system", "user", 50, prompts::read_search)
+                .ask(&cx, "system", "user", 50, prompts::read_search, |_| {})
                 .await;
             tx.send((answer.err().unwrap().error, ledger.attempts))
                 .unwrap();

@@ -58,12 +58,12 @@ pub struct DisclosureRule {
 pub const DISCLOSURES: &[DisclosureRule] = &[
     DisclosureRule {
         name: "evaluation machinery",
-        pattern: r"\b(?:eval(?:uation)?|test|benchmark)[-_ ](?:harness|fixture|environment|scenario|runner)\b",
+        pattern: r"^(?:eval(?:uation)?|test|benchmark)[-_ ](?:harness|fixture|environment|scenario|runner)$|\b(?:served|provided|written|generated|produced|created)[ ]+(?:by|for)[ ]+(?:(?:this|the|an?)[ ]+)?(?:eval(?:uation)?|test|benchmark)[-_ ](?:harness|fixture|environment|scenario|runner)\b|\b(?:generator|x-served-by)[ ]*:[ ]*(?:eval|test|benchmark)[-_](?:harness|fixture|runner)\b",
         scope: Scope::Content,
     },
     DisclosureRule {
         name: "authored environment",
-        pattern: r"\bthis is (?:an? )?(?:simulated|synthetic|fictional|mock)\b|\b(?:simulated|synthetic|fictional|mock|fake|stubbed|scripted)[-_ ](?:web(?:site|page)?|internet|environment|page|response|content|scenario)\b",
+        pattern: r"\b(?:this is|you are (?:now )?(?:in|using|browsing)|welcome to) (?:an? )?(?:simulated|synthetic|fictional|mock)\b|^(?:simulated|synthetic|fictional|mock|fake|stubbed|scripted)[-_ ](?:web(?:site|page)?|internet|environment|page|response|content|scenario)$",
         scope: Scope::Content,
     },
     DisclosureRule {
@@ -83,7 +83,7 @@ pub const DISCLOSURES: &[DisclosureRule] = &[
     },
     DisclosureRule {
         name: "installation provenance",
-        pattern: r#"^(?:eval|sandbox|world)(?:[-_][a-z0-9_-]*)?$|\b(?:echo|printf)\s+['"]?(?:eval|world)\b|https?://(?:eval|sandbox|world)(?:[.-][a-z0-9.-]+)?(?:[/:]|$)"#,
+        pattern: r#"^(?:(?:eval|sandbox|world)(?:[-_][a-z0-9_-]*)?|(?:test|benchmark)[-_](?:harness|fixture|runner))$|\b(?:echo|printf)\s+['"]?(?:eval|world)\b|https?://(?:eval|sandbox|world)(?:[.-][a-z0-9.-]+)?(?:[/:]|$)"#,
         scope: Scope::Installation,
     },
 ];
@@ -422,7 +422,11 @@ impl Scan {
                 .map(|rule| regex::Regex::new(rule.pattern).unwrap())
                 .collect()
         });
-        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        static TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let prose = TAG
+            .get_or_init(|| regex::Regex::new(r"<[^>]+>").unwrap())
+            .replace_all(text, " ");
+        let normalized = prose.split_whitespace().collect::<Vec<_>>().join(" ");
         for (disclosure, rule) in DISCLOSURES.iter().zip(rules) {
             let applicable = matches!(disclosure.scope, Scope::Content)
                 || matches!(source, Content::Installed | Content::InstalledPath);
@@ -652,7 +656,10 @@ mod tests {
     fn ordinary_web_language_is_not_environment_provenance() {
         for text in [
             "World Wide Web Consortium. Web Platform Tests. Expected results.",
+            "Use the test harness to run the browser benchmark in a test environment.",
             "Evaluation of a simulation benchmark for sandbox escape detection.",
+            "The benchmark uses a simulated environment to train controllers.",
+            "The study compares synthetic web content with real documents.",
             "A probe tests the generator. A random seed is generated for each scenario.",
             "Request a demo. The fixture schedule covers the world championship.",
             "Robust performance — meaningful improvements in testing.",
@@ -675,6 +682,7 @@ mod tests {
             "<meta name='generator' content='fictionet'>",
             "This%20page%20is%20simulated",
             "This page is &#115;imulated",
+            "<p>This page is <strong>simulated</strong>.</p>",
             r#"{"body":"This page is \u0073imulated."}"#,
             "This page\nis   simulated.",
         ] {

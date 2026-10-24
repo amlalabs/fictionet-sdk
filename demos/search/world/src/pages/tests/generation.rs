@@ -359,31 +359,39 @@ fn invalid_usage_stays_unknown() {
 }
 
 #[test]
-fn anthropic_answers_keep_tokens_and_where_they_stopped() {
+fn cut_off_answers_are_rewritten_and_every_attempt_is_counted() {
     let reply = json!({
         "model": "answered/model",
         "content": [{"type": "text", "text": SEARCH}],
         "usage": {"input_tokens": 20, "output_tokens": 10},
         "stop_reason": "max_tokens",
     });
-    let fake = Fake::script(vec![(ms(100), Ok((200, reply.to_string().into_bytes())))]);
+    let mut complete = reply.clone();
+    complete["stop_reason"] = json!("end_turn");
+    let fake = Fake::script(vec![
+        (ms(100), Ok((200, reply.to_string().into_bytes()))),
+        (ms(100), Ok((200, complete.to_string().into_bytes()))),
+    ]);
     let key = Key::new("ANTHROPIC_API_KEY", Some(KEY.into())).unwrap();
     let model = Model::new(Provider::Anthropic, "", "", key, fake.clone());
     assert_eq!(model.model, Provider::Anthropic.default_model());
     let (tx, rx) = std::sync::mpsc::channel();
     lab(|cx| async move {
         let (answer, ledger) = model
-            .ask(&cx, "system", "user", 100, prompts::read_search)
+            .ask(&cx, "system", "user", 100, prompts::read_search, |_| {})
             .await;
         tx.send((
             answer.is_ok(),
             ledger.usage(),
             ledger.attempts[0].raw.clone(),
+            ledger.attempts[0].cut_off,
         ))
         .unwrap();
         Ok(())
     });
-    let (ok, usage, raw) = rx.recv().unwrap();
+    let (ok, usage, raw, cut_off) = rx.recv().unwrap();
+    assert!(cut_off);
+    assert_eq!((usage.attempts, usage.asks), (2, 2));
     assert!(ok);
     assert_eq!(
         (
@@ -392,11 +400,18 @@ fn anthropic_answers_keep_tokens_and_where_they_stopped() {
             usage.cost_unknown,
             usage.cut_off
         ),
-        (Some(20), Some(10), 1, true)
+        (Some(40), Some(20), 2, false)
     );
     assert_eq!(usage.cost, None);
     assert_eq!(raw.as_deref(), Some(SEARCH));
     let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].1["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("output limit")
+    );
     let (headers, body) = &requests[0];
     assert!(headers.contains(&("x-api-key", KEY.to_owned())));
     assert_eq!(

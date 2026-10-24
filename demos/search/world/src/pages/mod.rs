@@ -47,11 +47,10 @@ use store::{CastRecord, PageRecord, SearchRecord, Store};
 /// cast, failed ones included.
 pub const GENERATION_BUDGET: usize = 200;
 
-/// Output budgets, in tokens. A page asks for 200 to 450 words of content
-/// plus a few header lines; a result list is ten short results. The limits
-/// leave room above that, and cut off an answer that runs on.
+/// Output budgets include document markup, site metadata and provider reasoning.
+/// Shorter complete answers are requested if a provider reaches its limit.
 const SEARCH_TOKENS: u32 = 1800;
-const PAGE_TOKENS: u32 = 3200;
+const PAGE_TOKENS: u32 = 8000;
 const CAST_TOKENS: u32 = 800;
 
 /// A change to the world: its generation setting, what answers, or a
