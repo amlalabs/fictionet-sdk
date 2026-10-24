@@ -105,7 +105,10 @@ Capture dates appear when the archive records them.
   the index before pagination. An unmatched query returns an empty list.
   Missing pages use captured site responses; unknown hosts return NXDOMAIN.
 - **Model-written** writes pages for the requested subject from the prose brief,
-  earlier mentions and stored claims. The host-held Claude token takes priority,
+  captured reference material, earlier mentions and stored claims. Written searches
+  use the offline index for relevant sources; pages preserve the original source's
+  facts unless the brief or established world documents explicitly change them.
+  The host-held Claude token takes priority,
   followed by `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`. The Anthropic writer is
   Claude Haiku 5.5, without thinking, with the API's 128K output maximum.
 - **Live** is selected by default when `EXA_API_KEY` is present. Exa supplies search
