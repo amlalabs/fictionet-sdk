@@ -1,7 +1,7 @@
 //! Shared HTML fragments and site display details.
 
 use super::{
-    make::{Page, Profile},
+    make::{Link, Page, Profile},
     text::{escape as e, normalize_space},
 };
 
@@ -64,10 +64,10 @@ pub fn server_of(profile: Option<&Profile>) -> &'static str {
         "Apache/2.4.58 (Ubuntu)",
     ][profile.map_or(1, |p| p.style) % 10]
 }
-pub(crate) fn nav(items: &[String], class: &str) -> String {
+pub(crate) fn nav(items: &[Link], class: &str) -> String {
     let mut out = format!(r#"<ul class="{class}">"#);
     for item in items {
-        let (label, href) = item.split_once('|').unwrap_or((item, ""));
+        let (label, href) = (item.label.as_str(), item.href.as_str());
         let href = href.trim();
         let href = if href.is_empty() {
             format!(
@@ -85,7 +85,7 @@ pub(crate) fn nav(items: &[String], class: &str) -> String {
     }
     out + "</ul>"
 }
-pub(crate) fn question_body(record: &Page) -> String {
+pub(crate) fn question_body(record: &Page, today: &str) -> String {
     use kuchiki::traits::TendrilSink;
     let dom = kuchiki::parse_html().one(record.body.as_str());
     if dom.select_first(".question-post").is_ok() {
@@ -95,9 +95,15 @@ pub(crate) fn question_body(record: &Page) -> String {
     if posts.is_empty() {
         return record.body.clone();
     }
+    let date = if record.date.is_empty() {
+        today
+    } else {
+        &record.date
+    };
     let mut out = format!(
-        "<h1>{}</h1><p class=\"question-meta\">Asked 3 days ago · Modified today · Viewed 960 times</p>",
-        e(super::make::heading(&record.title))
+        "<h1>{}</h1><p class=\"question-meta\">Asked {}</p>",
+        e(super::make::heading(&record.title)),
+        e(date)
     );
     for (index, post) in posts.iter().enumerate() {
         let (class, score, mark) = if index == 0 {

@@ -95,11 +95,11 @@ impl Pages {
                     _ => None,
                 };
                 let status = if answer.is_ok() {
-                    "ok"
+                    model::GenerationOutcome::Ok
                 } else if repaired.is_some() {
-                    "recovered"
+                    model::GenerationOutcome::Recovered
                 } else {
-                    "error"
+                    model::GenerationOutcome::Error
                 };
                 let mut rows = ledger.rows(&context, status);
                 rows.iter_mut().for_each(|row| model.redact_json(row));
@@ -195,7 +195,7 @@ impl Pages {
 
     pub(super) async fn site_stylesheet(&self, cx: &Cx, host: &str) -> Result<make::Profile, Stop> {
         let profile = make::site_profile(host);
-        if profile.kind == "qa" {
+        if profile.kind == make::SiteKind::Qa {
             return Ok(profile);
         }
         let _site = self
@@ -251,6 +251,16 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
+        let publication = if self.live_calls.is_some() {
+            Some(
+                self.locks
+                    .lock(cx, "page publications".into())
+                    .await
+                    .map_err(Stop::store)?,
+            )
+        } else {
+            None
+        };
         let _site = self
             .locks
             .lock(cx, format!("site {host}"))
@@ -280,6 +290,13 @@ impl Pages {
                 cast,
             }
         };
+        // Establish shared facts before parallel writers reuse the published context.
+        let _publication = publication.filter(|_| {
+            !self
+                .store()
+                .pages()
+                .any(|page| ask.claims.iter().any(|claim| claim.url == page.url))
+        });
         let expected = prompts::expected_type(&url);
         let seed = self.context().into_owned();
         let subject = format!("{url} {}", make::title_from(host, target));
@@ -294,7 +311,7 @@ impl Pages {
         let kind = self
             .store()
             .site(host)
-            .map(|p| p.kind.clone())
+            .map(|p| p.kind)
             .unwrap_or_else(|| make::site_profile(host).kind);
         let mut known = {
             let store = self.store();
@@ -348,7 +365,7 @@ impl Pages {
                             mentions.push(json!({"snippet": fact}));
                         }
                     }
-                    make::page_with_known(&seed, host, target, &mentions, &kind, &known)
+                    make::page_with_known(&seed, host, target, &mentions, kind, &known)
                 },
                 || {
                     let (system, user) = prompts::page(

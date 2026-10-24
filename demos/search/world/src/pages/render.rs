@@ -1,7 +1,7 @@
 //! Generic layouts for hosts without a bundled skin.
 
 use super::{
-    make::{Page, Profile},
+    make::{Page, Profile, SiteKind},
     text::escape as e,
 };
 
@@ -25,7 +25,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
     };
     let record = &adjusted;
     let mut illustrated;
-    let record = if ["news", "howto", "recipe"].contains(&profile.kind.as_str())
+    let record = if [SiteKind::News, SiteKind::Howto, SiteKind::Recipe].contains(&profile.kind)
         && !record.body.contains("article-hero")
     {
         illustrated = record.clone();
@@ -50,9 +50,9 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         record
     };
     let question;
-    let record = if profile.kind == "qa" {
+    let record = if profile.kind == SiteKind::Qa {
         question = Page {
-            body: question_body(record),
+            body: question_body(record, today),
             ..record.clone()
         };
         &question
@@ -60,7 +60,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         record
     };
     let path = target.split('?').next().unwrap_or(target);
-    let forum_listing = profile.kind == "forum"
+    let forum_listing = profile.kind == SiteKind::Forum
         && ["/", "/search", "/search/", "/latest", "/categories", "/top"].contains(&path);
     if !forum_listing
         && let Some(skin) = fictionet_extras::sites::lookup(host, target)
@@ -103,7 +103,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
     } else {
         &profile.name
     };
-    let kind = profile.kind.as_str();
+    let kind = profile.kind;
     let style = profile.style;
     let nav = nav(&profile.nav, "nav");
     let footer = self::nav(&profile.footer, "footer-links");
@@ -147,35 +147,35 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         format!(r#"<span class="tagline">{}</span>"#, e(&profile.tagline))
     };
     let main = match kind {
-        "listings" | "lodging" | "howto" => format!(
+        SiteKind::Listings | SiteKind::Lodging | SiteKind::Howto => format!(
             r#"<body class="{kind}"><header><div class="brand"><a href="/">{}</a></div><nav>{nav}</nav></header><div class="site-content"><p class="page-breadcrumb"><a href="/">Home</a> › {}</p><div class="filters"><span>{}</span><span>{}</span><span>{}</span></div><article>{body}</article></div></body></html>"#,
             e(name),
             e(title),
             if flights {
                 "Flights"
-            } else if kind == "lodging" {
+            } else if kind == SiteKind::Lodging {
                 "Stays"
-            } else if kind == "listings" {
+            } else if kind == SiteKind::Listings {
                 "Restaurants"
             } else {
                 "Steps"
             },
             if flights {
                 "Connections"
-            } else if kind == "lodging" {
+            } else if kind == SiteKind::Lodging {
                 "Room type"
-            } else if kind == "listings" {
+            } else if kind == SiteKind::Listings {
                 "Cuisine"
             } else {
                 "Tips"
             },
-            if kind == "listings" {
+            if kind == SiteKind::Listings {
                 "Price"
             } else {
                 "Related articles"
             }
         ),
-        "news" | "blog" => {
+        SiteKind::News | SiteKind::Blog => {
             let newsletter = if style.is_multiple_of(2) {
                 r#"<section class="newsletter"><h2>Newsletter</h2><form action="/newsletter" method="post"><input type="email" name="email" placeholder="Email address"><button>Sign up</button></form></section>"#
             } else {
@@ -201,7 +201,13 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
                 e(name)
             )
         }
-        "company" | "government" | "shop" | "weather" | "review" | "marketplace" | "advisory" => {
+        SiteKind::Company
+        | SiteKind::Government
+        | SiteKind::Shop
+        | SiteKind::Weather
+        | SiteKind::Review
+        | SiteKind::Marketplace
+        | SiteKind::Advisory => {
             let topbar = if !style.is_multiple_of(2) {
                 "<div class=\"topbar\"><a href=\"/contact\">Contact</a> <a href=\"/support\">Support</a> <a href=\"/login\">Log in</a></div>\n"
             } else {
@@ -231,7 +237,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
                 e(title)
             )
         }
-        "qa" => format!(
+        SiteKind::Qa => format!(
             r#"<body class="qa"><header><a class="home" href="/">{}</a><form action="/search" class="search"><input name="q" aria-label="Search" placeholder="Search"></form><a href="/login">Sign in</a></header><main class="{}">{body}</main>"#,
             e(name),
             if host.contains("quora.com") {
@@ -240,7 +246,7 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
                 "questions"
             }
         ),
-        "forum" | "docs" | "wiki" | "package" => {
+        SiteKind::Forum | SiteKind::Docs | SiteKind::Wiki | SiteKind::Package => {
             let related = ["See also", "Related", "More"][style % 3];
             let ad = if ad.is_empty() {
                 String::new()
@@ -277,7 +283,14 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
             )
         }
     };
-    let cookies = if !["government", "wiki", "docs", "package"].contains(&kind) && cookie_host(host)
+    let cookies = if ![
+        SiteKind::Government,
+        SiteKind::Wiki,
+        SiteKind::Docs,
+        SiteKind::Package,
+    ]
+    .contains(&kind)
+        && cookie_host(host)
     {
         let (message, accept, reject) = cookie_words(host);
         r#"<div class="cookie-banner" style="position:fixed;bottom:0;left:0;right:0;z-index:100;background:white;display:flex;align-items:center;gap:12px;padding:8px 20px;border-top:1px solid #bdc6d1;font:14px/1.4 system-ui,sans-serif" role="dialog" aria-label="Cookies"><p style="margin:0;flex:1">{message} <a href="/privacy">Privacy policy</a></p><button style="padding:6px 12px;margin:0" data-choice="accept">{accept}</button><button style="padding:6px 12px;margin:0" data-choice="reject">{reject}</button></div><script>(()=>{const bar=document.querySelector('.cookie-banner');let choice='seen';const remember=(value)=>{choice=value;document.cookie='site_cookies='+value+'; Max-Age=31536000; Path=/; SameSite=Lax';};if(document.cookie.split(';').some(value=>value.trim().startsWith('site_cookies='))){bar.remove();return;}remember('seen');bar.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>{remember(button.dataset.choice);bar.remove();}));window.addEventListener('pagehide',()=>remember(choice),{once:true});})();</script>"#.replace("{message}", message).replace("{accept}", accept).replace("{reject}", reject)
@@ -336,14 +349,14 @@ pub fn again(
     today: &str,
 ) -> Option<String> {
     let path = target.split('?').next().unwrap_or(target);
-    if super::make::site_profile(host).kind == "forum"
+    if super::make::site_profile(host).kind == SiteKind::Forum
         && ["/", "/search", "/search/", "/latest", "/categories", "/top"].contains(&path)
     {
         return None;
     }
     let profile = super::make::site_profile(host);
     let skin = fictionet_extras::sites::lookup(host, target);
-    if skin.is_none() && profile.kind != "qa" {
+    if skin.is_none() && profile.kind != SiteKind::Qa {
         return None;
     }
     let today = super::seed::parse_date(today).ok()?;

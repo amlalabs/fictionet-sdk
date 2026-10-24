@@ -180,8 +180,7 @@ async fn story(cx: &Cx, machine: &Machine, world: &World, query: &str) -> fictio
         .search(
             cx.clone(),
             query.into(),
-            "claude_web_search",
-            serde_json::json!({}),
+            fictionet_extras::models::tools::Domains::default(),
         )
         .await?;
     for hit in hits.iter().take(3) {

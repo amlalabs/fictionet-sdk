@@ -7,8 +7,7 @@ impl fictionet_extras::models::Engine for Pages {
         self: Arc<Self>,
         cx: Cx,
         query: String,
-        _source: &'static str,
-        settings: Value,
+        settings: fictionet_extras::models::tools::Domains,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
             let Ok((mut search, _, _, _)) = self.listing(&cx, Engine::Google, &query, 0).await

@@ -71,6 +71,15 @@ impl Provider {
     }
 }
 
+/// The published outcome of a page generation.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GenerationOutcome {
+    Ok,
+    Recovered,
+    Error,
+}
+
 /// The outcome of one provider attempt, rendered to words at the record boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttemptOutcome {
@@ -210,7 +219,7 @@ impl Ledger {
 
     /// One row per attempt, with `context` (`kind` and the query or URL).
     /// The last also carries the generation's totals and `status`.
-    pub fn rows(&self, context: &Value, status: &str) -> Vec<Value> {
+    pub fn rows(&self, context: &Value, status: GenerationOutcome) -> Vec<Value> {
         let count = self.attempts.len();
         self.attempts
             .iter()
@@ -269,7 +278,6 @@ pub struct Model {
     pub model: String,
     /// The reasoning effort, or empty for the provider default.
     pub reasoning: String,
-    key: Key,
     transport: fictionet_extras::models::Authenticated,
     live: Option<Arc<AtomicUsize>>,
 }
@@ -334,8 +342,11 @@ impl Model {
             provider,
             model: model.into(),
             reasoning: reasoning.into(),
-            transport: fictionet_extras::models::Authenticated::new(key.clone(), transport),
-            key,
+            transport: fictionet_extras::models::Authenticated::new(
+                provider.into(),
+                key,
+                transport,
+            ),
             live: None,
         }
     }
@@ -358,7 +369,7 @@ impl Model {
 
     /// `text` without the key.
     pub fn redact(&self, text: &str) -> String {
-        self.key.redact(text)
+        self.transport.redact(text)
     }
 
     /// Every string in `value` without the key.
@@ -371,21 +382,10 @@ impl Model {
         }
     }
 
-    fn request(
-        &self,
-        system: &str,
-        user: &str,
-        max_tokens: u32,
-    ) -> (Vec<(&'static str, String)>, Value) {
+    fn request(&self, system: &str, user: &str, max_tokens: u32) -> Value {
         match self.provider {
             Provider::Anthropic => {
-                let mut headers = vec![
-                    self.key.header(self.provider.into()),
-                    ("anthropic-version", "2023-06-01".into()),
-                    ("content-type", "application/json".into()),
-                ];
-                let system = if self.key.is_claude_token() {
-                    headers.push(("anthropic-beta", "oauth-2025-04-20".into()));
+                let system = if self.transport.is_claude_token() {
                     json!([
                         {"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."},
                         {"type":"text", "text":system}
@@ -403,7 +403,7 @@ impl Model {
                     body["output_config"] = json!({"effort":self.reasoning});
                     body["thinking"] = json!({"type":"between_tools"});
                 }
-                (headers, body)
+                body
             }
             Provider::OpenRouter => {
                 let mut body = json!({
@@ -421,27 +421,14 @@ impl Model {
                 if !self.reasoning.is_empty() {
                     body["reasoning"] = json!({"effort": self.reasoning});
                 }
-                (
-                    vec![
-                        self.key.header(self.provider.into()),
-                        ("content-type", "application/json".into()),
-                        ("x-title", "Fictionet web".into()),
-                    ],
-                    body,
-                )
+                body
             }
         }
     }
 
     /// POSTs one prompt, retrying what is worth retrying, and returns the
     /// answer's JSON with its attempt as the ledger's last.
-    async fn post(
-        &self,
-        cx: &Cx,
-        body: &Value,
-        headers: &[(&'static str, String)],
-        ledger: &mut Ledger,
-    ) -> Result<Value, Failure> {
+    async fn post(&self, cx: &Cx, body: &Value, ledger: &mut Ledger) -> Result<Value, Failure> {
         let what = format!("{} {}", self.provider.label(), self.model);
         let data = serde_json::to_vec(body).expect("a JSON value");
         let mut failure = String::new();
@@ -466,10 +453,7 @@ impl Model {
                 error: None,
             };
             let sent = cx
-                .race(
-                    Some(deadline),
-                    self.transport.post(cx, headers.to_vec(), data.clone()),
-                )
+                .race(Some(deadline), self.transport.post(cx, data.clone()))
                 .await;
             attempt.ended = now(cx);
             let mut retry = true;
@@ -550,8 +534,8 @@ impl Model {
         max_tokens: u32,
         ledger: &mut Ledger,
     ) -> Result<String, Failure> {
-        let (headers, body) = self.request(system, user, max_tokens);
-        let answer = self.post(cx, &body, &headers, ledger).await?;
+        let body = self.request(system, user, max_tokens);
+        let answer = self.post(cx, &body, ledger).await?;
         let attempt = ledger.attempts.last_mut().expect("an attempt");
         let what = format!("{} {}", self.provider.label(), self.model);
         let unreadable = |attempt: &mut Attempt, error: String| {
@@ -595,6 +579,7 @@ impl Model {
                 (text, choice["finish_reason"] == "length")
             }
         };
+        let text = self.redact(&text);
         attempt.raw = Some(text.clone());
         attempt.cut_off = cut_off;
         ledger.ended = Some(now(cx));
@@ -816,8 +801,8 @@ mod transport_tests {
         });
         fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(6), |cx| async move {
             let key = Key::claude_token(fictionet_extras::models::Secret::new("Claude token", "sk-ant-oat01-private-test".into())?).map_err(fictionet::Error::msg)?;
-            let mut model = Model::claude_token(key);
-            model.transport = fictionet_extras::models::Authenticated::new(model.key.clone(), Arc::new(fictionet_extras::models::Https::at(&cx, format!("http://{address}").parse()?, "/v1/messages")?));
+            let mut model = Model::claude_token(key.clone());
+            model.transport = fictionet_extras::models::Authenticated::new(fictionet_extras::models::Provider::Anthropic, key, Arc::new(fictionet_extras::models::Https::at(&cx, format!("http://{address}").parse()?, "/v1/messages")?));
             let pages = super::super::Pages::open(super::super::Seed::builtin("web")?, super::super::Store::memory(), Some(super::super::Maker::Model(model)), 0);
             let (sender, mut observations) = tokio::sync::mpsc::channel(crate::observation::OBSERVATION_CAPACITY);
             pages.observe(sender);

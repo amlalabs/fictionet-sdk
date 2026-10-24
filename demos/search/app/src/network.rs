@@ -27,34 +27,23 @@ pub fn build(
         cx,
         SearchObs::Signin {
             open: false,
-            exceptions: if claude_token.is_some() {
-                vec![SigninException::CodexAccount]
-            } else {
-                vec![
-                    SigninException::ClaudeAccount,
-                    SigninException::CodexAccount,
-                ]
-            },
+            exceptions: vec![],
         },
     );
-    let models = [Provider::Anthropic, Provider::OpenAi, Provider::ChatGpt]
+    let models = [Provider::Anthropic]
         .into_iter()
         .map(|provider| {
             Ok((
                 provider.host(),
                 (
                     Gateway {
-                        model: if provider == Provider::Anthropic {
-                            if let Some(credential) = &claude_token {
-                                Model::at(
-                                    cx,
-                                    provider,
-                                    credential.clone(),
-                                    "https://api.anthropic.com".parse()?,
-                                )?
-                            } else {
-                                Model::guest(cx, provider)?
-                            }
+                        model: if let Some(credential) = &claude_token {
+                            Model::at(
+                                cx,
+                                provider,
+                                credential.clone(),
+                                "https://api.anthropic.com".parse()?,
+                            )?
                         } else {
                             Model::guest(cx, provider)?
                         },
@@ -86,7 +75,7 @@ pub fn build(
 
 use fictionet::stdlib::web::{Body, httpd};
 use fictionet_extras::models::CallPhase as ModelPhase;
-use web_world::observation::{CallPhase, EgressPurpose, Hit, SearchObs, SigninException, Tool};
+use web_world::observation::{CallPhase, EgressPurpose, Hit, SearchObs, Tool};
 
 #[derive(Clone)]
 struct Gateway {
@@ -204,14 +193,13 @@ impl fictionet_extras::models::Engine for Tools {
         self: Arc<Self>,
         cx: Cx,
         query: String,
-        source: &'static str,
-        settings: serde_json::Value,
+        settings: fictionet_extras::models::tools::Domains,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
             let result = self
                 .pages
                 .clone()
-                .search(cx.clone(), query.clone(), source, settings)
+                .search(cx.clone(), query.clone(), settings)
                 .await;
             let hits = result
                 .as_ref()

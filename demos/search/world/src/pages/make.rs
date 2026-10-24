@@ -48,19 +48,92 @@ pub(super) const USERS: [&str; 12] = [
     "oldschool_ccna",
     "pfeiffer_it",
 ];
+/// Editorial layout selected while decoding a site description.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteKind {
+    News,
+    Blog,
+    Company,
+    Government,
+    Shop,
+    Forum,
+    Docs,
+    Wiki,
+    Qa,
+    Package,
+    Weather,
+    Marketplace,
+    Review,
+    Listings,
+    Lodging,
+    Howto,
+    Recipe,
+    Advisory,
+    #[default]
+    #[serde(alias = "")]
+    Other,
+}
+impl std::str::FromStr for SiteKind {
+    type Err = serde_json::Error;
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        serde_json::from_value(Value::String(text.to_lowercase()))
+    }
+}
+impl std::fmt::Display for SiteKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = serde_json::to_value(self).expect("site category");
+        f.write_str(text.as_str().expect("category name"))
+    }
+}
+
+/// A navigation destination with its displayed label.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Link {
+    pub label: String,
+    pub href: String,
+}
+impl<'de> Deserialize<'de> for Link {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Saved {
+            Fields { label: String, href: String },
+            Text(String),
+        }
+        match Saved::deserialize(deserializer)? {
+            Saved::Fields { label, href } => Ok(Self { label, href }),
+            Saved::Text(text) => Self::parse(&text)
+                .ok_or_else(|| serde::de::Error::custom("invalid saved navigation link")),
+        }
+    }
+}
+
+impl Link {
+    pub(super) fn parse(text: &str) -> Option<Self> {
+        let (label, href) = text.split_once('|')?;
+        Some(Self {
+            label: label.trim().into(),
+            href: href.trim().into(),
+        })
+    }
+}
+
 /// Site branding and layout settings shared by its pages.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     /// Display name derived from the hostname.
     pub name: String,
     /// Site category, such as news.
-    pub kind: String,
+    pub kind: SiteKind,
     /// Short text below the site name.
     pub tagline: String,
-    /// Navigation links in `label|target` form.
-    pub nav: Vec<String>,
-    /// Footer links in `label|target` form.
-    pub footer: Vec<String>,
+    /// Navigation labels and destinations.
+    pub nav: Vec<Link>,
+    /// Footer labels and destinations.
+    pub footer: Vec<Link>,
     /// Stylesheet shared by every page on the host.
     #[serde(default)]
     pub css: String,
@@ -299,7 +372,7 @@ pub fn videos<'a>(query: &str, pages: impl Iterator<Item = (&'a String, String)>
 pub use super::branding::site_profile;
 
 /// Shared layouts for each kind of site.
-pub(super) fn stylesheet(kind: &str) -> String {
+pub(super) fn stylesheet(kind: SiteKind) -> String {
     let base = r#"
 * { box-sizing: border-box; }
 body { margin: 0; color: #263345; background: #f5f6f8; font: 16px/1.65 Arial, sans-serif; }
@@ -333,25 +406,25 @@ pre { overflow-x: auto; padding: 20px; background: #edf1f5; } code { font-family
 @media(max-width: 760px) { .layout, .columns { grid-template-columns: minmax(0, 1fr); margin: 20px auto; gap: 20px; } header, .docs header { padding: 20px; flex-wrap: wrap; } main { padding: 24px; } nav ul { gap: 14px; } .search { margin-left: 0; } }
 "#;
     let theme = match kind {
-        "docs" => {
+        SiteKind::Docs => {
             ":root {--accent:#3156ad} header {background:#edf1f5} main {border:1px solid #d9dee5;border-radius:6px} h1 {font-size:34px}"
         }
-        "qa" => {
+        SiteKind::Qa => {
             ":root {--accent:#a74320;--app-made:#237a3b;--app-rule:#d9dee5;--app-soft:#edf1f5;--accent-text:#a74320} .qa header{display:flex;align-items:center;gap:24px}.qa main{max-width:1000px;margin:20px auto;padding:24px}.qa header a{color:var(--accent-text)}.qa h1{margin-bottom:16px}.qa h2{margin:20px 0 8px}.question-meta{font-size:13px}.question-post,.answer{display:grid;grid-template-columns:56px minmax(0,1fr);gap:20px;padding:16px 0;border-bottom:1px solid var(--app-rule)}.votes{font-size:24px;text-align:center}.accepted-mark{display:block;color:var(--app-made);font-size:32px}.tags{display:flex;gap:8px}.tags span{background:var(--app-soft);padding:3px 8px;border-radius:4px}.author{font-size:13px}.answer-cards .answer{border:1px solid var(--app-rule);border-radius:8px;padding:20px;margin:20px 0}.answer-cards .question-post{display:block}.answer-cards .question-post>.votes{display:none}"
         }
-        "forum" => {
+        SiteKind::Forum => {
             ":root {--accent:#a74320} body {background:#f2ede8} header {border-top:0} main {border:1px solid #d8cec5;border-radius:8px} main p {padding:14px;background:#faf8f5;border-radius:5px} h1 {font-size:30px}"
         }
-        "shop" => {
+        SiteKind::Shop => {
             ":root {--accent:#265f4a} header {text-align:center;background:#eff5ed} header nav ul {justify-content:center} h1 {font-weight:500} main {border-radius:12px} .promo-banner {text-align:center;background:#dfeadd}"
         }
-        "company" => {
+        SiteKind::Company => {
             ":root {--accent:#164d88} header {background:#edf1f5} header a {color:inherit} h1 {color:#153c63} main {border-top:4px solid var(--accent)} .topbar {text-align:right}"
         }
-        "wiki" => {
+        SiteKind::Wiki => {
             ":root {--accent:#365c99} body {background:white;font-family:Georgia,serif} header {border-top:0} h1 {font-weight:400;border-bottom:1px solid #aeb5be;padding-bottom:14px} nav, header, footer {font-family:Arial,sans-serif} main {padding-top:0}"
         }
-        "blog" => {
+        SiteKind::Blog => {
             ":root {--accent:#805235} body {background:#f5f1e9} .masthead {background:#f5f1e9;border-top:0} .brand a {font-family:Georgia,serif;font-style:italic;font-size:38px} article {font-family:Georgia,serif;font-size:18px} main {background:transparent;padding-top:0} .rail {border-top:1px solid #cbbca9}"
         }
         _ => {
@@ -441,7 +514,7 @@ pub(super) fn page_with_known(
     host: &str,
     target: &str,
     mentions: &[Value],
-    kind: &str,
+    kind: SiteKind,
     known: &[Result],
 ) -> Page {
     if host == "www.youtube.com" && target == "/" {
@@ -477,7 +550,7 @@ pub(super) fn page_with_known(
 
     let title = if let Some(query) = &query {
         format!("Search results for {query}")
-    } else if path == "/" && kind == "forum" {
+    } else if path == "/" && kind == SiteKind::Forum {
         "Latest discussions".into()
     } else if path == "/" {
         site_profile(host).name

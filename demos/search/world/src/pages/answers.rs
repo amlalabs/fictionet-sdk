@@ -1,6 +1,6 @@
 //! Parse result lists, people and page replies from the model.
 
-use super::make::{Page, Profile};
+use super::make::{Link, Page, Profile};
 use super::prompts::*;
 use fictionet_extras::search::{Ad, Result as Listed, Search};
 use regex::Regex;
@@ -135,12 +135,8 @@ pub fn read_search(text: &str) -> Result<Search, Unreadable> {
     Ok(search)
 }
 
-fn links(line: &str) -> Vec<String> {
-    line.split(',')
-        .map(str::trim)
-        .filter(|x| x.contains('|'))
-        .map(str::to_owned)
-        .collect()
+fn links(line: &str) -> Vec<Link> {
+    line.split(',').filter_map(Link::parse).collect()
 }
 
 pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result<Page, Unreadable> {
@@ -210,7 +206,11 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
             "SIDEBAR" => section = "sidebar",
             "AD" => page.ad = if none { String::new() } else { value.into() },
             "SITE_NAME" => site.name = value.into(),
-            "SITE_KIND" => site.kind = value.to_lowercase(),
+            "SITE_KIND" => {
+                site.kind = value
+                    .parse()
+                    .map_err(|_| Unreadable::Format("Unknown site category".into()))?
+            }
             "SITE_TAGLINE" => site.tagline = if none { String::new() } else { value.into() },
             "SITE_NAV" => site.nav = links(value),
             "SITE_FOOTER" => site.footer = links(value),

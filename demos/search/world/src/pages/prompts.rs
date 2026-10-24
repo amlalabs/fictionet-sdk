@@ -83,7 +83,11 @@ editorial context. They describe the same persistent web, not independent storie
 Preserve established names, dates, versions, claims and URL paths.
 All coverage of one event must agree on its date, location, organization and
 numbers, including across different sites. Distinguish publication dates from
-event dates. Search snippets establish these facts before any page is opened.
+event dates. Every event date, publication date, search snippet and stored claim uses
+a concrete calendar date including its year. Never use relative dates such as
+last week, yesterday, today, days ago or the second week of a month. When a
+source used relative wording, state the exact date or inclusive date range
+that it means in that source, preserving the established timeline. Search snippets establish these facts before any page is opened.
 Use earlier published text as binding context even when it has no explicit claims.
 Do not introduce a second incompatible timeline or leave an established identity vague.
 Use public site domains, never reserved example domains or special-use hostnames. A page must
@@ -120,6 +124,11 @@ link promises a real destination which will be available when opened. Keep links
 to earlier pages at their exact URLs. Never use placeholders or empty links.
 
 Nothing is dated after today. A dated article knows only what was known then.
+When covering a development after an article's original publication date,
+give the article an explicit update date on or after that development. Set
+DATE to that update date and show both the original publication and update
+dates visibly in BODY. A dated URL can retain its original publication date;
+it does not permit silently adding later knowledge to an unchanged dateline.
 Return only the requested format, without commentary.";
 
 fn world_brief(seed: &Seed) -> String {
@@ -192,6 +201,13 @@ RELATED: six related searches, separated by \" | \"
 QUESTIONS: four \"People also ask\" questions, separated by \" | \"
 AD: url | title | one line of ad copy   (zero to two AD lines)
 
+For a query about incidents, investigations or other dated developments,
+establish a concrete chronology before writing the results. If no earlier
+source establishes an event date, choose its full calendar date now. State
+that event date, including the year, in the relevant snippets; all reports
+of that event share it. DATE is each report's publication date, never a
+substitute for the event date. Later articles inherit this chronology.
+
 Rank what a real search engine would rank for this query today. Real
 result lists are messy, not a tidy story:
 - Include relevant sites and known pages only when the query is about them.
@@ -228,6 +244,16 @@ BODY:
 the page's main content
 
 If the title names a number of items, list exactly that many items.
+
+In a report about an incident or investigation, explicitly date the incident
+and each development in BODY with full calendar dates including their years.
+Keep these event dates separate from the article's publication or update date.
+If earlier sources leave an event undated, establish its concrete date in this
+article and in CLAIMS so subsequent sources reuse it. Do not substitute vague
+recent damage or an ongoing inquiry for an account of what happened when.
+Preserve any quoted snippet, but explain any contextual time it contains with
+an explicit date or date range in the surrounding prose. A reader must be able
+to extract the timeline without calendar arithmetic or opening another page.
 
 For HTML, BODY is what goes inside <main>: start with the page's <h1>, then
 the content (article text, tables, code, posts with usernames and times,

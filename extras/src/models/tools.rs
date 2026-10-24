@@ -12,8 +12,7 @@ pub trait Engine: Send + Sync {
         self: Arc<Self>,
         cx: Cx,
         query: String,
-        source: &'static str,
-        settings: Value,
+        domains: Domains,
     ) -> Answer<Vec<crate::search::Result>>;
     /// Reads a page through the world's handler, without a host internet request.
     fn fetch(self: Arc<Self>, cx: Cx, url: String) -> Answer<Page>;
@@ -42,25 +41,36 @@ pub(super) fn host(url: &str) -> Option<String> {
     }
     url.host_str().map(str::to_owned)
 }
+/// Domain restrictions on a world's search and fetch results.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Domains {
+    /// Permitted domains and their subdomains; absent means unrestricted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    /// Excluded domains and their subdomains, even when otherwise permitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
+}
 /// Whether the tool's domain restrictions permit this HTTP URL.
-pub fn allowed(tool: &Value, url: &str) -> bool {
+pub fn allowed(domains: &Domains, url: &str) -> bool {
     let Some(host) = host(url) else {
         return false;
     };
-    let matches = |domain: &Value| {
-        domain.as_str().is_some_and(|d| {
-            let domain = d.trim_start_matches('.').to_ascii_lowercase();
-            host == domain
-                || host
-                    .strip_suffix(&domain)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-        })
+    let matches = |domain: &String| {
+        let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+        host == domain
+            || host
+                .strip_suffix(&domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
     };
-    !tool["blocked_domains"]
-        .as_array()
+    !domains
+        .blocked_domains
+        .as_ref()
         .is_some_and(|ds| ds.iter().any(matches))
-        && tool["allowed_domains"]
-            .as_array()
+        && domains
+            .allowed_domains
+            .as_ref()
             .is_none_or(|ds| ds.iter().any(matches))
 }
 /// Elements that end a line of text, as a browser lays them out.

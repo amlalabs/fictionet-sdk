@@ -597,6 +597,7 @@ impl GuestHandle {
 
 /// Owns every process, bridge, and temporary file of a run.
 pub struct Run {
+    ownership: Option<vm::Ownership>,
     audit: Arc<fictionet_extras::guest_content::Audit>,
     guests: Vec<GuestHandle>,
     fcx: Arc<Mutex<Option<Cx>>>,
@@ -833,6 +834,7 @@ fn prepare<P: Software + Into<Boot>>(
     let setup = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let mut run = Run {
+        ownership: None,
         audit,
         guests: Vec::new(),
         setup: setup.clone(),
@@ -896,7 +898,7 @@ where
     F: Future<Output = fictionet::Result> + Send + 'static,
 {
     let downloads = downloads.as_ref();
-    vm::ensure_stopped(name)?;
+    let ownership = vm::Ownership::acquire(name)?;
     check_downloads(downloads, &guests)?;
     std::fs::OpenOptions::new()
         .read(true)
@@ -905,6 +907,7 @@ where
         .map_err(|error| io::Error::other(format!("/dev/kvm is not usable: {error}")))?;
     let identity = Arc::new(ssh::Identity::generate()?);
     let (mut run, mut prepared) = prepare(name, guests)?;
+    run.ownership = Some(ownership);
     ready(run.guests.iter().map(GuestHandle::console).collect());
     let backends = std::mem::take(&mut prepared.backends);
     let result = async {
@@ -1036,7 +1039,7 @@ impl Run {
                 product: &guest.guest.product,
                 uuid: &r.uuid,
             };
-            let vm = vm::Vm::start(&config, &r.dir)
+            let vm = vm::Vm::start(&config, &r.dir, self.ownership.as_ref().expect("owned run"))
                 .map_err(|e| io::Error::other(format!("{}: {e}", guest.name())))?;
             guest.vm = Some(vm);
         }

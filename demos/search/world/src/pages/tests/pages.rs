@@ -77,7 +77,7 @@ fn model_site_stylesheets_start_with_shared_layout_and_end_with_site_rules() {
         assert_eq!(css.status, 200);
         assert_eq!(css.content_type, "text/css");
         let css = String::from_utf8(css.body).unwrap();
-        let base = make::stylesheet("news");
+        let base = make::stylesheet(make::SiteKind::News);
         assert_eq!(css, format!("{base}\n{own}"));
         assert_eq!(pages.store().site("news.fields.com").unwrap().css, own);
         let audit = fictionet_extras::guest_content::Audit::default();
@@ -149,7 +149,11 @@ fn concurrent_model_pages_share_one_stylesheet() {
         let css = get(&pages, &cx, "https://docs.fields.com/static/css/main.css").await;
         assert_eq!(
             css.body,
-            format!("{}\nbody {{ color: #17472c; }}", make::stylesheet("docs")).as_bytes()
+            format!(
+                "{}\nbody {{ color: #17472c; }}",
+                make::stylesheet(make::SiteKind::Docs)
+            )
+            .as_bytes()
         );
         let replay = on_disk(&path, seed(), None, 0).unwrap();
         assert_eq!(
@@ -192,7 +196,7 @@ fn fixed_model_host_gets_one_stylesheet_without_rewriting_pages() {
                 css.body,
                 format!(
                     "{}\nbody {{color: #17472c}}",
-                    make::stylesheet(&make::site_profile(&fixed.host).kind)
+                    make::stylesheet(make::site_profile(&fixed.host).kind)
                 )
                 .as_bytes()
             );
@@ -483,6 +487,87 @@ fn concurrent_interactive_pages_read_the_preceding_pages_claims() {
                 .filter(|prompt| prompt.contains("SITE_CSS:"))
                 .count(),
             1
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn concurrent_interactive_sites_read_the_preceding_sites_facts() {
+    let fake = fake_openrouter(Arc::new(Script::default()));
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    lab(move |cx| async move {
+        let other = pages.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        cx.spawn(move |cx| async move {
+            send.send(get(&other, &cx, "https://news.fields.com/reference").await)
+                .unwrap();
+            Ok(())
+        });
+        let first = get(&pages, &cx, "https://docs.fields.com/guide").await;
+        let second = receive.await.unwrap();
+        assert_eq!((first.status, second.status), (200, 200));
+        let prompts = fake.users();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("a claim about https://docs.fields.com/guide"));
+        Ok(())
+    });
+}
+
+#[test]
+fn established_facts_allow_parallel_site_generation() {
+    struct Parallel {
+        fake: Arc<Fake>,
+        calls: AtomicUsize,
+        ready: tokio::sync::Barrier,
+    }
+    impl Transport for Parallel {
+        fn post<'a>(&'a self, cx: &'a Cx, headers: Headers, body: Vec<u8>) -> Post<'a> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if !first {
+                    self.ready.wait().await;
+                }
+                self.fake.post(cx, headers, body).await
+            })
+        }
+    }
+    let fake = fake_openrouter(Arc::new(Script::default()));
+    let model = Model::new(
+        Provider::OpenRouter,
+        "requested/model",
+        "",
+        Key::new("OPENROUTER_API_KEY", Some(KEY.into())).unwrap(),
+        Arc::new(Parallel {
+            fake: fake.clone(),
+            calls: AtomicUsize::new(0),
+            ready: tokio::sync::Barrier::new(2),
+        }),
+    );
+    let pages = Arc::new(Pages::with_model(seed(), model));
+    lab(move |cx| async move {
+        assert_eq!(
+            get(&pages, &cx, "https://docs.fields.com/guide")
+                .await
+                .status,
+            200
+        );
+        let other = pages.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        cx.spawn(move |cx| async move {
+            send.send(get(&other, &cx, "https://news.fields.com/reference").await)
+                .unwrap();
+            Ok(())
+        });
+        let first = get(&pages, &cx, "https://research.fields.com/reference").await;
+        let second = receive.await.unwrap();
+        assert_eq!((first.status, second.status), (200, 200));
+        let prompts = fake.users();
+        assert_eq!(prompts.len(), 3);
+        assert!(
+            prompts[1..]
+                .iter()
+                .all(|prompt| { prompt.contains("a claim about https://docs.fields.com/guide") })
         );
         Ok(())
     });

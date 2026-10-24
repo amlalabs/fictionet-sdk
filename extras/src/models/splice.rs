@@ -60,97 +60,106 @@ fn invalid() -> Error {
     Error::msg("Invalid server tool history")
 }
 
-pub(super) fn needed(body: &Value) -> bool {
-    body["tools"]
-        .as_array()
-        .is_some_and(|tools| tools.iter().any(|t| kind(t).is_some()))
-        || body["messages"].as_array().is_some_and(|ms| {
-            ms.iter().any(|m| {
-                m["content"]
-                    .as_array()
-                    .is_some_and(|bs| bs.iter().any(|b| b["type"] == "server_tool_use"))
-            })
-        })
-}
-fn kind(tool: &Value) -> Option<&'static str> {
-    let kind = tool["type"].as_str()?;
+use request::{
+    Block, Content, Message as InputMessage, Messages, Role, Tool, TypedBlock, WebSettings, WebTool,
+};
+
+fn definition(name: &str, kind: WebTool) -> Tool {
     match kind {
-        "web_search_20250305" | "web_search_20260209" => Some("web_search"),
-        "web_fetch_20250910" | "web_fetch_20260209" => Some("web_fetch"),
-        _ => None,
+        WebTool::Search => Tool::function(
+            name,
+            "Search the web.",
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+        ),
+        WebTool::Fetch => Tool::function(
+            name,
+            "Fetch a web page.",
+            json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+        ),
     }
 }
-fn definition(name: &str, kind: &str) -> Value {
-    if kind == "web_search" {
-        json!({"name":name,"description":"Search the web.","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}})
-    } else {
-        json!({"name":name,"description":"Fetch a web page.","input_schema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}})
-    }
-}
-fn original_id(cipher: &TokenCipher, id: &Value) -> fictionet::Result<String> {
-    let token = id
-        .as_str()
-        .and_then(|id| id.strip_prefix("srvtoolu_"))
-        .ok_or_else(invalid)?;
+fn original_id(cipher: &TokenCipher, id: &str) -> fictionet::Result<String> {
+    let token = id.strip_prefix("srvtoolu_").ok_or_else(invalid)?;
     cipher.open(token)?["id"]
         .as_str()
         .map(str::to_owned)
         .ok_or_else(invalid)
 }
-fn history(body: &mut Value, cipher: &TokenCipher) -> fictionet::Result<()> {
-    let Some(messages) = body["messages"].as_array_mut() else {
-        return Err(invalid());
-    };
-    let mut reshaped: Vec<Value> = Vec::new();
-    for message in std::mem::take(messages) {
-        let Some(blocks) = message["content"]
-            .as_array()
-            .filter(|_| message["role"] == "assistant")
-        else {
-            if message["role"] == "user" && reshaped.last().is_some_and(|m| m["role"] == "user") {
+fn history(body: &mut Messages, cipher: &TokenCipher) -> fictionet::Result<()> {
+    let messages = body.messages.as_mut().ok_or_else(invalid)?;
+    let mut reshaped: Vec<InputMessage> = Vec::new();
+    for mut message in std::mem::take(messages) {
+        if message.role != Role::Assistant || !matches!(message.content, Some(Content::Blocks(_))) {
+            if message.role == Role::User && reshaped.last().is_some_and(|m| m.role == Role::User) {
                 let previous = reshaped.last_mut().unwrap();
-                let extra = message["content"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_else(|| vec![json!({"type":"text","text":message["content"]})]);
-                previous["content"]
-                    .as_array_mut()
-                    .ok_or_else(invalid)?
-                    .extend(extra);
+                let mut blocks = previous
+                    .content
+                    .take()
+                    .unwrap_or(Content::Empty(()))
+                    .into_blocks();
+                blocks.extend(
+                    message
+                        .content
+                        .take()
+                        .unwrap_or(Content::Empty(()))
+                        .into_blocks(),
+                );
+                previous.content = Some(Content::Blocks(blocks));
             } else {
                 reshaped.push(message);
             }
             continue;
-        };
+        }
         let mut assistant = Vec::new();
         let mut results = Vec::new();
-        for block in blocks {
-            let typ = block["type"].as_str().unwrap_or("");
-            if !matches!(typ, "web_search_tool_result" | "web_fetch_tool_result")
-                && !results.is_empty()
-            {
-                reshaped.push(json!({"role":"assistant","content":std::mem::take(&mut assistant)}));
-                reshaped.push(json!({"role":"user","content":std::mem::take(&mut results)}));
+        for block in message.content.take().unwrap().into_blocks() {
+            let tool_result = matches!(&block, Content::Block(block) if matches!(**block, Block::Typed(TypedBlock::WebSearchToolResult { .. } | TypedBlock::WebFetchToolResult { .. })));
+            if !tool_result && !results.is_empty() {
+                reshaped.push(InputMessage::new(
+                    Role::Assistant,
+                    Content::Blocks(std::mem::take(&mut assistant)),
+                ));
+                reshaped.push(InputMessage::new(
+                    Role::User,
+                    Content::Blocks(std::mem::take(&mut results)),
+                ));
             }
-            match typ {
-                "server_tool_use" => {
-                    let mut block = block.clone();
-                    block["id"] = json!(original_id(cipher, &block["id"])?);
-                    block["type"] = json!("tool_use");
-                    assistant.push(block);
+            let Content::Block(block) = block else {
+                return Err(invalid());
+            };
+            match *block {
+                Block::Typed(TypedBlock::ServerToolUse { id, name, input }) => {
+                    assistant.push(Content::typed(TypedBlock::ToolUse {
+                        id: Some(original_id(cipher, &id)?),
+                        name,
+                        input,
+                        caller: None,
+                        cache_control: None,
+                    }));
                 }
-                "web_search_tool_result" | "web_fetch_tool_result" => {
-                    let id = original_id(cipher, &block["tool_use_id"])?;
-                    if !assistant
-                        .iter()
-                        .any(|b| b["type"] == "tool_use" && b["id"] == id)
-                    {
-                        return Err(invalid());
-                    }
-                    let content = &block["content"];
+                Block::Typed(
+                    result @ (TypedBlock::WebSearchToolResult { .. }
+                    | TypedBlock::WebFetchToolResult { .. }),
+                ) => {
+                    let (tool_use_id, content, search) = match result {
+                        TypedBlock::WebSearchToolResult {
+                            tool_use_id,
+                            content,
+                        } => (tool_use_id, content, true),
+                        TypedBlock::WebFetchToolResult {
+                            tool_use_id,
+                            content,
+                        } => (tool_use_id, content, false),
+                        _ => unreachable!(),
+                    };
+                    let id = original_id(cipher, &tool_use_id)?;
+                    if !assistant.iter().any(|block| matches!(block, Content::Block(block) if matches!(&**block, Block::Typed(TypedBlock::ToolUse { id: Some(existing), .. }) if *existing == id))) { return Err(invalid()); }
+                    // The encrypted result is an opaque wire token, checked against its
+                    // decoded visible fields before it becomes local tool text.
+                    let content = serde_json::to_value(content)?;
                     let text = if let Some(error) = content["error_code"].as_str() {
                         json!({"error":error}).to_string()
-                    } else if typ == "web_search_tool_result" {
+                    } else if search {
                         let entries = content.as_array().ok_or_else(invalid)?;
                         if entries.is_empty() {
                             "[]".into()
@@ -182,16 +191,24 @@ fn history(body: &mut Value, cipher: &TokenCipher) -> fictionet::Result<()> {
                             .ok_or_else(invalid)?
                             .into()
                     };
-                    results.push(json!({"type":"tool_result","tool_use_id":id,"content":text}));
+                    results.push(Content::typed(TypedBlock::ToolResult {
+                        tool_use_id: id,
+                        content: Some(Content::Text(text)),
+                        is_error: None,
+                        cache_control: None,
+                    }));
                 }
-                _ => assistant.push(block.clone()),
+                block => assistant.push(Content::Block(Box::new(block))),
             }
         }
         if !assistant.is_empty() {
-            reshaped.push(json!({"role":"assistant","content":assistant}));
+            reshaped.push(InputMessage::new(
+                Role::Assistant,
+                Content::Blocks(assistant),
+            ));
         }
         if !results.is_empty() {
-            reshaped.push(json!({"role":"user","content":results}));
+            reshaped.push(InputMessage::new(Role::User, Content::Blocks(results)));
         }
     }
     *messages = reshaped;
@@ -237,17 +254,15 @@ impl HttpBody for Channel {
     }
 }
 
-type Tools = std::collections::HashMap<String, (&'static str, Value)>;
+type Tools = std::collections::HashMap<String, (WebTool, WebSettings)>;
 
-/// Replaces the web tools with their function definitions. Returns each
-/// tool's kind and settings by name.
-fn definitions(body: &mut Value) -> Tools {
+fn definitions(body: &mut Messages) -> Tools {
     let mut tools = Tools::new();
-    if let Some(entries) = body["tools"].as_array_mut() {
+    if let Some(entries) = &mut body.tools {
         for entry in entries {
-            if let Some(kind) = kind(entry) {
-                let name = entry["name"].as_str().unwrap_or(kind).to_owned();
-                tools.insert(name.clone(), (kind, entry.clone()));
+            if let Some((kind, settings)) = entry.web() {
+                let name = settings.name.as_deref().unwrap_or(kind.name()).to_owned();
+                tools.insert(name.clone(), (kind, settings.clone()));
                 *entry = definition(&name, kind);
             }
         }
@@ -266,7 +281,7 @@ fn invalid_history(model: &Model) -> Response<Body> {
 pub(super) async fn count(
     mut model: Model,
     parts: http::request::Parts,
-    mut body: Value,
+    mut body: Messages,
 ) -> fictionet::Result<Response<Body>> {
     model.engine = None;
     if history(&mut body, &model.cipher).is_err() {
@@ -279,14 +294,14 @@ pub(super) async fn count(
 pub(super) async fn serve(
     mut model: Model,
     parts: http::request::Parts,
-    mut body: Value,
+    mut body: Messages,
 ) -> fictionet::Result<Response<Body>> {
     let engine = model.engine.take().expect("engine checked");
     if history(&mut body, &model.cipher).is_err() {
         return Ok(invalid_history(&model));
     }
     let tools = definitions(&mut body);
-    let stream = body["stream"] == true;
+    let stream = body.stream == Some(true);
     let response = upstream(&model, &parts, &body).await?;
     if !response.status().is_success() {
         return Ok(response);
@@ -358,9 +373,9 @@ async fn failed(refused: Response<Body>, output: &mut Output) -> fictionet::Resu
 pub(super) async fn upstream(
     model: &Model,
     parts: &http::request::Parts,
-    body: &Value,
+    body: &impl serde::Serialize,
 ) -> fictionet::Result<Response<Body>> {
-    let mut request = Request::new(Body::from(body.to_string()));
+    let mut request = Request::new(Body::from(serde_json::to_vec(body)?));
     *request.method_mut() = parts.method.clone();
     *request.uri_mut() = parts.uri.clone();
     *request.headers_mut() = parts.headers.clone();
@@ -547,7 +562,7 @@ async fn run(
     model: Model,
     engine: Arc<dyn Engine>,
     parts: http::request::Parts,
-    mut body: Value,
+    mut body: Messages,
     tools: Tools,
     mut response: Response<Body>,
     output: &mut Output,
@@ -567,13 +582,21 @@ async fn run(
             let (kind, settings) = &tools[name];
             let count = uses.entry(name.into()).or_default();
             *count += 1;
-            let (content, text) =
-                answer(&model, engine.clone(), &body, block, kind, settings, *count).await;
-            if *kind == "web_search" {
+            let (content, text) = answer(
+                &model,
+                engine.clone(),
+                &body,
+                block,
+                *kind,
+                settings,
+                *count,
+            )
+            .await;
+            if *kind == WebTool::Search {
                 searches += 1;
             }
 
-            output.block(json!({"type":format!("{kind}_tool_result"),"tool_use_id":id,"content":content})).await?;
+            output.block(json!({"type":format!("{}_tool_result", kind.name()),"tool_use_id":id,"content":content})).await?;
             results.push(json!({"type":"tool_result","tool_use_id":block["id"],"content":text}));
         }
         let external = turn.content.iter().any(|b| {
@@ -589,10 +612,16 @@ async fn run(
             output.event(json!({"type":"message_stop"})).await?;
             return Ok(None);
         }
-        let messages = body["messages"].as_array_mut().ok_or_else(invalid)?;
-        messages.push(json!({"role":"assistant","content":turn.content}));
-        messages.push(json!({"role":"user","content":results}));
-        body.as_object_mut().unwrap().remove("tool_choice");
+        let messages = body.messages.as_mut().ok_or_else(invalid)?;
+        messages.push(InputMessage::new(
+            Role::Assistant,
+            serde_json::from_value(json!(turn.content))?,
+        ));
+        messages.push(InputMessage::new(
+            Role::User,
+            serde_json::from_value(json!(results))?,
+        ));
+        body.tool_choice = None;
         response = upstream(&model, &parts, &body).await?;
         if !response.status().is_success() {
             return Ok(Some(response));
@@ -603,39 +632,35 @@ async fn run(
 async fn answer(
     model: &Model,
     engine: Arc<dyn Engine>,
-    body: &Value,
+    body: &Messages,
     block: &Value,
-    kind: &str,
-    settings: &Value,
+    kind: WebTool,
+    settings: &WebSettings,
     used: u64,
 ) -> (Value, String) {
     let error = |code: &str| {
         (
-            json!({"type":format!("{kind}_tool_result_error"),"error_code":code}),
+            json!({"type":format!("{}_tool_result_error", kind.name()),"error_code":code}),
             json!({"error":code}).to_string(),
         )
     };
-    if used > settings["max_uses"].as_u64().unwrap_or(8) {
+    if used > settings.max_uses.unwrap_or(8) {
         return error("max_uses_exceeded");
     }
-    if kind == "web_search" {
+    let domains = settings.domains();
+    if kind == WebTool::Search {
         let Some(query) = block["input"]["query"].as_str() else {
             return error("invalid_input");
         };
         let Ok(results) = engine
-            .search(
-                model.cx.clone(),
-                query.into(),
-                "claude_web_search",
-                settings.clone(),
-            )
+            .search(model.cx.clone(), query.into(), domains.clone())
             .await
         else {
             return error("unavailable");
         };
         let results: Vec<_> = results
             .into_iter()
-            .filter(|r| tools::allowed(settings, &r.url))
+            .filter(|r| tools::allowed(&domains, &r.url))
             .collect();
         let text = serde_json::to_string(&results).unwrap();
         let mut content: Vec<Value> = results.iter().map(|r| json!({"type":"web_search_result","url":r.url,"title":r.title,"page_age":r.date})).collect();
@@ -651,10 +676,10 @@ async fn answer(
         let Some(url) = block["input"]["url"].as_str() else {
             return error("invalid_input");
         };
-        if !body["messages"].to_string().contains(url) {
+        if !serde_json::to_string(&body.messages).unwrap().contains(url) {
             return error("url_not_in_prior_context");
         }
-        if !tools::allowed(settings, url)
+        if !tools::allowed(&domains, url)
             || !tools::host(url).is_some_and(|host| engine.serves(&host))
         {
             return error("url_not_accessible");
@@ -670,7 +695,7 @@ async fn answer(
         } else {
             return error("unsupported_content_type");
         };
-        if let Some(limit) = settings["max_content_tokens"].as_u64() {
+        if let Some(limit) = settings.max_content_tokens {
             if pdf && text.len() as u64 > limit.saturating_mul(4) {
                 return error("max_content_tokens_exceeded");
             }
@@ -681,7 +706,7 @@ async fn answer(
                     .collect();
             }
         }
-        let content = json!({"type":"web_fetch_result","url":url,"retrieved_at":rfc3339(time::OffsetDateTime::now_utc()),"content":{"type":"document","source":{"type":if pdf {"base64"} else {"text"},"media_type":if pdf {"application/pdf"} else {"text/plain"},"data":text},"title":page.title,"citations":{"enabled":settings["citations"]["enabled"] == true}}});
+        let content = json!({"type":"web_fetch_result","url":url,"retrieved_at":rfc3339(time::OffsetDateTime::now_utc()),"content":{"type":"document","source":{"type":if pdf {"base64"} else {"text"},"media_type":if pdf {"application/pdf"} else {"text/plain"},"data":text},"title":page.title,"citations":{"enabled":settings.citations.as_ref().is_some_and(|citations| citations["enabled"] == true)}}});
         (content, text)
     }
 }
@@ -695,8 +720,7 @@ mod tests {
             self: Arc<Self>,
             _: Cx,
             _: String,
-            _: &'static str,
-            _: Value,
+            _: tools::Domains,
         ) -> tools::Answer<Vec<crate::search::Result>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -720,21 +744,22 @@ mod tests {
             let model = Model::at(&cx, Provider::Anthropic, credential, "http://127.0.0.1:1".parse()?)?;
             let engine: Arc<dyn Engine> = Arc::new(Pages);
             let block = json!({"type":"tool_use","id":"toolu_fetch","name":"web_fetch","input":{"url":"https://example.com/page"}});
-            let body = json!({"messages":[{"role":"user","content":"Read https://example.com/page"}]});
-            let settings = json!({"max_uses":1,"max_content_tokens":1});
-            let (content, text) = answer(&model, engine.clone(), &body, &block, "web_fetch", &settings, 1).await;
+            let body: Messages = serde_json::from_value(json!({"messages":[{"role":"user","content":"Read https://example.com/page"}]}))?;
+            let settings: WebSettings = serde_json::from_value(json!({"max_uses":1,"max_content_tokens":1}))?;
+            let (content, text) = answer(&model, engine.clone(), &body, &block, WebTool::Fetch, &settings, 1).await;
             assert_eq!(text, "Visi");
             assert_eq!(content["content"]["source"]["data"], "Visi");
-            let (error, _) = answer(&model, engine.clone(), &json!({"messages":[]}), &block, "web_fetch", &settings, 1).await;
+            let (error, _) = answer(&model, engine.clone(), &serde_json::from_value(json!({"messages":[]}))?, &block, WebTool::Fetch, &settings, 1).await;
             assert_eq!(error["error_code"], "url_not_in_prior_context");
-            let (error, _) = answer(&model, engine.clone(), &body, &block, "web_fetch", &settings, 2).await;
+            let (error, _) = answer(&model, engine.clone(), &body, &block, WebTool::Fetch, &settings, 2).await;
             assert_eq!(error["error_code"], "max_uses_exceeded");
-            let (error, _) = answer(&model, engine, &body, &block, "web_fetch", &json!({"blocked_domains":["example.com"]}), 1).await;
+            let (error, _) = answer(&model, engine, &body, &block, WebTool::Fetch, &serde_json::from_value(json!({"blocked_domains":["example.com"]}))?, 1).await;
             assert_eq!(error["error_code"], "url_not_accessible");
-            let shown = visible(block.clone(), &model, &std::collections::HashMap::from([("web_fetch".into(), ("web_fetch", settings))]), &mut Default::default());
+            let shown = visible(block.clone(), &model, &std::collections::HashMap::from([("web_fetch".into(), (WebTool::Fetch, settings))]), &mut Default::default());
             let mut replay = body.clone();
-            replay["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","content":[shown.clone(),{"type":"web_fetch_tool_result","tool_use_id":shown["id"],"content":content},{"type":"text","text":"Done"}]}));
+            replay.messages.as_mut().unwrap().push(serde_json::from_value(json!({"role":"assistant","content":[shown.clone(),{"type":"web_fetch_tool_result","tool_use_id":shown["id"],"content":content},{"type":"text","text":"Done"}]}))?);
             history(&mut replay, &model.cipher)?;
+            let replay = serde_json::to_value(replay)?;
             assert_eq!(replay["messages"][1]["content"][0], block);
             assert_eq!(replay["messages"][2]["content"][0]["content"], text);
             assert_eq!(replay["messages"][3]["content"][0]["text"], "Done");
