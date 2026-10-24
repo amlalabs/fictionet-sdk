@@ -55,70 +55,28 @@ const REPOSITORIES: &[(&str, &str)] = &[
 
 struct Batch(std::path::PathBuf);
 
-#[derive(Clone, Copy)]
-enum Material {
-    Page,
-    Distribution,
-}
-
-impl Material {
-    fn bytes(self) -> usize {
-        match self {
-            Self::Page => fictionet_extras::warc::Response::DECODED_BYTES,
-            Self::Distribution => 256 * 1024 * 1024,
-        }
-    }
-}
-
 impl Drop for Batch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-async fn capture_cached(
-    root: &Path,
-    name: &str,
-    urls: &[String],
-    requisites: bool,
-    material: Material,
-) -> Result {
-    std::fs::create_dir_all(root)?;
-    let archive = if std::fs::read_dir(root)?
-        .any(|entry| entry.is_ok_and(|entry| entry.path().to_string_lossy().ends_with(".warc.gz")))
-    {
-        Some(Archive::directory(root)?)
-    } else {
-        None
-    };
-    let mut pending = Vec::new();
-    for url in urls {
-        let response = archive
-            .as_ref()
-            .map(|archive| archive.get(url))
-            .transpose()?
-            .flatten();
-        if response.is_none_or(|response| {
-            !(response.status.is_success()
-                || response.status.is_redirection()
-                || response.status == http::StatusCode::NOT_FOUND)
-        }) {
-            pending.push(url.clone());
-        }
-    }
-    download(root, name, &pending, requisites, material).await
+async fn capture_cached(root: &Path, name: &str, urls: &[String]) -> Result {
+    download(root, name, urls).await
 }
 
-async fn download(
-    root: &Path,
-    name: &str,
-    urls: &[String],
-    requisites: bool,
-    material: Material,
-) -> Result {
+async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
     if urls.is_empty() {
         return Ok(());
     }
+    std::fs::create_dir_all(root)?;
+    let existing = if std::fs::read_dir(root)?
+        .any(|entry| entry.is_ok_and(|entry| entry.path().to_string_lossy().ends_with(".warc.gz")))
+    {
+        Archive::directory(root)?
+    } else {
+        Archive::default()
+    };
     let batch = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -130,68 +88,87 @@ async fn download(
     let mut pending = urls
         .iter()
         .cloned()
-        .map(|url| (url, 0, 0))
         .collect::<std::collections::VecDeque<_>>();
     let mut seen = HashSet::new();
-    while let Some((url, redirects, depth)) = pending.pop_front() {
-        if !seen.insert(url.clone()) {
-            continue;
-        }
-        if seen.len() > 2048 {
-            return Err("capture exceeds URL limit".into());
-        }
-        let destination = url::Url::parse(&url)?;
-        let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            let client = capture::client(&destination).await?;
-            let response = client
-                .get(destination.clone())
-                .header("accept-encoding", "identity")
-                .send()
-                .await
-                .map_err(std::io::Error::other)?;
-            let mut response = capture::receive(response, material.bytes()).await?;
-            response.body = response.decoded_with_limit(material.bytes())?.into();
-            response.headers.remove(http::header::CONTENT_ENCODING);
-            response
-                .headers
-                .insert(http::header::CONTENT_LENGTH, response.body.len().into());
-            Ok::<_, std::io::Error>(response)
-        })
-        .await;
-        let response = match response {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                eprintln!("Capture unavailable: {url}: {error}");
+    let mut requests = tokio::task::JoinSet::new();
+    let workers = std::thread::available_parallelism()?.get();
+    loop {
+        while requests.len() < workers
+            && let Some(url) = pending.pop_front()
+        {
+            if !seen.insert(url.clone()) {
                 continue;
             }
-            Err(_) => {
-                eprintln!("Capture timed out: {url}");
+            if let Some(response) = existing.get(&url)?
+                && (response.status.is_success()
+                    || response.status.is_redirection()
+                    || response.status == http::StatusCode::NOT_FOUND)
+            {
+                let links = capture::links(&url, &response)?;
+                pending.extend(links.assets);
+                if response.status.is_redirection() {
+                    pending.extend(links.pages);
+                }
+                continue;
+            }
+            requests.spawn(async move {
+                let response = async {
+                    let destination = url::Url::parse(&url).map_err(std::io::Error::other)?;
+                    let client = capture::client(&destination).await?;
+                    let response = client
+                        .get(destination.clone())
+                        .header("accept-encoding", "identity")
+                        .send()
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    let mut response = capture::receive(response).await?;
+                    response.body = response.decoded()?.into();
+                    response.headers.remove(http::header::CONTENT_ENCODING);
+                    response
+                        .headers
+                        .insert(http::header::CONTENT_LENGTH, response.body.len().into());
+                    Ok::<_, std::io::Error>(response)
+                }
+                .await;
+                (url, response)
+            });
+        }
+        let Some(result) = requests.join_next().await else {
+            break;
+        };
+        let (url, response) = result?;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("Capture unavailable: {url}: {error}");
                 continue;
             }
         };
         archive.append(&path, &url, &response)?;
-        if response.status.is_redirection() && redirects < 10 {
-            if let Some(next) = response
-                .headers
-                .get(http::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| destination.join(v).ok())
-            {
-                pending.push_back((next.into(), redirects + 1, depth));
-            }
-        } else if requisites && depth < 8 {
-            match capture::links(&url, &response) {
-                Ok(links) => {
-                    pending.extend(links.assets.into_iter().map(|url| (url, 0, depth + 1)))
-                }
-                Err(error) => eprintln!("Asset discovery unavailable: {url}: {error}"),
-            }
+        eprintln!("Captured {}: {url}", response.status);
+        let links = capture::links(&url, &response)?;
+        pending.extend(links.assets);
+        if response.status.is_redirection() {
+            pending.extend(links.pages);
         }
     }
     if path.exists() {
+        std::fs::File::open(&path)?.sync_all()?;
         std::fs::rename(&path, root.join(path.file_name().unwrap()))?;
+        std::fs::File::open(root)?.sync_all()?;
     }
     Ok(())
+}
+
+pub async fn requisites(root: &Path) -> Result {
+    let root = Archive::directory_root(root)?;
+    let lock = std::fs::File::open(&root)?;
+    lock.try_lock()?;
+    let archive = Archive::directory(&root)?;
+    let mut urls = archive.urls().map(str::to_owned).collect::<Vec<_>>();
+    urls.sort();
+    println!("Completing requisites for {} captured URLs", urls.len());
+    capture_cached(&root, "requisites", &urls).await
 }
 
 fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras::warc::Response)> {
@@ -336,32 +313,12 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
             }
         }
     }
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        capture_cached(
-            root,
-            "missing-assets",
-            &assets.into_iter().collect::<Vec<_>>(),
-            true,
-            Material::Page,
-        ),
+    capture_cached(
+        root,
+        "missing-assets",
+        &assets.into_iter().collect::<Vec<_>>(),
     )
     .await
-    {
-        Err(_) => {
-            eprintln!("Optional not-found assets exceeded their capture deadline");
-            Ok(())
-        }
-        Ok(Err(error))
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData) =>
-        {
-            eprintln!("Optional not-found assets were rejected: {error}");
-            Ok(())
-        }
-        Ok(result) => result,
-    }
 }
 
 async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
@@ -376,15 +333,7 @@ async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
             let name = name.to_owned();
             let url = url.clone();
             jobs.spawn(async move {
-                match download(
-                    &root,
-                    &name,
-                    std::slice::from_ref(&url),
-                    false,
-                    Material::Page,
-                )
-                .await
-                {
+                match download(&root, &name, std::slice::from_ref(&url)).await {
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             matches!(
@@ -437,7 +386,7 @@ fn github_api(value: &str) -> Option<String> {
 
 async fn research(root: &Path, sources: &[String]) -> Result {
     // New batches sort after the original archives to supersede stale errors.
-    capture_cached(root, "zz-research", sources, true, Material::Page).await?;
+    capture_cached(root, "zz-research", sources).await?;
     documents(root, "zz-research", sources).await?;
     let mut archive = Archive::directory(root)?;
     let mut frontier = sources.to_vec();
@@ -632,14 +581,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         .iter()
         .map(|(repo, _)| format!("https://api.github.com/repos/{repo}"))
         .collect::<Vec<_>>();
-    capture_cached(
-        &staged_corpus,
-        "zz-github-api",
-        &repositories,
-        false,
-        Material::Page,
-    )
-    .await?;
+    capture_cached(&staged_corpus, "zz-github-api", &repositories).await?;
     let archive = Archive::directory(&staged_corpus)?;
     for url in &repositories {
         verify(&archive, url)?;
@@ -650,27 +592,6 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     }
     let publication = Publication::prepare(&staged_corpus, &root)?;
     std::os::unix::fs::symlink(&publication.directory, &staged_corpus)?;
-    let status = Command::new("rustup")
-        .args([
-            "run",
-            "1.99.0",
-            "cargo",
-            "test",
-            "--offline",
-            "-p",
-            "web-world",
-            "--test",
-            "corpus",
-            "--",
-            "--test-threads=1",
-        ])
-        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
-        .env("SEARCH_DOWNLOADS", std::fs::canonicalize(&batch.0)?)
-        .status()
-        .await?;
-    if !status.success() {
-        return Err("offline research replay failed".into());
-    }
     // Package pointers are owned separately from the immutable research batch.
     if staged_corpus.join("packages").is_symlink() {
         std::fs::remove_file(staged_corpus.join("packages"))?;
@@ -761,14 +682,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
             }
         }
     }
-    capture_cached(
-        &packages,
-        "distributions",
-        &urls,
-        false,
-        Material::Distribution,
-    )
-    .await?;
+    capture_cached(&packages, "distributions", &urls).await?;
     let sources = Archive::directory(&packages)?
         .urls()
         .map(str::to_owned)

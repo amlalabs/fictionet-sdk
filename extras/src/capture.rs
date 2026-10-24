@@ -6,12 +6,8 @@ pub use transport::{client, public_address, receive};
 
 use crate::warc;
 use kuchiki::traits::TendrilSink;
-use regex::Regex;
 use std::io;
 use url::Url;
-
-/// Maximum decoded input passed to HTML, CSS and search-response parsers.
-pub const PARSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// An ordinary desktop browser identity for host side live copies.
 pub const BROWSER: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
@@ -67,9 +63,6 @@ pub fn title(response: &warc::Response) -> io::Result<String> {
                 finished = !inside;
             }
             Token::CharacterTokens(text) if inside => {
-                if title.len() + text.len() > 4096 {
-                    return Err(io::Error::other("document title exceeds size limit"));
-                }
                 title.push_str(&text);
             }
             _ => {}
@@ -89,7 +82,7 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
     {
         return Ok(Vec::new());
     }
-    let decoded = response.decoded_with_limit(PARSE_BYTES)?;
+    let decoded = response.decoded()?;
     let dom = kuchiki::parse_html().one(String::from_utf8_lossy(&decoded).into_owned());
     for node in dom
         .select("nav, header, footer, aside, [role=navigation]")
@@ -120,9 +113,6 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
         })
         .filter(|url| url != original.as_str() && seen.insert(url.clone()))
     {
-        if references.len() >= 2048 || url.len() > 8192 {
-            return Err(io::Error::other("capture discovery exceeds link limit"));
-        }
         references.push(url);
     }
     Ok(references)
@@ -132,24 +122,50 @@ fn link(base: &Url, value: &str, out: &mut Vec<String>) -> io::Result<()> {
     let Some(url) = base.join(value).ok().and_then(|u| warc::key(u.as_str())) else {
         return Ok(());
     };
-    if out.len() >= 2048 || url.len() > 8192 {
-        return Err(io::Error::other("capture discovery exceeds link limit"));
-    }
     out.push(url);
     Ok(())
 }
 
 fn css(text: &str, base: &Url, out: &mut Vec<String>) -> io::Result<()> {
-    static URLS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let regex = URLS.get_or_init(|| {
-        Regex::new(r#"(?i)url\(\s*["']?([^\s\)"']+)|@import\s+["']([^"']+)"#).unwrap()
-    });
-    for captures in regex.captures_iter(text) {
-        if let Some(value) = captures.get(1).or_else(|| captures.get(2)) {
-            link(base, value.as_str(), out)?;
+    let mut input = cssparser::ParserInput::new(text);
+    css_tokens(&mut cssparser::Parser::new(&mut input), base, out);
+    Ok(())
+}
+
+fn css_tokens(input: &mut cssparser::Parser<'_, '_>, base: &Url, out: &mut Vec<String>) {
+    use cssparser::Token;
+    while let Ok(token) = input.next().cloned() {
+        match token {
+            Token::UnquotedUrl(value) => {
+                let _ = link(base, &value, out);
+            }
+            Token::AtKeyword(name) if name.eq_ignore_ascii_case("import") => {
+                if let Ok(value) = input.try_parse(|input| input.expect_string_cloned()) {
+                    let _ = link(base, &value, out);
+                }
+            }
+            Token::Function(name) if name.eq_ignore_ascii_case("url") => {
+                let _: Result<_, cssparser::ParseError<'_, ()>> =
+                    input.parse_nested_block(|input| {
+                        if let Ok(value) = input.expect_string() {
+                            let _ = link(base, value, out);
+                        }
+                        Ok(())
+                    });
+            }
+            Token::Function(_)
+            | Token::ParenthesisBlock
+            | Token::SquareBracketBlock
+            | Token::CurlyBracketBlock => {
+                let _: Result<_, cssparser::ParseError<'_, ()>> =
+                    input.parse_nested_block(|input| {
+                        css_tokens(input, base, out);
+                        Ok(())
+                    });
+            }
+            _ => {}
         }
     }
-    Ok(())
 }
 
 fn srcset(mut input: &str, base: &Url, out: &mut Vec<String>) -> io::Result<()> {
@@ -193,7 +209,7 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
     if !(content_type.starts_with("text/html") || content_type.starts_with("text/css")) {
         return Ok(links);
     }
-    let decoded = response.decoded_with_limit(PARSE_BYTES)?;
+    let decoded = response.decoded()?;
     let text = String::from_utf8_lossy(&decoded);
     if content_type.starts_with("text/css") {
         css(&text, &base, &mut links.assets)?;
@@ -218,9 +234,6 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         Ok(())
     })?;
     let base = document_base.unwrap_or(base);
-    if base.as_str().len() > 8192 {
-        return Err(io::Error::other("capture discovery exceeds link limit"));
-    }
     let mut picture = 0usize;
     let mut style = None;
     tokens(&text, |token| {
@@ -268,13 +281,20 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         {
             return Ok(());
         }
-        for name in ["src", "data"] {
+        for name in ["src", "data", "data-src", "data-lazy-src", "data-original"] {
             if let Some(value) = attr(name) {
                 link(&base, value, &mut links.assets)?;
             }
         }
-        if let Some(value) = attr("srcset") {
-            srcset(value, &base, &mut links.assets)?;
+        for name in ["srcset", "data-srcset", "data-lazy-srcset"] {
+            if let Some(value) = attr(name) {
+                srcset(value, &base, &mut links.assets)?;
+            }
+        }
+        if matches!(name, "image" | "use")
+            && let Some(value) = attr("href")
+        {
+            link(&base, value, &mut links.assets)?;
         }
         if name == "link"
             && attr("rel").is_some_and(|r| {

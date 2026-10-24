@@ -9,25 +9,19 @@ use fictionet_extras::{
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    time::Duration,
 };
 use tokio::sync::{oneshot, watch};
 
 mod transport;
 use transport::Transport;
 
-const CAPTURE_JOBS: usize = 2048;
-const CAPTURE_BYTES: usize = 128 * 1024 * 1024;
-
 struct Lifetime {
     stop: watch::Sender<bool>,
-    hosts: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<tokio::time::Instant>>>>,
 }
 impl Default for Lifetime {
     fn default() -> Self {
         Self {
             stop: watch::channel(false).0,
-            hosts: Default::default(),
         }
     }
 }
@@ -48,7 +42,6 @@ impl Drop for Lifetime {
 struct Job {
     url: String,
     navigation: Option<(String, u8)>,
-    redirects: u8,
     cx: Cx,
 }
 
@@ -57,8 +50,6 @@ struct State {
     archive: Archive,
     lifetime: Arc<Lifetime>,
     epoch: usize,
-    jobs: usize,
-    bytes: usize,
     searches_running: usize,
     reached: HashMap<String, watch::Sender<bool>>,
     depths: HashMap<(String, String), u8>,
@@ -112,11 +103,7 @@ impl Live {
             return;
         };
         let mut state = self.state();
-        if lifetime.cancelled()
-            || !Arc::ptr_eq(lifetime, &state.lifetime)
-            || state.jobs >= CAPTURE_JOBS
-            || state.bytes >= CAPTURE_BYTES
-        {
+        if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
             return;
         }
         let newly_reached = !state.reached.contains_key(&url);
@@ -135,7 +122,6 @@ impl Live {
         if !newly_reached && !shallower {
             return;
         }
-        state.jobs += 1;
         state
             .reached
             .entry(url)
@@ -192,21 +178,8 @@ impl Live {
                     if !Arc::ptr_eq(&lifetime, &state.lifetime) {
                         return;
                     }
-                    if downloaded && state.bytes + response.body.len() > CAPTURE_BYTES {
-                        for done in state.reached.values() {
-                            done.send_replace(true);
-                        }
-                        state.queue.clear();
-                        state.running = false;
-                        return;
-                    }
                     let path = self.archive_path(state.epoch);
-                    let saved =
-                        !downloaded || state.archive.append(&path, &job.url, &response).is_ok();
-                    if saved && downloaded {
-                        state.bytes += response.body.len();
-                    }
-                    saved
+                    !downloaded || state.archive.append(&path, &job.url, &response).is_ok()
                 };
                 let status = response.status;
                 let url = job.url.clone();
@@ -227,20 +200,18 @@ impl Live {
                             Job {
                                 url,
                                 navigation: None,
-                                redirects: 0,
                                 cx: job.cx.clone(),
                             },
                             true,
                         );
                     }
-                    if status.is_redirection() && job.redirects < 10 {
+                    if status.is_redirection() {
                         for url in links.pages {
                             self.enqueue_in(
                                 &lifetime,
                                 Job {
                                     url,
                                     navigation: job.navigation.clone(),
-                                    redirects: job.redirects + 1,
                                     cx: job.cx.clone(),
                                 },
                                 true,
@@ -262,7 +233,6 @@ impl Live {
                                 Job {
                                     url,
                                     navigation: Some((site.clone(), depth + 1)),
-                                    redirects: 0,
                                     cx: job.cx.clone(),
                                 },
                                 false,
@@ -317,7 +287,7 @@ impl Live {
             drop(state);
             let _ = send.send(result);
         });
-        cx.race(Some(cx.now() + Duration::from_secs(30)), receive)
+        cx.race(None, receive)
             .await
             .map_err(|_| "Live search timed out or was cancelled".to_owned())?
             .map_err(|_| "Live search worker stopped".to_owned())?
@@ -349,9 +319,7 @@ impl Live {
         let mut search = self
             .fetcher
             .process(cx, lifetime, move || {
-                let decoded = response
-                    .decoded_with_limit(capture::PARSE_BYTES)
-                    .map_err(|_| "Exa response exceeds parsing limit or has invalid encoding")?;
+                let decoded = response.decoded().map_err(|error| error.to_string())?;
                 let value: Value =
                     serde_json::from_slice(&decoded).map_err(|_| "Invalid Exa search response")?;
                 parse_search(&value, Some(&key))
@@ -381,7 +349,6 @@ impl Live {
                     Job {
                         url: result.url.clone(),
                         navigation: Some((host.to_owned(), 0)),
-                        redirects: 0,
                         cx: cx.clone(),
                     },
                     true,
@@ -415,7 +382,6 @@ impl Live {
             let completed: std::collections::HashSet<_> =
                 state.archive.urls().map(str::to_owned).collect();
             state.reached.retain(|url, _| completed.contains(url));
-            state.jobs = completed.len();
         }
     }
 
@@ -432,11 +398,20 @@ impl Live {
         let _ = std::fs::remove_file(old_path);
     }
 
-    async fn response(&self, cx: &Cx, url: &str) -> Option<warc::Response> {
+    async fn response(self: &Arc<Self>, cx: &Cx, url: &str) -> Option<warc::Response> {
         let url = warc::key(url)?;
+        let lifetime = self.state().lifetime.clone();
+        self.enqueue_in(
+            &lifetime,
+            Job {
+                url: url.clone(),
+                navigation: None,
+                cx: cx.clone(),
+            },
+            true,
+        );
         let (mut waiting, lifetime) = {
             let mut state = self.state();
-            // Browser requests can prioritize an already reached URL, never admit one.
             let waiting = state.reached.get(&url)?.subscribe();
             if let Some(index) = state.queue.iter().position(|job| job.url == url) {
                 let job = state.queue.remove(index).unwrap();
@@ -454,9 +429,7 @@ impl Live {
                 }
             }
         };
-        let _ = cx
-            .race(Some(cx.now() + Duration::from_secs(45)), ready)
-            .await;
+        let _ = cx.race(None, ready).await;
 
         let state = self.state();
         if !Arc::ptr_eq(&lifetime, &state.lifetime) {

@@ -1,4 +1,4 @@
-//! Cancellable, bounded public-web I/O owned by a Live session.
+//! Cancellable public-web I/O owned by a Live session.
 
 use super::*;
 use fictionet_extras::models::UpstreamPhase;
@@ -33,7 +33,6 @@ impl Transport {
         self.runtime.0.as_ref().unwrap().spawn(work);
     }
     // CPU work owns a permit until it finishes even if its caller is cancelled.
-    // Bounded input and one worker keep revoked sessions from accumulating parsers.
     pub(super) async fn process<T: Send + 'static>(
         &self,
         cx: &Cx,
@@ -62,9 +61,7 @@ impl Transport {
             biased;
             _ = stopped.changed() => Err("Live session stopped".into()),
             _ = cx.cancelled() => Err("Live run stopped".into()),
-            result = tokio::time::timeout(Duration::from_secs(10), task) => {
-                result.map_err(|_| "Live processing timed out")?
-            }
+            result = task => result,
         }
     }
 
@@ -124,19 +121,7 @@ impl Transport {
             }
         });
         let work = async {
-            let host = url.host_str().ok_or("Missing Live host")?;
             let client = capture::client(&url).await.map_err(|e| e.to_string())?;
-            let host_time = {
-                let mut hosts = lifetime.hosts.lock().await;
-                hosts
-                    .entry(host.to_owned())
-                    .or_insert_with(|| {
-                        Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()))
-                    })
-                    .clone()
-            };
-            let mut next = host_time.lock().await;
-            tokio::time::sleep_until(*next).await;
             let request = if let Some((key, body)) = search {
                 client
                     .post(url)
@@ -147,34 +132,18 @@ impl Transport {
                 client.get(url).header("accept-encoding", "identity")
             };
             let response = request.send().await;
-            *next = tokio::time::Instant::now()
-                + Duration::from_millis(if search.is_some() { 250 } else { 500 });
-            drop(next);
             let response = response.map_err(|_| "Live request failed")?;
             if let Some(attempt) = &mut attempt {
                 attempt.event.phase = UpstreamPhase::Response;
                 attempt.event.status = Some(response.status());
             }
-            let mut response = capture::receive(response, warc::Response::DECODED_BYTES)
+            let mut response = capture::receive(response)
                 .await
                 .map_err(|e| e.to_string())?;
-            let parse = search.is_some()
-                || response
-                    .headers
-                    .get(http::header::CONTENT_TYPE)
-                    .is_some_and(|value| {
-                        value.as_bytes().starts_with(b"text/html")
-                            || value.as_bytes().starts_with(b"text/css")
-                    });
             self.process(cx, lifetime, move || {
-                // Archive a decoded representation once. Replay and previews cannot
-                // expand a compressed body again or bypass the retained-byte budget.
+                // Store a decoded representation for both replay and discovery.
                 response.body = response
-                    .decoded_with_limit(if parse {
-                        capture::PARSE_BYTES
-                    } else {
-                        warc::Response::DECODED_BYTES
-                    })
+                    .decoded()
                     .map_err(|error| error.to_string())?
                     .into();
                 response.headers.remove(http::header::CONTENT_ENCODING);
@@ -193,8 +162,7 @@ impl Transport {
             biased;
             _ = stopped.changed() => Err("Live session stopped".into()),
             _ = cx.cancelled() => Err("Live run stopped".into()),
-            result = tokio::time::timeout(Duration::from_secs(20), work) => {
-                let result = result.map_err(|_| "Live request timed out".to_owned()).and_then(|r| r);
+            result = work => {
                 if result.is_err() && let Some(attempt) = &mut attempt && attempt.event.phase == UpstreamPhase::Cancelled {
                     attempt.event.phase = UpstreamPhase::Failed;
                 }

@@ -67,7 +67,7 @@ async fn get(url: url::Url) -> std::io::Result<warc::Response> {
         .send()
         .await
         .map_err(std::io::Error::other)?;
-    let mut response = capture::receive(response, warc::Response::DECODED_BYTES).await?;
+    let mut response = capture::receive(response).await?;
     response.body = response.decoded()?.into();
     response.headers.remove(http::header::CONTENT_ENCODING);
     response.headers.remove(http::header::TRANSFER_ENCODING);

@@ -45,14 +45,18 @@ impl Response {
     /// Maximum decoded representation retained for replay or text consumers.
     pub const DECODED_BYTES: usize = 32 * 1024 * 1024;
 
-    /// Decode representation compression with a bounded output allocation.
+    /// Decode the complete representation.
     pub fn decoded(&self) -> io::Result<Vec<u8>> {
-        self.decoded_with_limit(Self::DECODED_BYTES)
+        self.decode(None)
     }
 
     /// Decode at most `limit` bytes, rejecting larger representations rather than
     /// returning a truncated document to a parser.
     pub fn decoded_with_limit(&self, limit: usize) -> io::Result<Vec<u8>> {
+        self.decode(Some(limit))
+    }
+
+    fn decode(&self, limit: Option<usize>) -> io::Result<Vec<u8>> {
         let reader: Box<dyn Read + '_> = match self
             .headers
             .get(http::header::CONTENT_ENCODING)
@@ -67,10 +71,16 @@ impl Response {
             }
         };
         let mut bytes = Vec::new();
-        reader
-            .take(limit.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > limit {
+        match limit {
+            Some(limit) => reader
+                .take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)?,
+            None => {
+                let mut reader = reader;
+                reader.read_to_end(&mut bytes)?
+            }
+        };
+        if limit.is_some_and(|limit| bytes.len() > limit) {
             return Err(invalid("decoded response exceeds size limit"));
         }
         Ok(bytes)

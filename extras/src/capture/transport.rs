@@ -70,20 +70,10 @@ pub async fn client(url: &Url) -> io::Result<reqwest::Client> {
         .map_err(io::Error::other)
 }
 
-/// Retain at most `limit` wire bytes while receiving a response.
-/// Representation decoding has its own independent budget.
-pub async fn receive(mut response: reqwest::Response, limit: usize) -> io::Result<warc::Response> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(io::Error::other("response exceeds capture size limit"));
-    }
+/// Receive the complete representation, preserving its response headers.
+pub async fn receive(mut response: reqwest::Response) -> io::Result<warc::Response> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(io::Error::other)? {
-        if chunk.len() > limit.saturating_sub(body.len()) {
-            return Err(io::Error::other("response exceeds capture size limit"));
-        }
         body.extend_from_slice(&chunk);
     }
     Ok(warc::Response {
