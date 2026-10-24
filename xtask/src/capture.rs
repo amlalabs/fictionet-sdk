@@ -296,7 +296,10 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
     let mut assets = BTreeSet::new();
     for url in urls {
         if let Some(response) = missing.get(&url)? {
-            assets.extend(fictionet_extras::capture::links(&url, &response)?.assets);
+            match fictionet_extras::capture::links(&url, &response) {
+                Ok(links) => assets.extend(links.assets),
+                Err(error) => eprintln!("Not-found asset discovery unavailable: {url}: {error}"),
+            }
         }
     }
     match tokio::time::timeout(
@@ -312,6 +315,14 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
     {
         Err(_) => {
             eprintln!("Optional not-found assets exceeded their capture deadline");
+            Ok(())
+        }
+        Ok(Err(error))
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData) =>
+        {
+            eprintln!("Optional not-found assets were rejected: {error}");
             Ok(())
         }
         Ok(result) => result,
@@ -643,6 +654,46 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn large_not_found_documents_survive_optional_asset_discovery() {
+        let root = Batch(std::env::temp_dir().join(format!(
+            "missing-page-capture-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        std::fs::create_dir_all(&root.0).unwrap();
+        let path = root.0.join("missing-pages.warc.gz");
+        let url = "https://publisher.org/404";
+        let mut response = fictionet_extras::warc::Response {
+            status: http::StatusCode::NOT_FOUND,
+            headers: Default::default(),
+            body: format!(
+                "<title>Page not found</title>{}",
+                " ".repeat(fictionet_extras::capture::PARSE_BYTES)
+            )
+            .into(),
+        };
+        response
+            .headers
+            .insert("content-type", "text/html".parse().unwrap());
+        response.headers.insert(
+            "content-length",
+            response.body.len().to_string().parse().unwrap(),
+        );
+        let mut archive = Archive::default();
+        archive.append(&path, url, &response).unwrap();
+        missing_pages(
+            &root.0,
+            &["https://publisher.org/article".into()],
+            &["https://publisher.org/article".into()],
+        )
+        .await
+        .unwrap();
+        let replay = not_found(&Archive::open([path]).unwrap(), url).unwrap();
+        assert_eq!(replay.body, response.body);
+        assert_eq!(replay.headers, response.headers);
+    }
 
     #[tokio::test]
     async fn research_captures_two_article_hops_and_site_roots() {
