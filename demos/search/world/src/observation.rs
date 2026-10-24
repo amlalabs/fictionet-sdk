@@ -83,6 +83,11 @@ pub enum SearchObs {
         phase: EgressPhase,
         status: Option<u16>,
     },
+    PageRevision {
+        target: WriterTarget,
+        action: RevisionAction,
+        reason: String,
+    },
     ObservationFailed {
         reason: String,
     },
@@ -90,6 +95,24 @@ pub enum SearchObs {
         from: IpAddr,
         to: IpAddr,
     },
+}
+
+/// The document a page-writer correction belongs to.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WriterTarget {
+    Cast,
+    Stylesheet { host: String },
+    Search { query: String },
+    Page { url: String },
+}
+
+/// How the world recovered from a disclosure before serving content.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionAction {
+    Rewrite,
+    LocalRendering,
 }
 
 /// The reason a request entered the real network.
@@ -321,6 +344,10 @@ fn report(
             }
         }
         SearchObs::ModelCall { path, .. } => *path = redact_path(path),
+        SearchObs::PageRevision {
+            target: WriterTarget::Page { url },
+            ..
+        } => *url = redact_url(url),
         SearchObs::Egress { path, .. } => {
             *path = if path.starts_with("https://") || path.starts_with("http://") {
                 redact_url(path)
@@ -532,7 +559,8 @@ mod tests {
             let url = "https://user:private-password@example.org/page?code=private-code&q=stars#access_token=private-fragment";
             pages.report(&cx, SearchObs::Search { engine: Engine::Google, query: "stars".into(), results: vec![Hit { url: url.into(), title: "Stars".into() }] });
             pages.report(&cx, SearchObs::Tool { call: 1, tool: Tool::Fetch, target: url.into(), results: vec![Hit { url: url.into(), title: "Stars".into() }], error: None });
-            let rows = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap()];
+            pages.report(&cx, SearchObs::PageRevision { target: WriterTarget::Page { url: url.into() }, action: RevisionAction::Rewrite, reason: "page provenance".into() });
+            let rows = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap(), receiver.try_recv().unwrap()];
             let recorded = serde_json::to_string(&rows)?;
             assert!(!recorded.contains("private"));
             assert!(recorded.contains("q=stars"));

@@ -51,7 +51,7 @@ pub const GENERATION_BUDGET: usize = 200;
 /// plus a few header lines; a result list is ten short results. The limits
 /// leave room above that, and cut off an answer that runs on.
 const SEARCH_TOKENS: u32 = 1800;
-const PAGE_TOKENS: u32 = 2000;
+const PAGE_TOKENS: u32 = 3200;
 const CAST_TOKENS: u32 = 800;
 
 /// A change to the world: its generation setting, what answers, or a

@@ -1,26 +1,26 @@
 # Guest content checks
 
 `guest_content::Audit` inspects bytes explicitly supplied by a world or the kit.
-It checks the kit's rendered configuration and decoded installed files. HTTP
-content encodings and ZIP, tar, Debian, gzip, xz and zstd archives are decoded
-recursively. Checks fail on inspection limits or invalid complete archives.
-A world that wants to inspect service output supplies those bytes itself.
+It checks rendered configuration and decoded installed files. HTTP encodings and
+ZIP, tar, Debian, gzip, xz and zstd archives are decoded recursively. Inspection
+limits and invalid complete archives fail closed.
 
-The vocabulary includes project names, scenario names and test terminology.
-Names are matched without regard to case; ordinary words use word boundaries.
-HTML entities, URL escapes and JSON strings are decoded before matching.
+One shared policy checks internal project names and disclosures of the serving
+environment: evaluation machinery, synthetic page provenance, instructions for
+the evaluated agent and fixture artifacts. HTML entities, URL escapes and JSON
+strings are decoded before matching. The same rules supply the page writer's
+prompt, rejection feedback and page diagnostics.
 
-Exceptions are limited to:
+Words about a page's subject are allowed: World Wide Web Consortium, software
+tests, benchmark results, sandbox escapes, simulations and expected behavior are
+ordinary web language. Style choices such as punctuation are not disclosures.
 
-- Article paths `/corvane-acquisition` and `/fastjsonl-package` describe their
-  subjects; bare scenario names still fail. Financial prose may say `expected
-  to close`.
-- Vendor sales links: `Request a demo`, `/request-a-demo/` and `btn-demo`.
-- Shell `test -` syntax and Ubuntu's `snapd.seeded.service` unit name.
-- Unmodified software from Ubuntu, Mozilla, Anthropic and OpenAI release hosts,
-  including cached copies: ordinary test terminology is allowed because these
-  distributions include their own tests, documentation and language runtimes.
-  Project and scenario names remain forbidden, including inside archives.
+Article paths `/corvane-acquisition` and `/fastjsonl-package` describe their
+subjects; bare internal names remain forbidden. Unmodified vendor archives may
+contain their own testing machinery, but internal project names are still checked.
+First-party pages and installed tools receive the full disclosure check.
 
-An exception must describe real software or an ordinary use in the served
-content. It must not exempt first-party pages, packages or guest tools.
+The page writer retries a rejected answer with that answer and the named issue.
+Rejections and recovery are world observations. Repeated disclosure rejection
+uses the world's local renderer and established context, never the rejected
+bytes. Transport failures and invalid answer formats remain explicit failures.

@@ -342,10 +342,7 @@ fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-        && !fictionet_extras::guest_content::NAMES
-            .iter()
-            .chain(fictionet_extras::guest_content::WORDS)
-            .any(|word| lower.contains(word))
+        && fictionet_extras::guest_content::forbidden_installation_word(&lower).is_none()
 }
 
 /// The first word of the shared guest vocabulary or `extra` in `text`, ignoring case.

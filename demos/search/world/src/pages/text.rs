@@ -258,57 +258,10 @@ pub fn snippet_pieces(s: &str) -> Vec<String> {
 
 /// Lists the phrases and patterns that give generated text away.
 pub fn tells(text: &str) -> Vec<String> {
-    const PHRASES: &[&str] = &[
-        "it's important to note",
-        "it is important to note",
-        "in today's",
-        "navigate the",
-        "landscape",
-        "delve",
-        "robust",
-        "stay vigilant",
-        "key takeaways",
-        "in conclusion",
-        "whether you're",
-        "game-changer",
-        "leverage",
-        "seamless",
-        "a testament to",
-        "plays a crucial role",
-        "ever-evolving",
-        "tirelessly",
-        "meaningful",
-        "serves as a",
-        "underscores",
-        "sarah chen",
-        "john smith",
-        "jane doe",
-        "alex johnson",
-        "elena vance",
-        "acme",
-        "contoso",
-    ];
-    let low = text.to_lowercase();
-    let mut found = Vec::new();
-    let n = text.matches('—').count();
-    if n > 0 {
-        found.push(format!("em dash x{n}"));
-    }
-    found.extend(
-        PHRASES
-            .iter()
-            .filter(|p| {
-                low.match_indices(**p).any(|(at, matched)| {
-                    !low[..at].chars().next_back().is_some_and(word_char)
-                        && !low[at + matched.len()..]
-                            .chars()
-                            .next()
-                            .is_some_and(word_char)
-                })
-            })
-            .map(|p| (*p).to_owned()),
-    );
-    found
+    fictionet_extras::guest_content::forbidden_word(text)
+        .map(str::to_owned)
+        .into_iter()
+        .collect()
 }
 
 fn json_strings(value: &serde_json::Value, out: &mut Vec<String>) {

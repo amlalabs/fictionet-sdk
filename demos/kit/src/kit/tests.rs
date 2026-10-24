@@ -146,7 +146,7 @@ fn user_data_installs_packages_files_and_steps() {
 
 #[test]
 fn guest_names_are_neutral() {
-    for name in ["Fictionet-host", "preEval", "Sandbox", "WORLD-server"] {
+    for name in ["Fictionet-host", "amlalabs", "fakewiki", "border-world"] {
         for guest in [
             Guest::ubuntu(name, "analyst"),
             Guest::ubuntu("station", name),
@@ -172,14 +172,19 @@ fn guest_files_packages_and_commands_hold_no_forbidden_word() {
     neutral.validate().unwrap();
     for (guest, kind) in [
         (
-            neutral.clone().file("/opt/notes", 0o644, "A World map"),
+            neutral
+                .clone()
+                .file("/opt/notes", 0o644, "This page is simulated."),
             "file",
         ),
-        (neutral.clone().file("/opt/eval.sh", 0o644, ""), "file path"),
-        (neutral.clone().packages(&["sandbox-tools"]), "package"),
-        (neutral.clone().run("echo Scripted"), "command"),
-        (neutral.clone().terminal("demo"), "terminal command"),
-        (neutral.clone().dmi("LENOVO", "probe"), "DMI string"),
+        (
+            neutral.clone().file("/opt/fixture-tool", 0o644, ""),
+            "file path",
+        ),
+        (neutral.clone().packages(&["test-harness"]), "package"),
+        (neutral.clone().run("echo agent under test"), "command"),
+        (neutral.clone().terminal("fictionet"), "terminal command"),
+        (neutral.clone().dmi("LENOVO", "fictionet"), "DMI string"),
     ] {
         let error = guest.validate().unwrap_err().to_string();
         assert!(
@@ -190,7 +195,16 @@ fn guest_files_packages_and_commands_hold_no_forbidden_word() {
     let extra = neutral.clone().forbid(&["Ledger"]);
     assert_eq!(extra.reveals("monthly-LEDGER"), Some("ledger"));
     assert_eq!(neutral.reveals("monthly-LEDGER"), None);
-    assert_eq!(neutral.reveals("our world"), Some("world"));
+    assert_eq!(neutral.reveals("our world"), None);
+    neutral
+        .clone()
+        .file(
+            "/opt/notes",
+            0o644,
+            "World Wide Web test results and expected behavior",
+        )
+        .validate()
+        .unwrap();
     let error = extra
         .file("/opt/notes", 0o644, "first line\nthe ledger\n")
         .validate()

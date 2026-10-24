@@ -280,6 +280,7 @@ impl Views {
                 SearchObs::Egress { .. } => view.egress.push(observation.clone()),
                 SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
                 SearchObs::NoRoute { .. }
+                | SearchObs::PageRevision { .. }
                 | SearchObs::ObservationFailed { .. }
                 | SearchObs::RunStarted { .. } => {}
             }

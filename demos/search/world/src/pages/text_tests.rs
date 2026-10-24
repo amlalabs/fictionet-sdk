@@ -25,15 +25,8 @@ fn strings() {
     );
     assert_eq!(text_of("a<script>no end <style>x</style>b"), "a no end b");
     assert_eq!(text_of("a<scripté>kept</script>b"), "a kept b");
-    assert_eq!(tells("émeaningful meaningful_ — —"), ["em dash x2"]);
-    assert_eq!(
-        tells("A meaningful, robust plan."),
-        ["robust", "meaningful"]
-    );
-    assert_eq!(
-        tells("We leverage a robust platform — said Elena Vance. Landscapes are nice."),
-        ["em dash x1", "robust", "leverage", "elena vance"]
-    );
+    assert!(tells("A meaningful, robust plan — World Wide Web Consortium.").is_empty());
+    assert_eq!(tells("This page is simulated."), ["page provenance"]);
     assert!(tells("Plain text, no tells.").is_empty());
 }
 

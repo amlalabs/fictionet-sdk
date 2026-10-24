@@ -38,7 +38,7 @@ impl Pages {
 
     /// Runs one generation with the maker's stored or model path and
     /// writes its rows. `context` names it in `generations.jsonl`.
-    pub(super) async fn generate<T>(
+    pub(super) async fn generate<T: serde::Serialize>(
         &self,
         cx: &Cx,
         context: Value,
@@ -53,16 +53,29 @@ impl Pages {
                     self.reserve()?;
                 }
                 let (system, user, max_tokens) = prompt();
-                // Refuse text that reveals how pages are made.
+                let target: crate::observation::WriterTarget =
+                    serde_json::from_value(context.clone()).expect("generation context");
                 let read = |text: &str| match gives_away(text) {
-                    Some(word) => Err(prompts::Unreadable(format!(
-                        "the answer contains {word:?}, which no page may contain; write it again without it"
-                    ))),
+                    Some(reason) => {
+                        self.report(
+                            cx,
+                            crate::observation::SearchObs::PageRevision {
+                                target: target.clone(),
+                                action: crate::observation::RevisionAction::Rewrite,
+                                reason: reason.into(),
+                            },
+                        );
+                        Err(prompts::Unreadable::Disclosure(reason))
+                    }
                     None => read(text),
                 };
                 let (answer, ledger): (_, Ledger) =
                     model.ask(cx, &system, &user, max_tokens, read).await;
-                let status = if answer.is_ok() { "ok" } else { "error" };
+                let status = match &answer {
+                    Ok(_) => "ok",
+                    Err(failure) if failure.disclosure => "recovered",
+                    Err(_) => "error",
+                };
                 let mut rows = ledger.rows(&context, status);
                 rows.iter_mut().for_each(|row| model.redact_json(row));
                 self.log(cx, &rows)?;
@@ -72,7 +85,30 @@ impl Pages {
                         fields: answer.fields,
                         usage,
                     }),
-                    Err(Failure { error }) => Err(Stop::Failed {
+                    Err(Failure {
+                        error,
+                        disclosure: true,
+                    }) => {
+                        let fields = stored();
+                        let audit = fictionet_extras::guest_content::Audit::default();
+                        audit.inspect(
+                            "local rendering",
+                            &serde_json::to_vec(&fields).expect("page fields"),
+                        );
+                        audit
+                            .check()
+                            .map_err(|error| Stop::store(std::io::Error::other(error)))?;
+                        self.report(
+                            cx,
+                            crate::observation::SearchObs::PageRevision {
+                                target,
+                                action: crate::observation::RevisionAction::LocalRendering,
+                                reason: model.redact(&error),
+                            },
+                        );
+                        Ok(Made { fields, usage })
+                    }
+                    Err(Failure { error, .. }) => Err(Stop::Failed {
                         error: model.redact(&error),
                         usage: Some(Box::new(usage)),
                     }),
@@ -176,7 +212,7 @@ impl Pages {
                     |text| {
                         let css = text.trim();
                         if css.is_empty() {
-                            Err(prompts::Unreadable("empty stylesheet".into()))
+                            Err(prompts::Unreadable::Format("empty stylesheet".into()))
                         } else {
                             Ok(css.to_owned())
                         }
@@ -197,16 +233,11 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
-        let site_lock = if self.live_calls.is_none() {
-            Some(
-                self.locks
-                    .lock(cx, format!("site {host}"))
-                    .await
-                    .map_err(Stop::store)?,
-            )
-        } else {
-            None
-        };
+        let _site = self
+            .locks
+            .lock(cx, format!("site {host}"))
+            .await
+            .map_err(Stop::store)?;
         if self.live_calls.is_none() {
             self.reserve()?;
         }
@@ -223,7 +254,6 @@ impl Pages {
                 cast,
             }
         };
-        let _site = ask.profile.is_none().then_some(site_lock);
         let expected = prompts::expected_type(&url);
         let seed = self.context().into_owned();
         let subject = format!("{url} {}", make::title_from(host, target));
@@ -325,13 +355,15 @@ impl Pages {
                             page.body.clone()
                         };
                         text::validate_page(&page.content_type, body.as_bytes())
-                            .map_err(prompts::Unreadable)?;
+                            .map_err(prompts::Unreadable::Format)?;
                     }
                     if ask.profile.is_none()
                         && fictionet_extras::sites::lookup(host, target).is_none()
                         && page.site.as_ref().is_none_or(|p| p.css.is_empty())
                     {
-                        return Err(prompts::Unreadable("the first page needs SITE_CSS".into()));
+                        return Err(prompts::Unreadable::Format(
+                            "the first page needs SITE_CSS".into(),
+                        ));
                     }
                     Ok(page)
                 },

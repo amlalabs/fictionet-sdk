@@ -148,6 +148,10 @@ function activityText(row) {
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
     case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Opened sign-in' : ['Closed sign-in', fact.exceptions.join(', ')].filter(Boolean).join(' · '), 'signin'];
     case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
+    case 'page_revision': {
+      const target = fact.target.url || fact.target.host || fact.target.query || 'Pages';
+      return [target, 'Writer', `${fact.action === 'rewrite' ? 'Rewrite' : 'Recovered'} · ${fact.reason}`, 'sites'];
+    }
     case 'observation_failed': return ['Recording', 'Error', fact.reason, 'egress'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
     default: return ['', '', '', 'router'];

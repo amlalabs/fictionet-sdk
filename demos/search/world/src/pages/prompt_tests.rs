@@ -7,7 +7,7 @@ fn json_urls_need_json() {
         for body in ["Not found", "", "<h1>Missing</h1>"] {
             let answer = format!("STATUS: {status}\nTITLE: x\nBODY:\n{body}");
             let error = read_page(&answer, Some("application/json"), false).unwrap_err();
-            assert!(error.0.contains("not JSON"), "{error}");
+            assert!(error.to_string().contains("not JSON"), "{error}");
         }
     }
     for status in [200, 404] {
@@ -17,7 +17,7 @@ fn json_urls_need_json() {
             assert!(
                 read_page(&answer, None, false)
                     .unwrap_err()
-                    .0
+                    .to_string()
                     .contains("not JSON")
             );
         }
@@ -46,14 +46,17 @@ fn statuses_are_200_or_404_and_a_referenced_page_exists() {
         let answer = format!("STATUS: 404\nTITLE: x\nBODY:\n{body}");
         let error = read_page(&answer, expected, true).unwrap_err();
         assert!(
-            error.0.contains("referenced") && error.0.contains("404"),
+            error.to_string().contains("referenced") && error.to_string().contains("404"),
             "{error}"
         );
     }
     for status in [100, 101, 201, 204, 301, 304, 403, 410, 500] {
         let answer = format!("STATUS: {status}\nTITLE: x\nBODY:\n{{\"message\": \"x\"}}");
         let error = read_page(&answer, Some("application/json"), false).unwrap_err();
-        assert_eq!(error.0, format!("STATUS must be 200 or 404, got {status}"));
+        assert_eq!(
+            error.to_string(),
+            format!("STATUS must be 200 or 404, got {status}")
+        );
     }
 }
 
@@ -94,7 +97,7 @@ BODY:
     assert!(
         read_page("TITLE: x", None, false)
             .unwrap_err()
-            .0
+            .to_string()
             .contains("no BODY")
     );
     let fenced = "```text\nTITLE: x\nBODY:\nhello\n```";
@@ -116,7 +119,7 @@ fn urls_that_promise_a_type_get_it() {
     assert!(
         read_page(html, Some("application/json"), false)
             .unwrap_err()
-            .0
+            .to_string()
             .contains("not JSON")
     );
     let page = read_page(
@@ -156,7 +159,7 @@ AD: https://ad.example-shop.de/ | Buy | Now 20% off";
     assert!(
         read_search("Sorry, I can't help with that.")
             .unwrap_err()
-            .0
+            .to_string()
             .contains("no results")
     );
 }
@@ -174,7 +177,7 @@ fn a_cast_answer() {
     assert!(
         read_cast("A | b | c")
             .unwrap_err()
-            .0
+            .to_string()
             .contains("fewer than three")
     );
 }

@@ -220,6 +220,7 @@ impl Ledger {
 #[derive(Debug)]
 pub struct Failure {
     pub error: String,
+    pub disclosure: bool,
 }
 
 /// What a store made with a model records: provider, model (an empty one
@@ -507,6 +508,7 @@ impl Model {
         }
         Err(Failure {
             error: self.redact(&format!("{what} failed: {failure}")),
+            disclosure: false,
         })
     }
 
@@ -527,7 +529,10 @@ impl Model {
         let unreadable = |attempt: &mut Attempt, error: String| {
             attempt.outcome = "unreadable".into();
             attempt.error = Some(error.clone());
-            Failure { error }
+            Failure {
+                error,
+                disclosure: false,
+            }
         };
         let (text, cut_off) = match self.provider {
             Provider::Anthropic => {
@@ -596,7 +601,9 @@ impl Model {
             ledger.ended = Some(now(cx));
             match read {
                 Ok(fields) => return (Ok(Answer { fields, raw: text }), ledger),
-                Err(Unreadable(reason)) => {
+                Err(rejection) => {
+                    let disclosure = matches!(rejection, Unreadable::Disclosure(_));
+                    let reason = rejection.to_string();
                     let last = ledger.attempts.last_mut().expect("an attempt");
                     last.outcome = "unreadable".into();
                     last.error = Some(reason.clone());
@@ -618,11 +625,17 @@ impl Model {
                                 ""
                             }
                         );
-                        return (Err(Failure { error: reason }), ledger);
+                        return (
+                            Err(Failure {
+                                error: reason,
+                                disclosure,
+                            }),
+                            ledger,
+                        );
                     }
-                    user.push_str(&format!(
-                        "\n\nThe previous answer could not be read: {reason}\nAnswer again in the requested format."
-                    ));
+                    user = format!(
+                        "{user}\n\nPrevious answer:\n{text}\n\nThe previous answer could not be read: {reason}\nRewrite the full answer in the requested format. Preserve its legitimate facts and links, and remove the named disclosure."
+                    );
                 }
             }
         }
@@ -702,7 +715,7 @@ mod transport_tests {
                 .live(Arc::new(AtomicUsize::new(0)));
                 let (answer, ledger) = model
                     .ask(&cx, "Write a page.", "About stars.", 200, |_| {
-                        Err::<(), _>(Unreadable("try again".into()))
+                        Err::<(), _>(Unreadable::Format("try again".into()))
                     })
                     .await;
                 assert!(answer.is_err());

@@ -68,7 +68,7 @@ pub struct Profile {
     pub style: usize,
 }
 /// Generated page content before layout rendering.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Page {
     /// HTTP status code.
     pub status: u16,

@@ -422,10 +422,11 @@ impl Store {
         self.record(Entry::Page(page))
     }
 
-    /// The host's pages, oldest first, as a page prompt shows them.
+    /// The host's most recent pages, newest first, as its next prompt shows them.
     pub fn host_pages(&self, host: &str) -> Vec<HostPage> {
         self.order
             .iter()
+            .rev()
             .filter(|(h, _)| site_key(h) == site_key(host))
             .take(20)
             .map(|at| {

@@ -30,7 +30,7 @@ pub fn read_cast(text: &str) -> Result<Vec<Person>, Unreadable> {
         })
         .collect();
     if people.len() < 3 {
-        return Err(Unreadable(format!(
+        return Err(Unreadable::Format(format!(
             "fewer than three people in the cast answer: {:?}",
             prefix(text, 200)
         )));
@@ -89,7 +89,7 @@ pub fn read_search(text: &str) -> Result<Search, Unreadable> {
         .take(10)
         .collect();
     if search.results.is_empty() {
-        return Err(Unreadable(format!(
+        return Err(Unreadable::Format(format!(
             "no results in the search answer: {:?}",
             prefix(text, 200)
         )));
@@ -116,7 +116,7 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         .get_or_init(|| Regex::new(r"^```[a-z]*\s*\n").unwrap())
         .replace(text, "");
     let Some((head, body)) = text.split_once("\nBODY:") else {
-        return Err(Unreadable(format!(
+        return Err(Unreadable::Format(format!(
             "no BODY: line in the page answer: {:?}",
             prefix(&text, 200)
         )));
@@ -184,7 +184,7 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         }
     }
     if page.title.is_empty() {
-        return Err(Unreadable(format!(
+        return Err(Unreadable::Format(format!(
             "no TITLE: line in the page answer: {:?}",
             prefix(&text, 200)
         )));
@@ -201,19 +201,19 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
     if (ctype == "application/json" || ctype.ends_with("+json"))
         && let Err(error) = serde_json::from_str::<Value>(&page.body)
     {
-        return Err(Unreadable(format!(
+        return Err(Unreadable::Format(format!(
             "the body of a JSON URL is not JSON ({error}): {:?}",
             prefix(&page.body, 200)
         )));
     }
     if !matches!(page.status, 200 | 404) {
-        return Err(Unreadable(format!(
+        return Err(Unreadable::Format(format!(
             "STATUS must be 200 or 404, got {}",
             page.status
         )));
     }
     if referenced && page.status == 404 {
-        return Err(Unreadable(
+        return Err(Unreadable::Format(
             "a referenced page cannot have STATUS 404; a search result or link points here".into(),
         ));
     }

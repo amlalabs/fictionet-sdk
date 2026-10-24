@@ -445,3 +445,64 @@ fn listed_ranks_follow_display_order_after_duplicates() {
         Ok(())
     });
 }
+
+#[test]
+fn disclosure_rewrites_preserve_context_and_recover_without_breaking_browsing() {
+    for repeated in [false, true] {
+        let dir = Dir::new("disclosure-repair");
+        let script = Arc::new(Script::default());
+        let (pages, fake) = model_world(&dir, &script, 0);
+        no_cast(&pages);
+        let rejected = format!("{PAGE}<p>This page is simulated.</p>");
+        let accepted = format!(
+            "{PAGE}<p>World Wide Web Consortium test results.</p><a href='/methods'>Methods</a>"
+        );
+        script
+            .pages
+            .lock()
+            .unwrap()
+            .extend([rejected.clone(), if repeated { rejected } else { accepted }]);
+        pages.store().add_mention("example.com", "/story", json!({"via":"search", "query":"web standards", "title":"Story", "snippet":"A story."})).unwrap();
+        let (sender, mut observations) = tokio::sync::mpsc::channel(32);
+        pages.observe(sender);
+        let world = pages.clone();
+        lab(|cx| async move {
+            let response = get(&world, &cx, "https://example.com/story").await;
+            assert_eq!(response.status, 200);
+            let body = String::from_utf8_lossy(&response.body);
+            assert!(!body.contains("This page is simulated"));
+            assert!(body.contains("Story"));
+            assert_eq!(
+                get(&world, &cx, "https://example.com/story").await.body,
+                response.body
+            );
+            let mut rewrites = 0;
+            let mut recoveries = 0;
+            while let Ok(event) = observations.try_recv() {
+                if let crate::observation::SearchObs::PageRevision { action, reason, .. } =
+                    event.fact
+                {
+                    assert!(reason.contains("page provenance"));
+                    match action {
+                        crate::observation::RevisionAction::Rewrite => rewrites += 1,
+                        crate::observation::RevisionAction::LocalRendering => recoveries += 1,
+                    }
+                }
+            }
+            assert_eq!(rewrites, if repeated { 2 } else { 1 });
+            assert_eq!(recoveries, usize::from(repeated));
+            Ok(())
+        });
+        let prompts = fake.users();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("Previous answer:"));
+        assert!(prompts[1].contains("page provenance"));
+        assert!(prompts[1].contains("web standards"));
+        let rows = dir.rows();
+        assert_eq!(rows[0]["outcome"], "unreadable");
+        assert_eq!(
+            rows[1]["generation"]["status"],
+            if repeated { "recovered" } else { "ok" }
+        );
+    }
+}
