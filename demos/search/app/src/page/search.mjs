@@ -14,6 +14,7 @@ const button = (text, action, className) => {
 const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' });
 const time = stamp;
 const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000)} KB`;
+const quantity = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
 const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied · ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'live' : 'model-written';
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
 let latest = { at_ms: 0, oldest_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
@@ -62,9 +63,9 @@ function graph() {
   const modelHosts = (purpose) => [...new Set(shown.connections.filter((row) => row.purpose === purpose).map((row) => row.host))];
   const services = [
     { id: 'dns', title: 'DNS', subtitle: '10.0.0.1:53', reached: facts.some((fact) => fact.kind === 'resolved') },
-    { id: 'search', title: 'Search', subtitle: searches ? `${searches} searches` : '', reached: searches > 0, purpose: 'live_search' },
-    { id: 'sites', title: 'Sites', subtitle: sites.length ? `${sites.length} ${sites.length === 1 ? 'site' : 'sites'}` : '', reached: sites.some((site) => site.requests.length), purpose: 'live_capture' },
-    { id: 'calls', title: 'Model gateway', subtitle: shown.calls.length ? `${shown.calls.length} calls` : '', reached: shown.calls.length > 0, purpose: 'model' },
+    { id: 'search', title: 'Search', subtitle: searches ? quantity(searches, 'search', 'searches') : '', reached: searches > 0, purpose: 'live_search' },
+    { id: 'sites', title: 'Sites', subtitle: sites.length ? quantity(sites.length, 'site') : '', reached: sites.some((site) => site.requests.length), purpose: 'live_capture' },
+    { id: 'calls', title: 'Model gateway', subtitle: shown.calls.length ? quantity(shown.calls.length, 'call') : '', reached: shown.calls.length > 0, purpose: 'model' },
     { id: 'writer', title: 'Page writer', subtitle: '', reached: false, purpose: 'page writer' },
     { id: 'signin', title: 'Sign-in', subtitle: shown.signin?.fact.open ? 'Open' : 'Closed', reached: modelHosts('account').length > 0, purpose: 'account' },
     { id: 'router', title: 'Router', subtitle: facts.filter((fact) => fact.kind === 'no_route').at(-1)?.to || '10.0.0.1', reached: facts.some((fact) => fact.kind === 'no_route') },
@@ -96,7 +97,7 @@ function graph() {
       if (service.purpose === 'live_capture') {
         const pages = shown.sites.flatMap((site) => site.requests.filter((request) => request.source.kind === 'live' && request.has_preview));
         const copies = button('', () => select('copies'), 'destination');
-        copies.append(element('strong', 'Page copies'), element('small', `${pages.length} pages · ${hosts.length} hosts`));
+        copies.append(element('strong', 'Page copies'), element('small', `${quantity(pages.length, 'page')} · ${quantity(hosts.length, 'host')}`));
         destinations.append(copies);
       } else {
         for (const host of hosts) {
@@ -127,7 +128,7 @@ function activityText(row) {
     case 'egress': {
       if (fact.purpose === 'live_capture') {
         const copies = activityRows().filter((row) => row.fact.kind === 'egress' && row.fact.purpose === 'live_capture');
-        return ['Page copies', 'Upstream', `${copies.length} requests · ${new Set(copies.map((row) => row.fact.host)).size} hosts`, 'copies'];
+        return ['Page copies', 'Upstream', `${quantity(copies.length, 'request')} · ${quantity(new Set(copies.map((row) => row.fact.host)).size, 'host')}`, 'copies'];
       }
       return [fact.host, 'Upstream', `${purposeName(fact.purpose)} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || phaseName(fact.phase)}`, `egress:${fact.host}`];
     }

@@ -378,6 +378,10 @@ related-story links in the middle of the text, comment counts, a
 newsletter box. Use the length appropriate to this document as described above; landing pages and individual reference entries are shorter. Include ordinary editorial context: section labels, byline and dateline, concrete reporting and attribution, and related reading. Never add a photo credit, caption or image placeholder without its actual image. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
 header or the footer: the site adds them. Use plain tags: h1-h3, p, ul, ol,
 li, table, pre, code, a, blockquote, time, span. No scripts.
+An encyclopedia's References section uses an ol with class references. Each li
+gives the original authors, publication and date, with the paper's title inside
+an a element whose href leads directly to that primary paper or its abstract.
+Bibliography entries are navigable citations, never unlinked plain text.
 
 If the URL is not a web page (an API endpoint, a .json, .txt, .xml or .py
 file), set CONTENT_TYPE to its real type and make BODY the raw file. If the
