@@ -880,3 +880,16 @@ fn linked_pages_receive_the_complete_referring_document() {
         Ok(())
     });
 }
+
+#[test]
+fn future_plans_obey_the_same_publication_cutoff() {
+    let page = make::Page {
+        date: "2026-09-24".into(),
+        body: "<p>Replacement kits will begin shipping on 5 October 2026.</p>".into(),
+        content_type: "text/html".into(),
+        ..Default::default()
+    };
+    assert!(
+        crate::pages::answers::chronology(&page, seed::parse_date("2026-10-24").unwrap()).is_err()
+    );
+}

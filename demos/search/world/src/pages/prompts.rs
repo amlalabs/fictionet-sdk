@@ -133,6 +133,13 @@ named contact has been established, omit those details and link to the site's
 contact page. Do not invent contact coordinates or illustrative contact details.
 
 Nothing is dated after today. A dated article knows only what was known then.
+No calendar date in the headline, body or claims may be later than DATE.
+This includes forecasts, deadlines, planned shipments and dates quoted from
+other pages. Choose the publication/update dateline after all dates actually
+mentioned. If an older article would mention a later date, either omit that
+unavailable detail or write an explicit later update, retaining the original
+publication date separately. Do not retain a later date as a future plan on
+an earlier dateline; the publication validator rejects that too.
 When covering a development after an article's original publication date,
 give the article an explicit update date on or after that development. Set
 DATE to that update date and show both the original publication and update
