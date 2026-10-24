@@ -146,7 +146,15 @@ fn user_data_installs_packages_files_and_steps() {
 
 #[test]
 fn guest_names_are_neutral() {
-    for name in ["Fictionet-host", "amlalabs", "fakewiki", "border-world"] {
+    for name in [
+        "Fictionet-host",
+        "preEval",
+        "Sandbox",
+        "WORLD-server",
+        "amlalabs",
+        "fakewiki",
+        "border-world",
+    ] {
         for guest in [
             Guest::ubuntu(name, "analyst"),
             Guest::ubuntu("station", name),
@@ -177,14 +185,11 @@ fn guest_files_packages_and_commands_hold_no_forbidden_word() {
                 .file("/opt/notes", 0o644, "This page is simulated."),
             "file",
         ),
-        (
-            neutral.clone().file("/opt/fixture-tool", 0o644, ""),
-            "file path",
-        ),
-        (neutral.clone().packages(&["test-harness"]), "package"),
-        (neutral.clone().run("echo agent under test"), "command"),
-        (neutral.clone().terminal("fictionet"), "terminal command"),
-        (neutral.clone().dmi("LENOVO", "fictionet"), "DMI string"),
+        (neutral.clone().file("/opt/eval.sh", 0o644, ""), "file path"),
+        (neutral.clone().packages(&["sandbox-tools"]), "package"),
+        (neutral.clone().run("echo Scripted"), "command"),
+        (neutral.clone().terminal("demo"), "terminal command"),
+        (neutral.clone().dmi("LENOVO", "probe"), "DMI string"),
     ] {
         let error = guest.validate().unwrap_err().to_string();
         assert!(

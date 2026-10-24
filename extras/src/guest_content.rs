@@ -83,7 +83,7 @@ pub const DISCLOSURES: &[DisclosureRule] = &[
     },
     DisclosureRule {
         name: "installation provenance",
-        pattern: r#"^(?:(?:eval|sandbox|world)(?:[-_][a-z0-9_-]*)?|(?:test|benchmark)[-_](?:harness|fixture|runner))$|\b(?:echo|printf)\s+['"]?(?:eval|world)\b|https?://(?:eval|sandbox|world)(?:[.-][a-z0-9.-]+)?(?:[/:]|$)"#,
+        pattern: r#"^(?:(?:(?:pre|post)?eval|sandbox|world|demo|probe)(?:[-_][a-z0-9_-]*)?|(?:test|benchmark)[-_](?:harness|fixture|runner))$|\b(?:echo|printf)\s+['"]?(?:eval|world|scripted)\b|(?:^|/)(?:eval|sandbox|world)(?:[._-]|$)|https?://(?:eval|sandbox|world)(?:[.-][a-z0-9.-]+)?(?:[/:]|$)"#,
         scope: Scope::Installation,
     },
 ];
@@ -807,7 +807,7 @@ mod tests {
         assert!(audit.check().unwrap_err().contains("fictionet"));
         for bytes in [
             b"F&#105;ctionet".as_slice(),
-            b"%74est%20harness",
+            b"%66ixture",
             br#"{"name":"\u0066ictionet"}"#,
         ] {
             let audit = Audit::default();
