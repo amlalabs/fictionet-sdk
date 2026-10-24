@@ -3546,6 +3546,39 @@ mod test {
         sanity!(s, socket_established());
     }
 
+    /// When both ends open at once, the peer's SYN can arrive before this
+    /// socket has sent its own, and the peer can repeat it before this
+    /// socket gets to send. The socket must still send its SYN|ACK, or
+    /// neither end ever completes the handshake.
+    #[test]
+    fn test_syn_sent_peer_syn_before_own_syn() {
+        let mut s = socket();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
+        let syn = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            max_seg_size: Some(BASE_MSS - 80),
+            window_scale: Some(0),
+            ..SEND_TEMPL
+        };
+        send!(s, syn);
+        assert_eq!(s.state, State::SynReceived);
+        // The repeated SYN draws an ACK, and nothing else.
+        let _ = send(&mut s, Instant::from_millis(0), &syn);
+        let mut syn_ack = false;
+        for t in (0..=60_000).step_by(100) {
+            s.cx.set_now(Instant::from_millis(t));
+            let _ = s.socket.dispatch(&mut s.cx, |_, (_, repr)| {
+                syn_ack |= repr.control == TcpControl::Syn
+                    && repr.seq_number == LOCAL_SEQ
+                    && repr.ack_number == Some(REMOTE_SEQ + 1);
+                Ok::<(), ()>(())
+            });
+        }
+        assert!(syn_ack, "no SYN|ACK within a minute");
+    }
+
     #[test]
     fn test_syn_sent_syn_ack_not_incremented() {
         let mut s = socket_syn_sent();
@@ -8230,6 +8263,160 @@ mod test {
             payload: b"a",
             ..RECV_TEMPL
         }]);
+    }
+
+    /// The segment `s` sends at `now`, if any, with its payload copied out.
+    fn sent_at(s: &mut TestSocket, now: Instant) -> Option<(IpRepr, TcpRepr<'static>)> {
+        s.cx.set_now(now);
+        let mut sent = None;
+        let _ = s.socket.dispatch(&mut s.cx, |_, (ip, tcp)| {
+            let payload: &'static [u8] = Vec::leak(tcp.payload.to_vec());
+            sent = Some((ip, TcpRepr { payload, ..tcp }));
+            Ok::<(), ()>(())
+        });
+        sent
+    }
+
+    /// Gives `to` a segment, and gives `from` the reply `to` sends at once.
+    fn deliver(
+        from: &mut TestSocket,
+        to: &mut TestSocket,
+        now: Instant,
+        (ip, tcp): (IpRepr, TcpRepr<'static>),
+    ) {
+        to.cx.set_now(now);
+        from.cx.set_now(now);
+        if to.socket.accepts(&mut to.cx, &ip, &tcp)
+            && let Some((ip, tcp)) = to.socket.process(&mut to.cx, &ip, &tcp)
+            && from.socket.accepts(&mut from.cx, &ip, &tcp)
+        {
+            from.socket.process(&mut from.cx, &ip, &tcp);
+        }
+    }
+
+    /// Lets two sockets talk at `now`, with no loss, until both are quiet.
+    fn exchange(a: &mut TestSocket, b: &mut TestSocket, now: Instant) {
+        for _ in 0..64 {
+            let from_a = sent_at(a, now);
+            let quiet_a = from_a.is_none();
+            if let Some(segment) = from_a {
+                deliver(a, b, now, segment);
+            }
+            let from_b = sent_at(b, now);
+            let quiet_b = from_b.is_none();
+            if let Some(segment) = from_b {
+                deliver(b, a, now, segment);
+            }
+            if quiet_a && quiet_b {
+                return;
+            }
+        }
+    }
+
+    /// Two sockets whose windows are both closed probe each other at the
+    /// same moment, and both applications read while the probes are on
+    /// their way, in order on each path. Each probe carries a byte, which
+    /// the other side, its window now open, takes in. The transfer must go
+    /// on: each side's later segments must be acceptable to a peer that
+    /// has its probe byte, so the window updates and ACKs get through.
+    #[test]
+    fn test_crossing_zero_window_probes_keep_the_transfer_going() {
+        let mut a = socket_with_buffer_sizes(64, 16);
+        let mut b = socket_with_buffer_sizes(64, 16);
+        a.listen(LISTEN_END).unwrap();
+        b.socket.connect(&mut b.cx, LOCAL_END, REMOTE_END).unwrap();
+        exchange(&mut a, &mut b, Instant::from_millis(0));
+        assert_eq!((a.state, b.state), (State::Established, State::Established));
+
+        // Each side sends more than the other can hold.
+        assert_eq!(a.send_slice(&[1; 32]), Ok(32));
+        assert_eq!(b.send_slice(&[2; 32]), Ok(32));
+        exchange(&mut a, &mut b, Instant::from_millis(0));
+        assert_eq!((a.recv_queue(), b.recv_queue()), (16, 16));
+
+        // Both probes leave before either arrives.
+        let now = Instant::from_millis(1000);
+        let probe_a = sent_at(&mut a, now).unwrap();
+        let probe_b = sent_at(&mut b, now).unwrap();
+        assert_eq!((probe_a.1.payload.len(), probe_b.1.payload.len()), (1, 1));
+        // Both applications read before the probes arrive.
+        let mut got_a = Vec::new();
+        let mut got_b = Vec::new();
+        let mut buf = [0; 64];
+        let n = a.recv_slice(&mut buf).unwrap();
+        got_a.extend_from_slice(&buf[..n]);
+        let n = b.recv_slice(&mut buf).unwrap();
+        got_b.extend_from_slice(&buf[..n]);
+        let update_a = sent_at(&mut a, now).unwrap();
+        let update_b = sent_at(&mut b, now).unwrap();
+        // Each way, the probe arrives first, then the window update.
+        deliver(&mut a, &mut b, now, probe_a);
+        deliver(&mut b, &mut a, now, probe_b);
+        deliver(&mut a, &mut b, now, update_a);
+        deliver(&mut b, &mut a, now, update_b);
+
+        // A lossless network and readers that keep up from here on.
+        for t in (1000..=600_000).step_by(100) {
+            exchange(&mut a, &mut b, Instant::from_millis(t));
+            while let Ok(n @ 1..) = a.recv_slice(&mut buf) {
+                got_a.extend_from_slice(&buf[..n]);
+            }
+            while let Ok(n @ 1..) = b.recv_slice(&mut buf) {
+                got_b.extend_from_slice(&buf[..n]);
+            }
+        }
+        assert_eq!(got_a, [2; 32]);
+        assert_eq!(got_b, [1; 32]);
+    }
+
+    /// Two sockets send each other two segments at once, and all the ACKs
+    /// are lost. Both retransmission timers fire before either
+    /// retransmission arrives, and each resends only its first segment.
+    /// The transfer must still finish once the network delivers
+    /// everything: each side's later segments must be acceptable to a peer
+    /// that has both its segments, so the ACKs get through.
+    #[test]
+    fn test_crossing_retransmissions_keep_the_transfer_going() {
+        let mut a = socket_with_buffer_sizes(4096, 4096);
+        let mut b = socket_with_buffer_sizes(4096, 4096);
+        a.set_nagle_enabled(false);
+        b.set_nagle_enabled(false);
+        a.listen(LISTEN_END).unwrap();
+        b.socket.connect(&mut b.cx, LOCAL_END, REMOTE_END).unwrap();
+        exchange(&mut a, &mut b, Instant::from_millis(0));
+        assert_eq!((a.state, b.state), (State::Established, State::Established));
+
+        // The data crosses and arrives; the ACKs are lost.
+        let now = Instant::from_millis(0);
+        assert_eq!(a.send_slice(&[1; 2000]), Ok(2000));
+        assert_eq!(b.send_slice(&[2; 2000]), Ok(2000));
+        let data_a: Vec<_> = core::iter::from_fn(|| sent_at(&mut a, now)).collect();
+        let data_b: Vec<_> = core::iter::from_fn(|| sent_at(&mut b, now)).collect();
+        assert_eq!((data_a.len(), data_b.len()), (2, 2));
+        for (ip, tcp) in data_a {
+            b.cx.set_now(now);
+            b.socket.process(&mut b.cx, &ip, &tcp);
+        }
+        for (ip, tcp) in data_b {
+            a.cx.set_now(now);
+            a.socket.process(&mut a.cx, &ip, &tcp);
+        }
+        while sent_at(&mut a, now).is_some() {}
+        while sent_at(&mut b, now).is_some() {}
+
+        // Both retransmissions leave before either arrives.
+        let now = Instant::from_millis(1000);
+        let again_a = sent_at(&mut a, now).unwrap();
+        let again_b = sent_at(&mut b, now).unwrap();
+        assert!(again_a.1.payload.len() < 2000 && again_b.1.payload.len() < 2000);
+        deliver(&mut a, &mut b, now, again_a);
+        deliver(&mut b, &mut a, now, again_b);
+
+        // A lossless network from here on.
+        for t in (1000..=600_000).step_by(100) {
+            exchange(&mut a, &mut b, Instant::from_millis(t));
+        }
+        assert_eq!((a.send_queue(), b.send_queue()), (0, 0));
     }
 
     #[test]

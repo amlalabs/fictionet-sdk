@@ -887,6 +887,60 @@ mod tests {
         assert_eq!(tcp.flows(), 1);
     }
 
+    /// A SYN or SYN-ACK with the sequence number its direction started
+    /// at is a retransmission, as a lossy capture shows when the first
+    /// copy's answer was lost. It neither restarts the connection nor
+    /// rewinds the direction, so the bytes after it still follow the
+    /// bytes already delivered.
+    #[test]
+    fn a_retransmitted_syn_does_not_rewind_its_direction() {
+        let key = key();
+        let back = (key.2, key.3, key.0, key.1);
+        let server = |seq: u32, flags: u8, payload: &'static [u8]| Segment {
+            key: back,
+            seq,
+            ack: 101,
+            flags,
+            payload,
+        };
+        let mut tcp = Reassembler::default();
+        tcp.push(segment(100, 2, b""));
+        tcp.push(server(500, 0x12, b""));
+        assert_eq!(
+            tcp.push(server(501, 0x18, b"220 ready\r\n")).events,
+            [Chunk::Bytes {
+                dir: back,
+                offset: 0,
+                bytes: b"220 ready\r\n".to_vec(),
+                input_offset: Some(0),
+            }]
+        );
+        let again = tcp.push(server(500, 0x12, b""));
+        assert!(!again.restarted);
+        assert!(again.events.is_empty());
+        assert_eq!(
+            tcp.push(server(512, 0x18, b"next")).events,
+            [Chunk::Bytes {
+                dir: back,
+                offset: 11,
+                bytes: b"next".to_vec(),
+                input_offset: Some(0),
+            }]
+        );
+
+        assert_eq!(
+            tcp.push(segment(101, 0x18, b"EHLO")).events,
+            [bytes(0, b"EHLO", Some(0))]
+        );
+        let again = tcp.push(segment(100, 2, b""));
+        assert!(!again.restarted);
+        assert!(again.events.is_empty());
+        assert_eq!(
+            tcp.push(segment(105, 0x18, b" x")).events,
+            [bytes(4, b" x", Some(0))]
+        );
+    }
+
     #[test]
     fn one_byte_at_a_time_has_no_accumulating_input_buffer() {
         let mut tcp = Reassembler::default();
